@@ -1,4 +1,18 @@
-# TL Event Reminder Discord Bot
+import os, threading
+from flask import Flask
+
+app = Flask(__name__)
+
+@app.get("/")
+def ok():
+    return "ok"  # Healthcheck
+
+def run_flask():
+    # Render setzt PORT als Env-Var für Web Services
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
+
+# Webserver im Hintergrund starten
+threading.Thread(target=run_flask, daemon=True).start()# TL Event Reminder Discord Bot
 # Author: ChatGPT for Jonas
 # Python 3.11+ recommended
 
