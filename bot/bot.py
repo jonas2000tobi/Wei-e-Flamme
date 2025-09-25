@@ -14,7 +14,17 @@ def run_flask():
 # Webserver im Hintergrund starten
 threading.Thread(target=run_flask, daemon=True).start()# TL Event Reminder Discord Bot
 # Author: ChatGPT for Jonas
-# Python 3.11+ recommended
+# --- Selbst-Ping, damit Render-Free nicht einschläft ---
+import time, requests
+def keep_alive():
+    while True:
+        try:
+            requests.get("https://wei-e-flamme.onrender.com")  # deine Render-URL
+        except Exception as e:
+            print("Self-ping failed:", e)
+        time.sleep(300)  # alle 5 Minuten
+threading.Thread(target=keep_alive, daemon=True).start()
+# --- Ende Selbst-Ping ---
 
 # Features:
 # - Slash-Commands, serverweit
