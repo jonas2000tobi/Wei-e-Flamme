@@ -395,6 +395,8 @@ async def on_ready():
         print("Command sync failed:", e)
     scheduler_loop.start()
 
+client.load_extension("bot.event_rsvp")
+
 if __name__ == "__main__":
     if not TOKEN:
         raise SystemExit("Set DISCORD_BOT_TOKEN environment variable.")
