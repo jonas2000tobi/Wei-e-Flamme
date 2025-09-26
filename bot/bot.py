@@ -180,6 +180,7 @@ def save_post_log(log: Set[str]):
 # ---- Bot Setup ----
 intents = discord.Intents.default()
 intents.guilds = True
+intents.members = True
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
@@ -395,6 +396,237 @@ async def on_ready():
         print("Command sync failed:", e)
     scheduler_loop.start()
 
+# ====== RSVP Event mit Bild, Rollen-Auswertung und Buttons ======
+# Speichert Teilnahme-Status in data/event_rsvp.json (persistiert Neustarts).
+# Buttons sind persistent (timeout=None); on_ready() registriert sie erneut.
+
+from collections import defaultdict
+
+# --- KONFIG: Rollen-Erkennung Tank/Heal/DPS ---
+# Variante A (stabiler): trage hier die ID eurer Tank/Heal/DPS-Rollen ein (Zahlen).
+ROLE_IDS = {
+    "TANK":  0,  # z.B. 123456789012345678  (0 lassen, wenn ihr nur Namen nutzt)
+    "HEAL":  0,
+    "DPS":   0,
+}
+# Variante B (Fallback): Erkennung über Namen, wenn ROLE_IDS=0 sind
+ROLE_NAMES = {
+    "TANK": "Tank",
+    "HEAL": "Heal",
+    "DPS":  "DPS",
+}
+
+DATA_DIR.mkdir(exist_ok=True)
+RSVP_FILE = DATA_DIR / "event_rsvp.json"
+
+def _load_rsvp() -> dict:
+    if RSVP_FILE.exists():
+        try:
+            return json.loads(RSVP_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {}
+
+def _save_rsvp(blob: dict) -> None:
+    RSVP_FILE.write_text(json.dumps(blob, indent=2, ensure_ascii=False), encoding="utf-8")
+
+def _role_label_from_member(member: discord.Member) -> str:
+    """Gibt 'Tank' | 'Heal' | 'DPS' | 'Unassigned' zurück – nach IDs oder Namen."""
+    # Nach IDs (wenn gesetzt)
+    if ROLE_IDS.get("TANK"):
+        if any(r.id == ROLE_IDS["TANK"] for r in member.roles):
+            return "Tank"
+    if ROLE_IDS.get("HEAL"):
+        if any(r.id == ROLE_IDS["HEAL"] for r in member.roles):
+            return "Heal"
+    if ROLE_IDS.get("DPS"):
+        if any(r.id == ROLE_IDS["DPS"] for r in member.roles):
+            return "DPS"
+
+    # Fallback: nach Namen
+    tank_n = ROLE_NAMES.get("TANK", "").lower()
+    heal_n = ROLE_NAMES.get("HEAL", "").lower()
+    dps_n  = ROLE_NAMES.get("DPS", "").lower()
+    rl = [r.name.lower() for r in member.roles]
+    if tank_n and any(tank_n == x for x in rl):
+        return "Tank"
+    if heal_n and any(heal_n == x for x in rl):
+        return "Heal"
+    if dps_n and any(dps_n == x for x in rl):
+        return "DPS"
+
+    return "Unassigned"
+
+def _ensure_event(store: dict, message_id: str, payload: dict) -> dict:
+    """Legt die Datenstruktur für dieses Event an, falls neu."""
+    if message_id not in store:
+        store[message_id] = {
+            "title": payload.get("title", ""),
+            "when_text": payload.get("when_text", ""),
+            "channel_id": payload.get("channel_id"),
+            "image_url": payload.get("image_url", ""),
+            "description": payload.get("description", ""),
+            # Teilnehmer
+            "yes": {},      # user_id -> {"name": "...", "role": "Tank/Heal/DPS/..."}
+            "maybe": {},    # dito
+            "no": {},       # dito
+        }
+    return store[message_id]
+
+def _format_embed_for_event(ev: dict, guild: discord.Guild) -> discord.Embed:
+    """Baut den hübschen Embed inkl. Bild & Spalten für Yes/Maybe/No mit Rollen."""
+    title = ev.get("title") or "Event"
+    desc  = ev.get("description") or ""
+    when  = ev.get("when_text") or ""
+
+    embed = discord.Embed(
+        title=title,
+        description=f"{desc}\n\n**Zeit:** {when}",
+        color=discord.Color.blue()
+    )
+    if ev.get("image_url"):
+        embed.set_image(url=ev["image_url"])
+
+    # YES nach Rolle gruppieren
+    yes_by_role = defaultdict(list)
+    for uid, info in ev.get("yes", {}).items():
+        yes_by_role[info.get("role","Unassigned")].append(info.get("name", f"<@{uid}>"))
+
+    # YES Feld
+    if ev.get("yes"):
+        parts = []
+        for role in ("Tank","Heal","DPS","Unassigned"):
+            if yes_by_role.get(role):
+                parts.append(f"**{role} ({len(yes_by_role[role])})**: " + ", ".join(yes_by_role[role]))
+        embed.add_field(name="✅ Zusage", value="\n".join(parts)[:1024] or "—", inline=False)
+    else:
+        embed.add_field(name="✅ Zusage", value="—", inline=False)
+
+    # MAYBE Liste mit (Rolle)
+    if ev.get("maybe"):
+        maybe_list = []
+        for uid, info in ev["maybe"].items():
+            nm = info.get("name", f"<@{uid}>")
+            rl = info.get("role","Unassigned")
+            maybe_list.append(f"{nm} ({rl})")
+        embed.add_field(name="❔ Vielleicht", value="\n".join(maybe_list)[:1024] or "—", inline=False)
+    else:
+        embed.add_field(name="❔ Vielleicht", value="—", inline=False)
+
+    # NO Liste
+    if ev.get("no"):
+        no_list = [info.get("name", f"<@{uid}>") for uid, info in ev["no"].items()]
+        embed.add_field(name="❌ Abgesagt", value=", ".join(no_list)[:1024] or "—", inline=False)
+    else:
+        embed.add_field(name="❌ Abgesagt", value="—", inline=False)
+
+    return embed
+
+class RSVPView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)  # persistent
+
+    @discord.ui.button(label="Ja", style=discord.ButtonStyle.success, emoji="✅", custom_id="rsvp_yes")
+    async def rsvp_yes(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _handle_rsvp_click(interaction, status="yes")
+
+    @discord.ui.button(label="Vielleicht", style=discord.ButtonStyle.primary, emoji="❔", custom_id="rsvp_maybe")
+    async def rsvp_maybe(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _handle_rsvp_click(interaction, status="maybe")
+
+    @discord.ui.button(label="Nein", style=discord.ButtonStyle.danger, emoji="❌", custom_id="rsvp_no")
+    async def rsvp_no(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _handle_rsvp_click(interaction, status="no")
+
+async def _handle_rsvp_click(interaction: discord.Interaction, status: str):
+    """Schreibt den Klick in die JSON und aktualisiert den Embed."""
+    if not interaction.guild or not interaction.message:
+        await interaction.response.send_message("Nur in einem Server-Event nutzbar.", ephemeral=True)
+        return
+
+    store = _load_rsvp()
+    mid = str(interaction.message.id)
+    ev = store.get(mid)
+    if not ev:
+        await interaction.response.send_message("Daten für dieses Event fehlen (neu posten?).", ephemeral=True)
+        return
+
+    user = interaction.user
+    uid = str(user.id)
+    name = getattr(user, "display_name", user.name)
+    role = _role_label_from_member(user)
+
+    # aus allen Listen entfernen
+    for bucket in ("yes","maybe","no"):
+        ev.get(bucket, {}).pop(uid, None)
+
+    # in Ziel-Liste eintragen
+    ev.setdefault(status, {})[uid] = {"name": name, "role": role}
+
+    # Embed aktualisieren
+    embed = _format_embed_for_event(ev, interaction.guild)
+    try:
+        await interaction.message.edit(embed=embed, view=RSVPView())
+    except Exception as e:
+        print("edit failed:", e)
+
+    _save_rsvp(store)
+    await interaction.response.send_message("✅ Aktualisiert.", ephemeral=True)
+
+@tree.command(name="event_create", description="Erstellt ein RSVP-Event mit Bild und Rollen-Tracking.")
+@app_commands.describe(
+    title="Titel des Events",
+    date="Datum YYYY-MM-DD", 
+    time="Zeit HH:MM (24h)", 
+    channel="Channel für den Post",
+    image_url="(optional) Bild-URL für den Embed",
+    description="(optional) Beschreibung unter dem Titel"
+)
+async def event_create(
+    interaction: discord.Interaction,
+    title: str,
+    date: str,
+    time: str,
+    channel: discord.TextChannel,
+    image_url: str = "",
+    description: str = "",
+):
+    # Zeit-Text hübsch bauen (wir nutzen deinen TZ=Europe/Berlin)
+    when_text = f"{date} {time} (Europa/Berlin)"
+
+    # Embed initial
+    ev_blob = {
+        "title": title.strip(),
+        "when_text": when_text,
+        "channel_id": channel.id,
+        "image_url": image_url.strip(),
+        "description": description.strip(),
+    }
+    embed = _format_embed_for_event(
+        {**ev_blob, "yes": {}, "maybe": {}, "no": {}},
+        interaction.guild
+    )
+
+    view = RSVPView()
+    msg = await channel.send(embed=embed, view=view)
+
+    # Persistenz ablegen
+    store = _load_rsvp()
+    _ensure_event(store, str(msg.id), ev_blob)
+    _save_rsvp(store)
+
+    await interaction.response.send_message(f"✅ Event erstellt in {channel.mention}.", ephemeral=True)
+
+# Beim Start persistenten View registrieren (damit Buttons nach Neustart gehen)
+@client.event
+async def on_ready():
+    # Deine bestehende on_ready() ruft scheduler_loop.start() etc – also NICHT ersetzen,
+    # sondern nur sicherstellen, dass die View registriert ist.
+    try:
+        client.add_view(RSVPView())
+    except Exception as e:
+        print("add_view failed:", e)
+    # (Dein bestehender on_ready()-Inhalt bleibt wie gehabt.)
 
 
 if __name__ == "__main__":
