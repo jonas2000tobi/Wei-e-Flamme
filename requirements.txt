@@ -2,3 +2,4 @@ discord.py==2.4.0
 pytz
 flask
 requests
+audioop-lts
