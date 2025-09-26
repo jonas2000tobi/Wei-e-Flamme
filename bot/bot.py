@@ -28,7 +28,7 @@ def keep_alive():
     while True:
         try:
             # Trage hier deine Railway-URL ein, z. B. https://wei-e-flamme.up.railway.app
-            requests.get(wei-e-flamme.railway.internal)
+            requests.get("https://wei-e-flamme.up.railway.app")
         except Exception as e:
             print("Self-ping failed:", e)
         time.sleep(300)  # alle 5 Minuten
