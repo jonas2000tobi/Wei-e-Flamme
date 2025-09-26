@@ -1,31 +1,42 @@
-import os, threading
+import os, threading, time, requests
+from flask import Flask
+import json
+from dataclasses import dataclass, asdict
+from datetime import datetime, timedelta, time as time_cls, date as date_cls
+from pathlib import Path
+from typing import Dict, List, Optional, Set
+import discord
+from discord import app_commands
+from discord.ext import tasks
+from zoneinfo import ZoneInfo
 
-
+# --- Mini-Webserver für Railway Healthcheck ---
 app = Flask(__name__)
 
 @app.get("/")
 def ok():
-    return "ok"  # Healthcheck
+    return "ok"  # Healthcheck für Railway
 
 def run_flask():
-    # Render setzt PORT als Env-Var für Web Services
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
 
-# Webserver im Hintergrund starten
-threading.Thread(target=run_flask, daemon=True).start()# TL Event Reminder Discord Bot
-# Author: ChatGPT for Jonas
-# --- Selbst-Ping, damit Render-Free nicht einschläft ---
-import time, requests
+threading.Thread(target=run_flask, daemon=True).start()
+# --- Ende Mini-Webserver ---
+
+# --- Selbst-Ping (optional, hält Free-Pläne aktiv) ---
 def keep_alive():
     while True:
         try:
-            requests.get("https://wei-e-flamme.onrender.com")  # deine Render-URL
+            # Trage hier deine Railway-URL ein, z. B. https://wei-e-flamme.up.railway.app
+            requests.get(wei-e-flamme.railway.internal)
         except Exception as e:
             print("Self-ping failed:", e)
         time.sleep(300)  # alle 5 Minuten
+
 threading.Thread(target=keep_alive, daemon=True).start()
 # --- Ende Selbst-Ping ---
 
+# TL Event Reminder Discord Bot
 # Features:
 # - Slash-Commands, serverweit
 # - Pro Event eigener Ziel-Channel (Channel-Auswahl beim Erstellen)
@@ -34,18 +45,6 @@ threading.Thread(target=keep_alive, daemon=True).start()
 # - Vorab-Erinnerungen X Minuten vorher
 # - Zeitzone Europe/Berlin
 # - JSON-Persistenz (ohne DB)
-
-import os
-import json
-from dataclasses import dataclass, asdict
-from datetime import datetime, timedelta, time, date as date_cls
-from pathlib import Path
-from typing import Dict, List, Optional, Set
-
-import discord
-from discord import app_commands
-from discord.ext import tasks
-from zoneinfo import ZoneInfo
 
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 TZ = ZoneInfo("Europe/Berlin")
@@ -76,10 +75,10 @@ def parse_weekdays(s: str) -> List[int]:
         days.append(DOW_MAP[part])
     return sorted(set(days))
 
-def parse_time_hhmm(s: str) -> time:
+def parse_time_hhmm(s: str) -> time_cls:
     try:
         hh, mm = s.strip().split(":")
-        return time(int(hh), int(mm))
+        return time_cls(int(hh), int(mm))
     except Exception:
         raise ValueError("start_time must be 'HH:MM' 24h.")
 
@@ -102,14 +101,14 @@ def parse_date_yyyy_mm_dd(s: str) -> date_cls:
 @dataclass
 class Event:
     name: str
-    weekdays: List[int]           # 0=Mon..6=Sun
-    start_hhmm: str               # "HH:MM"
+    weekdays: List[int]
+    start_hhmm: str
     duration_min: int
-    pre_reminders: List[int]      # Minuten vor Start
+    pre_reminders: List[int]
     mention_role_id: Optional[int] = None
     channel_id: Optional[int] = None
     description: str = ""
-    one_time_date: Optional[str] = None  # "YYYY-MM-DD"
+    one_time_date: Optional[str] = None
 
     def next_occurrence_start(self, ref_dt: datetime) -> Optional[datetime]:
         start_t = parse_time_hhmm(self.start_hhmm)
@@ -141,7 +140,7 @@ class Event:
 class GuildConfig:
     guild_id: int
     announce_channel_id: Optional[int] = None
-    events: Dict[str, Event] = None  # key: lower-name
+    events: Dict[str, Event] = None
 
     def to_dict(self):
         return {
@@ -252,7 +251,6 @@ async def add_event(
         days: List[int] = []
 
         if date.strip():
-            # einmalig
             one_time_date = parse_date_yyyy_mm_dd(date.strip()).isoformat()
         else:
             days = parse_weekdays(weekdays)
@@ -334,8 +332,6 @@ async def test_event_ping(interaction: discord.Interaction, name: str):
     await interaction.response.send_message("✅ Test-Ping raus.", ephemeral=True)
 
 # ---- Scheduler ----
-post_log: Set[str] = load_post_log()
-
 @tasks.loop(seconds=30.0)
 async def scheduler_loop():
     now = datetime.now(TZ).replace(second=0, microsecond=0)
@@ -344,7 +340,6 @@ async def scheduler_loop():
         if not cfg or not cfg.events:
             continue
         for ev in list(cfg.events.values()):
-            # Zielkanal bestimmen
             channel_id = ev.channel_id or cfg.announce_channel_id
             channel = await ensure_text_channel(guild, channel_id)
             if not channel:
@@ -355,36 +350,30 @@ async def scheduler_loop():
                 continue
             end_dt = start_dt + timedelta(minutes=ev.duration_min)
 
-            # Vorab-Erinnerungen
             for m in ev.pre_reminders:
                 pre_dt = start_dt - timedelta(minutes=m)
-                if pre_dt == now:
-                    key = f"{guild.id}:{ev.name}:{start_dt.isoformat()}:pre{m}"
-                    if key not in post_log:
-                        role_mention = f"<@&{ev.mention_role_id}>" if ev.mention_role_id else ""
-                        body = f"⏳ **{ev.name}** startet in **{m} Min** ({start_dt.strftime('%H:%M')} Uhr). {role_mention}".strip()
-                        if ev.description:
-                            body += f"\n{ev.description}"
-                        await channel.send(body)
-                        post_log.add(key)
-
-            # Start
-            if start_dt == now:
-                key = f"{guild.id}:{ev.name}:{start_dt.isoformat()}:start"
-                if key not in post_log:
+                key = f"{guild.id}:{ev.name}:{start_dt.isoformat()}:pre{m}"
+                if pre_dt == now and key not in post_log:
                     role_mention = f"<@&{ev.mention_role_id}>" if ev.mention_role_id else ""
-                    body = f"🚀 **{ev.name}** ist **jetzt live**! Läuft bis {end_dt.strftime('%H:%M')} Uhr. {role_mention}".strip()
+                    body = f"⏳ **{ev.name}** startet in **{m} Min** ({start_dt.strftime('%H:%M')} Uhr). {role_mention}".strip()
                     if ev.description:
                         body += f"\n{ev.description}"
                     await channel.send(body)
                     post_log.add(key)
 
-            # Einmalige Events nach dem Tag aufräumen (optional, simpel)
+            key = f"{guild.id}:{ev.name}:{start_dt.isoformat()}:start"
+            if start_dt == now and key not in post_log:
+                role_mention = f"<@&{ev.mention_role_id}>" if ev.mention_role_id else ""
+                body = f"🚀 **{ev.name}** ist **jetzt live**! Läuft bis {end_dt.strftime('%H:%M')} Uhr. {role_mention}".strip()
+                if ev.description:
+                    body += f"\n{ev.description}"
+                await channel.send(body)
+                post_log.add(key)
+
             if ev.one_time_date:
                 try:
                     d = parse_date_yyyy_mm_dd(ev.one_time_date)
                     if now.date() > d:
-                        # Event ist vorbei -> löschen
                         del cfg.events[ev.name.lower()]
                         save_all(configs)
                 except Exception:
