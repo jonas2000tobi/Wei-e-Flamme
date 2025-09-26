@@ -395,7 +395,7 @@ async def on_ready():
         print("Command sync failed:", e)
     scheduler_loop.start()
 
-client.load_extension("bot.event_rsvp")
+
 
 if __name__ == "__main__":
     if not TOKEN:
