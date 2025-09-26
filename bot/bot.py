@@ -9,6 +9,13 @@ import discord
 from discord import app_commands
 from discord.ext import tasks
 from zoneinfo import ZoneInfo
+# --- RSVP Imports (für Raid-Teilnahme-Board) ---
+from bot_event_rsvp import (
+    register_rsvp_commands,  # slash commands /raid_create, /raid_set_roles usw.
+    load_rsvp_from_disk,     # lädt gespeicherte Anmeldungen nach Neustart
+    persistent_rsvp_view,    # die View mit Buttons (Tank/Heal/DPS/Vielleicht/Abmelden)
+)
+
 
 # --- Mini-Webserver für Railway Healthcheck ---
 app = Flask(__name__)
@@ -391,12 +398,24 @@ async def _before_scheduler():
 @client.event
 async def on_ready():
     print(f"Logged in as {client.user} (ID: {client.user.id})")
+
+    # ① RSVP-Daten von der Platte laden (damit Buttons nach Neustart wieder funktionieren)
+    load_rsvp_from_disk()
+
+    # ② Persistent View registrieren (Buttons sind nach Restarts sofort klickbar)
+    client.add_view(persistent_rsvp_view)
+
+    # ③ Slash-Commands für RSVP registrieren/syncen
     try:
+        await register_rsvp_commands(tree)
         synced = await tree.sync()
         print(f"Synced {len(synced)} commands.")
     except Exception as e:
         print("Command sync failed:", e)
-    scheduler_loop.start()
+
+    # falls du einen Scheduler hast, hier wieder starten:
+    # scheduler_loop.start()
+
 
 # ====== RSVP Event mit Bild, Rollen-Auswertung und Buttons ======
 # Speichert Teilnahme-Status in data/event_rsvp.json (persistiert Neustarts).
