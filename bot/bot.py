@@ -180,9 +180,11 @@ def save_post_log(log: Set[str]):
 # ---- Bot Setup ----
 intents = discord.Intents.default()
 intents.guilds = True
-intents.members = True
+intents.members = True          # <— WICHTIG
+intents.message_content = False
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
+
 
 configs: Dict[int, GuildConfig] = load_all()
 post_log: Set[str] = load_post_log()
