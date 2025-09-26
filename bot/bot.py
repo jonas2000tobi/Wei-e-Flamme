@@ -10,10 +10,8 @@ from discord import app_commands
 from discord.ext import tasks
 from zoneinfo import ZoneInfo
 # --- RSVP Imports (für Raid-Teilnahme-Board) ---
-from bot_event_rsvp import (
-    register_rsvp_commands,  # slash commands /raid_create, /raid_set_roles usw.
-    load_rsvp_from_disk,     # lädt gespeicherte Anmeldungen nach Neustart
-    persistent_rsvp_view,    # die View mit Buttons (Tank/Heal/DPS/Vielleicht/Abmelden)
+from event_rsvp import setup_rsvp
+
 )
 
 
