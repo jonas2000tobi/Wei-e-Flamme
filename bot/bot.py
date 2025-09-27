@@ -557,24 +557,24 @@ def register_rsvp_slash_commands():
         )
 
     @tree.command(name="raid_create", description="Raid-/Event-Anmeldung mit Buttons erstellen.")
-    @app_commands.describe(
-        title="Titel (im Embed)",
-        description="Zusätzliche Info oder Beschreibung",   # <--- NEU
-        date="Datum YYYY-MM-DD (Europe/Berlin)",
-        time="Zeit HH:MM (24h)",
-        channel="Zielkanal",
-        image_url="Optionales Bild-URL fürs Embed"
-    )
-    async def raid_create(
+@app_commands.describe(
+    title="Titel (im Embed)",
+    description="Zusätzliche Info oder Beschreibung",
+    date="Datum YYYY-MM-DD (Europe/Berlin)",
+    time="Zeit HH:MM (24h)",
+    channel="Zielkanal",
+    image_url="Optionales Bild-URL fürs Embed"
+)
+async def raid_create(
     inter: discord.Interaction,
     title: str,
-    description: Optional[str] = None,   # <— NEU
     date: str,
     time: str,
     channel: Optional[discord.TextChannel] = None,
     image_url: Optional[str] = None,
+    description: Optional[str] = None,   # <-- Optionals ans Ende
+):
 
-    ):
         if not is_admin(inter):
             await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True)
             return
