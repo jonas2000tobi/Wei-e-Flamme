@@ -24,6 +24,9 @@ POST_LOG_FILE = DATA_DIR / "post_log.json"
 RSVP_STORE_FILE = DATA_DIR / "event_rsvp.json"
 RSVP_CFG_FILE   = DATA_DIR / "event_rsvp_cfg.json"
 
+# Optional: Rollensuche steuern
+GUILD_ROLE_NAME = (os.getenv("GUILD_ROLE_NAME") or "Weiße Flamme").strip()
+
 # ===== Keepalive (Flask) =====
 app = Flask(__name__)
 @app.get("/")
@@ -44,7 +47,7 @@ threading.Thread(target=keep_alive, daemon=True).start()
 # ===== Discord Setup =====
 intents = discord.Intents.default()
 intents.guilds = True
-intents.members = True  # für Rollen bei RSVP
+intents.members = True  # für Rollen/RSVP
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
@@ -163,7 +166,7 @@ def is_admin(interaction: discord.Interaction) -> bool:
     perms = interaction.user.guild_permissions if interaction.user else None
     return bool(perms and (perms.administrator or perms.manage_guild))
 
-# ===== Config & Event Commands =====
+# ===== Slash-Commands: Config & Events =====
 @tree.command(name="set_announce_channel", description="Standard-Kanal für Erinnerungen setzen.")
 @app_commands.describe(channel="Ziel-Textkanal")
 async def set_announce_channel(interaction: discord.Interaction, channel: discord.TextChannel):
@@ -441,13 +444,22 @@ def register_rsvp_slash_commands():
         except Exception as e:
             await inter.response.send_message(f"❌ Fehler: {e}", ephemeral=True)
 
-    @tree.command(name="raid_set_guildrole", description='Gildenrolle für die Zählung (z. B. "Weiße Flamme") festlegen.')
-    @app_commands.describe(guild_role='Die Gildenrolle, deren Mitglieder gezählt werden sollen')
-    async def raid_set_guildrole(inter: discord.Interaction, guild_role: discord.Role):
-        if not is_admin(inter):
-            await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True); return
-        _set_guild_role_id(inter.guild_id, guild_role.id)
-        await inter.response.send_message(f"✅ Gildenrolle gesetzt: {guild_role.mention}", ephemeral=True)
+# ===== Auto-Set der Gildenrolle (kein Slash-Command nötig) =====
+async def _auto_set_guild_role_for_guild(g: discord.Guild):
+    """Versucht, die Gildenrolle automatisch zu finden & zu speichern."""
+    wanted = GUILD_ROLE_NAME.lower()
+    role = discord.utils.find(
+        lambda r: r.name.lower() == wanted or wanted in r.name.lower(),
+        g.roles
+    )
+    if role:
+        _set_guild_role_id(g.id, role.id)
+        print(f"[AUTO] Gildenrolle gesetzt für {g.name}: {role.name} ({role.id})")
+    else:
+        # nichts gefunden → 0 setzen (deaktiviert Statistik)
+        if _get_guild_role_id(g.id) != 0:
+            _set_guild_role_id(g.id, 0)
+        print(f"[AUTO] Keine passende Gildenrolle in {g.name} gefunden (gesucht nach '{GUILD_ROLE_NAME}').")
 
 def reregister_persistent_views_on_start():
     for msg_id, obj in list(rsvp_store.items()):
@@ -463,19 +475,16 @@ async def on_ready():
     reregister_persistent_views_on_start()
     register_rsvp_slash_commands()
 
-    # HARTES RESYNC: erst leeren, dann globale in Guild kopieren, dann syncen
+    # Auto-Set Gildenrolle für alle Guilds
+    for g in client.guilds:
+        await _auto_set_guild_role_for_guild(g)
+
+    # Hartes Resync je Guild (sofort sichtbar)
     for g in client.guilds:
         gid = g.id
         try:
             await tree.clear_commands(guild=discord.Object(id=gid))
-            print(f"Cleared commands for guild {gid}")
-        except Exception as e:
-            print("clear_commands failed:", e)
-
-    for g in client.guilds:
-        gid = g.id
-        try:
-            tree.copy_global_to(guild=discord.Object(id=gid))  # WICHTIG: globale → guild
+            tree.copy_global_to(guild=discord.Object(id=gid))
             synced = await tree.sync(guild=discord.Object(id=gid))
             print(f"Synced {len(synced)} commands for guild {gid}: {[c.name for c in synced]}")
         except Exception as e:
