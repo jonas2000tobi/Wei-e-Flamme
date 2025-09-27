@@ -398,6 +398,21 @@ def _get_role_ids(guild: discord.Guild) -> Dict[str, int]:
     g = rsvp_cfg.get(str(guild.id)) or {}
     return {"TANK": int(g.get("TANK", 0)), "HEAL": int(g.get("HEAL", 0)), "DPS": int(g.get("DPS", 0))}
 
+# --- Gildenrolle "Weiße Flamme" speichern/lesen (im rsvp_cfg mit drin) ---
+def _get_guild_role_id(guild_id: int) -> int:
+    g = rsvp_cfg.get(str(guild_id)) or {}
+    try:
+        return int(g.get("GUILD_ROLE", 0))
+    except Exception:
+        return 0
+
+def _set_guild_role_id(guild_id: int, role_id: int) -> None:
+    g = rsvp_cfg.get(str(guild_id)) or {}
+    g["GUILD_ROLE"] = int(role_id)
+    rsvp_cfg[str(guild_id)] = g
+    _save_cfg()
+
+
 def _label_from_member(member: discord.Member) -> str:
     rid = _get_role_ids(member.guild)
     if rid["TANK"] and discord.utils.get(member.roles, id=rid["TANK"]):
@@ -441,6 +456,37 @@ def _build_embed(guild: discord.Guild, obj: dict) -> discord.Embed:
 
     no_names = [_mention(guild, u) for u in obj["no"]]
     emb.add_field(name=f"❌ Abgemeldet ({len(no_names)})", value="\n".join(no_names) or "—", inline=False)
+
+    emb.add_field(name=f"❌ Abgemeldet ({len(no_names)})",
+              value="\n".join(no_names) or "—", inline=False)
+
+# === Gildenrollen-Statistik (z. B. Weiße Flamme) ===
+gr_id = _get_guild_role_id(guild.id)
+if gr_id:
+    gr = guild.get_role(gr_id)
+    if gr:
+        total = len(gr.members)
+        voted_ids = set(
+            obj["yes"]["TANK"] + obj["yes"]["HEAL"] + obj["yes"]["DPS"]
+            + [int(k) for k in obj["maybe"].keys()]
+            + obj["no"]
+        )
+        voted_in_guild = 0
+        for uid in voted_ids:
+            m = guild.get_member(uid)
+            if m and gr in m.roles:
+                voted_in_guild += 1
+        emb.add_field(
+            name="🏰 Weiße Flamme",
+            value=f"{voted_in_guild} / {total} haben abgestimmt",
+            inline=False
+        )
+
+if obj.get("image_url"):
+    emb.set_image(url=obj["image_url"])
+emb.set_footer(text="Klicke unten auf die Buttons, um dich anzumelden.")
+return emb
+
 
     if obj.get("image_url"):
         emb.set_image(url=obj["image_url"])
@@ -532,6 +578,17 @@ def register_rsvp_slash_commands():
         channel="Zielkanal",
         image_url="Optionales Bild-URL fürs Embed",
         description="Zusätzliche Info oder Beschreibung",
+
+        @tree.command(name="raid_set_guildrole", description='Gildenrolle für die Zählung (z. B. "Weiße Flamme") festlegen.')
+@app_commands.describe(guild_role='Die Gildenrolle, deren Mitglieder gezählt werden sollen')
+async def raid_set_guildrole(inter: discord.Interaction, guild_role: discord.Role):
+    if not is_admin(inter):
+        await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True)
+        return
+    _set_guild_role_id(inter.guild_id, guild_role.id)
+    await inter.response.send_message(f"✅ Gildenrolle gesetzt: {guild_role.mention}", ephemeral=True)
+
+    
     )
     async def raid_create(
         inter: discord.Interaction,
