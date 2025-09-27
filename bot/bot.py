@@ -1,56 +1,22 @@
-import os, threading, time, requests
-from flask import Flask
-import json
+# bot/bot.py
+# TL Event Reminder + Raid/RSVP in EINER Datei
+# discord.py 2.4.x
+
+from __future__ import annotations
+import os, json, threading, time, requests
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta, time as time_cls, date as date_cls
 from pathlib import Path
 from typing import Dict, List, Optional, Set
+from collections import defaultdict
+
 import discord
 from discord import app_commands
 from discord.ext import tasks
+from flask import Flask
 from zoneinfo import ZoneInfo
-# --- RSVP Imports (für Raid-Teilnahme-Board) ---
-from event_rsvp import setup_rsvp
 
-)
-
-
-# --- Mini-Webserver für Railway Healthcheck ---
-app = Flask(__name__)
-
-@app.get("/")
-def ok():
-    return "ok"  # Healthcheck für Railway
-
-def run_flask():
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
-
-threading.Thread(target=run_flask, daemon=True).start()
-# --- Ende Mini-Webserver ---
-
-# --- Selbst-Ping (optional, hält Free-Pläne aktiv) ---
-def keep_alive():
-    while True:
-        try:
-            # Trage hier deine Railway-URL ein, z. B. https://wei-e-flamme.up.railway.app
-            requests.get("https://wei-e-flamme.up.railway.app")
-        except Exception as e:
-            print("Self-ping failed:", e)
-        time.sleep(300)  # alle 5 Minuten
-
-threading.Thread(target=keep_alive, daemon=True).start()
-# --- Ende Selbst-Ping ---
-
-# TL Event Reminder Discord Bot
-# Features:
-# - Slash-Commands, serverweit
-# - Pro Event eigener Ziel-Channel (Channel-Auswahl beim Erstellen)
-# - Beschreibungstext pro Event
-# - Wiederkehrend (Wochentage) ODER einmalig (Datum)
-# - Vorab-Erinnerungen X Minuten vorher
-# - Zeitzone Europe/Berlin
-# - JSON-Persistenz (ohne DB)
-
+# ========= Grundkonfiguration =========
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 TZ = ZoneInfo("Europe/Berlin")
 
@@ -58,6 +24,41 @@ DATA_DIR = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
 CFG_FILE = DATA_DIR / "guild_configs.json"
 POST_LOG_FILE = DATA_DIR / "post_log.json"
+
+# ---- Mini-Webserver für Railway/Healthcheck ----
+app = Flask(__name__)
+
+@app.get("/")
+def ok():
+    return "ok"
+
+def _run_flask():
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
+
+threading.Thread(target=_run_flask, daemon=True).start()
+
+# ---- Optionales Self-Ping (Free-Pläne wach halten) ----
+def keep_alive():
+    url = os.getenv("KEEPALIVE_URL", "").strip()  # z.B. https://wei-e-flamme.up.railway.app
+    if not url:
+        return
+    while True:
+        try:
+            requests.get(url, timeout=10)
+        except Exception as e:
+            print("Self-ping failed:", e)
+        time.sleep(300)
+
+threading.Thread(target=keep_alive, daemon=True).start()
+
+# ========= Discord Setup =========
+intents = discord.Intents.default()
+intents.guilds = True
+intents.members = True         # im Dev-Portal aktivieren (Privileged Intents)
+client = discord.Client(intents=intents)
+tree = app_commands.CommandTree(client)
+
+# ========= Event-Reminder (dein ursprünglicher Bot) =========
 
 # ---- Parsing ----
 DOW_MAP = {
@@ -73,12 +74,12 @@ DOW_MAP = {
 def parse_weekdays(s: str) -> List[int]:
     if not s:
         return []
-    days = []
-    for part in [p.strip().lower() for p in s.split(",") if p.strip()]:
-        if part not in DOW_MAP:
-            raise ValueError(f"Unknown weekday '{part}'. Use Mon..Sun or 0..6 (0=Mon).")
-        days.append(DOW_MAP[part])
-    return sorted(set(days))
+    out = []
+    for p in [x.strip().lower() for x in s.split(",") if x.strip()]:
+        if p not in DOW_MAP:
+            raise ValueError(f"Unknown weekday '{p}'. Use Mon..Sun or 0..6 (0=Mon).")
+        out.append(DOW_MAP[p])
+    return sorted(set(out))
 
 def parse_time_hhmm(s: str) -> time_cls:
     try:
@@ -100,30 +101,30 @@ def parse_date_yyyy_mm_dd(s: str) -> date_cls:
         y, m, d = s.strip().split("-")
         return date_cls(int(y), int(m), int(d))
     except Exception:
-        raise ValueError("date must be 'YYYY-MM-DD' if provided.")
+        raise ValueError("date must be 'YYYY-MM-DD'.")
 
 # ---- Modelle ----
 @dataclass
 class Event:
     name: str
-    weekdays: List[int]
-    start_hhmm: str
+    weekdays: List[int]           # 0=Mon..6=Sun
+    start_hhmm: str               # "HH:MM"
     duration_min: int
     pre_reminders: List[int]
     mention_role_id: Optional[int] = None
     channel_id: Optional[int] = None
     description: str = ""
-    one_time_date: Optional[str] = None
+    one_time_date: Optional[str] = None  # "YYYY-MM-DD"
 
     def next_occurrence_start(self, ref_dt: datetime) -> Optional[datetime]:
         start_t = parse_time_hhmm(self.start_hhmm)
         if self.one_time_date:
-            dt_date = parse_date_yyyy_mm_dd(self.one_time_date)
-            dt = datetime.combine(dt_date, start_t, tzinfo=TZ)
+            d = parse_date_yyyy_mm_dd(self.one_time_date)
+            dt = datetime.combine(d, start_t, tzinfo=TZ)
             return dt if dt >= ref_dt else None
         today = ref_dt.date()
-        for add_days in range(0, 8):
-            d = today + timedelta(days=add_days)
+        for add in range(0, 8):
+            d = today + timedelta(days=add)
             if d.weekday() in self.weekdays:
                 dt = datetime.combine(d, start_t, tzinfo=TZ)
                 if dt >= ref_dt:
@@ -163,7 +164,7 @@ class GuildConfig:
             events=evs,
         )
 
-# ---- Persistenz ----
+# ---- Persistenz (Reminder) ----
 def load_all() -> Dict[int, GuildConfig]:
     if CFG_FILE.exists():
         raw = json.loads(CFG_FILE.read_text(encoding="utf-8"))
@@ -181,15 +182,6 @@ def load_post_log() -> Set[str]:
 
 def save_post_log(log: Set[str]):
     POST_LOG_FILE.write_text(json.dumps(sorted(list(log))), encoding="utf-8")
-
-# ---- Bot Setup ----
-intents = discord.Intents.default()
-intents.guilds = True
-intents.members = True          # <— WICHTIG
-intents.message_content = False
-client = discord.Client(intents=intents)
-tree = app_commands.CommandTree(client)
-
 
 configs: Dict[int, GuildConfig] = load_all()
 post_log: Set[str] = load_post_log()
@@ -212,7 +204,7 @@ def is_admin(interaction: discord.Interaction) -> bool:
     perms = interaction.user.guild_permissions if interaction.user else None
     return bool(perms and (perms.administrator or perms.manage_guild))
 
-# ---- Commands ----
+# ---- Slash-Commands (Reminder) ----
 @tree.command(name="set_announce_channel", description="Standard-Kanal für Erinnerungen setzen.")
 @app_commands.describe(channel="Ziel-Textkanal")
 async def set_announce_channel(interaction: discord.Interaction, channel: discord.TextChannel):
@@ -286,7 +278,10 @@ async def add_event(
 
     when = one_time_date if one_time_date else ",".join(["Mon","Tue","Wed","Thu","Fri","Sat","Sun"][d] for d in ev.weekdays)
     target = post_channel.mention if post_channel else (interaction.guild.get_channel(cfg.announce_channel_id).mention if cfg.announce_channel_id else "—")
-    await interaction.response.send_message(f"✅ Event **{ev.name}** angelegt → {when} {ev.start_hhmm}, Dauer {ev.duration_min} Min, Kanal {target}.", ephemeral=True)
+    await interaction.response.send_message(
+        f"✅ Event **{ev.name}** angelegt → {when} {ev.start_hhmm}, Dauer {ev.duration_min} Min, Kanal {target}.",
+        ephemeral=True
+    )
 
 @tree.command(name="list_events", description="Alle Events anzeigen.")
 async def list_events(interaction: discord.Interaction):
@@ -303,8 +298,7 @@ async def list_events(interaction: discord.Interaction):
         pre = ", ".join(str(m) for m in ev.pre_reminders) if ev.pre_reminders else "—"
         desc = (ev.description[:60] + "…") if ev.description and len(ev.description) > 60 else (ev.description or "—")
         lines.append(f"• **{ev.name}** — {when} {ev.start_hhmm} ({ev.duration_min} Min), Pre: {pre}, Role: {role}, Channel: {chan}, Desc: {desc}")
-    msg = "\n".join(lines)
-    await interaction.response.send_message(msg[:1990], ephemeral=True)
+    await interaction.response.send_message("\n".join(lines)[:1990], ephemeral=True)
 
 @tree.command(name="remove_event", description="Event löschen.")
 async def remove_event(interaction: discord.Interaction, name: str):
@@ -326,12 +320,10 @@ async def test_event_ping(interaction: discord.Interaction, name: str):
     if not ev:
         await interaction.response.send_message("❌ Event nicht gefunden.", ephemeral=True)
         return
-
     channel = await ensure_text_channel(interaction.guild, ev.channel_id or cfg.announce_channel_id)
     if not channel:
         await interaction.response.send_message("❌ Kein Zielkanal. Setze /set_announce_channel oder nutze post_channel beim Event.", ephemeral=True)
         return
-
     role_mention = f"<@&{ev.mention_role_id}>" if ev.mention_role_id else ""
     body = f"🔔 **{ev.name}** — Test-Ping {role_mention}".strip()
     if ev.description:
@@ -339,10 +331,11 @@ async def test_event_ping(interaction: discord.Interaction, name: str):
     await channel.send(body)
     await interaction.response.send_message("✅ Test-Ping raus.", ephemeral=True)
 
-# ---- Scheduler ----
+# ---- Scheduler (Reminder) ----
 @tasks.loop(seconds=30.0)
 async def scheduler_loop():
     now = datetime.now(TZ).replace(second=0, microsecond=0)
+    changed = False
     for guild in client.guilds:
         cfg = configs.get(guild.id)
         if not cfg or not cfg.events:
@@ -358,6 +351,7 @@ async def scheduler_loop():
                 continue
             end_dt = start_dt + timedelta(minutes=ev.duration_min)
 
+            # Pre-Reminders
             for m in ev.pre_reminders:
                 pre_dt = start_dt - timedelta(minutes=m)
                 key = f"{guild.id}:{ev.name}:{start_dt.isoformat()}:pre{m}"
@@ -368,7 +362,9 @@ async def scheduler_loop():
                         body += f"\n{ev.description}"
                     await channel.send(body)
                     post_log.add(key)
+                    changed = True
 
+            # Start
             key = f"{guild.id}:{ev.name}:{start_dt.isoformat()}:start"
             if start_dt == now and key not in post_log:
                 role_mention = f"<@&{ev.mention_role_id}>" if ev.mention_role_id else ""
@@ -377,7 +373,9 @@ async def scheduler_loop():
                     body += f"\n{ev.description}"
                 await channel.send(body)
                 post_log.add(key)
+                changed = True
 
+            # Einmalige Events nach dem Tag aufräumen
             if ev.one_time_date:
                 try:
                     d = parse_date_yyyy_mm_dd(ev.one_time_date)
@@ -387,267 +385,291 @@ async def scheduler_loop():
                 except Exception:
                     pass
 
-    save_post_log(post_log)
+    if changed:
+        save_post_log(post_log)
 
 @scheduler_loop.before_loop
 async def _before_scheduler():
     await client.wait_until_ready()
 
+# ========= Raid/RSVP (mit Bild, Buttons & Persistenz) =========
+
+RSVP_STORE_FILE = DATA_DIR / "event_rsvp.json"
+RSVP_CFG_FILE   = DATA_DIR / "event_rsvp_cfg.json"
+
+def _load_json(p: Path, default):
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return default
+
+def _save_json(p: Path, obj):
+    p.write_text(json.dumps(obj, indent=2, ensure_ascii=False), encoding="utf-8")
+
+# store Struktur:
+# { "<msg_id>": {"guild_id":int,"channel_id":int,"title":str,"when_iso":str,"image_url":str|None,
+#                "yes":{"TANK":[uid],"HEAL":[uid],"DPS":[uid]}, "maybe":{"<uid>":"Tank/Heal/DPS"}, "no":[uid] } }
+rsvp_store: Dict[str, dict] = _load_json(RSVP_STORE_FILE, {})
+rsvp_cfg: Dict[str, dict]   = _load_json(RSVP_CFG_FILE, {})   # pro guild: {"TANK":role_id, ...}
+
+def _save_store():
+    _save_json(RSVP_STORE_FILE, rsvp_store)
+
+def _save_cfg():
+    _save_json(RSVP_CFG_FILE, rsvp_cfg)
+
+def _get_role_ids(guild: discord.Guild) -> Dict[str, int]:
+    g = rsvp_cfg.get(str(guild.id)) or {}
+    return {"TANK": int(g.get("TANK", 0)), "HEAL": int(g.get("HEAL", 0)), "DPS": int(g.get("DPS", 0))}
+
+def _label_from_member(member: discord.Member) -> str:
+    rid = _get_role_ids(member.guild)
+    # 1) IDs (stabil)
+    if rid["TANK"] and discord.utils.get(member.roles, id=rid["TANK"]):
+        return "Tank"
+    if rid["HEAL"] and discord.utils.get(member.roles, id=rid["HEAL"]):
+        return "Heal"
+    if rid["DPS"] and discord.utils.get(member.roles, id=rid["DPS"]):
+        return "DPS"
+    # 2) Fallback per Name
+    names = [r.name.lower() for r in member.roles]
+    if any("tank" in n for n in names): return "Tank"
+    if any("heal" in n for n in names): return "Heal"
+    if any("dps" in n for n in names) or any("dd" in n for n in names): return "DPS"
+    return ""
+
+def _mention(guild: discord.Guild, uid: int) -> str:
+    m = guild.get_member(uid)
+    return m.mention if m else f"<@{uid}>"
+
+def _build_embed(guild: discord.Guild, obj: dict) -> discord.Embed:
+    dt = datetime.fromisoformat(obj["when_iso"])
+    emb = discord.Embed(
+        title=f"📅 {obj['title']}",
+        description=f"**Zeit:** {dt.strftime('%a, %d.%m.%Y %H:%M')} (Europe/Berlin)",
+        color=discord.Color.blurple(),
+    )
+    # YES nach Rollen
+    tank_names = [_mention(guild, u) for u in obj["yes"]["TANK"]]
+    heal_names = [_mention(guild, u) for u in obj["yes"]["HEAL"]]
+    dps_names  = [_mention(guild, u) for u in obj["yes"]["DPS"]]
+
+    emb.add_field(name=f"🛡️ Tank ({len(tank_names)})", value="\n".join(tank_names) or "—", inline=True)
+    emb.add_field(name=f"💚 Heal ({len(heal_names)})", value="\n".join(heal_names) or "—", inline=True)
+    emb.add_field(name=f"🗡️ DPS ({len(dps_names)})", value="\n".join(dps_names) or "—", inline=True)
+
+    # MAYBE
+    maybe_lines = []
+    for uid, rlab in obj["maybe"].items():
+        uid_i = int(uid)
+        label = f" ({rlab})" if rlab else ""
+        maybe_lines.append(f"{_mention(guild, uid_i)}{label}")
+    emb.add_field(name=f"❔ Vielleicht ({len(maybe_lines)})", value="\n".join(maybe_lines) or "—", inline=False)
+
+    # NO
+    no_names = [_mention(guild, u) for u in obj["no"]]
+    emb.add_field(name=f"❌ Abgemeldet ({len(no_names)})", value="\n".join(no_names) or "—", inline=False)
+
+    if obj.get("image_url"):
+        emb.set_image(url=obj["image_url"])
+    emb.set_footer(text="Klicke unten auf die Buttons, um dich anzumelden.")
+    return emb
+
+class RaidView(discord.ui.View):
+    def __init__(self, msg_id: int):
+        super().__init__(timeout=None)   # persistent
+        self.msg_id = str(msg_id)
+
+    async def _update(self, interaction: discord.Interaction, group: str):
+        if self.msg_id not in rsvp_store:
+            await interaction.response.send_message("Dieses Event ist nicht mehr vorhanden.", ephemeral=True)
+            return
+
+        obj = rsvp_store[self.msg_id]
+        uid = interaction.user.id
+
+        # aus allen Buckets entfernen
+        for k in ("TANK","HEAL","DPS"):
+            if uid in obj["yes"][k]:
+                obj["yes"][k].remove(uid)
+        obj["no"] = [u for u in obj["no"] if u != uid]
+        obj["maybe"].pop(str(uid), None)
+
+        # hinzufügen
+        if group in ("TANK","HEAL","DPS"):
+            obj["yes"][group].append(uid)
+            txt = f"Angemeldet als **{group}**."
+        elif group == "MAYBE":
+            obj["maybe"][str(uid)] = _label_from_member(interaction.user)
+            txt = "Als **Vielleicht** eingetragen."
+        elif group == "NO":
+            obj["no"].append(uid)
+            txt = "Als **Abgemeldet** eingetragen."
+        else:
+            txt = "Aktualisiert."
+
+        _save_store()
+
+        # Nachricht aktualisieren
+        guild = interaction.guild
+        emb = _build_embed(guild, obj)
+        ch = guild.get_channel(obj["channel_id"])
+        try:
+            msg = await ch.fetch_message(int(self.msg_id))
+            await msg.edit(embed=emb, view=self)
+        except Exception:
+            pass
+        await interaction.response.send_message(txt, ephemeral=True)
+
+    @discord.ui.button(label="Tank", style=discord.ButtonStyle.secondary, emoji="🛡️", custom_id="rsvp_tank")
+    async def btn_tank(self, interaction: discord.Interaction, _):
+        await self._update(interaction, "TANK")
+
+    @discord.ui.button(label="Heal", style=discord.ButtonStyle.secondary, emoji="💚", custom_id="rsvp_heal")
+    async def btn_heal(self, interaction: discord.Interaction, _):
+        await self._update(interaction, "HEAL")
+
+    @discord.ui.button(label="DPS", style=discord.ButtonStyle.secondary, emoji="🗡️", custom_id="rsvp_dps")
+    async def btn_dps(self, interaction: discord.Interaction, _):
+        await self._update(interaction, "DPS")
+
+    @discord.ui.button(label="Vielleicht", style=discord.ButtonStyle.secondary, emoji="❔", custom_id="rsvp_maybe")
+    async def btn_maybe(self, interaction: discord.Interaction, _):
+        await self._update(interaction, "MAYBE")
+
+    @discord.ui.button(label="Abmelden", style=discord.ButtonStyle.danger, emoji="❌", custom_id="rsvp_no")
+    async def btn_no(self, interaction: discord.Interaction, _):
+        await self._update(interaction, "NO")
+
+def register_rsvp_slash_commands():
+    @tree.command(name="raid_set_roles", description="Rollen für Tank/Heal/DPS festlegen (pro Server).")
+    @app_commands.describe(tank_role="Rolle für Tank", heal_role="Rolle für Heal", dps_role="Rolle für DPS")
+    async def raid_set_roles(inter: discord.Interaction, tank_role: discord.Role, heal_role: discord.Role, dps_role: discord.Role):
+        if not is_admin(inter):
+            await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True)
+            return
+        rsvp_cfg[str(inter.guild_id)] = {"TANK": tank_role.id, "HEAL": heal_role.id, "DPS": dps_role.id}
+        _save_cfg()
+        await inter.response.send_message(
+            f"✅ Gespeichert:\n🛡️ {tank_role.mention}\n💚 {heal_role.mention}\n🗡️ {dps_role.mention}",
+            ephemeral=True
+        )
+
+    @tree.command(name="raid_create", description="Raid-/Event-Anmeldung mit Buttons erstellen.")
+    @app_commands.describe(
+        title="Titel (im Embed)",
+        date="Datum YYYY-MM-DD (Europe/Berlin)",
+        time="Zeit HH:MM (24h)",
+        channel="Zielkanal",
+        image_url="Optionales Bild-URL fürs Embed"
+    )
+    async def raid_create(
+        inter: discord.Interaction,
+        title: str,
+        date: str,
+        time: str,
+        channel: Optional[discord.TextChannel] = None,
+        image_url: Optional[str] = None,
+    ):
+        if not is_admin(inter):
+            await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True)
+            return
+        try:
+            yyyy, mm, dd = [int(x) for x in date.split("-")]
+            hh, mi = [int(x) for x in time.split(":")]
+            when = datetime(yyyy, mm, dd, hh, mi, tzinfo=TZ)
+        except Exception:
+            await inter.response.send_message("❌ Datum/Zeit ungültig (YYYY-MM-DD / HH:MM).", ephemeral=True)
+            return
+
+        ch = channel or inter.channel
+        obj = {
+            "guild_id": inter.guild_id,
+            "channel_id": ch.id,
+            "title": title.strip(),
+            "when_iso": when.isoformat(),
+            "image_url": (image_url or "").strip() or None,
+            "yes": {"TANK": [], "HEAL": [], "DPS": []},
+            "maybe": {},
+            "no": []
+        }
+        emb = _build_embed(inter.guild, obj)
+        view = RaidView(0)
+        msg = await ch.send(embed=emb, view=view)
+        view.msg_id = str(msg.id)
+
+        rsvp_store[str(msg.id)] = obj
+        _save_store()
+
+        # persistent view registrieren (über Neustarts)
+        client.add_view(RaidView(msg.id), message_id=msg.id)
+
+        await inter.response.send_message(f"✅ Raid erstellt: {msg.jump_url}", ephemeral=True)
+
+    @tree.command(name="raid_show", description="Embed/Listen neu aufbauen.")
+    @app_commands.describe(message_id="ID der Raid-Nachricht")
+    async def raid_show(inter: discord.Interaction, message_id: str):
+        if message_id not in rsvp_store:
+            await inter.response.send_message("❌ Unbekannte message_id.", ephemeral=True)
+            return
+        obj = rsvp_store[message_id]
+        emb = _build_embed(inter.guild, obj)
+        ch = inter.guild.get_channel(obj["channel_id"])
+        try:
+            msg = await ch.fetch_message(int(message_id))
+            await msg.edit(embed=emb, view=RaidView(int(message_id)))
+            await inter.response.send_message("✅ Aktualisiert.", ephemeral=True)
+        except Exception as e:
+            await inter.response.send_message(f"❌ Fehler: {e}", ephemeral=True)
+
+    @tree.command(name="raid_close", description="Buttons sperren (nur Admin).")
+    @app_commands.describe(message_id="ID der Raid-Nachricht")
+    async def raid_close(inter: discord.Interaction, message_id: str):
+        if not is_admin(inter):
+            await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True)
+            return
+        if message_id not in rsvp_store:
+            await inter.response.send_message("❌ Unbekannte message_id.", ephemeral=True)
+            return
+        ch = inter.guild.get_channel(rsvp_store[message_id]["channel_id"])
+        try:
+            msg = await ch.fetch_message(int(message_id))
+            await msg.edit(view=None)
+            await inter.response.send_message("🔒 Gesperrt.", ephemeral=True)
+        except Exception as e:
+            await inter.response.send_message(f"❌ Fehler: {e}", ephemeral=True)
+
+def reregister_persistent_views_on_start():
+    # alle offenen RSVP-Events wieder anklemmen (Buttons funktionieren nach Neustart)
+    for msg_id, obj in list(rsvp_store.items()):
+        g = client.get_guild(obj["guild_id"])
+        if not g:
+            continue
+        try:
+            client.add_view(RaidView(int(msg_id)), message_id=int(msg_id))
+        except Exception as e:
+            print("add_view failed:", e)
+
+# ========= on_ready: ALLES hier registrieren =========
 @client.event
 async def on_ready():
     print(f"Logged in as {client.user} (ID: {client.user.id})")
 
-    # ① RSVP-Daten von der Platte laden (damit Buttons nach Neustart wieder funktionieren)
-    load_rsvp_from_disk()
+    # RSVP: Buttons + Slash-Commands registrieren & persistente Views anklemmen
+    reregister_persistent_views_on_start()
+    register_rsvp_slash_commands()
 
-    # ② Persistent View registrieren (Buttons sind nach Restarts sofort klickbar)
-    client.add_view(persistent_rsvp_view)
-
-    # ③ Slash-Commands für RSVP registrieren/syncen
+    # globale Slash-Commands syncen
     try:
-        await register_rsvp_commands(tree)
         synced = await tree.sync()
         print(f"Synced {len(synced)} commands.")
     except Exception as e:
         print("Command sync failed:", e)
 
-    # falls du einen Scheduler hast, hier wieder starten:
-    # scheduler_loop.start()
+    # Reminder-Scheduler starten
+    scheduler_loop.start()
 
-
-# ====== RSVP Event mit Bild, Rollen-Auswertung und Buttons ======
-# Speichert Teilnahme-Status in data/event_rsvp.json (persistiert Neustarts).
-# Buttons sind persistent (timeout=None); on_ready() registriert sie erneut.
-
-from collections import defaultdict
-
-# --- KONFIG: Rollen-Erkennung Tank/Heal/DPS ---
-# Variante A (stabiler): trage hier die ID eurer Tank/Heal/DPS-Rollen ein (Zahlen).
-ROLE_IDS = {
-    "TANK":  0,  # z.B. 123456789012345678  (0 lassen, wenn ihr nur Namen nutzt)
-    "HEAL":  0,
-    "DPS":   0,
-}
-# Variante B (Fallback): Erkennung über Namen, wenn ROLE_IDS=0 sind
-ROLE_NAMES = {
-    "TANK": "Tank",
-    "HEAL": "Heal",
-    "DPS":  "DPS",
-}
-
-DATA_DIR.mkdir(exist_ok=True)
-RSVP_FILE = DATA_DIR / "event_rsvp.json"
-
-def _load_rsvp() -> dict:
-    if RSVP_FILE.exists():
-        try:
-            return json.loads(RSVP_FILE.read_text(encoding="utf-8"))
-        except Exception:
-            pass
-    return {}
-
-def _save_rsvp(blob: dict) -> None:
-    RSVP_FILE.write_text(json.dumps(blob, indent=2, ensure_ascii=False), encoding="utf-8")
-
-def _role_label_from_member(member: discord.Member) -> str:
-    """Gibt 'Tank' | 'Heal' | 'DPS' | 'Unassigned' zurück – nach IDs oder Namen."""
-    # Nach IDs (wenn gesetzt)
-    if ROLE_IDS.get("TANK"):
-        if any(r.id == ROLE_IDS["TANK"] for r in member.roles):
-            return "Tank"
-    if ROLE_IDS.get("HEAL"):
-        if any(r.id == ROLE_IDS["HEAL"] for r in member.roles):
-            return "Heal"
-    if ROLE_IDS.get("DPS"):
-        if any(r.id == ROLE_IDS["DPS"] for r in member.roles):
-            return "DPS"
-
-    # Fallback: nach Namen
-    tank_n = ROLE_NAMES.get("TANK", "").lower()
-    heal_n = ROLE_NAMES.get("HEAL", "").lower()
-    dps_n  = ROLE_NAMES.get("DPS", "").lower()
-    rl = [r.name.lower() for r in member.roles]
-    if tank_n and any(tank_n == x for x in rl):
-        return "Tank"
-    if heal_n and any(heal_n == x for x in rl):
-        return "Heal"
-    if dps_n and any(dps_n == x for x in rl):
-        return "DPS"
-
-    return "Unassigned"
-
-def _ensure_event(store: dict, message_id: str, payload: dict) -> dict:
-    """Legt die Datenstruktur für dieses Event an, falls neu."""
-    if message_id not in store:
-        store[message_id] = {
-            "title": payload.get("title", ""),
-            "when_text": payload.get("when_text", ""),
-            "channel_id": payload.get("channel_id"),
-            "image_url": payload.get("image_url", ""),
-            "description": payload.get("description", ""),
-            # Teilnehmer
-            "yes": {},      # user_id -> {"name": "...", "role": "Tank/Heal/DPS/..."}
-            "maybe": {},    # dito
-            "no": {},       # dito
-        }
-    return store[message_id]
-
-def _format_embed_for_event(ev: dict, guild: discord.Guild) -> discord.Embed:
-    """Baut den hübschen Embed inkl. Bild & Spalten für Yes/Maybe/No mit Rollen."""
-    title = ev.get("title") or "Event"
-    desc  = ev.get("description") or ""
-    when  = ev.get("when_text") or ""
-
-    embed = discord.Embed(
-        title=title,
-        description=f"{desc}\n\n**Zeit:** {when}",
-        color=discord.Color.blue()
-    )
-    if ev.get("image_url"):
-        embed.set_image(url=ev["image_url"])
-
-    # YES nach Rolle gruppieren
-    yes_by_role = defaultdict(list)
-    for uid, info in ev.get("yes", {}).items():
-        yes_by_role[info.get("role","Unassigned")].append(info.get("name", f"<@{uid}>"))
-
-    # YES Feld
-    if ev.get("yes"):
-        parts = []
-        for role in ("Tank","Heal","DPS","Unassigned"):
-            if yes_by_role.get(role):
-                parts.append(f"**{role} ({len(yes_by_role[role])})**: " + ", ".join(yes_by_role[role]))
-        embed.add_field(name="✅ Zusage", value="\n".join(parts)[:1024] or "—", inline=False)
-    else:
-        embed.add_field(name="✅ Zusage", value="—", inline=False)
-
-    # MAYBE Liste mit (Rolle)
-    if ev.get("maybe"):
-        maybe_list = []
-        for uid, info in ev["maybe"].items():
-            nm = info.get("name", f"<@{uid}>")
-            rl = info.get("role","Unassigned")
-            maybe_list.append(f"{nm} ({rl})")
-        embed.add_field(name="❔ Vielleicht", value="\n".join(maybe_list)[:1024] or "—", inline=False)
-    else:
-        embed.add_field(name="❔ Vielleicht", value="—", inline=False)
-
-    # NO Liste
-    if ev.get("no"):
-        no_list = [info.get("name", f"<@{uid}>") for uid, info in ev["no"].items()]
-        embed.add_field(name="❌ Abgesagt", value=", ".join(no_list)[:1024] or "—", inline=False)
-    else:
-        embed.add_field(name="❌ Abgesagt", value="—", inline=False)
-
-    return embed
-
-class RSVPView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)  # persistent
-
-    @discord.ui.button(label="Ja", style=discord.ButtonStyle.success, emoji="✅", custom_id="rsvp_yes")
-    async def rsvp_yes(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await _handle_rsvp_click(interaction, status="yes")
-
-    @discord.ui.button(label="Vielleicht", style=discord.ButtonStyle.primary, emoji="❔", custom_id="rsvp_maybe")
-    async def rsvp_maybe(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await _handle_rsvp_click(interaction, status="maybe")
-
-    @discord.ui.button(label="Nein", style=discord.ButtonStyle.danger, emoji="❌", custom_id="rsvp_no")
-    async def rsvp_no(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await _handle_rsvp_click(interaction, status="no")
-
-async def _handle_rsvp_click(interaction: discord.Interaction, status: str):
-    """Schreibt den Klick in die JSON und aktualisiert den Embed."""
-    if not interaction.guild or not interaction.message:
-        await interaction.response.send_message("Nur in einem Server-Event nutzbar.", ephemeral=True)
-        return
-
-    store = _load_rsvp()
-    mid = str(interaction.message.id)
-    ev = store.get(mid)
-    if not ev:
-        await interaction.response.send_message("Daten für dieses Event fehlen (neu posten?).", ephemeral=True)
-        return
-
-    user = interaction.user
-    uid = str(user.id)
-    name = getattr(user, "display_name", user.name)
-    role = _role_label_from_member(user)
-
-    # aus allen Listen entfernen
-    for bucket in ("yes","maybe","no"):
-        ev.get(bucket, {}).pop(uid, None)
-
-    # in Ziel-Liste eintragen
-    ev.setdefault(status, {})[uid] = {"name": name, "role": role}
-
-    # Embed aktualisieren
-    embed = _format_embed_for_event(ev, interaction.guild)
-    try:
-        await interaction.message.edit(embed=embed, view=RSVPView())
-    except Exception as e:
-        print("edit failed:", e)
-
-    _save_rsvp(store)
-    await interaction.response.send_message("✅ Aktualisiert.", ephemeral=True)
-
-@tree.command(name="event_create", description="Erstellt ein RSVP-Event mit Bild und Rollen-Tracking.")
-@app_commands.describe(
-    title="Titel des Events",
-    date="Datum YYYY-MM-DD", 
-    time="Zeit HH:MM (24h)", 
-    channel="Channel für den Post",
-    image_url="(optional) Bild-URL für den Embed",
-    description="(optional) Beschreibung unter dem Titel"
-)
-async def event_create(
-    interaction: discord.Interaction,
-    title: str,
-    date: str,
-    time: str,
-    channel: discord.TextChannel,
-    image_url: str = "",
-    description: str = "",
-):
-    # Zeit-Text hübsch bauen (wir nutzen deinen TZ=Europe/Berlin)
-    when_text = f"{date} {time} (Europa/Berlin)"
-
-    # Embed initial
-    ev_blob = {
-        "title": title.strip(),
-        "when_text": when_text,
-        "channel_id": channel.id,
-        "image_url": image_url.strip(),
-        "description": description.strip(),
-    }
-    embed = _format_embed_for_event(
-        {**ev_blob, "yes": {}, "maybe": {}, "no": {}},
-        interaction.guild
-    )
-
-    view = RSVPView()
-    msg = await channel.send(embed=embed, view=view)
-
-    # Persistenz ablegen
-    store = _load_rsvp()
-    _ensure_event(store, str(msg.id), ev_blob)
-    _save_rsvp(store)
-
-    await interaction.response.send_message(f"✅ Event erstellt in {channel.mention}.", ephemeral=True)
-
-# Beim Start persistenten View registrieren (damit Buttons nach Neustart gehen)
-@client.event
-async def on_ready():
-    # Deine bestehende on_ready() ruft scheduler_loop.start() etc – also NICHT ersetzen,
-    # sondern nur sicherstellen, dass die View registriert ist.
-    try:
-        client.add_view(RSVPView())
-    except Exception as e:
-        print("add_view failed:", e)
-    # (Dein bestehender on_ready()-Inhalt bleibt wie gehabt.)
-
-
+# ========= Start =========
 if __name__ == "__main__":
     if not TOKEN:
         raise SystemExit("Set DISCORD_BOT_TOKEN environment variable.")
