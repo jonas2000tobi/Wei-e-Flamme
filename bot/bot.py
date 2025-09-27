@@ -331,7 +331,6 @@ def _build_embed(guild: discord.Guild, obj: dict) -> discord.Embed:
         if gr:
             voted_ids = set(obj["yes"]["TANK"] + obj["yes"]["HEAL"] + obj["yes"]["DPS"]
                             + [int(k) for k in obj["maybe"].keys()] + obj["no"])
-            # Zähle nur Mitglieder, die die Rolle haben
             voted_in_guild = sum(1 for uid in voted_ids if (m := guild.get_member(uid)) and gr in m.roles)
             total = len(gr.members)  # funktioniert nach guild.chunk()
             emb.add_field(name="🏰 Gildenbeteiligung",
@@ -448,6 +447,28 @@ def register_rsvp_slash_commands():
         except Exception as e:
             await inter.response.send_message(f"❌ Fehler: {e}", ephemeral=True)
 
+    # ---- Gildenrolle setzen (zurück) ----
+    @tree.command(name="raid_set_guildrole", description='Gildenrolle für die Zählung (z. B. "Weiße Flamme") festlegen.')
+    @app_commands.describe(guild_role='Die Gildenrolle, deren Mitglieder gezählt werden sollen')
+    async def raid_set_guildrole(inter: discord.Interaction, guild_role: discord.Role):
+        if not is_admin(inter):
+            await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True); return
+        _set_guild_role_id(inter.guild_id, guild_role.id)
+        await inter.response.send_message(f"✅ Gildenrolle gesetzt: {guild_role.mention}", ephemeral=True)
+
+    # ---- Debug: aktuelle Rolle + Zahlen ----
+    @tree.command(name="raid_stats", description="Zeigt gespeicherte Gildenrolle und Zählung.")
+    async def raid_stats(inter: discord.Interaction):
+        gid = inter.guild_id
+        rid = _get_guild_role_id(gid)
+        if not rid:
+            await inter.response.send_message("ℹ️ Keine Gildenrolle gespeichert.", ephemeral=True); return
+        role = inter.guild.get_role(rid)
+        if not role:
+            await inter.response.send_message(f"⚠️ Rolle {rid} nicht gefunden.", ephemeral=True); return
+        total = len(role.members)
+        await inter.response.send_message(f"🏰 Rolle: {role.name} ({rid}) — Mitglieder: {total}", ephemeral=True)
+
 # ===== Auto-Set der Gildenrolle (fallback) =====
 async def _auto_set_guild_role_for_guild(g: discord.Guild):
     """Findet Rolle per Name/Substring und speichert sie. Kein Command nötig."""
@@ -457,8 +478,6 @@ async def _auto_set_guild_role_for_guild(g: discord.Guild):
         _set_guild_role_id(g.id, role.id)
         print(f"[AUTO] Gildenrolle gesetzt für {g.name}: {role.name} ({role.id})")
     else:
-        if _get_guild_role_id(g.id) != 0:
-            _set_guild_role_id(g.id, 0)
         print(f"[AUTO] Keine passende Gildenrolle in {g.name} gefunden (gesucht nach '{GUILD_ROLE_NAME}').")
 
 def reregister_persistent_views_on_start():
@@ -473,10 +492,10 @@ def reregister_persistent_views_on_start():
 async def on_ready():
     print(f"Logged in as {client.user} (ID: {client.user.id})")
 
-    # ---- WICHTIG: Member-Cache laden, damit role.members gefüllt ist ----
+    # Member-Cache laden (für role.members / get_member)
     for g in client.guilds:
         try:
-            await g.chunk()  # lädt alle Member in den Cache
+            await g.chunk()
             print(f"Chunked guild {g.name} (id={g.id})")
         except Exception as e:
             print("guild.chunk() failed:", e)
@@ -484,11 +503,11 @@ async def on_ready():
     reregister_persistent_views_on_start()
     register_rsvp_slash_commands()
 
-    # Auto-Set Gildenrolle (falls nicht via Command gesetzt)
+    # Auto-Set Gildenrolle (falls noch nicht gesetzt)
     for g in client.guilds:
         await _auto_set_guild_role_for_guild(g)
 
-    # Hartes Resync je Guild (sofort sichtbar)
+    # Harter Guild-Sync → Befehle sofort sichtbar
     for g in client.guilds:
         gid = g.id
         try:
@@ -501,14 +520,12 @@ async def on_ready():
 
     scheduler_loop.start()
 
-# ===== Scheduler =====
+# ===== Scheduler (robust) =====
 def _in_window(now: datetime, ts: datetime, window_sec: int = 60) -> bool:
-    """True, wenn ts in [now, now+window) liegt (Minute-Toleranz)."""
     return 0 <= (now - ts).total_seconds() < window_sec
 
 @tasks.loop(seconds=30.0)
 async def scheduler_loop():
-    # runde auf Minute nach unten, damit 12:34:15/45 beide 12:34 sind
     now = datetime.now(TZ).replace(second=0, microsecond=0)
     changed = False
     for guild in client.guilds:
@@ -523,7 +540,6 @@ async def scheduler_loop():
             if not start_dt: continue
             end_dt = start_dt + timedelta(minutes=ev.duration_min)
 
-            # Pre-Reminder: fire im 60s-Fenster
             for m in ev.pre_reminders:
                 pre_dt = start_dt - timedelta(minutes=m)
                 key = f"{guild.id}:{ev.name}:{start_dt.isoformat()}:pre{m}"
@@ -534,7 +550,6 @@ async def scheduler_loop():
                     await channel.send(body)
                     post_log.add(key); changed = True
 
-            # Start-Post: fire im 60s-Fenster
             key = f"{guild.id}:{ev.name}:{start_dt.isoformat()}:start"
             if _in_window(now, start_dt) and key not in post_log:
                 role_mention = f"<@&{ev.mention_role_id}>" if ev.mention_role_id else ""
@@ -543,7 +558,6 @@ async def scheduler_loop():
                 await channel.send(body)
                 post_log.add(key); changed = True
 
-            # Einmal-Event nach Ablauf entfernen
             if ev.one_time_date:
                 try:
                     d = parse_date_yyyy_mm_dd(ev.one_time_date)
