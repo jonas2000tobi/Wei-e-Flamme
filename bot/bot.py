@@ -623,14 +623,22 @@ def reregister_persistent_views_on_start():
 @client.event
 async def on_ready():
     print(f"Logged in as {client.user} (ID: {client.user.id})")
+
     reregister_persistent_views_on_start()
     register_rsvp_slash_commands()
+
+    # HARTE Aktualisierung je Gilde
     try:
-        synced = await tree.sync()
-        print(f"Synced {len(synced)} commands.")
+        for g in client.guilds:
+            # optional: vorher alte Kommandos leeren
+            # tree.clear_commands(guild=discord.Object(id=g.id))
+            await tree.sync(guild=discord.Object(id=g.id))
+        print(f"Synced commands for {len(client.guilds)} guild(s).")
     except Exception as e:
         print("Command sync failed:", e)
+
     scheduler_loop.start()
+
 
 if __name__ == "__main__":
     if not TOKEN:
