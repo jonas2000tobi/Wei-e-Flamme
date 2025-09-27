@@ -445,9 +445,11 @@ def _mention(guild: discord.Guild, uid: int) -> str:
 def _build_embed(guild: discord.Guild, obj: dict) -> discord.Embed:
     dt = datetime.fromisoformat(obj["when_iso"])
     emb = discord.Embed(
-        title=f"📅 {obj['title']}",
-        description=f"**Zeit:** {dt.strftime('%a, %d.%m.%Y %H:%M')} (Europe/Berlin)",
-        color=discord.Color.blurple(),
+    title=f"📅 {obj['title']}",
+    description=f"{obj.get('description','')}\n\n🕒 Zeit: {dt.strftime('%a, %d.%m.%Y %H:%M')} (Europe/Berlin)",
+    color=discord.Color.blurple(),
+)
+
     )
     # YES nach Rollen
     tank_names = [_mention(guild, u) for u in obj["yes"]["TANK"]]
@@ -558,18 +560,21 @@ def register_rsvp_slash_commands():
     @tree.command(name="raid_create", description="Raid-/Event-Anmeldung mit Buttons erstellen.")
     @app_commands.describe(
         title="Titel (im Embed)",
+        description="Zusätzliche Info oder Beschreibung"   # <--- NEU
         date="Datum YYYY-MM-DD (Europe/Berlin)",
         time="Zeit HH:MM (24h)",
         channel="Zielkanal",
         image_url="Optionales Bild-URL fürs Embed"
     )
     async def raid_create(
-        inter: discord.Interaction,
-        title: str,
-        date: str,
-        time: str,
-        channel: Optional[discord.TextChannel] = None,
-        image_url: Optional[str] = None,
+    inter: discord.Interaction,
+    title: str,
+    description: Optional[str] = None,   # <— NEU
+    date: str,
+    time: str,
+    channel: Optional[discord.TextChannel] = None,
+    image_url: Optional[str] = None,
+
     ):
         if not is_admin(inter):
             await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True)
@@ -587,6 +592,8 @@ def register_rsvp_slash_commands():
             "guild_id": inter.guild_id,
             "channel_id": ch.id,
             "title": title.strip(),
+            "description": (description or "").strip(),
+
             "when_iso": when.isoformat(),
             "image_url": (image_url or "").strip() or None,
             "yes": {"TANK": [], "HEAL": [], "DPS": []},
