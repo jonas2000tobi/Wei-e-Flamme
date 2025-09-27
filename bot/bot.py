@@ -17,9 +17,7 @@ from discord.ext import tasks
 from flask import Flask
 from zoneinfo import ZoneInfo
 
-# =========================
-# Grundkonfiguration
-# =========================
+# ===== Grundkonfig =====
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 TZ = ZoneInfo("Europe/Berlin")
 
@@ -27,10 +25,10 @@ DATA_DIR = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
 CFG_FILE = DATA_DIR / "guild_configs.json"
 POST_LOG_FILE = DATA_DIR / "post_log.json"
+RSVP_STORE_FILE = DATA_DIR / "event_rsvp.json"
+RSVP_CFG_FILE   = DATA_DIR / "event_rsvp_cfg.json"
 
-# =========================
-# Keepalive / Webserver
-# =========================
+# ===== Keepalive (Flask) =====
 app = Flask(__name__)
 
 @app.get("/")
@@ -55,19 +53,15 @@ def keep_alive():
 
 threading.Thread(target=keep_alive, daemon=True).start()
 
-# =========================
-# Discord-Setup
-# =========================
+# ===== Discord Grundsetup =====
 intents = discord.Intents.default()
 intents.guilds = True
-intents.members = True  # für RSVP-Rollen-/Member-Zugriff
+intents.members = True  # für Rollen-Erkennung bei RSVP
 
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
-# =========================
-# Utilities / Parser
-# =========================
+# ===== Parser / Utils =====
 DOW_MAP = {
     "mon": 0, "monday": 0, "0": 0,
     "tue": 1, "tuesday": 1, "1": 1,
@@ -110,9 +104,7 @@ def parse_date_yyyy_mm_dd(s: str) -> date_cls:
     except Exception:
         raise ValueError("date must be 'YYYY-MM-DD'.")
 
-# =========================
-# Event-/Guild-Config
-# =========================
+# ===== Datenmodelle =====
 @dataclass
 class Event:
     name: str
@@ -173,6 +165,7 @@ class GuildConfig:
             events=evs,
         )
 
+# ===== Persistenz =====
 def load_all() -> Dict[int, GuildConfig]:
     if CFG_FILE.exists():
         raw = json.loads(CFG_FILE.read_text(encoding="utf-8"))
@@ -212,9 +205,7 @@ def is_admin(interaction: discord.Interaction) -> bool:
     perms = interaction.user.guild_permissions if interaction.user else None
     return bool(perms and (perms.administrator or perms.manage_guild))
 
-# =========================
-# Slash-Commands: Config & Events
-# =========================
+# ===== Slash-Commands: Config & Events =====
 @tree.command(name="set_announce_channel", description="Standard-Kanal für Erinnerungen setzen.")
 @app_commands.describe(channel="Ziel-Textkanal")
 async def set_announce_channel(interaction: discord.Interaction, channel: discord.TextChannel):
@@ -341,75 +332,7 @@ async def test_event_ping(interaction: discord.Interaction, name: str):
     await channel.send(body)
     await interaction.response.send_message("✅ Test-Ping raus.", ephemeral=True)
 
-# =========================
-# Scheduler für Event-Posts
-# =========================
-@tasks.loop(seconds=30.0)
-async def scheduler_loop():
-    now = datetime.now(TZ).replace(second=0, microsecond=0)
-    changed = False
-    for guild in client.guilds:
-        cfg = configs.get(guild.id)
-        if not cfg or not cfg.events:
-            continue
-        for ev in list(cfg.events.values()):
-            channel_id = ev.channel_id or cfg.announce_channel_id
-            channel = await ensure_text_channel(guild, channel_id)
-            if not channel:
-                continue
-
-            start_dt = ev.occurrence_start_on_date(now.date())
-            if not start_dt:
-                continue
-            end_dt = start_dt + timedelta(minutes=ev.duration_min)
-
-            # Pre-Reminder
-            for m in ev.pre_reminders:
-                pre_dt = start_dt - timedelta(minutes=m)
-                key = f"{guild.id}:{ev.name}:{start_dt.isoformat()}:pre{m}"
-                if pre_dt == now and key not in post_log:
-                    role_mention = f"<@&{ev.mention_role_id}>" if ev.mention_role_id else ""
-                    body = f"⏳ **{ev.name}** startet in **{m} Min** ({start_dt.strftime('%H:%M')} Uhr). {role_mention}".strip()
-                    if ev.description:
-                        body += f"\n{ev.description}"
-                    await channel.send(body)
-                    post_log.add(key)
-                    changed = True
-
-            # Start-Post
-            key = f"{guild.id}:{ev.name}:{start_dt.isoformat()}:start"
-            if start_dt == now and key not in post_log:
-                role_mention = f"<@&{ev.mention_role_id}>" if ev.mention_role_id else ""
-                body = f"🚀 **{ev.name}** ist **jetzt live**! Läuft bis {end_dt.strftime('%H:%M')} Uhr. {role_mention}".strip()
-                if ev.description:
-                    body += f"\n{ev.description}"
-                await channel.send(body)
-                post_log.add(key)
-                changed = True
-
-            # Einmal-Event nach Ablauf entfernen
-            if ev.one_time_date:
-                try:
-                    d = parse_date_yyyy_mm_dd(ev.one_time_date)
-                    if now.date() > d:
-                        del cfg.events[ev.name.lower()]
-                        save_all(configs)
-                except Exception:
-                    pass
-
-    if changed:
-        save_post_log(post_log)
-
-@scheduler_loop.before_loop
-async def _before_scheduler():
-    await client.wait_until_ready()
-
-# =========================
-# RSVP/Raid-Signup (Persistenz & UI)
-# =========================
-RSVP_STORE_FILE = DATA_DIR / "event_rsvp.json"
-RSVP_CFG_FILE   = DATA_DIR / "event_rsvp_cfg.json"
-
+# ===== RSVP / Raid mit Buttons =====
 def _load_json(p: Path, default):
     try:
         return json.loads(p.read_text(encoding="utf-8"))
@@ -432,7 +355,6 @@ def _get_role_ids(guild: discord.Guild) -> Dict[str, int]:
     g = rsvp_cfg.get(str(guild.id)) or {}
     return {"TANK": int(g.get("TANK", 0)), "HEAL": int(g.get("HEAL", 0)), "DPS": int(g.get("DPS", 0))}
 
-# Gildenrolle (z. B. Weiße Flamme) für Statistik
 def _get_guild_role_id(guild_id: int) -> int:
     g = rsvp_cfg.get(str(guild_id)) or {}
     try:
@@ -471,8 +393,6 @@ def _build_embed(guild: discord.Guild, obj: dict) -> discord.Embed:
         description=f"{obj.get('description','')}\n\n⏰ Zeit: {dt.strftime('%a, %d.%m.%Y %H:%M')} (Europe/Berlin)",
         color=discord.Color.blurple(),
     )
-
-    # YES-Buckets
     tank_names = [_mention(guild, u) for u in obj["yes"]["TANK"]]
     heal_names = [_mention(guild, u) for u in obj["yes"]["HEAL"]]
     dps_names  = [_mention(guild, u) for u in obj["yes"]["DPS"]]
@@ -480,7 +400,6 @@ def _build_embed(guild: discord.Guild, obj: dict) -> discord.Embed:
     emb.add_field(name=f"💚 Heal ({len(heal_names)})", value="\n".join(heal_names) or "—", inline=True)
     emb.add_field(name=f"🗡️ DPS ({len(dps_names)})", value="\n".join(dps_names) or "—", inline=True)
 
-    # MAYBE
     maybe_lines = []
     for uid, rlab in obj["maybe"].items():
         uid_i = int(uid)
@@ -488,11 +407,9 @@ def _build_embed(guild: discord.Guild, obj: dict) -> discord.Embed:
         maybe_lines.append(f"{_mention(guild, uid_i)}{label}")
     emb.add_field(name=f"❔ Vielleicht ({len(maybe_lines)})", value="\n".join(maybe_lines) or "—", inline=False)
 
-    # NO
     no_names = [_mention(guild, u) for u in obj["no"]]
     emb.add_field(name=f"❌ Abgemeldet ({len(no_names)})", value="\n".join(no_names) or "—", inline=False)
 
-    # Gildenrollen-Statistik (optional)
     gr_id = _get_guild_role_id(guild.id)
     if gr_id:
         gr = guild.get_role(gr_id)
@@ -525,14 +442,12 @@ class RaidView(discord.ui.View):
         obj = rsvp_store[self.msg_id]
         uid = interaction.user.id
 
-        # alle Buckets bereinigen
         for k in ("TANK", "HEAL", "DPS"):
             if uid in obj["yes"][k]:
                 obj["yes"][k].remove(uid)
         obj["no"] = [u for u in obj["no"] if u != uid]
         obj["maybe"].pop(str(uid), None)
 
-        # Zielgruppe setzen
         if group in ("TANK", "HEAL", "DPS"):
             obj["yes"][group].append(uid)
             txt = f"Angemeldet als **{group}**."
@@ -547,7 +462,6 @@ class RaidView(discord.ui.View):
 
         _save_store()
 
-        # Nachricht aktualisieren
         guild = interaction.guild
         emb = _build_embed(guild, obj)
         ch = guild.get_channel(obj["channel_id"])
@@ -697,9 +611,7 @@ def reregister_persistent_views_on_start():
         except Exception as e:
             print("add_view failed:", e)
 
-# =========================
-# Lifecycle
-# =========================
+# ===== Lifecycle =====
 @client.event
 async def on_ready():
     print(f"Logged in as {client.user} (ID: {client.user.id})")
@@ -707,19 +619,82 @@ async def on_ready():
     reregister_persistent_views_on_start()
     register_rsvp_slash_commands()
 
-    # Kommandos pro Gilde syncen (sofort sichtbar)
-    try:
-        for g in client.guilds:
-            await tree.sync(guild=discord.Object(id=g.id))
-        print(f"Synced commands for {len(client.guilds)} guild(s).")
-    except Exception as e:
-        print("Command sync failed:", e)
+    # Hart: erst Guild-Commands leeren, dann frisch syncen + gelistete Namen loggen
+    for g in client.guilds:
+        try:
+            await tree.clear_commands(guild=discord.Object(id=g.id))
+            print(f"Cleared commands for guild {g.id}")
+        except Exception as e:
+            print("clear_commands failed:", e)
+
+    for g in client.guilds:
+        try:
+            synced = await tree.sync(guild=discord.Object(id=g.id))
+            print(f"Synced {len(synced)} commands for guild {g.id}: {[c.name for c in synced]}")
+        except Exception as e:
+            print("Command sync failed:", e)
 
     scheduler_loop.start()
 
-# =========================
-# Start
-# =========================
+# ===== Scheduler =====
+@tasks.loop(seconds=30.0)
+async def scheduler_loop():
+    now = datetime.now(TZ).replace(second=0, microsecond=0)
+    changed = False
+    for guild in client.guilds:
+        cfg = configs.get(guild.id)
+        if not cfg or not cfg.events:
+            continue
+        for ev in list(cfg.events.values()):
+            channel_id = ev.channel_id or cfg.announce_channel_id
+            channel = await ensure_text_channel(guild, channel_id)
+            if not channel:
+                continue
+
+            start_dt = ev.occurrence_start_on_date(now.date())
+            if not start_dt:
+                continue
+            end_dt = start_dt + timedelta(minutes=ev.duration_min)
+
+            for m in ev.pre_reminders:
+                pre_dt = start_dt - timedelta(minutes=m)
+                key = f"{guild.id}:{ev.name}:{start_dt.isoformat()}:pre{m}"
+                if pre_dt == now and key not in post_log:
+                    role_mention = f"<@&{ev.mention_role_id}>" if ev.mention_role_id else ""
+                    body = f"⏳ **{ev.name}** startet in **{m} Min** ({start_dt.strftime('%H:%M')} Uhr). {role_mention}".strip()
+                    if ev.description:
+                        body += f"\n{ev.description}"
+                    await channel.send(body)
+                    post_log.add(key)
+                    changed = True
+
+            key = f"{guild.id}:{ev.name}:{start_dt.isoformat()}:start"
+            if start_dt == now and key not in post_log:
+                role_mention = f"<@&{ev.mention_role_id}>" if ev.mention_role_id else ""
+                body = f"🚀 **{ev.name}** ist **jetzt live**! Läuft bis {end_dt.strftime('%H:%M')} Uhr. {role_mention}".strip()
+                if ev.description:
+                    body += f"\n{ev.description}"
+                await channel.send(body)
+                post_log.add(key)
+                changed = True
+
+            if ev.one_time_date:
+                try:
+                    d = parse_date_yyyy_mm_dd(ev.one_time_date)
+                    if now.date() > d:
+                        del cfg.events[ev.name.lower()]
+                        save_all(configs)
+                except Exception:
+                    pass
+
+    if changed:
+        save_post_log(post_log)
+
+@scheduler_loop.before_loop
+async def _before_scheduler():
+    await client.wait_until_ready()
+
+# ===== Start =====
 if __name__ == "__main__":
     if not TOKEN:
         raise SystemExit("Set DISCORD_BOT_TOKEN environment variable.")
