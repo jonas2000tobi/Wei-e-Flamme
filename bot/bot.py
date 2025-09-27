@@ -445,12 +445,11 @@ def _mention(guild: discord.Guild, uid: int) -> str:
 def _build_embed(guild: discord.Guild, obj: dict) -> discord.Embed:
     dt = datetime.fromisoformat(obj["when_iso"])
     emb = discord.Embed(
-    title=f"📅 {obj['title']}",
-    description=f"{obj.get('description','')}\n\n🕒 Zeit: {dt.strftime('%a, %d.%m.%Y %H:%M')} (Europe/Berlin)",
+    title=f"{obj['title']}",
+    description=f"{obj.get('description','')}\n\n⏰ Zeit: {dt.strftime('%a, %d.%m.%Y %H:%M')} (Europe/Berlin)",
     color=discord.Color.blurple(),
 )
 
-    )
     # YES nach Rollen
     tank_names = [_mention(guild, u) for u in obj["yes"]["TANK"]]
     heal_names = [_mention(guild, u) for u in obj["yes"]["HEAL"]]
