@@ -559,7 +559,7 @@ def register_rsvp_slash_commands():
     @tree.command(name="raid_create", description="Raid-/Event-Anmeldung mit Buttons erstellen.")
     @app_commands.describe(
         title="Titel (im Embed)",
-        description="Zusätzliche Info oder Beschreibung"   # <--- NEU
+        description="Zusätzliche Info oder Beschreibung",   # <--- NEU
         date="Datum YYYY-MM-DD (Europe/Berlin)",
         time="Zeit HH:MM (24h)",
         channel="Zielkanal",
