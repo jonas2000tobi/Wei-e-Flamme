@@ -84,9 +84,11 @@ def build_embed(guild: discord.Guild, obj: dict) -> discord.Embed:
     no = obj["no"]
 
     emb = discord.Embed(
-        title=f"📅 {title}",
-        description=f"**Zeit:** {dt.strftime('%a, %d.%m.%Y %H:%M')} (Europe/Berlin)",
-        color=discord.Color.blurple(),
+    title=f"📅 {obj['title']}",
+    description=f"{obj.get('description','')}\n\n🕒 Zeit: {dt.strftime('%a, %d.%m.%Y %H:%M')} (Europe/Berlin)",
+    color=discord.Color.blurple()
+)
+
     )
 
     def mention(uid: int) -> str:
