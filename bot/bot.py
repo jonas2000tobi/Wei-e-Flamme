@@ -24,7 +24,7 @@ POST_LOG_FILE = DATA_DIR / "post_log.json"
 RSVP_STORE_FILE = DATA_DIR / "event_rsvp.json"
 RSVP_CFG_FILE   = DATA_DIR / "event_rsvp_cfg.json"
 
-# Optional: Rollensuche steuern
+# Optional: Name der Gildenrolle für die Quote (fallback, case-insensitive)
 GUILD_ROLE_NAME = (os.getenv("GUILD_ROLE_NAME") or "Weiße Flamme").strip()
 
 # ===== Keepalive (Flask) =====
@@ -47,7 +47,7 @@ threading.Thread(target=keep_alive, daemon=True).start()
 # ===== Discord Setup =====
 intents = discord.Intents.default()
 intents.guilds = True
-intents.members = True  # für Rollen/RSVP
+intents.members = True  # WICHTIG: für Rollenzählung und Member-Cache
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
@@ -323,17 +323,21 @@ def _build_embed(guild: discord.Guild, obj: dict) -> discord.Embed:
     emb.add_field(name=f"❔ Vielleicht ({len(maybe_lines)})", value="\n".join(maybe_lines) or "—", inline=False)
     no_names = [_mention(guild, u) for u in obj["no"]]
     emb.add_field(name=f"❌ Abgemeldet ({len(no_names)})", value="\n".join(no_names) or "—", inline=False)
+
+    # Gildenrollen-Quote
     gr_id = _get_guild_role_id(guild.id)
     if gr_id:
         gr = guild.get_role(gr_id)
         if gr:
             voted_ids = set(obj["yes"]["TANK"] + obj["yes"]["HEAL"] + obj["yes"]["DPS"]
                             + [int(k) for k in obj["maybe"].keys()] + obj["no"])
-            voted_in_guild = sum(1 for uid in voted_ids
-                                 if (m := guild.get_member(uid)) and gr in m.roles)
+            # Zähle nur Mitglieder, die die Rolle haben
+            voted_in_guild = sum(1 for uid in voted_ids if (m := guild.get_member(uid)) and gr in m.roles)
+            total = len(gr.members)  # funktioniert nach guild.chunk()
             emb.add_field(name="🏰 Gildenbeteiligung",
-                          value=f"{voted_in_guild} / {len(gr.members)} haben abgestimmt",
+                          value=f"{voted_in_guild} / {total} haben abgestimmt",
                           inline=False)
+
     if obj.get("image_url"): emb.set_image(url=obj["image_url"])
     emb.set_footer(text="Klicke unten auf die Buttons, um dich anzumelden.")
     return emb
@@ -444,19 +448,15 @@ def register_rsvp_slash_commands():
         except Exception as e:
             await inter.response.send_message(f"❌ Fehler: {e}", ephemeral=True)
 
-# ===== Auto-Set der Gildenrolle (kein Slash-Command nötig) =====
+# ===== Auto-Set der Gildenrolle (fallback) =====
 async def _auto_set_guild_role_for_guild(g: discord.Guild):
-    """Versucht, die Gildenrolle automatisch zu finden & zu speichern."""
+    """Findet Rolle per Name/Substring und speichert sie. Kein Command nötig."""
     wanted = GUILD_ROLE_NAME.lower()
-    role = discord.utils.find(
-        lambda r: r.name.lower() == wanted or wanted in r.name.lower(),
-        g.roles
-    )
+    role = discord.utils.find(lambda r: r.name.lower() == wanted or wanted in r.name.lower(), g.roles)
     if role:
         _set_guild_role_id(g.id, role.id)
         print(f"[AUTO] Gildenrolle gesetzt für {g.name}: {role.name} ({role.id})")
     else:
-        # nichts gefunden → 0 setzen (deaktiviert Statistik)
         if _get_guild_role_id(g.id) != 0:
             _set_guild_role_id(g.id, 0)
         print(f"[AUTO] Keine passende Gildenrolle in {g.name} gefunden (gesucht nach '{GUILD_ROLE_NAME}').")
@@ -472,10 +472,19 @@ def reregister_persistent_views_on_start():
 @client.event
 async def on_ready():
     print(f"Logged in as {client.user} (ID: {client.user.id})")
+
+    # ---- WICHTIG: Member-Cache laden, damit role.members gefüllt ist ----
+    for g in client.guilds:
+        try:
+            await g.chunk()  # lädt alle Member in den Cache
+            print(f"Chunked guild {g.name} (id={g.id})")
+        except Exception as e:
+            print("guild.chunk() failed:", e)
+
     reregister_persistent_views_on_start()
     register_rsvp_slash_commands()
 
-    # Auto-Set Gildenrolle für alle Guilds
+    # Auto-Set Gildenrolle (falls nicht via Command gesetzt)
     for g in client.guilds:
         await _auto_set_guild_role_for_guild(g)
 
@@ -493,8 +502,13 @@ async def on_ready():
     scheduler_loop.start()
 
 # ===== Scheduler =====
+def _in_window(now: datetime, ts: datetime, window_sec: int = 60) -> bool:
+    """True, wenn ts in [now, now+window) liegt (Minute-Toleranz)."""
+    return 0 <= (now - ts).total_seconds() < window_sec
+
 @tasks.loop(seconds=30.0)
 async def scheduler_loop():
+    # runde auf Minute nach unten, damit 12:34:15/45 beide 12:34 sind
     now = datetime.now(TZ).replace(second=0, microsecond=0)
     changed = False
     for guild in client.guilds:
@@ -509,28 +523,35 @@ async def scheduler_loop():
             if not start_dt: continue
             end_dt = start_dt + timedelta(minutes=ev.duration_min)
 
+            # Pre-Reminder: fire im 60s-Fenster
             for m in ev.pre_reminders:
                 pre_dt = start_dt - timedelta(minutes=m)
                 key = f"{guild.id}:{ev.name}:{start_dt.isoformat()}:pre{m}"
-                if pre_dt == now and key not in post_log:
+                if _in_window(now, pre_dt) and key not in post_log:
                     role_mention = f"<@&{ev.mention_role_id}>" if ev.mention_role_id else ""
                     body = f"⏳ **{ev.name}** startet in **{m} Min** ({start_dt.strftime('%H:%M')} Uhr). {role_mention}".strip()
                     if ev.description: body += f"\n{ev.description}"
-                    await channel.send(body); post_log.add(key); changed = True
+                    await channel.send(body)
+                    post_log.add(key); changed = True
 
+            # Start-Post: fire im 60s-Fenster
             key = f"{guild.id}:{ev.name}:{start_dt.isoformat()}:start"
-            if start_dt == now and key not in post_log:
+            if _in_window(now, start_dt) and key not in post_log:
                 role_mention = f"<@&{ev.mention_role_id}>" if ev.mention_role_id else ""
                 body = f"🚀 **{ev.name}** ist **jetzt live**! Läuft bis {end_dt.strftime('%H:%M')} Uhr. {role_mention}".strip()
                 if ev.description: body += f"\n{ev.description}"
-                await channel.send(body); post_log.add(key); changed = True
+                await channel.send(body)
+                post_log.add(key); changed = True
 
+            # Einmal-Event nach Ablauf entfernen
             if ev.one_time_date:
                 try:
                     d = parse_date_yyyy_mm_dd(ev.one_time_date)
                     if now.date() > d:
-                        del cfg.events[ev.name.lower()]; save_all(configs)
-                except Exception: pass
+                        del cfg.events[ev.name.lower()]
+                        save_all(configs)
+                except Exception:
+                    pass
 
     if changed: save_post_log(post_log)
 
