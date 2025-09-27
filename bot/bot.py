@@ -1,15 +1,3 @@
-Alles klar — hier ist eine **bereinigte, lauffähige `bot.py`** (komplett, für Copy & Paste).
-Einzug ist konsistent (4 Spaces), die fehlerhaften Stellen (`raid_set_roles`, `raid_create`, Deko-Einrückung, Embed-Aufbau) sind korrigiert.
-
-> Voraussetzungen (wie gehabt):
-> `discord.py==2.4.0`, `Flask`, `requests`, optional `audioop-lts` (falls Voice-Module importiert werden).
-> In Railway die Env **DISCORD_BOT_TOKEN** setzen. Privileged Intent **Server-Mitglieder** im Dev-Portal aktivieren.
-
-```python
-# bot/bot.py
-# TL Event Reminder + Raid/RSVP in EINER Datei
-# discord.py 2.4.x
-
 from __future__ import annotations
 import os, json, threading, time, requests
 from dataclasses import dataclass, asdict
@@ -23,7 +11,6 @@ from discord.ext import tasks
 from flask import Flask
 from zoneinfo import ZoneInfo
 
-# ========= Grundkonfiguration =========
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 TZ = ZoneInfo("Europe/Berlin")
 
@@ -32,7 +19,6 @@ DATA_DIR.mkdir(exist_ok=True)
 CFG_FILE = DATA_DIR / "guild_configs.json"
 POST_LOG_FILE = DATA_DIR / "post_log.json"
 
-# ---- Mini-Webserver für Railway/Healthcheck ----
 app = Flask(__name__)
 
 @app.get("/")
@@ -44,9 +30,8 @@ def _run_flask():
 
 threading.Thread(target=_run_flask, daemon=True).start()
 
-# ---- Optionales Self-Ping (Free-Pläne wach halten) ----
 def keep_alive():
-    url = os.getenv("KEEPALIVE_URL", "").strip()  # z.B. https://dein-project.up.railway.app
+    url = os.getenv("KEEPALIVE_URL", "").strip()
     if not url:
         return
     while True:
@@ -58,16 +43,12 @@ def keep_alive():
 
 threading.Thread(target=keep_alive, daemon=True).start()
 
-# ========= Discord Setup =========
 intents = discord.Intents.default()
 intents.guilds = True
-intents.members = True         # im Dev-Portal aktivieren (Privileged Intents)
+intents.members = True
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
-# ========= Event-Reminder =========
-
-# ---- Parsing ----
 DOW_MAP = {
     "mon": 0, "monday": 0, "0": 0,
     "tue": 1, "tuesday": 1, "1": 1,
@@ -110,18 +91,17 @@ def parse_date_yyyy_mm_dd(s: str) -> date_cls:
     except Exception:
         raise ValueError("date must be 'YYYY-MM-DD'.")
 
-# ---- Modelle ----
 @dataclass
 class Event:
     name: str
-    weekdays: List[int]           # 0=Mon..6=Sun
-    start_hhmm: str               # "HH:MM"
+    weekdays: List[int]
+    start_hhmm: str
     duration_min: int
     pre_reminders: List[int]
     mention_role_id: Optional[int] = None
     channel_id: Optional[int] = None
     description: str = ""
-    one_time_date: Optional[str] = None  # "YYYY-MM-DD"
+    one_time_date: Optional[str] = None
 
     def next_occurrence_start(self, ref_dt: datetime) -> Optional[datetime]:
         start_t = parse_time_hhmm(self.start_hhmm)
@@ -171,7 +151,6 @@ class GuildConfig:
             events=evs,
         )
 
-# ---- Persistenz (Reminder) ----
 def load_all() -> Dict[int, GuildConfig]:
     if CFG_FILE.exists():
         raw = json.loads(CFG_FILE.read_text(encoding="utf-8"))
@@ -211,7 +190,6 @@ def is_admin(interaction: discord.Interaction) -> bool:
     perms = interaction.user.guild_permissions if interaction.user else None
     return bool(perms and (perms.administrator or perms.manage_guild))
 
-# ---- Slash-Commands (Reminder) ----
 @tree.command(name="set_announce_channel", description="Standard-Kanal für Erinnerungen setzen.")
 @app_commands.describe(channel="Ziel-Textkanal")
 async def set_announce_channel(interaction: discord.Interaction, channel: discord.TextChannel):
@@ -338,7 +316,6 @@ async def test_event_ping(interaction: discord.Interaction, name: str):
     await channel.send(body)
     await interaction.response.send_message("✅ Test-Ping raus.", ephemeral=True)
 
-# ---- Scheduler (Reminder) ----
 @tasks.loop(seconds=30.0)
 async def scheduler_loop():
     now = datetime.now(TZ).replace(second=0, microsecond=0)
@@ -358,7 +335,6 @@ async def scheduler_loop():
                 continue
             end_dt = start_dt + timedelta(minutes=ev.duration_min)
 
-            # Pre-Reminders
             for m in ev.pre_reminders:
                 pre_dt = start_dt - timedelta(minutes=m)
                 key = f"{guild.id}:{ev.name}:{start_dt.isoformat()}:pre{m}"
@@ -371,7 +347,6 @@ async def scheduler_loop():
                     post_log.add(key)
                     changed = True
 
-            # Start
             key = f"{guild.id}:{ev.name}:{start_dt.isoformat()}:start"
             if start_dt == now and key not in post_log:
                 role_mention = f"<@&{ev.mention_role_id}>" if ev.mention_role_id else ""
@@ -382,7 +357,6 @@ async def scheduler_loop():
                 post_log.add(key)
                 changed = True
 
-            # Einmalige Events nach dem Tag aufräumen
             if ev.one_time_date:
                 try:
                     d = parse_date_yyyy_mm_dd(ev.one_time_date)
@@ -399,8 +373,6 @@ async def scheduler_loop():
 async def _before_scheduler():
     await client.wait_until_ready()
 
-# ========= Raid/RSVP (mit Bild, Buttons & Persistenz) =========
-
 RSVP_STORE_FILE = DATA_DIR / "event_rsvp.json"
 RSVP_CFG_FILE   = DATA_DIR / "event_rsvp_cfg.json"
 
@@ -413,11 +385,8 @@ def _load_json(p: Path, default):
 def _save_json(p: Path, obj):
     p.write_text(json.dumps(obj, indent=2, ensure_ascii=False), encoding="utf-8")
 
-# store Struktur:
-# { "<msg_id>": {"guild_id":int,"channel_id":int,"title":str,"when_iso":str,"image_url":str|None,"description":str,
-#                "yes":{"TANK":[uid],"HEAL":[uid],"DPS":[uid]}, "maybe":{"<uid>":"Tank/Heal/DPS"}, "no":[uid] } }
 rsvp_store: Dict[str, dict] = _load_json(RSVP_STORE_FILE, {})
-rsvp_cfg: Dict[str, dict]   = _load_json(RSVP_CFG_FILE, {})   # pro guild: {"TANK":role_id, ...}
+rsvp_cfg: Dict[str, dict]   = _load_json(RSVP_CFG_FILE, {})
 
 def _save_store():
     _save_json(RSVP_STORE_FILE, rsvp_store)
@@ -431,14 +400,12 @@ def _get_role_ids(guild: discord.Guild) -> Dict[str, int]:
 
 def _label_from_member(member: discord.Member) -> str:
     rid = _get_role_ids(member.guild)
-    # 1) IDs (stabil)
     if rid["TANK"] and discord.utils.get(member.roles, id=rid["TANK"]):
         return "Tank"
     if rid["HEAL"] and discord.utils.get(member.roles, id=rid["HEAL"]):
         return "Heal"
     if rid["DPS"] and discord.utils.get(member.roles, id=rid["DPS"]):
         return "DPS"
-    # 2) Fallback per Name
     names = [r.name.lower() for r in member.roles]
     if any("tank" in n for n in names): return "Tank"
     if any("heal" in n for n in names): return "Heal"
@@ -457,7 +424,6 @@ def _build_embed(guild: discord.Guild, obj: dict) -> discord.Embed:
         color=discord.Color.blurple(),
     )
 
-    # YES nach Rollen
     tank_names = [_mention(guild, u) for u in obj["yes"]["TANK"]]
     heal_names = [_mention(guild, u) for u in obj["yes"]["HEAL"]]
     dps_names  = [_mention(guild, u) for u in obj["yes"]["DPS"]]
@@ -466,7 +432,6 @@ def _build_embed(guild: discord.Guild, obj: dict) -> discord.Embed:
     emb.add_field(name=f"💚 Heal ({len(heal_names)})", value="\n".join(heal_names) or "—", inline=True)
     emb.add_field(name=f"🗡️ DPS ({len(dps_names)})", value="\n".join(dps_names) or "—", inline=True)
 
-    # MAYBE
     maybe_lines = []
     for uid, rlab in obj["maybe"].items():
         uid_i = int(uid)
@@ -474,7 +439,6 @@ def _build_embed(guild: discord.Guild, obj: dict) -> discord.Embed:
         maybe_lines.append(f"{_mention(guild, uid_i)}{label}")
     emb.add_field(name=f"❔ Vielleicht ({len(maybe_lines)})", value="\n".join(maybe_lines) or "—", inline=False)
 
-    # NO
     no_names = [_mention(guild, u) for u in obj["no"]]
     emb.add_field(name=f"❌ Abgemeldet ({len(no_names)})", value="\n".join(no_names) or "—", inline=False)
 
@@ -485,7 +449,7 @@ def _build_embed(guild: discord.Guild, obj: dict) -> discord.Embed:
 
 class RaidView(discord.ui.View):
     def __init__(self, msg_id: int):
-        super().__init__(timeout=None)   # persistent
+        super().__init__(timeout=None)
         self.msg_id = str(msg_id)
 
     async def _update(self, interaction: discord.Interaction, group: str):
@@ -496,14 +460,12 @@ class RaidView(discord.ui.View):
         obj = rsvp_store[self.msg_id]
         uid = interaction.user.id
 
-        # aus allen Buckets entfernen
         for k in ("TANK", "HEAL", "DPS"):
             if uid in obj["yes"][k]:
                 obj["yes"][k].remove(uid)
         obj["no"] = [u for u in obj["no"] if u != uid]
         obj["maybe"].pop(str(uid), None)
 
-        # hinzufügen
         if group in ("TANK", "HEAL", "DPS"):
             obj["yes"][group].append(uid)
             txt = f"Angemeldet als **{group}**."
@@ -518,7 +480,6 @@ class RaidView(discord.ui.View):
 
         _save_store()
 
-        # Nachricht aktualisieren
         guild = interaction.guild
         emb = _build_embed(guild, obj)
         ch = guild.get_channel(obj["channel_id"])
@@ -612,7 +573,6 @@ def register_rsvp_slash_commands():
         rsvp_store[str(msg.id)] = obj
         _save_store()
 
-        # persistente View (über Neustarts)
         client.add_view(RaidView(msg.id), message_id=msg.id)
 
         await inter.response.send_message(f"✅ Raid erstellt: {msg.jump_url}", ephemeral=True)
@@ -651,7 +611,6 @@ def register_rsvp_slash_commands():
             await inter.response.send_message(f"❌ Fehler: {e}", ephemeral=True)
 
 def reregister_persistent_views_on_start():
-    # alle offenen RSVP-Events wieder anklemmen (Buttons funktionieren nach Neustart)
     for msg_id, obj in list(rsvp_store.items()):
         g = client.get_guild(obj["guild_id"])
         if not g:
@@ -661,30 +620,20 @@ def reregister_persistent_views_on_start():
         except Exception as e:
             print("add_view failed:", e)
 
-# ========= on_ready =========
 @client.event
 async def on_ready():
     print(f"Logged in as {client.user} (ID: {client.user.id})")
-
-    # RSVP: Buttons + Slash-Commands registrieren & persistente Views anklemmen
     reregister_persistent_views_on_start()
     register_rsvp_slash_commands()
-
-    # globale Slash-Commands syncen
     try:
         synced = await tree.sync()
         print(f"Synced {len(synced)} commands.")
     except Exception as e:
         print("Command sync failed:", e)
-
-    # Reminder-Scheduler starten
     scheduler_loop.start()
 
-# ========= Start =========
 if __name__ == "__main__":
     if not TOKEN:
         raise SystemExit("Set DISCORD_BOT_TOKEN environment variable.")
     client.run(TOKEN)
-```
 
-Wenn du das so einfügst, commitest und auf Railway neu deployest, sollte der Dienst sauber starten und die Slash-Commands verfügbar sein (`/raid_set_roles`, `/raid_create`, …) – inkl. Beschreibungstext im Embed und Rollen-Auswertung (Tank/Heal/DPS).
