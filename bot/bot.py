@@ -551,19 +551,20 @@ def register_rsvp_slash_commands():
             return
         rsvp_cfg[str(inter.guild_id)] = {"TANK": tank_role.id, "HEAL": heal_role.id, "DPS": dps_role.id}
         _save_cfg()
-        await inter.response.send_message(
-            f"✅ Gespeichert:\n🛡️ {tank_role.mention}\n💚 {heal_role.mention}\n🗡️ {dps_role.mention}",
-            ephemeral=True
-        )
+            await inter.response.send_message(
+        f"✅ Gespeichert:\n🛡️ {tank_role.mention}\n💚 {heal_role.mention}\n🗡️ {dps_role.mention}",
+        ephemeral=True,
+    )
+
 
     @tree.command(name="raid_create", description="Raid-/Event-Anmeldung mit Buttons erstellen.")
 @app_commands.describe(
     title="Titel (im Embed)",
-    description="Zusätzliche Info oder Beschreibung",
     date="Datum YYYY-MM-DD (Europe/Berlin)",
     time="Zeit HH:MM (24h)",
     channel="Zielkanal",
-    image_url="Optionales Bild-URL fürs Embed"
+    image_url="Optionales Bild-URL fürs Embed",
+    description="Zusätzliche Info oder Beschreibung",
 )
 async def raid_create(
     inter: discord.Interaction,
@@ -572,8 +573,9 @@ async def raid_create(
     time: str,
     channel: Optional[discord.TextChannel] = None,
     image_url: Optional[str] = None,
-    description: Optional[str] = None,   # <-- Optionals ans Ende
+    description: Optional[str] = None,
 ):
+
 
         if not is_admin(inter):
             await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True)
