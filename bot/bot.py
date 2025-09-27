@@ -1,3 +1,11 @@
+Alles klar — hier ist eine **bereinigte, lauffähige `bot.py`** (komplett, für Copy & Paste).
+Einzug ist konsistent (4 Spaces), die fehlerhaften Stellen (`raid_set_roles`, `raid_create`, Deko-Einrückung, Embed-Aufbau) sind korrigiert.
+
+> Voraussetzungen (wie gehabt):
+> `discord.py==2.4.0`, `Flask`, `requests`, optional `audioop-lts` (falls Voice-Module importiert werden).
+> In Railway die Env **DISCORD_BOT_TOKEN** setzen. Privileged Intent **Server-Mitglieder** im Dev-Portal aktivieren.
+
+```python
 # bot/bot.py
 # TL Event Reminder + Raid/RSVP in EINER Datei
 # discord.py 2.4.x
@@ -8,7 +16,6 @@ from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta, time as time_cls, date as date_cls
 from pathlib import Path
 from typing import Dict, List, Optional, Set
-from collections import defaultdict
 
 import discord
 from discord import app_commands
@@ -39,7 +46,7 @@ threading.Thread(target=_run_flask, daemon=True).start()
 
 # ---- Optionales Self-Ping (Free-Pläne wach halten) ----
 def keep_alive():
-    url = os.getenv("KEEPALIVE_URL", "").strip()  # z.B. https://wei-e-flamme.up.railway.app
+    url = os.getenv("KEEPALIVE_URL", "").strip()  # z.B. https://dein-project.up.railway.app
     if not url:
         return
     while True:
@@ -58,7 +65,7 @@ intents.members = True         # im Dev-Portal aktivieren (Privileged Intents)
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
-# ========= Event-Reminder (dein ursprünglicher Bot) =========
+# ========= Event-Reminder =========
 
 # ---- Parsing ----
 DOW_MAP = {
@@ -407,7 +414,7 @@ def _save_json(p: Path, obj):
     p.write_text(json.dumps(obj, indent=2, ensure_ascii=False), encoding="utf-8")
 
 # store Struktur:
-# { "<msg_id>": {"guild_id":int,"channel_id":int,"title":str,"when_iso":str,"image_url":str|None,
+# { "<msg_id>": {"guild_id":int,"channel_id":int,"title":str,"when_iso":str,"image_url":str|None,"description":str,
 #                "yes":{"TANK":[uid],"HEAL":[uid],"DPS":[uid]}, "maybe":{"<uid>":"Tank/Heal/DPS"}, "no":[uid] } }
 rsvp_store: Dict[str, dict] = _load_json(RSVP_STORE_FILE, {})
 rsvp_cfg: Dict[str, dict]   = _load_json(RSVP_CFG_FILE, {})   # pro guild: {"TANK":role_id, ...}
@@ -445,10 +452,10 @@ def _mention(guild: discord.Guild, uid: int) -> str:
 def _build_embed(guild: discord.Guild, obj: dict) -> discord.Embed:
     dt = datetime.fromisoformat(obj["when_iso"])
     emb = discord.Embed(
-    title=f"{obj['title']}",
-    description=f"{obj.get('description','')}\n\n⏰ Zeit: {dt.strftime('%a, %d.%m.%Y %H:%M')} (Europe/Berlin)",
-    color=discord.Color.blurple(),
-)
+        title=f"{obj['title']}",
+        description=f"{obj.get('description','')}\n\n⏰ Zeit: {dt.strftime('%a, %d.%m.%Y %H:%M')} (Europe/Berlin)",
+        color=discord.Color.blurple(),
+    )
 
     # YES nach Rollen
     tank_names = [_mention(guild, u) for u in obj["yes"]["TANK"]]
@@ -490,14 +497,14 @@ class RaidView(discord.ui.View):
         uid = interaction.user.id
 
         # aus allen Buckets entfernen
-        for k in ("TANK","HEAL","DPS"):
+        for k in ("TANK", "HEAL", "DPS"):
             if uid in obj["yes"][k]:
                 obj["yes"][k].remove(uid)
         obj["no"] = [u for u in obj["no"] if u != uid]
         obj["maybe"].pop(str(uid), None)
 
         # hinzufügen
-        if group in ("TANK","HEAL","DPS"):
+        if group in ("TANK", "HEAL", "DPS"):
             obj["yes"][group].append(uid)
             txt = f"Angemeldet als **{group}**."
         elif group == "MAYBE":
@@ -551,32 +558,29 @@ def register_rsvp_slash_commands():
             return
         rsvp_cfg[str(inter.guild_id)] = {"TANK": tank_role.id, "HEAL": heal_role.id, "DPS": dps_role.id}
         _save_cfg()
-            await inter.response.send_message(
-        f"✅ Gespeichert:\n🛡️ {tank_role.mention}\n💚 {heal_role.mention}\n🗡️ {dps_role.mention}",
-        ephemeral=True,
-    )
-
+        await inter.response.send_message(
+            f"✅ Gespeichert:\n🛡️ {tank_role.mention}\n💚 {heal_role.mention}\n🗡️ {dps_role.mention}",
+            ephemeral=True,
+        )
 
     @tree.command(name="raid_create", description="Raid-/Event-Anmeldung mit Buttons erstellen.")
-@app_commands.describe(
-    title="Titel (im Embed)",
-    date="Datum YYYY-MM-DD (Europe/Berlin)",
-    time="Zeit HH:MM (24h)",
-    channel="Zielkanal",
-    image_url="Optionales Bild-URL fürs Embed",
-    description="Zusätzliche Info oder Beschreibung",
-)
-async def raid_create(
-    inter: discord.Interaction,
-    title: str,
-    date: str,
-    time: str,
-    channel: Optional[discord.TextChannel] = None,
-    image_url: Optional[str] = None,
-    description: Optional[str] = None,
-):
-
-
+    @app_commands.describe(
+        title="Titel (im Embed)",
+        date="Datum YYYY-MM-DD (Europe/Berlin)",
+        time="Zeit HH:MM (24h)",
+        channel="Zielkanal",
+        image_url="Optionales Bild-URL fürs Embed",
+        description="Zusätzliche Info oder Beschreibung",
+    )
+    async def raid_create(
+        inter: discord.Interaction,
+        title: str,
+        date: str,
+        time: str,
+        channel: Optional[discord.TextChannel] = None,
+        image_url: Optional[str] = None,
+        description: Optional[str] = None,
+    ):
         if not is_admin(inter):
             await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True)
             return
@@ -594,7 +598,6 @@ async def raid_create(
             "channel_id": ch.id,
             "title": title.strip(),
             "description": (description or "").strip(),
-
             "when_iso": when.isoformat(),
             "image_url": (image_url or "").strip() or None,
             "yes": {"TANK": [], "HEAL": [], "DPS": []},
@@ -609,7 +612,7 @@ async def raid_create(
         rsvp_store[str(msg.id)] = obj
         _save_store()
 
-        # persistent view registrieren (über Neustarts)
+        # persistente View (über Neustarts)
         client.add_view(RaidView(msg.id), message_id=msg.id)
 
         await inter.response.send_message(f"✅ Raid erstellt: {msg.jump_url}", ephemeral=True)
@@ -658,7 +661,7 @@ def reregister_persistent_views_on_start():
         except Exception as e:
             print("add_view failed:", e)
 
-# ========= on_ready: ALLES hier registrieren =========
+# ========= on_ready =========
 @client.event
 async def on_ready():
     print(f"Logged in as {client.user} (ID: {client.user.id})")
@@ -682,3 +685,6 @@ if __name__ == "__main__":
     if not TOKEN:
         raise SystemExit("Set DISCORD_BOT_TOKEN environment variable.")
     client.run(TOKEN)
+```
+
+Wenn du das so einfügst, commitest und auf Railway neu deployest, sollte der Dienst sauber starten und die Slash-Commands verfügbar sein (`/raid_set_roles`, `/raid_create`, …) – inkl. Beschreibungstext im Embed und Rollen-Auswertung (Tank/Heal/DPS).
