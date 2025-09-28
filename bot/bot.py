@@ -1,13 +1,12 @@
 # bot.py
 from __future__ import annotations
 
-import os, json, threading, time
+import os, json, threading, time, requests
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta, time as time_cls, date as date_cls
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
-import requests
 import discord
 from discord import app_commands
 from discord.ext import tasks
@@ -18,19 +17,16 @@ from zoneinfo import ZoneInfo
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 TZ = ZoneInfo("Europe/Berlin")
 
-DATA_DIR = Path("data"); DATA_DIR.mkdir(exist_ok=True)
-CFG_FILE = DATA_DIR / "guild_configs.json"
-POST_LOG_FILE = DATA_DIR / "post_log.json"
-RSVP_STORE_FILE = DATA_DIR / "event_rsvp.json"
-RSVP_CFG_FILE   = DATA_DIR / "event_rsvp_cfg.json"
+DATA_DIR = Path("data")
+DATA_DIR.mkdir(exist_ok=True)
 
-# Flammenscore Dateien
-SCORE_FILE      = DATA_DIR / "flammenscore.json"
-SCORE_CFG_FILE  = DATA_DIR / "flammenscore_cfg.json"
-SCORE_META_FILE = DATA_DIR / "flammenscore_meta.json"  # { "<gid>": {"last_reset_ym": "YYYY-MM"} }
-
-# Optional: Standardname deiner Gildenrolle, falls du auto-suchen willst
-GUILD_ROLE_NAME = (os.getenv("GUILD_ROLE_NAME") or "Weiße Flamme").strip()
+CFG_FILE         = DATA_DIR / "guild_configs.json"
+POST_LOG_FILE    = DATA_DIR / "post_log.json"
+RSVP_STORE_FILE  = DATA_DIR / "event_rsvp.json"
+RSVP_CFG_FILE    = DATA_DIR / "event_rsvp_cfg.json"
+SCORE_FILE       = DATA_DIR / "flammenscore.json"
+SCORE_CFG_FILE   = DATA_DIR / "flammenscore_cfg.json"
+SCORE_META_FILE  = DATA_DIR / "flammenscore_meta.json"  # {"<gid>":{"last_reset_ym":"YYYY-MM"}}
 
 # ======================== Keepalive (Flask) ========================
 app = Flask(__name__)
@@ -61,8 +57,7 @@ threading.Thread(target=keep_alive, daemon=True).start()
 intents = discord.Intents.default()
 intents.guilds = True
 intents.members = True
-# Für zuverlässiges Zählen von Nachrichten -> im Dev-Portal "Message Content Intent" aktivieren
-intents.message_content = True
+intents.message_content = True  # im Dev-Portal aktivieren
 
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
@@ -181,7 +176,20 @@ def _load_json(p: Path, default):
 def _save_json(p: Path, obj):
     p.write_text(json.dumps(obj, indent=2, ensure_ascii=False), encoding="utf-8")
 
-# Event/Guild
+# RSVP/Score Stores
+rsvp_store: Dict[str, dict] = _load_json(RSVP_STORE_FILE, {})
+rsvp_cfg:   Dict[str, dict] = _load_json(RSVP_CFG_FILE, {})
+scores:     Dict[str, dict] = _load_json(SCORE_FILE, {})      # {gid:{uid:{...}}}
+score_cfg:  Dict[str, dict] = _load_json(SCORE_CFG_FILE, {})  # {gid:{weights...}}
+score_meta: Dict[str, dict] = _load_json(SCORE_META_FILE, {}) # {gid:{last_reset_ym:"YYYY-MM"}}
+
+def _save_rsvp():       _save_json(RSVP_STORE_FILE, rsvp_store)
+def _save_rsvp_cfg():   _save_json(RSVP_CFG_FILE, rsvp_cfg)
+def _save_scores():     _save_json(SCORE_FILE, scores)
+def _save_score_cfg():  _save_json(SCORE_CFG_FILE, score_cfg)
+def _save_score_meta(): _save_json(SCORE_META_FILE, score_meta)
+
+# Event/Guild Config
 def load_all() -> Dict[int, GuildConfig]:
     if CFG_FILE.exists():
         raw = _load_json(CFG_FILE, {})
@@ -200,18 +208,8 @@ def load_post_log() -> Set[str]:
 def save_post_log(log: Set[str]):
     _save_json(POST_LOG_FILE, sorted(list(log)))
 
-# RSVP/Score Stores
-rsvp_store: Dict[str, dict] = _load_json(RSVP_STORE_FILE, {})
-rsvp_cfg:   Dict[str, dict] = _load_json(RSVP_CFG_FILE, {})
-scores:     Dict[str, dict] = _load_json(SCORE_FILE, {})      # {gid:{uid:{...}}}
-score_cfg:  Dict[str, dict] = _load_json(SCORE_CFG_FILE, {})  # {gid:{weights...}}
-score_meta: Dict[str, dict] = _load_json(SCORE_META_FILE, {}) # {gid:{last_reset_ym:"YYYY-MM"}}
-
-def _save_rsvp(): _save_json(RSVP_STORE_FILE, rsvp_store)
-def _save_rsvp_cfg(): _save_json(RSVP_CFG_FILE, rsvp_cfg)
-def _save_scores(): _save_json(SCORE_FILE, scores)
-def _save_score_cfg(): _save_json(SCORE_CFG_FILE, score_cfg)
-def _save_score_meta(): _save_json(SCORE_META_FILE, score_meta)
+configs: Dict[int, GuildConfig] = load_all()
+post_log: Set[str] = load_post_log()
 
 # ======================== Helpers ========================
 def get_or_create_guild_cfg(guild_id: int) -> GuildConfig:
@@ -228,8 +226,8 @@ async def ensure_text_channel(guild: discord.Guild, channel_id: Optional[int]) -
     ch = guild.get_channel(channel_id)
     return ch if isinstance(ch, discord.TextChannel) else None
 
-def is_admin(inter: discord.Interaction) -> bool:
-    m = inter.user
+def is_admin(interaction: discord.Interaction) -> bool:
+    m = interaction.user
     perms = getattr(m, "guild_permissions", None)
     return bool(perms and (perms.administrator or perms.manage_guild))
 
@@ -444,10 +442,12 @@ async def _build_embed_async(guild: discord.Guild, obj: dict) -> discord.Embed:
         role_member_ids = await _get_role_member_ids(guild, gr_id)
         if role_member_ids:
             voted_ids = set(
-                obj["yes"]["TANK"] + obj["yes"]["HEAL"] + obj["yes"]["DPS"]
-                + [int(k) for k in obj["maybe"].keys"]  # noqa
+                obj["yes"]["TANK"] +
+                obj["yes"]["HEAL"] +
+                obj["yes"]["DPS"] +
+                [int(k) for k in obj["maybe"].keys()] +
+                obj["no"]
             )
-            voted_ids |= set(obj["no"])
             voted_in_guild = len(voted_ids & role_member_ids)
             total = len(role_member_ids)
             pct = int(round((voted_in_guild / total) * 100)) if total else 0
@@ -652,11 +652,11 @@ def register_rsvp_slash_commands():
 
 # ======================== Flammenscore ========================
 WEIGHTS_DEFAULT = {
-    "voice_min": 0.20,   # Punkte pro Minute Voice
-    "message":   0.50,   # Punkte pro Nachricht
-    "react_given": 0.20, # Punkte pro gegebene Reaktion
-    "react_recv":  0.30, # Punkte pro erhaltene Reaktion
-    "rsvp":      3.00    # Punkte pro (einmalige) Teilnahme an einem RSVP-Post
+    "voice_min":   0.20,  # Punkte pro Minute Voice
+    "message":     0.50,  # Punkte pro Nachricht
+    "react_given": 0.20,  # Punkte pro gegebene Reaktion
+    "react_recv":  0.30,  # Punkte pro erhaltene Reaktion
+    "rsvp":        3.00   # Punkte pro (einmalige) Teilnahme an einem RSVP-Post
 }
 
 def _guild_weights(gid: int) -> Dict[str, float]:
@@ -681,10 +681,10 @@ def _calc_flammenscore(gid: int, uid: int) -> Tuple[float, Dict[str, float]]:
     voice_min = u["voice_ms"] / 60000.0
     parts = {
         "voice": voice_min * w["voice_min"],
-        "msg":   u["messages"] * w["message"],
+        "msg":   u["messages"]   * w["message"],
         "rg":    u["reacts_given"] * w["react_given"],
         "rr":    u["reacts_recv"]  * w["react_recv"],
-        "rsvp":  u["rsvp"] * w["rsvp"],
+        "rsvp":  u["rsvp"]       * w["rsvp"],
     }
     total = sum(parts.values())
     return total, parts
@@ -708,7 +708,6 @@ def _voice_end(gid: int, uid: int):
 message_author_cache: Dict[int, int] = {}  # message_id -> author_id
 def _cache_author(message_id: int, author_id: int, cap: int = 2000):
     if len(message_author_cache) >= cap:
-        # rudimentäres LRU
         message_author_cache.pop(next(iter(message_author_cache)))
     message_author_cache[message_id] = author_id
 
@@ -799,9 +798,6 @@ def reregister_persistent_views_on_start():
             print("add_view (RSVP) failed:", e)
 
 # ======================== Lifecycle & Scheduler ========================
-configs: Dict[int, GuildConfig] = load_all()
-post_log: Set[str] = load_post_log()
-
 @client.event
 async def on_ready():
     print(f"Logged in as {client.user} (ID: {client.user.id})")
@@ -810,14 +806,13 @@ async def on_ready():
     for g in client.guilds:
         try:
             await g.chunk()
-            print(f"Chunked guild {g.name} (id={g.id})")
         except Exception as e:
             print("guild.chunk() failed:", e)
 
     reregister_persistent_views_on_start()
     register_rsvp_slash_commands()
 
-    # Commands je Guild schnell sichtbar synchronisieren
+    # Commands je Guild synchronisieren
     try:
         for g in client.guilds:
             await tree.sync(guild=discord.Object(id=g.id))
@@ -895,7 +890,6 @@ async def _before_scheduler():
 # ======================== Flammenscore Event Hooks ========================
 @client.event
 async def on_message(message: discord.Message):
-    # zählen echte Messages (keine Bots, keine DMs)
     if not message.guild or message.author.bot:
         return
     b = _score_bucket(message.guild.id, message.author.id)
@@ -960,16 +954,12 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
     if member.bot or not member.guild:
         return
     gid = member.guild.id; uid = member.id
-    # join
     if before.channel is None and after.channel is not None:
-        _voice_start(gid, uid)
-    # leave
+        _voice_start(gid, uid)               # join
     elif before.channel is not None and after.channel is None:
-        _voice_end(gid, uid)
-    # move -> beende & starte neu
+        _voice_end(gid, uid)                 # leave
     elif (before.channel is not None and after.channel is not None and before.channel.id != after.channel.id):
-        _voice_end(gid, uid)
-        _voice_start(gid, uid)
+        _voice_end(gid, uid); _voice_start(gid, uid)  # move
 
 # ======================== Start ========================
 if __name__ == "__main__":
