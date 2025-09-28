@@ -779,9 +779,8 @@ async def _monthly_reset_if_due(now: datetime):
     for guild in client.guilds:
         last = _get_last_reset_ym(guild.id)
         if last == ym:
-            continue  # bereits erledigt
-        # Reset Scores für die Guild (inkl. credited-Listen)
-        scores[str(guild.id)] = {}
+            continue
+        scores[str(guild.id)] = {}  # kompletter Monatsreset
         _save_scores()
         _set_last_reset_ym(guild.id, ym)
         print(f"[Flammenscore] Reset for guild {guild.id} @ {ym}-30")
@@ -842,19 +841,7 @@ async def flammenscore_top(inter: discord.Interaction, limit: Optional[int] = 10
 
     await inter.response.send_message("\n".join(lines), ephemeral=True)
 
-@tree.command(name="admin_sync", description="Force re-sync der Slash-Commands in diesem Server.")
-async def admin_sync(inter: discord.Interaction):
-    if not is_admin(inter):
-        await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True)
-        return
-    try:
-        await tree.sync(guild=discord.Object(id=inter.guild_id))
-        cmds = await tree.fetch_commands(guild=discord.Object(id=inter.guild_id))
-        names = ", ".join(sorted(c.name for c in cmds))
-        await inter.response.send_message(f"✅ Gesynct. Befehle: {names}", ephemeral=True)
-    except Exception as e:
-        await inter.response.send_message(f"❌ Sync-Fehler: {e}", ephemeral=True)
-
+# ---- Admin Sync (einmalig definiert!) ----
 @tree.command(name="admin_sync", description="Re-sync der Slash-Commands in diesem Server.")
 async def admin_sync(inter: discord.Interaction):
     if not is_admin(inter):
@@ -874,7 +861,6 @@ async def admin_sync_hard(inter: discord.Interaction):
         await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True)
         return
     try:
-        # Remote-Liste leeren und neu setzen
         tree.clear_commands(guild=discord.Object(id=inter.guild_id))
         await tree.sync(guild=discord.Object(id=inter.guild_id))
         cmds = await tree.fetch_commands(guild=discord.Object(id=inter.guild_id))
@@ -882,8 +868,6 @@ async def admin_sync_hard(inter: discord.Interaction):
         await inter.response.send_message(f"✅ Hart gesynct. Befehle: {names}", ephemeral=True)
     except Exception as e:
         await inter.response.send_message(f"❌ Hard-Sync-Fehler: {e}", ephemeral=True)
-
-
 
 # ======================== Re-Register persistent Views ========================
 def reregister_persistent_views_on_start():
