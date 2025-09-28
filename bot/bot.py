@@ -490,6 +490,8 @@ def register_rsvp_slash_commands():
     async def raid_set_roles(inter: discord.Interaction, tank_role: discord.Role, heal_role: discord.Role, dps_role: discord.Role):
         if not is_admin(inter):
             await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True); return
+        rsvp_cfg[str(inter.guild_id)] = {"TANK": tank_role.id, "HEAL": tank_role.id if False else heal_role.id, "DPS": dps_role.id}
+        # (kleiner Schutz gegen Copy/Paste-Fehler oben – real setzt HEAL korrekt)
         rsvp_cfg[str(inter.guild_id)] = {"TANK": tank_role.id, "HEAL": heal_role.id, "DPS": dps_role.id}
         _save_rsvp_cfg()
         await inter.response.send_message(f"✅ Gespeichert:\n🛡️ {tank_role.mention}\n💚 {heal_role.mention}\n🗡️ {dps_role.mention}", ephemeral=True)
@@ -642,24 +644,48 @@ def _guild_total_score(guild: discord.Guild) -> float:
         s += tot
     return s
 
-voice_sessions: Dict[Tuple[int,int], datetime] = {}
-def _voice_start(gid: int, uid: int):
-    voice_sessions[(gid, uid)] = _now()
-def _voice_end(gid: int, uid: int):
-    key = (gid, uid)
-    start = voice_sessions.pop(key, None)
-    if start:
-        delta_ms = int((_now() - start).total_seconds() * 1000)
-        b = _score_bucket(gid, uid)
-        b["voice_ms"] += max(0, delta_ms)
+# ------- NEU: Live-Voice-Zählung per Heartbeat -------
+voice_sample_last: Dict[int, datetime] = {}
+
+@tasks.loop(seconds=60.0)
+async def voice_sampler_loop():
+    now = _now()
+    changed = False
+    for guild in client.guilds:
+        last = voice_sample_last.get(guild.id, now)
+        delta = (now - last).total_seconds()
+        if delta < 1:
+            voice_sample_last[guild.id] = now
+            continue
+
+        # Alle echten User in allen Voicechannels dieses Guilds
+        active_ids: List[int] = []
+        for vc in guild.voice_channels:
+            for m in vc.members:
+                if not m.bot:
+                    active_ids.append(m.id)
+
+        if active_ids:
+            add_ms = int(delta * 1000)
+            for uid in active_ids:
+                b = _score_bucket(guild.id, uid)
+                b["voice_ms"] += add_ms
+            changed = True
+
+        voice_sample_last[guild.id] = now
+
+    if changed:
         _save_scores()
 
-message_author_cache: Dict[int, int] = {}  # message_id -> author_id
-def _cache_author(message_id: int, author_id: int, cap: int = 2000):
-    if len(message_author_cache) >= cap:
-        message_author_cache.pop(next(iter(message_author_cache)))
-    message_author_cache[message_id] = author_id
+@voice_sampler_loop.before_loop
+async def _before_voice_sampler(): 
+    await client.wait_until_ready()
+    # initialize once on start
+    now = _now()
+    for g in client.guilds:
+        voice_sample_last[g.id] = now
 
+# ======================== Flammenscore Commands ========================
 def _fmt_table(rows: List[Dict[str, str]]) -> str:
     w = {"rank":3,"name":18,"pct":6,"score":7,"msg":4,"rg":3,"rr":3,"voice":5,"rsvp":4}
     def trunc(s: str, width: int) -> str: return s if len(s) <= width else (s[:max(0,width-1)] + "…")
@@ -780,12 +806,13 @@ def reregister_persistent_views_on_start():
 # ======================== Lifecycle & Scheduler ========================
 @client.event
 async def on_guild_join(guild: discord.Guild):
-    # neue Gilde → sofortige Registrierung & Sync
     try:
         await guild.chunk()
     except Exception:
         pass
     register_rsvp_slash_commands()
+    # init voice heartbeat timestamp für neue Gilde
+    voice_sample_last[guild.id] = _now()
     try:
         cmds = await tree.sync(guild=discord.Object(id=guild.id))
         print(f"[SYNC] joined {guild.name} ({guild.id}) -> {[c.name for c in cmds]}")
@@ -804,10 +831,14 @@ async def on_ready():
         try: await g.chunk()
         except Exception as e: print("guild.chunk() failed:", e)
 
+    # init voice heartbeat timestamps
+    now = _now()
+    for g in client.guilds:
+        voice_sample_last[g.id] = now
+
     reregister_persistent_views_on_start()
     register_rsvp_slash_commands()
 
-    # Guild-Scoped Sync beim Start
     try:
         for g in client.guilds:
             gid_obj = discord.Object(id=g.id)
@@ -818,10 +849,10 @@ async def on_ready():
 
     scheduler_loop.start()
     command_sync_loop.start()
+    voice_sampler_loop.start()   # <— NEU: Live Voice Zähler
 
 @tasks.loop(minutes=10.0)
 async def command_sync_loop():
-    # Fallback: hält die Slash-Commands aktuell
     try:
         for g in client.guilds:
             cmds = await tree.sync(guild=discord.Object(id=g.id))
@@ -924,16 +955,15 @@ async def scheduler_loop():
 @scheduler_loop.before_loop
 async def _before_scheduler(): await client.wait_until_ready()
 
-# ======================== Flammenscore Event Hooks ========================
+# ======================== Flammenscore Event Hooks (Messages/Reaktionen) ========================
 @client.event
 async def on_message(message: discord.Message):
     if not message.guild or message.author.bot: return
     b = _score_bucket(message.guild.id, message.author.id)
     b["messages"] += 1
     _save_scores()
-    message_author_cache[message.id] = message.author.id
-    if len(message_author_cache) > 2000:
-        message_author_cache.pop(next(iter(message_author_cache)))
+
+message_author_cache: Dict[int, int] = {}
 
 @client.event
 async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
@@ -981,16 +1011,10 @@ async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
 
     _save_scores()
 
+# Voice-Event-Hook brauchen wir mit Heartbeat nicht mehr – lassen wir leer
 @client.event
 async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
-    if member.bot or not member.guild: return
-    gid, uid = member.guild.id, member.id
-    if before.channel is None and after.channel is not None:
-        _voice_start(gid, uid)
-    elif before.channel is not None and after.channel is None:
-        _voice_end(gid, uid)
-    else:
-        pass
+    return
 
 # ======================== Start ========================
 if __name__ == "__main__":
