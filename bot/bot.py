@@ -689,6 +689,15 @@ def _calc_flammenscore(gid: int, uid: int) -> Tuple[float, Dict[str, float]]:
     total = sum(parts.values())
     return total, parts
 
+def _guild_total_score(gid: int) -> float:
+    data = scores.get(str(gid)) or {}
+    s = 0.0
+    for uid_str in data.keys():
+        u = int(uid_str)
+        tot, _ = _calc_flammenscore(gid, u)
+        s += tot
+    return s
+
 # Voice-Session-Map: (gid, uid) -> start_dt
 voice_sessions: Dict[Tuple[int,int], datetime] = {}
 
@@ -715,6 +724,7 @@ def _format_leaderboard_lines(guild: discord.Guild, limit: int = 10) -> List[str
     gid = guild.id
     data = scores.get(str(gid)) or {}
     arr = []
+    total_sum = _guild_total_score(gid)
     for uid_str in data.keys():
         uid = int(uid_str)
         total, _ = _calc_flammenscore(gid, uid)
@@ -725,7 +735,8 @@ def _format_leaderboard_lines(guild: discord.Guild, limit: int = 10) -> List[str
         m = guild.get_member(uid)
         name = m.display_name if m else f"<@{uid}>"
         medal = "🥇" if i==1 else ("🥈" if i==2 else ("🥉" if i==3 else f"{i}."))
-        lines.append(f"{medal} {name} — **{total:.1f}**")
+        pct = (total/total_sum*100) if total_sum>0 else 0.0
+        lines.append(f"{medal} {name} — **{pct:.1f}%** (Score {total:.1f})")
     return lines
 
 async def _post_weekly_leaderboard_if_due(now: datetime):
@@ -745,12 +756,13 @@ async def _post_weekly_leaderboard_if_due(now: datetime):
         lines = _format_leaderboard_lines(guild, limit=10)
         if not lines:
             continue
+        total_sum = _guild_total_score(guild.id)
         emb = discord.Embed(
             title="🔥 Flammenscore – Wochen-Leaderboard",
             description="\n".join(lines),
             color=discord.Color.orange()
         )
-        emb.set_footer(text=f"Stand: {now.strftime('%d.%m.%Y %H:%M')} • Reset am 30. jeden Monats")
+        emb.set_footer(text=f"Gesamt-Score: {total_sum:.1f} • Stand: {now.strftime('%d.%m.%Y %H:%M')} • Reset am 30. jeden Monats")
         try:
             await ch.send(embed=emb)
             post_log.add(key)
@@ -803,17 +815,20 @@ async def flammenscore_me(inter: discord.Interaction):
     gid = inter.guild_id
     uid = inter.user.id
     pos, total_count, my_total = _rank_of(gid, uid)
+    total_sum = _guild_total_score(gid)
+    my_pct = (my_total/total_sum*100) if total_sum>0 else 0.0
     _, parts = _calc_flammenscore(gid, uid)
     lines = [
         f"**Rang:** {pos}/{total_count}" if pos else f"**Rang:** –/{total_count}",
-        f"**Score:** {my_total:.1f}",
+        f"**Anteil:** {my_pct:.1f}% (Score {my_total:.1f})",
         f"• Voice: {parts['voice']:.1f}",
         f"• Messages: {parts['msg']:.1f}",
         f"• Reaktionen gegeben: {parts['rg']:.1f}",
         f"• Reaktionen erhalten: {parts['rr']:.1f}",
         f"• RSVP: {parts['rsvp']:.1f}",
     ]
-    await inter.response.send_message("\n".join(lines), ephemeral=True)
+    # Öffentlich (KEIN ephemeral)
+    await inter.response.send_message("\n".join(lines))
 
 @tree.command(name="flammenscore_top", description="Zeigt die Top-Liste des Flammenscore.")
 @app_commands.describe(limit="Anzahl Einträge (1–25, Standard 10)")
@@ -822,6 +837,7 @@ async def flammenscore_top(inter: discord.Interaction, limit: Optional[int] = 10
     gid = inter.guild_id
     data = scores.get(str(gid)) or {}
     scored = []
+    total_sum = _guild_total_score(gid)
     for uid_str in data.keys():
         u = int(uid_str)
         total, _ = _calc_flammenscore(gid, u)
@@ -829,7 +845,7 @@ async def flammenscore_top(inter: discord.Interaction, limit: Optional[int] = 10
     scored.sort(key=lambda t: t[1], reverse=True)
 
     if not scored:
-        await inter.response.send_message("Noch keine Daten.", ephemeral=True)
+        await inter.response.send_message("Noch keine Daten.")
         return
 
     lines = []
@@ -837,9 +853,10 @@ async def flammenscore_top(inter: discord.Interaction, limit: Optional[int] = 10
         m = inter.guild.get_member(uid)
         name = m.display_name if m else f"<@{uid}>"
         medal = "🥇" if i==1 else ("🥈" if i==2 else ("🥉" if i==3 else f"{i}."))
-        lines.append(f"{medal} {name} — **{total:.1f}**")
+        pct = (total/total_sum*100) if total_sum>0 else 0.0
+        lines.append(f"{medal} {name} — **{pct:.1f}%** (Score {total:.1f})")
 
-    await inter.response.send_message("\n".join(lines), ephemeral=True)
+    await inter.response.send_message("\n".join(lines))
 
 # ---- Admin Sync (eindeutige Namen) ----
 @tree.command(name="wf_admin_sync", description="Re-sync der Slash-Commands in diesem Server.")
@@ -899,11 +916,8 @@ async def on_ready():
     try:
         for g in client.guilds:
             gid_obj = discord.Object(id=g.id)
-            # 1) Bestehende Guild-Command-Liste leeren
             tree.clear_commands(guild=gid_obj)
-            # 2) Alle lokal registrierten (globalen) Commands in die Guild spiegeln
             tree.copy_global_to(guild=gid_obj)
-            # 3) Syncen
             cmds = await tree.sync(guild=gid_obj)
             print(f"[SYNC] {g.name} ({g.id}) -> {[c.name for c in cmds]}")
     except Exception as e:
