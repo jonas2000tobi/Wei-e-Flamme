@@ -786,6 +786,62 @@ async def _monthly_reset_if_due(now: datetime):
         _set_last_reset_ym(guild.id, ym)
         print(f"[Flammenscore] Reset for guild {guild.id} @ {ym}-30")
 
+# ---- Rang/Top Commands ----
+def _rank_of(gid: int, uid: int) -> tuple[int, int, float]:
+    data = scores.get(str(gid)) or {}
+    scored = []
+    for uid_str in data.keys():
+        u = int(uid_str)
+        total, _ = _calc_flammenscore(gid, u)
+        scored.append((u, total))
+    scored.sort(key=lambda t: t[1], reverse=True)
+    pos = next((i for i,(u,_) in enumerate(scored, start=1) if u == uid), 0)
+    my_total = next((tot for u,tot in scored if u == uid), 0.0)
+    return pos, len(scored), my_total
+
+@tree.command(name="flammenscore_me", description="Zeigt deinen Flammenscore und Rang.")
+async def flammenscore_me(inter: discord.Interaction):
+    gid = inter.guild_id
+    uid = inter.user.id
+    pos, total_count, my_total = _rank_of(gid, uid)
+    _, parts = _calc_flammenscore(gid, uid)
+    lines = [
+        f"**Rang:** {pos}/{total_count}" if pos else f"**Rang:** –/{total_count}",
+        f"**Score:** {my_total:.1f}",
+        f"• Voice: {parts['voice']:.1f}",
+        f"• Messages: {parts['msg']:.1f}",
+        f"• Reaktionen gegeben: {parts['rg']:.1f}",
+        f"• Reaktionen erhalten: {parts['rr']:.1f}",
+        f"• RSVP: {parts['rsvp']:.1f}",
+    ]
+    await inter.response.send_message("\n".join(lines), ephemeral=True)
+
+@tree.command(name="flammenscore_top", description="Zeigt die Top-Liste des Flammenscore.")
+@app_commands.describe(limit="Anzahl Einträge (1–25, Standard 10)")
+async def flammenscore_top(inter: discord.Interaction, limit: Optional[int] = 10):
+    limit = max(1, min(25, limit or 10))
+    gid = inter.guild_id
+    data = scores.get(str(gid)) or {}
+    scored = []
+    for uid_str in data.keys():
+        u = int(uid_str)
+        total, _ = _calc_flammenscore(gid, u)
+        scored.append((u, total))
+    scored.sort(key=lambda t: t[1], reverse=True)
+
+    if not scored:
+        await inter.response.send_message("Noch keine Daten.", ephemeral=True)
+        return
+
+    lines = []
+    for i, (uid, total) in enumerate(scored[:limit], start=1):
+        m = inter.guild.get_member(uid)
+        name = m.display_name if m else f"<@{uid}>"
+        medal = "🥇" if i==1 else ("🥈" if i==2 else ("🥉" if i==3 else f"{i}."))
+        lines.append(f"{medal} {name} — **{total:.1f}**")
+
+    await inter.response.send_message("\n".join(lines), ephemeral=True)
+
 # ======================== Re-Register persistent Views ========================
 def reregister_persistent_views_on_start():
     for msg_id, obj in list(rsvp_store.items()):
