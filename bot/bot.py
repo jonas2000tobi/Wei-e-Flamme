@@ -5,13 +5,13 @@ from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta, time as time_cls, date as date_cls
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
+from calendar import monthrange
 
 import discord
 from discord import app_commands
 from discord.ext import tasks
 from flask import Flask
 from zoneinfo import ZoneInfo
-from calendar import monthrange
 
 # ======================== Grundkonfig ========================
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
@@ -166,7 +166,7 @@ class GuildConfig:
             events=evs,
         )
 
-# ======================== Persistenz-Utils ========================
+# ======================== Persistenz ========================
 def _load_json(p: Path, default):
     try:
         return json.loads(p.read_text(encoding="utf-8"))
@@ -176,7 +176,6 @@ def _load_json(p: Path, default):
 def _save_json(p: Path, obj):
     p.write_text(json.dumps(obj, indent=2, ensure_ascii=False), encoding="utf-8")
 
-# RSVP/Score Stores
 rsvp_store: Dict[str, dict] = _load_json(RSVP_STORE_FILE, {})
 rsvp_cfg:   Dict[str, dict] = _load_json(RSVP_CFG_FILE, {})
 scores:     Dict[str, dict] = _load_json(SCORE_FILE, {})      # {gid:{uid:{...}}}
@@ -189,7 +188,6 @@ def _save_scores():     _save_json(SCORE_FILE, scores)
 def _save_score_cfg():  _save_json(SCORE_CFG_FILE, score_cfg)
 def _save_score_meta(): _save_json(SCORE_META_FILE, score_meta)
 
-# Event/Guild Config
 def load_all() -> Dict[int, GuildConfig]:
     if CFG_FILE.exists():
         raw = _load_json(CFG_FILE, {})
@@ -211,7 +209,7 @@ def save_post_log(log: Set[str]):
 configs: Dict[int, GuildConfig] = load_all()
 post_log: Set[str] = load_post_log()
 
-# ======================== Helpers ========================
+# ======================== Helper ========================
 def get_or_create_guild_cfg(guild_id: int) -> GuildConfig:
     cfg = configs.get(guild_id)
     if not cfg:
@@ -227,8 +225,7 @@ async def ensure_text_channel(guild: discord.Guild, channel_id: Optional[int]) -
     return ch if isinstance(ch, discord.TextChannel) else None
 
 def is_admin(interaction: discord.Interaction) -> bool:
-    m = interaction.user
-    perms = getattr(m, "guild_permissions", None)
+    perms = getattr(interaction.user, "guild_permissions", None)
     return bool(perms and (perms.administrator or perms.manage_guild))
 
 # ======================== Slash-Commands: Config & Events ========================
@@ -276,7 +273,6 @@ async def add_event(
         pre = parse_premins(pre_reminders or "")
         one_time_date = None
         days: List[int] = []
-
         if date.strip():
             one_time_date = parse_date_yyyy_mm_dd(date.strip()).isoformat()
         else:
@@ -358,12 +354,12 @@ async def test_event_ping(interaction: discord.Interaction, name: str):
     await channel.send(body)
     await interaction.response.send_message("✅ Test-Ping raus.", ephemeral=True)
 
-# ======================== RSVP / Raid (UI + Quote) ========================
+# ======================== RSVP / Raid ========================
 def _get_role_ids(guild: discord.Guild) -> Dict[str, int]:
     g = rsvp_cfg.get(str(guild.id)) or {}
     return {"TANK": int(g.get("TANK", 0)), "HEAL": int(g.get("HEAL", 0)), "DPS": int(g.get("DPS", 0))}
 
-def _get_guild_role_id(guild_id: int) -> int:
+def _get_guild_role_filter_id(guild_id: int) -> int:
     g = rsvp_cfg.get(str(guild_id)) or {}
     try:
         return int(g.get("GUILD_ROLE", 0))
@@ -378,12 +374,9 @@ def _set_guild_role_id(guild_id: int, role_id: int) -> None:
 
 def _label_from_member(member: discord.Member) -> str:
     rid = _get_role_ids(member.guild)
-    if rid["TANK"] and discord.utils.get(member.roles, id=rid["TANK"]):
-        return "Tank"
-    if rid["HEAL"] and discord.utils.get(member.roles, id=rid["HEAL"]):
-        return "Heal"
-    if rid["DPS"] and discord.utils.get(member.roles, id=rid["DPS"]):
-        return "DPS"
+    if rid["TANK"] and discord.utils.get(member.roles, id=rid["TANK"]): return "Tank"
+    if rid["HEAL"] and discord.utils.get(member.roles, id=rid["HEAL"]): return "Heal"
+    if rid["DPS"] and discord.utils.get(member.roles, id=rid["DPS"]): return "DPS"
     names = [r.name.lower() for r in member.roles]
     if any("tank" in n for n in names): return "Tank"
     if any("heal" in n for n in names): return "Heal"
@@ -406,8 +399,8 @@ async def _get_role_member_ids(guild: discord.Guild, role_id: int) -> Set[int]:
         async for m in guild.fetch_members(limit=None):
             if role in m.roles:
                 ids.add(m.id)
-    except Exception as e:
-        print("fetch_members failed:", e)
+    except Exception:
+        pass
     return ids
 
 async def _build_embed_async(guild: discord.Guild, obj: dict) -> discord.Embed:
@@ -417,14 +410,12 @@ async def _build_embed_async(guild: discord.Guild, obj: dict) -> discord.Embed:
         description=f"{obj.get('description','')}\n\n⏰ Zeit: {dt.strftime('%a, %d.%m.%Y %H:%M')} (Europe/Berlin)",
         color=discord.Color.blurple(),
     )
-
     tank_names = [_mention(guild, u) for u in obj["yes"]["TANK"]]
     heal_names = [_mention(guild, u) for u in obj["yes"]["HEAL"]]
     dps_names  = [_mention(guild, u) for u in obj["yes"]["DPS"]]
-
     emb.add_field(name=f"🛡️ Tank ({len(tank_names)})", value="\n".join(tank_names) or "—", inline=True)
     emb.add_field(name=f"💚 Heal ({len(heal_names)})", value="\n".join(heal_names) or "—", inline=True)
-    emb.add_field(name=f"🗡️ DPS ({len(dps_names)})",  value="\n".join(dps_names)  or "—", inline=True)
+    emb.add_field(name=f"🗡️ DPS ({len(dps_names)})", value="\n".join(dps_names) or "—", inline=True)
 
     maybe_lines = []
     for uid, rlab in obj["maybe"].items():
@@ -436,29 +427,20 @@ async def _build_embed_async(guild: discord.Guild, obj: dict) -> discord.Embed:
     no_names = [_mention(guild, u) for u in obj["no"]]
     emb.add_field(name=f"❌ Abgemeldet ({len(no_names)})", value="\n".join(no_names) or "—", inline=False)
 
-    # Gildenrollen-Quote (mit Prozent)
-    gr_id = _get_guild_role_id(guild.id)
+    # Gildenrollen-Quote
+    gr_id = _get_guild_role_filter_id(guild.id)
     if gr_id:
         role_member_ids = await _get_role_member_ids(guild, gr_id)
         if role_member_ids:
             voted_ids = set(
-                obj["yes"]["TANK"] +
-                obj["yes"]["HEAL"] +
-                obj["yes"]["DPS"] +
-                [int(k) for k in obj["maybe"].keys()] +
-                obj["no"]
+                obj["yes"]["TANK"] + obj["yes"]["HEAL"] + obj["yes"]["DPS"]
+                + [int(k) for k in obj["maybe"].keys()] + obj["no"]
             )
             voted_in_guild = len(voted_ids & role_member_ids)
             total = len(role_member_ids)
             pct = int(round((voted_in_guild / total) * 100)) if total else 0
-            emb.add_field(
-                name="🏰 Gildenbeteiligung",
-                value=f"{voted_in_guild} / {total} (**{pct}%**)",
-                inline=False
-            )
-        else:
-            emb.add_field(name="🏰 Gildenbeteiligung", value="— (Rolle leer oder kein Members-Intent)", inline=False)
-
+            emb.add_field(name="🏰 Gildenbeteiligung",
+                          value=f"{voted_in_guild} / {total} (**{pct}%**)", inline=False)
     if obj.get("image_url"):
         emb.set_image(url=obj["image_url"])
     emb.set_footer(text="Klicke unten auf die Buttons, um dich anzumelden.")
@@ -481,33 +463,25 @@ class RaidView(discord.ui.View):
         if self.msg_id not in rsvp_store:
             await interaction.response.send_message("Dieses Event ist nicht mehr vorhanden.", ephemeral=True)
             return
-
         obj = rsvp_store[self.msg_id]
         uid = interaction.user.id
 
-        # remove user from all buckets
         for k in ("TANK", "HEAL", "DPS"):
             if uid in obj["yes"][k]:
                 obj["yes"][k].remove(uid)
         obj["no"] = [u for u in obj["no"] if u != uid]
         obj["maybe"].pop(str(uid), None)
 
-        # add to selected
         if group in ("TANK", "HEAL", "DPS"):
-            obj["yes"][group].append(uid)
-            txt = f"Angemeldet als **{group}**."
+            obj["yes"][group].append(uid); txt=f"Angemeldet als **{group}**."
         elif group == "MAYBE":
-            obj["maybe"][str(uid)] = _label_from_member(interaction.user)
-            txt = "Als **Vielleicht** eingetragen."
+            obj["maybe"][str(uid)] = _label_from_member(interaction.user); txt="Als **Vielleicht** eingetragen."
         elif group == "NO":
-            obj["no"].append(uid)
-            txt = "Als **Abgemeldet** eingetragen."
+            obj["no"].append(uid); txt="Als **Abgemeldet** eingetragen."
         else:
-            txt = "Aktualisiert."
+            txt="Aktualisiert."
 
         _save_rsvp()
-
-        # Flammenscore (einmal pro RSVP-Post)
         await self._credit_rsvp(interaction)
 
         guild = interaction.guild
@@ -546,74 +520,51 @@ def register_rsvp_slash_commands():
     @app_commands.describe(tank_role="Rolle für Tank", heal_role="Rolle für Heal", dps_role="Rolle für DPS")
     async def raid_set_roles(inter: discord.Interaction, tank_role: discord.Role, heal_role: discord.Role, dps_role: discord.Role):
         if not is_admin(inter):
-            await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True)
-            return
+            await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True); return
         rsvp_cfg[str(inter.guild_id)] = {"TANK": tank_role.id, "HEAL": heal_role.id, "DPS": dps_role.id}
         _save_rsvp_cfg()
-        await inter.response.send_message(
-            f"✅ Gespeichert:\n🛡️ {tank_role.mention}\n💚 {heal_role.mention}\n🗡️ {dps_role.mention}",
-            ephemeral=True,
-        )
+        await inter.response.send_message(f"✅ Gespeichert:\n🛡️ {tank_role.mention}\n💚 {heal_role.mention}\n🗡️ {dps_role.mention}", ephemeral=True)
 
     @tree.command(name="raid_create", description="Raid-/Event-Anmeldung mit Buttons erstellen.")
     @app_commands.describe(
-        title="Titel (im Embed)",
-        date="Datum YYYY-MM-DD (Europe/Berlin)",
-        time="Zeit HH:MM (24h)",
-        channel="Zielkanal",
-        image_url="Optionales Bild-URL fürs Embed",
-        description="Zusätzliche Info"
+        title="Titel (im Embed)", date="Datum YYYY-MM-DD (Europe/Berlin)", time="Zeit HH:MM (24h)",
+        channel="Zielkanal", image_url="Optionales Bild-URL", description="Zusätzliche Info"
     )
     async def raid_create(
-        inter: discord.Interaction,
-        title: str,
-        date: str,
-        time: str,
-        channel: Optional[discord.TextChannel] = None,
-        image_url: Optional[str] = None,
+        inter: discord.Interaction, title: str, date: str, time: str,
+        channel: Optional[discord.TextChannel] = None, image_url: Optional[str] = None,
         description: Optional[str] = None,
     ):
         if not is_admin(inter):
-            await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True)
-            return
+            await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True); return
         try:
             yyyy, mm, dd = [int(x) for x in date.split("-")]
             hh, mi = [int(x) for x in time.split(":")]
             when = datetime(yyyy, mm, dd, hh, mi, tzinfo=TZ)
         except Exception:
-            await inter.response.send_message("❌ Datum/Zeit ungültig (YYYY-MM-DD / HH:MM).", ephemeral=True)
-            return
+            await inter.response.send_message("❌ Datum/Zeit ungültig (YYYY-MM-DD / HH:MM).", ephemeral=True); return
 
         ch = channel or inter.channel
         obj = {
-            "guild_id": inter.guild_id,
-            "channel_id": ch.id,
-            "title": title.strip(),
-            "description": (description or "").strip(),
-            "when_iso": when.isoformat(),
+            "guild_id": inter.guild_id, "channel_id": ch.id, "title": title.strip(),
+            "description": (description or "").strip(), "when_iso": when.isoformat(),
             "image_url": (image_url or "").strip() or None,
-            "yes": {"TANK": [], "HEAL": [], "DPS": []},
-            "maybe": {},
-            "no": []
+            "yes": {"TANK": [], "HEAL": [], "DPS": []}, "maybe": {}, "no": []
         }
         emb = await _build_embed_async(inter.guild, obj)
         view = RaidView(0)
         msg = await ch.send(embed=emb, view=view)
         view.msg_id = str(msg.id)
 
-        rsvp_store[str(msg.id)] = obj
-        _save_rsvp()
-
-        client.add_view(RaidView(msg.id), message_id=msg.id)
-
+        rsvp_store[str(msg.id)] = obj; _save_rsvp()
+        inter.client.add_view(RaidView(msg.id), message_id=msg.id)
         await inter.response.send_message(f"✅ Raid erstellt: {msg.jump_url}", ephemeral=True)
 
     @tree.command(name="raid_show", description="Embed/Listen neu aufbauen.")
     @app_commands.describe(message_id="ID der Raid-Nachricht")
     async def raid_show(inter: discord.Interaction, message_id: str):
         if message_id not in rsvp_store:
-            await inter.response.send_message("❌ Unbekannte message_id.", ephemeral=True)
-            return
+            await inter.response.send_message("❌ Unbekannte message_id.", ephemeral=True); return
         obj = rsvp_store[message_id]
         emb = await _build_embed_async(inter.guild, obj)
         ch = inter.guild.get_channel(obj["channel_id"])
@@ -628,11 +579,9 @@ def register_rsvp_slash_commands():
     @app_commands.describe(message_id="ID der Raid-Nachricht")
     async def raid_close(inter: discord.Interaction, message_id: str):
         if not is_admin(inter):
-            await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True)
-            return
+            await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True); return
         if message_id not in rsvp_store:
-            await inter.response.send_message("❌ Unbekannte message_id.", ephemeral=True)
-            return
+            await inter.response.send_message("❌ Unbekannte message_id.", ephemeral=True); return
         ch = inter.guild.get_channel(rsvp_store[message_id]["channel_id"])
         try:
             msg = await ch.fetch_message(int(message_id))
@@ -641,405 +590,264 @@ def register_rsvp_slash_commands():
         except Exception as e:
             await inter.response.send_message(f"❌ Fehler: {e}", ephemeral=True)
 
-    @tree.command(name="raid_set_guildrole", description='Gildenrolle für die Quote festlegen.')
+    @tree.command(name="raid_set_guildrole", description="Gildenrolle für Quote & Filter setzen.")
     @app_commands.describe(guild_role='Rolle, deren Mitglieder gezählt werden sollen')
     async def raid_set_guildrole(inter: discord.Interaction, guild_role: discord.Role):
         if not is_admin(inter):
-            await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True)
-            return
+            await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True); return
         _set_guild_role_id(inter.guild_id, guild_role.id)
         await inter.response.send_message(f"✅ Gildenrolle gesetzt: {guild_role.mention}", ephemeral=True)
 
-# ======================== Flammenscore (Scores/Topliste) ========================
-WEIGHTS_DEFAULT = {
-    "voice_min":   0.20,
-    "message":     0.50,
-    "react_given": 0.20,
-    "react_recv":  0.30,
-    "rsvp":        3.00
-}
+# ======================== Flammenscore ========================
+WEIGHTS_DEFAULT = {"voice_min":0.20,"message":0.50,"react_given":0.20,"react_recv":0.30,"rsvp":3.00}
 
-def _guild_weights(gid: int) -> Dict[str, float]:
-    g = score_cfg.get(str(gid)) or {}
-    return {**WEIGHTS_DEFAULT, **g}
+def _guild_weights(gid: int) -> Dict[str,float]:
+    return {**WEIGHTS_DEFAULT, **(score_cfg.get(str(gid)) or {})}
 
 def _score_bucket(gid: int, uid: int) -> dict:
     g = scores.setdefault(str(gid), {})
-    u = g.setdefault(str(uid), {
-        "voice_ms": 0,
-        "messages": 0,
-        "reacts_given": 0,
-        "reacts_recv": 0,
-        "rsvp": 0,
-        "credited_rsvp": []
-    })
-    return u
+    return g.setdefault(str(uid), {"voice_ms":0,"messages":0,"reacts_given":0,"reacts_recv":0,"rsvp":0,"credited_rsvp":[]})
 
-def _calc_flammenscore(gid: int, uid: int) -> Tuple[float, Dict[str, float]]:
-    u = _score_bucket(gid, uid)
-    w = _guild_weights(gid)
-    voice_min = u["voice_ms"] / 60000.0
-    parts = {
-        "voice": voice_min * w["voice_min"],
-        "msg":   u["messages"]   * w["message"],
-        "rg":    u["reacts_given"] * w["react_given"],
-        "rr":    u["reacts_recv"]  * w["react_recv"],
-        "rsvp":  u["rsvp"]       * w["rsvp"],
-    }
-    total = sum(parts.values())
-    return total, parts
+def _calc_flammenscore(gid: int, uid: int) -> Tuple[float, Dict[str,float]]:
+    u=_score_bucket(gid,uid); w=_guild_weights(gid)
+    voice_min=u["voice_ms"]/60000.0
+    parts={"voice":voice_min*w["voice_min"],"msg":u["messages"]*w["message"],
+           "rg":u["reacts_given"]*w["react_given"],"rr":u["reacts_recv"]*w["react_recv"],"rsvp":u["rsvp"]*w["rsvp"]}
+    return sum(parts.values()), parts
 
-# Voice-Session-Map: (gid, uid) -> start_dt
 voice_sessions: Dict[Tuple[int,int], datetime] = {}
+message_author_cache: Dict[int,int] = {}
 
-def _voice_start(gid: int, uid: int):
-    voice_sessions[(gid, uid)] = _now()
-
-def _voice_end(gid: int, uid: int):
-    key = (gid, uid)
-    start = voice_sessions.pop(key, None)
-    if start:
-        delta_ms = int((_now() - start).total_seconds() * 1000)
-        b = _score_bucket(gid, uid)
-        b["voice_ms"] += max(0, delta_ms)
-        _save_scores()
-
-# Message-Author Cache für Reaction „received“
-message_author_cache: Dict[int, int] = {}  # message_id -> author_id
 def _cache_author(message_id: int, author_id: int, cap: int = 2000):
     if len(message_author_cache) >= cap:
         message_author_cache.pop(next(iter(message_author_cache)))
     message_author_cache[message_id] = author_id
 
-# ---- Minimale Topliste + Filter (keine Bots, optional Gildenrolle) ----
 def _format_leaderboard_lines(guild: discord.Guild, limit: int = 10) -> List[str]:
     gid = guild.id
     data = scores.get(str(gid)) or {}
-    gr_id = _get_guild_role_id(gid)
+    gr_id = _get_guild_role_filter_id(gid)
     gr = guild.get_role(gr_id) if gr_id else None
 
-    arr: List[Tuple[float, int]] = []
+    arr: List[Tuple[float,int]] = []
     for uid_str in data.keys():
         uid = int(uid_str)
         m = guild.get_member(uid)
-        if not m or m.bot:
+        if not m or m.bot:  # keine Bots
             continue
-        if gr and gr not in m.roles:
+        if gr and gr not in m.roles:  # optionaler Rollenfilter
             continue
-        total, _ = _calc_flammenscore(gid, uid)
+        total,_ = _calc_flammenscore(gid, uid)
         arr.append((total, uid))
     if not arr:
         return []
     arr.sort(reverse=True, key=lambda x: x[0])
-
-    max_total = arr[0][0] if arr else 0.0
+    top = arr[0][0] or 1.0
     lines=[]
-    for i, (total, uid) in enumerate(arr[:limit], start=1):
+    for i,(total, uid) in enumerate(arr[:limit], start=1):
         m = guild.get_member(uid)
         name = m.display_name if m else f"<@{uid}>"
-        pct = (total / max_total * 100.0) if max_total > 0 else 0.0
+        pct = total/top*100.0
         lines.append(f"{i}. {name} — {pct:.1f}%")
     return lines
 
+# ======================== Scheduler (Leaderboard weekly + Reset monthly + Event-Reminders) ========================
 async def _post_weekly_leaderboard_if_due(now: datetime):
-    # Freitag (4), 18:00 (Europe/Berlin)
-    if not (now.weekday() == 4 and now.hour == 18 and now.minute == 0):
+    if not (now.weekday()==4 and now.hour==18 and now.minute==0):  # Freitag 18:00
         return
     for guild in client.guilds:
         cfg = configs.get(guild.id)
-        if not cfg or not cfg.announce_channel_id:
-            continue
+        if not cfg or not cfg.announce_channel_id: continue
         ch = guild.get_channel(cfg.announce_channel_id)
-        if not isinstance(ch, discord.TextChannel):
-            continue
+        if not isinstance(ch, discord.TextChannel): continue
         key = f"weekly_lb:{guild.id}:{now.date().isoformat()}"
-        if key in post_log:
-            continue
-        lines = _format_leaderboard_lines(guild, limit=10)
-        if not lines:
-            continue
-        emb = discord.Embed(
-            title="🔥 Flammenscore – Wochen-Leaderboard",
-            description="\n".join(lines),
-            color=discord.Color.orange()
-        )
+        if key in post_log: continue
+        lines = _format_leaderboard_lines(guild, 10)
+        if not lines: continue
+        emb = discord.Embed(title="🔥 Flammenscore – Wochen-Leaderboard",
+                            description="\n".join(lines), color=discord.Color.orange())
         emb.set_footer(text=f"Stand: {now.strftime('%d.%m.%Y %H:%M')} • Reset am Monatsende")
         try:
-            await ch.send(embed=emb)
-            post_log.add(key)
-            save_post_log(post_log)
+            await ch.send(embed=emb); post_log.add(key); save_post_log(post_log)
         except Exception as e:
             print("weekly leaderboard post failed:", e)
 
-def _month_key(dt: datetime) -> str:
-    return dt.strftime("%Y-%m")
-
-def _get_last_reset_ym(gid: int) -> str:
-    g = score_meta.get(str(gid)) or {}
-    return g.get("last_reset_ym", "")
-
-def _set_last_reset_ym(gid: int, ym: str):
-    g = score_meta.get(str(gid)) or {}
-    g["last_reset_ym"] = ym
-    score_meta[str(gid)] = g
-    _save_score_meta()
+def _month_key(dt: datetime) -> str: return dt.strftime("%Y-%m")
+def _get_last_reset_ym(gid: int) -> str: return (score_meta.get(str(gid)) or {}).get("last_reset_ym","")
+def _set_last_reset_ym(gid:int, ym:str): score_meta.setdefault(str(gid),{})["last_reset_ym"]=ym; _save_score_meta()
 
 async def _monthly_reset_if_due(now: datetime):
-    # Reset am letzten Tag des Monats um 00:00 (Europe/Berlin)
-    if not (now.day == monthrange(now.year, now.month)[1] and now.hour == 0 and now.minute == 0):
+    if not (now.day == monthrange(now.year, now.month)[1] and now.hour==0 and now.minute==0):
         return
-    ym = _month_key(now)
-    for guild in client.guilds:
-        last = _get_last_reset_ym(guild.id)
-        if last == ym:
-            continue
-        scores[str(guild.id)] = {}  # kompletter Monatsreset
-        _save_scores()
-        _set_last_reset_ym(guild.id, ym)
-        print(f"[Flammenscore] Reset for guild {guild.id} @ {ym}-EOM")
-
-# ---- Rang/Top Commands ----
-def _rank_of(gid: int, uid: int) -> tuple[int, int, float]:
-    data = scores.get(str(gid)) or {}
-    scored = []
-    for uid_str in data.keys():
-        u = int(uid_str)
-        total, _ = _calc_flammenscore(gid, u)
-        scored.append((u, total))
-    scored.sort(key=lambda t: t[1], reverse=True)
-    pos = next((i for i,(u,_) in enumerate(scored, start=1) if u == uid), 0)
-    my_total = next((tot for u,tot in scored if u == uid), 0.0)
-    return pos, len(scored), my_total
-
-@tree.command(name="flammenscore_me", description="Zeigt deinen Flammenscore und Rang.")
-async def flammenscore_me(inter: discord.Interaction):
-    gid = inter.guild_id
-    uid = inter.user.id
-    pos, total_count, my_total = _rank_of(gid, uid)
-    _, parts = _calc_flammenscore(gid, uid)
-    lines = [
-        f"**Rang:** {pos}/{total_count}" if pos else f"**Rang:** –/{total_count}",
-        f"**Score:** {my_total:.1f}",
-        f"• Voice: {parts['voice']:.1f}",
-        f"• Messages: {parts['msg']:.1f}",
-        f"• Reaktionen gegeben: {parts['rg']:.1f}",
-        f"• Reaktionen erhalten: {parts['rr']:.1f}",
-        f"• RSVP: {parts['rsvp']:.1f}",
-    ]
-    await inter.response.send_message("\n".join(lines), ephemeral=True)
-
-@tree.command(name="flammenscore_top", description="Zeigt die Top-Liste des Flammenscore.")
-@app_commands.describe(limit="Anzahl Einträge (1–25, Standard 10)")
-async def flammenscore_top(inter: discord.Interaction, limit: Optional[int] = 10):
-    limit = max(1, min(25, limit or 10))
-    lines = _format_leaderboard_lines(inter.guild, limit=limit)
-    if not lines:
-        await inter.response.send_message("Noch keine Daten.", ephemeral=True)
-        return
-    await inter.response.send_message("\n".join(lines), ephemeral=True)
-
-# ---- Admin Sync ----
-@tree.command(name="wf_admin_sync", description="Re-sync der Slash-Commands in diesem Server.")
-async def wf_admin_sync(inter: discord.Interaction):
-    if not is_admin(inter):
-        await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True)
-        return
-    try:
-        await tree.sync(guild=discord.Object(id=inter.guild_id))
-        cmds = await tree.fetch_commands(guild=discord.Object(id=inter.guild_id))
-        names = ", ".join(sorted(c.name for c in cmds))
-        await inter.response.send_message(f"✅ Gesynct. Befehle: {names}", ephemeral=True)
-    except Exception as e:
-        await inter.response.send_message(f"❌ Sync-Fehler: {e}", ephemeral=True)
-
-@tree.command(name="wf_admin_sync_hard", description="Harter Re-Sync (löscht & lädt neu).")
-async def wf_admin_sync_hard(inter: discord.Interaction):
-    if not is_admin(inter):
-        await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True)
-        return
-    try:
-        tree.clear_commands(guild=discord.Object(id=inter.guild_id))
-        await tree.sync(guild=discord.Object(id=inter.guild_id))
-        cmds = await tree.fetch_commands(guild=discord.Object(id=inter.guild_id))
-        names = ", ".join(sorted(c.name for c in cmds))
-        await inter.response.send_message(f"✅ Hart gesynct. Befehle: {names}", ephemeral=True)
-    except Exception as e:
-        await inter.response.send_message(f"❌ Hard-Sync-Fehler: {e}", ephemeral=True)
-
-# ======================== Re-Register persistent Views ========================
-def reregister_persistent_views_on_start():
-    for msg_id, obj in list(rsvp_store.items()):
-        g = client.get_guild(obj["guild_id"])
-        if not g:
-            continue
-        try:
-            client.add_view(RaidView(int(msg_id)), message_id=int(msg_id))
-        except Exception as e:
-            print("add_view (RSVP) failed:", e)
-
-# ======================== Lifecycle & Scheduler ========================
-@client.event
-async def on_ready():
-    print(f"Logged in as {client.user} (ID: {client.user.id})")
-
-    # Member-Cache laden (für role.members / get_member)
+    ym=_month_key(now)
     for g in client.guilds:
-        try:
-            await g.chunk()
-        except Exception as e:
-            print("guild.chunk() failed:", e)
-
-    reregister_persistent_views_on_start()
-    register_rsvp_slash_commands()
-
-    # Commands je Guild synchronisieren
-    try:
-        for g in client.guilds:
-            await tree.sync(guild=discord.Object(id=g.id))
-        print(f"Synced commands for {len(client.guilds)} guild(s).")
-    except Exception as e:
-        print("Command sync failed:", e)
-
-    scheduler_loop.start()
+        if _get_last_reset_ym(g.id)==ym: continue
+        scores[str(g.id)] = {}; _save_scores(); _set_last_reset_ym(g.id, ym)
 
 @tasks.loop(seconds=30.0)
 async def scheduler_loop():
     now = _now().replace(second=0, microsecond=0)
-    changed = False
-
-    # 1) Event-Reminder
+    # Event-Reminder
+    changed=False
     for guild in client.guilds:
         cfg = configs.get(guild.id)
-        if not cfg or not cfg.events:
-            continue
+        if not cfg or not cfg.events: continue
         for ev in list(cfg.events.values()):
             channel_id = ev.channel_id or cfg.announce_channel_id
             channel = await ensure_text_channel(guild, channel_id)
-            if not channel:
-                continue
-
+            if not channel: continue
             start_dt = ev.occurrence_start_on_date(now.date())
-            if not start_dt:
-                continue
+            if not start_dt: continue
             end_dt = start_dt + timedelta(minutes=ev.duration_min)
-
+            # Pre
             for m in ev.pre_reminders:
                 pre_dt = start_dt - timedelta(minutes=m)
                 key = f"{guild.id}:{ev.name}:{start_dt.isoformat()}:pre{m}"
                 if _in_window(now, pre_dt) and key not in post_log:
                     role_mention = f"<@&{ev.mention_role_id}>" if ev.mention_role_id else ""
                     body = f"⏳ **{ev.name}** startet in **{m} Min** ({start_dt.strftime('%H:%M')} Uhr). {role_mention}".strip()
-                    if ev.description:
-                        body += f"\n{ev.description}"
-                    await channel.send(body)
-                    post_log.add(key)
-                    changed = True
-
+                    if ev.description: body += f"\n{ev.description}"
+                    await channel.send(body); post_log.add(key); changed=True
+            # Start
             key = f"{guild.id}:{ev.name}:{start_dt.isoformat()}:start"
             if _in_window(now, start_dt) and key not in post_log:
                 role_mention = f"<@&{ev.mention_role_id}>" if ev.mention_role_id else ""
                 body = f"🚀 **{ev.name}** ist **jetzt live**! Läuft bis {end_dt.strftime('%H:%M')} Uhr. {role_mention}".strip()
-                if ev.description:
-                    body += f"\n{ev.description}"
-                await channel.send(body)
-                post_log.add(key)
-                changed = True
-
+                if ev.description: body += f"\n{ev.description}"
+                await channel.send(body); post_log.add(key); changed=True
+            # Einmalige Events aufräumen
             if ev.one_time_date:
                 try:
                     d = parse_date_yyyy_mm_dd(ev.one_time_date)
                     if now.date() > d:
-                        del cfg.events[ev.name.lower()]
-                        save_all(configs)
+                        del cfg.events[ev.name.lower()]; save_all(configs)
                 except Exception:
                     pass
+    if changed: save_post_log(post_log)
 
-    if changed:
-        save_post_log(post_log)
-
-    # 2) Wöchentliches Leaderboard (Fr 18:00)
     await _post_weekly_leaderboard_if_due(now)
-
-    # 3) Monatlicher Reset (EOM 00:00)
     await _monthly_reset_if_due(now)
 
 @scheduler_loop.before_loop
-async def _before_scheduler():
-    await client.wait_until_ready()
+async def _before_scheduler(): await client.wait_until_ready()
 
-# ======================== Flammenscore Event Hooks ========================
+# ======================== Score-Hooks ========================
 @client.event
 async def on_message(message: discord.Message):
-    if not message.guild or message.author.bot:
-        return
-    b = _score_bucket(message.guild.id, message.author.id)
-    b["messages"] += 1
+    if not message.guild or message.author.bot: return
+    _score_bucket(message.guild.id, message.author.id)["messages"] += 1
     _save_scores()
     _cache_author(message.id, message.author.id)
 
 @client.event
 async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
-    if payload.guild_id is None:
-        return
-    if payload.user_id == client.user.id:
-        return
-    # gegeben
-    b = _score_bucket(payload.guild_id, payload.user_id)
-    b["reacts_given"] += 1
-    # erhalten
+    if payload.guild_id is None or payload.user_id == client.user.id: return
+    _score_bucket(payload.guild_id, payload.user_id)["reacts_given"] += 1
     author_id = message_author_cache.get(payload.message_id)
     if author_id is None:
         try:
             ch = client.get_channel(payload.channel_id)
             if isinstance(ch, (discord.TextChannel, discord.Thread)):
                 msg = await ch.fetch_message(payload.message_id)
-                author_id = msg.author.id
-                _cache_author(payload.message_id, author_id)
+                author_id = msg.author.id; _cache_author(payload.message_id, author_id)
         except Exception:
             author_id = None
     if author_id and author_id != payload.user_id:
-        br = _score_bucket(payload.guild_id, author_id)
-        br["reacts_recv"] += 1
+        _score_bucket(payload.guild_id, author_id)["reacts_recv"] += 1
     _save_scores()
 
 @client.event
 async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
-    if payload.guild_id is None:
-        return
-    if payload.user_id == client.user.id:
-        return
-    # gegeben
+    if payload.guild_id is None or payload.user_id == client.user.id: return
     b = _score_bucket(payload.guild_id, payload.user_id)
-    if b["reacts_given"] > 0:
-        b["reacts_given"] -= 1
-    # erhalten
+    if b["reacts_given"] > 0: b["reacts_given"] -= 1
     author_id = message_author_cache.get(payload.message_id)
-    if author_id is None:
-        try:
-            ch = client.get_channel(payload.channel_id)
-            if isinstance(ch, (discord.TextChannel, discord.Thread)):
-                msg = await ch.fetch_message(payload.message_id)
-                author_id = msg.author.id
-                _cache_author(payload.message_id, author_id)
-        except Exception:
-            author_id = None
     if author_id and author_id != payload.user_id:
         br = _score_bucket(payload.guild_id, author_id)
-        if br["reacts_recv"] > 0:
-            br["reacts_recv"] -= 1
+        if br["reacts_recv"] > 0: br["reacts_recv"] -= 1
     _save_scores()
 
 @client.event
 async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
-    if member.bot or not member.guild:
-        return
-    gid = member.guild.id; uid = member.id
+    if member.bot or not member.guild: return
+    gid, uid = member.guild.id, member.id
     if before.channel is None and after.channel is not None:
-        _voice_start(gid, uid)               # join
+        voice_sessions[(gid,uid)] = _now()
     elif before.channel is not None and after.channel is None:
-        _voice_end(gid, uid)                 # leave
-    elif (before.channel is not None and after.channel is not None and before.channel.id != after.channel.id):
-        _voice_end(gid, uid); _voice_start(gid, uid)  # move
+        start = voice_sessions.pop((gid,uid), None)
+        if start:
+            _score_bucket(gid,uid)["voice_ms"] += int((_now()-start).total_seconds()*1000)
+            _save_scores()
+    elif before.channel and after.channel and before.channel.id != after.channel.id:
+        start = voice_sessions.pop((gid,uid), None)
+        if start:
+            _score_bucket(gid,uid)["voice_ms"] += int((_now()-start).total_seconds()*1000)
+            _save_scores()
+        voice_sessions[(gid,uid)] = _now()
+
+# ======================== Score-Befehle ========================
+@tree.command(name="flammenscore_me", description="Zeigt deinen Flammenscore und Rang.")
+async def flammenscore_me(inter: discord.Interaction):
+    gid = inter.guild_id; uid = inter.user.id
+    # Rang berechnen
+    data = scores.get(str(gid)) or {}
+    totals = []
+    for u in data.keys():
+        t,_ = _calc_flammenscore(gid, int(u)); totals.append(t)
+    my_total, parts = _calc_flammenscore(gid, uid)
+    rank = sorted(totals, reverse=True).index(my_total)+1 if my_total>0 and totals else 0
+    head = f"Rang: {rank}/{len(totals)}\nScore: {my_total:.1f}"
+    detail = (f"\n• Voice: {parts['voice']:.1f}\n• Messages: {parts['msg']:.1f}"
+              f"\n• Reaktionen gegeben: {parts['rg']:.1f}\n• Reaktionen erhalten: {parts['rr']:.1f}\n• RSVP: {parts['rsvp']:.1f}")
+    await inter.response.send_message(head+detail, ephemeral=True)
+
+@tree.command(name="flammenscore_top", description="Topliste (Platz · Name · %).")
+@app_commands.describe(limit="Anzahl Einträge (1–25, Standard 10)")
+async def flammenscore_top(inter: discord.Interaction, limit: Optional[int] = 10):
+    limit = max(1, min(25, limit or 10))
+    lines = _format_leaderboard_lines(inter.guild, limit)
+    if not lines:
+        await inter.response.send_message("Noch keine Daten.", ephemeral=True); return
+    await inter.response.send_message("\n".join(lines), ephemeral=True)
+
+# ======================== Admin: Sync ========================
+@tree.command(name="wf_admin_sync", description="Commands in diesem Server neu syncen.")
+async def wf_admin_sync(inter: discord.Interaction):
+    if not is_admin(inter):
+        await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True); return
+    try:
+        await tree.sync(guild=discord.Object(id=inter.guild_id))
+        await inter.response.send_message("✅ Befehle neu gesynct.", ephemeral=True)
+    except Exception as e:
+        await inter.response.send_message(f"❌ Sync-Fehler: {e}", ephemeral=True)
+
+# ======================== Persistent Views + Lifecycle ========================
+def reregister_persistent_views_on_start():
+    for msg_id, obj in list(rsvp_store.items()):
+        g = client.get_guild(obj["guild_id"])
+        if not g: continue
+        try:
+            client.add_view(RaidView(int(msg_id)), message_id=int(msg_id))
+        except Exception as e:
+            print("add_view (RSVP) failed:", e)
+
+@client.event
+async def on_ready():
+    print(f"Logged in as {client.user} (ID: {client.user.id})")
+    for g in client.guilds:
+        try: await g.chunk()
+        except Exception as e: print("guild.chunk() failed:", e)
+    reregister_persistent_views_on_start()
+    register_rsvp_slash_commands()
+    # Sync global + je Guild (stellt sicher, dass Slash-Befehle erscheinen)
+    try:
+        await tree.sync()
+        for g in client.guilds:
+            await tree.sync(guild=discord.Object(id=g.id))
+        print(f"Synced commands for {len(client.guilds)} guild(s).")
+    except Exception as e:
+        print("Command sync failed:", e)
+    scheduler_loop.start()
 
 # ======================== Start ========================
 if __name__ == "__main__":
