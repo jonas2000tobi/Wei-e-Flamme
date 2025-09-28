@@ -689,27 +689,6 @@ def _calc_flammenscore(gid: int, uid: int) -> Tuple[float, Dict[str, float]]:
     total = sum(parts.values())
     return total, parts
 
-def _raw_activity(gid: int, uid: int) -> Dict[str, int]:
-    """Ungewichtete Rohwerte für Anzeige/Tabellen."""
-    u = _score_bucket(gid, uid)
-    voice_min = int(round(u["voice_ms"] / 60000.0))
-    return {
-        "voice_min": voice_min,
-        "messages": u["messages"],
-        "reacts_given": u["reacts_given"],
-        "reacts_recv": u["reacts_recv"],
-        "rsvp": u["rsvp"],
-    }
-
-def _guild_total_score(gid: int) -> float:
-    data = scores.get(str(gid)) or {}
-    s = 0.0
-    for uid_str in data.keys():
-        u = int(uid_str)
-        tot, _ = _calc_flammenscore(gid, u)
-        s += tot
-    return s
-
 # Voice-Session-Map: (gid, uid) -> start_dt
 voice_sessions: Dict[Tuple[int,int], datetime] = {}
 
@@ -732,11 +711,27 @@ def _cache_author(message_id: int, author_id: int, cap: int = 2000):
         message_author_cache.pop(next(iter(message_author_cache)))
     message_author_cache[message_id] = author_id
 
-def _format_leaderboard_lines(guild: discord.Guild, limit: int = 10) -> List[str]:
+def _format_leaderboard_lines
+
+
+def _is_eligible_for_leaderboard(guild: discord.Guild, uid: int) -> bool:
+    """Filter: exclude bots; if a guild role (set via /raid_set_guildrole) is configured,
+    only count members who have that role."""
+    m = guild.get_member(uid)
+    if not m or getattr(m, "bot", False):
+        return False
+    gr_id = _get_guild_role_id(guild.id)
+    if gr_id:
+        role = guild.get_role(gr_id)
+        if role and role not in m.roles:
+            return False
+    return True
+
+
+(guild: discord.Guild, limit: int = 10) -> List[str]:
     gid = guild.id
     data = scores.get(str(gid)) or {}
     arr = []
-    total_sum = _guild_total_score(gid)
     for uid_str in data.keys():
         uid = int(uid_str)
         total, _ = _calc_flammenscore(gid, uid)
@@ -747,38 +742,8 @@ def _format_leaderboard_lines(guild: discord.Guild, limit: int = 10) -> List[str
         m = guild.get_member(uid)
         name = m.display_name if m else f"<@{uid}>"
         medal = "🥇" if i==1 else ("🥈" if i==2 else ("🥉" if i==3 else f"{i}."))
-        pct = (total/total_sum*100) if total_sum>0 else 0.0
-        lines.append(f"{medal} {name} — **{pct:.1f}%** (Score {total:.1f})")
+        lines.append(f"{medal} {name} — **{total:.1f}**")
     return lines
-
-def _fmt_table(rows: List[Dict[str, str]]) -> str:
-    """
-    Baut eine monospace-Tabelle aus rows (bereits als Strings formatiert).
-    Erwartete Keys: rank,name,pct,score,msg,rg,rr,voice,rsvp
-    """
-    # Spaltenbreiten (Name wird ggf. gekürzt)
-    w = {
-        "rank": 3, "name": 18, "pct": 6, "score": 7,
-        "msg": 4, "rg": 3, "rr": 3, "voice": 5, "rsvp": 4
-    }
-    def trunc(s: str, width: int) -> str:
-        return s if len(s) <= width else (s[:max(0,width-1)] + "…")
-    header = f"{'#':>{w['rank']}}  { 'Name':<{w['name']}}  { '%':>{w['pct']}}  { 'Score':>{w['score']}}  { 'Msg':>{w['msg']}}  { 'RG':>{w['rg']}}  { 'RR':>{w['rr']}}  { 'Voice':>{w['voice']}}  { 'RSVP':>{w['rsvp']}}"
-    lines = [header, "-"*len(header)]
-    for r in rows:
-        line = (
-            f"{r['rank']:>{w['rank']}}  "
-            f"{trunc(r['name'], w['name']):<{w['name']}}  "
-            f"{r['pct']:>{w['pct']}}  "
-            f"{r['score']:>{w['score']}}  "
-            f"{r['msg']:>{w['msg']}}  "
-            f"{r['rg']:>{w['rg']}}  "
-            f"{r['rr']:>{w['rr']}}  "
-            f"{r['voice']:>{w['voice']}}  "
-            f"{r['rsvp']:>{w['rsvp']}}"
-        )
-        lines.append(line)
-    return "\n".join(lines)
 
 async def _post_weekly_leaderboard_if_due(now: datetime):
     # Freitag (4), 18:00 (Europe/Berlin)
@@ -797,13 +762,12 @@ async def _post_weekly_leaderboard_if_due(now: datetime):
         lines = _format_leaderboard_lines(guild, limit=10)
         if not lines:
             continue
-        total_sum = _guild_total_score(guild.id)
         emb = discord.Embed(
             title="🔥 Flammenscore – Wochen-Leaderboard",
             description="\n".join(lines),
             color=discord.Color.orange()
         )
-        emb.set_footer(text=f"Gesamt-Score: {total_sum:.1f} • Stand: {now.strftime('%d.%m.%Y %H:%M')} • Reset am 30. jeden Monats")
+        emb.set_footer(text=f"Stand: {now.strftime('%d.%m.%Y %H:%M')} • Reset am 30. jeden Monats")
         try:
             await ch.send(embed=emb)
             post_log.add(key)
@@ -855,23 +819,19 @@ def _rank_of(gid: int, uid: int) -> tuple[int, int, float]:
 async def flammenscore_me(inter: discord.Interaction):
     gid = inter.guild_id
     uid = inter.user.id
-
     pos, total_count, my_total = _rank_of(gid, uid)
-    total_sum = _guild_total_score(gid)
-    my_pct = (my_total / total_sum * 100) if total_sum > 0 else 0.0
-
-    stats = _raw_activity(gid, uid)
-
+    _, parts = _calc_flammenscore(gid, uid)
     lines = [
         f"**Rang:** {pos}/{total_count}" if pos else f"**Rang:** –/{total_count}",
-        f"**Anteil:** {my_pct:.1f}% (Score {my_total:.1f})",
-        f"• Voice: {stats['voice_min']} Min",
-        f"• Messages: {stats['messages']}",
-        f"• Reaktionen gegeben: {stats['reacts_given']}",
-        f"• Reaktionen erhalten: {stats['reacts_recv']}",
-        f"• RSVP: {stats['rsvp']}",
+        f"**Score:** {my_total:.1f}",
+        f"• Voice: {parts['voice']:.1f}",
+        f"• Messages: {parts['msg']:.1f}",
+        f"• Reaktionen gegeben: {parts['rg']:.1f}",
+        f"• Reaktionen erhalten: {parts['rr']:.1f}",
+        f"• RSVP: {parts['rsvp']:.1f}",
     ]
-    await inter.response.send_message("\n".join(lines))
+    await inter.response.send_message("\n".join(lines), ephemeral=True)
+
 
 @tree.command(name="flammenscore_top", description="Zeigt die Top-Liste des Flammenscore.")
 @app_commands.describe(limit="Anzahl Einträge (1–25, Standard 10)")
@@ -879,48 +839,30 @@ async def flammenscore_top(inter: discord.Interaction, limit: Optional[int] = 10
     limit = max(1, min(25, limit or 10))
     gid = inter.guild_id
     data = scores.get(str(gid)) or {}
-    if not data:
-        await inter.response.send_message("Noch keine Daten.")
+    scored = []
+    for uid_str in data.keys():
+        u = int(uid_str)
+        # Skip ineligible members (bots / without configured guild role)
+        if not _is_eligible_for_leaderboard(inter.guild, u):
+            continue
+        total, _ = _calc_flammenscore(gid, u)
+        scored.append((u, total))
+    scored.sort(key=lambda t: t[1], reverse=True)
+
+    if not scored:
+        await inter.response.send_message("Noch keine Daten.", ephemeral=True)
         return
 
-    total_sum = _guild_total_score(gid)
+    max_total = scored[0][1] if scored else 0.0
 
-    # sammle Daten
-    ranked = []
-    for uid_str in data.keys():
-        uid = int(uid_str)
-        total, _ = _calc_flammenscore(gid, uid)
-        ranked.append((total, uid))
-    ranked.sort(key=lambda t: t[0], reverse=True)
-
-    rows = []
-    for i, (total, uid) in enumerate(ranked[:limit], start=1):
+    lines = []
+    for i, (uid, total) in enumerate(scored[:limit], start=1):
         m = inter.guild.get_member(uid)
-        name = (m.display_name if m else f"@{uid}")
-        pct = (total/total_sum*100) if total_sum>0 else 0.0
-        raw = _raw_activity(gid, uid)
-        rows.append({
-            "rank": str(i),
-            "name": name,
-            "pct":  f"{pct:.1f}%",
-            "score": f"{total:.1f}",
-            "msg":  str(raw["messages"]),
-            "rg":   str(raw["reacts_given"]),
-            "rr":   str(raw["reacts_recv"]),
-            "voice":str(raw["voice_min"]),
-            "rsvp": str(raw["rsvp"]),
-        })
+        name = m.display_name if m else f"<@{uid}>"
+        pct = (total / max_total * 100.0) if max_total > 0 else 0.0
+        lines.append(f"{i}. {name} — {pct:.1f}%")
 
-    table = _fmt_table(rows)
-    emb = discord.Embed(
-        title="🔥 Flammenscore – Topliste",
-        description=f"```\n{table}\n```",
-        color=discord.Color.orange()
-    )
-    emb.set_footer(text=f"Gesamt-Score: {total_sum:.1f} • Reset am 30. jeden Monats")
-    await inter.response.send_message(embed=emb)
-
-# ---- Admin Sync (eindeutige Namen) ----
+    await inter.response.send_message("\n".join(lines), ephemeral=True)
 @tree.command(name="wf_admin_sync", description="Re-sync der Slash-Commands in diesem Server.")
 async def wf_admin_sync(inter: discord.Interaction):
     if not is_admin(inter):
@@ -974,17 +916,13 @@ async def on_ready():
     reregister_persistent_views_on_start()
     register_rsvp_slash_commands()
 
-    # -------- HARTE GUILD-SYNC-SEQUENZ --------
+    # Commands je Guild synchronisieren
     try:
         for g in client.guilds:
-            gid_obj = discord.Object(id=g.id)
-            tree.clear_commands(guild=gid_obj)
-            tree.copy_global_to(guild=gid_obj)
-            cmds = await tree.sync(guild=gid_obj)
-            print(f"[SYNC] {g.name} ({g.id}) -> {[c.name for c in cmds]}")
+            await tree.sync(guild=discord.Object(id=g.id))
+        print(f"Synced commands for {len(client.guilds)} guild(s).")
     except Exception as e:
         print("Command sync failed:", e)
-    # -----------------------------------------
 
     scheduler_loop.start()
 
@@ -1132,3 +1070,24 @@ if __name__ == "__main__":
     if not TOKEN:
         raise SystemExit("Set DISCORD_BOT_TOKEN environment variable.")
     client.run(TOKEN)
+def _format_leaderboard_lines(guild: discord.Guild, limit: int = 10) -> List[str]:
+    gid = guild.id
+    data = scores.get(str(gid)) or {}
+    arr = []
+    for uid_str in data.keys():
+        uid = int(uid_str)
+        # Skip ineligible members (bots / without configured guild role)
+        if not _is_eligible_for_leaderboard(guild, uid):
+            continue
+        total, _ = _calc_flammenscore(gid, uid)
+        arr.append((total, uid))
+    arr.sort(reverse=True, key=lambda x: x[0])
+    max_total = arr[0][0] if arr else 0.0
+    lines = []
+    for i, (total, uid) in enumerate(arr[:limit], start=1):
+        m = guild.get_member(uid)
+        name = m.display_name if m else f"<@{uid}>"
+        pct = (total / max_total * 100.0) if max_total > 0 else 0.0
+        lines.append(f"{i}. {name} — {pct:.1f}%")
+    return lines
+
