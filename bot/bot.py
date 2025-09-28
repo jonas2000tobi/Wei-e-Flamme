@@ -59,6 +59,7 @@ intents = discord.Intents.default()
 intents.guilds = True
 intents.members = True
 intents.message_content = True
+intents.voice_states = True   # wichtig, aber wir pollen zusätzlich
 
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
@@ -471,50 +472,34 @@ def _calc_flammenscore(gid: int, uid: int) -> Tuple[float, Dict[str,float]]:
            "rg":u["reacts_given"]*w["react_given"],"rr":u["reacts_recv"]*w["react_recv"],"rsvp":u["rsvp"]*w["rsvp"]}
     return sum(parts.values()), parts
 
-# ---- Live-Voice ----
-voice_sessions: Dict[Tuple[int,int], datetime] = {}
-message_author_cache: Dict[int,int] = {}
+# ---- Voice-Counting per Poll (robust) ----
+voice_last_seen: Dict[Tuple[int,int], datetime] = {}
 
-def _cache_author(message_id: int, author_id: int, cap: int = 2000):
-    if len(message_author_cache) >= cap:
-        message_author_cache.pop(next(iter(message_author_cache)))
-    message_author_cache[message_id] = author_id
-
-# ---- Top-Ermittlung + Rendering ----
-def _collect_sorted_totals(guild: discord.Guild) -> List[Tuple[float,int]]:
+def _render_top_table(guild: discord.Guild, limit: int = 10) -> str:
     gid = guild.id
     data = scores.get(str(gid)) or {}
     gr_id = _get_guild_role_filter_id(gid)
     gr = guild.get_role(gr_id) if gr_id else None
-    arr: List[Tuple[float,int]] = []
+    rows=[]
     for uid_str in data.keys():
-        uid = int(uid_str)
-        m = guild.get_member(uid)
-        if not m or m.bot:
-            continue
-        if gr and gr not in m.roles:
-            continue
-        total,_ = _calc_flammenscore(gid, uid)
-        arr.append((total, uid))
-    arr.sort(reverse=True, key=lambda x: x[0])
-    return arr
-
-def _render_top_table(guild: discord.Guild, limit: int = 10) -> str:
-    rows = _collect_sorted_totals(guild)[:limit]
+        uid=int(uid_str)
+        m=guild.get_member(uid)
+        if not m or m.bot: continue
+        if gr and gr not in m.roles: continue
+        total,_=_calc_flammenscore(gid, uid)
+        rows.append((total, uid))
+    rows.sort(reverse=True, key=lambda x: x[0])
+    rows=rows[:limit]
     if not rows:
         return "Noch keine Daten."
-    top = rows[0][0] or 1.0
-    # dynamische Breite für Namen
-    names = []
-    for _, uid in rows:
-        m = guild.get_member(uid)
-        names.append(m.display_name if m else f"<@{uid}>")
-    name_w = max(6, min(28, max(len(n) for n in names)))
-    header = f"{'#':>2}  {'Name':<{name_w}}  {'Flammen':>8}"
-    sep    = "-" * (len(header))
-    lines  = [header, sep]
-    for i, ((total, uid), name) in enumerate(zip(rows, names), start=1):
-        pct = total/top*100.0
+    top=rows[0][0] or 1.0
+    names=[(guild.get_member(uid).display_name if guild.get_member(uid) else f"<@{uid}>") for _,uid in rows]
+    name_w=max(6, min(28, max(len(n) for n in names)))
+    header=f"{'#':>2}  {'Name':<{name_w}}  {'Flammen':>8}"
+    sep="-"*len(header)
+    lines=[header, sep]
+    for i,((total,uid),name) in enumerate(zip(rows, names), start=1):
+        pct=total/top*100.0
         lines.append(f"{i:>2}  {name[:name_w]:<{name_w}}  {pct:>6.1f}%")
     return "```\n" + "\n".join(lines) + "\n```"
 
@@ -523,15 +508,29 @@ def _render_top_table(guild: discord.Guild, limit: int = 10) -> str:
 async def scheduler_loop():
     now = _now().replace(second=0, microsecond=0)
 
-    # 0) Voice-Tick
+    # 0) Voice: poll alle Channels und addiere Delta
     changed=False
-    for (gid, uid), start in list(voice_sessions.items()):
-        delta = (_now() - start).total_seconds()
-        if delta >= 30:
-            b=_score_bucket(gid, uid)
-            b["voice_ms"] += int(delta*1000)
-            voice_sessions[(gid, uid)] = _now()
-            changed=True
+    present=set()
+    for g in client.guilds:
+        chans=list(g.voice_channels)
+        stage = getattr(g, "stage_channels", [])
+        chans.extend(stage)
+        for ch in chans:
+            for m in ch.members:
+                if m.bot: 
+                    continue
+                key=(g.id, m.id)
+                last = voice_last_seen.get(key, now)
+                delta_ms = int((now - last).total_seconds()*1000)
+                if delta_ms > 0:
+                    _score_bucket(g.id, m.id)["voice_ms"] += delta_ms
+                    changed=True
+                voice_last_seen[key]=now
+                present.add(key)
+    # cleanup, wer nicht mehr im Voice ist
+    for key in list(voice_last_seen.keys()):
+        if key not in present:
+            voice_last_seen.pop(key, None)
     if changed:
         _save_scores()
 
@@ -606,29 +605,26 @@ async def scheduler_loop():
 @scheduler_loop.before_loop
 async def _before_scheduler(): await client.wait_until_ready()
 
-# ======================== Score-Hooks ========================
+# ======================== Message/Reaction Hooks ========================
 @client.event
 async def on_message(message: discord.Message):
     if not message.guild or message.author.bot: return
     _score_bucket(message.guild.id, message.author.id)["messages"] += 1
     _save_scores()
-    _cache_author(message.id, message.author.id)
 
 @client.event
 async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     if payload.guild_id is None or payload.user_id == client.user.id: return
     _score_bucket(payload.guild_id, payload.user_id)["reacts_given"] += 1
-    author_id = message_author_cache.get(payload.message_id)
-    if author_id is None:
-        try:
-            ch = client.get_channel(payload.channel_id)
-            if isinstance(ch, (discord.TextChannel, discord.Thread)):
-                msg = await ch.fetch_message(payload.message_id)
-                author_id = msg.author.id; _cache_author(payload.message_id, author_id)
-        except Exception:
-            author_id = None
-    if author_id and author_id != payload.user_id:
-        _score_bucket(payload.guild_id, author_id)["reacts_recv"] += 1
+    # „received“ nur, wenn Author ≠ Reactor
+    try:
+        ch = client.get_channel(payload.channel_id)
+        if isinstance(ch, (discord.TextChannel, discord.Thread)):
+            msg = await ch.fetch_message(payload.message_id)
+            if msg.author and msg.author.id != payload.user_id:
+                _score_bucket(payload.guild_id, msg.author.id)["reacts_recv"] += 1
+    except Exception:
+        pass
     _save_scores()
 
 @client.event
@@ -636,27 +632,16 @@ async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
     if payload.guild_id is None or payload.user_id == client.user.id: return
     b = _score_bucket(payload.guild_id, payload.user_id)
     if b["reacts_given"] > 0: b["reacts_given"] -= 1
-    author_id = message_author_cache.get(payload.message_id)
-    if author_id and author_id != payload.user_id:
-        br = _score_bucket(payload.guild_id, author_id)
-        if br["reacts_recv"] > 0: br["reacts_recv"] -= 1
+    try:
+        ch = client.get_channel(payload.channel_id)
+        if isinstance(ch, (discord.TextChannel, discord.Thread)):
+            msg = await ch.fetch_message(payload.message_id)
+            if msg.author and msg.author.id != payload.user_id:
+                br = _score_bucket(payload.guild_id, msg.author.id)
+                if br["reacts_recv"] > 0: br["reacts_recv"] -= 1
+    except Exception:
+        pass
     _save_scores()
-
-@client.event
-async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
-    if member.bot or not member.guild: return
-    gid, uid = member.guild.id, member.id
-    if before.channel is None and after.channel is not None:
-        voice_sessions[(gid,uid)] = _now()            # join
-    elif before.channel is not None and after.channel is None:
-        start = voice_sessions.pop((gid,uid), None)   # leave
-        if start:
-            _score_bucket(gid,uid)["voice_ms"] += int((_now()-start).total_seconds()*1000); _save_scores()
-    elif before.channel and after.channel and before.channel.id != after.channel.id:
-        start = voice_sessions.pop((gid,uid), None)   # move
-        if start:
-            _score_bucket(gid,uid)["voice_ms"] += int((_now()-start).total_seconds()*1000); _save_scores()
-        voice_sessions[(gid,uid)] = _now()
 
 # ======================== Core Slash Commands (guild) ========================
 def register_core_commands():
@@ -752,13 +737,18 @@ def register_core_commands():
         gid = inter.guild_id; uid = inter.user.id
         data = scores.get(str(gid)) or {}
         all_totals=[_calc_flammenscore(gid,int(u))[0] for u in data.keys()]
-        my_total, parts = _calc_flammenscore(gid, uid)
-        rank = (sorted(all_totals, reverse=True).index(my_total)+1) if (my_total>0 and all_totals) else 0
-        lines=[f"**Rang:** {rank}/{len(all_totals)}" if rank else f"**Rang:** –/{len(all_totals)}",
-               f"**Score:** {my_total:.1f}",
-               f"• Voice: {parts['voice']:.1f}", f"• Messages: {parts['msg']:.1f}",
-               f"• Reaktionen gegeben: {parts['rg']:.1f}", f"• Reaktionen erhalten: {parts['rr']:.1f}",
-               f"• RSVP: {parts['rsvp']:.1f}"]
+        my_total, _ = _calc_flammenscore(gid, uid)
+        b = _score_bucket(gid, uid)
+        voice_min_raw = int(b["voice_ms"] / 60000)
+        lines=[
+            f"**Rang:** {(sorted(all_totals, reverse=True).index(my_total)+1) if (my_total>0 and all_totals) else '–'}/{len(all_totals)}",
+            f"**Score:** {my_total:.1f}",
+            f"• Voice: {voice_min_raw} Min",
+            f"• Messages: {b['messages']}",
+            f"• Reaktionen gegeben: {b['reacts_given']}",
+            f"• Reaktionen erhalten: {b['reacts_recv']}",
+            f"• RSVP: {b['rsvp']}",
+        ]
         await inter.response.send_message("\n".join(lines), ephemeral=True)
 
     @tree.command(name="flammenscore_top", description="Topliste (Platz · Name · Flammen%).")
@@ -770,18 +760,19 @@ def register_core_commands():
         emb.description = table
         await inter.response.send_message(embed=emb, ephemeral=True)
 
-    # ---- Admin: Sync (guild-only) ----
+    # ---- Admin: sauberer Guild-Sync (mit defer) ----
     @tree.command(name="wf_admin_sync", description="Befehle in diesem Server sauber neu syncen.")
     async def wf_admin_sync(inter: discord.Interaction):
         if not is_admin(inter):
             await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True); return
+        await inter.response.defer(ephemeral=True, thinking=True)
         try:
             guild_obj = discord.Object(id=inter.guild_id)
             tree.clear_commands(guild=guild_obj)
             await tree.sync(guild=guild_obj)
-            await inter.response.send_message("✅ Guild-Sync erledigt.", ephemeral=True)
+            await inter.followup.send("✅ Guild-Sync erledigt.", ephemeral=True)
         except Exception as e:
-            await inter.response.send_message(f"❌ Sync-Fehler: {e}", ephemeral=True)
+            await inter.followup.send(f"❌ Sync-Fehler: {e}", ephemeral=True)
 
 # ======================== Persistent Views + Lifecycle ========================
 def reregister_persistent_views_on_start():
@@ -801,7 +792,7 @@ async def on_ready():
         try: await g.chunk()
         except Exception as e: print("guild.chunk() failed:", e)
 
-    # Kein Global-Geraffel -> keine Duplikate
+    # global prune, dann guild-spezifisch syncen, um Doppelbefehle zu vermeiden
     try:
         tree.clear_commands(); await tree.sync()
         for g in client.guilds:
