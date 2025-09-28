@@ -855,6 +855,35 @@ async def admin_sync(inter: discord.Interaction):
     except Exception as e:
         await inter.response.send_message(f"❌ Sync-Fehler: {e}", ephemeral=True)
 
+@tree.command(name="admin_sync", description="Re-sync der Slash-Commands in diesem Server.")
+async def admin_sync(inter: discord.Interaction):
+    if not is_admin(inter):
+        await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True)
+        return
+    try:
+        await tree.sync(guild=discord.Object(id=inter.guild_id))
+        cmds = await tree.fetch_commands(guild=discord.Object(id=inter.guild_id))
+        names = ", ".join(sorted(c.name for c in cmds))
+        await inter.response.send_message(f"✅ Gesynct. Befehle: {names}", ephemeral=True)
+    except Exception as e:
+        await inter.response.send_message(f"❌ Sync-Fehler: {e}", ephemeral=True)
+
+@tree.command(name="admin_sync_hard", description="Harter Re-Sync (löscht & lädt neu).")
+async def admin_sync_hard(inter: discord.Interaction):
+    if not is_admin(inter):
+        await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True)
+        return
+    try:
+        # Remote-Liste leeren und neu setzen
+        tree.clear_commands(guild=discord.Object(id=inter.guild_id))
+        await tree.sync(guild=discord.Object(id=inter.guild_id))
+        cmds = await tree.fetch_commands(guild=discord.Object(id=inter.guild_id))
+        names = ", ".join(sorted(c.name for c in cmds))
+        await inter.response.send_message(f"✅ Hart gesynct. Befehle: {names}", ephemeral=True)
+    except Exception as e:
+        await inter.response.send_message(f"❌ Hard-Sync-Fehler: {e}", ephemeral=True)
+
+
 
 # ======================== Re-Register persistent Views ========================
 def reregister_persistent_views_on_start():
