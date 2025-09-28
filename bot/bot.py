@@ -841,9 +841,9 @@ async def flammenscore_top(inter: discord.Interaction, limit: Optional[int] = 10
 
     await inter.response.send_message("\n".join(lines), ephemeral=True)
 
-# ---- Admin Sync (einmalig definiert!) ----
-@tree.command(name="admin_sync", description="Re-sync der Slash-Commands in diesem Server.")
-async def admin_sync(inter: discord.Interaction):
+# ---- Admin Sync (eindeutige Namen) ----
+@tree.command(name="wf_admin_sync", description="Re-sync der Slash-Commands in diesem Server.")
+async def wf_admin_sync(inter: discord.Interaction):
     if not is_admin(inter):
         await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True)
         return
@@ -855,8 +855,8 @@ async def admin_sync(inter: discord.Interaction):
     except Exception as e:
         await inter.response.send_message(f"❌ Sync-Fehler: {e}", ephemeral=True)
 
-@tree.command(name="admin_sync_hard", description="Harter Re-Sync (löscht & lädt neu).")
-async def admin_sync_hard(inter: discord.Interaction):
+@tree.command(name="wf_admin_sync_hard", description="Harter Re-Sync (löscht & lädt neu).")
+async def wf_admin_sync_hard(inter: discord.Interaction):
     if not is_admin(inter):
         await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True)
         return
