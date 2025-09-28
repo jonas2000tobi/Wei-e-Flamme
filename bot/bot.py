@@ -56,12 +56,16 @@ threading.Thread(target=keep_alive, daemon=True).start()
 intents = discord.Intents.default()
 intents.guilds = True
 intents.members = True
-intents.message_content = True  # im Dev-Portal aktivieren
+intents.message_content = True
 intents.reactions = True
 intents.voice_states = True
 
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
+
+# Register-Guards (gegen Doppel-Registrierung)
+_ALREADY_READY = False
+_RSVP_CMDS_REGISTERED = False
 
 # ======================== Parser / Utils ========================
 DOW_MAP = {
@@ -399,7 +403,6 @@ async def _build_embed_async(guild: discord.Guild, obj: dict) -> discord.Embed:
     no_names = [_mention(guild, u) for u in obj["no"]]
     emb.add_field(name=f"❌ Abgemeldet ({len(no_names)})", value="\n".join(no_names) or "—", inline=False)
 
-    # Gildenrollen-Quote (mit Prozent)
     gr_id = _get_guild_role_id(guild.id)
     if gr_id:
         role_member_ids = await _get_role_member_ids(guild, gr_id)
@@ -477,6 +480,11 @@ class RaidView(discord.ui.View):
     async def btn_no(self, interaction: discord.Interaction, _): await self._update(interaction, "NO")
 
 def register_rsvp_slash_commands():
+    global _RSVP_CMDS_REGISTERED
+    if _RSVP_CMDS_REGISTERED:
+        return
+    _RSVP_CMDS_REGISTERED = True
+
     @tree.command(name="raid_set_roles", description="Rollen für Tank/Heal/DPS festlegen (pro Server).")
     @app_commands.describe(tank_role="Rolle für Tank", heal_role="Rolle für Heal", dps_role="Rolle für DPS")
     async def raid_set_roles(inter: discord.Interaction, tank_role: discord.Role, heal_role: discord.Role, dps_role: discord.Role):
@@ -576,11 +584,11 @@ def register_rsvp_slash_commands():
 
 # ======================== Flammenscore ========================
 WEIGHTS_DEFAULT = {
-    "voice_min":   0.20,  # Punkte pro Minute Voice
-    "message":     0.50,  # Punkte pro Nachricht
-    "react_given": 0.20,  # Punkte pro gegebene Reaktion
-    "react_recv":  0.30,  # Punkte pro erhaltene Reaktion
-    "rsvp":        3.00   # Punkte pro (einmalige) Teilnahme an einem RSVP-Post
+    "voice_min":   0.20,
+    "message":     0.50,
+    "react_given": 0.20,
+    "react_recv":  0.30,
+    "rsvp":        3.00
 }
 
 def _guild_weights(gid: int) -> Dict[str, float]:
@@ -595,7 +603,7 @@ def _score_bucket(gid: int, uid: int) -> dict:
         "reacts_given": 0,
         "reacts_recv": 0,
         "rsvp": 0,
-        "credited_rsvp": []   # message_ids (str), einmal pro RSVP-Post
+        "credited_rsvp": []
     })
     return u
 
@@ -770,16 +778,27 @@ def reregister_persistent_views_on_start():
         except Exception as e: print("add_view (RSVP) failed:", e)
 
 # ======================== Lifecycle & Scheduler ========================
-_already_ready = False
+@client.event
+async def on_guild_join(guild: discord.Guild):
+    # neue Gilde → sofortige Registrierung & Sync
+    try:
+        await guild.chunk()
+    except Exception:
+        pass
+    register_rsvp_slash_commands()
+    try:
+        cmds = await tree.sync(guild=discord.Object(id=guild.id))
+        print(f"[SYNC] joined {guild.name} ({guild.id}) -> {[c.name for c in cmds]}")
+    except Exception as e:
+        print("sync on guild_join failed:", e)
 
 @client.event
 async def on_ready():
-    global _already_ready
+    global _ALREADY_READY
     print(f"Logged in as {client.user} (ID: {client.user.id})")
-    if _already_ready:
-        # Bei Reconnects nicht erneut registrieren
+    if _ALREADY_READY:
         return
-    _already_ready = True
+    _ALREADY_READY = True
 
     for g in client.guilds:
         try: await g.chunk()
@@ -788,7 +807,7 @@ async def on_ready():
     reregister_persistent_views_on_start()
     register_rsvp_slash_commands()
 
-    # Guild-Scoped Sync
+    # Guild-Scoped Sync beim Start
     try:
         for g in client.guilds:
             gid_obj = discord.Object(id=g.id)
@@ -798,6 +817,17 @@ async def on_ready():
         print("Command sync failed:", e)
 
     scheduler_loop.start()
+    command_sync_loop.start()
+
+@tasks.loop(minutes=10.0)
+async def command_sync_loop():
+    # Fallback: hält die Slash-Commands aktuell
+    try:
+        for g in client.guilds:
+            cmds = await tree.sync(guild=discord.Object(id=g.id))
+            print(f"[SYNC-KEEPALIVE] {g.name} -> {[c.name for c in cmds]}")
+    except Exception as e:
+        print("periodic sync failed:", e)
 
 @tasks.loop(seconds=30.0)
 async def scheduler_loop():
@@ -854,7 +884,6 @@ async def scheduler_loop():
             if not isinstance(ch, discord.TextChannel): continue
             key = f"weekly_lb:{guild.id}:{now.date().isoformat()}"
             if key in post_log: continue
-            # baue lines
             data = scores.get(str(guild.id)) or {}
             arr=[]
             for uid_str in data.keys():
@@ -902,7 +931,9 @@ async def on_message(message: discord.Message):
     b = _score_bucket(message.guild.id, message.author.id)
     b["messages"] += 1
     _save_scores()
-    _cache_author(message.id, message.author.id)
+    message_author_cache[message.id] = message.author.id
+    if len(message_author_cache) > 2000:
+        message_author_cache.pop(next(iter(message_author_cache)))
 
 @client.event
 async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
@@ -910,13 +941,11 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     guild = client.get_guild(payload.guild_id)
     if guild:
         reactor = guild.get_member(payload.user_id)
-        if reactor and reactor.bot: return  # Bots nicht zählen
+        if reactor and reactor.bot: return
 
-    # gegeben
     b = _score_bucket(payload.guild_id, payload.user_id)
     b["reacts_given"] += 1
 
-    # erhalten (Autor muss Mensch sein)
     author_id = message_author_cache.get(payload.message_id)
     if author_id is None:
         try:
@@ -924,7 +953,7 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
             if isinstance(ch, (discord.TextChannel, discord.Thread)):
                 msg = await ch.fetch_message(payload.message_id)
                 author_id = msg.author.id
-                _cache_author(payload.message_id, author_id)
+                message_author_cache[payload.message_id] = author_id
         except Exception:
             author_id = None
 
@@ -956,13 +985,10 @@ async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
 async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
     if member.bot or not member.guild: return
     gid, uid = member.guild.id, member.id
-    # Join
     if before.channel is None and after.channel is not None:
         _voice_start(gid, uid)
-    # Leave
     elif before.channel is not None and after.channel is None:
         _voice_end(gid, uid)
-    # Channel-Wechsel -> Session bleibt laufen (kein Reset)
     else:
         pass
 
