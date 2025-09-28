@@ -842,6 +842,20 @@ async def flammenscore_top(inter: discord.Interaction, limit: Optional[int] = 10
 
     await inter.response.send_message("\n".join(lines), ephemeral=True)
 
+@tree.command(name="admin_sync", description="Force re-sync der Slash-Commands in diesem Server.")
+async def admin_sync(inter: discord.Interaction):
+    if not is_admin(inter):
+        await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True)
+        return
+    try:
+        await tree.sync(guild=discord.Object(id=inter.guild_id))
+        cmds = await tree.fetch_commands(guild=discord.Object(id=inter.guild_id))
+        names = ", ".join(sorted(c.name for c in cmds))
+        await inter.response.send_message(f"✅ Gesynct. Befehle: {names}", ephemeral=True)
+    except Exception as e:
+        await inter.response.send_message(f"❌ Sync-Fehler: {e}", ephemeral=True)
+
+
 # ======================== Re-Register persistent Views ========================
 def reregister_persistent_views_on_start():
     for msg_id, obj in list(rsvp_store.items()):
