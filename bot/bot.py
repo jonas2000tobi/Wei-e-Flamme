@@ -59,7 +59,7 @@ intents = discord.Intents.default()
 intents.guilds = True
 intents.members = True
 intents.message_content = True
-intents.voice_states = True   # wichtig, aber wir pollen zusätzlich
+intents.voice_states = True
 
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
@@ -476,31 +476,45 @@ def _calc_flammenscore(gid: int, uid: int) -> Tuple[float, Dict[str,float]]:
 voice_last_seen: Dict[Tuple[int,int], datetime] = {}
 
 def _render_top_table(guild: discord.Guild, limit: int = 10) -> str:
+    """Topliste als Anteil am Gesamt-Score (Summe ~ 100%)."""
     gid = guild.id
     data = scores.get(str(gid)) or {}
+
     gr_id = _get_guild_role_filter_id(gid)
     gr = guild.get_role(gr_id) if gr_id else None
-    rows=[]
+
+    # Alle Kandidaten (gefiltert)
+    entries: List[Tuple[float,int]] = []
     for uid_str in data.keys():
-        uid=int(uid_str)
-        m=guild.get_member(uid)
-        if not m or m.bot: continue
-        if gr and gr not in m.roles: continue
-        total,_=_calc_flammenscore(gid, uid)
-        rows.append((total, uid))
-    rows.sort(reverse=True, key=lambda x: x[0])
-    rows=rows[:limit]
-    if not rows:
+        uid = int(uid_str)
+        m = guild.get_member(uid)
+        if not m or m.bot:
+            continue
+        if gr and gr not in m.roles:
+            continue
+        total, _ = _calc_flammenscore(gid, uid)
+        if total <= 0:
+            continue
+        entries.append((total, uid))
+
+    if not entries:
         return "Noch keine Daten."
-    top=rows[0][0] or 1.0
-    names=[(guild.get_member(uid).display_name if guild.get_member(uid) else f"<@{uid}>") for _,uid in rows]
-    name_w=max(6, min(28, max(len(n) for n in names)))
-    header=f"{'#':>2}  {'Name':<{name_w}}  {'Flammen':>8}"
-    sep="-"*len(header)
-    lines=[header, sep]
-    for i,((total,uid),name) in enumerate(zip(rows, names), start=1):
-        pct=total/top*100.0
+
+    # Sortierung & Summe über **alle** gezählten
+    entries.sort(reverse=True, key=lambda x: x[0])
+    total_sum = sum(t for t, _ in entries) or 1.0
+
+    show = entries[:limit]
+    names = [(guild.get_member(uid).display_name if guild.get_member(uid) else f"<@{uid}>") for _, uid in show]
+    name_w = max(6, min(28, max(len(n) for n in names)))
+
+    header = f"{'#':>2}  {'Name':<{name_w}}  {'Flammen':>8}"
+    sep = "-" * len(header)
+    lines = [header, sep]
+    for i, ((t, uid), name) in enumerate(zip(show, names), start=1):
+        pct = (t / total_sum) * 100.0
         lines.append(f"{i:>2}  {name[:name_w]:<{name_w}}  {pct:>6.1f}%")
+
     return "```\n" + "\n".join(lines) + "\n```"
 
 # ======================== Scheduler ========================
@@ -517,7 +531,7 @@ async def scheduler_loop():
         chans.extend(stage)
         for ch in chans:
             for m in ch.members:
-                if m.bot: 
+                if m.bot:
                     continue
                 key=(g.id, m.id)
                 last = voice_last_seen.get(key, now)
@@ -527,7 +541,7 @@ async def scheduler_loop():
                     changed=True
                 voice_last_seen[key]=now
                 present.add(key)
-    # cleanup, wer nicht mehr im Voice ist
+    # cleanup
     for key in list(voice_last_seen.keys()):
         if key not in present:
             voice_last_seen.pop(key, None)
@@ -616,7 +630,6 @@ async def on_message(message: discord.Message):
 async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     if payload.guild_id is None or payload.user_id == client.user.id: return
     _score_bucket(payload.guild_id, payload.user_id)["reacts_given"] += 1
-    # „received“ nur, wenn Author ≠ Reactor
     try:
         ch = client.get_channel(payload.channel_id)
         if isinstance(ch, (discord.TextChannel, discord.Thread)):
