@@ -1,4 +1,3 @@
-# bot.py
 from __future__ import annotations
 
 import os, json, threading, time, requests
@@ -12,6 +11,7 @@ from discord import app_commands
 from discord.ext import tasks
 from flask import Flask
 from zoneinfo import ZoneInfo
+from calendar import monthrange
 
 # ======================== Grundkonfig ========================
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
@@ -711,39 +711,37 @@ def _cache_author(message_id: int, author_id: int, cap: int = 2000):
         message_author_cache.pop(next(iter(message_author_cache)))
     message_author_cache[message_id] = author_id
 
-def _format_leaderboard_lines
-
-
-def _is_eligible_for_leaderboard(guild: discord.Guild, uid: int) -> bool:
-    """Filter: exclude bots; if a guild role (set via /raid_set_guildrole) is configured,
-    only count members who have that role."""
-    m = guild.get_member(uid)
-    if not m or getattr(m, "bot", False):
-        return False
-    gr_id = _get_guild_role_id(guild.id)
-    if gr_id:
-        role = guild.get_role(gr_id)
-        if role and role not in m.roles:
-            return False
-    return True
-
-
-(guild: discord.Guild, limit: int = 10) -> List[str]:
+# ======== MOD: Minimal-Topliste & Filter (keine Bots, optional Gildenrolle) ========
+def _format_leaderboard_lines(guild: discord.Guild, limit: int = 10) -> List[str]:
     gid = guild.id
     data = scores.get(str(gid)) or {}
-    arr = []
+    # Optionaler Rollenfilter
+    gr_id = _get_guild_role_id(gid)
+    gr = guild.get_role(gr_id) if gr_id else None
+
+    arr: List[Tuple[float, int]] = []
     for uid_str in data.keys():
         uid = int(uid_str)
+        m = guild.get_member(uid)
+        if not m or m.bot:
+            continue
+        if gr and gr not in m.roles:
+            continue
         total, _ = _calc_flammenscore(gid, uid)
         arr.append((total, uid))
+    if not arr:
+        return []
     arr.sort(reverse=True, key=lambda x: x[0])
+
+    max_total = arr[0][0] if arr else 0.0
     lines=[]
     for i, (total, uid) in enumerate(arr[:limit], start=1):
         m = guild.get_member(uid)
         name = m.display_name if m else f"<@{uid}>"
-        medal = "🥇" if i==1 else ("🥈" if i==2 else ("🥉" if i==3 else f"{i}."))
-        lines.append(f"{medal} {name} — **{total:.1f}**")
+        pct = (total / max_total * 100.0) if max_total > 0 else 0.0
+        lines.append(f"{i}. {name} — {pct:.1f}%")
     return lines
+# ================================================================================
 
 async def _post_weekly_leaderboard_if_due(now: datetime):
     # Freitag (4), 18:00 (Europe/Berlin)
@@ -767,7 +765,7 @@ async def _post_weekly_leaderboard_if_due(now: datetime):
             description="\n".join(lines),
             color=discord.Color.orange()
         )
-        emb.set_footer(text=f"Stand: {now.strftime('%d.%m.%Y %H:%M')} • Reset am 30. jeden Monats")
+        emb.set_footer(text=f"Stand: {now.strftime('%d.%m.%Y %H:%M')} • Reset am Monatsende")
         try:
             await ch.send(embed=emb)
             post_log.add(key)
@@ -789,8 +787,8 @@ def _set_last_reset_ym(gid: int, ym: str):
     _save_score_meta()
 
 async def _monthly_reset_if_due(now: datetime):
-    # Reset am 30. des Monats um 00:00 (Europe/Berlin)
-    if not (now.day == 30 and now.hour == 0 and now.minute == 0):
+    # Reset am letzten Tag des Monats um 00:00
+    if not (now.day == monthrange(now.year, now.month)[1] and now.hour == 0 and now.minute == 0):
         return
     ym = _month_key(now)
     for guild in client.guilds:
@@ -800,7 +798,7 @@ async def _monthly_reset_if_due(now: datetime):
         scores[str(guild.id)] = {}  # kompletter Monatsreset
         _save_scores()
         _set_last_reset_ym(guild.id, ym)
-        print(f"[Flammenscore] Reset for guild {guild.id} @ {ym}-30")
+        print(f"[Flammenscore] Reset for guild {guild.id} @ {ym}-EOM")
 
 # ---- Rang/Top Commands ----
 def _rank_of(gid: int, uid: int) -> tuple[int, int, float]:
@@ -832,37 +830,17 @@ async def flammenscore_me(inter: discord.Interaction):
     ]
     await inter.response.send_message("\n".join(lines), ephemeral=True)
 
-
 @tree.command(name="flammenscore_top", description="Zeigt die Top-Liste des Flammenscore.")
 @app_commands.describe(limit="Anzahl Einträge (1–25, Standard 10)")
 async def flammenscore_top(inter: discord.Interaction, limit: Optional[int] = 10):
     limit = max(1, min(25, limit or 10))
-    gid = inter.guild_id
-    data = scores.get(str(gid)) or {}
-    scored = []
-    for uid_str in data.keys():
-        u = int(uid_str)
-        # Skip ineligible members (bots / without configured guild role)
-        if not _is_eligible_for_leaderboard(inter.guild, u):
-            continue
-        total, _ = _calc_flammenscore(gid, u)
-        scored.append((u, total))
-    scored.sort(key=lambda t: t[1], reverse=True)
-
-    if not scored:
+    lines = _format_leaderboard_lines(inter.guild, limit=limit)
+    if not lines:
         await inter.response.send_message("Noch keine Daten.", ephemeral=True)
         return
-
-    max_total = scored[0][1] if scored else 0.0
-
-    lines = []
-    for i, (uid, total) in enumerate(scored[:limit], start=1):
-        m = inter.guild.get_member(uid)
-        name = m.display_name if m else f"<@{uid}>"
-        pct = (total / max_total * 100.0) if max_total > 0 else 0.0
-        lines.append(f"{i}. {name} — {pct:.1f}%")
-
     await inter.response.send_message("\n".join(lines), ephemeral=True)
+
+# ---- Admin Sync (eindeutige Namen) ----
 @tree.command(name="wf_admin_sync", description="Re-sync der Slash-Commands in diesem Server.")
 async def wf_admin_sync(inter: discord.Interaction):
     if not is_admin(inter):
@@ -984,7 +962,7 @@ async def scheduler_loop():
     # 2) Wöchentliches Leaderboard (Fr 18:00)
     await _post_weekly_leaderboard_if_due(now)
 
-    # 3) Monatlicher Reset (30. 00:00)
+    # 3) Monatlicher Reset (EOM 00:00)
     await _monthly_reset_if_due(now)
 
 @scheduler_loop.before_loop
@@ -1070,24 +1048,3 @@ if __name__ == "__main__":
     if not TOKEN:
         raise SystemExit("Set DISCORD_BOT_TOKEN environment variable.")
     client.run(TOKEN)
-def _format_leaderboard_lines(guild: discord.Guild, limit: int = 10) -> List[str]:
-    gid = guild.id
-    data = scores.get(str(gid)) or {}
-    arr = []
-    for uid_str in data.keys():
-        uid = int(uid_str)
-        # Skip ineligible members (bots / without configured guild role)
-        if not _is_eligible_for_leaderboard(guild, uid):
-            continue
-        total, _ = _calc_flammenscore(gid, uid)
-        arr.append((total, uid))
-    arr.sort(reverse=True, key=lambda x: x[0])
-    max_total = arr[0][0] if arr else 0.0
-    lines = []
-    for i, (total, uid) in enumerate(arr[:limit], start=1):
-        m = guild.get_member(uid)
-        name = m.display_name if m else f"<@{uid}>"
-        pct = (total / max_total * 100.0) if max_total > 0 else 0.0
-        lines.append(f"{i}. {name} — {pct:.1f}%")
-    return lines
-
