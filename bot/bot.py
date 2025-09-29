@@ -620,7 +620,6 @@ class OnboardView(discord.ui.View):
         self.rules_ok=False
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        # nur der eingeladene User
         return interaction.user.id == self.user_id
 
     @discord.ui.select(placeholder="Wähle deine Primärrolle", min_values=1, max_values=1, options=[
@@ -674,7 +673,6 @@ class OnboardView(discord.ui.View):
             await interaction.response.send_message(f"❌ Rollenvergabe fehlgeschlagen: {e}", ephemeral=True); return
 
         await interaction.response.send_message("🎉 Rollen vergeben. Willkommen!", ephemeral=True)
-        # Öffentlicher Willkommenspost
         welcome_ch_id = int(cfg.get("WELCOME_CHANNEL", 0) or 0)
         if welcome_ch_id:
             ch = guild.get_channel(welcome_ch_id)
@@ -685,7 +683,6 @@ class OnboardView(discord.ui.View):
                                   f"Ab in die Schlacht – die Glut wartet! 🔥")
                 except Exception as e:
                     print("welcome post failed:", e)
-        # View schließen
         self.stop()
 
 async def _send_onboarding_dm(member: discord.Member):
@@ -702,7 +699,6 @@ async def _send_onboarding_dm(member: discord.Member):
         try:
             await member.send(embed=emb, view=view)
         except discord.Forbidden:
-            # DM zu, versuche Fallback: System-Channel falls sichtbar
             if member.guild.system_channel:
                 await member.guild.system_channel.send(
                     f"{member.mention} bitte öffne deine DMs – für das Onboarding habe ich dir soeben geschrieben.")
@@ -749,6 +745,33 @@ async def wf_onboarding_test(inter: discord.Interaction):
     await _send_onboarding_dm(inter.user)
     await inter.response.send_message("✅ DM verschickt (falls erlaubt).", ephemeral=True)
 
+# ======================== Admin: Command-Sync (WICHTIG) ========================
+@tree.command(name="wf_admin_sync", description="(Admin) Befehle für diesen Server sofort synchronisieren.")
+async def wf_admin_sync(inter: discord.Interaction):
+    if not is_admin(inter):
+        await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True); return
+    guild_obj = discord.Object(id=inter.guild_id)
+    try:
+        # Global → Guild spiegeln, dann Guild-sync
+        tree.copy_global_to(guild=guild_obj)
+        synced = await tree.sync(guild=guild_obj)
+        await inter.response.send_message(f"✅ Synced {len(synced)} Commands für diesen Server.", ephemeral=True)
+    except Exception as e:
+        await inter.response.send_message(f"❌ Sync-Fehler: {e}", ephemeral=True)
+
+@tree.command(name="wf_admin_sync_hard", description="(Admin) Harte Neu-Registrierung der Befehle für diesen Server.")
+async def wf_admin_sync_hard(inter: discord.Interaction):
+    if not is_admin(inter):
+        await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True); return
+    guild_obj = discord.Object(id=inter.guild_id)
+    try:
+        tree.clear_commands(guild=guild_obj)
+        tree.copy_global_to(guild=guild_obj)
+        synced = await tree.sync(guild=guild_obj)
+        await inter.response.send_message(f"🧹 Hard-Sync ok. {len(synced)} Commands neu registriert.", ephemeral=True)
+    except Exception as e:
+        await inter.response.send_message(f"❌ Hard-Sync-Fehler: {e}", ephemeral=True)
+
 # ======================== Lifecycle & Scheduler ========================
 def reregister_persistent_views_on_start():
     for msg_id, obj in list(rsvp_store.items()):
@@ -760,10 +783,19 @@ def reregister_persistent_views_on_start():
         except Exception as e:
             print("add_view (RSVP) failed:", e)
 
+async def _sync_all_guilds_now():
+    # Wichtig: Global → Guild spiegeln, damit Befehle sofort erscheinen
+    for g in client.guilds:
+        try:
+            guild_obj = discord.Object(id=g.id)
+            tree.copy_global_to(guild=guild_obj)
+            await tree.sync(guild=guild_obj)
+        except Exception as e:
+            print(f"sync for guild {g.id} failed:", e)
+
 @client.event
 async def on_ready():
     print(f"Logged in as {client.user} (ID: {client.user.id})")
-    # Member-Cache laden
     for g in client.guilds:
         try: await g.chunk()
         except Exception as e: print("guild.chunk() failed:", e)
@@ -771,18 +803,24 @@ async def on_ready():
     reregister_persistent_views_on_start()
     register_rsvp_slash_commands()
 
-    try:
-        for g in client.guilds:
-            await tree.sync(guild=discord.Object(id=g.id))
-        print(f"Synced commands for {len(client.guilds)} guild(s).")
-    except Exception as e:
-        print("Command sync failed:", e)
+    # <<<<<< WICHTIG: Sofortiger Guild-Sync >>>>>>
+    await _sync_all_guilds_now()
+    print(f"Synced commands for {len(client.guilds)} guild(s).")
 
     scheduler_loop.start()
 
 @client.event
+async def on_guild_join(guild: discord.Guild):
+    # Beim Beitreten direkt syncen (sofortige Verfügbarkeit)
+    try:
+        guild_obj = discord.Object(id=guild.id)
+        tree.copy_global_to(guild=guild_obj)
+        await tree.sync(guild=guild_obj)
+    except Exception as e:
+        print("sync on guild_join failed:", e)
+
+@client.event
 async def on_member_join(member: discord.Member):
-    # Bots ignorieren
     if member.bot: return
     await _send_onboarding_dm(member)
 
