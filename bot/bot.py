@@ -5,7 +5,7 @@ import os, json, threading, time, requests
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta, time as time_cls, date as date_cls
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple, Literal
 
 import discord
 from discord import app_commands
@@ -27,10 +27,7 @@ RSVP_CFG_FILE    = DATA_DIR / "event_rsvp_cfg.json"
 SCORE_FILE       = DATA_DIR / "flammenscore.json"
 SCORE_CFG_FILE   = DATA_DIR / "flammenscore_cfg.json"
 SCORE_META_FILE  = DATA_DIR / "flammenscore_meta.json"
-
-# Onboarding-Review + Kanäle
-ONBOARD_META_FILE = DATA_DIR / "onboarding_meta.json"   # {"<gid>":{"welcome_channel_id":int,"staff_channel_id":int}}
-onboard_meta: Dict[str, dict] = {}
+ONBOARD_META_FILE= DATA_DIR / "onboarding_meta.json"   # {"<gid>":{"welcome_channel_id":int,"staff_channel_id":int,"newbie_role_id":int}}
 
 # ======================== Keepalive (Flask) ========================
 app = Flask(__name__)
@@ -63,7 +60,6 @@ intents.guilds = True
 intents.members = True
 intents.message_content = True
 intents.voice_states = True
-
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
@@ -111,7 +107,7 @@ def _in_window(now: datetime, ts: datetime, window_sec: int = 60) -> bool:
     return 0 <= (now - ts).total_seconds() < window_sec
 
 def _ephemeral_ok(inter: discord.Interaction) -> bool:
-    # In DMs sind ephemerals nicht erlaubt → dort False
+    # In DMs sind ephemerals nicht erlaubt
     return inter.guild_id is not None
 
 # ======================== Datenmodelle (Events) ========================
@@ -237,6 +233,10 @@ def is_admin(interaction: discord.Interaction) -> bool:
     perms = getattr(interaction.user, "guild_permissions", None)
     return bool(perms and (perms.administrator or perms.manage_guild))
 
+def _mention(guild: discord.Guild, uid: int) -> str:
+    m = guild.get_member(uid)
+    return m.mention if m else f"<@{uid}>"
+
 # ======================== RSVP / Raid ========================
 def _get_role_ids(guild: discord.Guild) -> Dict[str, int]:
     g = rsvp_cfg.get(str(guild.id)) or {}
@@ -266,10 +266,6 @@ def _set_role_ids(gid: int, tank_id: int, heal_id: int, dps_id: int):
     g["DPS"]  = int(dps_id)
     rsvp_cfg[str(gid)] = g
     _save_rsvp_cfg()
-
-def _mention(guild: discord.Guild, uid: int) -> str:
-    m = guild.get_member(uid)
-    return m.mention if m else f"<@{uid}>"
 
 async def _get_role_member_ids(guild: discord.Guild, role_id: int) -> Set[int]:
     role = guild.get_role(role_id)
@@ -361,7 +357,6 @@ class RaidView(discord.ui.View):
             obj["yes"][group].append(uid)
             txt = f"Angemeldet als **{group}**."
         elif group == "MAYBE":
-            # Label-Fallback anhand Rollenname
             names = [r.name.lower() for r in interaction.user.roles]
             rlab = "Tank" if any("tank" in n for n in names) else ("Heal" if any("heal" in n for n in names) else ("DPS" if any(("dps" in n) or ("dd" in n) for n in names) else ""))
             obj["maybe"][str(uid)] = rlab
@@ -405,93 +400,6 @@ class RaidView(discord.ui.View):
     @discord.ui.button(label="Abmelden", style=discord.ButtonStyle.danger, emoji="❌", custom_id="rsvp_no")
     async def btn_no(self, interaction: discord.Interaction, _):
         await self._update(interaction, "NO")
-
-def register_rsvp_slash_commands():
-    @tree.command(name="raid_set_roles", description="Rollen für Tank/Heal/DPS festlegen (pro Server).")
-    @app_commands.describe(tank_role="Rolle für Tank", heal_role="Rolle für Heal", dps_role="Rolle für DPS")
-    async def raid_set_roles(inter: discord.Interaction, tank_role: discord.Role, heal_role: discord.Role, dps_role: discord.Role):
-        if not is_admin(inter):
-            await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True); return
-        _set_role_ids(inter.guild_id, tank_role.id, heal_role.id, dps_role.id)
-        await inter.response.send_message(
-            f"✅ Gespeichert:\n🛡️ {tank_role.mention}\n💚 {heal_role.mention}\n🗡️ {dps_role.mention}",
-            ephemeral=True
-        )
-
-    @tree.command(name="raid_create", description="Raid-/Event-Anmeldung mit Buttons erstellen.")
-    @app_commands.describe(title="Titel (im Embed)", date="Datum YYYY-MM-DD", time="Zeit HH:MM (24h)",
-                           channel="Zielkanal", image_url="Optionales Bild-URL", description="Zusätzliche Info")
-    async def raid_create(inter: discord.Interaction, title: str, date: str, time: str,
-                          channel: Optional[discord.TextChannel] = None,
-                          image_url: Optional[str] = None, description: Optional[str] = None):
-        if not is_admin(inter):
-            await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True); return
-        try:
-            yyyy, mm, dd = [int(x) for x in date.split("-")]
-            hh, mi = [int(x) for x in time.split(":")]
-            when = datetime(yyyy, mm, dd, hh, mi, tzinfo=TZ)
-        except Exception:
-            await inter.response.send_message("❌ Datum/Zeit ungültig (YYYY-MM-DD / HH:MM).", ephemeral=True); return
-
-        ch = channel or inter.channel
-        obj = {
-            "guild_id": inter.guild_id,
-            "channel_id": ch.id,
-            "title": title.strip(),
-            "description": (description or "").strip(),
-            "when_iso": when.isoformat(),
-            "image_url": (image_url or "").strip() or None,
-            "yes": {"TANK": [], "HEAL": [], "DPS": []},
-            "maybe": {},
-            "no": []
-        }
-        emb = await _build_embed_async(inter.guild, obj)
-        view = RaidView(0)
-        msg = await ch.send(embed=emb, view=view)
-        view.msg_id = str(msg.id)
-        rsvp_store[str(msg.id)] = obj
-        _save_rsvp()
-
-        client.add_view(RaidView(msg.id), message_id=msg.id)
-
-        await inter.response.send_message(f"✅ Raid erstellt: {msg.jump_url}", ephemeral=True)
-
-    @tree.command(name="raid_show", description="Embed/Listen neu aufbauen.")
-    @app_commands.describe(message_id="ID der Raid-Nachricht")
-    async def raid_show(inter: discord.Interaction, message_id: str):
-        if message_id not in rsvp_store:
-            await inter.response.send_message("❌ Unbekannte message_id.", ephemeral=True); return
-        obj = rsvp_store[message_id]
-        emb = await _build_embed_async(inter.guild, obj)
-        ch = inter.guild.get_channel(obj["channel_id"])
-        try:
-            msg = await ch.fetch_message(int(message_id))
-            await msg.edit(embed=emb, view=RaidView(int(message_id)))
-            await inter.response.send_message("✅ Aktualisiert.", ephemeral=True)
-        except Exception as e:
-            await inter.response.send_message(f"❌ Fehler: {e}", ephemeral=True)
-
-    @tree.command(name="raid_close", description="Buttons sperren (nur Admin).")
-    @app_commands.describe(message_id="ID der Raid-Nachricht")
-    async def raid_close(inter: discord.Interaction, message_id: str):
-        if not is_admin(inter):
-            await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True); return
-        if message_id not in rsvp_store:
-            await inter.response.send_message("❌ Unbekannte message_id.", ephemeral=True); return
-        ch = inter.guild.get_channel(rsvp_store[message_id]["channel_id"])
-        try:
-            msg = await ch.fetch_message(int(message_id))
-            await msg.edit(view=None)
-            await inter.response.send_message("🔒 Gesperrt.", ephemeral=True)
-        except Exception as e:
-            await inter.response.send_message(f"❌ Fehler: {e}", ephemeral=True)
-
-    @tree.command(name="raid_set_guildrole", description="Gildenrolle (Mitgliedsrolle) setzen – wird für Quote/Filter & Onboarding genutzt.")
-    async def raid_set_guildrole(inter: discord.Interaction, guild_role: discord.Role):
-        if not is_admin(inter):
-            await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True); return
-        _set_guild_role_id(inter.guild_id, guild_role.id)
-        await inter.response.send_message(f"✅ Gildenrolle gesetzt: {guild_role.mention}", ephemeral=True)
 
 # ======================== Flammenscore ========================
 WEIGHTS_DEFAULT = {
@@ -556,7 +464,6 @@ def _format_leaderboard_lines_simple(guild: discord.Guild, limit: int = 10) -> L
     gid=guild.id; data=scores.get(str(gid)) or {}
     if not data:
         return []
-    # Prozent relativ zur Summe – verhindert „100% trotz anderer Aktivität“
     total_possible = sum(_calc_flammenscore(gid,int(uid))[0] for uid in data.keys())
     total_possible = max(total_possible, 1e-9)
     scored=[]
@@ -620,42 +527,7 @@ async def _monthly_reset_if_due(now: datetime):
         _set_last_reset_ym(guild.id, ym)
         print(f"[Flammenscore] Reset for guild {guild.id} @ {ym}-30")
 
-@tree.command(name="flammenscore_me", description="Zeigt deinen Flammenscore und Rang.")
-async def flammenscore_me(inter: discord.Interaction):
-    gid = inter.guild_id; uid = inter.user.id
-    data = scores.get(str(gid)) or {}
-    arr = []
-    for uid_str in data.keys():
-        u = int(uid_str)
-        tot,_ = _calc_flammenscore(gid,u)
-        arr.append((u,tot))
-    arr.sort(key=lambda t:t[1], reverse=True)
-    pos = next((i for i,(u,_) in enumerate(arr, start=1) if u==uid), 0)
-    my_total = next((tot for u,tot in arr if u==uid), 0.0)
-    _, parts = _calc_flammenscore(gid, uid)
-    lines = [
-        f"**Rang:** {pos}/{len(arr)}" if pos else f"**Rang:** –/{len(arr)}",
-        f"**Score:** {my_total:.1f}",
-        f"• Voice: {parts['voice']:.1f}",
-        f"• Messages: {parts['msg']:.1f}",
-        f"• Reaktionen gegeben: {parts['rg']:.1f}",
-        f"• Reaktionen erhalten: {parts['rr']:.1f}",
-        f"• RSVP: {parts['rsvp']:.1f}",
-    ]
-    await inter.response.send_message("\n".join(lines), ephemeral=True)
-
-@tree.command(name="flammenscore_top", description="Topliste (Platz · Name · %).")
-@app_commands.describe(limit="Anzahl (1–25, Standard 10)")
-async def flammenscore_top(inter: discord.Interaction, limit: Optional[int] = 10):
-    limit = max(1, min(25, limit or 10))
-    lines = _format_leaderboard_lines_simple(inter.guild, limit=limit)
-    if not lines:
-        await inter.response.send_message("Noch keine Daten.", ephemeral=True); return
-    emb = discord.Embed(title="🔥 Flammen – Topliste", description="\n".join(lines), color=discord.Color.orange())
-    await inter.response.send_message(embed=emb, ephemeral=True)
-
-# ======================== ONBOARDING (mit Staff-Review) ========================
-# Speichert Pending-Auswahl bis Staff entscheidet
+# ======================== ONBOARDING (DM + Staff-Review) ========================
 pending_onboarding: Dict[Tuple[int,int], dict] = {}
 
 def _meta_g(gid: int) -> dict:
@@ -668,15 +540,12 @@ def _set_meta(gid: int, **kwargs):
     _save_onboard_meta()
 
 def _get_newbie_role_id(gid: int) -> int:
-    g = rsvp_cfg.get(str(gid)) or {}
-    try: return int(g.get("NEWBIE", 0))
-    except Exception: return 0
-
+    try:
+        return int(_meta_g(gid).get("newbie_role_id", 0))
+    except Exception:
+        return 0
 def _set_newbie_role_id(gid: int, role_id: int):
-    g = rsvp_cfg.get(str(gid)) or {}
-    g["NEWBIE"] = int(role_id)
-    rsvp_cfg[str(gid)] = g
-    _save_rsvp_cfg()
+    _set_meta(gid, newbie_role_id=int(role_id))
 
 class OnboardView(discord.ui.View):
     def __init__(self, guild_id: int, user_id: int):
@@ -721,9 +590,8 @@ class OnboardView(discord.ui.View):
         member = guild.get_member(self.user_id) or await guild.fetch_member(self.user_id)
         choice = self.primary  # "DD"|"Tank"|"Heal"
         experienced = (self.exp == "Erfahren")
-        # in Queue packen + Staff-Review posten
         await _queue_onboarding_review(guild, member, choice, experienced)
-        await interaction.response.send_message("Danke! Die Gildenleitung prüft kurz deine Angaben. Du bekommst gleich Zugriff, sobald bestätigt. ✋", ephemeral=_ephemeral_ok(interaction))
+        await interaction.response.send_message("Danke! Die Gildenleitung prüft kurz deine Angaben. ✋", ephemeral=_ephemeral_ok(interaction))
         self.stop()
 
 async def _send_onboarding_dm(member: discord.Member):
@@ -738,7 +606,6 @@ async def _send_onboarding_dm(member: discord.Member):
     try:
         await member.send(embed=emb, view=view)
     except discord.Forbidden:
-        # Fallback-Hinweis im Systemkanal (falls sichtbar)
         if member.guild.system_channel:
             try:
                 await member.guild.system_channel.send(
@@ -747,17 +614,16 @@ async def _send_onboarding_dm(member: discord.Member):
                 pass
 
 async def _finalize_onboarding(member: discord.Member, choice: str, experienced: bool):
-    """Vergibt Rollen + sendet Willkommenspost. choice: 'DD'|'Tank'|'Heal'"""
     gid = member.guild.id
     roles_to_add: List[discord.Role] = []
 
-    # Gildenrolle (Weiße Flamme)
+    # Gildenrolle
     guild_role_id = _get_guild_role_filter_id(gid)
     if guild_role_id:
         r = member.guild.get_role(guild_role_id)
         if r: roles_to_add.append(r)
 
-    # Klassenrolle aus rsvp_cfg (DPS/TANK/HEAL)
+    # Klassenrolle
     rid_map = _get_role_ids(member.guild)  # {"TANK":id, "HEAL":id, "DPS":id}
     key = "DPS" if choice == "DD" else ("TANK" if choice == "Tank" else "HEAL")
     role_id = rid_map.get(key) or 0
@@ -828,9 +694,6 @@ class _OnboardReviewView(discord.ui.View):
         if not self._allowed(inter):
             await inter.response.send_message("❌ Keine Berechtigung.", ephemeral=True); return
         pending_onboarding.pop((self.gid, self.uid), None)
-        # Optional: Kick
-        # try: await inter.guild.kick(discord.Object(id=self.uid), reason="Onboarding abgelehnt")
-        # except Exception: pass
         await inter.response.send_message("🛑 Abgelehnt.", ephemeral=True)
         await self._close(inter, "Abgelehnt")
 
@@ -840,7 +703,7 @@ async def _queue_onboarding_review(guild: discord.Guild, member: discord.Member,
     sc_id = int(meta.get("staff_channel_id", 0) or 0)
     ch = guild.get_channel(sc_id) if sc_id else None
     if not isinstance(ch, discord.TextChannel):
-        print(f"[onboarding] Kein Staff-Channel gesetzt. Nutze /wf_set_staff_channel.")
+        print(f"[onboarding] Kein Staff-Channel gesetzt. Nutze das Admin-Menü (⚙️) → Staff-Channel.")
         return
     lines = [
         f"👤 **User:** {member.mention} (`{member.id}`)",
@@ -857,69 +720,301 @@ async def _queue_onboarding_review(guild: discord.Guild, member: discord.Member,
     except Exception as e:
         print("queue review failed:", e)
 
-# ---- Onboarding-Admin-Befehle ----
-@tree.command(name="wf_set_welcome_channel", description="Kanal für öffentliche Begrüßung setzen.")
+# ======================== UI: Button-Menüs ========================
+# --- Hilfs-Embeds ---
+def hub_embed(guild: discord.Guild) -> discord.Embed:
+    e = discord.Embed(
+        title="Weiße Flamme – Hub",
+        description=(
+            "Wähle unten aus.\n\n"
+            "• **🏆 Flammenscore** – Mein Score / Topliste\n"
+            "• **📅 Events** – Raid/RSVP erstellen & Rollen setzen (Admin)\n"
+            "• **🧭 Onboarding** – Kanäle/Rollen & Test-DM (Admin)\n"
+            "• **⚙️ Admin** – Sync & Tools\n"
+            "• **🎮 WF-Spielwelt** – *bald*\n"
+        ),
+        color=discord.Color.orange()
+    )
+    return e
+
+def score_embed_intro() -> discord.Embed:
+    return discord.Embed(title="🏆 Flammenscore", description="Wähle:", color=discord.Color.orange())
+
+def events_embed_intro() -> discord.Embed:
+    return discord.Embed(title="📅 Events", description="Erstellen/Verwalten (nur Admin).", color=discord.Color.blurple())
+
+def onboard_embed_intro() -> discord.Embed:
+    return discord.Embed(title="🧭 Onboarding", description="Rollen & Kanäle setzen, Test-DM.", color=discord.Color.green())
+
+def admin_embed_intro() -> discord.Embed:
+    return discord.Embed(title="⚙️ Admin-Tools", description="Sync & Hilfen.", color=discord.Color.dark_grey())
+
+# --- Views ---
+class HubView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="WF-Spielwelt", emoji="🎮", style=discord.ButtonStyle.secondary, custom_id="hub_game_disabled")
+    async def game_soon(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        await inter.response.send_message("Kommt bald. 😉", ephemeral=True)
+
+    @discord.ui.button(label="Flammenscore", emoji="🏆", style=discord.ButtonStyle.primary, custom_id="hub_score")
+    async def score(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        await inter.response.edit_message(embed=score_embed_intro(), view=ScoreView())
+
+    @discord.ui.button(label="Events", emoji="📅", style=discord.ButtonStyle.primary, custom_id="hub_events")
+    async def events(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        if not is_admin(inter):
+            await inter.response.send_message("Nur Admin/Manage Server.", ephemeral=True); return
+        await inter.response.edit_message(embed=events_embed_intro(), view=EventsView())
+
+    @discord.ui.button(label="Onboarding", emoji="🧭", style=discord.ButtonStyle.primary, custom_id="hub_onboard")
+    async def onboard(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        if not is_admin(inter):
+            await inter.response.send_message("Nur Admin/Manage Server.", ephemeral=True); return
+        await inter.response.edit_message(embed=onboard_embed_intro(), view=OnboardAdminView())
+
+    @discord.ui.button(label="Admin", emoji="⚙️", style=discord.ButtonStyle.secondary, custom_id="hub_admin")
+    async def admin(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        if not is_admin(inter):
+            await inter.response.send_message("Nur Admin/Manage Server.", ephemeral=True); return
+        await inter.response.edit_message(embed=admin_embed_intro(), view=AdminToolsView())
+
+class BackToHubMixin:
+    @discord.ui.button(label="Zurück", emoji="⬅️", style=discord.ButtonStyle.secondary, row=4, custom_id="back_hub")
+    async def back(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        await inter.response.edit_message(embed=hub_embed(inter.guild), view=HubView())
+
+class ScoreView(discord.ui.View, BackToHubMixin):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Mein Score", emoji="👤", style=discord.ButtonStyle.primary)
+    async def my_score(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        gid = inter.guild_id; uid = inter.user.id
+        data = scores.get(str(gid)) or {}
+        arr = []
+        for uid_str in data.keys():
+            u = int(uid_str); tot,_ = _calc_flammenscore(gid,u)
+            arr.append((u,tot))
+        arr.sort(key=lambda t:t[1], reverse=True)
+        pos = next((i for i,(u,_) in enumerate(arr, start=1) if u==uid), 0)
+        my_total = next((tot for u,tot in arr if u==uid), 0.0)
+        _, parts = _calc_flammenscore(gid, uid)
+        lines = [
+            f"**Rang:** {pos}/{len(arr)}" if pos else f"**Rang:** –/{len(arr)}",
+            f"**Score:** {my_total:.1f}",
+            f"• Voice: {parts['voice']:.1f}",
+            f"• Messages: {parts['msg']:.1f}",
+            f"• Reaktionen gegeben: {parts['rg']:.1f}",
+            f"• Reaktionen erhalten: {parts['rr']:.1f}",
+            f"• RSVP: {parts['rsvp']:.1f}",
+        ]
+        await inter.response.send_message("\n".join(lines), ephemeral=True)
+
+    @discord.ui.button(label="Topliste (Top 10)", emoji="🏅", style=discord.ButtonStyle.secondary)
+    async def top(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        lines = _format_leaderboard_lines_simple(inter.guild, limit=10)
+        if not lines:
+            await inter.response.send_message("Noch keine Daten.", ephemeral=True); return
+        emb = discord.Embed(title="🔥 Flammen – Topliste", description="\n".join(lines), color=discord.Color.orange())
+        await inter.response.send_message(embed=emb, ephemeral=True)
+
+class CreateRaidModal(discord.ui.Modal, title="Raid/Event erstellen"):
+    def __init__(self, channel_id: int | None = None):
+        super().__init__()
+        self._channel_id = channel_id
+        self.title_in = discord.ui.TextInput(label="Titel", placeholder="z.B. Raid heute Abend", max_length=100)
+        self.date_in  = discord.ui.TextInput(label="Datum (YYYY-MM-DD)", placeholder="2025-09-30")
+        self.time_in  = discord.ui.TextInput(label="Zeit (HH:MM 24h)", placeholder="20:00")
+        self.desc_in  = discord.ui.TextInput(label="Beschreibung (optional)", style=discord.TextStyle.paragraph, required=False, max_length=400)
+        self.img_in   = discord.ui.TextInput(label="Bild-URL (optional)", required=False)
+        self.add_item(self.title_in); self.add_item(self.date_in); self.add_item(self.time_in); self.add_item(self.desc_in); self.add_item(self.img_in)
+
+    async def on_submit(self, inter: discord.Interaction):
+        if not is_admin(inter):
+            await inter.response.send_message("Nur Admin/Manage Server.", ephemeral=True); return
+        try:
+            yyyy, mm, dd = [int(x) for x in str(self.date_in).split("-")]
+            hh, mi = [int(x) for x in str(self.time_in).split(":")]
+            when = datetime(yyyy, mm, dd, hh, mi, tzinfo=TZ)
+        except Exception:
+            await inter.response.send_message("❌ Datum/Zeit ungültig (YYYY-MM-DD / HH:MM).", ephemeral=True); return
+
+        ch = inter.channel if self._channel_id is None else inter.guild.get_channel(self._channel_id)
+        if not isinstance(ch, discord.TextChannel):
+            await inter.response.send_message("❌ Zielkanal ungültig.", ephemeral=True); return
+
+        obj = {
+            "guild_id": inter.guild_id,
+            "channel_id": ch.id,
+            "title": str(self.title_in).strip(),
+            "description": str(self.desc_in).strip(),
+            "when_iso": when.isoformat(),
+            "image_url": (str(self.img_in).strip() or None),
+            "yes": {"TANK": [], "HEAL": [], "DPS": []},
+            "maybe": {},
+            "no": []
+        }
+        emb = await _build_embed_async(inter.guild, obj)
+        view = RaidView(0)
+        msg = await ch.send(embed=emb, view=view)
+        view.msg_id = str(msg.id)
+        rsvp_store[str(msg.id)] = obj
+        _save_rsvp()
+
+        client.add_view(RaidView(msg.id), message_id=msg.id)
+        await inter.response.send_message(f"✅ Raid erstellt: {msg.jump_url}", ephemeral=True)
+
+class PickTextChannelView(discord.ui.View, BackToHubMixin):
+    def __init__(self, meta_key: Literal["welcome_channel_id","staff_channel_id"]):
+        super().__init__(timeout=120)
+        self.meta_key = meta_key
+
+    @discord.ui.channel_select(channel_types=[discord.ChannelType.text], placeholder="Kanal wählen")
+    async def choose(self, inter: discord.Interaction, select: discord.ui.ChannelSelect):
+        ch: discord.abc.GuildChannel = select.values[0]
+        _set_meta(inter.guild_id, **{self.meta_key: ch.id})
+        label = "Willkommens-Kanal" if self.meta_key=="welcome_channel_id" else "Staff-Review-Kanal"
+        await inter.response.send_message(f"✅ {label}: {ch.mention}", ephemeral=True)
+
+class PickRoleView(discord.ui.View, BackToHubMixin):
+    def __init__(self, mode: Literal["guild","tank","heal","dps","newbie"]):
+        super().__init__(timeout=120)
+        self.mode = mode
+
+    @discord.ui.role_select(placeholder="Rolle wählen", min_values=1, max_values=1)
+    async def choose(self, inter: discord.Interaction, select: discord.ui.RoleSelect):
+        r: discord.Role = select.values[0]
+        gid = inter.guild_id
+        if self.mode=="guild":
+            _set_guild_role_id(gid, r.id)
+            await inter.response.send_message(f"✅ Mitgliedsrolle gesetzt: {r.mention}", ephemeral=True); return
+        if self.mode=="newbie":
+            _set_newbie_role_id(gid, r.id)
+            await inter.response.send_message(f"✅ NEWBIE-Rolle gesetzt: {r.mention}", ephemeral=True); return
+        # tank/heal/dps
+        cur = _get_role_ids(inter.guild)
+        if self.mode=="tank": cur["TANK"]=r.id
+        elif self.mode=="heal": cur["HEAL"]=r.id
+        elif self.mode=="dps": cur["DPS"]=r.id
+        _set_role_ids(gid, cur["TANK"], cur["HEAL"], cur["DPS"])
+        await inter.response.send_message("✅ Rollen verknüpft.", ephemeral=True)
+
+class EventsView(discord.ui.View, BackToHubMixin):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def interaction_check(self, inter: discord.Interaction) -> bool:
+        if not is_admin(inter):
+            await inter.response.send_message("Nur Admin/Manage Server.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Raid erstellen", emoji="📝", style=discord.ButtonStyle.primary)
+    async def create(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        await inter.response.send_modal(CreateRaidModal())
+
+    @discord.ui.button(label="Tank-Rolle setzen", emoji="🛡️", style=discord.ButtonStyle.secondary, row=1)
+    async def set_tank(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        await inter.response.edit_message(embed=events_embed_intro().set_footer(text="Wähle Tank-Rolle"), view=PickRoleView("tank"))
+
+    @discord.ui.button(label="Heal-Rolle setzen", emoji="💚", style=discord.ButtonStyle.secondary, row=1)
+    async def set_heal(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        await inter.response.edit_message(embed=events_embed_intro().set_footer(text="Wähle Heal-Rolle"), view=PickRoleView("heal"))
+
+    @discord.ui.button(label="DPS-Rolle setzen", emoji="🗡️", style=discord.ButtonStyle.secondary, row=1)
+    async def set_dps(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        await inter.response.edit_message(embed=events_embed_intro().set_footer(text="Wähle DPS-Rolle"), view=PickRoleView("dps"))
+
+    @discord.ui.button(label="Mitgliedsrolle (WF) setzen", emoji="🏰", style=discord.ButtonStyle.secondary, row=2)
+    async def set_guildrole(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        await inter.response.edit_message(embed=events_embed_intro().set_footer(text="Wähle Mitgliedsrolle"), view=PickRoleView("guild"))
+
+class OnboardAdminView(discord.ui.View, BackToHubMixin):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def interaction_check(self, inter: discord.Interaction) -> bool:
+        if not is_admin(inter):
+            await inter.response.send_message("Nur Admin/Manage Server.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Willkommens-Kanal", emoji="📣", style=discord.ButtonStyle.secondary)
+    async def set_welcome(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        await inter.response.edit_message(embed=onboard_embed_intro().set_footer(text="Kanal wählen"), view=PickTextChannelView("welcome_channel_id"))
+
+    @discord.ui.button(label="Staff-Review-Kanal", emoji="🛡️", style=discord.ButtonStyle.secondary)
+    async def set_staff(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        await inter.response.edit_message(embed=onboard_embed_intro().set_footer(text="Kanal wählen"), view=PickTextChannelView("staff_channel_id"))
+
+    @discord.ui.button(label="NEWBIE-Rolle", emoji="🌱", style=discord.ButtonStyle.secondary)
+    async def set_newbie(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        await inter.response.edit_message(embed=onboard_embed_intro().set_footer(text="Rolle wählen"), view=PickRoleView("newbie"))
+
+    @discord.ui.button(label="Onboarding Test-DM", emoji="✉️", style=discord.ButtonStyle.primary)
+    async def test_dm(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        await _send_onboarding_dm(inter.user)
+        await inter.response.send_message("✅ DM verschickt (falls DMs offen).", ephemeral=True)
+
+class AdminToolsView(discord.ui.View, BackToHubMixin):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def interaction_check(self, inter: discord.Interaction) -> bool:
+        if not is_admin(inter):
+            await inter.response.send_message("Nur Admin/Manage Server.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Commands Sync", emoji="🔁", style=discord.ButtonStyle.secondary)
+    async def sync(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        try:
+            guild_obj = discord.Object(id=inter.guild_id)
+            tree.copy_global_to(guild=guild_obj)
+            await tree.sync(guild=guild_obj)
+            await inter.response.send_message("✅ Commands synchronisiert.", ephemeral=True)
+        except Exception as e:
+            await inter.response.send_message(f"❌ Sync-Fehler: {e}", ephemeral=True)
+
+# ======================== Slash-Command: Hub spawnen ========================
+@tree.command(name="wf", description="Weiße Flamme – Menü anzeigen")
+async def wf(inter: discord.Interaction):
+    await inter.response.send_message(embed=hub_embed(inter.guild), view=HubView())
+
+# (Fallbacks – optional benutzbar, aber durch Buttons ersetzt)
+@tree.command(name="wf_set_welcome_channel", description="(Fallback) Kanal für öffentliche Begrüßung setzen.")
 async def wf_set_welcome_channel(inter: discord.Interaction, channel: discord.TextChannel):
-    if not is_admin(inter):
-        await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True); return
+    if not is_admin(inter): await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True); return
     _set_meta(inter.guild_id, welcome_channel_id=channel.id)
     await inter.response.send_message(f"✅ Willkommens-Kanal: {channel.mention}", ephemeral=True)
 
-@tree.command(name="wf_set_staff_channel", description="Kanal für Onboarding-Review (✅/❌) setzen.")
+@tree.command(name="wf_set_staff_channel", description="(Fallback) Kanal für Onboarding-Review setzen.")
 async def wf_set_staff_channel(inter: discord.Interaction, channel: discord.TextChannel):
-    if not is_admin(inter):
-        await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True); return
+    if not is_admin(inter): await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True); return
     _set_meta(inter.guild_id, staff_channel_id=channel.id)
     await inter.response.send_message(f"✅ Staff-Review-Kanal: {channel.mention}", ephemeral=True)
 
-@tree.command(name="wf_onboarding_set_newbie_role", description="NEWBIE-Rolle (optional) setzen.")
+@tree.command(name="wf_onboarding_set_newbie_role", description="(Fallback) NEWBIE-Rolle setzen.")
 async def wf_onboarding_set_newbie_role(inter: discord.Interaction, role: discord.Role):
-    if not is_admin(inter):
-        await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True); return
+    if not is_admin(inter): await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True); return
     _set_newbie_role_id(inter.guild_id, role.id)
     await inter.response.send_message(f"✅ NEWBIE-Rolle: {role.mention}", ephemeral=True)
 
-@tree.command(name="wf_onboarding_link", description="Vorhandene Rollen verknüpfen (Weiße Flamme + Tank/Heal/DPS).")
-@app_commands.describe(wf="Mitgliedsrolle (Weiße Flamme)", tank="Tank-Rolle", heal="Heal-Rolle", dps="DPS/DD-Rolle")
+@tree.command(name="wf_onboarding_link", description="(Fallback) Rollen verknüpfen (WF + Tank/Heal/DPS).")
+@app_commands.describe(wf="Mitgliedsrolle", tank="Tank", heal="Heal", dps="DPS/DD")
 async def wf_onboarding_link(inter: discord.Interaction, wf: discord.Role, tank: discord.Role, heal: discord.Role, dps: discord.Role):
-    if not is_admin(inter):
-        await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True); return
+    if not is_admin(inter): await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True); return
     _set_guild_role_id(inter.guild_id, wf.id)
     _set_role_ids(inter.guild_id, tank.id, heal.id, dps.id)
     await inter.response.send_message("✅ Verknüpft.", ephemeral=True)
 
-@tree.command(name="wf_onboarding_test", description="Onboarding-DM an dich schicken (Test).")
+@tree.command(name="wf_onboarding_test", description="(Fallback) Onboarding-DM Test")
 async def wf_onboarding_test(inter: discord.Interaction):
-    if not is_admin(inter):
-        await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True); return
+    if not is_admin(inter): await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True); return
     await _send_onboarding_dm(inter.user)
     await inter.response.send_message("✅ DM verschickt (falls DMs offen).", ephemeral=True)
-
-# ======================== Admin: Command-Sync ========================
-@tree.command(name="wf_admin_sync", description="(Admin) Befehle für diesen Server sofort synchronisieren.")
-async def wf_admin_sync(inter: discord.Interaction):
-    if not is_admin(inter):
-        await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True); return
-    guild_obj = discord.Object(id=inter.guild_id)
-    try:
-        tree.copy_global_to(guild=guild_obj)
-        synced = await tree.sync(guild=guild_obj)
-        await inter.response.send_message(f"✅ Synced {len(synced)} Commands.", ephemeral=True)
-    except Exception as e:
-        await inter.response.send_message(f"❌ Sync-Fehler: {e}", ephemeral=True)
-
-@tree.command(name="wf_admin_sync_hard", description="(Admin) Harte Neu-Registrierung der Befehle für diesen Server.")
-async def wf_admin_sync_hard(inter: discord.Interaction):
-    if not is_admin(inter):
-        await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True); return
-    guild_obj = discord.Object(id=inter.guild_id)
-    try:
-        tree.clear_commands(guild=guild_obj)
-        tree.copy_global_to(guild=guild_obj)
-        synced = await tree.sync(guild=guild_obj)
-        await inter.response.send_message(f"🧹 Hard-Sync ok. {len(synced)} Commands neu registriert.", ephemeral=True)
-    except Exception as e:
-        await inter.response.send_message(f"❌ Hard-Sync-Fehler: {e}", ephemeral=True)
 
 # ======================== Lifecycle & Scheduler ========================
 def reregister_persistent_views_on_start():
@@ -945,7 +1040,6 @@ async def _sync_all_guilds_now():
 async def on_ready():
     print(f"Logged in as {client.user} (ID: {client.user.id})")
 
-    # Member-Cache laden (für role.members / get_member)
     for g in client.guilds:
         try:
             await g.chunk()
@@ -953,9 +1047,6 @@ async def on_ready():
             print("guild.chunk() failed:", e)
 
     reregister_persistent_views_on_start()
-    register_rsvp_slash_commands()
-
-    # Sofortiger Guild-Sync
     await _sync_all_guilds_now()
     print(f"Synced commands for {len(client.guilds)} guild(s).")
 
@@ -1056,10 +1147,8 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
         return
     if payload.user_id == client.user.id:
         return
-    # gegeben
     b = _score_bucket(payload.guild_id, payload.user_id)
     b["reacts_given"] += 1
-    # erhalten
     author_id = message_author_cache.get(payload.message_id)
     if author_id is None:
         try:
@@ -1081,11 +1170,9 @@ async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
         return
     if payload.user_id == client.user.id:
         return
-    # gegeben
     b = _score_bucket(payload.guild_id, payload.user_id)
     if b["reacts_given"] > 0:
         b["reacts_given"] -= 1
-    # erhalten
     author_id = message_author_cache.get(payload.message_id)
     if author_id is None:
         try:
