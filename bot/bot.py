@@ -181,7 +181,7 @@ class GuildConfig:
             events=evs,
         )
 
-# ======================== Persistenz (bestehend) ========================
+# ======================== Persistenz ========================
 rsvp_store: Dict[str, dict] = _load_json(RSVP_STORE_FILE, {})
 rsvp_cfg:   Dict[str, dict] = _load_json(RSVP_CFG_FILE, {})
 scores:     Dict[str, dict] = _load_json(SCORE_FILE, {})      # {gid:{uid:{...}}}
@@ -774,19 +774,22 @@ def register_core_commands():
         emb.description = table
         await inter.response.send_message(embed=emb, ephemeral=True)
 
-    # ---- Admin: sauberer Guild-Sync ----
-    @tree.command(name="wf_admin_sync", description="Befehle in diesem Server sauber neu syncen.")
+    # ---- Admin Sync ----
+    @tree.command(name="wf_admin_sync", description="Befehle in diesem Server neu syncen.")
     async def wf_admin_sync(inter: discord.Interaction):
         if not is_admin(inter):
             await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True); return
-        await inter.response.defer(ephemeral=True, thinking=True)
-        try:
-            guild_obj = discord.Object(id=inter.guild_id)
-            tree.clear_commands(guild=guild_obj)
-            await tree.sync(guild=guild_obj)
-            await inter.followup.send("✅ Guild-Sync erledigt.", ephemeral=True)
-        except Exception as e:
-            await inter.followup.send(f"❌ Sync-Fehler: {e}", ephemeral=True)
+        await tree.sync(guild=discord.Object(id=inter.guild_id))
+        await inter.response.send_message("✅ Guild-Sync erledigt.", ephemeral=True)
+
+    @tree.command(name="wf_admin_sync_hard", description="Harter Re-Sync (löscht & lädt für diese Guild).")
+    async def wf_admin_sync_hard(inter: discord.Interaction):
+        if not is_admin(inter):
+            await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True); return
+        guild_obj = discord.Object(id=inter.guild_id)
+        tree.clear_commands(guild=guild_obj)
+        await tree.sync(guild=guild_obj)
+        await inter.response.send_message("✅ Hart gesynct.", ephemeral=True)
 
 # ======================== ONBOARDING ========================
 
@@ -948,8 +951,8 @@ async def _onb_rules_ok(interaction: discord.Interaction):
     _onb_set_user(guild.id, user.id, step="done", finished_iso=_now().isoformat())
     emb = _onb_embed(
         "Onboarding abgeschlossen",
-        f"Rollen gesetzt: **Weiße Flamme**, **{details.get('role_name','—')}**" +
-        (" und **NEWBIE**" if details.get("newbie_given") else "") + ". Viel Spaß!"
+        f"Rollen gesetzt: **Weiße Flamme**, **{details.get('role_name','—')}**"
+        + (" und **NEWBIE**" if details.get("newbie_given") else "") + ". Viel Spaß!"
     )
     await interaction.response.edit_message(embed=emb, view=None)
     await _onb_staff_log(guild, user, details, ok)
@@ -1056,18 +1059,13 @@ async def _ensure_role(guild: discord.Guild, name: str, color: Optional[discord.
     r = discord.utils.get(guild.roles, name=name)
     if r:
         return r
-    try:
-        r = await guild.create_role(
-            name=name,
-            color=color or discord.Color.default(),
-            mentionable=mentionable,
-            reason="Onboarding bootstrap"
-        )
-        return r
-    except discord.Forbidden:
-        raise
-    except Exception:
-        raise
+    r = await guild.create_role(
+        name=name,
+        color=color or discord.Color.default(),
+        mentionable=mentionable,
+        reason="Onboarding bootstrap"
+    )
+    return r
 
 def register_onboarding_commands():
     def _adm(inter: discord.Interaction) -> bool:
@@ -1222,23 +1220,17 @@ async def on_member_join(member: discord.Member):
 @client.event
 async def on_ready():
     print(f"Logged in as {client.user} (ID: {client.user.id})")
+    # Member-Cache
     for g in client.guilds:
         try: await g.chunk()
         except Exception as e: print("guild.chunk() failed:", e)
 
-    try:
-        tree.clear_commands(); await tree.sync()
-        for g in client.guilds:
-            guild_obj = discord.Object(id=g.id)
-            tree.clear_commands(guild=guild_obj)
-            await tree.sync(guild=guild_obj)
-    except Exception as e:
-        print("Initial prune failed:", e)
-
+    # Befehle registrieren
     register_core_commands()
     register_rsvp_slash_commands()
     register_onboarding_commands()
 
+    # pro Guild syncen
     try:
         for g in client.guilds:
             await tree.sync(guild=discord.Object(id=g.id))
