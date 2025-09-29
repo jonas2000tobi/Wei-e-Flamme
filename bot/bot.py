@@ -6,7 +6,7 @@ from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta, time as time_cls, date as date_cls
 from calendar import monthrange
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple, Any
+from typing import Dict, List, Optional, Set, Tuple
 
 import discord
 from discord import app_commands
@@ -28,10 +28,7 @@ RSVP_CFG_FILE    = DATA_DIR / "event_rsvp_cfg.json"
 SCORE_FILE       = DATA_DIR / "flammenscore.json"
 SCORE_CFG_FILE   = DATA_DIR / "flammenscore_cfg.json"
 SCORE_META_FILE  = DATA_DIR / "flammenscore_meta.json"
-
-# Onboarding Dateien
-ONB_CFG_FILE   = DATA_DIR / "onboarding_cfg.json"   # Rollen/Kanäle/URL/Toggle
-ONB_STATE_FILE = DATA_DIR / "onboarding.json"       # User-States je Guild
+ONBOARD_CFG_FILE = DATA_DIR / "onboarding_cfg.json"   # NEU
 
 # ======================== Keepalive (Flask) ========================
 app = Flask(__name__)
@@ -67,9 +64,6 @@ intents.voice_states = True
 
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
-
-# prevent duplicate registration on reconnects
-_COMMANDS_REGISTERED = False
 
 # ======================== Parser / Utils ========================
 DOW_MAP = {
@@ -113,15 +107,6 @@ def _now() -> datetime:
 
 def _in_window(now: datetime, ts: datetime, window_sec: int = 60) -> bool:
     return 0 <= (now - ts).total_seconds() < window_sec
-
-def _load_json(p: Path, default):
-    try:
-        return json.loads(p.read_text(encoding="utf-8"))
-    except Exception:
-        return default
-
-def _save_json(p: Path, obj):
-    p.write_text(json.dumps(obj, indent=2, ensure_ascii=False), encoding="utf-8")
 
 # ======================== Datenmodelle (Events) ========================
 @dataclass
@@ -185,17 +170,29 @@ class GuildConfig:
         )
 
 # ======================== Persistenz ========================
+def _load_json(p: Path, default):
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return default
+
+def _save_json(p: Path, obj):
+    p.write_text(json.dumps(obj, indent=2, ensure_ascii=False), encoding="utf-8")
+
+# RSVP / Score Stores
 rsvp_store: Dict[str, dict] = _load_json(RSVP_STORE_FILE, {})
 rsvp_cfg:   Dict[str, dict] = _load_json(RSVP_CFG_FILE, {})
 scores:     Dict[str, dict] = _load_json(SCORE_FILE, {})      # {gid:{uid:{...}}}
 score_cfg:  Dict[str, dict] = _load_json(SCORE_CFG_FILE, {})  # {gid:{weights...}}
 score_meta: Dict[str, dict] = _load_json(SCORE_META_FILE, {}) # {gid:{last_reset_ym:"YYYY-MM"}}
+onboard_cfg: Dict[str, dict] = _load_json(ONBOARD_CFG_FILE, {}) # {gid:{ROLE_WF:.., ROLE_TANK:.., ... WELCOME_CHANNEL:..}}
 
 def _save_rsvp():       _save_json(RSVP_STORE_FILE, rsvp_store)
 def _save_rsvp_cfg():   _save_json(RSVP_CFG_FILE, rsvp_cfg)
 def _save_scores():     _save_json(SCORE_FILE, scores)
 def _save_score_cfg():  _save_json(SCORE_CFG_FILE, score_cfg)
 def _save_score_meta(): _save_json(SCORE_META_FILE, score_meta)
+def _save_onboard():    _save_json(ONBOARD_CFG_FILE, onboard_cfg)
 
 configs: Dict[int, GuildConfig] = (lambda: {int(g): GuildConfig.from_dict(c) for g,c in (_load_json(CFG_FILE, {}) or {}).items()})()
 post_log: Set[str] = set(_load_json(POST_LOG_FILE, []))
@@ -475,841 +472,304 @@ def _score_bucket(gid: int, uid: int) -> dict:
 def _calc_flammenscore(gid: int, uid: int) -> Tuple[float, Dict[str,float]]:
     u=_score_bucket(gid,uid); w=_guild_weights(gid)
     voice_min=u["voice_ms"]/60000.0
-    parts={"voice":voice_min*w["voice_min"],"msg":u["messages"]*w["message"],
-           "rg":u["reacts_given"]*w["react_given"],"rr":u["reacts_recv"]*w["react_recv"],"rsvp":u["rsvp"]*w["rsvp"]}
+    parts={
+        "voice": voice_min*w["voice_min"],
+        "msg":   u["messages"]*w["message"],
+        "rg":    u["reacts_given"]*w["react_given"],
+        "rr":    u["reacts_recv"]*w["react_recv"],
+        "rsvp":  u["rsvp"]*w["rsvp"],
+    }
     return sum(parts.values()), parts
 
-# ---- Voice-Counting per Poll (robust) ----
-voice_last_seen: Dict[Tuple[int,int], datetime] = {}
+# Voice sessions (join/leave)
+voice_sessions: Dict[Tuple[int,int], datetime] = {}
+def _voice_start(gid: int, uid: int): voice_sessions[(gid,uid)] = _now()
+def _voice_end(gid: int, uid: int):
+    key=(gid,uid); start=voice_sessions.pop(key, None)
+    if start:
+        delta_ms = int((_now()-start).total_seconds()*1000)
+        b=_score_bucket(gid,uid); b["voice_ms"] += max(0, delta_ms); _save_scores()
 
-def _render_top_table(guild: discord.Guild, limit: int = 10) -> str:
-    gid = guild.id
-    data = scores.get(str(gid)) or {}
+# Message author cache for reaction "received"
+message_author_cache: Dict[int,int] = {}
 
-    gr_id = _get_guild_role_filter_id(gid)
-    gr = guild.get_role(gr_id) if gr_id else None
+def _cache_author(message_id: int, author_id: int, cap: int = 2000):
+    if len(message_author_cache) >= cap:
+        message_author_cache.pop(next(iter(message_author_cache)))
+    message_author_cache[message_id] = author_id
 
-    entries: List[Tuple[float,int]] = []
+def _format_leaderboard_lines_simple(guild: discord.Guild, limit: int = 10) -> List[str]:
+    gid=guild.id; data=scores.get(str(gid)) or {}
+    scored=[]
+    total_possible = max(1.0, sum(_calc_flammenscore(gid,int(uid))[0] for uid in data.keys()))
     for uid_str in data.keys():
-        uid = int(uid_str)
-        m = guild.get_member(uid)
-        if not m or m.bot:
-            continue
-        if gr and gr not in m.roles:
-            continue
-        total, _ = _calc_flammenscore(gid, uid)
-        if total <= 0:
-            continue
-        entries.append((total, uid))
+        uid=int(uid_str); total,_=_calc_flammenscore(gid,uid)
+        scored.append((uid, total))
+    scored.sort(key=lambda t: t[1], reverse=True)
+    lines=[]
+    for i,(uid,total) in enumerate(scored[:limit], start=1):
+        m=guild.get_member(uid); name=m.display_name if m else f"<@{uid}>"
+        pct = 0.0 if total_possible<=0 else (total/total_possible)*100.0
+        lines.append(f"{i}. {name} — {pct:.1f}%")
+    return lines
 
-    if not entries:
-        return "Noch keine Daten."
-
-    entries.sort(reverse=True, key=lambda x: x[0])
-    total_sum = sum(t for t, _ in entries) or 1.0
-
-    show = entries[:limit]
-    names = [(guild.get_member(uid).display_name if guild.get_member(uid) else f"<@{uid}>") for _, uid in show]
-    name_w = max(6, min(28, max(len(n) for n in names)))
-
-    header = f"{'#':>2}  {'Name':<{name_w}}  {'Flammen':>8}"
-    sep = "-" * len(header)
-    lines = [header, sep]
-    for i, ((t, uid), name) in enumerate(zip(show, names), start=1):
-        pct = (t / total_sum) * 100.0
-        lines.append(f"{i:>2}  {name[:name_w]:<{name_w}}  {pct:>6.1f}%")
-
-    return "```\n" + "\n".join(lines) + "\n```"
-
-# ======================== Scheduler ========================
-@tasks.loop(seconds=30.0)
-async def scheduler_loop():
-    now = _now().replace(second=0, microsecond=0)
-
-    # 0) Voice: poll alle Channels und addiere Delta
-    changed=False
-    present=set()
-    for g in client.guilds:
-        chans=list(g.voice_channels)
-        stage = getattr(g, "stage_channels", [])
-        chans.extend(stage)
-        for ch in chans:
-            for m in ch.members:
-                if m.bot:
-                    continue
-                key=(g.id, m.id)
-                last = voice_last_seen.get(key, now)
-                delta_ms = int((now - last).total_seconds()*1000)
-                if delta_ms > 0:
-                    _score_bucket(g.id, m.id)["voice_ms"] += delta_ms
-                    changed=True
-                voice_last_seen[key]=now
-                present.add(key)
-    # cleanup
-    for key in list(voice_last_seen.keys()):
-        if key not in present:
-            voice_last_seen.pop(key, None)
-    if changed:
-        _save_scores()
-
-    # 1) Event-Reminder
-    changed_log=False
+async def _post_weekly_leaderboard_if_due(now: datetime):
+    # Freitag 18:00
+    if not (now.weekday()==4 and now.hour==18 and now.minute==0): return
     for guild in client.guilds:
-        cfg = configs.get(guild.id)
-        if not cfg or not cfg.events: continue
-        for ev in list(cfg.events.values()):
-            channel_id = ev.channel_id or cfg.announce_channel_id
-            channel = await ensure_text_channel(guild, channel_id)
-            if not channel: continue
-            start_dt = ev.occurrence_start_on_date(now.date())
-            if not start_dt: continue
-            end_dt = start_dt + timedelta(minutes=ev.duration_min)
-
-            for m in ev.pre_reminders:
-                pre_dt = start_dt - timedelta(minutes=m)
-                key = f"{guild.id}:{ev.name}:{start_dt.isoformat()}:pre{m}"
-                if _in_window(now, pre_dt) and key not in post_log:
-                    role_mention = f"<@&{ev.mention_role_id}>" if ev.mention_role_id else ""
-                    body = f"⏳ **{ev.name}** startet in **{m} Min** ({start_dt.strftime('%H:%M')} Uhr). {role_mention}".strip()
-                    if ev.description: body += f"\n{ev.description}"
-                    await channel.send(body)
-                    post_log.add(key); changed_log=True
-
-            key = f"{guild.id}:{ev.name}:{start_dt.isoformat()}:start"
-            if _in_window(now, start_dt) and key not in post_log:
-                role_mention = f"<@&{ev.mention_role_id}>" if ev.mention_role_id else ""
-                body = f"🚀 **{ev.name}** ist **jetzt live**! Läuft bis {end_dt.strftime('%H:%M')} Uhr. {role_mention}".strip()
-                if ev.description: body += f"\n{ev.description}"
-                await channel.send(body)
-                post_log.add(key); changed_log=True
-
-            if ev.one_time_date:
-                try:
-                    d = parse_date_yyyy_mm_dd(ev.one_time_date)
-                    if now.date() > d:
-                        del cfg.events[ev.name.lower()]; save_all(configs)
-                except Exception:
-                    pass
-    if changed_log:
-        save_post_log(post_log)
-
-    # 2) Wochen-Leaderboard Fr 18:00
-    if now.weekday()==4 and now.hour==18 and now.minute==0:
-        for guild in client.guilds:
-            cfg = configs.get(guild.id)
-            if not cfg or not cfg.announce_channel_id: continue
-            ch = guild.get_channel(cfg.announce_channel_id)
-            if not isinstance(ch, discord.TextChannel): continue
-            key = f"weekly_lb:{guild.id}:{now.date().isoformat()}"
-            if key in post_log: continue
-            table = _render_top_table(guild, 10)
-            emb = discord.Embed(title="🔥 Flammen – Wochen-Topliste", color=discord.Color.orange())
-            emb.description = table
-            emb.set_footer(text=f"Stand: {now.strftime('%d.%m.%Y %H:%M')} • Reset am Monatsende")
-            try:
-                await ch.send(embed=emb); post_log.add(key); save_post_log(post_log)
-            except Exception as e:
-                print("weekly leaderboard post failed:", e)
-
-    # 3) Monatsreset (EOM 00:00)
-    if now.day == monthrange(now.year, now.month)[1] and now.hour==0 and now.minute==0:
-        ym = now.strftime("%Y-%m")
-        for g in client.guilds:
-            last = (score_meta.get(str(g.id)) or {}).get("last_reset_ym","")
-            if last == ym: continue
-            scores[str(g.id)] = {}; _save_scores()
-            score_meta.setdefault(str(g.id),{})["last_reset_ym"]=ym; _save_score_meta()
-
-@scheduler_loop.before_loop
-async def _before_scheduler(): await client.wait_until_ready()
-
-# ======================== Message/Reaction Hooks ========================
-@client.event
-async def on_message(message: discord.Message):
-    if not message.guild or message.author.bot: return
-    _score_bucket(message.guild.id, message.author.id)["messages"] += 1
-    _save_scores()
-
-@client.event
-async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
-    if payload.guild_id is None or payload.user_id == client.user.id: return
-    _score_bucket(payload.guild_id, payload.user_id)["reacts_given"] += 1
-    try:
-        ch = client.get_channel(payload.channel_id)
-        if isinstance(ch, (discord.TextChannel, discord.Thread)):
-            msg = await ch.fetch_message(payload.message_id)
-            if msg.author and msg.author.id != payload.user_id:
-                _score_bucket(payload.guild_id, msg.author.id)["reacts_recv"] += 1
-    except Exception:
-        pass
-    _save_scores()
-
-@client.event
-async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
-    if payload.guild_id is None or payload.user_id == client.user.id: return
-    b = _score_bucket(payload.guild_id, payload.user_id)
-    if b["reacts_given"] > 0: b["reacts_given"] -= 1
-    try:
-        ch = client.get_channel(payload.channel_id)
-        if isinstance(ch, (discord.TextChannel, discord.Thread)):
-            msg = await ch.fetch_message(payload.message_id)
-            if msg.author and msg.author.id != payload.user_id:
-                br = _score_bucket(payload.guild_id, msg.author.id)
-                if br["reacts_recv"] > 0: br["reacts_recv"] -= 1
-    except Exception:
-        pass
-    _save_scores()
-
-# ======================== Core Slash Commands (guild) ========================
-def register_core_commands():
-    @tree.command(name="set_announce_channel", description="Standard-Kanal für Erinnerungen setzen.")
-    @app_commands.describe(channel="Ziel-Textkanal")
-    async def set_announce_channel(inter: discord.Interaction, channel: discord.TextChannel):
-        if not is_admin(inter):
-            await inter.response.send_message("❌ Admin-/Manage Server-Recht nötig.", ephemeral=True); return
-        cfg = get_or_create_guild_cfg(inter.guild_id)
-        cfg.announce_channel_id = channel.id; save_all(configs)
-        await inter.response.send_message(f"✅ Standard-Kanal: {channel.mention}", ephemeral=True)
-
-    @tree.command(name="add_event", description="Event anlegen (wiederkehrend ODER einmalig).")
-    @app_commands.describe(
-        name="Event-Name",
-        weekdays='Kommagetrennt: "Mon,Wed,Sat" oder "0,3,5" (0=Mon..6=Sun). Ignoriert, wenn date gesetzt ist.',
-        start_time='Start "HH:MM" (Europa/Berlin)', duration_min="Dauer in Minuten",
-        pre_reminders='Vorab-Minuten, z. B. "30,10,5" (optional)',
-        mention_role="(optional) Rolle für Ping)", post_channel="(optional) Kanal (sonst Standard)",
-        description="(optional) Zusatztext", date='(optional) Einmalig: "YYYY-MM-DD"'
-    )
-    async def add_event(inter: discord.Interaction, name: str, weekdays: str, start_time: str, duration_min: int,
-                        pre_reminders: str = "", mention_role: Optional[discord.Role] = None,
-                        post_channel: Optional[discord.TextChannel] = None, description: str = "", date: str = ""):
-        if not is_admin(inter):
-            await inter.response.send_message("❌ Admin-/Manage Server-Recht nötig.", ephemeral=True); return
+        cfg=configs.get(guild.id)
+        if not cfg or not cfg.announce_channel_id: continue
+        ch=guild.get_channel(cfg.announce_channel_id)
+        if not isinstance(ch, discord.TextChannel): continue
+        key=f"weekly_lb:{guild.id}:{now.date().isoformat()}"
+        if key in post_log: continue
+        lines=_format_leaderboard_lines_simple(guild, limit=10)
+        if not lines: continue
+        emb=discord.Embed(title="🔥 Flammenscore – Wochen-Topliste", description="\n".join(lines), color=discord.Color.orange())
+        emb.set_footer(text=f"Stand: {now.strftime('%d.%m.%Y %H:%M')} • Reset am 30. jeden Monats")
         try:
-            t = parse_time_hhmm(start_time)
-            pre = parse_premins(pre_reminders or "")
-            one_time_date = None; days: List[int] = []
-            if date.strip():
-                one_time_date = parse_date_yyyy_mm_dd(date.strip()).isoformat()
-            else:
-                days = parse_weekdays(weekdays)
-                if not days:
-                    await inter.response.send_message("❌ Entweder 'weekdays' angeben ODER 'date' setzen.", ephemeral=True); return
-        except ValueError as e:
-            await inter.response.send_message(f"❌ {e}", ephemeral=True); return
-        cfg = get_or_create_guild_cfg(inter.guild_id)
-        ev = Event(name=name.strip(), weekdays=days, start_hhmm=f"{t.hour:02d}:{t.minute:02d}", duration_min=duration_min,
-                   pre_reminders=pre, mention_role_id=(mention_role.id if mention_role else None),
-                   channel_id=(post_channel.id if post_channel else None), description=(description or "").strip(),
-                   one_time_date=one_time_date)
-        cfg.events[name.lower()] = ev; save_all(configs)
-        when = one_time_date if one_time_date else ",".join(["Mon","Tue","Wed","Thu","Fri","Sat","Sun"][d] for d in ev.weekdays)
-        target = post_channel.mention if post_channel else (inter.guild.get_channel(cfg.announce_channel_id).mention if cfg.announce_channel_id else "—")
-        await inter.response.send_message(f"✅ Event **{ev.name}** angelegt → {when} {ev.start_hhmm}, {ev.duration_min} Min, Kanal {target}.", ephemeral=True)
-
-    @tree.command(name="list_events", description="Alle Events anzeigen.")
-    async def list_events(inter: discord.Interaction):
-        cfg = get_or_create_guild_cfg(inter.guild_id)
-        if not cfg.events:
-            await inter.response.send_message("ℹ️ Keine Events konfiguriert.", ephemeral=True); return
-        dow_names = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
-        lines=[]
-        for ev in cfg.events.values():
-            when = ev.one_time_date if ev.one_time_date else ",".join(dow_names[d] for d in ev.weekdays)
-            role = f"<@&{ev.mention_role_id}>" if ev.mention_role_id else "—"
-            chan = f"<#{ev.channel_id}>" if ev.channel_id else (f"<#{cfg.announce_channel_id}>" if cfg.announce_channel_id else "—")
-            pre = ", ".join(str(m) for m in ev.pre_reminders) if ev.pre_reminders else "—"
-            desc = (ev.description[:60] + "…") if ev.description and len(ev.description) > 60 else (ev.description or "—")
-            lines.append(f"• **{ev.name}** — {when} {ev.start_hhmm} ({ev.duration_min} Min), Pre: {pre}, Role: {role}, Channel: {chan}, Desc: {desc}")
-        await inter.response.send_message("\n".join(lines)[:1990], ephemeral=True)
-
-    @tree.command(name="remove_event", description="Event löschen.")
-    async def remove_event(inter: discord.Interaction, name: str):
-        if not is_admin(inter):
-            await inter.response.send_message("❌ Admin-/Manage Server-Recht nötig.", ephemeral=True); return
-        cfg = get_or_create_guild_cfg(inter.guild_id)
-        if name.lower() in cfg.events:
-            del cfg.events[name.lower()]; save_all(configs)
-            await inter.response.send_message(f"✅ Event **{name}** gelöscht.", ephemeral=True)
-        else:
-            await inter.response.send_message("❌ Event nicht gefunden.", ephemeral=True)
-
-    @tree.command(name="test_event_ping", description="Test-Ping (keine Planung).")
-    async def test_event_ping(inter: discord.Interaction, name: str):
-        cfg = get_or_create_guild_cfg(inter.guild_id)
-        ev = cfg.events.get(name.lower())
-        if not ev:
-            await inter.response.send_message("❌ Event nicht gefunden.", ephemeral=True); return
-        channel = await ensure_text_channel(inter.guild, ev.channel_id or cfg.announce_channel_id)
-        if not channel:
-            await inter.response.send_message("❌ Kein Zielkanal. Setze /set_announce_channel.", ephemeral=True); return
-        role_mention = f"<@&{ev.mention_role_id}>" if ev.mention_role_id else ""
-        body = f"🔔 **{ev.name}** — Test-Ping {role_mention}".strip()
-        if ev.description: body += f"\n{ev.description}"
-        await channel.send(body); await inter.response.send_message("✅ Test-Ping raus.", ephemeral=True)
-
-    # ---- Score-Befehle ----
-    @tree.command(name="flammenscore_me", description="Zeigt deinen Flammenscore und Rang.")
-    async def flammenscore_me(inter: discord.Interaction):
-        gid = inter.guild_id; uid = inter.user.id
-        data = scores.get(str(gid)) or {}
-        all_totals=[_calc_flammenscore(gid,int(u))[0] for u in data.keys()]
-        my_total, _ = _calc_flammenscore(gid, uid)
-        b = _score_bucket(gid, uid)
-        voice_min_raw = int(b["voice_ms"] / 60000)
-        lines=[
-            f"**Rang:** {(sorted(all_totals, reverse=True).index(my_total)+1) if (my_total>0 and all_totals) else '–'}/{len(all_totals)}",
-            f"**Score:** {my_total:.1f}",
-            f"• Voice: {voice_min_raw} Min",
-            f"• Messages: {b['messages']}",
-            f"• Reaktionen gegeben: {b['reacts_given']}",
-            f"• Reaktionen erhalten: {b['reacts_recv']}",
-            f"• RSVP: {b['rsvp']}",
-        ]
-        await inter.response.send_message("\n".join(lines), ephemeral=True)
-
-    @tree.command(name="flammenscore_top", description="Topliste (Platz · Name · Flammen%).")
-    @app_commands.describe(limit="Anzahl Einträge (1–25, Standard 10)")
-    async def flammenscore_top(inter: discord.Interaction, limit: Optional[int]=10):
-        limit=max(1,min(25,limit or 10))
-        table=_render_top_table(inter.guild, limit)
-        emb = discord.Embed(title="🔥 Flammen – Topliste", color=discord.Color.orange())
-        emb.description = table
-        await inter.response.send_message(embed=emb, ephemeral=True)
-
-    # ---- Admin Sync ----
-    @tree.command(name="wf_admin_sync", description="Befehle in diesem Server neu syncen.")
-    async def wf_admin_sync(inter: discord.Interaction):
-        if not is_admin(inter):
-            await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True); return
-        await tree.sync(guild=discord.Object(id=inter.guild_id))
-        await inter.response.send_message("✅ Guild-Sync erledigt.", ephemeral=True)
-
-    @tree.command(name="wf_admin_sync_hard", description="Harter Re-Sync (löscht & lädt für diese Guild).")
-    async def wf_admin_sync_hard(inter: discord.Interaction):
-        if not is_admin(inter):
-            await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True); return
-        guild_obj = discord.Object(id=inter.guild_id)
-        tree.clear_commands(guild=guild_obj)
-        await tree.sync(guild=guild_obj)
-        await inter.response.send_message("✅ Hart gesynct.", ephemeral=True)
-
-# ======================== ONBOARDING ========================
-
-# Persistenz
-onb_cfg: Dict[str, Any]   = _load_json(ONB_CFG_FILE, {})
-onb_state: Dict[str, Any] = _load_json(ONB_STATE_FILE, {})
-
-def _onb_save_cfg():   _save_json(ONB_CFG_FILE, onb_cfg)
-def _onb_save_state(): _save_json(ONB_STATE_FILE, onb_state)
-
-def _onb_g(guild_id: int) -> Dict[str, Any]:
-    g = onb_cfg.get(str(guild_id))
-    if not g:
-        g = {
-            "guild_role_id": 0,         # "Weiße Flamme"
-            "dd_role_id": 0,
-            "tank_role_id": 0,
-            "heal_role_id": 0,
-            "newbie_role_id": 0,        # "NEWBIE"
-            "log_channel_id": 0,        # Staff-Log
-            "welcome_channel_id": 0,    # öffentliche Begrüßung
-            "fallback_channel_id": 0,   # öffentlicher Eingangskanal
-            "rules_url": "",
-            "enabled": True,
-        }
-        onb_cfg[str(guild_id)] = g
-        _onb_save_cfg()
-    return g
-
-def _onb_s(guild_id: int) -> Dict[str, Any]:
-    sg = onb_state.get(str(guild_id))
-    if not sg:
-        sg = {}
-        onb_state[str(guild_id)] = sg
-        _onb_save_state()
-    return sg
-
-def _onb_s_user(guild_id: int, user_id: int) -> Dict[str, Any]:
-    sg = _onb_s(guild_id)
-    u = sg.get(str(user_id))
-    if not u:
-        u = {
-            "step": 0,
-            "role": None,   # "DD"|"Tank"|"Heal"
-            "xp": None,     # "erfahren"|"unerfahren"
-            "rules_ok": False,
-            "started_iso": datetime.now(TZ).isoformat(),
-            "finished_iso": None,
-            "welcomed": False,
-        }
-        sg[str(user_id)] = u
-        _onb_save_state()
-    return u
-
-def _onb_set_user(guild_id: int, user_id: int, **updates):
-    u = _onb_s_user(guild_id, user_id)
-    u.update(updates); _onb_save_state()
-
-# UI / Embed
-ONB_FOOTER = "Ehre der Flamme."
-def _onb_embed(title: str, desc: str = "", color: int = 0xEB4034) -> discord.Embed:
-    emb = discord.Embed(title=title, description=desc, color=color)
-    emb.set_footer(text=ONB_FOOTER)
-    return emb
-
-# Custom IDs
-CID_START     = "onb_start"
-CID_ROLE_DD   = "onb_role_dd"
-CID_ROLE_TANK = "onb_role_tank"
-CID_ROLE_HEAL = "onb_role_heal"
-CID_XP_PRO    = "onb_xp_pro"
-CID_XP_NEWBIE = "onb_xp_newbie"
-CID_RULES_OK  = "onb_rules_ok"
-
-class OnbPersistentView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
-
-    @discord.ui.button(label="Los geht's", style=discord.ButtonStyle.success, custom_id=CID_START, emoji="▶️")
-    async def onb_start(self, interaction: discord.Interaction, _):
-        await _onb_start_flow(interaction)
-
-    @discord.ui.button(label="DD", style=discord.ButtonStyle.secondary, custom_id=CID_ROLE_DD, emoji="🗡️")
-    async def onb_role_dd(self, interaction: discord.Interaction, _):
-        await _onb_set_role(interaction, "DD")
-
-    @discord.ui.button(label="Tank", style=discord.ButtonStyle.secondary, custom_id=CID_ROLE_TANK, emoji="🛡️")
-    async def onb_role_tank(self, interaction: discord.Interaction, _):
-        await _onb_set_role(interaction, "Tank")
-
-    @discord.ui.button(label="Heal", style=discord.ButtonStyle.secondary, custom_id=CID_ROLE_HEAL, emoji="💚")
-    async def onb_role_heal(self, interaction: discord.Interaction, _):
-        await _onb_set_role(interaction, "Heal")
-
-    @discord.ui.button(label="Erfahren", style=discord.ButtonStyle.primary, custom_id=CID_XP_PRO, emoji="⭐")
-    async def onb_xp_pro(self, interaction: discord.Interaction, _):
-        await _onb_set_xp(interaction, "erfahren")
-
-    @discord.ui.button(label="Unerfahren", style=discord.ButtonStyle.primary, custom_id=CID_XP_NEWBIE, emoji="🌱")
-    async def onb_xp_newbie(self, interaction: discord.Interaction, _):
-        await _onb_set_xp(interaction, "unerfahren")
-
-    @discord.ui.button(label="Gelesen & akzeptiert", style=discord.ButtonStyle.success, custom_id=CID_RULES_OK, emoji="✅")
-    async def onb_rules_ok(self, interaction: discord.Interaction, _):
-        await _onb_rules_ok(interaction)
-
-async def _onb_send_start(member: discord.Member) -> bool:
-    gcfg = _onb_g(member.guild.id)
-    view = OnbPersistentView()
-    emb = _onb_embed("Willkommen bei der Weißen Flamme",
-                     "Ich stelle dir 3 Fragen. Dauert < 1 Minute. Drücke **Los geht's**.")
-    try:
-        await member.send(embed=emb, view=view)
-        return True
-    except Exception:
-        pass
-    ch_id = int(gcfg.get("fallback_channel_id") or 0)
-    ch = member.guild.get_channel(ch_id) if ch_id else None
-    if isinstance(ch, (discord.TextChannel, discord.Thread)):
-        try:
-            await ch.send(content=f"{member.mention}", embed=emb, view=view, silent=True)
-            return True
-        except Exception:
-            pass
-    return False
-
-async def _onb_start_flow(interaction: discord.Interaction):
-    if interaction.user.bot or not interaction.guild:
-        return
-    if not _onb_g(interaction.guild.id).get("enabled", True):
-        await interaction.response.send_message("🛑 Onboarding ist derzeit deaktiviert.", ephemeral=True); return
-    _onb_set_user(interaction.guild.id, interaction.user.id, step=1)
-    emb = _onb_embed("1/3 – Deine Rolle", "Wähle, was du primär spielst.")
-    await interaction.response.edit_message(embed=emb, view=OnbPersistentView())
-
-async def _onb_set_role(interaction: discord.Interaction, role_label: str):
-    if interaction.user.bot or not interaction.guild:
-        return
-    _onb_set_user(interaction.guild.id, interaction.user.id, role=role_label, step=2)
-    emb = _onb_embed("2/3 – Erfahrung", "Wie erfahren bist du?")
-    await interaction.response.edit_message(embed=emb, view=OnbPersistentView())
-
-async def _onb_set_xp(interaction: discord.Interaction, xp_label: str):
-    if interaction.user.bot or not interaction.guild:
-        return
-    _onb_set_user(interaction.guild.id, interaction.user.id, xp=xp_label, step=3)
-    rules_url = str(_onb_g(interaction.guild.id).get("rules_url") or "").strip() or "https://discord.com/channels/@me"
-    emb = _onb_embed("3/3 – Regeln", "Bitte lies unsere Regeln. Mit **Gelesen & akzeptiert** stimmst du zu.")
-    view = OnbPersistentView()
-    view.add_item(discord.ui.Button(label="Regeln öffnen", style=discord.ButtonStyle.link, url=rules_url, emoji="📖"))
-    await interaction.response.edit_message(embed=emb, view=view)
-
-async def _onb_rules_ok(interaction: discord.Interaction):
-    if interaction.user.bot or not interaction.guild:
-        return
-    guild = interaction.guild; user = interaction.user
-    _onb_set_user(guild.id, user.id, rules_ok=True)
-    ok, details = await _onb_assign_roles(guild, user)
-    _onb_set_user(guild.id, user.id, step="done", finished_iso=_now().isoformat())
-    emb = _onb_embed(
-        "Onboarding abgeschlossen",
-        f"Rollen gesetzt: **Weiße Flamme**, **{details.get('role_name','—')}**"
-        + (" und **NEWBIE**" if details.get("newbie_given") else "") + ". Viel Spaß!"
-    )
-    await interaction.response.edit_message(embed=emb, view=None)
-    await _onb_staff_log(guild, user, details, ok)
-    if ok:
-        await _onb_public_welcome(guild, user, details)
-
-async def _onb_assign_roles(guild: discord.Guild, member: discord.Member):
-    det = {
-        "role": _onb_s_user(guild.id, member.id).get("role"),
-        "xp": _onb_s_user(guild.id, member.id).get("xp"),
-        "role_name": "—",
-        "newbie_given": False,
-        "errors": []
-    }
-    gcfg = _onb_g(guild.id)
-
-    role_ids = []
-    gr_id = int(gcfg.get("guild_role_id") or 0)
-    if gr_id: role_ids.append(gr_id)
-    else: det["errors"].append("guild_role_id not set")
-
-    if det["role"] == "DD":
-        rid = int(gcfg.get("dd_role_id") or 0)
-    elif det["role"] == "Tank":
-        rid = int(gcfg.get("tank_role_id") or 0)
-    elif det["role"] == "Heal":
-        rid = int(gcfg.get("heal_role_id") or 0)
-    else:
-        rid = 0; det["errors"].append("primary role not selected")
-
-    if rid:
-        role_ids.append(rid)
-        r = guild.get_role(rid)
-        if r: det["role_name"] = r.name
-
-    if det["xp"] == "unerfahren":
-        nb_id = int(gcfg.get("newbie_role_id") or 0)
-        if nb_id: role_ids.append(nb_id)
-
-    ok = True
-    roles_to_add = [guild.get_role(rid) for rid in role_ids if guild.get_role(rid)]
-    try:
-        if roles_to_add:
-            await member.add_roles(*roles_to_add, reason="Onboarding Abschluss")
-            if det["xp"] == "unerfahren" and int(gcfg.get("newbie_role_id") or 0):
-                det["newbie_given"] = True
-    except discord.Forbidden:
-        ok = False; det["errors"].append("Missing permissions or role hierarchy")
-    except Exception as e:
-        ok = False; det["errors"].append(str(e))
-
-    return ok, det
-
-async def _onb_staff_log(guild: discord.Guild, member: discord.Member, details: Dict[str, Any], ok: bool):
-    ch_id = int(_onb_g(guild.id).get("log_channel_id") or 0)
-    ch = guild.get_channel(ch_id) if ch_id else None
-    if not isinstance(ch, (discord.TextChannel, discord.Thread)):
-        return
-    status = "✅ Erfolgreich" if ok else "⚠️ Teilweise/Fehler"
-    emb = _onb_embed(
-        "Onboarding-Log",
-        f"**Nutzer:** {member.mention}\n"
-        f"**Rolle:** {details.get('role','—')}\n"
-        f"**Erfahrung:** {details.get('xp','—')}\n"
-        f"**Regeln:** Ja\n"
-        f"**Vergebene Rollen:** Weiße Flamme"
-        + (f", {details.get('role_name')}" if details.get("role_name") != "—" else "")
-        + (" + NEWBIE" if details.get("newbie_given") else "")
-        + f"\n**Ergebnis:** {status}"
-        + (f"\n**Fehler:** {', '.join(details.get('errors', []))}" if details.get("errors") else "")
-    )
-    await ch.send(embed=emb)
-
-async def _onb_public_welcome(guild: discord.Guild, member: discord.Member, details: Dict[str, Any]):
-    u = _onb_s_user(guild.id, member.id)
-    if u.get("welcomed"): return
-    _onb_set_user(guild.id, member.id, welcomed=True)
-
-    ch_id = int(_onb_g(guild.id).get("welcome_channel_id") or 0)
-    ch = guild.get_channel(ch_id) if ch_id else guild.system_channel
-    if not isinstance(ch, (discord.TextChannel, discord.Thread)):
-        return
-
-    is_newbie = (details.get("xp") == "unerfahren")
-    if is_newbie:
-        emb = _onb_embed(
-            f"Willkommen bei der Weißen Flamme, {member.display_name}!",
-            f"🧭 Status: **NEWBIE** · ⚔️ Rolle: **{details.get('role_name','—')}**\n"
-            f"🔥 Keine Sorge – wir zeigen dir alles. Starte mit **/wf** und frag, wenn du uns brauchst."
-        )
-        text = f"{member.mention} ist neu am Lagerfeuer. Seid nett. 🙂"
-    else:
-        emb = _onb_embed(
-            f"Willkommen bei der Weißen Flamme, {member.display_name}!",
-            f"⚔️ Rolle: **{details.get('role_name','—')}**\n"
-            f"🔥 Hol dir den Hub mit **/wf** und leg los."
-        )
-        text = f"{member.mention} ist gelandet. Macht Platz am Feuer."
-
-    await ch.send(content=text, embed=emb)
-
-# ====== Auto-Erstellung fehlender Rollen (Bootstrap) & Rollen-Commands ======
-async def _ensure_role(guild: discord.Guild, name: str, color: Optional[discord.Color] = None, mentionable: bool = True) -> discord.Role:
-    r = discord.utils.get(guild.roles, name=name)
-    if r:
-        return r
-    r = await guild.create_role(
-        name=name,
-        color=color or discord.Color.default(),
-        mentionable=mentionable,
-        reason="Onboarding bootstrap"
-    )
-    return r
-
-def register_onboarding_commands():
-    def _adm(inter: discord.Interaction) -> bool:
-        m = inter.user; p = getattr(m, "guild_permissions", None)
-        return bool(p and (p.administrator or p.manage_guild))
-
-    @tree.command(name="onb_bootstrap", description="Erstellt Standardrollen (Weiße Flamme, DD, Tank, Heal, NEWBIE) und trägt sie ein.")
-    async def onb_bootstrap(inter: discord.Interaction):
-        if not _adm(inter):
-            await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True); return
-        await inter.response.defer(ephemeral=True, thinking=True)
-        g = _onb_g(inter.guild_id)
-        try:
-            wf   = await _ensure_role(inter.guild, "Weiße Flamme", discord.Color.from_rgb(255, 255, 255))
-            dd   = await _ensure_role(inter.guild, "DD",   discord.Color.from_rgb(240, 80, 80))
-            tank = await _ensure_role(inter.guild, "Tank", discord.Color.from_rgb(80, 160, 240))
-            heal = await _ensure_role(inter.guild, "Heal", discord.Color.from_rgb(80, 200, 120))
-            nb   = await _ensure_role(inter.guild, "NEWBIE", discord.Color.from_rgb(200, 200, 200))
-
-            g["guild_role_id"] = wf.id
-            g["dd_role_id"]    = dd.id
-            g["tank_role_id"]  = tank.id
-            g["heal_role_id"]  = heal.id
-            g["newbie_role_id"]= nb.id
-            _onb_save_cfg()
-
-            # auch für RSVP/Score verwenden
-            _set_guild_role_id(inter.guild_id, wf.id)
-
-            await inter.followup.send(
-                f"✅ Rollen bereit:\n"
-                f"• {wf.mention} (Gildenrolle)\n"
-                f"• {dd.mention} / {tank.mention} / {heal.mention}\n"
-                f"• {nb.mention} (für Unerfahrene)\n\n"
-                f"ℹ️ Falls nötig: `/onb_set_welcome`, `/onb_set_log`, `/onb_set_fallback`, `/onb_set_rules`.",
-                ephemeral=True
-            )
-        except discord.Forbidden:
-            await inter.followup.send("❌ Mir fehlen Rechte: **Manage Roles** bzw. Rollen-Hierarchie.", ephemeral=True)
+            await ch.send(embed=emb); post_log.add(key); save_post_log(post_log)
         except Exception as e:
-            await inter.followup.send(f"❌ Fehler: {e}", ephemeral=True)
+            print("weekly leaderboard post failed:", e)
 
-    # Anzeige/Setzen (Onboarding)
-    @tree.command(name="onb_setup", description="Zeigt die Onboarding-Konfiguration.")
-    async def onb_setup(inter: discord.Interaction):
-        if not _adm(inter): await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True); return
-        g = _onb_g(inter.guild_id)
-        def role_mention(rid):
-            r = inter.guild.get_role(int(rid or 0)) if rid else None
-            return r.mention if r else "—"
-        def ch_mention(cid):
-            c = inter.guild.get_channel(int(cid or 0)) if cid else None
-            return c.mention if c else "—"
-        lines = [
-            f"**Status:** {'✅ aktiv' if g.get('enabled', True) else '🛑 aus'}",
-            f"**Weiße Flamme:** {role_mention(g.get('guild_role_id'))}",
-            f"**DD:** {role_mention(g.get('dd_role_id'))}",
-            f"**Tank:** {role_mention(g.get('tank_role_id'))}",
-            f"**Heal:** {role_mention(g.get('heal_role_id'))}",
-            f"**NEWBIE:** {role_mention(g.get('newbie_role_id'))}",
-            f"**Staff-Log:** {ch_mention(g.get('log_channel_id'))}",
-            f"**Willkommen:** {ch_mention(g.get('welcome_channel_id'))}",
-            f"**Fallback:** {ch_mention(g.get('fallback_channel_id'))}",
-            f"**Regeln-URL:** {g.get('rules_url') or '—'}",
-        ]
-        await inter.response.send_message("\n".join(lines), ephemeral=True)
+def _month_key(dt: datetime) -> str: return dt.strftime("%Y-%m")
+def _get_last_reset_ym(gid: int) -> str: return (score_meta.get(str(gid)) or {}).get("last_reset_ym","")
+def _set_last_reset_ym(gid: int, ym: str):
+    g=score_meta.get(str(gid)) or {}; g["last_reset_ym"]=ym; score_meta[str(gid)]=g; _save_score_meta()
 
-    @tree.command(name="onb_set_roles", description="Setzt die Primärrollen (DD/Tank/Heal).")
-    @app_commands.describe(dd_role="Rolle für DD", tank_role="Rolle für Tank", heal_role="Rolle für Heal")
-    async def onb_set_roles(inter: discord.Interaction, dd_role: discord.Role, tank_role: discord.Role, heal_role: discord.Role):
-        if not _adm(inter): await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True); return
-        g = _onb_g(inter.guild_id)
-        g["dd_role_id"] = dd_role.id; g["tank_role_id"] = tank_role.id; g["heal_role_id"] = heal_role.id
-        _onb_save_cfg()
-        await inter.response.send_message(f"✅ Gespeichert:\n🗡️ {dd_role.mention}\n🛡️ {tank_role.mention}\n💚 {heal_role.mention}", ephemeral=True)
+async def _monthly_reset_if_due(now: datetime):
+    if not (now.day==30 and now.hour==0 and now.minute==0): return
+    ym=_month_key(now)
+    for guild in client.guilds:
+        last=_get_last_reset_ym(guild.id)
+        if last==ym: continue
+        scores[str(guild.id)] = {}
+        _save_scores()
+        _set_last_reset_ym(guild.id, ym)
+        print(f"[Flammenscore] Reset for guild {guild.id} @ {ym}-30")
 
-    @tree.command(name="onb_set_guildrole", description="Setzt die Gildenrolle (Weiße Flamme).")
-    async def onb_set_guildrole(inter: discord.Interaction, role: discord.Role):
-        if not _adm(inter): await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True); return
-        g = _onb_g(inter.guild_id); g["guild_role_id"] = role.id; _onb_save_cfg()
-        _set_guild_role_id(inter.guild_id, role.id)
-        await inter.response.send_message(f"✅ Gildenrolle: {role.mention}", ephemeral=True)
+@tree.command(name="flammenscore_me", description="Zeigt deinen Flammenscore und Rang.")
+async def flammenscore_me(inter: discord.Interaction):
+    gid=inter.guild_id; uid=inter.user.id
+    data=scores.get(str(gid)) or {}
+    arr=[]
+    for uid_str in data.keys():
+        u=int(uid_str); tot,_=_calc_flammenscore(gid,u)
+        arr.append((u,tot))
+    arr.sort(key=lambda t:t[1], reverse=True)
+    pos=next((i for i,(u,_) in enumerate(arr, start=1) if u==uid), 0)
+    my_total=next((tot for u,tot in arr if u==uid), 0.0)
+    _,parts=_calc_flammenscore(gid,uid)
+    lines=[
+        f"**Rang:** {pos}/{len(arr)}" if pos else f"**Rang:** –/{len(arr)}",
+        f"**Score:** {my_total:.1f}",
+        f"• Voice: {parts['voice']:.1f}",
+        f"• Messages: {parts['msg']:.1f}",
+        f"• Reaktionen gegeben: {parts['rg']:.1f}",
+        f"• Reaktionen erhalten: {parts['rr']:.1f}",
+        f"• RSVP: {parts['rsvp']:.1f}",
+    ]
+    await inter.response.send_message("\n".join(lines), ephemeral=True)
 
-    @tree.command(name="onb_set_newbie_role", description="Setzt die NEWBIE-Rolle (für 'unerfahren').")
-    async def onb_set_newbie_role(inter: discord.Interaction, role: discord.Role):
-        if not _adm(inter): await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True); return
-        g = _onb_g(inter.guild_id); g["newbie_role_id"] = role.id; _onb_save_cfg()
-        await inter.response.send_message(f"✅ NEWBIE: {role.mention}", ephemeral=True)
+@tree.command(name="flammenscore_top", description="Topliste (Platz · Name · %).")
+@app_commands.describe(limit="Anzahl (1–25, Standard 10)")
+async def flammenscore_top(inter: discord.Interaction, limit: Optional[int]=10):
+    limit=max(1, min(25, limit or 10))
+    lines=_format_leaderboard_lines_simple(inter.guild, limit=limit)
+    if not lines:
+        await inter.response.send_message("Noch keine Daten.", ephemeral=True); return
+    emb=discord.Embed(title="🔥 Flammen – Topliste", description="\n".join(lines), color=discord.Color.orange())
+    await inter.response.send_message(embed=emb, ephemeral=True)
 
-    @tree.command(name="onb_set_log", description="Setzt den Staff-Log-Kanal.")
-    async def onb_set_log(inter: discord.Interaction, channel: discord.TextChannel):
-        if not _adm(inter): await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True); return
-        g = _onb_g(inter.guild_id); g["log_channel_id"] = channel.id; _onb_save_cfg()
-        await inter.response.send_message(f"✅ Staff-Log: {channel.mention}", ephemeral=True)
+# ======================== ONBOARDING (NEU) ========================
+def _ob_g(gid: int) -> dict:
+    return onboard_cfg.setdefault(str(gid), {})
 
-    @tree.command(name="onb_set_welcome", description="Setzt den öffentlichen Begrüßungs-Kanal.")
-    async def onb_set_welcome(inter: discord.Interaction, channel: discord.TextChannel):
-        if not _adm(inter): await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True); return
-        g = _onb_g(inter.guild_id); g["welcome_channel_id"] = channel.id; _onb_save_cfg()
-        await inter.response.send_message(f"✅ Welcome: {channel.mention}", ephemeral=True)
+async def _ensure_onboarding_roles(guild: discord.Guild) -> Dict[str,int]:
+    gcfg=_ob_g(guild.id)
+    names = {
+        "ROLE_WF":      "Weiße Flamme",
+        "ROLE_TANK":    "WF – Tank",
+        "ROLE_HEAL":    "WF – Heal",
+        "ROLE_DPS":     "WF – DD",
+        "ROLE_NEWBIE":  "WF – Newbie",
+    }
+    ids: Dict[str,int] = {}
+    for key, rname in names.items():
+        rid = int(gcfg.get(key, 0) or 0)
+        role = guild.get_role(rid) if rid else discord.utils.get(guild.roles, name=rname)
+        if not role:
+            try:
+                role = await guild.create_role(name=rname, reason="WF Onboarding Auto-Setup")
+            except Exception as e:
+                print("create_role failed", rname, e)
+        if role:
+            ids[key] = role.id
+            gcfg[key] = role.id
+    onboard_cfg[str(guild.id)] = gcfg
+    _save_onboard()
+    return ids
 
-    @tree.command(name="onb_set_fallback", description="Setzt den öffentlichen Eingangskanal (Fallback).")
-    async def onb_set_fallback(inter: discord.Interaction, channel: discord.TextChannel):
-        if not _adm(inter): await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True); return
-        g = _onb_g(inter.guild_id); g["fallback_channel_id"] = channel.id; _onb_save_cfg()
-        await inter.response.send_message(f"✅ Fallback: {channel.mention}", ephemeral=True)
+class OnboardView(discord.ui.View):
+    def __init__(self, guild_id: int, user_id: int):
+        super().__init__(timeout=600)
+        self.guild_id=guild_id
+        self.user_id=user_id
+        self.primary=None
+        self.exp=None
+        self.rules_ok=False
 
-    @tree.command(name="onb_set_rules", description="Setzt den Link zum Regel-Post.")
-    async def onb_set_rules(inter: discord.Interaction, url: str):
-        if not _adm(inter): await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True); return
-        g = _onb_g(inter.guild_id); g["rules_url"] = url.strip(); _onb_save_cfg()
-        await inter.response.send_message("✅ Regeln-URL gespeichert.", ephemeral=True)
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        # nur der eingeladene User
+        return interaction.user.id == self.user_id
 
-    @tree.command(name="onb_toggle", description="Onboarding an/aus.")
-    @app_commands.describe(state="on/off")
-    async def onb_toggle(inter: discord.Interaction, state: str):
-        if not _adm(inter): await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True); return
-        s = state.strip().lower()
-        if s not in ("on","off"):
-            await inter.response.send_message("Nutze: on/off", ephemeral=True); return
-        g = _onb_g(inter.guild_id); g["enabled"] = (s == "on"); _onb_save_cfg()
-        await inter.response.send_message(f"✅ Onboarding: {'aktiv' if g['enabled'] else 'aus'}", ephemeral=True)
+    @discord.ui.select(placeholder="Wähle deine Primärrolle", min_values=1, max_values=1, options=[
+        discord.SelectOption(label="DD", description="Schaden", emoji="🗡️"),
+        discord.SelectOption(label="Tank", description="Frontline", emoji="🛡️"),
+        discord.SelectOption(label="Heal", description="Support", emoji="💚"),
+    ])
+    async def select_primary(self, interaction: discord.Interaction, select: discord.ui.Select):
+        self.primary = select.values[0]
+        await interaction.response.send_message(f"✅ Primärrolle gesetzt: **{self.primary}**", ephemeral=True)
 
-    @tree.command(name="onb_resend", description="Onboarding-DM erneut senden.")
-    async def onb_resend(inter: discord.Interaction, user: discord.Member):
-        if not _adm(inter): await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True); return
-        _onb_s_user(inter.guild_id, user.id)
-        ok = await _onb_send_start(user)
-        await inter.response.send_message("✅ Gesendet." if ok else "❌ Konnte keine DM/Fallback senden.", ephemeral=True)
+    @discord.ui.select(placeholder="Erfahrung", min_values=1, max_values=1, options=[
+        discord.SelectOption(label="Erfahren", emoji="🔥"),
+        discord.SelectOption(label="Unerfahren", emoji="🌱"),
+    ])
+    async def select_exp(self, interaction: discord.Interaction, select: discord.ui.Select):
+        self.exp = select.values[0]
+        await interaction.response.send_message(f"✅ Erfahrung: **{self.exp}**", ephemeral=True)
 
-# ===== Rollen-Command-Gruppe (explizit) =====
-def register_role_commands():
-    def _adm(inter: discord.Interaction) -> bool:
-        m = inter.user; p = getattr(m, "guild_permissions", None)
-        return bool(p and (p.administrator or p.manage_guild))
+    @discord.ui.button(label="Regeln gelesen & akzeptiert", style=discord.ButtonStyle.success, emoji="📜")
+    async def btn_rules(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.rules_ok = True
+        await interaction.response.send_message("✅ Regeln akzeptiert.", ephemeral=True)
 
-    @tree.command(name="roles_bootstrap", description="Rollen anlegen & Configs setzen (Weiße Flamme, DD, Tank, Heal, NEWBIE).")
-    async def roles_bootstrap(inter: discord.Interaction):
-        if not _adm(inter):
-            await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True); return
-        await inter.response.defer(ephemeral=True, thinking=True)
-        # einfach onb_bootstrap-Logik wiederverwenden:
-        g = _onb_g(inter.guild_id)
-        wf   = await _ensure_role(inter.guild, "Weiße Flamme", discord.Color.from_rgb(255,255,255))
-        dd   = await _ensure_role(inter.guild, "DD",   discord.Color.from_rgb(240, 80, 80))
-        tank = await _ensure_role(inter.guild, "Tank", discord.Color.from_rgb(80,160,240))
-        heal = await _ensure_role(inter.guild, "Heal", discord.Color.from_rgb(80,200,120))
-        nb   = await _ensure_role(inter.guild, "NEWBIE", discord.Color.from_rgb(200,200,200))
-        g["guild_role_id"]=wf.id; g["dd_role_id"]=dd.id; g["tank_role_id"]=tank.id; g["heal_role_id"]=heal.id; g["newbie_role_id"]=nb.id
-        _onb_save_cfg()
-        _set_guild_role_id(inter.guild_id, wf.id)  # Score/Filter
-        await inter.followup.send("✅ Rollen erstellt & gesetzt. (/roles_show für Übersicht)", ephemeral=True)
+    @discord.ui.button(label="Bestätigen & Rollen vergeben", style=discord.ButtonStyle.primary, emoji="✅")
+    async def btn_confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not (self.primary and self.exp and self.rules_ok):
+            await interaction.response.send_message("❗ Bitte Primärrolle **und** Erfahrung wählen und die **Regeln akzeptieren**.", ephemeral=True)
+            return
+        guild = client.get_guild(self.guild_id)
+        member = guild.get_member(self.user_id)
+        if not member:
+            await interaction.response.send_message("Konnte dich im Server nicht finden.", ephemeral=True); return
+        cfg=_ob_g(guild.id)
+        role_ids = {
+            "Weiße Flamme": int(cfg.get("ROLE_WF",0)),
+            "Tank": int(cfg.get("ROLE_TANK",0)),
+            "Heal": int(cfg.get("ROLE_HEAL",0)),
+            "DD": int(cfg.get("ROLE_DPS",0)),
+            "Newbie": int(cfg.get("ROLE_NEWBIE",0)),
+        }
+        to_add = [guild.get_role(role_ids["Weiße Flamme"])]
+        if self.primary in ("Tank","Heal","DD"):
+            to_add.append(guild.get_role(role_ids[self.primary]))
+        if self.exp == "Unerfahren":
+            to_add.append(guild.get_role(role_ids["Newbie"]))
+        to_add = [r for r in to_add if r is not None]
+        try:
+            await member.add_roles(*to_add, reason="WF Onboarding")
+        except Exception as e:
+            await interaction.response.send_message(f"❌ Rollenvergabe fehlgeschlagen: {e}", ephemeral=True); return
 
-    @tree.command(name="roles_show", description="Zeigt Rollen-Mapping (Onboarding + RSVP/Filter).")
-    async def roles_show(inter: discord.Interaction):
-        if not _adm(inter): await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True); return
-        g = _onb_g(inter.guild_id)
-        rcfg = rsvp_cfg.get(str(inter.guild_id)) or {}
-        def rm(rid): 
-            r = inter.guild.get_role(int(rid or 0)) if rid else None
-            return r.mention if r else "—"
-        lines = [
-            "**Onboarding:**",
-            f"• Gilde: {rm(g.get('guild_role_id'))}",
-            f"• DD: {rm(g.get('dd_role_id'))} | Tank: {rm(g.get('tank_role_id'))} | Heal: {rm(g.get('heal_role_id'))}",
-            f"• NEWBIE: {rm(g.get('newbie_role_id'))}",
-            "",
-            "**RSVP/Score:**",
-            f"• TANK: {rm((rcfg.get('TANK') or 0))}",
-            f"• HEAL: {rm((rcfg.get('HEAL') or 0))}",
-            f"• DPS : {rm((rcfg.get('DPS')  or 0))}",
-            f"• Filter-Rolle: {rm((rcfg.get('GUILD_ROLE') or 0))}",
-        ]
-        await inter.response.send_message("\n".join(lines), ephemeral=True)
+        await interaction.response.send_message("🎉 Rollen vergeben. Willkommen!", ephemeral=True)
+        # Öffentlicher Willkommenspost
+        welcome_ch_id = int(cfg.get("WELCOME_CHANNEL", 0) or 0)
+        if welcome_ch_id:
+            ch = guild.get_channel(welcome_ch_id)
+            if isinstance(ch, discord.TextChannel):
+                try:
+                    await ch.send(f"🔥 Willkommen {member.mention}! Schön, dass du bei **Weiße Flamme** bist. "
+                                  f"Primärrolle: **{self.primary}** · Erfahrung: **{self.exp}**. "
+                                  f"Ab in die Schlacht – die Glut wartet! 🔥")
+                except Exception as e:
+                    print("welcome post failed:", e)
+        # View schließen
+        self.stop()
 
-    @tree.command(name="roles_set_guild", description="Setzt Gildenrolle (auch als Score-Filter).")
-    async def roles_set_guild(inter: discord.Interaction, role: discord.Role):
-        if not _adm(inter): await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True); return
-        g = _onb_g(inter.guild_id); g["guild_role_id"] = role.id; _onb_save_cfg(); _set_guild_role_id(inter.guild_id, role.id)
-        await inter.response.send_message(f"✅ Gildenrolle: {role.mention}", ephemeral=True)
+async def _send_onboarding_dm(member: discord.Member):
+    if member.bot: return
+    try:
+        await _ensure_onboarding_roles(member.guild)
+        view = OnboardView(member.guild.id, member.id)
+        emb = discord.Embed(
+            title="Willkommen bei Weiße Flamme",
+            description=("Wähle bitte deine **Primärrolle**, gib deine **Erfahrung** an und bestätige, "
+                         "dass du die Regeln gelesen hast. Danach bekommst du automatisch Zugriff."),
+            color=discord.Color.orange()
+        )
+        try:
+            await member.send(embed=emb, view=view)
+        except discord.Forbidden:
+            # DM zu, versuche Fallback: System-Channel falls sichtbar
+            if member.guild.system_channel:
+                await member.guild.system_channel.send(
+                    f"{member.mention} bitte öffne deine DMs – für das Onboarding habe ich dir soeben geschrieben.")
+    except Exception as e:
+        print("onboarding DM failed:", e)
 
-    @tree.command(name="roles_set_dd", description="Setzt DD-Rolle.")
-    async def roles_set_dd(inter: discord.Interaction, role: discord.Role):
-        if not _adm(inter): await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True); return
-        g = _onb_g(inter.guild_id); g["dd_role_id"] = role.id; _onb_save_cfg()
-        await inter.response.send_message(f"✅ DD: {role.mention}", ephemeral=True)
+# Admin-Kommandos
+@tree.command(name="wf_onboarding_autosetup", description="(Admin) Legt Standard-Rollen an/verküpft sie automatisch.")
+async def wf_onboarding_autosetup(inter: discord.Interaction):
+    if not is_admin(inter):
+        await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True); return
+    ids = await _ensure_onboarding_roles(inter.guild)
+    lines=[f"{k} → <@&{v}>" for k,v in ids.items()]
+    await inter.response.send_message("✅ Onboarding-Rollen bereit:\n" + "\n".join(lines), ephemeral=True)
 
-    @tree.command(name="roles_set_tank", description="Setzt Tank-Rolle.")
-    async def roles_set_tank(inter: discord.Interaction, role: discord.Role):
-        if not _adm(inter): await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True); return
-        g = _onb_g(inter.guild_id); g["tank_role_id"] = role.id; _onb_save_cfg()
-        await inter.response.send_message(f"✅ Tank: {role.mention}", ephemeral=True)
+@tree.command(name="wf_onboarding_link", description="(Admin) Vorhandene Rollen verknüpfen.")
+@app_commands.describe(
+    wf="Weiße Flamme",
+    tank="Tank-Rolle",
+    heal="Heal-Rolle",
+    dd="DD-Rolle",
+    newbie="Newbie-Rolle"
+)
+async def wf_onboarding_link(inter: discord.Interaction,
+                             wf: discord.Role, tank: discord.Role, heal: discord.Role, dd: discord.Role, newbie: discord.Role):
+    if not is_admin(inter):
+        await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True); return
+    g=_ob_g(inter.guild_id)
+    g.update({"ROLE_WF":wf.id,"ROLE_TANK":tank.id,"ROLE_HEAL":heal.id,"ROLE_DPS":dd.id,"ROLE_NEWBIE":newbie.id})
+    onboard_cfg[str(inter.guild_id)] = g; _save_onboard()
+    await inter.response.send_message("✅ Verknüpft.", ephemeral=True)
 
-    @tree.command(name="roles_set_heal", description="Setzt Heal-Rolle.")
-    async def roles_set_heal(inter: discord.Interaction, role: discord.Role):
-        if not _adm(inter): await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True); return
-        g = _onb_g(inter.guild_id); g["heal_role_id"] = role.id; _onb_save_cfg()
-        await inter.response.send_message(f"✅ Heal: {role.mention}", ephemeral=True)
+@tree.command(name="wf_set_welcome_channel", description="(Admin) Kanal für öffentliche Begrüßung setzen.")
+async def wf_set_welcome_channel(inter: discord.Interaction, channel: discord.TextChannel):
+    if not is_admin(inter):
+        await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True); return
+    g=_ob_g(inter.guild_id); g["WELCOME_CHANNEL"]=channel.id; onboard_cfg[str(inter.guild_id)]=g; _save_onboard()
+    await inter.response.send_message(f"✅ Willkommen-Kanal: {channel.mention}", ephemeral=True)
 
-    @tree.command(name="roles_set_newbie", description="Setzt NEWBIE-Rolle.")
-    async def roles_set_newbie(inter: discord.Interaction, role: discord.Role):
-        if not _adm(inter): await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True); return
-        g = _onb_g(inter.guild_id); g["newbie_role_id"] = role.id; _onb_save_cfg()
-        await inter.response.send_message(f"✅ NEWBIE: {role.mention}", ephemeral=True)
+@tree.command(name="wf_onboarding_test", description="(Admin) Onboarding-DM an dich schicken.")
+async def wf_onboarding_test(inter: discord.Interaction):
+    if not is_admin(inter):
+        await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True); return
+    await _send_onboarding_dm(inter.user)
+    await inter.response.send_message("✅ DM verschickt (falls erlaubt).", ephemeral=True)
 
-# ======================== Persistent Views + Lifecycle ========================
+# ======================== Lifecycle & Scheduler ========================
 def reregister_persistent_views_on_start():
     for msg_id, obj in list(rsvp_store.items()):
         g = client.get_guild(obj["guild_id"])
-        if not g: continue
+        if not g:
+            continue
         try:
             client.add_view(RaidView(int(msg_id)), message_id=int(msg_id))
         except Exception as e:
             print("add_view (RSVP) failed:", e)
-    try:
-        client.add_view(OnbPersistentView())
-    except Exception as e:
-        print("add_view (Onboarding) failed:", e)
-
-@client.event
-async def on_member_join(member: discord.Member):
-    gcfg = _onb_g(member.guild.id)
-    if not gcfg.get("enabled", True): return
-    if member.bot: return
-    _onb_s_user(member.guild.id, member.id)
-    await _onb_send_start(member)
 
 @client.event
 async def on_ready():
-    global _COMMANDS_REGISTERED
     print(f"Logged in as {client.user} (ID: {client.user.id})")
+    # Member-Cache laden
     for g in client.guilds:
         try: await g.chunk()
         except Exception as e: print("guild.chunk() failed:", e)
 
-    if not _COMMANDS_REGISTERED:
-        register_core_commands()
-        register_rsvp_slash_commands()
-        register_onboarding_commands()
-        register_role_commands()
-        _COMMANDS_REGISTERED = True
+    reregister_persistent_views_on_start()
+    register_rsvp_slash_commands()
 
     try:
         for g in client.guilds:
@@ -1318,8 +778,121 @@ async def on_ready():
     except Exception as e:
         print("Command sync failed:", e)
 
-    reregister_persistent_views_on_start()
     scheduler_loop.start()
+
+@client.event
+async def on_member_join(member: discord.Member):
+    # Bots ignorieren
+    if member.bot: return
+    await _send_onboarding_dm(member)
+
+@tasks.loop(seconds=30.0)
+async def scheduler_loop():
+    now=_now().replace(second=0, microsecond=0)
+    changed=False
+
+    # Event-Reminder
+    for guild in client.guilds:
+        cfg=configs.get(guild.id)
+        if not cfg or not cfg.events: continue
+        for ev in list(cfg.events.values()):
+            channel_id=ev.channel_id or cfg.announce_channel_id
+            channel=await ensure_text_channel(guild, channel_id)
+            if not channel: continue
+
+            start_dt=ev.occurrence_start_on_date(now.date())
+            if not start_dt: continue
+            end_dt=start_dt + timedelta(minutes=ev.duration_min)
+
+            for m in ev.pre_reminders:
+                pre_dt=start_dt - timedelta(minutes=m)
+                key=f"{guild.id}:{ev.name}:{start_dt.isoformat()}:pre{m}"
+                if _in_window(now, pre_dt) and key not in post_log:
+                    role_mention=f"<@&{ev.mention_role_id}>" if ev.mention_role_id else ""
+                    body=f"⏳ **{ev.name}** startet in **{m} Min** ({start_dt.strftime('%H:%M')} Uhr). {role_mention}".strip()
+                    if ev.description: body += f"\n{ev.description}"
+                    await channel.send(body)
+                    post_log.add(key); changed=True
+
+            key=f"{guild.id}:{ev.name}:{start_dt.isoformat()}:start"
+            if _in_window(now, start_dt) and key not in post_log:
+                role_mention=f"<@&{ev.mention_role_id}>" if ev.mention_role_id else ""
+                body=f"🚀 **{ev.name}** ist **jetzt live**! Läuft bis {end_dt.strftime('%H:%M')} Uhr. {role_mention}".strip()
+                if ev.description: body += f"\n{ev.description}"
+                await channel.send(body)
+                post_log.add(key); changed=True
+
+            if ev.one_time_date:
+                try:
+                    d=parse_date_yyyy_mm_dd(ev.one_time_date)
+                    if now.date()>d:
+                        del cfg.events[ev.name.lower()]; save_all(configs)
+                except Exception:
+                    pass
+
+    if changed: save_post_log(post_log)
+
+    # Weekly LB + monthly reset
+    await _post_weekly_leaderboard_if_due(now)
+    await _monthly_reset_if_due(now)
+
+@scheduler_loop.before_loop
+async def _before_scheduler(): await client.wait_until_ready()
+
+# ======================== Flammenscore Event Hooks ========================
+@client.event
+async def on_message(message: discord.Message):
+    if not message.guild or message.author.bot: return
+    b=_score_bucket(message.guild.id, message.author.id)
+    b["messages"] += 1; _save_scores()
+    _cache_author(message.id, message.author.id)
+
+@client.event
+async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
+    if payload.guild_id is None: return
+    if payload.user_id == client.user.id: return
+    b=_score_bucket(payload.guild_id, payload.user_id); b["reacts_given"] += 1
+    author_id = message_author_cache.get(payload.message_id)
+    if author_id is None:
+        try:
+            ch = client.get_channel(payload.channel_id)
+            if isinstance(ch, (discord.TextChannel, discord.Thread)):
+                msg = await ch.fetch_message(payload.message_id)
+                author_id = msg.author.id; _cache_author(payload.message_id, author_id)
+        except Exception: author_id=None
+    if author_id and author_id != payload.user_id:
+        br=_score_bucket(payload.guild_id, author_id); br["reacts_recv"] += 1
+    _save_scores()
+
+@client.event
+async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
+    if payload.guild_id is None: return
+    if payload.user_id == client.user.id: return
+    b=_score_bucket(payload.guild_id, payload.user_id)
+    if b["reacts_given"]>0: b["reacts_given"] -= 1
+    author_id = message_author_cache.get(payload.message_id)
+    if author_id is None:
+        try:
+            ch = client.get_channel(payload.channel_id)
+            if isinstance(ch, (discord.TextChannel, discord.Thread)):
+                msg = await ch.fetch_message(payload.message_id)
+                author_id = msg.author.id; _cache_author(payload.message_id, author_id)
+        except Exception: author_id=None
+    if author_id and author_id != payload.user_id:
+        br=_score_bucket(payload.guild_id, author_id)
+        if br["reacts_recv"]>0: br["reacts_recv"] -= 1
+    _save_scores()
+
+@client.event
+async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
+    if member.bot or not member.guild: return
+    gid=member.guild.id; uid=member.id
+    if before.channel is None and after.channel is not None:
+        _voice_start(gid, uid)
+    elif before.channel is not None and after.channel is None:
+        _voice_end(gid, uid)
+    elif (before.channel is not None and after.channel is not None and before.channel.id != after.channel.id):
+        _voice_end(gid, uid); _voice_start(gid, uid)
 
 # ======================== Start ========================
 if __name__ == "__main__":
