@@ -68,6 +68,9 @@ intents.voice_states = True
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
+# prevent duplicate registration on reconnects
+_COMMANDS_REGISTERED = False
+
 # ======================== Parser / Utils ========================
 DOW_MAP = {
     "mon":0,"monday":0,"0":0, "tue":1,"tuesday":1,"1":1, "wed":2,"wednesday":2,"2":2,
@@ -1054,7 +1057,7 @@ async def _onb_public_welcome(guild: discord.Guild, member: discord.Member, deta
 
     await ch.send(content=text, embed=emb)
 
-# ====== Auto-Erstellung fehlender Rollen (Bootstrap) ======
+# ====== Auto-Erstellung fehlender Rollen (Bootstrap) & Rollen-Commands ======
 async def _ensure_role(guild: discord.Guild, name: str, color: Optional[discord.Color] = None, mentionable: bool = True) -> discord.Role:
     r = discord.utils.get(guild.roles, name=name)
     if r:
@@ -1108,6 +1111,7 @@ def register_onboarding_commands():
         except Exception as e:
             await inter.followup.send(f"❌ Fehler: {e}", ephemeral=True)
 
+    # Anzeige/Setzen (Onboarding)
     @tree.command(name="onb_setup", description="Zeigt die Onboarding-Konfiguration.")
     async def onb_setup(inter: discord.Interaction):
         if not _adm(inter): await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True); return
@@ -1195,6 +1199,81 @@ def register_onboarding_commands():
         ok = await _onb_send_start(user)
         await inter.response.send_message("✅ Gesendet." if ok else "❌ Konnte keine DM/Fallback senden.", ephemeral=True)
 
+# ===== Rollen-Command-Gruppe (explizit) =====
+def register_role_commands():
+    def _adm(inter: discord.Interaction) -> bool:
+        m = inter.user; p = getattr(m, "guild_permissions", None)
+        return bool(p and (p.administrator or p.manage_guild))
+
+    @tree.command(name="roles_bootstrap", description="Rollen anlegen & Configs setzen (Weiße Flamme, DD, Tank, Heal, NEWBIE).")
+    async def roles_bootstrap(inter: discord.Interaction):
+        if not _adm(inter):
+            await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True); return
+        await inter.response.defer(ephemeral=True, thinking=True)
+        # einfach onb_bootstrap-Logik wiederverwenden:
+        g = _onb_g(inter.guild_id)
+        wf   = await _ensure_role(inter.guild, "Weiße Flamme", discord.Color.from_rgb(255,255,255))
+        dd   = await _ensure_role(inter.guild, "DD",   discord.Color.from_rgb(240, 80, 80))
+        tank = await _ensure_role(inter.guild, "Tank", discord.Color.from_rgb(80,160,240))
+        heal = await _ensure_role(inter.guild, "Heal", discord.Color.from_rgb(80,200,120))
+        nb   = await _ensure_role(inter.guild, "NEWBIE", discord.Color.from_rgb(200,200,200))
+        g["guild_role_id"]=wf.id; g["dd_role_id"]=dd.id; g["tank_role_id"]=tank.id; g["heal_role_id"]=heal.id; g["newbie_role_id"]=nb.id
+        _onb_save_cfg()
+        _set_guild_role_id(inter.guild_id, wf.id)  # Score/Filter
+        await inter.followup.send("✅ Rollen erstellt & gesetzt. (/roles_show für Übersicht)", ephemeral=True)
+
+    @tree.command(name="roles_show", description="Zeigt Rollen-Mapping (Onboarding + RSVP/Filter).")
+    async def roles_show(inter: discord.Interaction):
+        if not _adm(inter): await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True); return
+        g = _onb_g(inter.guild_id)
+        rcfg = rsvp_cfg.get(str(inter.guild_id)) or {}
+        def rm(rid): 
+            r = inter.guild.get_role(int(rid or 0)) if rid else None
+            return r.mention if r else "—"
+        lines = [
+            "**Onboarding:**",
+            f"• Gilde: {rm(g.get('guild_role_id'))}",
+            f"• DD: {rm(g.get('dd_role_id'))} | Tank: {rm(g.get('tank_role_id'))} | Heal: {rm(g.get('heal_role_id'))}",
+            f"• NEWBIE: {rm(g.get('newbie_role_id'))}",
+            "",
+            "**RSVP/Score:**",
+            f"• TANK: {rm((rcfg.get('TANK') or 0))}",
+            f"• HEAL: {rm((rcfg.get('HEAL') or 0))}",
+            f"• DPS : {rm((rcfg.get('DPS')  or 0))}",
+            f"• Filter-Rolle: {rm((rcfg.get('GUILD_ROLE') or 0))}",
+        ]
+        await inter.response.send_message("\n".join(lines), ephemeral=True)
+
+    @tree.command(name="roles_set_guild", description="Setzt Gildenrolle (auch als Score-Filter).")
+    async def roles_set_guild(inter: discord.Interaction, role: discord.Role):
+        if not _adm(inter): await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True); return
+        g = _onb_g(inter.guild_id); g["guild_role_id"] = role.id; _onb_save_cfg(); _set_guild_role_id(inter.guild_id, role.id)
+        await inter.response.send_message(f"✅ Gildenrolle: {role.mention}", ephemeral=True)
+
+    @tree.command(name="roles_set_dd", description="Setzt DD-Rolle.")
+    async def roles_set_dd(inter: discord.Interaction, role: discord.Role):
+        if not _adm(inter): await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True); return
+        g = _onb_g(inter.guild_id); g["dd_role_id"] = role.id; _onb_save_cfg()
+        await inter.response.send_message(f"✅ DD: {role.mention}", ephemeral=True)
+
+    @tree.command(name="roles_set_tank", description="Setzt Tank-Rolle.")
+    async def roles_set_tank(inter: discord.Interaction, role: discord.Role):
+        if not _adm(inter): await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True); return
+        g = _onb_g(inter.guild_id); g["tank_role_id"] = role.id; _onb_save_cfg()
+        await inter.response.send_message(f"✅ Tank: {role.mention}", ephemeral=True)
+
+    @tree.command(name="roles_set_heal", description="Setzt Heal-Rolle.")
+    async def roles_set_heal(inter: discord.Interaction, role: discord.Role):
+        if not _adm(inter): await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True); return
+        g = _onb_g(inter.guild_id); g["heal_role_id"] = role.id; _onb_save_cfg()
+        await inter.response.send_message(f"✅ Heal: {role.mention}", ephemeral=True)
+
+    @tree.command(name="roles_set_newbie", description="Setzt NEWBIE-Rolle.")
+    async def roles_set_newbie(inter: discord.Interaction, role: discord.Role):
+        if not _adm(inter): await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True); return
+        g = _onb_g(inter.guild_id); g["newbie_role_id"] = role.id; _onb_save_cfg()
+        await inter.response.send_message(f"✅ NEWBIE: {role.mention}", ephemeral=True)
+
 # ======================== Persistent Views + Lifecycle ========================
 def reregister_persistent_views_on_start():
     for msg_id, obj in list(rsvp_store.items()):
@@ -1219,18 +1298,19 @@ async def on_member_join(member: discord.Member):
 
 @client.event
 async def on_ready():
+    global _COMMANDS_REGISTERED
     print(f"Logged in as {client.user} (ID: {client.user.id})")
-    # Member-Cache
     for g in client.guilds:
         try: await g.chunk()
         except Exception as e: print("guild.chunk() failed:", e)
 
-    # Befehle registrieren
-    register_core_commands()
-    register_rsvp_slash_commands()
-    register_onboarding_commands()
+    if not _COMMANDS_REGISTERED:
+        register_core_commands()
+        register_rsvp_slash_commands()
+        register_onboarding_commands()
+        register_role_commands()
+        _COMMANDS_REGISTERED = True
 
-    # pro Guild syncen
     try:
         for g in client.guilds:
             await tree.sync(guild=discord.Object(id=g.id))
