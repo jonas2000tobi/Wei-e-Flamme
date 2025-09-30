@@ -58,7 +58,7 @@ threading.Thread(target=keep_alive, daemon=True).start()
 intents = discord.Intents.default()
 intents.guilds = True
 intents.members = True
-intents.message_content = True      # WICHTIG: auch im Dev-Portal aktivieren!
+intents.message_content = True      # WICHTIG: im Dev-Portal aktivieren!
 intents.voice_states = True
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
@@ -811,7 +811,7 @@ class ScoreView(discord.ui.View, BackToHubMixin):
         _save_scores()
         await inter.response.send_message("✅ Test: +1 Message gezählt.", ephemeral=True)
 
-# ----------- Select-Compat (robust) -----------
+# ----------- Select-Compat -----------
 class _ChannelPicker(discord.ui.ChannelSelect):
     def __init__(self, setter):
         super().__init__(channel_types=[discord.ChannelType.text], placeholder="Kanal wählen", min_values=1, max_values=1)
@@ -862,8 +862,7 @@ class RecurringBasicModal(discord.ui.Modal, title="Wiederkehrendes Event – Bas
             "role_id": None,
         }
         await inter.response.send_message(
-            f"📌 Basis gespeichert für **{name}**. "
-            f"Jetzt **Optionen** setzen oder **Speichern**.",
+            f"📌 Basis gespeichert für **{name}**. Jetzt **Optionen** setzen oder **Speichern**.",
             view=RecurringDraftView(), ephemeral=True
         )
 
@@ -975,7 +974,7 @@ class CreateRaidModal(discord.ui.Modal, title="Raid/Event mit RSVP erstellen"):
         self.title_in = discord.ui.TextInput(label="Titel", placeholder="z.B. Raid heute Abend", max_length=100)
         self.date_in  = discord.ui.TextInput(label="Datum (YYYY-MM-DD)", placeholder="2025-09-30")
         self.time_in  = discord.ui.TextInput(label="Zeit (HH:MM 24h)", placeholder="20:00")
-        self.desc_in  = discord.ui.TextInput(label="Beschreibung (optional)", style=discord.TextStyle.paragraph, required=False, max_length={})
+        self.desc_in  = discord.ui.TextInput(label="Beschreibung (optional)", style=discord.TextStyle.paragraph, required=False, max_length=400)
         self.img_in   = discord.ui.TextInput(label="Bild-URL (optional)", required=False)
         self.add_item(self.title_in); self.add_item(self.date_in); self.add_item(self.time_in); self.add_item(self.desc_in); self.add_item(self.img_in)
 
@@ -1098,7 +1097,6 @@ class OnboardAdminView(discord.ui.View, BackToHubMixin):
         v = discord.ui.View(timeout=120); v.add_item(_RolePicker(setter))
         await inter.response.send_message("Rolle wählen:", view=v, ephemeral=True)
 
-    # Tank/Heal/DPS auch hier
     @discord.ui.button(label="Tank-Rolle", emoji="🛡️", style=discord.ButtonStyle.secondary, row=2, custom_id="ob_tank")
     async def ob_tank(self, inter: discord.Interaction, _btn: discord.ui.Button):
         async def setter(i: discord.Interaction, r: discord.Role):
@@ -1176,6 +1174,22 @@ async def wf_debug_bump(inter: discord.Interaction):
     b = _score_bucket(inter.guild_id, inter.user.id)
     b["messages"] += 1; _save_scores()
     await inter.response.send_message("✅ +1 Message gezählt.", ephemeral=True)
+
+@tree.command(name="wf_debug_status", description="(Admin) Intents & Kanalrechte prüfen")
+async def wf_debug_status(inter: discord.Interaction):
+    if not is_admin(inter):
+        await inter.response.send_message("❌ Nur Admin.", ephemeral=True); return
+    me = inter.guild.me
+    perms = inter.channel.permissions_for(me)
+    lines = [
+        f"Intents – message_content: {client.intents.message_content}",
+        f"Intents – members: {client.intents.members}",
+        f"Intents – voice_states: {client.intents.voice_states}",
+        f"Perms ({inter.channel.name}) – view_channel: {perms.view_channel}",
+        f"Perms ({inter.channel.name}) – read_message_history: {perms.read_message_history}",
+        f"Perms ({inter.channel.name}) – add_reactions: {perms.add_reactions}",
+    ]
+    await inter.response.send_message("\n".join(lines), ephemeral=True)
 
 @tree.command(name="wf_set_announce_channel", description="(Fallback) Standard-Announce-Kanal setzen.")
 async def wf_set_announce_channel(inter: discord.Interaction, channel: discord.TextChannel):
