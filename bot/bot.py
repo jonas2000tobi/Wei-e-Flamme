@@ -16,6 +16,9 @@ from zoneinfo import ZoneInfo
 # ======================== Grundkonfig ========================
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 TZ = ZoneInfo("Europe/Berlin")
+DEBUG = os.getenv("DEBUG_SCORE", "0") == "1"
+def _dbg(*a): 
+    if DEBUG: print("[score]", *a)
 
 DATA_DIR = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
@@ -55,11 +58,14 @@ def keep_alive():
 threading.Thread(target=keep_alive, daemon=True).start()
 
 # ======================== Discord Setup ========================
-intents = discord.Intents.default()
+# Intents EXPLIZIT setzen (robust über alle discord.py Versionen)
+intents = discord.Intents.none()
 intents.guilds = True
 intents.members = True
-intents.message_content = True      # WICHTIG: im Dev-Portal aktivieren!
+intents.messages = True            # on_message
+intents.reactions = True           # raw_reaction_*
 intents.voice_states = True
+intents.message_content = True     # Portal-Schalter muss ON sein
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
@@ -811,7 +817,7 @@ class ScoreView(discord.ui.View, BackToHubMixin):
         _save_scores()
         await inter.response.send_message("✅ Test: +1 Message gezählt.", ephemeral=True)
 
-# ----------- Select-Compat -----------
+# ----------- Select-Compat (statt @channel_select/@role_select) -----------
 class _ChannelPicker(discord.ui.ChannelSelect):
     def __init__(self, setter):
         super().__init__(channel_types=[discord.ChannelType.text], placeholder="Kanal wählen", min_values=1, max_values=1)
@@ -1183,6 +1189,8 @@ async def wf_debug_status(inter: discord.Interaction):
     perms = inter.channel.permissions_for(me)
     lines = [
         f"Intents – message_content: {client.intents.message_content}",
+        f"Intents – messages: {client.intents.messages}",
+        f"Intents – reactions: {client.intents.reactions}",
         f"Intents – members: {client.intents.members}",
         f"Intents – voice_states: {client.intents.voice_states}",
         f"Perms ({inter.channel.name}) – view_channel: {perms.view_channel}",
@@ -1260,6 +1268,7 @@ async def scheduler_loop():
     now = _now().replace(second=0, microsecond=0)
     changed = False
 
+    # 1) Event-Reminder
     for guild in client.guilds:
         cfg = configs.get(guild.id)
         if not cfg or not cfg.events:
@@ -1306,17 +1315,32 @@ async def scheduler_loop():
                 except Exception:
                     pass
 
+    # 2) Voice-Live-Tick alle 5 Min (optional, für „sichtbare“ Fortschritte)
+    if now.minute % 5 == 0:
+        for (gid, uid), start in list(voice_sessions.items()):
+            delta_ms = int((now - start).total_seconds() * 1000)
+            if delta_ms > 0:
+                b = _score_bucket(gid, uid)
+                b["voice_ms"] += delta_ms
+                voice_sessions[(gid, uid)] = now
+                changed = True
+        if changed:
+            _save_scores()
+
+    # 3) Wöchentliches Leaderboard (Fr 18:00)
+    await _post_weekly_leaderboard_if_due(now)
+
+    # 4) Monatlicher Reset (30.)
+    await _monthly_reset_if_due(now)
+
     if changed:
         save_post_log(post_log)
-
-    await _post_weekly_leaderboard_if_due(now)
-    await _monthly_reset_if_due(now)
 
 @scheduler_loop.before_loop
 async def _before_scheduler():
     await client.wait_until_ready()
 
-# ======================== Score Hooks ========================
+# ======================== Score Hooks (robust + Debug) ========================
 @client.event
 async def on_message(message: discord.Message):
     if not message.guild or message.author.bot:
@@ -1325,13 +1349,15 @@ async def on_message(message: discord.Message):
     b["messages"] += 1
     _save_scores()
     _cache_author(message.id, message.author.id)
+    _dbg("msg+", message.guild.id, message.author.id, f"#{getattr(message.channel,'name','?')}")
 
 @client.event
 async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     if payload.guild_id is None or payload.user_id == client.user.id:
         return
-    b = _score_bucket(payload.guild_id, payload.user_id)
-    b["reacts_given"] += 1
+    sb = _score_bucket(payload.guild_id, payload.user_id)
+    sb["reacts_given"] += 1
+
     author_id = message_author_cache.get(payload.message_id)
     if author_id is None:
         try:
@@ -1340,20 +1366,26 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
                 msg = await ch.fetch_message(payload.message_id)
                 author_id = msg.author.id
                 _cache_author(payload.message_id, author_id)
-        except Exception:
+        except Exception as e:
+            _dbg("react_add fetch fail", payload.message_id, str(e))
             author_id = None
+
     if author_id and author_id != payload.user_id:
-        br = _score_bucket(payload.guild_id, author_id)
-        br["reacts_recv"] += 1
+        rb = _score_bucket(payload.guild_id, author_id)
+        rb["reacts_recv"] += 1
+
     _save_scores()
+    _dbg("react_add", payload.guild_id, "given+",
+         "recv+" if author_id and author_id != payload.user_id else "recv-")
 
 @client.event
 async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
     if payload.guild_id is None or payload.user_id == client.user.id:
         return
-    b = _score_bucket(payload.guild_id, payload.user_id)
-    if b["reacts_given"] > 0:
-        b["reacts_given"] -= 1
+    sb = _score_bucket(payload.guild_id, payload.user_id)
+    if sb["reacts_given"] > 0:
+        sb["reacts_given"] -= 1
+
     author_id = message_author_cache.get(payload.message_id)
     if author_id is None:
         try:
@@ -1362,13 +1394,18 @@ async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
                 msg = await ch.fetch_message(payload.message_id)
                 author_id = msg.author.id
                 _cache_author(payload.message_id, author_id)
-        except Exception:
+        except Exception as e:
+            _dbg("react_remove fetch fail", payload.message_id, str(e))
             author_id = None
+
     if author_id and author_id != payload.user_id:
-        br = _score_bucket(payload.guild_id, author_id)
-        if br["reacts_recv"] > 0:
-            br["reacts_recv"] -= 1
+        rb = _score_bucket(payload.guild_id, author_id)
+        if rb["reacts_recv"] > 0:
+            rb["reacts_recv"] -= 1
+
     _save_scores()
+    _dbg("react_remove", payload.guild_id, "given-", 
+         "recv-" if author_id and author_id != payload.user_id else "recv-NA")
 
 @client.event
 async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
