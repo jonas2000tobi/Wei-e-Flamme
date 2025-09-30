@@ -58,7 +58,7 @@ threading.Thread(target=keep_alive, daemon=True).start()
 intents = discord.Intents.default()
 intents.guilds = True
 intents.members = True
-intents.message_content = True      # >>> aktiviere das auch im Dev-Portal!
+intents.message_content = True      # WICHTIG: auch im Dev-Portal aktivieren!
 intents.voice_states = True
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
@@ -90,7 +90,7 @@ def parse_time_hhmm(s: str) -> time_cls:
         hh, mm = s.strip().split(":")
         return time_cls(int(hh), int(mm))
     except Exception:
-        raise ValueError("start_time must be 'HH:MM' 24h.")
+        raise ValueError("start_time muss 'HH:MM' 24h sein.")
 
 def parse_premins(s: str) -> List[int]:
     if not s or not s.strip():
@@ -103,7 +103,7 @@ def parse_date_yyyy_mm_dd(s: str) -> date_cls:
         y,m,d = s.strip().split("-")
         return date_cls(int(y), int(m), int(d))
     except Exception:
-        raise ValueError("date must be 'YYYY-MM-DD'.")
+        raise ValueError("date muss 'YYYY-MM-DD' sein.")
 
 def parse_any_id(text: str) -> int:
     if not text: return 0
@@ -802,7 +802,16 @@ class ScoreView(discord.ui.View, BackToHubMixin):
         emb = discord.Embed(title="🔥 Flammen – Topliste", description="\n".join(lines), color=discord.Color.orange())
         await inter.response.send_message(embed=emb, ephemeral=True)
 
-# ----------- Select-Compat (ohne channel_select/role_select Decorators) -----------
+    @discord.ui.button(label="Test +1 (Admin)", emoji="🧪", style=discord.ButtonStyle.secondary, row=2, custom_id="score_test")
+    async def test_plus(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        if not is_admin(inter):
+            await inter.response.send_message("Nur Admin.", ephemeral=True); return
+        b = _score_bucket(inter.guild_id, inter.user.id)
+        b["messages"] += 1
+        _save_scores()
+        await inter.response.send_message("✅ Test: +1 Message gezählt.", ephemeral=True)
+
+# ----------- Select-Compat (robust) -----------
 class _ChannelPicker(discord.ui.ChannelSelect):
     def __init__(self, setter):
         super().__init__(channel_types=[discord.ChannelType.text], placeholder="Kanal wählen", min_values=1, max_values=1)
@@ -819,57 +828,110 @@ class _RolePicker(discord.ui.RoleSelect):
         r: discord.Role = self.values[0]  # type: ignore
         await self._setter(inter, r)
 
-# ----------- Wiederkehrende Events (Admin) -----------
-class RecurringEventModal(discord.ui.Modal, title="Wiederkehrendes Event erstellen"):
-    def __init__(self, default_channel_id: Optional[int]):
+# ----------- Wiederkehrende Events: 2-Schritt-Flow -----------
+rec_drafts: Dict[Tuple[int,int], dict] = {}
+
+class RecurringBasicModal(discord.ui.Modal, title="Wiederkehrendes Event – Basis"):
+    def __init__(self):
         super().__init__()
-        self.default_channel_id = default_channel_id
         self.name_in  = discord.ui.TextInput(label="Name", max_length=80, placeholder="Gildenbesprechung")
         self.dow_in   = discord.ui.TextInput(label="Wochentage (z.B. Mo,Mi,Fr oder 0,2,4)", placeholder="Mo,Mi")
         self.time_in  = discord.ui.TextInput(label="Start (HH:MM)", placeholder="20:00")
         self.dur_in   = discord.ui.TextInput(label="Dauer (Minuten)", placeholder="60")
-        self.pre_in   = discord.ui.TextInput(label="Pre-Reminder Min (kommagetrennt)", placeholder="60,15,5", required=False)
-        self.desc_in  = discord.ui.TextInput(label="Beschreibung (optional)", style=discord.TextStyle.paragraph, required=False, max_length=400)
-        self.role_in  = discord.ui.TextInput(label="Erwähnungsrolle (ID/Erwähnung, optional)", required=False)
-        self.add_item(self.name_in); self.add_item(self.dow_in); self.add_item(self.time_in)
-        self.add_item(self.dur_in); self.add_item(self.pre_in); self.add_item(self.desc_in); self.add_item(self.role_in)
+        self.add_item(self.name_in); self.add_item(self.dow_in)
+        self.add_item(self.time_in); self.add_item(self.dur_in)
 
     async def on_submit(self, inter: discord.Interaction):
         if not is_admin(inter):
-            await inter.response.send_message("Nur Admin/Manage Server.", ephemeral=True); return
+            await inter.response.send_message("Nur Admin.", ephemeral=True); return
         try:
             name = str(self.name_in).strip()
             dows = parse_weekdays(str(self.dow_in))
             start = parse_time_hhmm(str(self.time_in))
             duration = int(str(self.dur_in))
+        except Exception as e:
+            await inter.response.send_message(f"❌ Ungültig: {e}", ephemeral=True); return
+
+        rec_drafts[(inter.guild_id, inter.user.id)] = {
+            "name": name,
+            "dows": dows,
+            "start": start.strftime("%H:%M"),
+            "duration": duration,
+            "pre": [],
+            "desc": "",
+            "role_id": None,
+        }
+        await inter.response.send_message(
+            f"📌 Basis gespeichert für **{name}**. "
+            f"Jetzt **Optionen** setzen oder **Speichern**.",
+            view=RecurringDraftView(), ephemeral=True
+        )
+
+class RecurringOptionsModal(discord.ui.Modal, title="Wiederkehrendes Event – Optionen"):
+    def __init__(self):
+        super().__init__()
+        self.pre_in  = discord.ui.TextInput(label="Pre-Reminder (Minuten, komma-getrennt)", placeholder="60,15,5", required=False)
+        self.desc_in = discord.ui.TextInput(label="Beschreibung (optional)", style=discord.TextStyle.paragraph, required=False, max_length=400)
+        self.role_in = discord.ui.TextInput(label="Erwähnungsrolle (ID/Erwähnung, optional)", required=False)
+        self.add_item(self.pre_in); self.add_item(self.desc_in); self.add_item(self.role_in)
+
+    async def on_submit(self, inter: discord.Interaction):
+        d = rec_drafts.get((inter.guild_id, inter.user.id))
+        if not d:
+            await inter.response.send_message("Kein Entwurf gefunden.", ephemeral=True); return
+        try:
             pre = parse_premins(str(self.pre_in))
             role_id = parse_any_id(str(self.role_in))
         except Exception as e:
-            await inter.response.send_message(f"❌ Ungültige Eingaben: {e}", ephemeral=True); return
+            await inter.response.send_message(f"❌ Ungültig: {e}", ephemeral=True); return
+        d["pre"] = pre
+        d["desc"] = str(self.desc_in).strip()
+        d["role_id"] = role_id or None
+        await inter.response.send_message("✅ Optionen übernommen.", ephemeral=True)
 
+class RecurringDraftView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=300)
+
+    @discord.ui.button(label="Optionen", emoji="⚙️", style=discord.ButtonStyle.secondary)
+    async def opts(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        if (inter.guild_id, inter.user.id) not in rec_drafts:
+            await inter.response.send_message("Kein Entwurf.", ephemeral=True); return
+        await inter.response.send_modal(RecurringOptionsModal())
+
+    @discord.ui.button(label="Speichern", emoji="💾", style=discord.ButtonStyle.success)
+    async def save(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        d = rec_drafts.pop((inter.guild_id, inter.user.id), None)
+        if not d:
+            await inter.response.send_message("Kein Entwurf.", ephemeral=True); return
         cfg = get_or_create_guild_cfg(inter.guild_id)
+        channel_id = cfg.announce_channel_id or (inter.channel.id if isinstance(inter.channel, discord.TextChannel) else None)
+        if not channel_id:
+            await inter.response.send_message("❌ Kein Ankündigungskanal gesetzt. Button „Standard-Kanal“ zuerst benutzen.", ephemeral=True); return
         ev = Event(
-            name=name,
-            weekdays=dows,
-            start_hhmm=start.strftime("%H:%M"),
-            duration_min=duration,
-            pre_reminders=pre,
-            mention_role_id=role_id or None,
-            channel_id=cfg.announce_channel_id or (inter.channel.id if isinstance(inter.channel, discord.TextChannel) else None),
-            description=str(self.desc_in).strip() if str(self.desc_in).strip() else "",
+            name=d["name"],
+            weekdays=d["dows"],
+            start_hhmm=d["start"],
+            duration_min=d["duration"],
+            pre_reminders=d["pre"],
+            mention_role_id=d["role_id"],
+            channel_id=channel_id,
+            description=d["desc"],
             one_time_date=None
         )
-        if not ev.channel_id:
-            await inter.response.send_message("❌ Kein Ankündigungskanal gesetzt. Button „Standard-Kanal“ benutzen.", ephemeral=True); return
-
         cfg.events = cfg.events or {}
-        cfg.events[name.lower()] = ev
+        cfg.events[ev.name.lower()] = ev
         save_all_cfgs(configs)
-        next_dt = ev.next_occurrence_start(_now())
-        when_txt = next_dt.strftime("%a, %d.%m.%Y %H:%M") if next_dt else "—"
-        await inter.response.send_message(f"✅ Wiederkehrendes Event **{name}** gespeichert. Nächster Termin: **{when_txt}** im <#{ev.channel_id}>.", ephemeral=True)
+        nxt = ev.next_occurrence_start(_now())
+        nxts = nxt.strftime("%a, %d.%m.%Y %H:%M") if nxt else "—"
+        await inter.response.send_message(f"✅ Wiederkehrendes Event **{ev.name}** gespeichert. Nächster Termin: **{nxts}**.", ephemeral=True)
 
-# Event-Listen/Löschen
+    @discord.ui.button(label="Verwerfen", emoji="🗑️", style=discord.ButtonStyle.danger)
+    async def discard(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        rec_drafts.pop((inter.guild_id, inter.user.id), None)
+        await inter.response.send_message("Entwurf verworfen.", ephemeral=True)
+
+# ----------- Event-Liste/Löschen -----------
 def _format_event_list(gid: int) -> str:
     cfg = configs.get(gid)
     if not cfg or not cfg.events:
@@ -913,7 +975,7 @@ class CreateRaidModal(discord.ui.Modal, title="Raid/Event mit RSVP erstellen"):
         self.title_in = discord.ui.TextInput(label="Titel", placeholder="z.B. Raid heute Abend", max_length=100)
         self.date_in  = discord.ui.TextInput(label="Datum (YYYY-MM-DD)", placeholder="2025-09-30")
         self.time_in  = discord.ui.TextInput(label="Zeit (HH:MM 24h)", placeholder="20:00")
-        self.desc_in  = discord.ui.TextInput(label="Beschreibung (optional)", style=discord.TextStyle.paragraph, required=False, max_length=400)
+        self.desc_in  = discord.ui.TextInput(label="Beschreibung (optional)", style=discord.TextStyle.paragraph, required=False, max_length={})
         self.img_in   = discord.ui.TextInput(label="Bild-URL (optional)", required=False)
         self.add_item(self.title_in); self.add_item(self.date_in); self.add_item(self.time_in); self.add_item(self.desc_in); self.add_item(self.img_in)
 
@@ -968,8 +1030,7 @@ class EventsView(discord.ui.View, BackToHubMixin):
 
     @discord.ui.button(label="Wiederkehrendes Event", emoji="🔁", style=discord.ButtonStyle.success, row=1, custom_id="ev_create_rec")
     async def create_rec(self, inter: discord.Interaction, _btn: discord.ui.Button):
-        cfg = get_or_create_guild_cfg(inter.guild_id)
-        await inter.response.send_modal(RecurringEventModal(cfg.announce_channel_id))
+        await inter.response.send_modal(RecurringBasicModal())
 
     @discord.ui.button(label="Event-Liste", emoji="📜", style=discord.ButtonStyle.secondary, row=1, custom_id="ev_list")
     async def list_events(self, inter: discord.Interaction, _btn: discord.ui.Button):
@@ -1037,7 +1098,7 @@ class OnboardAdminView(discord.ui.View, BackToHubMixin):
         v = discord.ui.View(timeout=120); v.add_item(_RolePicker(setter))
         await inter.response.send_message("Rolle wählen:", view=v, ephemeral=True)
 
-    # Tank/Heal/DPS auch hier verfügbar
+    # Tank/Heal/DPS auch hier
     @discord.ui.button(label="Tank-Rolle", emoji="🛡️", style=discord.ButtonStyle.secondary, row=2, custom_id="ob_tank")
     async def ob_tank(self, inter: discord.Interaction, _btn: discord.ui.Button):
         async def setter(i: discord.Interaction, r: discord.Role):
@@ -1108,16 +1169,14 @@ async def wf_admin_sync_hard(inter: discord.Interaction):
     except Exception as e:
         await inter.response.send_message(f"❌ Sync-Fehler: {e}", ephemeral=True)
 
-# Debug: Score anstubsen (nur Admin)
 @tree.command(name="wf_debug_bump", description="(Admin) Test: +1 Message auf meinen Score")
 async def wf_debug_bump(inter: discord.Interaction):
     if not is_admin(inter):
         await inter.response.send_message("❌ Nur Admin.", ephemeral=True); return
     b = _score_bucket(inter.guild_id, inter.user.id)
     b["messages"] += 1; _save_scores()
-    await inter.response.send_message("✅ +1 Message gezählt. Menü → Flammenscore → Mein Score prüfen.", ephemeral=True)
+    await inter.response.send_message("✅ +1 Message gezählt.", ephemeral=True)
 
-# Fallback: Ankündigungskanal setzen
 @tree.command(name="wf_set_announce_channel", description="(Fallback) Standard-Announce-Kanal setzen.")
 async def wf_set_announce_channel(inter: discord.Interaction, channel: discord.TextChannel):
     if not is_admin(inter): await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True); return
@@ -1128,9 +1187,7 @@ async def wf_set_announce_channel(inter: discord.Interaction, channel: discord.T
 
 # ======================== Lifecycle & Resync ========================
 def reregister_persistent_views_on_start():
-    # Statische Views
     client.add_view(HubView()); client.add_view(ScoreView()); client.add_view(EventsView()); client.add_view(OnboardAdminView()); client.add_view(AdminToolsView())
-    # RSVP-Views erneut anhängen
     for msg_id, obj in list(rsvp_store.items()):
         try:
             client.add_view(RaidView(int(msg_id)), message_id=int(msg_id))
@@ -1150,7 +1207,6 @@ async def _resync_global_only():
 async def on_ready():
     print(f"Logged in as {client.user} (ID: {client.user.id})")
 
-    # Persistenz laden
     global configs, post_log
     configs = load_all_cfgs()
     post_log = load_post_log()
@@ -1316,7 +1372,6 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
 if __name__ == "__main__":
     if not TOKEN:
         raise SystemExit("Set DISCORD_BOT_TOKEN environment variable.")
-    # Persistenz initial einlesen
     configs = load_all_cfgs()
     post_log = load_post_log()
     client.run(TOKEN)
