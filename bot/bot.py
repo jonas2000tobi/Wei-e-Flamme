@@ -675,7 +675,7 @@ async def _queue_onboarding_review(guild: discord.Guild, member: discord.Member,
     sc_id = int(meta.get("staff_channel_id", 0) or 0)
     ch = guild.get_channel(sc_id) if sc_id else None
     if not isinstance(ch, discord.TextChannel):
-        print(f"[onboarding] Kein Staff-Channel gesetzt. Nutze das Admin-Menü (⚙️) → Staff-Channel.")
+        print(f"[onboarding] Kein Staff-Channel gesetzt. Nutze das Admin-Menü (🧭) → Staff-Review-Kanal.")
         return
     lines = [
         f"👤 **User:** {member.mention} (`{member.id}`)",
@@ -927,6 +927,10 @@ class OnboardAdminView(discord.ui.View, BackToHubMixin):
     async def set_newbie(self, inter: discord.Interaction, _btn: discord.ui.Button):
         await inter.response.edit_message(embed=onboard_embed_intro().set_footer(text="Rolle wählen"), view=PickRoleView("newbie"))
 
+    @discord.ui.button(label="Mitgliedsrolle (WF)", emoji="🏰", style=discord.ButtonStyle.secondary, custom_id="ob_set_guildrole")
+    async def set_member_role(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        await inter.response.edit_message(embed=onboard_embed_intro().set_footer(text="Rolle wählen"), view=PickRoleView("guild"))
+
     @discord.ui.button(label="Onboarding Test-DM", emoji="✉️", style=discord.ButtonStyle.primary, custom_id="ob_test_dm")
     async def test_dm(self, inter: discord.Interaction, _btn: discord.ui.Button):
         await _send_onboarding_dm(inter.user)
@@ -945,8 +949,8 @@ class AdminToolsView(discord.ui.View, BackToHubMixin):
     @discord.ui.button(label="Commands Sync", emoji="🔁", style=discord.ButtonStyle.secondary, custom_id="admin_sync")
     async def sync(self, inter: discord.Interaction, _btn: discord.ui.Button):
         try:
-            await _full_resync_single_guild(inter.guild_id)
-            await inter.response.send_message("✅ Commands neu synchronisiert.", ephemeral=True)
+            await _resync_global_only()
+            await inter.response.send_message("✅ Commands neu synchronisiert (nur global).", ephemeral=True)
         except Exception as e:
             await inter.response.send_message(f"❌ Sync-Fehler: {e}", ephemeral=True)
 
@@ -959,17 +963,17 @@ async def wf(inter: discord.Interaction):
 async def wf_ping(inter: discord.Interaction):
     await inter.response.send_message("🏓 Pong. Ich lebe.", ephemeral=True)
 
-@tree.command(name="wf_admin_sync_hard", description="(Admin) Harte Neu-Synchronisation aller Slash-Commands")
+@tree.command(name="wf_admin_sync_hard", description="(Admin) Harte Neu-Synchronisation: nur globale Commands")
 async def wf_admin_sync_hard(inter: discord.Interaction):
     if not is_admin(inter):
         await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True); return
     try:
-        await _full_resync_all()
-        await inter.response.send_message("✅ Harte Neu-Synchronisation fertig. Versuch jetzt `/wf`.", ephemeral=True)
+        await _resync_global_only()
+        await inter.response.send_message("✅ Hard-Sync fertig. Nur globale Commands aktiv – Duplikate weg.", ephemeral=True)
     except Exception as e:
         await inter.response.send_message(f"❌ Sync-Fehler: {e}", ephemeral=True)
 
-# Fallbacks
+# Fallbacks (optional)
 @tree.command(name="wf_set_welcome_channel", description="(Fallback) Kanal für öffentliche Begrüßung setzen.")
 async def wf_set_welcome_channel(inter: discord.Interaction, channel: discord.TextChannel):
     if not is_admin(inter): await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True); return
@@ -1004,33 +1008,23 @@ async def wf_onboarding_test(inter: discord.Interaction):
 
 # ======================== Lifecycle & Resync ========================
 def reregister_persistent_views_on_start():
+    # statische Views registrieren (persistente Custom IDs)
     client.add_view(HubView()); client.add_view(ScoreView()); client.add_view(EventsView()); client.add_view(OnboardAdminView()); client.add_view(AdminToolsView())
+    # RSVP-Views erneut anhängen
     for msg_id, obj in list(rsvp_store.items()):
         try:
             client.add_view(RaidView(int(msg_id)), message_id=int(msg_id))
         except Exception as e:
             print("add_view (RSVP) failed:", e)
 
-async def _full_resync_single_guild(guild_id: int):
-    await tree.sync()  # globale aktualisieren
-    guild_obj = discord.Object(id=guild_id)
-    tree.clear_commands(guild=guild_obj)
-    tree.copy_global_to(guild=guild_obj)
-    await tree.sync(guild=guild_obj)
-
-async def _full_resync_all():
+async def _resync_global_only():
+    # Gilden-scope löschen
+    for g in client.guilds:
+        guild_obj = discord.Object(id=g.id)
+        tree.clear_commands(guild=guild_obj)
+        await tree.sync(guild=guild_obj)
+    # Nur global syncen (unsere @tree.command sind global)
     await tree.sync()
-    for g in client.guilds:
-        await _full_resync_single_guild(g.id)
-
-async def _sync_all_guilds_now():
-    for g in client.guilds:
-        try:
-            guild_obj = discord.Object(id=g.id)
-            tree.copy_global_to(guild=guild_obj)
-            await tree.sync(guild=guild_obj)
-        except Exception as e:
-            print(f"sync for guild {g.id} failed:", e)
 
 @client.event
 async def on_ready():
@@ -1045,11 +1039,10 @@ async def on_ready():
     reregister_persistent_views_on_start()
 
     try:
-        await _full_resync_all()
-        print("[sync] Full resync done.")
+        await _resync_global_only()
+        print("[sync] Global-only resync done.")
     except Exception as e:
-        print("[sync] Full resync failed:", e)
-        await _sync_all_guilds_now()
+        print("[sync] resync failed:", e)
 
     print(f"Synced commands for {len(client.guilds)} guild(s).")
     scheduler_loop.start()
@@ -1057,7 +1050,7 @@ async def on_ready():
 @client.event
 async def on_guild_join(guild: discord.Guild):
     try:
-        await _full_resync_single_guild(guild.id)
+        await _resync_global_only()
     except Exception as e:
         print("sync on guild_join failed:", e)
 
