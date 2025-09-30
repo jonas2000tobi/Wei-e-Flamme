@@ -183,17 +183,15 @@ def _load_json(p: Path, default):
         return default
 
 def _save_json(p: Path, obj):
-    # atomar
     tmp = p.with_suffix(p.suffix + ".tmp")
     tmp.write_text(json.dumps(obj, indent=2, ensure_ascii=False), encoding="utf-8")
     tmp.replace(p)
 
-# Stores
 rsvp_store: Dict[str, dict] = _load_json(RSVP_STORE_FILE, {})
 rsvp_cfg:   Dict[str, dict] = _load_json(RSVP_CFG_FILE, {})
-scores:     Dict[str, dict] = _load_json(SCORE_FILE, {})      # {gid:{uid:{...}}}
-score_cfg:  Dict[str, dict] = _load_json(SCORE_CFG_FILE, {})  # {gid:{weights...}}
-score_meta: Dict[str, dict] = _load_json(SCORE_META_FILE, {}) # {gid:{last_reset_ym:"YYYY-MM"}}
+scores:     Dict[str, dict] = _load_json(SCORE_FILE, {})
+score_cfg:  Dict[str, dict] = _load_json(SCORE_CFG_FILE, {})
+score_meta: Dict[str, dict] = _load_json(SCORE_META_FILE, {})
 onboard_meta: Dict[str, dict] = _load_json(ONBOARD_META_FILE, {})
 
 def _save_rsvp():       _save_json(RSVP_STORE_FILE, rsvp_store)
@@ -203,14 +201,6 @@ def _save_score_cfg():  _save_json(SCORE_CFG_FILE, score_cfg)
 def _save_score_meta(): _save_json(SCORE_META_FILE, score_meta)
 def _save_onboard_meta(): _save_json(ONBOARD_META_FILE, onboard_meta)
 
-def _gc_post_log():
-    MAX = 5000
-    if len(post_log) > MAX:
-        keep = sorted(post_log)[-MAX:]
-        post_log.clear(); post_log.update(keep)
-        save_post_log(post_log)
-
-# Konfig laden
 def load_all() -> Dict[int, GuildConfig]:
     raw = _load_json(CFG_FILE, {})
     return {int(gid): GuildConfig.from_dict(cfg) for gid,cfg in raw.items()} if raw else {}
@@ -227,21 +217,6 @@ def save_post_log(log: Set[str]):
 
 configs: Dict[int, GuildConfig] = load_all()
 post_log: Set[str] = load_post_log()
-
-# ======================== Helper ========================
-def get_or_create_guild_cfg(guild_id: int) -> GuildConfig:
-    cfg = configs.get(guild_id)
-    if not cfg:
-        cfg = GuildConfig(guild_id=guild_id, events={})
-        configs[guild_id] = cfg
-        save_all(configs)
-    return cfg
-
-async def ensure_text_channel(guild: discord.Guild, channel_id: Optional[int]) -> Optional[discord.TextChannel]:
-    if not channel_id:
-        return None
-    ch = guild.get_channel(channel_id)
-    return ch if isinstance(ch, discord.TextChannel) else None
 
 # ======================== RSVP / Raid ========================
 def _get_role_ids(guild: discord.Guild) -> Dict[str, int]:
@@ -379,7 +354,6 @@ class RaidView(discord.ui.View):
         if changed:
             _save_rsvp()
             await self._credit_rsvp(interaction)
-
             guild = interaction.guild
             emb = await _build_embed_async(guild, obj)
             ch = guild.get_channel(obj["channel_id"])
@@ -813,6 +787,38 @@ class ScoreView(discord.ui.View, BackToHubMixin):
         emb = discord.Embed(title="🔥 Flammen – Topliste", description="\n".join(lines), color=discord.Color.orange())
         await inter.response.send_message(embed=emb, ephemeral=True)
 
+# ----------- Select-Compat (ohne channel_select/role_select Decorators) -----------
+class _ChannelPicker(discord.ui.ChannelSelect):
+    def __init__(self, meta_key: Literal["welcome_channel_id","staff_channel_id"]):
+        super().__init__(channel_types=[discord.ChannelType.text], placeholder="Kanal wählen", min_values=1, max_values=1)
+        self.meta_key = meta_key
+    async def callback(self, inter: discord.Interaction):
+        ch = self.values[0]  # type: ignore
+        _set_meta(inter.guild_id, **{self.meta_key: ch.id})
+        label = "Willkommens-Kanal" if self.meta_key=="welcome_channel_id" else "Staff-Review-Kanal"
+        await inter.response.send_message(f"✅ {label}: {ch.mention}", ephemeral=True)
+
+class _RolePicker(discord.ui.RoleSelect):
+    def __init__(self, mode: Literal["guild","tank","heal","dps","newbie"]):
+        super().__init__(min_values=1, max_values=1)
+        self.mode = mode
+    async def callback(self, inter: discord.Interaction):
+        r: discord.Role = self.values[0]  # type: ignore
+        gid = inter.guild_id
+        if self.mode=="guild":
+            _set_guild_role_id(gid, r.id)
+            await inter.response.send_message(f"✅ Mitgliedsrolle gesetzt: {r.mention}", ephemeral=True); return
+        if self.mode=="newbie":
+            _set_newbie_role_id(gid, r.id)
+            await inter.response.send_message(f"✅ NEWBIE-Rolle gesetzt: {r.mention}", ephemeral=True); return
+        # tank/heal/dps
+        cur = _get_role_ids(inter.guild)
+        if self.mode=="tank": cur["TANK"]=r.id
+        elif self.mode=="heal": cur["HEAL"]=r.id
+        elif self.mode=="dps": cur["DPS"]=r.id
+        _set_role_ids(gid, cur["TANK"], cur["HEAL"], cur["DPS"])
+        await inter.response.send_message("✅ Rollen verknüpft.", ephemeral=True)
+
 class CreateRaidModal(discord.ui.Modal, title="Raid/Event erstellen"):
     def __init__(self, channel_id: int | None = None):
         super().__init__()
@@ -862,36 +868,12 @@ class CreateRaidModal(discord.ui.Modal, title="Raid/Event erstellen"):
 class PickTextChannelView(discord.ui.View, BackToHubMixin):
     def __init__(self, meta_key: Literal["welcome_channel_id","staff_channel_id"]):
         super().__init__(timeout=120)
-        self.meta_key = meta_key
-
-    @discord.ui.channel_select(channel_types=[discord.ChannelType.text], placeholder="Kanal wählen")
-    async def choose(self, inter: discord.Interaction, select: discord.ui.ChannelSelect):
-        ch: discord.abc.GuildChannel = select.values[0]
-        _set_meta(inter.guild_id, **{self.meta_key: ch.id})
-        label = "Willkommens-Kanal" if self.meta_key=="welcome_channel_id" else "Staff-Review-Kanal"
-        await inter.response.send_message(f"✅ {label}: {ch.mention}", ephemeral=True)
+        self.add_item(_ChannelPicker(meta_key))
 
 class PickRoleView(discord.ui.View, BackToHubMixin):
     def __init__(self, mode: Literal["guild","tank","heal","dps","newbie"]):
         super().__init__(timeout=120)
-        self.mode = mode
-
-    @discord.ui.role_select(placeholder="Rolle wählen", min_values=1, max_values=1)
-    async def choose(self, inter: discord.Interaction, select: discord.ui.RoleSelect):
-        r: discord.Role = select.values[0]
-        gid = inter.guild_id
-        if self.mode=="guild":
-            _set_guild_role_id(gid, r.id)
-            await inter.response.send_message(f"✅ Mitgliedsrolle gesetzt: {r.mention}", ephemeral=True); return
-        if self.mode=="newbie":
-            _set_newbie_role_id(gid, r.id)
-            await inter.response.send_message(f"✅ NEWBIE-Rolle gesetzt: {r.mention}", ephemeral=True); return
-        cur = _get_role_ids(inter.guild)
-        if self.mode=="tank": cur["TANK"]=r.id
-        elif self.mode=="heal": cur["HEAL"]=r.id
-        elif self.mode=="dps": cur["DPS"]=r.id
-        _set_role_ids(gid, cur["TANK"], cur["HEAL"], cur["DPS"])
-        await inter.response.send_message("✅ Rollen verknüpft.", ephemeral=True)
+        self.add_item(_RolePicker(mode))
 
 class EventsView(discord.ui.View, BackToHubMixin):
     def __init__(self):
@@ -987,7 +969,7 @@ async def wf_admin_sync_hard(inter: discord.Interaction):
     except Exception as e:
         await inter.response.send_message(f"❌ Sync-Fehler: {e}", ephemeral=True)
 
-# Fallbacks (optional)
+# Fallbacks
 @tree.command(name="wf_set_welcome_channel", description="(Fallback) Kanal für öffentliche Begrüßung setzen.")
 async def wf_set_welcome_channel(inter: discord.Interaction, channel: discord.TextChannel):
     if not is_admin(inter): await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True); return
@@ -1030,22 +1012,18 @@ def reregister_persistent_views_on_start():
             print("add_view (RSVP) failed:", e)
 
 async def _full_resync_single_guild(guild_id: int):
-    # 1) globale Commands syncen (damit globale Liste autoritativ ist)
-    await tree.sync()
-    # 2) Guild-Commands leeren & globale reinkopieren
+    await tree.sync()  # globale aktualisieren
     guild_obj = discord.Object(id=guild_id)
     tree.clear_commands(guild=guild_obj)
     tree.copy_global_to(guild=guild_obj)
     await tree.sync(guild=guild_obj)
 
 async def _full_resync_all():
-    # Globale Commands neu schreiben (entspricht allen @tree.command ohne guild)
     await tree.sync()
     for g in client.guilds:
         await _full_resync_single_guild(g.id)
 
 async def _sync_all_guilds_now():
-    # Sanfter Sync (ohne Leeren) – wird beim Start zusätzlich gemacht
     for g in client.guilds:
         try:
             guild_obj = discord.Object(id=g.id)
@@ -1058,8 +1036,6 @@ async def _sync_all_guilds_now():
 async def on_ready():
     print(f"Logged in as {client.user} (ID: {client.user.id})")
 
-    _gc_post_log()
-
     for g in client.guilds:
         try:
             await g.chunk()
@@ -1068,17 +1044,14 @@ async def on_ready():
 
     reregister_persistent_views_on_start()
 
-    # *** Harte Autoritäts-Synchronisierung ***
     try:
         await _full_resync_all()
         print("[sync] Full resync done.")
     except Exception as e:
         print("[sync] Full resync failed:", e)
-        # Fallback: sanfter Sync
         await _sync_all_guilds_now()
 
     print(f"Synced commands for {len(client.guilds)} guild(s).")
-
     scheduler_loop.start()
 
 @client.event
@@ -1099,15 +1072,14 @@ async def scheduler_loop():
     now = _now().replace(second=0, microsecond=0)
     changed = False
 
-    # 1) Event-Reminder
     for guild in client.guilds:
         cfg = configs.get(guild.id)
         if not cfg or not cfg.events:
             continue
         for ev in list(cfg.events.values()):
             channel_id = ev.channel_id or cfg.announce_channel_id
-            channel = await ensure_text_channel(guild, channel_id)
-            if not channel:
+            channel = guild.get_channel(channel_id) if channel_id else None
+            if not isinstance(channel, discord.TextChannel):
                 continue
 
             start_dt = ev.occurrence_start_on_date(now.date())
@@ -1149,10 +1121,7 @@ async def scheduler_loop():
     if changed:
         save_post_log(post_log)
 
-    # 2) Wöchentliches Leaderboard (Fr 18:00)
     await _post_weekly_leaderboard_if_due(now)
-
-    # 3) Monatlicher Reset (30.)
     await _monthly_reset_if_due(now)
 
 @scheduler_loop.before_loop
