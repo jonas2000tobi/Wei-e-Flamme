@@ -1,7 +1,7 @@
 # bot.py
 from __future__ import annotations
 
-import os, json, threading, time, requests, re
+import os, json, threading, time, requests, re, random
 from dataclasses import dataclass, asdict, field
 from datetime import datetime, timedelta, time as time_cls, date as date_cls
 from pathlib import Path
@@ -29,6 +29,8 @@ SCORE_FILE        = DATA_DIR / "flammenscore.json"
 SCORE_CFG_FILE    = DATA_DIR / "flammenscore_cfg.json"
 SCORE_META_FILE   = DATA_DIR / "flammenscore_meta.json"
 ONBOARD_META_FILE = DATA_DIR / "onboarding_meta.json"
+# WFWorld Persistenz
+WFWORLD_FILE      = DATA_DIR / "wfworld.json"   # {gid:{users:{uid:{...}}, casino:{...}}}
 
 # ======================== Keepalive (Flask) ========================
 app = Flask(__name__)
@@ -89,7 +91,7 @@ def _map_token_to_day(tok: str) -> int:
     if t in TEXT_DAY_MAP:
         return TEXT_DAY_MAP[t]
     if t.isdigit():
-        n=int(t); 
+        n=int(t)
         if n==0: return 0
         if 1<=n<=7: return n-1
     raise ValueError(f"Unbekannter Wochentag-Token: '{tok}'")
@@ -229,6 +231,8 @@ scores:     Dict[str, dict] = _load_json(SCORE_FILE, {})
 score_cfg:  Dict[str, dict] = _load_json(SCORE_CFG_FILE, {})
 score_meta: Dict[str, dict] = _load_json(SCORE_META_FILE, {})
 onboard_meta: Dict[str, dict] = _load_json(ONBOARD_META_FILE, {})
+# WFWorld
+wfworld: Dict[str, dict] = _load_json(WFWORLD_FILE, {})
 
 def _save_rsvp():       _save_json(RSVP_STORE_FILE, rsvp_store)
 def _save_rsvp_cfg():   _save_json(RSVP_CFG_FILE, rsvp_cfg)
@@ -236,6 +240,7 @@ def _save_scores():     _save_json(SCORE_FILE, scores)
 def _save_score_cfg():  _save_json(SCORE_CFG_FILE, score_cfg)
 def _save_score_meta(): _save_json(SCORE_META_FILE, score_meta)
 def _save_onboard_meta(): _save_json(ONBOARD_META_FILE, onboard_meta)
+def _save_wfworld():    _save_json(WFWORLD_FILE, wfworld)
 
 def load_all() -> Dict[int, GuildConfig]:
     raw = _load_json(CFG_FILE, {})
@@ -738,6 +743,99 @@ class SingleRolePicker(discord.ui.RoleSelect):
         _set_role_ids(gid, cur["TANK"], cur["HEAL"], cur["DPS"])
         await inter.response.send_message("✅ Rollen verknüpft.", ephemeral=True)
 
+# ======================== WFWorld – Persistenz & Helper ========================
+def _wf_g(gid: int) -> dict:
+    g = wfworld.get(str(gid))
+    if not g:
+        g = {"users": {}, "casino": {"server_seed_hash": ""}}
+        wfworld[str(gid)] = g
+        _save_wfworld()
+    return g
+
+def _wf_u(gid: int, uid: int) -> dict:
+    g = _wf_g(gid)
+    u = g["users"].get(str(uid))
+    if not u:
+        u = {
+            "balance": 0,
+            "cooldowns": {
+                "fishing_ready_at": "1970-01-01T00:00:00+00:00",
+                "mining_ready_at":  "1970-01-01T00:00:00+00:00",
+                "hunting_ready_at": "1970-01-01T00:00:00+00:00",
+                "daily_ready_at":   "1970-01-01T00:00:00+00:00",
+            },
+            "inventory": {
+                "fish": {},
+                "ore": {},
+                "bar": {},
+                "materials": {},
+                "consumables": {},
+                "runes": {},
+                "weapons": []
+            },
+            "ledger": []
+        }
+        g["users"][str(uid)] = u
+        _save_wfworld()
+    return u
+
+def _dt_from_iso(s: str) -> datetime:
+    try: return datetime.fromisoformat(s)
+    except Exception: return datetime(1970,1,1, tzinfo=TZ)
+
+def _set_cd(u: dict, key: str, dt: datetime): u["cooldowns"][key] = dt.isoformat(); _save_wfworld()
+def _get_cd(u: dict, key: str) -> datetime: return _dt_from_iso(u["cooldowns"].get(key, "1970-01-01T00:00:00+00:00"))
+def _pay(u: dict, delta: int, reason: str):
+    u["balance"] = max(0, int(u["balance"]) + int(delta))
+    u["ledger"].append({"ts": _now().isoformat(), "delta": int(delta), "reason": reason})
+    if len(u["ledger"]) > 200: u["ledger"] = u["ledger"][-200:]
+    _save_wfworld()
+def _inv_add(bucket: dict, key: str, qty: int=1): bucket[key] = int(bucket.get(key, 0)) + int(qty)
+
+def _has_wf_role(member: discord.Member) -> Tuple[bool, str]:
+    role_id = _get_guild_role_filter_id(member.guild.id)
+    if not role_id:
+        # Falls Gate-Rolle nicht gesetzt ist: freigeben (Admins sowieso)
+        return (True, "not-set")
+    has = any(r.id == role_id for r in member.roles)
+    return (has or member.guild_permissions.administrator, f"<@&{role_id}>")
+
+def S(amount: int) -> str:
+    return f"{amount:,}".replace(",", " ") + " Sollant"
+
+# ---- WFWorld Konfig ----
+FISH_TABLE = [
+    ("gemein",        50,  60),
+    ("ungewöhnlich", 120,  25),
+    ("selten",       300,  10),
+    ("episch",       800,   4),
+    ("mondlachs",   1800,   1),
+]
+FISH_EMOJI = "🎣"; MINING_EMOJI = "⛏️"; HUNT_EMOJI = "🏹"; DAILY_EMOJI = "🎁"
+WF_COOLDOWNS = {
+    "fishing": timedelta(hours=3),
+    "mining":  timedelta(hours=3),
+    "hunting": timedelta(minutes=30),
+    "daily":   timedelta(hours=24),
+}
+DAILY_REWARD = 2000
+
+def _weighted_choice(table):
+    total = sum(w for _,_,w in table)
+    r = random.uniform(0, total); upto = 0
+    for item, _, weight in table:
+        if upto + weight >= r: return item
+        upto += weight
+    return table[-1][0]
+
+def _fish_reward(fid: str) -> int:
+    for k, val, _ in FISH_TABLE:
+        if k == fid: return val
+    return 0
+
+def _fish_sell_value(fishes: Dict[str,int]) -> int:
+    return sum(_fish_reward(k) * int(v) for k,v in fishes.items())
+
 # ======================== UI: Menüs ========================
 def hub_embed(guild: discord.Guild) -> discord.Embed:
     return discord.Embed(
@@ -748,7 +846,7 @@ def hub_embed(guild: discord.Guild) -> discord.Embed:
             "• **📅 Events** – Raid/RSVP & wiederkehrende Erinnerungen (Admin)\n"
             "• **🧭 Onboarding** – Kanäle/Rollen & Test-DM (Admin)\n"
             "• **⚙️ Admin** – Sync & Tools\n"
-            "• **🎮 WF-Spielwelt** – *bald*\n"
+            "• **🎮 WF-Spielwelt** – Wirtschaft & Mini-Games\n"
         ),
         color=discord.Color.orange()
     )
@@ -767,12 +865,244 @@ class BackToHubMixin:
     async def back(self, inter: discord.Interaction, _btn: discord.ui.Button):
         await inter.response.edit_message(embed=hub_embed(inter.guild), view=HubView())
 
+# ---- WFWorld Views/Actions ----
+def wfworld_embed(user: discord.Member) -> discord.Embed:
+    u = _wf_u(user.guild.id, user.id)
+    e = discord.Embed(
+        title="🎮 WFWorld",
+        description=f"Kontostand: **{S(u['balance'])}**",
+        color=discord.Color.orange(),
+    )
+    e.set_footer(text="Privat/ephemeral. Öffentliche Posts nur für Boss/Casino (später).")
+    return e
+
+class WfWorldBackMixin:
+    @discord.ui.button(label="Menü", emoji="🏰", style=discord.ButtonStyle.secondary, row=4, custom_id="wf_back_world")
+    async def back_world(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        await inter.response.edit_message(embed=wfworld_embed(inter.user), view=WFWorldView())
+
+class WFWorldView(discord.ui.View, BackToHubMixin):
+    def __init__(self): super().__init__(timeout=None)
+
+    @discord.ui.button(label="Beruf", emoji="🛠️", style=discord.ButtonStyle.primary, custom_id="wf_prof")
+    async def v_prof(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        await inter.response.edit_message(embed=wfworld_embed(inter.user), view=ProfessionView())
+
+    @discord.ui.button(label="Weltboss", emoji="🐉", style=discord.ButtonStyle.primary, custom_id="wf_boss")
+    async def v_boss(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        e = discord.Embed(title="🐉 Weltboss", description="Fenster & Loot-Vorschau – kommt bald.", color=discord.Color.red())
+        await inter.response.edit_message(embed=e, view=WorldBossView())
+
+    @discord.ui.button(label="Schmied", emoji="🛠️", style=discord.ButtonStyle.secondary, custom_id="wf_smith")
+    async def v_smith(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        e=discord.Embed(title="🛠️ Schmied", description="Schmelzen & Upgrades – Stub (nächster Schritt).", color=discord.Color.blurple())
+        await inter.response.edit_message(embed=e, view=SmithView())
+
+    @discord.ui.button(label="Gildenhändler", emoji="🛒", style=discord.ButtonStyle.secondary, custom_id="wf_vendor")
+    async def v_vendor(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        e=discord.Embed(title="🛒 Gildenhändler", description="Buffs/Runen – Stub.", color=discord.Color.green())
+        await inter.response.edit_message(embed=e, view=VendorView())
+
+    @discord.ui.button(label="Glücksspiel", emoji="🎲", style=discord.ButtonStyle.secondary, custom_id="wf_casino")
+    async def v_casino(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        e=discord.Embed(title="🎲 Glücksspiel", description="Provably Fair – Stub. Edge 2–8 %, Limits, Verlust-Cap.", color=discord.Color.gold())
+        await inter.response.edit_message(embed=e, view=CasinoView())
+
+    @discord.ui.button(label="Bank", emoji="🏦", style=discord.ButtonStyle.secondary, custom_id="wf_bank")
+    async def v_bank(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        u=_wf_u(inter.guild_id, inter.user.id)
+        e=discord.Embed(title="🏦 Bank", description=f"Kontostand: **{S(u['balance'])}**\n(Überweisungen/Fees: später)", color=discord.Color.dark_blue())
+        await inter.response.edit_message(embed=e, view=BankView())
+
+    @discord.ui.button(label="Inventar", emoji="🎒", style=discord.ButtonStyle.secondary, custom_id="wf_inv")
+    async def v_inv(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        await show_inventory(inter)
+
+    @discord.ui.button(label="Status", emoji="🕒", style=discord.ButtonStyle.secondary, custom_id="wf_status")
+    async def v_status(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        await show_status(inter)
+
+    @discord.ui.button(label="Hilfe/Fairness", emoji="📖", style=discord.ButtonStyle.secondary, custom_id="wf_help")
+    async def v_help(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        e=discord.Embed(
+            title="📖 Hilfe & Fairness",
+            description=("• Server-Cooldowns verhindern Spam\n"
+                         "• Glücksspiel später mit Server-Seed-Hash & Runden-Hash\n"
+                         "• Risiko: Gewinne nicht garantiert – verliere nur, was du verkraftest"),
+            color=discord.Color.light_grey()
+        )
+        await inter.response.edit_message(embed=e, view=HelpView())
+
+class ProfessionView(discord.ui.View, WfWorldBackMixin):
+    def __init__(self): super().__init__(timeout=None)
+
+    @discord.ui.button(label="Angeln", emoji=FISH_EMOJI, style=discord.ButtonStyle.primary, custom_id="wf_prof_fish")
+    async def v_fishing(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        await show_fishing(inter)
+
+    @discord.ui.button(label="Bergbau", emoji=MINING_EMOJI, style=discord.ButtonStyle.primary, custom_id="wf_prof_mine")
+    async def v_mining(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        await show_mining(inter)
+
+    @discord.ui.button(label="Jagd", emoji=HUNT_EMOJI, style=discord.ButtonStyle.primary, custom_id="wf_prof_hunt")
+    async def v_hunt(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        await show_hunting(inter)
+
+    @discord.ui.button(label="Daily", emoji=DAILY_EMOJI, style=discord.ButtonStyle.success, custom_id="wf_prof_daily")
+    async def v_daily(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        await claim_daily(inter)
+
+# Sub-Views (Stubs)
+class WorldBossView(discord.ui.View, WfWorldBackMixin): 
+    def __init__(self): super().__init__(timeout=None)
+class SmithView(discord.ui.View, WfWorldBackMixin):
+    def __init__(self): super().__init__(timeout=None)
+class VendorView(discord.ui.View, WfWorldBackMixin):
+    def __init__(self): super().__init__(timeout=None)
+class CasinoView(discord.ui.View, WfWorldBackMixin):
+    def __init__(self): super().__init__(timeout=None)
+class BankView(discord.ui.View, WfWorldBackMixin):
+    def __init__(self): super().__init__(timeout=None)
+class HelpView(discord.ui.View, WfWorldBackMixin):
+    def __init__(self): super().__init__(timeout=None)
+
+# ---- Beruf: Angeln ----
+class FishingStartView(discord.ui.View, WfWorldBackMixin):
+    def __init__(self): super().__init__(timeout=60)
+
+    @discord.ui.button(label="Angeln starten", emoji=FISH_EMOJI, style=discord.ButtonStyle.primary, custom_id="wf_fish_start")
+    async def fish_start(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        u=_wf_u(inter.guild_id, inter.user.id)
+        ready=_get_cd(u, "fishing_ready_at")
+        if ready>_now():
+            await inter.response.send_message(f"⏳ Cooldown: **{_fmt_dur(ready)}**", ephemeral=True); return
+        pulls=random.randint(2,4)
+        out: Dict[str,int]={}
+        for _ in range(pulls):
+            fid=_weighted_choice(FISH_TABLE); out[fid]=out.get(fid,0)+1
+            _inv_add(u["inventory"]["fish"], fid, 1)
+        _set_cd(u, "fishing_ready_at", _now()+WF_COOLDOWNS["fishing"])
+        lines=[f"• {k} ×{v} (+{S(_fish_reward(k)*v)})" for k,v in out.items()]
+        e=discord.Embed(title="🎣 Fang", description="\n".join(lines) or "Nichts gefangen.", color=discord.Color.blue())
+        e.set_footer(text="Du kannst Fische im Inventar verkaufen.")
+        await inter.response.edit_message(embed=e, view=InventorySellView())
+
+class InventorySellView(discord.ui.View, WfWorldBackMixin):
+    def __init__(self): super().__init__(timeout=60)
+
+    @discord.ui.button(label="Alle Fische verkaufen", emoji="💰", style=discord.ButtonStyle.success, custom_id="wf_sell_fish_all")
+    async def sell_all(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        u=_wf_u(inter.guild_id, inter.user.id)
+        fish=u["inventory"]["fish"]
+        val=_fish_sell_value(fish)
+        if val<=0:
+            await inter.response.send_message("Keine Fische im Inventar.", ephemeral=True); return
+        fish.clear(); _pay(u, val, "Fischverkauf")
+        e=discord.Embed(title="💰 Verkauf", description=f"Erlös: **{S(val)}**\nKontostand: **{S(u['balance'])}**", color=discord.Color.gold())
+        await inter.response.edit_message(embed=e, view=WFWorldView())
+
+async def show_fishing(inter: discord.Interaction):
+    u=_wf_u(inter.guild_id, inter.user.id)
+    ready=_get_cd(u, "fishing_ready_at")
+    if ready>_now():
+        e=discord.Embed(title="🎣 Angeln", description=f"Cooldown: **{_fmt_dur(ready)}**", color=discord.Color.blue())
+        await inter.response.edit_message(embed=e, view=ProfessionView())
+    else:
+        e=discord.Embed(title="🎣 Angeln", description="Bereit. Fang simuliert, 2–4 Fische.\nVerkauf im Inventar.", color=discord.Color.blue())
+        await inter.response.edit_message(embed=e, view=FishingStartView())
+
+# ---- Beruf: Bergbau (Stub) ----
+ORE_TABLE = [("kupfer", 1, 60), ("eisen",1,30), ("stahl",1,10)]
+class MiningStartView(discord.ui.View, WfWorldBackMixin):
+    def __init__(self): super().__init__(timeout=60)
+    @discord.ui.button(label="Bergbau starten", emoji=MINING_EMOJI, style=discord.ButtonStyle.primary, custom_id="wf_mine_start")
+    async def mine(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        u=_wf_u(inter.guild_id, inter.user.id)
+        ready=_get_cd(u, "mining_ready_at")
+        if ready>_now():
+            await inter.response.send_message(f"⏳ Cooldown: **{_fmt_dur(ready)}**", ephemeral=True); return
+        pulls=random.randint(1,3)
+        out={}
+        for _ in range(pulls):
+            total=sum(w for _,_,w in ORE_TABLE); r=random.uniform(0,total); acc=0
+            for ore,qty,w in ORE_TABLE:
+                acc+=w
+                if r<=acc:
+                    _inv_add(u["inventory"]["ore"], ore, qty)
+                    out[ore]=out.get(ore,0)+qty
+                    break
+        _set_cd(u, "mining_ready_at", _now()+WF_COOLDOWNS["mining"])
+        lines=[f"• {k} ×{v}" for k,v in out.items()]
+        e=discord.Embed(title="⛏️ Bergbau", description="\n".join(lines) or "Nichts gefunden.", color=discord.Color.dark_grey())
+        e.set_footer(text="Schmelzen beim Schmied (bald).")
+        await inter.response.edit_message(embed=e, view=ProfessionView())
+
+async def show_mining(inter: discord.Interaction):
+    u=_wf_u(inter.guild_id, inter.user.id)
+    ready=_get_cd(u, "mining_ready_at")
+    if ready>_now():
+        e=discord.Embed(title="⛏️ Bergbau", description=f"Cooldown: **{_fmt_dur(ready)}**", color=discord.Color.dark_grey())
+        await inter.response.edit_message(embed=e, view=ProfessionView())
+    else:
+        e=discord.Embed(title="⛏️ Bergbau", description="Bereit. 1–3 Erze, seltene Adern später.", color=discord.Color.dark_grey())
+        await inter.response.edit_message(embed=e, view=MiningStartView())
+
+# ---- Beruf: Jagd (Stub) ----
+async def show_hunting(inter: discord.Interaction):
+    u=_wf_u(inter.guild_id, inter.user.id)
+    ready=_get_cd(u, "hunting_ready_at")
+    if ready>_now():
+        e=discord.Embed(title="🏹 Jagd", description=f"Cooldown: **{_fmt_dur(ready)}**", color=discord.Color.green())
+        await inter.response.edit_message(embed=e, view=ProfessionView())
+    else:
+        _set_cd(u, "hunting_ready_at", _now()+WF_COOLDOWNS["hunting"])
+        e=discord.Embed(title="🏹 Jagd", description="Minispiele (QTE/Memory) kommen. Cooldown gesetzt.", color=discord.Color.green())
+        await inter.response.edit_message(embed=e, view=ProfessionView())
+
+# ---- Inventar/Status/Hilfe ----
+def _fmt_dur(ts: datetime) -> str:
+    now=_now()
+    if ts<=now: return "bereit"
+    delta=ts-now
+    h, rem = divmod(int(delta.total_seconds()), 3600)
+    m, _ = divmod(rem, 60)
+    if h>0: return f"{h} h {m} min"
+    return f"{m} min"
+
+async def show_inventory(inter: discord.Interaction):
+    u=_wf_u(inter.guild_id, inter.user.id)
+    inv=u["inventory"]
+    fish=inv["fish"]; ores=inv["ore"]; bars=inv["bar"]
+    lines=[]
+    if fish: lines.append("**Fische**:\n" + "\n".join(f"• {k} ×{v}" for k,v in fish.items()) + f"\nWert gesamt: **{S(_fish_sell_value(fish))}**")
+    if ores: lines.append("**Erze**:\n" + "\n".join(f"• {k} ×{v}" for k,v in ores.items()))
+    if bars: lines.append("**Barren**:\n" + "\n".join(f"• {k} ×{v}" for k,v in bars.items()))
+    desc = "\n\n".join(lines) if lines else "Leer."
+    e=discord.Embed(title="🎒 Inventar", description=desc, color=discord.Color.teal())
+    await inter.response.edit_message(embed=e, view=InventorySellView())
+
+async def show_status(inter: discord.Interaction):
+    u=_wf_u(inter.guild_id, inter.user.id)
+    items=[
+        ("Angeln", _get_cd(u,"fishing_ready_at")),
+        ("Bergbau", _get_cd(u,"mining_ready_at")),
+        ("Jagd", _get_cd(u,"hunting_ready_at")),
+        ("Daily", _get_cd(u,"daily_ready_at")),
+    ]
+    lines=[f"• {name}: **{_fmt_dur(dt)}**" for name,dt in items]
+    e=discord.Embed(title="🕒 Status & Cooldowns", description="\n".join(lines), color=discord.Color.dark_teal())
+    e.add_field(name="Kontostand", value=f"**{S(u['balance'])}**", inline=False)
+    await inter.response.edit_message(embed=e, view=WFWorldView())
+
 class HubView(discord.ui.View):
     def __init__(self): super().__init__(timeout=None)
 
-    @discord.ui.button(label="WF-Spielwelt", emoji="🎮", style=discord.ButtonStyle.secondary, custom_id="hub_game_disabled")
-    async def game_soon(self, inter: discord.Interaction, _btn: discord.ui.Button):
-        await inter.response.send_message("Kommt bald. 😉", ephemeral=True)
+    @discord.ui.button(label="WF-Spielwelt", emoji="🎮", style=discord.ButtonStyle.secondary, custom_id="hub_game")
+    async def game(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        ok, need = _has_wf_role(inter.user)
+        if not ok:
+            await inter.response.send_message(f"❌ Zugriff nur mit Rolle {need}.", ephemeral=True); return
+        await inter.response.edit_message(embed=wfworld_embed(inter.user), view=WFWorldView())
 
     @discord.ui.button(label="Flammenscore", emoji="🏆", style=discord.ButtonStyle.primary, custom_id="hub_score")
     async def score(self, inter: discord.Interaction, _btn: discord.ui.Button):
@@ -839,94 +1169,9 @@ class ScoreView(discord.ui.View, BackToHubMixin):
         b["messages"] += 1; _save_scores()
         await inter.response.send_message("Test: +1 Message gezählt.", ephemeral=True)
 
-class CreateRaidModal(discord.ui.Modal):
-    def __init__(self, channel_id: int | None = None):
-        super().__init__(title="Raid/Event erstellen")
-        self._channel_id = channel_id
-        self.title_in = discord.ui.TextInput(label="Titel", placeholder="z.B. Raid heute Abend", max_length=100)
-        self.date_in  = discord.ui.TextInput(label="Datum (YYYY-MM-DD)", placeholder="2025-10-01")
-        self.time_in  = discord.ui.TextInput(label="Zeit (HH:MM 24h)", placeholder="20:00")
-        self.desc_in  = discord.ui.TextInput(label="Beschreibung (optional)", style=discord.TextStyle.paragraph, required=False, max_length=400)
-        self.img_in   = discord.ui.TextInput(label="Bild-URL (optional)", required=False)
-        for c in (self.title_in, self.date_in, self.time_in, self.desc_in, self.img_in): self.add_item(c)
-
-    async def on_submit(self, inter: discord.Interaction):
-        if not is_admin(inter):
-            await inter.response.send_message("Nur Admin/Manage Server.", ephemeral=True); return
-        try:
-            yyyy, mm, dd = [int(x) for x in self.date_in.value.split("-")]
-            hh, mi = [int(x) for x in self.time_in.value.split(":")]
-            when = datetime(yyyy, mm, dd, hh, mi, tzinfo=TZ)
-        except Exception:
-            await inter.response.send_message("❌ Datum/Zeit ungültig (YYYY-MM-DD / HH:MM).", ephemeral=True); return
-
-        ch = inter.channel if self._channel_id is None else inter.guild.get_channel(self._channel_id)
-        if not isinstance(ch, discord.TextChannel):
-            await inter.response.send_message("❌ Zielkanal ungültig.", ephemeral=True); return
-
-        obj = {
-            "guild_id": inter.guild_id,
-            "channel_id": ch.id,
-            "title": self.title_in.value.strip(),
-            "description": (self.desc_in.value or "").strip(),
-            "when_iso": when.isoformat(),
-            "image_url": ((self.img_in.value or "").strip() or None),
-            "yes": {"TANK": [], "HEAL": [], "DPS": []},
-            "maybe": {},
-            "no": []
-        }
-        emb = await _build_embed_async(inter.guild, obj)
-        view = RaidView(0)
-        msg = await ch.send(embed=emb, view=view)
-        view.msg_id = str(msg.id)
-        rsvp_store[str(msg.id)] = obj; _save_rsvp()
-        client.add_view(RaidView(msg.id), message_id=msg.id)
-        await inter.response.send_message(f"✅ Raid erstellt: {msg.jump_url}", ephemeral=True)
-
-class CreateRecurringEventModal(discord.ui.Modal):
-    def __init__(self):
-        super().__init__(title="Wiederkehrendes Event")
-        self.name_in  = discord.ui.TextInput(label="Name", placeholder="Gildenbesprechung", max_length=60)
-        self.dow_in   = discord.ui.TextInput(label="Wochentage", placeholder="Mo,Mi | Mon,Wed | Mo-So | täglich")
-        self.time_in  = discord.ui.TextInput(label="Start (HH:MM)", placeholder="20:00")
-        self.dur_in   = discord.ui.TextInput(label="Dauer (Minuten)", placeholder="60")
-        self.opts_in  = discord.ui.TextInput(
-            label="Vorwarnungen/Beschreibung (optional)",
-            style=discord.TextStyle.paragraph,
-            required=False,
-            placeholder="Erste Zeile: Vorwarnungen z.B. 30,10,5\nAb Zeile 2: Beschreibung…"
-        )
-        for c in (self.name_in, self.dow_in, self.time_in, self.dur_in, self.opts_in): self.add_item(c)
-
-    async def on_submit(self, inter: discord.Interaction):
-        if not is_admin(inter):
-            await inter.response.send_message("Nur Admin.", ephemeral=True); return
-        try:
-            dows = parse_weekdays(self.dow_in.value)
-            start = parse_time_hhmm(self.time_in.value)
-            dur = int(self.dur_in.value)
-            pre, desc = parse_options_block(self.opts_in.value)
-        except Exception as e:
-            await inter.response.send_message(f"❌ Ungültige Eingaben: {e}", ephemeral=True); return
-        cfg = get_or_create_guild_cfg(inter.guild_id)
-        ev = Event(
-            name=self.name_in.value.strip(),
-            weekdays=dows,
-            start_hhmm=start.strftime("%H:%M"),
-            duration_min=dur,
-            pre_reminders=pre,
-            mention_role_id=None,
-            channel_id=cfg.announce_channel_id,
-            description=desc
-        )
-        cfg.events[ev.name.lower()] = ev; save_all(configs)
-        await inter.response.send_message(
-            f"✅ Wiederkehrendes Event gespeichert.\n"
-            f"• Start: {ev.start_hhmm}\n"
-            f"• Tage: {fmt_weekdays(ev.weekdays)}\n"
-            f"• Beschreibung: {(ev.description or '—')}",
-            ephemeral=True
-        )
+# ----- Events / Onboarding Admin Views aus deinem Bestand -----
+def events_embed_intro() -> discord.Embed:
+    return discord.Embed(title="📅 Events", description="Erstellen/Verwalten (nur Admin).", color=discord.Color.blurple())
 
 class EventsView(discord.ui.View, BackToHubMixin):
     def __init__(self): super().__init__(timeout=None)
@@ -1050,10 +1295,100 @@ class AdminToolsView(discord.ui.View, BackToHubMixin):
         except Exception as e:
             await inter.followup.send(f"❌ Sync-Fehler: {e}", ephemeral=True)
 
+# ======================== Modals (Events) ========================
+class CreateRaidModal(discord.ui.Modal):
+    def __init__(self, channel_id: int | None = None):
+        super().__init__(title="Raid/Event erstellen")
+        self._channel_id = channel_id
+        self.title_in = discord.ui.TextInput(label="Titel", placeholder="z.B. Raid heute Abend", max_length=100)
+        self.date_in  = discord.ui.TextInput(label="Datum (YYYY-MM-DD)", placeholder="2025-10-01")
+        self.time_in  = discord.ui.TextInput(label="Zeit (HH:MM 24h)", placeholder="20:00")
+        self.desc_in  = discord.ui.TextInput(label="Beschreibung (optional)", style=discord.TextStyle.paragraph, required=False, max_length=400)
+        self.img_in   = discord.ui.TextInput(label="Bild-URL (optional)", required=False)
+        for c in (self.title_in, self.date_in, self.time_in, self.desc_in, self.img_in): self.add_item(c)
+
+    async def on_submit(self, inter: discord.Interaction):
+        if not is_admin(inter):
+            await inter.response.send_message("Nur Admin/Manage Server.", ephemeral=True); return
+        try:
+            yyyy, mm, dd = [int(x) for x in self.date_in.value.split("-")]
+            hh, mi = [int(x) for x in self.time_in.value.split(":")]
+            when = datetime(yyyy, mm, dd, hh, mi, tzinfo=TZ)
+        except Exception:
+            await inter.response.send_message("❌ Datum/Zeit ungültig (YYYY-MM-DD / HH:MM).", ephemeral=True); return
+
+        ch = inter.channel if self._channel_id is None else inter.guild.get_channel(self._channel_id)
+        if not isinstance(ch, discord.TextChannel):
+            await inter.response.send_message("❌ Zielkanal ungültig.", ephemeral=True); return
+
+        obj = {
+            "guild_id": inter.guild_id,
+            "channel_id": ch.id,
+            "title": self.title_in.value.strip(),
+            "description": (self.desc_in.value or "").strip(),
+            "when_iso": when.isoformat(),
+            "image_url": ((self.img_in.value or "").strip() or None),
+            "yes": {"TANK": [], "HEAL": [], "DPS": []},
+            "maybe": {},
+            "no": []
+        }
+        emb = await _build_embed_async(inter.guild, obj)
+        view = RaidView(0)
+        msg = await ch.send(embed=emb, view=view)
+        view.msg_id = str(msg.id)
+        rsvp_store[str(msg.id)] = obj; _save_rsvp()
+        client.add_view(RaidView(msg.id), message_id=msg.id)
+        await inter.response.send_message(f"✅ Raid erstellt: {msg.jump_url}", ephemeral=True)
+
+class CreateRecurringEventModal(discord.ui.Modal):
+    def __init__(self):
+        super().__init__(title="Wiederkehrendes Event")
+        self.name_in  = discord.ui.TextInput(label="Name", placeholder="Gildenbesprechung", max_length=60)
+        self.dow_in   = discord.ui.TextInput(label="Wochentage", placeholder="Mo,Mi | Mon,Wed | Mo-So | täglich")
+        self.time_in  = discord.ui.TextInput(label="Start (HH:MM)", placeholder="20:00")
+        self.dur_in   = discord.ui.TextInput(label="Dauer (Minuten)", placeholder="60")
+        self.opts_in  = discord.ui.TextInput(
+            label="Vorwarnungen/Beschreibung (optional)",
+            style=discord.TextStyle.paragraph,
+            required=False,
+            placeholder="Erste Zeile: Vorwarnungen z.B. 30,10,5\nAb Zeile 2: Beschreibung…"
+        )
+        for c in (self.name_in, self.dow_in, self.time_in, self.dur_in, self.opts_in): self.add_item(c)
+
+    async def on_submit(self, inter: discord.Interaction):
+        if not is_admin(inter):
+            await inter.response.send_message("Nur Admin.", ephemeral=True); return
+        try:
+            dows = parse_weekdays(self.dow_in.value)
+            start = parse_time_hhmm(self.time_in.value)
+            dur = int(self.dur_in.value)
+            pre, desc = parse_options_block(self.opts_in.value)
+        except Exception as e:
+            await inter.response.send_message(f"❌ Ungültige Eingaben: {e}", ephemeral=True); return
+        cfg = get_or_create_guild_cfg(inter.guild_id)
+        ev = Event(
+            name=self.name_in.value.strip(),
+            weekdays=dows,
+            start_hhmm=start.strftime("%H:%M"),
+            duration_min=dur,
+            pre_reminders=pre,
+            mention_role_id=None,
+            channel_id=cfg.announce_channel_id,
+            description=desc
+        )
+        cfg.events[ev.name.lower()] = ev; save_all(configs)
+        await inter.response.send_message(
+            f"✅ Wiederkehrendes Event gespeichert.\n"
+            f"• Start: {ev.start_hhmm}\n"
+            f"• Tage: {fmt_weekdays(ev.weekdays)}\n"
+            f"• Beschreibung: {(ev.description or '—')}",
+            ephemeral=True
+        )
+
 # ======================== Slash-Commands ========================
 @tree.command(name="wf", description="Weiße Flamme – Menü anzeigen")
 async def wf(inter: discord.Interaction):
-    await inter.response.send_message(embed=hub_embed(inter.guild), view=HubView())
+    await inter.response.send_message(embed=hub_embed(inter.guild), view=HubView(), ephemeral=True)
 
 @tree.command(name="wf_admin_sync_hard", description="(Admin) Global sync & Guild-Duplikate entfernen")
 async def wf_admin_sync_hard(inter: discord.Interaction):
@@ -1128,11 +1463,9 @@ async def wf_event_recurring(inter: discord.Interaction,
 # ======================== Lifecycle & Command Sync ========================
 async def _clean_and_sync_commands_for_guild(guild_id: int):
     """Nur globale Commands nutzen; Guild-Scope leeren um Duplikate zu vermeiden."""
-    # 1) Global sync
-    await tree.sync()
-    # 2) Leere Guild-Scope (damit dort nichts 'kopiert' liegt)
+    await tree.sync()  # global
     guild_obj = discord.Object(id=guild_id)
-    tree.clear_commands(guild=guild_obj)   # entfernt alle guild-spezifischen
+    tree.clear_commands(guild=guild_obj)   # Guild-spezifische löschen
     await tree.sync(guild=guild_obj)       # commit clear
 
 def reregister_persistent_views_on_start():
