@@ -1052,15 +1052,28 @@ class EventsView(discord.ui.View, BackToHubMixin):
             return False
         return True
 
-    @discord.ui.button(label="Raid mit RSVP", emoji="📝", style=discord.ButtonStyle.primary)
+    @discord.ui.button(label="Raid mit RSVP", emoji="📝",
+                       style=discord.ButtonStyle.primary,
+                       custom_id="wf_ev_rsvp")
     async def create(self, inter: discord.Interaction, _btn: discord.ui.Button):
         await inter.response.send_modal(CreateRaidModal())
 
-    @discord.ui.button(label="Wiederkehrendes Event", emoji="🔁", style=discord.ButtonStyle.success)
+    @discord.ui.button(label="Wiederkehrendes Event", emoji="🔁",
+                       style=discord.ButtonStyle.success,
+                       custom_id="wf_ev_recurring")
     async def recurring(self, inter: discord.Interaction, _btn: discord.ui.Button):
-        await inter.response.send_modal(CreateRecurringEventModal())
+        try:
+            await inter.response.send_modal(CreateRecurringEventModal())
+        except Exception as e:
+            if not inter.response.is_done():
+                await inter.response.send_message(f"❌ Konnte das Formular nicht öffnen: {e}", ephemeral=True)
+            else:
+                try:
+                    await inter.followup.send(f"❌ Konnte das Formular nicht öffnen: {e}", ephemeral=True)
+                except Exception:
+                    pass
 
-    @discord.ui.button(label="Event-Liste", emoji="📋", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="Event-Liste", emoji="📋", style=discord.ButtonStyle.secondary, custom_id="wf_ev_list")
     async def list_events(self, inter: discord.Interaction, _btn: discord.ui.Button):
         cfg = get_or_create_guild_cfg(inter.guild_id)
         if not (cfg.events):
@@ -1072,7 +1085,7 @@ class EventsView(discord.ui.View, BackToHubMixin):
             lines.append(f"• **{e.name}** ({typ}) — {e.start_hhmm}, Tage: {fmt_weekdays(e.weekdays)}{extra}")
         await inter.response.send_message("\n".join(lines), ephemeral=True)
 
-    @discord.ui.button(label="Event löschen", emoji="🧹", style=discord.ButtonStyle.danger)
+    @discord.ui.button(label="Event löschen", emoji="🧹", style=discord.ButtonStyle.danger, custom_id="wf_ev_delete")
     async def delete_event(self, inter: discord.Interaction, _btn: discord.ui.Button):
         cfg = get_or_create_guild_cfg(inter.guild_id)
         if not cfg.events:
@@ -1083,11 +1096,14 @@ class EventsView(discord.ui.View, BackToHubMixin):
         save_all(configs)
         await inter.response.send_message(f"🗑️ Event **{name}** gelöscht.", ephemeral=True)
 
-    @discord.ui.button(label="Standard-Kanal", emoji="📣", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="Standard-Kanal", emoji="📣",
+                       style=discord.ButtonStyle.secondary,
+                       custom_id="wf_ev_set_default_channel")
     async def set_default_channel(self, inter: discord.Interaction, _btn: discord.ui.Button):
         class _AnnouncePicker(discord.ui.ChannelSelect):
             def __init__(self):
-                super().__init__(channel_types=[discord.ChannelType.text], placeholder="Ankündigungs-Kanal wählen", min_values=1, max_values=1)
+                super().__init__(channel_types=[discord.ChannelType.text],
+                                 placeholder="Ankündigungs-Kanal wählen", min_values=1, max_values=1)
             async def callback(self, inner_inter: discord.Interaction):
                 ch: discord.TextChannel = self.values[0]
                 cfg = get_or_create_guild_cfg(inner_inter.guild_id)
@@ -1198,6 +1214,50 @@ async def wf_debug_status(inter: discord.Interaction):
     await inter.response.send_message(
         f"Intents: MC={client.intents.message_content} Members={client.intents.members} Voice={client.intents.voice_states}\n"
         f"Perms in #{ch.name}: " + ", ".join(flags),
+        ephemeral=True
+    )
+
+@tree.command(name="wf_event_recurring", description="(Admin) Wiederkehrendes Event anlegen (Fallback ohne Modal)")
+@app_commands.describe(
+    name="Name des Events",
+    days="Wochentage (z. B. Mo,Mi,Fr / Mon,Wed / Mo-So / täglich)",
+    start="Startzeit HH:MM (24h)",
+    duration_min="Dauer in Minuten",
+    options="Vorwarnungen/Beschreibung. 1. Zeile: '30,10,5'; ab Zeile 2: Beschreibung."
+)
+async def wf_event_recurring(inter: discord.Interaction,
+                             name: str,
+                             days: str,
+                             start: str,
+                             duration_min: int,
+                             options: str = ""):
+    if not is_admin(inter):
+        await inter.response.send_message("Nur Admin.", ephemeral=True); return
+    try:
+        dows = parse_weekdays(days)
+        t = parse_time_hhmm(start)
+        pre, desc = parse_options_block(options)
+    except Exception as e:
+        await inter.response.send_message(f"❌ Ungültig: {e}", ephemeral=True); return
+
+    cfg = get_or_create_guild_cfg(inter.guild_id)
+    ev = Event(
+        name=name.strip(),
+        weekdays=dows,
+        start_hhmm=t.strftime("%H:%M"),
+        duration_min=int(duration_min),
+        pre_reminders=pre,
+        mention_role_id=None,
+        channel_id=cfg.announce_channel_id,
+        description=desc.strip()
+    )
+    cfg.events[ev.name.lower()] = ev
+    save_all(configs)
+    await inter.response.send_message(
+        f"✅ Wiederkehrendes Event gespeichert.\n"
+        f"• Start: {ev.start_hhmm}\n"
+        f"• Tage: {fmt_weekdays(ev.weekdays)}\n"
+        f"• Beschreibung: {(ev.description or '—')}",
         ephemeral=True
     )
 
