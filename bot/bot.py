@@ -1,7 +1,7 @@
- # bot.py
+# bot.py
 from __future__ import annotations
 
-import os, json, threading, time, requests
+import os, json, threading, time, requests, re
 from dataclasses import dataclass, asdict, field
 from datetime import datetime, timedelta, time as time_cls, date as date_cls
 from pathlib import Path
@@ -65,34 +65,86 @@ client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
 # ======================== Parser / Utils ========================
-DOW_MAP = {
-    # EN
-    "mon":0,"monday":0,"0":0,
-    "tue":1,"tuesday":1,"1":1,
-    "wed":2,"wednesday":2,"2":2,
-    "thu":3,"thursday":3,"3":3,
-    "fri":4,"friday":4,"4":4,
-    "sat":5,"saturday":5,"5":5,
-    "sun":6,"sunday":6,"6":6,
-    # DE
-    "mo":0,"montag":0,
-    "di":1,"dienstag":1,
-    "mi":2,"mittwoch":2,
-    "do":3,"donnerstag":3,
-    "fr":4,"freitag":4,
-    "sa":5,"samstag":5,
-    "so":6,"sonntag":6,
+# Text-Aliasse für alle Wochentage
+TEXT_DAY_MAP = {
+    # Deutsch kurz/lang
+    "mo":0, "montag":0,
+    "di":1, "dienstag":1,
+    "mi":2, "mittwoch":2,
+    "do":3, "donnerstag":3,
+    "fr":4, "freitag":4,
+    "sa":5, "samstag":5,
+    "so":6, "sonntag":6,
+    # Englisch kurz/lang
+    "mon":0, "monday":0,
+    "tue":1, "tues":1, "tuesday":1,
+    "wed":2, "wednesday":2,
+    "thu":3, "thur":3, "thurs":3, "thursday":3,
+    "fri":4, "friday":4,
+    "sat":5, "saturday":5,
+    "sun":6, "sunday":6,
 }
 
+# Shortcuts
+ALL_DAY_TOKENS = {"all","alle","daily","everyday","taeglich","täglich","jeden","jeden_tag","jeden-tag","tages"}
+WEEKDAY_TOKENS = {"werktag","werktage","weekdays"}
+
+GER_SHORT = ["Mo","Di","Mi","Do","Fr","Sa","So"]
+def fmt_weekdays(days: List[int]) -> str:
+    return ",".join(GER_SHORT[d] for d in sorted(set(days)))
+
+def _tok_split(s: str) -> List[str]:
+    # split nach , ; / whitespace
+    return [t for t in re.split(r"[,\;/\s]+", s.strip()) if t]
+
+def _map_token_to_day(tok: str) -> int:
+    """Akzeptiert Text (de/en) oder Zahlen:
+       1..7 -> Mo..So, 0 -> Mo
+    """
+    t = tok.strip().lower()
+    if t in TEXT_DAY_MAP:
+        return TEXT_DAY_MAP[t]
+    if t.isdigit():
+        n = int(t)
+        if n == 0:
+            return 0  # 0 = Montag (Kompatibilität)
+        if 1 <= n <= 7:
+            return n - 1  # 1..7 => Mo..So
+    raise ValueError(f"Unbekannter Wochentag-Token: '{tok}'")
+
 def parse_weekdays(s: str) -> List[int]:
-    if not s:
+    """Akzeptiert:
+       - Mo,Di,... / Mon,Tue,...
+       - Montag..Sonntag / Monday..Sunday
+       - Zahlen 1..7 (1=Mo) + 0 (0=Mo)
+       - Bereiche: Mo-So / Mon-Sun / 1-7 / 0-6 / Fr-Mo (wrap)
+       - Shortcuts: täglich / daily, werktage / weekdays
+    """
+    if not s or not s.strip():
         return []
-    out=[]
-    for p in [x.strip().lower() for x in s.split(",") if x.strip()]:
-        if p not in DOW_MAP:
-            raise ValueError(f"Unknown weekday '{p}'. Use Mon..Sun / Mo..So or 0..6 (0=Mon).")
-        out.append(DOW_MAP[p])
-    return sorted(set(out))
+    out: Set[int] = set()
+    parts = _tok_split(s)
+
+    # Shortcuts, wenn einzeln oder gemischt
+    if any(p.lower() in ALL_DAY_TOKENS for p in parts) or any(p.lower() in {"mo-so","mon-sun","1-7","0-6"} for p in parts):
+        return list(range(0,7))
+    if any(p.lower() in WEEKDAY_TOKENS for p in parts) or any(p.lower() in {"mo-fr","mon-fri","1-5","0-4"} for p in parts):
+        return list(range(0,5))
+
+    for p in parts:
+        pl = p.lower()
+        if "-" in pl:
+            a,b = pl.split("-",1)
+            ai = _map_token_to_day(a)
+            bi = _map_token_to_day(b)
+            if ai <= bi:
+                for d in range(ai, bi+1): out.add(d)
+            else:
+                # Wrap, z.B. Fr-Mo
+                for d in list(range(ai,7)) + list(range(0,bi+1)): out.add(d)
+        else:
+            out.add(_map_token_to_day(pl))
+    return sorted(out)
 
 def parse_time_hhmm(s: str) -> time_cls:
     try:
@@ -104,7 +156,7 @@ def parse_time_hhmm(s: str) -> time_cls:
 def parse_premins(s: str) -> List[int]:
     if not s or not s.strip():
         return []
-    mins=[int(p.strip()) for p in s.split(",") if p.strip()]
+    mins=[int(p.strip()) for p in re.split(r"[,\s;]+", s) if p.strip()]
     return sorted(set([m for m in mins if m>0]))
 
 def parse_date_yyyy_mm_dd(s: str) -> date_cls:
@@ -113,6 +165,27 @@ def parse_date_yyyy_mm_dd(s: str) -> date_cls:
         return date_cls(int(y), int(m), int(d))
     except Exception:
         raise ValueError("date must be 'YYYY-MM-DD'.")
+
+def parse_options_block(s: str) -> Tuple[List[int], str]:
+    """1. Zeile: Vorwarnungen (30,10,5)
+       Ab Zeile 2: Beschreibung (mehrzeilig)
+       Alternativ: pre=30,10,5; desc=Text
+    """
+    if not s or not s.strip():
+        return [], ""
+    txt = s.strip()
+    # key=val support
+    m_pre = re.search(r"(?i)\bpre\s*=\s*([0-9,\s;]+)", txt)
+    m_desc = re.search(r"(?i)\b(desc|beschreibung)\s*=\s*(.+)", txt, flags=re.S)
+    if m_pre or m_desc:
+        pre = parse_premins(m_pre.group(1)) if m_pre else []
+        desc = m_desc.group(2).strip() if m_desc else ""
+        return pre, desc
+    # Zeilenmodus
+    lines = txt.splitlines()
+    pre = parse_premins(lines[0]) if lines else []
+    desc = "\n".join(lines[1:]).strip() if len(lines) > 1 else ""
+    return pre, desc
 
 def _now() -> datetime:
     return datetime.now(TZ)
@@ -859,9 +932,10 @@ class ScoreView(discord.ui.View, BackToHubMixin):
     async def top(self, inter: discord.Interaction, _btn: discord.ui.Button):
         lines = _format_leaderboard_lines_simple(inter.guild, limit=10)
         if not lines:
-            await inter.response.send_message("Noch keine Daten.", ephemeral=True); return
+            await inter.response.send_message("Noch keine Daten.")  # öffentlich
+            return
         emb = discord.Embed(title="🔥 Flammen – Topliste", description="\n".join(lines), color=discord.Color.orange())
-        await inter.response.send_message(embed=emb, ephemeral=True)
+        await inter.response.send_message(embed=emb)  # öffentlich
 
     @discord.ui.button(label="Test +1(Admin)", emoji="🧪", style=discord.ButtonStyle.secondary, row=3)
     async def test_admin(self, inter: discord.Interaction, _btn: discord.ui.Button):
@@ -923,11 +997,16 @@ class CreateRecurringEventModal(discord.ui.Modal):
         super().__init__(title="Wiederkehrendes Event")
         # Max 5 Inputs (Discord-Limit)
         self.name_in  = discord.ui.TextInput(label="Name", placeholder="Gildenbesprechung", max_length=60)
-        self.dow_in   = discord.ui.TextInput(label="Wochentage (Mon,Thu / Mo,Do / 0,3)", placeholder="Mon,Thu")
+        self.dow_in   = discord.ui.TextInput(label="Wochentage (z.B. Mo,Mi,Fr / Mon,Wed,Fri / Mo-So / Mon-Sun / täglich)", placeholder="Mo,Do")
         self.time_in  = discord.ui.TextInput(label="Start (HH:MM 24h)", placeholder="20:00")
         self.dur_in   = discord.ui.TextInput(label="Dauer (Minuten)", placeholder="60")
-        self.pre_in   = discord.ui.TextInput(label="Vorwarnungen (Minuten, optional)", required=False, placeholder="30,10,5")
-        self.add_item(self.name_in); self.add_item(self.dow_in); self.add_item(self.time_in); self.add_item(self.dur_in); self.add_item(self.pre_in)
+        self.opts_in  = discord.ui.TextInput(
+            label="Vorwarnungen / Beschreibung (optional)",
+            style=discord.TextStyle.paragraph,
+            required=False,
+            placeholder="Beispiel:\n30,10,5\nKurze Beschreibung hier..."
+        )
+        self.add_item(self.name_in); self.add_item(self.dow_in); self.add_item(self.time_in); self.add_item(self.dur_in); self.add_item(self.opts_in)
 
     async def on_submit(self, inter: discord.Interaction):
         if not is_admin(inter):
@@ -936,7 +1015,7 @@ class CreateRecurringEventModal(discord.ui.Modal):
             dows = parse_weekdays(self.dow_in.value)
             start = parse_time_hhmm(self.time_in.value)
             dur = int(self.dur_in.value)
-            pre = parse_premins(self.pre_in.value)
+            pre, desc = parse_options_block(self.opts_in.value)
             role_id = None  # optional: später per Edit-Flow setzbar
         except Exception as e:
             await inter.response.send_message(f"❌ Ungültige Eingaben: {e}", ephemeral=True); return
@@ -949,13 +1028,19 @@ class CreateRecurringEventModal(discord.ui.Modal):
             pre_reminders=pre,
             mention_role_id=role_id,
             channel_id=cfg.announce_channel_id,
-            description=""
+            description=desc
         )
         key = ev.name.lower()
         cfg.events = cfg.events or {}
         cfg.events[key] = ev
         save_all(configs)
-        await inter.response.send_message(f"✅ Wiederkehrendes Event gespeichert. Start: {ev.start_hhmm}, Tage: {','.join(map(str,ev.weekdays))}", ephemeral=True)
+        await inter.response.send_message(
+            f"✅ Wiederkehrendes Event gespeichert.\n"
+            f"• Start: {ev.start_hhmm}\n"
+            f"• Tage: {fmt_weekdays(ev.weekdays)}\n"
+            f"• Beschreibung: {(ev.description or '—')}",
+            ephemeral=True
+        )
 
 class EventsView(discord.ui.View, BackToHubMixin):
     def __init__(self):
@@ -983,7 +1068,8 @@ class EventsView(discord.ui.View, BackToHubMixin):
         lines=[]
         for e in cfg.events.values():
             typ = "Once" if e.one_time_date else "Recurring"
-            lines.append(f"• **{e.name}** ({typ}) — {e.start_hhmm}, Tage: {','.join(map(str,e.weekdays)) or '-'}")
+            extra = f"\n• Beschreibung: {e.description}" if e.description else ""
+            lines.append(f"• **{e.name}** ({typ}) — {e.start_hhmm}, Tage: {fmt_weekdays(e.weekdays)}{extra}")
         await inter.response.send_message("\n".join(lines), ephemeral=True)
 
     @discord.ui.button(label="Event löschen", emoji="🧹", style=discord.ButtonStyle.danger)
@@ -991,7 +1077,6 @@ class EventsView(discord.ui.View, BackToHubMixin):
         cfg = get_or_create_guild_cfg(inter.guild_id)
         if not cfg.events:
             await inter.response.send_message("Keine Events vorhanden.", ephemeral=True); return
-        # Lösch das erste (Komfort – später Select einbauen)
         key = sorted(cfg.events.keys())[0]
         name = cfg.events[key].name
         del cfg.events[key]
@@ -1033,7 +1118,6 @@ class OnboardAdminView(discord.ui.View, BackToHubMixin):
         v=discord.ui.View(); v.add_item(TextChannelPicker("staff_channel_id"))
         await inter.response.send_message("Kanal wählen:", view=v, ephemeral=True)
 
-    # Tank/Heal/DPS-Rollen setzen
     @discord.ui.button(label="Tank-Rolle", emoji="🛡️", style=discord.ButtonStyle.secondary)
     async def set_tank(self, inter: discord.Interaction, _btn: discord.ui.Button):
         v=discord.ui.View(); v.add_item(SingleRolePicker("tank"))
