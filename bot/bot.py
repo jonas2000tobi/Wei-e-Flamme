@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import os, json, threading, time, requests
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from datetime import datetime, timedelta, time as time_cls, date as date_cls
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple, Literal
@@ -153,7 +153,7 @@ class Event:
 class GuildConfig:
     guild_id: int
     announce_channel_id: Optional[int] = None
-    events: Dict[str, Event] = None
+    events: Dict[str, Event] = field(default_factory=dict)
 
     def to_dict(self):
         return {
@@ -875,8 +875,8 @@ class CreateRaidModal(discord.ui.Modal, title="Raid/Event erstellen"):
         if not is_admin(inter):
             await inter.response.send_message("Nur Admin/Manage Server.", ephemeral=True); return
         try:
-            yyyy, mm, dd = [int(x) for x in str(self.date_in).split("-")]
-            hh, mi = [int(x) for x in str(self.time_in).split(":")]
+            yyyy, mm, dd = [int(x) for x in self.date_in.value.split("-")]
+            hh, mi = [int(x) for x in self.time_in.value.split(":")]
             when = datetime(yyyy, mm, dd, hh, mi, tzinfo=TZ)
         except Exception:
             await inter.response.send_message("❌ Datum/Zeit ungültig (YYYY-MM-DD / HH:MM).", ephemeral=True); return
@@ -888,10 +888,10 @@ class CreateRaidModal(discord.ui.Modal, title="Raid/Event erstellen"):
         obj = {
             "guild_id": inter.guild_id,
             "channel_id": ch.id,
-            "title": str(self.title_in).strip(),
-            "description": str(self.desc_in).strip(),
+            "title": self.title_in.value.strip(),
+            "description": (self.desc_in.value or "").strip(),
             "when_iso": when.isoformat(),
-            "image_url": (str(self.img_in).strip() or None),
+            "image_url": ((self.img_in.value or "").strip() or None),
             "yes": {"TANK": [], "HEAL": [], "DPS": []},
             "maybe": {},
             "no": []
@@ -922,23 +922,23 @@ class CreateRecurringEventModal(discord.ui.Modal, title="Wiederkehrendes Event")
         if not is_admin(inter):
             await inter.response.send_message("Nur Admin.", ephemeral=True); return
         try:
-            dows = parse_weekdays(str(self.dow_in))
-            start = parse_time_hhmm(str(self.time_in))
-            dur = int(str(self.dur_in))
-            pre = parse_premins(str(self.pre_in))
-            role_id = int(str(self.role_in)) if str(self.role_in).strip() else None
+            dows = parse_weekdays(self.dow_in.value)
+            start = parse_time_hhmm(self.time_in.value)
+            dur = int(self.dur_in.value)
+            pre = parse_premins(self.pre_in.value)
+            role_id = int(self.role_in.value) if (self.role_in.value or "").strip() else None
         except Exception as e:
             await inter.response.send_message(f"❌ Ungültige Eingaben: {e}", ephemeral=True); return
         cfg = get_or_create_guild_cfg(inter.guild_id)
         ev = Event(
-            name=str(self.name_in).strip(),
+            name=self.name_in.value.strip(),
             weekdays=dows,
             start_hhmm=start.strftime("%H:%M"),
             duration_min=dur,
             pre_reminders=pre,
             mention_role_id=role_id,
             channel_id=cfg.announce_channel_id,
-            description=str(self.desc_in).strip()
+            description=(self.desc_in.value or "").strip()
         )
         key = ev.name.lower()
         cfg.events = cfg.events or {}
@@ -980,7 +980,7 @@ class EventsView(discord.ui.View, BackToHubMixin):
         cfg = get_or_create_guild_cfg(inter.guild_id)
         if not cfg.events:
             await inter.response.send_message("Keine Events vorhanden.", ephemeral=True); return
-        # Lösch das letzte per Komfort
+        # Lösch das erste (Komfort – ggf. später Select einbauen)
         key = sorted(cfg.events.keys())[0]
         name = cfg.events[key].name
         del cfg.events[key]
@@ -989,9 +989,18 @@ class EventsView(discord.ui.View, BackToHubMixin):
 
     @discord.ui.button(label="Standard-Kanal", emoji="📣", style=discord.ButtonStyle.secondary)
     async def set_default_channel(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        class _AnnouncePicker(discord.ui.ChannelSelect):
+            def __init__(self):
+                super().__init__(channel_types=[discord.ChannelType.text], placeholder="Ankündigungs-Kanal wählen", min_values=1, max_values=1)
+            async def callback(self, inner_inter: discord.Interaction):
+                ch: discord.TextChannel = self.values[0]
+                cfg = get_or_create_guild_cfg(inner_inter.guild_id)
+                cfg.announce_channel_id = ch.id
+                save_all(configs)
+                await inner_inter.response.send_message(f"✅ Ankündigungs-Kanal gesetzt: {ch.mention}", ephemeral=True)
         v = discord.ui.View()
-        v.add_item(TextChannelPicker("welcome_channel_id"))  # Trick: Für Anzeige; wir verwenden unten staff/welcome bewusst separat
-        await inter.response.send_message("Kanal wählen:", view=v, ephemeral=True)
+        v.add_item(_AnnouncePicker())
+        await inter.response.send_message("Ankündigungs-Kanal wählen:", view=v, ephemeral=True)
 
 class OnboardAdminView(discord.ui.View, BackToHubMixin):
     def __init__(self):
@@ -1084,6 +1093,7 @@ async def wf_debug_status(inter: discord.Interaction):
 
 # ======================== Lifecycle & Scheduler ========================
 def reregister_persistent_views_on_start():
+    to_delete = []
     for msg_id, obj in list(rsvp_store.items()):
         g = client.get_guild(obj["guild_id"])
         if not g:
@@ -1092,6 +1102,11 @@ def reregister_persistent_views_on_start():
             client.add_view(RaidView(int(msg_id)), message_id=int(msg_id))
         except Exception as e:
             print("add_view (RSVP) failed:", e)
+            to_delete.append(msg_id)
+    if to_delete:
+        for mid in to_delete:
+            rsvp_store.pop(mid, None)
+        _save_rsvp()
 
 async def _sync_all_guilds_now():
     for g in client.guilds:
