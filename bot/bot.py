@@ -1,11 +1,14 @@
 # bot.py
 from __future__ import annotations
 
-import os, json, threading, time, requests, re, random, secrets, hmac, hashlib
+import os, json, threading, time, requests, re
 from dataclasses import dataclass, asdict, field
 from datetime import datetime, timedelta, time as time_cls, date as date_cls
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple, Literal
+
+# === WFWorld / Casino ===
+import secrets, hashlib, hmac, random
 
 import discord
 from discord import app_commands
@@ -29,7 +32,7 @@ SCORE_FILE        = DATA_DIR / "flammenscore.json"
 SCORE_CFG_FILE    = DATA_DIR / "flammenscore_cfg.json"
 SCORE_META_FILE   = DATA_DIR / "flammenscore_meta.json"
 ONBOARD_META_FILE = DATA_DIR / "onboarding_meta.json"
-WFWORLD_FILE      = DATA_DIR / "wfworld.json"   # {gid:{users:{uid:{...}}, casino:{...}}}
+WORLD_FILE        = DATA_DIR / "wfworld.json"   # <-- NEU
 
 # ======================== Keepalive (Flask) ========================
 app = Flask(__name__)
@@ -230,7 +233,7 @@ scores:     Dict[str, dict] = _load_json(SCORE_FILE, {})
 score_cfg:  Dict[str, dict] = _load_json(SCORE_CFG_FILE, {})
 score_meta: Dict[str, dict] = _load_json(SCORE_META_FILE, {})
 onboard_meta: Dict[str, dict] = _load_json(ONBOARD_META_FILE, {})
-wfworld: Dict[str, dict] = _load_json(WFWORLD_FILE, {})
+world_store: Dict[str, dict] = _load_json(WORLD_FILE, {})  # <-- NEU
 
 def _save_rsvp():       _save_json(RSVP_STORE_FILE, rsvp_store)
 def _save_rsvp_cfg():   _save_json(RSVP_CFG_FILE, rsvp_cfg)
@@ -238,7 +241,7 @@ def _save_scores():     _save_json(SCORE_FILE, scores)
 def _save_score_cfg():  _save_json(SCORE_CFG_FILE, score_cfg)
 def _save_score_meta(): _save_json(SCORE_META_FILE, score_meta)
 def _save_onboard_meta(): _save_json(ONBOARD_META_FILE, onboard_meta)
-def _save_wfworld():    _save_json(WFWORLD_FILE, wfworld)
+def _save_world():      _save_json(WORLD_FILE, world_store)   # <-- NEU
 
 def load_all() -> Dict[int, GuildConfig]:
     raw = _load_json(CFG_FILE, {})
@@ -278,6 +281,37 @@ def is_admin(interaction: discord.Interaction) -> bool:
 def _mention(guild: discord.Guild, uid: int) -> str:
     m = guild.get_member(uid)
     return m.mention if m else f"<@{uid}>"
+
+# --- WFWorld helpers ---
+def _world_guild(gid: int) -> dict:
+    g = world_store.setdefault(str(gid), {"users": {}, "casino": {}})
+    c = g["casino"]
+    if "server_seed" not in c:
+        seed = secrets.token_hex(32)
+        c["server_seed"] = seed
+        c["server_seed_hash"] = hashlib.sha256(seed.encode()).hexdigest()
+        c["nonce"] = 0
+    return g
+
+def _world_user(gid: int, uid: int) -> dict:
+    g = _world_guild(gid)
+    u = g["users"].setdefault(str(uid), {
+        "balance": 10_000,
+        "cooldowns": {},
+        "inventory": {"fish":{}, "ore":{}, "bar":{}, "materials":{}, "consumables":{}, "runes":{}, "weapons":[]},
+        "buffs": {}
+    })
+    return u
+
+def _fmt_soll(v: int) -> str:
+    return f"{v:,}".replace(",", ".")
+
+def _has_wf_role(member: discord.Member) -> bool:
+    role_id = _get_guild_role_filter_id(member.guild.id)
+    if not role_id:
+        return True
+    r = member.guild.get_role(role_id)
+    return bool(r and r in member.roles)
 
 # ======================== RSVP / Raid ========================
 def _get_role_ids(guild: discord.Guild) -> Dict[str, int]:
@@ -741,127 +775,6 @@ class SingleRolePicker(discord.ui.RoleSelect):
         _set_role_ids(gid, cur["TANK"], cur["HEAL"], cur["DPS"])
         await inter.response.send_message("✅ Rollen verknüpft.", ephemeral=True)
 
-# ======================== WFWorld – Persistenz & Helper ========================
-def _wf_g(gid: int) -> dict:
-    g = wfworld.get(str(gid))
-    if not g:
-        g = {"users": {}, "casino": {}}
-        wfworld[str(gid)] = g
-        _save_wfworld()
-    return g
-
-def _wf_u(gid: int, uid: int) -> dict:
-    g = _wf_g(gid)
-    u = g["users"].get(str(uid))
-    if not u:
-        u = {
-            "balance": 0,
-            "cooldowns": {
-                "fishing_ready_at": "1970-01-01T00:00:00+00:00",
-                "mining_ready_at":  "1970-01-01T00:00:00+00:00",
-                "hunting_ready_at": "1970-01-01T00:00:00+00:00",
-                "daily_ready_at":   "1970-01-01T00:00:00+00:00",
-            },
-            "inventory": {
-                "fish": {},
-                "ore": {},
-                "bar": {},
-                "materials": {},
-                "consumables": {},
-                "runes": {},
-                "weapons": []
-            },
-            "casino_nonce": 0,
-            "ledger": []
-        }
-        g["users"][str(uid)] = u
-        _save_wfworld()
-    return u
-
-def _dt_from_iso(s: str) -> datetime:
-    try: return datetime.fromisoformat(s)
-    except Exception: return datetime(1970,1,1, tzinfo=TZ)
-
-def _set_cd(u: dict, key: str, dt: datetime): u["cooldowns"][key] = dt.isoformat(); _save_wfworld()
-def _get_cd(u: dict, key: str) -> datetime: return _dt_from_iso(u["cooldowns"].get(key, "1970-01-01T00:00:00+00:00"))
-def _pay(u: dict, delta: int, reason: str):
-    u["balance"] = max(0, int(u["balance"]) + int(delta))
-    u["ledger"].append({"ts": _now().isoformat(), "delta": int(delta), "reason": reason})
-    if len(u["ledger"]) > 200: u["ledger"] = u["ledger"][-200:]
-    _save_wfworld()
-def _inv_add(bucket: dict, key: str, qty: int=1): bucket[key] = int(bucket.get(key, 0)) + int(qty)
-
-def _has_wf_role(member: discord.Member) -> Tuple[bool, str]:
-    role_id = _get_guild_role_filter_id(member.guild.id)
-    if not role_id:
-        return (True, "not-set")
-    has = any(r.id == role_id for r in member.roles)
-    return (has or member.guild_permissions.administrator, f"<@&{role_id}>")
-
-def S(amount: int) -> str:
-    return f"{amount:,}".replace(",", " ") + " Sollant"
-
-# ---- WFWorld Konfig ----
-FISH_TABLE = [
-    ("gemein",        50,  60),
-    ("ungewöhnlich", 120,  25),
-    ("selten",       300,  10),
-    ("episch",       800,   4),
-    ("mondlachs",   1800,   1),
-]
-FISH_EMOJI = "🎣"; MINING_EMOJI = "⛏️"; HUNT_EMOJI = "🏹"; DAILY_EMOJI = "🎁"
-WF_COOLDOWNS = {
-    "fishing": timedelta(hours=3),
-    "mining":  timedelta(hours=3),
-    "hunting": timedelta(minutes=30),
-    "daily":   timedelta(hours=24),
-}
-DAILY_REWARD = 2000
-
-def _weighted_choice(table):
-    total = sum(w for _,_,w in table)
-    r = random.uniform(0, total); upto = 0
-    for item, _, weight in table:
-        if upto + weight >= r: return item
-        upto += weight
-    return table[-1][0]
-
-def _fish_reward(fid: str) -> int:
-    for k, val, _ in FISH_TABLE:
-        if k == fid: return val
-    return 0
-
-def _fish_sell_value(fishes: Dict[str,int]) -> int:
-    return sum(_fish_reward(k) * int(v) for k,v in fishes.items())
-
-# ---- Casino helper ----
-CASINO_EDGE_DICE = 0.03  # 3 %
-
-def _casino_g(gid: int) -> dict:
-    c = _wf_g(gid).setdefault("casino", {})
-    if "server_seed" not in c:
-        seed = secrets.token_hex(32)
-        c["server_seed"] = seed
-        c["server_seed_hash"] = hashlib.sha256(seed.encode()).hexdigest()
-        _save_wfworld()
-    if "server_seed_hash" not in c:
-        c["server_seed_hash"] = hashlib.sha256(c["server_seed"].encode()).hexdigest()
-        _save_wfworld()
-    return c
-
-def _casino_rotate_seed(gid: int):
-    c = _casino_g(gid)
-    seed = secrets.token_hex(32)
-    c["server_seed"] = seed
-    c["server_seed_hash"] = hashlib.sha256(seed.encode()).hexdigest()
-    _save_wfworld()
-
-def _provably_roll(server_seed: str, client_seed: str) -> Tuple[int, str]:
-    """Returns (roll 1..100, round_hash)"""
-    digest = hmac.new(server_seed.encode(), client_seed.encode(), hashlib.sha256).hexdigest()
-    num = (int(digest[:8], 16) % 100) + 1
-    return num, digest
-
 # ======================== UI: Menüs ========================
 def hub_embed(guild: discord.Guild) -> discord.Embed:
     return discord.Embed(
@@ -872,7 +785,7 @@ def hub_embed(guild: discord.Guild) -> discord.Embed:
             "• **📅 Events** – Raid/RSVP & wiederkehrende Erinnerungen (Admin)\n"
             "• **🧭 Onboarding** – Kanäle/Rollen & Test-DM (Admin)\n"
             "• **⚙️ Admin** – Sync & Tools\n"
-            "• **🎮 WF-Spielwelt** – Wirtschaft & Mini-Games\n"
+            "• **🎮 WF-World** – Spielwelt\n"
         ),
         color=discord.Color.orange()
     )
@@ -891,331 +804,19 @@ class BackToHubMixin:
     async def back(self, inter: discord.Interaction, _btn: discord.ui.Button):
         await inter.response.edit_message(embed=hub_embed(inter.guild), view=HubView())
 
-# ---- WFWorld Views/Actions ----
-def wfworld_embed(user: discord.Member) -> discord.Embed:
-    u = _wf_u(user.guild.id, user.id)
-    e = discord.Embed(
-        title="🎮 WFWorld",
-        description=f"Kontostand: **{S(u['balance'])}**",
-        color=discord.Color.orange(),
-    )
-    e.set_footer(text="Privat/ephemeral. Öffentliche Posts nur für Boss/Casino (später).")
-    return e
-
-class WfWorldBackMixin:
-    @discord.ui.button(label="Menü", emoji="🏰", style=discord.ButtonStyle.secondary, row=4, custom_id="wf_back_world")
-    async def back_world(self, inter: discord.Interaction, _btn: discord.ui.Button):
-        await inter.response.edit_message(embed=wfworld_embed(inter.user), view=WFWorldView())
-
-class WFWorldView(discord.ui.View, BackToHubMixin):
-    def __init__(self): super().__init__(timeout=600)
-
-    @discord.ui.button(label="Beruf", emoji="🛠️", style=discord.ButtonStyle.primary, custom_id="wf_prof")
-    async def v_prof(self, inter: discord.Interaction, _btn: discord.ui.Button):
-        await inter.response.edit_message(embed=wfworld_embed(inter.user), view=ProfessionView())
-
-    @discord.ui.button(label="Weltboss", emoji="🐉", style=discord.ButtonStyle.primary, custom_id="wf_boss")
-    async def v_boss(self, inter: discord.Interaction, _btn: discord.ui.Button):
-        e = discord.Embed(title="🐉 Weltboss", description="Fenster & Loot-Vorschau – kommt bald.", color=discord.Color.red())
-        await inter.response.edit_message(embed=e, view=WorldBossView())
-
-    @discord.ui.button(label="Schmied", emoji="🛠️", style=discord.ButtonStyle.secondary, custom_id="wf_smith")
-    async def v_smith(self, inter: discord.Interaction, _btn: discord.ui.Button):
-        e=discord.Embed(title="🛠️ Schmied", description="Schmelzen & Upgrades – Stub (nächster Schritt).", color=discord.Color.blurple())
-        await inter.response.edit_message(embed=e, view=SmithView())
-
-    @discord.ui.button(label="Gildenhändler", emoji="🛒", style=discord.ButtonStyle.secondary, custom_id="wf_vendor")
-    async def v_vendor(self, inter: discord.Interaction, _btn: discord.ui.Button):
-        e=discord.Embed(title="🛒 Gildenhändler", description="Buffs/Runen – Stub.", color=discord.Color.green())
-        await inter.response.edit_message(embed=e, view=VendorView())
-
-    @discord.ui.button(label="Glücksspiel", emoji="🎲", style=discord.ButtonStyle.secondary, custom_id="wf_casino")
-    async def v_casino(self, inter: discord.Interaction, _btn: discord.ui.Button):
-        c=_casino_g(inter.guild_id)
-        e=discord.Embed(title="🎲 Glücksspiel", description="**W100 – Würfel** ist verfügbar.\nEdge 3 %, provably fair.", color=discord.Color.gold())
-        e.add_field(name="Aktueller Server-Seed (Hash)", value=f"`{c['server_seed_hash']}`", inline=False)
-        await inter.response.edit_message(embed=e, view=CasinoView())
-
-    @discord.ui.button(label="Bank", emoji="🏦", style=discord.ButtonStyle.secondary, custom_id="wf_bank")
-    async def v_bank(self, inter: discord.Interaction, _btn: discord.ui.Button):
-        u=_wf_u(inter.guild_id, inter.user.id)
-        e=discord.Embed(title="🏦 Bank", description=f"Kontostand: **{S(u['balance'])}**\n(Überweisungen/Fees: später)", color=discord.Color.dark_blue())
-        await inter.response.edit_message(embed=e, view=BankView())
-
-    @discord.ui.button(label="Inventar", emoji="🎒", style=discord.ButtonStyle.secondary, custom_id="wf_inv")
-    async def v_inv(self, inter: discord.Interaction, _btn: discord.ui.Button):
-        await show_inventory(inter)
-
-    @discord.ui.button(label="Status", emoji="🕒", style=discord.ButtonStyle.secondary, custom_id="wf_status")
-    async def v_status(self, inter: discord.Interaction, _btn: discord.ui.Button):
-        await show_status(inter)
-
-    @discord.ui.button(label="Hilfe/Fairness", emoji="📖", style=discord.ButtonStyle.secondary, custom_id="wf_help")
-    async def v_help(self, inter: discord.Interaction, _btn: discord.ui.Button):
-        e=discord.Embed(
-            title="📖 Hilfe & Fairness",
-            description=("• Server-Cooldowns verhindern Spam\n"
-                         "• Glücksspiel mit Server-Seed-Hash & Runden-Hash\n"
-                         "• Risiko: Gewinne nicht garantiert – verliere nur, was du verkraftest"),
-            color=discord.Color.light_grey()
-        )
-        await inter.response.edit_message(embed=e, view=HelpView())
-
-class ProfessionView(discord.ui.View, WfWorldBackMixin):
-    def __init__(self): super().__init__(timeout=600)
-
-    @discord.ui.button(label="Angeln", emoji=FISH_EMOJI, style=discord.ButtonStyle.primary, custom_id="wf_prof_fish")
-    async def v_fishing(self, inter: discord.Interaction, _btn: discord.ui.Button):
-        await show_fishing(inter)
-
-    @discord.ui.button(label="Bergbau", emoji=MINING_EMOJI, style=discord.ButtonStyle.primary, custom_id="wf_prof_mine")
-    async def v_mining(self, inter: discord.Interaction, _btn: discord.ui.Button):
-        await show_mining(inter)
-
-    @discord.ui.button(label="Jagd", emoji=HUNT_EMOJI, style=discord.ButtonStyle.primary, custom_id="wf_prof_hunt")
-    async def v_hunt(self, inter: discord.Interaction, _btn: discord.ui.Button):
-        await show_hunting(inter)
-
-    @discord.ui.button(label="Daily", emoji=DAILY_EMOJI, style=discord.ButtonStyle.success, custom_id="wf_prof_daily")
-    async def v_daily(self, inter: discord.Interaction, _btn: discord.ui.Button):
-        await claim_daily(inter)
-
-# Sub-Views
-class WorldBossView(discord.ui.View, WfWorldBackMixin): 
-    def __init__(self): super().__init__(timeout=600)
-class SmithView(discord.ui.View, WfWorldBackMixin):
-    def __init__(self): super().__init__(timeout=600)
-class VendorView(discord.ui.View, WfWorldBackMixin):
-    def __init__(self): super().__init__(timeout=600)
-class BankView(discord.ui.View, WfWorldBackMixin):
-    def __init__(self): super().__init__(timeout=600)
-class HelpView(discord.ui.View, WfWorldBackMixin):
-    def __init__(self): super().__init__(timeout=600)
-
-# ---- Casino UI ----
-class CasinoView(discord.ui.View, WfWorldBackMixin):
-    def __init__(self): super().__init__(timeout=600)
-
-    @discord.ui.button(label="W100 – Würfel", emoji="🎲", style=discord.ButtonStyle.primary, custom_id="wf_casino_dice")
-    async def dice(self, inter: discord.Interaction, _btn: discord.ui.Button):
-        await inter.response.send_modal(DiceModal())
-
-    @discord.ui.button(label="Seed Info", emoji="🔒", style=discord.ButtonStyle.secondary, custom_id="wf_casino_seed")
-    async def seed_info(self, inter: discord.Interaction, _btn: discord.ui.Button):
-        c=_casino_g(inter.guild_id)
-        e=discord.Embed(title="🔒 Seed-Info", description=f"Server-Seed-Hash:\n`{c['server_seed_hash']}`", color=discord.Color.dark_theme())
-        await inter.response.edit_message(embed=e, view=CasinoView())
-
-    @discord.ui.button(label="Seed rotieren (Admin)", emoji="♻️", style=discord.ButtonStyle.secondary, custom_id="wf_casino_seed_rot")
-    async def seed_rotate(self, inter: discord.Interaction, _btn: discord.ui.Button):
-        if not is_admin(inter):
-            await inter.response.send_message("Nur Admin.", ephemeral=True); return
-        _casino_rotate_seed(inter.guild_id)
-        c=_casino_g(inter.guild_id)
-        await inter.response.send_message(f"✅ Neuer Seed-Hash:\n`{c['server_seed_hash']}`", ephemeral=True)
-
-class DiceModal(discord.ui.Modal):
-    def __init__(self):
-        super().__init__(title="🎲 W100 – Würfel")
-        self.bet_in = discord.ui.TextInput(label="Einsatz (Sollant)", placeholder="z. B. 1000")
-        self.dir_in = discord.ui.TextInput(label="Richtung (<= oder >=)", placeholder="<=")
-        self.target_in = discord.ui.TextInput(label="Ziel (1..99)", placeholder="50")
-        for c in (self.bet_in, self.dir_in, self.target_in): self.add_item(c)
-
-    async def on_submit(self, inter: discord.Interaction):
-        u=_wf_u(inter.guild_id, inter.user.id)
-        try:
-            bet = max(1, int(self.bet_in.value.replace(" ","")))
-            direction = self.dir_in.value.strip()
-            if direction not in ("<=" , ">="): raise ValueError("Richtung")
-            target = int(self.target_in.value)
-            if not (1 <= target <= 99): raise ValueError("Ziel")
-        except Exception:
-            await inter.response.send_message("❌ Ungültige Eingaben.", ephemeral=True); return
-
-        max_bet = max(1, int(u["balance"] * 0.5)) if u["balance"]>0 else 1000
-        bet = min(bet, max_bet)
-        if u["balance"] < bet:
-            await inter.response.send_message("❌ Zu wenig Sollant.", ephemeral=True); return
-
-        # Provably fair roll
-        c=_casino_g(inter.guild_id)
-        u["casino_nonce"] = int(u.get("casino_nonce",0)) + 1
-        client_seed = f"{inter.user.id}:{u['casino_nonce']}"
-        roll, round_hash = _provably_roll(c["server_seed"], client_seed)
-
-        # Payout
-        p = target/100.0 if direction=="<=" else (100-target)/100.0
-        payout_mult = (1.0 - CASINO_EDGE_DICE) / p
-        win = (roll <= target) if direction=="<=" else (roll >= (target+1))
-        delta = 0
-        if win:
-            won = int(bet * payout_mult)
-            delta = won - bet   # Gewinn abzüglich Einsatz (Nettoplus)
-            _pay(u, delta, f"Dice win (roll={roll}, dir={direction}, target={target})")
-        else:
-            delta = -bet
-            _pay(u, delta, f"Dice lose (roll={roll}, dir={direction}, target={target})")
-
-        e = discord.Embed(title="🎲 Würfel – Ergebnis", color=discord.Color.gold() if win else discord.Color.red())
-        e.add_field(name="Roll", value=str(roll))
-        e.add_field(name="Wette", value=f"{direction} {target}")
-        e.add_field(name="Einsatz", value=S(bet))
-        e.add_field(name="Δ Kontostand", value=S(delta), inline=False)
-        e.add_field(name="Neuer Kontostand", value=S(u["balance"]), inline=False)
-        e.add_field(name="Server-Seed-Hash", value=f"`{c['server_seed_hash']}`", inline=False)
-        e.add_field(name="Client-Seed", value=f"`{client_seed}`", inline=False)
-        e.add_field(name="Round-Hash", value=f"`{round_hash}`", inline=False)
-        await inter.response.send_message(embed=e, ephemeral=True)
-
-# ---- Beruf: Angeln ----
-class FishingStartView(discord.ui.View, WfWorldBackMixin):
-    def __init__(self): super().__init__(timeout=600)
-
-    @discord.ui.button(label="Angeln starten", emoji=FISH_EMOJI, style=discord.ButtonStyle.primary, custom_id="wf_fish_start")
-    async def fish_start(self, inter: discord.Interaction, _btn: discord.ui.Button):
-        u=_wf_u(inter.guild_id, inter.user.id)
-        ready=_get_cd(u, "fishing_ready_at")
-        if ready>_now():
-            await inter.response.send_message(f"⏳ Cooldown: **{_fmt_dur(ready)}**", ephemeral=True); return
-        pulls=random.randint(2,4)
-        out: Dict[str,int]={}
-        for _ in range(pulls):
-            fid=_weighted_choice(FISH_TABLE); out[fid]=out.get(fid,0)+1
-            _inv_add(u["inventory"]["fish"], fid, 1)
-        _set_cd(u, "fishing_ready_at", _now()+WF_COOLDOWNS["fishing"])
-        lines=[f"• {k} ×{v} (+{S(_fish_reward(k)*v)})" for k,v in out.items()]
-        e=discord.Embed(title="🎣 Fang", description="\n".join(lines) or "Nichts gefangen.", color=discord.Color.blue())
-        e.set_footer(text="Du kannst Fische im Inventar verkaufen.")
-        await inter.response.edit_message(embed=e, view=InventorySellView())
-
-class InventorySellView(discord.ui.View, WfWorldBackMixin):
-    def __init__(self): super().__init__(timeout=600)
-
-    @discord.ui.button(label="Alle Fische verkaufen", emoji="💰", style=discord.ButtonStyle.success, custom_id="wf_sell_fish_all")
-    async def sell_all(self, inter: discord.Interaction, _btn: discord.ui.Button):
-        u=_wf_u(inter.guild_id, inter.user.id)
-        fish=u["inventory"]["fish"]
-        val=_fish_sell_value(fish)
-        if val<=0:
-            await inter.response.send_message("Keine Fische im Inventar.", ephemeral=True); return
-        fish.clear(); _pay(u, val, "Fischverkauf")
-        e=discord.Embed(title="💰 Verkauf", description=f"Erlös: **{S(val)}**\nKontostand: **{S(u['balance'])}**", color=discord.Color.gold())
-        await inter.response.edit_message(embed=e, view=WFWorldView())
-
-async def show_fishing(inter: discord.Interaction):
-    u=_wf_u(inter.guild_id, inter.user.id)
-    ready=_get_cd(u, "fishing_ready_at")
-    if ready>_now():
-        e=discord.Embed(title="🎣 Angeln", description=f"Cooldown: **{_fmt_dur(ready)}**", color=discord.Color.blue())
-        await inter.response.edit_message(embed=e, view=ProfessionView())
-    else:
-        e=discord.Embed(title="🎣 Angeln", description="Bereit. Fang simuliert, 2–4 Fische.\nVerkauf im Inventar.", color=discord.Color.blue())
-        await inter.response.edit_message(embed=e, view=FishingStartView())
-
-# ---- Beruf: Bergbau ----
-ORE_TABLE = [("kupfer", 1, 60), ("eisen",1,30), ("stahl",1,10)]
-class MiningStartView(discord.ui.View, WfWorldBackMixin):
-    def __init__(self): super().__init__(timeout=600)
-    @discord.ui.button(label="Bergbau starten", emoji=MINING_EMOJI, style=discord.ButtonStyle.primary, custom_id="wf_mine_start")
-    async def mine(self, inter: discord.Interaction, _btn: discord.ui.Button):
-        u=_wf_u(inter.guild_id, inter.user.id)
-        ready=_get_cd(u, "mining_ready_at")
-        if ready>_now():
-            await inter.response.send_message(f"⏳ Cooldown: **{_fmt_dur(ready)}**", ephemeral=True); return
-        pulls=random.randint(1,3)
-        out={}
-        for _ in range(pulls):
-            total=sum(w for _,_,w in ORE_TABLE); r=random.uniform(0,total); acc=0
-            for ore,qty,w in ORE_TABLE:
-                acc+=w
-                if r<=acc:
-                    _inv_add(u["inventory"]["ore"], ore, qty)
-                    out[ore]=out.get(ore,0)+qty
-                    break
-        _set_cd(u, "mining_ready_at", _now()+WF_COOLDOWNS["mining"])
-        lines=[f"• {k} ×{v}" for k,v in out.items()]
-        e=discord.Embed(title="⛏️ Bergbau", description="\n".join(lines) or "Nichts gefunden.", color=discord.Color.dark_grey())
-        e.set_footer(text="Schmelzen beim Schmied (bald).")
-        await inter.response.edit_message(embed=e, view=ProfessionView())
-
-async def show_mining(inter: discord.Interaction):
-    u=_wf_u(inter.guild_id, inter.user.id)
-    ready=_get_cd(u, "mining_ready_at")
-    if ready>_now():
-        e=discord.Embed(title="⛏️ Bergbau", description=f"Cooldown: **{_fmt_dur(ready)}**", color=discord.Color.dark_grey())
-        await inter.response.edit_message(embed=e, view=ProfessionView())
-    else:
-        e=discord.Embed(title="⛏️ Bergbau", description="Bereit. 1–3 Erze, seltene Adern später.", color=discord.Color.dark_grey())
-        await inter.response.edit_message(embed=e, view=MiningStartView())
-
-# ---- Beruf: Jagd (Stub) ----
-async def show_hunting(inter: discord.Interaction):
-    u=_wf_u(inter.guild_id, inter.user.id)
-    ready=_get_cd(u, "hunting_ready_at")
-    if ready>_now():
-        e=discord.Embed(title="🏹 Jagd", description=f"Cooldown: **{_fmt_dur(ready)}**", color=discord.Color.green())
-        await inter.response.edit_message(embed=e, view=ProfessionView())
-    else:
-        _set_cd(u, "hunting_ready_at", _now()+WF_COOLDOWNS["hunting"])
-        e=discord.Embed(title="🏹 Jagd", description="Minispiele (QTE/Memory) kommen. Cooldown gesetzt.", color=discord.Color.green())
-        await inter.response.edit_message(embed=e, view=ProfessionView())
-
-# ---- Daily ----
-async def claim_daily(inter: discord.Interaction):
-    u=_wf_u(inter.guild_id, inter.user.id)
-    ready=_get_cd(u, "daily_ready_at")
-    if ready>_now():
-        await inter.response.send_message(f"⏳ Daily erst wieder in **{_fmt_dur(ready)}**.", ephemeral=True); return
-    _pay(u, DAILY_REWARD, "Daily")
-    _set_cd(u, "daily_ready_at", _now()+WF_COOLDOWNS["daily"])
-    e=discord.Embed(title="🎁 Daily", description=f"+ **{S(DAILY_REWARD)}** gutgeschrieben.\nKontostand: **{S(u['balance'])}**", color=discord.Color.green())
-    await inter.response.edit_message(embed=e, view=ProfessionView())
-
-# ---- Inventar/Status/Hilfe ----
-def _fmt_dur(ts: datetime) -> str:
-    now=_now()
-    if ts<=now: return "bereit"
-    delta=ts-now
-    h, rem = divmod(int(delta.total_seconds()), 3600)
-    m, _ = divmod(rem, 60)
-    if h>0: return f"{h} h {m} min"
-    return f"{m} min"
-
-async def show_inventory(inter: discord.Interaction):
-    u=_wf_u(inter.guild_id, inter.user.id)
-    inv=u["inventory"]
-    fish=inv["fish"]; ores=inv["ore"]; bars=inv["bar"]
-    lines=[]
-    if fish: lines.append("**Fische**:\n" + "\n".join(f"• {k} ×{v}" for k,v in fish.items()) + f"\nWert gesamt: **{S(_fish_sell_value(fish))}**")
-    if ores: lines.append("**Erze**:\n" + "\n".join(f"• {k} ×{v}" for k,v in ores.items()))
-    if bars: lines.append("**Barren**:\n" + "\n".join(f"• {k} ×{v}" for k,v in bars.items()))
-    desc = "\n\n".join(lines) if lines else "Leer."
-    e=discord.Embed(title="🎒 Inventar", description=desc, color=discord.Color.teal())
-    await inter.response.edit_message(embed=e, view=InventorySellView())
-
-async def show_status(inter: discord.Interaction):
-    u=_wf_u(inter.guild_id, inter.user.id)
-    items=[
-        ("Angeln", _get_cd(u,"fishing_ready_at")),
-        ("Bergbau", _get_cd(u,"mining_ready_at")),
-        ("Jagd", _get_cd(u,"hunting_ready_at")),
-        ("Daily", _get_cd(u,"daily_ready_at")),
-    ]
-    lines=[f"• {name}: **{_fmt_dur(dt)}**" for name,dt in items]
-    e=discord.Embed(title="🕒 Status & Cooldowns", description="\n".join(lines), color=discord.Color.dark_teal())
-    e.add_field(name="Kontostand", value=f"**{S(u['balance'])}**", inline=False)
-    await inter.response.edit_message(embed=e, view=WFWorldView())
-
 class HubView(discord.ui.View):
-    def __init__(self): super().__init__(timeout=600)
+    def __init__(self): super().__init__(timeout=None)
 
-    @discord.ui.button(label="WF-Spielwelt", emoji="🎮", style=discord.ButtonStyle.secondary, custom_id="hub_game")
+    @discord.ui.button(label="WF-World", emoji="🎮", style=discord.ButtonStyle.primary, custom_id="hub_game")
     async def game(self, inter: discord.Interaction, _btn: discord.ui.Button):
-        ok, need = _has_wf_role(inter.user)
-        if not ok:
-            await inter.response.send_message(f"❌ Zugriff nur mit Rolle {need}.", ephemeral=True); return
-        await inter.response.edit_message(embed=wfworld_embed(inter.user), view=WFWorldView())
+        if not _has_wf_role(inter.user):
+            await inter.response.send_message("Nur mit der **Weiße Flamme**-Rolle.", ephemeral=True); return
+        em = discord.Embed(
+            title="WF-World",
+            description="Wähle: **Beruf**, **Glücksspiel**, **Inventar**, **Status**.",
+            color=discord.Color.orange()
+        )
+        await inter.response.edit_message(embed=em, view=WFWorldView())
 
     @discord.ui.button(label="Flammenscore", emoji="🏆", style=discord.ButtonStyle.primary, custom_id="hub_score")
     async def score(self, inter: discord.Interaction, _btn: discord.ui.Button):
@@ -1240,7 +841,7 @@ class HubView(discord.ui.View):
         await inter.response.edit_message(embed=admin_embed_intro(), view=AdminToolsView())
 
 class ScoreView(discord.ui.View, BackToHubMixin):
-    def __init__(self): super().__init__(timeout=600)
+    def __init__(self): super().__init__(timeout=None)
 
     @discord.ui.button(label="Mein Score", emoji="👤", style=discord.ButtonStyle.primary)
     async def my_score(self, inter: discord.Interaction, _btn: discord.ui.Button):
@@ -1282,113 +883,414 @@ class ScoreView(discord.ui.View, BackToHubMixin):
         b["messages"] += 1; _save_scores()
         await inter.response.send_message("Test: +1 Message gezählt.", ephemeral=True)
 
-# ----- Events / Onboarding Admin Views ----
-class EventsView(discord.ui.View, BackToHubMixin):
-    def __init__(self): super().__init__(timeout=600)
+# ======================== WFWorld – Menüs & Casino ========================
+CASINO_EDGE = 0.05  # 5% House Edge
 
-    async def interaction_check(self, inter: discord.Interaction) -> bool:
-        if not is_admin(inter):
-            await inter.response.send_message("Nur Admin/Manage Server.", ephemeral=True); return False
+def _casino_next_nonce(gid: int) -> int:
+    g = _world_guild(gid)
+    g["casino"]["nonce"] += 1
+    _save_world()
+    return g["casino"]["nonce"]
+
+def _casino_seed_info(gid: int) -> Tuple[str, str]:
+    g = _world_guild(gid)
+    return g["casino"]["server_seed"], g["casino"]["server_seed_hash"]
+
+def _casino_rotate_seed(gid: int):
+    g = _world_guild(gid)
+    seed = secrets.token_hex(32)
+    g["casino"]["server_seed"] = seed
+    g["casino"]["server_seed_hash"] = hashlib.sha256(seed.encode()).hexdigest()
+    g["casino"]["nonce"] = 0
+    _save_world()
+
+def _hmac_roll_int(server_seed: str, client_seed: str, nonce: int, tag: str = "", mod: int = 100) -> int:
+    msg = f"{client_seed}:{nonce}:{tag}".encode()
+    digest = hmac.new(server_seed.encode(), msg, hashlib.sha256).hexdigest()
+    num = int(digest[:8], 16)
+    return (num % mod)
+
+def _pf_rand_choice(seq: list, server_seed: str, client_seed: str, nonce: int, step: int) -> any:
+    idx = _hmac_roll_int(server_seed, client_seed, nonce, f"step{step}", len(seq))
+    return seq[idx]
+
+class WFWorldView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def _gate(self, inter: discord.Interaction) -> bool:
+        if not _has_wf_role(inter.user):
+            await inter.response.send_message("❌ Nur mit der **Weiße Flamme**-Rolle.", ephemeral=True)
+            return False
         return True
 
-    @discord.ui.button(label="Raid mit RSVP", emoji="📝", style=discord.ButtonStyle.primary, custom_id="wf_ev_rsvp")
-    async def create(self, inter: discord.Interaction, _btn: discord.ui.Button):
-        await inter.response.send_modal(CreateRaidModal())
+    @discord.ui.button(label="Beruf", emoji="🛠️", style=discord.ButtonStyle.secondary, custom_id="wf_world_jobs")
+    async def jobs(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        if not await self._gate(inter): return
+        e = discord.Embed(title="Berufe", description="Angeln · Bergbau · Jagd · Daily", color=discord.Color.orange())
+        v = WFJobsView()
+        await inter.response.edit_message(embed=e, view=v)
 
-    @discord.ui.button(label="Wiederkehrendes Event", emoji="🔁", style=discord.ButtonStyle.success, custom_id="wf_ev_recurring")
-    async def recurring(self, inter: discord.Interaction, _btn: discord.ui.Button):
+    @discord.ui.button(label="Glücksspiel", emoji="🎲", style=discord.ButtonStyle.primary, custom_id="wf_world_casino")
+    async def casino(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        if not await self._gate(inter): return
+        _, seed_hash = _casino_seed_info(inter.guild_id)
+        e = discord.Embed(
+            title="Glücksspiel",
+            description=(f"**Edge:** {int(CASINO_EDGE*100)} %, provably fair.\n"
+                         f"**Aktueller Server-Seed (Hash):** `{seed_hash}`"),
+            color=discord.Color.blurple()
+        )
+        await inter.response.edit_message(embed=e, view=CasinoView())
+
+    @discord.ui.button(label="Inventar", emoji="🎒", style=discord.ButtonStyle.secondary, custom_id="wf_world_inv")
+    async def inv(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        if not await self._gate(inter): return
+        u = _world_user(inter.guild_id, inter.user.id)
+        inv = u["inventory"]
+        lines = []
+        def _fmt(cat):
+            d = inv.get(cat, {})
+            if not d: return "—"
+            return ", ".join([f"{k}×{v}" for k,v in d.items() if v]) or "—"
+        lines.append(f"**Fische:** {_fmt('fish')}")
+        lines.append(f"**Erze:** {_fmt('ore')}")
+        lines.append(f"**Barren:** {_fmt('bar')}")
+        lines.append(f"**Konsum:** {_fmt('consumables')}")
+        lines.append(f"**Runen:** {_fmt('runes')}")
+        e = discord.Embed(title="Inventar", description="\n".join(lines), color=discord.Color.dark_teal())
+        e.set_footer(text=f"Kontostand: { _fmt_soll(u['balance']) } Sollant")
+        await inter.response.edit_message(embed=e, view=WFWorldBackView())
+
+    @discord.ui.button(label="Status/Cooldowns", emoji="🕒", style=discord.ButtonStyle.secondary, custom_id="wf_world_status")
+    async def status(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        if not await self._gate(inter): return
+        u = _world_user(inter.guild_id, inter.user.id)
+        cd = u["cooldowns"]
+        def left(key):
+            iso = cd.get(key)
+            if not iso: return "bereit"
+            t = datetime.fromisoformat(iso)
+            s = int((t - _now()).total_seconds())
+            return "bereit" if s <= 0 else f"{s//3600}h {(s%3600)//60}m"
+        e = discord.Embed(title="Status & Cooldowns", color=discord.Color.dark_gold())
+        e.add_field(name="Angeln", value=left("fishing_ready_at"), inline=True)
+        e.add_field(name="Bergbau", value=left("mining_ready_at"), inline=True)
+        e.add_field(name="Jagd", value=left("hunting_ready_at"), inline=True)
+        e.add_field(name="Daily", value=left("daily_ready_at"), inline=True)
+        await inter.response.edit_message(embed=e, view=WFWorldBackView())
+
+class WFWorldBackView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Menü", emoji="🏠", style=discord.ButtonStyle.secondary)
+    async def back(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        em = discord.Embed(
+            title="WF-World",
+            description="Wähle: **Beruf**, **Glücksspiel**, **Inventar**, **Status**.",
+            color=discord.Color.orange()
+        )
+        await inter.response.edit_message(embed=em, view=WFWorldView())
+
+class WFJobsView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def _gate(self, inter: discord.Interaction) -> bool:
+        if not _has_wf_role(inter.user):
+            await inter.response.send_message("❌ Nur mit **Weiße Flamme**.", ephemeral=True); return False
+        return True
+
+    @discord.ui.button(label="Angeln", emoji="🎣", style=discord.ButtonStyle.primary)
+    async def fish(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        if not await self._gate(inter): return
+        await inter.response.send_message("🎣 Angeln-Minigame kommt als Nächstes (Memory/QTE).", ephemeral=True)
+
+    @discord.ui.button(label="Bergbau", emoji="⛏️", style=discord.ButtonStyle.primary)
+    async def mine(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        if not await self._gate(inter): return
+        await inter.response.send_message("⛏️ Bergbau-Minigame kommt als Nächstes (Reaktions-QTE).", ephemeral=True)
+
+    @discord.ui.button(label="Jagd", emoji="🏹", style=discord.ButtonStyle.primary)
+    async def hunt(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        if not await self._gate(inter): return
+        await inter.response.send_message("🏹 Jagd-Minispiele (Memory/QTE/Zählen) folgen.", ephemeral=True)
+
+    @discord.ui.button(label="Daily", emoji="🎁", style=discord.ButtonStyle.secondary)
+    async def daily(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        if not await self._gate(inter): return
+        u = _world_user(inter.guild_id, inter.user.id)
+        cd = u["cooldowns"].get("daily_ready_at")
+        now = _now()
+        if cd and datetime.fromisoformat(cd) > now:
+            left = int((datetime.fromisoformat(cd) - now).total_seconds())
+            await inter.response.send_message(f"⏳ Daily in {left//3600}h {(left%3600)//60}m.", ephemeral=True); return
+        gain = 2000
+        u["balance"] += gain
+        u["cooldowns"]["daily_ready_at"] = (now + timedelta(hours=24)).isoformat()
+        _save_world()
+        await inter.response.send_message(f"✅ Daily: +{_fmt_soll(gain)} Sollant. Kontostand: {_fmt_soll(u['balance'])}.", ephemeral=True)
+
+class CasinoView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Calanthias Schreckensturm (Tower)", emoji="🗼", style=discord.ButtonStyle.success)
+    async def tower(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        await inter.response.send_modal(TowerStartModal())
+
+    @discord.ui.button(label="Vientas Blackjack", emoji="🃏", style=discord.ButtonStyle.primary)
+    async def bj(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        await inter.response.send_modal(BlackjackStartModal())
+
+    @discord.ui.button(label="Seed Info", emoji="🔒", style=discord.ButtonStyle.secondary)
+    async def seedinfo(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        _, seed_hash = _casino_seed_info(inter.guild_id)
+        await inter.response.send_message(f"Server-Seed (Hash): `{seed_hash}`", ephemeral=True)
+
+    @discord.ui.button(label="Seed rotieren (Admin)", emoji="♻️", style=discord.ButtonStyle.secondary)
+    async def seedrotate(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        if not is_admin(inter):
+            await inter.response.send_message("Nur Admin.", ephemeral=True); return
+        _casino_rotate_seed(inter.guild_id)
+        await inter.response.send_message("🔁 Server-Seed rotiert.", ephemeral=True)
+
+    @discord.ui.button(label="Menü", emoji="🏠", style=discord.ButtonStyle.secondary, row=1)
+    async def back(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        em = discord.Embed(
+            title="WF-World",
+            description="Wähle: **Beruf**, **Glücksspiel**, **Inventar**, **Status**.",
+            color=discord.Color.orange()
+        )
+        await inter.response.edit_message(embed=em, view=WFWorldView())
+
+# ----- Tower -----
+_tower_sessions: Dict[Tuple[int,int], dict] = {}
+
+class TowerStartModal(discord.ui.Modal, title="🗼 Tower – Einsatz"):
+    bet_in = discord.ui.TextInput(label="Einsatz (Sollant)", placeholder="z. B. 1000")
+    def __init__(self): super().__init__()
+
+    async def on_submit(self, inter: discord.Interaction):
         try:
-            await inter.response.send_modal(CreateRecurringEventModal())
-        except Exception as e:
-            if not inter.response.is_done():
-                await inter.response.send_message(f"❌ Konnte das Formular nicht öffnen: {e}", ephemeral=True)
+            bet = max(1, int(self.bet_in.value))
+        except Exception:
+            await inter.response.send_message("❌ Ungültiger Einsatz.", ephemeral=True); return
+        u = _world_user(inter.guild_id, inter.user.id)
+        if bet > u["balance"]:
+            await inter.response.send_message("❌ Zu wenig Sollant.", ephemeral=True); return
+        u["balance"] -= bet; _save_world()
+        nonce = _casino_next_nonce(inter.guild_id)
+        _tower_sessions[(inter.guild_id, inter.user.id)] = {
+            "bet": bet, "nonce": nonce, "level": 0, "mult": 1.0, "alive": True
+        }
+        e = discord.Embed(title="🗼 Tower", description=f"Einsatz **{_fmt_soll(bet)}**. Wähle ein Feld (1–3) oder **Cash-out**.", color=discord.Color.green())
+        e.set_footer(text="1 Mine pro Reihe • 10 Ebenen • Cash-out wann immer du willst.")
+        await inter.response.send_message(embed=e, view=TowerPlayView(), ephemeral=True)
+
+class TowerPlayView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    def _per_level_multiplier(self) -> float:
+        return 1.5 * (1.0 - CASINO_EDGE)
+
+    async def _state(self, inter: discord.Interaction) -> Optional[dict]:
+        s = _tower_sessions.get((inter.guild_id, inter.user.id))
+        if not s or not s["alive"]:
+            await inter.response.send_message("❌ Keine aktive Runde.", ephemeral=True); return None
+        return s
+
+    async def _choose(self, inter: discord.Interaction, choice: int):
+        s = await self._state(inter)
+        if not s: return
+        gid, uid = inter.guild_id, inter.user.id
+        server_seed, _ = _casino_seed_info(gid)
+        client_seed = str(uid)
+        bomb = _hmac_roll_int(server_seed, client_seed, s["nonce"], f"lvl{s['level']}", 3)  # 0..2
+        if choice == bomb:
+            s["alive"] = False
+            _tower_sessions.pop((gid, uid), None)
+            e = discord.Embed(title="💥 Tower – Explodiert", description=f"Verloren. Einsatz weg.", color=discord.Color.red())
+            await inter.response.edit_message(embed=e, view=WFWorldBackView()); return
+        s["level"] += 1
+        s["mult"] *= self._per_level_multiplier()
+        if s["level"] >= 10:
+            win = int(round(s["bet"] * s["mult"]))
+            u = _world_user(gid, uid); u["balance"] += win; _save_world()
+            _tower_sessions.pop((gid, uid), None)
+            e = discord.Embed(title="🏆 Tower – Geschafft!", description=f"Du hast **Level 10** gemeistert.\nAuszahlung: **{_fmt_soll(win)}**", color=discord.Color.gold())
+            await inter.response.edit_message(embed=e, view=WFWorldBackView()); return
+        e = discord.Embed(
+            title=f"🗼 Tower – Ebene {s['level']}/10",
+            description=f"Aktueller Multiplikator: **{s['mult']:.2f}×**\nWähle ein Feld (1–3) oder **Cash-out**.",
+            color=discord.Color.green()
+        )
+        await inter.response.edit_message(embed=e, view=self)
+
+    @discord.ui.button(label="1", style=discord.ButtonStyle.secondary)
+    async def b1(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        await self._choose(inter, 0)
+
+    @discord.ui.button(label="2", style=discord.ButtonStyle.secondary)
+    async def b2(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        await self._choose(inter, 1)
+
+    @discord.ui.button(label="3", style=discord.ButtonStyle.secondary)
+    async def b3(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        await self._choose(inter, 2)
+
+    @discord.ui.button(label="Cash-out", emoji="💰", style=discord.ButtonStyle.success, row=1)
+    async def cash(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        s = await self._state(inter)
+        if not s: return
+        win = int(round(s["bet"] * s["mult"]))
+        u = _world_user(inter.guild_id, inter.user.id); u["balance"] += win; _save_world()
+        _tower_sessions.pop((inter.guild_id, inter.user.id), None)
+        e = discord.Embed(title="💰 Tower – Cash-out", description=f"Auszahlung: **{_fmt_soll(win)}**", color=discord.Color.blurple())
+        await inter.response.edit_message(embed=e, view=WFWorldBackView())
+
+# ----- Blackjack -----
+_bj_sessions: Dict[Tuple[int,int], dict] = {}
+
+def _bj_new_deck(server_seed: str, client_seed: str, nonce: int) -> List[str]:
+    ranks = ['A','2','3','4','5','6','7','8','9','10','J','Q','K']
+    suits = ['♠','♥','♦','♣']
+    deck = [f"{r}{s}" for r in ranks for s in suits]
+    for i in range(len(deck)-1, 0, -1):
+        j = _hmac_roll_int(server_seed, client_seed, nonce, f"shuf{i}", i+1)
+        deck[i], deck[j] = deck[j], deck[i]
+    return deck
+
+def _bj_value(hand: List[str]) -> int:
+    vals = []
+    for c in hand:
+        r = c[:-1]
+        if r in ("J","Q","K","10"): vals.append(10)
+        elif r == "A": vals.append(11)
+        else: vals.append(int(r))
+    total = sum(vals)
+    aces = sum(1 for c in hand if c[:-1]=="A")
+    while total > 21 and aces:
+        total -= 10; aces -= 1
+    return total
+
+class BlackjackStartModal(discord.ui.Modal, title="🃏 Blackjack – Einsatz"):
+    bet_in = discord.ui.TextInput(label="Einsatz (Sollant)", placeholder="z. B. 1000")
+    def __init__(self): super().__init__()
+
+    async def on_submit(self, inter: discord.Interaction):
+        try: bet = max(1, int(self.bet_in.value))
+        except Exception:
+            await inter.response.send_message("❌ Ungültiger Einsatz.", ephemeral=True); return
+        u = _world_user(inter.guild_id, inter.user.id)
+        if bet > u["balance"]:
+            await inter.response.send_message("❌ Zu wenig Sollant.", ephemeral=True); return
+        u["balance"] -= bet; _save_world()
+        nonce = _casino_next_nonce(inter.guild_id)
+        server_seed, _ = _casino_seed_info(inter.guild_id)
+        client_seed = str(inter.user.id)
+        deck = _bj_new_deck(server_seed, client_seed, nonce)
+        player = [deck.pop(), deck.pop()]
+        dealer = [deck.pop(), deck.pop()]
+        _bj_sessions[(inter.guild_id, inter.user.id)] = {
+            "bet": bet, "nonce": nonce, "deck": deck,
+            "player": player, "dealer": dealer, "done": False, "doubled": False
+        }
+        await inter.response.send_message(embed=_bj_embed(inter, reveal=False), view=BlackjackPlayView(), ephemeral=True)
+
+def _bj_embed(inter: discord.Interaction, reveal: bool) -> discord.Embed:
+    s = _bj_sessions[(inter.guild_id, inter.user.id)]
+    pv, dv = _bj_value(s["player"]), _bj_value(s["dealer"])
+    dshow = s["dealer"] if reveal else [s["dealer"][0], "??"]
+    e = discord.Embed(title="🃏 Blackjack", color=discord.Color.purple())
+    e.add_field(name=f"Deine Hand ({pv})", value=" ".join(s["player"]), inline=False)
+    e.add_field(name=f"Dealer ({dv if reveal else '?'} )", value=" ".join(dshow), inline=False)
+    e.set_footer(text=f"Einsatz: {_fmt_soll(s['bet'])} Sollant")
+    return e
+
+class BlackjackPlayView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    def _st(self, inter: discord.Interaction) -> dict:
+        s = _bj_sessions.get((inter.guild_id, inter.user.id))
+        return s
+
+    async def _finish(self, inter: discord.Interaction):
+        s = self._st(inter)
+        if not s:
+            await inter.response.send_message("❌ Keine aktive Runde.", ephemeral=True)
+            return
+        while _bj_value(s["dealer"]) < 17 and s["deck"]:
+            s["dealer"].append(s["deck"].pop())
+        pv, dv = _bj_value(s["player"]), _bj_value(s["dealer"])
+        result = ""
+        payout = 0
+        bet = s["bet"]
+        is_player_bj = (len(s["player"])==2 and pv==21)
+        is_dealer_bj = (len(s["dealer"])==2 and dv==21)
+        if pv > 21:
+            result = "Bust – verloren."
+        elif dv > 21:
+            payout = int(bet * 2)
+            result = "Dealer bust – Sieg."
+        elif is_player_bj and not is_dealer_bj:
+            payout = int(bet * 2.5)  # 3:2
+            result = "Blackjack! 3:2 Auszahlung."
+        elif not is_player_bj and is_dealer_bj:
+            result = "Dealer Blackjack – verloren."
+        else:
+            if pv > dv:
+                payout = int(bet * 2)
+                result = "Sieg."
+            elif pv < dv:
+                result = "Verloren."
             else:
-                try: await inter.followup.send(f"❌ Konnte das Formular nicht öffnen: {e}", ephemeral=True)
-                except Exception: pass
+                payout = bet  # Push
+                result = "Push."
+        u = _world_user(inter.guild_id, inter.user.id)
+        if payout: u["balance"] += payout
+        _save_world()
+        _bj_sessions.pop((inter.guild_id, inter.user.id), None)
+        e = _bj_embed(inter, reveal=True)
+        e.color = discord.Color.green() if payout>bet else (discord.Color.orange() if payout==bet else discord.Color.red())
+        e.add_field(name="Ergebnis", value=result, inline=False)
+        e.set_footer(text=f"Auszahlung: {_fmt_soll(payout)} • Kontostand: {_fmt_soll(u['balance'])}")
+        await inter.response.edit_message(embed=e, view=WFWorldBackView())
 
-    @discord.ui.button(label="Event-Liste", emoji="📋", style=discord.ButtonStyle.secondary, custom_id="wf_ev_list")
-    async def list_events(self, inter: discord.Interaction, _btn: discord.ui.Button):
-        cfg = get_or_create_guild_cfg(inter.guild_id)
-        if not cfg.events:
-            await inter.response.send_message("Keine Events gespeichert.", ephemeral=True); return
-        lines=[]
-        for e in cfg.events.values():
-            typ = "Once" if e.one_time_date else "Recurring"
-            extra = f"\n• Beschreibung: {e.description}" if e.description else ""
-            lines.append(f"• **{e.name}** ({typ}) — {e.start_hhmm}, Tage: {fmt_weekdays(e.weekdays)}{extra}")
-        await inter.response.send_message("\n".join(lines), ephemeral=True)
+    @discord.ui.button(label="Hit", emoji="➕", style=discord.ButtonStyle.primary)
+    async def hit(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        s = self._st(inter)
+        if not s:
+            await inter.response.send_message("❌ Keine aktive Runde.", ephemeral=True)
+            return
+        s["player"].append(s["deck"].pop())
+        if _bj_value(s["player"]) >= 21:
+            await self._finish(inter); return
+        await inter.response.edit_message(embed=_bj_embed(inter, reveal=False), view=self)
 
-    @discord.ui.button(label="Event löschen", emoji="🧹", style=discord.ButtonStyle.danger, custom_id="wf_ev_delete")
-    async def delete_event(self, inter: discord.Interaction, _btn: discord.ui.Button):
-        cfg = get_or_create_guild_cfg(inter.guild_id)
-        if not cfg.events:
-            await inter.response.send_message("Keine Events vorhanden.", ephemeral=True); return
-        key = sorted(cfg.events.keys())[0]; name = cfg.events[key].name
-        del cfg.events[key]; save_all(configs)
-        await inter.response.send_message(f"🗑️ Event **{name}** gelöscht.", ephemeral=True)
+    @discord.ui.button(label="Stand", emoji="✋", style=discord.ButtonStyle.secondary)
+    async def stand(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        await self._finish(inter)
 
-    @discord.ui.button(label="Standard-Kanal", emoji="📣", style=discord.ButtonStyle.secondary, custom_id="wf_ev_set_default_channel")
-    async def set_default_channel(self, inter: discord.Interaction, _btn: discord.ui.Button):
-        class _AnnouncePicker(discord.ui.ChannelSelect):
-            def __init__(self):
-                super().__init__(channel_types=[discord.ChannelType.text], placeholder="Ankündigungs-Kanal wählen", min_values=1, max_values=1)
-            async def callback(self, inner: discord.Interaction):
-                ch: discord.TextChannel = self.values[0]
-                cfg = get_or_create_guild_cfg(inner.guild_id)
-                cfg.announce_channel_id = ch.id; save_all(configs)
-                await inner.response.send_message(f"✅ Ankündigungs-Kanal gesetzt: {ch.mention}", ephemeral=True)
-        v = discord.ui.View(); v.add_item(_AnnouncePicker())
-        await inter.response.send_message("Ankündigungs-Kanal wählen:", view=v, ephemeral=True)
+    @discord.ui.button(label="Double", emoji="🪙", style=discord.ButtonStyle.success)
+    async def double(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        s = self._st(inter)
+        if not s:
+            await inter.response.send_message("❌ Keine aktive Runde.", ephemeral=True)
+            return
+        if s["doubled"]:
+            await inter.response.send_message("Schon verdoppelt.", ephemeral=True); return
+        u = _world_user(inter.guild_id, inter.user.id)
+        if u["balance"] < s["bet"]:
+            await inter.response.send_message("Zu wenig Sollant fürs Double.", ephemeral=True); return
+        u["balance"] -= s["bet"]; s["bet"] *= 2; s["doubled"] = True; _save_world()
+        s["player"].append(s["deck"].pop())
+        await self._finish(inter)
 
-class OnboardAdminView(discord.ui.View, BackToHubMixin):
-    def __init__(self): super().__init__(timeout=600)
-
-    async def interaction_check(self, inter: discord.Interaction) -> bool:
-        if not is_admin(inter):
-            await inter.response.send_message("Nur Admin/Manage Server.", ephemeral=True); return False
-        return True
-
-    @discord.ui.button(label="Willkommens-Kanal", emoji="📣", style=discord.ButtonStyle.secondary)
-    async def set_welcome(self, inter: discord.Interaction, _btn: discord.ui.Button):
-        v=discord.ui.View(); v.add_item(TextChannelPicker("welcome_channel_id"))
-        await inter.response.send_message("Kanal wählen:", view=v, ephemeral=True)
-
-    @discord.ui.button(label="Staff-Review-Kanal", emoji="🛡️", style=discord.ButtonStyle.secondary)
-    async def set_staff(self, inter: discord.Interaction, _btn: discord.ui.Button):
-        v=discord.ui.View(); v.add_item(TextChannelPicker("staff_channel_id"))
-        await inter.response.send_message("Kanal wählen:", view=v, ephemeral=True)
-
-    @discord.ui.button(label="Tank-Rolle", emoji="🛡️", style=discord.ButtonStyle.secondary)
-    async def set_tank(self, inter: discord.Interaction, _btn: discord.ui.Button):
-        v=discord.ui.View(); v.add_item(SingleRolePicker("tank"))
-        await inter.response.send_message("Tank-Rolle wählen:", view=v, ephemeral=True)
-
-    @discord.ui.button(label="Heal-Rolle", emoji="💚", style=discord.ButtonStyle.secondary)
-    async def set_heal(self, inter: discord.Interaction, _btn: discord.ui.Button):
-        v=discord.ui.View(); v.add_item(SingleRolePicker("heal"))
-        await inter.response.send_message("Heal-Rolle wählen:", view=v, ephemeral=True)
-
-    @discord.ui.button(label="DPS-Rolle", emoji="🗡️", style=discord.ButtonStyle.secondary)
-    async def set_dps(self, inter: discord.Interaction, _btn: discord.ui.Button):
-        v=discord.ui.View(); v.add_item(SingleRolePicker("dps"))
-        await inter.response.send_message("DPS-Rolle wählen:", view=v, ephemeral=True)
-
-    @discord.ui.button(label="Mitgliedsrolle (WF)", emoji="🏰", style=discord.ButtonStyle.secondary)
-    async def set_guildrole(self, inter: discord.Interaction, _btn: discord.ui.Button):
-        v=discord.ui.View(); v.add_item(SingleRolePicker("guild"))
-        await inter.response.send_message("Rolle wählen:", view=v, ephemeral=True)
-
-    @discord.ui.button(label="NEWBIE-Rolle", emoji="🌱", style=discord.ButtonStyle.secondary)
-    async def set_newbie(self, inter: discord.Interaction, _btn: discord.ui.Button):
-        v=discord.ui.View(); v.add_item(SingleRolePicker("newbie"))
-        await inter.response.send_message("Rolle wählen:", view=v, ephemeral=True)
-
-    @discord.ui.button(label="Onboarding Test-DM", emoji="✉️", style=discord.ButtonStyle.primary)
-    async def test_dm(self, inter: discord.Interaction, _btn: discord.ui.Button):
-        await _send_onboarding_dm(inter.user)
-        await inter.response.send_message("✅ DM verschickt (falls DMs offen).", ephemeral=True)
-
-# ======================== Modals (Events) ========================
+# ======================== Events (Views) ========================
 class CreateRaidModal(discord.ui.Modal):
     def __init__(self, channel_id: int | None = None):
         super().__init__(title="Raid/Event erstellen")
@@ -1478,10 +1380,132 @@ class CreateRecurringEventModal(discord.ui.Modal):
             ephemeral=True
         )
 
+class EventsView(discord.ui.View, BackToHubMixin):
+    def __init__(self): super().__init__(timeout=None)
+
+    async def interaction_check(self, inter: discord.Interaction) -> bool:
+        if not is_admin(inter):
+            await inter.response.send_message("Nur Admin/Manage Server.", ephemeral=True); return False
+        return True
+
+    @discord.ui.button(label="Raid mit RSVP", emoji="📝", style=discord.ButtonStyle.primary, custom_id="wf_ev_rsvp")
+    async def create(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        await inter.response.send_modal(CreateRaidModal())
+
+    @discord.ui.button(label="Wiederkehrendes Event", emoji="🔁", style=discord.ButtonStyle.success, custom_id="wf_ev_recurring")
+    async def recurring(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        try:
+            await inter.response.send_modal(CreateRecurringEventModal())
+        except Exception as e:
+            if not inter.response.is_done():
+                await inter.response.send_message(f"❌ Konnte das Formular nicht öffnen: {e}", ephemeral=True)
+            else:
+                try: await inter.followup.send(f"❌ Konnte das Formular nicht öffnen: {e}", ephemeral=True)
+                except Exception: pass
+
+    @discord.ui.button(label="Event-Liste", emoji="📋", style=discord.ButtonStyle.secondary, custom_id="wf_ev_list")
+    async def list_events(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        cfg = get_or_create_guild_cfg(inter.guild_id)
+        if not cfg.events:
+            await inter.response.send_message("Keine Events gespeichert.", ephemeral=True); return
+        lines=[]
+        for e in cfg.events.values():
+            typ = "Once" if e.one_time_date else "Recurring"
+            extra = f"\n• Beschreibung: {e.description}" if e.description else ""
+            lines.append(f"• **{e.name}** ({typ}) — {e.start_hhmm}, Tage: {fmt_weekdays(e.weekdays)}{extra}")
+        await inter.response.send_message("\n".join(lines), ephemeral=True)
+
+    @discord.ui.button(label="Event löschen", emoji="🧹", style=discord.ButtonStyle.danger, custom_id="wf_ev_delete")
+    async def delete_event(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        cfg = get_or_create_guild_cfg(inter.guild_id)
+        if not cfg.events:
+            await inter.response.send_message("Keine Events vorhanden.", ephemeral=True); return
+        key = sorted(cfg.events.keys())[0]; name = cfg.events[key].name
+        del cfg.events[key]; save_all(configs)
+        await inter.response.send_message(f"🗑️ Event **{name}** gelöscht.", ephemeral=True)
+
+    @discord.ui.button(label="Standard-Kanal", emoji="📣", style=discord.ButtonStyle.secondary, custom_id="wf_ev_set_default_channel")
+    async def set_default_channel(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        class _AnnouncePicker(discord.ui.ChannelSelect):
+            def __init__(self):
+                super().__init__(channel_types=[discord.ChannelType.text], placeholder="Ankündigungs-Kanal wählen", min_values=1, max_values=1)
+            async def callback(self, inner: discord.Interaction):
+                ch: discord.TextChannel = self.values[0]
+                cfg = get_or_create_guild_cfg(inner.guild_id)
+                cfg.announce_channel_id = ch.id; save_all(configs)
+                await inner.response.send_message(f"✅ Ankündigungs-Kanal gesetzt: {ch.mention}", ephemeral=True)
+        v = discord.ui.View(); v.add_item(_AnnouncePicker())
+        await inter.response.send_message("Ankündigungs-Kanal wählen:", view=v, ephemeral=True)
+
+class OnboardAdminView(discord.ui.View, BackToHubMixin):
+    def __init__(self): super().__init__(timeout=None)
+
+    async def interaction_check(self, inter: discord.Interaction) -> bool:
+        if not is_admin(inter):
+            await inter.response.send_message("Nur Admin/Manage Server.", ephemeral=True); return False
+        return True
+
+    @discord.ui.button(label="Willkommens-Kanal", emoji="📣", style=discord.ButtonStyle.secondary)
+    async def set_welcome(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        v=discord.ui.View(); v.add_item(TextChannelPicker("welcome_channel_id"))
+        await inter.response.send_message("Kanal wählen:", view=v, ephemeral=True)
+
+    @discord.ui.button(label="Staff-Review-Kanal", emoji="🛡️", style=discord.ButtonStyle.secondary)
+    async def set_staff(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        v=discord.ui.View(); v.add_item(TextChannelPicker("staff_channel_id"))
+        await inter.response.send_message("Kanal wählen:", view=v, ephemeral=True)
+
+    @discord.ui.button(label="Tank-Rolle", emoji="🛡️", style=discord.ButtonStyle.secondary)
+    async def set_tank(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        v=discord.ui.View(); v.add_item(SingleRolePicker("tank"))
+        await inter.response.send_message("Tank-Rolle wählen:", view=v, ephemeral=True)
+
+    @discord.ui.button(label="Heal-Rolle", emoji="💚", style=discord.ButtonStyle.secondary)
+    async def set_heal(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        v=discord.ui.View(); v.add_item(SingleRolePicker("heal"))
+        await inter.response.send_message("Heal-Rolle wählen:", view=v, ephemeral=True)
+
+    @discord.ui.button(label="DPS-Rolle", emoji="🗡️", style=discord.ButtonStyle.secondary)
+    async def set_dps(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        v=discord.ui.View(); v.add_item(SingleRolePicker("dps"))
+        await inter.response.send_message("DPS-Rolle wählen:", view=v, ephemeral=True)
+
+    @discord.ui.button(label="Mitgliedsrolle (WF)", emoji="🏰", style=discord.ButtonStyle.secondary)
+    async def set_guildrole(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        v=discord.ui.View(); v.add_item(SingleRolePicker("guild"))
+        await inter.response.send_message("Rolle wählen:", view=v, ephemeral=True)
+
+    @discord.ui.button(label="NEWBIE-Rolle", emoji="🌱", style=discord.ButtonStyle.secondary)
+    async def set_newbie(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        v=discord.ui.View(); v.add_item(SingleRolePicker("newbie"))
+        await inter.response.send_message("Rolle wählen:", view=v, ephemeral=True)
+
+    @discord.ui.button(label="Onboarding Test-DM", emoji="✉️", style=discord.ButtonStyle.primary)
+    async def test_dm(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        await _send_onboarding_dm(inter.user)
+        await inter.response.send_message("✅ DM verschickt (falls DMs offen).", ephemeral=True)
+
+class AdminToolsView(discord.ui.View, BackToHubMixin):
+    def __init__(self): super().__init__(timeout=None)
+
+    async def interaction_check(self, inter: discord.Interaction) -> bool:
+        if not is_admin(inter):
+            await inter.response.send_message("Nur Admin/Manage Server.", ephemeral=True); return False
+        return True
+
+    @discord.ui.button(label="Commands Clean+Sync", emoji="🔁", style=discord.ButtonStyle.secondary)
+    async def sync(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        await inter.response.defer(thinking=True, ephemeral=True)
+        try:
+            await _clean_and_sync_commands_for_guild(inter.guild_id)
+            await inter.followup.send("✅ Commands bereinigt (Guild-Scope geleert) & global synchronisiert.", ephemeral=True)
+        except Exception as e:
+            await inter.followup.send(f"❌ Sync-Fehler: {e}", ephemeral=True)
+
 # ======================== Slash-Commands ========================
 @tree.command(name="wf", description="Weiße Flamme – Menü anzeigen")
 async def wf(inter: discord.Interaction):
-    await inter.response.send_message(embed=hub_embed(inter.guild), view=HubView(), ephemeral=True)
+    await inter.response.send_message(embed=hub_embed(inter.guild), view=HubView())
 
 @tree.command(name="wf_admin_sync_hard", description="(Admin) Global sync & Guild-Duplikate entfernen")
 async def wf_admin_sync_hard(inter: discord.Interaction):
@@ -1556,10 +1580,10 @@ async def wf_event_recurring(inter: discord.Interaction,
 # ======================== Lifecycle & Command Sync ========================
 async def _clean_and_sync_commands_for_guild(guild_id: int):
     """Nur globale Commands nutzen; Guild-Scope leeren um Duplikate zu vermeiden."""
-    await tree.sync()  # global
+    await tree.sync()
     guild_obj = discord.Object(id=guild_id)
-    tree.clear_commands(guild=guild_obj)   # Guild-spezifische löschen
-    await tree.sync(guild=guild_obj)       # commit clear
+    tree.clear_commands(guild=guild_obj)
+    await tree.sync(guild=guild_obj)
 
 def reregister_persistent_views_on_start():
     to_drop=[]
@@ -1583,7 +1607,6 @@ async def on_ready():
         except Exception as e: print("guild.chunk() failed:", e)
     await _seed_voice_sessions()
     reregister_persistent_views_on_start()
-    # Global sync einmal & alle Guild-Scopes leeren (Duplikate weg):
     await tree.sync()
     for g in client.guilds:
         await _clean_and_sync_commands_for_guild(g.id)
@@ -1593,8 +1616,8 @@ async def on_ready():
 @client.event
 async def on_guild_join(guild: discord.Guild):
     try:
-        await tree.sync()                 # global
-        await _clean_and_sync_commands_for_guild(guild.id)  # Guild-Scope leer
+        await tree.sync()
+        await _clean_and_sync_commands_for_guild(guild.id)
     except Exception as e:
         print("sync on guild_join failed:", e)
 
