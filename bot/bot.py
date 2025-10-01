@@ -1,4 +1,4 @@
-# bot.py
+ # bot.py
 from __future__ import annotations
 
 import os, json, threading, time, requests
@@ -74,7 +74,7 @@ DOW_MAP = {
     "fri":4,"friday":4,"4":4,
     "sat":5,"saturday":5,"5":5,
     "sun":6,"sunday":6,"6":6,
-    # DE (Kurz/Lang)
+    # DE
     "mo":0,"montag":0,
     "di":1,"dienstag":1,
     "mi":2,"mittwoch":2,
@@ -921,14 +921,13 @@ class CreateRaidModal(discord.ui.Modal):
 class CreateRecurringEventModal(discord.ui.Modal):
     def __init__(self):
         super().__init__(title="Wiederkehrendes Event")
+        # Max 5 Inputs (Discord-Limit)
         self.name_in  = discord.ui.TextInput(label="Name", placeholder="Gildenbesprechung", max_length=60)
-        self.dow_in   = discord.ui.TextInput(label="Wochentage (z.B. Mon,Thu oder Mo,Do oder 0,4)", placeholder="Mon,Fri")
+        self.dow_in   = discord.ui.TextInput(label="Wochentage (Mon,Thu / Mo,Do / 0,3)", placeholder="Mon,Thu")
         self.time_in  = discord.ui.TextInput(label="Start (HH:MM 24h)", placeholder="20:00")
         self.dur_in   = discord.ui.TextInput(label="Dauer (Minuten)", placeholder="60")
         self.pre_in   = discord.ui.TextInput(label="Vorwarnungen (Minuten, optional)", required=False, placeholder="30,10,5")
-        self.role_in  = discord.ui.TextInput(label="Rollen-ID zum Pingen (optional)", required=False, placeholder="1234567890")
-        self.desc_in  = discord.ui.TextInput(label="Beschreibung (optional)", required=False, style=discord.TextStyle.paragraph, max_length=400)
-        self.add_item(self.name_in); self.add_item(self.dow_in); self.add_item(self.time_in); self.add_item(self.dur_in); self.add_item(self.pre_in); self.add_item(self.role_in); self.add_item(self.desc_in)
+        self.add_item(self.name_in); self.add_item(self.dow_in); self.add_item(self.time_in); self.add_item(self.dur_in); self.add_item(self.pre_in)
 
     async def on_submit(self, inter: discord.Interaction):
         if not is_admin(inter):
@@ -938,7 +937,7 @@ class CreateRecurringEventModal(discord.ui.Modal):
             start = parse_time_hhmm(self.time_in.value)
             dur = int(self.dur_in.value)
             pre = parse_premins(self.pre_in.value)
-            role_id = int(self.role_in.value) if (self.role_in.value or "").strip() else None
+            role_id = None  # optional: später per Edit-Flow setzbar
         except Exception as e:
             await inter.response.send_message(f"❌ Ungültige Eingaben: {e}", ephemeral=True); return
         cfg = get_or_create_guild_cfg(inter.guild_id)
@@ -950,7 +949,7 @@ class CreateRecurringEventModal(discord.ui.Modal):
             pre_reminders=pre,
             mention_role_id=role_id,
             channel_id=cfg.announce_channel_id,
-            description=(self.desc_in.value or "").strip()
+            description=""
         )
         key = ev.name.lower()
         cfg.events = cfg.events or {}
@@ -992,6 +991,7 @@ class EventsView(discord.ui.View, BackToHubMixin):
         cfg = get_or_create_guild_cfg(inter.guild_id)
         if not cfg.events:
             await inter.response.send_message("Keine Events vorhanden.", ephemeral=True); return
+        # Lösch das erste (Komfort – später Select einbauen)
         key = sorted(cfg.events.keys())[0]
         name = cfg.events[key].name
         del cfg.events[key]
@@ -1033,7 +1033,7 @@ class OnboardAdminView(discord.ui.View, BackToHubMixin):
         v=discord.ui.View(); v.add_item(TextChannelPicker("staff_channel_id"))
         await inter.response.send_message("Kanal wählen:", view=v, ephemeral=True)
 
-    # NEU: Tank/Heal/DPS-Rollen setzen
+    # Tank/Heal/DPS-Rollen setzen
     @discord.ui.button(label="Tank-Rolle", emoji="🛡️", style=discord.ButtonStyle.secondary)
     async def set_tank(self, inter: discord.Interaction, _btn: discord.ui.Button):
         v=discord.ui.View(); v.add_item(SingleRolePicker("tank"))
