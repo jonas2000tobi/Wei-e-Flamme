@@ -4,10 +4,6 @@
 # - Sendet DMs mit Buttons (Tank/Heal/DPS/Vielleicht/Abmelden) an eine Zielrolle.
 # - Antworten in DMs aktualisieren die öffentliche Übersicht live.
 # - Zielrolle kann beim Erstellen angegeben ODER vorab gespeichert werden.
-#
-# Voraussetzungen:
-# - Intents.members = True
-# - Bot darf in DMs schreiben (User müssen DMs von Servermitgliedern erlauben)
 
 from __future__ import annotations
 import json
@@ -132,9 +128,8 @@ def build_public_embed(guild: discord.Guild, payload: dict) -> discord.Embed:
     if payload.get("image_url"):
         emb.set_image(url=payload["image_url"])
 
-    # Footer: Zielrolle + DM/Antwort-Stats
     rid = payload.get("target_role_id") or 0
-    footer = "Antworten kommen per DM; Übersicht aktualisiert sich automatisch."
+    footer = "Antworten per DM; Übersicht aktualisiert sich automatisch."
     if rid:
         r = guild.get_role(int(rid))
         if r:
@@ -217,8 +212,8 @@ class DMRSVPView(View):
 
 # ---------------------- Utils ----------------------
 def _is_admin(inter: discord.Interaction) -> bool:
-    m = inter.user
-    return bool(m and (m.guild_permissions.administrator or m.guild_permissions.manage_guild))
+    p = getattr(inter.user, "guild_permissions", None)
+    return bool(p and (p.administrator or p.manage_guild))
 
 async def _iter_role_members(guild: discord.Guild, role: discord.Role) -> List[discord.Member]:
     cached = list(role.members)
@@ -262,7 +257,7 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
             except Exception as e:
                 print("re-register DM view failed:", e)
 
-    # Optional: Standard-Zielrolle speichern
+    # Standard-Zielrolle speichern (optional)
     @tree.command(name="raid_dm_set_role", description="(Admin) Standard-Zielrolle für DM-Einladungen speichern")
     @app_commands.describe(role="Rolle, die standardmäßig per DM eingeladen wird")
     async def raid_dm_set_role(inter: discord.Interaction, role: discord.Role):
@@ -272,10 +267,10 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
         save_cfg()
         await inter.response.send_message(f"✅ Standard-Zielrolle gespeichert: {role.mention}", ephemeral=True)
 
-    # Raid erstellen – JETZT mit optionalem Rollen-Parameter
+    # Raid erstellen – mit optionalem Rollen-Parameter
     @tree.command(name="raid_dm_create", description="(Admin) Raid erstellen – Anmeldung per DM")
     @app_commands.describe(
-        title="Titel des Raids",
+        title="Titel",
         date="Datum YYYY-MM-DD",
         time="Zeit HH:MM (24h)",
         description="Beschreibung (optional)",
@@ -342,7 +337,7 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
         members = await _iter_role_members(inter.guild, final_role)
         sent = 0
         for m in members:
-            if m.bot: 
+            if m.bot:
                 continue
             ok = await _send_dm_for_event(m, inter.guild_id, msg.id, obj.title, obj.when_iso, obj.description)
             if ok:
@@ -356,7 +351,10 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
         except Exception as e:
             print("edit after dm failed:", e)
 
-        await inter.response.send_message(f"✅ Raid erstellt: {msg.jump_url}\n🎯 Zielrolle: {final_role.mention}\n📨 DMs verschickt: {sent}", ephemeral=True)
+        await inter.response.send_message(
+            f"✅ Raid erstellt: {msg.jump_url}\n🎯 Zielrolle: {final_role.mention}\n📨 DMs verschickt: {sent}",
+            ephemeral=True
+        )
 
     # Übersicht neu zeichnen
     @tree.command(name="raid_dm_show", description="Übersicht neu aufbauen (ohne Buttons)")
@@ -373,7 +371,7 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
         except Exception as e:
             await inter.response.send_message(f"❌ Fehler: {e}", ephemeral=True)
 
-    # Übersicht „schließen“ (Server hat sowieso keine Buttons)
+    # Übersicht schließen (Server hat keine Buttons, DMs bleiben nutzbar)
     @tree.command(name="raid_dm_close", description="Übersicht sperren (DMs bleiben nutzbar)")
     @app_commands.describe(message_id="ID der öffentlichen Raid-Nachricht")
     async def raid_dm_close(inter: discord.Interaction, message_id: str):
