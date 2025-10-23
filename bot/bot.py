@@ -13,7 +13,7 @@ from discord.ext import tasks
 from flask import Flask
 from zoneinfo import ZoneInfo
 
-# >>> Integration DM-RSVP (Punkt 2) <<<
+# >>> DM-RSVP Integration
 from bot.event_rsvp_dm import setup_rsvp_dm
 
 # ======================== Grundkonfig ========================
@@ -279,7 +279,7 @@ def _mention(guild: discord.Guild, uid: int) -> str:
     m = guild.get_member(uid)
     return m.mention if m else f"<@{uid}>"
 
-# ======================== RSVP / Raid ========================
+# ======================== RSVP / Raid (altes öffentliches System – bleibt) ========================
 def _get_role_ids(guild: discord.Guild) -> Dict[str, int]:
     g = rsvp_cfg.get(str(guild.id)) or {}
     return {"TANK": int(g.get("TANK", 0) or 0),
@@ -737,7 +737,7 @@ class SingleRolePicker(discord.ui.RoleSelect):
         cur = _get_role_ids(inter.guild)
         if self.mode=="tank": cur["TANK"]=r.id
         elif self.mode=="heal": cur["HEAL"]=r.id
-        elif self.mode=="dps": cur["DPS"] =r.id
+        elif self.mode=="dps": cur["DPS"]=r.id
         _set_role_ids(gid, cur["TANK"], cur["HEAL"], cur["DPS"])
         await inter.response.send_message("✅ Rollen verknüpft.", ephemeral=True)
 
@@ -1056,7 +1056,19 @@ class AdminToolsView(discord.ui.View, BackToHubMixin):
 # ======================== Slash-Commands ========================
 @tree.command(name="wf", description="Weiße Flamme – Menü anzeigen")
 async def wf(inter: discord.Interaction):
-    await inter.response.send_message(embed=hub_embed(inter.guild), view=HubView())
+    try:
+        await inter.response.send_message(embed=hub_embed(inter.guild), view=HubView())
+    except discord.Forbidden:
+        if not inter.response.is_done():
+            await inter.response.send_message("❌ Keine Schreibrechte in diesem Kanal.", ephemeral=True)
+        else:
+            await inter.followup.send("❌ Keine Schreibrechte in diesem Kanal.", ephemeral=True)
+    except Exception as e:
+        print("wf error:", repr(e))
+        if not inter.response.is_done():
+            await inter.response.send_message(f"❌ Fehler: {e}", ephemeral=True)
+        else:
+            await inter.followup.send(f"❌ Fehler: {e}", ephemeral=True)
 
 @tree.command(name="wf_admin_sync_hard", description="(Admin) Global sync & Guild-Duplikate entfernen")
 async def wf_admin_sync_hard(inter: discord.Interaction):
@@ -1067,7 +1079,8 @@ async def wf_admin_sync_hard(inter: discord.Interaction):
         await _clean_and_sync_commands_for_guild(inter.guild_id)
         await inter.followup.send("✅ Hard-Sync: Guild-Scope geleert, global synchronisiert.", ephemeral=True)
     except Exception as e:
-        await inter.followup.send(f"❌ Fehler: {e}", ephemeral=True)
+        print("sync_hard error:", repr(e))
+        await inter.followup.send(f"❌ Sync-Fehler: {e}", ephemeral=True)
 
 @tree.command(name="wf_debug_status", description="Debug: Intents/Perms anzeigen (Channel)")
 async def wf_debug_status(inter: discord.Interaction):
@@ -1128,15 +1141,33 @@ async def wf_event_recurring(inter: discord.Interaction,
         ephemeral=True
     )
 
+# --- Healthcheck ---
+@tree.command(name="ping", description="Healthcheck")
+async def ping(inter: discord.Interaction):
+    try:
+        await inter.response.send_message("pong", ephemeral=True)
+    except Exception as e:
+        print("ping error:", repr(e))
+
+# --- Globaler Error-Hook für Slash-Commands ---
+@tree.error
+async def on_app_command_error(inter: discord.Interaction, error: app_commands.AppCommandError):
+    print("Slash error:", repr(error))
+    try:
+        if not inter.response.is_done():
+            await inter.response.send_message(f"❌ Fehler: {error.__class__.__name__}: {error}", ephemeral=True)
+        else:
+            await inter.followup.send(f"❌ Fehler: {error.__class__.__name__}: {error}", ephemeral=True)
+    except Exception as e:
+        print("on_app_command_error notify failed:", e)
+
 # ======================== Lifecycle & Command Sync ========================
 async def _clean_and_sync_commands_for_guild(guild_id: int):
     """Nur globale Commands nutzen; Guild-Scope leeren um Duplikate zu vermeiden."""
-    # 1) Global sync
-    await tree.sync()
-    # 2) Leere Guild-Scope (damit dort nichts 'kopiert' liegt)
+    await tree.sync()                         # global sync
     guild_obj = discord.Object(id=guild_id)
-    tree.clear_commands(guild=guild_obj)   # entfernt alle guild-spezifischen
-    await tree.sync(guild=guild_obj)       # commit clear
+    tree.clear_commands(guild=guild_obj)      # Guild-spezifische löschen
+    await tree.sync(guild=guild_obj)          # commit clear
 
 def reregister_persistent_views_on_start():
     to_drop=[]
@@ -1160,22 +1191,20 @@ async def on_ready():
         except Exception as e: print("guild.chunk() failed:", e)
     await _seed_voice_sessions()
     reregister_persistent_views_on_start()
-    # Global sync einmal & alle Guild-Scopes leeren (Duplikate weg):
+    # Global sync & Guild-Scopes leeren
     await tree.sync()
     for g in client.guilds:
         await _clean_and_sync_commands_for_guild(g.id)
-
-    # >>> Integration DM-RSVP (Punkt 2) <<<
+    # DM-RSVP registrieren (Commands + persistente Views)
     await setup_rsvp_dm(client, tree)
-
     print(f"Synced (global) for {len(client.guilds)} guild(s).")
     scheduler_loop.start(); voice_tick_loop.start()
 
 @client.event
 async def on_guild_join(guild: discord.Guild):
     try:
-        await tree.sync()                 # global
-        await _clean_and_sync_commands_for_guild(guild.id)  # Guild-Scope leer
+        await tree.sync()
+        await _clean_and_sync_commands_for_guild(guild.id)
     except Exception as e:
         print("sync on guild_join failed:", e)
 
@@ -1210,16 +1239,22 @@ async def scheduler_loop():
                     role_mention = f"<@&{ev.mention_role_id}>" if ev.mention_role_id else ""
                     body = f"⏳ **{ev.name}** startet in **{m} Min** ({start_dt.strftime('%H:%M')} Uhr). {role_mention}".strip()
                     if ev.description: body += f"\n{ev.description}"
-                    await channel.send(body)
-                    post_log.add(key); changed = True
+                    try:
+                        await channel.send(body)
+                        post_log.add(key); changed = True
+                    except Exception as e:
+                        print("reminder pre failed:", e)
 
             key = f"{guild.id}:{ev.name}:{start_dt.isoformat()}:start"
             if _in_window(now, start_dt) and key not in post_log:
                 role_mention = f"<@&{ev.mention_role_id}>" if ev.mention_role_id else ""
                 body = f"🚀 **{ev.name}** ist **jetzt live**! Läuft bis {end_dt.strftime('%H:%M')} Uhr. {role_mention}".strip()
                 if ev.description: body += f"\n{ev.description}"
-                await channel.send(body)
-                post_log.add(key); changed = True
+                try:
+                    await channel.send(body)
+                    post_log.add(key); changed = True
+                except Exception as e:
+                    print("reminder start failed:", e)
 
             if ev.one_time_date:
                 try:
