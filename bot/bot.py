@@ -13,6 +13,9 @@ from discord.ext import tasks
 from flask import Flask
 from zoneinfo import ZoneInfo
 
+# >>> Integration DM-RSVP (Punkt 2) <<<
+from bot.event_rsvp_dm import setup_rsvp_dm
+
 # ======================== Grundkonfig ========================
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 TZ = ZoneInfo("Europe/Berlin")
@@ -734,7 +737,7 @@ class SingleRolePicker(discord.ui.RoleSelect):
         cur = _get_role_ids(inter.guild)
         if self.mode=="tank": cur["TANK"]=r.id
         elif self.mode=="heal": cur["HEAL"]=r.id
-        elif self.mode=="dps": cur["DPS"]=r.id
+        elif self.mode=="dps": cur["DPS"] =r.id
         _set_role_ids(gid, cur["TANK"], cur["HEAL"], cur["DPS"])
         await inter.response.send_message("✅ Rollen verknüpft.", ephemeral=True)
 
@@ -1161,6 +1164,10 @@ async def on_ready():
     await tree.sync()
     for g in client.guilds:
         await _clean_and_sync_commands_for_guild(g.id)
+
+    # >>> Integration DM-RSVP (Punkt 2) <<<
+    await setup_rsvp_dm(client, tree)
+
     print(f"Synced (global) for {len(client.guilds)} guild(s).")
     scheduler_loop.start(); voice_tick_loop.start()
 
