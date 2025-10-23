@@ -14,7 +14,7 @@ from flask import Flask
 from zoneinfo import ZoneInfo
 
 # >>> DM-RSVP Integration
-from bot.event_rsvp_dm import setup_rsvp_dm
+from event_rsvp_dm import setup_rsvp_dm
 
 # ======================== Grundkonfig ========================
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
