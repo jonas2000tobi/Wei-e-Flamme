@@ -3,6 +3,11 @@ from __future__ import annotations
 import os
 import discord
 from discord import app_commands
+# Join-Hook import (robust)
+try:
+    from bot.join_hook import register_join_hook
+except ModuleNotFoundError:
+    from join_hook import register_join_hook
 
 # Robust import (Paket/flat)
 try:
@@ -19,6 +24,8 @@ INTENTS.message_content = False
 
 client = discord.Client(intents=INTENTS)
 tree = app_commands.CommandTree(client)
+# Join-Handler anhängen (schickt neuen Mitgliedern ggf. die RSVP-DM)
+register_join_hook(client)
 
 # ---------- Admin: Hard Sync ----------
 @tree.command(name="wf_admin_sync_hard", description="Hard-Sync: Guild-Scope leeren & global syncen (Admin)")
