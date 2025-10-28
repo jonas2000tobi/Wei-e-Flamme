@@ -1,14 +1,8 @@
 # bot/event_rsvp_dm.py
-# DM-basiertes RSVP für Raids.
-# - Postet eine öffentliche Übersicht (OHNE Buttons) in den gewählten Channel.
-# - Sendet DMs mit Buttons (Tank/Heal/DPS/Vielleicht/Abmelden) an eine Zielrolle.
-# - Antworten in DMs aktualisieren die öffentliche Übersicht live.
-# - Zielrolle kann beim Erstellen angegeben ODER vorab gespeichert werden.
-
 from __future__ import annotations
-import json
+import json, asyncio
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, Optional, List
 
@@ -245,9 +239,85 @@ async def _send_dm_for_event(user: discord.Member, guild_id: int, public_message
         print("send dm failed:", e)
         return False
 
+# ---------------------- Auto-Invite / Cleanup ----------------------
+async def auto_resend_for_new_member(member: discord.Member):
+    """Neuen (oder aktualisierten) Member für aktive Events (<=+2h) nachträglich einladen."""
+    guild = member.guild
+    now = datetime.now(TZ)
+    for msg_id, payload in list(store.items()):
+        try:
+            when = datetime.fromisoformat(payload["when_iso"])
+        except Exception:
+            continue
+        # nur Events, die noch nicht älter als +2h sind
+        if when + timedelta(hours=2) < now:
+            continue
+        rid = payload.get("target_role_id")
+        if not rid:
+            continue
+        role = guild.get_role(int(rid))
+        if not role or role not in member.roles:
+            continue
+        invited = set(payload.get("invited") or [])
+        if member.id in invited:
+            continue
+        ok = await _send_dm_for_event(
+            member, guild.id, int(msg_id),
+            payload["title"], payload["when_iso"], payload.get("description","")
+        )
+        if ok:
+            invited.add(member.id)
+            payload["invited"] = list(invited)
+            save_store()
+
+async def _cleanup_old_events_task(client: discord.Client):
+    """Alle 30 Min: Events, die >+2h alt sind, aus Kanal + DMs entfernen."""
+    while True:
+        now = datetime.now(TZ)
+        to_delete = []
+        for msg_id, payload in list(store.items()):
+            try:
+                when = datetime.fromisoformat(payload["when_iso"])
+            except Exception:
+                continue
+            if when + timedelta(hours=2) >= now:
+                continue
+            # Öffentliche Übersicht löschen
+            guild = client.get_guild(payload["guild_id"])
+            if guild:
+                ch = guild.get_channel(payload["channel_id"])
+                if isinstance(ch, discord.TextChannel):
+                    try:
+                        msg = await ch.fetch_message(int(msg_id))
+                        await msg.delete()
+                    except Exception:
+                        pass
+            # DMs löschen (nur die vom Bot)
+            for uid in payload.get("invited", []):
+                user = client.get_user(uid)
+                if not user:
+                    continue
+                try:
+                    async for m in user.history(limit=50):
+                        try:
+                            t = (m.embeds[0].title if m.embeds else "") if m.author == client.user else ""
+                        except Exception:
+                            t = ""
+                        if t.startswith("📩 Anmeldung:") and payload["title"] in t:
+                            await m.delete()
+                except Exception:
+                    pass
+            to_delete.append(msg_id)
+
+        for mid in to_delete:
+            store.pop(mid, None)
+        if to_delete:
+            save_store()
+            print(f"[DM-RSVP] Cleaned {len(to_delete)} old events.")
+        await asyncio.sleep(1800)  # 30 Minuten
+
 # ---------------------- Setup + Commands ----------------------
 async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
-
     # Persistente DM-Views re-registrieren
     for msg_id, payload in list(store.items()):
         gid = payload.get("guild_id")
@@ -257,7 +327,10 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
             except Exception as e:
                 print("re-register DM view failed:", e)
 
-    # Standard-Zielrolle speichern (optional)
+    # Cleanup-Task starten
+    client.loop.create_task(_cleanup_old_events_task(client))
+
+    # Standard-Zielrolle speichern
     @tree.command(name="raid_dm_set_role", description="(Admin) Standard-Zielrolle für DM-Einladungen speichern")
     @app_commands.describe(role="Rolle, die standardmäßig per DM eingeladen wird")
     async def raid_dm_set_role(inter: discord.Interaction, role: discord.Role):
@@ -267,7 +340,7 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
         save_cfg()
         await inter.response.send_message(f"✅ Standard-Zielrolle gespeichert: {role.mention}", ephemeral=True)
 
-    # Raid erstellen – mit optionalem Rollen-Parameter
+    # Raid erstellen
     @tree.command(name="raid_dm_create", description="(Admin) Raid erstellen – Anmeldung per DM")
     @app_commands.describe(
         title="Titel",
@@ -290,8 +363,7 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
     ):
         if not _is_admin(inter):
             await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True); return
-
-        # Datum/Zeit parsen
+        # Datum/Zeit
         try:
             yyyy, mm, dd = [int(x) for x in date.split("-")]
             hh, mi = [int(x) for x in time.split(":")]
@@ -303,18 +375,15 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
         if not isinstance(ch, discord.TextChannel):
             await inter.response.send_message("❌ Zielkanal ungültig.", ephemeral=True); return
 
-        # Zielrolle bestimmen: Parameter > gespeicherte Standardrolle
+        # Zielrolle
         final_role = target_role
         if final_role is None:
             gcfg = cfg.get(str(inter.guild_id)) or {}
             rid = int(gcfg.get("TARGET_ROLE_ID", 0))
             final_role = inter.guild.get_role(rid) if rid else None
-
         if final_role is None:
-            await inter.response.send_message("❌ Keine Zielrolle angegeben/gespeichert. Entweder `target_role` setzen oder vorher `/raid_dm_set_role` ausführen.", ephemeral=True)
-            return
+            await inter.response.send_message("❌ Keine Zielrolle angegeben/gespeichert. Entweder `target_role` setzen oder `/raid_dm_set_role` vorher ausführen.", ephemeral=True); return
 
-        # Öffentliche Übersicht initial posten
         obj = DMEvent(
             guild_id=inter.guild_id,
             channel_id=ch.id,
@@ -333,7 +402,7 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
         store[str(msg.id)] = payload
         save_store()
 
-        # DMs senden
+        # DMs versenden
         members = await _iter_role_members(inter.guild, final_role)
         sent = 0
         for m in members:
@@ -345,7 +414,7 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
                 sent += 1
         save_store()
 
-        # Übersicht aktualisieren (Footer mit Stats)
+        # Übersicht aktualisieren
         try:
             await msg.edit(embed=build_public_embed(inter.guild, payload))
         except Exception as e:
@@ -371,7 +440,7 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
         except Exception as e:
             await inter.response.send_message(f"❌ Fehler: {e}", ephemeral=True)
 
-    # Übersicht schließen (Server hat keine Buttons, DMs bleiben nutzbar)
+    # Übersicht sperren
     @tree.command(name="raid_dm_close", description="Übersicht sperren (DMs bleiben nutzbar)")
     @app_commands.describe(message_id="ID der öffentlichen Raid-Nachricht")
     async def raid_dm_close(inter: discord.Interaction, message_id: str):
@@ -384,3 +453,64 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
             await inter.response.send_message("🔒 Übersicht gesperrt.", ephemeral=True)
         except Exception as e:
             await inter.response.send_message(f"❌ Fehler: {e}", ephemeral=True)
+
+    # Übersicht löschen
+    @tree.command(name="raid_dm_delete", description="(Admin) Raid-Übersicht komplett löschen")
+    @app_commands.describe(message_id="ID der öffentlichen Raid-Nachricht")
+    async def raid_dm_delete(inter: discord.Interaction, message_id: str):
+        if not _is_admin(inter):
+            await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True); return
+        if message_id not in store:
+            await inter.response.send_message("❌ Unbekannte message_id.", ephemeral=True); return
+        payload = store[message_id]
+        ch = inter.guild.get_channel(payload["channel_id"])
+        try:
+            msg = await ch.fetch_message(int(message_id))
+            await msg.delete()
+            del store[message_id]; save_store()
+            await inter.response.send_message("🗑️ Übersicht gelöscht und Event entfernt.", ephemeral=True)
+        except discord.NotFound:
+            del store[message_id]; save_store()
+            await inter.response.send_message("🗑️ Nachricht war schon gelöscht, Eintrag entfernt.", ephemeral=True)
+        except Exception as e:
+            await inter.response.send_message(f"❌ Fehler beim Löschen: {e}", ephemeral=True)
+
+    # Nachträglich neue Rollenmitglieder einladen
+    @tree.command(name="raid_dm_resend", description="(Admin) Neue Mitglieder der Zielrolle nachträglich einladen")
+    @app_commands.describe(message_id="ID der öffentlichen Raid-Nachricht")
+    async def raid_dm_resend(inter: discord.Interaction, message_id: str):
+        if not _is_admin(inter):
+            await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True); return
+        if message_id not in store:
+            await inter.response.send_message("❌ Unbekannte message_id.", ephemeral=True); return
+        payload = store[message_id]
+        guild = inter.guild
+        rid = payload.get("target_role_id")
+        if not rid:
+            await inter.response.send_message("❌ Keine Zielrolle gespeichert.", ephemeral=True); return
+        role = guild.get_role(int(rid))
+        if not role:
+            await inter.response.send_message("❌ Zielrolle nicht gefunden.", ephemeral=True); return
+
+        # nur aktive Events (<= +2h)
+        try:
+            when = datetime.fromisoformat(payload["when_iso"])
+        except Exception:
+            await inter.response.send_message("❌ Event-Zeitpunkt defekt.", ephemeral=True); return
+        if when + timedelta(hours=2) < datetime.now(TZ):
+            await inter.response.send_message("ℹ️ Event ist älter als +2h – keine neuen Einladungen.", ephemeral=True); return
+
+        members = await _iter_role_members(guild, role)
+        invited = set(payload.get("invited") or [])
+        new_sent = 0
+        for m in members:
+            if m.bot or m.id in invited:
+                continue
+            ok = await _send_dm_for_event(
+                m, guild.id, int(message_id),
+                payload["title"], payload["when_iso"], payload.get("description","")
+            )
+            if ok:
+                invited.add(m.id); new_sent += 1
+        payload["invited"] = list(invited); save_store()
+        await inter.response.send_message(f"✅ {new_sent} neue Mitglieder eingeladen.", ephemeral=True)
