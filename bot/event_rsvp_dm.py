@@ -1,305 +1,248 @@
-# bot/event_rsvp_dm.py
+# bot/onboarding_dm.py
 # -----------------------------------------------------------
-# Raid-/Event-Anmeldungen per DM mit automatischer Übersicht
+# Automatische Willkommens-DM mit Rollenwahl und Weiterleitung
+# - Kategorien: Gildenmitglied / Allianzmitglied / Freund
+# - Bei Gilde/Allianz: Abfrage "Erfahren/Unerfahren" (Unerfahren => NEWBIE-Rolle)
+# - Anfrage-Post an Staff-/Gildenleitungs-Channel mit Accept/Ablehnen
+# - Rollenvergabe per gespeicherten Rollen-IDs (nicht Namen!)
+# - Optionaler Welcome-Channel für Begrüßungspost
 # -----------------------------------------------------------
 
 from __future__ import annotations
 import json
-import asyncio
 from pathlib import Path
-from typing import Dict, Optional
+
 import discord
 from discord import app_commands
 from discord.ui import View, button
 from discord.enums import ButtonStyle
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
 
-TZ = ZoneInfo("Europe/Berlin")
 DATA_DIR = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
+CFG_FILE = DATA_DIR / "onboarding_cfg.json"
 
-RSVP_FILE = DATA_DIR / "event_rsvp.json"
-DM_CFG_FILE = DATA_DIR / "event_rsvp_cfg.json"
-
-def _load(p: Path, default):
+def _load_cfg():
     try:
-        return json.loads(p.read_text(encoding="utf-8"))
+        return json.loads(CFG_FILE.read_text(encoding="utf-8"))
     except Exception:
-        return default
+        return {}
 
-def _save(p: Path, obj):
-    p.write_text(json.dumps(obj, indent=2, ensure_ascii=False), encoding="utf-8")
+def _save_cfg(obj):
+    CFG_FILE.write_text(json.dumps(obj, indent=2, ensure_ascii=False), encoding="utf-8")
 
-store: Dict[str, dict] = _load(RSVP_FILE, {})
-cfg: Dict[str, dict] = _load(DM_CFG_FILE, {})
+# cfg[str(guild_id)] = {
+#   "accept_ch": int,            # Kanal für Gildenleitungs-Review
+#   "welcome_ch": int,           # optionaler Welcome-Kanal
+#   "newbie_role": int,          # Rolle für Unerfahren
+#   "guild_role": int,           # Rolle für Gildenmitglied
+#   "alliance_role": int,        # Rolle für Allianzmitglied
+#   "friend_role": int           # Rolle für Freund
+# }
 
-def save_store(): _save(RSVP_FILE, store)
-def save_cfg(): _save(DM_CFG_FILE, cfg)
+cfg = _load_cfg()
 
-# -----------------------------------------------------------
-# Hilfsfunktionen
-# -----------------------------------------------------------
+# ---------------------------- UI Views ----------------------------
 
-async def _log(client: discord.Client, guild_id: int, text: str):
-    gcfg = cfg.get(str(guild_id)) or {}
-    ch_id = int(gcfg.get("LOG_CH", 0) or 0)
-    if not ch_id:
-        return
-    g = client.get_guild(guild_id)
-    if not g:
-        return
-    ch = g.get_channel(ch_id)
-    if isinstance(ch, (discord.TextChannel, discord.Thread)):
-        try:
-            await ch.send(f"[RSVP-DM] {text}")
-        except Exception:
-            pass
-
-def _mention(guild: discord.Guild, uid: int) -> str:
-    m = guild.get_member(uid)
-    return m.mention if m else f"<@{uid}>"
-
-def _init_event_shape(obj: dict):
-    if "yes" not in obj or not isinstance(obj["yes"], dict):
-        obj["yes"] = {"TANK": [], "HEAL": [], "DPS": []}
-    for k in ("TANK", "HEAL", "DPS"):
-        if k not in obj["yes"] or not isinstance(obj["yes"][k], list):
-            obj["yes"][k] = []
-    obj.setdefault("maybe", {})
-    obj.setdefault("no", [])
-    obj.setdefault("target_role_id", 0)
-    obj.setdefault("sent_dm_ids", [])  # Neue Liste für spätere DM-Löschung
-
-def build_embed(guild: discord.Guild, obj: dict) -> discord.Embed:
-    when = datetime.fromisoformat(obj["when_iso"])
-    emb = discord.Embed(
-        title=f"📅 {obj['title']}",
-        description=f"{obj.get('description','')}\n\n🕒 Zeit: {when.strftime('%a, %d.%m.%Y %H:%M')} (Europe/Berlin)",
-        color=discord.Color.blurple()
-    )
-    yes = obj["yes"]; maybe = obj["maybe"]; no = obj["no"]
-
-    tank_names = [_mention(guild, int(u)) for u in yes.get("TANK", [])]
-    heal_names = [_mention(guild, int(u)) for u in yes.get("HEAL", [])]
-    dps_names  = [_mention(guild, int(u)) for u in yes.get("DPS",  [])]
-
-    emb.add_field(name=f"🛡️ Tank ({len(tank_names)})", value="\n".join(tank_names) or "—", inline=True)
-    emb.add_field(name=f"💚 Heal ({len(heal_names)})", value="\n".join(heal_names) or "—", inline=True)
-    emb.add_field(name=f"🗡️ DPS ({len(dps_names)})", value="\n".join(dps_names) or "—", inline=True)
-
-    maybe_lines = []
-    for uid_str, rlab in maybe.items():
-        try:
-            uid_i = int(uid_str)
-        except Exception:
-            continue
-        label = f" ({rlab})" if rlab else ""
-        maybe_lines.append(f"{_mention(guild, uid_i)}{label}")
-    emb.add_field(name=f"❔ Vielleicht ({len(maybe_lines)})", value="\n".join(maybe_lines) or "—", inline=False)
-
-    no_names = [_mention(guild, int(u)) for u in no]
-    emb.add_field(name=f"❌ Abgemeldet ({len(no_names)})", value="\n".join(no_names) or "—", inline=False)
-
-    tr_id = int(obj.get("target_role_id", 0) or 0)
-    if tr_id:
-        r = guild.get_role(tr_id)
-        if r:
-            emb.add_field(name="🎯 Zielgruppe", value=r.mention, inline=False)
-
-    emb.set_footer(text="(An-/Abmeldung läuft per DM)")
-    return emb
-
-# -----------------------------------------------------------
-# DM-View für Buttons
-# -----------------------------------------------------------
-
-class RaidView(View):
-    def __init__(self, msg_id: int):
+class RoleSelectView(View):
+    """1. Schritt: Kategorie auswählen."""
+    def __init__(self, guild: discord.Guild):
         super().__init__(timeout=None)
-        self.msg_id = str(msg_id)
+        self.guild = guild
 
-    async def _push_overview(self, inter: discord.Interaction, obj: dict):
-        guild = inter.client.get_guild(obj["guild_id"])
-        if not guild:
-            return
-        ch = guild.get_channel(obj["channel_id"])
+    async def _send_to_admins(self, member: discord.Member, category: str, experience: str):
+        gcfg = cfg.get(str(member.guild.id)) or {}
+        accept_id = int(gcfg.get("accept_ch", 0) or 0)
+        ch = member.guild.get_channel(accept_id)
         if not isinstance(ch, (discord.TextChannel, discord.Thread)):
             return
-        try:
-            msg = await ch.fetch_message(int(self.msg_id))
-        except Exception:
+        txt = (f"**Onboarding-Review:** {member.mention}\n"
+               f"• Kategorie: **{category}**\n"
+               f"• Erfahrung: **{experience or '—'}**\n"
+               f"Bitte **Akzeptieren** oder **Ablehnen**.")
+        await ch.send(txt, view=AcceptView(member.id, category, experience))
+
+    async def _handle_category(self, inter: discord.Interaction, category: str):
+        # Für Gilde/Allianz danach die Erfahrung abfragen
+        if category in ("Gildenmitglied", "Allianzmitglied"):
+            await inter.response.edit_message(
+                content=f"🧭 Du hast **{category}** gewählt.\nBist du **Erfahren** oder **Unerfahren**?",
+                view=ExperienceView(self.guild, category)
+            )
+        else:
+            # Freund: direkt an Gildenleitung schicken
+            await inter.response.edit_message(
+                content=f"🧭 Du hast **{category}** gewählt.\nDeine Angaben gehen jetzt an die Gildenleitung.",
+                view=None
+            )
+            await self._send_to_admins(inter.user, category, "N/A")
+
+    @button(label="⚔️ Gildenmitglied", style=ButtonStyle.primary)
+    async def btn_gilde(self, inter: discord.Interaction, _):
+        await self._handle_category(inter, "Gildenmitglied")
+
+    @button(label="🏰 Allianzmitglied", style=ButtonStyle.secondary)
+    async def btn_allianz(self, inter: discord.Interaction, _):
+        await self._handle_category(inter, "Allianzmitglied")
+
+    @button(label="🫱 Freund", style=ButtonStyle.success)
+    async def btn_friend(self, inter: discord.Interaction, _):
+        await self._handle_category(inter, "Freund")
+
+class ExperienceView(View):
+    """2. Schritt für Gilde/Allianz: Erfahrung auswählen."""
+    def __init__(self, guild: discord.Guild, category: str):
+        super().__init__(timeout=None)
+        self.guild = guild
+        self.category = category
+
+    async def _send_to_admins(self, member: discord.Member, experience: str):
+        gcfg = cfg.get(str(member.guild.id)) or {}
+        accept_id = int(gcfg.get("accept_ch", 0) or 0)
+        ch = member.guild.get_channel(accept_id)
+        if not isinstance(ch, (discord.TextChannel, discord.Thread)):
             return
-        emb = build_embed(guild, obj)
-        try:
-            await msg.edit(embed=emb)
-        except Exception:
-            pass
+        txt = (f"**Onboarding-Review:** {member.mention}\n"
+               f"• Kategorie: **{self.category}**\n"
+               f"• Erfahrung: **{experience}**\n"
+               f"Bitte **Akzeptieren** oder **Ablehnen**.")
+        await ch.send(txt, view=AcceptView(member.id, self.category, experience))
 
-    async def _safe_reply(self, inter: discord.Interaction, text: str):
-        try:
-            await inter.response.send_message(text, ephemeral=True)
-        except discord.InteractionResponded:
-            await inter.followup.send(text, ephemeral=True)
-        except Exception:
-            pass
+    @button(label="🧠 Erfahren", style=ButtonStyle.primary)
+    async def btn_exp(self, inter: discord.Interaction, _):
+        await inter.response.edit_message(content="✅ Gespeichert: **Erfahren**.\nDie Gildenleitung prüft kurz.", view=None)
+        await self._send_to_admins(inter.user, "Erfahren")
 
-    async def _update(self, inter: discord.Interaction, group: str):
-        try:
-            obj = store.get(self.msg_id)
-            if not obj:
-                await self._safe_reply(inter, "Dieses Event existiert nicht mehr.")
-                return
+    @button(label="🌱 Unerfahren", style=ButtonStyle.secondary)
+    async def btn_new(self, inter: discord.Interaction, _):
+        # NEWBIE-Rolle sofort vergeben
+        gcfg = cfg.get(str(self.guild.id)) or {}
+        newbie_role_id = int(gcfg.get("newbie_role", 0) or 0)
+        r_new = self.guild.get_role(newbie_role_id) if newbie_role_id else None
+        if r_new:
+            try: await inter.user.add_roles(r_new, reason="Onboarding: Unerfahren")
+            except Exception: pass
 
-            _init_event_shape(obj)
-            uid = inter.user.id
+        await inter.response.edit_message(content="✅ Gespeichert: **Unerfahren**.\nDie Gildenleitung prüft kurz.", view=None)
+        await self._send_to_admins(inter.user, "Unerfahren")
 
-            # User aus allen Kategorien entfernen
-            for k in ("TANK", "HEAL", "DPS"):
-                obj["yes"][k] = [u for u in obj["yes"].get(k, []) if u != uid]
-            obj["no"] = [u for u in obj.get("no", []) if u != uid]
-            obj["maybe"].pop(str(uid), None)
+class AcceptView(View):
+    """Review durch Gildenleitung (Server-Channel). Vergibt Rollen per ID, postet ggf. Welcome."""
+    def __init__(self, user_id: int, category: str, experience: str):
+        super().__init__(timeout=3600)
+        self.user_id = user_id
+        self.category = category
+        self.experience = experience
 
-            if group in ("TANK", "HEAL", "DPS"):
-                obj["yes"][group].append(uid)
-                text = f"Angemeldet als **{group}**."
-            elif group == "MAYBE":
-                obj["maybe"][str(uid)] = ""
-                text = "Als **Vielleicht** eingetragen."
-            elif group == "NO":
-                obj["no"].append(uid)
-                text = "Als **Abgemeldet** eingetragen."
-            else:
-                text = "Aktualisiert."
+    def _role_for_category(self, guild: discord.Guild) -> discord.Role | None:
+        gcfg = cfg.get(str(guild.id)) or {}
+        key = "guild_role" if self.category == "Gildenmitglied" else ("alliance_role" if self.category == "Allianzmitglied" else "friend_role")
+        rid = int(gcfg.get(key, 0) or 0)
+        return guild.get_role(rid) if rid else None
 
-            save_store()
-            await self._push_overview(inter, obj)
-            await self._safe_reply(inter, text)
-        except Exception as e:
-            await self._safe_reply(inter, f"Fehler: {e!r}")
+    @button(label="✅ Akzeptieren", style=ButtonStyle.success)
+    async def accept(self, inter: discord.Interaction, _):
+        if not (inter.user.guild_permissions.administrator or inter.user.guild_permissions.manage_guild):
+            await inter.response.send_message("❌ Keine Berechtigung.", ephemeral=True); return
 
-    @button(label="🛡️ Tank", style=ButtonStyle.primary)
-    async def btn_tank(self, inter: discord.Interaction, _):
-        await self._update(inter, "TANK")
+        member = inter.guild.get_member(self.user_id) or await inter.guild.fetch_member(self.user_id)
+        base_role = self._role_for_category(inter.guild)
+        if base_role:
+            try: await member.add_roles(base_role, reason="Onboarding akzeptiert")
+            except Exception: pass
 
-    @button(label="💚 Heal", style=ButtonStyle.secondary)
-    async def btn_heal(self, inter: discord.Interaction, _):
-        await self._update(inter, "HEAL")
-
-    @button(label="🗡️ DPS", style=ButtonStyle.secondary)
-    async def btn_dps(self, inter: discord.Interaction, _):
-        await self._update(inter, "DPS")
-
-    @button(label="❔ Vielleicht", style=ButtonStyle.secondary)
-    async def btn_maybe(self, inter: discord.Interaction, _):
-        await self._update(inter, "MAYBE")
-
-    @button(label="❌ Abmelden", style=ButtonStyle.danger)
-    async def btn_no(self, inter: discord.Interaction, _):
-        await self._update(inter, "NO")
-
-# -----------------------------------------------------------
-# Slash-Commands
-# -----------------------------------------------------------
-
-async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
-    """Slash Commands für das RSVP-System"""
-
-    # Persistente Views
-    for msg_id in list(store.keys()):
-        try:
-            client.add_view(RaidView(int(msg_id)))
-        except Exception:
-            pass
-
-    @tree.command(name="raid_create_dm", description="Raid mit DM-Anmeldung erstellen")
-    async def raid_create_dm(inter: discord.Interaction,
-        title: str,
-        date: str,
-        time: str,
-        channel: Optional[discord.TextChannel] = None,
-        target_role: Optional[discord.Role] = None):
-        if not inter.user.guild_permissions.administrator:
-            await inter.response.send_message("Nur Admins dürfen das.", ephemeral=True)
-            return
-
-        try:
-            yyyy, mm, dd = [int(x) for x in date.split("-")]
-            hh, mi = [int(x) for x in time.split(":")]
-            when = datetime(yyyy, mm, dd, hh, mi, tzinfo=TZ)
-        except Exception:
-            await inter.response.send_message("Ungültiges Datum oder Zeitformat.", ephemeral=True)
-            return
-
-        ch = channel or inter.channel
-        obj = {
-            "guild_id": inter.guild_id,
-            "channel_id": ch.id,
-            "title": title.strip(),
-            "when_iso": when.isoformat(),
-            "yes": {"TANK": [], "HEAL": [], "DPS": []},
-            "maybe": {},
-            "no": [],
-            "target_role_id": int(target_role.id) if target_role else 0,
-            "sent_dm_ids": []
-        }
-
-        emb = build_embed(inter.guild, obj)
-        msg = await ch.send(embed=emb)
-        store[str(msg.id)] = obj
-        save_store()
-
-        sent = 0
-        for m in inter.guild.members:
-            if m.bot: continue
-            if target_role and target_role not in m.roles: continue
+        # Welcome-Post (optional)
+        gcfg = cfg.get(str(inter.guild.id)) or {}
+        welcome_id = int(gcfg.get("welcome_ch", 0) or 0)
+        wch = inter.guild.get_channel(welcome_id) if welcome_id else None
+        if isinstance(wch, discord.TextChannel):
             try:
-                text = (f"**{title}**\n"
-                        f"🕒 {when.strftime('%a, %d.%m.%Y %H:%M')} (Europe/Berlin)\n"
-                        f"Server-Übersicht: {ch.mention}\n\n"
-                        "Bitte wähle unten deine Rolle.")
-                dm_msg = await m.send(text, view=RaidView(int(msg.id)))
-                obj["sent_dm_ids"].append({"uid": m.id, "mid": dm_msg.id})
-                sent += 1
+                exp = self.experience if self.experience and self.experience != "N/A" else "—"
+                await wch.send(f"🔥 Willkommen {member.mention}!\nKategorie: **{self.category}**, Erfahrung: **{exp}**.")
             except Exception:
                 pass
 
-        save_store()
-        await inter.response.send_message(f"✅ Raid erstellt. DMs versendet: {sent}", ephemeral=True)
+        await inter.response.send_message(f"✅ {member.mention} akzeptiert. Rollen vergeben.", ephemeral=True)
 
-        # Autolöschung der DMs 2 Stunden nach Eventstart
-        async def delete_dms_later():
-            await asyncio.sleep(max(0, (when - datetime.now(TZ)).total_seconds() + 7200))
-            for entry in obj.get("sent_dm_ids", []):
-                try:
-                    user = await client.fetch_user(entry["uid"])
-                    msg = await user.fetch_message(entry["mid"])
-                    await msg.delete()
-                except Exception:
-                    continue
-            await _log(client, inter.guild_id, f"DMs für '{title}' gelöscht (nach Eventende).")
+    @button(label="❌ Ablehnen", style=ButtonStyle.danger)
+    async def deny(self, inter: discord.Interaction, _):
+        if not (inter.user.guild_permissions.administrator or inter.user.guild_permissions.manage_guild):
+            await inter.response.send_message("❌ Keine Berechtigung.", ephemeral=True); return
 
-        asyncio.create_task(delete_dms_later())
-
-# -----------------------------------------------------------
-# Auto-Resend für neue Mitglieder
-# -----------------------------------------------------------
-
-async def auto_resend_for_new_member(member: discord.Member):
-    if member.bot:
-        return
-    now = datetime.now(TZ)
-    for mid, obj in list(store.items()):
+        member = inter.guild.get_member(self.user_id) or await inter.guild.fetch_member(self.user_id)
+        await inter.response.send_message(f"🛑 {member.mention} abgelehnt.", ephemeral=True)
         try:
-            when = datetime.fromisoformat(obj.get("when_iso"))
-            if now > when + timedelta(hours=2):
-                continue
-            tr_id = int(obj.get("target_role_id", 0) or 0)
-            if tr_id and (member.guild.get_role(tr_id) not in member.roles):
-                continue
-            text = (f"**{obj.get('title','Event')}**\n"
-                    f"🕒 {when.strftime('%a, %d.%m.%Y %H:%M')}\n"
-                    f"Server: <#{obj.get('channel_id')}>")
-            await member.send(text, view=RaidView(int(mid)))
+            await member.send("🛑 Deine Onboarding-Anfrage wurde abgelehnt. Bitte melde dich bei der Gildenleitung.")
         except Exception:
-            continue
+            pass
+
+# ---------------------- Öffentliche Funktionen ----------------------
+
+async def send_onboarding_dm(member: discord.Member):
+    """Wird bei on_member_join(member) aufgerufen."""
+    try:
+        if member.bot:
+            return
+        text = ("👋 **Willkommen!**\n"
+                "Bitte wähle zuerst eine **Kategorie**. Danach (bei Gilde/Allianz) deine **Erfahrung**.")
+        await member.send(text, view=RoleSelectView(member.guild))
+    except Exception:
+        # DMs evtl. geschlossen – dann schweigen
+        pass
+
+# --------------------------- Slash-Setup ----------------------------
+
+async def setup_onboarding(client: discord.Client, tree: app_commands.CommandTree):
+    """Slash-Commands zur Konfiguration"""
+
+    def _is_admin(inter: discord.Interaction) -> bool:
+        p = getattr(inter.user, "guild_permissions", None)
+        return bool(p and (p.administrator or p.manage_guild))
+
+    @tree.command(name="onboarding_set_channel", description="(Admin) Review-Kanal (Gildenleitung) setzen")
+    async def onboarding_set_channel(inter: discord.Interaction, channel: discord.TextChannel):
+        if not _is_admin(inter):
+            await inter.response.send_message("Nur Admins.", ephemeral=True); return
+        c = cfg.get(str(inter.guild_id)) or {}
+        c["accept_ch"] = int(channel.id)
+        cfg[str(inter.guild_id)] = c; _save_cfg(cfg)
+        await inter.response.send_message(f"✅ Review-Kanal gesetzt: {channel.mention}", ephemeral=True)
+
+    @tree.command(name="onboarding_set_welcome", description="(Admin) Welcome-Kanal setzen (optional)")
+    async def onboarding_set_welcome(inter: discord.Interaction, channel: discord.TextChannel):
+        if not _is_admin(inter):
+            await inter.response.send_message("Nur Admins.", ephemeral=True); return
+        c = cfg.get(str(inter.guild_id)) or {}
+        c["welcome_ch"] = int(channel.id)
+        cfg[str(inter.guild_id)] = c; _save_cfg(cfg)
+        await inter.response.send_message(f"✅ Welcome-Kanal gesetzt: {channel.mention}", ephemeral=True)
+
+    @tree.command(name="onboarding_set_newbie", description="(Admin) NEWBIE-Rolle (für Unerfahren) setzen")
+    async def onboarding_set_newbie(inter: discord.Interaction, role: discord.Role):
+        if not _is_admin(inter):
+            await inter.response.send_message("Nur Admins.", ephemeral=True); return
+        c = cfg.get(str(inter.guild_id)) or {}
+        c["newbie_role"] = int(role.id)
+        cfg[str(inter.guild_id)] = c; _save_cfg(cfg)
+        await inter.response.send_message(f"✅ NEWBIE-Rolle gesetzt: {role.mention}", ephemeral=True)
+
+    @tree.command(name="onboarding_set_roles", description="(Admin) Basisrollen setzen (Gildenmitglied/Allianz/Freund)")
+    async def onboarding_set_roles(
+        inter: discord.Interaction,
+        guild_role: discord.Role,
+        alliance_role: discord.Role,
+        friend_role: discord.Role
+    ):
+        if not _is_admin(inter):
+            await inter.response.send_message("Nur Admins.", ephemeral=True); return
+        c = cfg.get(str(inter.guild_id)) or {}
+        c["guild_role"] = int(guild_role.id)
+        c["alliance_role"] = int(alliance_role.id)
+        c["friend_role"] = int(friend_role.id)
+        cfg[str(inter.guild_id)] = c; _save_cfg(cfg)
+        await inter.response.send_message(
+            f"✅ Rollen gespeichert:\n"
+            f"• Gildenmitglied: {guild_role.mention}\n"
+            f"• Allianzmitglied: {alliance_role.mention}\n"
+            f"• Freund: {friend_role.mention}",
+            ephemeral=True
+        )
