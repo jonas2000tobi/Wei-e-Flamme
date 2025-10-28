@@ -75,7 +75,21 @@ class CategoryView(discord.ui.View):
         key = f"{self.guild_id}:{self.user_id}"
         state[key] = {"choice": choice}   # choice: guild|alliance|friend
         save_state()
-        await inter.response.send_message(f"Ausgewählt: **{'WeißeFlamme' if choice=='guild' else ('Allianz' if choice=='alliance' else 'Freund')}**", ephemeral=True)
+
+        # Info zurück in der DM (NICHT ephemeral – DMs unterstützen das nicht)
+        try:
+            await inter.response.send_message(
+                f"Ausgewählt: **{'WeißeFlamme' if choice=='guild' else ('Allianz' if choice=='alliance' else 'Freund')}**"
+            )
+        except Exception:
+            # falls schon geantwortet wurde, Followup versuchen
+            try:
+                await inter.followup.send(
+                    f"Ausgewählt: **{'WeißeFlamme' if choice=='guild' else ('Allianz' if choice=='alliance' else 'Freund')}**"
+                )
+            except Exception:
+                pass
+
         # Schritt 2 anstoßen
         try:
             emb = discord.Embed(
@@ -83,9 +97,10 @@ class CategoryView(discord.ui.View):
                 description="Welche Rolle spielst du? (Nur eine auswählen)",
                 color=discord.Color.blurple()
             )
-            await inter.followup.send(embed=emb, view=PrimaryRoleView(self.guild_id, self.user_id), ephemeral=False)
+            await inter.channel.send(embed=emb, view=PrimaryRoleView(self.guild_id, self.user_id))
         except Exception:
             pass
+
         self.stop()
 
     @discord.ui.button(label="Gildenmitglied (WeißeFlamme)", emoji="🏰", style=discord.ButtonStyle.primary)
@@ -113,7 +128,14 @@ class PrimaryRoleView(discord.ui.View):
         st["primary"] = role_label  # 'TANK'|'HEAL'|'DPS'
         state[key] = st
         save_state()
-        await inter.response.send_message(f"Primärrolle: **{role_label}**", ephemeral=True)
+
+        try:
+            await inter.response.send_message(f"Primärrolle: **{role_label}**")
+        except Exception:
+            try:
+                await inter.followup.send(f"Primärrolle: **{role_label}**")
+            except Exception:
+                pass
 
         # Bei Gilde/Allianz -> Schritt 3 (Erfahrung). Bei Freund -> direkt Staff-Post.
         choice = st.get("choice")
@@ -124,7 +146,7 @@ class PrimaryRoleView(discord.ui.View):
                     description="Bist du **Erfahren** oder **Unerfahren**?",
                     color=discord.Color.green()
                 )
-                await inter.followup.send(embed=emb, view=ExperienceView(self.guild_id, self.user_id), ephemeral=False)
+                await inter.channel.send(embed=emb, view=ExperienceView(self.guild_id, self.user_id))
             except Exception:
                 pass
         else:
@@ -157,8 +179,17 @@ class ExperienceView(discord.ui.View):
         st["experienced"] = bool(experienced)
         st["rules_ok"] = True  # implizit akzeptiert
         state[key] = st; save_state()
+
         await _submit_to_staff(inter.client, self.guild_id, self.user_id)
-        await inter.response.send_message("Danke! Deine Angaben wurden an die **Gildenleitung** gesendet.", ephemeral=True)
+
+        try:
+            await inter.response.send_message("Danke! Deine Angaben wurden an die **Gildenleitung** gesendet.")
+        except Exception:
+            try:
+                await inter.followup.send("Danke! Deine Angaben wurden an die **Gildenleitung** gesendet.")
+            except Exception:
+                pass
+
         self.stop()
 
     @discord.ui.button(label="Erfahren", emoji="🔥", style=discord.ButtonStyle.success)
@@ -226,7 +257,8 @@ class StaffReviewView(discord.ui.View):
         self.user_id  = user_id
 
     def _allowed(self, inter: discord.Interaction) -> bool:
-        return _is_admin(inter)
+        gp = getattr(inter.user, "guild_permissions", None)
+        return bool(gp and (gp.administrator or gp.manage_guild))
 
     async def _close(self, inter: discord.Interaction, label: str):
         for c in self.children:
@@ -250,7 +282,7 @@ class StaffReviewView(discord.ui.View):
         guild = inter.guild
         member = guild.get_member(self.user_id) or await guild.fetch_member(self.user_id)
         gcfg = cfg.get(str(self.guild_id)) or {}
-        # Zielrollen
+
         role_ids = {
             "guild":   int(gcfg.get("role_guild", 0)),
             "alliance":int(gcfg.get("role_alliance", 0)),
