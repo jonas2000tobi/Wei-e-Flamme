@@ -1,171 +1,118 @@
-# bot/onboarding_dm.py
-# -----------------------------------------------------------
-# Automatische Willkommens-DM mit Rollenwahl und Weiterleitung
-# -----------------------------------------------------------
+# bot/bot.py
+from __future__ import annotations
+import os
+import asyncio
+import logging
 
 import discord
 from discord import app_commands
-from discord.ui import View, button
-from discord.enums import ButtonStyle
-from pathlib import Path
-import json
 
-DATA_DIR = Path("data")
-DATA_DIR.mkdir(exist_ok=True)
-CFG_FILE = DATA_DIR / "onboarding_cfg.json"
+# ---- Logging so we see why "Die Anwendung reagiert nicht" passiert ----
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("wf-bot")
 
-def _load_cfg():
+# ---- Intents: Members sind nötig für on_member_join & Rollenvergabe ----
+intents = discord.Intents.default()
+intents.guilds = True
+intents.members = True  # in Dev-Portal aktivieren!
+
+client = discord.Client(intents=intents)
+tree = app_commands.CommandTree(client)
+
+# ---- Module laden (die Dateien hast du bereits) ------------------------
+# event_rsvp_dm: /raid_create_dm + Auto-Resend
+# onboarding_dm: Willkommens-DM + Review
+from event_rsvp_dm import setup_rsvp_dm, auto_resend_for_new_member
+from onboarding_dm import setup_onboarding, send_onboarding_dm
+
+# ---- First-run Guard (damit setup & sync nur 1x laufen) ---------------
+_ready_once = False
+
+@client.event
+async def on_ready():
+    global _ready_once
+    log.info(f"Logged in as {client.user} (id={client.user.id})")
+    if _ready_once:
+        return
+    _ready_once = True
+
+    # Commands registrieren
     try:
-        return json.loads(CFG_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+        await setup_onboarding(client, tree)
+        await setup_rsvp_dm(client, tree)
+    except Exception as e:
+        log.exception("Fehler beim setup_*: %r", e)
 
-def _save_cfg(obj):
-    CFG_FILE.write_text(json.dumps(obj, indent=2, ensure_ascii=False), encoding="utf-8")
-
-cfg = _load_cfg()
-
-# cfg[guild_id] = {"log_ch": id, "newbie_role": id, "accept_ch": id}
-
-# -----------------------------------------------------------
-# DM Views
-# -----------------------------------------------------------
-
-class RoleSelectView(View):
-    def __init__(self, guild: discord.Guild):
-        super().__init__(timeout=None)
-        self.guild = guild
-
-    async def _send_to_admins(self, member: discord.Member, category: str, experience: str):
-        gcfg = cfg.get(str(member.guild.id)) or {}
-        log_id = int(gcfg.get("accept_ch", 0) or 0)
-        ch = member.guild.get_channel(log_id)
-        if not ch:
-            return
-        txt = (f"**Neue Anfrage:** {member.mention}\n"
-               f"Rolle: {category}\n"
-               f"Erfahrung: {experience}")
-        await ch.send(txt, view=AcceptView(member, category, experience))
-
-    async def handle_role(self, inter: discord.Interaction, category: str):
-        if category in ["Gildenmitglied", "Allianzmitglied"]:
-            view = ExperienceView(self.guild, category)
-            await inter.response.edit_message(content=f"🧙 Du hast **{category}** gewählt. Bist du erfahren oder unerfahren?", view=view)
+    # Erstes Sync (global). Wenn du schneller testen willst, setze GUILD_ID.
+    try:
+        guild_id = os.getenv("GUILD_ID")
+        if guild_id:
+            gobj = discord.Object(id=int(guild_id))
+            await tree.sync(guild=gobj)
+            log.info("Slash-Commands GUILD-scope gesynct für %s", guild_id)
         else:
-            await inter.response.edit_message(content=f"🧙 Du hast **{category}** gewählt.", view=None)
-            await self._send_to_admins(inter.user, category, "N/A")
+            await tree.sync()
+            log.info("Slash-Commands GLOBAL gesynct")
+    except Exception as e:
+        log.exception("Fehler beim tree.sync(): %r", e)
 
-    @button(label="⚔️ Gildenmitglied", style=ButtonStyle.primary)
-    async def btn_gilde(self, inter: discord.Interaction, _):
-        await self.handle_role(inter, "Gildenmitglied")
-
-    @button(label="🏰 Allianzmitglied", style=ButtonStyle.secondary)
-    async def btn_allianz(self, inter: discord.Interaction, _):
-        await self.handle_role(inter, "Allianzmitglied")
-
-    @button(label="🫱 Freund", style=ButtonStyle.success)
-    async def btn_friend(self, inter: discord.Interaction, _):
-        await self.handle_role(inter, "Freund")
-
-class ExperienceView(View):
-    def __init__(self, guild: discord.Guild, category: str):
-        super().__init__(timeout=None)
-        self.guild = guild
-        self.category = category
-
-    async def _send_to_admins(self, member: discord.Member, experience: str):
-        gcfg = cfg.get(str(member.guild.id)) or {}
-        log_id = int(gcfg.get("accept_ch", 0) or 0)
-        ch = member.guild.get_channel(log_id)
-        if not ch:
-            return
-        txt = (f"**Neue Anfrage:** {member.mention}\n"
-               f"Rolle: {self.category}\n"
-               f"Erfahrung: {experience}")
-        await ch.send(txt, view=AcceptView(member, self.category, experience))
-
-    @button(label="🧠 Erfahren", style=ButtonStyle.primary)
-    async def btn_exp(self, inter: discord.Interaction, _):
-        await inter.response.edit_message(content="✅ Gespeichert: Erfahren.", view=None)
-        await self._send_to_admins(inter.user, "Erfahren")
-
-    @button(label="🌱 Unerfahren", style=ButtonStyle.secondary)
-    async def btn_new(self, inter: discord.Interaction, _):
-        gcfg = cfg.get(str(self.guild.id)) or {}
-        newbie_role_id = int(gcfg.get("newbie_role", 0) or 0)
-        role = self.guild.get_role(newbie_role_id)
-        if role:
-            try:
-                await inter.user.add_roles(role)
-            except Exception:
-                pass
-        await inter.response.edit_message(content="✅ Gespeichert: Unerfahren.", view=None)
-        await self._send_to_admins(inter.user, "Unerfahren")
-
-class AcceptView(View):
-    def __init__(self, member: discord.Member, category: str, experience: str):
-        super().__init__(timeout=None)
-        self.member = member
-        self.category = category
-        self.experience = experience
-
-    @button(label="✅ Akzeptieren", style=ButtonStyle.success)
-    async def accept(self, inter: discord.Interaction, _):
-        role_name = self.category
-        role = discord.utils.get(inter.guild.roles, name=role_name)
-        if role:
-            await self.member.add_roles(role)
-        await inter.response.send_message(f"✅ {self.member.mention} akzeptiert.", ephemeral=True)
-        try:
-            await self.member.send(f"Willkommen in der {role_name}!")
-        except Exception:
-            pass
-
-    @button(label="❌ Ablehnen", style=ButtonStyle.danger)
-    async def deny(self, inter: discord.Interaction, _):
-        await inter.response.send_message(f"❌ {self.member.mention} wurde abgelehnt.", ephemeral=True)
-        try:
-            await self.member.send("Deine Anfrage wurde abgelehnt.")
-        except Exception:
-            pass
-
-# -----------------------------------------------------------
-# Onboarding-DM an neue Mitglieder
-# -----------------------------------------------------------
-
-async def send_onboarding_dm(member: discord.Member):
+# ---- Member Join: Onboarding-DM & Auto-Resend für Events --------------
+@client.event
+async def on_member_join(member: discord.Member):
+    # Schicke die Onboarding-DM
     try:
-        if member.bot:
-            return
-        text = ("👋 Willkommen auf dem Server!\n"
-                "Bitte wähle, was du bist:")
-        await member.send(text, view=RoleSelectView(member.guild))
+        await send_onboarding_dm(member)
+    except Exception:
+        log.exception("send_onboarding_dm crashte")
+
+    # RSVP-DMs für noch relevante Events erneut senden
+    try:
+        await auto_resend_for_new_member(member)
+    except Exception:
+        log.exception("auto_resend_for_new_member crashte")
+
+# ---- Nützliche Admin-/Debug-Commands ----------------------------------
+
+@tree.command(name="ping", description="Lebenszeichen des Bots (Debug).")
+async def ping_cmd(inter: discord.Interaction):
+    await inter.response.send_message("Pong 🏓", ephemeral=True)
+
+@tree.command(name="wf_admin_sync_hard", description="(Admin) Slash-Commands neu synchronisieren.")
+async def wf_admin_sync_hard(inter: discord.Interaction):
+    perms = getattr(inter.user, "guild_permissions", None)
+    if not perms or not (perms.administrator or perms.manage_guild):
+        await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True)
+        return
+    await inter.response.defer(ephemeral=True, thinking=True)
+    try:
+        # bevorzuge GUILD-Scoped Sync (sofort sichtbar)
+        await tree.sync(guild=discord.Object(id=inter.guild_id))
+        await inter.followup.send("✅ Slash-Commands (guild) neu gesynct.", ephemeral=True)
+    except Exception as e:
+        log.exception("wf_admin_sync_hard Fehler: %r", e)
+        await inter.followup.send(f"❌ Sync-Fehler: `{e}`", ephemeral=True)
+
+# ---- Globaler Fehlerhaken für app_commands ----------------------------
+
+@tree.error
+async def on_app_command_error(inter: discord.Interaction, error: app_commands.AppCommandError):
+    # Das hilft enorm, um „Die Anwendung reagiert nicht“ zu beseitigen.
+    log.exception("AppCmd Error bei %s: %r", getattr(inter.command, 'name', '?'), error)
+    try:
+        if inter.response.is_done():
+            await inter.followup.send("❌ Unerwarteter Fehler. (Log checken)", ephemeral=True)
+        else:
+            await inter.response.send_message("❌ Unerwarteter Fehler. (Log checken)", ephemeral=True)
     except Exception:
         pass
 
-# -----------------------------------------------------------
-# Slash-Command Setup
-# -----------------------------------------------------------
+# ---- Start -------------------------------------------------------------
 
-async def setup_onboarding(client: discord.Client, tree: app_commands.CommandTree):
-    """Slash Commands für DM-Onboarding"""
+def main():
+    token = os.getenv("DISCORD_TOKEN")
+    if not token:
+        raise RuntimeError("DISCORD_TOKEN ist nicht gesetzt.")
+    client.run(token)
 
-    @tree.command(name="onboarding_set_channel", description="(Admin) Zielkanal für Anfragen setzen")
-    async def onboarding_set_channel(inter: discord.Interaction, channel: discord.TextChannel):
-        if not inter.user.guild_permissions.administrator:
-            await inter.response.send_message("Nur Admins.", ephemeral=True)
-            return
-        c = cfg.get(str(inter.guild_id)) or {}
-        c["accept_ch"] = int(channel.id)
-        cfg[str(inter.guild_id)] = c; _save_cfg(cfg)
-        await inter.response.send_message(f"✅ Channel gesetzt: {channel.mention}", ephemeral=True)
-
-    @tree.command(name="onboarding_set_newbie", description="(Admin) Rolle für Newbies setzen")
-    async def onboarding_set_newbie(inter: discord.Interaction, role: discord.Role):
-        if not inter.user.guild_permissions.administrator:
-            await inter.response.send_message("Nur Admins.", ephemeral=True)
-            return
-        c = cfg.get(str(inter.guild_id)) or {}
-        c["newbie_role"] = int(role.id)
-        cfg[str(inter.guild_id)] = c; _save_cfg(cfg)
-        await inter.response.send_message(f"✅ Newbie-Rolle gesetzt: {role.mention}", ephemeral=True)
+if __name__ == "__main__":
+    main()
