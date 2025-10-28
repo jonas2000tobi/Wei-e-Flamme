@@ -445,3 +445,4 @@ async def setup_onboarding(client: discord.Client, tree: app_commands.CommandTre
             await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True); return
         await _start_flow(inter.user)
         await inter.response.send_message("✅ Onboarding-DM verschickt (falls DMs offen).", ephemeral=True)
+
