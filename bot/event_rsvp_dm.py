@@ -392,7 +392,12 @@ async def auto_resend_for_new_member(member: discord.Member) -> None:
             except Exception:
                 continue
 
-        if sent:
-            await _log(member._state._get_client(), member.guild.id, f"Auto-Resend an {member} -> {sent} DM(s).")
+        # Logging ist optional – wenn dein Lib-Objekt das nicht hergibt, einfach ignorieren.
+        try:
+            if sent and hasattr(member, "_state") and hasattr(member._state, "_get_client"):
+                client = member._state._get_client()
+                await _log(client, member.guild.id, f"Auto-Resend an {member} -> {sent} DM(s).")
+        except Exception:
+            pass
     except Exception:
         pass
