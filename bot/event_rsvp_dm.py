@@ -70,6 +70,8 @@ def _init_event_shape(obj: dict):
         obj["maybe"] = {}
     if "no" not in obj or not isinstance(obj["no"], list):
         obj["no"] = []
+    # Neu: Zielrolle-Feld immer vorhanden halten
+    obj.setdefault("target_role_id", 0)
 
 def get_role_ids_for_guild(guild_id: int) -> Dict[str, int]:
     g = cfg.get(str(guild_id)) or {}
@@ -139,6 +141,13 @@ def build_embed(guild: discord.Guild, obj: dict) -> discord.Embed:
 
     no_names = [_mention(guild, int(u)) for u in no]
     emb.add_field(name=f"❌ Abgemeldet ({len(no_names)})", value="\n".join(no_names) or "—", inline=False)
+
+    # Zeig die Zielrolle (falls gesetzt)
+    tr_id = int(obj.get("target_role_id", 0) or 0)
+    if tr_id:
+        r = guild.get_role(tr_id)
+        if r:
+            emb.add_field(name="🎯 Zielgruppe", value=r.mention, inline=False)
 
     if obj.get("image_url"):
         emb.set_image(url=obj["image_url"])
@@ -249,6 +258,7 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
     - /raid_set_roles_dm     – Tank/Heal/DPS für Maybe-Label
     - /raid_set_log_channel  – optionaler Log-Kanal für Fehler
     - /raid_create_dm        – Erstellt Raid (Server-Übersicht) & verschickt DMs mit Buttons
+                               (NEU: optional target_role)
     """
     # Persistente DM-Views nach Neustart
     for msg_id in list(store.keys()):
@@ -293,6 +303,7 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
         date="Datum YYYY-MM-DD",
         time="Zeit HH:MM (24h)",
         channel="Server-Channel für die Übersicht",
+        target_role="(Optional) Nur an diese Rolle DMs versenden",
         image_url="Optionales Bild fürs Embed"
     )
     async def raid_create_dm(
@@ -301,6 +312,7 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
         date: str,
         time: str,
         channel: Optional[discord.TextChannel] = None,
+        target_role: Optional[discord.Role] = None,
         image_url: Optional[str] = None
     ):
         if not _is_admin(inter):
@@ -327,7 +339,8 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
             "image_url": (image_url or "").strip() or None,
             "yes": {"TANK": [], "HEAL": [], "DPS": []},
             "maybe": {},
-            "no": []
+            "no": [],
+            "target_role_id": int(target_role.id) if target_role else 0  # NEU
         }
 
         emb = build_embed(inter.guild, obj)
@@ -335,10 +348,15 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
         store[str(msg.id)] = obj
         save_store()
 
-        # DMs versenden – simpel an alle Nicht-Bot-Mitglieder.
+        # DMs versenden – an Zielrolle (falls gesetzt), sonst an alle Nicht-Bots.
         sent = 0
+        tr_id = int(obj.get("target_role_id", 0) or 0)
+        role_obj = inter.guild.get_role(tr_id) if tr_id else None
+
         for m in inter.guild.members:
             if m.bot:
+                continue
+            if role_obj and role_obj not in m.roles:
                 continue
             try:
                 dm_text = (f"**{title}** – Anmeldung\n"
@@ -350,12 +368,14 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
             except Exception:
                 pass
 
+        ziel = role_obj.mention if role_obj else "alle Mitglieder (ohne Bots)"
         await inter.response.send_message(
-            f"✅ Raid erstellt: {msg.jump_url}\n✉️ DMs versendet: {sent}", ephemeral=True
+            f"✅ Raid erstellt: {msg.jump_url}\n🎯 Zielgruppe: {ziel}\n✉️ DMs versendet: {sent}",
+            ephemeral=True
         )
 
 # ------------------------------------------------------------
-# Neu: Auto-Resend für neue Mitglieder (Join nach Event-Start)
+# Auto-Resend für neue Mitglieder (Join nach Event-Start)
 # ------------------------------------------------------------
 
 async def auto_resend_for_new_member(member: discord.Member) -> None:
@@ -365,6 +385,7 @@ async def auto_resend_for_new_member(member: discord.Member) -> None:
       - Event gehört zur gleichen Guild
       - Startzeit nicht länger als 2h her (Start <= now <= Start+2h)
       - oder Start liegt noch in der Zukunft
+      - UND (falls gesetzt) Member besitzt die Zielrolle
     """
     try:
         if member.bot:
@@ -381,6 +402,13 @@ async def auto_resend_for_new_member(member: discord.Member) -> None:
                 if now > when + timedelta(hours=2):
                     continue
 
+                # Zielrolle prüfen
+                tr_id = int(obj.get("target_role_id", 0) or 0)
+                if tr_id:
+                    r = member.guild.get_role(tr_id)
+                    if not (r and r in member.roles):
+                        continue
+
                 text = (f"**{obj.get('title','Event')}** – Anmeldung\n"
                         f"• {when.strftime('%a, %d.%m.%Y %H:%M')} (Europe/Berlin)\n"
                         f"• Übersicht im Server: <#{obj.get('channel_id')}>")
@@ -392,7 +420,6 @@ async def auto_resend_for_new_member(member: discord.Member) -> None:
             except Exception:
                 continue
 
-        # Logging ist optional – wenn dein Lib-Objekt das nicht hergibt, einfach ignorieren.
         try:
             if sent and hasattr(member, "_state") and hasattr(member._state, "_get_client"):
                 client = member._state._get_client()
