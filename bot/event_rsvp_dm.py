@@ -1,11 +1,13 @@
 # bot/event_rsvp_dm.py
-# RSVP per DM: User klicken in der DM (Tank/Heal/DPS/Vielleicht/Abmelden),
-# die Übersicht (Embed) bleibt im Server-Channel und wird live aktualisiert.
+# -----------------------------------------------------------
+# DM-basiertes Raid-Anmelde-System mit Auto-Löschung nach 2 h
+# -----------------------------------------------------------
 
 from __future__ import annotations
 import json
 from pathlib import Path
 from typing import Dict, Optional
+import asyncio
 
 import discord
 from discord import app_commands
@@ -18,9 +20,9 @@ TZ = ZoneInfo("Europe/Berlin")
 DATA_DIR = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
 
-RSVP_FILE     = DATA_DIR / "event_rsvp.json"      # Events + Anmeldungen (Übersicht im Server)
-DM_CFG_FILE   = DATA_DIR / "event_rsvp_cfg.json"  # Rollen-IDs (Tank/Heal/DPS) + Log-Channel
-# cfg[str(guild_id)] = {"TANK": role_id, "HEAL": role_id, "DPS": role_id, "LOG_CH": channel_id}
+RSVP_FILE = DATA_DIR / "event_rsvp.json"
+DM_CFG_FILE = DATA_DIR / "event_rsvp_cfg.json"
+DM_TRACK_FILE = DATA_DIR / "event_dm_sent.json"  # <- neu: verfolgt gesendete DMs
 
 def _load(p: Path, default):
     try:
@@ -32,15 +34,15 @@ def _save(p: Path, obj):
     p.write_text(json.dumps(obj, indent=2, ensure_ascii=False), encoding="utf-8")
 
 store: Dict[str, dict] = _load(RSVP_FILE, {})
-cfg:   Dict[str, dict] = _load(DM_CFG_FILE, {})
+cfg: Dict[str, dict] = _load(DM_CFG_FILE, {})
+sent_dm: Dict[str, list] = _load(DM_TRACK_FILE, {})  # {msg_id:[message_ids]}
 
 def save_store(): _save(RSVP_FILE, store)
-def save_cfg():   _save(DM_CFG_FILE, cfg)
+def save_cfg(): _save(DM_CFG_FILE, cfg)
+def save_sent_dm(): _save(DM_TRACK_FILE, sent_dm)
 
-# ---------------- Utils / Logging ----------------
-
+# ---------------- Logging ----------------
 async def _log(client: discord.Client, guild_id: int, text: str):
-    """Optionalen Log-Kanal benutzen, wenn gesetzt."""
     gcfg = cfg.get(str(guild_id)) or {}
     ch_id = int(gcfg.get("LOG_CH", 0) or 0)
     if not ch_id:
@@ -59,372 +61,166 @@ def _mention(guild: discord.Guild, uid: int) -> str:
     m = guild.get_member(uid)
     return m.mention if m else f"<@{uid}>"
 
+# ---------------- Struktur sichern ----------------
 def _init_event_shape(obj: dict):
-    """Sichert die Struktur yes/maybe/no ab (defensiv gegen alte Saves)."""
     if "yes" not in obj or not isinstance(obj["yes"], dict):
         obj["yes"] = {"TANK": [], "HEAL": [], "DPS": []}
     for k in ("TANK", "HEAL", "DPS"):
-        if k not in obj["yes"] or not isinstance(obj["yes"][k], list):
-            obj["yes"][k] = []
-    if "maybe" not in obj or not isinstance(obj["maybe"], dict):
-        obj["maybe"] = {}
-    if "no" not in obj or not isinstance(obj["no"], list):
-        obj["no"] = []
-    # Neu: Zielrolle-Feld immer vorhanden halten
+        if k not in obj["yes"]: obj["yes"][k] = []
+    obj.setdefault("maybe", {})
+    obj.setdefault("no", [])
     obj.setdefault("target_role_id", 0)
 
-def get_role_ids_for_guild(guild_id: int) -> Dict[str, int]:
-    g = cfg.get(str(guild_id)) or {}
-    return {
-        "TANK": int(g.get("TANK", 0) or 0),
-        "HEAL": int(g.get("HEAL", 0) or 0),
-        "DPS":  int(g.get("DPS",  0) or 0),
-    }
-
-def _member_from_event(inter: discord.Interaction, obj: dict) -> Optional[discord.Member]:
-    """In DMs ist interaction.guild None → Member über guild_id aus dem Event holen."""
-    try:
-        if inter.guild is not None:
-            return inter.guild.get_member(inter.user.id)
-        gid = int(obj.get("guild_id", 0) or 0)
-        if not gid:
-            return None
-        g = inter.client.get_guild(gid)
-        if not g:
-            return None
-        return g.get_member(inter.user.id)
-    except Exception:
-        return None
-
-def _primary_label(member: Optional[discord.Member], rid_map: Dict[str, int]) -> str:
-    """Gibt 'Tank'/'Heal'/'DPS' zurück – robust, auch wenn member None ist."""
-    if member is None:
-        return ""
-    r = member.guild.get_role(rid_map.get("TANK", 0) or 0)
-    if r and r in getattr(member, "roles", []): return "Tank"
-    r = member.guild.get_role(rid_map.get("HEAL", 0) or 0)
-    if r and r in getattr(member, "roles", []): return "Heal"
-    r = member.guild.get_role(rid_map.get("DPS", 0) or 0)
-    if r and r in getattr(member, "roles", []): return "DPS"
-    names = [getattr(rr, "name", "").lower() for rr in getattr(member, "roles", [])]
-    if any("tank" in n for n in names): return "Tank"
-    if any("heal" in n for n in names): return "Heal"
-    if any("dps" in n for n in names) or any("dd" in n for n in names): return "DPS"
-    return ""
-
+# ---------------- Embed ----------------
 def build_embed(guild: discord.Guild, obj: dict) -> discord.Embed:
     when = datetime.fromisoformat(obj["when_iso"])
     emb = discord.Embed(
         title=f"📅 {obj['title']}",
-        description=f"{obj.get('description','')}\n\n🕒 Zeit: {when.strftime('%a, %d.%m.%Y %H:%M')} (Europe/Berlin)",
+        description=f"{obj.get('description','')}\n🕒 {when.strftime('%a, %d.%m.%Y %H:%M')} Europe/Berlin",
         color=discord.Color.blurple()
     )
     yes = obj["yes"]; maybe = obj["maybe"]; no = obj["no"]
 
-    tank_names = [_mention(guild, int(u)) for u in yes.get("TANK", [])]
-    heal_names = [_mention(guild, int(u)) for u in yes.get("HEAL", [])]
-    dps_names  = [_mention(guild, int(u)) for u in yes.get("DPS",  [])]
+    def list_or_dash(lst): return "\n".join(lst) if lst else "—"
+    emb.add_field(name=f"🛡️ Tank ({len(yes['TANK'])})", value=list_or_dash([_mention(guild,u) for u in yes["TANK"]]), inline=True)
+    emb.add_field(name=f"💚 Heal ({len(yes['HEAL'])})", value=list_or_dash([_mention(guild,u) for u in yes["HEAL"]]), inline=True)
+    emb.add_field(name=f"🗡️ DPS ({len(yes['DPS'])})",  value=list_or_dash([_mention(guild,u) for u in yes["DPS"]]), inline=True)
 
-    emb.add_field(name=f"🛡️ Tank ({len(tank_names)})", value="\n".join(tank_names) or "—", inline=True)
-    emb.add_field(name=f"💚 Heal ({len(heal_names)})", value="\n".join(heal_names) or "—", inline=True)
-    emb.add_field(name=f"🗡️ DPS ({len(dps_names)})",  value="\n".join(dps_names)  or "—", inline=True)
+    maybel = [f"{_mention(guild,int(k))} ({v})" if v else _mention(guild,int(k)) for k,v in maybe.items()]
+    emb.add_field(name=f"❔ Vielleicht ({len(maybel)})", value=list_or_dash(maybel), inline=False)
+    emb.add_field(name=f"❌ Abgemeldet ({len(no)})", value=list_or_dash([_mention(guild,u) for u in no]), inline=False)
 
-    maybe_lines = []
-    for uid_str, rlab in maybe.items():
-        try:
-            uid_i = int(uid_str)
-        except Exception:
-            continue
-        label = f" ({rlab})" if rlab else ""
-        maybe_lines.append(f"{_mention(guild, uid_i)}{label}")
-    emb.add_field(name=f"❔ Vielleicht ({len(maybe_lines)})", value="\n".join(maybe_lines) or "—", inline=False)
-
-    no_names = [_mention(guild, int(u)) for u in no]
-    emb.add_field(name=f"❌ Abgemeldet ({len(no_names)})", value="\n".join(no_names) or "—", inline=False)
-
-    # Zeig die Zielrolle (falls gesetzt)
-    tr_id = int(obj.get("target_role_id", 0) or 0)
-    if tr_id:
-        r = guild.get_role(tr_id)
-        if r:
-            emb.add_field(name="🎯 Zielgruppe", value=r.mention, inline=False)
-
-    if obj.get("image_url"):
-        emb.set_image(url=obj["image_url"])
-
-    emb.set_footer(text="(An-/Abmeldung läuft per DM-Buttons)")
+    tr_id = int(obj.get("target_role_id",0))
+    if tr_id and (r := guild.get_role(tr_id)): emb.add_field(name="🎯 Zielgruppe", value=r.mention, inline=False)
+    if obj.get("image_url"): emb.set_image(url=obj["image_url"])
+    emb.set_footer(text="An-/Abmeldung läuft per DM-Buttons")
     return emb
 
-# ---------------- DM View ----------------
-
+# ---------------- View ----------------
 class RaidView(View):
-    """Diese View läuft **in der DM**. Sie editiert die Übersicht im Server-Channel."""
-    def __init__(self, msg_id: int):
-        super().__init__(timeout=None)
-        self.msg_id = str(msg_id)
+    def __init__(self, msg_id:int): super().__init__(timeout=None); self.msg_id=str(msg_id)
 
-    async def _push_overview(self, inter: discord.Interaction, obj: dict):
-        guild = inter.client.get_guild(obj["guild_id"])
-        if not guild:
-            return
-        ch = guild.get_channel(obj["channel_id"])
-        if not isinstance(ch, (discord.TextChannel, discord.Thread)):
-            return
+    async def _update(self, inter:discord.Interaction, group:str):
         try:
-            msg = await ch.fetch_message(int(self.msg_id))
-        except Exception:
-            return
-        emb = build_embed(guild, obj)
-        try:
-            await msg.edit(embed=emb)  # Buttons im Server-Post bleiben wie sie sind
-        except Exception:
-            pass
-
-    async def _safe_reply(self, inter: discord.Interaction, text: str):
-        try:
-            await inter.response.send_message(text)
-        except discord.InteractionResponded:
-            try:
-                await inter.followup.send(text)
-            except Exception:
-                pass
-        except Exception:
-            pass
-
-    async def _update(self, inter: discord.Interaction, group: str):
-        try:
-            obj = store.get(self.msg_id)
-            if not obj:
-                await self._safe_reply(inter, "Dieses Event existiert nicht mehr.")
-                return
-
+            obj=store.get(self.msg_id)
+            if not obj: return await inter.response.send_message("Event existiert nicht mehr.", ephemeral=True)
             _init_event_shape(obj)
+            uid=inter.user.id
+            for k in("TANK","HEAL","DPS"): obj["yes"][k]=[x for x in obj["yes"][k] if x!=uid]
+            obj["no"]=[x for x in obj["no"] if x!=uid]
+            obj["maybe"].pop(str(uid),None)
 
-            uid = inter.user.id
-
-            # User aus allen Buckets entfernen
-            for k in ("TANK", "HEAL", "DPS"):
-                obj["yes"][k] = [int(u) for u in obj["yes"].get(k, []) if int(u) != uid]
-            obj["no"] = [int(u) for u in obj.get("no", []) if int(u) != uid]
-            obj["maybe"].pop(str(uid), None)
-
-            if group in ("TANK", "HEAL", "DPS"):
-                obj["yes"][group].append(uid)
-                text = f"Angemeldet als **{group}**."
-            elif group == "MAYBE":
-                member = _member_from_event(inter, obj)
-                rid_map = get_role_ids_for_guild(obj["guild_id"])
-                label = _primary_label(member, rid_map)  # "Tank"/"Heal"/"DPS" oder ""
-                obj["maybe"][str(uid)] = label
-                text = "Als **Vielleicht** eingetragen."
-            elif group == "NO":
-                obj["no"].append(uid)
-                text = "Als **Abgemeldet** eingetragen."
-            else:
-                text = "Aktualisiert."
-
+            if group in("TANK","HEAL","DPS"):
+                obj["yes"][group].append(uid); text=f"Angemeldet als {group}"
+            elif group=="MAYBE":
+                obj["maybe"][str(uid)]=""; text="Als Vielleicht eingetragen."
+            elif group=="NO":
+                obj["no"].append(uid); text="Abgemeldet."
+            else: text="Aktualisiert."
             save_store()
-            await self._push_overview(inter, obj)
-            await self._safe_reply(inter, text)
 
-        except Exception as e:
-            await _log(inter.client, store.get(self.msg_id, {}).get("guild_id", 0), f"Button-Fehler: {e!r}")
-            await self._safe_reply(inter, "❌ Unerwarteter Fehler bei der Anmeldung. Probier es bitte nochmal.")
-
-    @button(label="🛡️ Tank", style=ButtonStyle.primary, custom_id="dm_rsvp_tank")
-    async def btn_tank(self, inter: discord.Interaction, _):      await self._update(inter, "TANK")
-
-    @button(label="💚 Heal", style=ButtonStyle.secondary, custom_id="dm_rsvp_heal")
-    async def btn_heal(self, inter: discord.Interaction, _):      await self._update(inter, "HEAL")
-
-    @button(label="🗡️ DPS", style=ButtonStyle.secondary, custom_id="dm_rsvp_dps")
-    async def btn_dps(self, inter: discord.Interaction, _):       await self._update(inter, "DPS")
-
-    @button(label="❔ Vielleicht", style=ButtonStyle.secondary, custom_id="dm_rsvp_maybe")
-    async def btn_maybe(self, inter: discord.Interaction, _):     await self._update(inter, "MAYBE")
-
-    @button(label="❌ Abmelden", style=ButtonStyle.danger, custom_id="dm_rsvp_no")
-    async def btn_no(self, inter: discord.Interaction, _):        await self._update(inter, "NO")
-
-# ---------------- Commands / Setup ----------------
-
-def _is_admin(inter: discord.Interaction) -> bool:
-    perms = getattr(inter.user, "guild_permissions", None)
-    return bool(perms and (perms.administrator or perms.manage_guild))
-
-async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
-    """
-    Registriert:
-    - /raid_set_roles_dm     – Tank/Heal/DPS für Maybe-Label
-    - /raid_set_log_channel  – optionaler Log-Kanal für Fehler
-    - /raid_create_dm        – Erstellt Raid (Server-Übersicht) & verschickt DMs mit Buttons
-                               (NEU: optional target_role)
-    """
-    # Persistente DM-Views nach Neustart
-    for msg_id in list(store.keys()):
-        try:
-            client.add_view(RaidView(int(msg_id)))
-        except Exception:
-            pass
-
-    @tree.command(name="raid_set_roles_dm", description="(Admin) Primärrollen (Tank/Heal/DPS) für Maybe-Label setzen")
-    @app_commands.describe(tank_role="Rolle: Tank", heal_role="Rolle: Heal", dps_role="Rolle: DPS")
-    async def raid_set_roles_dm(
-        inter: discord.Interaction,
-        tank_role: discord.Role,
-        heal_role: discord.Role,
-        dps_role: discord.Role
-    ):
-        if not _is_admin(inter):
-            await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True); return
-        c = cfg.get(str(inter.guild_id)) or {}
-        c["TANK"] = int(tank_role.id)
-        c["HEAL"] = int(heal_role.id)
-        c["DPS"]  = int(dps_role.id)
-        cfg[str(inter.guild_id)] = c; save_cfg()
-        await inter.response.send_message(
-            f"✅ Gespeichert:\n🛡️ {tank_role.mention}\n💚 {heal_role.mention}\n🗡️ {dps_role.mention}",
-            ephemeral=True
-        )
-
-    @tree.command(name="raid_set_log_channel", description="(Admin) Log-Kanal für RSVP-DM-Fehler setzen (optional)")
-    @app_commands.describe(channel="Kanal für Log-Ausgaben")
-    async def raid_set_log_channel(inter: discord.Interaction, channel: discord.TextChannel):
-        if not _is_admin(inter):
-            await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True); return
-        c = cfg.get(str(inter.guild_id)) or {}
-        c["LOG_CH"] = int(channel.id)
-        cfg[str(inter.guild_id)] = c; save_cfg()
-        await inter.response.send_message(f"✅ Log-Kanal gesetzt: {channel.mention}", ephemeral=True)
-
-    @tree.command(name="raid_create_dm", description="(Admin) Raid/Anmeldung per DM erzeugen (mit Server-Übersicht)")
-    @app_commands.describe(
-        title="Titel",
-        date="Datum YYYY-MM-DD",
-        time="Zeit HH:MM (24h)",
-        channel="Server-Channel für die Übersicht",
-        target_role="(Optional) Nur an diese Rolle DMs versenden",
-        image_url="Optionales Bild fürs Embed"
-    )
-    async def raid_create_dm(
-        inter: discord.Interaction,
-        title: str,
-        date: str,
-        time: str,
-        channel: Optional[discord.TextChannel] = None,
-        target_role: Optional[discord.Role] = None,
-        image_url: Optional[str] = None
-    ):
-        if not _is_admin(inter):
-            await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True); return
-        # Zeitpunkt parsen
-        try:
-            yyyy, mm, dd = [int(x) for x in date.split("-")]
-            hh, mi = [int(x) for x in time.split(":")]
-            when = datetime(yyyy, mm, dd, hh, mi, tzinfo=TZ)
-        except Exception:
-            await inter.response.send_message("❌ Datum/Zeit ungültig. (YYYY-MM-DD / HH:MM)", ephemeral=True)
-            return
-
-        ch = channel or inter.channel
-        if not isinstance(ch, discord.TextChannel):
-            await inter.response.send_message("❌ Zielkanal ist kein Textkanal.", ephemeral=True); return
-
-        obj = {
-            "guild_id": inter.guild_id,
-            "channel_id": ch.id,
-            "title": title.strip(),
-            "description": "",
-            "when_iso": when.isoformat(),
-            "image_url": (image_url or "").strip() or None,
-            "yes": {"TANK": [], "HEAL": [], "DPS": []},
-            "maybe": {},
-            "no": [],
-            "target_role_id": int(target_role.id) if target_role else 0  # NEU
-        }
-
-        emb = build_embed(inter.guild, obj)
-        msg = await ch.send(embed=emb)
-        store[str(msg.id)] = obj
-        save_store()
-
-        # DMs versenden – an Zielrolle (falls gesetzt), sonst an alle Nicht-Bots.
-        sent = 0
-        tr_id = int(obj.get("target_role_id", 0) or 0)
-        role_obj = inter.guild.get_role(tr_id) if tr_id else None
-
-        for m in inter.guild.members:
-            if m.bot:
-                continue
-            if role_obj and role_obj not in m.roles:
-                continue
-            try:
-                dm_text = (f"**{title}** – Anmeldung\n"
-                           f"• {when.strftime('%a, %d.%m.%Y %H:%M')} (Europe/Berlin)\n"
-                           f"• Übersicht im Server: #{ch.name}\n\n"
-                           f"Wähle unten deine Teilnahme.")
-                await m.send(dm_text, view=RaidView(int(msg.id)))
-                sent += 1
-            except Exception:
-                pass
-
-        ziel = role_obj.mention if role_obj else "alle Mitglieder (ohne Bots)"
-        await inter.response.send_message(
-            f"✅ Raid erstellt: {msg.jump_url}\n🎯 Zielgruppe: {ziel}\n✉️ DMs versendet: {sent}",
-            ephemeral=True
-        )
-
-# ------------------------------------------------------------
-# Auto-Resend für neue Mitglieder (Join nach Event-Start)
-# ------------------------------------------------------------
-
-async def auto_resend_for_new_member(member: discord.Member) -> None:
-    """
-    Bei on_member_join(member) aufrufen.
-    Schickt dem neuen Member die RSVP-DM für alle noch relevanten Events seiner Guild:
-      - Event gehört zur gleichen Guild
-      - Startzeit nicht länger als 2h her (Start <= now <= Start+2h)
-      - oder Start liegt noch in der Zukunft
-      - UND (falls gesetzt) Member besitzt die Zielrolle
-    """
-    try:
-        if member.bot:
-            return
-        now = datetime.now(TZ)
-
-        sent = 0
-        for mid, obj in list(store.items()):
-            try:
-                if int(obj.get("guild_id", 0) or 0) != member.guild.id:
-                    continue
-
-                when = datetime.fromisoformat(obj.get("when_iso"))
-                if now > when + timedelta(hours=2):
-                    continue
-
-                # Zielrolle prüfen
-                tr_id = int(obj.get("target_role_id", 0) or 0)
-                if tr_id:
-                    r = member.guild.get_role(tr_id)
-                    if not (r and r in member.roles):
-                        continue
-
-                text = (f"**{obj.get('title','Event')}** – Anmeldung\n"
-                        f"• {when.strftime('%a, %d.%m.%Y %H:%M')} (Europe/Berlin)\n"
-                        f"• Übersicht im Server: <#{obj.get('channel_id')}>")
+            guild=inter.client.get_guild(obj["guild_id"])
+            if guild and (ch:=guild.get_channel(obj["channel_id"])):
                 try:
-                    await member.send(text, view=RaidView(int(mid)))
-                    sent += 1
-                except Exception:
-                    pass
-            except Exception:
-                continue
+                    msg=await ch.fetch_message(int(self.msg_id))
+                    await msg.edit(embed=build_embed(guild,obj))
+                except Exception: pass
+            await inter.response.send_message(text, ephemeral=True)
+        except Exception as e:
+            await _log(inter.client, store.get(self.msg_id,{}).get("guild_id",0), f"Button-Fehler: {e}")
 
+    @button(label="🛡️ Tank", style=ButtonStyle.primary)  async def t(self,i,_): await self._update(i,"TANK")
+    @button(label="💚 Heal", style=ButtonStyle.secondary) async def h(self,i,_): await self._update(i,"HEAL")
+    @button(label="🗡️ DPS",  style=ButtonStyle.secondary) async def d(self,i,_): await self._update(i,"DPS")
+    @button(label="❔ Vielleicht",style=ButtonStyle.secondary) async def m(self,i,_): await self._update(i,"MAYBE")
+    @button(label="❌ Abmelden", style=ButtonStyle.danger)   async def n(self,i,_): await self._update(i,"NO")
+
+# ---------------- Commands ----------------
+def _is_admin(i:discord.Interaction)->bool:
+    p=getattr(i.user,"guild_permissions",None)
+    return bool(p and (p.administrator or p.manage_guild))
+
+async def setup_rsvp_dm(client:discord.Client, tree:app_commands.CommandTree):
+    # Alte Views wiederherstellen
+    for msg_id in list(store.keys()):
+        try: client.add_view(RaidView(int(msg_id)))
+        except Exception: pass
+
+    @tree.command(name="raid_set_log_channel",description="(Admin) Log-Kanal setzen")
+    async def setlog(i:discord.Interaction,channel:discord.TextChannel):
+        if not _is_admin(i): return await i.response.send_message("Nur Admin.",ephemeral=True)
+        c=cfg.get(str(i.guild_id),{}); c["LOG_CH"]=channel.id; cfg[str(i.guild_id)]=c; save_cfg()
+        await i.response.send_message(f"✅ Log-Kanal: {channel.mention}",ephemeral=True)
+
+    @tree.command(name="raid_create_dm",description="(Admin) Raid/Anmeldung per DM erzeugen")
+    async def create(i:discord.Interaction,title:str,date:str,time:str,
+                     channel:Optional[discord.TextChannel]=None,
+                     target_role:Optional[discord.Role]=None,
+                     image_url:Optional[str]=None):
+        if not _is_admin(i): return await i.response.send_message("Nur Admin.",ephemeral=True)
         try:
-            if sent and hasattr(member, "_state") and hasattr(member._state, "_get_client"):
-                client = member._state._get_client()
-                await _log(client, member.guild.id, f"Auto-Resend an {member} -> {sent} DM(s).")
-        except Exception:
-            pass
-    except Exception:
-        pass
+            y,m,d=[int(x) for x in date.split("-")]; h,mi=[int(x) for x in time.split(":")]
+            when=datetime(y,m,d,h,mi,tzinfo=TZ)
+        except: return await i.response.send_message("❌ Datum/Zeit ungültig.",ephemeral=True)
+
+        ch=channel or i.channel
+        obj={"guild_id":i.guild_id,"channel_id":ch.id,"title":title,
+             "description":"","when_iso":when.isoformat(),"image_url":image_url or None,
+             "yes":{"TANK":[],"HEAL":[],"DPS":[]}, "maybe":{}, "no":[],
+             "target_role_id":int(target_role.id) if target_role else 0}
+        emb=build_embed(i.guild,obj)
+        msg=await ch.send(embed=emb)
+        store[str(msg.id)]=obj; save_store()
+
+        sent_dm[str(msg.id)]=[]
+        role=target_role if target_role else None
+        count=0
+        for m in i.guild.members:
+            if m.bot: continue
+            if role and role not in m.roles: continue
+            try:
+                t=f"**{title}**\n{when.strftime('%a %d.%m %H:%M')} Europe/Berlin\nÜbersicht: #{ch.name}"
+                dm=await m.send(t,view=RaidView(int(msg.id)))
+                sent_dm[str(msg.id)].append(dm.id); count+=1
+            except: pass
+        save_sent_dm()
+
+        # Auto-Löschung in 2 h nach Start
+        async def _cleanup():
+            await asyncio.sleep(max((when-datetime.now(TZ)).total_seconds()+7200,0))
+            await _delete_old_dms(i.client,int(msg.id))
+        asyncio.create_task(_cleanup())
+
+        await i.response.send_message(f"✅ Raid erstellt – {count} DMs versendet.",ephemeral=True)
+
+# ---------------- DM-Löschung ----------------
+async def _delete_old_dms(client:discord.Client,msg_id:int):
+    msg_key=str(msg_id)
+    if msg_key not in sent_dm: return
+    for guild in client.guilds:
+        for m in guild.members:
+            if m.bot: continue
+            try:
+                async for dm in m.history(limit=50):
+                    if dm.id in sent_dm[msg_key]:
+                        try: await dm.delete()
+                        except: pass
+            except: pass
+    sent_dm.pop(msg_key,None); save_sent_dm()
+
+# ---------------- Auto-Resend ----------------
+async def auto_resend_for_new_member(member:discord.Member):
+    if member.bot: return
+    now=datetime.now(TZ); sent=0
+    for mid,obj in store.items():
+        try:
+            if obj["guild_id"]!=member.guild.id: continue
+            when=datetime.fromisoformat(obj["when_iso"])
+            if now>when+timedelta(hours=2): continue
+            tr=int(obj.get("target_role_id",0))
+            if tr and (r:=member.guild.get_role(tr)) and r not in member.roles: continue
+            t=f"**{obj['title']}**\n{when.strftime('%a %d.%m %H:%M')} Europe/Berlin"
+            dm=await member.send(t,view=RaidView(int(mid)))
+            sent_dm.setdefault(mid,[]).append(dm.id); sent+=1
+        except: pass
+    if sent: save_sent_dm()
