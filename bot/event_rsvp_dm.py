@@ -1,18 +1,18 @@
 # bot/event_rsvp_dm.py
-# RSVP per DM: User klickt in der DM (Tank/Heal/DPS/Vielleicht/Abmelden),
-# Übersicht (Embed) bleibt im Server-Channel und wird live aktualisiert.
+# RSVP per DM: User klicken in der DM (Tank/Heal/DPS/Vielleicht/Abmelden),
+# die Übersicht (Embed) bleibt im Server-Channel und wird live aktualisiert.
 
 from __future__ import annotations
 import json
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional
 
 import discord
 from discord import app_commands
 from discord.ui import View, button
 from discord.enums import ButtonStyle
 from zoneinfo import ZoneInfo
-from datetime import datetime
+from datetime import datetime, timedelta
 
 TZ = ZoneInfo("Europe/Berlin")
 DATA_DIR = Path("data")
@@ -37,9 +37,10 @@ cfg:   Dict[str, dict] = _load(DM_CFG_FILE, {})
 def save_store(): _save(RSVP_FILE, store)
 def save_cfg():   _save(DM_CFG_FILE, cfg)
 
-# ------------- Utils / Logging -------------
+# ---------------- Utils / Logging ----------------
 
 async def _log(client: discord.Client, guild_id: int, text: str):
+    """Optionalen Log-Kanal benutzen, wenn gesetzt."""
     gcfg = cfg.get(str(guild_id)) or {}
     ch_id = int(gcfg.get("LOG_CH", 0) or 0)
     if not ch_id:
@@ -59,7 +60,7 @@ def _mention(guild: discord.Guild, uid: int) -> str:
     return m.mention if m else f"<@{uid}>"
 
 def _init_event_shape(obj: dict):
-    # sorgt dafür, dass yes/maybe/no existieren & die drei Keys da sind
+    """Sichert die Struktur yes/maybe/no ab (defensiv gegen alte Saves)."""
     if "yes" not in obj or not isinstance(obj["yes"], dict):
         obj["yes"] = {"TANK": [], "HEAL": [], "DPS": []}
     for k in ("TANK", "HEAL", "DPS"):
@@ -82,8 +83,7 @@ def _member_from_event(inter: discord.Interaction, obj: dict) -> Optional[discor
     """In DMs ist interaction.guild None → Member über guild_id aus dem Event holen."""
     try:
         if inter.guild is not None:
-            m = inter.guild.get_member(inter.user.id)
-            return m
+            return inter.guild.get_member(inter.user.id)
         gid = int(obj.get("guild_id", 0) or 0)
         if not gid:
             return None
@@ -98,14 +98,12 @@ def _primary_label(member: Optional[discord.Member], rid_map: Dict[str, int]) ->
     """Gibt 'Tank'/'Heal'/'DPS' zurück – robust, auch wenn member None ist."""
     if member is None:
         return ""
-    # 1) IDs (stabil)
     r = member.guild.get_role(rid_map.get("TANK", 0) or 0)
     if r and r in getattr(member, "roles", []): return "Tank"
     r = member.guild.get_role(rid_map.get("HEAL", 0) or 0)
     if r and r in getattr(member, "roles", []): return "Heal"
     r = member.guild.get_role(rid_map.get("DPS", 0) or 0)
     if r and r in getattr(member, "roles", []): return "DPS"
-    # 2) Namen-Fallback
     names = [getattr(rr, "name", "").lower() for rr in getattr(member, "roles", [])]
     if any("tank" in n for n in names): return "Tank"
     if any("heal" in n for n in names): return "Heal"
@@ -148,12 +146,10 @@ def build_embed(guild: discord.Guild, obj: dict) -> discord.Embed:
     emb.set_footer(text="(An-/Abmeldung läuft per DM-Buttons)")
     return emb
 
-# ------------- DM View -------------
+# ---------------- DM View ----------------
 
 class RaidView(View):
-    """
-    Diese View läuft **in der DM**. Sie editiert die Übersicht im Server-Channel.
-    """
+    """Diese View läuft **in der DM**. Sie editiert die Übersicht im Server-Channel."""
     def __init__(self, msg_id: int):
         super().__init__(timeout=None)
         self.msg_id = str(msg_id)
@@ -187,7 +183,6 @@ class RaidView(View):
             pass
 
     async def _update(self, inter: discord.Interaction, group: str):
-        # Kompletter Schutz – wenn irgendwas schiefgeht, bekommt der User Feedback und wir loggen.
         try:
             obj = store.get(self.msg_id)
             if not obj:
@@ -197,23 +192,11 @@ class RaidView(View):
             _init_event_shape(obj)
 
             uid = inter.user.id
-            # sauber int-casten
-            def _as_int_list(x):
-                out = []
-                for v in x:
-                    try: out.append(int(v))
-                    except: pass
-                return out
-
-            # sicherstellen, dass Listen ints enthalten
-            for k in ("TANK","HEAL","DPS"):
-                obj["yes"][k] = _as_int_list(obj["yes"].get(k, []))
-            obj["no"] = _as_int_list(obj["no"])
 
             # User aus allen Buckets entfernen
             for k in ("TANK", "HEAL", "DPS"):
-                obj["yes"][k] = [u for u in obj["yes"][k] if u != uid]
-            obj["no"] = [u for u in obj["no"] if u != uid]
+                obj["yes"][k] = [int(u) for u in obj["yes"].get(k, []) if int(u) != uid]
+            obj["no"] = [int(u) for u in obj.get("no", []) if int(u) != uid]
             obj["maybe"].pop(str(uid), None)
 
             if group in ("TANK", "HEAL", "DPS"):
@@ -254,7 +237,7 @@ class RaidView(View):
     @button(label="❌ Abmelden", style=ButtonStyle.danger, custom_id="dm_rsvp_no")
     async def btn_no(self, inter: discord.Interaction, _):        await self._update(inter, "NO")
 
-# ------------- Commands / Setup -------------
+# ---------------- Commands / Setup ----------------
 
 def _is_admin(inter: discord.Interaction) -> bool:
     perms = getattr(inter.user, "guild_permissions", None)
@@ -263,9 +246,9 @@ def _is_admin(inter: discord.Interaction) -> bool:
 async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
     """
     Registriert:
-    - /raid_set_roles_dm   – Tank/Heal/DPS für Maybe-Label
-    - /raid_set_log_channel – optionaler Log-Kanal für Fehler
-    - /raid_create_dm      – Erstellt Raid (Server-Übersicht) & verschickt DMs mit Buttons
+    - /raid_set_roles_dm     – Tank/Heal/DPS für Maybe-Label
+    - /raid_set_log_channel  – optionaler Log-Kanal für Fehler
+    - /raid_create_dm        – Erstellt Raid (Server-Übersicht) & verschickt DMs mit Buttons
     """
     # Persistente DM-Views nach Neustart
     for msg_id in list(store.keys()):
@@ -370,3 +353,46 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
         await inter.response.send_message(
             f"✅ Raid erstellt: {msg.jump_url}\n✉️ DMs versendet: {sent}", ephemeral=True
         )
+
+# ------------------------------------------------------------
+# Neu: Auto-Resend für neue Mitglieder (Join nach Event-Start)
+# ------------------------------------------------------------
+
+async def auto_resend_for_new_member(member: discord.Member) -> None:
+    """
+    Bei on_member_join(member) aufrufen.
+    Schickt dem neuen Member die RSVP-DM für alle noch relevanten Events seiner Guild:
+      - Event gehört zur gleichen Guild
+      - Startzeit nicht länger als 2h her (Start <= now <= Start+2h)
+      - oder Start liegt noch in der Zukunft
+    """
+    try:
+        if member.bot:
+            return
+        now = datetime.now(TZ)
+
+        sent = 0
+        for mid, obj in list(store.items()):
+            try:
+                if int(obj.get("guild_id", 0) or 0) != member.guild.id:
+                    continue
+
+                when = datetime.fromisoformat(obj.get("when_iso"))
+                if now > when + timedelta(hours=2):
+                    continue
+
+                text = (f"**{obj.get('title','Event')}** – Anmeldung\n"
+                        f"• {when.strftime('%a, %d.%m.%Y %H:%M')} (Europe/Berlin)\n"
+                        f"• Übersicht im Server: <#{obj.get('channel_id')}>")
+                try:
+                    await member.send(text, view=RaidView(int(mid)))
+                    sent += 1
+                except Exception:
+                    pass
+            except Exception:
+                continue
+
+        if sent:
+            await _log(member._state._get_client(), member.guild.id, f"Auto-Resend an {member} -> {sent} DM(s).")
+    except Exception:
+        pass
