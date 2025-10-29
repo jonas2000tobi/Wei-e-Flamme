@@ -1,118 +1,129 @@
 # bot/bot.py
-from __future__ import annotations
-import os
-import asyncio
-import logging
+# ------------------------------------------------------
+# Hauptbot mit Onboarding-DM + Raid/Event RSVP-System
+# ------------------------------------------------------
 
 import discord
+from discord.ext import tasks, commands
 from discord import app_commands
+import asyncio
+import os
+import sys
+from pathlib import Path
+from datetime import datetime, timedelta, timezone
 
-# ---- Logging so we see why "Die Anwendung reagiert nicht" passiert ----
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("wf-bot")
+# --- robustes Import-Setup ---
+HERE = Path(__file__).resolve().parent
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
+if str(HERE.parent) not in sys.path:
+    sys.path.insert(0, str(HERE.parent))
 
-# ---- Intents: Members sind nötig für on_member_join & Rollenvergabe ----
-intents = discord.Intents.default()
-intents.guilds = True
-intents.members = True  # in Dev-Portal aktivieren!
+# Event- & Onboarding-Module sicher importieren
+try:
+    from bot.event_rsvp_dm import setup_rsvp_dm, auto_resend_for_new_member, store, save_store
+except ModuleNotFoundError:
+    from event_rsvp_dm import setup_rsvp_dm, auto_resend_for_new_member, store, save_store
 
-client = discord.Client(intents=intents)
-tree = app_commands.CommandTree(client)
+try:
+    from bot.onboarding_dm import setup_onboarding, send_onboarding_dm
+except ModuleNotFoundError:
+    from onboarding_dm import setup_onboarding, send_onboarding_dm
 
-# ---- Module laden (die Dateien hast du bereits) ------------------------
-# event_rsvp_dm: /raid_create_dm + Auto-Resend
-# onboarding_dm: Willkommens-DM + Review
-from event_rsvp_dm import setup_rsvp_dm, auto_resend_for_new_member
-from onboarding_dm import setup_onboarding, send_onboarding_dm
 
-# ---- First-run Guard (damit setup & sync nur 1x laufen) ---------------
-_ready_once = False
+# ------------------------------------------------------
+# Grundkonfiguration
+# ------------------------------------------------------
+
+intents = discord.Intents.all()
+client = commands.Bot(command_prefix="!", intents=intents)
+tree = client.tree
+
+
+# ------------------------------------------------------
+# On Ready – Botstart
+# ------------------------------------------------------
 
 @client.event
 async def on_ready():
-    global _ready_once
-    log.info(f"Logged in as {client.user} (id={client.user.id})")
-    if _ready_once:
-        return
-    _ready_once = True
-
-    # Commands registrieren
+    print(f"✅ Eingeloggt als {client.user}")
     try:
-        await setup_onboarding(client, tree)
-        await setup_rsvp_dm(client, tree)
+        await tree.sync()
+        print("✅ Slash-Commands synchronisiert.")
     except Exception as e:
-        log.exception("Fehler beim setup_*: %r", e)
+        print(f"⚠️ Slash-Command Sync Fehler: {e}")
+    cleanup_expired_events.start()
 
-    # Erstes Sync (global). Wenn du schneller testen willst, setze GUILD_ID.
-    try:
-        guild_id = os.getenv("GUILD_ID")
-        if guild_id:
-            gobj = discord.Object(id=int(guild_id))
-            await tree.sync(guild=gobj)
-            log.info("Slash-Commands GUILD-scope gesynct für %s", guild_id)
-        else:
-            await tree.sync()
-            log.info("Slash-Commands GLOBAL gesynct")
-    except Exception as e:
-        log.exception("Fehler beim tree.sync(): %r", e)
 
-# ---- Member Join: Onboarding-DM & Auto-Resend für Events --------------
+# ------------------------------------------------------
+# Member Join – schickt Onboarding + Event-DMs
+# ------------------------------------------------------
+
 @client.event
 async def on_member_join(member: discord.Member):
-    # Schicke die Onboarding-DM
     try:
         await send_onboarding_dm(member)
-    except Exception:
-        log.exception("send_onboarding_dm crashte")
-
-    # RSVP-DMs für noch relevante Events erneut senden
-    try:
         await auto_resend_for_new_member(member)
-    except Exception:
-        log.exception("auto_resend_for_new_member crashte")
-
-# ---- Nützliche Admin-/Debug-Commands ----------------------------------
-
-@tree.command(name="ping", description="Lebenszeichen des Bots (Debug).")
-async def ping_cmd(inter: discord.Interaction):
-    await inter.response.send_message("Pong 🏓", ephemeral=True)
-
-@tree.command(name="wf_admin_sync_hard", description="(Admin) Slash-Commands neu synchronisieren.")
-async def wf_admin_sync_hard(inter: discord.Interaction):
-    perms = getattr(inter.user, "guild_permissions", None)
-    if not perms or not (perms.administrator or perms.manage_guild):
-        await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True)
-        return
-    await inter.response.defer(ephemeral=True, thinking=True)
-    try:
-        # bevorzuge GUILD-Scoped Sync (sofort sichtbar)
-        await tree.sync(guild=discord.Object(id=inter.guild_id))
-        await inter.followup.send("✅ Slash-Commands (guild) neu gesynct.", ephemeral=True)
     except Exception as e:
-        log.exception("wf_admin_sync_hard Fehler: %r", e)
-        await inter.followup.send(f"❌ Sync-Fehler: `{e}`", ephemeral=True)
+        print(f"[on_member_join] Fehler: {e}")
 
-# ---- Globaler Fehlerhaken für app_commands ----------------------------
 
-@tree.error
-async def on_app_command_error(inter: discord.Interaction, error: app_commands.AppCommandError):
-    # Das hilft enorm, um „Die Anwendung reagiert nicht“ zu beseitigen.
-    log.exception("AppCmd Error bei %s: %r", getattr(inter.command, 'name', '?'), error)
+# ------------------------------------------------------
+# Hintergrund-Task: Löscht alte Events 2h nach Start
+# ------------------------------------------------------
+
+@tasks.loop(minutes=5)
+async def cleanup_expired_events():
     try:
-        if inter.response.is_done():
-            await inter.followup.send("❌ Unerwarteter Fehler. (Log checken)", ephemeral=True)
-        else:
-            await inter.response.send_message("❌ Unerwarteter Fehler. (Log checken)", ephemeral=True)
-    except Exception:
-        pass
+        now = datetime.now(timezone.utc)
+        remove_ids = []
+        for msg_id, obj in list(store.items()):
+            try:
+                when = datetime.fromisoformat(obj.get("when_iso"))
+                if now > when + timedelta(hours=2):
+                    guild = client.get_guild(int(obj["guild_id"]))
+                    if guild:
+                        ch = guild.get_channel(int(obj["channel_id"]))
+                        if ch:
+                            try:
+                                msg = await ch.fetch_message(int(msg_id))
+                                await msg.delete()
+                            except Exception:
+                                pass
+                    remove_ids.append(msg_id)
+            except Exception:
+                continue
+        # alte Events löschen
+        for mid in remove_ids:
+            store.pop(mid, None)
+        if remove_ids:
+            save_store()
+            print(f"🧹 Alte Events entfernt: {len(remove_ids)}")
+    except Exception as e:
+        print(f"[cleanup_expired_events] Fehler: {e}")
 
-# ---- Start -------------------------------------------------------------
 
-def main():
-    token = os.getenv("DISCORD_TOKEN")
-    if not token:
-        raise RuntimeError("DISCORD_TOKEN ist nicht gesetzt.")
-    client.run(token)
+# ------------------------------------------------------
+# Setup aller Slash Commands
+# ------------------------------------------------------
 
-if __name__ == "__main__":
-    main()
+async def setup_bot():
+    await setup_rsvp_dm(client, tree)
+    await setup_onboarding(client, tree)
+    print("✅ Setup abgeschlossen.")
+
+
+@client.event
+async def on_connect():
+    client.loop.create_task(setup_bot())
+
+
+# ------------------------------------------------------
+# Botstart
+# ------------------------------------------------------
+
+TOKEN = os.getenv("DISCORD_TOKEN")
+if not TOKEN:
+    print("❌ Kein Token gefunden! Bitte Umgebungsvariable DISCORD_TOKEN setzen.")
+else:
+    client.run(TOKEN)
