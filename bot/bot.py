@@ -1,4 +1,7 @@
 # /bot/bot.py
+# Schlanker Starter mit robusten Imports (Root- oder /bot-Start),
+# Auto-Cleanup, und Modul-Setup.
+
 from __future__ import annotations
 import os
 from datetime import datetime, timedelta
@@ -7,10 +10,23 @@ from typing import List
 import discord
 from discord.ext import commands, tasks
 
-# Lokale Module (ohne Paketpräfix!)
-from event_rsvp_dm import setup_rsvp_dm, store, TZ  # store & TZ wiederverwenden
-from onboarding import setup_onboarding
-from join_hook import register_join_hook
+# --- Robuste Imports (funktioniert bei Start aus Repo-Root ODER /bot) ---
+try:
+    from bot.event_rsvp_dm import setup_rsvp_dm  # type: ignore
+except ModuleNotFoundError:
+    from event_rsvp_dm import setup_rsvp_dm  # type: ignore
+
+try:
+    from bot.onboarding import setup_onboarding  # type: ignore
+except ModuleNotFoundError:
+    from onboarding import setup_onboarding  # type: ignore
+
+try:
+    from bot.join_hook import register_join_hook  # type: ignore
+except ModuleNotFoundError:
+    from join_hook import register_join_hook  # type: ignore
+
+# Für Cleanup importieren wir store/TZ/save_store erst im Task (lazy), damit der Import hier nicht scheitert.
 
 INTENTS = discord.Intents.all()
 bot = commands.Bot(command_prefix="!", intents=INTENTS)
@@ -21,12 +37,14 @@ tree = bot.tree
 async def on_ready():
     print(f"✅ Eingeloggt als {bot.user} (ID: {bot.user.id})")
 
+    # Slash-Commands syncen
     try:
         synced = await tree.sync()
         print(f"✅ Slash-Commands synchronisiert: {len(synced)}")
     except Exception as e:
         print(f"⚠️ Slash-Command Sync Fehler: {e}")
 
+    # Module initialisieren
     try:
         await setup_rsvp_dm(bot, tree)
         await setup_onboarding(bot, tree)
@@ -34,12 +52,14 @@ async def on_ready():
     except Exception as e:
         print(f"⚠️ Modul-Setup Fehler: {e}")
 
+    # Join-Hook registrieren (ein einziger on_member_join)
     try:
         register_join_hook(bot)
         print("✅ Join-Hook registriert.")
     except Exception as e:
         print(f"⚠️ Join-Hook Fehler: {e}")
 
+    # Cleanup starten
     if not cleanup_expired_events.is_running():
         cleanup_expired_events.start()
         print("🧹 Cleanup-Task gestartet.")
@@ -47,7 +67,16 @@ async def on_ready():
 
 @tasks.loop(minutes=5)
 async def cleanup_expired_events():
+    """
+    Entfernt Server-Posts & Store-Objekte > 2h nach Eventstart.
+    Lazy-Imports, damit Start unabhängig vom Importpfad klappt.
+    """
     try:
+        try:
+            from bot.event_rsvp_dm import store, save_store, TZ  # type: ignore
+        except ModuleNotFoundError:
+            from event_rsvp_dm import store, save_store, TZ  # type: ignore
+
         now = datetime.now(TZ)
         to_remove: List[str] = []
 
@@ -61,6 +90,7 @@ async def cleanup_expired_events():
             if now <= when + timedelta(hours=2):
                 continue
 
+            # Nachricht löschen
             try:
                 guild = bot.get_guild(int(obj["guild_id"]))
                 if guild:
@@ -75,7 +105,6 @@ async def cleanup_expired_events():
                 to_remove.append(msg_id)
 
         if to_remove:
-            from event_rsvp_dm import save_store  # lazy import
             for mid in to_remove:
                 store.pop(mid, None)
             save_store()
