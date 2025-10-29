@@ -1,7 +1,5 @@
 # /bot/onboarding.py
-# Automatische Willkommens-DM mit Rollenwahl und Weiterleitung (Staff-Review)
-# Discord.py 2.4.x
-
+# Onboarding-DM mit Rollenwahl & Staff-Review
 from __future__ import annotations
 import json
 from pathlib import Path
@@ -11,14 +9,10 @@ from discord import app_commands
 from discord.ui import View, button
 from discord.enums import ButtonStyle
 
-DATA_DIR = Path("bot/data")
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 CFG_FILE = DATA_DIR / "onboarding_cfg.json"
-
-# cfg[guild_id] = {
-#   "accept_ch": int,     # Kanal, in dem Anfragen landen (Gildenleitung)
-#   "newbie_role": int    # Unter-Rolle für Unerfahrene (NEWBIE)
-# }
 
 def _load_cfg() -> dict:
     try:
@@ -30,10 +24,6 @@ def _save_cfg(obj: dict) -> None:
     CFG_FILE.write_text(json.dumps(obj, indent=2, ensure_ascii=False), encoding="utf-8")
 
 cfg: dict = _load_cfg()
-
-# -----------------------------------------------------------
-# Admin-Helfer
-# -----------------------------------------------------------
 
 def _is_admin(inter: discord.Interaction) -> bool:
     p = getattr(inter.user, "guild_permissions", None)
@@ -51,12 +41,7 @@ def _get_newbie_role(guild: discord.Guild) -> discord.Role | None:
     r = guild.get_role(rid)
     return r if isinstance(r, discord.Role) else None
 
-# -----------------------------------------------------------
-# Views (laufen ausschließlich in DM / im Staff-Kanal)
-# -----------------------------------------------------------
-
 class RoleSelectView(View):
-    """DM-View: erster Schritt → Kategorie wählen."""
     def __init__(self, guild: discord.Guild):
         super().__init__(timeout=None)
         self.guild = guild
@@ -69,7 +54,6 @@ class RoleSelectView(View):
             except Exception:
                 pass
             return
-
         desc = (
             f"**Onboarding-Review:** {member.mention}\n"
             f"**Kategorie:** {category}\n"
@@ -99,9 +83,7 @@ class RoleSelectView(View):
         )
         await self._send_to_staff(inter.user, "Freund", "N/A")
 
-
 class ExperienceView(View):
-    """DM-View: zweiter Schritt → Erfahrung wählen; NEWBIE-Rolle optional vergeben."""
     def __init__(self, guild: discord.Guild, category: str):
         super().__init__(timeout=None)
         self.guild = guild
@@ -115,7 +97,6 @@ class ExperienceView(View):
                     await inter.user.add_roles(nb, reason="Onboarding: Unerfahren")
                 except Exception:
                     pass
-
         ch = _get_accept_channel(self.guild)
         if ch:
             await ch.send(
@@ -137,9 +118,7 @@ class ExperienceView(View):
     async def btn_new(self, inter: discord.Interaction, _):
         await self._finish(inter, "Unerfahren")
 
-
 class AcceptView(View):
-    """Staff-Kanal: Anfrage annehmen/ablehnen. Rollenzuweisung nach Kategorie."""
     def __init__(self, user_id: int, category: str, experience: str):
         super().__init__(timeout=None)
         self.user_id = user_id
@@ -189,10 +168,6 @@ class AcceptView(View):
                 pass
         await inter.response.send_message("Abgelehnt.", ephemeral=True)
 
-# -----------------------------------------------------------
-# DM an neue Mitglieder (vom Join-Hook aufgerufen)
-# -----------------------------------------------------------
-
 async def send_onboarding_dm(member: discord.Member) -> None:
     try:
         if member.bot:
@@ -203,19 +178,9 @@ async def send_onboarding_dm(member: discord.Member) -> None:
         )
         await member.send(text, view=RoleSelectView(member.guild))
     except Exception:
-        # DMs evtl. geschlossen – stillschweigend ignorieren
         pass
 
-# -----------------------------------------------------------
-# Slash-Commands registrieren
-# -----------------------------------------------------------
-
 async def setup_onboarding(client: discord.Client, tree: app_commands.CommandTree) -> None:
-    """
-    /onboarding_set_channel  – Kanal für Gildenleitung setzen (Anfragen landen dort)
-    /onboarding_set_newbie   – Unterrolle für 'Unerfahren' (NEWBIE) setzen
-    /onboarding_test         – Test-DM an dich selbst schicken (zum Ausprobieren)
-    """
     @tree.command(name="onboarding_set_channel", description="(Admin) Zielkanal für Onboarding-Anfragen setzen")
     async def onboarding_set_channel(inter: discord.Interaction, channel: discord.TextChannel):
         if not _is_admin(inter):
@@ -239,10 +204,7 @@ async def setup_onboarding(client: discord.Client, tree: app_commands.CommandTre
         if not _is_admin(inter):
             await inter.response.send_message("Nur Admins.", ephemeral=True); return
         try:
-            await inter.user.send(
-                "Test: Onboarding-DM",
-                view=RoleSelectView(inter.guild)
-            )
+            await inter.user.send("Test: Onboarding-DM", view=RoleSelectView(inter.guild))
             await inter.response.send_message("✉️ DM gesendet (prüfe Postfach).", ephemeral=True)
         except Exception:
             await inter.response.send_message("Konnte keine DM senden (ggf. DMs geschlossen).", ephemeral=True)
