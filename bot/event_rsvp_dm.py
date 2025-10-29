@@ -1,7 +1,6 @@
 # /bot/event_rsvp_dm.py
-# RSVP per DM: User klicken in der DM (Tank/Heal/DPS/Vielleicht/Abmelden),
-# die Übersicht (Embed) bleibt im Server-Channel und wird live aktualisiert.
-# Discord.py 2.4.x
+# RSVP per DM: Buttons in der DM aktualisieren die Server-Übersicht.
+# Robuste Datenpfade relativ zu dieser Datei.
 
 from __future__ import annotations
 import json
@@ -17,11 +16,14 @@ from datetime import datetime, timedelta
 import asyncio
 
 TZ = ZoneInfo("Europe/Berlin")
-DATA_DIR = Path("bot/data")  # unter /bot/data ablegen
+
+# Pfade relativ zu dieser Datei, unabhängig vom Working-Dir
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-RSVP_FILE     = DATA_DIR / "event_rsvp.json"      # Events + Anmeldungen (Übersicht im Server)
-DM_CFG_FILE   = DATA_DIR / "event_rsvp_cfg.json"  # Rollen-IDs (Tank/Heal/DPS) + Log-Channel
+RSVP_FILE   = DATA_DIR / "event_rsvp.json"      # Events + Anmeldungen
+DM_CFG_FILE = DATA_DIR / "event_rsvp_cfg.json"  # Rollen-IDs + Log-Channel
 # cfg[str(guild_id)] = {"TANK": role_id, "HEAL": role_id, "DPS": role_id, "LOG_CH": channel_id}
 
 def _load(p: Path, default):
@@ -72,7 +74,6 @@ def _init_event_shape(obj: dict):
         obj["maybe"] = {}
     if "no" not in obj or not isinstance(obj["no"], list):
         obj["no"] = []
-    # Zielrolle-Feld immer vorhanden halten (0 = keine Einschränkung)
     obj.setdefault("target_role_id", 0)
 
 def get_role_ids_for_guild(guild_id: int) -> Dict[str, int]:
@@ -262,10 +263,9 @@ def _is_admin(inter: discord.Interaction) -> bool:
 async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
     """
     Registriert:
-    - /raid_set_roles_dm     – Tank/Heal/DPS für Maybe-Label
-    - /raid_set_log_channel  – optionaler Log-Kanal für Fehler
-    - /raid_create_dm        – Erstellt Raid (Server-Übersicht) & verschickt DMs mit Buttons
-                               (optional: target_role & image_url)
+    - /raid_set_roles_dm
+    - /raid_set_log_channel
+    - /raid_create_dm
     Außerdem: Persistente DM-Views nach Neustart.
     """
     # Persistente DM-Views nach Neustart
@@ -373,8 +373,7 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
                            f"Wähle unten deine Teilnahme.")
                 await m.send(dm_text, view=RaidView(int(msg.id)))
                 sent += 1
-                # Optionale kleine Pause zur Schonung von Rate Limits:
-                await asyncio.sleep(0.05)
+                await asyncio.sleep(0.05)  # Rate-Limit-Schonung
             except Exception:
                 pass
 
@@ -389,14 +388,6 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
 # ------------------------------------------------------------
 
 async def auto_resend_for_new_member(member: discord.Member) -> None:
-    """
-    Bei on_member_join(member) aufrufen.
-    Schickt dem neuen Member die RSVP-DM für alle noch relevanten Events seiner Guild:
-      - Event gehört zur gleichen Guild
-      - Startzeit nicht länger als 2h her (Start <= now <= Start+2h)
-      - oder Start liegt noch in der Zukunft
-      - UND (falls gesetzt) Member besitzt die Zielrolle
-    """
     try:
         if member.bot:
             return
@@ -412,7 +403,6 @@ async def auto_resend_for_new_member(member: discord.Member) -> None:
                 if now > when + timedelta(hours=2):
                     continue
 
-                # Zielrolle prüfen
                 tr_id = int(obj.get("target_role_id", 0) or 0)
                 if tr_id:
                     r = member.guild.get_role(tr_id)
