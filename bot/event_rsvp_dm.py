@@ -285,6 +285,7 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
         title="Titel",
         date="Datum YYYY-MM-DD",
         time="Zeit HH:MM (24h)",
+        description="Kurzbeschreibung (optional)",
         channel="Server-Channel für die Übersicht",
         target_role="(Optional) Nur an diese Rolle DMs versenden",
         image_url="Optionales Bild fürs Embed"
@@ -294,6 +295,7 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
         title: str,
         date: str,
         time: str,
+        description: Optional[str] = None,
         channel: Optional[discord.TextChannel] = None,
         target_role: Optional[discord.Role] = None,
         image_url: Optional[str] = None
@@ -316,7 +318,7 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
             "guild_id": inter.guild_id,
             "channel_id": ch.id,
             "title": title.strip(),
-            "description": "",
+            "description": (description or "").strip(),
             "when_iso": when.isoformat(),
             "image_url": (image_url or "").strip() or None,
             "yes": {"TANK": [], "HEAL": [], "DPS": []},
