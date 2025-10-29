@@ -1,7 +1,4 @@
 # /bot/bot.py
-# Schlanker Starter mit robusten Imports (Root- oder /bot-Start),
-# Auto-Cleanup, und Modul-Setup.
-
 from __future__ import annotations
 import os
 from datetime import datetime, timedelta
@@ -9,8 +6,9 @@ from typing import List
 
 import discord
 from discord.ext import commands, tasks
+from discord import app_commands
 
-# --- Robuste Imports (funktioniert bei Start aus Repo-Root ODER /bot) ---
+# --- Robuste Imports (Root- oder /bot-Start) ---
 try:
     from bot.event_rsvp_dm import setup_rsvp_dm  # type: ignore
 except ModuleNotFoundError:
@@ -26,7 +24,6 @@ try:
 except ModuleNotFoundError:
     from join_hook import register_join_hook  # type: ignore
 
-# Für Cleanup importieren wir store/TZ/save_store erst im Task (lazy), damit der Import hier nicht scheitert.
 
 INTENTS = discord.Intents.all()
 bot = commands.Bot(command_prefix="!", intents=INTENTS)
@@ -37,14 +34,7 @@ tree = bot.tree
 async def on_ready():
     print(f"✅ Eingeloggt als {bot.user} (ID: {bot.user.id})")
 
-    # Slash-Commands syncen
-    try:
-        synced = await tree.sync()
-        print(f"✅ Slash-Commands synchronisiert: {len(synced)}")
-    except Exception as e:
-        print(f"⚠️ Slash-Command Sync Fehler: {e}")
-
-    # Module initialisieren
+    # 1) ZUERST Module registrieren (damit die Commands existieren) ...
     try:
         await setup_rsvp_dm(bot, tree)
         await setup_onboarding(bot, tree)
@@ -52,25 +42,42 @@ async def on_ready():
     except Exception as e:
         print(f"⚠️ Modul-Setup Fehler: {e}")
 
-    # Join-Hook registrieren (ein einziger on_member_join)
+    # 2) ... DANN syncen
+    try:
+        synced = await tree.sync()
+        print(f"✅ Slash-Commands synchronisiert: {len(synced)}")
+    except Exception as e:
+        print(f"⚠️ Slash-Command Sync Fehler: {e}")
+
+    # Join-Hook (genau ein on_member_join)
     try:
         register_join_hook(bot)
         print("✅ Join-Hook registriert.")
     except Exception as e:
         print(f"⚠️ Join-Hook Fehler: {e}")
 
-    # Cleanup starten
     if not cleanup_expired_events.is_running():
         cleanup_expired_events.start()
         print("🧹 Cleanup-Task gestartet.")
 
 
+# Globaler Fehler-Logger für App-Commands
+@tree.error
+async def on_app_command_error(inter: discord.Interaction, error: app_commands.AppCommandError):
+    try:
+        # versuche, sauber zu antworten (falls noch nicht geantwortet)
+        if not inter.response.is_done():
+            await inter.response.send_message(f"❌ Command-Fehler: {error}", ephemeral=True)
+        else:
+            await inter.followup.send(f"❌ Command-Fehler: {error}", ephemeral=True)
+    except Exception:
+        pass
+    print(f"[AppCmdError] {getattr(inter.command, 'name', '?')}: {error!r}")
+
+
 @tasks.loop(minutes=5)
 async def cleanup_expired_events():
-    """
-    Entfernt Server-Posts & Store-Objekte > 2h nach Eventstart.
-    Lazy-Imports, damit Start unabhängig vom Importpfad klappt.
-    """
+    """Entfernt Server-Posts & Store-Objekte > 2h nach Eventstart (lazy imports)."""
     try:
         try:
             from bot.event_rsvp_dm import store, save_store, TZ  # type: ignore
@@ -90,7 +97,6 @@ async def cleanup_expired_events():
             if now <= when + timedelta(hours=2):
                 continue
 
-            # Nachricht löschen
             try:
                 guild = bot.get_guild(int(obj["guild_id"]))
                 if guild:
