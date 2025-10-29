@@ -1,7 +1,6 @@
-# bot/onboarding_dm.py
-# -----------------------------------------------------------
-# Automatische Willkommens-DM mit Rollenwahl und Weiterleitung
-# -----------------------------------------------------------
+# /bot/onboarding.py
+# Automatische Willkommens-DM mit Rollenwahl und Weiterleitung (Staff-Review)
+# Discord.py 2.4.x
 
 from __future__ import annotations
 import json
@@ -12,8 +11,8 @@ from discord import app_commands
 from discord.ui import View, button
 from discord.enums import ButtonStyle
 
-DATA_DIR = Path("data")
-DATA_DIR.mkdir(exist_ok=True)
+DATA_DIR = Path("bot/data")
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 CFG_FILE = DATA_DIR / "onboarding_cfg.json"
 
 # cfg[guild_id] = {
@@ -65,14 +64,12 @@ class RoleSelectView(View):
     async def _send_to_staff(self, member: discord.Member, category: str, experience: str) -> None:
         ch = _get_accept_channel(member.guild)
         if not ch:
-            # Kein Zielkanal gesetzt – schicke dem User einen Hinweis.
             try:
                 await member.send("⚠️ Aktuell kann deine Anfrage nicht geprüft werden (kein Prüfkanal gesetzt).")
             except Exception:
                 pass
             return
 
-        # Kleine Zusammenfassung + Admin-Buttons:
         desc = (
             f"**Onboarding-Review:** {member.mention}\n"
             f"**Kategorie:** {category}\n"
@@ -96,7 +93,6 @@ class RoleSelectView(View):
 
     @button(label="🫱 Freund", style=ButtonStyle.success)
     async def btn_friend(self, inter: discord.Interaction, _):
-        # Freunde: keine Erfahrung abfragen – direkt an Staff schicken
         await inter.response.edit_message(
             content="Du hast **Freund** gewählt. Deine Anfrage wurde an die Gildenleitung gesendet.",
             view=None
@@ -112,7 +108,6 @@ class ExperienceView(View):
         self.category = category
 
     async def _finish(self, inter: discord.Interaction, experience: str) -> None:
-        # NEWBIE-Rolle bei 'Unerfahren' (falls konfiguriert)
         if experience == "Unerfahren":
             nb = _get_newbie_role(self.guild)
             if nb:
@@ -121,7 +116,6 @@ class ExperienceView(View):
                 except Exception:
                     pass
 
-        # Zur Prüfung an Gildenleitung
         ch = _get_accept_channel(self.guild)
         if ch:
             await ch.send(
@@ -153,7 +147,6 @@ class AcceptView(View):
         self.experience = experience
 
     def _target_role(self, guild: discord.Guild) -> discord.Role | None:
-        # Kategorie-Name entspricht der Server-Rolle (z.B. 'Gildenmitglied', 'Allianzmitglied', 'Freund')
         return discord.utils.get(guild.roles, name=self.category)
 
     async def _get_member(self, guild: discord.Guild) -> discord.Member | None:
@@ -172,25 +165,22 @@ class AcceptView(View):
         member = await self._get_member(inter.guild)
         if not member:
             await inter.response.send_message("Mitglied nicht gefunden.", ephemeral=True); return
-
         role = self._target_role(inter.guild)
         if role:
             try:
                 await member.add_roles(role, reason="Onboarding akzeptiert")
             except Exception:
                 pass
-
         try:
             await member.send(f"🎉 Willkommen! Du wurdest als **{self.category}** akzeptiert.")
         except Exception:
             pass
-
         await inter.response.send_message(f"✅ {member.mention} akzeptiert.", ephemeral=True)
 
     @button(label="❌ Ablehnen", style=ButtonStyle.danger)
     async def btn_deny(self, inter: discord.Interaction, _):
         if not _is_admin(inter):
-            await inter.response.send_message("Nur Admins können das.", ephemeral=True); return
+            await inter.response.send_message("Nur Admins.", ephemeral=True); return
         member = await self._get_member(inter.guild)
         if member:
             try:
@@ -200,11 +190,10 @@ class AcceptView(View):
         await inter.response.send_message("Abgelehnt.", ephemeral=True)
 
 # -----------------------------------------------------------
-# DM an neue Mitglieder
+# DM an neue Mitglieder (vom Join-Hook aufgerufen)
 # -----------------------------------------------------------
 
 async def send_onboarding_dm(member: discord.Member) -> None:
-    """Wird von on_member_join aufgerufen. Schickt die erste DM."""
     try:
         if member.bot:
             return
@@ -227,7 +216,6 @@ async def setup_onboarding(client: discord.Client, tree: app_commands.CommandTre
     /onboarding_set_newbie   – Unterrolle für 'Unerfahren' (NEWBIE) setzen
     /onboarding_test         – Test-DM an dich selbst schicken (zum Ausprobieren)
     """
-
     @tree.command(name="onboarding_set_channel", description="(Admin) Zielkanal für Onboarding-Anfragen setzen")
     async def onboarding_set_channel(inter: discord.Interaction, channel: discord.TextChannel):
         if not _is_admin(inter):
