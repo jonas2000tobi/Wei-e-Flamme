@@ -21,24 +21,41 @@ tree = bot.tree
 
 # -------- Robuste Imports (Root- oder /bot-Start) ----------
 def _import_modules():
+    # RSVP-DM
     global setup_rsvp_dm, auto_resend_for_new_member
     try:
         from bot.event_rsvp_dm import setup_rsvp_dm, auto_resend_for_new_member  # type: ignore
+        print("✅ Import: bot.event_rsvp_dm")
     except ModuleNotFoundError:
         from event_rsvp_dm import setup_rsvp_dm, auto_resend_for_new_member      # type: ignore
+        print("✅ Import: event_rsvp_dm (root)")
 
-    # Onboarding und Join-Hook bleiben deine Originaldateien:
+    # Onboarding (richtiger Dateiname: onboarding_dm.py)
     global setup_onboarding, send_onboarding_dm
     try:
-        from bot.onboarding import setup_onboarding, send_onboarding_dm  # type: ignore
+        from bot.onboarding_dm import setup_onboarding, send_onboarding_dm  # type: ignore
+        print("✅ Import: bot.onboarding_dm")
     except ModuleNotFoundError:
-        from onboarding import setup_onboarding, send_onboarding_dm      # type: ignore
+        try:
+            from onboarding_dm import setup_onboarding, send_onboarding_dm  # type: ignore
+            print("✅ Import: onboarding_dm (root)")
+        except ModuleNotFoundError:
+            # Fallback, falls jemand die Datei onboarding.py genannt hat
+            try:
+                from bot.onboarding import setup_onboarding, send_onboarding_dm  # type: ignore
+                print("⚠️ Fallback-Import: bot.onboarding")
+            except ModuleNotFoundError:
+                from onboarding import setup_onboarding, send_onboarding_dm      # type: ignore
+                print("⚠️ Fallback-Import: onboarding (root)")
 
+    # Join-Hook
     global register_join_hook
     try:
         from bot.join_hook import register_join_hook  # type: ignore
+        print("✅ Import: bot.join_hook")
     except ModuleNotFoundError:
         from join_hook import register_join_hook      # type: ignore
+        print("✅ Import: join_hook (root)")
 
 
 # -------- Token ----------
@@ -60,7 +77,7 @@ async def on_ready():
     try:
         _import_modules()
         await setup_rsvp_dm(bot, tree)          # RSVP/DM Commands
-        await setup_onboarding(bot, tree)       # deine Onboarding-Slash-Commands
+        await setup_onboarding(bot, tree)       # Onboarding-Slash-Commands
         register_join_hook(bot, send_onboarding_dm, auto_resend_for_new_member)
         print("✅ Module geladen (RSVP-DM, Onboarding, Join-Hook).")
     except Exception as e:
