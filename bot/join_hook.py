@@ -1,8 +1,5 @@
 # bot/join_hook.py
-# Robust: Onboarding-DM auch bei Discord-"Review erforderlich" (pending=True).
-# Schickt DM sowohl beim Join als auch NACH dem Regeln-Akzeptieren (pending->False),
-# verhindert doppelte DMs mit einer kleinen Persistenz.
-
+# Onboarding-DM robust + erneutes Onboarding bei Rejoin.
 from __future__ import annotations
 import json
 from pathlib import Path
@@ -27,7 +24,6 @@ def _save_state(obj: dict) -> None:
 
 _sent_cache = _load_state()  # guild_id -> list[str user_id]
 
-
 def _already_sent(gid: int, uid: int) -> bool:
     arr = set(_sent_cache.get(str(gid), []))
     return str(uid) in arr
@@ -38,6 +34,12 @@ def _mark_sent(gid: int, uid: int) -> None:
     _sent_cache[str(gid)] = sorted(arr)
     _save_state(_sent_cache)
 
+def _clear_sent(gid: int, uid: int) -> None:
+    arr: Set[str] = set(_sent_cache.get(str(gid), []))
+    if str(uid) in arr:
+        arr.remove(str(uid))
+        _sent_cache[str(gid)] = sorted(arr)
+        _save_state(_sent_cache)
 
 async def _try_send_onboarding(
     member: discord.Member,
@@ -45,7 +47,6 @@ async def _try_send_onboarding(
     auto_resend_for_new_member: Callable[[discord.Member], Awaitable[None]],
     reason: str
 ) -> None:
-    """Schickt Onboarding-DM + Event-Resend, wenn noch nicht gesendet."""
     try:
         if member.bot:
             return
@@ -58,18 +59,18 @@ async def _try_send_onboarding(
             _mark_sent(member.guild.id, member.id)
             print(f"[join_hook] Onboarding-DM an {member} ({reason}) gesendet.")
         except Exception as e:
-            # DM kann an Privacy scheitern – stillschweigend ignorieren.
+            # DM kann an Privacy scheitern – trotzdem markieren wir NICHT als sent
+            # damit Admins notfalls manuell /onboarding_reset_user nicht brauchen.
             print(f"[join_hook] Onboarding-DM an {member} fehlgeschlagen: {e}")
 
-        # 2) Laufende Raid-Events an neue Member (falls vorhanden)
+        # 2) Laufende Raid-Events an neue Member
         try:
             await auto_resend_for_new_member(member)
         except Exception as e:
-            print(f"[join_hook] Auto-Resend-Events an {member} fehlgeschlagen: {e}")
+            print(f"[join_hook] Auto-Resend an {member} fehlgeschlagen: {e}")
 
     except Exception as e:
         print(f"[join_hook] _try_send_onboarding Fehler: {e}")
-
 
 def register_join_hook(
     client: discord.Client,
@@ -77,24 +78,30 @@ def register_join_hook(
     auto_resend_for_new_member: Callable[[discord.Member], Awaitable[None]],
 ) -> None:
     """
-    Registriert zwei Listener:
-      - on_member_join: sofort versuchen zu DM'en
-      - on_member_update: falls Discord Screening aktiv ist, erst NACH pending->False DM schicken
+    Listener:
+      - on_member_join: sofort versuchen
+      - on_member_update: falls Screening aktiv (pending True->False)
+      - on_member_remove: Merker löschen, damit Rejoin wieder Onboarding bekommt
     """
-    # Sofort bei Join probieren (funktioniert oft auch mit pending=True)
     @client.event
     async def on_member_join(member: discord.Member):
         await _try_send_onboarding(member, send_onboarding_dm, auto_resend_for_new_member, reason="join")
 
-    # Wenn Screening aktiv ist: pending geht von True -> False, DANN nochmal sicher DM versuchen
     @client.event
     async def on_member_update(before: discord.Member, after: discord.Member):
         try:
-            # Nur reagieren, wenn es tatsächlich die gleiche Person und Guild ist
             if before.guild.id != after.guild.id:
                 return
-            # Nur wenn pending von True auf False wechselt (Regeln akzeptiert / Review abgeschlossen)
             if getattr(before, "pending", False) and not getattr(after, "pending", False):
                 await _try_send_onboarding(after, send_onboarding_dm, auto_resend_for_new_member, reason="pending->False")
         except Exception as e:
             print(f"[join_hook] on_member_update Fehler: {e}")
+
+    @client.event
+    async def on_member_remove(member: discord.Member):
+        # Rejoin = wieder wie neu behandeln
+        try:
+            _clear_sent(member.guild.id, member.id)
+            print(f"[join_hook] Merker für {member} entfernt (Leave/Rejoin).")
+        except Exception as e:
+            print(f"[join_hook] on_member_remove Fehler: {e}")
