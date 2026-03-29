@@ -1,4 +1,3 @@
-# bot/bot.py
 from __future__ import annotations
 import os
 from datetime import datetime, timedelta
@@ -22,15 +21,23 @@ tree = bot.tree
 # -------- Robuste Imports (Root- oder /bot-Start) ----------
 def _import_modules():
     # RSVP-DM
-    global setup_rsvp_dm, auto_resend_for_new_member
+    global setup_rsvp_dm, auto_resend_for_new_member, auto_ping_due_events
     try:
-        from bot.event_rsvp_dm import setup_rsvp_dm, auto_resend_for_new_member  # type: ignore
+        from bot.event_rsvp_dm import (
+            setup_rsvp_dm,
+            auto_resend_for_new_member,
+            auto_ping_due_events,
+        )  # type: ignore
         print("✅ Import: bot.event_rsvp_dm")
     except ModuleNotFoundError:
-        from event_rsvp_dm import setup_rsvp_dm, auto_resend_for_new_member      # type: ignore
+        from event_rsvp_dm import (
+            setup_rsvp_dm,
+            auto_resend_for_new_member,
+            auto_ping_due_events,
+        )  # type: ignore
         print("✅ Import: event_rsvp_dm (root)")
 
-    # Onboarding (richtiger Dateiname: onboarding_dm.py)
+    # Onboarding
     global setup_onboarding, send_onboarding_dm
     try:
         from bot.onboarding_dm import setup_onboarding, send_onboarding_dm  # type: ignore
@@ -40,12 +47,11 @@ def _import_modules():
             from onboarding_dm import setup_onboarding, send_onboarding_dm  # type: ignore
             print("✅ Import: onboarding_dm (root)")
         except ModuleNotFoundError:
-            # Fallback, falls jemand die Datei onboarding.py genannt hat
             try:
                 from bot.onboarding import setup_onboarding, send_onboarding_dm  # type: ignore
                 print("⚠️ Fallback-Import: bot.onboarding")
             except ModuleNotFoundError:
-                from onboarding import setup_onboarding, send_onboarding_dm      # type: ignore
+                from onboarding import setup_onboarding, send_onboarding_dm  # type: ignore
                 print("⚠️ Fallback-Import: onboarding (root)")
 
     # Join-Hook
@@ -54,7 +60,7 @@ def _import_modules():
         from bot.join_hook import register_join_hook  # type: ignore
         print("✅ Import: bot.join_hook")
     except ModuleNotFoundError:
-        from join_hook import register_join_hook      # type: ignore
+        from join_hook import register_join_hook  # type: ignore
         print("✅ Import: join_hook (root)")
 
 
@@ -76,8 +82,8 @@ async def on_ready():
 
     try:
         _import_modules()
-        await setup_rsvp_dm(bot, tree)          # RSVP/DM Commands
-        await setup_onboarding(bot, tree)       # Onboarding-Slash-Commands
+        await setup_rsvp_dm(bot, tree)
+        await setup_onboarding(bot, tree)
         register_join_hook(bot, send_onboarding_dm, auto_resend_for_new_member)
         print("✅ Module geladen (RSVP-DM, Onboarding, Join-Hook).")
     except Exception as e:
@@ -94,6 +100,11 @@ async def on_ready():
     if not cleanup_expired_events.is_running():
         cleanup_expired_events.start()
         print("🧹 Cleanup-Task gestartet.")
+
+    # Auto-Ping-Task starten
+    if not auto_ping_events_loop.is_running():
+        auto_ping_events_loop.start()
+        print("📣 Auto-Ping-Task gestartet.")
 
 
 # -------- AppCommand-Fehler global ----------
@@ -116,7 +127,7 @@ async def cleanup_expired_events():
         try:
             from bot.event_rsvp_dm import store, save_store, TZ  # type: ignore
         except ModuleNotFoundError:
-            from event_rsvp_dm import store, save_store, TZ      # type: ignore
+            from event_rsvp_dm import store, save_store, TZ  # type: ignore
 
         now = datetime.now(TZ)
         remove: List[str] = []
@@ -148,6 +159,15 @@ async def cleanup_expired_events():
             print(f"🧹 Alte Events entfernt: {len(remove)}")
     except Exception as e:
         print(f"[cleanup_expired_events] Fehler: {e}")
+
+
+# -------- Auto-Pings für fehlende Rollen ----------
+@tasks.loop(minutes=1)
+async def auto_ping_events_loop():
+    try:
+        await auto_ping_due_events(bot)
+    except Exception as e:
+        print(f"[auto_ping_events_loop] Fehler: {e}")
 
 
 # -------- Minimaler Test ----------
