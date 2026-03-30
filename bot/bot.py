@@ -199,7 +199,10 @@ async def raid_dm(inter: discord.Interaction, mode: str):
 
     if m == "off":
         set_dm_pref(inter.guild_id, inter.user.id, False)
-        await inter.response.send_message("✅ Raid-/Event-DMs deaktiviert.", ephemeral=True)
+        await inter.response.send_message(
+            "✅ Raid-/Event-DMs deaktiviert. Du kannst trotzdem direkt unter der Raid-Ankündigung per Button abstimmen.",
+            ephemeral=True
+        )
         return
 
     if m == "status":
