@@ -25,10 +25,6 @@ prefs: Dict[str, Dict[str, bool]] = _load()
 
 
 def is_dm_enabled(guild_id: int, user_id: int) -> bool:
-    """
-    Standard = True
-    Nur wenn explizit deaktiviert wurde, ist es False.
-    """
     guild_prefs = prefs.get(str(guild_id), {})
     return bool(guild_prefs.get(str(user_id), True))
 
