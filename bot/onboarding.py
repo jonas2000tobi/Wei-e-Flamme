@@ -1,4 +1,3 @@
-# bot/onboarding.py
 from __future__ import annotations
 import json
 from pathlib import Path
@@ -15,8 +14,8 @@ CFG_FILE = DATA_DIR / "onboarding_cfg.json"
 
 # cfg[guild_id] = {
 #   "enabled": bool,
-#   "review_channel": int,               # Kanal-ID für Review/Logs
-#   "require_review": bool,              # ob Staff bestätigen muss
+#   "review_channel": int,
+#   "require_review": bool,
 #   "category_roles": {"guild": int, "ally": int, "friend": int},
 #   "primary_roles":  {"TANK": int, "HEAL": int, "DPS": int},
 #   "experience_roles": {"experienced": int, "newbie": int}
@@ -41,7 +40,6 @@ def _is_admin(inter: discord.Interaction) -> bool:
 
 def _gcfg(guild: discord.Guild) -> dict:
     c = cfg.get(str(guild.id)) or {}
-    # Defaults
     c.setdefault("enabled", True)
     c.setdefault("review_channel", 0)
     c.setdefault("require_review", False)
@@ -62,15 +60,18 @@ async def _assign_roles(member: discord.Member, category_key: str, primary_key: 
     # Kategorie
     cat_map = (c.get("category_roles") or {})
     cat_rid = {"guild": cat_map.get("guild"), "ally": cat_map.get("ally"), "friend": cat_map.get("friend")}.get(category_key)
-    r = _role(g, cat_rid);  out += [r] if r else []
+    r = _role(g, cat_rid)
+    out += [r] if r else []
 
     # Primärrolle
     prim_map = (c.get("primary_roles") or {})
-    r = _role(g, prim_map.get(primary_key.upper()));  out += [r] if r else []
+    r = _role(g, prim_map.get(primary_key.upper()))
+    out += [r] if r else []
 
     # Erfahrungsrolle
     exp_map = (c.get("experience_roles") or {})
-    r = _role(g, exp_map.get("experienced" if experienced else "newbie"));  out += [r] if r else []
+    r = _role(g, exp_map.get("experienced" if experienced else "newbie"))
+    out += [r] if r else []
 
     granted = []
     for role in out:
@@ -80,7 +81,6 @@ async def _assign_roles(member: discord.Member, category_key: str, primary_key: 
             if role:
                 granted.append(role)
         except Exception:
-            # fehlende Berechtigungen/Hierarchie – ignorieren
             pass
     return granted
 
@@ -89,7 +89,7 @@ def _review_channel(guild: discord.Guild) -> Optional[discord.abc.Messageable]:
     ch = guild.get_channel(ch_id)
     return ch if isinstance(ch, (discord.TextChannel, discord.Thread)) else None
 
-# ----------------- DM Flow (3 Schritte) -----------------
+# ----------------- DM Flow -----------------
 
 class StepContext:
     def __init__(self, member_id: int, guild_id: int):
@@ -103,7 +103,7 @@ _sessions: dict[int, StepContext] = {}
 
 class CategoryView(View):
     def __init__(self, ctx: StepContext):
-        super().__init__(timeout=180)
+        super().__init__(timeout=None)
         self.ctx = ctx
 
     async def _next(self, inter: discord.Interaction, cat: str):
@@ -113,21 +113,21 @@ class CategoryView(View):
             view=PrimaryView(self.ctx)
         )
 
-    @button(label="⚔️ Gildenmitglied", style=ButtonStyle.primary)
+    @button(label="⚔️ Gildenmitglied", style=ButtonStyle.primary, custom_id="onboarding_category_guild")
     async def btn_guild(self, inter: discord.Interaction, _):
         await self._next(inter, "guild")
 
-    @button(label="🏰 Allianzmitglied", style=ButtonStyle.secondary)
+    @button(label="🏰 Allianzmitglied", style=ButtonStyle.secondary, custom_id="onboarding_category_ally")
     async def btn_ally(self, inter: discord.Interaction, _):
         await self._next(inter, "ally")
 
-    @button(label="🫱 Freund", style=ButtonStyle.success)
+    @button(label="🫱 Freund", style=ButtonStyle.success, custom_id="onboarding_category_friend")
     async def btn_friend(self, inter: discord.Interaction, _):
         await self._next(inter, "friend")
 
 class PrimaryView(View):
     def __init__(self, ctx: StepContext):
-        super().__init__(timeout=180)
+        super().__init__(timeout=None)
         self.ctx = ctx
 
     async def _next(self, inter: discord.Interaction, primary: str):
@@ -137,15 +137,15 @@ class PrimaryView(View):
             view=ExperienceView(self.ctx)
         )
 
-    @button(label="🛡️ Tank", style=ButtonStyle.primary)
+    @button(label="🛡️ Tank", style=ButtonStyle.primary, custom_id="onboarding_primary_tank")
     async def btn_tank(self, inter: discord.Interaction, _):
         await self._next(inter, "TANK")
 
-    @button(label="💚 Heal", style=ButtonStyle.secondary)
+    @button(label="💚 Heal", style=ButtonStyle.secondary, custom_id="onboarding_primary_heal")
     async def btn_heal(self, inter: discord.Interaction, _):
         await self._next(inter, "HEAL")
 
-    @button(label="🗡️ DPS", style=ButtonStyle.secondary)
+    @button(label="🗡️ DPS", style=ButtonStyle.secondary, custom_id="onboarding_primary_dps")
     async def btn_dps(self, inter: discord.Interaction, _):
         await self._next(inter, "DPS")
 
@@ -172,24 +172,30 @@ class ReviewView(View):
                 m = None
         return m
 
-    @button(label="✅ Akzeptieren", style=ButtonStyle.success)
+    @button(label="✅ Akzeptieren", style=ButtonStyle.success, custom_id="onboarding_review_accept")
     async def btn_accept(self, inter: discord.Interaction, _):
         if not self._is_admin(inter):
-            await inter.response.send_message("Nur Admins.", ephemeral=True); return
+            await inter.response.send_message("Nur Admins.", ephemeral=True)
+            return
         member = await self._get_member(inter.guild)
         if not member:
-            await inter.response.send_message("Mitglied nicht gefunden.", ephemeral=True); return
+            await inter.response.send_message("Mitglied nicht gefunden.", ephemeral=True)
+            return
         roles = await _assign_roles(member, self.category, self.primary, self.experienced)
-        await inter.response.edit_message(content=f"✅ **Akzeptiert** – Rollen: {', '.join(r.mention for r in roles) if roles else '—'}", view=None)
+        await inter.response.edit_message(
+            content=f"✅ **Akzeptiert** – Rollen: {', '.join(r.mention for r in roles) if roles else '—'}",
+            view=None
+        )
         try:
             await member.send("✅ Deine Anfrage wurde **akzeptiert**. Willkommen!")
         except Exception:
             pass
 
-    @button(label="❌ Ablehnen", style=ButtonStyle.danger)
+    @button(label="❌ Ablehnen", style=ButtonStyle.danger, custom_id="onboarding_review_deny")
     async def btn_deny(self, inter: discord.Interaction, _):
         if not self._is_admin(inter):
-            await inter.response.send_message("Nur Admins.", ephemeral=True); return
+            await inter.response.send_message("Nur Admins.", ephemeral=True)
+            return
         member = await self._get_member(inter.guild)
         await inter.response.edit_message(content="❌ **Abgelehnt**.", view=None)
         if member:
@@ -200,61 +206,81 @@ class ReviewView(View):
 
 class ExperienceView(View):
     def __init__(self, ctx: StepContext):
-        super().__init__(timeout=180)
+        super().__init__(timeout=None)
         self.ctx = ctx
 
     async def _finish(self, inter: discord.Interaction, experienced: bool):
-        self.ctx.experienced = experienced
-        guild = inter.client.get_guild(self.ctx.guild_id)
-        if not guild:
-            await inter.response.edit_message(content="⚠️ Server nicht gefunden.", view=None); return
+        try:
+            self.ctx.experienced = experienced
+            guild = inter.client.get_guild(self.ctx.guild_id)
+            if not guild:
+                await inter.response.edit_message(content="⚠️ Server nicht gefunden.", view=None)
+                return
 
-        # Review oder Auto-Assign?
-        c = _gcfg(guild)
-        review_ch = _review_channel(guild)
-        require = bool(c.get("require_review"))
+            c = _gcfg(guild)
+            review_ch = _review_channel(guild)
+            require = bool(c.get("require_review"))
 
-        # Member referenzieren
-        member = guild.get_member(self.ctx.member_id)
-        if not member:
-            try:
-                member = await guild.fetch_member(self.ctx.member_id)
-            except Exception:
-                member = None
+            member = guild.get_member(self.ctx.member_id)
+            if not member:
+                try:
+                    member = await guild.fetch_member(self.ctx.member_id)
+                except Exception:
+                    member = None
 
-        # Compose Zusammenfassung
-        cat_txt = {"guild": "Gildenmitglied", "ally": "Allianzmitglied", "friend": "Freund"}.get(self.ctx.category, "—")
-        pri_txt = {"TANK": "Tank", "HEAL": "Heal", "DPS": "DPS"}.get(self.ctx.primary, "—")
-        exp_txt = "Erfahren" if experienced else "Unerfahren"
+            cat_txt = {"guild": "Gildenmitglied", "ally": "Allianzmitglied", "friend": "Freund"}.get(self.ctx.category, "—")
+            pri_txt = {"TANK": "Tank", "HEAL": "Heal", "DPS": "DPS"}.get(self.ctx.primary, "—")
+            exp_txt = "Erfahren" if experienced else "Unerfahren"
 
-        if require and review_ch:
-            # Post mit Accept/Deny
-            desc = (
-                f"**Onboarding-Review:** {member.mention if member else f'<@{self.ctx.member_id}>'}\n"
-                f"**Kategorie:** {cat_txt}\n"
-                f"**Rolle:** {pri_txt}\n"
-                f"**Erfahrung:** {exp_txt}"
-            )
-            await review_ch.send(desc, view=ReviewView(self.ctx.member_id, self.ctx.category, self.ctx.primary, experienced))
-            await inter.response.edit_message(content="✅ Danke! Deine Angaben wurden zur **Prüfung** an die Gildenleitung gesendet.", view=None)
-        else:
-            # Auto-Assign
-            if member:
-                roles = await _assign_roles(member, self.ctx.category, self.ctx.primary, experienced)
-                if review_ch:
-                    await review_ch.send(
-                        f"📝 **Auto-Onboarding:** {member.mention} – {cat_txt}, {pri_txt}, {exp_txt}\n"
-                        f"Rollen: {', '.join(r.mention for r in roles) if roles else '—'}"
+            if require:
+                if not review_ch:
+                    await inter.response.edit_message(
+                        content="❌ Review ist aktiviert, aber kein Review-Kanal gesetzt.",
+                        view=None
                     )
-            await inter.response.edit_message(content="✅ Danke! Deine Rollen wurden vergeben.", view=None)
+                    return
 
-        _sessions.pop(self.ctx.member_id, None)
+                desc = (
+                    f"**Onboarding-Review:** {member.mention if member else f'<@{self.ctx.member_id}>'}\n"
+                    f"**Kategorie:** {cat_txt}\n"
+                    f"**Rolle:** {pri_txt}\n"
+                    f"**Erfahrung:** {exp_txt}"
+                )
+                await review_ch.send(
+                    desc,
+                    view=ReviewView(self.ctx.member_id, self.ctx.category, self.ctx.primary, experienced)
+                )
+                await inter.response.edit_message(
+                    content="✅ Danke! Deine Angaben wurden zur **Prüfung** an die Gildenleitung gesendet.",
+                    view=None
+                )
+            else:
+                if member:
+                    roles = await _assign_roles(member, self.ctx.category, self.ctx.primary, experienced)
+                    if review_ch:
+                        await review_ch.send(
+                            f"📝 **Auto-Onboarding:** {member.mention} – {cat_txt}, {pri_txt}, {exp_txt}\n"
+                            f"Rollen: {', '.join(r.mention for r in roles) if roles else '—'}"
+                        )
+                await inter.response.edit_message(content="✅ Danke! Deine Rollen wurden vergeben.", view=None)
 
-    @button(label="🧠 Erfahren", style=ButtonStyle.primary)
+            _sessions.pop(self.ctx.member_id, None)
+
+        except Exception as e:
+            try:
+                if not inter.response.is_done():
+                    await inter.response.send_message(f"❌ Fehler im Onboarding: {e}", ephemeral=True)
+                else:
+                    await inter.followup.send(f"❌ Fehler im Onboarding: {e}", ephemeral=True)
+            except Exception:
+                pass
+            print(f"[onboarding] ExperienceView _finish Fehler: {e!r}")
+
+    @button(label="🧠 Erfahren", style=ButtonStyle.primary, custom_id="onboarding_experience_yes")
     async def btn_exp(self, inter: discord.Interaction, _):
         await self._finish(inter, True)
 
-    @button(label="🌱 Unerfahren", style=ButtonStyle.secondary)
+    @button(label="🌱 Unerfahren", style=ButtonStyle.secondary, custom_id="onboarding_experience_no")
     async def btn_new(self, inter: discord.Interaction, _):
         await self._finish(inter, False)
 
@@ -275,7 +301,6 @@ async def send_onboarding_dm(member: discord.Member) -> None:
         )
         await member.send(text, view=CategoryView(ctx))
     except Exception:
-        # DMs evtl. geschlossen – ignoriere
         pass
 
 # ----------------- Slash-Commands -----------------
@@ -285,8 +310,12 @@ async def setup_onboarding(client: discord.Client, tree: app_commands.CommandTre
     @app_commands.describe(enabled="true = an, false = aus")
     async def onboarding_toggle(inter: discord.Interaction, enabled: bool):
         if not _is_admin(inter):
-            await inter.response.send_message("Nur Admins.", ephemeral=True); return
-        c = _gcfg(inter.guild); c["enabled"] = bool(enabled); cfg[str(inter.guild_id)] = c; _save_cfg(cfg)
+            await inter.response.send_message("Nur Admins.", ephemeral=True)
+            return
+        c = _gcfg(inter.guild)
+        c["enabled"] = bool(enabled)
+        cfg[str(inter.guild_id)] = c
+        _save_cfg(cfg)
         await inter.response.send_message(f"✅ Onboarding {'aktiviert' if enabled else 'deaktiviert'}.", ephemeral=True)
 
     @tree.command(name="onboarding_set_categories", description="(Admin) Rollen für Gildenmitglied / Allianzmitglied / Freund setzen")
@@ -297,10 +326,12 @@ async def setup_onboarding(client: discord.Client, tree: app_commands.CommandTre
         freund: discord.Role
     ):
         if not _is_admin(inter):
-            await inter.response.send_message("Nur Admins.", ephemeral=True); return
+            await inter.response.send_message("Nur Admins.", ephemeral=True)
+            return
         c = _gcfg(inter.guild)
         c["category_roles"] = {"guild": gildenmitglied.id, "ally": allianzmitglied.id, "friend": freund.id}
-        cfg[str(inter.guild_id)] = c; _save_cfg(cfg)
+        cfg[str(inter.guild_id)] = c
+        _save_cfg(cfg)
         await inter.response.send_message(
             f"✅ Kategorien gesetzt:\n• Gildenmitglied: {gildenmitglied.mention}\n• Allianzmitglied: {allianzmitglied.mention}\n• Freund: {freund.mention}",
             ephemeral=True
@@ -314,10 +345,12 @@ async def setup_onboarding(client: discord.Client, tree: app_commands.CommandTre
         dps: discord.Role
     ):
         if not _is_admin(inter):
-            await inter.response.send_message("Nur Admins.", ephemeral=True); return
+            await inter.response.send_message("Nur Admins.", ephemeral=True)
+            return
         c = _gcfg(inter.guild)
         c["primary_roles"] = {"TANK": tank.id, "HEAL": heal.id, "DPS": dps.id}
-        cfg[str(inter.guild_id)] = c; _save_cfg(cfg)
+        cfg[str(inter.guild_id)] = c
+        _save_cfg(cfg)
         await inter.response.send_message(
             f"✅ Primärrollen gesetzt:\n• 🛡️ {tank.mention}\n• 💚 {heal.mention}\n• 🗡️ {dps.mention}",
             ephemeral=True
@@ -330,11 +363,15 @@ async def setup_onboarding(client: discord.Client, tree: app_commands.CommandTre
         newbie_role: Optional[discord.Role] = None
     ):
         if not _is_admin(inter):
-            await inter.response.send_message("Nur Admins.", ephemeral=True); return
+            await inter.response.send_message("Nur Admins.", ephemeral=True)
+            return
         c = _gcfg(inter.guild)
-        c["experience_roles"] = {"experienced": int(experienced_role.id) if experienced_role else 0,
-                                 "newbie": int(newbie_role.id) if newbie_role else 0}
-        cfg[str(inter.guild_id)] = c; _save_cfg(cfg)
+        c["experience_roles"] = {
+            "experienced": int(experienced_role.id) if experienced_role else 0,
+            "newbie": int(newbie_role.id) if newbie_role else 0
+        }
+        cfg[str(inter.guild_id)] = c
+        _save_cfg(cfg)
         await inter.response.send_message(
             f"✅ Erfahrungsrollen gesetzt:\n• 🧠 {experienced_role.mention if experienced_role else '—'}\n• 🌱 {newbie_role.mention if newbie_role else '—'}",
             ephemeral=True
@@ -343,39 +380,48 @@ async def setup_onboarding(client: discord.Client, tree: app_commands.CommandTre
     @tree.command(name="onboarding_set_review_channel", description="(Admin) Kanal für Review/Logs setzen")
     async def onboarding_set_review_channel(inter: discord.Interaction, channel: discord.TextChannel):
         if not _is_admin(inter):
-            await inter.response.send_message("Nur Admins.", ephemeral=True); return
+            await inter.response.send_message("Nur Admins.", ephemeral=True)
+            return
         c = _gcfg(inter.guild)
         c["review_channel"] = int(channel.id)
-        cfg[str(inter.guild_id)] = c; _save_cfg(cfg)
+        cfg[str(inter.guild_id)] = c
+        _save_cfg(cfg)
         await inter.response.send_message(f"✅ Review/Log-Kanal gesetzt: {channel.mention}", ephemeral=True)
 
     @tree.command(name="onboarding_require_review", description="(Admin) Review durch Staff erzwingen (Accept/Deny)")
     async def onboarding_require_review(inter: discord.Interaction, require: bool):
         if not _is_admin(inter):
-            await inter.response.send_message("Nur Admins.", ephemeral=True); return
+            await inter.response.send_message("Nur Admins.", ephemeral=True)
+            return
         c = _gcfg(inter.guild)
         c["require_review"] = bool(require)
-        cfg[str(inter.guild_id)] = c; _save_cfg(cfg)
+        cfg[str(inter.guild_id)] = c
+        _save_cfg(cfg)
         await inter.response.send_message(f"✅ Review erforderlich: {'Ja' if require else 'Nein'}", ephemeral=True)
 
     @tree.command(name="onboarding_send", description="(Admin) Onboarding-DM manuell an ein Mitglied senden")
     async def onboarding_send(inter: discord.Interaction, member: discord.Member):
         if not _is_admin(inter):
-            await inter.response.send_message("Nur Admins.", ephemeral=True); return
+            await inter.response.send_message("Nur Admins.", ephemeral=True)
+            return
         await send_onboarding_dm(member)
         await inter.response.send_message(f"✉️ DM an {member.mention} geschickt (falls DMs offen).", ephemeral=True)
 
     @tree.command(name="onboarding_status", description="(Admin) Zeigt aktuelle Onboarding-Konfiguration")
     async def onboarding_status(inter: discord.Interaction):
         if not _is_admin(inter):
-            await inter.response.send_message("Nur Admins.", ephemeral=True); return
+            await inter.response.send_message("Nur Admins.", ephemeral=True)
+            return
         c = _gcfg(inter.guild)
         cat = c.get("category_roles") or {}
         pri = c.get("primary_roles") or {}
         exp = c.get("experience_roles") or {}
         rch = _review_channel(inter.guild)
+
         def _m(rid):
-            r = _role(inter.guild, rid);  return r.mention if r else "—"
+            r = _role(inter.guild, rid)
+            return r.mention if r else "—"
+
         text = (
             f"**Onboarding:** {'aktiv' if c.get('enabled', True) else 'inaktiv'}\n"
             f"**Review erforderlich:** {'Ja' if c.get('require_review') else 'Nein'}\n"
