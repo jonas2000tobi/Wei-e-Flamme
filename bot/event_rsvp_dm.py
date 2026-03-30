@@ -1,4 +1,7 @@
-# RSVP per DM: Buttons in DM, Übersicht im Server-Channel wird live aktualisiert.
+# RSVP per DM + Buttons direkt im Server-Post:
+# - DMs mit Buttons für normale Nutzer
+# - Server-Buttons als Fallback / Komfort
+# - Beide Wege schreiben in denselben Store
 
 from __future__ import annotations
 import json
@@ -29,7 +32,7 @@ BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-RSVP_FILE   = DATA_DIR / "event_rsvp.json"       # Events + Anmeldungen (Server-Übersicht)
+RSVP_FILE   = DATA_DIR / "event_rsvp.json"       # Events + Anmeldungen
 DM_CFG_FILE = DATA_DIR / "event_rsvp_cfg.json"   # {"guild": {"TANK":id,"HEAL":id,"DPS":id,"LOG_CH":id}}
 
 def _load(p: Path, default):
@@ -46,6 +49,7 @@ cfg:   Dict[str, dict] = _load(DM_CFG_FILE, {})
 
 def save_store(): _save(RSVP_FILE, store)
 def save_cfg():   _save(DM_CFG_FILE, cfg)
+
 
 # ---------------- Utils / Logging ----------------
 
@@ -109,15 +113,17 @@ def _member_from_event(inter: discord.Interaction, obj: dict) -> Optional[discor
         if inter.guild is not None:
             return inter.guild.get_member(inter.user.id)
         gid = int(obj.get("guild_id", 0) or 0)
-        if not gid: return None
+        if not gid:
+            return None
         g = inter.client.get_guild(gid)
-        if not g: return None
+        if not g:
+            return None
         return g.get_member(inter.user.id)
     except Exception:
         return None
 
 
-# ---------------- Embed (mit Zähler) ----------------
+# ---------------- Embed ----------------
 
 def _voters_set(obj: dict) -> set[int]:
     voted: set[int] = set()
@@ -130,7 +136,6 @@ def _voters_set(obj: dict) -> set[int]:
 def _eligible_members(guild: discord.Guild, obj: dict) -> List[discord.Member]:
     tr_id = int(obj.get("target_role_id", 0) or 0)
     if not tr_id:
-        # alle Nicht-Bots
         return [m for m in guild.members if not m.bot]
     role = guild.get_role(tr_id)
     if not role:
@@ -139,7 +144,9 @@ def _eligible_members(guild: discord.Guild, obj: dict) -> List[discord.Member]:
 
 def build_embed(guild: discord.Guild, obj: dict) -> discord.Embed:
     when = datetime.fromisoformat(obj["when_iso"])
-    yes = obj["yes"]; maybe = obj["maybe"]; no = obj["no"]
+    yes = obj["yes"]
+    maybe = obj["maybe"]
+    no = obj["no"]
 
     eligible = _eligible_members(guild, obj)
     voted = _voters_set(obj)
@@ -150,6 +157,7 @@ def build_embed(guild: discord.Guild, obj: dict) -> discord.Embed:
             (obj.get('description', '') or '') +
             f"\n\n🕒 Zeit: {when.strftime('%a, %d.%m.%Y %H:%M')} (Europe/Berlin)"
             f"\n🗳️ Abgestimmt: **{len(voted)}** / **{len(eligible)}**"
+            f"\n💡 Wenn du keine DM bekommst oder sie deaktiviert hast: nutze die Buttons direkt unter dieser Ankündigung."
         ).strip(),
         color=discord.Color.blurple()
     )
@@ -160,7 +168,7 @@ def build_embed(guild: discord.Guild, obj: dict) -> discord.Embed:
 
     emb.add_field(name=f"🛡️ Tank ({len(tank_names)})", value="\n".join(tank_names) or "—", inline=True)
     emb.add_field(name=f"💚 Heal ({len(heal_names)})", value="\n".join(heal_names) or "—", inline=True)
-    emb.add_field(name=f"🗡️ DPS ({len(dps_names)})",  value="\n".join(dps_names)  or "—", inline=True)
+    emb.add_field(name=f"🗡️ DPS ({len(dps_names)})", value="\n".join(dps_names) or "—", inline=True)
 
     maybe_lines = []
     for uid_str, rlab in maybe.items():
@@ -184,104 +192,151 @@ def build_embed(guild: discord.Guild, obj: dict) -> discord.Embed:
     if obj.get("image_url"):
         emb.set_image(url=obj["image_url"])
 
-    emb.set_footer(text="(An-/Abmeldung läuft per DM-Buttons)")
+    emb.set_footer(text="DM-Buttons und Server-Buttons schreiben beide in dieselbe Anmeldung.")
     return emb
 
 
-# ---------------- DM View ----------------
+# ---------------- Gemeinsame Logik ----------------
 
-class RaidView(View):
-    """Buttons laufen in der DM. Nach Klick: Übersicht aktualisieren + DM löschen."""
+async def _push_overview(client: discord.Client, msg_id: str, obj: dict):
+    guild = client.get_guild(int(obj["guild_id"]))
+    if not guild:
+        return
+    ch = guild.get_channel(int(obj["channel_id"]))
+    if not isinstance(ch, (discord.TextChannel, discord.Thread)):
+        return
+    try:
+        msg = await ch.fetch_message(int(msg_id))
+    except Exception:
+        return
+
+    emb = build_embed(guild, obj)
+    try:
+        await msg.edit(embed=emb, view=ServerRaidView(int(msg_id)))
+    except Exception:
+        pass
+
+async def apply_rsvp(inter: discord.Interaction, msg_id: str, group: str) -> tuple[bool, str]:
+    obj = store.get(str(msg_id))
+    if not obj:
+        return False, "Dieses Event existiert nicht mehr."
+
+    _init_event_shape(obj)
+
+    uid = inter.user.id
+    response_key = "yes" if group in ("TANK", "HEAL", "DPS") else ("maybe" if group == "MAYBE" else "no")
+
+    # User aus allen Buckets entfernen
+    for k in ("TANK", "HEAL", "DPS"):
+        obj["yes"][k] = [int(u) for u in obj["yes"].get(k, []) if int(u) != uid]
+    obj["no"] = [int(u) for u in obj.get("no", []) if int(u) != uid]
+    obj["maybe"].pop(str(uid), None)
+
+    if group in ("TANK", "HEAL", "DPS"):
+        obj["yes"][group].append(uid)
+        text = f"Angemeldet als **{group}**."
+    elif group == "MAYBE":
+        member = _member_from_event(inter, obj)
+        rid_map = get_role_ids_for_guild(int(obj["guild_id"]))
+        label = _primary_label(member, rid_map)
+        obj["maybe"][str(uid)] = label
+        text = "Als **Vielleicht** eingetragen."
+    elif group == "NO":
+        obj["no"].append(uid)
+        text = "Als **Abgemeldet** eingetragen."
+    else:
+        return False, "Ungültige Auswahl."
+
+    save_store()
+    record_response(int(obj["guild_id"]), uid, str(msg_id), response_key)
+    await _push_overview(inter.client, str(msg_id), obj)
+    return True, text
+
+
+# ---------------- Views ----------------
+
+class BaseRaidView(View):
     def __init__(self, msg_id: int):
         super().__init__(timeout=None)
         self.msg_id = str(msg_id)
 
-    async def _push_overview(self, inter: discord.Interaction, obj: dict):
-        guild = inter.client.get_guild(obj["guild_id"])
-        if not guild: return
-        ch = guild.get_channel(obj["channel_id"])
-        if not isinstance(ch, (discord.TextChannel, discord.Thread)): return
-        try:
-            msg = await ch.fetch_message(int(self.msg_id))
-        except Exception:
-            return
-        emb = build_embed(guild, obj)
-        try:
-            await msg.edit(embed=emb)
-        except Exception:
-            pass
+    async def _send_feedback(self, inter: discord.Interaction, text: str):
+        if not inter.response.is_done():
+            await inter.response.send_message(text, ephemeral=True)
+        else:
+            await inter.followup.send(text, ephemeral=True)
 
-    async def _confirm_and_delete_dm(self, inter: discord.Interaction, text: str):
-        # kurze Bestätigung + DM mit Buttons weg
+    async def _after_success(self, inter: discord.Interaction):
+        # überschreibbar
+        return
+
+    async def _handle(self, inter: discord.Interaction, group: str):
         try:
-            if not inter.response.is_done():
-                await inter.response.send_message(text, ephemeral=True)
-            else:
-                await inter.followup.send(text, ephemeral=True)
-        except Exception:
-            pass
+            ok, text = await apply_rsvp(inter, self.msg_id, group)
+            await self._send_feedback(inter, text)
+            if ok:
+                await self._after_success(inter)
+        except Exception as e:
+            await self._send_feedback(inter, "❌ Unerwarteter Fehler. Bitte erneut probieren.")
+            try:
+                gid = 0
+                obj = store.get(self.msg_id) or {}
+                gid = int(obj.get("guild_id", 0) or 0)
+                await _log(inter.client, gid, f"Button-Fehler ({type(self).__name__}): {e!r}")
+            except Exception:
+                pass
+
+
+class RaidView(BaseRaidView):
+    """Buttons in der DM."""
+    async def _after_success(self, inter: discord.Interaction):
         try:
             await inter.message.delete()
         except Exception:
             pass
 
-    async def _update(self, inter: discord.Interaction, group: str):
-        try:
-            obj = store.get(self.msg_id)
-            if not obj:
-                await self._confirm_and_delete_dm(inter, "Dieses Event existiert nicht mehr.")
-                return
-
-            _init_event_shape(obj)
-
-            uid = inter.user.id
-            response_key = "yes" if group in ("TANK", "HEAL", "DPS") else ("maybe" if group == "MAYBE" else "no")
-
-            # User aus allen Buckets entfernen
-            for k in ("TANK", "HEAL", "DPS"):
-                obj["yes"][k] = [int(u) for u in obj["yes"].get(k, []) if int(u) != uid]
-            obj["no"] = [int(u) for u in obj.get("no", []) if int(u) != uid]
-            obj["maybe"].pop(str(uid), None)
-
-            if group in ("TANK", "HEAL", "DPS"):
-                obj["yes"][group].append(uid)
-                text = f"Angemeldet als **{group}**."
-            elif group == "MAYBE":
-                member = _member_from_event(inter, obj)
-                rid_map = get_role_ids_for_guild(obj["guild_id"])
-                label = _primary_label(member, rid_map)  # "Tank"/"Heal"/"DPS" oder ""
-                obj["maybe"][str(uid)] = label
-                text = "Als **Vielleicht** eingetragen."
-            elif group == "NO":
-                obj["no"].append(uid)
-                text = "Als **Abgemeldet** eingetragen."
-            else:
-                text = "Aktualisiert."
-
-            save_store()
-            record_response(obj["guild_id"], uid, self.msg_id, response_key)
-
-            await self._push_overview(inter, obj)
-            await self._confirm_and_delete_dm(inter, text)
-
-        except Exception as e:
-            await _log(inter.client, store.get(self.msg_id, {}).get("guild_id", 0), f"Button-Fehler: {e!r}")
-            await self._confirm_and_delete_dm(inter, "❌ Unerwarteter Fehler. Bitte erneut probieren.")
-
     @button(label="🛡️ Tank", style=ButtonStyle.primary, custom_id="dm_rsvp_tank")
-    async def btn_tank(self, inter: discord.Interaction, _):      await self._update(inter, "TANK")
+    async def btn_tank(self, inter: discord.Interaction, _):
+        await self._handle(inter, "TANK")
 
     @button(label="💚 Heal", style=ButtonStyle.secondary, custom_id="dm_rsvp_heal")
-    async def btn_heal(self, inter: discord.Interaction, _):      await self._update(inter, "HEAL")
+    async def btn_heal(self, inter: discord.Interaction, _):
+        await self._handle(inter, "HEAL")
 
     @button(label="🗡️ DPS", style=ButtonStyle.secondary, custom_id="dm_rsvp_dps")
-    async def btn_dps(self, inter: discord.Interaction, _):       await self._update(inter, "DPS")
+    async def btn_dps(self, inter: discord.Interaction, _):
+        await self._handle(inter, "DPS")
 
     @button(label="❔ Vielleicht", style=ButtonStyle.secondary, custom_id="dm_rsvp_maybe")
-    async def btn_maybe(self, inter: discord.Interaction, _):     await self._update(inter, "MAYBE")
+    async def btn_maybe(self, inter: discord.Interaction, _):
+        await self._handle(inter, "MAYBE")
 
     @button(label="❌ Abmelden", style=ButtonStyle.danger, custom_id="dm_rsvp_no")
-    async def btn_no(self, inter: discord.Interaction, _):        await self._update(inter, "NO")
+    async def btn_no(self, inter: discord.Interaction, _):
+        await self._handle(inter, "NO")
+
+
+class ServerRaidView(BaseRaidView):
+    """Buttons direkt unter der Raid-Ankündigung im Server."""
+    @button(label="🛡️ Tank", style=ButtonStyle.primary, custom_id="srv_rsvp_tank")
+    async def btn_tank(self, inter: discord.Interaction, _):
+        await self._handle(inter, "TANK")
+
+    @button(label="💚 Heal", style=ButtonStyle.secondary, custom_id="srv_rsvp_heal")
+    async def btn_heal(self, inter: discord.Interaction, _):
+        await self._handle(inter, "HEAL")
+
+    @button(label="🗡️ DPS", style=ButtonStyle.secondary, custom_id="srv_rsvp_dps")
+    async def btn_dps(self, inter: discord.Interaction, _):
+        await self._handle(inter, "DPS")
+
+    @button(label="❔ Vielleicht", style=ButtonStyle.secondary, custom_id="srv_rsvp_maybe")
+    async def btn_maybe(self, inter: discord.Interaction, _):
+        await self._handle(inter, "MAYBE")
+
+    @button(label="❌ Abmelden", style=ButtonStyle.danger, custom_id="srv_rsvp_no")
+    async def btn_no(self, inter: discord.Interaction, _):
+        await self._handle(inter, "NO")
 
 
 # ---------------- Commands / Setup ----------------
@@ -290,13 +345,15 @@ def _is_admin(inter: discord.Interaction) -> bool:
     perms = getattr(inter.user, "guild_permissions", None)
     return bool(perms and (perms.administrator or perms.manage_guild))
 
-
 async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
-    """Registriert alle Slash-Commands und re-attached persistente DM-Views."""
-    # Persistente Views nach Neustart
+    """Registriert Slash-Commands und hängt persistente Views wieder an."""
     for msg_id in list(store.keys()):
         try:
             client.add_view(RaidView(int(msg_id)))
+        except Exception:
+            pass
+        try:
+            client.add_view(ServerRaidView(int(msg_id)))
         except Exception:
             pass
 
@@ -311,12 +368,14 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
     ):
         await inter.response.defer(ephemeral=True, thinking=False)
         if not _is_admin(inter):
-            await inter.followup.send("❌ Nur Admin/Manage Server.", ephemeral=True); return
+            await inter.followup.send("❌ Nur Admin/Manage Server.", ephemeral=True)
+            return
         c = cfg.get(str(inter.guild_id)) or {}
         c["TANK"] = int(tank_role.id)
         c["HEAL"] = int(heal_role.id)
         c["DPS"]  = int(dps_role.id)
-        cfg[str(inter.guild_id)] = c; save_cfg()
+        cfg[str(inter.guild_id)] = c
+        save_cfg()
         await inter.followup.send(
             f"✅ Gespeichert:\n🛡️ {tank_role.mention}\n💚 {heal_role.mention}\n🗡️ {dps_role.mention}",
             ephemeral=True
@@ -327,14 +386,16 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
     async def raid_set_log_channel(inter: discord.Interaction, channel: discord.TextChannel):
         await inter.response.defer(ephemeral=True, thinking=False)
         if not _is_admin(inter):
-            await inter.followup.send("❌ Nur Admin/Manage Server.", ephemeral=True); return
+            await inter.followup.send("❌ Nur Admin/Manage Server.", ephemeral=True)
+            return
         c = cfg.get(str(inter.guild_id)) or {}
         c["LOG_CH"] = int(channel.id)
-        cfg[str(inter.guild_id)] = c; save_cfg()
+        cfg[str(inter.guild_id)] = c
+        save_cfg()
         await inter.followup.send(f"✅ Log-Kanal gesetzt: {channel.mention}", ephemeral=True)
 
     # ---- Admin: Raid erstellen
-    @tree.command(name="raid_create_dm", description="(Admin) Raid/Anmeldung per DM erzeugen + Übersicht posten")
+    @tree.command(name="raid_create_dm", description="(Admin) Raid/Anmeldung erzeugen + Übersicht posten")
     @app_commands.describe(
         title="Titel",
         date="Datum YYYY-MM-DD",
@@ -356,21 +417,25 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
     ):
         await inter.response.defer(ephemeral=True, thinking=True)
         if not _is_admin(inter):
-            await inter.followup.send("❌ Nur Admin/Manage Server.", ephemeral=True); return
+            await inter.followup.send("❌ Nur Admin/Manage Server.", ephemeral=True)
+            return
+
         try:
             yyyy, mm, dd = [int(x) for x in date.split("-")]
             hh, mi = [int(x) for x in time.split(":")]
             when = datetime(yyyy, mm, dd, hh, mi, tzinfo=TZ)
         except Exception:
-            await inter.followup.send("❌ Datum/Zeit ungültig. (YYYY-MM-DD / HH:MM)", ephemeral=True); return
+            await inter.followup.send("❌ Datum/Zeit ungültig. (YYYY-MM-DD / HH:MM)", ephemeral=True)
+            return
 
         ch = channel or inter.channel
         if not isinstance(ch, (discord.TextChannel, discord.Thread)):
-            await inter.followup.send("❌ Zielkanal ist kein Textkanal/Thread.", ephemeral=True); return
+            await inter.followup.send("❌ Zielkanal ist kein Textkanal/Thread.", ephemeral=True)
+            return
 
         obj = {
-            "guild_id": inter.guild_id,
-            "channel_id": ch.id,
+            "guild_id": int(inter.guild_id),
+            "channel_id": int(ch.id),
             "title": title.strip(),
             "description": (description or "").strip(),
             "when_iso": when.isoformat(),
@@ -381,10 +446,16 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
             "target_role_id": int(target_role.id) if target_role else 0
         }
 
+        # Erst posten, dann mit Buttons editieren, weil wir die Message-ID brauchen
         emb = build_embed(inter.guild, obj)
         msg = await ch.send(embed=emb)
         store[str(msg.id)] = obj
         save_store()
+
+        try:
+            await msg.edit(view=ServerRaidView(int(msg.id)))
+        except Exception:
+            pass
 
         sent = 0
         skipped_opt_out = 0
@@ -395,13 +466,15 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
                 skipped_opt_out += 1
                 continue
             try:
-                dm_text = (f"**{title}** – Anmeldung\n"
-                           f"• {when.strftime('%a, %d.%m.%Y %H:%M')} (Europe/Berlin)\n"
-                           f"• Übersicht im Server: #{ch.name}\n\n"
-                           f"Wähle unten deine Teilnahme.")
+                dm_text = (
+                    f"**{title}** – Anmeldung\n"
+                    f"• {when.strftime('%a, %d.%m.%Y %H:%M')} (Europe/Berlin)\n"
+                    f"• Übersicht im Server: #{ch.name}\n\n"
+                    f"Wähle unten deine Teilnahme."
+                )
                 await m.send(dm_text, view=RaidView(int(msg.id)))
                 sent += 1
-                await asyncio.sleep(0.05)  # Rate-Limit freundlich
+                await asyncio.sleep(0.05)
             except Exception:
                 pass
 
@@ -410,7 +483,8 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
             f"✅ Raid erstellt: {msg.jump_url}\n"
             f"🎯 Zielgruppe: {ziel}\n"
             f"✉️ DMs versendet: {sent}\n"
-            f"🔕 Opt-out übersprungen: {skipped_opt_out}",
+            f"🔕 Opt-out übersprungen: {skipped_opt_out}\n"
+            f"🖱️ Abstimmung ist zusätzlich direkt unter der Raid-Ankündigung per Button möglich.",
             ephemeral=True
         )
 
@@ -419,20 +493,24 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
     async def raid_resend_missing(inter: discord.Interaction, message_id: str):
         await inter.response.defer(ephemeral=True, thinking=True)
         if not _is_admin(inter):
-            await inter.followup.send("❌ Nur Admin/Manage Server.", ephemeral=True); return
+            await inter.followup.send("❌ Nur Admin/Manage Server.", ephemeral=True)
+            return
 
         obj = store.get(str(message_id))
         if not obj or int(obj.get("guild_id", 0) or 0) != inter.guild_id:
-            await inter.followup.send("❌ Unbekanntes Event/Message-ID.", ephemeral=True); return
+            await inter.followup.send("❌ Unbekanntes Event/Message-ID.", ephemeral=True)
+            return
 
         guild = inter.guild
         ch = guild.get_channel(int(obj["channel_id"]))
         if not isinstance(ch, (discord.TextChannel, discord.Thread)):
-            await inter.followup.send("❌ Zielkanal existiert nicht mehr.", ephemeral=True); return
+            await inter.followup.send("❌ Zielkanal existiert nicht mehr.", ephemeral=True)
+            return
 
         when = datetime.fromisoformat(obj["when_iso"])
         if datetime.now(TZ) > when + timedelta(hours=2):
-            await inter.followup.send("⚠️ Event ist älter als 2h nach Start – keine Resend.", ephemeral=True); return
+            await inter.followup.send("⚠️ Event ist älter als 2h nach Start – keine Resend.", ephemeral=True)
+            return
 
         eligible = _eligible_members(guild, obj)
         already = _voters_set(obj)
@@ -470,15 +548,18 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
     ):
         await inter.response.defer(ephemeral=True, thinking=True)
         if not _is_admin(inter):
-            await inter.followup.send("❌ Nur Admin/Manage Server.", ephemeral=True); return
+            await inter.followup.send("❌ Nur Admin/Manage Server.", ephemeral=True)
+            return
 
         obj = store.get(str(message_id))
         if not obj or int(obj.get("guild_id", 0) or 0) != inter.guild_id:
-            await inter.followup.send("❌ Unbekanntes Event/Message-ID.", ephemeral=True); return
+            await inter.followup.send("❌ Unbekanntes Event/Message-ID.", ephemeral=True)
+            return
 
         when = datetime.fromisoformat(obj["when_iso"])
         if datetime.now(TZ) > when + timedelta(hours=2):
-            await inter.followup.send("⚠️ Event ist älter als 2h nach Start – keine Resend.", ephemeral=True); return
+            await inter.followup.send("⚠️ Event ist älter als 2h nach Start – keine Resend.", ephemeral=True)
+            return
 
         targets: Iterable[discord.Member]
         if user:
@@ -486,7 +567,8 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
         elif role:
             targets = [m for m in role.members if not m.bot]
         else:
-            await inter.followup.send("❌ Bitte `role` oder `user` angeben.", ephemeral=True); return
+            await inter.followup.send("❌ Bitte `role` oder `user` angeben.", ephemeral=True)
+            return
 
         sent = 0
         skipped_opt_out = 0
@@ -511,16 +593,16 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
 
 
 # ------------------------------------------------------------
-# Auto-Resend für neue Mitglieder (Join nach Event-Start)
+# Auto-Resend für neue Mitglieder
 # ------------------------------------------------------------
 async def auto_resend_for_new_member(member: discord.Member) -> None:
     """
     Bei on_member_join(member) aufrufen.
     Schickt dem neuen Member die RSVP-DM für alle noch relevanten Events seiner Guild:
-      - Event gehört zur gleichen Guild
-      - Startzeit nicht länger als 2h her (Start <= now <= Start+2h) oder in Zukunft
-      - UND (falls gesetzt) Member besitzt die Zielrolle
-      - UND User hat Raid-DMs nicht deaktiviert
+      - gleiche Guild
+      - Startzeit nicht länger als 2h her oder in Zukunft
+      - Zielrolle passt (falls gesetzt)
+      - User hat Raid-DMs nicht deaktiviert
     """
     try:
         if member.bot:
@@ -530,8 +612,8 @@ async def auto_resend_for_new_member(member: discord.Member) -> None:
             return
 
         now = datetime.now(TZ)
-
         sent = 0
+
         for mid, obj in list(store.items()):
             try:
                 if int(obj.get("guild_id", 0) or 0) != member.guild.id:
@@ -541,16 +623,17 @@ async def auto_resend_for_new_member(member: discord.Member) -> None:
                 if now > when + timedelta(hours=2):
                     continue
 
-                # Zielrolle prüfen
                 tr_id = int(obj.get("target_role_id", 0) or 0)
                 if tr_id:
                     r = member.guild.get_role(tr_id)
                     if not (r and r in member.roles):
                         continue
 
-                text = (f"**{obj.get('title','Event')}** – Anmeldung\n"
-                        f"• {when.strftime('%a, %d.%m.%Y %H:%M')} (Europe/Berlin)\n"
-                        f"• Übersicht im Server: <#{obj.get('channel_id')}>")
+                text = (
+                    f"**{obj.get('title','Event')}** – Anmeldung\n"
+                    f"• {when.strftime('%a, %d.%m.%Y %H:%M')} (Europe/Berlin)\n"
+                    f"• Übersicht im Server: <#{obj.get('channel_id')}>"
+                )
                 try:
                     await member.send(text, view=RaidView(int(mid)))
                     sent += 1
