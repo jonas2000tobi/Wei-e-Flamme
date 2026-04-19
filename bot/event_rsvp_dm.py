@@ -2,11 +2,14 @@
 # - DMs mit Buttons für normale Nutzer
 # - Server-Buttons als Fallback / Komfort
 # - Beide Wege schreiben in denselben Store
+# - Namen werden gespeichert, damit mobil nicht nur IDs/Nummern auftauchen
+# - Neue Option: BANK (Reserve)
+# - Offene DMs von Nicht-Abstimmern werden ab Eventstart gelöscht
 
 from __future__ import annotations
 import json
 from pathlib import Path
-from typing import Dict, Optional, Iterable, List
+from typing import Dict, Optional, Iterable, List, Any
 import asyncio
 
 import discord
@@ -47,8 +50,11 @@ def _save(p: Path, obj):
 store: Dict[str, dict] = _load(RSVP_FILE, {})
 cfg:   Dict[str, dict] = _load(DM_CFG_FILE, {})
 
-def save_store(): _save(RSVP_FILE, store)
-def save_cfg():   _save(DM_CFG_FILE, cfg)
+def save_store():
+    _save(RSVP_FILE, store)
+
+def save_cfg():
+    _save(DM_CFG_FILE, cfg)
 
 
 # ---------------- Utils / Logging ----------------
@@ -68,21 +74,172 @@ async def _log(client: discord.Client, guild_id: int, text: str):
         except Exception:
             pass
 
-def _mention(guild: discord.Guild, uid: int) -> str:
-    m = guild.get_member(uid)
-    return m.mention if m else f"<@{uid}>"
+def _safe_name(name: str) -> str:
+    return (name or "").replace("@", "@\u200b").strip() or "Unbekannt"
+
+def _current_display_name(member: Optional[discord.Member], fallback_user: Optional[discord.abc.User] = None) -> str:
+    if member is not None:
+        return _safe_name(member.display_name)
+    if fallback_user is not None:
+        return _safe_name(getattr(fallback_user, "display_name", None) or getattr(fallback_user, "name", "Unbekannt"))
+    return "Unbekannt"
+
+def _participant_entry(uid: int, name: str) -> dict:
+    return {
+        "id": int(uid),
+        "name": _safe_name(name),
+    }
+
+def _entry_user_id(entry: Any) -> int:
+    try:
+        if isinstance(entry, dict):
+            return int(entry.get("id", 0) or 0)
+        return int(entry)
+    except Exception:
+        return 0
+
+def _entry_name(entry: Any, guild: Optional[discord.Guild] = None) -> str:
+    if isinstance(entry, dict):
+        stored = _safe_name(str(entry.get("name", "") or ""))
+        uid = _entry_user_id(entry)
+        if guild and uid:
+            m = guild.get_member(uid)
+            if m:
+                return _safe_name(m.display_name)
+        return stored or f"User {uid}" if uid else "Unbekannt"
+
+    try:
+        uid = int(entry)
+    except Exception:
+        return "Unbekannt"
+
+    if guild:
+        m = guild.get_member(uid)
+        if m:
+            return _safe_name(m.display_name)
+    return f"User {uid}"
+
+def _maybe_entry(uid: int, name: str, label: str) -> dict:
+    return {
+        "id": int(uid),
+        "name": _safe_name(name),
+        "label": (label or "").strip(),
+    }
+
+def _maybe_name_and_label(entry: Any, uid_fallback: int, guild: Optional[discord.Guild] = None) -> tuple[str, str]:
+    if isinstance(entry, dict):
+        uid = int(entry.get("id", uid_fallback) or uid_fallback)
+        label = str(entry.get("label", "") or "").strip()
+        name = _entry_name({"id": uid, "name": entry.get("name", "")}, guild)
+        return name, label
+
+    label = str(entry or "").strip()
+    if guild:
+        m = guild.get_member(uid_fallback)
+        if m:
+            return _safe_name(m.display_name), label
+    return f"User {uid_fallback}", label
 
 def _init_event_shape(obj: dict):
     if "yes" not in obj or not isinstance(obj["yes"], dict):
-        obj["yes"] = {"TANK": [], "HEAL": [], "DPS": []}
-    for k in ("TANK", "HEAL", "DPS"):
+        obj["yes"] = {"TANK": [], "HEAL": [], "DPS": [], "BANK": []}
+
+    for k in ("TANK", "HEAL", "DPS", "BANK"):
         if k not in obj["yes"] or not isinstance(obj["yes"][k], list):
             obj["yes"][k] = []
+
     if "maybe" not in obj or not isinstance(obj["maybe"], dict):
         obj["maybe"] = {}
+
     if "no" not in obj or not isinstance(obj["no"], list):
         obj["no"] = []
+
     obj.setdefault("target_role_id", 0)
+
+    # user_id -> dm_message_id
+    if "dm_messages" not in obj or not isinstance(obj["dm_messages"], dict):
+        obj["dm_messages"] = {}
+
+    # Legacy-Migration
+    migrated = False
+
+    for role_key in ("TANK", "HEAL", "DPS"):
+        new_list = []
+        for raw in obj["yes"].get(role_key, []):
+            if isinstance(raw, dict):
+                new_list.append({
+                    "id": int(raw.get("id", 0) or 0),
+                    "name": _safe_name(str(raw.get("name", "") or f"User {raw.get('id', 0)}"))
+                })
+            else:
+                try:
+                    uid = int(raw)
+                    new_list.append(_participant_entry(uid, f"User {uid}"))
+                except Exception:
+                    continue
+        if obj["yes"].get(role_key) != new_list:
+            obj["yes"][role_key] = new_list
+            migrated = True
+
+    if "BANK" not in obj["yes"]:
+        obj["yes"]["BANK"] = []
+        migrated = True
+    else:
+        bank_new = []
+        for raw in obj["yes"].get("BANK", []):
+            if isinstance(raw, dict):
+                bank_new.append({
+                    "id": int(raw.get("id", 0) or 0),
+                    "name": _safe_name(str(raw.get("name", "") or f"User {raw.get('id', 0)}"))
+                })
+            else:
+                try:
+                    uid = int(raw)
+                    bank_new.append(_participant_entry(uid, f"User {uid}"))
+                except Exception:
+                    continue
+        if obj["yes"].get("BANK") != bank_new:
+            obj["yes"]["BANK"] = bank_new
+            migrated = True
+
+    maybe_new = {}
+    for uid_str, raw in obj.get("maybe", {}).items():
+        try:
+            uid_i = int(uid_str)
+        except Exception:
+            continue
+
+        if isinstance(raw, dict):
+            maybe_new[str(uid_i)] = {
+                "id": uid_i,
+                "name": _safe_name(str(raw.get("name", "") or f"User {uid_i}")),
+                "label": str(raw.get("label", "") or "").strip()
+            }
+        else:
+            maybe_new[str(uid_i)] = _maybe_entry(uid_i, f"User {uid_i}", str(raw or "").strip())
+    if obj.get("maybe") != maybe_new:
+        obj["maybe"] = maybe_new
+        migrated = True
+
+    no_new = []
+    for raw in obj.get("no", []):
+        if isinstance(raw, dict):
+            no_new.append({
+                "id": int(raw.get("id", 0) or 0),
+                "name": _safe_name(str(raw.get("name", "") or f"User {raw.get('id', 0)}"))
+            })
+        else:
+            try:
+                uid = int(raw)
+                no_new.append(_participant_entry(uid, f"User {uid}"))
+            except Exception:
+                continue
+    if obj.get("no") != no_new:
+        obj["no"] = no_new
+        migrated = True
+
+    if migrated:
+        save_store()
 
 def get_role_ids_for_guild(guild_id: int) -> Dict[str, int]:
     g = cfg.get(str(guild_id)) or {}
@@ -97,15 +254,21 @@ def _primary_label(member: Optional[discord.Member], rid_map: Dict[str, int]) ->
         return ""
     g = member.guild
     r = g.get_role(rid_map.get("TANK", 0) or 0)
-    if r and r in getattr(member, "roles", []): return "Tank"
+    if r and r in getattr(member, "roles", []):
+        return "Tank"
     r = g.get_role(rid_map.get("HEAL", 0) or 0)
-    if r and r in getattr(member, "roles", []): return "Heal"
+    if r and r in getattr(member, "roles", []):
+        return "Heal"
     r = g.get_role(rid_map.get("DPS", 0) or 0)
-    if r and r in getattr(member, "roles", []): return "DPS"
+    if r and r in getattr(member, "roles", []):
+        return "DPS"
     names = [getattr(rr, "name", "").lower() for rr in getattr(member, "roles", [])]
-    if any("tank" in n for n in names): return "Tank"
-    if any("heal" in n for n in names): return "Heal"
-    if any("dps" in n for n in names) or any("dd" in n for n in names): return "DPS"
+    if any("tank" in n for n in names):
+        return "Tank"
+    if any("heal" in n for n in names):
+        return "Heal"
+    if any("dps" in n for n in names) or any("dd" in n for n in names):
+        return "DPS"
     return ""
 
 def _member_from_event(inter: discord.Interaction, obj: dict) -> Optional[discord.Member]:
@@ -127,10 +290,16 @@ def _member_from_event(inter: discord.Interaction, obj: dict) -> Optional[discor
 
 def _voters_set(obj: dict) -> set[int]:
     voted: set[int] = set()
-    for k in ("TANK", "HEAL", "DPS"):
-        voted.update(int(u) for u in obj["yes"].get(k, []))
-    voted.update(int(u) for u in obj["no"])
-    voted.update(int(uid) for uid in obj["maybe"].keys())
+    for k in ("TANK", "HEAL", "DPS", "BANK"):
+        voted.update(_entry_user_id(u) for u in obj["yes"].get(k, []))
+    voted.update(_entry_user_id(u) for u in obj["no"])
+    for uid_str, entry in obj["maybe"].items():
+        try:
+            uid_i = int(uid_str)
+        except Exception:
+            uid_i = _entry_user_id(entry)
+        if uid_i:
+            voted.add(uid_i)
     return voted
 
 def _eligible_members(guild: discord.Guild, obj: dict) -> List[discord.Member]:
@@ -143,6 +312,8 @@ def _eligible_members(guild: discord.Guild, obj: dict) -> List[discord.Member]:
     return [m for m in role.members if not m.bot]
 
 def build_embed(guild: discord.Guild, obj: dict) -> discord.Embed:
+    _init_event_shape(obj)
+
     when = datetime.fromisoformat(obj["when_iso"])
     yes = obj["yes"]
     maybe = obj["maybe"]
@@ -162,25 +333,28 @@ def build_embed(guild: discord.Guild, obj: dict) -> discord.Embed:
         color=discord.Color.blurple()
     )
 
-    tank_names = [_mention(guild, int(u)) for u in yes.get("TANK", [])]
-    heal_names = [_mention(guild, int(u)) for u in yes.get("HEAL", [])]
-    dps_names  = [_mention(guild, int(u)) for u in yes.get("DPS",  [])]
+    tank_names = [_entry_name(u, guild) for u in yes.get("TANK", [])]
+    heal_names = [_entry_name(u, guild) for u in yes.get("HEAL", [])]
+    dps_names  = [_entry_name(u, guild) for u in yes.get("DPS",  [])]
+    bank_names = [_entry_name(u, guild) for u in yes.get("BANK", [])]
 
     emb.add_field(name=f"🛡️ Tank ({len(tank_names)})", value="\n".join(tank_names) or "—", inline=True)
     emb.add_field(name=f"💚 Heal ({len(heal_names)})", value="\n".join(heal_names) or "—", inline=True)
     emb.add_field(name=f"🗡️ DPS ({len(dps_names)})", value="\n".join(dps_names) or "—", inline=True)
+    emb.add_field(name=f"🏦 Bank ({len(bank_names)})", value="\n".join(bank_names) or "—", inline=False)
 
     maybe_lines = []
-    for uid_str, rlab in maybe.items():
+    for uid_str, entry in maybe.items():
         try:
             uid_i = int(uid_str)
         except Exception:
-            continue
-        label = f" ({rlab})" if rlab else ""
-        maybe_lines.append(f"{_mention(guild, uid_i)}{label}")
+            uid_i = _entry_user_id(entry)
+        name, label = _maybe_name_and_label(entry, uid_i, guild)
+        label_txt = f" ({label})" if label else ""
+        maybe_lines.append(f"{name}{label_txt}")
     emb.add_field(name=f"❔ Vielleicht ({len(maybe_lines)})", value="\n".join(maybe_lines) or "—", inline=False)
 
-    no_names = [_mention(guild, int(u)) for u in no]
+    no_names = [_entry_name(u, guild) for u in no]
     emb.add_field(name=f"❌ Abgemeldet ({len(no_names)})", value="\n".join(no_names) or "—", inline=False)
 
     tr_id = int(obj.get("target_role_id", 0) or 0)
@@ -194,6 +368,101 @@ def build_embed(guild: discord.Guild, obj: dict) -> discord.Embed:
 
     emb.set_footer(text="DM-Buttons und Server-Buttons schreiben beide in dieselbe Anmeldung.")
     return emb
+
+
+# ---------------- DM-Handling ----------------
+
+async def _delete_dm_message_for_user(client: discord.Client, obj: dict, user_id: int) -> bool:
+    _init_event_shape(obj)
+
+    dm_map = obj.get("dm_messages") or {}
+    mid = dm_map.get(str(user_id))
+    if not mid:
+        return False
+
+    user = client.get_user(int(user_id))
+    if user is None:
+        try:
+            user = await client.fetch_user(int(user_id))
+        except Exception:
+            user = None
+
+    deleted = False
+    if user is not None:
+        try:
+            dm = user.dm_channel or await user.create_dm()
+            msg = await dm.fetch_message(int(mid))
+            await msg.delete()
+            deleted = True
+        except Exception:
+            pass
+
+    dm_map.pop(str(user_id), None)
+    obj["dm_messages"] = dm_map
+    return deleted
+
+async def _delete_all_pending_dm_messages_for_event(client: discord.Client, obj: dict) -> int:
+    _init_event_shape(obj)
+
+    removed = 0
+    for uid_str in list((obj.get("dm_messages") or {}).keys()):
+        try:
+            uid = int(uid_str)
+        except Exception:
+            obj["dm_messages"].pop(uid_str, None)
+            removed += 1
+            continue
+        try:
+            ok = await _delete_dm_message_for_user(client, obj, uid)
+            if ok or str(uid) not in obj.get("dm_messages", {}):
+                removed += 1
+        except Exception:
+            obj["dm_messages"].pop(str(uid), None)
+            removed += 1
+    return removed
+
+async def delete_pending_dm_messages_for_started_events(client: discord.Client) -> int:
+    """
+    Löscht offene RSVP-DMs für User, die noch nicht abgestimmt haben,
+    sobald das Event angefangen hat.
+    """
+    changed = 0
+    now = datetime.now(TZ)
+
+    for _msg_id, obj in list(store.items()):
+        try:
+            _init_event_shape(obj)
+            when = datetime.fromisoformat(obj.get("when_iso"))
+        except Exception:
+            continue
+
+        if now < when:
+            continue
+
+        dm_map = obj.get("dm_messages") or {}
+        if not dm_map:
+            continue
+
+        # Nur die offen gebliebenen DMs löschen
+        for uid_str in list(dm_map.keys()):
+            try:
+                uid = int(uid_str)
+            except Exception:
+                obj["dm_messages"].pop(uid_str, None)
+                changed += 1
+                continue
+
+            # Falls inzwischen doch abgestimmt -> DM auch entfernen
+            voted = uid in _voters_set(obj)
+            try:
+                ok = await _delete_dm_message_for_user(client, obj, uid)
+                if ok or voted or str(uid) not in obj.get("dm_messages", {}):
+                    changed += 1
+            except Exception:
+                obj["dm_messages"].pop(str(uid), None)
+                changed += 1
+
+    return changed
 
 
 # ---------------- Gemeinsame Logik ----------------
@@ -224,31 +493,52 @@ async def apply_rsvp(inter: discord.Interaction, msg_id: str, group: str) -> tup
     _init_event_shape(obj)
 
     uid = inter.user.id
-    response_key = "yes" if group in ("TANK", "HEAL", "DPS") else ("maybe" if group == "MAYBE" else "no")
+    member = _member_from_event(inter, obj)
+    display_name = _current_display_name(member, inter.user)
+
+    if group in ("TANK", "HEAL", "DPS"):
+        response_key = "yes"
+    elif group == "BANK":
+        response_key = "bank"
+    elif group == "MAYBE":
+        response_key = "maybe"
+    else:
+        response_key = "no"
 
     # User aus allen Buckets entfernen
-    for k in ("TANK", "HEAL", "DPS"):
-        obj["yes"][k] = [int(u) for u in obj["yes"].get(k, []) if int(u) != uid]
-    obj["no"] = [int(u) for u in obj.get("no", []) if int(u) != uid]
+    for k in ("TANK", "HEAL", "DPS", "BANK"):
+        obj["yes"][k] = [entry for entry in obj["yes"].get(k, []) if _entry_user_id(entry) != uid]
+
+    obj["no"] = [entry for entry in obj.get("no", []) if _entry_user_id(entry) != uid]
     obj["maybe"].pop(str(uid), None)
 
     if group in ("TANK", "HEAL", "DPS"):
-        obj["yes"][group].append(uid)
+        obj["yes"][group].append(_participant_entry(uid, display_name))
         text = f"Angemeldet als **{group}**."
+    elif group == "BANK":
+        obj["yes"]["BANK"].append(_participant_entry(uid, display_name))
+        text = "Als **Bank / Reserve** eingetragen."
     elif group == "MAYBE":
-        member = _member_from_event(inter, obj)
         rid_map = get_role_ids_for_guild(int(obj["guild_id"]))
         label = _primary_label(member, rid_map)
-        obj["maybe"][str(uid)] = label
+        obj["maybe"][str(uid)] = _maybe_entry(uid, display_name, label)
         text = "Als **Vielleicht** eingetragen."
     elif group == "NO":
-        obj["no"].append(uid)
+        obj["no"].append(_participant_entry(uid, display_name))
         text = "Als **Abgemeldet** eingetragen."
     else:
         return False, "Ungültige Auswahl."
 
     save_store()
     record_response(int(obj["guild_id"]), uid, str(msg_id), response_key)
+
+    # Egal ob per Server oder DM abgestimmt: offene Event-DM für den User weg
+    try:
+        await _delete_dm_message_for_user(inter.client, obj, uid)
+    except Exception:
+        pass
+
+    save_store()
     await _push_overview(inter.client, str(msg_id), obj)
     return True, text
 
@@ -307,6 +597,10 @@ class RaidView(BaseRaidView):
     async def btn_dps(self, inter: discord.Interaction, _):
         await self._handle(inter, "DPS")
 
+    @button(label="🏦 Bank", style=ButtonStyle.secondary, custom_id="dm_rsvp_bank")
+    async def btn_bank(self, inter: discord.Interaction, _):
+        await self._handle(inter, "BANK")
+
     @button(label="❔ Vielleicht", style=ButtonStyle.secondary, custom_id="dm_rsvp_maybe")
     async def btn_maybe(self, inter: discord.Interaction, _):
         await self._handle(inter, "MAYBE")
@@ -330,6 +624,10 @@ class ServerRaidView(BaseRaidView):
     async def btn_dps(self, inter: discord.Interaction, _):
         await self._handle(inter, "DPS")
 
+    @button(label="🏦 Bank", style=ButtonStyle.secondary, custom_id="srv_rsvp_bank")
+    async def btn_bank(self, inter: discord.Interaction, _):
+        await self._handle(inter, "BANK")
+
     @button(label="❔ Vielleicht", style=ButtonStyle.secondary, custom_id="srv_rsvp_maybe")
     async def btn_maybe(self, inter: discord.Interaction, _):
         await self._handle(inter, "MAYBE")
@@ -347,7 +645,12 @@ def _is_admin(inter: discord.Interaction) -> bool:
 
 async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
     """Registriert Slash-Commands und hängt persistente Views wieder an."""
-    for msg_id in list(store.keys()):
+    for msg_id, obj in list(store.items()):
+        try:
+            _init_event_shape(obj)
+        except Exception:
+            pass
+
         try:
             client.add_view(RaidView(int(msg_id)))
         except Exception:
@@ -356,6 +659,8 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
             client.add_view(ServerRaidView(int(msg_id)))
         except Exception:
             pass
+
+    save_store()
 
     # ---- Admin: Rollen für Maybe-Label
     @tree.command(name="raid_set_roles_dm", description="(Admin) Primärrollen (Tank/Heal/DPS) für Maybe-Label setzen")
@@ -440,10 +745,11 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
             "description": (description or "").strip(),
             "when_iso": when.isoformat(),
             "image_url": (image_url or "").strip() or None,
-            "yes": {"TANK": [], "HEAL": [], "DPS": []},
+            "yes": {"TANK": [], "HEAL": [], "DPS": [], "BANK": []},
             "maybe": {},
             "no": [],
-            "target_role_id": int(target_role.id) if target_role else 0
+            "target_role_id": int(target_role.id) if target_role else 0,
+            "dm_messages": {}
         }
 
         # Erst posten, dann mit Buttons editieren, weil wir die Message-ID brauchen
@@ -472,11 +778,14 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
                     f"• Übersicht im Server: #{ch.name}\n\n"
                     f"Wähle unten deine Teilnahme."
                 )
-                await m.send(dm_text, view=RaidView(int(msg.id)))
+                dm_msg = await m.send(dm_text, view=RaidView(int(msg.id)))
+                obj["dm_messages"][str(m.id)] = int(dm_msg.id)
                 sent += 1
                 await asyncio.sleep(0.05)
             except Exception:
                 pass
+
+        save_store()
 
         ziel = role_obj.mention if role_obj else "alle Mitglieder (ohne Bots)"
         await inter.followup.send(
@@ -501,6 +810,8 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
             await inter.followup.send("❌ Unbekanntes Event/Message-ID.", ephemeral=True)
             return
 
+        _init_event_shape(obj)
+
         guild = inter.guild
         ch = guild.get_channel(int(obj["channel_id"]))
         if not isinstance(ch, (discord.TextChannel, discord.Thread)):
@@ -523,15 +834,18 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
                 skipped_opt_out += 1
                 continue
             try:
-                await m.send(
+                dm_msg = await m.send(
                     f"**{obj['title']}** – du hast noch nicht abgestimmt.\n"
                     f"• Übersicht: <#{obj['channel_id']}>",
                     view=RaidView(int(message_id))
                 )
+                obj["dm_messages"][str(m.id)] = int(dm_msg.id)
                 sent += 1
                 await asyncio.sleep(0.05)
             except Exception:
                 pass
+
+        save_store()
 
         await inter.followup.send(
             f"✅ Resent an {sent} Nutzer.\n🔕 Opt-out übersprungen: {skipped_opt_out}",
@@ -556,6 +870,8 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
             await inter.followup.send("❌ Unbekanntes Event/Message-ID.", ephemeral=True)
             return
 
+        _init_event_shape(obj)
+
         when = datetime.fromisoformat(obj["when_iso"])
         if datetime.now(TZ) > when + timedelta(hours=2):
             await inter.followup.send("⚠️ Event ist älter als 2h nach Start – keine Resend.", ephemeral=True)
@@ -577,14 +893,17 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
                 skipped_opt_out += 1
                 continue
             try:
-                await m.send(
+                dm_msg = await m.send(
                     f"**{obj['title']}** – Anmeldung\n• Übersicht: <#{obj['channel_id']}>",
                     view=RaidView(int(message_id))
                 )
+                obj["dm_messages"][str(m.id)] = int(dm_msg.id)
                 sent += 1
                 await asyncio.sleep(0.05)
             except Exception:
                 pass
+
+        save_store()
 
         await inter.followup.send(
             f"✅ Resent an {sent} Ziel(e).\n🔕 Opt-out übersprungen: {skipped_opt_out}",
@@ -616,6 +935,8 @@ async def auto_resend_for_new_member(member: discord.Member) -> None:
 
         for mid, obj in list(store.items()):
             try:
+                _init_event_shape(obj)
+
                 if int(obj.get("guild_id", 0) or 0) != member.guild.id:
                     continue
 
@@ -635,13 +956,17 @@ async def auto_resend_for_new_member(member: discord.Member) -> None:
                     f"• Übersicht im Server: <#{obj.get('channel_id')}>"
                 )
                 try:
-                    await member.send(text, view=RaidView(int(mid)))
+                    dm_msg = await member.send(text, view=RaidView(int(mid)))
+                    obj["dm_messages"][str(member.id)] = int(dm_msg.id)
                     sent += 1
                     await asyncio.sleep(0.05)
                 except Exception:
                     pass
             except Exception:
                 continue
+
+        if sent:
+            save_store()
 
         try:
             if sent and hasattr(member, "_state") and hasattr(member._state, "_get_client"):
