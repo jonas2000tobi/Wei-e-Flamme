@@ -81,13 +81,6 @@ def _is_leader_or_admin(inter: discord.Interaction) -> bool:
     return role in inter.user.roles
 
 
-def _status_text_from_embed(embed: discord.Embed) -> str:
-    for field in embed.fields:
-        if field.name == "Status":
-            return str(field.value)
-    return "🆕 Offen"
-
-
 def _replace_status_field(embed: discord.Embed, text: str) -> discord.Embed:
     new_embed = discord.Embed(
         title=embed.title,
@@ -103,15 +96,6 @@ def _replace_status_field(embed: discord.Embed, text: str) -> discord.Embed:
 
     if embed.footer and embed.footer.text:
         new_embed.set_footer(text=embed.footer.text)
-
-    if embed.author and embed.author.name:
-        new_embed.set_author(name=embed.author.name, icon_url=embed.author.icon_url)
-
-    if embed.thumbnail and embed.thumbnail.url:
-        new_embed.set_thumbnail(url=embed.thumbnail.url)
-
-    if embed.image and embed.image.url:
-        new_embed.set_image(url=embed.image.url)
 
     return new_embed
 
@@ -203,7 +187,7 @@ class ContactModal(Modal):
             return
 
         now = datetime.now(TZ)
-        ping_txt = leader_role.mention if leader_role else ""
+        ping_txt = leader_role.mention if leader_role else None
 
         topic = _safe_text(str(self.topic.value))
         msg = _safe_text(str(self.message.value))
@@ -237,7 +221,7 @@ class ContactModal(Modal):
 
         try:
             await internal_ch.send(
-                content=ping_txt or None,
+                content=ping_txt,
                 embed=emb,
                 view=LeaderStatusView()
             )
@@ -246,15 +230,9 @@ class ContactModal(Modal):
             return
 
         if self.anonymous:
-            await inter.response.send_message(
-                "✅ Deine anonyme Meldung wurde an die Leader gesendet.",
-                ephemeral=True
-            )
+            await inter.response.send_message("✅ Deine anonyme Meldung wurde an die Leader gesendet.", ephemeral=True)
         else:
-            await inter.response.send_message(
-                "✅ Deine Nachricht wurde an die Leader gesendet.",
-                ephemeral=True
-            )
+            await inter.response.send_message("✅ Deine Nachricht wurde an die Leader gesendet.", ephemeral=True)
 
 
 class LeaderContactView(View):
@@ -271,7 +249,6 @@ class LeaderContactView(View):
 
 
 async def setup_leader_contact(client: discord.Client, tree: app_commands.CommandTree):
-    # Persistente Views registrieren
     try:
         client.add_view(LeaderContactView())
     except Exception:
@@ -282,8 +259,8 @@ async def setup_leader_contact(client: discord.Client, tree: app_commands.Comman
     except Exception:
         pass
 
-    @tree.command(name="leader_contact_set_public_channel", description="(Admin) Öffentlichen Kontakt-Channel setzen")
-    async def leader_contact_set_public_channel(inter: discord.Interaction, channel: discord.TextChannel):
+    @tree.command(name="leadercontact_set_public_channel", description="(Admin) Öffentlichen Kontakt-Channel setzen")
+    async def leadercontact_set_public_channel(inter: discord.Interaction, channel: discord.TextChannel):
         if not _is_admin(inter):
             await inter.response.send_message("❌ Nur Admins.", ephemeral=True)
             return
@@ -293,13 +270,10 @@ async def setup_leader_contact(client: discord.Client, tree: app_commands.Comman
         cfg[str(inter.guild_id)] = c
         _save_cfg(cfg)
 
-        await inter.response.send_message(
-            f"✅ Öffentlicher Kontakt-Channel gesetzt: {channel.mention}",
-            ephemeral=True
-        )
+        await inter.response.send_message(f"✅ Öffentlicher Kontakt-Channel gesetzt: {channel.mention}", ephemeral=True)
 
-    @tree.command(name="leader_contact_set_internal_channel", description="(Admin) Internen Leader-Channel setzen")
-    async def leader_contact_set_internal_channel(inter: discord.Interaction, channel: discord.TextChannel):
+    @tree.command(name="leadercontact_set_internal_channel", description="(Admin) Internen Leader-Channel setzen")
+    async def leadercontact_set_internal_channel(inter: discord.Interaction, channel: discord.TextChannel):
         if not _is_admin(inter):
             await inter.response.send_message("❌ Nur Admins.", ephemeral=True)
             return
@@ -309,13 +283,10 @@ async def setup_leader_contact(client: discord.Client, tree: app_commands.Comman
         cfg[str(inter.guild_id)] = c
         _save_cfg(cfg)
 
-        await inter.response.send_message(
-            f"✅ Interner Leader-Channel gesetzt: {channel.mention}",
-            ephemeral=True
-        )
+        await inter.response.send_message(f"✅ Interner Leader-Channel gesetzt: {channel.mention}", ephemeral=True)
 
-    @tree.command(name="leader_contact_set_role", description="(Admin) Leader-Rolle setzen")
-    async def leader_contact_set_role(inter: discord.Interaction, role: discord.Role):
+    @tree.command(name="leadercontact_set_role", description="(Admin) Leader-Rolle setzen")
+    async def leadercontact_set_role(inter: discord.Interaction, role: discord.Role):
         if not _is_admin(inter):
             await inter.response.send_message("❌ Nur Admins.", ephemeral=True)
             return
@@ -325,13 +296,10 @@ async def setup_leader_contact(client: discord.Client, tree: app_commands.Comman
         cfg[str(inter.guild_id)] = c
         _save_cfg(cfg)
 
-        await inter.response.send_message(
-            f"✅ Leader-Rolle gesetzt: {role.mention}",
-            ephemeral=True
-        )
+        await inter.response.send_message(f"✅ Leader-Rolle gesetzt: {role.mention}", ephemeral=True)
 
-    @tree.command(name="leader_contact_status", description="(Admin) Zeigt die aktuelle Leader-Kontakt-Konfiguration")
-    async def leader_contact_status(inter: discord.Interaction):
+    @tree.command(name="leadercontact_status", description="(Admin) Zeigt die aktuelle Leader-Kontakt-Konfiguration")
+    async def leadercontact_status(inter: discord.Interaction):
         if not _is_admin(inter):
             await inter.response.send_message("❌ Nur Admins.", ephemeral=True)
             return
@@ -353,8 +321,8 @@ async def setup_leader_contact(client: discord.Client, tree: app_commands.Comman
         )
         await inter.response.send_message(text, ephemeral=True)
 
-    @tree.command(name="leader_contact_post", description="(Admin) Postet die Kontakt-Nachricht im öffentlichen Kontakt-Channel")
-    async def leader_contact_post(inter: discord.Interaction):
+    @tree.command(name="leadercontact_post", description="(Admin) Postet die Kontakt-Nachricht im öffentlichen Kontakt-Channel")
+    async def leadercontact_post(inter: discord.Interaction):
         if not _is_admin(inter):
             await inter.response.send_message("❌ Nur Admins.", ephemeral=True)
             return
@@ -393,13 +361,10 @@ async def setup_leader_contact(client: discord.Client, tree: app_commands.Comman
         cfg[str(inter.guild_id)] = c
         _save_cfg(cfg)
 
-        await inter.response.send_message(
-            f"✅ Kontakt-Post erstellt: {msg.jump_url}",
-            ephemeral=True
-        )
+        await inter.response.send_message(f"✅ Kontakt-Post erstellt: {msg.jump_url}", ephemeral=True)
 
-    @tree.command(name="leader_contact_repost", description="(Admin) Löscht alten Kontakt-Post nicht, erstellt aber einen neuen")
-    async def leader_contact_repost(inter: discord.Interaction):
+    @tree.command(name="leadercontact_repost", description="(Admin) Erstellt einen neuen Kontakt-Post")
+    async def leadercontact_repost(inter: discord.Interaction):
         if not _is_admin(inter):
             await inter.response.send_message("❌ Nur Admins.", ephemeral=True)
             return
@@ -438,7 +403,4 @@ async def setup_leader_contact(client: discord.Client, tree: app_commands.Comman
         cfg[str(inter.guild_id)] = c
         _save_cfg(cfg)
 
-        await inter.response.send_message(
-            f"✅ Neuer Kontakt-Post erstellt: {msg.jump_url}",
-            ephemeral=True
-        )
+        await inter.response.send_message(f"✅ Neuer Kontakt-Post erstellt: {msg.jump_url}", ephemeral=True)
