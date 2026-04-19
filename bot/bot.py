@@ -134,13 +134,23 @@ async def on_app_command_error(inter: discord.Interaction, error: app_commands.A
 async def cleanup_expired_events():
     try:
         try:
-            from bot.event_rsvp_dm import store, save_store, TZ  # type: ignore
+            from bot.event_rsvp_dm import store, save_store, TZ, delete_pending_dm_messages_for_started_events  # type: ignore
         except ModuleNotFoundError:
-            from event_rsvp_dm import store, save_store, TZ  # type: ignore
+            from event_rsvp_dm import store, save_store, TZ, delete_pending_dm_messages_for_started_events  # type: ignore
 
         now = datetime.now(TZ)
         remove: List[str] = []
 
+        # 1) Sobald Event begonnen hat -> offene DMs von Nicht-Abstimmern löschen
+        try:
+            changed = await delete_pending_dm_messages_for_started_events(bot)
+            if changed:
+                save_store()
+                print(f"🧹 Offene Event-DMs entfernt: {changed}")
+        except Exception as e:
+            print(f"[cleanup_expired_events] delete_pending_dm_messages_for_started_events Fehler: {e}")
+
+        # 2) 2h nach Eventstart -> Server-Post + Store entfernen
         for msg_id, obj in list(store.items()):
             try:
                 when = datetime.fromisoformat(obj.get("when_iso"))
@@ -274,13 +284,19 @@ async def raid_stats_cmd(inter: discord.Interaction):
         await inter.response.send_message("📊 Noch keine Statistik vorhanden.", ephemeral=True)
         return
 
-    total = int(s.get("yes", 0)) + int(s.get("maybe", 0)) + int(s.get("no", 0))
+    total = (
+        int(s.get("yes", 0))
+        + int(s.get("bank", 0))
+        + int(s.get("maybe", 0))
+        + int(s.get("no", 0))
+    )
 
     emb = discord.Embed(
         title=f"📊 Raid-Statistik: {inter.user.display_name}",
         color=discord.Color.orange()
     )
     emb.add_field(name="✅ Zusagen", value=str(s.get("yes", 0)), inline=True)
+    emb.add_field(name="🏦 Bank", value=str(s.get("bank", 0)), inline=True)
     emb.add_field(name="❔ Vielleicht", value=str(s.get("maybe", 0)), inline=True)
     emb.add_field(name="❌ Abmeldungen", value=str(s.get("no", 0)), inline=True)
     emb.add_field(name="📦 Gesamt", value=str(total), inline=False)
