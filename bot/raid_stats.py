@@ -12,14 +12,30 @@ FILE = DATA_DIR / "raid_stats.json"
 
 def _default() -> dict:
     return {
-        "users": {},   # users[guild_id][user_id] = {"yes":0,"maybe":0,"no":0}
-        "events": {}   # events[guild_id][event_id][user_id] = "yes"|"maybe"|"no"
+        "users": {},   # users[guild_id][user_id] = {"yes":0,"bank":0,"maybe":0,"no":0}
+        "events": {}   # events[guild_id][event_id][user_id] = "yes"|"bank"|"maybe"|"no"
     }
 
 
 def _load() -> dict:
     try:
-        return json.loads(FILE.read_text(encoding="utf-8"))
+        data = json.loads(FILE.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return _default()
+
+        users = data.setdefault("users", {})
+        for _gid, guild_users in users.items():
+            if not isinstance(guild_users, dict):
+                continue
+            for _uid, bucket in guild_users.items():
+                if isinstance(bucket, dict):
+                    bucket.setdefault("yes", 0)
+                    bucket.setdefault("bank", 0)
+                    bucket.setdefault("maybe", 0)
+                    bucket.setdefault("no", 0)
+
+        data.setdefault("events", {})
+        return data
     except Exception:
         return _default()
 
@@ -34,7 +50,11 @@ stats = _load()
 def _user_bucket(guild_id: int, user_id: int) -> dict:
     users = stats.setdefault("users", {})
     guild_users = users.setdefault(str(guild_id), {})
-    user_stats = guild_users.setdefault(str(user_id), {"yes": 0, "maybe": 0, "no": 0})
+    user_stats = guild_users.setdefault(str(user_id), {"yes": 0, "bank": 0, "maybe": 0, "no": 0})
+    user_stats.setdefault("yes", 0)
+    user_stats.setdefault("bank", 0)
+    user_stats.setdefault("maybe", 0)
+    user_stats.setdefault("no", 0)
     return user_stats
 
 
@@ -52,12 +72,12 @@ def _dec_if_possible(bucket: dict, key: str) -> None:
 
 def record_response(guild_id: int, user_id: int, event_id: str, response: str) -> None:
     """
-    response = "yes" | "maybe" | "no"
+    response = "yes" | "bank" | "maybe" | "no"
     Pro Event zählt immer nur der aktuelle Status eines Users.
-    Wenn er von maybe -> yes wechselt, wird maybe runter und yes hochgezählt.
+    Wenn er wechselt, wird alt runter und neu hochgezählt.
     """
     response = str(response).strip().lower()
-    if response not in {"yes", "maybe", "no"}:
+    if response not in {"yes", "bank", "maybe", "no"}:
         return
 
     user_bucket = _user_bucket(guild_id, user_id)
@@ -69,7 +89,7 @@ def record_response(guild_id: int, user_id: int, event_id: str, response: str) -
     if old_response == response:
         return
 
-    if old_response in {"yes", "maybe", "no"}:
+    if old_response in {"yes", "bank", "maybe", "no"}:
         _dec_if_possible(user_bucket, old_response)
 
     user_bucket[response] = int(user_bucket.get(response, 0)) + 1
@@ -81,7 +101,13 @@ def record_response(guild_id: int, user_id: int, event_id: str, response: str) -
 def get_user_stats(guild_id: int, user_id: int) -> Optional[dict]:
     users = stats.get("users", {})
     guild_users = users.get(str(guild_id), {})
-    return guild_users.get(str(user_id))
+    data = guild_users.get(str(user_id))
+    if isinstance(data, dict):
+        data.setdefault("yes", 0)
+        data.setdefault("bank", 0)
+        data.setdefault("maybe", 0)
+        data.setdefault("no", 0)
+    return data
 
 
 def get_top_yes_stats(guild_id: int, limit: int = 10) -> List[Tuple[int, int]]:
