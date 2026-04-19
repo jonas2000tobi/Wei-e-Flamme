@@ -259,8 +259,8 @@ async def setup_leader_contact(client: discord.Client, tree: app_commands.Comman
     except Exception:
         pass
 
-    @tree.command(name="leadercontact_set_public_channel", description="(Admin) Öffentlichen Kontakt-Channel setzen")
-    async def leadercontact_set_public_channel(inter: discord.Interaction, channel: discord.TextChannel):
+    @tree.command(name="leadercontact_public", description="(Admin) Öffentlichen Kontakt-Channel setzen")
+    async def leadercontact_public(inter: discord.Interaction, channel: discord.TextChannel):
         if not _is_admin(inter):
             await inter.response.send_message("❌ Nur Admins.", ephemeral=True)
             return
@@ -272,8 +272,8 @@ async def setup_leader_contact(client: discord.Client, tree: app_commands.Comman
 
         await inter.response.send_message(f"✅ Öffentlicher Kontakt-Channel gesetzt: {channel.mention}", ephemeral=True)
 
-    @tree.command(name="leadercontact_set_internal_channel", description="(Admin) Internen Leader-Channel setzen")
-    async def leadercontact_set_internal_channel(inter: discord.Interaction, channel: discord.TextChannel):
+    @tree.command(name="leadercontact_internal", description="(Admin) Internen Leader-Channel setzen")
+    async def leadercontact_internal(inter: discord.Interaction, channel: discord.TextChannel):
         if not _is_admin(inter):
             await inter.response.send_message("❌ Nur Admins.", ephemeral=True)
             return
@@ -285,8 +285,8 @@ async def setup_leader_contact(client: discord.Client, tree: app_commands.Comman
 
         await inter.response.send_message(f"✅ Interner Leader-Channel gesetzt: {channel.mention}", ephemeral=True)
 
-    @tree.command(name="leadercontact_set_role", description="(Admin) Leader-Rolle setzen")
-    async def leadercontact_set_role(inter: discord.Interaction, role: discord.Role):
+    @tree.command(name="leadercontact_role", description="(Admin) Leader-Rolle setzen")
+    async def leadercontact_role(inter: discord.Interaction, role: discord.Role):
         if not _is_admin(inter):
             await inter.response.send_message("❌ Nur Admins.", ephemeral=True)
             return
