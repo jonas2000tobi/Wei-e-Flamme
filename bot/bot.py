@@ -27,6 +27,7 @@ set_dm_pref = None
 is_dm_enabled = None
 get_user_stats = None
 get_top_yes_stats = None
+setup_leader_contact = None
 store = {}
 
 
@@ -79,6 +80,14 @@ def _import_modules():
         from raid_stats import get_user_stats, get_top_yes_stats  # type: ignore
         print("✅ Import: raid_stats (root)")
 
+    global setup_leader_contact
+    try:
+        from bot.leader_contact import setup_leader_contact  # type: ignore
+        print("✅ Import: bot.leader_contact")
+    except ModuleNotFoundError:
+        from leader_contact import setup_leader_contact  # type: ignore
+        print("✅ Import: leader_contact (root)")
+
 
 # -------- Token ----------
 def _get_token() -> str | None:
@@ -100,8 +109,9 @@ async def on_ready():
         _import_modules()
         await setup_rsvp_dm(bot, tree)
         await setup_onboarding(bot, tree)
+        await setup_leader_contact(bot, tree)
         register_join_hook(bot, send_onboarding_dm, auto_resend_for_new_member)
-        print("✅ Module geladen (RSVP-DM, Onboarding, Join-Hook, DM-Prefs, Stats).")
+        print("✅ Module geladen (RSVP-DM, Onboarding, Join-Hook, DM-Prefs, Stats, Leader-Contact).")
     except Exception as e:
         print(f"⚠️ Modul-Setup Fehler: {e}")
 
