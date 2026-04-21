@@ -106,7 +106,7 @@ def _entry_name(entry: Any, guild: Optional[discord.Guild] = None) -> str:
             m = guild.get_member(uid)
             if m:
                 return _safe_name(m.display_name)
-        return stored or f"User {uid}" if uid else "Unbekannt"
+        return stored or (f"User {uid}" if uid else "Unbekannt")
 
     try:
         uid = int(entry)
@@ -139,6 +139,25 @@ def _maybe_name_and_label(entry: Any, uid_fallback: int, guild: Optional[discord
         if m:
             return _safe_name(m.display_name), label
     return f"User {uid_fallback}", label
+
+def _format_dm_text(title: str, when: datetime, channel_name_or_ref: str, description: str | None, intro_line: str | None = None) -> str:
+    desc = (description or "").strip()
+
+    dm_text = (
+        f"📅 **{title}**\n"
+        f"🕒 {when.strftime('%a, %d.%m.%Y %H:%M')} (Europe/Berlin)\n"
+        f"📍 {channel_name_or_ref}\n"
+    )
+
+    if desc:
+        dm_text += f"\n📝 **Beschreibung:**\n{desc[:500]}\n"
+
+    if intro_line:
+        dm_text += f"\n👇 **{intro_line}**"
+    else:
+        dm_text += "\n👇 **Wähle unten deine Teilnahme:**"
+
+    return dm_text
 
 def _init_event_shape(obj: dict):
     if "yes" not in obj or not isinstance(obj["yes"], dict):
@@ -772,11 +791,12 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
                 skipped_opt_out += 1
                 continue
             try:
-                dm_text = (
-                    f"**{title}** – Anmeldung\n"
-                    f"• {when.strftime('%a, %d.%m.%Y %H:%M')} (Europe/Berlin)\n"
-                    f"• Übersicht im Server: #{ch.name}\n\n"
-                    f"Wähle unten deine Teilnahme."
+                dm_text = _format_dm_text(
+                    title=title,
+                    when=when,
+                    channel_name_or_ref=f"Übersicht im Server: #{ch.name}",
+                    description=description,
+                    intro_line="Wähle unten deine Teilnahme:"
                 )
                 dm_msg = await m.send(dm_text, view=RaidView(int(msg.id)))
                 obj["dm_messages"][str(m.id)] = int(dm_msg.id)
@@ -834,11 +854,14 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
                 skipped_opt_out += 1
                 continue
             try:
-                dm_msg = await m.send(
-                    f"**{obj['title']}** – du hast noch nicht abgestimmt.\n"
-                    f"• Übersicht: <#{obj['channel_id']}>",
-                    view=RaidView(int(message_id))
+                dm_text = _format_dm_text(
+                    title=str(obj["title"]),
+                    when=when,
+                    channel_name_or_ref=f"Übersicht: <#{obj['channel_id']}>",
+                    description=obj.get("description"),
+                    intro_line="Du hast noch nicht abgestimmt:"
                 )
+                dm_msg = await m.send(dm_text, view=RaidView(int(message_id)))
                 obj["dm_messages"][str(m.id)] = int(dm_msg.id)
                 sent += 1
                 await asyncio.sleep(0.05)
@@ -893,10 +916,14 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
                 skipped_opt_out += 1
                 continue
             try:
-                dm_msg = await m.send(
-                    f"**{obj['title']}** – Anmeldung\n• Übersicht: <#{obj['channel_id']}>",
-                    view=RaidView(int(message_id))
+                dm_text = _format_dm_text(
+                    title=str(obj["title"]),
+                    when=when,
+                    channel_name_or_ref=f"Übersicht: <#{obj['channel_id']}>",
+                    description=obj.get("description"),
+                    intro_line="Wähle unten deine Teilnahme:"
                 )
+                dm_msg = await m.send(dm_text, view=RaidView(int(message_id)))
                 obj["dm_messages"][str(m.id)] = int(dm_msg.id)
                 sent += 1
                 await asyncio.sleep(0.05)
@@ -950,10 +977,12 @@ async def auto_resend_for_new_member(member: discord.Member) -> None:
                     if not (r and r in member.roles):
                         continue
 
-                text = (
-                    f"**{obj.get('title','Event')}** – Anmeldung\n"
-                    f"• {when.strftime('%a, %d.%m.%Y %H:%M')} (Europe/Berlin)\n"
-                    f"• Übersicht im Server: <#{obj.get('channel_id')}>"
+                text = _format_dm_text(
+                    title=str(obj.get("title", "Event")),
+                    when=when,
+                    channel_name_or_ref=f"Übersicht im Server: <#{obj.get('channel_id')}>",
+                    description=obj.get("description"),
+                    intro_line="Wähle unten deine Teilnahme:"
                 )
                 try:
                     dm_msg = await member.send(text, view=RaidView(int(mid)))
