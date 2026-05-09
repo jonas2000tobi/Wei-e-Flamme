@@ -27,7 +27,10 @@ get_user_stats = None
 get_top_yes_stats = None
 get_non_response_stats = None
 setup_leader_contact = None
+setup_raid_templates = None
+setup_weekly_report = None
 store = {}
+
 
 def _import_modules():
     global setup_rsvp_dm, auto_resend_for_new_member, store
@@ -92,6 +95,25 @@ def _import_modules():
         from leader_contact import setup_leader_contact  # type: ignore
         print("✅ Import: leader_contact (root)")
 
+    global setup_raid_templates
+
+    try:
+        from bot.raid_templates import setup_raid_templates  # type: ignore
+        print("✅ Import: bot.raid_templates")
+    except ModuleNotFoundError:
+        from raid_templates import setup_raid_templates  # type: ignore
+        print("✅ Import: raid_templates (root)")
+
+    global setup_weekly_report
+
+    try:
+        from bot.weekly_report import setup_weekly_report  # type: ignore
+        print("✅ Import: bot.weekly_report")
+    except ModuleNotFoundError:
+        from weekly_report import setup_weekly_report  # type: ignore
+        print("✅ Import: weekly_report (root)")
+
+
 def _get_token() -> str | None:
     for key in ("DISCORD_TOKEN", "DISCORD_BOT_TOKEN", "TOKEN"):
         val = os.getenv(key)
@@ -103,6 +125,7 @@ def _get_token() -> str | None:
     print("❌ Kein Token gefunden (DISCORD_TOKEN / DISCORD_BOT_TOKEN / TOKEN).")
     return None
 
+
 @bot.event
 async def on_ready():
     print(f"✅ Eingeloggt als {bot.user} (ID: {bot.user.id})")
@@ -113,10 +136,12 @@ async def on_ready():
         await setup_rsvp_dm(bot, tree)
         await setup_onboarding(bot, tree)
         await setup_leader_contact(bot, tree)
+        await setup_raid_templates(bot, tree)
+        await setup_weekly_report(bot, tree)
 
         register_join_hook(bot, send_onboarding_dm, auto_resend_for_new_member)
 
-        print("✅ Module geladen (RSVP-DM, Onboarding, Join-Hook, DM-Prefs, Stats, Leader-Contact).")
+        print("✅ Module geladen.")
 
     except Exception as e:
         print(f"⚠️ Modul-Setup Fehler: {e}")
@@ -131,6 +156,7 @@ async def on_ready():
         cleanup_expired_events.start()
         print("🧹 Cleanup-Task gestartet.")
 
+
 @tree.error
 async def on_app_command_error(inter: discord.Interaction, error: app_commands.AppCommandError):
     try:
@@ -142,6 +168,7 @@ async def on_app_command_error(inter: discord.Interaction, error: app_commands.A
         pass
 
     print(f"[AppCmdError] {getattr(inter.command, 'name', '?')}: {error!r}")
+
 
 @tasks.loop(minutes=5)
 async def cleanup_expired_events():
@@ -198,9 +225,11 @@ async def cleanup_expired_events():
     except Exception as e:
         print(f"[cleanup_expired_events] Fehler: {e}")
 
+
 @tree.command(name="ping", description="Lebenszeichen.")
 async def ping(inter: discord.Interaction):
     await inter.response.send_message("🏓 Pong!", ephemeral=True)
+
 
 @tree.command(name="raid_dm", description="Eigene Raid-DM Einstellungen")
 @app_commands.describe(mode="on / off / status")
@@ -237,6 +266,7 @@ async def raid_dm(inter: discord.Interaction, mode: str):
         return
 
     await inter.response.send_message("Nutze: `on`, `off` oder `status`.", ephemeral=True)
+
 
 @tree.command(name="raid_calendar", description="Zeigt kommende Raid-/Event-Termine")
 async def raid_calendar(inter: discord.Interaction):
@@ -285,6 +315,7 @@ async def raid_calendar(inter: discord.Interaction):
 
     await inter.response.send_message(embed=emb, ephemeral=True)
 
+
 @tree.command(name="raid_stats", description="Zeigt Mitglieder, die bei Raid-/Events nicht abgestimmt haben")
 async def raid_stats_cmd(inter: discord.Interaction):
     if inter.guild_id is None or inter.guild is None:
@@ -318,6 +349,7 @@ async def raid_stats_cmd(inter: discord.Interaction):
 
     await inter.response.send_message(embed=emb, ephemeral=True)
 
+
 @tree.command(name="raid_stats_top", description="Top 10 Mitglieder, die am häufigsten nicht abgestimmt haben")
 async def raid_stats_top_cmd(inter: discord.Interaction):
     if inter.guild_id is None or inter.guild is None:
@@ -349,6 +381,7 @@ async def raid_stats_top_cmd(inter: discord.Interaction):
 
     await inter.response.send_message(embed=emb)
 
+
 def main():
     print("🚀 Starte Bot ...")
     token = _get_token()
@@ -357,6 +390,7 @@ def main():
         return
 
     bot.run(token)
+
 
 if __name__ == "__main__":
     main()
