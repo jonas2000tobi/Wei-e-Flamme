@@ -28,6 +28,7 @@ CFG_FILE = DATA_DIR / "weekly_report_cfg.json"
 POST_LOG_FILE = DATA_DIR / "weekly_report_post_log.json"
 ONBOARDING_CFG_FILE = DATA_DIR / "onboarding_cfg.json"
 LEADER_CONTACT_CFG_FILE = DATA_DIR / "leader_contact_cfg.json"
+MEMBER_PROFILE_FILE = DATA_DIR / "member_profiles.json"
 
 
 def _load_json(path: Path, default):
@@ -195,6 +196,51 @@ def _load_leader_contact_cfg() -> dict:
     return _load_json(LEADER_CONTACT_CFG_FILE, {})
 
 
+def _load_member_profiles() -> dict:
+    return _load_json(MEMBER_PROFILE_FILE, {})
+
+
+def _active_absences(guild: discord.Guild) -> List[str]:
+    data = _load_member_profiles()
+    g = data.get(str(guild.id)) or {}
+    absences = g.get("absences") or {}
+    users = g.get("users") or {}
+
+    out = []
+
+    today = datetime.now(TZ).date()
+
+    for uid_str, a in absences.items():
+        try:
+            uid = int(uid_str)
+            member = guild.get_member(uid)
+
+            if not member or member.bot:
+                continue
+
+            to_s = str(a.get("to", "") or "")
+            if "-" not in to_s:
+                continue
+
+            dd, mm = [int(x) for x in to_s.split("-")]
+            to_d = datetime(today.year, mm, dd, tzinfo=TZ).date()
+
+            if to_d < today:
+                continue
+
+            profile = users.get(uid_str) or {}
+            name = profile.get("ingame_name") or member.display_name
+            from_s = str(a.get("from", "—"))
+            reason = str(a.get("reason", "—"))
+
+            out.append(f"• **{name}**: {from_s} bis {to_s} – {reason[:80]}")
+
+        except Exception:
+            continue
+
+    return out[:15]
+
+
 async def _leader_contact_status_counts(guild: discord.Guild) -> dict:
     out = {
         "open": 0,
@@ -249,9 +295,10 @@ async def build_weekly_report_embed(guild: discord.Guild) -> discord.Embed:
     events = _events_this_week(guild)
     non_response = get_non_response_stats(guild, store, only_started=True)
     leader_counts = await _leader_contact_status_counts(guild)
+    absences = _active_absences(guild)
 
     emb = discord.Embed(
-        title="📋 Wochenbericht – Weiße Flamme",
+        title="📋 Wochenbericht – ebolus",
         description=(
             f"Zeitraum: **{start.strftime('%d.%m.%Y')} – {(end - timedelta(days=1)).strftime('%d.%m.%Y')}**"
         ),
@@ -318,6 +365,12 @@ async def build_weekly_report_embed(guild: discord.Guild) -> discord.Embed:
     )
 
     emb.add_field(
+        name="🏖️ Abwesenheiten",
+        value="\n".join(absences) if absences else "Keine aktiven/geplanten Abwesenheiten gefunden.",
+        inline=False,
+    )
+
+    emb.add_field(
         name="🎁 Loot / Needliste",
         value="Noch kein Loot-Modul aktiv.",
         inline=False,
@@ -356,7 +409,7 @@ def _should_post_now(guild_id: int, c: dict) -> bool:
 
 def _mark_posted(guild_id: int) -> None:
     post_log[str(guild_id)] = datetime.now(TZ).strftime("%Y-%m-%d")
-    _save_post_log()
+    _save_json(POST_LOG_FILE, post_log)
 
 
 _report_task_started = False
