@@ -46,6 +46,13 @@ cfg: dict = _load_json(CFG_FILE, {})
 post_log: dict = _load_json(POST_LOG_FILE, {})
 
 
+def _display_name(guild: discord.Guild, user_id: int) -> str:
+    member = guild.get_member(int(user_id))
+    if member:
+        return member.display_name
+    return f"Unbekannt ({user_id})"
+
+
 def _is_admin(inter: discord.Interaction) -> bool:
     perms = getattr(inter.user, "guild_permissions", None)
     return bool(perms and (perms.administrator or perms.manage_guild))
@@ -64,10 +71,6 @@ def _gcfg(guild_id: int) -> dict:
 
 def _save_cfg() -> None:
     _save_json(CFG_FILE, cfg)
-
-
-def _save_post_log() -> None:
-    _save_json(POST_LOG_FILE, post_log)
 
 
 def _week_start_end() -> tuple[datetime, datetime]:
@@ -207,7 +210,6 @@ def _active_absences(guild: discord.Guild) -> List[str]:
     users = g.get("users") or {}
 
     out = []
-
     today = datetime.now(TZ).date()
 
     for uid_str, a in absences.items():
@@ -266,7 +268,6 @@ async def _leader_contact_status_counts(guild: discord.Guild) -> dict:
                 continue
 
             emb = msg.embeds[0]
-
             status_text = ""
 
             for field in emb.fields:
@@ -313,7 +314,7 @@ async def build_weekly_report_embed(guild: discord.Guild) -> discord.Embed:
 
     if new_members:
         member_lines.append("")
-        member_lines.extend([f"• {m.mention}" for m in new_members[:10]])
+        member_lines.extend([f"• {m.display_name}" for m in new_members[:10]])
 
     emb.add_field(
         name="👥 Mitglieder",
@@ -342,8 +343,10 @@ async def build_weekly_report_embed(guild: discord.Guild) -> discord.Embed:
         nr_lines = []
 
         for i, entry in enumerate(non_response[:10], start=1):
+            uid = int(entry["user_id"])
+            name = _display_name(guild, uid)
             nr_lines.append(
-                f"{i}. <@{int(entry['user_id'])}> — **{int(entry['missing'])}x** nicht abgestimmt"
+                f"{i}. **{name}** — **{int(entry['missing'])}x** nicht abgestimmt"
             )
     else:
         nr_lines = ["Keine Nicht-Abstimmer gefunden."]
