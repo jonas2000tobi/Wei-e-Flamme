@@ -5,7 +5,7 @@ import re
 import asyncio
 from pathlib import Path
 from datetime import datetime, date
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Any, List, Tuple
 
 import discord
 from discord import app_commands
@@ -343,11 +343,26 @@ def _members_list_embed(guild: discord.Guild) -> discord.Embed:
     )
 
     lines = []
-    members = [m for m in guild.members if not m.bot]
+
+    c = _gcfg(guild.id)
+    member_role_id = int(c.get("member_role_id", 0) or 0)
+
+    if not member_role_id:
+        emb.description = "❌ Keine Ebolus-/Gildenmitglied-Rolle gesetzt. Nutze zuerst `/portal_set_member_role`."
+        return emb
+
+    member_role = guild.get_role(member_role_id)
+
+    if not member_role:
+        emb.description = "❌ Die gespeicherte Ebolus-/Gildenmitglied-Rolle wurde nicht gefunden."
+        return emb
+
+    members = [m for m in member_role.members if not m.bot]
     members.sort(key=lambda m: _member_sort_key(guild, m))
 
     for m in members[:40]:
         p = _user_profile(guild.id, m.id)
+
         name = p.get("ingame_name") or _display_name(m)
         main_role = p.get("main_role") or "—"
         gs = p.get("gearscore") or "—"
@@ -355,15 +370,23 @@ def _members_list_embed(guild: discord.Guild) -> discord.Embed:
         status = _absence_label(guild.id, m.id)
         joined = _guild_join_date(m)
 
-        lines.append(f"• **{name}** – {main_role} – GS {gs} – {pos} – seit {joined} – {status}")
+        lines.append(
+            f"• **{name}** – {main_role} – GS {gs} – {pos} – seit {joined} – {status}"
+        )
 
     if not lines:
-        emb.description = "Keine Mitglieder gefunden."
+        emb.description = "Keine Mitglieder mit der Ebolus-/Gildenmitglied-Rolle gefunden."
     else:
         emb.description = "\n".join(lines)
 
     if len(members) > 40:
-        emb.set_footer(text=f"Anzeige begrenzt auf 40 von {len(members)} Mitgliedern. Sortierung: Rang, dann Gearscore.")
+        emb.set_footer(
+            text=f"Anzeige begrenzt auf 40 von {len(members)} Mitgliedern. Sortierung: Rang, dann Gearscore."
+        )
+    else:
+        emb.set_footer(
+            text="Angezeigt werden nur Mitglieder mit der Ebolus-/Gildenmitglied-Rolle."
+        )
 
     return emb
 
@@ -707,7 +730,7 @@ class MemberPortalMainView(View):
                 "**Abwesenheit melden**\n"
                 "Meldet deine Abwesenheit an die Gildenleitung und speichert sie für die Mitgliederliste.\n\n"
                 "**Mitgliederliste**\n"
-                "Sortiert nach Rang und Gearscore."
+                "Sortiert nach Rang und Gearscore. Angezeigt werden nur Mitglieder mit der Ebolus-/Gildenmitglied-Rolle."
             ),
             color=discord.Color.blurple()
         )
@@ -892,7 +915,7 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
         save_cfg()
 
         await inter.response.send_message(
-            f"✅ Gildenmitglied-Rolle gesetzt: {role.mention}\n"
+            f"✅ Ebolus-/Gildenmitglied-Rolle gesetzt: {role.mention}\n"
             f"Neue Mitglieder mit dieser Rolle bekommen automatisch das Gildenmenü per DM.",
             ephemeral=True
         )
@@ -909,13 +932,13 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
         member_role_id = int(c.get("member_role_id", 0) or 0)
 
         if not member_role_id:
-            await inter.followup.send("❌ Keine Gildenmitglied-Rolle gesetzt. Nutze zuerst `/portal_set_member_role`.", ephemeral=True)
+            await inter.followup.send("❌ Keine Ebolus-/Gildenmitglied-Rolle gesetzt. Nutze zuerst `/portal_set_member_role`.", ephemeral=True)
             return
 
         role = inter.guild.get_role(member_role_id)
 
         if not role:
-            await inter.followup.send("❌ Gildenmitglied-Rolle nicht gefunden.", ephemeral=True)
+            await inter.followup.send("❌ Ebolus-/Gildenmitglied-Rolle nicht gefunden.", ephemeral=True)
             return
 
         sent = 0
@@ -1012,7 +1035,7 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
 
         if not member_role_id:
             await inter.followup.send(
-                "❌ Keine Gildenmitglied-Rolle gesetzt. Nutze zuerst `/portal_set_member_role`.",
+                "❌ Keine Ebolus-/Gildenmitglied-Rolle gesetzt. Nutze zuerst `/portal_set_member_role`.",
                 ephemeral=True
             )
             return
@@ -1020,7 +1043,7 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
         role = inter.guild.get_role(member_role_id)
 
         if not role:
-            await inter.followup.send("❌ Gildenmitglied-Rolle nicht gefunden.", ephemeral=True)
+            await inter.followup.send("❌ Ebolus-/Gildenmitglied-Rolle nicht gefunden.", ephemeral=True)
             return
 
         total_deleted = 0
@@ -1041,7 +1064,7 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
                 failed += 1
 
         await inter.followup.send(
-            f"✅ DM-Cleanup für Gildenmitglieder abgeschlossen.\n"
+            f"✅ DM-Cleanup für Ebolus-/Gildenmitglieder abgeschlossen.\n"
             f"👥 Geprüft: **{checked}**\n"
             f"🧹 Gelöschte Bot-Nachrichten: **{total_deleted}**\n"
             f"❌ Fehlgeschlagen: **{failed}**\n\n"
@@ -1192,16 +1215,20 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
         portal_ch_id = int(c.get("portal_post_channel_id", 0) or 0)
         member_role_id = int(c.get("member_role_id", 0) or 0)
 
+        leader_role_id = int(roles.get("leader", 0) or 0)
+        advisor_role_id = int(roles.get("advisor", 0) or 0)
+        guardian_role_id = int(roles.get("guardian", 0) or 0)
+
         text = (
             f"**Member-Portal Status**\n"
-            f"• Gildenmitglied-Rolle: {f'<@&{member_role_id}>' if member_role_id else '—'}\n"
+            f"• Ebolus-/Gildenmitglied-Rolle: {f'<@&{member_role_id}>' if member_role_id else '—'}\n"
             f"• Abwesenheitskanal: {f'<#{absence_ch_id}>' if absence_ch_id else '—'}\n"
             f"• Portal-Post-Channel: {f'<#{portal_ch_id}>' if portal_ch_id else '—'}\n"
             f"• Portal-Message-ID: `{c.get('portal_post_message_id', 0)}`\n\n"
             f"**Positionsrollen**\n"
-            f"• Anführer: {f'<@&{roles.get('leader')}>' if int(roles.get('leader', 0) or 0) else '—'}\n"
-            f"• Gildenberater: {f'<@&{roles.get('advisor')}>' if int(roles.get('advisor', 0) or 0) else '—'}\n"
-            f"• Wächter: {f'<@&{roles.get('guardian')}>' if int(roles.get('guardian', 0) or 0) else '—'}\n\n"
+            f"• Anführer: {f'<@&{leader_role_id}>' if leader_role_id else '—'}\n"
+            f"• Gildenberater: {f'<@&{advisor_role_id}>' if advisor_role_id else '—'}\n"
+            f"• Wächter: {f'<@&{guardian_role_id}>' if guardian_role_id else '—'}\n\n"
             f"**Feste Events:** {len(c.get('events') or [])}"
         )
 
