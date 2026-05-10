@@ -110,8 +110,10 @@ def _portal_was_sent(guild_id: int, user_id: int) -> bool:
 def _clear_portal_sent(guild_id: int, user_id: int) -> None:
     g = sent_state.get(str(guild_id)) or {}
     arr = set(g.get("sent_users", []))
+
     if str(user_id) in arr:
         arr.remove(str(user_id))
+
     g["sent_users"] = sorted(arr)
     sent_state[str(guild_id)] = g
     save_sent()
@@ -178,8 +180,10 @@ def _guild_join_date(member: discord.Member) -> str:
 def _guild_days(member: discord.Member) -> int:
     if not member.joined_at:
         return 0
+
     joined = member.joined_at.astimezone(TZ)
     now = datetime.now(TZ)
+
     return max(0, (now.date() - joined.date()).days)
 
 
@@ -188,6 +192,7 @@ _DATE_RE = re.compile(r"^\d{2}-\d{2}$")
 
 def _valid_ddmm(value: str) -> bool:
     value = (value or "").strip()
+
     if not _DATE_RE.match(value):
         return False
 
@@ -213,6 +218,7 @@ def _absence_for_user(guild_id: int, user_id: int) -> Optional[dict]:
 def _absence_not_expired(absence: dict) -> bool:
     try:
         to_s = str(absence.get("to", "")).strip()
+
         if not _valid_ddmm(to_s):
             return False
 
@@ -223,6 +229,7 @@ def _absence_not_expired(absence: dict) -> bool:
             return False
 
         return True
+
     except Exception:
         return False
 
@@ -250,15 +257,19 @@ def _is_absent_now(absence: dict) -> bool:
 
 def _status_for_user(guild_id: int, user_id: int) -> str:
     absence = _absence_for_user(guild_id, user_id)
+
     if absence and _is_absent_now(absence):
         return f"Abwesend bis {absence.get('to', '—')}"
+
     return "Aktiv"
 
 
 def _absence_label(guild_id: int, user_id: int) -> str:
     absence = _absence_for_user(guild_id, user_id)
+
     if absence and _absence_not_expired(absence):
         return f"abwesend bis {absence.get('to', '—')}"
+
     return "aktiv"
 
 
@@ -304,6 +315,7 @@ def _events_embed(guild_id: int) -> discord.Embed:
         return emb
 
     lines = []
+
     for e in events:
         weekday = str(e.get("weekday", "—"))
         time = str(e.get("time", "—"))
@@ -331,7 +343,6 @@ def _members_list_embed(guild: discord.Guild) -> discord.Embed:
     )
 
     lines = []
-
     members = [m for m in guild.members if not m.bot]
     members.sort(key=lambda m: _member_sort_key(guild, m))
 
@@ -400,6 +411,41 @@ def _member_has_member_role(member: discord.Member) -> bool:
 
     role = member.guild.get_role(role_id)
     return bool(role and role in member.roles)
+
+
+async def _delete_old_bot_dms_for_member(
+    client: discord.Client,
+    member: discord.Member,
+    limit: int = 300
+) -> int:
+    """
+    Löscht alte Nachrichten des Bots im DM-Verlauf mit diesem Mitglied.
+    Der Bot kann nur eigene Nachrichten löschen.
+    """
+    if member.bot:
+        return 0
+
+    if client.user is None:
+        return 0
+
+    deleted = 0
+
+    try:
+        dm = member.dm_channel or await member.create_dm()
+
+        async for msg in dm.history(limit=limit):
+            try:
+                if msg.author.id == client.user.id:
+                    await msg.delete()
+                    deleted += 1
+                    await asyncio.sleep(0.08)
+            except Exception:
+                pass
+
+    except Exception:
+        pass
+
+    return deleted
 
 
 class ProfileEditModal(Modal):
@@ -513,11 +559,13 @@ class AbsenceModal(Modal):
             return
 
         guild = inter.client.get_guild(self.guild_id)
+
         if not guild:
             await inter.response.send_message("❌ Server nicht gefunden.", view=MemberPortalMainView())
             return
 
         member = guild.get_member(self.user_id)
+
         if not member:
             try:
                 member = await guild.fetch_member(self.user_id)
@@ -597,10 +645,12 @@ class MemberPortalMainView(View):
 
     async def _guild_member(self, inter: discord.Interaction) -> tuple[Optional[discord.Guild], Optional[discord.Member]]:
         guild = _resolve_guild_for_user(inter.client, inter.user.id)
+
         if not guild:
             return None, None
 
         member = guild.get_member(inter.user.id)
+
         if not member:
             try:
                 member = await guild.fetch_member(inter.user.id)
@@ -671,10 +721,12 @@ class ProfileView(View):
 
     async def _guild_member(self, inter: discord.Interaction) -> tuple[Optional[discord.Guild], Optional[discord.Member]]:
         guild = _resolve_guild_for_user(inter.client, inter.user.id)
+
         if not guild:
             return None, None
 
         member = guild.get_member(inter.user.id)
+
         if not member:
             try:
                 member = await guild.fetch_member(inter.user.id)
@@ -910,6 +962,92 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
             await inter.followup.send(f"✅ Gildenmenü an **{member.display_name}** gesendet.", ephemeral=True)
         else:
             await inter.followup.send(f"❌ Konnte **{member.display_name}** keine DM senden.", ephemeral=True)
+
+    @tree.command(name="portal_dm_cleanup_user", description="(Admin) Löscht alte Bot-DMs bei einem Mitglied")
+    async def portal_dm_cleanup_user(
+        inter: discord.Interaction,
+        member: discord.Member,
+        limit: int = 300
+    ):
+        await inter.response.defer(ephemeral=True, thinking=True)
+
+        if not _is_admin(inter):
+            await inter.followup.send("❌ Nur Admin/Manage Server.", ephemeral=True)
+            return
+
+        if limit < 1:
+            limit = 1
+
+        if limit > 1000:
+            limit = 1000
+
+        deleted = await _delete_old_bot_dms_for_member(inter.client, member, limit=limit)
+
+        await inter.followup.send(
+            f"✅ DM-Cleanup bei **{member.display_name}** abgeschlossen.\n"
+            f"🧹 Gelöschte Bot-Nachrichten: **{deleted}**\n\n"
+            f"Hinweis: Der Bot kann nur eigene Nachrichten löschen.",
+            ephemeral=True
+        )
+
+    @tree.command(name="portal_dm_cleanup_all", description="(Admin) Löscht alte Bot-DMs bei allen Gildenmitgliedern")
+    async def portal_dm_cleanup_all(
+        inter: discord.Interaction,
+        limit: int = 300
+    ):
+        await inter.response.defer(ephemeral=True, thinking=True)
+
+        if not _is_admin(inter):
+            await inter.followup.send("❌ Nur Admin/Manage Server.", ephemeral=True)
+            return
+
+        if limit < 1:
+            limit = 1
+
+        if limit > 1000:
+            limit = 1000
+
+        c = _gcfg(inter.guild_id)
+        member_role_id = int(c.get("member_role_id", 0) or 0)
+
+        if not member_role_id:
+            await inter.followup.send(
+                "❌ Keine Gildenmitglied-Rolle gesetzt. Nutze zuerst `/portal_set_member_role`.",
+                ephemeral=True
+            )
+            return
+
+        role = inter.guild.get_role(member_role_id)
+
+        if not role:
+            await inter.followup.send("❌ Gildenmitglied-Rolle nicht gefunden.", ephemeral=True)
+            return
+
+        total_deleted = 0
+        checked = 0
+        failed = 0
+
+        for member in role.members:
+            if member.bot:
+                continue
+
+            checked += 1
+
+            try:
+                deleted = await _delete_old_bot_dms_for_member(inter.client, member, limit=limit)
+                total_deleted += deleted
+                await asyncio.sleep(0.2)
+            except Exception:
+                failed += 1
+
+        await inter.followup.send(
+            f"✅ DM-Cleanup für Gildenmitglieder abgeschlossen.\n"
+            f"👥 Geprüft: **{checked}**\n"
+            f"🧹 Gelöschte Bot-Nachrichten: **{total_deleted}**\n"
+            f"❌ Fehlgeschlagen: **{failed}**\n\n"
+            f"Hinweis: Der Bot kann nur eigene Nachrichten löschen. Wenn jemand DMs geschlossen hat, kann er dort nichts bereinigen.",
+            ephemeral=True
+        )
 
     @tree.command(name="portal_set_position_roles", description="(Admin) Rollen für Anführer/Gildenberater/Wächter setzen")
     async def portal_set_position_roles(
