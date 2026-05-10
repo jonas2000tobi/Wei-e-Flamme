@@ -29,6 +29,7 @@ get_non_response_stats = None
 setup_leader_contact = None
 setup_raid_templates = None
 setup_weekly_report = None
+setup_member_portal = None
 store = {}
 
 
@@ -113,6 +114,15 @@ def _import_modules():
         from weekly_report import setup_weekly_report  # type: ignore
         print("✅ Import: weekly_report (root)")
 
+    global setup_member_portal
+
+    try:
+        from bot.member_portal import setup_member_portal  # type: ignore
+        print("✅ Import: bot.member_portal")
+    except ModuleNotFoundError:
+        from member_portal import setup_member_portal  # type: ignore
+        print("✅ Import: member_portal (root)")
+
 
 def _get_token() -> str | None:
     for key in ("DISCORD_TOKEN", "DISCORD_BOT_TOKEN", "TOKEN"):
@@ -138,6 +148,7 @@ async def on_ready():
         await setup_leader_contact(bot, tree)
         await setup_raid_templates(bot, tree)
         await setup_weekly_report(bot, tree)
+        await setup_member_portal(bot, tree)
 
         register_join_hook(bot, send_onboarding_dm, auto_resend_for_new_member)
 
