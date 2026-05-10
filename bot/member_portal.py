@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import json
 import re
+import asyncio
 from pathlib import Path
 from datetime import datetime, date
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 
 import discord
 from discord import app_commands
@@ -20,6 +21,7 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 CFG_FILE = DATA_DIR / "member_portal_cfg.json"
 PROFILE_FILE = DATA_DIR / "member_profiles.json"
+SENT_FILE = DATA_DIR / "member_portal_sent.json"
 
 
 def _load_json(path: Path, default):
@@ -35,6 +37,7 @@ def _save_json(path: Path, obj) -> None:
 
 cfg: dict = _load_json(CFG_FILE, {})
 profiles: dict = _load_json(PROFILE_FILE, {})
+sent_state: dict = _load_json(SENT_FILE, {})
 
 
 def save_cfg() -> None:
@@ -43,6 +46,10 @@ def save_cfg() -> None:
 
 def save_profiles() -> None:
     _save_json(PROFILE_FILE, profiles)
+
+
+def save_sent() -> None:
+    _save_json(SENT_FILE, sent_state)
 
 
 def _is_admin(inter: discord.Interaction) -> bool:
@@ -55,6 +62,7 @@ def _gcfg(guild_id: int) -> dict:
     c.setdefault("absence_channel_id", 0)
     c.setdefault("portal_post_channel_id", 0)
     c.setdefault("portal_post_message_id", 0)
+    c.setdefault("member_role_id", 0)
     c.setdefault("position_roles", {
         "leader": 0,
         "advisor": 0,
@@ -84,6 +92,31 @@ def _user_profile(guild_id: int, user_id: int) -> dict:
     return u
 
 
+def _mark_portal_sent(guild_id: int, user_id: int) -> None:
+    g = sent_state.get(str(guild_id)) or {}
+    arr = set(g.get("sent_users", []))
+    arr.add(str(user_id))
+    g["sent_users"] = sorted(arr)
+    sent_state[str(guild_id)] = g
+    save_sent()
+
+
+def _portal_was_sent(guild_id: int, user_id: int) -> bool:
+    g = sent_state.get(str(guild_id)) or {}
+    arr = set(g.get("sent_users", []))
+    return str(user_id) in arr
+
+
+def _clear_portal_sent(guild_id: int, user_id: int) -> None:
+    g = sent_state.get(str(guild_id)) or {}
+    arr = set(g.get("sent_users", []))
+    if str(user_id) in arr:
+        arr.remove(str(user_id))
+    g["sent_users"] = sorted(arr)
+    sent_state[str(guild_id)] = g
+    save_sent()
+
+
 def _resolve_guild_for_user(client: discord.Client, user_id: int) -> Optional[discord.Guild]:
     for guild in client.guilds:
         member = guild.get_member(user_id)
@@ -103,11 +136,43 @@ def _member_position(guild: discord.Guild, member: discord.Member) -> str:
     if leader and leader in member.roles:
         return "Anführer"
     if advisor and advisor in member.roles:
-        return "Berater"
+        return "Gildenberater"
     if guardian and guardian in member.roles:
         return "Wächter"
 
     return "Mitglied"
+
+
+def _position_rank(position: str) -> int:
+    order = {
+        "Anführer": 0,
+        "Gildenberater": 1,
+        "Berater": 1,
+        "Wächter": 2,
+        "Mitglied": 3,
+    }
+    return order.get(position, 99)
+
+
+def _parse_gearscore(value: Any) -> int:
+    try:
+        s = str(value or "").strip()
+        s = re.sub(r"[^0-9]", "", s)
+        if not s:
+            return 0
+        return int(s)
+    except Exception:
+        return 0
+
+
+def _display_name(member: discord.Member) -> str:
+    return member.display_name
+
+
+def _guild_join_date(member: discord.Member) -> str:
+    if not member.joined_at:
+        return "Unbekannt"
+    return member.joined_at.astimezone(TZ).strftime("%d.%m.%Y")
 
 
 def _guild_days(member: discord.Member) -> int:
@@ -200,7 +265,7 @@ def _absence_label(guild_id: int, user_id: int) -> str:
 def _profile_embed(guild: discord.Guild, member: discord.Member) -> discord.Embed:
     p = _user_profile(guild.id, member.id)
 
-    ingame = p.get("ingame_name") or member.display_name
+    ingame = p.get("ingame_name") or _display_name(member)
     main_role = p.get("main_role") or "Nicht gesetzt"
     gearscore = p.get("gearscore") or "Nicht gesetzt"
 
@@ -212,7 +277,11 @@ def _profile_embed(guild: discord.Guild, member: discord.Member) -> discord.Embe
     emb.add_field(name="Ingame-Name", value=str(ingame), inline=False)
     emb.add_field(name="Main-Rolle", value=str(main_role), inline=True)
     emb.add_field(name="Gearscore", value=str(gearscore), inline=True)
-    emb.add_field(name="Seit", value=f"{_guild_days(member)} Tagen in der Gilde", inline=False)
+    emb.add_field(
+        name="Seit",
+        value=f"{_guild_days(member)} Tage in der Gilde\nBeigetreten am: {_guild_join_date(member)}",
+        inline=False
+    )
     emb.add_field(name="Position", value=_member_position(guild, member), inline=True)
     emb.add_field(name="Status", value=_status_for_user(guild.id, member.id), inline=True)
 
@@ -247,6 +316,14 @@ def _events_embed(guild_id: int) -> discord.Embed:
     return emb
 
 
+def _member_sort_key(guild: discord.Guild, member: discord.Member) -> Tuple[int, int, str]:
+    p = _user_profile(guild.id, member.id)
+    position = _member_position(guild, member)
+    rank = _position_rank(position)
+    gs = _parse_gearscore(p.get("gearscore"))
+    return (rank, -gs, _display_name(member).lower())
+
+
 def _members_list_embed(guild: discord.Guild) -> discord.Embed:
     emb = discord.Embed(
         title="👥 Mitgliederliste – ebolus",
@@ -256,17 +333,18 @@ def _members_list_embed(guild: discord.Guild) -> discord.Embed:
     lines = []
 
     members = [m for m in guild.members if not m.bot]
-    members.sort(key=lambda m: m.display_name.lower())
+    members.sort(key=lambda m: _member_sort_key(guild, m))
 
     for m in members[:40]:
         p = _user_profile(guild.id, m.id)
-        ingame = p.get("ingame_name") or m.display_name
+        name = p.get("ingame_name") or _display_name(m)
         main_role = p.get("main_role") or "—"
         gs = p.get("gearscore") or "—"
         pos = _member_position(guild, m)
         status = _absence_label(guild.id, m.id)
+        joined = _guild_join_date(m)
 
-        lines.append(f"• **{ingame}** – {main_role} – GS {gs} – {pos} – {status}")
+        lines.append(f"• **{name}** – {main_role} – GS {gs} – {pos} – seit {joined} – {status}")
 
     if not lines:
         emb.description = "Keine Mitglieder gefunden."
@@ -274,12 +352,12 @@ def _members_list_embed(guild: discord.Guild) -> discord.Embed:
         emb.description = "\n".join(lines)
 
     if len(members) > 40:
-        emb.set_footer(text=f"Anzeige begrenzt auf 40 von {len(members)} Mitgliedern.")
+        emb.set_footer(text=f"Anzeige begrenzt auf 40 von {len(members)} Mitgliedern. Sortierung: Rang, dann Gearscore.")
 
     return emb
 
 
-async def _send_main_menu(user: discord.abc.User, guild: discord.Guild) -> None:
+async def _send_main_menu(user: discord.abc.User, guild: discord.Guild) -> bool:
     emb = discord.Embed(
         title="🏰 ebolus – Gildenmenü",
         description=(
@@ -291,7 +369,37 @@ async def _send_main_menu(user: discord.abc.User, guild: discord.Guild) -> None:
 
     emb.set_footer(text=f"Server: {guild.name}")
 
-    await user.send(embed=emb, view=MemberPortalMainView())
+    try:
+        await user.send(embed=emb, view=MemberPortalMainView())
+        return True
+    except Exception:
+        return False
+
+
+async def _send_main_menu_to_member(member: discord.Member, force: bool = False) -> bool:
+    if member.bot:
+        return False
+
+    if not force and _portal_was_sent(member.guild.id, member.id):
+        return False
+
+    ok = await _send_main_menu(member, member.guild)
+
+    if ok:
+        _mark_portal_sent(member.guild.id, member.id)
+
+    return ok
+
+
+def _member_has_member_role(member: discord.Member) -> bool:
+    c = _gcfg(member.guild.id)
+    role_id = int(c.get("member_role_id", 0) or 0)
+
+    if not role_id:
+        return False
+
+    role = member.guild.get_role(role_id)
+    return bool(role and role in member.roles)
 
 
 class ProfileEditModal(Modal):
@@ -331,10 +439,20 @@ class ProfileEditModal(Modal):
         self.add_item(self.gearscore)
 
     async def on_submit(self, inter: discord.Interaction):
+        gs_raw = str(self.gearscore.value).strip()
+        gs = _parse_gearscore(gs_raw)
+
+        if gs <= 0:
+            await inter.response.send_message(
+                "❌ Gearscore ungültig. Bitte nur Zahlen eintragen, z. B. `4200`.",
+                view=MemberPortalMainView()
+            )
+            return
+
         p = _user_profile(self.guild_id, self.user_id)
         p["ingame_name"] = str(self.ingame_name.value).strip()
         p["main_role"] = str(self.main_role.value).strip()
-        p["gearscore"] = str(self.gearscore.value).strip()
+        p["gearscore"] = str(gs)
 
         save_profiles()
 
@@ -421,7 +539,7 @@ class AbsenceModal(Modal):
         save_profiles()
 
         p = _user_profile(self.guild_id, self.user_id)
-        ingame = p.get("ingame_name") or member.display_name
+        ingame = p.get("ingame_name") or _display_name(member)
 
         c = _gcfg(self.guild_id)
         ch_id = int(c.get("absence_channel_id", 0) or 0)
@@ -438,7 +556,7 @@ class AbsenceModal(Modal):
                 timestamp=datetime.now(TZ)
             )
 
-            emb.set_footer(text=f"Gemeldet von {member.display_name}")
+            emb.set_footer(text=f"Gemeldet von {_display_name(member)}")
 
             try:
                 await ch.send(embed=emb)
@@ -461,10 +579,12 @@ class PortalOpenView(View):
             await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
             return
 
-        try:
-            await _send_main_menu(inter.user, inter.guild)
+        ok = await _send_main_menu(inter.user, inter.guild)
+
+        if ok:
+            _mark_portal_sent(inter.guild.id, inter.user.id)
             await inter.response.send_message("✅ Ich habe dir das Gildenmenü per Privatnachricht geschickt.", ephemeral=True)
-        except Exception:
+        else:
             await inter.response.send_message(
                 "❌ Konnte dir keine Privatnachricht schicken. Prüfe deine Discord-DM-Einstellungen.",
                 ephemeral=True
@@ -537,7 +657,7 @@ class MemberPortalMainView(View):
                 "**Abwesenheit melden**\n"
                 "Meldet deine Abwesenheit an die Gildenleitung und speichert sie für die Mitgliederliste.\n\n"
                 "**Mitgliederliste**\n"
-                "Findest du im Profilbereich."
+                "Sortiert nach Rang und Gearscore."
             ),
             color=discord.Color.blurple()
         )
@@ -647,6 +767,54 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
     except Exception:
         pass
 
+    if hasattr(client, "add_listener"):
+        async def _portal_on_member_update(before: discord.Member, after: discord.Member):
+            try:
+                if after.bot:
+                    return
+
+                c = _gcfg(after.guild.id)
+                member_role_id = int(c.get("member_role_id", 0) or 0)
+
+                if not member_role_id:
+                    return
+
+                before_ids = {r.id for r in before.roles}
+                after_ids = {r.id for r in after.roles}
+
+                got_member_role = member_role_id not in before_ids and member_role_id in after_ids
+
+                if got_member_role:
+                    await _send_main_menu_to_member(after, force=False)
+
+            except Exception as e:
+                print(f"[member_portal] on_member_update Fehler: {e!r}")
+
+        async def _portal_on_member_join(member: discord.Member):
+            try:
+                if member.bot:
+                    return
+
+                if _member_has_member_role(member):
+                    await _send_main_menu_to_member(member, force=False)
+
+            except Exception as e:
+                print(f"[member_portal] on_member_join Fehler: {e!r}")
+
+        async def _portal_on_member_remove(member: discord.Member):
+            try:
+                _clear_portal_sent(member.guild.id, member.id)
+            except Exception:
+                pass
+
+        try:
+            client.add_listener(_portal_on_member_update, "on_member_update")
+            client.add_listener(_portal_on_member_join, "on_member_join")
+            client.add_listener(_portal_on_member_remove, "on_member_remove")
+            print("✅ Member-Portal Listener aktiv.")
+        except Exception as e:
+            print(f"[member_portal] Listener-Setup Fehler: {e!r}")
+
     @tree.command(name="portal_set_absence_channel", description="(Admin) Abwesenheitskanal setzen")
     async def portal_set_absence_channel(inter: discord.Interaction, channel: discord.TextChannel):
         if not _is_admin(inter):
@@ -660,11 +828,94 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
 
         await inter.response.send_message(f"✅ Abwesenheitskanal gesetzt: {channel.mention}", ephemeral=True)
 
-    @tree.command(name="portal_set_position_roles", description="(Admin) Rollen für Anführer/Berater/Wächter setzen")
+    @tree.command(name="portal_set_member_role", description="(Admin) Rolle setzen, deren Mitglieder automatisch das Gildenmenü bekommen")
+    async def portal_set_member_role(inter: discord.Interaction, role: discord.Role):
+        if not _is_admin(inter):
+            await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True)
+            return
+
+        c = _gcfg(inter.guild_id)
+        c["member_role_id"] = int(role.id)
+        cfg[str(inter.guild_id)] = c
+        save_cfg()
+
+        await inter.response.send_message(
+            f"✅ Gildenmitglied-Rolle gesetzt: {role.mention}\n"
+            f"Neue Mitglieder mit dieser Rolle bekommen automatisch das Gildenmenü per DM.",
+            ephemeral=True
+        )
+
+    @tree.command(name="portal_send_all", description="(Admin) Sendet das Gildenmenü per DM an alle mit Gildenmitglied-Rolle")
+    async def portal_send_all(inter: discord.Interaction, force: bool = False):
+        await inter.response.defer(ephemeral=True, thinking=True)
+
+        if not _is_admin(inter):
+            await inter.followup.send("❌ Nur Admin/Manage Server.", ephemeral=True)
+            return
+
+        c = _gcfg(inter.guild_id)
+        member_role_id = int(c.get("member_role_id", 0) or 0)
+
+        if not member_role_id:
+            await inter.followup.send("❌ Keine Gildenmitglied-Rolle gesetzt. Nutze zuerst `/portal_set_member_role`.", ephemeral=True)
+            return
+
+        role = inter.guild.get_role(member_role_id)
+
+        if not role:
+            await inter.followup.send("❌ Gildenmitglied-Rolle nicht gefunden.", ephemeral=True)
+            return
+
+        sent = 0
+        skipped = 0
+        failed = 0
+
+        for member in role.members:
+            if member.bot:
+                continue
+
+            if not force and _portal_was_sent(inter.guild_id, member.id):
+                skipped += 1
+                continue
+
+            ok = await _send_main_menu_to_member(member, force=force)
+
+            if ok:
+                sent += 1
+            else:
+                failed += 1
+
+            await asyncio.sleep(0.15)
+
+        await inter.followup.send(
+            f"✅ Portal-DM Versand abgeschlossen.\n"
+            f"✉️ Gesendet: **{sent}**\n"
+            f"⏭️ Bereits bekannt/übersprungen: **{skipped}**\n"
+            f"❌ Fehlgeschlagen/DMs zu: **{failed}**\n\n"
+            f"Hinweis: Mit `force: True` kannst du auch bereits bekannte Mitglieder erneut anschreiben.",
+            ephemeral=True
+        )
+
+    @tree.command(name="portal_resend_user", description="(Admin) Sendet einem Spieler das Gildenmenü erneut")
+    async def portal_resend_user(inter: discord.Interaction, member: discord.Member):
+        await inter.response.defer(ephemeral=True, thinking=True)
+
+        if not _is_admin(inter):
+            await inter.followup.send("❌ Nur Admin/Manage Server.", ephemeral=True)
+            return
+
+        ok = await _send_main_menu_to_member(member, force=True)
+
+        if ok:
+            await inter.followup.send(f"✅ Gildenmenü an **{member.display_name}** gesendet.", ephemeral=True)
+        else:
+            await inter.followup.send(f"❌ Konnte **{member.display_name}** keine DM senden.", ephemeral=True)
+
+    @tree.command(name="portal_set_position_roles", description="(Admin) Rollen für Anführer/Gildenberater/Wächter setzen")
     async def portal_set_position_roles(
         inter: discord.Interaction,
         anfuehrer: discord.Role,
-        berater: discord.Role,
+        gildenberater: discord.Role,
         waechter: discord.Role,
     ):
         if not _is_admin(inter):
@@ -674,7 +925,7 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
         c = _gcfg(inter.guild_id)
         c["position_roles"] = {
             "leader": int(anfuehrer.id),
-            "advisor": int(berater.id),
+            "advisor": int(gildenberater.id),
             "guardian": int(waechter.id),
         }
 
@@ -684,7 +935,7 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
         await inter.response.send_message(
             f"✅ Positionsrollen gesetzt:\n"
             f"• Anführer: {anfuehrer.mention}\n"
-            f"• Berater: {berater.mention}\n"
+            f"• Gildenberater: {gildenberater.mention}\n"
             f"• Wächter: {waechter.mention}",
             ephemeral=True
         )
@@ -801,15 +1052,17 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
 
         absence_ch_id = int(c.get("absence_channel_id", 0) or 0)
         portal_ch_id = int(c.get("portal_post_channel_id", 0) or 0)
+        member_role_id = int(c.get("member_role_id", 0) or 0)
 
         text = (
             f"**Member-Portal Status**\n"
+            f"• Gildenmitglied-Rolle: {f'<@&{member_role_id}>' if member_role_id else '—'}\n"
             f"• Abwesenheitskanal: {f'<#{absence_ch_id}>' if absence_ch_id else '—'}\n"
             f"• Portal-Post-Channel: {f'<#{portal_ch_id}>' if portal_ch_id else '—'}\n"
             f"• Portal-Message-ID: `{c.get('portal_post_message_id', 0)}`\n\n"
             f"**Positionsrollen**\n"
             f"• Anführer: {f'<@&{roles.get('leader')}>' if int(roles.get('leader', 0) or 0) else '—'}\n"
-            f"• Berater: {f'<@&{roles.get('advisor')}>' if int(roles.get('advisor', 0) or 0) else '—'}\n"
+            f"• Gildenberater: {f'<@&{roles.get('advisor')}>' if int(roles.get('advisor', 0) or 0) else '—'}\n"
             f"• Wächter: {f'<@&{roles.get('guardian')}>' if int(roles.get('guardian', 0) or 0) else '—'}\n\n"
             f"**Feste Events:** {len(c.get('events') or [])}"
         )
