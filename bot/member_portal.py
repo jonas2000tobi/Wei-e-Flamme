@@ -5,7 +5,7 @@ import re
 import asyncio
 from pathlib import Path
 from datetime import datetime, date
-from typing import Optional, Any, List, Tuple
+from typing import Optional, Any, Tuple
 
 import discord
 from discord import app_commands
@@ -259,7 +259,9 @@ def _status_for_user(guild_id: int, user_id: int) -> str:
     absence = _absence_for_user(guild_id, user_id)
 
     if absence and _is_absent_now(absence):
-        return f"Abwesend bis {absence.get('to', '—')}"
+        from_s = str(absence.get("from", "—"))
+        to_s = str(absence.get("to", "—"))
+        return f"Abwesend von {from_s} bis {to_s}"
 
     return "Aktiv"
 
@@ -268,7 +270,9 @@ def _absence_label(guild_id: int, user_id: int) -> str:
     absence = _absence_for_user(guild_id, user_id)
 
     if absence and _absence_not_expired(absence):
-        return f"abwesend bis {absence.get('to', '—')}"
+        from_s = str(absence.get("from", "—"))
+        to_s = str(absence.get("to", "—"))
+        return f"abwesend von {from_s} bis {to_s}"
 
     return "aktiv"
 
