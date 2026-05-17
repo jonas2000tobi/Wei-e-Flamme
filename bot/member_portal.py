@@ -22,6 +22,7 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 CFG_FILE = DATA_DIR / "member_portal_cfg.json"
 PROFILE_FILE = DATA_DIR / "member_profiles.json"
 SENT_FILE = DATA_DIR / "member_portal_sent.json"
+LEADER_CONTACT_CFG_FILE = DATA_DIR / "leader_contact_cfg.json"
 
 
 def _load_json(path: Path, default):
@@ -55,6 +56,10 @@ def save_sent() -> None:
 def _is_admin(inter: discord.Interaction) -> bool:
     perms = getattr(inter.user, "guild_permissions", None)
     return bool(perms and (perms.administrator or perms.manage_guild))
+
+
+def _safe_text(s: str) -> str:
+    return (s or "").replace("@", "@\u200b").strip()
 
 
 def _gcfg(guild_id: int) -> dict:
@@ -266,17 +271,6 @@ def _status_for_user(guild_id: int, user_id: int) -> str:
     return "Aktiv"
 
 
-def _absence_label(guild_id: int, user_id: int) -> str:
-    absence = _absence_for_user(guild_id, user_id)
-
-    if absence and _absence_not_expired(absence):
-        from_s = str(absence.get("from", "—"))
-        to_s = str(absence.get("to", "—"))
-        return f"abwesend von {from_s} bis {to_s}"
-
-    return "aktiv"
-
-
 def _profile_embed(guild: discord.Guild, member: discord.Member) -> discord.Embed:
     p = _user_profile(guild.id, member.id)
 
@@ -310,7 +304,7 @@ def _events_embed(guild_id: int) -> discord.Embed:
     events = c.get("events") or []
 
     emb = discord.Embed(
-        title="📅 Gilden-Events",
+        title="📅 Gildenkalender – ebolus",
         color=discord.Color.green()
     )
 
@@ -324,9 +318,9 @@ def _events_embed(guild_id: int) -> discord.Embed:
         weekday = str(e.get("weekday", "—"))
         time = str(e.get("time", "—"))
         title = str(e.get("title", "Event"))
-        lines.append(f"**{weekday}, {time} Uhr** – {title}")
+        lines.append(f"**{weekday}, {time} Uhr**\n{title}")
 
-    emb.description = "\n".join(lines)
+    emb.description = "\n\n".join(lines)
     emb.set_footer(text="Reine Übersicht. Keine Anmeldung / keine RSVP-Funktion.")
 
     return emb
@@ -346,8 +340,6 @@ def _members_list_embed(guild: discord.Guild) -> discord.Embed:
         color=discord.Color.gold()
     )
 
-    lines = []
-
     c = _gcfg(guild.id)
     member_role_id = int(c.get("member_role_id", 0) or 0)
 
@@ -364,19 +356,16 @@ def _members_list_embed(guild: discord.Guild) -> discord.Embed:
     members = [m for m in member_role.members if not m.bot]
     members.sort(key=lambda m: _member_sort_key(guild, m))
 
-    for m in members[:40]:
+    lines = []
+
+    for i, m in enumerate(members[:40], start=1):
         p = _user_profile(guild.id, m.id)
 
         name = p.get("ingame_name") or _display_name(m)
-        main_role = p.get("main_role") or "—"
-        gs = p.get("gearscore") or "—"
         pos = _member_position(guild, m)
-        status = _absence_label(guild.id, m.id)
-        joined = _guild_join_date(m)
+        gs = p.get("gearscore") or "—"
 
-        lines.append(
-            f"• **{name}** – {main_role} – GS {gs} – {pos} – seit {joined} – {status}"
-        )
+        lines.append(f"**{i}. {name}** — {pos} — GS {gs}")
 
     if not lines:
         emb.description = "Keine Mitglieder mit der Ebolus-/Gildenmitglied-Rolle gefunden."
@@ -391,6 +380,53 @@ def _members_list_embed(guild: discord.Guild) -> discord.Embed:
         emb.set_footer(
             text="Angezeigt werden nur Mitglieder mit der Ebolus-/Gildenmitglied-Rolle."
         )
+
+    return emb
+
+
+def _rules_loot_embed() -> discord.Embed:
+    emb = discord.Embed(
+        title="📜 Regeln & Lootsystem – ebolus",
+        color=discord.Color.orange()
+    )
+
+    emb.add_field(
+        name="📌 Grundregeln",
+        value=(
+            "• Bei Events im Discord an- oder abmelden.\n"
+            "• Voice ist bei wichtigen Gildenterminen erwünscht.\n"
+            "• Bei längerer Abwesenheit bitte im Bot abmelden.\n"
+            "• Nach 9 Tagen ohne Abmeldung/Reaktion kann ein Ausschluss aus der Gilde erfolgen.\n"
+            "• Lootsystem beachten."
+        ),
+        inline=False
+    )
+
+    emb.add_field(
+        name="🎁 ERZ & Weltbosse",
+        value=(
+            "• Wenn der Empfänger den Drop für seine Hauptwaffe braucht: Item behalten.\n"
+            "• Wenn nicht: Gildenverkauf für 25% des Auktionshauspreises.\n"
+            "• Erlös geht an die Dropgruppe.\n"
+            "• Wenn keiner aus der Gilde kaufen will: nach 10 Tagen ins Auktionshaus.\n"
+            "• Erlös geht ebenfalls an die Dropgruppe.\n"
+            "• Wichtig: Needliste vor dem Drop eintragen."
+        ),
+        inline=False
+    )
+
+    emb.add_field(
+        name="🧱 Erzboss-Materialien",
+        value=(
+            "• Gildenauktion für 50% des Auktionshauspreises.\n"
+            "• Keine Needliste notwendig.\n"
+            "• Wenn nach 10 Tagen kein Kauf erfolgt: Verkauf im Auktionshaus.\n"
+            "• Erlös geht an die Dropgruppe."
+        ),
+        inline=False
+    )
+
+    emb.set_footer(text="Kurzfassung. Im Zweifel entscheidet die Gildenleitung.")
 
     return emb
 
@@ -447,6 +483,7 @@ async def _delete_old_bot_dms_for_member(
 ) -> int:
     """
     Löscht alte Nachrichten des Bots im DM-Verlauf mit diesem Mitglied.
+    Das Gildenmenü und Portal-Seiten werden geschützt.
     Der Bot kann nur eigene Nachrichten löschen.
     """
     if member.bot:
@@ -455,6 +492,16 @@ async def _delete_old_bot_dms_for_member(
     if client.user is None:
         return 0
 
+    protected_titles = {
+        "🏰 ebolus – Gildenmenü",
+        "👤 Dein Gildenprofil",
+        "📅 Gildenkalender – ebolus",
+        "📅 Gilden-Events",
+        "❓ Hilfe – ebolus Gildenbot",
+        "👥 Mitgliederliste – ebolus",
+        "📜 Regeln & Lootsystem – ebolus",
+    }
+
     deleted = 0
 
     try:
@@ -462,10 +509,23 @@ async def _delete_old_bot_dms_for_member(
 
         async for msg in dm.history(limit=limit):
             try:
-                if msg.author.id == client.user.id:
-                    await msg.delete()
-                    deleted += 1
-                    await asyncio.sleep(0.08)
+                if msg.author.id != client.user.id:
+                    continue
+
+                protected = False
+
+                if msg.embeds:
+                    title = msg.embeds[0].title or ""
+                    if title in protected_titles:
+                        protected = True
+
+                if protected:
+                    continue
+
+                await msg.delete()
+                deleted += 1
+                await asyncio.sleep(0.08)
+
             except Exception:
                 pass
 
@@ -473,6 +533,28 @@ async def _delete_old_bot_dms_for_member(
         pass
 
     return deleted
+
+
+def _get_leader_cfg(guild_id: int) -> dict:
+    data = _load_json(LEADER_CONTACT_CFG_FILE, {})
+    c = data.get(str(guild_id)) or {}
+    c.setdefault("internal_channel_id", 0)
+    c.setdefault("leader_role_id", 0)
+    return c
+
+
+def _leader_status_view():
+    try:
+        from bot.leader_contact import LeaderStatusView  # type: ignore
+        return LeaderStatusView()
+    except ModuleNotFoundError:
+        try:
+            from leader_contact import LeaderStatusView  # type: ignore
+            return LeaderStatusView()
+        except Exception:
+            return None
+    except Exception:
+        return None
 
 
 class ProfileEditModal(Modal):
@@ -644,6 +726,97 @@ class AbsenceModal(Modal):
         )
 
 
+class PortalLeaderContactModal(Modal):
+    def __init__(self, guild_id: int, user_id: int):
+        super().__init__(title="Leader kontaktieren", timeout=None)
+        self.guild_id = guild_id
+        self.user_id = user_id
+
+        self.topic = TextInput(
+            label="Thema",
+            placeholder="z. B. Frage, Beschwerde, Hilfe, Problem",
+            required=True,
+            max_length=120
+        )
+
+        self.message = TextInput(
+            label="Nachricht",
+            placeholder="Schreib hier dein Anliegen rein.",
+            required=True,
+            max_length=1500,
+            style=discord.TextStyle.paragraph
+        )
+
+        self.add_item(self.topic)
+        self.add_item(self.message)
+
+    async def on_submit(self, inter: discord.Interaction):
+        guild = inter.client.get_guild(self.guild_id)
+
+        if not guild:
+            await inter.response.send_message("❌ Server nicht gefunden.", view=MemberPortalMainView())
+            return
+
+        member = guild.get_member(self.user_id)
+
+        if not member:
+            try:
+                member = await guild.fetch_member(self.user_id)
+            except Exception:
+                member = None
+
+        if not member:
+            await inter.response.send_message("❌ Mitglied nicht gefunden.", view=MemberPortalMainView())
+            return
+
+        leader_cfg = _get_leader_cfg(self.guild_id)
+        internal_channel_id = int(leader_cfg.get("internal_channel_id", 0) or 0)
+        leader_role_id = int(leader_cfg.get("leader_role_id", 0) or 0)
+
+        internal_ch = guild.get_channel(internal_channel_id) if internal_channel_id else None
+        leader_role = guild.get_role(leader_role_id) if leader_role_id else None
+
+        if not isinstance(internal_ch, (discord.TextChannel, discord.Thread)):
+            await inter.response.send_message(
+                "❌ Leader-Kontakt ist noch nicht eingerichtet. Es fehlt der interne Leader-Kanal.",
+                view=MemberPortalMainView()
+            )
+            return
+
+        topic = _safe_text(str(self.topic.value))
+        msg = _safe_text(str(self.message.value))
+
+        p = _user_profile(self.guild_id, self.user_id)
+        ingame = p.get("ingame_name") or _display_name(member)
+
+        emb = discord.Embed(
+            title="📨 Neue Leader-Anfrage",
+            color=discord.Color.blurple(),
+            timestamp=datetime.now(TZ)
+        )
+
+        emb.add_field(name="Von", value=f"{ingame} ({_display_name(member)})", inline=False)
+        emb.add_field(name="Thema", value=topic or "—", inline=False)
+        emb.add_field(name="Nachricht", value=msg or "—", inline=False)
+        emb.add_field(name="Status", value="🆕 Offen", inline=False)
+        emb.set_footer(text=f"{datetime.now(TZ).strftime('%d.%m.%Y %H:%M')} (Europe/Berlin)")
+
+        try:
+            await internal_ch.send(
+                content=leader_role.mention if leader_role else None,
+                embed=emb,
+                view=_leader_status_view()
+            )
+        except Exception as e:
+            await inter.response.send_message(f"❌ Konnte Anfrage nicht senden: {e}", view=MemberPortalMainView())
+            return
+
+        await inter.response.send_message(
+            "✅ Deine Nachricht wurde an die Leader gesendet.",
+            view=MemberPortalMainView()
+        )
+
+
 class PortalOpenView(View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -686,7 +859,7 @@ class MemberPortalMainView(View):
 
         return guild, member
 
-    @button(label="👤 Mein Profil", style=ButtonStyle.primary, custom_id="portal_profile")
+    @button(label="👤 Mein Profil", style=ButtonStyle.primary, custom_id="portal_profile", row=0)
     async def btn_profile(self, inter: discord.Interaction, _):
         guild, member = await self._guild_member(inter)
 
@@ -699,7 +872,7 @@ class MemberPortalMainView(View):
             view=ProfileView()
         )
 
-    @button(label="📅 Gilden-Events", style=ButtonStyle.secondary, custom_id="portal_events")
+    @button(label="📅 Gilden-Events", style=ButtonStyle.secondary, custom_id="portal_events", row=0)
     async def btn_events(self, inter: discord.Interaction, _):
         guild, member = await self._guild_member(inter)
 
@@ -712,7 +885,7 @@ class MemberPortalMainView(View):
             view=EventsInfoView()
         )
 
-    @button(label="🏖️ Abwesenheit melden", style=ButtonStyle.secondary, custom_id="portal_absence")
+    @button(label="🏖️ Abwesenheit melden", style=ButtonStyle.secondary, custom_id="portal_absence", row=0)
     async def btn_absence(self, inter: discord.Interaction, _):
         guild, member = await self._guild_member(inter)
 
@@ -722,7 +895,21 @@ class MemberPortalMainView(View):
 
         await inter.response.send_modal(AbsenceModal(guild.id, inter.user.id))
 
-    @button(label="❓ Hilfe", style=ButtonStyle.secondary, custom_id="portal_help")
+    @button(label="📨 Leader kontaktieren", style=ButtonStyle.primary, custom_id="portal_leader_contact", row=1)
+    async def btn_leader_contact(self, inter: discord.Interaction, _):
+        guild, member = await self._guild_member(inter)
+
+        if not guild or not member:
+            await inter.response.send_message("❌ Ich konnte deinen Server nicht zuordnen.")
+            return
+
+        await inter.response.send_modal(PortalLeaderContactModal(guild.id, inter.user.id))
+
+    @button(label="📜 Regeln & Loot", style=ButtonStyle.secondary, custom_id="portal_rules_loot", row=1)
+    async def btn_rules_loot(self, inter: discord.Interaction, _):
+        await inter.response.edit_message(embed=_rules_loot_embed(), view=BackOnlyView())
+
+    @button(label="❓ Hilfe", style=ButtonStyle.secondary, custom_id="portal_help", row=1)
     async def btn_help(self, inter: discord.Interaction, _):
         emb = discord.Embed(
             title="❓ Hilfe – ebolus Gildenbot",
@@ -732,7 +919,11 @@ class MemberPortalMainView(View):
                 "**Gilden-Events**\n"
                 "Zeigt feste Gildentermine. Das ist nur eine Übersicht, keine Anmeldung.\n\n"
                 "**Abwesenheit melden**\n"
-                "Meldet deine Abwesenheit an die Gildenleitung und speichert sie für die Mitgliederliste.\n\n"
+                "Meldet deine Abwesenheit an die Gildenleitung und speichert sie.\n\n"
+                "**Leader kontaktieren**\n"
+                "Schickt eine Anfrage direkt an die Gildenleitung.\n\n"
+                "**Regeln & Loot**\n"
+                "Zeigt die wichtigsten Gildenregeln und das Lootsystem.\n\n"
                 "**Mitgliederliste**\n"
                 "Sortiert nach Rang und Gearscore. Angezeigt werden nur Mitglieder mit der Ebolus-/Gildenmitglied-Rolle."
             ),
@@ -1013,7 +1204,7 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
         await inter.followup.send(
             f"✅ DM-Cleanup bei **{member.display_name}** abgeschlossen.\n"
             f"🧹 Gelöschte Bot-Nachrichten: **{deleted}**\n\n"
-            f"Hinweis: Der Bot kann nur eigene Nachrichten löschen.",
+            f"Hinweis: Der Bot kann nur eigene Nachrichten löschen. Das Gildenmenü wird geschützt.",
             ephemeral=True
         )
 
@@ -1072,7 +1263,7 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
             f"👥 Geprüft: **{checked}**\n"
             f"🧹 Gelöschte Bot-Nachrichten: **{total_deleted}**\n"
             f"❌ Fehlgeschlagen: **{failed}**\n\n"
-            f"Hinweis: Der Bot kann nur eigene Nachrichten löschen. Wenn jemand DMs geschlossen hat, kann er dort nichts bereinigen.",
+            f"Hinweis: Der Bot kann nur eigene Nachrichten löschen. Das Gildenmenü wird geschützt.",
             ephemeral=True
         )
 
@@ -1187,6 +1378,8 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
                 "• dein Profil\n"
                 "• feste Gilden-Events\n"
                 "• Abwesenheit melden\n"
+                "• Leader kontaktieren\n"
+                "• Regeln & Loot\n"
                 "• Hilfe"
             ),
             color=discord.Color.blurple()
