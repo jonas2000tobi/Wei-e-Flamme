@@ -5,7 +5,7 @@ import re
 import asyncio
 from pathlib import Path
 from datetime import datetime
-from typing import Optional, Any, Dict, List, Tuple
+from typing import Optional, Any
 from zoneinfo import ZoneInfo
 
 import discord
@@ -30,7 +30,7 @@ MEMBER_PROFILES_FILE = DATA_DIR / "member_profiles.json"
 LEADER_CONTACT_CFG_FILE = DATA_DIR / "leader_contact_cfg.json"
 
 
-SLOTS = [
+NEED_SLOTS = [
     "Waffe 1",
     "Waffe 2",
     "Helm",
@@ -48,8 +48,24 @@ SLOTS = [
     "Umhang",
 ]
 
+CATALOG_SLOTS = [
+    "Waffe",
+    "Helm",
+    "Brust",
+    "Hose",
+    "Handschuhe",
+    "Schuhe",
+    "Brosche",
+    "Ohrringe",
+    "Kette",
+    "Armband",
+    "Ring",
+    "Gürtel",
+    "Umhang",
+]
+
 TABS = ["Main", "Secondary"]
-WEAPON_SLOTS = ["Waffe 1", "Waffe 2"]
+WEAPON_NEED_SLOTS = ["Waffe 1", "Waffe 2"]
 
 GILDENBOSS_KEYWORDS = [
     "gildenboss",
@@ -186,17 +202,17 @@ def _user_needs(guild_id: int, user_id: int) -> dict:
         if tab not in u or not isinstance(u[tab], dict):
             u[tab] = {}
 
-        for slot in SLOTS:
+        for slot in NEED_SLOTS:
             u[tab].setdefault(slot, "")
 
     users[str(user_id)] = u
     return u
 
 
-def _normalize_slot(slot: str) -> str:
+def _normalize_need_slot(slot: str) -> str:
     slot = (slot or "").strip().lower()
 
-    for s in SLOTS:
+    for s in NEED_SLOTS:
         if s.lower() == slot:
             return s
 
@@ -210,6 +226,37 @@ def _normalize_slot(slot: str) -> str:
     }
 
     return aliases.get(compact, "")
+
+
+def _normalize_catalog_slot(slot: str) -> str:
+    slot = (slot or "").strip().lower()
+
+    for s in CATALOG_SLOTS:
+        if s.lower() == slot:
+            return s
+
+    compact = slot.replace(" ", "")
+
+    aliases = {
+        "waffe1": "Waffe",
+        "waffe2": "Waffe",
+        "weapon": "Waffe",
+        "weapons": "Waffe",
+        "ring1": "Ring",
+        "ring2": "Ring",
+    }
+
+    return aliases.get(compact, "")
+
+
+def _catalog_slot_for_need_slot(need_slot: str) -> str:
+    if need_slot in ("Waffe 1", "Waffe 2"):
+        return "Waffe"
+
+    if need_slot in ("Ring 1", "Ring 2"):
+        return "Ring"
+
+    return need_slot
 
 
 def _normalize_tab(tab: str) -> str:
@@ -228,12 +275,21 @@ def _all_items(guild_id: int) -> dict:
     return _gitems(guild_id).setdefault("items", {})
 
 
-def _items_for_slot(guild_id: int, slot: str) -> list[dict]:
+def _items_for_need_slot(guild_id: int, need_slot: str) -> list[dict]:
+    catalog_slot = _catalog_slot_for_need_slot(need_slot)
     items = _all_items(guild_id)
     out = []
 
+    legacy_slots = {catalog_slot}
+
+    if catalog_slot == "Waffe":
+        legacy_slots.update({"Waffe 1", "Waffe 2"})
+
+    if catalog_slot == "Ring":
+        legacy_slots.update({"Ring 1", "Ring 2"})
+
     for item_id, item in items.items():
-        if str(item.get("slot", "")).lower() == slot.lower():
+        if str(item.get("slot", "")) in legacy_slots:
             i = dict(item)
             i["id"] = item_id
             out.append(i)
@@ -252,11 +308,6 @@ def _item_name(guild_id: int, item_id: str) -> str:
         return f"Unbekanntes Item ({item_id})"
 
     return str(item.get("name", item_id))
-
-
-def _item_slot(guild_id: int, item_id: str) -> str:
-    item = _all_items(guild_id).get(str(item_id)) or {}
-    return str(item.get("slot", ""))
 
 
 def _member_role_id(guild_id: int) -> int:
@@ -330,18 +381,18 @@ def _cleanup_needs_without_guild_role(guild: discord.Guild) -> int:
     return len(remove)
 
 
-def _find_item_by_name(guild_id: int, slot: str, name: str) -> Optional[tuple[str, dict]]:
+def _find_item_by_name(guild_id: int, catalog_slot: str, name: str) -> Optional[tuple[str, dict]]:
     name_l = name.strip().lower()
 
     for item_id, item in _all_items(guild_id).items():
-        if str(item.get("slot", "")).lower() == slot.lower() and str(item.get("name", "")).lower() == name_l:
+        if str(item.get("slot", "")).lower() == catalog_slot.lower() and str(item.get("name", "")).lower() == name_l:
             return item_id, item
 
     return None
 
 
-def _make_item_id(guild_id: int, slot: str, name: str) -> str:
-    base = _slug(f"{slot}-{name}")
+def _make_item_id(guild_id: int, catalog_slot: str, name: str) -> str:
+    base = _slug(f"{catalog_slot}-{name}")
     item_id = base
     items = _all_items(guild_id)
     n = 2
@@ -362,50 +413,24 @@ def _need_embed(guild: discord.Guild, user_id: int, tab: str = "Main") -> discor
 
     emb = discord.Embed(
         title="🎁 Needliste – ebolus",
-        description=f"**{name}**\nBereich: **{tab}**",
+        description=(
+            f"**{name}**\n"
+            f"Bereich: **{tab}**\n\n"
+            "Waffen werden über den gemeinsamen Item-Katalog **Waffe** ausgewählt.\n"
+            "Du kannst trotzdem getrennt **Waffe 1** und **Waffe 2** eintragen."
+        ),
         color=discord.Color.gold()
     )
 
     lines = []
 
-    for slot in SLOTS:
+    for slot in NEED_SLOTS:
         item_id = str(data.get(tab, {}).get(slot, "") or "")
         item_name = _item_name(guild.id, item_id) if item_id else "—"
         lines.append(f"**{slot}:** {item_name}")
 
     emb.add_field(name=tab, value="\n".join(lines), inline=False)
-    emb.set_footer(text="Main und Secondary werden getrennt gespeichert.")
-
-    return emb
-
-
-def _need_menu_embed(guild: discord.Guild, user_id: int) -> discord.Embed:
-    member = guild.get_member(user_id)
-    name = _profile_name(guild, user_id, member.display_name if member else "Unbekannt")
-
-    emb = discord.Embed(
-        title="🎁 Needliste – ebolus",
-        description=(
-            f"**{name}**\n\n"
-            "Hier kannst du deine gewünschten Items für **Main** und **Secondary** pflegen.\n"
-            "Items werden nicht frei geschrieben, sondern aus dem Item-Katalog ausgewählt."
-        ),
-        color=discord.Color.gold()
-    )
-
-    emb.add_field(
-        name="Bereiche",
-        value="• Main\n• Secondary",
-        inline=True
-    )
-
-    emb.add_field(
-        name="Slots",
-        value="2 Waffen, Rüstung, Schmuck, Gürtel, Umhang",
-        inline=True
-    )
-
-    emb.set_footer(text="Für Gildenbosse werden Waffe 1 und Waffe 2 ausgewertet.")
+    emb.set_footer(text="Für Gildenbosse werden nur Waffe 1 und Waffe 2 ausgewertet.")
 
     return emb
 
@@ -419,7 +444,7 @@ def _format_need_user_full(guild: discord.Guild, user_id: int) -> str:
     for tab in TABS:
         used = []
 
-        for slot in SLOTS:
+        for slot in NEED_SLOTS:
             item_id = str(data.get(tab, {}).get(slot, "") or "")
 
             if item_id:
@@ -475,7 +500,7 @@ def _weapon_summary_embed(
         name = _profile_name(guild, uid)
 
         for tab in TABS:
-            for slot in WEAPON_SLOTS:
+            for slot in WEAPON_NEED_SLOTS:
                 item_id = str(data.get(tab, {}).get(slot, "") or "")
 
                 if not item_id:
@@ -523,7 +548,7 @@ def _weapon_summary_embed(
 
         emb.add_field(name=f"{tab.upper()}-NEED", value=value or "—", inline=False)
 
-    emb.set_footer(text="Ausgewertet werden nur Waffe 1 und Waffe 2. Main und Secondary bleiben getrennt.")
+    emb.set_footer(text="Ausgewertet werden Waffe 1 und Waffe 2. Main und Secondary bleiben getrennt.")
 
     return emb
 
@@ -598,7 +623,7 @@ async def open_need_menu(inter: discord.Interaction, guild_id: int, user_id: int
     save_needs()
 
     await inter.response.edit_message(
-        embed=_need_menu_embed(guild, user_id),
+        embed=_need_embed(guild, user_id, "Main"),
         view=NeedMainView(guild_id, user_id)
     )
 
@@ -697,7 +722,7 @@ class NeedTabSelectView(View):
             return
 
         await inter.response.edit_message(
-            embed=_need_menu_embed(guild, self.user_id),
+            embed=_need_embed(guild, self.user_id, "Main"),
             view=NeedMainView(self.guild_id, self.user_id)
         )
 
@@ -726,7 +751,7 @@ class NeedTabSelect(Select):
         action_text = "setzen" if self.action == "set" else "entfernen"
 
         emb = discord.Embed(
-            title=f"🎁 Needliste – Slot wählen",
+            title="🎁 Needliste – Slot wählen",
             description=f"Bereich: **{tab}**\nAktion: **Item {action_text}**",
             color=discord.Color.gold()
         )
@@ -769,7 +794,7 @@ class NeedSlotSelect(Select):
 
         options = [
             discord.SelectOption(label=slot, value=slot)
-            for slot in SLOTS
+            for slot in NEED_SLOTS
         ]
 
         super().__init__(
@@ -781,11 +806,11 @@ class NeedSlotSelect(Select):
         )
 
     async def callback(self, inter: discord.Interaction):
-        slot = self.values[0]
+        need_slot = self.values[0]
 
         if self.action == "clear":
             data = _user_needs(self.guild_id, self.user_id)
-            data[self.tab][slot] = ""
+            data[self.tab][need_slot] = ""
             save_needs()
 
             guild = inter.client.get_guild(self.guild_id)
@@ -799,15 +824,17 @@ class NeedSlotSelect(Select):
                 await inter.response.send_message("✅ Eintrag entfernt.")
             return
 
-        items = _items_for_slot(self.guild_id, slot)
+        items = _items_for_need_slot(self.guild_id, need_slot)
 
         if not items:
+            catalog_slot = _catalog_slot_for_need_slot(need_slot)
+
             emb = discord.Embed(
                 title="🎁 Needliste – kein Item hinterlegt",
                 description=(
-                    f"Für den Slot **{slot}** gibt es noch keine Items im Katalog.\n\n"
+                    f"Für den Slot **{need_slot}** gibt es noch keine passenden Items im Katalog.\n\n"
                     f"Ein Leader muss zuerst ein Item hinzufügen:\n"
-                    f"`/loot_item_add slot:{slot} name:Itemname`"
+                    f"`/loot_item_add slot:{catalog_slot} name:Itemname`"
                 ),
                 color=discord.Color.orange()
             )
@@ -822,7 +849,8 @@ class NeedSlotSelect(Select):
             title="🎁 Needliste – Item wählen",
             description=(
                 f"Bereich: **{self.tab}**\n"
-                f"Slot: **{slot}**\n\n"
+                f"Slot: **{need_slot}**\n"
+                f"Item-Katalog: **{_catalog_slot_for_need_slot(need_slot)}**\n\n"
                 f"Wähle ein Item aus dem Katalog."
             ),
             color=discord.Color.gold()
@@ -830,18 +858,18 @@ class NeedSlotSelect(Select):
 
         await inter.response.edit_message(
             embed=emb,
-            view=NeedItemSelectView(self.guild_id, self.user_id, self.tab, slot)
+            view=NeedItemSelectView(self.guild_id, self.user_id, self.tab, need_slot)
         )
 
 
 class NeedItemSelectView(View):
-    def __init__(self, guild_id: int, user_id: int, tab: str, slot: str):
+    def __init__(self, guild_id: int, user_id: int, tab: str, need_slot: str):
         super().__init__(timeout=None)
         self.guild_id = int(guild_id)
         self.user_id = int(user_id)
         self.tab = tab
-        self.slot = slot
-        self.add_item(NeedItemSelect(guild_id, user_id, tab, slot))
+        self.need_slot = need_slot
+        self.add_item(NeedItemSelect(guild_id, user_id, tab, need_slot))
 
     @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="need_item_back")
     async def btn_back(self, inter: discord.Interaction, _):
@@ -858,13 +886,13 @@ class NeedItemSelectView(View):
 
 
 class NeedItemSelect(Select):
-    def __init__(self, guild_id: int, user_id: int, tab: str, slot: str):
+    def __init__(self, guild_id: int, user_id: int, tab: str, need_slot: str):
         self.guild_id = int(guild_id)
         self.user_id = int(user_id)
         self.tab = tab
-        self.slot = slot
+        self.need_slot = need_slot
 
-        items = _items_for_slot(guild_id, slot)[:25]
+        items = _items_for_need_slot(guild_id, need_slot)[:25]
 
         options = [
             discord.SelectOption(
@@ -885,7 +913,7 @@ class NeedItemSelect(Select):
     async def callback(self, inter: discord.Interaction):
         item_id = self.values[0]
         data = _user_needs(self.guild_id, self.user_id)
-        data[self.tab][self.slot] = item_id
+        data[self.tab][self.need_slot] = item_id
         save_needs()
 
         guild = inter.client.get_guild(self.guild_id)
@@ -900,10 +928,10 @@ class NeedItemSelect(Select):
         )
 
 
-def _slot_choices():
+def _catalog_slot_choices():
     return [
         app_commands.Choice(name=s, value=s)
-        for s in SLOTS
+        for s in CATALOG_SLOTS
     ]
 
 
@@ -1052,7 +1080,7 @@ async def setup_loot_needs(client: discord.Client, tree: app_commands.CommandTre
         )
 
     @tree.command(name="loot_item_add", description="(Leader) Item zum Need-Katalog hinzufügen")
-    @app_commands.choices(slot=_slot_choices())
+    @app_commands.choices(slot=_catalog_slot_choices())
     async def loot_item_add(inter: discord.Interaction, slot: app_commands.Choice[str], name: str):
         if inter.guild is None:
             await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
@@ -1062,9 +1090,9 @@ async def setup_loot_needs(client: discord.Client, tree: app_commands.CommandTre
             await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
             return
 
-        slot_name = _normalize_slot(slot.value)
+        catalog_slot = _normalize_catalog_slot(slot.value)
 
-        if not slot_name:
+        if not catalog_slot:
             await inter.response.send_message("❌ Ungültiger Slot.", ephemeral=True)
             return
 
@@ -1074,20 +1102,20 @@ async def setup_loot_needs(client: discord.Client, tree: app_commands.CommandTre
             await inter.response.send_message("❌ Itemname fehlt.", ephemeral=True)
             return
 
-        existing = _find_item_by_name(inter.guild.id, slot_name, clean_name)
+        existing = _find_item_by_name(inter.guild.id, catalog_slot, clean_name)
 
         if existing:
             await inter.response.send_message(
-                f"⚠️ Dieses Item existiert für **{slot_name}** bereits.",
+                f"⚠️ Dieses Item existiert für **{catalog_slot}** bereits.",
                 ephemeral=True
             )
             return
 
-        item_id = _make_item_id(inter.guild.id, slot_name, clean_name)
+        item_id = _make_item_id(inter.guild.id, catalog_slot, clean_name)
         items = _all_items(inter.guild.id)
         items[item_id] = {
             "name": clean_name,
-            "slot": slot_name,
+            "slot": catalog_slot,
             "created_at": _now_iso(),
             "created_by": int(inter.user.id),
         }
@@ -1095,28 +1123,36 @@ async def setup_loot_needs(client: discord.Client, tree: app_commands.CommandTre
         save_items()
 
         await inter.response.send_message(
-            f"✅ Item hinzugefügt:\n**{clean_name}**\nSlot: **{slot_name}**\nID: `{item_id}`",
+            f"✅ Item hinzugefügt:\n**{clean_name}**\nSlot: **{catalog_slot}**\nID: `{item_id}`",
             ephemeral=True
         )
 
     @tree.command(name="loot_item_list", description="Zeigt Items aus dem Need-Katalog")
-    @app_commands.choices(slot=_slot_choices())
+    @app_commands.choices(slot=_catalog_slot_choices())
     async def loot_item_list(inter: discord.Interaction, slot: Optional[app_commands.Choice[str]] = None):
         if inter.guild is None:
             await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
             return
 
-        slot_name = _normalize_slot(slot.value) if slot else ""
+        catalog_slot = _normalize_catalog_slot(slot.value) if slot else ""
 
-        if slot_name:
-            items = _items_for_slot(inter.guild.id, slot_name)
-            title = f"🎁 Item-Katalog – {slot_name}"
+        if catalog_slot:
+            items = []
+            for item_id, item in _all_items(inter.guild.id).items():
+                if str(item.get("slot", "")) == catalog_slot:
+                    x = dict(item)
+                    x["id"] = item_id
+                    items.append(x)
+
+            items.sort(key=lambda x: str(x.get("name", "")).lower())
+            title = f"🎁 Item-Katalog – {catalog_slot}"
         else:
             items = []
             for item_id, item in _all_items(inter.guild.id).items():
                 x = dict(item)
                 x["id"] = item_id
                 items.append(x)
+
             items.sort(key=lambda x: (str(x.get("slot", "")), str(x.get("name", "")).lower()))
             title = "🎁 Item-Katalog – alle Items"
 
@@ -1145,7 +1181,7 @@ async def setup_loot_needs(client: discord.Client, tree: app_commands.CommandTre
         await inter.response.send_message(embed=emb, ephemeral=True)
 
     @tree.command(name="loot_item_remove", description="(Leader) Item aus dem Need-Katalog entfernen")
-    @app_commands.choices(slot=_slot_choices())
+    @app_commands.choices(slot=_catalog_slot_choices())
     async def loot_item_remove(inter: discord.Interaction, slot: app_commands.Choice[str], name: str):
         if inter.guild is None:
             await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
@@ -1155,12 +1191,12 @@ async def setup_loot_needs(client: discord.Client, tree: app_commands.CommandTre
             await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
             return
 
-        slot_name = _normalize_slot(slot.value)
-        found = _find_item_by_name(inter.guild.id, slot_name, name)
+        catalog_slot = _normalize_catalog_slot(slot.value)
+        found = _find_item_by_name(inter.guild.id, catalog_slot, name)
 
         if not found:
             await inter.response.send_message(
-                f"❌ Item **{name}** im Slot **{slot_name}** nicht gefunden.",
+                f"❌ Item **{name}** im Slot **{catalog_slot}** nicht gefunden.",
                 ephemeral=True
             )
             return
@@ -1176,7 +1212,7 @@ async def setup_loot_needs(client: discord.Client, tree: app_commands.CommandTre
             changed = False
 
             for tab in TABS:
-                for s in SLOTS:
+                for s in NEED_SLOTS:
                     if data.get(tab, {}).get(s) == item_id:
                         data[tab][s] = ""
                         changed = True
