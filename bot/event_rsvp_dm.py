@@ -1,25 +1,27 @@
 from __future__ import annotations
+
 import json
+import asyncio
 from pathlib import Path
 from typing import Dict, Optional, Iterable, List, Any
-import asyncio
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import discord
 from discord import app_commands
 from discord.ui import View, button
 from discord.enums import ButtonStyle
-from zoneinfo import ZoneInfo
-from datetime import datetime, timedelta
 
 try:
     from bot.event_dm_prefs import is_dm_enabled  # type: ignore
 except ModuleNotFoundError:
-    from event_dm_prefs import is_dm_enabled      # type: ignore
+    from event_dm_prefs import is_dm_enabled  # type: ignore
 
 try:
     from bot.raid_stats import record_response  # type: ignore
 except ModuleNotFoundError:
-    from raid_stats import record_response      # type: ignore
+    from raid_stats import record_response  # type: ignore
+
 
 TZ = ZoneInfo("Europe/Berlin")
 
@@ -30,23 +32,29 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 RSVP_FILE = DATA_DIR / "event_rsvp.json"
 DM_CFG_FILE = DATA_DIR / "event_rsvp_cfg.json"
 
+
 def _load(p: Path, default):
     try:
         return json.loads(p.read_text(encoding="utf-8"))
     except Exception:
         return default
 
+
 def _save(p: Path, obj):
     p.write_text(json.dumps(obj, indent=2, ensure_ascii=False), encoding="utf-8")
+
 
 store: Dict[str, dict] = _load(RSVP_FILE, {})
 cfg: Dict[str, dict] = _load(DM_CFG_FILE, {})
 
+
 def save_store():
     _save(RSVP_FILE, store)
 
+
 def save_cfg():
     _save(DM_CFG_FILE, cfg)
+
 
 async def _log(client: discord.Client, guild_id: int, text: str):
     gcfg = cfg.get(str(guild_id)) or {}
@@ -55,12 +63,12 @@ async def _log(client: discord.Client, guild_id: int, text: str):
     if not ch_id:
         return
 
-    g = client.get_guild(guild_id)
+    guild = client.get_guild(guild_id)
 
-    if not g:
+    if not guild:
         return
 
-    ch = g.get_channel(ch_id)
+    ch = guild.get_channel(ch_id)
 
     if isinstance(ch, (discord.TextChannel, discord.Thread)):
         try:
@@ -68,23 +76,33 @@ async def _log(client: discord.Client, guild_id: int, text: str):
         except Exception:
             pass
 
+
 def _safe_name(name: str) -> str:
     return (name or "").replace("@", "@\u200b").strip() or "Unbekannt"
 
-def _current_display_name(member: Optional[discord.Member], fallback_user: Optional[discord.abc.User] = None) -> str:
+
+def _current_display_name(
+    member: Optional[discord.Member],
+    fallback_user: Optional[discord.abc.User] = None
+) -> str:
     if member is not None:
         return _safe_name(member.display_name)
 
     if fallback_user is not None:
-        return _safe_name(getattr(fallback_user, "display_name", None) or getattr(fallback_user, "name", "Unbekannt"))
+        return _safe_name(
+            getattr(fallback_user, "display_name", None)
+            or getattr(fallback_user, "name", "Unbekannt")
+        )
 
     return "Unbekannt"
+
 
 def _participant_entry(uid: int, name: str) -> dict:
     return {
         "id": int(uid),
         "name": _safe_name(name),
     }
+
 
 def _entry_user_id(entry: Any) -> int:
     try:
@@ -94,16 +112,17 @@ def _entry_user_id(entry: Any) -> int:
     except Exception:
         return 0
 
+
 def _entry_name(entry: Any, guild: Optional[discord.Guild] = None) -> str:
     if isinstance(entry, dict):
         stored = _safe_name(str(entry.get("name", "") or ""))
         uid = _entry_user_id(entry)
 
         if guild and uid:
-            m = guild.get_member(uid)
+            member = guild.get_member(uid)
 
-            if m:
-                return _safe_name(m.display_name)
+            if member:
+                return _safe_name(member.display_name)
 
         return stored or (f"User {uid}" if uid else "Unbekannt")
 
@@ -113,12 +132,13 @@ def _entry_name(entry: Any, guild: Optional[discord.Guild] = None) -> str:
         return "Unbekannt"
 
     if guild:
-        m = guild.get_member(uid)
+        member = guild.get_member(uid)
 
-        if m:
-            return _safe_name(m.display_name)
+        if member:
+            return _safe_name(member.display_name)
 
     return f"User {uid}"
+
 
 def _maybe_entry(uid: int, name: str, label: str) -> dict:
     return {
@@ -127,7 +147,12 @@ def _maybe_entry(uid: int, name: str, label: str) -> dict:
         "label": (label or "").strip(),
     }
 
-def _maybe_name_and_label(entry: Any, uid_fallback: int, guild: Optional[discord.Guild] = None) -> tuple[str, str]:
+
+def _maybe_name_and_label(
+    entry: Any,
+    uid_fallback: int,
+    guild: Optional[discord.Guild] = None
+) -> tuple[str, str]:
     if isinstance(entry, dict):
         uid = int(entry.get("id", uid_fallback) or uid_fallback)
         label = str(entry.get("label", "") or "").strip()
@@ -137,12 +162,13 @@ def _maybe_name_and_label(entry: Any, uid_fallback: int, guild: Optional[discord
     label = str(entry or "").strip()
 
     if guild:
-        m = guild.get_member(uid_fallback)
+        member = guild.get_member(uid_fallback)
 
-        if m:
-            return _safe_name(m.display_name), label
+        if member:
+            return _safe_name(member.display_name), label
 
     return f"User {uid_fallback}", label
+
 
 def _format_dm_text(
     title: str,
@@ -168,6 +194,7 @@ def _format_dm_text(
         dm_text += "\n👇 **Wähle unten deine Teilnahme:**"
 
     return dm_text
+
 
 def _init_event_shape(obj: dict):
     if "yes" not in obj or not isinstance(obj["yes"], dict):
@@ -225,7 +252,11 @@ def _init_event_shape(obj: dict):
                 "label": str(raw.get("label", "") or "").strip()
             }
         else:
-            maybe_new[str(uid_i)] = _maybe_entry(uid_i, f"User {uid_i}", str(raw or "").strip())
+            maybe_new[str(uid_i)] = _maybe_entry(
+                uid_i,
+                f"User {uid_i}",
+                str(raw or "").strip()
+            )
 
     if obj.get("maybe") != maybe_new:
         obj["maybe"] = maybe_new
@@ -253,6 +284,7 @@ def _init_event_shape(obj: dict):
     if migrated:
         save_store()
 
+
 def get_role_ids_for_guild(guild_id: int) -> Dict[str, int]:
     g = cfg.get(str(guild_id)) or {}
 
@@ -262,21 +294,22 @@ def get_role_ids_for_guild(guild_id: int) -> Dict[str, int]:
         "DPS": int(g.get("DPS", 0) or 0),
     }
 
+
 def _primary_label(member: Optional[discord.Member], rid_map: Dict[str, int]) -> str:
     if member is None:
         return ""
 
-    g = member.guild
+    guild = member.guild
 
-    r = g.get_role(rid_map.get("TANK", 0) or 0)
+    r = guild.get_role(rid_map.get("TANK", 0) or 0)
     if r and r in getattr(member, "roles", []):
         return "Tank"
 
-    r = g.get_role(rid_map.get("HEAL", 0) or 0)
+    r = guild.get_role(rid_map.get("HEAL", 0) or 0)
     if r and r in getattr(member, "roles", []):
         return "Heal"
 
-    r = g.get_role(rid_map.get("DPS", 0) or 0)
+    r = guild.get_role(rid_map.get("DPS", 0) or 0)
     if r and r in getattr(member, "roles", []):
         return "DPS"
 
@@ -293,6 +326,7 @@ def _primary_label(member: Optional[discord.Member], rid_map: Dict[str, int]) ->
 
     return ""
 
+
 def _member_from_event(inter: discord.Interaction, obj: dict) -> Optional[discord.Member]:
     try:
         if inter.guild is not None:
@@ -303,15 +337,16 @@ def _member_from_event(inter: discord.Interaction, obj: dict) -> Optional[discor
         if not gid:
             return None
 
-        g = inter.client.get_guild(gid)
+        guild = inter.client.get_guild(gid)
 
-        if not g:
+        if not guild:
             return None
 
-        return g.get_member(inter.user.id)
+        return guild.get_member(inter.user.id)
 
     except Exception:
         return None
+
 
 def _voters_set(obj: dict) -> set[int]:
     voted: set[int] = set()
@@ -332,6 +367,7 @@ def _voters_set(obj: dict) -> set[int]:
 
     return voted
 
+
 def _eligible_members(guild: discord.Guild, obj: dict) -> List[discord.Member]:
     tr_id = int(obj.get("target_role_id", 0) or 0)
 
@@ -344,6 +380,7 @@ def _eligible_members(guild: discord.Guild, obj: dict) -> List[discord.Member]:
         return [m for m in guild.members if not m.bot]
 
     return [m for m in role.members if not m.bot]
+
 
 def build_embed(guild: discord.Guild, obj: dict) -> discord.Embed:
     _init_event_shape(obj)
@@ -397,10 +434,10 @@ def build_embed(guild: discord.Guild, obj: dict) -> discord.Embed:
     tr_id = int(obj.get("target_role_id", 0) or 0)
 
     if tr_id:
-        r = guild.get_role(tr_id)
+        role = guild.get_role(tr_id)
 
-        if r:
-            emb.add_field(name="🎯 Zielgruppe", value=r.mention, inline=False)
+        if role:
+            emb.add_field(name="🎯 Zielgruppe", value=role.mention, inline=False)
 
     if obj.get("image_url"):
         emb.set_image(url=obj["image_url"])
@@ -408,6 +445,7 @@ def build_embed(guild: discord.Guild, obj: dict) -> discord.Embed:
     emb.set_footer(text="DM-Buttons und Server-Buttons schreiben beide in dieselbe Anmeldung.")
 
     return emb
+
 
 async def _delete_dm_message_for_user(client: discord.Client, obj: dict, user_id: int) -> bool:
     _init_event_shape(obj)
@@ -442,10 +480,42 @@ async def _delete_dm_message_for_user(client: discord.Client, obj: dict, user_id
 
     return deleted
 
-async def _delete_all_bot_dm_messages_for_user(client: discord.Client, user_id: int, limit: int = 200) -> int:
+
+def _portal_protected_titles() -> set[str]:
+    return {
+        "🏰 ebolus – Gildenmenü",
+        "👤 Dein Gildenprofil",
+        "📅 Gildenkalender – ebolus",
+        "📅 Gilden-Events",
+        "❓ Hilfe – ebolus Gildenbot",
+        "👥 Mitgliederliste – ebolus",
+        "📜 Regeln & Lootsystem – ebolus",
+        "🎁 Needliste – ebolus",
+    }
+
+
+async def _ensure_portal_after_rsvp(client: discord.Client, guild_id: int, user_id: int) -> None:
+    try:
+        try:
+            from bot.member_portal import ensure_portal_menu_for_user  # type: ignore
+        except ModuleNotFoundError:
+            from member_portal import ensure_portal_menu_for_user  # type: ignore
+
+        await ensure_portal_menu_for_user(client, guild_id, user_id, force_view="main")
+    except Exception:
+        pass
+
+
+async def _delete_all_bot_dm_messages_for_user(
+    client: discord.Client,
+    user_id: int,
+    guild_id: int | None = None,
+    limit: int = 200
+) -> int:
     """
     Löscht alte Bot-Nachrichten im privaten Chat mit dem User.
-    Wichtig: Der Bot kann nur eigene Nachrichten löschen.
+    Geschützt werden Gildenmenü/Portal-Seiten.
+    Der Bot kann nur eigene Nachrichten löschen.
     """
     if client.user is None:
         return 0
@@ -458,6 +528,7 @@ async def _delete_all_bot_dm_messages_for_user(client: discord.Client, user_id: 
         except Exception:
             return 0
 
+    protected_titles = _portal_protected_titles()
     deleted = 0
 
     try:
@@ -465,10 +536,21 @@ async def _delete_all_bot_dm_messages_for_user(client: discord.Client, user_id: 
 
         async for msg in dm.history(limit=limit):
             try:
-                if msg.author.id == client.user.id:
-                    await msg.delete()
-                    deleted += 1
-                    await asyncio.sleep(0.05)
+                if msg.author.id != client.user.id:
+                    continue
+
+                title = ""
+
+                if msg.embeds:
+                    title = msg.embeds[0].title or ""
+
+                if title in protected_titles:
+                    continue
+
+                await msg.delete()
+                deleted += 1
+                await asyncio.sleep(0.05)
+
             except Exception:
                 pass
 
@@ -485,7 +567,11 @@ async def _delete_all_bot_dm_messages_for_user(client: discord.Client, user_id: 
     if deleted:
         save_store()
 
+    if guild_id:
+        await _ensure_portal_after_rsvp(client, guild_id, int(user_id))
+
     return deleted
+
 
 async def _delete_all_pending_dm_messages_for_event(client: discord.Client, obj: dict) -> int:
     _init_event_shape(obj)
@@ -511,6 +597,7 @@ async def _delete_all_pending_dm_messages_for_event(client: discord.Client, obj:
             removed += 1
 
     return removed
+
 
 async def delete_pending_dm_messages_for_started_events(client: discord.Client) -> int:
     changed = 0
@@ -553,6 +640,7 @@ async def delete_pending_dm_messages_for_started_events(client: discord.Client) 
 
     return changed
 
+
 async def _push_overview(client: discord.Client, msg_id: str, obj: dict):
     guild = client.get_guild(int(obj["guild_id"]))
 
@@ -576,6 +664,7 @@ async def _push_overview(client: discord.Client, msg_id: str, obj: dict):
     except Exception:
         pass
 
+
 async def apply_rsvp(inter: discord.Interaction, msg_id: str, group: str) -> tuple[bool, str]:
     obj = store.get(str(msg_id))
 
@@ -598,9 +687,16 @@ async def apply_rsvp(inter: discord.Interaction, msg_id: str, group: str) -> tup
         response_key = "no"
 
     for k in ("TANK", "HEAL", "DPS", "BANK"):
-        obj["yes"][k] = [entry for entry in obj["yes"].get(k, []) if _entry_user_id(entry) != uid]
+        obj["yes"][k] = [
+            entry for entry in obj["yes"].get(k, [])
+            if _entry_user_id(entry) != uid
+        ]
 
-    obj["no"] = [entry for entry in obj.get("no", []) if _entry_user_id(entry) != uid]
+    obj["no"] = [
+        entry for entry in obj.get("no", [])
+        if _entry_user_id(entry) != uid
+    ]
+
     obj["maybe"].pop(str(uid), None)
 
     if group in ("TANK", "HEAL", "DPS"):
@@ -630,6 +726,7 @@ async def apply_rsvp(inter: discord.Interaction, msg_id: str, group: str) -> tup
 
     return True, text
 
+
 class BaseRaidView(View):
     def __init__(self, msg_id: int):
         super().__init__(timeout=None)
@@ -643,7 +740,15 @@ class BaseRaidView(View):
 
     async def _after_success(self, inter: discord.Interaction):
         try:
-            await _delete_all_bot_dm_messages_for_user(inter.client, inter.user.id)
+            obj = store.get(self.msg_id) or {}
+            guild_id = int(obj.get("guild_id", 0) or 0)
+
+            await _delete_all_bot_dm_messages_for_user(
+                inter.client,
+                inter.user.id,
+                guild_id=guild_id if guild_id else None,
+                limit=200
+            )
         except Exception:
             pass
 
@@ -665,6 +770,7 @@ class BaseRaidView(View):
                 await _log(inter.client, gid, f"Button-Fehler ({type(self).__name__}): {e!r}")
             except Exception:
                 pass
+
 
 class RaidView(BaseRaidView):
     @button(label="🛡️ Tank", style=ButtonStyle.primary, custom_id="dm_rsvp_tank")
@@ -691,6 +797,7 @@ class RaidView(BaseRaidView):
     async def btn_no(self, inter: discord.Interaction, _):
         await self._handle(inter, "NO")
 
+
 class ServerRaidView(BaseRaidView):
     @button(label="🛡️ Tank", style=ButtonStyle.primary, custom_id="srv_rsvp_tank")
     async def btn_tank(self, inter: discord.Interaction, _):
@@ -716,9 +823,11 @@ class ServerRaidView(BaseRaidView):
     async def btn_no(self, inter: discord.Interaction, _):
         await self._handle(inter, "NO")
 
+
 def _is_admin(inter: discord.Interaction) -> bool:
     perms = getattr(inter.user, "guild_permissions", None)
     return bool(perms and (perms.administrator or perms.manage_guild))
+
 
 async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
     for msg_id, obj in list(store.items()):
@@ -849,8 +958,8 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
         skipped_opt_out = 0
         role_obj = inter.guild.get_role(int(obj.get("target_role_id", 0) or 0)) if obj.get("target_role_id") else None
 
-        for m in _eligible_members(inter.guild, obj):
-            if not is_dm_enabled(inter.guild_id, m.id):
+        for member in _eligible_members(inter.guild, obj):
+            if not is_dm_enabled(inter.guild_id, member.id):
                 skipped_opt_out += 1
                 continue
 
@@ -863,8 +972,8 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
                     intro_line="Wähle unten deine Teilnahme:"
                 )
 
-                dm_msg = await m.send(dm_text, view=RaidView(int(msg.id)))
-                obj["dm_messages"][str(m.id)] = int(dm_msg.id)
+                dm_msg = await member.send(dm_text, view=RaidView(int(msg.id)))
+                obj["dm_messages"][str(member.id)] = int(dm_msg.id)
                 sent += 1
                 await asyncio.sleep(0.05)
 
@@ -920,8 +1029,8 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
         sent = 0
         skipped_opt_out = 0
 
-        for m in targets:
-            if not is_dm_enabled(inter.guild_id, m.id):
+        for member in targets:
+            if not is_dm_enabled(inter.guild_id, member.id):
                 skipped_opt_out += 1
                 continue
 
@@ -934,8 +1043,8 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
                     intro_line="Du hast noch nicht abgestimmt:"
                 )
 
-                dm_msg = await m.send(dm_text, view=RaidView(int(message_id)))
-                obj["dm_messages"][str(m.id)] = int(dm_msg.id)
+                dm_msg = await member.send(dm_text, view=RaidView(int(message_id)))
+                obj["dm_messages"][str(member.id)] = int(dm_msg.id)
                 sent += 1
                 await asyncio.sleep(0.05)
 
@@ -989,8 +1098,8 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
         sent = 0
         skipped_opt_out = 0
 
-        for m in targets:
-            if not is_dm_enabled(inter.guild_id, m.id):
+        for member in targets:
+            if not is_dm_enabled(inter.guild_id, member.id):
                 skipped_opt_out += 1
                 continue
 
@@ -1003,8 +1112,8 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
                     intro_line="Wähle unten deine Teilnahme:"
                 )
 
-                dm_msg = await m.send(dm_text, view=RaidView(int(message_id)))
-                obj["dm_messages"][str(m.id)] = int(dm_msg.id)
+                dm_msg = await member.send(dm_text, view=RaidView(int(message_id)))
+                obj["dm_messages"][str(member.id)] = int(dm_msg.id)
                 sent += 1
                 await asyncio.sleep(0.05)
 
@@ -1061,6 +1170,7 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
                 if ok:
                     deleted_dms += 1
 
+                await _ensure_portal_after_rsvp(inter.client, int(obj["guild_id"]), uid)
                 await asyncio.sleep(0.05)
 
             except Exception:
@@ -1075,6 +1185,7 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
             f"✉️ DMs gelöscht: {deleted_dms}",
             ephemeral=True
         )
+
 
 async def auto_resend_for_new_member(member: discord.Member) -> None:
     try:
@@ -1102,9 +1213,9 @@ async def auto_resend_for_new_member(member: discord.Member) -> None:
                 tr_id = int(obj.get("target_role_id", 0) or 0)
 
                 if tr_id:
-                    r = member.guild.get_role(tr_id)
+                    role = member.guild.get_role(tr_id)
 
-                    if not (r and r in member.roles):
+                    if not (role and role in member.roles):
                         continue
 
                 text = _format_dm_text(
