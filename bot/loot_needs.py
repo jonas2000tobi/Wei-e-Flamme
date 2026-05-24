@@ -64,6 +64,19 @@ CATALOG_SLOTS = [
     "Umhang",
 ]
 
+WEAPON_TYPES = [
+    "Schwert & Schild",
+    "Großschwert",
+    "Dolche",
+    "Armbrust",
+    "Langbogen",
+    "Stab",
+    "Zauberstab",
+    "Speer",
+    "Kugel",
+    "Fäustlinge",
+]
+
 TABS = ["Main", "Secondary"]
 WEAPON_NEED_SLOTS = ["Waffe 1", "Waffe 2"]
 
@@ -209,25 +222,6 @@ def _user_needs(guild_id: int, user_id: int) -> dict:
     return u
 
 
-def _normalize_need_slot(slot: str) -> str:
-    slot = (slot or "").strip().lower()
-
-    for s in NEED_SLOTS:
-        if s.lower() == slot:
-            return s
-
-    compact = slot.replace(" ", "")
-
-    aliases = {
-        "waffe1": "Waffe 1",
-        "waffe2": "Waffe 2",
-        "ring1": "Ring 1",
-        "ring2": "Ring 2",
-    }
-
-    return aliases.get(compact, "")
-
-
 def _normalize_catalog_slot(slot: str) -> str:
     slot = (slot or "").strip().lower()
 
@@ -247,6 +241,56 @@ def _normalize_catalog_slot(slot: str) -> str:
     }
 
     return aliases.get(compact, "")
+
+
+def _normalize_weapon_type(value: str | None) -> str:
+    value = (value or "").strip().lower()
+
+    if not value:
+        return ""
+
+    for w in WEAPON_TYPES:
+        if w.lower() == value:
+            return w
+
+    aliases = {
+        "sns": "Schwert & Schild",
+        "schwert": "Schwert & Schild",
+        "schild": "Schwert & Schild",
+        "schwert und schild": "Schwert & Schild",
+        "sword": "Schwert & Schild",
+        "sword shield": "Schwert & Schild",
+        "sword and shield": "Schwert & Schild",
+        "greatsword": "Großschwert",
+        "gs": "Großschwert",
+        "grossschwert": "Großschwert",
+        "großschwert": "Großschwert",
+        "dagger": "Dolche",
+        "daggers": "Dolche",
+        "dolch": "Dolche",
+        "dolche": "Dolche",
+        "crossbow": "Armbrust",
+        "xbow": "Armbrust",
+        "armbrust": "Armbrust",
+        "longbow": "Langbogen",
+        "bow": "Langbogen",
+        "bogen": "Langbogen",
+        "langbogen": "Langbogen",
+        "staff": "Stab",
+        "stab": "Stab",
+        "wand": "Zauberstab",
+        "zauberstab": "Zauberstab",
+        "spear": "Speer",
+        "speer": "Speer",
+        "orb": "Kugel",
+        "kugel": "Kugel",
+        "gauntlet": "Fäustlinge",
+        "gauntlets": "Fäustlinge",
+        "faeustlinge": "Fäustlinge",
+        "fäustlinge": "Fäustlinge",
+    }
+
+    return aliases.get(value, "")
 
 
 def _catalog_slot_for_need_slot(need_slot: str) -> str:
@@ -275,7 +319,12 @@ def _all_items(guild_id: int) -> dict:
     return _gitems(guild_id).setdefault("items", {})
 
 
-def _items_for_need_slot(guild_id: int, need_slot: str) -> list[dict]:
+def _item_weapon_type(guild_id: int, item_id: str) -> str:
+    item = _all_items(guild_id).get(str(item_id)) or {}
+    return str(item.get("weapon_type", "") or "").strip()
+
+
+def _items_for_need_slot(guild_id: int, need_slot: str, weapon_type: str | None = None) -> list[dict]:
     catalog_slot = _catalog_slot_for_need_slot(need_slot)
     items = _all_items(guild_id)
     out = []
@@ -288,17 +337,27 @@ def _items_for_need_slot(guild_id: int, need_slot: str) -> list[dict]:
     if catalog_slot == "Ring":
         legacy_slots.update({"Ring 1", "Ring 2"})
 
+    normalized_weapon_type = _normalize_weapon_type(weapon_type) if weapon_type else ""
+
     for item_id, item in items.items():
-        if str(item.get("slot", "")) in legacy_slots:
-            i = dict(item)
-            i["id"] = item_id
-            out.append(i)
+        item_slot = str(item.get("slot", ""))
+
+        if item_slot not in legacy_slots:
+            continue
+
+        if catalog_slot == "Waffe" and normalized_weapon_type:
+            if str(item.get("weapon_type", "") or "") != normalized_weapon_type:
+                continue
+
+        i = dict(item)
+        i["id"] = item_id
+        out.append(i)
 
     out.sort(key=lambda x: str(x.get("name", "")).lower())
     return out
 
 
-def _item_name(guild_id: int, item_id: str) -> str:
+def _item_name(guild_id: int, item_id: str, with_type: bool = False) -> str:
     if not item_id:
         return "—"
 
@@ -307,7 +366,16 @@ def _item_name(guild_id: int, item_id: str) -> str:
     if not item:
         return f"Unbekanntes Item ({item_id})"
 
-    return str(item.get("name", item_id))
+    name = str(item.get("name", item_id))
+    slot = str(item.get("slot", ""))
+
+    if with_type and slot == "Waffe":
+        wt = str(item.get("weapon_type", "") or "").strip()
+        if wt:
+            return f"{name} ({wt})"
+        return f"{name} (Unbekannt)"
+
+    return name
 
 
 def _member_role_id(guild_id: int) -> int:
@@ -416,21 +484,36 @@ def _need_embed(guild: discord.Guild, user_id: int, tab: str = "Main") -> discor
         description=(
             f"**{name}**\n"
             f"Bereich: **{tab}**\n\n"
-            "Waffen werden über den gemeinsamen Item-Katalog **Waffe** ausgewählt.\n"
-            "Du kannst trotzdem getrennt **Waffe 1** und **Waffe 2** eintragen."
+            "Bei Waffen wählst du erst den Waffentyp und danach das Item."
         ),
         color=discord.Color.gold()
     )
 
-    lines = []
+    weapon_lines = []
+    armor_lines = []
+    jewelry_lines = []
+    other_lines = []
 
     for slot in NEED_SLOTS:
         item_id = str(data.get(tab, {}).get(slot, "") or "")
-        item_name = _item_name(guild.id, item_id) if item_id else "—"
-        lines.append(f"**{slot}:** {item_name}")
+        item_name = _item_name(guild.id, item_id, with_type=True) if item_id else "—"
+        line = f"**{slot}:** {item_name}"
 
-    emb.add_field(name=tab, value="\n".join(lines), inline=False)
-    emb.set_footer(text="Für Gildenbosse werden nur Waffe 1 und Waffe 2 ausgewertet.")
+        if slot in ("Waffe 1", "Waffe 2"):
+            weapon_lines.append(line)
+        elif slot in ("Helm", "Brust", "Hose", "Handschuhe", "Schuhe"):
+            armor_lines.append(line)
+        elif slot in ("Brosche", "Ohrringe", "Kette", "Armband", "Ring 1", "Ring 2"):
+            jewelry_lines.append(line)
+        else:
+            other_lines.append(line)
+
+    emb.add_field(name="⚔️ Waffen", value="\n".join(weapon_lines) or "—", inline=False)
+    emb.add_field(name="🛡️ Rüstung", value="\n".join(armor_lines) or "—", inline=False)
+    emb.add_field(name="💍 Schmuck", value="\n".join(jewelry_lines) or "—", inline=False)
+    emb.add_field(name="🧥 Sonstiges", value="\n".join(other_lines) or "—", inline=False)
+
+    emb.set_footer(text="Für Gildenbosse werden Waffe 1 und Waffe 2 ausgewertet.")
 
     return emb
 
@@ -448,7 +531,7 @@ def _format_need_user_full(guild: discord.Guild, user_id: int) -> str:
             item_id = str(data.get(tab, {}).get(slot, "") or "")
 
             if item_id:
-                used.append(f"{slot}: {_item_name(guild.id, item_id)}")
+                used.append(f"{slot}: {_item_name(guild.id, item_id, with_type=True)}")
 
         if used:
             lines.append(f"__{tab}__")
@@ -487,7 +570,7 @@ def _weapon_summary_embed(
     title: str,
     subtitle: str
 ) -> discord.Embed:
-    grouped: dict[str, dict[str, list[str]]] = {
+    grouped: dict[str, dict[str, dict[str, list[str]]]] = {
         "Main": {},
         "Secondary": {},
     }
@@ -506,15 +589,18 @@ def _weapon_summary_embed(
                 if not item_id:
                     continue
 
-                item_name = _item_name(guild.id, item_id)
+                item_name = _item_name(guild.id, item_id, with_type=False)
 
                 if item_name.startswith("Unbekanntes Item"):
                     continue
 
-                grouped[tab].setdefault(item_name, [])
+                weapon_type = _item_weapon_type(guild.id, item_id) or "Unbekannt"
 
-                if name not in grouped[tab][item_name]:
-                    grouped[tab][item_name].append(name)
+                grouped[tab].setdefault(weapon_type, {})
+                grouped[tab][weapon_type].setdefault(item_name, [])
+
+                if name not in grouped[tab][weapon_type][item_name]:
+                    grouped[tab][weapon_type][item_name].append(name)
 
     emb = discord.Embed(
         title=title,
@@ -523,22 +609,31 @@ def _weapon_summary_embed(
     )
 
     for tab in TABS:
-        item_map = grouped.get(tab) or {}
+        type_map = grouped.get(tab) or {}
 
-        if not item_map:
+        if not type_map:
             emb.add_field(name=f"{tab.upper()}-NEED", value="—", inline=False)
             continue
 
-        sorted_items = sorted(
-            item_map.items(),
-            key=lambda kv: (-len(kv[1]), kv[0].lower())
-        )
-
         lines = []
 
-        for item_name, names in sorted_items:
-            lines.append(f"**{item_name} — {len(names)}x**")
-            lines.append(", ".join(names))
+        sorted_types = sorted(
+            type_map.items(),
+            key=lambda kv: (WEAPON_TYPES.index(kv[0]) if kv[0] in WEAPON_TYPES else 999, kv[0])
+        )
+
+        for weapon_type, item_map in sorted_types:
+            lines.append(f"**{weapon_type}**")
+
+            sorted_items = sorted(
+                item_map.items(),
+                key=lambda kv: (-len(kv[1]), kv[0].lower())
+            )
+
+            for item_name, names in sorted_items:
+                lines.append(f"• {item_name} — **{len(names)}x**")
+                lines.append(f"  {', '.join(names)}")
+
             lines.append("")
 
         value = "\n".join(lines).strip()
@@ -634,7 +729,7 @@ class NeedMainView(View):
         self.guild_id = int(guild_id)
         self.user_id = int(user_id)
 
-    @button(label="Main anzeigen", style=ButtonStyle.primary, custom_id="need_show_main", row=0)
+    @button(label="⭐ Main", style=ButtonStyle.secondary, custom_id="need_show_main", row=0)
     async def btn_show_main(self, inter: discord.Interaction, _):
         guild = inter.client.get_guild(self.guild_id)
 
@@ -647,7 +742,7 @@ class NeedMainView(View):
             view=NeedMainView(self.guild_id, self.user_id)
         )
 
-    @button(label="Secondary anzeigen", style=ButtonStyle.secondary, custom_id="need_show_secondary", row=0)
+    @button(label="🔁 Secondary", style=ButtonStyle.secondary, custom_id="need_show_secondary", row=0)
     async def btn_show_secondary(self, inter: discord.Interaction, _):
         guild = inter.client.get_guild(self.guild_id)
 
@@ -660,10 +755,10 @@ class NeedMainView(View):
             view=NeedMainView(self.guild_id, self.user_id)
         )
 
-    @button(label="Item eintragen", style=ButtonStyle.success, custom_id="need_add_item", row=1)
+    @button(label="➕ Item setzen", style=ButtonStyle.secondary, custom_id="need_add_item", row=1)
     async def btn_add_item(self, inter: discord.Interaction, _):
         emb = discord.Embed(
-            title="🎁 Needliste – Item eintragen",
+            title="🎁 Needliste – Item setzen",
             description="Wähle zuerst, ob du den Eintrag für **Main** oder **Secondary** setzen möchtest.",
             color=discord.Color.gold()
         )
@@ -673,7 +768,7 @@ class NeedMainView(View):
             view=NeedTabSelectView(self.guild_id, self.user_id, action="set")
         )
 
-    @button(label="Item entfernen", style=ButtonStyle.danger, custom_id="need_remove_item", row=1)
+    @button(label="🗑️ Item entfernen", style=ButtonStyle.secondary, custom_id="need_remove_item", row=1)
     async def btn_remove_item(self, inter: discord.Interaction, _):
         emb = discord.Embed(
             title="🎁 Needliste – Item entfernen",
@@ -698,9 +793,9 @@ class NeedMainView(View):
             await ensure_portal_menu_for_user(inter.client, self.guild_id, self.user_id, force_view="main")
         except Exception:
             emb = discord.Embed(
-                title="🏰 ebolus – Gildenmenü",
+                title="⚜️ Ebolus Kommandozentrale",
                 description="Zurück zum Gildenmenü.",
-                color=discord.Color.blurple()
+                color=discord.Color.gold()
             )
             await inter.response.edit_message(embed=emb, view=None)
 
@@ -824,6 +919,23 @@ class NeedSlotSelect(Select):
                 await inter.response.send_message("✅ Eintrag entfernt.")
             return
 
+        if _catalog_slot_for_need_slot(need_slot) == "Waffe":
+            emb = discord.Embed(
+                title="🎁 Needliste – Waffentyp wählen",
+                description=(
+                    f"Bereich: **{self.tab}**\n"
+                    f"Slot: **{need_slot}**\n\n"
+                    "Wähle zuerst den Waffentyp."
+                ),
+                color=discord.Color.gold()
+            )
+
+            await inter.response.edit_message(
+                embed=emb,
+                view=NeedWeaponTypeSelectView(self.guild_id, self.user_id, self.tab, need_slot)
+            )
+            return
+
         items = _items_for_need_slot(self.guild_id, need_slot)
 
         if not items:
@@ -862,16 +974,16 @@ class NeedSlotSelect(Select):
         )
 
 
-class NeedItemSelectView(View):
+class NeedWeaponTypeSelectView(View):
     def __init__(self, guild_id: int, user_id: int, tab: str, need_slot: str):
         super().__init__(timeout=None)
         self.guild_id = int(guild_id)
         self.user_id = int(user_id)
         self.tab = tab
         self.need_slot = need_slot
-        self.add_item(NeedItemSelect(guild_id, user_id, tab, need_slot))
+        self.add_item(NeedWeaponTypeSelect(guild_id, user_id, tab, need_slot))
 
-    @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="need_item_back")
+    @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="need_weapon_type_back")
     async def btn_back(self, inter: discord.Interaction, _):
         emb = discord.Embed(
             title="🎁 Needliste – Slot wählen",
@@ -885,19 +997,119 @@ class NeedItemSelectView(View):
         )
 
 
-class NeedItemSelect(Select):
+class NeedWeaponTypeSelect(Select):
     def __init__(self, guild_id: int, user_id: int, tab: str, need_slot: str):
         self.guild_id = int(guild_id)
         self.user_id = int(user_id)
         self.tab = tab
         self.need_slot = need_slot
 
-        items = _items_for_need_slot(guild_id, need_slot)[:25]
+        options = [
+            discord.SelectOption(label=w, value=w)
+            for w in WEAPON_TYPES
+        ]
+
+        super().__init__(
+            placeholder="Waffentyp wählen",
+            min_values=1,
+            max_values=1,
+            options=options,
+            custom_id="need_weapon_type_select"
+        )
+
+    async def callback(self, inter: discord.Interaction):
+        weapon_type = self.values[0]
+        items = _items_for_need_slot(self.guild_id, self.need_slot, weapon_type=weapon_type)
+
+        if not items:
+            emb = discord.Embed(
+                title="🎁 Needliste – kein Item hinterlegt",
+                description=(
+                    f"Für **{weapon_type}** gibt es noch keine Waffen im Katalog.\n\n"
+                    f"Ein Leader muss zuerst ein Item hinzufügen:\n"
+                    f"`/loot_item_add slot:Waffe weapon_type:{weapon_type} name:Itemname`"
+                ),
+                color=discord.Color.orange()
+            )
+
+            await inter.response.edit_message(
+                embed=emb,
+                view=NeedWeaponTypeSelectView(self.guild_id, self.user_id, self.tab, self.need_slot)
+            )
+            return
+
+        emb = discord.Embed(
+            title="🎁 Needliste – Waffe wählen",
+            description=(
+                f"Bereich: **{self.tab}**\n"
+                f"Slot: **{self.need_slot}**\n"
+                f"Waffentyp: **{weapon_type}**\n\n"
+                "Wähle eine Waffe aus dem Katalog."
+            ),
+            color=discord.Color.gold()
+        )
+
+        await inter.response.edit_message(
+            embed=emb,
+            view=NeedItemSelectView(self.guild_id, self.user_id, self.tab, self.need_slot, weapon_type=weapon_type)
+        )
+
+
+class NeedItemSelectView(View):
+    def __init__(self, guild_id: int, user_id: int, tab: str, need_slot: str, weapon_type: str | None = None):
+        super().__init__(timeout=None)
+        self.guild_id = int(guild_id)
+        self.user_id = int(user_id)
+        self.tab = tab
+        self.need_slot = need_slot
+        self.weapon_type = weapon_type
+        self.add_item(NeedItemSelect(guild_id, user_id, tab, need_slot, weapon_type=weapon_type))
+
+    @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="need_item_back")
+    async def btn_back(self, inter: discord.Interaction, _):
+        if _catalog_slot_for_need_slot(self.need_slot) == "Waffe":
+            emb = discord.Embed(
+                title="🎁 Needliste – Waffentyp wählen",
+                description=(
+                    f"Bereich: **{self.tab}**\n"
+                    f"Slot: **{self.need_slot}**"
+                ),
+                color=discord.Color.gold()
+            )
+
+            await inter.response.edit_message(
+                embed=emb,
+                view=NeedWeaponTypeSelectView(self.guild_id, self.user_id, self.tab, self.need_slot)
+            )
+            return
+
+        emb = discord.Embed(
+            title="🎁 Needliste – Slot wählen",
+            description=f"Bereich: **{self.tab}**",
+            color=discord.Color.gold()
+        )
+
+        await inter.response.edit_message(
+            embed=emb,
+            view=NeedSlotSelectView(self.guild_id, self.user_id, "set", self.tab)
+        )
+
+
+class NeedItemSelect(Select):
+    def __init__(self, guild_id: int, user_id: int, tab: str, need_slot: str, weapon_type: str | None = None):
+        self.guild_id = int(guild_id)
+        self.user_id = int(user_id)
+        self.tab = tab
+        self.need_slot = need_slot
+        self.weapon_type = weapon_type
+
+        items = _items_for_need_slot(guild_id, need_slot, weapon_type=weapon_type)[:25]
 
         options = [
             discord.SelectOption(
                 label=str(item.get("name", item["id"]))[:100],
-                value=str(item["id"])[:100]
+                value=str(item["id"])[:100],
+                description=str(item.get("weapon_type", "") or item.get("slot", ""))[:100]
             )
             for item in items
         ]
@@ -932,6 +1144,13 @@ def _catalog_slot_choices():
     return [
         app_commands.Choice(name=s, value=s)
         for s in CATALOG_SLOTS
+    ]
+
+
+def _weapon_type_choices():
+    return [
+        app_commands.Choice(name=s, value=s)
+        for s in WEAPON_TYPES
     ]
 
 
@@ -1080,8 +1299,13 @@ async def setup_loot_needs(client: discord.Client, tree: app_commands.CommandTre
         )
 
     @tree.command(name="loot_item_add", description="(Leader) Item zum Need-Katalog hinzufügen")
-    @app_commands.choices(slot=_catalog_slot_choices())
-    async def loot_item_add(inter: discord.Interaction, slot: app_commands.Choice[str], name: str):
+    @app_commands.choices(slot=_catalog_slot_choices(), weapon_type=_weapon_type_choices())
+    async def loot_item_add(
+        inter: discord.Interaction,
+        slot: app_commands.Choice[str],
+        name: str,
+        weapon_type: Optional[app_commands.Choice[str]] = None
+    ):
         if inter.guild is None:
             await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
             return
@@ -1102,6 +1326,22 @@ async def setup_loot_needs(client: discord.Client, tree: app_commands.CommandTre
             await inter.response.send_message("❌ Itemname fehlt.", ephemeral=True)
             return
 
+        wt = ""
+
+        if catalog_slot == "Waffe":
+            if weapon_type is None:
+                await inter.response.send_message(
+                    "❌ Bei Slot **Waffe** musst du zusätzlich `weapon_type` setzen.",
+                    ephemeral=True
+                )
+                return
+
+            wt = _normalize_weapon_type(weapon_type.value)
+
+            if not wt:
+                await inter.response.send_message("❌ Ungültiger Waffentyp.", ephemeral=True)
+                return
+
         existing = _find_item_by_name(inter.guild.id, catalog_slot, clean_name)
 
         if existing:
@@ -1113,47 +1353,102 @@ async def setup_loot_needs(client: discord.Client, tree: app_commands.CommandTre
 
         item_id = _make_item_id(inter.guild.id, catalog_slot, clean_name)
         items = _all_items(inter.guild.id)
-        items[item_id] = {
+        obj = {
             "name": clean_name,
             "slot": catalog_slot,
             "created_at": _now_iso(),
             "created_by": int(inter.user.id),
         }
 
+        if catalog_slot == "Waffe":
+            obj["weapon_type"] = wt
+
+        items[item_id] = obj
+
+        save_items()
+
+        extra = f"\nWaffentyp: **{wt}**" if wt else ""
+
+        await inter.response.send_message(
+            f"✅ Item hinzugefügt:\n**{clean_name}**\nSlot: **{catalog_slot}**{extra}\nID: `{item_id}`",
+            ephemeral=True
+        )
+
+    @tree.command(name="loot_item_set_weapon_type", description="(Leader) Waffentyp bei bestehender Waffe nachtragen/ändern")
+    @app_commands.choices(weapon_type=_weapon_type_choices())
+    async def loot_item_set_weapon_type(
+        inter: discord.Interaction,
+        name: str,
+        weapon_type: app_commands.Choice[str]
+    ):
+        if inter.guild is None:
+            await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
+            return
+
+        if not _is_leader_or_admin(inter):
+            await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
+            return
+
+        found = _find_item_by_name(inter.guild.id, "Waffe", name)
+
+        if not found:
+            await inter.response.send_message(
+                f"❌ Waffe **{name}** nicht gefunden.",
+                ephemeral=True
+            )
+            return
+
+        wt = _normalize_weapon_type(weapon_type.value)
+
+        if not wt:
+            await inter.response.send_message("❌ Ungültiger Waffentyp.", ephemeral=True)
+            return
+
+        item_id, item = found
+        item["slot"] = "Waffe"
+        item["weapon_type"] = wt
+        _all_items(inter.guild.id)[item_id] = item
         save_items()
 
         await inter.response.send_message(
-            f"✅ Item hinzugefügt:\n**{clean_name}**\nSlot: **{catalog_slot}**\nID: `{item_id}`",
+            f"✅ Waffentyp gesetzt:\n**{item.get('name')}** → **{wt}**",
             ephemeral=True
         )
 
     @tree.command(name="loot_item_list", description="Zeigt Items aus dem Need-Katalog")
-    @app_commands.choices(slot=_catalog_slot_choices())
-    async def loot_item_list(inter: discord.Interaction, slot: Optional[app_commands.Choice[str]] = None):
+    @app_commands.choices(slot=_catalog_slot_choices(), weapon_type=_weapon_type_choices())
+    async def loot_item_list(
+        inter: discord.Interaction,
+        slot: Optional[app_commands.Choice[str]] = None,
+        weapon_type: Optional[app_commands.Choice[str]] = None
+    ):
         if inter.guild is None:
             await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
             return
 
         catalog_slot = _normalize_catalog_slot(slot.value) if slot else ""
+        wt = _normalize_weapon_type(weapon_type.value) if weapon_type else ""
 
-        if catalog_slot:
-            items = []
-            for item_id, item in _all_items(inter.guild.id).items():
-                if str(item.get("slot", "")) == catalog_slot:
-                    x = dict(item)
-                    x["id"] = item_id
-                    items.append(x)
+        items = []
 
-            items.sort(key=lambda x: str(x.get("name", "")).lower())
+        for item_id, item in _all_items(inter.guild.id).items():
+            if catalog_slot and str(item.get("slot", "")) != catalog_slot:
+                continue
+
+            if wt and str(item.get("weapon_type", "") or "") != wt:
+                continue
+
+            x = dict(item)
+            x["id"] = item_id
+            items.append(x)
+
+        items.sort(key=lambda x: (str(x.get("slot", "")), str(x.get("weapon_type", "")), str(x.get("name", "")).lower()))
+
+        if catalog_slot and wt:
+            title = f"🎁 Item-Katalog – {catalog_slot} / {wt}"
+        elif catalog_slot:
             title = f"🎁 Item-Katalog – {catalog_slot}"
         else:
-            items = []
-            for item_id, item in _all_items(inter.guild.id).items():
-                x = dict(item)
-                x["id"] = item_id
-                items.append(x)
-
-            items.sort(key=lambda x: (str(x.get("slot", "")), str(x.get("name", "")).lower()))
             title = "🎁 Item-Katalog – alle Items"
 
         if not items:
@@ -1162,8 +1457,11 @@ async def setup_loot_needs(client: discord.Client, tree: app_commands.CommandTre
 
         lines = []
 
-        for item in items[:80]:
-            lines.append(f"• **{item.get('name')}** — {item.get('slot')}")
+        for item in items[:100]:
+            slot_txt = str(item.get("slot", ""))
+            wt_txt = str(item.get("weapon_type", "") or "")
+            extra = f" / {wt_txt}" if wt_txt else ""
+            lines.append(f"• **{item.get('name')}** — {slot_txt}{extra}")
 
         desc = "\n".join(lines)
 
