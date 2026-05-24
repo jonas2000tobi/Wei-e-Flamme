@@ -298,11 +298,41 @@ def _status_for_user(guild_id: int, user_id: int) -> str:
 
 def _main_menu_embed(guild: discord.Guild) -> discord.Embed:
     emb = discord.Embed(
-        title="🏰 ebolus – Gildenmenü",
-        description="Wähle unten aus, was du öffnen möchtest.",
-        color=discord.Color.blurple()
+        title="⚜️ Ebolus Kommandozentrale",
+        description=(
+            "Willkommen im privaten Gildenmenü.\n\n"
+            "Hier verwaltest du dein Profil, deine Needliste, Abwesenheiten "
+            "und findest alle wichtigen Infos zur Gilde."
+        ),
+        color=discord.Color.gold()
     )
-    emb.set_footer(text=f"Server: {guild.name}")
+
+    emb.add_field(
+        name="👤 Persönlich",
+        value="Profil ansehen und bearbeiten, Gearscore pflegen, Abwesenheit melden.",
+        inline=False
+    )
+
+    emb.add_field(
+        name="🎁 Loot & Bedarf",
+        value="Needliste für Main und Secondary verwalten.",
+        inline=False
+    )
+
+    emb.add_field(
+        name="📅 Gilde",
+        value="Feste Gildentermine, Mitgliederübersicht und Regeln.",
+        inline=False
+    )
+
+    emb.add_field(
+        name="🛡️ Kontakt",
+        value="Leader kontaktieren oder Hilfe zum Bot öffnen.",
+        inline=False
+    )
+
+    emb.set_footer(text=f"Server: {guild.name} • Ebolus Gildenbot")
+
     return emb
 
 
@@ -315,19 +345,20 @@ def _profile_embed(guild: discord.Guild, member: discord.Member) -> discord.Embe
 
     emb = discord.Embed(
         title="👤 Dein Gildenprofil",
-        color=discord.Color.blurple()
+        description=f"Profil von **{ingame}**",
+        color=discord.Color.gold()
     )
 
-    emb.add_field(name="Ingame-Name", value=str(ingame), inline=False)
-    emb.add_field(name="Main-Rolle", value=str(main_role), inline=True)
-    emb.add_field(name="Gearscore", value=str(gearscore), inline=True)
+    emb.add_field(name="🎮 Ingame-Name", value=str(ingame), inline=False)
+    emb.add_field(name="⚔️ Main-Rolle", value=str(main_role), inline=True)
+    emb.add_field(name="💠 Gearscore", value=str(gearscore), inline=True)
+    emb.add_field(name="🏰 Rang", value=_member_position(guild, member), inline=True)
     emb.add_field(
-        name="Seit",
-        value=f"{_guild_days(member)} Tage in der Gilde\nBeigetreten am: {_guild_join_date(member)}",
-        inline=False
+        name="📆 In der Gilde seit",
+        value=f"{_guild_join_date(member)}\n{_guild_days(member)} Tage",
+        inline=True
     )
-    emb.add_field(name="Position", value=_member_position(guild, member), inline=True)
-    emb.add_field(name="Status", value=_status_for_user(guild.id, member.id), inline=True)
+    emb.add_field(name="🟢 Status", value=_status_for_user(guild.id, member.id), inline=False)
 
     emb.set_footer(text="Bearbeitbar: Ingame-Name, Main-Rolle, Gearscore")
 
@@ -339,8 +370,8 @@ def _events_embed(guild_id: int) -> discord.Embed:
     events = c.get("events") or []
 
     emb = discord.Embed(
-        title="📅 Gildenkalender – ebolus",
-        color=discord.Color.green()
+        title="📅 Ebolus Gildenkalender",
+        color=discord.Color.gold()
     )
 
     if not events:
@@ -353,7 +384,18 @@ def _events_embed(guild_id: int) -> discord.Embed:
         weekday = str(e.get("weekday", "—"))
         time = str(e.get("time", "—"))
         title = str(e.get("title", "Event"))
-        lines.append(f"**{weekday}, {time} Uhr**\n{title}")
+
+        icon = "📌"
+        title_l = title.lower()
+
+        if "gildenboss" in title_l or "boss" in title_l:
+            icon = "🔥"
+        elif "raid" in title_l:
+            icon = "⚔️"
+        elif "fenrir" in title_l:
+            icon = "🐺"
+
+        lines.append(f"{icon} **{weekday}**\n{time} Uhr – {title}")
 
     emb.description = "\n\n".join(lines)
     emb.set_footer(text="Reine Übersicht. Keine Anmeldung / keine RSVP-Funktion.")
@@ -371,7 +413,7 @@ def _member_sort_key(guild: discord.Guild, member: discord.Member) -> Tuple[int,
 
 def _members_list_embed(guild: discord.Guild) -> discord.Embed:
     emb = discord.Embed(
-        title="👥 Mitgliederliste – ebolus",
+        title="👥 Ebolus Mitglieder",
         color=discord.Color.gold()
     )
 
@@ -417,12 +459,12 @@ def _members_list_embed(guild: discord.Guild) -> discord.Embed:
 
 def _rules_loot_embed() -> discord.Embed:
     emb = discord.Embed(
-        title="📜 Regeln & Lootsystem – ebolus",
-        color=discord.Color.orange()
+        title="📜 Regeln & Lootsystem",
+        color=discord.Color.gold()
     )
 
     emb.add_field(
-        name="📌 Grundregeln",
+        name="📌 Gildenregeln",
         value=(
             "• Bei Events im Discord an- oder abmelden.\n"
             "• Voice ist bei wichtigen Gildenterminen erwünscht.\n"
@@ -523,6 +565,8 @@ async def ensure_portal_menu_for_user(
                 await msg.edit(embed=_profile_embed(guild, member), view=ProfileView())
             elif force_view == "events":
                 await msg.edit(embed=_events_embed(guild_id), view=EventsInfoView())
+            elif force_view == "members":
+                await msg.edit(embed=_members_list_embed(guild), view=BackOnlyView())
             else:
                 await msg.edit(embed=_main_menu_embed(guild), view=MemberPortalMainView())
 
@@ -573,12 +617,17 @@ async def _delete_old_bot_dms_for_member(
     active_menu_id = _portal_message_id(member.guild.id, member.id)
 
     protected_titles = {
+        "⚜️ Ebolus Kommandozentrale",
         "🏰 ebolus – Gildenmenü",
         "👤 Dein Gildenprofil",
+        "📅 Ebolus Gildenkalender",
         "📅 Gildenkalender – ebolus",
         "📅 Gilden-Events",
+        "❓ Hilfe – Ebolus Gildenbot",
         "❓ Hilfe – ebolus Gildenbot",
+        "👥 Ebolus Mitglieder",
         "👥 Mitgliederliste – ebolus",
+        "📜 Regeln & Lootsystem",
         "📜 Regeln & Lootsystem – ebolus",
         "🎁 Needliste – ebolus",
     }
@@ -805,7 +854,7 @@ class AbsenceModal(Modal):
                     f"**{ingame}** ist abwesend von **{from_s}** bis **{to_s}**.\n\n"
                     f"**Grund:**\n{reason_s}"
                 ),
-                color=discord.Color.orange(),
+                color=discord.Color.gold(),
                 timestamp=datetime.now(TZ)
             )
 
@@ -886,7 +935,7 @@ class PortalLeaderContactModal(Modal):
 
         emb = discord.Embed(
             title="📨 Neue Leader-Anfrage",
-            color=discord.Color.blurple(),
+            color=discord.Color.gold(),
             timestamp=datetime.now(TZ)
         )
 
@@ -918,7 +967,7 @@ class PortalOpenView(View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @button(label="📬 Gildenmenü im Privatchat öffnen", style=ButtonStyle.primary, custom_id="portal_open_dm")
+    @button(label="⚜️ Gildenmenü im Privatchat öffnen", style=ButtonStyle.secondary, custom_id="portal_open_dm")
     async def btn_open_dm(self, inter: discord.Interaction, _):
         if inter.guild is None:
             await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
@@ -942,7 +991,7 @@ class MemberPortalMainView(View):
     async def _guild_member(self, inter: discord.Interaction) -> tuple[Optional[discord.Guild], Optional[discord.Member]]:
         return await _resolve_guild_member_from_inter(inter)
 
-    @button(label="👤 Mein Profil", style=ButtonStyle.primary, custom_id="portal_profile", row=0)
+    @button(label="👤 Profil", style=ButtonStyle.secondary, custom_id="portal_profile", row=0)
     async def btn_profile(self, inter: discord.Interaction, _):
         guild, member = await self._guild_member(inter)
 
@@ -957,23 +1006,7 @@ class MemberPortalMainView(View):
             view=ProfileView()
         )
 
-    @button(label="📅 Gilden-Events", style=ButtonStyle.secondary, custom_id="portal_events", row=0)
-    async def btn_events(self, inter: discord.Interaction, _):
-        guild, member = await self._guild_member(inter)
-
-        if not guild:
-            await inter.response.send_message("❌ Ich konnte deinen Server nicht zuordnen.")
-            return
-
-        if member and inter.message:
-            _mark_portal_sent(guild.id, member.id, inter.message.id)
-
-        await inter.response.edit_message(
-            embed=_events_embed(guild.id),
-            view=EventsInfoView()
-        )
-
-    @button(label="🏖️ Abwesenheit melden", style=ButtonStyle.secondary, custom_id="portal_absence", row=0)
+    @button(label="🏖️ Abwesenheit", style=ButtonStyle.secondary, custom_id="portal_absence", row=0)
     async def btn_absence(self, inter: discord.Interaction, _):
         guild, member = await self._guild_member(inter)
 
@@ -985,28 +1018,6 @@ class MemberPortalMainView(View):
             _mark_portal_sent(guild.id, member.id, inter.message.id)
 
         await inter.response.send_modal(AbsenceModal(guild.id, inter.user.id))
-
-    @button(label="📨 Leader kontaktieren", style=ButtonStyle.primary, custom_id="portal_leader_contact", row=1)
-    async def btn_leader_contact(self, inter: discord.Interaction, _):
-        guild, member = await self._guild_member(inter)
-
-        if not guild or not member:
-            await inter.response.send_message("❌ Ich konnte deinen Server nicht zuordnen.")
-            return
-
-        if inter.message:
-            _mark_portal_sent(guild.id, member.id, inter.message.id)
-
-        await inter.response.send_modal(PortalLeaderContactModal(guild.id, inter.user.id))
-
-    @button(label="📜 Regeln & Loot", style=ButtonStyle.secondary, custom_id="portal_rules_loot", row=1)
-    async def btn_rules_loot(self, inter: discord.Interaction, _):
-        guild, member = await self._guild_member(inter)
-
-        if guild and member and inter.message:
-            _mark_portal_sent(guild.id, member.id, inter.message.id)
-
-        await inter.response.edit_message(embed=_rules_loot_embed(), view=BackOnlyView())
 
     @button(label="🎁 Needliste", style=ButtonStyle.secondary, custom_id="portal_needlist", row=1)
     async def btn_needlist(self, inter: discord.Interaction, _):
@@ -1031,11 +1042,65 @@ class MemberPortalMainView(View):
             emb = discord.Embed(
                 title="🎁 Needliste – ebolus",
                 description="Die Needliste ist noch nicht aktiv. Das Modul `loot_needs.py` muss noch eingebaut werden.",
-                color=discord.Color.orange()
+                color=discord.Color.gold()
             )
             await inter.response.edit_message(embed=emb, view=BackOnlyView())
 
-    @button(label="❓ Hilfe", style=ButtonStyle.secondary, custom_id="portal_help", row=2)
+    @button(label="📜 Regeln & Loot", style=ButtonStyle.secondary, custom_id="portal_rules_loot", row=1)
+    async def btn_rules_loot(self, inter: discord.Interaction, _):
+        guild, member = await self._guild_member(inter)
+
+        if guild and member and inter.message:
+            _mark_portal_sent(guild.id, member.id, inter.message.id)
+
+        await inter.response.edit_message(embed=_rules_loot_embed(), view=RulesLootView())
+
+    @button(label="📅 Kalender", style=ButtonStyle.secondary, custom_id="portal_events", row=2)
+    async def btn_events(self, inter: discord.Interaction, _):
+        guild, member = await self._guild_member(inter)
+
+        if not guild:
+            await inter.response.send_message("❌ Ich konnte deinen Server nicht zuordnen.")
+            return
+
+        if member and inter.message:
+            _mark_portal_sent(guild.id, member.id, inter.message.id)
+
+        await inter.response.edit_message(
+            embed=_events_embed(guild.id),
+            view=EventsInfoView()
+        )
+
+    @button(label="👥 Mitglieder", style=ButtonStyle.secondary, custom_id="portal_members_main", row=2)
+    async def btn_members(self, inter: discord.Interaction, _):
+        guild, member = await self._guild_member(inter)
+
+        if not guild:
+            await inter.response.send_message("❌ Ich konnte deinen Server nicht zuordnen.")
+            return
+
+        if member and inter.message:
+            _mark_portal_sent(guild.id, member.id, inter.message.id)
+
+        await inter.response.edit_message(
+            embed=_members_list_embed(guild),
+            view=BackOnlyView()
+        )
+
+    @button(label="🛡️ Leaderkontakt", style=ButtonStyle.secondary, custom_id="portal_leader_contact", row=3)
+    async def btn_leader_contact(self, inter: discord.Interaction, _):
+        guild, member = await self._guild_member(inter)
+
+        if not guild or not member:
+            await inter.response.send_message("❌ Ich konnte deinen Server nicht zuordnen.")
+            return
+
+        if inter.message:
+            _mark_portal_sent(guild.id, member.id, inter.message.id)
+
+        await inter.response.send_modal(PortalLeaderContactModal(guild.id, inter.user.id))
+
+    @button(label="❓ Hilfe", style=ButtonStyle.secondary, custom_id="portal_help", row=3)
     async def btn_help(self, inter: discord.Interaction, _):
         guild, member = await self._guild_member(inter)
 
@@ -1043,27 +1108,25 @@ class MemberPortalMainView(View):
             _mark_portal_sent(guild.id, member.id, inter.message.id)
 
         emb = discord.Embed(
-            title="❓ Hilfe – ebolus Gildenbot",
+            title="❓ Hilfe – Ebolus Gildenbot",
             description=(
-                "**Mein Profil**\n"
-                "Zeigt dein Gildenprofil. Du kannst Ingame-Name, Main-Rolle und Gearscore bearbeiten.\n\n"
-                "**Gilden-Events**\n"
-                "Zeigt feste Gildentermine. Das ist nur eine Übersicht, keine Anmeldung.\n\n"
-                "**Abwesenheit melden**\n"
-                "Meldet deine Abwesenheit an die Gildenleitung und speichert sie.\n\n"
-                "**Leader kontaktieren**\n"
-                "Schickt eine Anfrage direkt an die Gildenleitung.\n\n"
-                "**Regeln & Loot**\n"
+                "**👤 Profil**\n"
+                "Hier pflegst du Ingame-Name, Main-Rolle und Gearscore.\n\n"
+                "**🎁 Needliste**\n"
+                "Hier trägst du ein, welche Items du brauchst. Die Gildenleitung nutzt das für Bossplanung und Lootübersicht.\n\n"
+                "**🏖️ Abwesenheit**\n"
+                "Hier meldest du Urlaub, Schicht oder längere Inaktivität.\n\n"
+                "**📅 Kalender**\n"
+                "Zeigt feste Gildentermine als Übersicht.\n\n"
+                "**📜 Regeln & Loot**\n"
                 "Zeigt die wichtigsten Gildenregeln und das Lootsystem.\n\n"
-                "**Needliste**\n"
-                "Hier trägst du später deine gewünschten Items ein.\n\n"
-                "**Mitgliederliste**\n"
-                "Sortiert nach Rang und Gearscore. Angezeigt werden nur Mitglieder mit der Ebolus-/Gildenmitglied-Rolle."
+                "**🛡️ Leaderkontakt**\n"
+                "Schickt eine Anfrage direkt an die Gildenleitung."
             ),
-            color=discord.Color.blurple()
+            color=discord.Color.gold()
         )
 
-        await inter.response.edit_message(embed=emb, view=BackOnlyView())
+        await inter.response.edit_message(embed=emb, view=HelpView())
 
 
 class ProfileView(View):
@@ -1073,7 +1136,7 @@ class ProfileView(View):
     async def _guild_member(self, inter: discord.Interaction) -> tuple[Optional[discord.Guild], Optional[discord.Member]]:
         return await _resolve_guild_member_from_inter(inter)
 
-    @button(label="✏️ Profil bearbeiten", style=ButtonStyle.primary, custom_id="portal_profile_edit")
+    @button(label="✏️ Profil bearbeiten", style=ButtonStyle.secondary, custom_id="portal_profile_edit")
     async def btn_edit(self, inter: discord.Interaction, _):
         guild, member = await self._guild_member(inter)
 
@@ -1086,7 +1149,7 @@ class ProfileView(View):
 
         await inter.response.send_modal(ProfileEditModal(guild.id, inter.user.id))
 
-    @button(label="👥 Mitgliederliste", style=ButtonStyle.secondary, custom_id="portal_member_list")
+    @button(label="👥 Mitglieder", style=ButtonStyle.secondary, custom_id="portal_member_list")
     async def btn_members(self, inter: discord.Interaction, _):
         guild, member = await self._guild_member(inter)
 
@@ -1110,9 +1173,9 @@ class ProfileView(View):
             _mark_portal_sent(guild.id, member.id, inter.message.id)
 
         emb = _main_menu_embed(guild) if guild else discord.Embed(
-            title="🏰 ebolus – Gildenmenü",
+            title="⚜️ Ebolus Kommandozentrale",
             description="Wähle unten aus, was du öffnen möchtest.",
-            color=discord.Color.blurple()
+            color=discord.Color.gold()
         )
 
         await inter.response.edit_message(embed=emb, view=MemberPortalMainView())
@@ -1122,7 +1185,7 @@ class EventsInfoView(View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @button(label="🔄 Aktualisieren", style=ButtonStyle.primary, custom_id="portal_events_refresh")
+    @button(label="🔄 Aktualisieren", style=ButtonStyle.secondary, custom_id="portal_events_refresh")
     async def btn_refresh(self, inter: discord.Interaction, _):
         guild, member = await _resolve_guild_member_from_inter(inter)
 
@@ -1143,9 +1206,83 @@ class EventsInfoView(View):
             _mark_portal_sent(guild.id, member.id, inter.message.id)
 
         emb = _main_menu_embed(guild) if guild else discord.Embed(
-            title="🏰 ebolus – Gildenmenü",
+            title="⚜️ Ebolus Kommandozentrale",
             description="Wähle unten aus, was du öffnen möchtest.",
-            color=discord.Color.blurple()
+            color=discord.Color.gold()
+        )
+
+        await inter.response.edit_message(embed=emb, view=MemberPortalMainView())
+
+
+class RulesLootView(View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @button(label="🎁 Needliste öffnen", style=ButtonStyle.secondary, custom_id="rules_open_need")
+    async def btn_need(self, inter: discord.Interaction, _):
+        guild, member = await _resolve_guild_member_from_inter(inter)
+
+        if not guild or not member:
+            await inter.response.send_message("❌ Ich konnte deinen Server nicht zuordnen.")
+            return
+
+        if inter.message:
+            _mark_portal_sent(guild.id, member.id, inter.message.id)
+
+        try:
+            try:
+                from bot.loot_needs import open_need_menu  # type: ignore
+            except ModuleNotFoundError:
+                from loot_needs import open_need_menu  # type: ignore
+
+            await open_need_menu(inter, guild.id, member.id)
+        except Exception:
+            await inter.response.edit_message(embed=_rules_loot_embed(), view=RulesLootView())
+
+    @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="rules_back_main")
+    async def btn_back(self, inter: discord.Interaction, _):
+        guild, member = await _resolve_guild_member_from_inter(inter)
+
+        if guild and member and inter.message:
+            _mark_portal_sent(guild.id, member.id, inter.message.id)
+
+        emb = _main_menu_embed(guild) if guild else discord.Embed(
+            title="⚜️ Ebolus Kommandozentrale",
+            description="Wähle unten aus, was du öffnen möchtest.",
+            color=discord.Color.gold()
+        )
+
+        await inter.response.edit_message(embed=emb, view=MemberPortalMainView())
+
+
+class HelpView(View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @button(label="🛡️ Leaderkontakt", style=ButtonStyle.secondary, custom_id="help_leader_contact")
+    async def btn_leader(self, inter: discord.Interaction, _):
+        guild, member = await _resolve_guild_member_from_inter(inter)
+
+        if not guild or not member:
+            await inter.response.send_message("❌ Ich konnte deinen Server nicht zuordnen.")
+            return
+
+        if inter.message:
+            _mark_portal_sent(guild.id, member.id, inter.message.id)
+
+        await inter.response.send_modal(PortalLeaderContactModal(guild.id, inter.user.id))
+
+    @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="help_back_main")
+    async def btn_back(self, inter: discord.Interaction, _):
+        guild, member = await _resolve_guild_member_from_inter(inter)
+
+        if guild and member and inter.message:
+            _mark_portal_sent(guild.id, member.id, inter.message.id)
+
+        emb = _main_menu_embed(guild) if guild else discord.Embed(
+            title="⚜️ Ebolus Kommandozentrale",
+            description="Wähle unten aus, was du öffnen möchtest.",
+            color=discord.Color.gold()
         )
 
         await inter.response.edit_message(embed=emb, view=MemberPortalMainView())
@@ -1163,9 +1300,9 @@ class BackOnlyView(View):
             _mark_portal_sent(guild.id, member.id, inter.message.id)
 
         emb = _main_menu_embed(guild) if guild else discord.Embed(
-            title="🏰 ebolus – Gildenmenü",
+            title="⚜️ Ebolus Kommandozentrale",
             description="Wähle unten aus, was du öffnen möchtest.",
-            color=discord.Color.blurple()
+            color=discord.Color.gold()
         )
 
         await inter.response.edit_message(embed=emb, view=MemberPortalMainView())
@@ -1177,6 +1314,8 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
         client.add_view(MemberPortalMainView())
         client.add_view(ProfileView())
         client.add_view(EventsInfoView())
+        client.add_view(RulesLootView())
+        client.add_view(HelpView())
         client.add_view(BackOnlyView())
     except Exception:
         pass
@@ -1339,7 +1478,7 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
         await inter.followup.send(
             f"✅ DM-Cleanup bei **{member.display_name}** abgeschlossen.\n"
             f"🧹 Gelöschte Bot-Nachrichten: **{deleted}**\n"
-            f"🏰 Aktives Gildenmenü wurde geschützt.",
+            f"⚜️ Aktives Gildenmenü wurde geschützt.",
             ephemeral=True
         )
 
@@ -1396,7 +1535,7 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
             f"👥 Geprüft: **{checked}**\n"
             f"🧹 Gelöschte Bot-Nachrichten: **{total_deleted}**\n"
             f"❌ Fehlgeschlagen: **{failed}**\n"
-            f"🏰 Aktive Gildenmenüs wurden geschützt.",
+            f"⚜️ Aktive Gildenmenüs wurden geschützt.",
             ephemeral=True
         )
 
@@ -1504,19 +1643,20 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
             return
 
         emb = discord.Embed(
-            title="🏰 ebolus – Gildenbot",
+            title="⚜️ Ebolus Gildenbot",
             description=(
                 "Öffne hier dein persönliches Gildenmenü im Privatchat.\n\n"
                 "Dort findest du:\n"
                 "• dein Profil\n"
+                "• deine Needliste\n"
                 "• feste Gilden-Events\n"
                 "• Abwesenheit melden\n"
                 "• Leader kontaktieren\n"
                 "• Regeln & Loot\n"
-                "• Needliste\n"
+                "• Mitgliederübersicht\n"
                 "• Hilfe"
             ),
-            color=discord.Color.blurple()
+            color=discord.Color.gold()
         )
 
         try:
