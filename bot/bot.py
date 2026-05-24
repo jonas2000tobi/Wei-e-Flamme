@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 import os
 from datetime import datetime, timedelta
 from typing import List, Tuple
@@ -30,6 +31,7 @@ setup_leader_contact = None
 setup_raid_templates = None
 setup_weekly_report = None
 setup_member_portal = None
+setup_loot_needs = None
 store = {}
 
 
@@ -123,6 +125,15 @@ def _import_modules():
         from member_portal import setup_member_portal  # type: ignore
         print("✅ Import: member_portal (root)")
 
+    global setup_loot_needs
+
+    try:
+        from bot.loot_needs import setup_loot_needs  # type: ignore
+        print("✅ Import: bot.loot_needs")
+    except ModuleNotFoundError:
+        from loot_needs import setup_loot_needs  # type: ignore
+        print("✅ Import: loot_needs (root)")
+
 
 def _get_token() -> str | None:
     for key in ("DISCORD_TOKEN", "DISCORD_BOT_TOKEN", "TOKEN"):
@@ -149,6 +160,7 @@ async def on_ready():
         await setup_raid_templates(bot, tree)
         await setup_weekly_report(bot, tree)
         await setup_member_portal(bot, tree)
+        await setup_loot_needs(bot, tree)
 
         register_join_hook(bot, send_onboarding_dm, auto_resend_for_new_member)
 
