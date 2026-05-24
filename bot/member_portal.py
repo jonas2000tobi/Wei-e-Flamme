@@ -97,30 +97,71 @@ def _user_profile(guild_id: int, user_id: int) -> dict:
     return u
 
 
-def _mark_portal_sent(guild_id: int, user_id: int) -> None:
+def _sent_guild(guild_id: int) -> dict:
     g = sent_state.get(str(guild_id)) or {}
-    arr = set(g.get("sent_users", []))
+    g.setdefault("sent_users", [])
+    g.setdefault("users", {})
+    sent_state[str(guild_id)] = g
+    return g
+
+
+def _portal_user_state(guild_id: int, user_id: int) -> dict:
+    g = _sent_guild(guild_id)
+    users = g.setdefault("users", {})
+    u = users.get(str(user_id)) or {}
+    u.setdefault("menu_message_id", 0)
+    u.setdefault("sent_at", "")
+    users[str(user_id)] = u
+    return u
+
+
+def _mark_portal_sent(guild_id: int, user_id: int, message_id: int | None = None) -> None:
+    g = _sent_guild(guild_id)
+
+    arr = set(str(x) for x in g.get("sent_users", []))
     arr.add(str(user_id))
     g["sent_users"] = sorted(arr)
-    sent_state[str(guild_id)] = g
+
+    u = _portal_user_state(guild_id, user_id)
+
+    if message_id:
+        u["menu_message_id"] = int(message_id)
+
+    u["sent_at"] = datetime.now(TZ).isoformat()
+
     save_sent()
 
 
 def _portal_was_sent(guild_id: int, user_id: int) -> bool:
-    g = sent_state.get(str(guild_id)) or {}
-    arr = set(g.get("sent_users", []))
-    return str(user_id) in arr
+    g = _sent_guild(guild_id)
+    arr = set(str(x) for x in g.get("sent_users", []))
+
+    if str(user_id) in arr:
+        return True
+
+    u = _portal_user_state(guild_id, user_id)
+    return bool(int(u.get("menu_message_id", 0) or 0))
+
+
+def _portal_message_id(guild_id: int, user_id: int) -> int:
+    u = _portal_user_state(guild_id, user_id)
+
+    try:
+        return int(u.get("menu_message_id", 0) or 0)
+    except Exception:
+        return 0
 
 
 def _clear_portal_sent(guild_id: int, user_id: int) -> None:
-    g = sent_state.get(str(guild_id)) or {}
-    arr = set(g.get("sent_users", []))
+    g = _sent_guild(guild_id)
 
-    if str(user_id) in arr:
-        arr.remove(str(user_id))
-
+    arr = set(str(x) for x in g.get("sent_users", []))
+    arr.discard(str(user_id))
     g["sent_users"] = sorted(arr)
-    sent_state[str(guild_id)] = g
+
+    users = g.setdefault("users", {})
+    users.pop(str(user_id), None)
+
     save_sent()
 
 
@@ -165,8 +206,10 @@ def _parse_gearscore(value: Any) -> int:
     try:
         s = str(value or "").strip()
         s = re.sub(r"[^0-9]", "", s)
+
         if not s:
             return 0
+
         return int(s)
     except Exception:
         return 0
@@ -179,6 +222,7 @@ def _display_name(member: discord.Member) -> str:
 def _guild_join_date(member: discord.Member) -> str:
     if not member.joined_at:
         return "Unbekannt"
+
     return member.joined_at.astimezone(TZ).strftime("%d.%m.%Y")
 
 
@@ -220,25 +264,6 @@ def _absence_for_user(guild_id: int, user_id: int) -> Optional[dict]:
     return raw if isinstance(raw, dict) else None
 
 
-def _absence_not_expired(absence: dict) -> bool:
-    try:
-        to_s = str(absence.get("to", "")).strip()
-
-        if not _valid_ddmm(to_s):
-            return False
-
-        today = datetime.now(TZ).date()
-        to_d = _ddmm_to_date(to_s, today.year)
-
-        if to_d < today:
-            return False
-
-        return True
-
-    except Exception:
-        return False
-
-
 def _is_absent_now(absence: dict) -> bool:
     try:
         from_s = str(absence.get("from", "")).strip()
@@ -269,6 +294,16 @@ def _status_for_user(guild_id: int, user_id: int) -> str:
         return f"Abwesend von {from_s} bis {to_s}"
 
     return "Aktiv"
+
+
+def _main_menu_embed(guild: discord.Guild) -> discord.Embed:
+    emb = discord.Embed(
+        title="🏰 ebolus – Gildenmenü",
+        description="Wähle unten aus, was du öffnen möchtest.",
+        color=discord.Color.blurple()
+    )
+    emb.set_footer(text=f"Server: {guild.name}")
+    return emb
 
 
 def _profile_embed(guild: discord.Guild, member: discord.Member) -> discord.Embed:
@@ -373,13 +408,9 @@ def _members_list_embed(guild: discord.Guild) -> discord.Embed:
         emb.description = "\n".join(lines)
 
     if len(members) > 40:
-        emb.set_footer(
-            text=f"Anzeige begrenzt auf 40 von {len(members)} Mitgliedern. Sortierung: Rang, dann Gearscore."
-        )
+        emb.set_footer(text=f"Anzeige begrenzt auf 40 von {len(members)} Mitgliedern. Sortierung: Rang, dann Gearscore.")
     else:
-        emb.set_footer(
-            text="Angezeigt werden nur Mitglieder mit der Ebolus-/Gildenmitglied-Rolle."
-        )
+        emb.set_footer(text="Angezeigt werden nur Mitglieder mit der Ebolus-/Gildenmitglied-Rolle.")
 
     return emb
 
@@ -431,23 +462,79 @@ def _rules_loot_embed() -> discord.Embed:
     return emb
 
 
-async def _send_main_menu(user: discord.abc.User, guild: discord.Guild) -> bool:
-    emb = discord.Embed(
-        title="🏰 ebolus – Gildenmenü",
-        description=(
-            "Wähle unten aus, was du öffnen möchtest.\n\n"
-            "Dieses Menü funktioniert direkt im Privatchat mit dem Bot."
-        ),
-        color=discord.Color.blurple()
-    )
+async def _fetch_portal_message(client: discord.Client, guild_id: int, user_id: int) -> Optional[discord.Message]:
+    mid = _portal_message_id(guild_id, user_id)
 
-    emb.set_footer(text=f"Server: {guild.name}")
+    if not mid:
+        return None
+
+    user = client.get_user(user_id)
+
+    if user is None:
+        try:
+            user = await client.fetch_user(user_id)
+        except Exception:
+            return None
 
     try:
-        await user.send(embed=emb, view=MemberPortalMainView())
-        return True
+        dm = user.dm_channel or await user.create_dm()
+        msg = await dm.fetch_message(mid)
+        return msg
     except Exception:
+        return None
+
+
+async def _send_new_portal_menu(user: discord.abc.User, guild: discord.Guild) -> Optional[discord.Message]:
+    try:
+        msg = await user.send(embed=_main_menu_embed(guild), view=MemberPortalMainView())
+        _mark_portal_sent(guild.id, user.id, msg.id)
+        return msg
+    except Exception:
+        return None
+
+
+async def ensure_portal_menu_for_user(
+    client: discord.Client,
+    guild_id: int,
+    user_id: int,
+    force_view: str = "main"
+) -> bool:
+    guild = client.get_guild(guild_id)
+
+    if not guild:
         return False
+
+    member = guild.get_member(user_id)
+
+    if not member:
+        try:
+            member = await guild.fetch_member(user_id)
+        except Exception:
+            member = None
+
+    if not member or member.bot:
+        return False
+
+    msg = await _fetch_portal_message(client, guild_id, user_id)
+
+    try:
+        if msg:
+            if force_view == "profile":
+                await msg.edit(embed=_profile_embed(guild, member), view=ProfileView())
+            elif force_view == "events":
+                await msg.edit(embed=_events_embed(guild_id), view=EventsInfoView())
+            else:
+                await msg.edit(embed=_main_menu_embed(guild), view=MemberPortalMainView())
+
+            _mark_portal_sent(guild_id, user_id, msg.id)
+            return True
+
+        sent = await _send_new_portal_menu(member, guild)
+        return sent is not None
+
+    except Exception:
+        sent = await _send_new_portal_menu(member, guild)
+        return sent is not None
 
 
 async def _send_main_menu_to_member(member: discord.Member, force: bool = False) -> bool:
@@ -455,14 +542,10 @@ async def _send_main_menu_to_member(member: discord.Member, force: bool = False)
         return False
 
     if not force and _portal_was_sent(member.guild.id, member.id):
-        return False
+        ok = await ensure_portal_menu_for_user(member._state._get_client(), member.guild.id, member.id)
+        return ok
 
-    ok = await _send_main_menu(member, member.guild)
-
-    if ok:
-        _mark_portal_sent(member.guild.id, member.id)
-
-    return ok
+    return await ensure_portal_menu_for_user(member._state._get_client(), member.guild.id, member.id)
 
 
 def _member_has_member_role(member: discord.Member) -> bool:
@@ -481,16 +564,13 @@ async def _delete_old_bot_dms_for_member(
     member: discord.Member,
     limit: int = 300
 ) -> int:
-    """
-    Löscht alte Nachrichten des Bots im DM-Verlauf mit diesem Mitglied.
-    Das Gildenmenü und Portal-Seiten werden geschützt.
-    Der Bot kann nur eigene Nachrichten löschen.
-    """
     if member.bot:
         return 0
 
     if client.user is None:
         return 0
+
+    active_menu_id = _portal_message_id(member.guild.id, member.id)
 
     protected_titles = {
         "🏰 ebolus – Gildenmenü",
@@ -500,6 +580,7 @@ async def _delete_old_bot_dms_for_member(
         "❓ Hilfe – ebolus Gildenbot",
         "👥 Mitgliederliste – ebolus",
         "📜 Regeln & Lootsystem – ebolus",
+        "🎁 Needliste – ebolus",
     }
 
     deleted = 0
@@ -512,14 +593,22 @@ async def _delete_old_bot_dms_for_member(
                 if msg.author.id != client.user.id:
                     continue
 
-                protected = False
+                if active_menu_id and msg.id == active_menu_id:
+                    continue
 
+                title = ""
                 if msg.embeds:
                     title = msg.embeds[0].title or ""
-                    if title in protected_titles:
-                        protected = True
 
-                if protected:
+                if title in protected_titles:
+                    if not active_menu_id:
+                        _mark_portal_sent(member.guild.id, member.id, msg.id)
+                        active_menu_id = msg.id
+                        continue
+
+                    await msg.delete()
+                    deleted += 1
+                    await asyncio.sleep(0.08)
                     continue
 
                 await msg.delete()
@@ -555,6 +644,23 @@ def _leader_status_view():
             return None
     except Exception:
         return None
+
+
+async def _resolve_guild_member_from_inter(inter: discord.Interaction) -> tuple[Optional[discord.Guild], Optional[discord.Member]]:
+    guild = _resolve_guild_for_user(inter.client, inter.user.id)
+
+    if not guild:
+        return None, None
+
+    member = guild.get_member(inter.user.id)
+
+    if not member:
+        try:
+            member = await guild.fetch_member(inter.user.id)
+        except Exception:
+            member = None
+
+    return guild, member
 
 
 class ProfileEditModal(Modal):
@@ -598,10 +704,7 @@ class ProfileEditModal(Modal):
         gs = _parse_gearscore(gs_raw)
 
         if gs <= 0:
-            await inter.response.send_message(
-                "❌ Gearscore ungültig. Bitte nur Zahlen eintragen, z. B. `4200`.",
-                view=MemberPortalMainView()
-            )
+            await inter.response.send_message("❌ Gearscore ungültig. Bitte nur Zahlen eintragen, z. B. `4200`.")
             return
 
         p = _user_profile(self.guild_id, self.user_id)
@@ -611,16 +714,12 @@ class ProfileEditModal(Modal):
 
         save_profiles()
 
-        guild = inter.client.get_guild(self.guild_id)
-        member = guild.get_member(self.user_id) if guild else None
+        try:
+            await inter.response.defer()
+        except Exception:
+            pass
 
-        if guild and member:
-            await inter.response.send_message(
-                embed=_profile_embed(guild, member),
-                view=ProfileView(),
-            )
-        else:
-            await inter.response.send_message("✅ Profil gespeichert.", view=MemberPortalMainView())
+        await ensure_portal_menu_for_user(inter.client, self.guild_id, self.user_id, force_view="profile")
 
 
 class AbsenceModal(Modal):
@@ -661,16 +760,13 @@ class AbsenceModal(Modal):
         reason_s = str(self.reason.value).strip()
 
         if not _valid_ddmm(from_s) or not _valid_ddmm(to_s):
-            await inter.response.send_message(
-                "❌ Datum ungültig. Bitte im Format `TT-MM` eintragen, z. B. `15-05`.",
-                view=MemberPortalMainView()
-            )
+            await inter.response.send_message("❌ Datum ungültig. Bitte im Format `TT-MM` eintragen, z. B. `15-05`.")
             return
 
         guild = inter.client.get_guild(self.guild_id)
 
         if not guild:
-            await inter.response.send_message("❌ Server nicht gefunden.", view=MemberPortalMainView())
+            await inter.response.send_message("❌ Server nicht gefunden.")
             return
 
         member = guild.get_member(self.user_id)
@@ -682,7 +778,7 @@ class AbsenceModal(Modal):
                 member = None
 
         if not member:
-            await inter.response.send_message("❌ Mitglied nicht gefunden.", view=MemberPortalMainView())
+            await inter.response.send_message("❌ Mitglied nicht gefunden.")
             return
 
         g = _gdata(self.guild_id)
@@ -720,10 +816,12 @@ class AbsenceModal(Modal):
             except Exception:
                 pass
 
-        await inter.response.send_message(
-            f"✅ Abwesenheit gespeichert: **{from_s} bis {to_s}**.",
-            view=MemberPortalMainView()
-        )
+        try:
+            await inter.response.defer()
+        except Exception:
+            pass
+
+        await ensure_portal_menu_for_user(inter.client, self.guild_id, self.user_id, force_view="main")
 
 
 class PortalLeaderContactModal(Modal):
@@ -754,7 +852,7 @@ class PortalLeaderContactModal(Modal):
         guild = inter.client.get_guild(self.guild_id)
 
         if not guild:
-            await inter.response.send_message("❌ Server nicht gefunden.", view=MemberPortalMainView())
+            await inter.response.send_message("❌ Server nicht gefunden.")
             return
 
         member = guild.get_member(self.user_id)
@@ -766,7 +864,7 @@ class PortalLeaderContactModal(Modal):
                 member = None
 
         if not member:
-            await inter.response.send_message("❌ Mitglied nicht gefunden.", view=MemberPortalMainView())
+            await inter.response.send_message("❌ Mitglied nicht gefunden.")
             return
 
         leader_cfg = _get_leader_cfg(self.guild_id)
@@ -777,10 +875,7 @@ class PortalLeaderContactModal(Modal):
         leader_role = guild.get_role(leader_role_id) if leader_role_id else None
 
         if not isinstance(internal_ch, (discord.TextChannel, discord.Thread)):
-            await inter.response.send_message(
-                "❌ Leader-Kontakt ist noch nicht eingerichtet. Es fehlt der interne Leader-Kanal.",
-                view=MemberPortalMainView()
-            )
+            await inter.response.send_message("❌ Leader-Kontakt ist noch nicht eingerichtet. Es fehlt der interne Leader-Kanal.")
             return
 
         topic = _safe_text(str(self.topic.value))
@@ -808,13 +903,15 @@ class PortalLeaderContactModal(Modal):
                 view=_leader_status_view()
             )
         except Exception as e:
-            await inter.response.send_message(f"❌ Konnte Anfrage nicht senden: {e}", view=MemberPortalMainView())
+            await inter.response.send_message(f"❌ Konnte Anfrage nicht senden: {e}")
             return
 
-        await inter.response.send_message(
-            "✅ Deine Nachricht wurde an die Leader gesendet.",
-            view=MemberPortalMainView()
-        )
+        try:
+            await inter.response.defer()
+        except Exception:
+            pass
+
+        await ensure_portal_menu_for_user(inter.client, self.guild_id, self.user_id, force_view="main")
 
 
 class PortalOpenView(View):
@@ -827,11 +924,10 @@ class PortalOpenView(View):
             await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
             return
 
-        ok = await _send_main_menu(inter.user, inter.guild)
+        ok = await ensure_portal_menu_for_user(inter.client, inter.guild.id, inter.user.id, force_view="main")
 
         if ok:
-            _mark_portal_sent(inter.guild.id, inter.user.id)
-            await inter.response.send_message("✅ Ich habe dir das Gildenmenü per Privatnachricht geschickt.", ephemeral=True)
+            await inter.response.send_message("✅ Ich habe dein Gildenmenü im Privatchat geöffnet oder aktualisiert.", ephemeral=True)
         else:
             await inter.response.send_message(
                 "❌ Konnte dir keine Privatnachricht schicken. Prüfe deine Discord-DM-Einstellungen.",
@@ -844,20 +940,7 @@ class MemberPortalMainView(View):
         super().__init__(timeout=None)
 
     async def _guild_member(self, inter: discord.Interaction) -> tuple[Optional[discord.Guild], Optional[discord.Member]]:
-        guild = _resolve_guild_for_user(inter.client, inter.user.id)
-
-        if not guild:
-            return None, None
-
-        member = guild.get_member(inter.user.id)
-
-        if not member:
-            try:
-                member = await guild.fetch_member(inter.user.id)
-            except Exception:
-                member = None
-
-        return guild, member
+        return await _resolve_guild_member_from_inter(inter)
 
     @button(label="👤 Mein Profil", style=ButtonStyle.primary, custom_id="portal_profile", row=0)
     async def btn_profile(self, inter: discord.Interaction, _):
@@ -866,6 +949,8 @@ class MemberPortalMainView(View):
         if not guild or not member:
             await inter.response.send_message("❌ Ich konnte deinen Server nicht zuordnen.")
             return
+
+        _mark_portal_sent(guild.id, member.id, inter.message.id if inter.message else None)
 
         await inter.response.edit_message(
             embed=_profile_embed(guild, member),
@@ -880,6 +965,9 @@ class MemberPortalMainView(View):
             await inter.response.send_message("❌ Ich konnte deinen Server nicht zuordnen.")
             return
 
+        if member and inter.message:
+            _mark_portal_sent(guild.id, member.id, inter.message.id)
+
         await inter.response.edit_message(
             embed=_events_embed(guild.id),
             view=EventsInfoView()
@@ -893,6 +981,9 @@ class MemberPortalMainView(View):
             await inter.response.send_message("❌ Ich konnte deinen Server nicht zuordnen.")
             return
 
+        if inter.message:
+            _mark_portal_sent(guild.id, member.id, inter.message.id)
+
         await inter.response.send_modal(AbsenceModal(guild.id, inter.user.id))
 
     @button(label="📨 Leader kontaktieren", style=ButtonStyle.primary, custom_id="portal_leader_contact", row=1)
@@ -903,14 +994,54 @@ class MemberPortalMainView(View):
             await inter.response.send_message("❌ Ich konnte deinen Server nicht zuordnen.")
             return
 
+        if inter.message:
+            _mark_portal_sent(guild.id, member.id, inter.message.id)
+
         await inter.response.send_modal(PortalLeaderContactModal(guild.id, inter.user.id))
 
     @button(label="📜 Regeln & Loot", style=ButtonStyle.secondary, custom_id="portal_rules_loot", row=1)
     async def btn_rules_loot(self, inter: discord.Interaction, _):
+        guild, member = await self._guild_member(inter)
+
+        if guild and member and inter.message:
+            _mark_portal_sent(guild.id, member.id, inter.message.id)
+
         await inter.response.edit_message(embed=_rules_loot_embed(), view=BackOnlyView())
 
-    @button(label="❓ Hilfe", style=ButtonStyle.secondary, custom_id="portal_help", row=1)
+    @button(label="🎁 Needliste", style=ButtonStyle.secondary, custom_id="portal_needlist", row=1)
+    async def btn_needlist(self, inter: discord.Interaction, _):
+        guild, member = await self._guild_member(inter)
+
+        if not guild or not member:
+            await inter.response.send_message("❌ Ich konnte deinen Server nicht zuordnen.")
+            return
+
+        if inter.message:
+            _mark_portal_sent(guild.id, member.id, inter.message.id)
+
+        try:
+            try:
+                from bot.loot_needs import open_need_menu  # type: ignore
+            except ModuleNotFoundError:
+                from loot_needs import open_need_menu  # type: ignore
+
+            await open_need_menu(inter, guild.id, member.id)
+
+        except Exception:
+            emb = discord.Embed(
+                title="🎁 Needliste – ebolus",
+                description="Die Needliste ist noch nicht aktiv. Das Modul `loot_needs.py` muss noch eingebaut werden.",
+                color=discord.Color.orange()
+            )
+            await inter.response.edit_message(embed=emb, view=BackOnlyView())
+
+    @button(label="❓ Hilfe", style=ButtonStyle.secondary, custom_id="portal_help", row=2)
     async def btn_help(self, inter: discord.Interaction, _):
+        guild, member = await self._guild_member(inter)
+
+        if guild and member and inter.message:
+            _mark_portal_sent(guild.id, member.id, inter.message.id)
+
         emb = discord.Embed(
             title="❓ Hilfe – ebolus Gildenbot",
             description=(
@@ -924,6 +1055,8 @@ class MemberPortalMainView(View):
                 "Schickt eine Anfrage direkt an die Gildenleitung.\n\n"
                 "**Regeln & Loot**\n"
                 "Zeigt die wichtigsten Gildenregeln und das Lootsystem.\n\n"
+                "**Needliste**\n"
+                "Hier trägst du später deine gewünschten Items ein.\n\n"
                 "**Mitgliederliste**\n"
                 "Sortiert nach Rang und Gearscore. Angezeigt werden nur Mitglieder mit der Ebolus-/Gildenmitglied-Rolle."
             ),
@@ -938,20 +1071,7 @@ class ProfileView(View):
         super().__init__(timeout=None)
 
     async def _guild_member(self, inter: discord.Interaction) -> tuple[Optional[discord.Guild], Optional[discord.Member]]:
-        guild = _resolve_guild_for_user(inter.client, inter.user.id)
-
-        if not guild:
-            return None, None
-
-        member = guild.get_member(inter.user.id)
-
-        if not member:
-            try:
-                member = await guild.fetch_member(inter.user.id)
-            except Exception:
-                member = None
-
-        return guild, member
+        return await _resolve_guild_member_from_inter(inter)
 
     @button(label="✏️ Profil bearbeiten", style=ButtonStyle.primary, custom_id="portal_profile_edit")
     async def btn_edit(self, inter: discord.Interaction, _):
@@ -960,6 +1080,9 @@ class ProfileView(View):
         if not guild or not member:
             await inter.response.send_message("❌ Ich konnte deinen Server nicht zuordnen.")
             return
+
+        if inter.message:
+            _mark_portal_sent(guild.id, member.id, inter.message.id)
 
         await inter.response.send_modal(ProfileEditModal(guild.id, inter.user.id))
 
@@ -971,6 +1094,9 @@ class ProfileView(View):
             await inter.response.send_message("❌ Ich konnte deinen Server nicht zuordnen.")
             return
 
+        if member and inter.message:
+            _mark_portal_sent(guild.id, member.id, inter.message.id)
+
         await inter.response.edit_message(
             embed=_members_list_embed(guild),
             view=BackOnlyView()
@@ -978,7 +1104,12 @@ class ProfileView(View):
 
     @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="portal_profile_back")
     async def btn_back(self, inter: discord.Interaction, _):
-        emb = discord.Embed(
+        guild, member = await self._guild_member(inter)
+
+        if guild and member and inter.message:
+            _mark_portal_sent(guild.id, member.id, inter.message.id)
+
+        emb = _main_menu_embed(guild) if guild else discord.Embed(
             title="🏰 ebolus – Gildenmenü",
             description="Wähle unten aus, was du öffnen möchtest.",
             color=discord.Color.blurple()
@@ -993,17 +1124,25 @@ class EventsInfoView(View):
 
     @button(label="🔄 Aktualisieren", style=ButtonStyle.primary, custom_id="portal_events_refresh")
     async def btn_refresh(self, inter: discord.Interaction, _):
-        guild = _resolve_guild_for_user(inter.client, inter.user.id)
+        guild, member = await _resolve_guild_member_from_inter(inter)
 
         if not guild:
             await inter.response.send_message("❌ Ich konnte deinen Server nicht zuordnen.")
             return
 
+        if member and inter.message:
+            _mark_portal_sent(guild.id, member.id, inter.message.id)
+
         await inter.response.edit_message(embed=_events_embed(guild.id), view=EventsInfoView())
 
     @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="portal_events_back")
     async def btn_back(self, inter: discord.Interaction, _):
-        emb = discord.Embed(
+        guild, member = await _resolve_guild_member_from_inter(inter)
+
+        if guild and member and inter.message:
+            _mark_portal_sent(guild.id, member.id, inter.message.id)
+
+        emb = _main_menu_embed(guild) if guild else discord.Embed(
             title="🏰 ebolus – Gildenmenü",
             description="Wähle unten aus, was du öffnen möchtest.",
             color=discord.Color.blurple()
@@ -1018,7 +1157,12 @@ class BackOnlyView(View):
 
     @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="portal_back_main")
     async def btn_back(self, inter: discord.Interaction, _):
-        emb = discord.Embed(
+        guild, member = await _resolve_guild_member_from_inter(inter)
+
+        if guild and member and inter.message:
+            _mark_portal_sent(guild.id, member.id, inter.message.id)
+
+        emb = _main_menu_embed(guild) if guild else discord.Embed(
             title="🏰 ebolus – Gildenmenü",
             description="Wähle unten aus, was du öffnen möchtest.",
             color=discord.Color.blurple()
@@ -1055,7 +1199,7 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
                 got_member_role = member_role_id not in before_ids and member_role_id in after_ids
 
                 if got_member_role:
-                    await _send_main_menu_to_member(after, force=False)
+                    await ensure_portal_menu_for_user(client, after.guild.id, after.id)
 
             except Exception as e:
                 print(f"[member_portal] on_member_update Fehler: {e!r}")
@@ -1066,7 +1210,7 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
                     return
 
                 if _member_has_member_role(member):
-                    await _send_main_menu_to_member(member, force=False)
+                    await ensure_portal_menu_for_user(client, member.guild.id, member.id)
 
             except Exception as e:
                 print(f"[member_portal] on_member_join Fehler: {e!r}")
@@ -1115,7 +1259,7 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
             ephemeral=True
         )
 
-    @tree.command(name="portal_send_all", description="(Admin) Sendet das Gildenmenü per DM an alle mit Gildenmitglied-Rolle")
+    @tree.command(name="portal_send_all", description="(Admin) Öffnet/aktualisiert das Gildenmenü per DM bei allen mit Gildenmitglied-Rolle")
     async def portal_send_all(inter: discord.Interaction, force: bool = False):
         await inter.response.defer(ephemeral=True, thinking=True)
 
@@ -1136,37 +1280,30 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
             await inter.followup.send("❌ Ebolus-/Gildenmitglied-Rolle nicht gefunden.", ephemeral=True)
             return
 
-        sent = 0
-        skipped = 0
+        sent_or_updated = 0
         failed = 0
 
         for member in role.members:
             if member.bot:
                 continue
 
-            if not force and _portal_was_sent(inter.guild_id, member.id):
-                skipped += 1
-                continue
-
-            ok = await _send_main_menu_to_member(member, force=force)
+            ok = await ensure_portal_menu_for_user(client, inter.guild_id, member.id)
 
             if ok:
-                sent += 1
+                sent_or_updated += 1
             else:
                 failed += 1
 
             await asyncio.sleep(0.15)
 
         await inter.followup.send(
-            f"✅ Portal-DM Versand abgeschlossen.\n"
-            f"✉️ Gesendet: **{sent}**\n"
-            f"⏭️ Bereits bekannt/übersprungen: **{skipped}**\n"
-            f"❌ Fehlgeschlagen/DMs zu: **{failed}**\n\n"
-            f"Hinweis: Mit `force: True` kannst du auch bereits bekannte Mitglieder erneut anschreiben.",
+            f"✅ Portal-DM abgeschlossen.\n"
+            f"✉️ Geöffnet/aktualisiert: **{sent_or_updated}**\n"
+            f"❌ Fehlgeschlagen/DMs zu: **{failed}**",
             ephemeral=True
         )
 
-    @tree.command(name="portal_resend_user", description="(Admin) Sendet einem Spieler das Gildenmenü erneut")
+    @tree.command(name="portal_resend_user", description="(Admin) Öffnet/aktualisiert bei einem Spieler das Gildenmenü")
     async def portal_resend_user(inter: discord.Interaction, member: discord.Member):
         await inter.response.defer(ephemeral=True, thinking=True)
 
@@ -1174,14 +1311,14 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
             await inter.followup.send("❌ Nur Admin/Manage Server.", ephemeral=True)
             return
 
-        ok = await _send_main_menu_to_member(member, force=True)
+        ok = await ensure_portal_menu_for_user(client, inter.guild_id, member.id)
 
         if ok:
-            await inter.followup.send(f"✅ Gildenmenü an **{member.display_name}** gesendet.", ephemeral=True)
+            await inter.followup.send(f"✅ Gildenmenü bei **{member.display_name}** geöffnet/aktualisiert.", ephemeral=True)
         else:
             await inter.followup.send(f"❌ Konnte **{member.display_name}** keine DM senden.", ephemeral=True)
 
-    @tree.command(name="portal_dm_cleanup_user", description="(Admin) Löscht alte Bot-DMs bei einem Mitglied")
+    @tree.command(name="portal_dm_cleanup_user", description="(Admin) Löscht alte Bot-DMs bei einem Mitglied, schützt aktives Gildenmenü")
     async def portal_dm_cleanup_user(
         inter: discord.Interaction,
         member: discord.Member,
@@ -1193,22 +1330,20 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
             await inter.followup.send("❌ Nur Admin/Manage Server.", ephemeral=True)
             return
 
-        if limit < 1:
-            limit = 1
+        limit = max(1, min(limit, 1000))
 
-        if limit > 1000:
-            limit = 1000
-
+        await ensure_portal_menu_for_user(client, inter.guild_id, member.id)
         deleted = await _delete_old_bot_dms_for_member(inter.client, member, limit=limit)
+        await ensure_portal_menu_for_user(client, inter.guild_id, member.id)
 
         await inter.followup.send(
             f"✅ DM-Cleanup bei **{member.display_name}** abgeschlossen.\n"
-            f"🧹 Gelöschte Bot-Nachrichten: **{deleted}**\n\n"
-            f"Hinweis: Der Bot kann nur eigene Nachrichten löschen. Das Gildenmenü wird geschützt.",
+            f"🧹 Gelöschte Bot-Nachrichten: **{deleted}**\n"
+            f"🏰 Aktives Gildenmenü wurde geschützt.",
             ephemeral=True
         )
 
-    @tree.command(name="portal_dm_cleanup_all", description="(Admin) Löscht alte Bot-DMs bei allen Gildenmitgliedern")
+    @tree.command(name="portal_dm_cleanup_all", description="(Admin) Löscht alte Bot-DMs bei allen Gildenmitgliedern, schützt aktives Gildenmenü")
     async def portal_dm_cleanup_all(
         inter: discord.Interaction,
         limit: int = 300
@@ -1219,11 +1354,7 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
             await inter.followup.send("❌ Nur Admin/Manage Server.", ephemeral=True)
             return
 
-        if limit < 1:
-            limit = 1
-
-        if limit > 1000:
-            limit = 1000
+        limit = max(1, min(limit, 1000))
 
         c = _gcfg(inter.guild_id)
         member_role_id = int(c.get("member_role_id", 0) or 0)
@@ -1252,8 +1383,10 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
             checked += 1
 
             try:
+                await ensure_portal_menu_for_user(client, inter.guild_id, member.id)
                 deleted = await _delete_old_bot_dms_for_member(inter.client, member, limit=limit)
                 total_deleted += deleted
+                await ensure_portal_menu_for_user(client, inter.guild_id, member.id)
                 await asyncio.sleep(0.2)
             except Exception:
                 failed += 1
@@ -1262,8 +1395,8 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
             f"✅ DM-Cleanup für Ebolus-/Gildenmitglieder abgeschlossen.\n"
             f"👥 Geprüft: **{checked}**\n"
             f"🧹 Gelöschte Bot-Nachrichten: **{total_deleted}**\n"
-            f"❌ Fehlgeschlagen: **{failed}**\n\n"
-            f"Hinweis: Der Bot kann nur eigene Nachrichten löschen. Das Gildenmenü wird geschützt.",
+            f"❌ Fehlgeschlagen: **{failed}**\n"
+            f"🏰 Aktive Gildenmenüs wurden geschützt.",
             ephemeral=True
         )
 
@@ -1380,6 +1513,7 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
                 "• Abwesenheit melden\n"
                 "• Leader kontaktieren\n"
                 "• Regeln & Loot\n"
+                "• Needliste\n"
                 "• Hilfe"
             ),
             color=discord.Color.blurple()
