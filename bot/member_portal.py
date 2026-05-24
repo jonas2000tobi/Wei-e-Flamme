@@ -9,7 +9,7 @@ from typing import Optional, Any, Tuple
 
 import discord
 from discord import app_commands
-from discord.ui import View, button, Modal, TextInput
+from discord.ui import View, button, Modal, TextInput, Select
 from discord.enums import ButtonStyle
 from zoneinfo import ZoneInfo
 
@@ -301,34 +301,10 @@ def _main_menu_embed(guild: discord.Guild) -> discord.Embed:
         title="⚜️ Ebolus Kommandozentrale",
         description=(
             "Willkommen im privaten Gildenmenü.\n\n"
-            "Hier verwaltest du dein Profil, deine Needliste, Abwesenheiten "
-            "und findest alle wichtigen Infos zur Gilde."
+            "Wähle unten im Menü einen Bereich aus.\n"
+            "Die Beschreibung steht direkt in der Auswahl."
         ),
         color=discord.Color.gold()
-    )
-
-    emb.add_field(
-        name="👤 Persönlich",
-        value="Profil ansehen und bearbeiten, Gearscore pflegen, Abwesenheit melden.",
-        inline=False
-    )
-
-    emb.add_field(
-        name="🎁 Loot & Bedarf",
-        value="Needliste für Main und Secondary verwalten.",
-        inline=False
-    )
-
-    emb.add_field(
-        name="📅 Gilde",
-        value="Feste Gildentermine, Mitgliederübersicht und Regeln.",
-        inline=False
-    )
-
-    emb.add_field(
-        name="🛡️ Kontakt",
-        value="Leader kontaktieren oder Hilfe zum Bot öffnen.",
-        inline=False
     )
 
     emb.set_footer(text=f"Server: {guild.name} • Ebolus Gildenbot")
@@ -630,6 +606,10 @@ async def _delete_old_bot_dms_for_member(
         "📜 Regeln & Lootsystem",
         "📜 Regeln & Lootsystem – ebolus",
         "🎁 Needliste – ebolus",
+        "👤 Persönlich",
+        "🎁 Loot & Bedarf",
+        "📅 Gilde",
+        "🛡️ Kontakt & Hilfe",
     }
 
     deleted = 0
@@ -984,31 +964,146 @@ class PortalOpenView(View):
             )
 
 
-class MemberPortalMainView(View):
+class PortalMainSelect(Select):
     def __init__(self):
-        super().__init__(timeout=None)
+        options = [
+            discord.SelectOption(
+                label="Persönlich",
+                value="personal",
+                description="Profil ansehen, Gearscore pflegen, Abwesenheit melden",
+                emoji="👤"
+            ),
+            discord.SelectOption(
+                label="Loot & Bedarf",
+                value="loot",
+                description="Needliste für Main/Secondary und Lootregeln",
+                emoji="🎁"
+            ),
+            discord.SelectOption(
+                label="Gilde",
+                value="guild",
+                description="Gildenkalender und Mitgliederübersicht",
+                emoji="📅"
+            ),
+            discord.SelectOption(
+                label="Kontakt & Hilfe",
+                value="support",
+                description="Leader kontaktieren oder Hilfe zum Bot öffnen",
+                emoji="🛡️"
+            ),
+        ]
 
-    async def _guild_member(self, inter: discord.Interaction) -> tuple[Optional[discord.Guild], Optional[discord.Member]]:
-        return await _resolve_guild_member_from_inter(inter)
+        super().__init__(
+            placeholder="Bereich auswählen …",
+            min_values=1,
+            max_values=1,
+            options=options,
+            custom_id="portal_main_select"
+        )
 
-    @button(label="👤 Profil", style=ButtonStyle.secondary, custom_id="portal_profile", row=0)
-    async def btn_profile(self, inter: discord.Interaction, _):
-        guild, member = await self._guild_member(inter)
+    async def callback(self, inter: discord.Interaction):
+        guild, member = await _resolve_guild_member_from_inter(inter)
 
         if not guild or not member:
             await inter.response.send_message("❌ Ich konnte deinen Server nicht zuordnen.")
             return
 
-        _mark_portal_sent(guild.id, member.id, inter.message.id if inter.message else None)
+        if inter.message:
+            _mark_portal_sent(guild.id, member.id, inter.message.id)
 
-        await inter.response.edit_message(
-            embed=_profile_embed(guild, member),
-            view=ProfileView()
-        )
+        choice = self.values[0]
 
-    @button(label="🏖️ Abwesenheit", style=ButtonStyle.secondary, custom_id="portal_absence", row=0)
+        if choice == "personal":
+            emb = discord.Embed(
+                title="👤 Persönlich",
+                description=(
+                    "Hier findest du alles, was dein eigenes Profil und deine Anwesenheit betrifft.\n\n"
+                    "**Profil**\n"
+                    "Ingame-Name, Main-Rolle und Gearscore ansehen oder bearbeiten.\n\n"
+                    "**Abwesenheit**\n"
+                    "Urlaub, Schicht, Pause oder längere Inaktivität melden."
+                ),
+                color=discord.Color.gold()
+            )
+
+            await inter.response.edit_message(embed=emb, view=PersonalMenuView())
+            return
+
+        if choice == "loot":
+            emb = discord.Embed(
+                title="🎁 Loot & Bedarf",
+                description=(
+                    "Hier verwaltest du alles rund um Items und Loot.\n\n"
+                    "**Needliste**\n"
+                    "Trage ein, welche Items du für Main und Secondary brauchst.\n\n"
+                    "**Regeln & Loot**\n"
+                    "Zeigt die wichtigsten Regeln zum Lootsystem."
+                ),
+                color=discord.Color.gold()
+            )
+
+            await inter.response.edit_message(embed=emb, view=LootMenuView())
+            return
+
+        if choice == "guild":
+            emb = discord.Embed(
+                title="📅 Gilde",
+                description=(
+                    "Hier findest du die wichtigsten Gildenübersichten.\n\n"
+                    "**Kalender**\n"
+                    "Feste Gildentermine und regelmäßige Events.\n\n"
+                    "**Mitglieder**\n"
+                    "Übersicht der Ebolus-Mitglieder mit Rang und Gearscore."
+                ),
+                color=discord.Color.gold()
+            )
+
+            await inter.response.edit_message(embed=emb, view=GuildMenuView())
+            return
+
+        if choice == "support":
+            emb = discord.Embed(
+                title="🛡️ Kontakt & Hilfe",
+                description=(
+                    "Hier kannst du die Gildenleitung erreichen oder Hilfe zum Bot lesen.\n\n"
+                    "**Leaderkontakt**\n"
+                    "Sende eine Anfrage direkt an die Gildenleitung.\n\n"
+                    "**Hilfe**\n"
+                    "Kurze Erklärung der Bot-Funktionen."
+                ),
+                color=discord.Color.gold()
+            )
+
+            await inter.response.edit_message(embed=emb, view=SupportMenuView())
+            return
+
+
+class MemberPortalMainView(View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.add_item(PortalMainSelect())
+
+
+class PersonalMenuView(View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @button(label="👤 Profil", style=ButtonStyle.secondary, custom_id="portal_personal_profile")
+    async def btn_profile(self, inter: discord.Interaction, _):
+        guild, member = await _resolve_guild_member_from_inter(inter)
+
+        if not guild or not member:
+            await inter.response.send_message("❌ Ich konnte deinen Server nicht zuordnen.")
+            return
+
+        if inter.message:
+            _mark_portal_sent(guild.id, member.id, inter.message.id)
+
+        await inter.response.edit_message(embed=_profile_embed(guild, member), view=ProfileView())
+
+    @button(label="🏖️ Abwesenheit melden", style=ButtonStyle.secondary, custom_id="portal_personal_absence")
     async def btn_absence(self, inter: discord.Interaction, _):
-        guild, member = await self._guild_member(inter)
+        guild, member = await _resolve_guild_member_from_inter(inter)
 
         if not guild or not member:
             await inter.response.send_message("❌ Ich konnte deinen Server nicht zuordnen.")
@@ -1019,9 +1114,23 @@ class MemberPortalMainView(View):
 
         await inter.response.send_modal(AbsenceModal(guild.id, inter.user.id))
 
-    @button(label="🎁 Needliste", style=ButtonStyle.secondary, custom_id="portal_needlist", row=1)
+    @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="portal_personal_back")
+    async def btn_back(self, inter: discord.Interaction, _):
+        guild, member = await _resolve_guild_member_from_inter(inter)
+
+        if guild and member and inter.message:
+            _mark_portal_sent(guild.id, member.id, inter.message.id)
+
+        await inter.response.edit_message(embed=_main_menu_embed(guild), view=MemberPortalMainView())
+
+
+class LootMenuView(View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @button(label="🎁 Needliste", style=ButtonStyle.secondary, custom_id="portal_loot_needlist")
     async def btn_needlist(self, inter: discord.Interaction, _):
-        guild, member = await self._guild_member(inter)
+        guild, member = await _resolve_guild_member_from_inter(inter)
 
         if not guild or not member:
             await inter.response.send_message("❌ Ich konnte deinen Server nicht zuordnen.")
@@ -1046,18 +1155,32 @@ class MemberPortalMainView(View):
             )
             await inter.response.edit_message(embed=emb, view=BackOnlyView())
 
-    @button(label="📜 Regeln & Loot", style=ButtonStyle.secondary, custom_id="portal_rules_loot", row=1)
-    async def btn_rules_loot(self, inter: discord.Interaction, _):
-        guild, member = await self._guild_member(inter)
+    @button(label="📜 Regeln & Loot", style=ButtonStyle.secondary, custom_id="portal_loot_rules")
+    async def btn_rules(self, inter: discord.Interaction, _):
+        guild, member = await _resolve_guild_member_from_inter(inter)
 
         if guild and member and inter.message:
             _mark_portal_sent(guild.id, member.id, inter.message.id)
 
         await inter.response.edit_message(embed=_rules_loot_embed(), view=RulesLootView())
 
-    @button(label="📅 Kalender", style=ButtonStyle.secondary, custom_id="portal_events", row=2)
-    async def btn_events(self, inter: discord.Interaction, _):
-        guild, member = await self._guild_member(inter)
+    @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="portal_loot_back")
+    async def btn_back(self, inter: discord.Interaction, _):
+        guild, member = await _resolve_guild_member_from_inter(inter)
+
+        if guild and member and inter.message:
+            _mark_portal_sent(guild.id, member.id, inter.message.id)
+
+        await inter.response.edit_message(embed=_main_menu_embed(guild), view=MemberPortalMainView())
+
+
+class GuildMenuView(View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @button(label="📅 Kalender", style=ButtonStyle.secondary, custom_id="portal_guild_calendar")
+    async def btn_calendar(self, inter: discord.Interaction, _):
+        guild, member = await _resolve_guild_member_from_inter(inter)
 
         if not guild:
             await inter.response.send_message("❌ Ich konnte deinen Server nicht zuordnen.")
@@ -1066,14 +1189,11 @@ class MemberPortalMainView(View):
         if member and inter.message:
             _mark_portal_sent(guild.id, member.id, inter.message.id)
 
-        await inter.response.edit_message(
-            embed=_events_embed(guild.id),
-            view=EventsInfoView()
-        )
+        await inter.response.edit_message(embed=_events_embed(guild.id), view=EventsInfoView())
 
-    @button(label="👥 Mitglieder", style=ButtonStyle.secondary, custom_id="portal_members_main", row=2)
+    @button(label="👥 Mitglieder", style=ButtonStyle.secondary, custom_id="portal_guild_members")
     async def btn_members(self, inter: discord.Interaction, _):
-        guild, member = await self._guild_member(inter)
+        guild, member = await _resolve_guild_member_from_inter(inter)
 
         if not guild:
             await inter.response.send_message("❌ Ich konnte deinen Server nicht zuordnen.")
@@ -1082,14 +1202,25 @@ class MemberPortalMainView(View):
         if member and inter.message:
             _mark_portal_sent(guild.id, member.id, inter.message.id)
 
-        await inter.response.edit_message(
-            embed=_members_list_embed(guild),
-            view=BackOnlyView()
-        )
+        await inter.response.edit_message(embed=_members_list_embed(guild), view=BackOnlyView())
 
-    @button(label="🛡️ Leaderkontakt", style=ButtonStyle.secondary, custom_id="portal_leader_contact", row=3)
-    async def btn_leader_contact(self, inter: discord.Interaction, _):
-        guild, member = await self._guild_member(inter)
+    @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="portal_guild_back")
+    async def btn_back(self, inter: discord.Interaction, _):
+        guild, member = await _resolve_guild_member_from_inter(inter)
+
+        if guild and member and inter.message:
+            _mark_portal_sent(guild.id, member.id, inter.message.id)
+
+        await inter.response.edit_message(embed=_main_menu_embed(guild), view=MemberPortalMainView())
+
+
+class SupportMenuView(View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @button(label="🛡️ Leaderkontakt", style=ButtonStyle.secondary, custom_id="portal_support_leader")
+    async def btn_leader(self, inter: discord.Interaction, _):
+        guild, member = await _resolve_guild_member_from_inter(inter)
 
         if not guild or not member:
             await inter.response.send_message("❌ Ich konnte deinen Server nicht zuordnen.")
@@ -1100,9 +1231,9 @@ class MemberPortalMainView(View):
 
         await inter.response.send_modal(PortalLeaderContactModal(guild.id, inter.user.id))
 
-    @button(label="❓ Hilfe", style=ButtonStyle.secondary, custom_id="portal_help", row=3)
+    @button(label="❓ Hilfe", style=ButtonStyle.secondary, custom_id="portal_support_help")
     async def btn_help(self, inter: discord.Interaction, _):
-        guild, member = await self._guild_member(inter)
+        guild, member = await _resolve_guild_member_from_inter(inter)
 
         if guild and member and inter.message:
             _mark_portal_sent(guild.id, member.id, inter.message.id)
@@ -1128,17 +1259,23 @@ class MemberPortalMainView(View):
 
         await inter.response.edit_message(embed=emb, view=HelpView())
 
+    @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="portal_support_back")
+    async def btn_back(self, inter: discord.Interaction, _):
+        guild, member = await _resolve_guild_member_from_inter(inter)
+
+        if guild and member and inter.message:
+            _mark_portal_sent(guild.id, member.id, inter.message.id)
+
+        await inter.response.edit_message(embed=_main_menu_embed(guild), view=MemberPortalMainView())
+
 
 class ProfileView(View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    async def _guild_member(self, inter: discord.Interaction) -> tuple[Optional[discord.Guild], Optional[discord.Member]]:
-        return await _resolve_guild_member_from_inter(inter)
-
     @button(label="✏️ Profil bearbeiten", style=ButtonStyle.secondary, custom_id="portal_profile_edit")
     async def btn_edit(self, inter: discord.Interaction, _):
-        guild, member = await self._guild_member(inter)
+        guild, member = await _resolve_guild_member_from_inter(inter)
 
         if not guild or not member:
             await inter.response.send_message("❌ Ich konnte deinen Server nicht zuordnen.")
@@ -1151,7 +1288,7 @@ class ProfileView(View):
 
     @button(label="👥 Mitglieder", style=ButtonStyle.secondary, custom_id="portal_member_list")
     async def btn_members(self, inter: discord.Interaction, _):
-        guild, member = await self._guild_member(inter)
+        guild, member = await _resolve_guild_member_from_inter(inter)
 
         if not guild:
             await inter.response.send_message("❌ Ich konnte deinen Server nicht zuordnen.")
@@ -1160,25 +1297,16 @@ class ProfileView(View):
         if member and inter.message:
             _mark_portal_sent(guild.id, member.id, inter.message.id)
 
-        await inter.response.edit_message(
-            embed=_members_list_embed(guild),
-            view=BackOnlyView()
-        )
+        await inter.response.edit_message(embed=_members_list_embed(guild), view=BackOnlyView())
 
     @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="portal_profile_back")
     async def btn_back(self, inter: discord.Interaction, _):
-        guild, member = await self._guild_member(inter)
+        guild, member = await _resolve_guild_member_from_inter(inter)
 
         if guild and member and inter.message:
             _mark_portal_sent(guild.id, member.id, inter.message.id)
 
-        emb = _main_menu_embed(guild) if guild else discord.Embed(
-            title="⚜️ Ebolus Kommandozentrale",
-            description="Wähle unten aus, was du öffnen möchtest.",
-            color=discord.Color.gold()
-        )
-
-        await inter.response.edit_message(embed=emb, view=MemberPortalMainView())
+        await inter.response.edit_message(embed=_main_menu_embed(guild), view=MemberPortalMainView())
 
 
 class EventsInfoView(View):
@@ -1205,13 +1333,7 @@ class EventsInfoView(View):
         if guild and member and inter.message:
             _mark_portal_sent(guild.id, member.id, inter.message.id)
 
-        emb = _main_menu_embed(guild) if guild else discord.Embed(
-            title="⚜️ Ebolus Kommandozentrale",
-            description="Wähle unten aus, was du öffnen möchtest.",
-            color=discord.Color.gold()
-        )
-
-        await inter.response.edit_message(embed=emb, view=MemberPortalMainView())
+        await inter.response.edit_message(embed=_main_menu_embed(guild), view=MemberPortalMainView())
 
 
 class RulesLootView(View):
@@ -1246,13 +1368,7 @@ class RulesLootView(View):
         if guild and member and inter.message:
             _mark_portal_sent(guild.id, member.id, inter.message.id)
 
-        emb = _main_menu_embed(guild) if guild else discord.Embed(
-            title="⚜️ Ebolus Kommandozentrale",
-            description="Wähle unten aus, was du öffnen möchtest.",
-            color=discord.Color.gold()
-        )
-
-        await inter.response.edit_message(embed=emb, view=MemberPortalMainView())
+        await inter.response.edit_message(embed=_main_menu_embed(guild), view=MemberPortalMainView())
 
 
 class HelpView(View):
@@ -1279,13 +1395,7 @@ class HelpView(View):
         if guild and member and inter.message:
             _mark_portal_sent(guild.id, member.id, inter.message.id)
 
-        emb = _main_menu_embed(guild) if guild else discord.Embed(
-            title="⚜️ Ebolus Kommandozentrale",
-            description="Wähle unten aus, was du öffnen möchtest.",
-            color=discord.Color.gold()
-        )
-
-        await inter.response.edit_message(embed=emb, view=MemberPortalMainView())
+        await inter.response.edit_message(embed=_main_menu_embed(guild), view=MemberPortalMainView())
 
 
 class BackOnlyView(View):
@@ -1299,19 +1409,17 @@ class BackOnlyView(View):
         if guild and member and inter.message:
             _mark_portal_sent(guild.id, member.id, inter.message.id)
 
-        emb = _main_menu_embed(guild) if guild else discord.Embed(
-            title="⚜️ Ebolus Kommandozentrale",
-            description="Wähle unten aus, was du öffnen möchtest.",
-            color=discord.Color.gold()
-        )
-
-        await inter.response.edit_message(embed=emb, view=MemberPortalMainView())
+        await inter.response.edit_message(embed=_main_menu_embed(guild), view=MemberPortalMainView())
 
 
 async def setup_member_portal(client: discord.Client, tree: app_commands.CommandTree):
     try:
         client.add_view(PortalOpenView())
         client.add_view(MemberPortalMainView())
+        client.add_view(PersonalMenuView())
+        client.add_view(LootMenuView())
+        client.add_view(GuildMenuView())
+        client.add_view(SupportMenuView())
         client.add_view(ProfileView())
         client.add_view(EventsInfoView())
         client.add_view(RulesLootView())
