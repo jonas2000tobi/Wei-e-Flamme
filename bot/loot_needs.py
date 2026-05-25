@@ -204,6 +204,89 @@ def _gstate(guild_id: int) -> dict:
     return g
 
 
+def _blank_slot() -> dict:
+    return {
+        "item_id": "",
+        "received": False,
+        "received_at": "",
+        "received_by": 0,
+    }
+
+
+def _slot_obj(value: Any) -> dict:
+    if isinstance(value, dict):
+        obj = dict(value)
+        obj.setdefault("item_id", "")
+        obj.setdefault("received", False)
+        obj.setdefault("received_at", "")
+        obj.setdefault("received_by", 0)
+        return obj
+
+    if isinstance(value, str):
+        if not value:
+            return _blank_slot()
+
+        return {
+            "item_id": value,
+            "received": False,
+            "received_at": "",
+            "received_by": 0,
+        }
+
+    return _blank_slot()
+
+
+def _slot_item_id(value: Any) -> str:
+    return str(_slot_obj(value).get("item_id", "") or "")
+
+
+def _slot_received(value: Any) -> bool:
+    return bool(_slot_obj(value).get("received", False))
+
+
+def _set_slot_item(data: dict, tab: str, slot: str, item_id: str) -> None:
+    data.setdefault(tab, {})
+    data[tab][slot] = {
+        "item_id": str(item_id),
+        "received": False,
+        "received_at": "",
+        "received_by": 0,
+    }
+
+
+def _clear_slot_item(data: dict, tab: str, slot: str) -> None:
+    data.setdefault(tab, {})
+    data[tab][slot] = _blank_slot()
+
+
+def _mark_slot_received(data: dict, tab: str, slot: str, received_by: int) -> bool:
+    data.setdefault(tab, {})
+    obj = _slot_obj(data[tab].get(slot))
+
+    if not obj.get("item_id"):
+        return False
+
+    obj["received"] = True
+    obj["received_at"] = _now_iso()
+    obj["received_by"] = int(received_by)
+    data[tab][slot] = obj
+    return True
+
+
+def _unmark_slot_received(data: dict, tab: str, slot: str) -> bool:
+    data.setdefault(tab, {})
+    obj = _slot_obj(data[tab].get(slot))
+
+    if not obj.get("item_id"):
+        return False
+
+    obj["received"] = False
+    obj["received_at"] = ""
+    obj["received_by"] = 0
+    data[tab][slot] = obj
+    return True
+
+
 def _user_needs(guild_id: int, user_id: int) -> dict:
     g = _gneeds(guild_id)
     users = g.setdefault("users", {})
@@ -211,14 +294,30 @@ def _user_needs(guild_id: int, user_id: int) -> dict:
     u.setdefault("Main", {})
     u.setdefault("Secondary", {})
 
+    changed = False
+
     for tab in TABS:
         if tab not in u or not isinstance(u[tab], dict):
             u[tab] = {}
+            changed = True
 
         for slot in NEED_SLOTS:
-            u[tab].setdefault(slot, "")
+            if slot not in u[tab]:
+                u[tab][slot] = _blank_slot()
+                changed = True
+            else:
+                old = u[tab][slot]
+                new = _slot_obj(old)
+
+                if old != new:
+                    u[tab][slot] = new
+                    changed = True
 
     users[str(user_id)] = u
+
+    if changed:
+        loot_needs[str(guild_id)] = g
+
     return u
 
 
@@ -238,6 +337,25 @@ def _normalize_catalog_slot(slot: str) -> str:
         "weapons": "Waffe",
         "ring1": "Ring",
         "ring2": "Ring",
+    }
+
+    return aliases.get(compact, "")
+
+
+def _normalize_need_slot(slot: str) -> str:
+    s = (slot or "").strip().lower()
+
+    for x in NEED_SLOTS:
+        if x.lower() == s:
+            return x
+
+    compact = s.replace(" ", "")
+
+    aliases = {
+        "waffe1": "Waffe 1",
+        "waffe2": "Waffe 2",
+        "ring1": "Ring 1",
+        "ring2": "Ring 2",
     }
 
     return aliases.get(compact, "")
@@ -484,7 +602,7 @@ def _need_embed(guild: discord.Guild, user_id: int, tab: str = "Main") -> discor
         description=(
             f"**{name}**\n"
             f"Bereich: **{tab}**\n\n"
-            "Bei Waffen wählst du erst den Waffentyp und danach das Item."
+            "✅ Erhaltene Items bleiben sichtbar, zählen aber nicht mehr als offener Need."
         ),
         color=discord.Color.gold()
     )
@@ -495,8 +613,16 @@ def _need_embed(guild: discord.Guild, user_id: int, tab: str = "Main") -> discor
     other_lines = []
 
     for slot in NEED_SLOTS:
-        item_id = str(data.get(tab, {}).get(slot, "") or "")
-        item_name = _item_name(guild.id, item_id, with_type=True) if item_id else "—"
+        slot_data = _slot_obj(data.get(tab, {}).get(slot))
+        item_id = str(slot_data.get("item_id", "") or "")
+
+        if item_id:
+            item_name = _item_name(guild.id, item_id, with_type=True)
+            if bool(slot_data.get("received", False)):
+                item_name = f"{item_name} ✅ Erhalten"
+        else:
+            item_name = "—"
+
         line = f"**{slot}:** {item_name}"
 
         if slot in ("Waffe 1", "Waffe 2"):
@@ -513,7 +639,7 @@ def _need_embed(guild: discord.Guild, user_id: int, tab: str = "Main") -> discor
     emb.add_field(name="💍 Schmuck", value="\n".join(jewelry_lines) or "—", inline=False)
     emb.add_field(name="🧥 Sonstiges", value="\n".join(other_lines) or "—", inline=False)
 
-    emb.set_footer(text="Für Gildenbosse werden Waffe 1 und Waffe 2 ausgewertet.")
+    emb.set_footer(text="Erhaltene Slots können nur durch die Gildenleitung wieder freigegeben werden.")
 
     return emb
 
@@ -528,10 +654,15 @@ def _format_need_user_full(guild: discord.Guild, user_id: int) -> str:
         used = []
 
         for slot in NEED_SLOTS:
-            item_id = str(data.get(tab, {}).get(slot, "") or "")
+            slot_data = _slot_obj(data.get(tab, {}).get(slot))
+            item_id = str(slot_data.get("item_id", "") or "")
 
             if item_id:
-                used.append(f"{slot}: {_item_name(guild.id, item_id, with_type=True)}")
+                item_name = _item_name(guild.id, item_id, with_type=True)
+                if bool(slot_data.get("received", False)):
+                    item_name = f"{item_name} ✅ Erhalten"
+
+                used.append(f"{slot}: {item_name}")
 
         if used:
             lines.append(f"__{tab}__")
@@ -584,7 +715,12 @@ def _weapon_summary_embed(
 
         for tab in TABS:
             for slot in WEAPON_NEED_SLOTS:
-                item_id = str(data.get(tab, {}).get(slot, "") or "")
+                slot_data = _slot_obj(data.get(tab, {}).get(slot))
+
+                if bool(slot_data.get("received", False)):
+                    continue
+
+                item_id = str(slot_data.get("item_id", "") or "")
 
                 if not item_id:
                     continue
@@ -643,7 +779,7 @@ def _weapon_summary_embed(
 
         emb.add_field(name=f"{tab.upper()}-NEED", value=value or "—", inline=False)
 
-    emb.set_footer(text="Ausgewertet werden Waffe 1 und Waffe 2. Main und Secondary bleiben getrennt.")
+    emb.set_footer(text="Erhaltene Items werden nicht mehr als offener Need gezählt.")
 
     return emb
 
@@ -772,7 +908,10 @@ class NeedMainView(View):
     async def btn_remove_item(self, inter: discord.Interaction, _):
         emb = discord.Embed(
             title="🎁 Needliste – Item entfernen",
-            description="Wähle zuerst, ob du den Eintrag aus **Main** oder **Secondary** entfernen möchtest.",
+            description=(
+                "Wähle zuerst, ob du den Eintrag aus **Main** oder **Secondary** entfernen möchtest.\n\n"
+                "Erhaltene Slots können nur durch die Gildenleitung geändert werden."
+            ),
             color=discord.Color.gold()
         )
 
@@ -902,10 +1041,31 @@ class NeedSlotSelect(Select):
 
     async def callback(self, inter: discord.Interaction):
         need_slot = self.values[0]
+        data = _user_needs(self.guild_id, self.user_id)
+        current_slot = _slot_obj(data.get(self.tab, {}).get(need_slot))
+
+        if bool(current_slot.get("received", False)):
+            guild = inter.client.get_guild(self.guild_id)
+            item_name = _item_name(self.guild_id, str(current_slot.get("item_id", "") or ""), with_type=True)
+
+            emb = discord.Embed(
+                title="🔒 Slot gesperrt",
+                description=(
+                    f"Der Slot **{self.tab} – {need_slot}** ist bereits als erhalten markiert.\n\n"
+                    f"Item: **{item_name}** ✅ Erhalten\n\n"
+                    "Diesen Slot kann nur die Gildenleitung wieder freigeben."
+                ),
+                color=discord.Color.orange()
+            )
+
+            await inter.response.edit_message(
+                embed=emb,
+                view=NeedMainView(self.guild_id, self.user_id)
+            )
+            return
 
         if self.action == "clear":
-            data = _user_needs(self.guild_id, self.user_id)
-            data[self.tab][need_slot] = ""
+            _clear_slot_item(data, self.tab, need_slot)
             save_needs()
 
             guild = inter.client.get_guild(self.guild_id)
@@ -1125,7 +1285,23 @@ class NeedItemSelect(Select):
     async def callback(self, inter: discord.Interaction):
         item_id = self.values[0]
         data = _user_needs(self.guild_id, self.user_id)
-        data[self.tab][self.need_slot] = item_id
+
+        current_slot = _slot_obj(data.get(self.tab, {}).get(self.need_slot))
+
+        if bool(current_slot.get("received", False)):
+            emb = discord.Embed(
+                title="🔒 Slot gesperrt",
+                description="Dieser Slot ist bereits als erhalten markiert und kann nur durch die Gildenleitung geändert werden.",
+                color=discord.Color.orange()
+            )
+
+            await inter.response.edit_message(
+                embed=emb,
+                view=NeedMainView(self.guild_id, self.user_id)
+            )
+            return
+
+        _set_slot_item(data, self.tab, self.need_slot, item_id)
         save_needs()
 
         guild = inter.client.get_guild(self.guild_id)
@@ -1151,6 +1327,20 @@ def _weapon_type_choices():
     return [
         app_commands.Choice(name=s, value=s)
         for s in WEAPON_TYPES
+    ]
+
+
+def _tab_choices():
+    return [
+        app_commands.Choice(name=s, value=s)
+        for s in TABS
+    ]
+
+
+def _need_slot_choices():
+    return [
+        app_commands.Choice(name=s, value=s)
+        for s in NEED_SLOTS
     ]
 
 
@@ -1511,8 +1701,10 @@ async def setup_loot_needs(client: discord.Client, tree: app_commands.CommandTre
 
             for tab in TABS:
                 for s in NEED_SLOTS:
-                    if data.get(tab, {}).get(s) == item_id:
-                        data[tab][s] = ""
+                    obj = _slot_obj(data.get(tab, {}).get(s))
+
+                    if obj.get("item_id") == item_id:
+                        data[tab][s] = _blank_slot()
                         changed = True
 
             if changed:
@@ -1524,6 +1716,178 @@ async def setup_loot_needs(client: discord.Client, tree: app_commands.CommandTre
         await inter.response.send_message(
             f"✅ Item entfernt: **{item.get('name')}**\n"
             f"Bereinigte Spieler-Needlisten: **{changed_users}**",
+            ephemeral=True
+        )
+
+    @tree.command(name="loot_mark_received", description="(Leader) Markiert einen Need-Slot als erhalten und sperrt ihn")
+    @app_commands.choices(tab=_tab_choices(), slot=_need_slot_choices())
+    async def loot_mark_received(
+        inter: discord.Interaction,
+        member: discord.Member,
+        tab: app_commands.Choice[str],
+        slot: app_commands.Choice[str],
+    ):
+        if inter.guild is None:
+            await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
+            return
+
+        if not _is_leader_or_admin(inter):
+            await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
+            return
+
+        tab_name = _normalize_tab(tab.value)
+        slot_name = _normalize_need_slot(slot.value)
+
+        if not tab_name or not slot_name:
+            await inter.response.send_message("❌ Tab oder Slot ungültig.", ephemeral=True)
+            return
+
+        data = _user_needs(inter.guild.id, member.id)
+        current = _slot_obj(data.get(tab_name, {}).get(slot_name))
+        item_id = str(current.get("item_id", "") or "")
+
+        if not item_id:
+            await inter.response.send_message(
+                f"❌ Bei **{member.display_name}** ist in **{tab_name} – {slot_name}** kein Item eingetragen.",
+                ephemeral=True
+            )
+            return
+
+        if bool(current.get("received", False)):
+            await inter.response.send_message(
+                f"ℹ️ Dieser Slot ist bereits als erhalten markiert.\n"
+                f"**{member.display_name}** — **{tab_name} – {slot_name}** — {_item_name(inter.guild.id, item_id, with_type=True)}",
+                ephemeral=True
+            )
+            return
+
+        _mark_slot_received(data, tab_name, slot_name, inter.user.id)
+        save_needs()
+
+        item_name = _item_name(inter.guild.id, item_id, with_type=True)
+
+        try:
+            await member.send(
+                f"✅ Dein Need **{item_name}** wurde von der Gildenleitung als **erhalten** markiert.\n"
+                f"Slot: **{tab_name} – {slot_name}**\n\n"
+                f"Der Slot bleibt sichtbar, zählt aber nicht mehr als offener Need."
+            )
+        except Exception:
+            pass
+
+        await inter.response.send_message(
+            f"✅ Als erhalten markiert:\n"
+            f"**{member.display_name}**\n"
+            f"**{tab_name} – {slot_name}:** {item_name} ✅ Erhalten",
+            ephemeral=True
+        )
+
+    @tree.command(name="loot_unmark_received", description="(Leader) Gibt einen erhaltenen Need-Slot wieder frei")
+    @app_commands.choices(tab=_tab_choices(), slot=_need_slot_choices())
+    async def loot_unmark_received(
+        inter: discord.Interaction,
+        member: discord.Member,
+        tab: app_commands.Choice[str],
+        slot: app_commands.Choice[str],
+    ):
+        if inter.guild is None:
+            await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
+            return
+
+        if not _is_leader_or_admin(inter):
+            await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
+            return
+
+        tab_name = _normalize_tab(tab.value)
+        slot_name = _normalize_need_slot(slot.value)
+
+        if not tab_name or not slot_name:
+            await inter.response.send_message("❌ Tab oder Slot ungültig.", ephemeral=True)
+            return
+
+        data = _user_needs(inter.guild.id, member.id)
+        current = _slot_obj(data.get(tab_name, {}).get(slot_name))
+        item_id = str(current.get("item_id", "") or "")
+
+        if not item_id:
+            await inter.response.send_message(
+                f"❌ Bei **{member.display_name}** ist in **{tab_name} – {slot_name}** kein Item eingetragen.",
+                ephemeral=True
+            )
+            return
+
+        if not bool(current.get("received", False)):
+            await inter.response.send_message("ℹ️ Dieser Slot war nicht als erhalten markiert.", ephemeral=True)
+            return
+
+        _unmark_slot_received(data, tab_name, slot_name)
+        save_needs()
+
+        item_name = _item_name(inter.guild.id, item_id, with_type=True)
+
+        await inter.response.send_message(
+            f"✅ Erhalten-Markierung entfernt:\n"
+            f"**{member.display_name}**\n"
+            f"**{tab_name} – {slot_name}:** {item_name}",
+            ephemeral=True
+        )
+
+    @tree.command(name="loot_reset_all_needs", description="(Leader) Setzt alle Needlisten zurück, z.B. für T4")
+    async def loot_reset_all_needs(
+        inter: discord.Interaction,
+        confirm: str,
+        only_guild_role: bool = True,
+    ):
+        if inter.guild is None:
+            await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
+            return
+
+        if not _is_leader_or_admin(inter):
+            await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
+            return
+
+        if confirm != "RESET":
+            await inter.response.send_message(
+                "❌ Sicherheitswort falsch.\n"
+                "Nutze: `/loot_reset_all_needs confirm:RESET`",
+                ephemeral=True
+            )
+            return
+
+        g = _gneeds(inter.guild.id)
+        users = g.setdefault("users", {})
+
+        if only_guild_role:
+            allowed_ids = {str(m.id) for m in _current_guild_role_members(inter.guild)}
+        else:
+            allowed_ids = set(users.keys())
+
+        affected = 0
+
+        for uid_str, data in list(users.items()):
+            if uid_str not in allowed_ids:
+                continue
+
+            changed = False
+
+            for tab in TABS:
+                data.setdefault(tab, {})
+                for slot in NEED_SLOTS:
+                    if _slot_item_id(data.get(tab, {}).get(slot)):
+                        data[tab][slot] = _blank_slot()
+                        changed = True
+                    else:
+                        data[tab][slot] = _blank_slot()
+
+            if changed:
+                affected += 1
+
+        save_needs()
+
+        await inter.response.send_message(
+            f"✅ Alle Needlisten wurden zurückgesetzt.\n"
+            f"Betroffene Spieler: **{affected}**\n"
+            f"Scope: **{'Nur aktuelle Ebolus-/Gildenrolle' if only_guild_role else 'Alle gespeicherten Spieler'}**",
             ephemeral=True
         )
 
