@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, date
 
 import discord
 from discord import app_commands
+from discord.ext import tasks
 
 try:
     from bot.event_dm_prefs import is_dm_enabled  # type: ignore
@@ -43,6 +44,9 @@ DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 TEMPLATE_FILE = DATA_DIR / "raid_templates.json"
+AUTO_STATE_FILE = DATA_DIR / "raid_template_auto_state.json"
+
+_client_ref: Optional[discord.Client] = None
 
 
 def _load() -> dict:
@@ -56,7 +60,19 @@ def _save(obj: dict) -> None:
     TEMPLATE_FILE.write_text(json.dumps(obj, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
+def _load_auto_state() -> dict:
+    try:
+        return json.loads(AUTO_STATE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _save_auto_state(obj: dict) -> None:
+    AUTO_STATE_FILE.write_text(json.dumps(obj, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
 templates: dict = _load()
+auto_state: dict = _load_auto_state()
 
 
 def _is_admin(inter: discord.Interaction) -> bool:
@@ -71,8 +87,28 @@ def _gcfg(guild_id: int) -> dict:
     return g
 
 
+def _g_auto_state(guild_id: int) -> dict:
+    g = auto_state.get(str(guild_id)) or {}
+    g.setdefault("posted", {})
+    auto_state[str(guild_id)] = g
+    return g
+
+
 def _normalize_name(name: str) -> str:
     return (name or "").strip().lower().replace(" ", "_")
+
+
+def _weekday_name(weekday: int) -> str:
+    names = {
+        0: "Montag",
+        1: "Dienstag",
+        2: "Mittwoch",
+        3: "Donnerstag",
+        4: "Freitag",
+        5: "Samstag",
+        6: "Sonntag",
+    }
+    return names.get(int(weekday), str(weekday))
 
 
 def _parse_weekday(value: str) -> int:
@@ -164,6 +200,39 @@ def _parse_reminders(value: str) -> List[int]:
     return out
 
 
+def _event_datetime_for_template(tpl: dict, event_date: date) -> datetime:
+    hh, mi = _parse_time_hhmm(str(tpl.get("time", "21:30")))
+    return datetime(event_date.year, event_date.month, event_date.day, hh, mi, tzinfo=TZ)
+
+
+def _current_or_next_event_date_for_template(tpl: dict, now: datetime) -> date:
+    weekday = int(tpl.get("weekday", 0) or 0)
+    today = now.date()
+    days_ahead = (weekday - today.weekday()) % 7
+    return today + timedelta(days=days_ahead)
+
+
+def _auto_key(template_key: str, event_date: date) -> str:
+    return f"{template_key}:{event_date.isoformat()}"
+
+
+def _template_auto_enabled(tpl: dict) -> bool:
+    return bool(tpl.get("auto_weekly", False))
+
+
+def _post_before_minutes(tpl: dict) -> int:
+    if "post_before_minutes" in tpl:
+        try:
+            return max(0, int(tpl.get("post_before_minutes", 0) or 0))
+        except Exception:
+            return 1440
+
+    try:
+        return max(0, int(tpl.get("post_before_hours", 24) or 24) * 60)
+    except Exception:
+        return 1440
+
+
 async def _resolve_media_url(client: discord.Client, guild: discord.Guild, tpl: dict) -> Optional[str]:
     image_url = (tpl.get("image_url") or "").strip()
 
@@ -204,8 +273,7 @@ async def _create_event_from_template(
     event_date: date,
     override_channel: Optional[discord.TextChannel] = None,
 ) -> tuple[Optional[discord.Message], int, int]:
-    hh, mi = _parse_time_hhmm(str(tpl.get("time", "21:30")))
-    when = datetime(event_date.year, event_date.month, event_date.day, hh, mi, tzinfo=TZ)
+    when = _event_datetime_for_template(tpl, event_date)
 
     channel_id = int(tpl.get("channel_id", 0) or 0)
     target_role_id = int(tpl.get("target_role_id", 0) or 0)
@@ -229,6 +297,7 @@ async def _create_event_from_template(
         "no": [],
         "target_role_id": target_role_id,
         "dm_messages": {},
+        "template_name": str(tpl.get("name", "") or ""),
     }
 
     emb = build_embed(guild, obj)
@@ -275,7 +344,93 @@ async def _create_event_from_template(
     return msg, sent, skipped_opt_out
 
 
+async def _auto_post_due_templates(client: discord.Client) -> None:
+    now = datetime.now(TZ)
+
+    for guild_id_str, g in list(templates.items()):
+        try:
+            guild_id = int(guild_id_str)
+        except Exception:
+            continue
+
+        guild = client.get_guild(guild_id)
+
+        if not guild:
+            continue
+
+        all_tpl = g.get("templates") or {}
+        state = _g_auto_state(guild_id)
+        posted = state.setdefault("posted", {})
+
+        for key, tpl in list(all_tpl.items()):
+            try:
+                if not _template_auto_enabled(tpl):
+                    continue
+
+                event_date = _current_or_next_event_date_for_template(tpl, now)
+                event_dt = _event_datetime_for_template(tpl, event_date)
+                post_dt = event_dt - timedelta(minutes=_post_before_minutes(tpl))
+
+                unique_key = _auto_key(key, event_date)
+
+                if unique_key in posted:
+                    continue
+
+                if now < post_dt:
+                    continue
+
+                if now > event_dt + timedelta(hours=2):
+                    continue
+
+                msg, sent, skipped = await _create_event_from_template(
+                    client=client,
+                    guild=guild,
+                    tpl=tpl,
+                    event_date=event_date,
+                    override_channel=None,
+                )
+
+                posted[unique_key] = {
+                    "posted_at": now.isoformat(),
+                    "event_date": event_date.isoformat(),
+                    "template": key,
+                    "message_id": int(msg.id) if msg else 0,
+                    "sent_dm": int(sent),
+                    "skipped_opt_out": int(skipped),
+                }
+
+                _save_auto_state(auto_state)
+
+                print(
+                    f"✅ Auto-Raid-Vorlage gepostet: guild={guild_id} template={key} "
+                    f"event_date={event_date.isoformat()} msg={msg.id if msg else '—'}"
+                )
+
+                await asyncio.sleep(1)
+
+            except Exception as e:
+                print(f"[raid_template_auto] Fehler bei Vorlage {key}: {e!r}")
+
+
+@tasks.loop(minutes=1)
+async def raid_template_auto_loop():
+    if _client_ref is None:
+        return
+
+    try:
+        await _auto_post_due_templates(_client_ref)
+    except Exception as e:
+        print(f"[raid_template_auto] Loop-Fehler: {e!r}")
+
+
 async def setup_raid_templates(client: discord.Client, tree: app_commands.CommandTree):
+    global _client_ref
+    _client_ref = client
+
+    if not raid_template_auto_loop.is_running():
+        raid_template_auto_loop.start()
+        print("📋 Raid-Template Auto-Task gestartet.")
+
     @tree.command(name="raid_template_create", description="(Admin) Erstellt eine Raid-/Event-Vorlage")
     @app_commands.describe(
         name="Interner Vorlagenname, z.B. gildenraid",
@@ -287,7 +442,9 @@ async def setup_raid_templates(client: discord.Client, tree: app_commands.Comman
         description="Beschreibung",
         duration_min="Dauer in Minuten",
         image_url="Direkte Bild-URL optional",
-        send_dm="Soll der Bot DMs verschicken?"
+        send_dm="Soll der Bot DMs verschicken?",
+        auto_weekly="Soll diese Vorlage jede Woche automatisch gepostet werden?",
+        post_before_hours="Wie viele Stunden vor Eventstart automatisch posten?"
     )
     async def raid_template_create(
         inter: discord.Interaction,
@@ -301,6 +458,8 @@ async def setup_raid_templates(client: discord.Client, tree: app_commands.Comman
         duration_min: int = 120,
         image_url: Optional[str] = None,
         send_dm: bool = True,
+        auto_weekly: bool = False,
+        post_before_hours: int = 24,
     ):
         await inter.response.defer(ephemeral=True, thinking=True)
 
@@ -311,6 +470,7 @@ async def setup_raid_templates(client: discord.Client, tree: app_commands.Comman
         try:
             wd = _parse_weekday(weekday)
             _parse_time_hhmm(time)
+            post_before_hours = max(0, int(post_before_hours))
         except Exception as e:
             await inter.followup.send(f"❌ {e}", ephemeral=True)
             return
@@ -334,6 +494,9 @@ async def setup_raid_templates(client: discord.Client, tree: app_commands.Comman
             "pre_reminders": [],
             "send_dm": bool(send_dm),
             "post_server": True,
+            "auto_weekly": bool(auto_weekly),
+            "post_before_hours": int(post_before_hours),
+            "post_before_minutes": int(post_before_hours) * 60,
         }
 
         templates[str(inter.guild_id)] = g
@@ -341,10 +504,12 @@ async def setup_raid_templates(client: discord.Client, tree: app_commands.Comman
 
         await inter.followup.send(
             f"✅ Vorlage `{key}` erstellt.\n"
-            f"📅 Wochentag: `{wd}`\n"
+            f"📅 Wochentag: `{wd}` ({_weekday_name(wd)})\n"
             f"🕒 Zeit: `{time}`\n"
             f"📢 Channel: {channel.mention}\n"
-            f"🎯 Zielrolle: {target_role.mention if target_role else '—'}",
+            f"🎯 Zielrolle: {target_role.mention if target_role else '—'}\n"
+            f"🔁 Automatisch wöchentlich: **{'Ja' if auto_weekly else 'Nein'}**\n"
+            f"⏰ Auto-Post: **{post_before_hours}h vorher**",
             ephemeral=True
         )
 
@@ -494,6 +659,102 @@ async def setup_raid_templates(client: discord.Client, tree: app_commands.Comman
             ephemeral=True
         )
 
+    @tree.command(name="raid_template_auto_set", description="(Admin) Aktiviert/deaktiviert wöchentliches Auto-Posting für eine Vorlage")
+    async def raid_template_auto_set(
+        inter: discord.Interaction,
+        name: str,
+        enabled: bool,
+        post_before_hours: int = 24,
+    ):
+        await inter.response.defer(ephemeral=True, thinking=False)
+
+        if not _is_admin(inter):
+            await inter.followup.send("❌ Nur Admin/Manage Server.", ephemeral=True)
+            return
+
+        key = _normalize_name(name)
+        g = _gcfg(inter.guild_id)
+        tpl = g["templates"].get(key)
+
+        if not tpl:
+            await inter.followup.send("❌ Vorlage nicht gefunden.", ephemeral=True)
+            return
+
+        post_before_hours = max(0, int(post_before_hours))
+
+        tpl["auto_weekly"] = bool(enabled)
+        tpl["post_before_hours"] = int(post_before_hours)
+        tpl["post_before_minutes"] = int(post_before_hours) * 60
+
+        _save(templates)
+
+        await inter.followup.send(
+            f"✅ Auto-Posting für `{key}`: **{'AN' if enabled else 'AUS'}**\n"
+            f"⏰ Postet **{post_before_hours}h vorher**.",
+            ephemeral=True
+        )
+
+    @tree.command(name="raid_template_auto_status", description="Zeigt Auto-Posting-Status aller Vorlagen")
+    async def raid_template_auto_status(inter: discord.Interaction):
+        g = _gcfg(inter.guild_id)
+        all_tpl = g.get("templates") or {}
+
+        if not all_tpl:
+            await inter.response.send_message("📋 Keine Vorlagen vorhanden.", ephemeral=True)
+            return
+
+        now = datetime.now(TZ)
+        lines = []
+
+        for key, tpl in all_tpl.items():
+            auto = _template_auto_enabled(tpl)
+            wd = int(tpl.get("weekday", 0) or 0)
+            time = str(tpl.get("time", "—"))
+            event_date = _current_or_next_event_date_for_template(tpl, now)
+            event_dt = _event_datetime_for_template(tpl, event_date)
+            post_dt = event_dt - timedelta(minutes=_post_before_minutes(tpl))
+            ch_id = int(tpl.get("channel_id", 0) or 0)
+
+            lines.append(
+                f"• `{key}` — **{'AN' if auto else 'AUS'}**\n"
+                f"  Event: {_weekday_name(wd)} `{time}` | nächstes Datum: `{event_date.strftime('%d.%m.%Y')}`\n"
+                f"  Auto-Post: `{post_dt.strftime('%d.%m.%Y %H:%M')}` | Channel: <#{ch_id}>"
+            )
+
+        await inter.response.send_message("\n\n".join(lines), ephemeral=True)
+
+    @tree.command(name="raid_template_auto_reset", description="(Admin) Löscht Auto-Post-Merker einer Vorlage für ein Datum")
+    async def raid_template_auto_reset(
+        inter: discord.Interaction,
+        name: str,
+        event_date: str,
+    ):
+        await inter.response.defer(ephemeral=True, thinking=False)
+
+        if not _is_admin(inter):
+            await inter.followup.send("❌ Nur Admin/Manage Server.", ephemeral=True)
+            return
+
+        key = _normalize_name(name)
+
+        try:
+            y, m, d = [int(x) for x in event_date.strip().split("-")]
+            d_obj = date(y, m, d)
+        except Exception:
+            await inter.followup.send("❌ Datum ungültig. Nutze YYYY-MM-DD.", ephemeral=True)
+            return
+
+        state = _g_auto_state(inter.guild_id)
+        posted = state.setdefault("posted", {})
+        marker = _auto_key(key, d_obj)
+
+        if marker in posted:
+            posted.pop(marker, None)
+            _save_auto_state(auto_state)
+            await inter.followup.send(f"✅ Auto-Merker `{marker}` gelöscht.", ephemeral=True)
+        else:
+            await inter.followup.send(f"ℹ️ Kein Auto-Merker für `{marker}` gefunden.", ephemeral=True)
+
     @tree.command(name="raid_template_run", description="(Admin) Erstellt ein Event aus Vorlage")
     @app_commands.describe(
         name="Vorlagenname",
@@ -556,13 +817,15 @@ async def setup_raid_templates(client: discord.Client, tree: app_commands.Comman
         for key, tpl in all_tpl.items():
             ch_id = int(tpl.get("channel_id", 0) or 0)
             role_id = int(tpl.get("target_role_id", 0) or 0)
+            auto = bool(tpl.get("auto_weekly", False))
 
             lines.append(
                 f"• `{key}` — **{tpl.get('title', 'Event')}** "
                 f"| Wochentag `{tpl.get('weekday')}` "
                 f"| `{tpl.get('time')}` "
                 f"| <#{ch_id}> "
-                f"| Zielrolle: {f'<@&{role_id}>' if role_id else '—'}"
+                f"| Zielrolle: {f'<@&{role_id}>' if role_id else '—'} "
+                f"| Auto: **{'AN' if auto else 'AUS'}**"
             )
 
         await inter.response.send_message("\n".join(lines), ephemeral=True)
@@ -579,12 +842,13 @@ async def setup_raid_templates(client: discord.Client, tree: app_commands.Comman
 
         role_id = int(tpl.get("target_role_id", 0) or 0)
         ch_id = int(tpl.get("channel_id", 0) or 0)
+        wd = int(tpl.get("weekday", 0) or 0)
 
         text = (
             f"**Vorlage `{key}`**\n"
             f"**Titel:** {tpl.get('title', '—')}\n"
             f"**Beschreibung:** {tpl.get('description', '—') or '—'}\n"
-            f"**Wochentag:** `{tpl.get('weekday')}`\n"
+            f"**Wochentag:** `{tpl.get('weekday')}` ({_weekday_name(wd)})\n"
             f"**Zeit:** `{tpl.get('time')}`\n"
             f"**Dauer:** `{tpl.get('duration_min')}` Minuten\n"
             f"**Channel:** <#{ch_id}>\n"
@@ -594,7 +858,9 @@ async def setup_raid_templates(client: discord.Client, tree: app_commands.Comman
             f"**Media Message ID:** `{tpl.get('media_message_id', 0)}`\n"
             f"**Attachment Index:** `{tpl.get('attachment_index', 0)}`\n"
             f"**Reminder:** `{tpl.get('pre_reminders', [])}`\n"
-            f"**DMs:** `{'Ja' if tpl.get('send_dm', True) else 'Nein'}`"
+            f"**DMs:** `{'Ja' if tpl.get('send_dm', True) else 'Nein'}`\n"
+            f"**Auto wöchentlich:** `{'Ja' if tpl.get('auto_weekly', False) else 'Nein'}`\n"
+            f"**Auto-Post vorher:** `{_post_before_minutes(tpl)} Minuten`"
         )
 
         await inter.response.send_message(text, ephemeral=True)
