@@ -55,6 +55,49 @@ def _clean_short_label(value: str) -> str:
     return value[:6]
 
 
+EVENT_TYPES = [
+    "NM Raid",
+    "HM Raid",
+    "PvP Schlacht",
+    "Dimensionsprüfung",
+]
+
+
+def _normalize_event_type(value: str) -> str:
+    raw = (value or "").strip().lower()
+
+    aliases = {
+        "nm": "NM Raid",
+        "nm raid": "NM Raid",
+        "normal raid": "NM Raid",
+        "normalraid": "NM Raid",
+        "hm": "HM Raid",
+        "hm raid": "HM Raid",
+        "hardmode": "HM Raid",
+        "hardmode raid": "HM Raid",
+        "pvp": "PvP Schlacht",
+        "pvp schlacht": "PvP Schlacht",
+        "schlacht": "PvP Schlacht",
+        "dimensionsprüfung": "Dimensionsprüfung",
+        "dimensionspruefung": "Dimensionsprüfung",
+        "dimension": "Dimensionsprüfung",
+        "dimensionen": "Dimensionsprüfung",
+    }
+
+    if raw in aliases:
+        return aliases[raw]
+
+    for event_type in EVENT_TYPES:
+        if event_type.lower() == raw:
+            return event_type
+
+    return ""
+
+
+def _event_type_text() -> str:
+    return ", ".join(EVENT_TYPES)
+
+
 def _alliance_root() -> dict:
     root = alliance_cfg.setdefault("_global", {})
     root.setdefault("home_guild_id", 0)
@@ -69,6 +112,26 @@ def _home_guild_id(default: int = 0) -> int:
 
 def _groups() -> dict:
     return _alliance_root().setdefault("groups", {})
+
+
+
+def _templates() -> dict:
+    return _alliance_root().setdefault("templates", {})
+
+
+def _template_key(name: str) -> str:
+    return _normalize_key(name)
+
+
+def get_alliance_template(name: str) -> Optional[dict]:
+    key = _template_key(name)
+    if not key:
+        return None
+    return _templates().get(key)
+
+
+def list_alliance_templates() -> dict:
+    return _templates()
 
 
 def _group_obj(group_name: str) -> Optional[dict]:
@@ -151,11 +214,19 @@ def _server_line(guild_id: str, s: dict) -> str:
     partner = "Ja" if s.get("partner_registered", False) else "Nein"
     channel_txt = f"<#{ch_id}>" if ch_id else "—"
 
+    event_channels = s.get("event_channels") or {}
+    event_lines = []
+    for event_type in EVENT_TYPES:
+        ec = event_channels.get(event_type) or {}
+        ec_id = int(ec.get("channel_id", 0) or 0)
+        event_lines.append(f"  {event_type}: {f'<#{ec_id}>' if ec_id else '—'}")
+
     return (
         f"• **{label}** ({short_label})\n"
         f"  Discord: `{server_name}`\n"
         f"  Server-ID: `{guild_id}`\n"
-        f"  Channel: {channel_txt}\n"
+        f"  Fallback-Channel: {channel_txt}\n"
+        f"  Event-Channels:\n" + "\n".join(event_lines) + "\n"
         f"  DMs: **{dms}**\n"
         f"  Partner-registriert: **{partner}**"
     )
@@ -326,6 +397,7 @@ async def setup_alliance_config(client: discord.Client, tree: app_commands.Comma
             "home": True,
             "partner_registered": False,
             "added_by": int(inter.user.id),
+            "event_channels": {},
         }
         save_alliance_cfg()
         await inter.response.send_message(
@@ -387,6 +459,7 @@ async def setup_alliance_config(client: discord.Client, tree: app_commands.Comma
             "home": int(inter.guild.id) == int(home_id),
             "partner_registered": True,
             "registered_by": int(inter.user.id),
+            "event_channels": {},
         }
         save_alliance_cfg()
         await inter.response.send_message(
@@ -546,6 +619,246 @@ async def setup_alliance_config(client: discord.Client, tree: app_commands.Comma
         servers[str(inter.guild.id)]["discord_name"] = inter.guild.name
         save_alliance_cfg()
         await inter.response.send_message(f"✅ Home-Zielchannel geändert:\nServer: **{inter.guild.name}**\nChannel: {channel.mention}", ephemeral=True)
+
+    @tree.command(name="alliance_event_channel_set", description="(Leader) Eventtyp-Channel für den Home-/Ebolus-Server setzen")
+    async def alliance_event_channel_set(inter: discord.Interaction, group: str, event_type: str, channel: discord.TextChannel):
+        ok, msg = _require_home_leader(inter)
+        if not ok:
+            await inter.response.send_message(msg, ephemeral=True)
+            return
+
+        normalized = _normalize_event_type(event_type)
+        if not normalized:
+            await inter.response.send_message(f"❌ Ungültiger Eventtyp. Erlaubt: {_event_type_text()}", ephemeral=True)
+            return
+
+        key = _normalize_key(group)
+        obj = _group_obj(key)
+        if not obj:
+            await inter.response.send_message("❌ Allianz-Gruppe nicht gefunden.", ephemeral=True)
+            return
+
+        if channel.guild.id != inter.guild.id:
+            await inter.response.send_message("❌ Der Channel muss auf dem Home-/Ebolus-Server liegen.", ephemeral=True)
+            return
+
+        servers = obj.setdefault("servers", {})
+        server = servers.get(str(inter.guild.id))
+        if not server:
+            await inter.response.send_message("❌ Home-Server ist noch nicht in dieser Gruppe. Nutze zuerst `/alliance_server_add_home`.", ephemeral=True)
+            return
+
+        event_channels = server.setdefault("event_channels", {})
+        event_channels[normalized] = {
+            "channel_id": int(channel.id),
+            "channel_name": channel.name,
+        }
+        save_alliance_cfg()
+
+        await inter.response.send_message(
+            f"✅ Event-Channel gesetzt:\nGruppe: **{obj.get('name', key)}**\nEventtyp: **{normalized}**\nServer: **{inter.guild.name}**\nChannel: {channel.mention}",
+            ephemeral=True
+        )
+
+    @tree.command(name="alliance_partner_event_channel_set", description="(Partner-Admin) Eventtyp-Channel für diesen Partner-Server setzen")
+    async def alliance_partner_event_channel_set(inter: discord.Interaction, group: str, event_type: str, channel: discord.TextChannel):
+        ok, msg = _require_partner_admin(inter)
+        if not ok:
+            await inter.response.send_message(msg, ephemeral=True)
+            return
+
+        if inter.guild is None:
+            await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
+            return
+
+        normalized = _normalize_event_type(event_type)
+        if not normalized:
+            await inter.response.send_message(f"❌ Ungültiger Eventtyp. Erlaubt: {_event_type_text()}", ephemeral=True)
+            return
+
+        if channel.guild.id != inter.guild.id:
+            await inter.response.send_message("❌ Der Channel muss auf diesem Partner-Server liegen.", ephemeral=True)
+            return
+
+        key = _normalize_key(group)
+        obj = _group_obj(key)
+        if not obj:
+            await inter.response.send_message("❌ Allianz-Gruppe nicht gefunden.", ephemeral=True)
+            return
+
+        servers = obj.setdefault("servers", {})
+        server = servers.get(str(inter.guild.id))
+        if not server:
+            await inter.response.send_message("❌ Dieser Discord ist noch nicht registriert. Nutze zuerst `/alliance_partner_register`.", ephemeral=True)
+            return
+
+        event_channels = server.setdefault("event_channels", {})
+        event_channels[normalized] = {
+            "channel_id": int(channel.id),
+            "channel_name": channel.name,
+        }
+        save_alliance_cfg()
+
+        await inter.response.send_message(
+            f"✅ Partner-Event-Channel gesetzt:\nGruppe: **{obj.get('name', key)}**\nEventtyp: **{normalized}**\nServer: **{inter.guild.name}**\nChannel: {channel.mention}",
+            ephemeral=True
+        )
+
+    @tree.command(name="alliance_event_channel_list", description="(Leader) Eventtyp-Channels einer Allianz-Gruppe anzeigen")
+    async def alliance_event_channel_list(inter: discord.Interaction, group: str):
+        ok, msg = _require_home_leader(inter)
+        if not ok:
+            await inter.response.send_message(msg, ephemeral=True)
+            return
+
+        key = _normalize_key(group)
+        obj = _group_obj(key)
+        if not obj:
+            await inter.response.send_message("❌ Allianz-Gruppe nicht gefunden.", ephemeral=True)
+            return
+
+        servers = obj.get("servers") or {}
+        if not servers:
+            await inter.response.send_message("📋 Keine Server in dieser Gruppe.", ephemeral=True)
+            return
+
+        lines = []
+        for guild_id, s in servers.items():
+            lines.append(f"**{s.get('label', guild_id)}** ({s.get('short_label', '—')})")
+            ecs = s.get("event_channels") or {}
+            for et in EVENT_TYPES:
+                ec = ecs.get(et) or {}
+                cid = int(ec.get("channel_id", 0) or 0)
+                lines.append(f"• {et}: {f'<#{cid}>' if cid else '—'}")
+            lines.append("")
+
+        emb = discord.Embed(
+            title=f"📌 Event-Channels – {obj.get('name', key)}",
+            description="\n".join(lines).strip(),
+            color=discord.Color.blurple()
+        )
+        await inter.response.send_message(embed=emb, ephemeral=True)
+
+    @tree.command(name="alliance_template_add", description="(Leader) Allianz-Raid-Template speichern")
+    async def alliance_template_add(
+        inter: discord.Interaction,
+        name: str,
+        group: str,
+        event_type: str,
+        title: str,
+        description: str,
+        default_time: str = "21:00",
+        target_role: Optional[discord.Role] = None
+    ):
+        ok, msg = _require_home_leader(inter)
+        if not ok:
+            await inter.response.send_message(msg, ephemeral=True)
+            return
+
+        normalized = _normalize_event_type(event_type)
+        if not normalized:
+            await inter.response.send_message(f"❌ Ungültiger Eventtyp. Erlaubt: {_event_type_text()}", ephemeral=True)
+            return
+
+        if not _group_obj(group):
+            await inter.response.send_message("❌ Allianz-Gruppe nicht gefunden.", ephemeral=True)
+            return
+
+        tkey = _template_key(name)
+        if not tkey:
+            await inter.response.send_message("❌ Template-Name ungültig.", ephemeral=True)
+            return
+
+        # simple HH:MM check
+        try:
+            hh, mm = [int(x) for x in default_time.split(":")]
+            if not (0 <= hh <= 23 and 0 <= mm <= 59):
+                raise ValueError
+        except Exception:
+            await inter.response.send_message("❌ default_time muss im Format HH:MM sein, z. B. `21:00`.", ephemeral=True)
+            return
+
+        templates = _templates()
+        templates[tkey] = {
+            "name": name.strip(),
+            "group": group.strip(),
+            "event_type": normalized,
+            "title": title.strip(),
+            "description": description.strip(),
+            "default_time": default_time.strip(),
+            "target_role_id": int(target_role.id) if target_role else 0,
+            "created_by": int(inter.user.id),
+        }
+        save_alliance_cfg()
+
+        role_txt = target_role.mention if target_role else "—"
+        await inter.response.send_message(
+            f"✅ Allianz-Template gespeichert:\n**{name.strip()}**\nGruppe: **{group.strip()}**\nEventtyp: **{normalized}**\nStandardzeit: **{default_time.strip()}**\nZielrolle: {role_txt}",
+            ephemeral=True
+        )
+
+    @tree.command(name="alliance_template_list", description="(Leader) Allianz-Raid-Templates anzeigen")
+    async def alliance_template_list(inter: discord.Interaction):
+        ok, msg = _require_home_leader(inter)
+        if not ok:
+            await inter.response.send_message(msg, ephemeral=True)
+            return
+
+        templates = list_alliance_templates()
+        if not templates:
+            await inter.response.send_message("📋 Keine Allianz-Templates gespeichert.", ephemeral=True)
+            return
+
+        lines = []
+        for key, t in templates.items():
+            lines.append(f"• **{t.get('name', key)}** — {t.get('event_type', '—')} — {t.get('group', '—')} — {t.get('default_time', '—')}")
+
+        emb = discord.Embed(title="📋 Allianz-Raid-Templates", description="\n".join(lines), color=discord.Color.blurple())
+        await inter.response.send_message(embed=emb, ephemeral=True)
+
+    @tree.command(name="alliance_template_show", description="(Leader) Allianz-Raid-Template anzeigen")
+    async def alliance_template_show(inter: discord.Interaction, name: str):
+        ok, msg = _require_home_leader(inter)
+        if not ok:
+            await inter.response.send_message(msg, ephemeral=True)
+            return
+
+        t = get_alliance_template(name)
+        if not t:
+            await inter.response.send_message("❌ Template nicht gefunden.", ephemeral=True)
+            return
+
+        role_id = int(t.get("target_role_id", 0) or 0)
+        role_txt = f"<@&{role_id}>" if role_id else "—"
+        emb = discord.Embed(title=f"📋 Template: {t.get('name', name)}", color=discord.Color.blurple())
+        emb.add_field(name="Gruppe", value=str(t.get("group", "—")), inline=False)
+        emb.add_field(name="Eventtyp", value=str(t.get("event_type", "—")), inline=True)
+        emb.add_field(name="Standardzeit", value=str(t.get("default_time", "—")), inline=True)
+        emb.add_field(name="Zielrolle", value=role_txt, inline=True)
+        emb.add_field(name="Titel", value=str(t.get("title", "—")), inline=False)
+        emb.add_field(name="Beschreibung", value=str(t.get("description", "—"))[:1000] or "—", inline=False)
+        await inter.response.send_message(embed=emb, ephemeral=True)
+
+    @tree.command(name="alliance_template_delete", description="(Leader) Allianz-Raid-Template löschen")
+    async def alliance_template_delete(inter: discord.Interaction, name: str, confirm: str):
+        ok, msg = _require_home_leader(inter)
+        if not ok:
+            await inter.response.send_message(msg, ephemeral=True)
+            return
+
+        if confirm != "DELETE":
+            await inter.response.send_message("❌ Sicherheitswort falsch. Nutze `confirm:DELETE`.", ephemeral=True)
+            return
+
+        key = _template_key(name)
+        templates = _templates()
+        if key not in templates:
+            await inter.response.send_message("❌ Template nicht gefunden.", ephemeral=True)
+            return
+
+        old = templates.pop(key)
+        save_alliance_cfg()
+        await inter.response.send_message(f"✅ Template gelöscht: **{old.get('name', name)}**", ephemeral=True)
 
     @tree.command(name="alliance_server_list", description="(Leader) Alle Server einer Allianz-Gruppe anzeigen")
     async def alliance_server_list(inter: discord.Interaction, group: str):
