@@ -360,19 +360,16 @@ def _absence_dates(absence: dict) -> Optional[tuple[date, date]]:
         from_d = _ddmm_to_date(from_s, today.year)
         to_d = _ddmm_to_date(to_s, today.year)
 
+        # Nur echter Jahreswechsel:
+        # Beispiel: 28-12 bis 03-01
+        # Nicht: 29-05 bis 29-05 am 30.05.
         if to_d < from_d:
-            to_d = date(today.year + 1, to_d.month, to_d.day)
-
-        if to_d < today:
-            from_d = date(today.year + 1, from_d.month, from_d.day)
             to_d = date(today.year + 1, to_d.month, to_d.day)
 
         return from_d, to_d
 
     except Exception:
         return None
-
-
 def _is_absent_now(absence: dict) -> bool:
     try:
         dates = _absence_dates(absence)
