@@ -473,8 +473,24 @@ def _event_status_block(guild: discord.Guild, member: discord.Member) -> str:
 
         for _msg_id, obj in list(event_store.items()):
             try:
-                if int(obj.get("guild_id", 0) or 0) != guild.id:
-                    continue
+                event_guild_id = int(obj.get("guild_id", 0) or 0)
+scope = str(obj.get("scope", "") or "").lower()
+
+if scope == "alliance":
+    mirrors = obj.get("mirrors") or []
+    mirror_guild_ids = set()
+
+    for mirror in mirrors:
+        try:
+            mirror_guild_ids.add(int(mirror.get("guild_id", 0) or 0))
+        except Exception:
+            pass
+
+    if int(guild.id) not in mirror_guild_ids and event_guild_id != int(guild.id):
+        continue
+else:
+    if event_guild_id != int(guild.id):
+        continue
 
                 when = datetime.fromisoformat(obj.get("when_iso", ""))
 
