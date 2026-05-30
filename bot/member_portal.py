@@ -360,9 +360,7 @@ def _absence_dates(absence: dict) -> Optional[tuple[date, date]]:
         from_d = _ddmm_to_date(from_s, today.year)
         to_d = _ddmm_to_date(to_s, today.year)
 
-        # Nur echter Jahreswechsel:
-        # Beispiel: 28-12 bis 03-01
-        # Nicht: 29-05 bis 29-05 am 30.05.
+        # Nur echter Jahreswechsel, z. B. 28-12 bis 03-01.
         if to_d < from_d:
             to_d = date(today.year + 1, to_d.month, to_d.day)
 
@@ -370,6 +368,7 @@ def _absence_dates(absence: dict) -> Optional[tuple[date, date]]:
 
     except Exception:
         return None
+
 def _is_absent_now(absence: dict) -> bool:
     try:
         dates = _absence_dates(absence)
@@ -671,7 +670,8 @@ def _absence_calendar_embed(guild: discord.Guild) -> discord.Embed:
     )
 
     today = datetime.now(TZ).date()
-    rows = []
+    running_rows = []
+    upcoming_rows = []
 
     c = _gcfg(guild.id)
     member_role_id = int(c.get("member_role_id", 0) or 0)
@@ -701,6 +701,7 @@ def _absence_calendar_embed(guild: discord.Guild) -> discord.Embed:
 
         from_d, to_d = dates
 
+        # Abgelaufene Abwesenheiten komplett ausblenden.
         if to_d < today:
             continue
 
@@ -711,24 +712,46 @@ def _absence_calendar_embed(guild: discord.Guild) -> discord.Embed:
         to_s = str(absence.get("to", "—"))
         reason = str(absence.get("reason", "—")).strip() or "—"
 
-        prefix = "🟠" if from_d <= today <= to_d else "⚪"
+        if from_d <= today <= to_d:
+            line = f"🟠 **{name}** — {from_s} bis {to_s}\nGrund: {reason}"
+            running_rows.append((to_d, from_d, line))
+        else:
+            line = f"⚪ **{name}** — {from_s} bis {to_s}\nGrund: {reason}"
+            upcoming_rows.append((from_d, to_d, line))
 
-        rows.append((from_d, f"{prefix} **{name}** — {from_s} bis {to_s}\nGrund: {reason}"))
+    # Laufende zuerst nach Enddatum: wer zuerst wieder da ist, steht oben.
+    running_rows.sort(key=lambda x: (x[0], x[1]))
 
-    rows.sort(key=lambda x: x[0])
+    # Bevorstehende nach Startdatum: wer zuerst weg ist, steht oben.
+    upcoming_rows.sort(key=lambda x: (x[0], x[1]))
 
-    if not rows:
+    parts = []
+
+    if running_rows:
+        parts.append(
+            "**🟠 Laufende Abwesenheiten**\n" +
+            "\n\n".join(row[2] for row in running_rows[:15])
+        )
+
+    if upcoming_rows:
+        parts.append(
+            "**⚪ Bevorstehende Abwesenheiten**\n" +
+            "\n\n".join(row[2] for row in upcoming_rows[:15])
+        )
+
+    if not parts:
         emb.description = "Aktuell sind keine laufenden oder kommenden Abwesenheiten eingetragen."
     else:
-        emb.description = "\n\n".join(row[1] for row in rows[:25])
+        emb.description = "\n\n".join(parts)
 
-    if len(rows) > 25:
-        emb.set_footer(text=f"Anzeige begrenzt auf 25 von {len(rows)} Abwesenheiten.")
+    total = len(running_rows) + len(upcoming_rows)
+
+    if total > 30:
+        emb.set_footer(text=f"Anzeige begrenzt auf 30 von {total} Abwesenheiten. 🟠 läuft aktuell • ⚪ kommt noch")
     else:
         emb.set_footer(text="🟠 läuft aktuell • ⚪ kommt noch")
 
     return emb
-
 
 def _dm_settings_embed(guild: discord.Guild, member: discord.Member) -> discord.Embed:
     enabled = True
