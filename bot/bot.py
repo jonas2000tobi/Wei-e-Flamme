@@ -32,6 +32,7 @@ setup_raid_templates = None
 setup_weekly_report = None
 setup_member_portal = None
 setup_loot_needs = None
+setup_alliance_config = None
 store = {}
 
 
@@ -134,6 +135,15 @@ def _import_modules():
         from loot_needs import setup_loot_needs  # type: ignore
         print("✅ Import: loot_needs (root)")
 
+    global setup_alliance_config
+
+    try:
+        from bot.alliance_config import setup_alliance_config  # type: ignore
+        print("✅ Import: bot.alliance_config")
+    except ModuleNotFoundError:
+        from alliance_config import setup_alliance_config  # type: ignore
+        print("✅ Import: alliance_config (root)")
+
 
 def _get_token() -> str | None:
     for key in ("DISCORD_TOKEN", "DISCORD_BOT_TOKEN", "TOKEN"):
@@ -161,6 +171,7 @@ async def on_ready():
         await setup_weekly_report(bot, tree)
         await setup_member_portal(bot, tree)
         await setup_loot_needs(bot, tree)
+        await setup_alliance_config(bot, tree)
 
         register_join_hook(bot, send_onboarding_dm, auto_resend_for_new_member)
 
