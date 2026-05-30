@@ -483,39 +483,113 @@ async def _delete_dm_message_for_user(client: discord.Client, obj: dict, user_id
 
 def _portal_protected_titles() -> set[str]:
     return {
+        "⚜️ Ebolus Kommandozentrale",
         "🏰 ebolus – Gildenmenü",
+
+        "👤 Persönlich",
+        "🎁 Loot & Bedarf",
+        "📅 Gilde",
+        "🛡️ Kontakt & Hilfe",
+
         "👤 Dein Gildenprofil",
+        "📅 Ebolus Gildenkalender",
         "📅 Gildenkalender – ebolus",
         "📅 Gilden-Events",
+        "❓ Hilfe – Ebolus Gildenbot",
         "❓ Hilfe – ebolus Gildenbot",
+        "👥 Ebolus Mitglieder",
         "👥 Mitgliederliste – ebolus",
+        "📜 Regeln & Lootsystem",
         "📜 Regeln & Lootsystem – ebolus",
         "🎁 Needliste – ebolus",
     }
 
 
-async def _ensure_portal_after_rsvp(client: discord.Client, guild_id: int, user_id: int) -> None:
-    try:
+def _is_portal_message(msg: discord.Message) -> bool:
+    if not msg.embeds:
+        return False
+
+    title = msg.embeds[0].title or ""
+    return title in _portal_protected_titles()
+
+
+def _pending_dm_message_ids_to_keep(user_id: int, current_msg_id: str | None = None) -> set[int]:
+    """
+    Behält offene Raid-DMs anderer Events, wenn:
+    - Event noch nicht vorbei ist
+    - User dort noch nicht abgestimmt hat
+    - es nicht die gerade geklickte Event-DM ist
+    """
+    keep: set[int] = set()
+    now = datetime.now(TZ)
+
+    for msg_id, obj in list(store.items()):
         try:
-            from bot.member_portal import ensure_portal_menu_for_user  # type: ignore
-        except ModuleNotFoundError:
-            from member_portal import ensure_portal_menu_for_user  # type: ignore
+            if current_msg_id and str(msg_id) == str(current_msg_id):
+                continue
 
-        await ensure_portal_menu_for_user(client, guild_id, user_id, force_view="main")
-    except Exception:
-        pass
+            _init_event_shape(obj)
+
+            when = datetime.fromisoformat(obj.get("when_iso"))
+            if now > when + timedelta(hours=2):
+                continue
+
+            if int(user_id) in _voters_set(obj):
+                continue
+
+            dm_map = obj.get("dm_messages") or {}
+            mid = dm_map.get(str(user_id))
+
+            if mid:
+                keep.add(int(mid))
+
+        except Exception:
+            continue
+
+    return keep
 
 
-async def _delete_all_bot_dm_messages_for_user(
+def _known_dm_message_ids_for_user(user_id: int) -> dict[int, str]:
+    """
+    Map: DM-Message-ID -> Event-Message-ID
+    """
+    known: dict[int, str] = {}
+
+    for msg_id, obj in list(store.items()):
+        try:
+            _init_event_shape(obj)
+            dm_map = obj.get("dm_messages") or {}
+            mid = dm_map.get(str(user_id))
+
+            if mid:
+                known[int(mid)] = str(msg_id)
+
+        except Exception:
+            continue
+
+    return known
+
+
+async def _delete_irrelevant_bot_dm_messages_for_user(
     client: discord.Client,
     user_id: int,
-    guild_id: int | None = None,
+    current_msg_id: str | None = None,
     limit: int = 200
 ) -> int:
     """
-    Löscht alte Bot-Nachrichten im privaten Chat mit dem User.
-    Geschützt werden Gildenmenü/Portal-Seiten.
-    Der Bot kann nur eigene Nachrichten löschen.
+    Löscht alte/erledigte Bot-DMs.
+    Schützt:
+    - aktives Gildenmenü und Portal-Unterseiten
+    - offene Raid-DMs anderer Events, bei denen der User noch nicht abgestimmt hat
+
+    Löscht:
+    - aktuelle Raid-DM nach Auswahl
+    - alte Bot-DMs
+    - erledigte Raid-DMs
+    - gestartete/veraltete Raid-DMs
+
+    Wichtig:
+    Das Gildenmenü wird hier NICHT neu gesendet und NICHT editiert.
     """
     if client.user is None:
         return 0
@@ -528,8 +602,11 @@ async def _delete_all_bot_dm_messages_for_user(
         except Exception:
             return 0
 
-    protected_titles = _portal_protected_titles()
+    keep_dm_ids = _pending_dm_message_ids_to_keep(user_id, current_msg_id=current_msg_id)
+    known_dm_ids = _known_dm_message_ids_for_user(user_id)
+
     deleted = 0
+    deleted_or_stale_dm_ids: set[int] = set()
 
     try:
         dm = user.dm_channel or await user.create_dm()
@@ -539,16 +616,15 @@ async def _delete_all_bot_dm_messages_for_user(
                 if msg.author.id != client.user.id:
                     continue
 
-                title = ""
+                if _is_portal_message(msg):
+                    continue
 
-                if msg.embeds:
-                    title = msg.embeds[0].title or ""
-
-                if title in protected_titles:
+                if msg.id in keep_dm_ids:
                     continue
 
                 await msg.delete()
                 deleted += 1
+                deleted_or_stale_dm_ids.add(int(msg.id))
                 await asyncio.sleep(0.05)
 
             except Exception:
@@ -557,18 +633,29 @@ async def _delete_all_bot_dm_messages_for_user(
     except Exception:
         pass
 
-    for obj in store.values():
+    changed_store = False
+
+    for dm_id, event_msg_id in known_dm_ids.items():
         try:
-            if "dm_messages" in obj and isinstance(obj["dm_messages"], dict):
-                obj["dm_messages"].pop(str(user_id), None)
+            if dm_id in keep_dm_ids:
+                continue
+
+            obj = store.get(str(event_msg_id))
+            if not obj:
+                continue
+
+            dm_map = obj.get("dm_messages") or {}
+
+            if dm_map.get(str(user_id)) == dm_id:
+                dm_map.pop(str(user_id), None)
+                obj["dm_messages"] = dm_map
+                changed_store = True
+
         except Exception:
-            pass
+            continue
 
-    if deleted:
+    if changed_store:
         save_store()
-
-    if guild_id:
-        await _ensure_portal_after_rsvp(client, guild_id, int(user_id))
 
     return deleted
 
@@ -740,13 +827,10 @@ class BaseRaidView(View):
 
     async def _after_success(self, inter: discord.Interaction):
         try:
-            obj = store.get(self.msg_id) or {}
-            guild_id = int(obj.get("guild_id", 0) or 0)
-
-            await _delete_all_bot_dm_messages_for_user(
+            await _delete_irrelevant_bot_dm_messages_for_user(
                 inter.client,
                 inter.user.id,
-                guild_id=guild_id if guild_id else None,
+                current_msg_id=self.msg_id,
                 limit=200
             )
         except Exception:
@@ -1170,7 +1254,6 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
                 if ok:
                     deleted_dms += 1
 
-                await _ensure_portal_after_rsvp(inter.client, int(obj["guild_id"]), uid)
                 await asyncio.sleep(0.05)
 
             except Exception:
