@@ -1770,6 +1770,96 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
         await inter.followup.send(text, ephemeral=True)
 
 
+    @tree.command(name="alliance_raid_delete", description="(Leader) Löscht einen Allianz-Raid inkl. aller Mirror-Posts")
+    async def alliance_raid_delete(inter: discord.Interaction, message_id: str):
+        await inter.response.defer(ephemeral=True, thinking=True)
+
+        ok, msg = _require_alliance_home_leader(inter)
+
+        if not ok:
+            await inter.followup.send(msg, ephemeral=True)
+            return
+
+        obj = store.get(str(message_id))
+
+        if not obj:
+            await inter.followup.send("❌ Unbekannter Allianz-Raid / Message-ID nicht gefunden.", ephemeral=True)
+            return
+
+        _init_event_shape(obj)
+
+        if not _is_alliance_event(obj):
+            await inter.followup.send(
+                "❌ Das ist kein Allianz-Raid. Normale Raids bitte mit `/raid_delete` löschen.",
+                ephemeral=True
+            )
+            return
+
+        if int(obj.get("guild_id", 0) or 0) != inter.guild_id:
+            await inter.followup.send("❌ Dieser Allianz-Raid gehört nicht zu diesem Home-/Ebolus-Server.", ephemeral=True)
+            return
+
+        deleted_posts = 0
+        failed_posts = []
+        deleted_dms = 0
+
+        for mirror in list(obj.get("mirrors") or []):
+            try:
+                guild = inter.client.get_guild(int(mirror.get("guild_id", 0) or 0))
+
+                if not guild:
+                    failed_posts.append(f"{mirror.get('label', 'Unbekannt')} — Server nicht gefunden")
+                    continue
+
+                ch = guild.get_channel(int(mirror.get("channel_id", 0) or 0))
+
+                if not isinstance(ch, (discord.TextChannel, discord.Thread)):
+                    failed_posts.append(f"{mirror.get('label', guild.name)} — Channel nicht gefunden")
+                    continue
+
+                try:
+                    msg_obj = await ch.fetch_message(int(mirror.get("message_id", 0) or 0))
+                    await msg_obj.delete()
+                    deleted_posts += 1
+                except Exception:
+                    failed_posts.append(f"{mirror.get('label', guild.name)} — Post nicht gefunden oder keine Rechte")
+
+                await asyncio.sleep(0.05)
+
+            except Exception as e:
+                failed_posts.append(f"{mirror.get('label', 'Unbekannt')} — {e}")
+
+        for uid_str in list((obj.get("dm_messages") or {}).keys()):
+            try:
+                uid = int(uid_str)
+                ok_deleted = await _delete_dm_message_for_user(inter.client, obj, uid)
+
+                if ok_deleted:
+                    deleted_dms += 1
+
+                await asyncio.sleep(0.05)
+
+            except Exception:
+                pass
+
+        store.pop(str(message_id), None)
+        save_store()
+
+        text = (
+            f"✅ Allianz-Raid gelöscht.\n"
+            f"🧾 Mirror-Posts gelöscht: **{deleted_posts}**\n"
+            f"✉️ Home-DMs gelöscht: **{deleted_dms}**"
+        )
+
+        if failed_posts:
+            text += "\n\n⚠️ Nicht gelöscht:\n" + "\n".join(f"• {x}" for x in failed_posts[:10])
+
+        if len(text) > 1900:
+            text = text[:1850] + "\n… gekürzt"
+
+        await inter.followup.send(text, ephemeral=True)
+
+
 async def auto_resend_for_new_member(member: discord.Member) -> None:
     try:
         if member.bot:
