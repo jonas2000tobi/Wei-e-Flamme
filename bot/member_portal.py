@@ -478,7 +478,7 @@ def _event_status_block(guild: discord.Guild, member: discord.Member) -> str:
 
                 when = datetime.fromisoformat(obj.get("when_iso", ""))
 
-                if now > when + timedelta(hours=2):
+                if now >= when:
                     continue
 
                 title = str(obj.get("title", "Event"))
