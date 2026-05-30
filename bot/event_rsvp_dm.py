@@ -97,11 +97,24 @@ def _current_display_name(
     return "Unbekannt"
 
 
-def _participant_entry(uid: int, name: str) -> dict:
-    return {
+def _participant_entry(
+    uid: int,
+    name: str,
+    guild_label: str = "",
+    source_guild_id: int = 0,
+) -> dict:
+    obj = {
         "id": int(uid),
         "name": _safe_name(name),
     }
+
+    if guild_label:
+        obj["guild_label"] = str(guild_label).strip()
+
+    if source_guild_id:
+        obj["source_guild_id"] = int(source_guild_id)
+
+    return obj
 
 
 def _entry_user_id(entry: Any) -> int:
@@ -138,6 +151,39 @@ def _entry_name(entry: Any, guild: Optional[discord.Guild] = None) -> str:
             return _safe_name(member.display_name)
 
     return f"User {uid}"
+
+
+def _entry_display_name(entry: Any, guild: Optional[discord.Guild] = None) -> str:
+    name = _entry_name(entry, guild)
+
+    if isinstance(entry, dict):
+        label = str(entry.get("guild_label", "") or "").strip()
+
+        if label:
+            return f"{name} [{label}]"
+
+    return name
+
+
+def _source_label_for_inter(inter: discord.Interaction, obj: dict) -> tuple[str, int]:
+    source_guild_id = int(inter.guild_id or 0)
+
+    if not source_guild_id:
+        source_guild_id = int(obj.get("guild_id", 0) or 0)
+
+    for mirror in obj.get("mirrors", []) or []:
+        try:
+            if int(mirror.get("guild_id", 0) or 0) == source_guild_id:
+                return str(mirror.get("label", "") or mirror.get("discord_name", "") or "").strip(), source_guild_id
+        except Exception:
+            continue
+
+    guild = inter.client.get_guild(source_guild_id) if source_guild_id else None
+    return (guild.name if guild else ""), source_guild_id
+
+
+def _is_alliance_event(obj: dict) -> bool:
+    return str(obj.get("scope", "") or "").lower() == "alliance"
 
 
 def _maybe_entry(uid: int, name: str, label: str) -> dict:
@@ -214,6 +260,11 @@ def _init_event_shape(obj: dict):
 
     if "dm_messages" not in obj or not isinstance(obj["dm_messages"], dict):
         obj["dm_messages"] = {}
+
+    if "mirrors" not in obj or not isinstance(obj.get("mirrors"), list):
+        obj["mirrors"] = []
+
+    obj.setdefault("scope", "single")
 
     migrated = False
 
@@ -390,24 +441,31 @@ def build_embed(guild: discord.Guild, obj: dict) -> discord.Embed:
     maybe = obj["maybe"]
     no = obj["no"]
 
-    eligible = _eligible_members(guild, obj)
     voted = _voters_set(obj)
+
+    if _is_alliance_event(obj):
+        vote_line = f"🗳️ Abgestimmt: **{len(voted)}**"
+        hint_line = "💡 Allianz-Raid: Partner-Server stimmen direkt über diesen Post ab. DMs gibt es nur für den Home-Server."
+    else:
+        eligible = _eligible_members(guild, obj)
+        vote_line = f"🗳️ Abgestimmt: **{len(voted)}** / **{len(eligible)}**"
+        hint_line = "💡 Wenn du keine DM bekommst oder sie deaktiviert hast: nutze die Buttons direkt unter dieser Ankündigung."
 
     emb = discord.Embed(
         title=f"📅 {obj['title']}",
         description=(
             (obj.get("description", "") or "") +
             f"\n\n🕒 Zeit: {when.strftime('%a, %d.%m.%Y %H:%M')} (Europe/Berlin)"
-            f"\n🗳️ Abgestimmt: **{len(voted)}** / **{len(eligible)}**"
-            f"\n💡 Wenn du keine DM bekommst oder sie deaktiviert hast: nutze die Buttons direkt unter dieser Ankündigung."
+            f"\n{vote_line}"
+            f"\n{hint_line}"
         ).strip(),
         color=discord.Color.blurple()
     )
 
-    tank_names = [_entry_name(u, guild) for u in yes.get("TANK", [])]
-    heal_names = [_entry_name(u, guild) for u in yes.get("HEAL", [])]
-    dps_names = [_entry_name(u, guild) for u in yes.get("DPS", [])]
-    bank_names = [_entry_name(u, guild) for u in yes.get("BANK", [])]
+    tank_names = [_entry_display_name(u, guild) for u in yes.get("TANK", [])]
+    heal_names = [_entry_display_name(u, guild) for u in yes.get("HEAL", [])]
+    dps_names = [_entry_display_name(u, guild) for u in yes.get("DPS", [])]
+    bank_names = [_entry_display_name(u, guild) for u in yes.get("BANK", [])]
 
     emb.add_field(name=f"🛡️ Tank ({len(tank_names)})", value="\n".join(tank_names) or "—", inline=True)
     emb.add_field(name=f"💚 Heal ({len(heal_names)})", value="\n".join(heal_names) or "—", inline=True)
@@ -423,12 +481,15 @@ def build_embed(guild: discord.Guild, obj: dict) -> discord.Embed:
             uid_i = _entry_user_id(entry)
 
         name, label = _maybe_name_and_label(entry, uid_i, guild)
+        guild_label = str(entry.get("guild_label", "") or "").strip() if isinstance(entry, dict) else ""
+        if guild_label:
+            name = f"{name} [{guild_label}]"
         label_txt = f" ({label})" if label else ""
         maybe_lines.append(f"{name}{label_txt}")
 
     emb.add_field(name=f"❔ Vielleicht ({len(maybe_lines)})", value="\n".join(maybe_lines) or "—", inline=False)
 
-    no_names = [_entry_name(u, guild) for u in no]
+    no_names = [_entry_display_name(u, guild) for u in no]
     emb.add_field(name=f"❌ Abgemeldet ({len(no_names)})", value="\n".join(no_names) or "—", inline=False)
 
     tr_id = int(obj.get("target_role_id", 0) or 0)
@@ -729,6 +790,32 @@ async def delete_pending_dm_messages_for_started_events(client: discord.Client) 
 
 
 async def _push_overview(client: discord.Client, msg_id: str, obj: dict):
+    _init_event_shape(obj)
+
+    if _is_alliance_event(obj) and obj.get("mirrors"):
+        master_id = int(obj.get("message_id", msg_id) or msg_id)
+
+        for mirror in list(obj.get("mirrors") or []):
+            try:
+                guild = client.get_guild(int(mirror.get("guild_id", 0) or 0))
+
+                if not guild:
+                    continue
+
+                ch = guild.get_channel(int(mirror.get("channel_id", 0) or 0))
+
+                if not isinstance(ch, (discord.TextChannel, discord.Thread)):
+                    continue
+
+                msg = await ch.fetch_message(int(mirror.get("message_id", 0) or 0))
+                emb = build_embed(guild, obj)
+                await msg.edit(embed=emb, view=ServerRaidView(master_id))
+
+            except Exception:
+                continue
+
+        return
+
     guild = client.get_guild(int(obj["guild_id"]))
 
     if not guild:
@@ -763,6 +850,7 @@ async def apply_rsvp(inter: discord.Interaction, msg_id: str, group: str) -> tup
     uid = inter.user.id
     member = _member_from_event(inter, obj)
     display_name = _current_display_name(member, inter.user)
+    guild_label, source_guild_id = _source_label_for_inter(inter, obj) if _is_alliance_event(obj) else ("", int(inter.guild_id or obj.get("guild_id", 0) or 0))
 
     if group in ("TANK", "HEAL", "DPS"):
         response_key = "yes"
@@ -787,21 +875,26 @@ async def apply_rsvp(inter: discord.Interaction, msg_id: str, group: str) -> tup
     obj["maybe"].pop(str(uid), None)
 
     if group in ("TANK", "HEAL", "DPS"):
-        obj["yes"][group].append(_participant_entry(uid, display_name))
+        obj["yes"][group].append(_participant_entry(uid, display_name, guild_label, source_guild_id))
         text = f"Angemeldet als **{group}**."
 
     elif group == "BANK":
-        obj["yes"]["BANK"].append(_participant_entry(uid, display_name))
+        obj["yes"]["BANK"].append(_participant_entry(uid, display_name, guild_label, source_guild_id))
         text = "Als **Bank / Reserve** eingetragen."
 
     elif group == "MAYBE":
         rid_map = get_role_ids_for_guild(int(obj["guild_id"]))
         label = _primary_label(member, rid_map)
-        obj["maybe"][str(uid)] = _maybe_entry(uid, display_name, label)
+        maybe_obj = _maybe_entry(uid, display_name, label)
+        if guild_label:
+            maybe_obj["guild_label"] = guild_label
+        if source_guild_id:
+            maybe_obj["source_guild_id"] = int(source_guild_id)
+        obj["maybe"][str(uid)] = maybe_obj
         text = "Als **Vielleicht** eingetragen."
 
     elif group == "NO":
-        obj["no"].append(_participant_entry(uid, display_name))
+        obj["no"].append(_participant_entry(uid, display_name, guild_label, source_guild_id))
         text = "Als **Abgemeldet** eingetragen."
 
     else:
@@ -911,6 +1004,50 @@ class ServerRaidView(BaseRaidView):
 def _is_admin(inter: discord.Interaction) -> bool:
     perms = getattr(inter.user, "guild_permissions", None)
     return bool(perms and (perms.administrator or perms.manage_guild))
+
+
+def _import_alliance_config():
+    try:
+        from bot.alliance_config import get_alliance_group  # type: ignore
+        return get_alliance_group
+    except ModuleNotFoundError:
+        from alliance_config import get_alliance_group  # type: ignore
+        return get_alliance_group
+
+
+async def _send_home_dms_for_alliance_event(
+    guild: discord.Guild,
+    obj: dict,
+    master_msg_id: int,
+    channel_name_or_ref: str,
+) -> tuple[int, int]:
+    sent = 0
+    skipped_opt_out = 0
+
+    for member in _eligible_members(guild, obj):
+        if not is_dm_enabled(guild.id, member.id):
+            skipped_opt_out += 1
+            continue
+
+        try:
+            when = datetime.fromisoformat(obj["when_iso"])
+            dm_text = _format_dm_text(
+                title=str(obj.get("title", "Event")),
+                when=when,
+                channel_name_or_ref=channel_name_or_ref,
+                description=obj.get("description"),
+                intro_line="Wähle unten deine Teilnahme:"
+            )
+
+            dm_msg = await member.send(dm_text, view=RaidView(int(master_msg_id)))
+            obj["dm_messages"][str(member.id)] = int(dm_msg.id)
+            sent += 1
+            await asyncio.sleep(0.05)
+
+        except Exception:
+            pass
+
+    return sent, skipped_opt_out
 
 
 async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
@@ -1076,6 +1213,197 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
             f"🖱️ Abstimmung ist zusätzlich direkt unter der Raid-Ankündigung per Button möglich.",
             ephemeral=True
         )
+
+    @tree.command(name="alliance_raid_create", description="(Leader) Allianz-Raid auf alle Server einer Allianz-Gruppe posten")
+    @app_commands.describe(
+        group="Name der Allianz-Gruppe",
+        title="Titel",
+        date="Datum YYYY-MM-DD",
+        time="Zeit HH:MM (24h)",
+        description="Kurzbeschreibung (optional)",
+        target_role="Optional: Nur diese Home-/Ebolus-Rolle bekommt DMs",
+        image_url="Optionales Bild fürs Embed"
+    )
+    async def alliance_raid_create(
+        inter: discord.Interaction,
+        group: str,
+        title: str,
+        date: str,
+        time: str,
+        description: Optional[str] = None,
+        target_role: Optional[discord.Role] = None,
+        image_url: Optional[str] = None
+    ):
+        await inter.response.defer(ephemeral=True, thinking=True)
+
+        if inter.guild is None or inter.guild_id is None:
+            await inter.followup.send("❌ Nur im Server nutzbar.", ephemeral=True)
+            return
+
+        if not _is_admin(inter):
+            await inter.followup.send("❌ Nur Admin/Manage Server.", ephemeral=True)
+            return
+
+        try:
+            yyyy, mm, dd = [int(x) for x in date.split("-")]
+            hh, mi = [int(x) for x in time.split(":")]
+            when = datetime(yyyy, mm, dd, hh, mi, tzinfo=TZ)
+        except Exception:
+            await inter.followup.send("❌ Datum/Zeit ungültig. (YYYY-MM-DD / HH:MM)", ephemeral=True)
+            return
+
+        try:
+            get_alliance_group = _import_alliance_config()
+            group_obj = get_alliance_group(group)
+        except Exception as e:
+            await inter.followup.send(f"❌ Allianz-Konfiguration konnte nicht geladen werden: `{e}`", ephemeral=True)
+            return
+
+        if not group_obj:
+            await inter.followup.send("❌ Allianz-Gruppe nicht gefunden.", ephemeral=True)
+            return
+
+        servers = group_obj.get("servers") or {}
+
+        if not servers:
+            await inter.followup.send("❌ In dieser Allianz-Gruppe sind keine Server/Channels hinterlegt.", ephemeral=True)
+            return
+
+        home_server = servers.get(str(inter.guild.id))
+
+        if not home_server:
+            await inter.followup.send(
+                "❌ Der Home-/Ebolus-Server ist in dieser Allianz-Gruppe nicht hinterlegt.\n"
+                "Nutze zuerst `/alliance_server_add_home`.",
+                ephemeral=True
+            )
+            return
+
+        home_channel_id = int(home_server.get("channel_id", 0) or 0)
+        home_channel = inter.guild.get_channel(home_channel_id)
+
+        if not isinstance(home_channel, (discord.TextChannel, discord.Thread)):
+            await inter.followup.send("❌ Home-Zielchannel wurde nicht gefunden oder ist kein Textkanal.", ephemeral=True)
+            return
+
+        obj = {
+            "scope": "alliance",
+            "alliance_group": str(group_obj.get("name", group)),
+            "guild_id": int(inter.guild.id),
+            "channel_id": int(home_channel.id),
+            "title": title.strip(),
+            "description": (description or "").strip(),
+            "when_iso": when.isoformat(),
+            "image_url": (image_url or "").strip() or None,
+            "yes": {"TANK": [], "HEAL": [], "DPS": [], "BANK": []},
+            "maybe": {},
+            "no": [],
+            "target_role_id": int(target_role.id) if target_role else 0,
+            "dm_messages": {},
+            "mirrors": [],
+        }
+
+        # Erst Home-Post erstellen, damit dessen Message-ID die Master-ID wird.
+        home_emb = build_embed(inter.guild, obj)
+        home_msg = await home_channel.send(embed=home_emb)
+        master_id = int(home_msg.id)
+        obj["message_id"] = master_id
+
+        obj["mirrors"].append({
+            "guild_id": int(inter.guild.id),
+            "discord_name": inter.guild.name,
+            "label": str(home_server.get("label", inter.guild.name)),
+            "channel_id": int(home_channel.id),
+            "channel_name": getattr(home_channel, "name", ""),
+            "message_id": master_id,
+            "send_dm": bool(home_server.get("send_dm", True)),
+            "home": True,
+        })
+
+        store[str(master_id)] = obj
+        save_store()
+
+        try:
+            await home_msg.edit(view=ServerRaidView(master_id))
+        except Exception:
+            pass
+
+        posted = [f"✅ **{inter.guild.name}** → {home_channel.mention}"]
+        failed = []
+
+        # Partner-Posts erstellen. DMs werden dort nicht verschickt.
+        for guild_id_str, server_cfg in servers.items():
+            try:
+                gid = int(guild_id_str)
+
+                if gid == inter.guild.id:
+                    continue
+
+                guild = inter.client.get_guild(gid)
+
+                if not guild:
+                    failed.append(f"❌ `{server_cfg.get('label', guild_id_str)}` — Bot sieht den Server nicht")
+                    continue
+
+                ch = guild.get_channel(int(server_cfg.get("channel_id", 0) or 0))
+
+                if not isinstance(ch, (discord.TextChannel, discord.Thread)):
+                    failed.append(f"❌ `{server_cfg.get('label', guild.name)}` — Channel nicht gefunden")
+                    continue
+
+                emb = build_embed(guild, obj)
+                msg = await ch.send(embed=emb, view=ServerRaidView(master_id))
+
+                obj["mirrors"].append({
+                    "guild_id": int(guild.id),
+                    "discord_name": guild.name,
+                    "label": str(server_cfg.get("label", guild.name)),
+                    "channel_id": int(ch.id),
+                    "channel_name": getattr(ch, "name", ""),
+                    "message_id": int(msg.id),
+                    "send_dm": False,
+                    "home": False,
+                })
+
+                posted.append(f"✅ **{server_cfg.get('label', guild.name)}** → <#{ch.id}>")
+                await asyncio.sleep(0.15)
+
+            except Exception as e:
+                failed.append(f"❌ `{server_cfg.get('label', guild_id_str)}` — {e}")
+
+        sent = 0
+        skipped_opt_out = 0
+
+        if bool(home_server.get("send_dm", True)):
+            sent, skipped_opt_out = await _send_home_dms_for_alliance_event(
+                inter.guild,
+                obj,
+                master_id,
+                f"Allianz-Übersicht im Server: #{getattr(home_channel, 'name', 'raid')}"
+            )
+
+        store[str(master_id)] = obj
+        save_store()
+
+        # Nach dem Speichern nochmal alle Mirror-Posts mit vollständiger Mirror-Liste aktualisieren.
+        await _push_overview(inter.client, str(master_id), obj)
+
+        result = (
+            f"✅ Allianz-Raid erstellt.\n"
+            f"Gruppe: **{group_obj.get('name', group)}**\n"
+            f"Master-Message-ID: `{master_id}`\n"
+            f"✉️ Home-DMs versendet: **{sent}**\n"
+            f"🔕 Home-Opt-out übersprungen: **{skipped_opt_out}**\n\n"
+            f"**Gepostet:**\n" + "\n".join(posted)
+        )
+
+        if failed:
+            result += "\n\n**Fehler:**\n" + "\n".join(failed)
+
+        if len(result) > 1900:
+            result = result[:1850] + "\n… gekürzt"
+
+        await inter.followup.send(result, ephemeral=True)
 
     @tree.command(name="raid_resend_missing", description="(Admin) DMs an alle, die noch nicht abgestimmt haben")
     async def raid_resend_missing(inter: discord.Interaction, message_id: str):
