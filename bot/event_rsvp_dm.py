@@ -153,17 +153,31 @@ def _entry_name(entry: Any, guild: Optional[discord.Guild] = None) -> str:
     return f"User {uid}"
 
 
+def _short_guild_label(label: str) -> str:
+    label = (label or "").strip()
+
+    if not label:
+        return ""
+
+    clean = "".join(ch for ch in label if ch.isalnum())
+
+    if len(clean) <= 4:
+        return clean
+
+    return clean[:3].title()
+
+
 def _entry_display_name(entry: Any, guild: Optional[discord.Guild] = None) -> str:
     name = _entry_name(entry, guild)
 
     if isinstance(entry, dict):
         label = str(entry.get("guild_label", "") or "").strip()
+        short = _short_guild_label(label)
 
-        if label:
-            return f"{name} [{label}]"
+        if short:
+            return f"{name} ({short})"
 
     return name
-
 
 def _source_label_for_inter(inter: discord.Interaction, obj: dict) -> tuple[str, int]:
     source_guild_id = int(inter.guild_id or 0)
@@ -174,7 +188,7 @@ def _source_label_for_inter(inter: discord.Interaction, obj: dict) -> tuple[str,
     for mirror in obj.get("mirrors", []) or []:
         try:
             if int(mirror.get("guild_id", 0) or 0) == source_guild_id:
-                return str(mirror.get("label", "") or mirror.get("discord_name", "") or "").strip(), source_guild_id
+                return str(mirror.get("short_label", "") or mirror.get("label", "") or mirror.get("discord_name", "") or "").strip(), source_guild_id
         except Exception:
             continue
 
@@ -273,10 +287,21 @@ def _init_event_shape(obj: dict):
 
         for raw in obj["yes"].get(role_key, []):
             if isinstance(raw, dict):
-                new_list.append({
+                entry = {
                     "id": int(raw.get("id", 0) or 0),
-                    "name": _safe_name(str(raw.get("name", "") or f"User {raw.get('id', 0)}"))
-                })
+                    "name": _safe_name(str(raw.get("name", "") or f"User {raw.get('id', 0)}")),
+                }
+
+                guild_label = str(raw.get("guild_label", "") or "").strip()
+                source_guild_id = int(raw.get("source_guild_id", 0) or 0)
+
+                if guild_label:
+                    entry["guild_label"] = guild_label
+
+                if source_guild_id:
+                    entry["source_guild_id"] = source_guild_id
+
+                new_list.append(entry)
             else:
                 try:
                     uid = int(raw)
@@ -297,11 +322,22 @@ def _init_event_shape(obj: dict):
             continue
 
         if isinstance(raw, dict):
-            maybe_new[str(uid_i)] = {
+            entry = {
                 "id": uid_i,
                 "name": _safe_name(str(raw.get("name", "") or f"User {uid_i}")),
-                "label": str(raw.get("label", "") or "").strip()
+                "label": str(raw.get("label", "") or "").strip(),
             }
+
+            guild_label = str(raw.get("guild_label", "") or "").strip()
+            source_guild_id = int(raw.get("source_guild_id", 0) or 0)
+
+            if guild_label:
+                entry["guild_label"] = guild_label
+
+            if source_guild_id:
+                entry["source_guild_id"] = source_guild_id
+
+            maybe_new[str(uid_i)] = entry
         else:
             maybe_new[str(uid_i)] = _maybe_entry(
                 uid_i,
@@ -317,10 +353,21 @@ def _init_event_shape(obj: dict):
 
     for raw in obj.get("no", []):
         if isinstance(raw, dict):
-            no_new.append({
+            entry = {
                 "id": int(raw.get("id", 0) or 0),
-                "name": _safe_name(str(raw.get("name", "") or f"User {raw.get('id', 0)}"))
-            })
+                "name": _safe_name(str(raw.get("name", "") or f"User {raw.get('id', 0)}")),
+            }
+
+            guild_label = str(raw.get("guild_label", "") or "").strip()
+            source_guild_id = int(raw.get("source_guild_id", 0) or 0)
+
+            if guild_label:
+                entry["guild_label"] = guild_label
+
+            if source_guild_id:
+                entry["source_guild_id"] = source_guild_id
+
+            no_new.append(entry)
         else:
             try:
                 uid = int(raw)
@@ -483,7 +530,8 @@ def build_embed(guild: discord.Guild, obj: dict) -> discord.Embed:
         name, label = _maybe_name_and_label(entry, uid_i, guild)
         guild_label = str(entry.get("guild_label", "") or "").strip() if isinstance(entry, dict) else ""
         if guild_label:
-            name = f"{name} [{guild_label}]"
+            short = _short_guild_label(guild_label)
+            name = f"{name} ({short})" if short else name
         label_txt = f" ({label})" if label else ""
         maybe_lines.append(f"{name}{label_txt}")
 
@@ -1313,6 +1361,7 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
             "guild_id": int(inter.guild.id),
             "discord_name": inter.guild.name,
             "label": str(home_server.get("label", inter.guild.name)),
+            "short_label": str(home_server.get("short_label", home_server.get("label", inter.guild.name))),
             "channel_id": int(home_channel.id),
             "channel_name": getattr(home_channel, "name", ""),
             "message_id": master_id,
@@ -1358,6 +1407,7 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
                     "guild_id": int(guild.id),
                     "discord_name": guild.name,
                     "label": str(server_cfg.get("label", guild.name)),
+                    "short_label": str(server_cfg.get("short_label", server_cfg.get("label", guild.name))),
                     "channel_id": int(ch.id),
                     "channel_name": getattr(ch, "name", ""),
                     "message_id": int(msg.id),
