@@ -31,6 +31,7 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 RSVP_FILE = DATA_DIR / "event_rsvp.json"
 DM_CFG_FILE = DATA_DIR / "event_rsvp_cfg.json"
+LEADER_CONTACT_CFG_FILE = DATA_DIR / "leader_contact_cfg.json"
 
 
 def _load(p: Path, default):
@@ -1054,6 +1055,56 @@ def _is_admin(inter: discord.Interaction) -> bool:
     return bool(perms and (perms.administrator or perms.manage_guild))
 
 
+def _is_leader_or_admin(inter: discord.Interaction) -> bool:
+    if _is_admin(inter):
+        return True
+
+    if inter.guild is None or not isinstance(inter.user, discord.Member):
+        return False
+
+    try:
+        leader_cfg = _load(LEADER_CONTACT_CFG_FILE, {})
+        c = leader_cfg.get(str(inter.guild.id)) or {}
+        role_id = int(c.get("leader_role_id", 0) or 0)
+
+        if not role_id:
+            return False
+
+        role = inter.guild.get_role(role_id)
+        return bool(role and role in inter.user.roles)
+
+    except Exception:
+        return False
+
+
+def _alliance_home_guild_id(default: int = 0) -> int:
+    try:
+        try:
+            from bot.alliance_config import _home_guild_id  # type: ignore
+        except ModuleNotFoundError:
+            from alliance_config import _home_guild_id  # type: ignore
+
+        return int(_home_guild_id(default=default) or default or 0)
+
+    except Exception:
+        return int(default or 0)
+
+
+def _require_alliance_home_leader(inter: discord.Interaction) -> tuple[bool, str]:
+    if inter.guild is None or inter.guild_id is None:
+        return False, "❌ Nur im Server nutzbar."
+
+    home_id = _alliance_home_guild_id(default=inter.guild_id)
+
+    if int(inter.guild_id) != int(home_id):
+        return False, "❌ Allianz-Raids können nur auf dem Home-/Ebolus-Server erstellt werden."
+
+    if not _is_leader_or_admin(inter):
+        return False, "❌ Nur Leader/Admins."
+
+    return True, ""
+
+
 def _import_alliance_config():
     try:
         from bot.alliance_config import get_alliance_group  # type: ignore
@@ -1288,8 +1339,10 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
             await inter.followup.send("❌ Nur im Server nutzbar.", ephemeral=True)
             return
 
-        if not _is_admin(inter):
-            await inter.followup.send("❌ Nur Admin/Manage Server.", ephemeral=True)
+        ok, msg = _require_alliance_home_leader(inter)
+
+        if not ok:
+            await inter.followup.send(msg, ephemeral=True)
             return
 
         try:
@@ -1455,6 +1508,33 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
 
         await inter.followup.send(result, ephemeral=True)
 
+
+    @tree.command(name="alliance_raid_template", description="(Leader) Zeigt Copy-Paste-Vorlagen für Allianz-Raids")
+    async def alliance_raid_template(inter: discord.Interaction):
+        await inter.response.defer(ephemeral=True, thinking=False)
+
+        ok, msg = _require_alliance_home_leader(inter)
+
+        if not ok:
+            await inter.followup.send(msg, ephemeral=True)
+            return
+
+        text = (
+            "**🤝 Allianz-Raid Vorlagen**\n\n"
+            "**HM Raid:**\n"
+            "`/alliance_raid_create group:HM Raid Allianz title:HM Raid date:2026-05-30 time:21:00 description:HM Raid – bitte Rolle wählen`\n\n"
+            "**Gildenbosse:**\n"
+            "`/alliance_raid_create group:Gildenboss Allianz title:Gildenbosse date:2026-05-30 time:20:00 description:Gildenbosse – Anmeldung für Loot-/Needübersicht`\n\n"
+            "**PvP Event:**\n"
+            "`/alliance_raid_create group:PvP Allianz title:Allianz PvP date:2026-05-30 time:20:30 description:Allianz-PvP – bitte anmelden`\n\n"
+            "**Mit Zielrolle für Home-DMs:**\n"
+            "`/alliance_raid_create group:HM Raid Allianz title:HM Raid date:2026-05-30 time:21:00 description:HM Raid target_role:@Raid`\n\n"
+            "**Hinweis:**\n"
+            "Partner-Server bekommen keine DMs. Dort läuft nur der Channel-Post mit Buttons."
+        )
+
+        await inter.followup.send(text, ephemeral=True)
+
     @tree.command(name="raid_resend_missing", description="(Admin) DMs an alle, die noch nicht abgestimmt haben")
     async def raid_resend_missing(inter: discord.Interaction, message_id: str):
         await inter.response.defer(ephemeral=True, thinking=True)
@@ -1599,31 +1679,66 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
 
         obj = store.get(str(message_id))
 
-        if not obj or int(obj.get("guild_id", 0) or 0) != inter.guild_id:
+        if not obj:
             await inter.followup.send("❌ Unbekanntes Event/Message-ID.", ephemeral=True)
             return
 
         _init_event_shape(obj)
 
-        deleted_server = False
+        if int(obj.get("guild_id", 0) or 0) != inter.guild_id:
+            await inter.followup.send("❌ Dieses Event gehört nicht zu diesem Home-Server.", ephemeral=True)
+            return
+
+        deleted_posts = 0
+        failed_posts = []
         deleted_dms = 0
 
-        guild = inter.guild
-
-        try:
-            ch = guild.get_channel(int(obj["channel_id"]))
-
-            if isinstance(ch, (discord.TextChannel, discord.Thread)):
+        # Serverposts löschen.
+        if _is_alliance_event(obj) and obj.get("mirrors"):
+            for mirror in list(obj.get("mirrors") or []):
                 try:
-                    msg = await ch.fetch_message(int(message_id))
-                    await msg.delete()
-                    deleted_server = True
-                except Exception:
-                    pass
+                    guild = inter.client.get_guild(int(mirror.get("guild_id", 0) or 0))
 
-        except Exception:
-            pass
+                    if not guild:
+                        failed_posts.append(f"{mirror.get('label', 'Unbekannt')} — Server nicht gefunden")
+                        continue
 
+                    ch = guild.get_channel(int(mirror.get("channel_id", 0) or 0))
+
+                    if not isinstance(ch, (discord.TextChannel, discord.Thread)):
+                        failed_posts.append(f"{mirror.get('label', guild.name)} — Channel nicht gefunden")
+                        continue
+
+                    try:
+                        msg = await ch.fetch_message(int(mirror.get("message_id", 0) or 0))
+                        await msg.delete()
+                        deleted_posts += 1
+                    except Exception:
+                        failed_posts.append(f"{mirror.get('label', guild.name)} — Post nicht gefunden oder keine Rechte")
+
+                    await asyncio.sleep(0.05)
+
+                except Exception as e:
+                    failed_posts.append(f"{mirror.get('label', 'Unbekannt')} — {e}")
+
+        else:
+            guild = inter.guild
+
+            try:
+                ch = guild.get_channel(int(obj["channel_id"]))
+
+                if isinstance(ch, (discord.TextChannel, discord.Thread)):
+                    try:
+                        msg = await ch.fetch_message(int(message_id))
+                        await msg.delete()
+                        deleted_posts += 1
+                    except Exception:
+                        failed_posts.append("Serverpost nicht gefunden oder keine Rechte")
+
+            except Exception as e:
+                failed_posts.append(str(e))
+
+        # DMs löschen.
         for uid_str in list((obj.get("dm_messages") or {}).keys()):
             try:
                 uid = int(uid_str)
@@ -1640,12 +1755,19 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
         store.pop(str(message_id), None)
         save_store()
 
-        await inter.followup.send(
+        text = (
             f"✅ Raid/Event gelöscht.\n"
-            f"🧾 Server-Post gelöscht: {'Ja' if deleted_server else 'Nein / nicht gefunden'}\n"
-            f"✉️ DMs gelöscht: {deleted_dms}",
-            ephemeral=True
+            f"🧾 Serverposts gelöscht: **{deleted_posts}**\n"
+            f"✉️ DMs gelöscht: **{deleted_dms}**"
         )
+
+        if failed_posts:
+            text += "\n\n⚠️ Nicht gelöscht:\n" + "\n".join(f"• {x}" for x in failed_posts[:10])
+
+        if len(text) > 1900:
+            text = text[:1850] + "\n… gekürzt"
+
+        await inter.followup.send(text, ephemeral=True)
 
 
 async def auto_resend_for_new_member(member: discord.Member) -> None:
