@@ -660,7 +660,7 @@ async def setup_alliance_config(client: discord.Client, tree: app_commands.Comma
             ephemeral=True
         )
 
-    @tree.command(name="alliance_partner_event_channel_set", description="(Partner-Admin) Eventtyp-Channel für diesen Partner-Server setzen")
+    @tree.command(name="alliance_partner_channel_set", description="(Partner-Admin) Eventtyp-Channel für diesen Partner-Server setzen")
     async def alliance_partner_event_channel_set(inter: discord.Interaction, group: str, event_type: str, channel: discord.TextChannel):
         ok, msg = _require_partner_admin(inter)
         if not ok:
