@@ -795,6 +795,152 @@ async def _send_embed_response(
         await inter.followup.send(embed=embed, ephemeral=not public)
 
 
+def _loot_leader_channel(guild: discord.Guild) -> Optional[discord.abc.Messageable]:
+    c = _gcfg(guild.id)
+    ch_id = int(c.get("leader_channel_id", 0) or 0)
+
+    if not ch_id:
+        leader_cfg = _load_leader_cfg()
+        lc = leader_cfg.get(str(guild.id)) or {}
+        ch_id = int(lc.get("internal_channel_id", 0) or 0)
+
+    if not ch_id:
+        return None
+
+    ch = guild.get_channel(ch_id)
+
+    if isinstance(ch, (discord.TextChannel, discord.Thread)):
+        return ch
+
+    return None
+
+
+def _received_request_footer(guild_id: int, user_id: int, tab: str, slot: str) -> str:
+    return f"loot_received_request|{int(guild_id)}|{int(user_id)}|{tab}|{slot}"
+
+
+def _parse_received_request_footer(text: str) -> Optional[tuple[int, int, str, str]]:
+    raw = str(text or "").strip()
+
+    if not raw.startswith("loot_received_request|"):
+        return None
+
+    parts = raw.split("|")
+
+    if len(parts) != 5:
+        return None
+
+    try:
+        guild_id = int(parts[1])
+        user_id = int(parts[2])
+        tab = _normalize_tab(parts[3])
+        slot = _normalize_need_slot(parts[4])
+
+        if not tab or not slot:
+            return None
+
+        return guild_id, user_id, tab, slot
+
+    except Exception:
+        return None
+
+
+async def _send_received_request(
+    inter: discord.Interaction,
+    guild: discord.Guild,
+    user_id: int,
+    tab: str,
+    slot: str
+) -> bool:
+    ch = _loot_leader_channel(guild)
+
+    if not ch:
+        await inter.response.edit_message(
+            embed=discord.Embed(
+                title="❌ Leaderkanal fehlt",
+                description=(
+                    "Es ist kein Leader-/Loot-Kanal gesetzt.\n\n"
+                    "Die Gildenleitung muss zuerst einen Kanal setzen:\n"
+                    "`/loot_set_leader_channel channel:#gildenleitung`"
+                ),
+                color=discord.Color.red()
+            ),
+            view=NeedMainView(guild.id, user_id)
+        )
+        return False
+
+    data = _user_needs(guild.id, user_id)
+    slot_data = _slot_obj(data.get(tab, {}).get(slot))
+    item_id = str(slot_data.get("item_id", "") or "")
+
+    if not item_id:
+        await inter.response.edit_message(
+            embed=discord.Embed(
+                title="❌ Kein Item eingetragen",
+                description=f"In **{tab} – {slot}** ist aktuell kein Item eingetragen.",
+                color=discord.Color.orange()
+            ),
+            view=NeedMainView(guild.id, user_id)
+        )
+        return False
+
+    if bool(slot_data.get("received", False)):
+        await inter.response.edit_message(
+            embed=discord.Embed(
+                title="🔒 Bereits erhalten",
+                description=f"**{tab} – {slot}** ist bereits als erhalten markiert.",
+                color=discord.Color.orange()
+            ),
+            view=NeedMainView(guild.id, user_id)
+        )
+        return False
+
+    member = guild.get_member(user_id)
+    player_name = _profile_name(guild, user_id, member.display_name if member else "Unbekannt")
+    item_name = _item_name(guild.id, item_id, with_type=True)
+
+    emb = discord.Embed(
+        title="🎁 Item erhalten gemeldet",
+        description=(
+            f"**{player_name}** meldet ein Item als erhalten.\n\n"
+            f"**Bereich:** {tab}\n"
+            f"**Slot:** {slot}\n"
+            f"**Item:** {item_name}\n\n"
+            "Bitte bestätigen oder ablehnen."
+        ),
+        color=discord.Color.gold(),
+        timestamp=datetime.now(TZ)
+    )
+    emb.set_footer(text=_received_request_footer(guild.id, user_id, tab, slot))
+
+    try:
+        await ch.send(embed=emb, view=ReceivedReportReviewView())
+    except Exception as e:
+        await inter.response.edit_message(
+            embed=discord.Embed(
+                title="❌ Meldung konnte nicht gesendet werden",
+                description=f"Fehler: `{e}`",
+                color=discord.Color.red()
+            ),
+            view=NeedMainView(guild.id, user_id)
+        )
+        return False
+
+    await inter.response.edit_message(
+        embed=discord.Embed(
+            title="✅ Erhalten-Meldung gesendet",
+            description=(
+                f"Deine Meldung wurde an die Gildenleitung geschickt.\n\n"
+                f"**{tab} – {slot}:** {item_name}\n\n"
+                "Sobald die Gildenleitung bestätigt, wird das Item als ✅ Erhalten markiert."
+            ),
+            color=discord.Color.gold()
+        ),
+        view=NeedMainView(guild.id, user_id)
+    )
+    return True
+
+
 async def _send_long_need_list(
     inter: discord.Interaction,
     guild: discord.Guild,
@@ -920,7 +1066,23 @@ class NeedMainView(View):
             view=NeedTabSelectView(self.guild_id, self.user_id, action="clear")
         )
 
-    @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="need_back_portal", row=2)
+    @button(label="✅ Erhalten melden", style=ButtonStyle.secondary, custom_id="need_report_received", row=2)
+    async def btn_report_received(self, inter: discord.Interaction, _):
+        emb = discord.Embed(
+            title="🎁 Item erhalten melden",
+            description=(
+                "Wähle zuerst, ob du ein Item aus **Main** oder **Secondary** als erhalten melden möchtest.\n\n"
+                "Die Meldung geht zur Gildenleitung und wird erst nach Bestätigung übernommen."
+            ),
+            color=discord.Color.gold()
+        )
+
+        await inter.response.edit_message(
+            embed=emb,
+            view=NeedTabSelectView(self.guild_id, self.user_id, action="report_received")
+        )
+
+    @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="need_back_portal", row=3)
     async def btn_back(self, inter: discord.Interaction, _):
         try:
             try:
@@ -982,11 +1144,18 @@ class NeedTabSelect(Select):
 
     async def callback(self, inter: discord.Interaction):
         tab = self.values[0]
-        action_text = "setzen" if self.action == "set" else "entfernen"
+        if self.action == "set":
+            action_text = "Item setzen"
+        elif self.action == "clear":
+            action_text = "Item entfernen"
+        elif self.action == "report_received":
+            action_text = "Item erhalten melden"
+        else:
+            action_text = "Aktion auswählen"
 
         emb = discord.Embed(
             title="🎁 Needliste – Slot wählen",
-            description=f"Bereich: **{tab}**\nAktion: **Item {action_text}**",
+            description=f"Bereich: **{tab}**\nAktion: **{action_text}**",
             color=discord.Color.gold()
         )
 
@@ -1077,6 +1246,29 @@ class NeedSlotSelect(Select):
                 )
             else:
                 await inter.response.send_message("✅ Eintrag entfernt.")
+            return
+
+        if self.action == "report_received":
+            guild = inter.client.get_guild(self.guild_id)
+
+            if not guild:
+                await inter.response.send_message("❌ Server nicht gefunden.")
+                return
+
+            item_id = str(current_slot.get("item_id", "") or "")
+
+            if not item_id:
+                await inter.response.edit_message(
+                    embed=discord.Embed(
+                        title="❌ Kein Item eingetragen",
+                        description=f"In **{self.tab} – {need_slot}** ist aktuell kein Item eingetragen.",
+                        color=discord.Color.orange()
+                    ),
+                    view=NeedMainView(self.guild_id, self.user_id)
+                )
+                return
+
+            await _send_received_request(inter, guild, self.user_id, self.tab, need_slot)
             return
 
         if _catalog_slot_for_need_slot(need_slot) == "Waffe":
@@ -1316,6 +1508,139 @@ class NeedItemSelect(Select):
         )
 
 
+class ReceivedReportReviewView(View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    def _get_request_data(self, inter: discord.Interaction) -> Optional[tuple[int, int, str, str]]:
+        try:
+            if not inter.message or not inter.message.embeds:
+                return None
+
+            footer = inter.message.embeds[0].footer.text or ""
+            return _parse_received_request_footer(footer)
+        except Exception:
+            return None
+
+    @button(label="✅ Bestätigen", style=ButtonStyle.success, custom_id="loot_received_confirm")
+    async def btn_confirm(self, inter: discord.Interaction, _):
+        data = self._get_request_data(inter)
+
+        if not data:
+            await inter.response.send_message("❌ Diese Meldung konnte nicht gelesen werden.", ephemeral=True)
+            return
+
+        guild_id, user_id, tab, slot = data
+
+        if inter.guild is None or inter.guild.id != guild_id:
+            await inter.response.send_message("❌ Falscher Server.", ephemeral=True)
+            return
+
+        if not _is_leader_or_admin(inter):
+            await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
+            return
+
+        guild = inter.guild
+        needs = _user_needs(guild.id, user_id)
+        slot_data = _slot_obj(needs.get(tab, {}).get(slot))
+        item_id = str(slot_data.get("item_id", "") or "")
+
+        if not item_id:
+            await inter.response.send_message("❌ Der Spieler hat in diesem Slot kein Item mehr eingetragen.", ephemeral=True)
+            return
+
+        item_name = _item_name(guild.id, item_id, with_type=True)
+
+        if bool(slot_data.get("received", False)):
+            await inter.response.send_message("ℹ️ Dieses Item ist bereits als erhalten markiert.", ephemeral=True)
+            return
+
+        _mark_slot_received(needs, tab, slot, inter.user.id)
+        save_needs()
+
+        member = guild.get_member(user_id)
+        player_name = _profile_name(guild, user_id, member.display_name if member else "Unbekannt")
+
+        emb = discord.Embed(
+            title="✅ Item erhalten bestätigt",
+            description=(
+                f"**{player_name}** wurde bestätigt.\n\n"
+                f"**Bereich:** {tab}\n"
+                f"**Slot:** {slot}\n"
+                f"**Item:** {item_name} ✅ Erhalten\n\n"
+                f"Bestätigt von: {inter.user.mention}"
+            ),
+            color=discord.Color.green(),
+            timestamp=datetime.now(TZ)
+        )
+        emb.set_footer(text=f"Bestätigt am {datetime.now(TZ).strftime('%d.%m.%Y %H:%M')}")
+
+        try:
+            if member:
+                await member.send(
+                    f"✅ Deine Meldung wurde bestätigt.\n"
+                    f"**{tab} – {slot}:** {item_name} ✅ Erhalten\n\n"
+                    f"Das Item bleibt in deiner Needliste sichtbar, zählt aber nicht mehr als offener Need."
+                )
+        except Exception:
+            pass
+
+        await inter.response.edit_message(embed=emb, view=None)
+
+    @button(label="❌ Ablehnen", style=ButtonStyle.danger, custom_id="loot_received_deny")
+    async def btn_deny(self, inter: discord.Interaction, _):
+        data = self._get_request_data(inter)
+
+        if not data:
+            await inter.response.send_message("❌ Diese Meldung konnte nicht gelesen werden.", ephemeral=True)
+            return
+
+        guild_id, user_id, tab, slot = data
+
+        if inter.guild is None or inter.guild.id != guild_id:
+            await inter.response.send_message("❌ Falscher Server.", ephemeral=True)
+            return
+
+        if not _is_leader_or_admin(inter):
+            await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
+            return
+
+        guild = inter.guild
+        needs = _user_needs(guild.id, user_id)
+        slot_data = _slot_obj(needs.get(tab, {}).get(slot))
+        item_id = str(slot_data.get("item_id", "") or "")
+        item_name = _item_name(guild.id, item_id, with_type=True) if item_id else "—"
+
+        member = guild.get_member(user_id)
+        player_name = _profile_name(guild, user_id, member.display_name if member else "Unbekannt")
+
+        emb = discord.Embed(
+            title="❌ Item-erhalten-Meldung abgelehnt",
+            description=(
+                f"Die Meldung von **{player_name}** wurde abgelehnt.\n\n"
+                f"**Bereich:** {tab}\n"
+                f"**Slot:** {slot}\n"
+                f"**Item:** {item_name}\n\n"
+                f"Abgelehnt von: {inter.user.mention}"
+            ),
+            color=discord.Color.red(),
+            timestamp=datetime.now(TZ)
+        )
+        emb.set_footer(text=f"Abgelehnt am {datetime.now(TZ).strftime('%d.%m.%Y %H:%M')}")
+
+        try:
+            if member:
+                await member.send(
+                    f"❌ Deine Item-erhalten-Meldung wurde abgelehnt.\n"
+                    f"**{tab} – {slot}:** {item_name}\n\n"
+                    f"Deine Needliste wurde nicht geändert."
+                )
+        except Exception:
+            pass
+
+        await inter.response.edit_message(embed=emb, view=None)
+
+
 def _catalog_slot_choices():
     return [
         app_commands.Choice(name=s, value=s)
@@ -1463,6 +1788,11 @@ async def auto_loot_need_eventstart():
 async def setup_loot_needs(client: discord.Client, tree: app_commands.CommandTree):
     global _client_ref
     _client_ref = client
+
+    try:
+        client.add_view(ReceivedReportReviewView())
+    except Exception:
+        pass
 
     if not auto_loot_need_eventstart.is_running():
         auto_loot_need_eventstart.start()
