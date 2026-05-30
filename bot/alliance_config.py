@@ -49,6 +49,12 @@ def _normalize_key(name: str) -> str:
     )
 
 
+def _clean_short_label(value: str) -> str:
+    value = (value or "").strip()
+    value = "".join(ch for ch in value if ch.isalnum())
+    return value[:6]
+
+
 def _alliance_root() -> dict:
     root = alliance_cfg.setdefault("_global", {})
     root.setdefault("home_guild_id", 0)
@@ -139,13 +145,14 @@ def _require_partner_admin(inter: discord.Interaction) -> tuple[bool, str]:
 def _server_line(guild_id: str, s: dict) -> str:
     ch_id = int(s.get("channel_id", 0) or 0)
     label = s.get("label", "Unbenannt")
+    short_label = s.get("short_label", "—")
     server_name = s.get("discord_name", "Unbekannter Discord")
     dms = "Ja" if s.get("send_dm", False) else "Nein"
     partner = "Ja" if s.get("partner_registered", False) else "Nein"
     channel_txt = f"<#{ch_id}>" if ch_id else "—"
 
     return (
-        f"• **{label}**\n"
+        f"• **{label}** ({short_label})\n"
         f"  Discord: `{server_name}`\n"
         f"  Server-ID: `{guild_id}`\n"
         f"  Channel: {channel_txt}\n"
@@ -184,82 +191,49 @@ async def setup_alliance_config(client: discord.Client, tree: app_commands.Comma
         home_guild = client.get_guild(home_id) if home_id else None
         groups = _groups()
 
-        emb = discord.Embed(
-            title="🤝 Allianz-Konfiguration",
-            color=discord.Color.blurple()
-        )
-
+        emb = discord.Embed(title="🤝 Allianz-Konfiguration", color=discord.Color.blurple())
         emb.add_field(
             name="Home-/Ebolus-Server",
             value=f"{home_guild.name if home_guild else 'Unbekannt / nicht gesetzt'} `{home_id or '—'}`",
             inline=False
         )
-
-        emb.add_field(
-            name="Allianz-Gruppen",
-            value=str(len(groups)),
-            inline=True
-        )
-
-        emb.add_field(
-            name="Dieser Server",
-            value=f"{inter.guild.name} `{inter.guild.id}`",
-            inline=False
-        )
-
+        emb.add_field(name="Allianz-Gruppen", value=str(len(groups)), inline=True)
+        emb.add_field(name="Dieser Server", value=f"{inter.guild.name} `{inter.guild.id}`", inline=False)
         await inter.response.send_message(embed=emb, ephemeral=True)
 
     @tree.command(name="alliance_group_create", description="(Leader) Allianz-Gruppe anlegen")
     async def alliance_group_create(inter: discord.Interaction, name: str):
         ok, msg = _require_home_leader(inter)
-
         if not ok:
             await inter.response.send_message(msg, ephemeral=True)
             return
 
         key = _normalize_key(name)
-
         if not key:
             await inter.response.send_message("❌ Gruppenname ungültig.", ephemeral=True)
             return
 
         groups = _groups()
-
         if key in groups:
             await inter.response.send_message("⚠️ Diese Allianz-Gruppe existiert bereits.", ephemeral=True)
             return
 
-        groups[key] = {
-            "name": name.strip(),
-            "created_by": int(inter.user.id),
-            "servers": {}
-        }
-
+        groups[key] = {"name": name.strip(), "created_by": int(inter.user.id), "servers": {}}
         save_alliance_cfg()
-
-        await inter.response.send_message(
-            f"✅ Allianz-Gruppe erstellt:\n**{name.strip()}**\nKey: `{key}`",
-            ephemeral=True
-        )
+        await inter.response.send_message(f"✅ Allianz-Gruppe erstellt:\n**{name.strip()}**\nKey: `{key}`", ephemeral=True)
 
     @tree.command(name="alliance_group_delete", description="(Leader) Allianz-Gruppe löschen")
     async def alliance_group_delete(inter: discord.Interaction, group: str, confirm: str):
         ok, msg = _require_home_leader(inter)
-
         if not ok:
             await inter.response.send_message(msg, ephemeral=True)
             return
-
         if confirm != "DELETE":
-            await inter.response.send_message(
-                "❌ Sicherheitswort falsch.\nNutze `confirm:DELETE`.",
-                ephemeral=True
-            )
+            await inter.response.send_message("❌ Sicherheitswort falsch.\nNutze `confirm:DELETE`.", ephemeral=True)
             return
 
         key = _normalize_key(group)
         groups = _groups()
-
         if key not in groups:
             await inter.response.send_message("❌ Allianz-Gruppe nicht gefunden.", ephemeral=True)
             return
@@ -267,7 +241,6 @@ async def setup_alliance_config(client: discord.Client, tree: app_commands.Comma
         old_name = groups[key].get("name", key)
         groups.pop(key, None)
         save_alliance_cfg()
-
         await inter.response.send_message(
             f"✅ Allianz-Gruppe gelöscht:\n**{old_name}**\n\nAlte Events werden dadurch nicht rückwirkend gelöscht.",
             ephemeral=True
@@ -276,58 +249,39 @@ async def setup_alliance_config(client: discord.Client, tree: app_commands.Comma
     @tree.command(name="alliance_group_list", description="(Leader) Allianz-Gruppen anzeigen")
     async def alliance_group_list(inter: discord.Interaction):
         ok, msg = _require_home_leader(inter)
-
         if not ok:
             await inter.response.send_message(msg, ephemeral=True)
             return
 
         groups = list_alliance_groups()
-
         if not groups:
             await inter.response.send_message("📋 Keine Allianz-Gruppen angelegt.", ephemeral=True)
             return
 
         lines = []
-
         for key, group in groups.items():
             servers = group.get("servers") or {}
             lines.append(f"• **{group.get('name', key)}** `/{key}` — Server: **{len(servers)}**")
 
-        emb = discord.Embed(
-            title="🤝 Allianz-Gruppen",
-            description="\n".join(lines),
-            color=discord.Color.blurple()
-        )
-
+        emb = discord.Embed(title="🤝 Allianz-Gruppen", description="\n".join(lines), color=discord.Color.blurple())
         await inter.response.send_message(embed=emb, ephemeral=True)
 
     @tree.command(name="alliance_group_show", description="(Leader) Allianz-Gruppe anzeigen")
     async def alliance_group_show(inter: discord.Interaction, group: str):
         ok, msg = _require_home_leader(inter)
-
         if not ok:
             await inter.response.send_message(msg, ephemeral=True)
             return
 
         key = _normalize_key(group)
         obj = _group_obj(key)
-
         if not obj:
             await inter.response.send_message("❌ Allianz-Gruppe nicht gefunden.", ephemeral=True)
             return
 
         servers = obj.get("servers") or {}
-
-        emb = discord.Embed(
-            title=f"🤝 Allianz-Gruppe: {obj.get('name', key)}",
-            color=discord.Color.blurple()
-        )
-
-        if not servers:
-            emb.description = "Noch keine Discord-Server in dieser Gruppe."
-        else:
-            emb.description = "\n\n".join(_server_line(guild_id, s) for guild_id, s in servers.items())
-
+        emb = discord.Embed(title=f"🤝 Allianz-Gruppe: {obj.get('name', key)}", color=discord.Color.blurple())
+        emb.description = "Noch keine Discord-Server in dieser Gruppe." if not servers else "\n\n".join(_server_line(guild_id, s) for guild_id, s in servers.items())
         await inter.response.send_message(embed=emb, ephemeral=True)
 
     @tree.command(name="alliance_server_add_home", description="(Leader) Home-/Ebolus-Server zu Allianz-Gruppe hinzufügen")
@@ -335,24 +289,27 @@ async def setup_alliance_config(client: discord.Client, tree: app_commands.Comma
         inter: discord.Interaction,
         group: str,
         label: str,
+        short_label: str,
         channel: discord.TextChannel,
         send_dm: bool = True
     ):
         ok, msg = _require_home_leader(inter)
-
         if not ok:
             await inter.response.send_message(msg, ephemeral=True)
             return
 
+        short = _clean_short_label(short_label)
+        if not short:
+            await inter.response.send_message("❌ short_label darf nur Buchstaben/Zahlen enthalten, z. B. `EB`.", ephemeral=True)
+            return
+
         key = _normalize_key(group)
         groups = _groups()
-
         if key not in groups:
             await inter.response.send_message("❌ Allianz-Gruppe nicht gefunden.", ephemeral=True)
             return
 
         target_guild = channel.guild
-
         if target_guild.id != inter.guild.id:
             await inter.response.send_message("❌ Für Home-Add muss der Channel auf diesem Server liegen.", ephemeral=True)
             return
@@ -362,6 +319,7 @@ async def setup_alliance_config(client: discord.Client, tree: app_commands.Comma
             "guild_id": int(target_guild.id),
             "discord_name": target_guild.name,
             "label": label.strip() or target_guild.name,
+            "short_label": short,
             "channel_id": int(channel.id),
             "channel_name": channel.name,
             "send_dm": bool(send_dm),
@@ -369,13 +327,12 @@ async def setup_alliance_config(client: discord.Client, tree: app_commands.Comma
             "partner_registered": False,
             "added_by": int(inter.user.id),
         }
-
         save_alliance_cfg()
-
         await inter.response.send_message(
             f"✅ Home-Server zur Allianz-Gruppe hinzugefügt:\n"
             f"Gruppe: **{groups[key].get('name', key)}**\n"
             f"Label: **{label.strip() or target_guild.name}**\n"
+            f"Kürzel: **{short}**\n"
             f"Discord: **{target_guild.name}**\n"
             f"Channel: {channel.mention}\n"
             f"DMs: **{'AN' if send_dm else 'AUS'}**",
@@ -387,35 +344,31 @@ async def setup_alliance_config(client: discord.Client, tree: app_commands.Comma
         inter: discord.Interaction,
         group: str,
         label: str,
+        short_label: str,
         channel: discord.TextChannel
     ):
         ok, msg = _require_partner_admin(inter)
-
         if not ok:
             await inter.response.send_message(msg, ephemeral=True)
             return
-
         if inter.guild is None:
             await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
             return
 
-        home_id = _home_guild_id()
+        short = _clean_short_label(short_label)
+        if not short:
+            await inter.response.send_message("❌ short_label darf nur Buchstaben/Zahlen enthalten, z. B. `Ga`.", ephemeral=True)
+            return
 
+        home_id = _home_guild_id()
         if not home_id:
-            await inter.response.send_message(
-                "❌ Home-/Ebolus-Server ist noch nicht gesetzt. Auf Ebolus zuerst `/alliance_home_set` ausführen.",
-                ephemeral=True
-            )
+            await inter.response.send_message("❌ Home-/Ebolus-Server ist noch nicht gesetzt. Auf Ebolus zuerst `/alliance_home_set` ausführen.", ephemeral=True)
             return
 
         key = _normalize_key(group)
         groups = _groups()
-
         if key not in groups:
-            await inter.response.send_message(
-                "❌ Allianz-Gruppe nicht gefunden. Die Gruppe muss zuerst auf dem Ebolus-Server angelegt werden.",
-                ephemeral=True
-            )
+            await inter.response.send_message("❌ Allianz-Gruppe nicht gefunden. Die Gruppe muss zuerst auf dem Ebolus-Server angelegt werden.", ephemeral=True)
             return
 
         if channel.guild.id != inter.guild.id:
@@ -427,6 +380,7 @@ async def setup_alliance_config(client: discord.Client, tree: app_commands.Comma
             "guild_id": int(inter.guild.id),
             "discord_name": inter.guild.name,
             "label": label.strip() or inter.guild.name,
+            "short_label": short,
             "channel_id": int(channel.id),
             "channel_name": channel.name,
             "send_dm": False,
@@ -434,13 +388,12 @@ async def setup_alliance_config(client: discord.Client, tree: app_commands.Comma
             "partner_registered": True,
             "registered_by": int(inter.user.id),
         }
-
         save_alliance_cfg()
-
         await inter.response.send_message(
             f"✅ Partner-Discord registriert:\n"
             f"Gruppe: **{groups[key].get('name', key)}**\n"
             f"Label: **{label.strip() or inter.guild.name}**\n"
+            f"Kürzel: **{short}**\n"
             f"Channel: {channel.mention}\n\n"
             f"DMs sind für Partner-Server automatisch **AUS**.",
             ephemeral=True
@@ -449,63 +402,48 @@ async def setup_alliance_config(client: discord.Client, tree: app_commands.Comma
     @tree.command(name="alliance_partner_unregister", description="(Partner-Admin) Diesen Discord aus einer Allianz-Gruppe entfernen")
     async def alliance_partner_unregister(inter: discord.Interaction, group: str, confirm: str):
         ok, msg = _require_partner_admin(inter)
-
         if not ok:
             await inter.response.send_message(msg, ephemeral=True)
             return
-
         if inter.guild is None:
             await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
             return
-
         if confirm != "REMOVE":
-            await inter.response.send_message(
-                "❌ Sicherheitswort falsch.\nNutze `confirm:REMOVE`.",
-                ephemeral=True
-            )
+            await inter.response.send_message("❌ Sicherheitswort falsch.\nNutze `confirm:REMOVE`.", ephemeral=True)
             return
 
         key = _normalize_key(group)
         obj = _group_obj(key)
-
         if not obj:
             await inter.response.send_message("❌ Allianz-Gruppe nicht gefunden.", ephemeral=True)
             return
 
         servers = obj.setdefault("servers", {})
-
         if str(inter.guild.id) not in servers:
             await inter.response.send_message("❌ Dieser Discord ist nicht in dieser Allianz-Gruppe registriert.", ephemeral=True)
             return
 
         old = servers.pop(str(inter.guild.id), {})
         save_alliance_cfg()
-
         await inter.response.send_message(
-            f"✅ Dieser Discord wurde aus der Allianz-Gruppe entfernt:\n"
-            f"**{old.get('label', inter.guild.name)}**\n\n"
-            f"Neue Allianz-Raids werden hier nicht mehr gepostet. Alte Posts bleiben bestehen.",
+            f"✅ Dieser Discord wurde aus der Allianz-Gruppe entfernt:\n**{old.get('label', inter.guild.name)}**\n\nNeue Allianz-Raids werden hier nicht mehr gepostet. Alte Posts bleiben bestehen.",
             ephemeral=True
         )
 
     @tree.command(name="alliance_partner_status", description="(Partner-Admin) Zeigt Registrierung dieses Discords")
     async def alliance_partner_status(inter: discord.Interaction):
         ok, msg = _require_partner_admin(inter)
-
         if not ok:
             await inter.response.send_message(msg, ephemeral=True)
             return
-
         if inter.guild is None:
             await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
             return
 
         found = []
-
         for key, group in _groups().items():
             servers = group.get("servers") or {}
             s = servers.get(str(inter.guild.id))
-
             if s:
                 found.append((key, group, s))
 
@@ -514,147 +452,115 @@ async def setup_alliance_config(client: discord.Client, tree: app_commands.Comma
             return
 
         lines = []
-
         for key, group, s in found:
             ch_id = int(s.get("channel_id", 0) or 0)
             lines.append(
                 f"• Gruppe: **{group.get('name', key)}**\n"
                 f"  Label: **{s.get('label', inter.guild.name)}**\n"
+                f"  Kürzel: **{s.get('short_label', '—')}**\n"
                 f"  Channel: {f'<#{ch_id}>' if ch_id else '—'}"
             )
 
-        emb = discord.Embed(
-            title=f"🤝 Partner-Status – {inter.guild.name}",
-            description="\n\n".join(lines),
-            color=discord.Color.blurple()
-        )
-
+        emb = discord.Embed(title=f"🤝 Partner-Status – {inter.guild.name}", description="\n\n".join(lines), color=discord.Color.blurple())
         await inter.response.send_message(embed=emb, ephemeral=True)
 
     @tree.command(name="alliance_server_remove", description="(Leader) Discord-Server aus Allianz-Gruppe entfernen")
     async def alliance_server_remove(inter: discord.Interaction, group: str, guild_id: str, confirm: str):
         ok, msg = _require_home_leader(inter)
-
         if not ok:
             await inter.response.send_message(msg, ephemeral=True)
             return
-
         if confirm != "REMOVE":
-            await inter.response.send_message(
-                "❌ Sicherheitswort falsch.\nNutze `confirm:REMOVE`.",
-                ephemeral=True
-            )
+            await inter.response.send_message("❌ Sicherheitswort falsch.\nNutze `confirm:REMOVE`.", ephemeral=True)
             return
 
         key = _normalize_key(group)
         obj = _group_obj(key)
-
         if not obj:
             await inter.response.send_message("❌ Allianz-Gruppe nicht gefunden.", ephemeral=True)
             return
 
         servers = obj.setdefault("servers", {})
-
         if str(guild_id) not in servers:
             await inter.response.send_message("❌ Server ist nicht in dieser Allianz-Gruppe.", ephemeral=True)
             return
 
         old = servers.pop(str(guild_id), {})
         save_alliance_cfg()
-
         await inter.response.send_message(
-            f"✅ Server aus Allianz-Gruppe entfernt:\n"
-            f"**{old.get('label', guild_id)}** / `{guild_id}`\n\n"
-            f"Neue Allianz-Raids werden dort nicht mehr gepostet. Alte Posts bleiben bestehen.",
+            f"✅ Server aus Allianz-Gruppe entfernt:\n**{old.get('label', guild_id)}** / `{guild_id}`\n\nNeue Allianz-Raids werden dort nicht mehr gepostet. Alte Posts bleiben bestehen.",
             ephemeral=True
         )
 
-    @tree.command(name="alliance_server_rename", description="(Leader) Anzeigenamen eines Allianz-Servers ändern")
-    async def alliance_server_rename(inter: discord.Interaction, group: str, guild_id: str, new_label: str):
+    @tree.command(name="alliance_server_rename", description="(Leader) Anzeigename und Kürzel eines Allianz-Servers ändern")
+    async def alliance_server_rename(inter: discord.Interaction, group: str, guild_id: str, new_label: str, new_short_label: str):
         ok, msg = _require_home_leader(inter)
-
         if not ok:
             await inter.response.send_message(msg, ephemeral=True)
             return
 
+        short = _clean_short_label(new_short_label)
+        if not short:
+            await inter.response.send_message("❌ new_short_label darf nur Buchstaben/Zahlen enthalten, z. B. `SG`.", ephemeral=True)
+            return
+
         key = _normalize_key(group)
         obj = _group_obj(key)
-
         if not obj:
             await inter.response.send_message("❌ Allianz-Gruppe nicht gefunden.", ephemeral=True)
             return
 
         servers = obj.setdefault("servers", {})
-
         if str(guild_id) not in servers:
             await inter.response.send_message("❌ Server ist nicht in dieser Allianz-Gruppe.", ephemeral=True)
             return
 
         servers[str(guild_id)]["label"] = new_label.strip()
+        servers[str(guild_id)]["short_label"] = short
         save_alliance_cfg()
-
-        await inter.response.send_message(
-            f"✅ Allianz-Server umbenannt:\n`{guild_id}` → **{new_label.strip()}**",
-            ephemeral=True
-        )
+        await inter.response.send_message(f"✅ Allianz-Server umbenannt:\n`{guild_id}` → **{new_label.strip()}** ({short})", ephemeral=True)
 
     @tree.command(name="alliance_server_set_channel_home", description="(Leader) Zielchannel des Home-Servers ändern")
     async def alliance_server_set_channel_home(inter: discord.Interaction, group: str, channel: discord.TextChannel):
         ok, msg = _require_home_leader(inter)
-
         if not ok:
             await inter.response.send_message(msg, ephemeral=True)
             return
 
         key = _normalize_key(group)
         obj = _group_obj(key)
-
         if not obj:
             await inter.response.send_message("❌ Allianz-Gruppe nicht gefunden.", ephemeral=True)
             return
-
         if channel.guild.id != inter.guild.id:
             await inter.response.send_message("❌ Dieser Befehl kann nur den Home-Server-Channel ändern.", ephemeral=True)
             return
 
         servers = obj.setdefault("servers", {})
-
         if str(inter.guild.id) not in servers:
-            await inter.response.send_message(
-                "❌ Home-Server ist noch nicht in dieser Allianz-Gruppe. Nutze zuerst `/alliance_server_add_home`.",
-                ephemeral=True
-            )
+            await inter.response.send_message("❌ Home-Server ist noch nicht in dieser Allianz-Gruppe. Nutze zuerst `/alliance_server_add_home`.", ephemeral=True)
             return
 
         servers[str(inter.guild.id)]["channel_id"] = int(channel.id)
         servers[str(inter.guild.id)]["channel_name"] = channel.name
         servers[str(inter.guild.id)]["discord_name"] = inter.guild.name
         save_alliance_cfg()
-
-        await inter.response.send_message(
-            f"✅ Home-Zielchannel geändert:\n"
-            f"Server: **{inter.guild.name}**\n"
-            f"Channel: {channel.mention}",
-            ephemeral=True
-        )
+        await inter.response.send_message(f"✅ Home-Zielchannel geändert:\nServer: **{inter.guild.name}**\nChannel: {channel.mention}", ephemeral=True)
 
     @tree.command(name="alliance_server_list", description="(Leader) Alle Server einer Allianz-Gruppe anzeigen")
     async def alliance_server_list(inter: discord.Interaction, group: str):
         ok, msg = _require_home_leader(inter)
-
         if not ok:
             await inter.response.send_message(msg, ephemeral=True)
             return
 
         key = _normalize_key(group)
         obj = _group_obj(key)
-
         if not obj:
             await inter.response.send_message("❌ Allianz-Gruppe nicht gefunden.", ephemeral=True)
             return
 
         servers = obj.get("servers") or {}
-
         if not servers:
             await inter.response.send_message("📋 In dieser Allianz-Gruppe sind noch keine Server.", ephemeral=True)
             return
@@ -664,5 +570,4 @@ async def setup_alliance_config(client: discord.Client, tree: app_commands.Comma
             description="\n\n".join(_server_line(guild_id, s) for guild_id, s in servers.items()),
             color=discord.Color.blurple()
         )
-
         await inter.response.send_message(embed=emb, ephemeral=True)
