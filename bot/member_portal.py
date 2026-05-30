@@ -13,6 +13,16 @@ from discord.ui import View, button, Modal, TextInput, Select
 from discord.enums import ButtonStyle
 from zoneinfo import ZoneInfo
 
+try:
+    from bot.event_dm_prefs import set_dm_pref, is_dm_enabled  # type: ignore
+except ModuleNotFoundError:
+    try:
+        from event_dm_prefs import set_dm_pref, is_dm_enabled  # type: ignore
+    except ModuleNotFoundError:
+        set_dm_pref = None  # type: ignore
+        is_dm_enabled = None  # type: ignore
+
+
 TZ = ZoneInfo("Europe/Berlin")
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -264,13 +274,13 @@ def _absence_for_user(guild_id: int, user_id: int) -> Optional[dict]:
     return raw if isinstance(raw, dict) else None
 
 
-def _is_absent_now(absence: dict) -> bool:
+def _absence_dates(absence: dict) -> Optional[tuple[date, date]]:
     try:
         from_s = str(absence.get("from", "")).strip()
         to_s = str(absence.get("to", "")).strip()
 
         if not _valid_ddmm(from_s) or not _valid_ddmm(to_s):
-            return False
+            return None
 
         today = datetime.now(TZ).date()
         from_d = _ddmm_to_date(from_s, today.year)
@@ -278,6 +288,26 @@ def _is_absent_now(absence: dict) -> bool:
 
         if to_d < from_d:
             to_d = date(today.year + 1, to_d.month, to_d.day)
+
+        if to_d < today:
+            from_d = date(today.year + 1, from_d.month, from_d.day)
+            to_d = date(today.year + 1, to_d.month, to_d.day)
+
+        return from_d, to_d
+
+    except Exception:
+        return None
+
+
+def _is_absent_now(absence: dict) -> bool:
+    try:
+        dates = _absence_dates(absence)
+
+        if not dates:
+            return False
+
+        from_d, to_d = dates
+        today = datetime.now(TZ).date()
 
         return from_d <= today <= to_d
 
@@ -296,10 +326,136 @@ def _status_for_user(guild_id: int, user_id: int) -> str:
     return "Aktiv"
 
 
-def _main_menu_embed(guild: discord.Guild) -> discord.Embed:
+def _rsvp_entry_user_id(entry: Any) -> int:
+    try:
+        if isinstance(entry, dict):
+            return int(entry.get("id", 0) or 0)
+        return int(entry)
+    except Exception:
+        return 0
+
+
+def _rsvp_voted(obj: dict, user_id: int) -> bool:
+    yes = obj.get("yes") or {}
+
+    for key in ("TANK", "HEAL", "DPS", "BANK"):
+        for entry in yes.get(key, []) or []:
+            if _rsvp_entry_user_id(entry) == int(user_id):
+                return True
+
+    for entry in obj.get("no", []) or []:
+        if _rsvp_entry_user_id(entry) == int(user_id):
+            return True
+
+    maybe = obj.get("maybe") or {}
+
+    if str(user_id) in maybe:
+        return True
+
+    for entry in maybe.values():
+        if _rsvp_entry_user_id(entry) == int(user_id):
+            return True
+
+    return False
+
+
+def _rsvp_user_status(obj: dict, user_id: int) -> str:
+    yes = obj.get("yes") or {}
+
+    labels = {
+        "TANK": "Tank",
+        "HEAL": "Heal",
+        "DPS": "DPS",
+        "BANK": "Bank",
+    }
+
+    for key, label in labels.items():
+        for entry in yes.get(key, []) or []:
+            if _rsvp_entry_user_id(entry) == int(user_id):
+                return label
+
+    maybe = obj.get("maybe") or {}
+
+    if str(user_id) in maybe:
+        return "Vielleicht"
+
+    for entry in maybe.values():
+        if _rsvp_entry_user_id(entry) == int(user_id):
+            return "Vielleicht"
+
+    for entry in obj.get("no", []) or []:
+        if _rsvp_entry_user_id(entry) == int(user_id):
+            return "Abgemeldet"
+
+    return ""
+
+
+def _event_status_block(guild: discord.Guild, member: discord.Member) -> str:
+    try:
+        try:
+            from bot.event_rsvp_dm import store as event_store  # type: ignore
+        except ModuleNotFoundError:
+            from event_rsvp_dm import store as event_store  # type: ignore
+
+        now = datetime.now(TZ)
+        answered = []
+        open_votes = []
+
+        for _msg_id, obj in list(event_store.items()):
+            try:
+                if int(obj.get("guild_id", 0) or 0) != guild.id:
+                    continue
+
+                when = datetime.fromisoformat(obj.get("when_iso", ""))
+
+                if now > when + timedelta(hours=2):
+                    continue
+
+                title = str(obj.get("title", "Event"))
+                line_base = f"{when.strftime('%d.%m. %H:%M')} – {title}"
+
+                status = _rsvp_user_status(obj, member.id)
+
+                if status:
+                    answered.append((when, f"• {line_base} – {status}"))
+                else:
+                    open_votes.append((when, f"• {line_base}"))
+
+            except Exception:
+                continue
+
+        answered.sort(key=lambda x: x[0])
+        open_votes.sort(key=lambda x: x[0])
+
+        parts = []
+
+        if answered:
+            lines = [x[1] for x in answered[:3]]
+            parts.append("📌 **Deine kommenden Events:**\n" + "\n".join(lines))
+
+        if open_votes:
+            lines = [x[1] for x in open_votes[:3]]
+            parts.append("⚠️ **Offene Abstimmungen:**\n" + "\n".join(lines))
+
+        if not parts:
+            return "📌 **Deine kommenden Events:**\nKeine aktiven Anmeldungen oder offenen Abstimmungen."
+
+        return "\n\n".join(parts)
+
+    except Exception:
+        return "📌 **Deine kommenden Events:**\nKeine Übersicht verfügbar."
+
+
+def _main_menu_embed(guild: discord.Guild, member: Optional[discord.Member] = None) -> discord.Embed:
+    event_block = ""
+
+    if member:
+        event_block = _event_status_block(guild, member) + "\n\n"
+
     emb = discord.Embed(
         title="⚜️ Ebolus Kommandozentrale",
         description=(
+            event_block +
             "Willkommen im privaten Gildenmenü.\n\n"
             "Wähle unten im Menü einen Bereich aus.\n"
             "Die Beschreibung steht direkt in der Auswahl."
@@ -433,6 +589,100 @@ def _members_list_embed(guild: discord.Guild) -> discord.Embed:
     return emb
 
 
+def _absence_calendar_embed(guild: discord.Guild) -> discord.Embed:
+    g = _gdata(guild.id)
+    absences = g.get("absences") or {}
+    users = g.get("users") or {}
+
+    emb = discord.Embed(
+        title="🏖️ Abwesenheitskalender",
+        color=discord.Color.gold()
+    )
+
+    today = datetime.now(TZ).date()
+    rows = []
+
+    c = _gcfg(guild.id)
+    member_role_id = int(c.get("member_role_id", 0) or 0)
+    member_role = guild.get_role(member_role_id) if member_role_id else None
+
+    for uid_str, absence in absences.items():
+        try:
+            uid = int(uid_str)
+        except Exception:
+            continue
+
+        member = guild.get_member(uid)
+
+        if not member or member.bot:
+            continue
+
+        if member_role and member_role not in member.roles:
+            continue
+
+        if not isinstance(absence, dict):
+            continue
+
+        dates = _absence_dates(absence)
+
+        if not dates:
+            continue
+
+        from_d, to_d = dates
+
+        if to_d < today:
+            continue
+
+        p = users.get(str(uid)) or {}
+        name = p.get("ingame_name") or _display_name(member)
+
+        from_s = str(absence.get("from", "—"))
+        to_s = str(absence.get("to", "—"))
+        reason = str(absence.get("reason", "—")).strip() or "—"
+
+        prefix = "🟠" if from_d <= today <= to_d else "⚪"
+
+        rows.append((from_d, f"{prefix} **{name}** — {from_s} bis {to_s}\nGrund: {reason}"))
+
+    rows.sort(key=lambda x: x[0])
+
+    if not rows:
+        emb.description = "Aktuell sind keine laufenden oder kommenden Abwesenheiten eingetragen."
+    else:
+        emb.description = "\n\n".join(row[1] for row in rows[:25])
+
+    if len(rows) > 25:
+        emb.set_footer(text=f"Anzeige begrenzt auf 25 von {len(rows)} Abwesenheiten.")
+    else:
+        emb.set_footer(text="🟠 läuft aktuell • ⚪ kommt noch")
+
+    return emb
+
+
+def _dm_settings_embed(guild: discord.Guild, member: discord.Member) -> discord.Embed:
+    enabled = True
+
+    if is_dm_enabled is not None:
+        try:
+            enabled = is_dm_enabled(guild.id, member.id)
+        except Exception:
+            enabled = True
+
+    emb = discord.Embed(
+        title="📬 Raid-/Event-DMs",
+        description=(
+            f"Aktueller Status: **{'AN' if enabled else 'AUS'}**\n\n"
+            "Wenn DMs aktiviert sind, bekommst du bei neuen Raid-/Event-Anmeldungen eine Privatnachricht.\n\n"
+            "Wenn DMs deaktiviert sind, kannst du trotzdem direkt unter der Raid-Ankündigung im Server abstimmen."
+        ),
+        color=discord.Color.gold()
+    )
+
+    emb.set_footer(text="Diese Einstellung betrifft nur Raid-/Event-DMs, nicht das Gildenmenü.")
+
+    return emb
+
+
 def _rules_loot_embed() -> discord.Embed:
     emb = discord.Embed(
         title="📜 Regeln & Lootsystem",
@@ -503,8 +753,10 @@ async def _fetch_portal_message(client: discord.Client, guild_id: int, user_id: 
 
 
 async def _send_new_portal_menu(user: discord.abc.User, guild: discord.Guild) -> Optional[discord.Message]:
+    member = guild.get_member(user.id)
+
     try:
-        msg = await user.send(embed=_main_menu_embed(guild), view=MemberPortalMainView())
+        msg = await user.send(embed=_main_menu_embed(guild, member), view=MemberPortalMainView())
         _mark_portal_sent(guild.id, user.id, msg.id)
         return msg
     except Exception:
@@ -543,8 +795,12 @@ async def ensure_portal_menu_for_user(
                 await msg.edit(embed=_events_embed(guild_id), view=EventsInfoView())
             elif force_view == "members":
                 await msg.edit(embed=_members_list_embed(guild), view=BackOnlyView())
+            elif force_view == "absences":
+                await msg.edit(embed=_absence_calendar_embed(guild), view=AbsenceCalendarView())
+            elif force_view == "dm_settings":
+                await msg.edit(embed=_dm_settings_embed(guild, member), view=DmSettingsView())
             else:
-                await msg.edit(embed=_main_menu_embed(guild), view=MemberPortalMainView())
+                await msg.edit(embed=_main_menu_embed(guild, member), view=MemberPortalMainView())
 
             _mark_portal_sent(guild_id, user_id, msg.id)
             return True
@@ -599,6 +855,8 @@ async def _delete_old_bot_dms_for_member(
         "📅 Ebolus Gildenkalender",
         "📅 Gildenkalender – ebolus",
         "📅 Gilden-Events",
+        "🏖️ Abwesenheitskalender",
+        "📬 Raid-/Event-DMs",
         "❓ Hilfe – Ebolus Gildenbot",
         "❓ Hilfe – ebolus Gildenbot",
         "👥 Ebolus Mitglieder",
@@ -970,7 +1228,7 @@ class PortalMainSelect(Select):
             discord.SelectOption(
                 label="Persönlich",
                 value="personal",
-                description="Profil ansehen, Gearscore pflegen, Abwesenheit melden",
+                description="Profil, Gearscore, Abwesenheit und Raid-DMs",
                 emoji="👤"
             ),
             discord.SelectOption(
@@ -982,7 +1240,7 @@ class PortalMainSelect(Select):
             discord.SelectOption(
                 label="Gilde",
                 value="guild",
-                description="Gildenkalender und Mitgliederübersicht",
+                description="Kalender, Abwesenheiten und Mitgliederübersicht",
                 emoji="📅"
             ),
             discord.SelectOption(
@@ -1014,6 +1272,14 @@ class PortalMainSelect(Select):
         choice = self.values[0]
 
         if choice == "personal":
+            enabled = True
+
+            if is_dm_enabled is not None:
+                try:
+                    enabled = is_dm_enabled(guild.id, member.id)
+                except Exception:
+                    enabled = True
+
             emb = discord.Embed(
                 title="👤 Persönlich",
                 description=(
@@ -1021,7 +1287,9 @@ class PortalMainSelect(Select):
                     "**Profil**\n"
                     "Ingame-Name, Main-Rolle und Gearscore ansehen oder bearbeiten.\n\n"
                     "**Abwesenheit**\n"
-                    "Urlaub, Schicht, Pause oder längere Inaktivität melden."
+                    "Urlaub, Schicht, Pause oder längere Inaktivität melden.\n\n"
+                    f"**Raid-/Event-DMs**\n"
+                    f"Aktueller Status: **{'AN' if enabled else 'AUS'}**"
                 ),
                 color=discord.Color.gold()
             )
@@ -1052,6 +1320,8 @@ class PortalMainSelect(Select):
                     "Hier findest du die wichtigsten Gildenübersichten.\n\n"
                     "**Kalender**\n"
                     "Feste Gildentermine und regelmäßige Events.\n\n"
+                    "**Abwesenheiten**\n"
+                    "Übersicht aktueller und kommender Abwesenheiten.\n\n"
                     "**Mitglieder**\n"
                     "Übersicht der Ebolus-Mitglieder mit Rang und Gearscore."
                 ),
@@ -1114,6 +1384,19 @@ class PersonalMenuView(View):
 
         await inter.response.send_modal(AbsenceModal(guild.id, inter.user.id))
 
+    @button(label="📬 Raid-DMs", style=ButtonStyle.secondary, custom_id="portal_personal_dm_settings")
+    async def btn_dm_settings(self, inter: discord.Interaction, _):
+        guild, member = await _resolve_guild_member_from_inter(inter)
+
+        if not guild or not member:
+            await inter.response.send_message("❌ Ich konnte deinen Server nicht zuordnen.")
+            return
+
+        if inter.message:
+            _mark_portal_sent(guild.id, member.id, inter.message.id)
+
+        await inter.response.edit_message(embed=_dm_settings_embed(guild, member), view=DmSettingsView())
+
     @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="portal_personal_back")
     async def btn_back(self, inter: discord.Interaction, _):
         guild, member = await _resolve_guild_member_from_inter(inter)
@@ -1121,7 +1404,63 @@ class PersonalMenuView(View):
         if guild and member and inter.message:
             _mark_portal_sent(guild.id, member.id, inter.message.id)
 
-        await inter.response.edit_message(embed=_main_menu_embed(guild), view=MemberPortalMainView())
+        await inter.response.edit_message(embed=_main_menu_embed(guild, member), view=MemberPortalMainView())
+
+
+class DmSettingsView(View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @button(label="📬 DMs an/aus schalten", style=ButtonStyle.secondary, custom_id="portal_dm_toggle")
+    async def btn_toggle(self, inter: discord.Interaction, _):
+        guild, member = await _resolve_guild_member_from_inter(inter)
+
+        if not guild or not member:
+            await inter.response.send_message("❌ Ich konnte deinen Server nicht zuordnen.")
+            return
+
+        if set_dm_pref is None or is_dm_enabled is None:
+            await inter.response.send_message("❌ DM-Einstellungssystem ist nicht geladen.")
+            return
+
+        current = is_dm_enabled(guild.id, member.id)
+        set_dm_pref(guild.id, member.id, not current)
+
+        if inter.message:
+            _mark_portal_sent(guild.id, member.id, inter.message.id)
+
+        await inter.response.edit_message(embed=_dm_settings_embed(guild, member), view=DmSettingsView())
+
+    @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="portal_dm_back")
+    async def btn_back(self, inter: discord.Interaction, _):
+        guild, member = await _resolve_guild_member_from_inter(inter)
+
+        if guild and member and inter.message:
+            _mark_portal_sent(guild.id, member.id, inter.message.id)
+
+        enabled = True
+
+        if is_dm_enabled is not None and guild and member:
+            try:
+                enabled = is_dm_enabled(guild.id, member.id)
+            except Exception:
+                enabled = True
+
+        emb = discord.Embed(
+            title="👤 Persönlich",
+            description=(
+                "Hier findest du alles, was dein eigenes Profil und deine Anwesenheit betrifft.\n\n"
+                "**Profil**\n"
+                "Ingame-Name, Main-Rolle und Gearscore ansehen oder bearbeiten.\n\n"
+                "**Abwesenheit**\n"
+                "Urlaub, Schicht, Pause oder längere Inaktivität melden.\n\n"
+                f"**Raid-/Event-DMs**\n"
+                f"Aktueller Status: **{'AN' if enabled else 'AUS'}**"
+            ),
+            color=discord.Color.gold()
+        )
+
+        await inter.response.edit_message(embed=emb, view=PersonalMenuView())
 
 
 class LootMenuView(View):
@@ -1171,7 +1510,7 @@ class LootMenuView(View):
         if guild and member and inter.message:
             _mark_portal_sent(guild.id, member.id, inter.message.id)
 
-        await inter.response.edit_message(embed=_main_menu_embed(guild), view=MemberPortalMainView())
+        await inter.response.edit_message(embed=_main_menu_embed(guild, member), view=MemberPortalMainView())
 
 
 class GuildMenuView(View):
@@ -1190,6 +1529,19 @@ class GuildMenuView(View):
             _mark_portal_sent(guild.id, member.id, inter.message.id)
 
         await inter.response.edit_message(embed=_events_embed(guild.id), view=EventsInfoView())
+
+    @button(label="🏖️ Abwesenheiten", style=ButtonStyle.secondary, custom_id="portal_guild_absences")
+    async def btn_absences(self, inter: discord.Interaction, _):
+        guild, member = await _resolve_guild_member_from_inter(inter)
+
+        if not guild:
+            await inter.response.send_message("❌ Ich konnte deinen Server nicht zuordnen.")
+            return
+
+        if member and inter.message:
+            _mark_portal_sent(guild.id, member.id, inter.message.id)
+
+        await inter.response.edit_message(embed=_absence_calendar_embed(guild), view=AbsenceCalendarView())
 
     @button(label="👥 Mitglieder", style=ButtonStyle.secondary, custom_id="portal_guild_members")
     async def btn_members(self, inter: discord.Interaction, _):
@@ -1211,7 +1563,48 @@ class GuildMenuView(View):
         if guild and member and inter.message:
             _mark_portal_sent(guild.id, member.id, inter.message.id)
 
-        await inter.response.edit_message(embed=_main_menu_embed(guild), view=MemberPortalMainView())
+        await inter.response.edit_message(embed=_main_menu_embed(guild, member), view=MemberPortalMainView())
+
+
+class AbsenceCalendarView(View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @button(label="🔄 Aktualisieren", style=ButtonStyle.secondary, custom_id="portal_absence_calendar_refresh")
+    async def btn_refresh(self, inter: discord.Interaction, _):
+        guild, member = await _resolve_guild_member_from_inter(inter)
+
+        if not guild:
+            await inter.response.send_message("❌ Ich konnte deinen Server nicht zuordnen.")
+            return
+
+        if member and inter.message:
+            _mark_portal_sent(guild.id, member.id, inter.message.id)
+
+        await inter.response.edit_message(embed=_absence_calendar_embed(guild), view=AbsenceCalendarView())
+
+    @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="portal_absence_calendar_back")
+    async def btn_back(self, inter: discord.Interaction, _):
+        guild, member = await _resolve_guild_member_from_inter(inter)
+
+        if guild and member and inter.message:
+            _mark_portal_sent(guild.id, member.id, inter.message.id)
+
+        emb = discord.Embed(
+            title="📅 Gilde",
+            description=(
+                "Hier findest du die wichtigsten Gildenübersichten.\n\n"
+                "**Kalender**\n"
+                "Feste Gildentermine und regelmäßige Events.\n\n"
+                "**Abwesenheiten**\n"
+                "Übersicht aktueller und kommender Abwesenheiten.\n\n"
+                "**Mitglieder**\n"
+                "Übersicht der Ebolus-Mitglieder mit Rang und Gearscore."
+            ),
+            color=discord.Color.gold()
+        )
+
+        await inter.response.edit_message(embed=emb, view=GuildMenuView())
 
 
 class SupportMenuView(View):
@@ -1243,12 +1636,14 @@ class SupportMenuView(View):
             description=(
                 "**👤 Profil**\n"
                 "Hier pflegst du Ingame-Name, Main-Rolle und Gearscore.\n\n"
+                "**📬 Raid-/Event-DMs**\n"
+                "Im Bereich Persönlich kannst du Raid-DMs aktivieren oder deaktivieren.\n\n"
                 "**🎁 Needliste**\n"
                 "Hier trägst du ein, welche Items du brauchst. Die Gildenleitung nutzt das für Bossplanung und Lootübersicht.\n\n"
                 "**🏖️ Abwesenheit**\n"
                 "Hier meldest du Urlaub, Schicht oder längere Inaktivität.\n\n"
-                "**📅 Kalender**\n"
-                "Zeigt feste Gildentermine als Übersicht.\n\n"
+                "**📅 Kalender & Abwesenheiten**\n"
+                "Zeigt feste Gildentermine und aktuelle/kommende Abwesenheiten.\n\n"
                 "**📜 Regeln & Loot**\n"
                 "Zeigt die wichtigsten Gildenregeln und das Lootsystem.\n\n"
                 "**🛡️ Leaderkontakt**\n"
@@ -1266,7 +1661,7 @@ class SupportMenuView(View):
         if guild and member and inter.message:
             _mark_portal_sent(guild.id, member.id, inter.message.id)
 
-        await inter.response.edit_message(embed=_main_menu_embed(guild), view=MemberPortalMainView())
+        await inter.response.edit_message(embed=_main_menu_embed(guild, member), view=MemberPortalMainView())
 
 
 class ProfileView(View):
@@ -1306,7 +1701,7 @@ class ProfileView(View):
         if guild and member and inter.message:
             _mark_portal_sent(guild.id, member.id, inter.message.id)
 
-        await inter.response.edit_message(embed=_main_menu_embed(guild), view=MemberPortalMainView())
+        await inter.response.edit_message(embed=_main_menu_embed(guild, member), view=MemberPortalMainView())
 
 
 class EventsInfoView(View):
@@ -1333,7 +1728,21 @@ class EventsInfoView(View):
         if guild and member and inter.message:
             _mark_portal_sent(guild.id, member.id, inter.message.id)
 
-        await inter.response.edit_message(embed=_main_menu_embed(guild), view=MemberPortalMainView())
+        emb = discord.Embed(
+            title="📅 Gilde",
+            description=(
+                "Hier findest du die wichtigsten Gildenübersichten.\n\n"
+                "**Kalender**\n"
+                "Feste Gildentermine und regelmäßige Events.\n\n"
+                "**Abwesenheiten**\n"
+                "Übersicht aktueller und kommender Abwesenheiten.\n\n"
+                "**Mitglieder**\n"
+                "Übersicht der Ebolus-Mitglieder mit Rang und Gearscore."
+            ),
+            color=discord.Color.gold()
+        )
+
+        await inter.response.edit_message(embed=emb, view=GuildMenuView())
 
 
 class RulesLootView(View):
@@ -1368,7 +1777,7 @@ class RulesLootView(View):
         if guild and member and inter.message:
             _mark_portal_sent(guild.id, member.id, inter.message.id)
 
-        await inter.response.edit_message(embed=_main_menu_embed(guild), view=MemberPortalMainView())
+        await inter.response.edit_message(embed=_main_menu_embed(guild, member), view=MemberPortalMainView())
 
 
 class HelpView(View):
@@ -1395,7 +1804,7 @@ class HelpView(View):
         if guild and member and inter.message:
             _mark_portal_sent(guild.id, member.id, inter.message.id)
 
-        await inter.response.edit_message(embed=_main_menu_embed(guild), view=MemberPortalMainView())
+        await inter.response.edit_message(embed=_main_menu_embed(guild, member), view=MemberPortalMainView())
 
 
 class BackOnlyView(View):
@@ -1409,7 +1818,7 @@ class BackOnlyView(View):
         if guild and member and inter.message:
             _mark_portal_sent(guild.id, member.id, inter.message.id)
 
-        await inter.response.edit_message(embed=_main_menu_embed(guild), view=MemberPortalMainView())
+        await inter.response.edit_message(embed=_main_menu_embed(guild, member), view=MemberPortalMainView())
 
 
 async def setup_member_portal(client: discord.Client, tree: app_commands.CommandTree):
@@ -1417,8 +1826,10 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
         client.add_view(PortalOpenView())
         client.add_view(MemberPortalMainView())
         client.add_view(PersonalMenuView())
+        client.add_view(DmSettingsView())
         client.add_view(LootMenuView())
         client.add_view(GuildMenuView())
+        client.add_view(AbsenceCalendarView())
         client.add_view(SupportMenuView())
         client.add_view(ProfileView())
         client.add_view(EventsInfoView())
@@ -1757,8 +2168,10 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
                 "Dort findest du:\n"
                 "• dein Profil\n"
                 "• deine Needliste\n"
+                "• Raid-DM Einstellungen\n"
                 "• feste Gilden-Events\n"
                 "• Abwesenheit melden\n"
+                "• Abwesenheitskalender\n"
                 "• Leader kontaktieren\n"
                 "• Regeln & Loot\n"
                 "• Mitgliederübersicht\n"
