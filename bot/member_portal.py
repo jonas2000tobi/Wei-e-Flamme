@@ -176,10 +176,84 @@ def _clear_portal_sent(guild_id: int, user_id: int) -> None:
 
 
 def _resolve_guild_for_user(client: discord.Client, user_id: int) -> Optional[discord.Guild]:
+    """
+    Wichtig bei Allianz-/Multi-Server-Betrieb:
+    Der Bot ist auf mehreren Discords. Für das private Gildenmenü müssen wir
+    den echten Ebolus/Home-Server nehmen, nicht irgendeinen Partner-Server,
+    auf dem der User zufällig auch ist.
+    """
+
+    # 1. Bevorzugt: Server, auf dem der User die gesetzte Gildenmitglied-Rolle hat.
+    for guild in client.guilds:
+        try:
+            c = _gcfg(guild.id)
+            member_role_id = int(c.get("member_role_id", 0) or 0)
+
+            if not member_role_id:
+                continue
+
+            role = guild.get_role(member_role_id)
+
+            if not role:
+                continue
+
+            member = guild.get_member(user_id)
+
+            if member and not member.bot and role in member.roles:
+                return guild
+
+        except Exception:
+            continue
+
+    # 2. Bevorzugt: Server, für den bereits ein Portal-Menü für diesen User gespeichert ist.
+    for guild_id_str, g in list(sent_state.items()):
+        try:
+            guild_id = int(guild_id_str)
+            guild = client.get_guild(guild_id)
+
+            if not guild:
+                continue
+
+            sent_users = {str(x) for x in g.get("sent_users", [])}
+            users = g.get("users", {}) or {}
+
+            if str(user_id) in sent_users or str(user_id) in users:
+                member = guild.get_member(user_id)
+
+                if member and not member.bot:
+                    return guild
+
+        except Exception:
+            continue
+
+    # 3. Falls alliance_config vorhanden ist: Home-/Ebolus-Server bevorzugen.
+    try:
+        try:
+            from bot.alliance_config import _home_guild_id  # type: ignore
+        except ModuleNotFoundError:
+            from alliance_config import _home_guild_id  # type: ignore
+
+        home_id = int(_home_guild_id() or 0)
+
+        if home_id:
+            guild = client.get_guild(home_id)
+
+            if guild:
+                member = guild.get_member(user_id)
+
+                if member and not member.bot:
+                    return guild
+
+    except Exception:
+        pass
+
+    # 4. Fallback: altes Verhalten.
     for guild in client.guilds:
         member = guild.get_member(user_id)
+
         if member and not member.bot:
             return guild
+
     return None
 
 
