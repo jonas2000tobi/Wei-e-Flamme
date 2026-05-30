@@ -1114,6 +1114,69 @@ def _import_alliance_config():
         return get_alliance_group
 
 
+def _import_alliance_template():
+    try:
+        from bot.alliance_config import get_alliance_template  # type: ignore
+        return get_alliance_template
+    except ModuleNotFoundError:
+        from alliance_config import get_alliance_template  # type: ignore
+        return get_alliance_template
+
+
+ALLIANCE_EVENT_TYPES = [
+    "NM Raid",
+    "HM Raid",
+    "PvP Schlacht",
+    "Dimensionsprüfung",
+]
+
+
+def _normalize_alliance_event_type(value: str) -> str:
+    raw = (value or "").strip().lower()
+
+    aliases = {
+        "nm": "NM Raid",
+        "nm raid": "NM Raid",
+        "normal raid": "NM Raid",
+        "normalraid": "NM Raid",
+        "hm": "HM Raid",
+        "hm raid": "HM Raid",
+        "hardmode": "HM Raid",
+        "hardmode raid": "HM Raid",
+        "pvp": "PvP Schlacht",
+        "pvp schlacht": "PvP Schlacht",
+        "schlacht": "PvP Schlacht",
+        "dimensionsprüfung": "Dimensionsprüfung",
+        "dimensionspruefung": "Dimensionsprüfung",
+        "dimension": "Dimensionsprüfung",
+        "dimensionen": "Dimensionsprüfung",
+    }
+
+    if raw in aliases:
+        return aliases[raw]
+
+    for event_type in ALLIANCE_EVENT_TYPES:
+        if event_type.lower() == raw:
+            return event_type
+
+    return ""
+
+
+def _alliance_event_type_text() -> str:
+    return ", ".join(ALLIANCE_EVENT_TYPES)
+
+
+def _server_channel_id_for_event(server_cfg: dict, event_type: str) -> int:
+    event_channels = server_cfg.get("event_channels") or {}
+    channel_obj = event_channels.get(event_type) or {}
+    cid = int(channel_obj.get("channel_id", 0) or 0)
+
+    if cid:
+        return cid
+
+    return int(server_cfg.get("channel_id", 0) or 0)
+
+
 async def _send_home_dms_for_alliance_event(
     guild: discord.Guild,
     obj: dict,
@@ -1313,28 +1376,17 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
             ephemeral=True
         )
 
-    @tree.command(name="alliance_raid_create", description="(Leader) Allianz-Raid auf alle Server einer Allianz-Gruppe posten")
-    @app_commands.describe(
-        group="Name der Allianz-Gruppe",
-        title="Titel",
-        date="Datum YYYY-MM-DD",
-        time="Zeit HH:MM (24h)",
-        description="Kurzbeschreibung (optional)",
-        target_role="Optional: Nur diese Home-/Ebolus-Rolle bekommt DMs",
-        image_url="Optionales Bild fürs Embed"
-    )
-    async def alliance_raid_create(
+    async def _create_alliance_raid_impl(
         inter: discord.Interaction,
         group: str,
+        event_type: str,
         title: str,
         date: str,
         time: str,
         description: Optional[str] = None,
         target_role: Optional[discord.Role] = None,
-        image_url: Optional[str] = None
+        image_url: Optional[str] = None,
     ):
-        await inter.response.defer(ephemeral=True, thinking=True)
-
         if inter.guild is None or inter.guild_id is None:
             await inter.followup.send("❌ Nur im Server nutzbar.", ephemeral=True)
             return
@@ -1343,6 +1395,15 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
 
         if not ok:
             await inter.followup.send(msg, ephemeral=True)
+            return
+
+        normalized_event_type = _normalize_alliance_event_type(event_type)
+
+        if not normalized_event_type:
+            await inter.followup.send(
+                f"❌ Ungültiger Eventtyp. Erlaubt: {_alliance_event_type_text()}",
+                ephemeral=True
+            )
             return
 
         try:
@@ -1380,16 +1441,21 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
             )
             return
 
-        home_channel_id = int(home_server.get("channel_id", 0) or 0)
+        home_channel_id = _server_channel_id_for_event(home_server, normalized_event_type)
         home_channel = inter.guild.get_channel(home_channel_id)
 
         if not isinstance(home_channel, (discord.TextChannel, discord.Thread)):
-            await inter.followup.send("❌ Home-Zielchannel wurde nicht gefunden oder ist kein Textkanal.", ephemeral=True)
+            await inter.followup.send(
+                f"❌ Home-Zielchannel für **{normalized_event_type}** wurde nicht gefunden.\n"
+                f"Setze ihn mit `/alliance_event_channel_set group:{group} event_type:{normalized_event_type} channel:#channel`.",
+                ephemeral=True
+            )
             return
 
         obj = {
             "scope": "alliance",
             "alliance_group": str(group_obj.get("name", group)),
+            "event_type": normalized_event_type,
             "guild_id": int(inter.guild.id),
             "channel_id": int(home_channel.id),
             "title": title.strip(),
@@ -1404,7 +1470,6 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
             "mirrors": [],
         }
 
-        # Erst Home-Post erstellen, damit dessen Message-ID die Master-ID wird.
         home_emb = build_embed(inter.guild, obj)
         home_msg = await home_channel.send(embed=home_emb)
         master_id = int(home_msg.id)
@@ -1433,7 +1498,6 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
         posted = [f"✅ **{inter.guild.name}** → {home_channel.mention}"]
         failed = []
 
-        # Partner-Posts erstellen. DMs werden dort nicht verschickt.
         for guild_id_str, server_cfg in servers.items():
             try:
                 gid = int(guild_id_str)
@@ -1447,10 +1511,13 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
                     failed.append(f"❌ `{server_cfg.get('label', guild_id_str)}` — Bot sieht den Server nicht")
                     continue
 
-                ch = guild.get_channel(int(server_cfg.get("channel_id", 0) or 0))
+                target_channel_id = _server_channel_id_for_event(server_cfg, normalized_event_type)
+                ch = guild.get_channel(target_channel_id)
 
                 if not isinstance(ch, (discord.TextChannel, discord.Thread)):
-                    failed.append(f"❌ `{server_cfg.get('label', guild.name)}` — Channel nicht gefunden")
+                    failed.append(
+                        f"❌ `{server_cfg.get('label', guild.name)}` — Channel für {normalized_event_type} nicht gefunden"
+                    )
                     continue
 
                 emb = build_embed(guild, obj)
@@ -1487,13 +1554,12 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
 
         store[str(master_id)] = obj
         save_store()
-
-        # Nach dem Speichern nochmal alle Mirror-Posts mit vollständiger Mirror-Liste aktualisieren.
         await _push_overview(inter.client, str(master_id), obj)
 
         result = (
             f"✅ Allianz-Raid erstellt.\n"
             f"Gruppe: **{group_obj.get('name', group)}**\n"
+            f"Eventtyp: **{normalized_event_type}**\n"
             f"Master-Message-ID: `{master_id}`\n"
             f"✉️ Home-DMs versendet: **{sent}**\n"
             f"🔕 Home-Opt-out übersprungen: **{skipped_opt_out}**\n\n"
@@ -1508,6 +1574,82 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
 
         await inter.followup.send(result, ephemeral=True)
 
+    @tree.command(name="alliance_raid_create", description="(Leader) Allianz-Raid auf alle Server einer Allianz-Gruppe posten")
+    @app_commands.describe(
+        group="Name der Allianz-Gruppe",
+        event_type="NM Raid / HM Raid / PvP Schlacht / Dimensionsprüfung",
+        title="Titel",
+        date="Datum YYYY-MM-DD",
+        time="Zeit HH:MM (24h)",
+        description="Kurzbeschreibung (optional)",
+        target_role="Optional: Nur diese Home-/Ebolus-Rolle bekommt DMs",
+        image_url="Optionales Bild fürs Embed"
+    )
+    async def alliance_raid_create(
+        inter: discord.Interaction,
+        group: str,
+        event_type: str,
+        title: str,
+        date: str,
+        time: str,
+        description: Optional[str] = None,
+        target_role: Optional[discord.Role] = None,
+        image_url: Optional[str] = None
+    ):
+        await inter.response.defer(ephemeral=True, thinking=True)
+        await _create_alliance_raid_impl(inter, group, event_type, title, date, time, description, target_role, image_url)
+
+    @tree.command(name="alliance_raid_from_template", description="(Leader) Allianz-Raid aus gespeichertem Template erstellen")
+    @app_commands.describe(
+        name="Name des Templates",
+        date="Datum YYYY-MM-DD",
+        time="Optional: andere Uhrzeit HH:MM",
+        title="Optional: anderer Titel",
+        description="Optional: andere Beschreibung",
+        target_role="Optional: andere Home-/Ebolus-Zielrolle für DMs",
+        image_url="Optionales Bild fürs Embed"
+    )
+    async def alliance_raid_from_template(
+        inter: discord.Interaction,
+        name: str,
+        date: str,
+        time: Optional[str] = None,
+        title: Optional[str] = None,
+        description: Optional[str] = None,
+        target_role: Optional[discord.Role] = None,
+        image_url: Optional[str] = None,
+    ):
+        await inter.response.defer(ephemeral=True, thinking=True)
+
+        try:
+            get_alliance_template = _import_alliance_template()
+            tmpl = get_alliance_template(name)
+        except Exception as e:
+            await inter.followup.send(f"❌ Template-System konnte nicht geladen werden: `{e}`", ephemeral=True)
+            return
+
+        if not tmpl:
+            await inter.followup.send("❌ Template nicht gefunden.", ephemeral=True)
+            return
+
+        if target_role is None and inter.guild is not None:
+            role_id = int(tmpl.get("target_role_id", 0) or 0)
+            if role_id:
+                role = inter.guild.get_role(role_id)
+                if isinstance(role, discord.Role):
+                    target_role = role
+
+        await _create_alliance_raid_impl(
+            inter=inter,
+            group=str(tmpl.get("group", "")),
+            event_type=str(tmpl.get("event_type", "")),
+            title=str(title or tmpl.get("title", "Allianz-Raid")),
+            date=date,
+            time=str(time or tmpl.get("default_time", "21:00")),
+            description=str(description if description is not None else tmpl.get("description", "")),
+            target_role=target_role,
+            image_url=image_url,
+        )
 
     @tree.command(name="alliance_raid_template", description="(Leader) Zeigt Copy-Paste-Vorlagen für Allianz-Raids")
     async def alliance_raid_template(inter: discord.Interaction):
