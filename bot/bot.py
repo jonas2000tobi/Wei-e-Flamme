@@ -208,9 +208,23 @@ async def on_app_command_error(inter: discord.Interaction, error: app_commands.A
 async def cleanup_expired_events():
     try:
         try:
-            from bot.event_rsvp_dm import store, save_store, TZ, delete_pending_dm_messages_for_started_events  # type: ignore
+            from bot.event_rsvp_dm import (  # type: ignore
+                store,
+                save_store,
+                TZ,
+                delete_pending_dm_messages_for_started_events,
+                _is_alliance_event,
+                _init_event_shape,
+            )
         except ModuleNotFoundError:
-            from event_rsvp_dm import store, save_store, TZ, delete_pending_dm_messages_for_started_events  # type: ignore
+            from event_rsvp_dm import (  # type: ignore
+                store,
+                save_store,
+                TZ,
+                delete_pending_dm_messages_for_started_events,
+                _is_alliance_event,
+                _init_event_shape,
+            )
 
         now = datetime.now(TZ)
         remove: List[str] = []
@@ -227,13 +241,38 @@ async def cleanup_expired_events():
 
         for msg_id, obj in list(store.items()):
             try:
+                _init_event_shape(obj)
                 when = datetime.fromisoformat(obj.get("when_iso"))
             except Exception:
                 remove.append(msg_id)
                 continue
 
-            if now > when + timedelta(hours=2):
-                try:
+            # Discord-Posts bleiben bis 2 Stunden nach Eventstart bestehen.
+            if now <= when + timedelta(hours=2):
+                continue
+
+            try:
+                if _is_alliance_event(obj) and obj.get("mirrors"):
+                    for mirror in list(obj.get("mirrors") or []):
+                        try:
+                            guild = bot.get_guild(int(mirror.get("guild_id", 0) or 0))
+
+                            if not guild:
+                                continue
+
+                            ch = guild.get_channel(int(mirror.get("channel_id", 0) or 0))
+
+                            if isinstance(ch, (discord.TextChannel, discord.Thread)):
+                                try:
+                                    msg = await ch.fetch_message(int(mirror.get("message_id", 0) or 0))
+                                    await msg.delete()
+                                except Exception:
+                                    pass
+
+                        except Exception:
+                            pass
+
+                else:
                     guild = bot.get_guild(int(obj["guild_id"]))
 
                     if guild:
@@ -246,8 +285,8 @@ async def cleanup_expired_events():
                             except Exception:
                                 pass
 
-                finally:
-                    remove.append(msg_id)
+            finally:
+                remove.append(msg_id)
 
         if remove:
             for mid in remove:
