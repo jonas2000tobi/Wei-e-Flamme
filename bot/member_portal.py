@@ -2118,6 +2118,66 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
                 ephemeral=True
             )
 
+    @tree.command(name="portal_force_new_all", description="(Admin) Erzwingt ein komplett neues Gildenmenü bei allen Gildenmitgliedern")
+    async def portal_force_new_all(inter: discord.Interaction):
+        await inter.response.defer(ephemeral=True, thinking=True)
+
+        if not _is_admin(inter):
+            await inter.followup.send("❌ Nur Admin/Manage Server.", ephemeral=True)
+            return
+
+        c = _gcfg(inter.guild_id)
+        member_role_id = int(c.get("member_role_id", 0) or 0)
+
+        if not member_role_id:
+            await inter.followup.send(
+                "❌ Keine Ebolus-/Gildenmitglied-Rolle gesetzt. Nutze zuerst `/portal_set_member_role`.",
+                ephemeral=True
+            )
+            return
+
+        role = inter.guild.get_role(member_role_id)
+
+        if not role:
+            await inter.followup.send("❌ Ebolus-/Gildenmitglied-Rolle nicht gefunden.", ephemeral=True)
+            return
+
+        sent_count = 0
+        failed_count = 0
+        checked_count = 0
+
+        for member in role.members:
+            if member.bot:
+                continue
+
+            checked_count += 1
+
+            try:
+                # Alte gespeicherte Portal-ID vergessen.
+                # Löscht keine Needlisten, Profile, Abwesenheiten oder sonstige Nutzerdaten.
+                _clear_portal_sent(inter.guild_id, member.id)
+
+                # Wirklich neue DM senden, nicht alte Nachricht editieren.
+                msg = await _send_new_portal_menu(member, inter.guild)
+
+                if msg:
+                    sent_count += 1
+                else:
+                    failed_count += 1
+
+                await asyncio.sleep(0.25)
+
+            except Exception:
+                failed_count += 1
+
+        await inter.followup.send(
+            f"✅ Force-New für alle abgeschlossen.\n"
+            f"👥 Geprüft: **{checked_count}**\n"
+            f"✉️ Neu gesendet: **{sent_count}**\n"
+            f"❌ Fehlgeschlagen/DMs zu: **{failed_count}**",
+            ephemeral=True
+        )
+
     @tree.command(name="portal_dm_cleanup_user", description="(Admin) Löscht alte Bot-DMs bei einem Mitglied, schützt aktives Gildenmenü")
     async def portal_dm_cleanup_user(
         inter: discord.Interaction,
