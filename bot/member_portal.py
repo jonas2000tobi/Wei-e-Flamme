@@ -2086,6 +2086,39 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
         else:
             await inter.followup.send(f"❌ Konnte **{member.display_name}** keine DM senden.", ephemeral=True)
 
+
+    @tree.command(name="portal_force_new_user", description="(Admin) Erzwingt ein komplett neues Gildenmenü per DM")
+    async def portal_force_new_user(inter: discord.Interaction, member: discord.Member):
+        await inter.response.defer(ephemeral=True, thinking=True)
+
+        if not _is_admin(inter):
+            await inter.followup.send("❌ Nur Admin/Manage Server.", ephemeral=True)
+            return
+
+        if inter.guild is None or inter.guild_id is None:
+            await inter.followup.send("❌ Nur im Server nutzbar.", ephemeral=True)
+            return
+
+        if member.bot:
+            await inter.followup.send("❌ Bots bekommen kein Gildenmenü.", ephemeral=True)
+            return
+
+        _clear_portal_sent(inter.guild_id, member.id)
+
+        msg = await _send_new_portal_menu(member, inter.guild)
+
+        if msg:
+            await inter.followup.send(
+                f"✅ Neues Gildenmenü bei **{member.display_name}** gesendet.\n"
+                f"Neue Menü-ID: `{msg.id}`",
+                ephemeral=True
+            )
+        else:
+            await inter.followup.send(
+                f"❌ Konnte **{member.display_name}** keine neue DM senden.",
+                ephemeral=True
+            )
+
     @tree.command(name="portal_dm_cleanup_user", description="(Admin) Löscht alte Bot-DMs bei einem Mitglied, schützt aktives Gildenmenü")
     async def portal_dm_cleanup_user(
         inter: discord.Interaction,
