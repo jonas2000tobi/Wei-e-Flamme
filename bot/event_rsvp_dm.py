@@ -888,6 +888,104 @@ async def _push_overview(client: discord.Client, msg_id: str, obj: dict):
         pass
 
 
+async def _refresh_existing_portal_for_user(client: discord.Client, guild_id: int, user_id: int) -> bool:
+    """
+    Aktualisiert nur ein bereits vorhandenes Gildenmenü per msg.edit(...).
+    Wichtig: Diese Funktion sendet KEINE neue DM.
+    """
+    try:
+        try:
+            from bot.member_portal import (  # type: ignore
+                _fetch_portal_message,
+                _main_menu_embed,
+                MemberPortalMainView,
+            )
+        except ModuleNotFoundError:
+            from member_portal import (  # type: ignore
+                _fetch_portal_message,
+                _main_menu_embed,
+                MemberPortalMainView,
+            )
+
+        guild = client.get_guild(int(guild_id))
+
+        if not guild:
+            return False
+
+        member = guild.get_member(int(user_id))
+
+        if not member or member.bot:
+            return False
+
+        msg = await _fetch_portal_message(client, guild.id, member.id)
+
+        if msg is None:
+            return False
+
+        await msg.edit(embed=_main_menu_embed(guild, member), view=MemberPortalMainView())
+        return True
+
+    except Exception as e:
+        print(f"[event_rsvp_dm] Portal-Refresh User Fehler: {e!r}")
+        return False
+
+
+async def _refresh_existing_portals_for_members(
+    client: discord.Client,
+    guild: discord.Guild,
+    members: Iterable[discord.Member],
+    delay: float = 0.08,
+) -> int:
+    refreshed = 0
+    seen: set[int] = set()
+
+    for member in members:
+        try:
+            if member.bot or member.id in seen:
+                continue
+
+            seen.add(member.id)
+
+            if await _refresh_existing_portal_for_user(client, guild.id, member.id):
+                refreshed += 1
+
+            if delay > 0:
+                await asyncio.sleep(delay)
+
+        except Exception:
+            continue
+
+    return refreshed
+
+
+async def _refresh_existing_portals_for_event(client: discord.Client, guild: discord.Guild, obj: dict) -> int:
+    """Aktualisiert bestehende Portal-Startseiten der Event-Zielgruppe. Sendet keine neuen DMs."""
+    try:
+        _init_event_shape(obj)
+        members = _eligible_members(guild, obj)
+        return await _refresh_existing_portals_for_members(client, guild, members)
+    except Exception as e:
+        print(f"[event_rsvp_dm] Portal-Refresh Event Fehler: {e!r}")
+        return 0
+
+
+def _schedule_portal_refresh_for_user(client: discord.Client, guild_id: int, user_id: int) -> None:
+    try:
+        asyncio.create_task(_refresh_existing_portal_for_user(client, guild_id, user_id))
+    except Exception:
+        pass
+
+
+def _schedule_portal_refresh_for_event(client: discord.Client, guild: Optional[discord.Guild], obj: dict) -> None:
+    if guild is None:
+        return
+
+    try:
+        asyncio.create_task(_refresh_existing_portals_for_event(client, guild, obj))
+    except Exception:
+        pass
+
+
 async def apply_rsvp(inter: discord.Interaction, msg_id: str, group: str) -> tuple[bool, str]:
     obj = store.get(str(msg_id))
 
@@ -952,6 +1050,17 @@ async def apply_rsvp(inter: discord.Interaction, msg_id: str, group: str) -> tup
     save_store()
     record_response(int(obj["guild_id"]), uid, str(msg_id), response_key)
     await _push_overview(inter.client, str(msg_id), obj)
+
+    # Gildenmenü-Startseite aktualisieren, aber nur vorhandene Portal-DM bearbeiten.
+    # Es wird keine neue Portal-DM gesendet.
+    refresh_guild_ids = {int(obj.get("guild_id", 0) or 0)}
+
+    if source_guild_id:
+        refresh_guild_ids.add(int(source_guild_id))
+
+    for gid in refresh_guild_ids:
+        if gid:
+            _schedule_portal_refresh_for_user(inter.client, gid, uid)
 
     return True, text
 
@@ -1376,6 +1485,9 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
             ephemeral=True
         )
 
+        # Bestehende Gildenmenüs der Zielgruppe aktualisieren, ohne neue Portal-DMs zu senden.
+        _schedule_portal_refresh_for_event(inter.client, inter.guild, obj)
+
     async def _create_alliance_raid_impl(
         inter: discord.Interaction,
         group: str,
@@ -1573,6 +1685,9 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
             result = result[:1850] + "\n… gekürzt"
 
         await inter.followup.send(result, ephemeral=True)
+
+        # Home-/Ebolus-Gildenmenüs aktualisieren, ohne neue Portal-DMs zu senden.
+        _schedule_portal_refresh_for_event(inter.client, inter.guild, obj)
 
     @tree.command(name="alliance_raid_create", description="(Leader) Allianz-Raid auf alle Server einer Allianz-Gruppe posten")
     @app_commands.describe(
@@ -1894,6 +2009,22 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
             except Exception:
                 pass
 
+        refresh_members = []
+
+        try:
+            if inter.guild is not None:
+                refresh_members = list(_eligible_members(inter.guild, obj))
+        except Exception:
+            refresh_members = []
+
+        refresh_members = []
+
+        try:
+            if inter.guild is not None:
+                refresh_members = list(_eligible_members(inter.guild, obj))
+        except Exception:
+            refresh_members = []
+
         store.pop(str(message_id), None)
         save_store()
 
@@ -1910,6 +2041,13 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
             text = text[:1850] + "\n… gekürzt"
 
         await inter.followup.send(text, ephemeral=True)
+
+        # Nach dem Löschen bestehende Gildenmenüs aktualisieren, damit das Event dort verschwindet.
+        if inter.guild is not None and refresh_members:
+            try:
+                asyncio.create_task(_refresh_existing_portals_for_members(inter.client, inter.guild, refresh_members))
+            except Exception:
+                pass
 
 
     @tree.command(name="alliance_raid_delete", description="(Leader) Löscht einen Allianz-Raid inkl. aller Mirror-Posts")
@@ -2000,6 +2138,13 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
             text = text[:1850] + "\n… gekürzt"
 
         await inter.followup.send(text, ephemeral=True)
+
+        # Nach dem Löschen bestehende Home-Gildenmenüs aktualisieren, damit der Allianz-Raid dort verschwindet.
+        if inter.guild is not None and refresh_members:
+            try:
+                asyncio.create_task(_refresh_existing_portals_for_members(inter.client, inter.guild, refresh_members))
+            except Exception:
+                pass
 
 
 async def auto_resend_for_new_member(member: discord.Member) -> None:
