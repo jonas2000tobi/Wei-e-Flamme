@@ -1781,6 +1781,469 @@ class AbsenceCalendarView(View):
 
 
 
+
+def _admin_parse_id(value: str) -> int:
+    raw = str(value or "").strip()
+    digits = re.sub(r"[^0-9]", "", raw)
+    try:
+        return int(digits) if digits else 0
+    except Exception:
+        return 0
+
+
+def _admin_parse_event_date(value: str) -> tuple[int, int, int]:
+    raw = str(value or "").strip()
+    if "." in raw:
+        dd, mm, yyyy = [int(x) for x in raw.split(".")]
+        return yyyy, mm, dd
+    yyyy, mm, dd = [int(x) for x in raw.split("-")]
+    return yyyy, mm, dd
+
+
+def _admin_event_module():
+    try:
+        import bot.event_rsvp_dm as rsvp_mod  # type: ignore
+    except ModuleNotFoundError:
+        import event_rsvp_dm as rsvp_mod  # type: ignore
+    return rsvp_mod
+
+
+EVENT_IMAGE_PRESETS = {
+    "Normal Raid": "https://media.discordapp.net/attachments/1488142284812714085/1516086614957494312/282b2b20-5a8f-4251-b038-15fde2ac723d.png?ex=6a315d30&is=6a300bb0&hm=767b9ad51564019a71be77906c480350e29137f24e08b6abd99f67a9c9edad33&=&format=webp&quality=lossless",
+    "Hard Raid": "https://media.discordapp.net/attachments/1488142284812714085/1513816935832228033/7225f274-cc4f-4eda-ba74-ca401f4e572b.png?ex=6a310462&is=6a2fb2e2&hm=9aa88c9c5b45f6eea14ec33541344421b7d467b3b5969f2c8d7faeebb3b30df2&=&format=webp&quality=lossless",
+    "Nightmare": "https://media.discordapp.net/attachments/1488142284812714085/1513816992358858842/d6ee8bc1-432a-4d28-914d-31be80adf835.png?ex=6a310470&is=6a2fb2f0&hm=77fbec16dae3b00858a4dd20000eec86150d99de8823aab5acc7a3189f39092c&=&format=webp&quality=lossless",
+    "Trials": "https://media.discordapp.net/attachments/1488142284812714085/1491660359952502825/file_000000007dcc7246bb6e57ae41860769.png?ex=6a30d4f7&is=6a2f8377&hm=40ae17883015fa630db3155e0d922cdfbf8fea9ca88a43a0b20a51d6852a9e64&=&format=webp&quality=lossless&width=1440&height=960",
+    "PvP": "https://media.discordapp.net/attachments/1488142284812714085/1513202292302811186/1780845919107.png?ex=6a30c234&is=6a2f70b4&hm=eb19a0dbc88e29a962ba726adc39f397f6240652dfd5b377a87c74b311f680b5&=&format=webp&quality=lossless",
+}
+
+
+def _admin_active_rsvp_events(guild: Optional[discord.Guild]) -> list[tuple[str, dict]]:
+    if guild is None:
+        return []
+
+    try:
+        rsvp = _admin_event_module()
+        now = datetime.now(rsvp.TZ)
+        out = []
+        for msg_id, obj in list((getattr(rsvp, "store", {}) or {}).items()):
+            try:
+                if int(obj.get("guild_id", 0) or 0) != int(guild.id):
+                    continue
+                when = datetime.fromisoformat(str(obj.get("when_iso", "")))
+                if when < now:
+                    continue
+                out.append((str(msg_id), obj))
+            except Exception:
+                continue
+        out.sort(key=lambda pair: datetime.fromisoformat(str(pair[1].get("when_iso", ""))))
+        return out[:25]
+    except Exception:
+        return []
+
+
+async def _admin_create_regular_raid_from_menu(
+    inter: discord.Interaction,
+    guild_id: int,
+    title: str,
+    date_text: str,
+    time_text: str,
+    channel_text: str,
+    description: str,
+    image_url: str | None = None,
+):
+    rsvp = _admin_event_module()
+    guild = inter.client.get_guild(int(guild_id))
+    if not guild:
+        await inter.followup.send("❌ Server nicht gefunden.", ephemeral=True)
+        return
+
+    if not _is_portal_admin(guild, guild.get_member(inter.user.id)):
+        await inter.followup.send("❌ Dieser Bereich ist nur für Gildenleitung, Berater oder Wächter.", ephemeral=True)
+        return
+
+    try:
+        yyyy, mm, dd = _admin_parse_event_date(date_text)
+        hh, mi = [int(x) for x in str(time_text).strip().split(":")]
+        when = datetime(yyyy, mm, dd, hh, mi, tzinfo=rsvp.TZ)
+    except Exception:
+        await inter.followup.send("❌ Datum/Zeit ungültig. Nutze z. B. `2026-06-20` oder `20.06.2026` und `20:30`.", ephemeral=True)
+        return
+
+    channel_id = _admin_parse_id(channel_text)
+    ch = guild.get_channel(channel_id) if channel_id else None
+    if not isinstance(ch, (discord.TextChannel, discord.Thread)):
+        await inter.followup.send("❌ Zielkanal nicht gefunden. Kopiere die Channel-ID oder nutze eine Channel-Erwähnung wie `<#123>`.", ephemeral=True)
+        return
+
+    obj = {
+        "guild_id": int(guild.id),
+        "channel_id": int(ch.id),
+        "title": str(title).strip(),
+        "description": str(description or "").strip(),
+        "when_iso": when.isoformat(),
+        "image_url": str(image_url or "").strip() or None,
+        "yes": {"TANK": [], "HEAL": [], "DPS": [], "BANK": []},
+        "maybe": {},
+        "no": [],
+        "target_role_id": 0,
+        "dm_messages": {},
+    }
+
+    emb = rsvp.build_embed(guild, obj)
+    msg = await ch.send(embed=emb)
+    rsvp.store[str(msg.id)] = obj
+    rsvp.save_store()
+
+    try:
+        await msg.edit(view=rsvp.ServerRaidView(int(msg.id)))
+    except Exception:
+        pass
+
+    sent = 0
+    skipped_opt_out = 0
+    for target in rsvp._eligible_members(guild, obj):
+        try:
+            if not rsvp.is_dm_enabled(guild.id, target.id):
+                skipped_opt_out += 1
+                continue
+            dm_text = rsvp._format_dm_text(
+                title=str(title).strip(),
+                when=when,
+                channel_name_or_ref=f"Übersicht im Server: #{getattr(ch, 'name', 'Event')}",
+                description=str(description or "").strip(),
+                intro_line="Wähle unten deine Teilnahme:",
+            )
+            dm_msg = await target.send(dm_text, view=rsvp.RaidView(int(msg.id)))
+            obj["dm_messages"][str(target.id)] = int(dm_msg.id)
+            sent += 1
+            await asyncio.sleep(0.05)
+        except Exception:
+            pass
+
+    rsvp.save_store()
+
+    try:
+        rsvp._schedule_portal_refresh_for_event(inter.client, guild, obj)
+    except Exception:
+        pass
+
+    await inter.followup.send(
+        f"✅ Event erstellt: {msg.jump_url}\n"
+        f"✉️ DMs versendet: **{sent}**\n"
+        f"🔕 Opt-out übersprungen: **{skipped_opt_out}**",
+        ephemeral=True
+    )
+
+
+async def _admin_resend_missing_from_menu(inter: discord.Interaction, guild_id: int, message_id: str):
+    rsvp = _admin_event_module()
+    guild = inter.client.get_guild(int(guild_id))
+    if not guild:
+        await inter.followup.send("❌ Server nicht gefunden.", ephemeral=True)
+        return
+
+    obj = rsvp.store.get(str(message_id))
+    if not obj or int(obj.get("guild_id", 0) or 0) != int(guild.id):
+        await inter.followup.send("❌ Event nicht gefunden.", ephemeral=True)
+        return
+
+    rsvp._init_event_shape(obj)
+    when = datetime.fromisoformat(obj["when_iso"])
+    already = rsvp._voters_set(obj)
+    targets = [m for m in rsvp._eligible_members(guild, obj) if m.id not in already]
+
+    sent = 0
+    skipped_opt_out = 0
+    for target in targets:
+        try:
+            if not rsvp.is_dm_enabled(guild.id, target.id):
+                skipped_opt_out += 1
+                continue
+            dm_text = rsvp._format_dm_text(
+                title=str(obj.get("title", "Event")),
+                when=when,
+                channel_name_or_ref=f"Übersicht: <#{obj.get('channel_id')}>",
+                description=obj.get("description"),
+                intro_line="Du hast noch nicht abgestimmt:",
+            )
+            dm_msg = await target.send(dm_text, view=rsvp.RaidView(int(message_id)))
+            obj.setdefault("dm_messages", {})[str(target.id)] = int(dm_msg.id)
+            sent += 1
+            await asyncio.sleep(0.05)
+        except Exception:
+            pass
+
+    rsvp.save_store()
+    await inter.followup.send(f"✅ Resend an **{sent}** Nutzer.\n🔕 Opt-out übersprungen: **{skipped_opt_out}**", ephemeral=True)
+
+
+async def _admin_delete_event_from_menu(inter: discord.Interaction, guild_id: int, message_id: str):
+    rsvp = _admin_event_module()
+    guild = inter.client.get_guild(int(guild_id))
+    if not guild:
+        await inter.followup.send("❌ Server nicht gefunden.", ephemeral=True)
+        return
+
+    obj = rsvp.store.get(str(message_id))
+    if not obj or int(obj.get("guild_id", 0) or 0) != int(guild.id):
+        await inter.followup.send("❌ Event nicht gefunden.", ephemeral=True)
+        return
+
+    rsvp._init_event_shape(obj)
+    refresh_members = []
+    try:
+        refresh_members = list(rsvp._eligible_members(guild, obj))
+    except Exception:
+        refresh_members = []
+
+    deleted_posts = 0
+    failed_posts = []
+    deleted_dms = 0
+
+    if rsvp._is_alliance_event(obj) and obj.get("mirrors"):
+        mirrors = list(obj.get("mirrors") or [])
+    else:
+        mirrors = [{"guild_id": guild.id, "channel_id": obj.get("channel_id"), "message_id": message_id, "label": guild.name}]
+
+    for mirror in mirrors:
+        try:
+            mguild = inter.client.get_guild(int(mirror.get("guild_id", 0) or 0))
+            if not mguild:
+                failed_posts.append(f"{mirror.get('label', 'Unbekannt')} — Server nicht gefunden")
+                continue
+            ch = mguild.get_channel(int(mirror.get("channel_id", 0) or 0))
+            if not isinstance(ch, (discord.TextChannel, discord.Thread)):
+                failed_posts.append(f"{mirror.get('label', mguild.name)} — Channel nicht gefunden")
+                continue
+            try:
+                msg = await ch.fetch_message(int(mirror.get("message_id", message_id) or message_id))
+                await msg.delete()
+                deleted_posts += 1
+            except Exception:
+                failed_posts.append(f"{mirror.get('label', mguild.name)} — Post nicht gefunden oder keine Rechte")
+            await asyncio.sleep(0.05)
+        except Exception as e:
+            failed_posts.append(str(e))
+
+    for uid_str in list((obj.get("dm_messages") or {}).keys()):
+        try:
+            ok = await rsvp._delete_dm_message_for_user(inter.client, obj, int(uid_str))
+            if ok:
+                deleted_dms += 1
+            await asyncio.sleep(0.05)
+        except Exception:
+            pass
+
+    rsvp.store.pop(str(message_id), None)
+    rsvp.save_store()
+
+    try:
+        if refresh_members:
+            asyncio.create_task(rsvp._refresh_existing_portals_for_members(inter.client, guild, refresh_members))
+    except Exception:
+        pass
+
+    text = f"✅ Event gelöscht.\n🧾 Serverposts gelöscht: **{deleted_posts}**\n✉️ DMs gelöscht: **{deleted_dms}**"
+    if failed_posts:
+        text += "\n\n⚠️ Nicht gelöscht:\n" + "\n".join(f"• {x}" for x in failed_posts[:10])
+    await inter.followup.send(text[:1900], ephemeral=True)
+
+
+class AdminEventCreateModal(Modal):
+    def __init__(self, guild_id: int, user_id: int):
+        super().__init__(title="Event erstellen", timeout=None)
+        self.guild_id = int(guild_id)
+        self.user_id = int(user_id)
+        self.title_input = TextInput(label="Titel", placeholder="z. B. Gildenbosse", required=True, max_length=100)
+        self.date_input = TextInput(label="Datum", placeholder="YYYY-MM-DD oder TT.MM.JJJJ", required=True, max_length=20)
+        self.time_input = TextInput(label="Uhrzeit", placeholder="HH:MM", required=True, max_length=10)
+        self.channel_input = TextInput(label="Zielkanal", placeholder="#raid-anmeldung oder Channel-ID", required=True, max_length=80)
+        self.description_input = TextInput(label="Beschreibung", placeholder="Optional", required=False, style=discord.TextStyle.paragraph, max_length=800)
+        self.add_item(self.title_input)
+        self.add_item(self.date_input)
+        self.add_item(self.time_input)
+        self.add_item(self.channel_input)
+        self.add_item(self.description_input)
+
+    async def on_submit(self, inter: discord.Interaction):
+        data = {
+            "guild_id": self.guild_id,
+            "user_id": self.user_id,
+            "title": str(self.title_input.value),
+            "date_text": str(self.date_input.value),
+            "time_text": str(self.time_input.value),
+            "channel_text": str(self.channel_input.value),
+            "description": str(self.description_input.value or ""),
+        }
+
+        emb = discord.Embed(
+            title="🖼️ Event-Bild wählen",
+            description=(
+                "Wähle, welches Bild für dieses Event verwendet werden soll.\n\n"
+                "**Kein Bild** erstellt den Raid ohne Bild.\n"
+                "**Eigene URL** öffnet danach ein Eingabefeld für deinen Bildlink."
+            ),
+            color=discord.Color.gold()
+        )
+
+        await inter.response.send_message(embed=emb, view=AdminEventImageSelectView(data), ephemeral=True)
+
+
+class AdminEventImageSelectView(View):
+    def __init__(self, data: dict):
+        super().__init__(timeout=None)
+        self.data = dict(data)
+        self.add_item(AdminEventImageSelect(self.data))
+
+    @button(label="❌ Abbrechen", style=ButtonStyle.secondary, custom_id="admin_event_image_cancel")
+    async def btn_cancel(self, inter: discord.Interaction, _):
+        await inter.response.edit_message(
+            embed=discord.Embed(
+                title="Abgebrochen",
+                description="Das Event wurde nicht erstellt.",
+                color=discord.Color.orange()
+            ),
+            view=None
+        )
+
+
+class AdminEventImageSelect(Select):
+    def __init__(self, data: dict):
+        self.data = dict(data)
+        options = [
+            discord.SelectOption(label="Kein Bild", value="none", description="Event ohne Bild erstellen"),
+            discord.SelectOption(label="Eigene URL", value="custom", description="Eigenen Bildlink eingeben"),
+            discord.SelectOption(label="Normal Raid", value="Normal Raid"),
+            discord.SelectOption(label="Hard Raid", value="Hard Raid"),
+            discord.SelectOption(label="Trials", value="Trials"),
+            discord.SelectOption(label="Nightmare", value="Nightmare"),
+            discord.SelectOption(label="PvP", value="PvP"),
+        ]
+        super().__init__(
+            placeholder="Bildtyp wählen",
+            min_values=1,
+            max_values=1,
+            options=options,
+            custom_id="admin_event_image_select"
+        )
+
+    async def callback(self, inter: discord.Interaction):
+        value = self.values[0]
+
+        if value == "custom":
+            await inter.response.send_modal(AdminEventCustomImageModal(self.data))
+            return
+
+        image_url = None if value == "none" else EVENT_IMAGE_PRESETS.get(value)
+        await inter.response.defer(ephemeral=True, thinking=True)
+        await _admin_create_regular_raid_from_menu(
+            inter,
+            int(self.data["guild_id"]),
+            str(self.data["title"]),
+            str(self.data["date_text"]),
+            str(self.data["time_text"]),
+            str(self.data["channel_text"]),
+            str(self.data.get("description", "")),
+            image_url=image_url,
+        )
+
+
+class AdminEventCustomImageModal(Modal):
+    def __init__(self, data: dict):
+        super().__init__(title="Eigene Event-Bild-URL", timeout=None)
+        self.data = dict(data)
+        self.url_input = TextInput(
+            label="Bild-URL",
+            placeholder="https://...",
+            required=True,
+            max_length=500
+        )
+        self.add_item(self.url_input)
+
+    async def on_submit(self, inter: discord.Interaction):
+        image_url = str(self.url_input.value or "").strip()
+
+        if not (image_url.startswith("http://") or image_url.startswith("https://")):
+            await inter.response.send_message("❌ Bitte eine gültige Bild-URL mit http:// oder https:// eingeben.", ephemeral=True)
+            return
+
+        await inter.response.defer(ephemeral=True, thinking=True)
+        await _admin_create_regular_raid_from_menu(
+            inter,
+            int(self.data["guild_id"]),
+            str(self.data["title"]),
+            str(self.data["date_text"]),
+            str(self.data["time_text"]),
+            str(self.data["channel_text"]),
+            str(self.data.get("description", "")),
+            image_url=image_url,
+        )
+
+
+class AdminEventSelectView(View):
+    def __init__(self, guild_id: int, user_id: int, action: str, events: list[tuple[str, dict]]):
+        super().__init__(timeout=None)
+        self.guild_id = int(guild_id)
+        self.user_id = int(user_id)
+        self.action = action
+        self.add_item(AdminEventSelect(guild_id, user_id, action, events))
+
+    @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="admin_event_select_back")
+    async def btn_back(self, inter: discord.Interaction, _):
+        emb = discord.Embed(title="📅 Admin – Event", description="Wähle eine Event-Aktion.", color=discord.Color.gold())
+        await inter.response.edit_message(embed=emb, view=AdminEventMenuView())
+
+
+class AdminEventSelect(Select):
+    def __init__(self, guild_id: int, user_id: int, action: str, events: list[tuple[str, dict]]):
+        self.guild_id = int(guild_id)
+        self.user_id = int(user_id)
+        self.action = action
+        options = []
+        for msg_id, obj in events[:25]:
+            try:
+                when = datetime.fromisoformat(str(obj.get("when_iso", "")))
+                label = f"{when.strftime('%d.%m. %H:%M')} – {str(obj.get('title', 'Event'))}"[:100]
+            except Exception:
+                label = str(obj.get("title", "Event"))[:100]
+            options.append(discord.SelectOption(label=label, value=str(msg_id), description=f"ID {msg_id}"[:100]))
+        super().__init__(placeholder="Event wählen", min_values=1, max_values=1, options=options, custom_id=f"admin_event_select_{action}")
+
+    async def callback(self, inter: discord.Interaction):
+        msg_id = str(self.values[0])
+        if self.action == "resend":
+            await inter.response.defer(ephemeral=True, thinking=True)
+            await _admin_resend_missing_from_menu(inter, self.guild_id, msg_id)
+            return
+
+        if self.action == "delete":
+            emb = discord.Embed(
+                title="🗑️ Event löschen – Bestätigung",
+                description=f"Soll dieses Event wirklich gelöscht werden?\n\nMessage-ID: `{msg_id}`",
+                color=discord.Color.orange()
+            )
+            await inter.response.edit_message(embed=emb, view=AdminEventDeleteConfirmView(self.guild_id, self.user_id, msg_id))
+            return
+
+
+class AdminEventDeleteConfirmView(View):
+    def __init__(self, guild_id: int, user_id: int, message_id: str):
+        super().__init__(timeout=None)
+        self.guild_id = int(guild_id)
+        self.user_id = int(user_id)
+        self.message_id = str(message_id)
+
+    @button(label="✅ Löschen", style=ButtonStyle.danger, custom_id="admin_event_delete_confirm")
+    async def btn_confirm(self, inter: discord.Interaction, _):
+        await inter.response.defer(ephemeral=True, thinking=True)
+        await _admin_delete_event_from_menu(inter, self.guild_id, self.message_id)
+
+    @button(label="❌ Abbrechen", style=ButtonStyle.secondary, custom_id="admin_event_delete_cancel")
+    async def btn_cancel(self, inter: discord.Interaction, _):
+        emb = discord.Embed(title="Abgebrochen", description="Das Event wurde nicht gelöscht.", color=discord.Color.orange())
+        await inter.response.edit_message(embed=emb, view=AdminEventMenuView())
+
+
 class AdminMenuView(View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -1838,19 +2301,44 @@ class AdminEventMenuView(View):
 
     @button(label="📅 Event erstellen", style=ButtonStyle.secondary, custom_id="portal_admin_event_create", row=0)
     async def btn_create(self, inter: discord.Interaction, _):
-        await inter.response.send_message("Nutze aktuell: `/raid_create_dm`. Die Menü-Formular-Version kommt als nächster Schritt.", ephemeral=True)
+        guild, member = await _resolve_guild_member_from_inter(inter)
+        if not _is_portal_admin(guild, member):
+            await inter.response.send_message("❌ Dieser Bereich ist nur für Gildenleitung, Berater oder Wächter.", ephemeral=True)
+            return
+        await inter.response.send_modal(AdminEventCreateModal(guild.id, member.id))
 
     @button(label="🌐 Allianz-Event", style=ButtonStyle.secondary, custom_id="portal_admin_event_alliance", row=0)
     async def btn_alliance(self, inter: discord.Interaction, _):
-        await inter.response.send_message("Nutze aktuell: `/alliance_raid_create`. Die Menü-Formular-Version kommt als nächster Schritt.", ephemeral=True)
+        await inter.response.send_message(
+            "🌐 Allianz-Events bleiben vorerst über `/alliance_raid_create`, weil dort Allianz-Gruppe, Eventtyp und Partner-Channel-Konfigurationen sauber geprüft werden müssen. Normale Raids kannst du jetzt direkt hier im Menü erstellen.",
+            ephemeral=True
+        )
 
     @button(label="🗑️ Event löschen", style=ButtonStyle.secondary, custom_id="portal_admin_event_delete", row=1)
     async def btn_delete(self, inter: discord.Interaction, _):
-        await inter.response.send_message("Nutze aktuell: `/raid_delete` oder `/alliance_raid_delete`.", ephemeral=True)
+        guild, member = await _resolve_guild_member_from_inter(inter)
+        if not _is_portal_admin(guild, member):
+            await inter.response.send_message("❌ Dieser Bereich ist nur für Gildenleitung, Berater oder Wächter.", ephemeral=True)
+            return
+        events = _admin_active_rsvp_events(guild)
+        if not events:
+            await inter.response.send_message("📅 Keine aktiven Events gefunden.", ephemeral=True)
+            return
+        emb = discord.Embed(title="🗑️ Event löschen", description="Wähle das Event, das gelöscht werden soll.", color=discord.Color.gold())
+        await inter.response.edit_message(embed=emb, view=AdminEventSelectView(guild.id, member.id, "delete", events))
 
     @button(label="📨 Resend Missing", style=ButtonStyle.secondary, custom_id="portal_admin_event_resend", row=1)
     async def btn_resend(self, inter: discord.Interaction, _):
-        await inter.response.send_message("Nutze aktuell: `/raid_resend_missing`.", ephemeral=True)
+        guild, member = await _resolve_guild_member_from_inter(inter)
+        if not _is_portal_admin(guild, member):
+            await inter.response.send_message("❌ Dieser Bereich ist nur für Gildenleitung, Berater oder Wächter.", ephemeral=True)
+            return
+        events = _admin_active_rsvp_events(guild)
+        if not events:
+            await inter.response.send_message("📅 Keine aktiven Events gefunden.", ephemeral=True)
+            return
+        emb = discord.Embed(title="📨 Resend Missing", description="Wähle das Event, für das fehlende Abstimmungen erneut gesendet werden sollen.", color=discord.Color.gold())
+        await inter.response.edit_message(embed=emb, view=AdminEventSelectView(guild.id, member.id, "resend", events))
 
     @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="portal_admin_event_back", row=2)
     async def btn_back(self, inter: discord.Interaction, _):
