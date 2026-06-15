@@ -9,7 +9,7 @@ from typing import Optional, Any, Tuple
 
 import discord
 from discord import app_commands
-from discord.ui import View, button, Modal, TextInput, Select
+from discord.ui import View, button, Modal, TextInput, Select, ChannelSelect, RoleSelect
 from discord.enums import ButtonStyle
 from zoneinfo import ZoneInfo
 
@@ -1847,7 +1847,8 @@ async def _admin_create_regular_raid_from_menu(
     title: str,
     date_text: str,
     time_text: str,
-    channel_text: str,
+    channel_id: int,
+    target_role_id: int,
     description: str,
     image_url: str | None = None,
 ):
@@ -1869,10 +1870,14 @@ async def _admin_create_regular_raid_from_menu(
         await inter.followup.send("❌ Datum/Zeit ungültig. Nutze z. B. `2026-06-20` oder `20.06.2026` und `20:30`.", ephemeral=True)
         return
 
-    channel_id = _admin_parse_id(channel_text)
-    ch = guild.get_channel(channel_id) if channel_id else None
+    ch = guild.get_channel(int(channel_id or 0))
     if not isinstance(ch, (discord.TextChannel, discord.Thread)):
-        await inter.followup.send("❌ Zielkanal nicht gefunden. Kopiere die Channel-ID oder nutze eine Channel-Erwähnung wie `<#123>`.", ephemeral=True)
+        await inter.followup.send("❌ Zielkanal nicht gefunden.", ephemeral=True)
+        return
+
+    target_role_id = int(target_role_id or 0)
+    if target_role_id and guild.get_role(target_role_id) is None:
+        await inter.followup.send("❌ Zielrolle nicht gefunden.", ephemeral=True)
         return
 
     obj = {
@@ -1885,7 +1890,7 @@ async def _admin_create_regular_raid_from_menu(
         "yes": {"TANK": [], "HEAL": [], "DPS": [], "BANK": []},
         "maybe": {},
         "no": [],
-        "target_role_id": 0,
+        "target_role_id": int(target_role_id),
         "dm_messages": {},
     }
 
@@ -2057,12 +2062,10 @@ class AdminEventCreateModal(Modal):
         self.title_input = TextInput(label="Titel", placeholder="z. B. Gildenbosse", required=True, max_length=100)
         self.date_input = TextInput(label="Datum", placeholder="YYYY-MM-DD oder TT.MM.JJJJ", required=True, max_length=20)
         self.time_input = TextInput(label="Uhrzeit", placeholder="HH:MM", required=True, max_length=10)
-        self.channel_input = TextInput(label="Zielkanal", placeholder="#raid-anmeldung oder Channel-ID", required=True, max_length=80)
         self.description_input = TextInput(label="Beschreibung", placeholder="Optional", required=False, style=discord.TextStyle.paragraph, max_length=800)
         self.add_item(self.title_input)
         self.add_item(self.date_input)
         self.add_item(self.time_input)
-        self.add_item(self.channel_input)
         self.add_item(self.description_input)
 
     async def on_submit(self, inter: discord.Interaction):
@@ -2072,10 +2075,71 @@ class AdminEventCreateModal(Modal):
             "title": str(self.title_input.value),
             "date_text": str(self.date_input.value),
             "time_text": str(self.time_input.value),
-            "channel_text": str(self.channel_input.value),
             "description": str(self.description_input.value or ""),
         }
 
+        emb = discord.Embed(
+            title="📍 Zielkanal wählen",
+            description="Wähle den Discord-Kanal, in dem der Raid/Event-Post erscheinen soll.",
+            color=discord.Color.gold()
+        )
+
+        await inter.response.send_message(embed=emb, view=AdminEventChannelSelectView(data), ephemeral=True)
+
+
+class AdminEventChannelSelectView(View):
+    def __init__(self, data: dict):
+        super().__init__(timeout=None)
+        self.data = dict(data)
+        self.add_item(AdminEventChannelSelect(self.data))
+
+    @button(label="❌ Abbrechen", style=ButtonStyle.secondary, custom_id="admin_event_channel_cancel")
+    async def btn_cancel(self, inter: discord.Interaction, _):
+        await inter.response.edit_message(
+            embed=discord.Embed(
+                title="Abgebrochen",
+                description="Das Event wurde nicht erstellt.",
+                color=discord.Color.orange()
+            ),
+            view=None
+        )
+
+
+class AdminEventChannelSelect(ChannelSelect):
+    def __init__(self, data: dict):
+        self.data = dict(data)
+        super().__init__(
+            placeholder="Zielkanal wählen",
+            min_values=1,
+            max_values=1,
+            channel_types=[discord.ChannelType.text],
+            custom_id="admin_event_channel_select"
+        )
+
+    async def callback(self, inter: discord.Interaction):
+        channel = self.values[0]
+        self.data["channel_id"] = int(channel.id)
+
+        emb = discord.Embed(
+            title="🎯 Zielrolle wählen",
+            description=(
+                "Wähle die Rolle, die für dieses Event angeschrieben werden soll.\n\n"
+                "Oder klicke **Alle / keine Zielrolle**, wenn alle Servermitglieder zählen sollen."
+            ),
+            color=discord.Color.gold()
+        )
+
+        await inter.response.edit_message(embed=emb, view=AdminEventRoleSelectView(self.data))
+
+
+class AdminEventRoleSelectView(View):
+    def __init__(self, data: dict):
+        super().__init__(timeout=None)
+        self.data = dict(data)
+        self.add_item(AdminEventRoleSelect(self.data))
+
+    async def _go_image_select(self, inter: discord.Interaction, target_role_id: int):
+        self.data["target_role_id"] = int(target_role_id or 0)
         emb = discord.Embed(
             title="🖼️ Event-Bild wählen",
             description=(
@@ -2085,8 +2149,59 @@ class AdminEventCreateModal(Modal):
             ),
             color=discord.Color.gold()
         )
+        await inter.response.edit_message(embed=emb, view=AdminEventImageSelectView(self.data))
 
-        await inter.response.send_message(embed=emb, view=AdminEventImageSelectView(data), ephemeral=True)
+    @button(label="👥 Alle / keine Zielrolle", style=ButtonStyle.secondary, custom_id="admin_event_role_all", row=1)
+    async def btn_all(self, inter: discord.Interaction, _):
+        await self._go_image_select(inter, 0)
+
+    @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="admin_event_role_back", row=1)
+    async def btn_back(self, inter: discord.Interaction, _):
+        emb = discord.Embed(
+            title="📍 Zielkanal wählen",
+            description="Wähle den Discord-Kanal, in dem der Raid/Event-Post erscheinen soll.",
+            color=discord.Color.gold()
+        )
+        await inter.response.edit_message(embed=emb, view=AdminEventChannelSelectView(self.data))
+
+    @button(label="❌ Abbrechen", style=ButtonStyle.secondary, custom_id="admin_event_role_cancel", row=2)
+    async def btn_cancel(self, inter: discord.Interaction, _):
+        await inter.response.edit_message(
+            embed=discord.Embed(
+                title="Abgebrochen",
+                description="Das Event wurde nicht erstellt.",
+                color=discord.Color.orange()
+            ),
+            view=None
+        )
+
+
+class AdminEventRoleSelect(RoleSelect):
+    def __init__(self, data: dict):
+        self.data = dict(data)
+        super().__init__(
+            placeholder="Zielrolle wählen",
+            min_values=1,
+            max_values=1,
+            custom_id="admin_event_role_select"
+        )
+
+    async def callback(self, inter: discord.Interaction):
+        role = self.values[0]
+        self.data["target_role_id"] = int(role.id)
+
+        emb = discord.Embed(
+            title="🖼️ Event-Bild wählen",
+            description=(
+                f"Zielrolle: {role.mention}\n\n"
+                "Wähle, welches Bild für dieses Event verwendet werden soll.\n\n"
+                "**Kein Bild** erstellt den Raid ohne Bild.\n"
+                "**Eigene URL** öffnet danach ein Eingabefeld für deinen Bildlink."
+            ),
+            color=discord.Color.gold()
+        )
+
+        await inter.response.edit_message(embed=emb, view=AdminEventImageSelectView(self.data))
 
 
 class AdminEventImageSelectView(View):
@@ -2142,7 +2257,8 @@ class AdminEventImageSelect(Select):
             str(self.data["title"]),
             str(self.data["date_text"]),
             str(self.data["time_text"]),
-            str(self.data["channel_text"]),
+            int(self.data.get("channel_id", 0) or 0),
+            int(self.data.get("target_role_id", 0) or 0),
             str(self.data.get("description", "")),
             image_url=image_url,
         )
@@ -2174,7 +2290,8 @@ class AdminEventCustomImageModal(Modal):
             str(self.data["title"]),
             str(self.data["date_text"]),
             str(self.data["time_text"]),
-            str(self.data["channel_text"]),
+            int(self.data.get("channel_id", 0) or 0),
+            int(self.data.get("target_role_id", 0) or 0),
             str(self.data.get("description", "")),
             image_url=image_url,
         )
