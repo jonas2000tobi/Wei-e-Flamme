@@ -2084,14 +2084,14 @@ class AdminEventCreateModal(Modal):
             color=discord.Color.gold()
         )
 
-        await inter.response.send_message(embed=emb, view=AdminEventChannelSelectView(data), ephemeral=True)
+        await inter.response.send_message(embed=emb, view=AdminEventChannelSelectView(data, inter.client), ephemeral=True)
 
 
 class AdminEventChannelSelectView(View):
-    def __init__(self, data: dict):
+    def __init__(self, data: dict, client: discord.Client | None = None):
         super().__init__(timeout=None)
         self.data = dict(data)
-        self.add_item(AdminEventChannelSelect(self.data))
+        self.add_item(AdminEventChannelSelect(self.data, client))
 
     @button(label="❌ Abbrechen", style=ButtonStyle.secondary, custom_id="admin_event_channel_cancel")
     async def btn_cancel(self, inter: discord.Interaction, _):
@@ -2105,38 +2105,87 @@ class AdminEventChannelSelectView(View):
         )
 
 
-class AdminEventChannelSelect(ChannelSelect):
-    def __init__(self, data: dict):
+class AdminEventChannelSelect(Select):
+    def __init__(self, data: dict, client: discord.Client | None = None):
         self.data = dict(data)
+        guild_id = int(self.data.get("guild_id", 0) or 0)
+        guild = client.get_guild(guild_id) if client is not None else None
+
+        options: list[discord.SelectOption] = []
+
+        if guild is not None:
+            channels = []
+
+            for ch in guild.text_channels:
+                try:
+                    me = guild.me
+                    perms = ch.permissions_for(me) if me else None
+
+                    if perms and not (perms.view_channel and perms.send_messages):
+                        continue
+
+                    channels.append(ch)
+                except Exception:
+                    channels.append(ch)
+
+            channels.sort(key=lambda c: (c.category.name.lower() if c.category else "", c.position, c.name.lower()))
+
+            for ch in channels[:25]:
+                category = ch.category.name if ch.category else "Ohne Kategorie"
+                options.append(
+                    discord.SelectOption(
+                        label=f"#{ch.name}"[:100],
+                        value=str(ch.id),
+                        description=category[:100]
+                    )
+                )
+
+        if not options:
+            options.append(
+                discord.SelectOption(
+                    label="Keine Kanäle gefunden",
+                    value="0",
+                    description="Bot findet keinen beschreibbaren Textkanal."
+                )
+            )
+
         super().__init__(
             placeholder="Zielkanal wählen",
             min_values=1,
             max_values=1,
-            channel_types=[discord.ChannelType.text],
+            options=options,
             custom_id="admin_event_channel_select"
         )
 
     async def callback(self, inter: discord.Interaction):
-        channel = self.values[0]
-        self.data["channel_id"] = int(channel.id)
+        try:
+            channel_id = int(self.values[0])
+        except Exception:
+            channel_id = 0
+
+        if not channel_id:
+            await inter.response.send_message("❌ Kein gültiger Kanal gefunden. Prüfe, ob der Bot Zugriff auf Server-Textkanäle hat.", ephemeral=True)
+            return
+
+        self.data["channel_id"] = channel_id
 
         emb = discord.Embed(
             title="🎯 Zielrolle wählen",
             description=(
                 "Wähle die Rolle, die für dieses Event angeschrieben werden soll.\n\n"
-                "Oder klicke **Alle / keine Zielrolle**, wenn alle Servermitglieder zählen sollen."
+                "Oder wähle **Alle / keine Zielrolle**, wenn alle Servermitglieder zählen sollen."
             ),
             color=discord.Color.gold()
         )
 
-        await inter.response.edit_message(embed=emb, view=AdminEventRoleSelectView(self.data))
+        await inter.response.edit_message(embed=emb, view=AdminEventRoleSelectView(self.data, inter.client))
 
 
 class AdminEventRoleSelectView(View):
-    def __init__(self, data: dict):
+    def __init__(self, data: dict, client: discord.Client | None = None):
         super().__init__(timeout=None)
         self.data = dict(data)
-        self.add_item(AdminEventRoleSelect(self.data))
+        self.add_item(AdminEventRoleSelect(self.data, client))
 
     async def _go_image_select(self, inter: discord.Interaction, target_role_id: int):
         self.data["target_role_id"] = int(target_role_id or 0)
@@ -2151,10 +2200,6 @@ class AdminEventRoleSelectView(View):
         )
         await inter.response.edit_message(embed=emb, view=AdminEventImageSelectView(self.data))
 
-    @button(label="👥 Alle / keine Zielrolle", style=ButtonStyle.secondary, custom_id="admin_event_role_all", row=1)
-    async def btn_all(self, inter: discord.Interaction, _):
-        await self._go_image_select(inter, 0)
-
     @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="admin_event_role_back", row=1)
     async def btn_back(self, inter: discord.Interaction, _):
         emb = discord.Embed(
@@ -2162,7 +2207,7 @@ class AdminEventRoleSelectView(View):
             description="Wähle den Discord-Kanal, in dem der Raid/Event-Post erscheinen soll.",
             color=discord.Color.gold()
         )
-        await inter.response.edit_message(embed=emb, view=AdminEventChannelSelectView(self.data))
+        await inter.response.edit_message(embed=emb, view=AdminEventChannelSelectView(self.data, inter.client))
 
     @button(label="❌ Abbrechen", style=ButtonStyle.secondary, custom_id="admin_event_role_cancel", row=2)
     async def btn_cancel(self, inter: discord.Interaction, _):
@@ -2176,24 +2221,61 @@ class AdminEventRoleSelectView(View):
         )
 
 
-class AdminEventRoleSelect(RoleSelect):
-    def __init__(self, data: dict):
+class AdminEventRoleSelect(Select):
+    def __init__(self, data: dict, client: discord.Client | None = None):
         self.data = dict(data)
+        guild_id = int(self.data.get("guild_id", 0) or 0)
+        guild = client.get_guild(guild_id) if client is not None else None
+
+        options: list[discord.SelectOption] = [
+            discord.SelectOption(
+                label="Alle / keine Zielrolle",
+                value="0",
+                description="Alle Servermitglieder zählen als Zielgruppe."
+            )
+        ]
+
+        if guild is not None:
+            roles = [r for r in guild.roles if not r.is_default() and not r.managed]
+            roles.sort(key=lambda r: (-r.position, r.name.lower()))
+
+            for role in roles[:24]:
+                options.append(
+                    discord.SelectOption(
+                        label=f"@{role.name}"[:100],
+                        value=str(role.id),
+                        description=f"Mitglieder: {len(role.members)}"[:100]
+                    )
+                )
+
         super().__init__(
             placeholder="Zielrolle wählen",
             min_values=1,
             max_values=1,
+            options=options,
             custom_id="admin_event_role_select"
         )
 
     async def callback(self, inter: discord.Interaction):
-        role = self.values[0]
-        self.data["target_role_id"] = int(role.id)
+        try:
+            role_id = int(self.values[0])
+        except Exception:
+            role_id = 0
+
+        self.data["target_role_id"] = int(role_id or 0)
+
+        guild = inter.client.get_guild(int(self.data.get("guild_id", 0) or 0))
+        role_text = "Alle / keine Zielrolle"
+
+        if guild and role_id:
+            role = guild.get_role(role_id)
+            if role:
+                role_text = role.mention
 
         emb = discord.Embed(
             title="🖼️ Event-Bild wählen",
             description=(
-                f"Zielrolle: {role.mention}\n\n"
+                f"Zielrolle: {role_text}\n\n"
                 "Wähle, welches Bild für dieses Event verwendet werden soll.\n\n"
                 "**Kein Bild** erstellt den Raid ohne Bild.\n"
                 "**Eigene URL** öffnet danach ein Eingabefeld für deinen Bildlink."
