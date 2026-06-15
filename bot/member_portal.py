@@ -68,6 +68,39 @@ def _is_admin(inter: discord.Interaction) -> bool:
     return bool(perms and (perms.administrator or perms.manage_guild))
 
 
+def _is_portal_admin(guild: Optional[discord.Guild], member: Optional[discord.Member]) -> bool:
+    if guild is None or member is None:
+        return False
+
+    perms = getattr(member, "guild_permissions", None)
+    if perms and (perms.administrator or perms.manage_guild):
+        return True
+
+    try:
+        c = _gcfg(guild.id)
+        roles = c.get("position_roles") or {}
+        for key in ("leader", "advisor", "guardian"):
+            role_id = int(roles.get(key, 0) or 0)
+            if not role_id:
+                continue
+            role = guild.get_role(role_id)
+            if role and role in member.roles:
+                return True
+    except Exception:
+        pass
+
+    try:
+        leader_cfg = _get_leader_cfg(guild.id)
+        role_id = int(leader_cfg.get("leader_role_id", 0) or 0)
+        role = guild.get_role(role_id) if role_id else None
+        if role and role in member.roles:
+            return True
+    except Exception:
+        pass
+
+    return False
+
+
 def _safe_text(s: str) -> str:
     return (s or "").replace("@", "@\u200b").strip()
 
@@ -978,6 +1011,9 @@ async def _delete_old_bot_dms_for_member(
         "🎁 Loot & Bedarf",
         "📅 Gilde",
         "🛡️ Kontakt & Hilfe",
+        "🛡️ Admin",
+        "📅 Admin – Event",
+        "🎁 Admin – Loot",
     }
 
     deleted = 0
@@ -1359,6 +1395,12 @@ class PortalMainSelect(Select):
                 description="Leader kontaktieren oder Hilfe zum Bot öffnen",
                 emoji="🛡️"
             ),
+            discord.SelectOption(
+                label="Admin",
+                value="admin",
+                description="Event- und Loot-Verwaltung für Leitung",
+                emoji="⚙️"
+            ),
         ]
 
         super().__init__(
@@ -1455,6 +1497,27 @@ class PortalMainSelect(Select):
             )
 
             await inter.response.edit_message(embed=emb, view=SupportMenuView())
+            return
+
+
+        if choice == "admin":
+            if not _is_portal_admin(guild, member):
+                await inter.response.send_message("❌ Dieser Bereich ist nur für Gildenleitung, Berater oder Wächter.", ephemeral=True)
+                return
+
+            emb = discord.Embed(
+                title="🛡️ Admin",
+                description=(
+                    "Interner Verwaltungsbereich für die Gildenleitung.\n\n"
+                    "**Event**\n"
+                    "Raids erstellen, Allianz-Raids erstellen, Events löschen und fehlende Abstimmungen erneut senden.\n\n"
+                    "**Loot**\n"
+                    "Items hinzufügen, Loot-Drops melden, Items als erhalten markieren und Katalog anzeigen."
+                ),
+                color=discord.Color.gold()
+            )
+
+            await inter.response.edit_message(embed=emb, view=AdminMenuView())
             return
 
 
@@ -1715,6 +1778,134 @@ class AbsenceCalendarView(View):
         )
 
         await inter.response.edit_message(embed=emb, view=GuildMenuView())
+
+
+
+class AdminMenuView(View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @button(label="📅 Event", style=ButtonStyle.secondary, custom_id="portal_admin_event")
+    async def btn_event(self, inter: discord.Interaction, _):
+        guild, member = await _resolve_guild_member_from_inter(inter)
+        if not _is_portal_admin(guild, member):
+            await inter.response.send_message("❌ Dieser Bereich ist nur für Gildenleitung, Berater oder Wächter.", ephemeral=True)
+            return
+        if guild and member and inter.message:
+            _mark_portal_sent(guild.id, member.id, inter.message.id)
+        emb = discord.Embed(
+            title="📅 Admin – Event",
+            description=(
+                "Event-Verwaltung im Menü.\n\n"
+                "Aktuell sind die bestehenden Slash-Commands weiterhin die sicherste Eingabeform:\n"
+                "• `/raid_create_dm` – normalen Raid erstellen\n"
+                "• `/alliance_raid_create` – Allianz-Raid erstellen\n"
+                "• `/raid_delete` – Event löschen\n"
+                "• `/alliance_raid_delete` – Allianz-Event löschen\n"
+                "• `/raid_resend_missing` – fehlende Abstimmungen erneut senden\n\n"
+                "Die vollständige Formular-Version bauen wir als nächsten Schritt, ohne die bestehenden Eventdaten anzufassen."
+            ),
+            color=discord.Color.gold()
+        )
+        await inter.response.edit_message(embed=emb, view=AdminEventMenuView())
+
+    @button(label="🎁 Loot", style=ButtonStyle.secondary, custom_id="portal_admin_loot")
+    async def btn_loot(self, inter: discord.Interaction, _):
+        guild, member = await _resolve_guild_member_from_inter(inter)
+        if not _is_portal_admin(guild, member):
+            await inter.response.send_message("❌ Dieser Bereich ist nur für Gildenleitung, Berater oder Wächter.", ephemeral=True)
+            return
+        if guild and member and inter.message:
+            _mark_portal_sent(guild.id, member.id, inter.message.id)
+        emb = discord.Embed(
+            title="🎁 Admin – Loot",
+            description="Wähle eine Loot-Aktion.",
+            color=discord.Color.gold()
+        )
+        await inter.response.edit_message(embed=emb, view=AdminLootMenuView())
+
+    @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="portal_admin_back")
+    async def btn_back(self, inter: discord.Interaction, _):
+        guild, member = await _resolve_guild_member_from_inter(inter)
+        if guild and member and inter.message:
+            _mark_portal_sent(guild.id, member.id, inter.message.id)
+        await inter.response.edit_message(embed=_main_menu_embed(guild, member), view=MemberPortalMainView())
+
+
+class AdminEventMenuView(View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @button(label="📅 Event erstellen", style=ButtonStyle.secondary, custom_id="portal_admin_event_create", row=0)
+    async def btn_create(self, inter: discord.Interaction, _):
+        await inter.response.send_message("Nutze aktuell: `/raid_create_dm`. Die Menü-Formular-Version kommt als nächster Schritt.", ephemeral=True)
+
+    @button(label="🌐 Allianz-Event", style=ButtonStyle.secondary, custom_id="portal_admin_event_alliance", row=0)
+    async def btn_alliance(self, inter: discord.Interaction, _):
+        await inter.response.send_message("Nutze aktuell: `/alliance_raid_create`. Die Menü-Formular-Version kommt als nächster Schritt.", ephemeral=True)
+
+    @button(label="🗑️ Event löschen", style=ButtonStyle.secondary, custom_id="portal_admin_event_delete", row=1)
+    async def btn_delete(self, inter: discord.Interaction, _):
+        await inter.response.send_message("Nutze aktuell: `/raid_delete` oder `/alliance_raid_delete`.", ephemeral=True)
+
+    @button(label="📨 Resend Missing", style=ButtonStyle.secondary, custom_id="portal_admin_event_resend", row=1)
+    async def btn_resend(self, inter: discord.Interaction, _):
+        await inter.response.send_message("Nutze aktuell: `/raid_resend_missing`.", ephemeral=True)
+
+    @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="portal_admin_event_back", row=2)
+    async def btn_back(self, inter: discord.Interaction, _):
+        emb = discord.Embed(title="🛡️ Admin", description="Wähle einen Bereich.", color=discord.Color.gold())
+        await inter.response.edit_message(embed=emb, view=AdminMenuView())
+
+
+class AdminLootMenuView(View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def _open(self, inter: discord.Interaction, fn_name: str):
+        guild, member = await _resolve_guild_member_from_inter(inter)
+        if not guild or not member:
+            await inter.response.send_message("❌ Ich konnte deinen Server nicht zuordnen.", ephemeral=True)
+            return
+        if not _is_portal_admin(guild, member):
+            await inter.response.send_message("❌ Dieser Bereich ist nur für Gildenleitung, Berater oder Wächter.", ephemeral=True)
+            return
+        if inter.message:
+            _mark_portal_sent(guild.id, member.id, inter.message.id)
+        try:
+            try:
+                import bot.loot_needs as loot_mod  # type: ignore
+            except ModuleNotFoundError:
+                import loot_needs as loot_mod  # type: ignore
+            fn = getattr(loot_mod, fn_name)
+            await fn(inter, guild.id, member.id)
+        except Exception as e:
+            await inter.response.send_message(f"❌ Loot-Menü konnte nicht geöffnet werden: `{e}`", ephemeral=True)
+
+    @button(label="➕ Item hinzufügen", style=ButtonStyle.secondary, custom_id="portal_admin_loot_add", row=0)
+    async def btn_add(self, inter: discord.Interaction, _):
+        await self._open(inter, "open_admin_item_add_menu")
+
+    @button(label="📦 Loot gedroppt", style=ButtonStyle.secondary, custom_id="portal_admin_loot_drop", row=0)
+    async def btn_drop(self, inter: discord.Interaction, _):
+        await self._open(inter, "open_admin_loot_drop_menu")
+
+    @button(label="✅ Item erhalten", style=ButtonStyle.secondary, custom_id="portal_admin_loot_mark", row=1)
+    async def btn_mark(self, inter: discord.Interaction, _):
+        await self._open(inter, "open_admin_mark_received_menu")
+
+    @button(label="❌ Erhalten freigeben", style=ButtonStyle.secondary, custom_id="portal_admin_loot_unmark", row=1)
+    async def btn_unmark(self, inter: discord.Interaction, _):
+        await self._open(inter, "open_admin_unmark_received_menu")
+
+    @button(label="📋 Katalog", style=ButtonStyle.secondary, custom_id="portal_admin_loot_catalog", row=2)
+    async def btn_catalog(self, inter: discord.Interaction, _):
+        await self._open(inter, "open_admin_item_catalog_menu")
+
+    @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="portal_admin_loot_back", row=3)
+    async def btn_back(self, inter: discord.Interaction, _):
+        emb = discord.Embed(title="🛡️ Admin", description="Wähle einen Bereich.", color=discord.Color.gold())
+        await inter.response.edit_message(embed=emb, view=AdminMenuView())
 
 
 class SupportMenuView(View):
