@@ -2669,6 +2669,21 @@ class AdminLootSlotSelect(Select):
             await inter.response.send_modal(AdminItemAddModal(self.guild_id, self.user_id, slot, ""))
             return
 
+        if slot == "Waffe" and self.action in {"drop", "mark", "unmark"}:
+            emb = discord.Embed(
+                title="🎁 Waffentyp wählen",
+                description=(
+                    f"Aktion: **{self.action}**\n"
+                    "Wähle zuerst den Waffentyp, damit auch bei mehr als 25 Waffen alle Items erreichbar bleiben."
+                ),
+                color=discord.Color.gold()
+            )
+            await inter.response.edit_message(
+                embed=emb,
+                view=AdminLootActionWeaponTypeSelectView(self.guild_id, self.user_id, self.action, slot)
+            )
+            return
+
         if self.action == "catalog":
             items = [dict(v, id=k) for k, v in _all_items(self.guild_id).items() if str(v.get("slot", "")) == slot]
             items.sort(key=lambda x: (str(x.get("weapon_type", "")), str(x.get("name", "")).lower()))
@@ -2729,6 +2744,66 @@ class AdminLootWeaponTypeSelect(Select):
         await inter.response.send_modal(AdminItemAddModal(self.guild_id, self.user_id, self.slot, self.values[0]))
 
 
+class AdminLootActionWeaponTypeSelectView(View):
+    def __init__(self, guild_id: int, user_id: int, action: str, slot: str):
+        super().__init__(timeout=None)
+        self.guild_id = int(guild_id)
+        self.user_id = int(user_id)
+        self.action = action
+        self.slot = slot
+        self.add_item(AdminLootActionWeaponTypeSelect(guild_id, user_id, action, slot))
+
+    @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="admin_loot_action_weapon_back")
+    async def btn_back(self, inter: discord.Interaction, _):
+        if self.slot == "Waffe" and self.weapon_type:
+            emb = discord.Embed(title="🎁 Waffentyp wählen", description="Wähle den Waffentyp.", color=discord.Color.gold())
+            await inter.response.edit_message(embed=emb, view=AdminLootActionWeaponTypeSelectView(self.guild_id, self.user_id, self.action, self.slot))
+            return
+        emb = discord.Embed(title="🎁 Slot wählen", description="Wähle den Slot.", color=discord.Color.gold())
+        await inter.response.edit_message(embed=emb, view=AdminLootSlotSelectView(self.guild_id, self.user_id, self.action))
+
+
+class AdminLootActionWeaponTypeSelect(Select):
+    def __init__(self, guild_id: int, user_id: int, action: str, slot: str):
+        self.guild_id = int(guild_id)
+        self.user_id = int(user_id)
+        self.action = action
+        self.slot = slot
+        options = [discord.SelectOption(label=w, value=w) for w in WEAPON_TYPES]
+        super().__init__(
+            placeholder="Waffentyp wählen",
+            min_values=1,
+            max_values=1,
+            options=options,
+            custom_id=f"admin_loot_action_weapon_type_{action}"
+        )
+
+    async def callback(self, inter: discord.Interaction):
+        weapon_type = self.values[0]
+        items = _items_for_need_slot(self.guild_id, self.slot, weapon_type=weapon_type)
+        if not items:
+            emb = discord.Embed(
+                title="❌ Kein Item im Katalog",
+                description=f"Für **{weapon_type}** sind noch keine Waffen hinterlegt.",
+                color=discord.Color.orange()
+            )
+            await inter.response.edit_message(
+                embed=emb,
+                view=AdminLootActionWeaponTypeSelectView(self.guild_id, self.user_id, self.action, self.slot)
+            )
+            return
+
+        emb = discord.Embed(
+            title="🎁 Item wählen",
+            description=f"Slot: **{self.slot}**\nWaffentyp: **{weapon_type}**",
+            color=discord.Color.gold()
+        )
+        await inter.response.edit_message(
+            embed=emb,
+            view=AdminLootItemSelectView(self.guild_id, self.user_id, self.action, self.slot, weapon_type=weapon_type)
+        )
+
+
 class AdminItemAddModal(Modal):
     def __init__(self, guild_id: int, user_id: int, slot: str, weapon_type: str):
         super().__init__(title="Item hinzufügen", timeout=None)
@@ -2772,27 +2847,33 @@ class AdminItemAddModal(Modal):
 
 
 class AdminLootItemSelectView(View):
-    def __init__(self, guild_id: int, user_id: int, action: str, slot: str):
+    def __init__(self, guild_id: int, user_id: int, action: str, slot: str, weapon_type: str | None = None):
         super().__init__(timeout=None)
         self.guild_id = int(guild_id)
         self.user_id = int(user_id)
         self.action = action
         self.slot = slot
-        self.add_item(AdminLootItemSelect(guild_id, user_id, action, slot))
+        self.weapon_type = weapon_type
+        self.add_item(AdminLootItemSelect(guild_id, user_id, action, slot, weapon_type=weapon_type))
 
     @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="admin_loot_item_back")
     async def btn_back(self, inter: discord.Interaction, _):
+        if self.slot == "Waffe" and self.weapon_type:
+            emb = discord.Embed(title="🎁 Waffentyp wählen", description="Wähle den Waffentyp.", color=discord.Color.gold())
+            await inter.response.edit_message(embed=emb, view=AdminLootActionWeaponTypeSelectView(self.guild_id, self.user_id, self.action, self.slot))
+            return
         emb = discord.Embed(title="🎁 Slot wählen", description="Wähle den Slot.", color=discord.Color.gold())
         await inter.response.edit_message(embed=emb, view=AdminLootSlotSelectView(self.guild_id, self.user_id, self.action))
 
 
 class AdminLootItemSelect(Select):
-    def __init__(self, guild_id: int, user_id: int, action: str, slot: str):
+    def __init__(self, guild_id: int, user_id: int, action: str, slot: str, weapon_type: str | None = None):
         self.guild_id = int(guild_id)
         self.user_id = int(user_id)
         self.action = action
         self.slot = slot
-        items = _items_for_need_slot(guild_id, slot)[:25]
+        self.weapon_type = weapon_type
+        items = _items_for_need_slot(guild_id, slot, weapon_type=weapon_type)[:25]
         options = [
             discord.SelectOption(
                 label=str(item.get("name", item["id"]))[:100],
