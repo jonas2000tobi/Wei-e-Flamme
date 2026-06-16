@@ -30,9 +30,18 @@ TZ = ZoneInfo("Europe/Berlin")
 EMOJI_TANK = "<:tank:1516436970543386635>"
 EMOJI_HEAL = "<:heal:1516436679735382136>"
 EMOJI_DPS = "<:dps:1516436928814252054>"
-EMOJI_BANK = "🏦"
+EMOJI_BANK = "<:reserve:1516439143385792522>"
 EMOJI_MAYBE = "<:maybe:1516437110624747752>"
 EMOJI_NO = "<:no:1516437249481380042>"
+
+# Custom Discord-Emojis für das Gildenmenü
+# Ebolus-Logo braucht noch den vollständigen Emoji-Code. Bis dahin bleibt das alte Symbol als Fallback.
+EMOJI_EBOLUS = "⚜️"
+EMOJI_PERSONAL = "<:persoenlich:1516444313868046366>"
+EMOJI_LOOT = "<:loot:1516444382683992205>"
+EMOJI_GUILD = "<:gilde:1516444419040215050>"
+EMOJI_CONTACT = "<:kontakt:1516444479421419703>"
+EMOJI_ADMIN = "<:admin:1516444522270167091>"
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
@@ -480,7 +489,7 @@ def _rsvp_user_status(obj: dict, user_id: int) -> str:
         "TANK": f"{EMOJI_TANK} Tank",
         "HEAL": f"{EMOJI_HEAL} Heal",
         "DPS": f"{EMOJI_DPS} DPS",
-        "BANK": f"{EMOJI_BANK} Bank",
+        "BANK": f"{EMOJI_BANK} Reserve",
     }
 
     for key, label in labels.items():
@@ -583,7 +592,7 @@ def _main_menu_embed(guild: discord.Guild, member: Optional[discord.Member] = No
         event_block = _event_status_block(guild, member) + "\n\n"
 
     emb = discord.Embed(
-        title="⚜️ Ebolus Kommandozentrale",
+        title=f"{EMOJI_EBOLUS} Ebolus Kommandozentrale",
         description=(
             event_block +
             "Willkommen im privaten Gildenmenü.\n\n"
@@ -606,7 +615,7 @@ def _profile_embed(guild: discord.Guild, member: discord.Member) -> discord.Embe
     gearscore = p.get("gearscore") or "Nicht gesetzt"
 
     emb = discord.Embed(
-        title="👤 Dein Gildenprofil",
+        title=f"{EMOJI_PERSONAL} Dein Gildenprofil",
         description=f"Profil von **{ingame}**",
         color=discord.Color.gold()
     )
@@ -1004,8 +1013,10 @@ async def _delete_old_bot_dms_for_member(
 
     protected_titles = {
         "⚜️ Ebolus Kommandozentrale",
+        f"{EMOJI_EBOLUS} Ebolus Kommandozentrale",
         "🏰 ebolus – Gildenmenü",
         "👤 Dein Gildenprofil",
+        f"{EMOJI_PERSONAL} Dein Gildenprofil",
         "📅 Ebolus Gildenkalender",
         "📅 Gildenkalender – ebolus",
         "📅 Gilden-Events",
@@ -1019,12 +1030,19 @@ async def _delete_old_bot_dms_for_member(
         "📜 Regeln & Lootsystem – ebolus",
         "🎁 Needliste – ebolus",
         "👤 Persönlich",
+        f"{EMOJI_PERSONAL} Persönlich",
         "🎁 Loot & Bedarf",
+        f"{EMOJI_LOOT} Loot & Bedarf",
         "📅 Gilde",
+        f"{EMOJI_GUILD} Gilde",
         "🛡️ Kontakt & Hilfe",
+        f"{EMOJI_CONTACT} Kontakt & Hilfe",
         "🛡️ Admin",
+        f"{EMOJI_ADMIN} Admin",
         "📅 Admin – Event",
+        f"{EMOJI_GUILD} Admin – Event",
         "🎁 Admin – Loot",
+        f"{EMOJI_LOOT} Admin – Loot",
         "✅ Admin – Anwesenheit",
         "✅ Anwesenheit prüfen",
     }
@@ -1388,31 +1406,31 @@ class PortalMainSelect(Select):
                 label="Persönlich",
                 value="personal",
                 description="Profil, Gearscore, Abwesenheit und Raid-DMs",
-                emoji="👤"
+                emoji=EMOJI_PERSONAL
             ),
             discord.SelectOption(
                 label="Loot & Bedarf",
                 value="loot",
                 description="Needliste für Main/Secondary und Lootregeln",
-                emoji="🎁"
+                emoji=EMOJI_LOOT
             ),
             discord.SelectOption(
                 label="Gilde",
                 value="guild",
                 description="Kalender, Abwesenheiten und Mitgliederübersicht",
-                emoji="📅"
+                emoji=EMOJI_GUILD
             ),
             discord.SelectOption(
                 label="Kontakt & Hilfe",
                 value="support",
                 description="Leader kontaktieren oder Hilfe zum Bot öffnen",
-                emoji="🛡️"
+                emoji=EMOJI_CONTACT
             ),
             discord.SelectOption(
                 label="Admin",
                 value="admin",
                 description="Event- und Loot-Verwaltung für Leitung",
-                emoji="⚙️"
+                emoji=EMOJI_ADMIN
             ),
         ]
 
@@ -1446,7 +1464,7 @@ class PortalMainSelect(Select):
                     enabled = True
 
             emb = discord.Embed(
-                title="👤 Persönlich",
+                title=f"{EMOJI_PERSONAL} Persönlich",
                 description=(
                     "Hier findest du alles, was dein eigenes Profil und deine Anwesenheit betrifft.\n\n"
                     "**Profil**\n"
@@ -1464,7 +1482,7 @@ class PortalMainSelect(Select):
 
         if choice == "loot":
             emb = discord.Embed(
-                title="🎁 Loot & Bedarf",
+                title=f"{EMOJI_LOOT} Loot & Bedarf",
                 description=(
                     "Hier verwaltest du alles rund um Items und Loot.\n\n"
                     "**Needliste**\n"
@@ -1480,7 +1498,7 @@ class PortalMainSelect(Select):
 
         if choice == "guild":
             emb = discord.Embed(
-                title="📅 Gilde",
+                title=f"{EMOJI_GUILD} Gilde",
                 description=(
                     "Hier findest du die wichtigsten Gildenübersichten.\n\n"
                     "**Kalender**\n"
@@ -1498,7 +1516,7 @@ class PortalMainSelect(Select):
 
         if choice == "support":
             emb = discord.Embed(
-                title="🛡️ Kontakt & Hilfe",
+                title=f"{EMOJI_CONTACT} Kontakt & Hilfe",
                 description=(
                     "Hier kannst du die Gildenleitung erreichen oder Hilfe zum Bot lesen.\n\n"
                     "**Leaderkontakt**\n"
@@ -1519,7 +1537,7 @@ class PortalMainSelect(Select):
                 return
 
             emb = discord.Embed(
-                title="🛡️ Admin",
+                title=f"{EMOJI_ADMIN} Admin",
                 description=(
                     "Interner Verwaltungsbereich für die Gildenleitung.\n\n"
                     "**Event**\n"
@@ -1633,7 +1651,7 @@ class DmSettingsView(View):
                 enabled = True
 
         emb = discord.Embed(
-            title="👤 Persönlich",
+            title=f"{EMOJI_PERSONAL} Persönlich",
             description=(
                 "Hier findest du alles, was dein eigenes Profil und deine Anwesenheit betrifft.\n\n"
                 "**Profil**\n"
@@ -1777,7 +1795,7 @@ class AbsenceCalendarView(View):
             _mark_portal_sent(guild.id, member.id, inter.message.id)
 
         emb = discord.Embed(
-            title="📅 Gilde",
+            title=f"{EMOJI_GUILD} Gilde",
             description=(
                 "Hier findest du die wichtigsten Gildenübersichten.\n\n"
                 "**Kalender**\n"
@@ -2706,7 +2724,7 @@ class AdminEventSelectView(View):
 
     @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="admin_event_select_back")
     async def btn_back(self, inter: discord.Interaction, _):
-        emb = discord.Embed(title="📅 Admin – Event", description="Wähle eine Event-Aktion.", color=discord.Color.gold())
+        emb = discord.Embed(title=f"{EMOJI_GUILD} Admin – Event", description="Wähle eine Event-Aktion.", color=discord.Color.gold())
         await inter.response.edit_message(embed=emb, view=AdminEventMenuView())
 
 
@@ -2770,7 +2788,7 @@ class AdminAttendanceEventSelectView(View):
 
     @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="admin_attendance_event_back")
     async def btn_back(self, inter: discord.Interaction, _):
-        emb = discord.Embed(title="📅 Admin – Event", description="Wähle eine Event-Aktion.", color=discord.Color.gold())
+        emb = discord.Embed(title=f"{EMOJI_GUILD} Admin – Event", description="Wähle eine Event-Aktion.", color=discord.Color.gold())
         await inter.response.edit_message(embed=emb, view=AdminEventMenuView())
 
 
@@ -2970,7 +2988,7 @@ class AdminVoiceSettingsView(View):
 
     @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="admin_voice_back", row=1)
     async def btn_back(self, inter: discord.Interaction, _):
-        emb = discord.Embed(title="📅 Admin – Event", description="Wähle eine Event-Aktion.", color=discord.Color.gold())
+        emb = discord.Embed(title=f"{EMOJI_GUILD} Admin – Event", description="Wähle eine Event-Aktion.", color=discord.Color.gold())
         await inter.response.edit_message(embed=emb, view=AdminEventMenuView())
 
 
@@ -3074,7 +3092,7 @@ class AdminMenuView(View):
         if guild and member and inter.message:
             _mark_portal_sent(guild.id, member.id, inter.message.id)
         emb = discord.Embed(
-            title="📅 Admin – Event",
+            title=f"{EMOJI_GUILD} Admin – Event",
             description=(
                 "Event-Verwaltung im Menü.\n\n"
                 "Aktuell sind die bestehenden Slash-Commands weiterhin die sicherste Eingabeform:\n"
@@ -3098,7 +3116,7 @@ class AdminMenuView(View):
         if guild and member and inter.message:
             _mark_portal_sent(guild.id, member.id, inter.message.id)
         emb = discord.Embed(
-            title="🎁 Admin – Loot",
+            title=f"{EMOJI_LOOT} Admin – Loot",
             description="Wähle eine Loot-Aktion.",
             color=discord.Color.gold()
         )
@@ -3180,7 +3198,7 @@ class AdminEventMenuView(View):
 
     @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="portal_admin_event_back", row=4)
     async def btn_back(self, inter: discord.Interaction, _):
-        emb = discord.Embed(title="🛡️ Admin", description="Wähle einen Bereich.", color=discord.Color.gold())
+        emb = discord.Embed(title=f"{EMOJI_ADMIN} Admin", description="Wähle einen Bereich.", color=discord.Color.gold())
         await inter.response.edit_message(embed=emb, view=AdminMenuView())
 
 
@@ -3230,7 +3248,7 @@ class AdminLootMenuView(View):
 
     @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="portal_admin_loot_back", row=3)
     async def btn_back(self, inter: discord.Interaction, _):
-        emb = discord.Embed(title="🛡️ Admin", description="Wähle einen Bereich.", color=discord.Color.gold())
+        emb = discord.Embed(title=f"{EMOJI_ADMIN} Admin", description="Wähle einen Bereich.", color=discord.Color.gold())
         await inter.response.edit_message(embed=emb, view=AdminMenuView())
 
 
@@ -3356,7 +3374,7 @@ class EventsInfoView(View):
             _mark_portal_sent(guild.id, member.id, inter.message.id)
 
         emb = discord.Embed(
-            title="📅 Gilde",
+            title=f"{EMOJI_GUILD} Gilde",
             description=(
                 "Hier findest du die wichtigsten Gildenübersichten.\n\n"
                 "**Kalender**\n"
