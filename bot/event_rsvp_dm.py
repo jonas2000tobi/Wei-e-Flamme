@@ -31,9 +31,17 @@ TZ = ZoneInfo("Europe/Berlin")
 EMOJI_TANK = "<:tank:1516436970543386635>"
 EMOJI_HEAL = "<:heal:1516436679735382136>"
 EMOJI_DPS = "<:dps:1516436928814252054>"
-EMOJI_BANK = "🏦"
+EMOJI_BANK = "<:reserve:1516439143385792522>"
 EMOJI_MAYBE = "<:maybe:1516437110624747752>"
 EMOJI_NO = "<:no:1516437249481380042>"
+
+# Portal-Menü-Emojis zum Schutz vor DM-Cleanup
+EMOJI_EBOLUS = "⚜️"
+EMOJI_PERSONAL = "<:persoenlich:1516444313868046366>"
+EMOJI_LOOT = "<:loot:1516444382683992205>"
+EMOJI_GUILD = "<:gilde:1516444419040215050>"
+EMOJI_CONTACT = "<:kontakt:1516444479421419703>"
+EMOJI_ADMIN = "<:admin:1516444522270167091>"
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
@@ -538,7 +546,7 @@ def build_embed(guild: discord.Guild, obj: dict) -> discord.Embed:
     emb.add_field(name=f"{EMOJI_TANK} Tank ({len(tank_names)})", value="\n".join(tank_names) or "—", inline=True)
     emb.add_field(name=f"{EMOJI_HEAL} Heal ({len(heal_names)})", value="\n".join(heal_names) or "—", inline=True)
     emb.add_field(name=f"{EMOJI_DPS} DPS ({len(dps_names)})", value="\n".join(dps_names) or "—", inline=True)
-    emb.add_field(name=f"{EMOJI_BANK} Bank ({len(bank_names)})", value="\n".join(bank_names) or "—", inline=False)
+    emb.add_field(name=f"{EMOJI_BANK} Reserve ({len(bank_names)})", value="\n".join(bank_names) or "—", inline=False)
 
     maybe_lines = []
 
@@ -614,12 +622,18 @@ async def _delete_dm_message_for_user(client: discord.Client, obj: dict, user_id
 def _portal_protected_titles() -> set[str]:
     return {
         "⚜️ Ebolus Kommandozentrale",
+        f"{EMOJI_EBOLUS} Ebolus Kommandozentrale",
         "🏰 ebolus – Gildenmenü",
 
         "👤 Persönlich",
+        f"{EMOJI_PERSONAL} Persönlich",
         "🎁 Loot & Bedarf",
+        f"{EMOJI_LOOT} Loot & Bedarf",
         "📅 Gilde",
+        f"{EMOJI_GUILD} Gilde",
         "🛡️ Kontakt & Hilfe",
+        f"{EMOJI_CONTACT} Kontakt & Hilfe",
+        f"{EMOJI_ADMIN} Admin",
 
         "👤 Dein Gildenprofil",
         "📅 Ebolus Gildenkalender",
@@ -1443,7 +1457,7 @@ async def apply_rsvp(inter: discord.Interaction, msg_id: str, group: str) -> tup
 
     elif group == "BANK":
         obj["yes"]["BANK"].append(_participant_entry(uid, display_name, guild_label, source_guild_id))
-        text = "Als **Bank / Reserve** eingetragen."
+        text = "Als **Reserve** eingetragen."
 
     elif group == "MAYBE":
         rid_map = get_role_ids_for_guild(int(obj["guild_id"]))
@@ -1536,7 +1550,7 @@ class RaidView(BaseRaidView):
     async def btn_dps(self, inter: discord.Interaction, _):
         await self._handle(inter, "DPS")
 
-    @button(label="Bank", emoji=EMOJI_BANK, style=ButtonStyle.secondary, custom_id="dm_rsvp_bank")
+    @button(label="Reserve", emoji=EMOJI_BANK, style=ButtonStyle.secondary, custom_id="dm_rsvp_bank")
     async def btn_bank(self, inter: discord.Interaction, _):
         await self._handle(inter, "BANK")
 
@@ -1562,7 +1576,7 @@ class ServerRaidView(BaseRaidView):
     async def btn_dps(self, inter: discord.Interaction, _):
         await self._handle(inter, "DPS")
 
-    @button(label="Bank", emoji=EMOJI_BANK, style=ButtonStyle.secondary, custom_id="srv_rsvp_bank")
+    @button(label="Reserve", emoji=EMOJI_BANK, style=ButtonStyle.secondary, custom_id="srv_rsvp_bank")
     async def btn_bank(self, inter: discord.Interaction, _):
         await self._handle(inter, "BANK")
 
