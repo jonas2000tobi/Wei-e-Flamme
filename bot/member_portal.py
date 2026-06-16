@@ -117,6 +117,8 @@ def _gcfg(guild_id: int) -> dict:
         "guardian": 0,
     })
     c.setdefault("events", [])
+    c.setdefault("event_voice_category_id", 0)
+    c.setdefault("event_voice_return_channel_id", 0)
     cfg[str(guild_id)] = c
     return c
 
@@ -1808,6 +1810,34 @@ def _admin_event_module():
     return rsvp_mod
 
 
+def _admin_clean_voice_name(title: str) -> str:
+    raw = str(title or "Event").strip() or "Event"
+    raw = re.sub(r"[#@`*_~|<>\n\r]+", "", raw).strip()
+    if len(raw) > 60:
+        raw = raw[:60].strip()
+    return f"🔊 {raw}"
+
+
+async def _admin_create_event_voice(
+    guild: discord.Guild,
+    title: str,
+    category_id: int = 0,
+) -> Optional[discord.VoiceChannel]:
+    category = guild.get_channel(int(category_id or 0)) if category_id else None
+    if category is not None and not isinstance(category, discord.CategoryChannel):
+        category = None
+
+    try:
+        return await guild.create_voice_channel(
+            name=_admin_clean_voice_name(title),
+            category=category,
+            reason="Event-Voice automatisch über Gildenmenü erstellt",
+        )
+    except Exception as e:
+        print(f"[member_portal] Event-Voice konnte nicht erstellt werden: {e!r}")
+        return None
+
+
 EVENT_IMAGE_PRESETS = {
     "Normal Raid": "https://media.discordapp.net/attachments/1488142284812714085/1516086614957494312/282b2b20-5a8f-4251-b038-15fde2ac723d.png?ex=6a315d30&is=6a300bb0&hm=767b9ad51564019a71be77906c480350e29137f24e08b6abd99f67a9c9edad33&=&format=webp&quality=lossless",
     "Hard Raid": "https://media.discordapp.net/attachments/1488142284812714085/1513816935832228033/7225f274-cc4f-4eda-ba74-ca401f4e572b.png?ex=6a310462&is=6a2fb2e2&hm=9aa88c9c5b45f6eea14ec33541344421b7d467b3b5969f2c8d7faeebb3b30df2&=&format=webp&quality=lossless",
@@ -1852,6 +1882,9 @@ async def _admin_create_regular_raid_from_menu(
     description: str,
     image_url: str | None = None,
     reminders: list[dict] | None = None,
+    voice_enabled: bool = False,
+    voice_category_id: int = 0,
+    voice_return_channel_id: int = 0,
 ):
     rsvp = _admin_event_module()
     guild = inter.client.get_guild(int(guild_id))
@@ -1881,6 +1914,17 @@ async def _admin_create_regular_raid_from_menu(
         await inter.followup.send("❌ Zielrolle nicht gefunden.", ephemeral=True)
         return
 
+    voice_channel_id = 0
+    if voice_enabled:
+        voice = await _admin_create_event_voice(guild, str(title).strip(), int(voice_category_id or 0))
+        if voice is None:
+            await inter.followup.send(
+                "⚠️ Event-Voice konnte nicht erstellt werden. Das Event wird trotzdem ohne Voice erstellt.",
+                ephemeral=True,
+            )
+        else:
+            voice_channel_id = int(voice.id)
+
     obj = {
         "guild_id": int(guild.id),
         "channel_id": int(ch.id),
@@ -1894,6 +1938,10 @@ async def _admin_create_regular_raid_from_menu(
         "target_role_id": int(target_role_id),
         "reminders": reminders or [],
         "reminder_sent": {},
+        "voice_enabled": bool(voice_channel_id),
+        "voice_channel_id": int(voice_channel_id),
+        "voice_return_channel_id": int(voice_return_channel_id or 0),
+        "voice_cleanup_done": False,
         "dm_messages": {},
     }
 
@@ -1939,7 +1987,8 @@ async def _admin_create_regular_raid_from_menu(
         f"✅ Event erstellt: {msg.jump_url}\n"
         f"✉️ DMs versendet: **{sent}**\n"
         f"🔕 Opt-out übersprungen: **{skipped_opt_out}**\n"
-        f"⏰ Reminder: **{len(reminders or [])}**",
+        f"⏰ Reminder: **{len(reminders or [])}**\n"
+        f"🔊 Voice: **{'erstellt' if voice_channel_id else 'nein'}**",
         ephemeral=True
     )
 
@@ -2416,6 +2465,76 @@ class AdminEventReminderSelect(Select):
 
     async def callback(self, inter: discord.Interaction):
         reminders = _admin_reminder_options(self.values[0])
+        self.data["reminders"] = reminders
+        await _admin_show_voice_select(inter, self.data)
+
+
+async def _admin_show_voice_select(inter: discord.Interaction, data: dict):
+    guild = inter.client.get_guild(int(data.get("guild_id", 0) or 0))
+    c = _gcfg(guild.id) if guild else {}
+    category_id = int(c.get("event_voice_category_id", 0) or 0)
+    return_id = int(c.get("event_voice_return_channel_id", 0) or 0)
+
+    category_txt = "Nicht gesetzt"
+    return_txt = "Nicht gesetzt"
+
+    if guild and category_id:
+        category = guild.get_channel(category_id)
+        if isinstance(category, discord.CategoryChannel):
+            category_txt = category.name
+
+    if guild and return_id:
+        channel = guild.get_channel(return_id)
+        if isinstance(channel, discord.VoiceChannel):
+            return_txt = channel.name
+
+    emb = discord.Embed(
+        title="🔊 Event-Voice wählen",
+        description=(
+            "Soll für dieses Event automatisch ein Voice-Channel erstellt werden?\n\n"
+            f"Kategorie: **{category_txt}**\n"
+            f"Sammel-Voice nach Event: **{return_txt}**\n\n"
+            "Der Event-Voice wird nach Eventende geschlossen. Wenn ein Sammel-Voice gesetzt ist, werden Mitglieder vorher dorthin verschoben."
+        ),
+        color=discord.Color.gold(),
+    )
+    await inter.response.edit_message(embed=emb, view=AdminEventVoiceSelectView(data))
+
+
+class AdminEventVoiceSelectView(View):
+    def __init__(self, data: dict):
+        super().__init__(timeout=None)
+        self.data = dict(data)
+        self.add_item(AdminEventVoiceSelect(self.data))
+
+    @button(label="❌ Abbrechen", style=ButtonStyle.secondary, custom_id="admin_event_voice_cancel")
+    async def btn_cancel(self, inter: discord.Interaction, _):
+        await inter.response.edit_message(
+            embed=discord.Embed(title="Abgebrochen", description="Das Event wurde nicht erstellt.", color=discord.Color.orange()),
+            view=None,
+        )
+
+
+class AdminEventVoiceSelect(Select):
+    def __init__(self, data: dict):
+        self.data = dict(data)
+        options = [
+            discord.SelectOption(label="Kein Voice-Channel", value="no", description="Event ohne eigenen Voice erstellen"),
+            discord.SelectOption(label="Voice-Channel erstellen", value="yes", description="Bot erstellt einen temporären Event-Voice"),
+        ]
+        super().__init__(
+            placeholder="Voice-Option wählen",
+            min_values=1,
+            max_values=1,
+            options=options,
+            custom_id="admin_event_voice_select",
+        )
+
+    async def callback(self, inter: discord.Interaction):
+        voice_enabled = self.values[0] == "yes"
+        guild = inter.client.get_guild(int(self.data.get("guild_id", 0) or 0))
+        c = _gcfg(guild.id) if guild else {}
+
         await inter.response.defer(ephemeral=True, thinking=True)
         await _admin_create_regular_raid_from_menu(
             inter,
@@ -2427,7 +2546,10 @@ class AdminEventReminderSelect(Select):
             int(self.data.get("target_role_id", 0) or 0),
             str(self.data.get("description", "")),
             image_url=(str(self.data.get("image_url", "") or "").strip() or None),
-            reminders=reminders,
+            reminders=list(self.data.get("reminders") or []),
+            voice_enabled=voice_enabled,
+            voice_category_id=int(c.get("event_voice_category_id", 0) or 0),
+            voice_return_channel_id=int(c.get("event_voice_return_channel_id", 0) or 0),
         )
 
 
@@ -2516,6 +2638,126 @@ class AdminEventDeleteConfirmView(View):
     async def btn_cancel(self, inter: discord.Interaction, _):
         emb = discord.Embed(title="Abgebrochen", description="Das Event wurde nicht gelöscht.", color=discord.Color.orange())
         await inter.response.edit_message(embed=emb, view=AdminEventMenuView())
+
+
+class AdminVoiceSettingsView(View):
+    def __init__(self, guild_id: int):
+        super().__init__(timeout=None)
+        self.guild_id = int(guild_id)
+
+    @button(label="📁 Kategorie setzen", style=ButtonStyle.secondary, custom_id="admin_voice_set_category", row=0)
+    async def btn_category(self, inter: discord.Interaction, _):
+        guild = inter.client.get_guild(self.guild_id)
+        if not guild:
+            await inter.response.send_message("❌ Server nicht gefunden.", ephemeral=True)
+            return
+        await inter.response.edit_message(
+            embed=discord.Embed(title="📁 Event-Voice-Kategorie", description="Wähle die Kategorie, in der Event-Voices erstellt werden sollen.", color=discord.Color.gold()),
+            view=AdminVoiceCategorySelectView(self.guild_id, guild),
+        )
+
+    @button(label="🔁 Sammel-Voice setzen", style=ButtonStyle.secondary, custom_id="admin_voice_set_return", row=0)
+    async def btn_return(self, inter: discord.Interaction, _):
+        guild = inter.client.get_guild(self.guild_id)
+        if not guild:
+            await inter.response.send_message("❌ Server nicht gefunden.", ephemeral=True)
+            return
+        await inter.response.edit_message(
+            embed=discord.Embed(title="🔁 Sammel-Voice", description="Wähle den Voice-Channel, in den Mitglieder nach Eventende verschoben werden sollen.", color=discord.Color.gold()),
+            view=AdminVoiceReturnSelectView(self.guild_id, guild),
+        )
+
+    @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="admin_voice_back", row=1)
+    async def btn_back(self, inter: discord.Interaction, _):
+        emb = discord.Embed(title="📅 Admin – Event", description="Wähle eine Event-Aktion.", color=discord.Color.gold())
+        await inter.response.edit_message(embed=emb, view=AdminEventMenuView())
+
+
+class AdminVoiceCategorySelectView(View):
+    def __init__(self, guild_id: int, guild: discord.Guild):
+        super().__init__(timeout=None)
+        self.guild_id = int(guild_id)
+        self.add_item(AdminVoiceCategorySelect(guild_id, guild))
+
+    @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="admin_voice_category_back")
+    async def btn_back(self, inter: discord.Interaction, _):
+        await _admin_show_voice_settings(inter, self.guild_id)
+
+
+class AdminVoiceCategorySelect(Select):
+    def __init__(self, guild_id: int, guild: discord.Guild):
+        self.guild_id = int(guild_id)
+        categories = sorted(guild.categories, key=lambda c: c.position)[:25]
+        options = [discord.SelectOption(label=c.name[:100], value=str(c.id)) for c in categories]
+        if not options:
+            options = [discord.SelectOption(label="Keine Kategorie gefunden", value="0")]
+        super().__init__(placeholder="Kategorie wählen", min_values=1, max_values=1, options=options, custom_id="admin_voice_category_select")
+
+    async def callback(self, inter: discord.Interaction):
+        c = _gcfg(self.guild_id)
+        c["event_voice_category_id"] = int(self.values[0])
+        cfg[str(self.guild_id)] = c
+        save_cfg()
+        await inter.response.send_message("✅ Event-Voice-Kategorie gespeichert.", ephemeral=True)
+
+
+class AdminVoiceReturnSelectView(View):
+    def __init__(self, guild_id: int, guild: discord.Guild):
+        super().__init__(timeout=None)
+        self.guild_id = int(guild_id)
+        self.add_item(AdminVoiceReturnSelect(guild_id, guild))
+
+    @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="admin_voice_return_back")
+    async def btn_back(self, inter: discord.Interaction, _):
+        await _admin_show_voice_settings(inter, self.guild_id)
+
+
+class AdminVoiceReturnSelect(Select):
+    def __init__(self, guild_id: int, guild: discord.Guild):
+        self.guild_id = int(guild_id)
+        channels = sorted(guild.voice_channels, key=lambda c: (c.category.position if c.category else 999, c.position, c.name.lower()))[:25]
+        options = [discord.SelectOption(label=c.name[:100], value=str(c.id), description=(c.category.name[:100] if c.category else "Keine Kategorie")) for c in channels]
+        if not options:
+            options = [discord.SelectOption(label="Kein Voice-Channel gefunden", value="0")]
+        super().__init__(placeholder="Sammel-Voice wählen", min_values=1, max_values=1, options=options, custom_id="admin_voice_return_select")
+
+    async def callback(self, inter: discord.Interaction):
+        c = _gcfg(self.guild_id)
+        c["event_voice_return_channel_id"] = int(self.values[0])
+        cfg[str(self.guild_id)] = c
+        save_cfg()
+        await inter.response.send_message("✅ Sammel-Voice gespeichert.", ephemeral=True)
+
+
+async def _admin_show_voice_settings(inter: discord.Interaction, guild_id: int):
+    guild = inter.client.get_guild(int(guild_id))
+    c = _gcfg(int(guild_id))
+    category_id = int(c.get("event_voice_category_id", 0) or 0)
+    return_id = int(c.get("event_voice_return_channel_id", 0) or 0)
+
+    category_txt = "Nicht gesetzt"
+    return_txt = "Nicht gesetzt"
+
+    if guild and category_id:
+        category = guild.get_channel(category_id)
+        if isinstance(category, discord.CategoryChannel):
+            category_txt = category.name
+
+    if guild and return_id:
+        channel = guild.get_channel(return_id)
+        if isinstance(channel, discord.VoiceChannel):
+            return_txt = channel.name
+
+    emb = discord.Embed(
+        title="🔊 Voice-Einstellungen",
+        description=(
+            f"Event-Voice-Kategorie: **{category_txt}**\n"
+            f"Sammel-Voice nach Event: **{return_txt}**\n\n"
+            "Diese Einstellungen werden verwendet, wenn beim Event-Erstellen `Voice-Channel erstellen` gewählt wird."
+        ),
+        color=discord.Color.gold(),
+    )
+    await inter.response.edit_message(embed=emb, view=AdminVoiceSettingsView(int(guild_id)))
 
 
 class AdminMenuView(View):
@@ -2614,7 +2856,15 @@ class AdminEventMenuView(View):
         emb = discord.Embed(title="📨 Resend Missing", description="Wähle das Event, für das fehlende Abstimmungen erneut gesendet werden sollen.", color=discord.Color.gold())
         await inter.response.edit_message(embed=emb, view=AdminEventSelectView(guild.id, member.id, "resend", events))
 
-    @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="portal_admin_event_back", row=2)
+    @button(label="🔊 Voice-Einstellungen", style=ButtonStyle.secondary, custom_id="portal_admin_event_voice_settings", row=2)
+    async def btn_voice_settings(self, inter: discord.Interaction, _):
+        guild, member = await _resolve_guild_member_from_inter(inter)
+        if not _is_portal_admin(guild, member):
+            await inter.response.send_message("❌ Dieser Bereich ist nur für Gildenleitung, Berater oder Wächter.", ephemeral=True)
+            return
+        await _admin_show_voice_settings(inter, guild.id)
+
+    @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="portal_admin_event_back", row=3)
     async def btn_back(self, inter: discord.Interaction, _):
         emb = discord.Embed(title="🛡️ Admin", description="Wähle einen Bereich.", color=discord.Color.gold())
         await inter.response.edit_message(embed=emb, view=AdminMenuView())
