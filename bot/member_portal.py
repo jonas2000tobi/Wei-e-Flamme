@@ -1593,19 +1593,7 @@ class PersonalMenuView(View):
         if inter.message:
             _mark_portal_sent(guild.id, member.id, inter.message.id)
 
-        try:
-            await inter.response.edit_message(embed=_profile_embed(guild, member), view=ProfileView())
-        except Exception as e:
-            import traceback
-            print(f"[member_portal] Profil öffnen fehlgeschlagen: {e!r}")
-            traceback.print_exc()
-            if not inter.response.is_done():
-                await inter.response.send_message("❌ Profil konnte nicht geöffnet werden. Fehler wurde in der Konsole geloggt.", ephemeral=True)
-            else:
-                try:
-                    await inter.followup.send("❌ Profil konnte nicht geöffnet werden. Fehler wurde in der Konsole geloggt.", ephemeral=True)
-                except Exception:
-                    pass
+        await inter.response.edit_message(embed=_profile_embed(guild, member), view=ProfileView())
 
     @button(label="Abwesenheit melden", emoji=_menu_emoji(EMOJI_ABSENCE), style=ButtonStyle.secondary, custom_id="portal_personal_absence")
     async def btn_absence(self, inter: discord.Interaction, _):
@@ -1779,7 +1767,7 @@ class GuildMenuView(View):
 
         await inter.response.edit_message(embed=_absence_calendar_embed(guild), view=AbsenceCalendarView())
 
-    @button(label="Mitglieder", emoji=_menu_emoji(EMOJI_MEMBER), style=ButtonStyle.secondary, custom_id="portal_guild_members")
+    @button(label=f"{EMOJI_MEMBER} Mitglieder", style=ButtonStyle.secondary, custom_id="portal_guild_members")
     async def btn_members(self, inter: discord.Interaction, _):
         guild, member = await _resolve_guild_member_from_inter(inter)
 
@@ -3358,6 +3346,18 @@ class ProfileView(View):
 
         await inter.response.send_modal(ProfileEditModal(guild.id, inter.user.id))
 
+    @button(label=f"{EMOJI_MEMBER} Mitglieder", style=ButtonStyle.secondary, custom_id="portal_member_list")
+    async def btn_members(self, inter: discord.Interaction, _):
+        guild, member = await _resolve_guild_member_from_inter(inter)
+
+        if not guild:
+            await inter.response.send_message("❌ Ich konnte deinen Server nicht zuordnen.")
+            return
+
+        if member and inter.message:
+            _mark_portal_sent(guild.id, member.id, inter.message.id)
+
+        await inter.response.edit_message(embed=_members_list_embed(guild), view=BackOnlyView())
 
     @button(label="Zurück", emoji=_menu_emoji(EMOJI_BACK), style=ButtonStyle.secondary, custom_id="portal_profile_back")
     async def btn_back(self, inter: discord.Interaction, _):
