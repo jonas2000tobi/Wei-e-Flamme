@@ -36,7 +36,7 @@ EMOJI_NO = "<:no:1516437249481380042>"
 
 # Custom Discord-Emojis für das Gildenmenü
 # Ebolus-Logo braucht noch den vollständigen Emoji-Code. Bis dahin bleibt das alte Symbol als Fallback.
-EMOJI_EBOLUS = "⚜️"
+EMOJI_EBOLUS = "<:ebolus:1516448234355163208>"
 EMOJI_PERSONAL = "<:persoenlich:1516444313868046366>"
 EMOJI_LOOT = "<:loot:1516444382683992205>"
 EMOJI_GUILD = "<:gilde:1516444419040215050>"
