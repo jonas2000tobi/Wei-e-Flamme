@@ -26,6 +26,15 @@ except ModuleNotFoundError:
 
 TZ = ZoneInfo("Europe/Berlin")
 
+
+# Custom Discord-Emojis für RSVP/Rollen
+EMOJI_TANK = "<:tank:1516436970543386635>"
+EMOJI_HEAL = "<:heal:1516436679735382136>"
+EMOJI_DPS = "<:dps:1516436928814252054>"
+EMOJI_BANK = "🏦"
+EMOJI_MAYBE = "<:maybe:1516437110624747752>"
+EMOJI_NO = "<:no:1516437249481380042>"
+
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -526,10 +535,10 @@ def build_embed(guild: discord.Guild, obj: dict) -> discord.Embed:
     dps_names = [_entry_display_name(u, guild) for u in yes.get("DPS", [])]
     bank_names = [_entry_display_name(u, guild) for u in yes.get("BANK", [])]
 
-    emb.add_field(name=f"🛡️ Tank ({len(tank_names)})", value="\n".join(tank_names) or "—", inline=True)
-    emb.add_field(name=f"💚 Heal ({len(heal_names)})", value="\n".join(heal_names) or "—", inline=True)
-    emb.add_field(name=f"🗡️ DPS ({len(dps_names)})", value="\n".join(dps_names) or "—", inline=True)
-    emb.add_field(name=f"🏦 Bank ({len(bank_names)})", value="\n".join(bank_names) or "—", inline=False)
+    emb.add_field(name=f"{EMOJI_TANK} Tank ({len(tank_names)})", value="\n".join(tank_names) or "—", inline=True)
+    emb.add_field(name=f"{EMOJI_HEAL} Heal ({len(heal_names)})", value="\n".join(heal_names) or "—", inline=True)
+    emb.add_field(name=f"{EMOJI_DPS} DPS ({len(dps_names)})", value="\n".join(dps_names) or "—", inline=True)
+    emb.add_field(name=f"{EMOJI_BANK} Bank ({len(bank_names)})", value="\n".join(bank_names) or "—", inline=False)
 
     maybe_lines = []
 
@@ -547,10 +556,10 @@ def build_embed(guild: discord.Guild, obj: dict) -> discord.Embed:
         label_txt = f" ({label})" if label else ""
         maybe_lines.append(f"{name}{label_txt}")
 
-    emb.add_field(name=f"❔ Vielleicht ({len(maybe_lines)})", value="\n".join(maybe_lines) or "—", inline=False)
+    emb.add_field(name=f"{EMOJI_MAYBE} Vielleicht ({len(maybe_lines)})", value="\n".join(maybe_lines) or "—", inline=False)
 
     no_names = [_entry_display_name(u, guild) for u in no]
-    emb.add_field(name=f"❌ Abgemeldet ({len(no_names)})", value="\n".join(no_names) or "—", inline=False)
+    emb.add_field(name=f"{EMOJI_NO} Abgemeldet ({len(no_names)})", value="\n".join(no_names) or "—", inline=False)
 
     tr_id = int(obj.get("target_role_id", 0) or 0)
 
@@ -1515,53 +1524,53 @@ class BaseRaidView(View):
 
 
 class RaidView(BaseRaidView):
-    @button(label="🛡️ Tank", style=ButtonStyle.primary, custom_id="dm_rsvp_tank")
+    @button(label="Tank", emoji=EMOJI_TANK, style=ButtonStyle.primary, custom_id="dm_rsvp_tank")
     async def btn_tank(self, inter: discord.Interaction, _):
         await self._handle(inter, "TANK")
 
-    @button(label="💚 Heal", style=ButtonStyle.secondary, custom_id="dm_rsvp_heal")
+    @button(label="Heal", emoji=EMOJI_HEAL, style=ButtonStyle.secondary, custom_id="dm_rsvp_heal")
     async def btn_heal(self, inter: discord.Interaction, _):
         await self._handle(inter, "HEAL")
 
-    @button(label="🗡️ DPS", style=ButtonStyle.secondary, custom_id="dm_rsvp_dps")
+    @button(label="DPS", emoji=EMOJI_DPS, style=ButtonStyle.secondary, custom_id="dm_rsvp_dps")
     async def btn_dps(self, inter: discord.Interaction, _):
         await self._handle(inter, "DPS")
 
-    @button(label="🏦 Bank", style=ButtonStyle.secondary, custom_id="dm_rsvp_bank")
+    @button(label="Bank", emoji=EMOJI_BANK, style=ButtonStyle.secondary, custom_id="dm_rsvp_bank")
     async def btn_bank(self, inter: discord.Interaction, _):
         await self._handle(inter, "BANK")
 
-    @button(label="❔ Vielleicht", style=ButtonStyle.secondary, custom_id="dm_rsvp_maybe")
+    @button(label="Vielleicht", emoji=EMOJI_MAYBE, style=ButtonStyle.secondary, custom_id="dm_rsvp_maybe")
     async def btn_maybe(self, inter: discord.Interaction, _):
         await self._handle(inter, "MAYBE")
 
-    @button(label="❌ Abmelden", style=ButtonStyle.danger, custom_id="dm_rsvp_no")
+    @button(label="Abmelden", emoji=EMOJI_NO, style=ButtonStyle.danger, custom_id="dm_rsvp_no")
     async def btn_no(self, inter: discord.Interaction, _):
         await self._handle(inter, "NO")
 
 
 class ServerRaidView(BaseRaidView):
-    @button(label="🛡️ Tank", style=ButtonStyle.primary, custom_id="srv_rsvp_tank")
+    @button(label="Tank", emoji=EMOJI_TANK, style=ButtonStyle.primary, custom_id="srv_rsvp_tank")
     async def btn_tank(self, inter: discord.Interaction, _):
         await self._handle(inter, "TANK")
 
-    @button(label="💚 Heal", style=ButtonStyle.secondary, custom_id="srv_rsvp_heal")
+    @button(label="Heal", emoji=EMOJI_HEAL, style=ButtonStyle.secondary, custom_id="srv_rsvp_heal")
     async def btn_heal(self, inter: discord.Interaction, _):
         await self._handle(inter, "HEAL")
 
-    @button(label="🗡️ DPS", style=ButtonStyle.secondary, custom_id="srv_rsvp_dps")
+    @button(label="DPS", emoji=EMOJI_DPS, style=ButtonStyle.secondary, custom_id="srv_rsvp_dps")
     async def btn_dps(self, inter: discord.Interaction, _):
         await self._handle(inter, "DPS")
 
-    @button(label="🏦 Bank", style=ButtonStyle.secondary, custom_id="srv_rsvp_bank")
+    @button(label="Bank", emoji=EMOJI_BANK, style=ButtonStyle.secondary, custom_id="srv_rsvp_bank")
     async def btn_bank(self, inter: discord.Interaction, _):
         await self._handle(inter, "BANK")
 
-    @button(label="❔ Vielleicht", style=ButtonStyle.secondary, custom_id="srv_rsvp_maybe")
+    @button(label="Vielleicht", emoji=EMOJI_MAYBE, style=ButtonStyle.secondary, custom_id="srv_rsvp_maybe")
     async def btn_maybe(self, inter: discord.Interaction, _):
         await self._handle(inter, "MAYBE")
 
-    @button(label="❌ Abmelden", style=ButtonStyle.danger, custom_id="srv_rsvp_no")
+    @button(label="Abmelden", emoji=EMOJI_NO, style=ButtonStyle.danger, custom_id="srv_rsvp_no")
     async def btn_no(self, inter: discord.Interaction, _):
         await self._handle(inter, "NO")
 
@@ -1777,7 +1786,7 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
         save_cfg()
 
         await inter.followup.send(
-            f"✅ Gespeichert:\n🛡️ {tank_role.mention}\n💚 {heal_role.mention}\n🗡️ {dps_role.mention}",
+            f"✅ Gespeichert:\n{EMOJI_TANK} {tank_role.mention}\n{EMOJI_HEAL} {heal_role.mention}\n{EMOJI_DPS} {dps_role.mention}",
             ephemeral=True
         )
 
