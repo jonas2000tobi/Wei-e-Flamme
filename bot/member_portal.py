@@ -930,7 +930,8 @@ async def _send_new_portal_menu(user: discord.abc.User, guild: discord.Guild) ->
         msg = await user.send(embed=_main_menu_embed(guild, member), view=MemberPortalMainView())
         _mark_portal_sent(guild.id, user.id, msg.id)
         return msg
-    except Exception:
+    except Exception as e:
+        print(f"[member_portal] DM-Send Fehler für user={getattr(user, 'id', '?')} guild={guild.id}: {e!r}")
         return None
 
 
@@ -979,7 +980,8 @@ async def ensure_portal_menu_for_user(
         sent = await _send_new_portal_menu(member, guild)
         return sent is not None
 
-    except Exception:
+    except Exception as e:
+        print(f"[member_portal] Portal-Menü edit/send Fehler für guild={guild_id} user={user_id}: {e!r}")
         sent = await _send_new_portal_menu(member, guild)
         return sent is not None
 
@@ -1414,31 +1416,31 @@ class PortalMainSelect(Select):
                 label="Persönlich",
                 value="personal",
                 description="Profil, Gearscore, Abwesenheit und Raid-DMs",
-                emoji=_menu_emoji(EMOJI_PERSONAL)
+                emoji="👤"
             ),
             discord.SelectOption(
                 label="Loot & Bedarf",
                 value="loot",
                 description="Needliste für Main/Secondary und Lootregeln",
-                emoji=_menu_emoji(EMOJI_LOOT)
+                emoji="🎁"
             ),
             discord.SelectOption(
                 label="Gilde",
                 value="guild",
                 description="Kalender, Abwesenheiten und Mitgliederübersicht",
-                emoji=_menu_emoji(EMOJI_GUILD)
+                emoji="📅"
             ),
             discord.SelectOption(
                 label="Kontakt & Hilfe",
                 value="support",
                 description="Leader kontaktieren oder Hilfe zum Bot öffnen",
-                emoji=_menu_emoji(EMOJI_CONTACT)
+                emoji="🛡️"
             ),
             discord.SelectOption(
                 label="Admin",
                 value="admin",
                 description="Event- und Loot-Verwaltung für Leitung",
-                emoji=_menu_emoji(EMOJI_ADMIN)
+                emoji="⚙️"
             ),
         ]
 
