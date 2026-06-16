@@ -43,6 +43,15 @@ EMOJI_GUILD = "<:gilde:1516444419040215050>"
 EMOJI_CONTACT = "<:kontakt:1516444479421419703>"
 EMOJI_ADMIN = "<:admin:1516444522270167091>"
 
+
+def _button_emoji(value: str):
+    try:
+        if isinstance(value, str) and (value.startswith("<:") or value.startswith("<a:")):
+            return discord.PartialEmoji.from_str(value)
+    except Exception:
+        pass
+    return value
+
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
