@@ -25,6 +25,15 @@ except ModuleNotFoundError:
 
 TZ = ZoneInfo("Europe/Berlin")
 
+
+# Custom Discord-Emojis für Rollen/RSVP
+EMOJI_TANK = "<:tank:1516436970543386635>"
+EMOJI_HEAL = "<:heal:1516436679735382136>"
+EMOJI_DPS = "<:dps:1516436928814252054>"
+EMOJI_BANK = "🏦"
+EMOJI_MAYBE = "<:maybe:1516437110624747752>"
+EMOJI_NO = "<:no:1516437249481380042>"
+
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -468,10 +477,10 @@ def _rsvp_user_status(obj: dict, user_id: int) -> str:
     yes = obj.get("yes") or {}
 
     labels = {
-        "TANK": "Tank",
-        "HEAL": "Heal",
-        "DPS": "DPS",
-        "BANK": "Bank",
+        "TANK": f"{EMOJI_TANK} Tank",
+        "HEAL": f"{EMOJI_HEAL} Heal",
+        "DPS": f"{EMOJI_DPS} DPS",
+        "BANK": f"{EMOJI_BANK} Bank",
     }
 
     for key, label in labels.items():
@@ -482,15 +491,15 @@ def _rsvp_user_status(obj: dict, user_id: int) -> str:
     maybe = obj.get("maybe") or {}
 
     if str(user_id) in maybe:
-        return "Vielleicht"
+        return f"{EMOJI_MAYBE} Vielleicht"
 
     for entry in maybe.values():
         if _rsvp_entry_user_id(entry) == int(user_id):
-            return "Vielleicht"
+            return f"{EMOJI_MAYBE} Vielleicht"
 
     for entry in obj.get("no", []) or []:
         if _rsvp_entry_user_id(entry) == int(user_id):
-            return "Abgemeldet"
+            return f"{EMOJI_NO} Abgemeldet"
 
     return ""
 
