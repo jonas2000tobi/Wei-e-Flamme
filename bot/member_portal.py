@@ -1851,6 +1851,7 @@ async def _admin_create_regular_raid_from_menu(
     target_role_id: int,
     description: str,
     image_url: str | None = None,
+    reminders: list[dict] | None = None,
 ):
     rsvp = _admin_event_module()
     guild = inter.client.get_guild(int(guild_id))
@@ -1891,6 +1892,8 @@ async def _admin_create_regular_raid_from_menu(
         "maybe": {},
         "no": [],
         "target_role_id": int(target_role_id),
+        "reminders": reminders or [],
+        "reminder_sent": {},
         "dm_messages": {},
     }
 
@@ -1935,7 +1938,8 @@ async def _admin_create_regular_raid_from_menu(
     await inter.followup.send(
         f"✅ Event erstellt: {msg.jump_url}\n"
         f"✉️ DMs versendet: **{sent}**\n"
-        f"🔕 Opt-out übersprungen: **{skipped_opt_out}**",
+        f"🔕 Opt-out übersprungen: **{skipped_opt_out}**\n"
+        f"⏰ Reminder: **{len(reminders or [])}**",
         ephemeral=True
     )
 
@@ -2332,6 +2336,86 @@ class AdminEventImageSelect(Select):
             return
 
         image_url = None if value == "none" else EVENT_IMAGE_PRESETS.get(value)
+        self.data["image_url"] = image_url or ""
+        await _admin_show_reminder_select(inter, self.data)
+
+
+def _admin_reminder_options(value: str) -> list[dict]:
+    if value == "none":
+        return []
+    if value == "24":
+        return [{"minutes": 1440, "target": "missing"}]
+    if value == "2":
+        return [{"minutes": 120, "target": "missing"}]
+    if value == "30":
+        return [{"minutes": 30, "target": "yes"}]
+    if value == "24_2":
+        return [{"minutes": 1440, "target": "missing"}, {"minutes": 120, "target": "missing"}]
+    if value == "all":
+        return [
+            {"minutes": 1440, "target": "missing"},
+            {"minutes": 120, "target": "missing"},
+            {"minutes": 30, "target": "yes"},
+        ]
+    return []
+
+
+async def _admin_show_reminder_select(inter: discord.Interaction, data: dict, send_new: bool = False):
+    emb = discord.Embed(
+        title="⏰ Reminder wählen",
+        description=(
+            "Wähle, welche automatischen Erinnerungen für dieses Event aktiv sein sollen.\n\n"
+            "24h/2h gehen an Leute, die noch nicht abgestimmt haben.\n"
+            "30min geht an angemeldete Teilnehmer."
+        ),
+        color=discord.Color.gold(),
+    )
+    view = AdminEventReminderSelectView(data)
+    if send_new:
+        await inter.response.send_message(embed=emb, view=view, ephemeral=True)
+    else:
+        await inter.response.edit_message(embed=emb, view=view)
+
+
+class AdminEventReminderSelectView(View):
+    def __init__(self, data: dict):
+        super().__init__(timeout=None)
+        self.data = dict(data)
+        self.add_item(AdminEventReminderSelect(self.data))
+
+    @button(label="❌ Abbrechen", style=ButtonStyle.secondary, custom_id="admin_event_reminder_cancel")
+    async def btn_cancel(self, inter: discord.Interaction, _):
+        await inter.response.edit_message(
+            embed=discord.Embed(
+                title="Abgebrochen",
+                description="Das Event wurde nicht erstellt.",
+                color=discord.Color.orange(),
+            ),
+            view=None,
+        )
+
+
+class AdminEventReminderSelect(Select):
+    def __init__(self, data: dict):
+        self.data = dict(data)
+        options = [
+            discord.SelectOption(label="Kein Reminder", value="none", description="Keine automatische Erinnerung"),
+            discord.SelectOption(label="24h vorher", value="24", description="An alle ohne Antwort"),
+            discord.SelectOption(label="2h vorher", value="2", description="An alle ohne Antwort"),
+            discord.SelectOption(label="30min vorher", value="30", description="An angemeldete Teilnehmer"),
+            discord.SelectOption(label="24h + 2h vorher", value="24_2", description="An alle ohne Antwort"),
+            discord.SelectOption(label="24h + 2h + 30min", value="all", description="Fehlende + Teilnehmer kurz vorher"),
+        ]
+        super().__init__(
+            placeholder="Reminder wählen",
+            min_values=1,
+            max_values=1,
+            options=options,
+            custom_id="admin_event_reminder_select",
+        )
+
+    async def callback(self, inter: discord.Interaction):
+        reminders = _admin_reminder_options(self.values[0])
         await inter.response.defer(ephemeral=True, thinking=True)
         await _admin_create_regular_raid_from_menu(
             inter,
@@ -2342,7 +2426,8 @@ class AdminEventImageSelect(Select):
             int(self.data.get("channel_id", 0) or 0),
             int(self.data.get("target_role_id", 0) or 0),
             str(self.data.get("description", "")),
-            image_url=image_url,
+            image_url=(str(self.data.get("image_url", "") or "").strip() or None),
+            reminders=reminders,
         )
 
 
@@ -2365,18 +2450,8 @@ class AdminEventCustomImageModal(Modal):
             await inter.response.send_message("❌ Bitte eine gültige Bild-URL mit http:// oder https:// eingeben.", ephemeral=True)
             return
 
-        await inter.response.defer(ephemeral=True, thinking=True)
-        await _admin_create_regular_raid_from_menu(
-            inter,
-            int(self.data["guild_id"]),
-            str(self.data["title"]),
-            str(self.data["date_text"]),
-            str(self.data["time_text"]),
-            int(self.data.get("channel_id", 0) or 0),
-            int(self.data.get("target_role_id", 0) or 0),
-            str(self.data.get("description", "")),
-            image_url=image_url,
-        )
+        self.data["image_url"] = image_url
+        await _admin_show_reminder_select(inter, self.data, send_new=True)
 
 
 class AdminEventSelectView(View):
