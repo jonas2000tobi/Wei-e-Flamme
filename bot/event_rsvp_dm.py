@@ -281,6 +281,10 @@ def _init_event_shape(obj: dict):
         obj["mirrors"] = []
 
     obj.setdefault("scope", "single")
+    obj.setdefault("voice_enabled", False)
+    obj.setdefault("voice_channel_id", 0)
+    obj.setdefault("voice_return_channel_id", 0)
+    obj.setdefault("voice_cleanup_done", False)
 
     migrated = False
 
@@ -797,6 +801,64 @@ async def _delete_all_pending_dm_messages_for_event(client: discord.Client, obj:
     return removed
 
 
+async def _cleanup_event_voice_for_obj(client: discord.Client, obj: dict) -> bool:
+    """
+    Verschiebt Mitglieder aus einem Event-Voice in den gespeicherten Sammel-Voice
+    und löscht danach den Event-Voice. Gibt True zurück, wenn der Event-Status
+    geändert wurde.
+    """
+    try:
+        _init_event_shape(obj)
+
+        if bool(obj.get("voice_cleanup_done", False)):
+            return False
+
+        voice_channel_id = int(obj.get("voice_channel_id", 0) or 0)
+
+        if not voice_channel_id:
+            return False
+
+        guild_id = int(obj.get("guild_id", 0) or 0)
+        guild = client.get_guild(guild_id) if guild_id else None
+
+        if guild is None:
+            return False
+
+        channel = guild.get_channel(voice_channel_id)
+
+        if not isinstance(channel, discord.VoiceChannel):
+            obj["voice_cleanup_done"] = True
+            return True
+
+        return_channel_id = int(obj.get("voice_return_channel_id", 0) or 0)
+        return_channel = guild.get_channel(return_channel_id) if return_channel_id else None
+
+        moved = 0
+
+        if isinstance(return_channel, discord.VoiceChannel):
+            for member in list(channel.members):
+                try:
+                    await member.move_to(return_channel, reason="Event-Voice wird automatisch geschlossen")
+                    moved += 1
+                    await asyncio.sleep(0.1)
+                except Exception:
+                    continue
+
+        try:
+            await channel.delete(reason="Event-Voice automatisch nach Eventende gelöscht")
+        except Exception as e:
+            print(f"[event_rsvp_dm] Event-Voice konnte nicht gelöscht werden: {e!r}")
+            return False
+
+        obj["voice_cleanup_done"] = True
+        print(f"[event_rsvp_dm] Event-Voice gelöscht: {voice_channel_id}, verschoben: {moved}")
+        return True
+
+    except Exception as e:
+        print(f"[event_rsvp_dm] Event-Voice Cleanup Fehler: {e!r}")
+        return False
+
+
 async def delete_pending_dm_messages_for_started_events(client: discord.Client) -> int:
     changed = 0
     now = datetime.now(TZ)
@@ -807,6 +869,13 @@ async def delete_pending_dm_messages_for_started_events(client: discord.Client) 
             when = datetime.fromisoformat(obj.get("when_iso"))
         except Exception:
             continue
+
+        if now >= when + timedelta(hours=2):
+            try:
+                if await _cleanup_event_voice_for_obj(client, obj):
+                    changed += 1
+            except Exception as e:
+                print(f"[delete_pending_dm_messages_for_started_events] Voice-Cleanup Fehler: {e!r}")
 
         if now < when:
             continue
@@ -1133,12 +1202,19 @@ async def event_reminder_loop():
     for msg_id, obj in list(store.items()):
         try:
             _init_event_shape(obj)
+            when = datetime.fromisoformat(obj.get("when_iso", ""))
+
+            if now >= when + timedelta(hours=2):
+                try:
+                    if await _cleanup_event_voice_for_obj(event_reminder_loop._client, obj):  # type: ignore[attr-defined]
+                        changed = True
+                except Exception as e:
+                    print(f"[event_reminder_loop] Voice-Cleanup Fehler: {e!r}")
+
             reminders = obj.get("reminders") or []
 
             if not isinstance(reminders, list) or not reminders:
                 continue
-
-            when = datetime.fromisoformat(obj.get("when_iso", ""))
 
             if now > when + timedelta(hours=2):
                 continue
@@ -2214,6 +2290,11 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
             except Exception:
                 pass
 
+        try:
+            await _cleanup_event_voice_for_obj(inter.client, obj)
+        except Exception:
+            pass
+
         refresh_members = []
 
         try:
@@ -2326,6 +2407,11 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
 
             except Exception:
                 pass
+
+        try:
+            await _cleanup_event_voice_for_obj(inter.client, obj)
+        except Exception:
+            pass
 
         store.pop(str(message_id), None)
         save_store()
