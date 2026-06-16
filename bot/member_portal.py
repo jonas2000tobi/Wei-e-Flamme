@@ -46,6 +46,9 @@ EMOJI_VOTED = "<:voted:1516461766761119936>"
 EMOJI_TARGET = "<:target:1516461644471865365>"
 EMOJI_ABSENCE = "<:nichtda:1516463499872833616>"
 EMOJI_CALENDAR = "<:Kalender:1516462026468098181>"
+EMOJI_BACK = "<:zurueck:1516470839120498778>"
+EMOJI_HELP = "<:hilfe:1516470888818802900>"
+EMOJI_MEMBER = "<:member:1516471290020499467>"
 
 
 def _menu_emoji(value: str):
@@ -1579,7 +1582,7 @@ class PersonalMenuView(View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @button(label="👤 Profil", style=ButtonStyle.secondary, custom_id="portal_personal_profile")
+    @button(label="Profil", emoji=_menu_emoji(EMOJI_PERSONAL), style=ButtonStyle.secondary, custom_id="portal_personal_profile")
     async def btn_profile(self, inter: discord.Interaction, _):
         guild, member = await _resolve_guild_member_from_inter(inter)
 
@@ -1592,7 +1595,7 @@ class PersonalMenuView(View):
 
         await inter.response.edit_message(embed=_profile_embed(guild, member), view=ProfileView())
 
-    @button(label="🏖️ Abwesenheit melden", style=ButtonStyle.secondary, custom_id="portal_personal_absence")
+    @button(label="Abwesenheit melden", emoji=_menu_emoji(EMOJI_ABSENCE), style=ButtonStyle.secondary, custom_id="portal_personal_absence")
     async def btn_absence(self, inter: discord.Interaction, _):
         guild, member = await _resolve_guild_member_from_inter(inter)
 
@@ -1605,7 +1608,7 @@ class PersonalMenuView(View):
 
         await inter.response.send_modal(AbsenceModal(guild.id, inter.user.id))
 
-    @button(label="📬 Raid-DMs", style=ButtonStyle.secondary, custom_id="portal_personal_dm_settings")
+    @button(label="Raid-DMs", emoji=_menu_emoji(EMOJI_VOTED), style=ButtonStyle.secondary, custom_id="portal_personal_dm_settings")
     async def btn_dm_settings(self, inter: discord.Interaction, _):
         guild, member = await _resolve_guild_member_from_inter(inter)
 
@@ -1618,7 +1621,7 @@ class PersonalMenuView(View):
 
         await inter.response.edit_message(embed=_dm_settings_embed(guild, member), view=DmSettingsView())
 
-    @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="portal_personal_back")
+    @button(label="Zurück", emoji=_menu_emoji(EMOJI_BACK), style=ButtonStyle.secondary, custom_id="portal_personal_back")
     async def btn_back(self, inter: discord.Interaction, _):
         guild, member = await _resolve_guild_member_from_inter(inter)
 
@@ -1632,7 +1635,7 @@ class DmSettingsView(View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @button(label="📬 DMs an/aus schalten", style=ButtonStyle.secondary, custom_id="portal_dm_toggle")
+    @button(label="DMs an/aus schalten", emoji=_menu_emoji(EMOJI_VOTED), style=ButtonStyle.secondary, custom_id="portal_dm_toggle")
     async def btn_toggle(self, inter: discord.Interaction, _):
         guild, member = await _resolve_guild_member_from_inter(inter)
 
@@ -1652,7 +1655,7 @@ class DmSettingsView(View):
 
         await inter.response.edit_message(embed=_dm_settings_embed(guild, member), view=DmSettingsView())
 
-    @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="portal_dm_back")
+    @button(label="Zurück", emoji=_menu_emoji(EMOJI_BACK), style=ButtonStyle.secondary, custom_id="portal_dm_back")
     async def btn_back(self, inter: discord.Interaction, _):
         guild, member = await _resolve_guild_member_from_inter(inter)
 
@@ -1688,7 +1691,7 @@ class LootMenuView(View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @button(label="🎁 Needliste", style=ButtonStyle.secondary, custom_id="portal_loot_needlist")
+    @button(label="Needliste", emoji=_menu_emoji(EMOJI_LOOT), style=ButtonStyle.secondary, custom_id="portal_loot_needlist")
     async def btn_needlist(self, inter: discord.Interaction, _):
         guild, member = await _resolve_guild_member_from_inter(inter)
 
@@ -1715,7 +1718,7 @@ class LootMenuView(View):
             )
             await inter.response.edit_message(embed=emb, view=BackOnlyView())
 
-    @button(label="📜 Regeln & Loot", style=ButtonStyle.secondary, custom_id="portal_loot_rules")
+    @button(label="Regeln & Loot", emoji=_menu_emoji(EMOJI_LOOT), style=ButtonStyle.secondary, custom_id="portal_loot_rules")
     async def btn_rules(self, inter: discord.Interaction, _):
         guild, member = await _resolve_guild_member_from_inter(inter)
 
@@ -1724,7 +1727,7 @@ class LootMenuView(View):
 
         await inter.response.edit_message(embed=_rules_loot_embed(), view=RulesLootView())
 
-    @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="portal_loot_back")
+    @button(label="Zurück", emoji=_menu_emoji(EMOJI_BACK), style=ButtonStyle.secondary, custom_id="portal_loot_back")
     async def btn_back(self, inter: discord.Interaction, _):
         guild, member = await _resolve_guild_member_from_inter(inter)
 
@@ -1738,7 +1741,7 @@ class GuildMenuView(View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @button(label="📅 Kalender", style=ButtonStyle.secondary, custom_id="portal_guild_calendar")
+    @button(label="Kalender", emoji=_menu_emoji(EMOJI_CALENDAR), style=ButtonStyle.secondary, custom_id="portal_guild_calendar")
     async def btn_calendar(self, inter: discord.Interaction, _):
         guild, member = await _resolve_guild_member_from_inter(inter)
 
@@ -1751,7 +1754,7 @@ class GuildMenuView(View):
 
         await inter.response.edit_message(embed=_events_embed(guild.id), view=EventsInfoView())
 
-    @button(label="🏖️ Abwesenheiten", style=ButtonStyle.secondary, custom_id="portal_guild_absences")
+    @button(label="Abwesenheiten", emoji=_menu_emoji(EMOJI_ABSENCE), style=ButtonStyle.secondary, custom_id="portal_guild_absences")
     async def btn_absences(self, inter: discord.Interaction, _):
         guild, member = await _resolve_guild_member_from_inter(inter)
 
@@ -1764,7 +1767,7 @@ class GuildMenuView(View):
 
         await inter.response.edit_message(embed=_absence_calendar_embed(guild), view=AbsenceCalendarView())
 
-    @button(label="👥 Mitglieder", style=ButtonStyle.secondary, custom_id="portal_guild_members")
+    @button(label="Mitglieder", emoji=_menu_emoji(EMOJI_MEMBER), style=ButtonStyle.secondary, custom_id="portal_guild_members")
     async def btn_members(self, inter: discord.Interaction, _):
         guild, member = await _resolve_guild_member_from_inter(inter)
 
@@ -1777,7 +1780,7 @@ class GuildMenuView(View):
 
         await inter.response.edit_message(embed=_members_list_embed(guild), view=BackOnlyView())
 
-    @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="portal_guild_back")
+    @button(label="Zurück", emoji=_menu_emoji(EMOJI_BACK), style=ButtonStyle.secondary, custom_id="portal_guild_back")
     async def btn_back(self, inter: discord.Interaction, _):
         guild, member = await _resolve_guild_member_from_inter(inter)
 
@@ -1804,7 +1807,7 @@ class AbsenceCalendarView(View):
 
         await inter.response.edit_message(embed=_absence_calendar_embed(guild), view=AbsenceCalendarView())
 
-    @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="portal_absence_calendar_back")
+    @button(label="Zurück", emoji=_menu_emoji(EMOJI_BACK), style=ButtonStyle.secondary, custom_id="portal_absence_calendar_back")
     async def btn_back(self, inter: discord.Interaction, _):
         guild, member = await _resolve_guild_member_from_inter(inter)
 
@@ -2299,7 +2302,7 @@ class AdminEventRoleSelectView(View):
         )
         await inter.response.edit_message(embed=emb, view=AdminEventImageSelectView(self.data))
 
-    @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="admin_event_role_back", row=1)
+    @button(label="Zurück", emoji=_menu_emoji(EMOJI_BACK), style=ButtonStyle.secondary, custom_id="admin_event_role_back", row=1)
     async def btn_back(self, inter: discord.Interaction, _):
         emb = discord.Embed(
             title="📍 Zielkanal wählen",
@@ -2739,7 +2742,7 @@ class AdminEventSelectView(View):
         self.action = action
         self.add_item(AdminEventSelect(guild_id, user_id, action, events))
 
-    @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="admin_event_select_back")
+    @button(label="Zurück", emoji=_menu_emoji(EMOJI_BACK), style=ButtonStyle.secondary, custom_id="admin_event_select_back")
     async def btn_back(self, inter: discord.Interaction, _):
         emb = discord.Embed(title=f"{EMOJI_GUILD} Admin – Event", description="Wähle eine Event-Aktion.", color=discord.Color.gold())
         await inter.response.edit_message(embed=emb, view=AdminEventMenuView())
@@ -2803,7 +2806,7 @@ class AdminAttendanceEventSelectView(View):
         self.user_id = int(user_id)
         self.add_item(AdminAttendanceEventSelect(guild_id, user_id, events))
 
-    @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="admin_attendance_event_back")
+    @button(label="Zurück", emoji=_menu_emoji(EMOJI_BACK), style=ButtonStyle.secondary, custom_id="admin_attendance_event_back")
     async def btn_back(self, inter: discord.Interaction, _):
         emb = discord.Embed(title=f"{EMOJI_GUILD} Admin – Event", description="Wähle eine Event-Aktion.", color=discord.Color.gold())
         await inter.response.edit_message(embed=emb, view=AdminEventMenuView())
@@ -2965,7 +2968,7 @@ class AdminAttendanceMarkView(View):
     async def btn_clear(self, inter: discord.Interaction, _):
         await self._mark(inter, "clear")
 
-    @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="admin_attendance_mark_back", row=2)
+    @button(label="Zurück", emoji=_menu_emoji(EMOJI_BACK), style=ButtonStyle.secondary, custom_id="admin_attendance_mark_back", row=2)
     async def btn_back(self, inter: discord.Interaction, _):
         rsvp = _admin_event_module()
         guild = inter.client.get_guild(self.guild_id)
@@ -3003,7 +3006,7 @@ class AdminVoiceSettingsView(View):
             view=AdminVoiceReturnSelectView(self.guild_id, guild),
         )
 
-    @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="admin_voice_back", row=1)
+    @button(label="Zurück", emoji=_menu_emoji(EMOJI_BACK), style=ButtonStyle.secondary, custom_id="admin_voice_back", row=1)
     async def btn_back(self, inter: discord.Interaction, _):
         emb = discord.Embed(title=f"{EMOJI_GUILD} Admin – Event", description="Wähle eine Event-Aktion.", color=discord.Color.gold())
         await inter.response.edit_message(embed=emb, view=AdminEventMenuView())
@@ -3015,7 +3018,7 @@ class AdminVoiceCategorySelectView(View):
         self.guild_id = int(guild_id)
         self.add_item(AdminVoiceCategorySelect(guild_id, guild))
 
-    @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="admin_voice_category_back")
+    @button(label="Zurück", emoji=_menu_emoji(EMOJI_BACK), style=ButtonStyle.secondary, custom_id="admin_voice_category_back")
     async def btn_back(self, inter: discord.Interaction, _):
         await _admin_show_voice_settings(inter, self.guild_id)
 
@@ -3043,7 +3046,7 @@ class AdminVoiceReturnSelectView(View):
         self.guild_id = int(guild_id)
         self.add_item(AdminVoiceReturnSelect(guild_id, guild))
 
-    @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="admin_voice_return_back")
+    @button(label="Zurück", emoji=_menu_emoji(EMOJI_BACK), style=ButtonStyle.secondary, custom_id="admin_voice_return_back")
     async def btn_back(self, inter: discord.Interaction, _):
         await _admin_show_voice_settings(inter, self.guild_id)
 
@@ -3100,7 +3103,7 @@ class AdminMenuView(View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @button(label="📅 Event", style=ButtonStyle.secondary, custom_id="portal_admin_event")
+    @button(label="Event", emoji=_menu_emoji(EMOJI_EBOLUS), style=ButtonStyle.secondary, custom_id="portal_admin_event")
     async def btn_event(self, inter: discord.Interaction, _):
         guild, member = await _resolve_guild_member_from_inter(inter)
         if not _is_portal_admin(guild, member):
@@ -3124,7 +3127,7 @@ class AdminMenuView(View):
         )
         await inter.response.edit_message(embed=emb, view=AdminEventMenuView())
 
-    @button(label="🎁 Loot", style=ButtonStyle.secondary, custom_id="portal_admin_loot")
+    @button(label="Loot", emoji=_menu_emoji(EMOJI_LOOT), style=ButtonStyle.secondary, custom_id="portal_admin_loot")
     async def btn_loot(self, inter: discord.Interaction, _):
         guild, member = await _resolve_guild_member_from_inter(inter)
         if not _is_portal_admin(guild, member):
@@ -3139,7 +3142,7 @@ class AdminMenuView(View):
         )
         await inter.response.edit_message(embed=emb, view=AdminLootMenuView())
 
-    @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="portal_admin_back")
+    @button(label="Zurück", emoji=_menu_emoji(EMOJI_BACK), style=ButtonStyle.secondary, custom_id="portal_admin_back")
     async def btn_back(self, inter: discord.Interaction, _):
         guild, member = await _resolve_guild_member_from_inter(inter)
         if guild and member and inter.message:
@@ -3213,7 +3216,7 @@ class AdminEventMenuView(View):
             return
         await _admin_show_voice_settings(inter, guild.id)
 
-    @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="portal_admin_event_back", row=4)
+    @button(label="Zurück", emoji=_menu_emoji(EMOJI_BACK), style=ButtonStyle.secondary, custom_id="portal_admin_event_back", row=4)
     async def btn_back(self, inter: discord.Interaction, _):
         emb = discord.Embed(title=f"{EMOJI_ADMIN} Admin", description="Wähle einen Bereich.", color=discord.Color.gold())
         await inter.response.edit_message(embed=emb, view=AdminMenuView())
@@ -3263,7 +3266,7 @@ class AdminLootMenuView(View):
     async def btn_catalog(self, inter: discord.Interaction, _):
         await self._open(inter, "open_admin_item_catalog_menu")
 
-    @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="portal_admin_loot_back", row=3)
+    @button(label="Zurück", emoji=_menu_emoji(EMOJI_BACK), style=ButtonStyle.secondary, custom_id="portal_admin_loot_back", row=3)
     async def btn_back(self, inter: discord.Interaction, _):
         emb = discord.Embed(title=f"{EMOJI_ADMIN} Admin", description="Wähle einen Bereich.", color=discord.Color.gold())
         await inter.response.edit_message(embed=emb, view=AdminMenuView())
@@ -3273,7 +3276,7 @@ class SupportMenuView(View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @button(label="🛡️ Leaderkontakt", style=ButtonStyle.secondary, custom_id="portal_support_leader")
+    @button(label="Leaderkontakt", emoji=_menu_emoji(EMOJI_CONTACT), style=ButtonStyle.secondary, custom_id="portal_support_leader")
     async def btn_leader(self, inter: discord.Interaction, _):
         guild, member = await _resolve_guild_member_from_inter(inter)
 
@@ -3286,7 +3289,7 @@ class SupportMenuView(View):
 
         await inter.response.send_modal(PortalLeaderContactModal(guild.id, inter.user.id))
 
-    @button(label="❓ Hilfe", style=ButtonStyle.secondary, custom_id="portal_support_help")
+    @button(label="Hilfe", emoji=_menu_emoji(EMOJI_HELP), style=ButtonStyle.secondary, custom_id="portal_support_help")
     async def btn_help(self, inter: discord.Interaction, _):
         guild, member = await _resolve_guild_member_from_inter(inter)
 
@@ -3316,7 +3319,7 @@ class SupportMenuView(View):
 
         await inter.response.edit_message(embed=emb, view=HelpView())
 
-    @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="portal_support_back")
+    @button(label="Zurück", emoji=_menu_emoji(EMOJI_BACK), style=ButtonStyle.secondary, custom_id="portal_support_back")
     async def btn_back(self, inter: discord.Interaction, _):
         guild, member = await _resolve_guild_member_from_inter(inter)
 
@@ -3330,7 +3333,7 @@ class ProfileView(View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @button(label="✏️ Profil bearbeiten", style=ButtonStyle.secondary, custom_id="portal_profile_edit")
+    @button(label="Profil bearbeiten", emoji=_menu_emoji(EMOJI_PERSONAL), style=ButtonStyle.secondary, custom_id="portal_profile_edit")
     async def btn_edit(self, inter: discord.Interaction, _):
         guild, member = await _resolve_guild_member_from_inter(inter)
 
@@ -3343,7 +3346,7 @@ class ProfileView(View):
 
         await inter.response.send_modal(ProfileEditModal(guild.id, inter.user.id))
 
-    @button(label="👥 Mitglieder", style=ButtonStyle.secondary, custom_id="portal_member_list")
+    @button(label="Mitglieder", emoji=_menu_emoji(EMOJI_MEMBER), style=ButtonStyle.secondary, custom_id="portal_member_list")
     async def btn_members(self, inter: discord.Interaction, _):
         guild, member = await _resolve_guild_member_from_inter(inter)
 
@@ -3356,7 +3359,7 @@ class ProfileView(View):
 
         await inter.response.edit_message(embed=_members_list_embed(guild), view=BackOnlyView())
 
-    @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="portal_profile_back")
+    @button(label="Zurück", emoji=_menu_emoji(EMOJI_BACK), style=ButtonStyle.secondary, custom_id="portal_profile_back")
     async def btn_back(self, inter: discord.Interaction, _):
         guild, member = await _resolve_guild_member_from_inter(inter)
 
@@ -3383,7 +3386,7 @@ class EventsInfoView(View):
 
         await inter.response.edit_message(embed=_events_embed(guild.id), view=EventsInfoView())
 
-    @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="portal_events_back")
+    @button(label="Zurück", emoji=_menu_emoji(EMOJI_BACK), style=ButtonStyle.secondary, custom_id="portal_events_back")
     async def btn_back(self, inter: discord.Interaction, _):
         guild, member = await _resolve_guild_member_from_inter(inter)
 
@@ -3411,7 +3414,7 @@ class RulesLootView(View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @button(label="🎁 Needliste öffnen", style=ButtonStyle.secondary, custom_id="rules_open_need")
+    @button(label="Needliste öffnen", emoji=_menu_emoji(EMOJI_LOOT), style=ButtonStyle.secondary, custom_id="rules_open_need")
     async def btn_need(self, inter: discord.Interaction, _):
         guild, member = await _resolve_guild_member_from_inter(inter)
 
@@ -3432,7 +3435,7 @@ class RulesLootView(View):
         except Exception:
             await inter.response.edit_message(embed=_rules_loot_embed(), view=RulesLootView())
 
-    @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="rules_back_main")
+    @button(label="Zurück", emoji=_menu_emoji(EMOJI_BACK), style=ButtonStyle.secondary, custom_id="rules_back_main")
     async def btn_back(self, inter: discord.Interaction, _):
         guild, member = await _resolve_guild_member_from_inter(inter)
 
@@ -3446,7 +3449,7 @@ class HelpView(View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @button(label="🛡️ Leaderkontakt", style=ButtonStyle.secondary, custom_id="help_leader_contact")
+    @button(label="Leaderkontakt", emoji=_menu_emoji(EMOJI_CONTACT), style=ButtonStyle.secondary, custom_id="help_leader_contact")
     async def btn_leader(self, inter: discord.Interaction, _):
         guild, member = await _resolve_guild_member_from_inter(inter)
 
@@ -3459,7 +3462,7 @@ class HelpView(View):
 
         await inter.response.send_modal(PortalLeaderContactModal(guild.id, inter.user.id))
 
-    @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="help_back_main")
+    @button(label="Zurück", emoji=_menu_emoji(EMOJI_BACK), style=ButtonStyle.secondary, custom_id="help_back_main")
     async def btn_back(self, inter: discord.Interaction, _):
         guild, member = await _resolve_guild_member_from_inter(inter)
 
@@ -3473,7 +3476,7 @@ class BackOnlyView(View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="portal_back_main")
+    @button(label="Zurück", emoji=_menu_emoji(EMOJI_BACK), style=ButtonStyle.secondary, custom_id="portal_back_main")
     async def btn_back(self, inter: discord.Interaction, _):
         guild, member = await _resolve_guild_member_from_inter(inter)
 
