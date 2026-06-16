@@ -27,20 +27,25 @@ TZ = ZoneInfo("Europe/Berlin")
 
 
 # Custom Discord-Emojis für Rollen/RSVP
-EMOJI_TANK = "<:tank:1516436970543386635>"
+EMOJI_TANK = "<:tank:1516465336054972456>"
 EMOJI_HEAL = "<:heal:1516457180205940858>"
-EMOJI_DPS = "<:dps:1516436928814252054>"
-EMOJI_BANK = "<:reserve:1516439143385792522>"
-EMOJI_MAYBE = "<:maybe:1516437110624747752>"
-EMOJI_NO = "<:no:1516437249481380042>"
+EMOJI_DPS = "<:dps:1273702712474730496>"
+EMOJI_BANK = "<:reserve:1516465611243520201>"
+EMOJI_MAYBE = "<:maybe:1516465379445047497>"
+EMOJI_NO = "<:no:1516465299359273070>"
 
 # Custom Discord-Emojis für das Gildenmenü
 EMOJI_EBOLUS = "<:ebolus:1516448234355163208>"
-EMOJI_PERSONAL = "<:persoenlich:1516444313868046366>"
-EMOJI_LOOT = "<:loot:1516444382683992205>"
-EMOJI_GUILD = "<:gilde:1516444419040215050>"
-EMOJI_CONTACT = "<:kontakt:1516444479421419703>"
-EMOJI_ADMIN = "<:admin:1516444522270167091>"
+EMOJI_PERSONAL = "<:persoenlich:1516459694997372949>"
+EMOJI_LOOT = "<:loot:1516459736659136672>"
+EMOJI_GUILD = "<:ebolus:1516448234355163208>"
+EMOJI_CONTACT = "<:kontakt:1516459812999921775>"
+EMOJI_ADMIN = "<:admin:1516459630572601487>"
+EMOJI_TIME = "<:time:1516461870146523379>"
+EMOJI_VOTED = "<:voted:1516461766761119936>"
+EMOJI_TARGET = "<:target:1516461644471865365>"
+EMOJI_ABSENCE = "<:nichtda:1516463499872833616>"
+EMOJI_CALENDAR = "<:Kalender:1516462026468098181>"
 
 
 def _menu_emoji(value: str):
@@ -578,19 +583,19 @@ def _event_status_block(guild: discord.Guild, member: discord.Member) -> str:
 
         if answered:
             lines = [x[1] for x in answered[:3]]
-            parts.append("📌 **Deine kommenden Events:**\n" + "\n".join(lines))
+            parts.append(f"{EMOJI_CALENDAR} **Deine kommenden Events:**\n" + "\n".join(lines))
 
         if open_votes:
             lines = [x[1] for x in open_votes[:3]]
-            parts.append("⚠️ **Offene Abstimmungen:**\n" + "\n".join(lines))
+            parts.append(f"{EMOJI_VOTED} **Offene Abstimmungen:**\n" + "\n".join(lines))
 
         if not parts:
-            return "📌 **Deine kommenden Events:**\nKeine aktiven Anmeldungen oder offenen Abstimmungen."
+            return f"{EMOJI_CALENDAR} **Deine kommenden Events:**\nKeine aktiven Anmeldungen oder offenen Abstimmungen."
 
         return "\n\n".join(parts)
 
     except Exception:
-        return "📌 **Deine kommenden Events:**\nKeine Übersicht verfügbar."
+        return f"{EMOJI_CALENDAR} **Deine kommenden Events:**\nKeine Übersicht verfügbar."
 
 
 def _main_menu_embed(guild: discord.Guild, member: Optional[discord.Member] = None) -> discord.Embed:
@@ -649,7 +654,7 @@ def _events_embed(guild_id: int) -> discord.Embed:
     events = c.get("events") or []
 
     emb = discord.Embed(
-        title="📅 Ebolus Gildenkalender",
+        title=f"{EMOJI_CALENDAR} Ebolus Gildenkalender",
         color=discord.Color.gold()
     )
 
@@ -742,7 +747,7 @@ def _absence_calendar_embed(guild: discord.Guild) -> discord.Embed:
     users = g.get("users") or {}
 
     emb = discord.Embed(
-        title="🏖️ Abwesenheitskalender",
+        title=f"{EMOJI_ABSENCE} Abwesenheitskalender",
         color=discord.Color.gold()
     )
 
@@ -1049,6 +1054,8 @@ async def _delete_old_bot_dms_for_member(
         f"{EMOJI_CONTACT} Kontakt & Hilfe",
         "🛡️ Admin",
         f"{EMOJI_ADMIN} Admin",
+        "<:gilde:1516444419040215050> Gilde",
+        "<:gilde:1516444419040215050> Admin – Event",
         "📅 Admin – Event",
         f"{EMOJI_GUILD} Admin – Event",
         "🎁 Admin – Loot",
@@ -1274,7 +1281,7 @@ class AbsenceModal(Modal):
 
         if isinstance(ch, (discord.TextChannel, discord.Thread)):
             emb = discord.Embed(
-                title="🏖️ Abwesenheit gemeldet",
+                title=f"{EMOJI_ABSENCE} Abwesenheit gemeldet",
                 description=(
                     f"**{ingame}** ist abwesend von **{from_s}** bis **{to_s}**.\n\n"
                     f"**Grund:**\n{reason_s}"
@@ -1416,31 +1423,31 @@ class PortalMainSelect(Select):
                 label="Persönlich",
                 value="personal",
                 description="Profil, Gearscore, Abwesenheit und Raid-DMs",
-                emoji="👤"
+                emoji=_menu_emoji(EMOJI_PERSONAL)
             ),
             discord.SelectOption(
                 label="Loot & Bedarf",
                 value="loot",
                 description="Needliste für Main/Secondary und Lootregeln",
-                emoji="🎁"
+                emoji=_menu_emoji(EMOJI_LOOT)
             ),
             discord.SelectOption(
                 label="Gilde",
                 value="guild",
                 description="Kalender, Abwesenheiten und Mitgliederübersicht",
-                emoji="📅"
+                emoji=_menu_emoji(EMOJI_EBOLUS)
             ),
             discord.SelectOption(
                 label="Kontakt & Hilfe",
                 value="support",
                 description="Leader kontaktieren oder Hilfe zum Bot öffnen",
-                emoji="🛡️"
+                emoji=_menu_emoji(EMOJI_CONTACT)
             ),
             discord.SelectOption(
                 label="Admin",
                 value="admin",
                 description="Event- und Loot-Verwaltung für Leitung",
-                emoji="⚙️"
+                emoji=_menu_emoji(EMOJI_ADMIN)
             ),
         ]
 
@@ -2262,7 +2269,7 @@ class AdminEventChannelSelect(Select):
         self.data["channel_id"] = channel_id
 
         emb = discord.Embed(
-            title="🎯 Zielrolle wählen",
+            title=f"{EMOJI_TARGET} Zielrolle wählen",
             description=(
                 "Wähle die Rolle, die für dieses Event angeschrieben werden soll.\n\n"
                 "Oder wähle **Alle / keine Zielrolle**, wenn alle Servermitglieder zählen sollen."
@@ -2700,7 +2707,7 @@ def _admin_attendance_embed(guild: discord.Guild, event: dict) -> discord.Embed:
 
     desc = (
         f"**{title}**\n"
-        f"🕒 {when}\n\n"
+        f"{EMOJI_TIME} {when}\n\n"
         f"✅ War da: **{counts['present']}**\n"
         f"❌ Nicht da: **{counts['absent']}**\n"
         f"🟡 Entschuldigt: **{counts['excused']}**\n"
@@ -2823,7 +2830,7 @@ class AdminAttendanceEventSelect(Select):
     async def callback(self, inter: discord.Interaction):
         event_id = str(self.values[0])
         if event_id == "0":
-            await inter.response.send_message("📅 Keine Events gefunden.", ephemeral=True)
+            await inter.response.send_message(f"{EMOJI_CALENDAR} Keine Events gefunden.", ephemeral=True)
             return
         rsvp = _admin_event_module()
         event = rsvp.get_attendance_event(self.guild_id, event_id)
@@ -3167,7 +3174,7 @@ class AdminEventMenuView(View):
             return
         events = _admin_active_rsvp_events(guild)
         if not events:
-            await inter.response.send_message("📅 Keine aktiven Events gefunden.", ephemeral=True)
+            await inter.response.send_message(f"{EMOJI_CALENDAR} Keine aktiven Events gefunden.", ephemeral=True)
             return
         emb = discord.Embed(title="🗑️ Event löschen", description="Wähle das Event, das gelöscht werden soll.", color=discord.Color.gold())
         await inter.response.edit_message(embed=emb, view=AdminEventSelectView(guild.id, member.id, "delete", events))
@@ -3180,7 +3187,7 @@ class AdminEventMenuView(View):
             return
         events = _admin_active_rsvp_events(guild)
         if not events:
-            await inter.response.send_message("📅 Keine aktiven Events gefunden.", ephemeral=True)
+            await inter.response.send_message(f"{EMOJI_CALENDAR} Keine aktiven Events gefunden.", ephemeral=True)
             return
         emb = discord.Embed(title="📨 Resend Missing", description="Wähle das Event, für das fehlende Abstimmungen erneut gesendet werden sollen.", color=discord.Color.gold())
         await inter.response.edit_message(embed=emb, view=AdminEventSelectView(guild.id, member.id, "resend", events))
@@ -3193,7 +3200,7 @@ class AdminEventMenuView(View):
             return
         events = await _admin_attendance_events(guild)
         if not events:
-            await inter.response.send_message("📅 Keine gestarteten Events für Anwesenheit gefunden.", ephemeral=True)
+            await inter.response.send_message(f"{EMOJI_CALENDAR} Keine gestarteten Events für Anwesenheit gefunden.", ephemeral=True)
             return
         emb = discord.Embed(title="✅ Admin – Anwesenheit", description="Wähle ein gestartetes Event aus den letzten 30 Tagen.", color=discord.Color.gold())
         await inter.response.edit_message(embed=emb, view=AdminAttendanceEventSelectView(guild.id, member.id, events))
@@ -3295,9 +3302,9 @@ class SupportMenuView(View):
                 "Im Bereich Persönlich kannst du Raid-DMs aktivieren oder deaktivieren.\n\n"
                 "**🎁 Needliste**\n"
                 "Hier trägst du ein, welche Items du brauchst. Die Gildenleitung nutzt das für Bossplanung und Lootübersicht.\n\n"
-                "**🏖️ Abwesenheit**\n"
+                f"**{EMOJI_ABSENCE} Abwesenheit**\n"
                 "Hier meldest du Urlaub, Schicht oder längere Inaktivität.\n\n"
-                "**📅 Kalender & Abwesenheiten**\n"
+                f"**{EMOJI_CALENDAR} Kalender & Abwesenheiten**\n"
                 "Zeigt feste Gildentermine und aktuelle/kommende Abwesenheiten.\n\n"
                 "**📜 Regeln & Loot**\n"
                 "Zeigt die wichtigsten Gildenregeln und das Lootsystem.\n\n"
@@ -3886,7 +3893,7 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
         events = c.get("events") or []
 
         if not events:
-            await inter.response.send_message("📅 Keine Events gespeichert.", ephemeral=True)
+            await inter.response.send_message(f"{EMOJI_CALENDAR} Keine Events gespeichert.", ephemeral=True)
             return
 
         lines = []
