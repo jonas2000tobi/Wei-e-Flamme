@@ -48,7 +48,7 @@ EMOJI_ABSENCE = "<:nichtda:1516463499872833616>"
 EMOJI_CALENDAR = "<:Kalender:1516462026468098181>"
 EMOJI_BACK = "<:zurueck:1516470839120498778>"
 EMOJI_HELP = "<:hilfe:1516470888818802900>"
-EMOJI_MEMBER = EMOJI_EBOLUS
+EMOJI_MEMBER = "<:member:1516474249492168734>"
 
 
 def _menu_emoji(value: str):
@@ -1767,7 +1767,7 @@ class GuildMenuView(View):
 
         await inter.response.edit_message(embed=_absence_calendar_embed(guild), view=AbsenceCalendarView())
 
-    @button(label=f"{EMOJI_MEMBER} Mitglieder", style=ButtonStyle.secondary, custom_id="portal_guild_members")
+    @button(label="Mitglieder", emoji=_menu_emoji(EMOJI_MEMBER), style=ButtonStyle.secondary, custom_id="portal_guild_members")
     async def btn_members(self, inter: discord.Interaction, _):
         guild, member = await _resolve_guild_member_from_inter(inter)
 
@@ -3346,7 +3346,7 @@ class ProfileView(View):
 
         await inter.response.send_modal(ProfileEditModal(guild.id, inter.user.id))
 
-    @button(label=f"{EMOJI_MEMBER} Mitglieder", style=ButtonStyle.secondary, custom_id="portal_member_list")
+    @button(label="Mitglieder", emoji=_menu_emoji(EMOJI_MEMBER), style=ButtonStyle.secondary, custom_id="portal_member_list")
     async def btn_members(self, inter: discord.Interaction, _):
         guild, member = await _resolve_guild_member_from_inter(inter)
 
