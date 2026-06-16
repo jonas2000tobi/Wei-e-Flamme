@@ -28,20 +28,25 @@ TZ = ZoneInfo("Europe/Berlin")
 
 
 # Custom Discord-Emojis für RSVP/Rollen
-EMOJI_TANK = "<:tank:1516436970543386635>"
+EMOJI_TANK = "<:tank:1516465336054972456>"
 EMOJI_HEAL = "<:heal:1516457180205940858>"
-EMOJI_DPS = "<:dps:1516436928814252054>"
-EMOJI_BANK = "<:reserve:1516439143385792522>"
-EMOJI_MAYBE = "<:maybe:1516437110624747752>"
-EMOJI_NO = "<:no:1516437249481380042>"
+EMOJI_DPS = "<:dps:1273702712474730496>"
+EMOJI_BANK = "<:reserve:1516465611243520201>"
+EMOJI_MAYBE = "<:maybe:1516465379445047497>"
+EMOJI_NO = "<:no:1516465299359273070>"
 
 # Portal-Menü-Emojis zum Schutz vor DM-Cleanup
 EMOJI_EBOLUS = "<:ebolus:1516448234355163208>"
-EMOJI_PERSONAL = "<:persoenlich:1516444313868046366>"
-EMOJI_LOOT = "<:loot:1516444382683992205>"
-EMOJI_GUILD = "<:gilde:1516444419040215050>"
-EMOJI_CONTACT = "<:kontakt:1516444479421419703>"
-EMOJI_ADMIN = "<:admin:1516444522270167091>"
+EMOJI_PERSONAL = "<:persoenlich:1516459694997372949>"
+EMOJI_LOOT = "<:loot:1516459736659136672>"
+EMOJI_GUILD = "<:ebolus:1516448234355163208>"
+EMOJI_CONTACT = "<:kontakt:1516459812999921775>"
+EMOJI_ADMIN = "<:admin:1516459630572601487>"
+EMOJI_TIME = "<:time:1516461870146523379>"
+EMOJI_VOTED = "<:voted:1516461766761119936>"
+EMOJI_TARGET = "<:target:1516461644471865365>"
+EMOJI_ABSENCE = "<:nichtda:1516463499872833616>"
+EMOJI_CALENDAR = "<:Kalender:1516462026468098181>"
 
 
 def _button_emoji(value: str):
@@ -274,8 +279,8 @@ def _format_dm_text(
     desc = (description or "").strip()
 
     dm_text = (
-        f"📅 **{title}**\n"
-        f"🕒 {when.strftime('%a, %d.%m.%Y %H:%M')} (Europe/Berlin)\n"
+        f"{EMOJI_CALENDAR} **{title}**\n"
+        f"{EMOJI_TIME} {when.strftime('%a, %d.%m.%Y %H:%M')} (Europe/Berlin)\n"
         f"📍 {channel_name_or_ref}\n"
     )
 
@@ -529,18 +534,18 @@ def build_embed(guild: discord.Guild, obj: dict) -> discord.Embed:
     voted = _voters_set(obj)
 
     if _is_alliance_event(obj):
-        vote_line = f"🗳️ Abgestimmt: **{len(voted)}**"
+        vote_line = f"{EMOJI_VOTED} Abgestimmt: **{len(voted)}**"
         hint_line = "💡 Allianz-Raid: Partner-Server stimmen direkt über diesen Post ab. DMs gibt es nur für den Home-Server."
     else:
         eligible = _eligible_members(guild, obj)
-        vote_line = f"🗳️ Abgestimmt: **{len(voted)}** / **{len(eligible)}**"
+        vote_line = f"{EMOJI_VOTED} Abgestimmt: **{len(voted)}** / **{len(eligible)}**"
         hint_line = "💡 Wenn du keine DM bekommst oder sie deaktiviert hast: nutze die Buttons direkt unter dieser Ankündigung."
 
     emb = discord.Embed(
-        title=f"📅 {obj['title']}",
+        title=f"{EMOJI_CALENDAR} {obj['title']}",
         description=(
             (obj.get("description", "") or "") +
-            f"\n\n🕒 Zeit: {when.strftime('%a, %d.%m.%Y %H:%M')} (Europe/Berlin)"
+            f"\n\n{EMOJI_TIME} Zeit: {when.strftime('%a, %d.%m.%Y %H:%M')} (Europe/Berlin)"
             f"\n{vote_line}"
             f"\n{hint_line}"
         ).strip(),
@@ -584,7 +589,7 @@ def build_embed(guild: discord.Guild, obj: dict) -> discord.Embed:
         role = guild.get_role(tr_id)
 
         if role:
-            emb.add_field(name="🎯 Zielgruppe", value=role.mention, inline=False)
+            emb.add_field(name=f"{EMOJI_TARGET} Zielgruppe", value=role.mention, inline=False)
 
     if obj.get("image_url"):
         emb.set_image(url=obj["image_url"])
@@ -643,6 +648,8 @@ def _portal_protected_titles() -> set[str]:
         "🛡️ Kontakt & Hilfe",
         f"{EMOJI_CONTACT} Kontakt & Hilfe",
         f"{EMOJI_ADMIN} Admin",
+        "<:gilde:1516444419040215050> Gilde",
+        "<:gilde:1516444419040215050> Admin – Event",
 
         "👤 Dein Gildenprofil",
         "📅 Ebolus Gildenkalender",
@@ -1927,7 +1934,7 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
 
         await inter.followup.send(
             f"✅ Raid erstellt: {msg.jump_url}\n"
-            f"🎯 Zielgruppe: {ziel}\n"
+            f"{EMOJI_TARGET} Zielgruppe: {ziel}\n"
             f"✉️ DMs versendet: {sent}\n"
             f"🔕 Opt-out übersprungen: {skipped_opt_out}\n"
             f"🖱️ Abstimmung ist zusätzlich direkt unter der Raid-Ankündigung per Button möglich.",
