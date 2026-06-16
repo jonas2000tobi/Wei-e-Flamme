@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 
 import discord
 from discord import app_commands
+from discord.ext import tasks
 from discord.ui import View, button
 from discord.enums import ButtonStyle
 
@@ -986,6 +987,195 @@ def _schedule_portal_refresh_for_event(client: discord.Client, guild: Optional[d
         pass
 
 
+async def _member_allowed_for_target_role(inter: discord.Interaction, obj: dict, user_id: int) -> tuple[bool, str]:
+    """Blockt RSVP über Serverbuttons, wenn ein Event eine Zielrolle hat."""
+    role_id = int(obj.get("target_role_id", 0) or 0)
+
+    if not role_id:
+        return True, ""
+
+    guild_id = int(inter.guild_id or obj.get("guild_id", 0) or 0)
+    guild = inter.client.get_guild(guild_id) if guild_id else None
+
+    if guild is None:
+        return False, "Dieses Event hat eine Zielrolle. Dein Server konnte nicht geprüft werden."
+
+    role = guild.get_role(role_id)
+
+    if role is None:
+        return False, "Die Zielrolle dieses Events wurde nicht gefunden. Bitte melde dich bei der Gildenleitung."
+
+    member = guild.get_member(int(user_id))
+
+    if member is None:
+        try:
+            member = await guild.fetch_member(int(user_id))
+        except Exception:
+            member = None
+
+    if member is None or member.bot or role not in getattr(member, "roles", []):
+        return False, f"Du gehörst nicht zur Zielgruppe dieses Events ({role.mention}) und kannst dich dafür nicht anmelden."
+
+    return True, ""
+
+
+def _reminder_label(minutes: int, target: str) -> str:
+    if minutes >= 1440 and minutes % 1440 == 0:
+        time_txt = f"{minutes // 1440} Tag(e) vorher"
+    elif minutes >= 60 and minutes % 60 == 0:
+        time_txt = f"{minutes // 60} Stunde(n) vorher"
+    else:
+        time_txt = f"{minutes} Minute(n) vorher"
+
+    if target == "yes":
+        target_txt = "angemeldete Teilnehmer"
+    elif target == "all":
+        target_txt = "Zielgruppe"
+    else:
+        target_txt = "fehlende Abstimmungen"
+
+    return f"{time_txt} an {target_txt}"
+
+
+def _reminder_voters(obj: dict) -> set[int]:
+    try:
+        _init_event_shape(obj)
+        return _voters_set(obj)
+    except Exception:
+        return set()
+
+
+def _reminder_yes_participants(obj: dict) -> set[int]:
+    ids: set[int] = set()
+    try:
+        _init_event_shape(obj)
+        for key in ("TANK", "HEAL", "DPS", "BANK"):
+            for entry in obj.get("yes", {}).get(key, []) or []:
+                uid = _entry_user_id(entry)
+                if uid:
+                    ids.add(uid)
+    except Exception:
+        pass
+    return ids
+
+
+def _reminder_target_members(guild: discord.Guild, obj: dict, target: str) -> list[discord.Member]:
+    try:
+        members = _eligible_members(guild, obj)
+    except Exception:
+        members = [m for m in guild.members if not m.bot]
+
+    if target == "yes":
+        allowed = _reminder_yes_participants(obj)
+        return [m for m in members if m.id in allowed and not m.bot]
+
+    if target == "all":
+        return [m for m in members if not m.bot]
+
+    voted = _reminder_voters(obj)
+    return [m for m in members if m.id not in voted and not m.bot]
+
+
+async def _send_event_reminder(client: discord.Client, msg_id: str, obj: dict, reminder: dict) -> int:
+    guild_id = int(obj.get("guild_id", 0) or 0)
+    guild = client.get_guild(guild_id) if guild_id else None
+
+    if guild is None:
+        return 0
+
+    try:
+        when = datetime.fromisoformat(obj.get("when_iso", ""))
+    except Exception:
+        return 0
+
+    minutes = int(reminder.get("minutes", 0) or 0)
+    target = str(reminder.get("target", "missing") or "missing")
+    label = _reminder_label(minutes, target)
+    members = _reminder_target_members(guild, obj, target)
+
+    sent = 0
+    for member in members:
+        try:
+            if not is_dm_enabled(guild.id, member.id):
+                continue
+
+            if target == "yes":
+                intro = "Reminder: Du bist für dieses Event angemeldet."
+            elif target == "all":
+                intro = "Reminder für dieses Event."
+            else:
+                intro = "Reminder: Du hast für dieses Event noch nicht abgestimmt."
+
+            dm_text = _format_dm_text(
+                title=str(obj.get("title", "Event")),
+                when=when,
+                channel_name_or_ref=f"Übersicht: <#{obj.get('channel_id')}>",
+                description=obj.get("description"),
+                intro_line=intro,
+            )
+            dm_text += f"\n\n⏰ **Reminder:** {label}"
+
+            dm_msg = await member.send(dm_text, view=RaidView(int(msg_id)))
+            obj.setdefault("dm_messages", {})[str(member.id)] = int(dm_msg.id)
+            sent += 1
+            await asyncio.sleep(0.05)
+        except Exception:
+            pass
+
+    return sent
+
+
+@tasks.loop(minutes=1)
+async def event_reminder_loop():
+    now = datetime.now(TZ)
+    changed = False
+
+    for msg_id, obj in list(store.items()):
+        try:
+            _init_event_shape(obj)
+            reminders = obj.get("reminders") or []
+
+            if not isinstance(reminders, list) or not reminders:
+                continue
+
+            when = datetime.fromisoformat(obj.get("when_iso", ""))
+
+            if now > when + timedelta(hours=2):
+                continue
+
+            sent_map = obj.setdefault("reminder_sent", {})
+
+            for idx, reminder in enumerate(reminders):
+                try:
+                    minutes = int(reminder.get("minutes", 0) or 0)
+                    if minutes <= 0:
+                        continue
+
+                    due_at = when - timedelta(minutes=minutes)
+                    key = f"{idx}:{minutes}:{reminder.get('target', 'missing')}"
+
+                    if sent_map.get(key):
+                        continue
+
+                    if now < due_at:
+                        continue
+
+                    sent = await _send_event_reminder(event_reminder_loop._client, str(msg_id), obj, reminder)  # type: ignore[attr-defined]
+                    sent_map[key] = {"sent_at": now.isoformat(), "sent": int(sent)}
+                    changed = True
+
+                except Exception as e:
+                    print(f"[event_reminder_loop] Reminder Fehler: {e!r}")
+                    continue
+
+        except Exception as e:
+            print(f"[event_reminder_loop] Event Fehler: {e!r}")
+            continue
+
+    if changed:
+        save_store()
+
+
 async def apply_rsvp(inter: discord.Interaction, msg_id: str, group: str) -> tuple[bool, str]:
     obj = store.get(str(msg_id))
 
@@ -995,6 +1185,11 @@ async def apply_rsvp(inter: discord.Interaction, msg_id: str, group: str) -> tup
     _init_event_shape(obj)
 
     uid = inter.user.id
+
+    allowed, reason = await _member_allowed_for_target_role(inter, obj, uid)
+    if not allowed:
+        return False, f"❌ {reason}"
+
     member = _member_from_event(inter, obj)
     display_name = _current_display_name(member, inter.user)
     guild_label, source_guild_id = _source_label_for_inter(inter, obj) if _is_alliance_event(obj) else ("", int(inter.guild_id or obj.get("guild_id", 0) or 0))
@@ -1340,6 +1535,14 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
 
     save_store()
 
+    try:
+        event_reminder_loop._client = client  # type: ignore[attr-defined]
+        if not event_reminder_loop.is_running():
+            event_reminder_loop.start()
+            print("⏰ Event-Reminder-Task gestartet.")
+    except Exception as e:
+        print(f"[event_rsvp_dm] Reminder-Task Startfehler: {e!r}")
+
     @tree.command(name="raid_set_roles_dm", description="(Admin) Primärrollen (Tank/Heal/DPS) für Maybe-Label setzen")
     @app_commands.describe(tank_role="Rolle: Tank", heal_role="Rolle: Heal", dps_role="Rolle: DPS")
     async def raid_set_roles_dm(
@@ -1432,6 +1635,8 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
             "maybe": {},
             "no": [],
             "target_role_id": int(target_role.id) if target_role else 0,
+            "reminders": [],
+            "reminder_sent": {},
             "dm_messages": {}
         }
 
