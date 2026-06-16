@@ -36,7 +36,7 @@ EMOJI_MAYBE = "<:maybe:1516437110624747752>"
 EMOJI_NO = "<:no:1516437249481380042>"
 
 # Portal-Menü-Emojis zum Schutz vor DM-Cleanup
-EMOJI_EBOLUS = "⚜️"
+EMOJI_EBOLUS = "<:ebolus:1516448234355163208>"
 EMOJI_PERSONAL = "<:persoenlich:1516444313868046366>"
 EMOJI_LOOT = "<:loot:1516444382683992205>"
 EMOJI_GUILD = "<:gilde:1516444419040215050>"
@@ -1538,53 +1538,53 @@ class BaseRaidView(View):
 
 
 class RaidView(BaseRaidView):
-    @button(label="Tank", emoji=EMOJI_TANK, style=ButtonStyle.primary, custom_id="dm_rsvp_tank")
+    @button(label="Tank", emoji=_button_emoji(EMOJI_TANK), style=ButtonStyle.primary, custom_id="dm_rsvp_tank")
     async def btn_tank(self, inter: discord.Interaction, _):
         await self._handle(inter, "TANK")
 
-    @button(label="Heal", emoji=EMOJI_HEAL, style=ButtonStyle.secondary, custom_id="dm_rsvp_heal")
+    @button(label="Heal", emoji=_button_emoji(EMOJI_HEAL), style=ButtonStyle.secondary, custom_id="dm_rsvp_heal")
     async def btn_heal(self, inter: discord.Interaction, _):
         await self._handle(inter, "HEAL")
 
-    @button(label="DPS", emoji=EMOJI_DPS, style=ButtonStyle.secondary, custom_id="dm_rsvp_dps")
+    @button(label="DPS", emoji=_button_emoji(EMOJI_DPS), style=ButtonStyle.secondary, custom_id="dm_rsvp_dps")
     async def btn_dps(self, inter: discord.Interaction, _):
         await self._handle(inter, "DPS")
 
-    @button(label="Reserve", emoji=EMOJI_BANK, style=ButtonStyle.secondary, custom_id="dm_rsvp_bank")
+    @button(label="Reserve", emoji=_button_emoji(EMOJI_BANK), style=ButtonStyle.secondary, custom_id="dm_rsvp_bank")
     async def btn_bank(self, inter: discord.Interaction, _):
         await self._handle(inter, "BANK")
 
-    @button(label="Vielleicht", emoji=EMOJI_MAYBE, style=ButtonStyle.secondary, custom_id="dm_rsvp_maybe")
+    @button(label="Vielleicht", emoji=_button_emoji(EMOJI_MAYBE), style=ButtonStyle.secondary, custom_id="dm_rsvp_maybe")
     async def btn_maybe(self, inter: discord.Interaction, _):
         await self._handle(inter, "MAYBE")
 
-    @button(label="Abmelden", emoji=EMOJI_NO, style=ButtonStyle.danger, custom_id="dm_rsvp_no")
+    @button(label="Abmelden", emoji=_button_emoji(EMOJI_NO), style=ButtonStyle.danger, custom_id="dm_rsvp_no")
     async def btn_no(self, inter: discord.Interaction, _):
         await self._handle(inter, "NO")
 
 
 class ServerRaidView(BaseRaidView):
-    @button(label="Tank", emoji=EMOJI_TANK, style=ButtonStyle.primary, custom_id="srv_rsvp_tank")
+    @button(label="Tank", emoji=_button_emoji(EMOJI_TANK), style=ButtonStyle.primary, custom_id="srv_rsvp_tank")
     async def btn_tank(self, inter: discord.Interaction, _):
         await self._handle(inter, "TANK")
 
-    @button(label="Heal", emoji=EMOJI_HEAL, style=ButtonStyle.secondary, custom_id="srv_rsvp_heal")
+    @button(label="Heal", emoji=_button_emoji(EMOJI_HEAL), style=ButtonStyle.secondary, custom_id="srv_rsvp_heal")
     async def btn_heal(self, inter: discord.Interaction, _):
         await self._handle(inter, "HEAL")
 
-    @button(label="DPS", emoji=EMOJI_DPS, style=ButtonStyle.secondary, custom_id="srv_rsvp_dps")
+    @button(label="DPS", emoji=_button_emoji(EMOJI_DPS), style=ButtonStyle.secondary, custom_id="srv_rsvp_dps")
     async def btn_dps(self, inter: discord.Interaction, _):
         await self._handle(inter, "DPS")
 
-    @button(label="Reserve", emoji=EMOJI_BANK, style=ButtonStyle.secondary, custom_id="srv_rsvp_bank")
+    @button(label="Reserve", emoji=_button_emoji(EMOJI_BANK), style=ButtonStyle.secondary, custom_id="srv_rsvp_bank")
     async def btn_bank(self, inter: discord.Interaction, _):
         await self._handle(inter, "BANK")
 
-    @button(label="Vielleicht", emoji=EMOJI_MAYBE, style=ButtonStyle.secondary, custom_id="srv_rsvp_maybe")
+    @button(label="Vielleicht", emoji=_button_emoji(EMOJI_MAYBE), style=ButtonStyle.secondary, custom_id="srv_rsvp_maybe")
     async def btn_maybe(self, inter: discord.Interaction, _):
         await self._handle(inter, "MAYBE")
 
-    @button(label="Abmelden", emoji=EMOJI_NO, style=ButtonStyle.danger, custom_id="srv_rsvp_no")
+    @button(label="Abmelden", emoji=_button_emoji(EMOJI_NO), style=ButtonStyle.danger, custom_id="srv_rsvp_no")
     async def btn_no(self, inter: discord.Interaction, _):
         await self._handle(inter, "NO")
 
