@@ -1016,6 +1016,8 @@ async def _delete_old_bot_dms_for_member(
         "🛡️ Admin",
         "📅 Admin – Event",
         "🎁 Admin – Loot",
+        "✅ Admin – Anwesenheit",
+        "✅ Anwesenheit prüfen",
     }
 
     deleted = 0
@@ -2576,6 +2578,115 @@ class AdminEventCustomImageModal(Modal):
         await _admin_show_reminder_select(inter, self.data, send_new=True)
 
 
+
+
+def _attendance_status_label(status: str) -> str:
+    status = str(status or "").strip().lower()
+    if status == "present":
+        return "✅ War da"
+    if status == "absent":
+        return "❌ Nicht da"
+    if status == "excused":
+        return "🟡 Entschuldigt"
+    return "⚪ Offen"
+
+
+async def _admin_attendance_events(guild: Optional[discord.Guild]) -> list[dict]:
+    if guild is None:
+        return []
+
+    try:
+        rsvp = _admin_event_module()
+        now = datetime.now(rsvp.TZ)
+
+        # Wenn ein Event bereits gestartet ist, aber noch im RSVP-Store liegt,
+        # legen wir sofort einen Attendance-Snapshot an.
+        for msg_id, obj in list((getattr(rsvp, "store", {}) or {}).items()):
+            try:
+                if int(obj.get("guild_id", 0) or 0) != int(guild.id):
+                    continue
+                when = datetime.fromisoformat(str(obj.get("when_iso", "")))
+                if when <= now:
+                    rsvp.ensure_attendance_snapshot(guild._state._get_client(), str(msg_id), obj)
+            except Exception:
+                continue
+
+        events = []
+        for ev in rsvp.get_attendance_events_for_guild(int(guild.id)):
+            try:
+                when = datetime.fromisoformat(str(ev.get("when_iso", "")))
+                # Anzeige begrenzen: letzte 30 Tage und gestartete Events.
+                if when > now:
+                    continue
+                if when < now - timedelta(days=30):
+                    continue
+                events.append(ev)
+            except Exception:
+                continue
+
+        events.sort(key=lambda ev: datetime.fromisoformat(str(ev.get("when_iso", ""))), reverse=True)
+        return events[:25]
+
+    except Exception:
+        return []
+
+
+def _admin_attendance_embed(guild: discord.Guild, event: dict) -> discord.Embed:
+    participants = event.get("participants") or []
+    attendance = event.get("attendance") or {}
+
+    counts = {"present": 0, "absent": 0, "excused": 0, "open": 0}
+    lines = []
+
+    for p in participants:
+        try:
+            uid = int(p.get("id", 0) or 0)
+        except Exception:
+            continue
+
+        status = str((attendance.get(str(uid)) or {}).get("status", "") or "")
+        if status in ("present", "absent", "excused"):
+            counts[status] += 1
+        else:
+            counts["open"] += 1
+
+        name = _profile_name(guild, uid, str(p.get("name", "Unbekannt") or "Unbekannt"))
+        signup = str(p.get("signup", "") or "")
+        suffix = f" — {signup}" if signup else ""
+        lines.append(f"• **{name}**{suffix}: {_attendance_status_label(status)}")
+
+    title = str(event.get("title", "Event") or "Event")
+    try:
+        when = datetime.fromisoformat(str(event.get("when_iso", ""))).strftime("%d.%m.%Y %H:%M")
+    except Exception:
+        when = "Unbekannt"
+
+    desc = (
+        f"**{title}**\n"
+        f"🕒 {when}\n\n"
+        f"✅ War da: **{counts['present']}**\n"
+        f"❌ Nicht da: **{counts['absent']}**\n"
+        f"🟡 Entschuldigt: **{counts['excused']}**\n"
+        f"⚪ Offen: **{counts['open']}**\n"
+    )
+
+    if lines:
+        shown = lines[:20]
+        desc += "\n" + "\n".join(shown)
+        if len(lines) > 20:
+            desc += f"\n… {len(lines) - 20} weitere Teilnehmer"
+    else:
+        desc += "\nKeine angemeldeten Teilnehmer gefunden."
+
+    emb = discord.Embed(
+        title="✅ Anwesenheit prüfen",
+        description=desc[:3900],
+        color=discord.Color.gold(),
+    )
+    emb.set_footer(text="Markiert werden nur Spieler, die beim Event angemeldet waren.")
+    return emb
+
+
 class AdminEventSelectView(View):
     def __init__(self, guild_id: int, user_id: int, action: str, events: list[tuple[str, dict]]):
         super().__init__(timeout=None)
@@ -2638,6 +2749,187 @@ class AdminEventDeleteConfirmView(View):
     async def btn_cancel(self, inter: discord.Interaction, _):
         emb = discord.Embed(title="Abgebrochen", description="Das Event wurde nicht gelöscht.", color=discord.Color.orange())
         await inter.response.edit_message(embed=emb, view=AdminEventMenuView())
+
+
+
+class AdminAttendanceEventSelectView(View):
+    def __init__(self, guild_id: int, user_id: int, events: list[dict]):
+        super().__init__(timeout=None)
+        self.guild_id = int(guild_id)
+        self.user_id = int(user_id)
+        self.add_item(AdminAttendanceEventSelect(guild_id, user_id, events))
+
+    @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="admin_attendance_event_back")
+    async def btn_back(self, inter: discord.Interaction, _):
+        emb = discord.Embed(title="📅 Admin – Event", description="Wähle eine Event-Aktion.", color=discord.Color.gold())
+        await inter.response.edit_message(embed=emb, view=AdminEventMenuView())
+
+
+class AdminAttendanceEventSelect(Select):
+    def __init__(self, guild_id: int, user_id: int, events: list[dict]):
+        self.guild_id = int(guild_id)
+        self.user_id = int(user_id)
+        options = []
+        for ev in events[:25]:
+            event_id = str(ev.get("event_id", "") or ev.get("message_id", ""))
+            try:
+                when = datetime.fromisoformat(str(ev.get("when_iso", "")))
+                label = f"{when.strftime('%d.%m. %H:%M')} – {str(ev.get('title', 'Event'))}"[:100]
+            except Exception:
+                label = str(ev.get("title", "Event"))[:100]
+            count = len(ev.get("participants") or [])
+            options.append(discord.SelectOption(label=label, value=event_id, description=f"Teilnehmer: {count}"[:100]))
+        if not options:
+            options = [discord.SelectOption(label="Keine Events gefunden", value="0")]
+        super().__init__(placeholder="Event für Anwesenheit wählen", min_values=1, max_values=1, options=options, custom_id="admin_attendance_event_select")
+
+    async def callback(self, inter: discord.Interaction):
+        event_id = str(self.values[0])
+        if event_id == "0":
+            await inter.response.send_message("📅 Keine Events gefunden.", ephemeral=True)
+            return
+        rsvp = _admin_event_module()
+        event = rsvp.get_attendance_event(self.guild_id, event_id)
+        guild = inter.client.get_guild(self.guild_id)
+        if not guild or not event:
+            await inter.response.send_message("❌ Event nicht gefunden.", ephemeral=True)
+            return
+        await inter.response.edit_message(embed=_admin_attendance_embed(guild, event), view=AdminAttendanceMemberSelectView(self.guild_id, self.user_id, event_id, event))
+
+
+class AdminAttendanceMemberSelectView(View):
+    def __init__(self, guild_id: int, user_id: int, event_id: str, event: dict, page: int = 0):
+        super().__init__(timeout=None)
+        self.guild_id = int(guild_id)
+        self.user_id = int(user_id)
+        self.event_id = str(event_id)
+        self.page = max(0, int(page))
+        participants = event.get("participants") or []
+        max_page = max(0, (len(participants) - 1) // 25)
+        if self.page > max_page:
+            self.page = max_page
+        self.add_item(AdminAttendanceMemberSelect(guild_id, user_id, event_id, event, self.page))
+
+    @button(label="⬅️ Eventliste", style=ButtonStyle.secondary, custom_id="admin_attendance_member_back", row=1)
+    async def btn_back(self, inter: discord.Interaction, _):
+        guild = inter.client.get_guild(self.guild_id)
+        events = await _admin_attendance_events(guild)
+        emb = discord.Embed(title="✅ Admin – Anwesenheit", description="Wähle ein gestartetes Event aus den letzten 30 Tagen.", color=discord.Color.gold())
+        await inter.response.edit_message(embed=emb, view=AdminAttendanceEventSelectView(self.guild_id, self.user_id, events))
+
+    @button(label="◀️", style=ButtonStyle.secondary, custom_id="admin_attendance_page_prev", row=1)
+    async def btn_prev(self, inter: discord.Interaction, _):
+        rsvp = _admin_event_module()
+        guild = inter.client.get_guild(self.guild_id)
+        event = rsvp.get_attendance_event(self.guild_id, self.event_id)
+        if not guild or not event:
+            await inter.response.send_message("❌ Event nicht gefunden.", ephemeral=True)
+            return
+        await inter.response.edit_message(embed=_admin_attendance_embed(guild, event), view=AdminAttendanceMemberSelectView(self.guild_id, self.user_id, self.event_id, event, max(0, self.page - 1)))
+
+    @button(label="▶️", style=ButtonStyle.secondary, custom_id="admin_attendance_page_next", row=1)
+    async def btn_next(self, inter: discord.Interaction, _):
+        rsvp = _admin_event_module()
+        guild = inter.client.get_guild(self.guild_id)
+        event = rsvp.get_attendance_event(self.guild_id, self.event_id)
+        if not guild or not event:
+            await inter.response.send_message("❌ Event nicht gefunden.", ephemeral=True)
+            return
+        participants = event.get("participants") or []
+        max_page = max(0, (len(participants) - 1) // 25)
+        await inter.response.edit_message(embed=_admin_attendance_embed(guild, event), view=AdminAttendanceMemberSelectView(self.guild_id, self.user_id, self.event_id, event, min(max_page, self.page + 1)))
+
+class AdminAttendanceMemberSelect(Select):
+    def __init__(self, guild_id: int, user_id: int, event_id: str, event: dict, page: int = 0):
+        self.guild_id = int(guild_id)
+        self.user_id = int(user_id)
+        self.event_id = str(event_id)
+        self.page = max(0, int(page))
+        participants = event.get("participants") or []
+        attendance = event.get("attendance") or {}
+        start_i = self.page * 25
+        page_participants = participants[start_i:start_i + 25]
+        options = []
+        # guild ist hier nicht zuverlässig verfügbar, darum nutzen wir gespeicherte Namen.
+        for p in page_participants:
+            try:
+                uid = int(p.get("id", 0) or 0)
+            except Exception:
+                continue
+            name = str(p.get("name", f"User {uid}") or f"User {uid}")
+            signup = str(p.get("signup", "") or "")
+            status = str((attendance.get(str(uid)) or {}).get("status", "") or "")
+            desc = f"{signup} • {_attendance_status_label(status)}" if signup else _attendance_status_label(status)
+            options.append(discord.SelectOption(label=name[:100], value=str(uid), description=desc[:100]))
+        if not options:
+            options = [discord.SelectOption(label="Keine Teilnehmer gefunden", value="0")]
+        super().__init__(placeholder=f"Spieler markieren – Seite {self.page + 1}", min_values=1, max_values=1, options=options, custom_id="admin_attendance_member_select")
+
+    async def callback(self, inter: discord.Interaction):
+        uid = int(self.values[0])
+        if uid == 0:
+            await inter.response.send_message("Keine Teilnehmer gefunden.", ephemeral=True)
+            return
+        rsvp = _admin_event_module()
+        event = rsvp.get_attendance_event(self.guild_id, self.event_id)
+        guild = inter.client.get_guild(self.guild_id)
+        if not guild or not event:
+            await inter.response.send_message("❌ Event nicht gefunden.", ephemeral=True)
+            return
+
+        name = _profile_name(guild, uid, f"User {uid}")
+        emb = discord.Embed(
+            title="✅ Anwesenheit markieren",
+            description=f"Spieler: **{name}**\nEvent: **{event.get('title', 'Event')}**\n\nWähle den Status.",
+            color=discord.Color.gold(),
+        )
+        await inter.response.edit_message(embed=emb, view=AdminAttendanceMarkView(self.guild_id, self.user_id, self.event_id, uid, self.page))
+
+
+class AdminAttendanceMarkView(View):
+    def __init__(self, guild_id: int, user_id: int, event_id: str, target_user_id: int, page: int = 0):
+        super().__init__(timeout=None)
+        self.guild_id = int(guild_id)
+        self.user_id = int(user_id)
+        self.event_id = str(event_id)
+        self.target_user_id = int(target_user_id)
+        self.page = max(0, int(page))
+
+    async def _mark(self, inter: discord.Interaction, status: str):
+        rsvp = _admin_event_module()
+        ok = rsvp.set_attendance_status(self.guild_id, self.event_id, self.target_user_id, status, inter.user.id)
+        guild = inter.client.get_guild(self.guild_id)
+        event = rsvp.get_attendance_event(self.guild_id, self.event_id)
+        if not ok or not guild or not event:
+            await inter.response.send_message("❌ Anwesenheit konnte nicht gespeichert werden.", ephemeral=True)
+            return
+        await inter.response.edit_message(embed=_admin_attendance_embed(guild, event), view=AdminAttendanceMemberSelectView(self.guild_id, self.user_id, self.event_id, event, self.page))
+
+    @button(label="✅ War da", style=ButtonStyle.success, custom_id="admin_attendance_mark_present", row=0)
+    async def btn_present(self, inter: discord.Interaction, _):
+        await self._mark(inter, "present")
+
+    @button(label="❌ Nicht da", style=ButtonStyle.danger, custom_id="admin_attendance_mark_absent", row=0)
+    async def btn_absent(self, inter: discord.Interaction, _):
+        await self._mark(inter, "absent")
+
+    @button(label="🟡 Entschuldigt", style=ButtonStyle.secondary, custom_id="admin_attendance_mark_excused", row=1)
+    async def btn_excused(self, inter: discord.Interaction, _):
+        await self._mark(inter, "excused")
+
+    @button(label="⚪ Offen", style=ButtonStyle.secondary, custom_id="admin_attendance_mark_clear", row=1)
+    async def btn_clear(self, inter: discord.Interaction, _):
+        await self._mark(inter, "clear")
+
+    @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="admin_attendance_mark_back", row=2)
+    async def btn_back(self, inter: discord.Interaction, _):
+        rsvp = _admin_event_module()
+        guild = inter.client.get_guild(self.guild_id)
+        event = rsvp.get_attendance_event(self.guild_id, self.event_id)
+        if not guild or not event:
+            await inter.response.send_message("❌ Event nicht gefunden.", ephemeral=True)
+            return
+        await inter.response.edit_message(embed=_admin_attendance_embed(guild, event), view=AdminAttendanceMemberSelectView(self.guild_id, self.user_id, self.event_id, event, self.page))
 
 
 class AdminVoiceSettingsView(View):
@@ -2856,7 +3148,20 @@ class AdminEventMenuView(View):
         emb = discord.Embed(title="📨 Resend Missing", description="Wähle das Event, für das fehlende Abstimmungen erneut gesendet werden sollen.", color=discord.Color.gold())
         await inter.response.edit_message(embed=emb, view=AdminEventSelectView(guild.id, member.id, "resend", events))
 
-    @button(label="🔊 Voice-Einstellungen", style=ButtonStyle.secondary, custom_id="portal_admin_event_voice_settings", row=2)
+    @button(label="✅ Anwesenheit", style=ButtonStyle.secondary, custom_id="portal_admin_event_attendance", row=2)
+    async def btn_attendance(self, inter: discord.Interaction, _):
+        guild, member = await _resolve_guild_member_from_inter(inter)
+        if not _is_portal_admin(guild, member):
+            await inter.response.send_message("❌ Dieser Bereich ist nur für Gildenleitung, Berater oder Wächter.", ephemeral=True)
+            return
+        events = await _admin_attendance_events(guild)
+        if not events:
+            await inter.response.send_message("📅 Keine gestarteten Events für Anwesenheit gefunden.", ephemeral=True)
+            return
+        emb = discord.Embed(title="✅ Admin – Anwesenheit", description="Wähle ein gestartetes Event aus den letzten 30 Tagen.", color=discord.Color.gold())
+        await inter.response.edit_message(embed=emb, view=AdminAttendanceEventSelectView(guild.id, member.id, events))
+
+    @button(label="🔊 Voice-Einstellungen", style=ButtonStyle.secondary, custom_id="portal_admin_event_voice_settings", row=3)
     async def btn_voice_settings(self, inter: discord.Interaction, _):
         guild, member = await _resolve_guild_member_from_inter(inter)
         if not _is_portal_admin(guild, member):
@@ -2864,7 +3169,7 @@ class AdminEventMenuView(View):
             return
         await _admin_show_voice_settings(inter, guild.id)
 
-    @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="portal_admin_event_back", row=3)
+    @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="portal_admin_event_back", row=4)
     async def btn_back(self, inter: discord.Interaction, _):
         emb = discord.Embed(title="🛡️ Admin", description="Wähle einen Bereich.", color=discord.Color.gold())
         await inter.response.edit_message(embed=emb, view=AdminMenuView())
