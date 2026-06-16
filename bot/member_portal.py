@@ -35,13 +35,21 @@ EMOJI_MAYBE = "<:maybe:1516437110624747752>"
 EMOJI_NO = "<:no:1516437249481380042>"
 
 # Custom Discord-Emojis für das Gildenmenü
-# Ebolus-Logo braucht noch den vollständigen Emoji-Code. Bis dahin bleibt das alte Symbol als Fallback.
 EMOJI_EBOLUS = "<:ebolus:1516448234355163208>"
 EMOJI_PERSONAL = "<:persoenlich:1516444313868046366>"
 EMOJI_LOOT = "<:loot:1516444382683992205>"
 EMOJI_GUILD = "<:gilde:1516444419040215050>"
 EMOJI_CONTACT = "<:kontakt:1516444479421419703>"
 EMOJI_ADMIN = "<:admin:1516444522270167091>"
+
+
+def _menu_emoji(value: str):
+    try:
+        if isinstance(value, str) and (value.startswith("<:") or value.startswith("<a:")):
+            return discord.PartialEmoji.from_str(value)
+    except Exception:
+        pass
+    return value
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
@@ -1406,31 +1414,31 @@ class PortalMainSelect(Select):
                 label="Persönlich",
                 value="personal",
                 description="Profil, Gearscore, Abwesenheit und Raid-DMs",
-                emoji=EMOJI_PERSONAL
+                emoji=_menu_emoji(EMOJI_PERSONAL)
             ),
             discord.SelectOption(
                 label="Loot & Bedarf",
                 value="loot",
                 description="Needliste für Main/Secondary und Lootregeln",
-                emoji=EMOJI_LOOT
+                emoji=_menu_emoji(EMOJI_LOOT)
             ),
             discord.SelectOption(
                 label="Gilde",
                 value="guild",
                 description="Kalender, Abwesenheiten und Mitgliederübersicht",
-                emoji=EMOJI_GUILD
+                emoji=_menu_emoji(EMOJI_GUILD)
             ),
             discord.SelectOption(
                 label="Kontakt & Hilfe",
                 value="support",
                 description="Leader kontaktieren oder Hilfe zum Bot öffnen",
-                emoji=EMOJI_CONTACT
+                emoji=_menu_emoji(EMOJI_CONTACT)
             ),
             discord.SelectOption(
                 label="Admin",
                 value="admin",
                 description="Event- und Loot-Verwaltung für Leitung",
-                emoji=EMOJI_ADMIN
+                emoji=_menu_emoji(EMOJI_ADMIN)
             ),
         ]
 
