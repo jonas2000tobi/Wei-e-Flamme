@@ -33,6 +33,7 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 RSVP_FILE = DATA_DIR / "event_rsvp.json"
 DM_CFG_FILE = DATA_DIR / "event_rsvp_cfg.json"
 LEADER_CONTACT_CFG_FILE = DATA_DIR / "leader_contact_cfg.json"
+ATTENDANCE_FILE = DATA_DIR / "event_attendance.json"
 
 
 def _load(p: Path, default):
@@ -48,6 +49,7 @@ def _save(p: Path, obj):
 
 store: Dict[str, dict] = _load(RSVP_FILE, {})
 cfg: Dict[str, dict] = _load(DM_CFG_FILE, {})
+attendance_store: Dict[str, dict] = _load(ATTENDANCE_FILE, {})
 
 
 def save_store():
@@ -56,6 +58,10 @@ def save_store():
 
 def save_cfg():
     _save(DM_CFG_FILE, cfg)
+
+
+def save_attendance():
+    _save(ATTENDANCE_FILE, attendance_store)
 
 
 async def _log(client: discord.Client, guild_id: int, text: str):
@@ -801,6 +807,129 @@ async def _delete_all_pending_dm_messages_for_event(client: discord.Client, obj:
     return removed
 
 
+
+def _attendance_guild_bucket(guild_id: int) -> dict:
+    g = attendance_store.get(str(guild_id)) or {}
+    g.setdefault("events", {})
+    attendance_store[str(guild_id)] = g
+    return g
+
+
+def _attendance_participants_from_event(obj: dict) -> list[dict]:
+    _init_event_shape(obj)
+    out: list[dict] = []
+    seen: set[int] = set()
+
+    for role_key in ("TANK", "HEAL", "DPS", "BANK"):
+        for entry in obj.get("yes", {}).get(role_key, []) or []:
+            uid = _entry_user_id(entry)
+            if not uid or uid in seen:
+                continue
+            seen.add(uid)
+            out.append({
+                "id": int(uid),
+                "name": _entry_name(entry),
+                "signup": role_key,
+            })
+
+    return out
+
+
+def ensure_attendance_snapshot(client: discord.Client, msg_id: str, obj: dict) -> dict | None:
+    """
+    Speichert eine Event-/Teilnehmer-Kopie für die spätere Anwesenheitsprüfung.
+    Dadurch bleibt die Anwesenheit auswertbar, auch wenn der normale RSVP-Post später bereinigt wird.
+    """
+    try:
+        _init_event_shape(obj)
+        guild_id = int(obj.get("guild_id", 0) or 0)
+        if not guild_id:
+            return None
+
+        g = _attendance_guild_bucket(guild_id)
+        events = g.setdefault("events", {})
+        event_id = str(msg_id)
+        snap = events.get(event_id)
+
+        participants = _attendance_participants_from_event(obj)
+
+        if not isinstance(snap, dict):
+            snap = {
+                "event_id": event_id,
+                "guild_id": guild_id,
+                "channel_id": int(obj.get("channel_id", 0) or 0),
+                "message_id": event_id,
+                "title": str(obj.get("title", "Event") or "Event"),
+                "description": str(obj.get("description", "") or ""),
+                "when_iso": str(obj.get("when_iso", "") or ""),
+                "created_at": datetime.now(TZ).isoformat(),
+                "participants": participants,
+                "attendance": {},
+            }
+        else:
+            # Teilnehmerliste aktualisieren, aber bereits gesetzte Anwesenheit behalten.
+            old_att = snap.get("attendance") if isinstance(snap.get("attendance"), dict) else {}
+            snap["guild_id"] = guild_id
+            snap["channel_id"] = int(obj.get("channel_id", 0) or 0)
+            snap["message_id"] = event_id
+            snap["title"] = str(obj.get("title", "Event") or "Event")
+            snap["description"] = str(obj.get("description", "") or "")
+            snap["when_iso"] = str(obj.get("when_iso", "") or "")
+            snap["participants"] = participants
+            snap["attendance"] = old_att
+
+        events[event_id] = snap
+        save_attendance()
+        return snap
+
+    except Exception as e:
+        print(f"[event_rsvp_dm] Attendance-Snapshot Fehler: {e!r}")
+        return None
+
+
+def get_attendance_events_for_guild(guild_id: int) -> list[dict]:
+    g = _attendance_guild_bucket(int(guild_id))
+    events = list((g.get("events") or {}).values())
+
+    def _key(ev: dict):
+        try:
+            return datetime.fromisoformat(str(ev.get("when_iso", "")))
+        except Exception:
+            return datetime.min.replace(tzinfo=TZ)
+
+    events.sort(key=_key, reverse=True)
+    return events
+
+
+def get_attendance_event(guild_id: int, event_id: str) -> dict | None:
+    g = _attendance_guild_bucket(int(guild_id))
+    ev = (g.get("events") or {}).get(str(event_id))
+    return ev if isinstance(ev, dict) else None
+
+
+def set_attendance_status(guild_id: int, event_id: str, user_id: int, status: str, marked_by: int) -> bool:
+    ev = get_attendance_event(int(guild_id), str(event_id))
+    if not ev:
+        return False
+
+    valid = {"present", "absent", "excused"}
+    attendance = ev.setdefault("attendance", {})
+
+    if status == "clear":
+        attendance.pop(str(user_id), None)
+    elif status in valid:
+        attendance[str(user_id)] = {
+            "status": status,
+            "marked_by": int(marked_by),
+            "marked_at": datetime.now(TZ).isoformat(),
+        }
+    else:
+        return False
+
+    save_attendance()
+    return True
+
+
 async def _cleanup_event_voice_for_obj(client: discord.Client, obj: dict) -> bool:
     """
     Verschiebt Mitglieder aus einem Event-Voice in den gespeicherten Sammel-Voice
@@ -1203,6 +1332,13 @@ async def event_reminder_loop():
         try:
             _init_event_shape(obj)
             when = datetime.fromisoformat(obj.get("when_iso", ""))
+
+            if now >= when:
+                try:
+                    if ensure_attendance_snapshot(event_reminder_loop._client, str(msg_id), obj):  # type: ignore[attr-defined]
+                        changed = True
+                except Exception as e:
+                    print(f"[event_reminder_loop] Attendance-Snapshot Fehler: {e!r}")
 
             if now >= when + timedelta(hours=2):
                 try:
