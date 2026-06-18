@@ -469,7 +469,12 @@ async def _place_bid(inter: discord.Interaction, guild_id: int, auction_id: str,
 
     await _refresh_auction_message(inter.client, guild_id, auction)
     # Die ursprünglichen Main-Need-DMs werden im Hintergrund aktualisiert, damit die Button-Reaktion nicht timeoutet.
-    asyncio.create_task(_refresh_auction_tracking_dms(inter.client, guild_id, auction))
+    # Falls diese Auktion noch aus einer älteren Version stammt und keine DM-Message-IDs gespeichert hat,
+    # wird einmalig eine neue Live-Tracking-DM gesendet und ab dann aktualisiert/bei Übergabe gelöscht.
+    async def _repair_and_refresh_tracking_dm():
+        await _ensure_auction_tracking_dms(inter.client, guild_id, auction)
+        await _refresh_auction_tracking_dms(inter.client, guild_id, auction)
+    asyncio.create_task(_repair_and_refresh_tracking_dm())
 
     # Wenn das Gebot aus dem Gildenmenü/DM kommt, muss auch diese aktuelle DM-Nachricht
     # aktualisiert werden. Die normale Refresh-Funktion aktualisiert nur die öffentliche
@@ -649,6 +654,7 @@ class AuctionDeliveryView(View):
         auction["charged_amount"] = amount
         _mark_chest_item_status(self.guild_id, auction, "delivered", {"delivered_to": winner, "delivered_by": int(inter.user.id), "delivered_at": auction["delivered_at"]})
         _mark_need_received_for_winner(self.guild_id, winner, str(auction.get("item_id", "") or ""))
+        await _delete_auction_tracking_dms(inter.client, auction)
         save_auctions()
 
         emb = discord.Embed(
@@ -768,6 +774,64 @@ async def _refresh_auction_tracking_dms(client: discord.Client, guild_id: int, a
             await asyncio.sleep(0.05)
         except Exception as e:
             print(f"[loot_auction] tracking dm refresh failed: {e!r}")
+
+
+
+
+async def _ensure_auction_tracking_dms(client: discord.Client, guild_id: int, auction: dict) -> None:
+    """Ensure active Need auctions have stored DM message refs.
+
+    Older auctions created before the live-DM feature do not have refs, so their old
+    DM cannot be edited/deleted. For those, send a new live tracking DM once and
+    store its message id for all future updates/deletion.
+    """
+    if _auction_phase(auction) != "need" or str(auction.get("status", "")) != "active":
+        return
+    refs = auction.get("notify_message_refs")
+    if isinstance(refs, list) and refs:
+        return
+    guild = client.get_guild(int(guild_id))
+    if not guild:
+        return
+    eligible = [int(x) for x in auction.get("eligible_user_ids", []) or []]
+    if not eligible:
+        return
+    new_refs: list[dict] = []
+    for uid in eligible:
+        ref = await _send_auction_tracking_dm(guild, uid, auction)
+        if ref:
+            new_refs.append(ref)
+        await asyncio.sleep(0.08)
+    if new_refs:
+        auction["notify_message_refs"] = new_refs
+        auction["tracking_dm_repaired_at"] = _now_iso()
+        save_auctions()
+
+
+async def _delete_auction_tracking_dms(client: discord.Client, auction: dict) -> None:
+    """Delete the persistent Main-Need tracking DMs after the item is actually distributed."""
+    refs = auction.get("notify_message_refs")
+    if not isinstance(refs, list) or not refs:
+        return
+    for ref in list(refs):
+        try:
+            uid = int(ref.get("user_id", 0) or 0)
+            cid = int(ref.get("channel_id", 0) or 0)
+            mid = int(ref.get("message_id", 0) or 0)
+            if not uid or not mid:
+                continue
+            ch = client.get_channel(cid) if cid else None
+            if ch is None:
+                user = client.get_user(uid) or await client.fetch_user(uid)
+                ch = await user.create_dm()
+            msg = await ch.fetch_message(mid)
+            await msg.delete()
+            await asyncio.sleep(0.05)
+        except Exception as e:
+            # The member may have deleted the DM manually or blocked DMs. That should not break delivery.
+            print(f"[loot_auction] tracking dm delete failed: {e!r}")
+    auction["notify_message_refs"] = []
+    auction["tracking_dms_deleted_at"] = _now_iso()
 
 
 def _mark_chest_item_status(guild_id: int, auction: dict, status: str, extra: Optional[dict] = None) -> None:
@@ -1262,6 +1326,7 @@ async def _buy_sale_item(inter: discord.Interaction, guild_id: int, auction_id: 
     auc["charged_amount"] = price
     _mark_chest_item_status(int(guild_id), auc, "delivered", {"delivered_to": user_id, "delivered_by": user_id, "delivered_at": auc["sold_at"]})
     _mark_need_received_for_winner(int(guild_id), user_id, str(auc.get("item_id", "") or ""))
+    await _delete_auction_tracking_dms(inter.client, auc)
     save_auctions()
     try:
         await _refresh_auction_message(inter.client, int(guild_id), auc)
