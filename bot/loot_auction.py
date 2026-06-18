@@ -22,6 +22,7 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 AUCTION_FILE = DATA_DIR / "loot_auctions.json"
 AUCTION_CFG_FILE = DATA_DIR / "loot_auction_cfg.json"
+GUILD_CHEST_FILE = DATA_DIR / "guild_chest.json"
 LOOT_ITEMS_FILE = DATA_DIR / "loot_items.json"
 LOOT_NEEDS_FILE = DATA_DIR / "loot_needs.json"
 MEMBER_PORTAL_CFG_FILE = DATA_DIR / "member_portal_cfg.json"
@@ -30,6 +31,12 @@ LEADER_CONTACT_CFG_FILE = DATA_DIR / "leader_contact_cfg.json"
 DEFAULT_DURATION_HOURS = 24
 DEFAULT_MIN_INCREMENT = 5
 DEFAULT_START_BID = 1
+NEED_AUCTION_HOURS = 48
+FREE_AUCTION_HOURS = 24
+SALE_HOURS = 240
+NEED_START_BID = 40
+FREE_START_BID = 20
+SALE_PRICE = 10
 
 ELIGIBILITY_CHOICES = [
     app_commands.Choice(name="Automatisch: Main-Need zuerst, sonst alle Ebolus", value="auto"),
@@ -54,6 +61,7 @@ def _save_json(path: Path, obj) -> None:
 
 auction_state: dict = _load_json(AUCTION_FILE, {})
 auction_cfg: dict = _load_json(AUCTION_CFG_FILE, {})
+guild_chest: dict = _load_json(GUILD_CHEST_FILE, {})
 
 
 def save_auctions() -> None:
@@ -62,6 +70,18 @@ def save_auctions() -> None:
 
 def save_cfg() -> None:
     _save_json(AUCTION_CFG_FILE, auction_cfg)
+
+
+def save_chest() -> None:
+    _save_json(GUILD_CHEST_FILE, guild_chest)
+
+
+def _gchest(guild_id: int) -> dict:
+    gid = str(int(guild_id))
+    g = guild_chest.get(gid) or {}
+    g.setdefault("items", {})
+    guild_chest[gid] = g
+    return g
 
 
 def _now() -> datetime:
@@ -345,6 +365,7 @@ def _status_label(status: str) -> str:
         "closed": "🔒 Beendet",
         "delivered": "✅ Übergeben / abgebucht",
         "cancelled": "❌ Abgebrochen",
+        "expired": "⌛ Abgelaufen",
     }.get(str(status or ""), str(status or "?"))
 
 
@@ -357,7 +378,10 @@ def _auction_embed(guild: discord.Guild, auction: dict, compact: bool = False) -
     current = int(top.get("amount", 0) or 0) if top else 0
     min_next = _min_next_bid(auction)
     color = discord.Color.gold() if status == "active" else discord.Color.dark_gold()
-    emb = discord.Embed(title=f"🏷️ Loot-Auktion: {item_name}", color=color, timestamp=_now())
+    kind = str(auction.get("kind", "auction") or "auction")
+    phase = _auction_phase(auction)
+    title_prefix = "🛒 Sale-Kauf" if phase == "sale" else ("🎯 Need-Auktion" if phase == "need" else "⚖️ Freie Auktion")
+    emb = discord.Embed(title=f"{title_prefix}: {item_name}", color=color, timestamp=_now())
     desc = [
         f"Status: **{_status_label(status)}**",
         f"Auktions-ID: `{auction_id}`",
@@ -397,16 +421,16 @@ async def _refresh_auction_message(client: discord.Client, guild_id: int, auctio
         return
     try:
         msg = await ch.fetch_message(msg_id)
-        view = AuctionBidView(int(guild_id), str(auction.get("id", ""))) if auction.get("status") == "active" else None
+        view = (SaleBuyView(int(guild_id), str(auction.get("id", ""))) if _auction_phase(auction) == "sale" else AuctionBidView(int(guild_id), str(auction.get("id", "")))) if auction.get("status") == "active" else None
         await msg.edit(embed=_auction_embed(guild, auction), view=view)
     except Exception as e:
         print(f"[loot_auction] refresh failed: {e!r}")
 
 
 async def _place_bid(inter: discord.Interaction, guild_id: int, auction_id: str, amount: int) -> None:
-    guild = inter.guild
+    guild = inter.guild or inter.client.get_guild(int(guild_id))
     if guild is None:
-        await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
+        await inter.response.send_message("❌ Server konnte nicht zugeordnet werden.", ephemeral=True)
         return
     auction = _auction(guild_id, auction_id)
     if not auction:
@@ -554,6 +578,8 @@ class AuctionDeliveryView(View):
         auction["delivered_at"] = _now_iso()
         auction["delivered_by"] = int(inter.user.id)
         auction["charged_amount"] = amount
+        _mark_chest_item_status(self.guild_id, auction, "delivered", {"delivered_to": winner, "delivered_by": int(inter.user.id), "delivered_at": auction["delivered_at"]})
+        _mark_need_received_for_winner(self.guild_id, winner, str(auction.get("item_id", "") or ""))
         save_auctions()
 
         emb = discord.Embed(
@@ -586,31 +612,193 @@ class AuctionDeliveryView(View):
         await inter.response.send_message("ℹ️ Okay, die Auktion bleibt ohne EC-Abbuchung offen. Du kannst später erneut bestätigen.", ephemeral=True)
 
 
+async def _announce_log(client: discord.Client, guild_id: int, title: str, description: str, color: discord.Color = discord.Color.gold()) -> None:
+    ch = _log_channel(client, guild_id)
+    if not ch:
+        return
+    try:
+        await ch.send(embed=discord.Embed(title=title, description=description, color=color, timestamp=_now()))
+    except Exception:
+        pass
+
+
+async def _dm_user(guild: discord.Guild, user_id: int, text: str) -> bool:
+    member = guild.get_member(int(user_id))
+    if not member or member.bot:
+        return False
+    try:
+        await member.send(text)
+        return True
+    except Exception:
+        return False
+
+
+def _mark_chest_item_status(guild_id: int, auction: dict, status: str, extra: Optional[dict] = None) -> None:
+    chest_id = str(auction.get("chest_item_id", "") or "")
+    if not chest_id:
+        return
+    items = _gchest(guild_id).setdefault("items", {})
+    item = items.get(chest_id)
+    if isinstance(item, dict):
+        item["status"] = status
+        item["updated_at"] = _now_iso()
+        if extra:
+            item.update(extra)
+        save_chest()
+
+
+def _mark_need_received_for_winner(guild_id: int, user_id: int, item_id: str) -> None:
+    if not item_id:
+        return
+    data = _load_json(LOOT_NEEDS_FILE, {})
+    g = data.get(str(int(guild_id))) or {}
+    users = g.get("users") if isinstance(g.get("users"), dict) else {}
+    u = users.get(str(int(user_id)))
+    if not isinstance(u, dict):
+        return
+    changed = False
+    main = u.get("Main") if isinstance(u.get("Main"), dict) else {}
+    for slot, val in list(main.items()):
+        obj = _slot_obj(val)
+        if str(obj.get("item_id", "") or "") == str(item_id):
+            obj["received"] = True
+            obj["received_at"] = _now_iso()
+            main[slot] = obj
+            changed = True
+    if changed:
+        u["Main"] = main
+        users[str(int(user_id))] = u
+        g["users"] = users
+        data[str(int(guild_id))] = g
+        _save_json(LOOT_NEEDS_FILE, data)
+
+
+async def _transition_to_free_auction(client: discord.Client, guild_id: int, auction_id: str, auction: dict) -> bool:
+    guild = client.get_guild(int(guild_id))
+    if not guild:
+        return False
+    auction.update({
+        "kind": "auction",
+        "phase": "free",
+        "eligibility_mode": "all",
+        "eligible_user_ids": [],
+        "start_bid": FREE_START_BID,
+        "min_increment": DEFAULT_MIN_INCREMENT,
+        "bids": [],
+        "status": "active",
+        "ends_at": (_now() + timedelta(hours=FREE_AUCTION_HOURS)).isoformat(),
+        "transitioned_to_free_at": _now_iso(),
+        "updated_at": _now_iso(),
+    })
+    _mark_chest_item_status(guild_id, auction, "free_auction")
+    save_auctions()
+    await _refresh_auction_message(client, guild_id, auction)
+    await _announce_log(
+        client, guild_id,
+        "⚖️ Item jetzt in freier Auktion",
+        f"**Item:** {auction.get('item_name','Item')}\n"
+        f"Die Need-Auktion hatte keine Gebote. Das Item ist jetzt für alle Ebolus-Mitglieder in der **Freien Auktion** verfügbar.\n"
+        f"Startgebot: **{FREE_START_BID} EC**\nDauer: **24 Stunden**\nAuktions-ID: `{auction_id}`",
+        discord.Color.gold(),
+    )
+    return True
+
+
+async def _transition_to_sale(client: discord.Client, guild_id: int, auction_id: str, auction: dict) -> bool:
+    guild = client.get_guild(int(guild_id))
+    if not guild:
+        return False
+    auction.update({
+        "kind": "sale",
+        "phase": "sale",
+        "eligibility_mode": "all",
+        "eligible_user_ids": [],
+        "fixed_price": SALE_PRICE,
+        "start_bid": SALE_PRICE,
+        "min_increment": 0,
+        "bids": [],
+        "status": "active",
+        "ends_at": (_now() + timedelta(hours=SALE_HOURS)).isoformat(),
+        "transitioned_to_sale_at": _now_iso(),
+        "updated_at": _now_iso(),
+    })
+    _mark_chest_item_status(guild_id, auction, "sale")
+    save_auctions()
+    await _refresh_auction_message(client, guild_id, auction)
+    await _announce_log(
+        client, guild_id,
+        "🛒 Item jetzt im Sale-Kauf",
+        f"**Item:** {auction.get('item_name','Item')}\n"
+        f"Die freie Auktion hatte keine Gebote. Das Item ist jetzt im **Sale-Kauf** verfügbar.\n"
+        f"Sofortkauf: **{SALE_PRICE} EC**\nAuktions-ID: `{auction_id}`",
+        discord.Color.green(),
+    )
+    return True
+
+
 async def _close_auction(client: discord.Client, guild_id: int, auction_id: str, reason: str = "time") -> bool:
     guild = client.get_guild(int(guild_id))
     auction = _auction(guild_id, auction_id)
     if not guild or not auction or str(auction.get("status", "")) != "active":
         return False
+
+    phase = _auction_phase(auction)
+    top = _highest_bid(auction)
+
+    # No bid: automatic chain Need -> Free -> Sale -> Expired.
+    if not top:
+        if phase == "need":
+            return await _transition_to_free_auction(client, guild_id, auction_id, auction)
+        if phase == "free":
+            return await _transition_to_sale(client, guild_id, auction_id, auction)
+        if phase == "sale":
+            auction["status"] = "expired"
+            auction["expired_at"] = _now_iso()
+            auction["close_reason"] = reason
+            _mark_chest_item_status(guild_id, auction, "expired")
+            save_auctions()
+            await _refresh_auction_message(client, guild_id, auction)
+            await _announce_log(
+                client, guild_id,
+                "⌛ Sale-Kauf abgelaufen",
+                f"**Item:** {auction.get('item_name','Item')}\nDas Item wurde nicht gekauft und ist jetzt abgelaufen.\nAuktions-ID: `{auction_id}`",
+                discord.Color.dark_grey(),
+            )
+            return True
+
+    # Bid exists: close and ask leaders to deliver.
     auction["status"] = "closed"
     auction["closed_at"] = _now_iso()
     auction["close_reason"] = reason
+    _mark_chest_item_status(guild_id, auction, "waiting_delivery")
     save_auctions()
     await _refresh_auction_message(client, guild_id, auction)
-    top = _highest_bid(auction)
+
+    winner = int(top.get("user_id", 0) or 0)
+    amount = int(top.get("amount", 0) or 0)
+    try:
+        await _dm_user(
+            guild,
+            winner,
+            "🏁 **Du hast eine Loot-Auktion gewonnen!**\n\n"
+            f"**Item:** {auction.get('item_name','Item')}\n"
+            f"**Gebot:** {amount} EC\n\n"
+            "Die Gildenleitung wird dir das Item übergeben. EC werden erst nach bestätigter Übergabe abgebucht."
+        )
+    except Exception:
+        pass
+
     ch = _log_channel(client, guild_id)
-    if not ch:
-        return True
-    if top:
-        winner = int(top.get("user_id", 0) or 0)
-        amount = int(top.get("amount", 0) or 0)
+    if ch:
         emb = discord.Embed(
             title="🏁 Loot-Auktion beendet",
             description=(
                 f"**Item:** {auction.get('item_name','Item')}\n"
                 f"**Gewinner:** <@{winner}>\n"
                 f"**Gebot:** **{amount} EC**\n"
+                f"**Phase:** {'Need-Auktion' if phase == 'need' else 'Freie Auktion'}\n"
                 f"**Auktions-ID:** `{auction_id}`\n\n"
-                "Bitte Item übergeben und danach bestätigen, damit EC abgebucht werden."
+                "Bitte Item übergeben und danach bestätigen, damit EC abgebucht werden und das Item aus der virtuellen Gildentruhe entfernt wird."
             ),
             color=discord.Color.gold(),
             timestamp=_now(),
@@ -619,14 +807,6 @@ async def _close_auction(client: discord.Client, guild_id: int, auction_id: str,
         auction["delivery_message_id"] = int(msg.id)
         auction["delivery_channel_id"] = int(getattr(ch, "id", 0) or 0)
         save_auctions()
-    else:
-        emb = discord.Embed(
-            title="🏁 Loot-Auktion beendet",
-            description=f"**Item:** {auction.get('item_name','Item')}\nKeine Gebote eingegangen.\nAuktions-ID: `{auction_id}`",
-            color=discord.Color.dark_grey(),
-            timestamp=_now(),
-        )
-        await ch.send(embed=emb)
     return True
 
 
@@ -670,11 +850,451 @@ def _active_auctions(guild_id: int) -> list[dict]:
     return out
 
 
+
+
+# ---------------------------------------------------------------------------
+# Gildenmenü / Portal integration
+# ---------------------------------------------------------------------------
+
+def _auction_kind(auction: dict) -> str:
+    return str(auction.get("kind", "auction") or "auction")
+
+
+def _auction_phase(auction: dict) -> str:
+    phase = str(auction.get("phase", "") or "")
+    if phase:
+        return phase
+    if _auction_phase(auction) == "sale":
+        return "sale"
+    if str(auction.get("eligibility_mode", "")) == "main_need":
+        return "need"
+    return "free"
+
+
+def _active_need_auctions(guild_id: int) -> list[dict]:
+    return [a for a in _active_auctions(guild_id) if _auction_phase(a) == "need"]
+
+
+def _active_free_auctions(guild_id: int) -> list[dict]:
+    return [a for a in _active_auctions(guild_id) if _auction_phase(a) == "free"]
+
+
+def _active_sale_items(guild_id: int) -> list[dict]:
+    items = [a for a in _active_auctions(guild_id) if _auction_phase(a) == "sale"]
+    items.sort(key=lambda a: str(a.get("ends_at", "")))
+    return items
+
+
+def _short_auction_line(auction: dict) -> str:
+    end_dt = _parse_dt(str(auction.get("ends_at", "") or ""))
+    top = _highest_bid(auction)
+    if _auction_phase(auction) == "sale":
+        bid = f"Preis **{int(auction.get('fixed_price', auction.get('start_bid', 0)) or 0)} EC**"
+    else:
+        bid = f"Höchstgebot **{int(top.get('amount',0) or 0)} EC**" if top else "noch kein Gebot"
+    when = end_dt.strftime("%d.%m. %H:%M") if end_dt else "?"
+    return f"• `{auction.get('id')}` – **{auction.get('item_name','Item')}** – {bid} – bis {when}"
+
+
+def _auction_portal_embed(guild: discord.Guild, user_id: int | None = None) -> discord.Embed:
+    emb = discord.Embed(
+        title="🏷️ Auktion",
+        description=(
+            "Hier findest du alle aktuellen EC-Lootangebote.\n\n"
+            "**Need-Auktion**\n"
+            "Zeigt Auktionen, die aktuell nur für berechtigte Main-Need-Spieler laufen.\n\n"
+            "**Freie Auktion**\n"
+            "Hier kannst du freie Auktionen auswählen und mit EC mitbieten.\n\n"
+            "**Sale-Kauf**\n"
+            "Hier kannst du Items direkt kaufen, die bald auslaufen oder günstiger verkauft werden."
+        ),
+        color=discord.Color.gold(),
+        timestamp=_now(),
+    )
+    if user_id:
+        emb.add_field(name="🪙 Dein EC", value=f"**{_ec_balance(guild.id, int(user_id))} EC**", inline=True)
+    emb.set_footer(text="Gebote und Käufe werden privat bestätigt. EC werden erst beim Kauf oder bei Übergabe abgebucht.")
+    return emb
+
+
+async def _portal_back_to_main(inter: discord.Interaction, guild_id: int, user_id: int):
+    try:
+        try:
+            from bot import member_portal as mp  # type: ignore
+        except Exception:
+            import member_portal as mp  # type: ignore
+        guild = inter.client.get_guild(int(guild_id))
+        member = guild.get_member(int(user_id)) if guild else None
+        if guild and member and hasattr(mp, "_main_menu_embed") and hasattr(mp, "MemberPortalMainView"):
+            await inter.response.edit_message(embed=mp._main_menu_embed(guild, member), view=mp.MemberPortalMainView())  # type: ignore[attr-defined]
+            return
+    except Exception:
+        pass
+    await inter.response.edit_message(embed=discord.Embed(title="⚜️ Gildenmenü", description="Öffne das Gildenmenü bitte erneut über den Server-Button.", color=discord.Color.gold()), view=None)
+
+
+class AuctionPortalMenuView(View):
+    def __init__(self, guild_id: int, user_id: int):
+        super().__init__(timeout=None)
+        self.guild_id = int(guild_id)
+        self.user_id = int(user_id)
+        for child in self.children:
+            if isinstance(child, discord.ui.Button):
+                child.custom_id = f"portal_auction:{self.guild_id}:{self.user_id}:{child.custom_id or child.label}"
+
+    @button(label="Need-Auktion", style=ButtonStyle.secondary, custom_id="need")
+    async def need(self, inter: discord.Interaction, btn: discord.ui.Button):
+        guild = inter.client.get_guild(self.guild_id)
+        if not guild:
+            await inter.response.send_message("❌ Server nicht gefunden.", ephemeral=True)
+            return
+        auctions = _active_need_auctions(self.guild_id)
+        emb = discord.Embed(title="🏷️ Need-Auktionen", color=discord.Color.gold(), timestamp=_now())
+        if not auctions:
+            emb.description = "Aktuell gibt es keine aktiven Need-Auktionen."
+            await inter.response.edit_message(embed=emb, view=AuctionPortalSubView(self.guild_id, self.user_id))
+            return
+        emb.description = "Wähle eine Need-Auktion aus. Bieten können nur berechtigte Main-Need-Spieler.\n\n" + "\n".join(_short_auction_line(a) for a in auctions[:20])
+        await inter.response.edit_message(embed=emb, view=AuctionSelectView(self.guild_id, self.user_id, "need"))
+
+    @button(label="Freie Auktion", style=ButtonStyle.primary, custom_id="free")
+    async def free(self, inter: discord.Interaction, btn: discord.ui.Button):
+        guild = inter.client.get_guild(self.guild_id)
+        if not guild:
+            await inter.response.send_message("❌ Server nicht gefunden.", ephemeral=True)
+            return
+        auctions = _active_free_auctions(self.guild_id)
+        emb = discord.Embed(title="⚖️ Freie Auktionen", color=discord.Color.gold(), timestamp=_now())
+        if not auctions:
+            emb.description = "Aktuell gibt es keine freien Auktionen."
+            await inter.response.edit_message(embed=emb, view=AuctionPortalSubView(self.guild_id, self.user_id))
+            return
+        emb.description = "Wähle eine freie Auktion aus, um mitzubieten.\n\n" + "\n".join(_short_auction_line(a) for a in auctions[:20])
+        await inter.response.edit_message(embed=emb, view=AuctionSelectView(self.guild_id, self.user_id, "free"))
+
+    @button(label="Sale-Kauf", style=ButtonStyle.success, custom_id="sale")
+    async def sale(self, inter: discord.Interaction, btn: discord.ui.Button):
+        guild = inter.client.get_guild(self.guild_id)
+        if not guild:
+            await inter.response.send_message("❌ Server nicht gefunden.", ephemeral=True)
+            return
+        sales = _active_sale_items(self.guild_id)
+        emb = discord.Embed(title="🛒 Sale-Kauf", color=discord.Color.gold(), timestamp=_now())
+        if not sales:
+            emb.description = "Aktuell gibt es keine Sale-Käufe."
+            await inter.response.edit_message(embed=emb, view=AuctionPortalSubView(self.guild_id, self.user_id))
+            return
+        emb.description = "Wähle ein Sale-Item aus, um es direkt mit EC zu kaufen.\n\n" + "\n".join(_short_auction_line(a) for a in sales[:20])
+        await inter.response.edit_message(embed=emb, view=AuctionSelectView(self.guild_id, self.user_id, "sale"))
+
+    @button(label="Zurück", style=ButtonStyle.secondary, custom_id="back")
+    async def back(self, inter: discord.Interaction, btn: discord.ui.Button):
+        await _portal_back_to_main(inter, self.guild_id, self.user_id)
+
+
+class AuctionPortalSubView(View):
+    def __init__(self, guild_id: int, user_id: int):
+        super().__init__(timeout=300)
+        self.guild_id = int(guild_id)
+        self.user_id = int(user_id)
+
+    @button(label="Zurück zu Auktion", style=ButtonStyle.secondary)
+    async def back_auction(self, inter: discord.Interaction, btn: discord.ui.Button):
+        guild = inter.client.get_guild(self.guild_id)
+        if not guild:
+            await inter.response.send_message("❌ Server nicht gefunden.", ephemeral=True)
+            return
+        await inter.response.edit_message(embed=_auction_portal_embed(guild, self.user_id), view=AuctionPortalMenuView(self.guild_id, self.user_id))
+
+    @button(label="Gildenmenü", style=ButtonStyle.secondary)
+    async def back_main(self, inter: discord.Interaction, btn: discord.ui.Button):
+        await _portal_back_to_main(inter, self.guild_id, self.user_id)
+
+
+class AuctionSelect(discord.ui.Select):
+    def __init__(self, guild_id: int, mode: str):
+        self.guild_id = int(guild_id)
+        self.mode = str(mode)
+        auctions = _active_sale_items(guild_id) if mode == "sale" else (_active_need_auctions(guild_id) if mode == "need" else _active_free_auctions(guild_id))
+        options = []
+        for a in auctions[:25]:
+            end_dt = _parse_dt(str(a.get("ends_at", "") or ""))
+            when = end_dt.strftime("%d.%m. %H:%M") if end_dt else "?"
+            if mode == "sale":
+                price = int(a.get("fixed_price", a.get("start_bid", 0)) or 0)
+                desc = f"Direktkauf {price} EC • bis {when}"
+            else:
+                top = _highest_bid(a)
+                bid = f"{int(top.get('amount',0) or 0)} EC" if top else "noch kein Gebot"
+                desc = f"{bid} • bis {when}"
+            options.append(discord.SelectOption(label=str(a.get("item_name", "Item"))[:100], value=str(a.get("id")), description=desc[:100]))
+        if not options:
+            options.append(discord.SelectOption(label="Keine Einträge", value="none", description="Aktuell nichts vorhanden"))
+        super().__init__(placeholder=("Need-Auktion auswählen …" if mode == "need" else ("Auktion auswählen …" if mode != "sale" else "Sale-Item auswählen …")), min_values=1, max_values=1, options=options)
+
+    async def callback(self, inter: discord.Interaction):
+        if self.values[0] == "none":
+            await inter.response.send_message("Aktuell gibt es hier nichts auszuwählen.", ephemeral=True)
+            return
+        guild = inter.client.get_guild(self.guild_id)
+        if not guild:
+            await inter.response.send_message("❌ Server nicht gefunden.", ephemeral=True)
+            return
+        aid = self.values[0]
+        auc = _auction(self.guild_id, aid)
+        if not auc:
+            await inter.response.send_message("❌ Auktion nicht gefunden.", ephemeral=True)
+            return
+        if self.mode == "sale":
+            await inter.response.edit_message(embed=_sale_embed(guild, auc), view=SaleBuyView(self.guild_id, aid))
+        else:
+            await inter.response.edit_message(embed=_auction_embed(guild, auc), view=AuctionBidView(self.guild_id, aid))
+
+
+class AuctionSelectView(View):
+    def __init__(self, guild_id: int, user_id: int, mode: str):
+        super().__init__(timeout=300)
+        self.guild_id = int(guild_id)
+        self.user_id = int(user_id)
+        self.mode = str(mode)
+        self.add_item(AuctionSelect(self.guild_id, self.mode))
+
+    @button(label="Zurück zu Auktion", style=ButtonStyle.secondary)
+    async def back_auction(self, inter: discord.Interaction, btn: discord.ui.Button):
+        guild = inter.client.get_guild(self.guild_id)
+        if not guild:
+            await inter.response.send_message("❌ Server nicht gefunden.", ephemeral=True)
+            return
+        await inter.response.edit_message(embed=_auction_portal_embed(guild, self.user_id), view=AuctionPortalMenuView(self.guild_id, self.user_id))
+
+
+def _sale_embed(guild: discord.Guild, auction: dict) -> discord.Embed:
+    end_dt = _parse_dt(str(auction.get("ends_at", "") or ""))
+    price = int(auction.get("fixed_price", auction.get("start_bid", 0)) or 0)
+    emb = discord.Embed(
+        title=f"🛒 Sale-Kauf: {auction.get('item_name','Item')}",
+        description=(
+            f"Auktions-ID: `{auction.get('id')}`\n"
+            f"Preis: **{price} EC**\n"
+            f"Verfügbar bis: **{end_dt.strftime('%d.%m.%Y %H:%M') if end_dt else '?'}**\n\n"
+            "Beim Kauf werden die EC sofort abgebucht."
+        ),
+        color=discord.Color.green(),
+        timestamp=_now(),
+    )
+    return emb
+
+
+async def _buy_sale_item(inter: discord.Interaction, guild_id: int, auction_id: str):
+    guild = inter.guild or inter.client.get_guild(int(guild_id))
+    if guild is None:
+        await inter.response.send_message("❌ Server konnte nicht zugeordnet werden.", ephemeral=True)
+        return
+    auc = _auction(guild_id, auction_id)
+    if not auc or str(auc.get("status", "")) != "active" or _auction_phase(auc) != "sale":
+        await inter.response.send_message("❌ Sale-Kauf nicht gefunden oder nicht mehr aktiv.", ephemeral=True)
+        return
+    end_dt = _parse_dt(str(auc.get("ends_at", "") or ""))
+    if end_dt and _now() >= end_dt:
+        await inter.response.send_message("❌ Dieses Sale-Item ist bereits abgelaufen.", ephemeral=True)
+        return
+    user_id = int(inter.user.id)
+    if not _is_ebolus_member(guild, user_id):
+        await inter.response.send_message("❌ Nur Ebolus-Mitglieder können mit EC kaufen.", ephemeral=True)
+        return
+    price = int(auc.get("fixed_price", auc.get("start_bid", 0)) or 0)
+    bal = _ec_balance(guild_id, user_id)
+    if bal < price:
+        await inter.response.send_message(f"❌ Du hast aktuell nur **{bal} EC**, benötigst aber **{price} EC**.", ephemeral=True)
+        return
+    ok = _add_ec_transaction(
+        int(guild_id), user_id, -price,
+        f"Sale-Kauf: {auc.get('item_name','Item')}",
+        user_id, str(auction_id),
+        meta={"auction_id": str(auction_id), "item_id": auc.get("item_id", ""), "item_name": auc.get("item_name", ""), "kind": "sale"},
+    )
+    if not ok:
+        await inter.response.send_message("❌ DKP/EC-System konnte nicht geladen werden. Keine EC abgebucht.", ephemeral=True)
+        return
+    auc["status"] = "delivered"
+    auc["sold_at"] = _now_iso()
+    auc["sold_to"] = user_id
+    auc["charged_amount"] = price
+    _mark_chest_item_status(int(guild_id), auc, "delivered", {"delivered_to": user_id, "delivered_by": user_id, "delivered_at": auc["sold_at"]})
+    _mark_need_received_for_winner(int(guild_id), user_id, str(auc.get("item_id", "") or ""))
+    save_auctions()
+    try:
+        await _refresh_auction_message(inter.client, int(guild_id), auc)
+    except Exception:
+        pass
+    emb = discord.Embed(
+        title="✅ Sale-Kauf abgeschlossen",
+        description=f"**Item:** {auc.get('item_name','Item')}\n**Käufer:** <@{user_id}>\n**Preis:** **{price} EC**",
+        color=discord.Color.green(),
+        timestamp=_now(),
+    )
+    ch = _log_channel(inter.client, int(guild_id))
+    if ch:
+        try:
+            await ch.send(embed=emb)
+        except Exception:
+            pass
+    try:
+        if inter.message:
+            await inter.message.edit(view=None)
+    except Exception:
+        pass
+    await inter.response.send_message(embed=emb, ephemeral=True)
+
+
+class SaleBuyView(View):
+    def __init__(self, guild_id: int, auction_id: str):
+        super().__init__(timeout=None)
+        self.guild_id = int(guild_id)
+        self.auction_id = str(auction_id)
+        for child in self.children:
+            if isinstance(child, discord.ui.Button):
+                child.custom_id = f"lootsale:{auction_id}:{child.custom_id or child.label}"
+
+    @button(label="Sofort kaufen", style=ButtonStyle.success, custom_id="buy")
+    async def buy(self, inter: discord.Interaction, btn: discord.ui.Button):
+        await _buy_sale_item(inter, self.guild_id, self.auction_id)
+
+    @button(label="Mein EC", style=ButtonStyle.secondary, custom_id="balance")
+    async def balance(self, inter: discord.Interaction, btn: discord.ui.Button):
+        bal = _ec_balance(self.guild_id, int(inter.user.id))
+        await inter.response.send_message(f"🪙 Dein aktueller Kontostand: **{bal} EC**", ephemeral=True)
+
+
+async def open_auction_menu(inter: discord.Interaction, guild_id: int, user_id: int):
+    guild = inter.client.get_guild(int(guild_id))
+    if not guild:
+        await inter.response.send_message("❌ Server nicht gefunden.", ephemeral=True)
+        return
+    await inter.response.edit_message(embed=_auction_portal_embed(guild, int(user_id)), view=AuctionPortalMenuView(int(guild_id), int(user_id)))
+
+
+
+async def start_loot_drop_auction(inter: discord.Interaction, guild: discord.Guild, item_id: str, actor_id: int | None = None) -> dict:
+    """Called by loot_needs.py when Admin -> Loot -> Loot gedroppt is confirmed.
+
+    Creates a virtual guild chest item and starts either a 48h Need auction or,
+    if no Main Need exists, a 24h Free auction.
+    """
+    actor_id = int(actor_id or getattr(inter.user, "id", 0) or 0)
+    item_name = _item_display(guild.id, item_id, fallback=str(item_id))
+    main_ids = _main_need_user_ids(guild, item_id)
+    phase = "need" if main_ids else "free"
+    aid = _new_auction_id()
+    chest_id = f"C{aid[1:]}"
+    hours = NEED_AUCTION_HOURS if phase == "need" else FREE_AUCTION_HOURS
+    start_bid = NEED_START_BID if phase == "need" else FREE_START_BID
+    mode = "main_need" if phase == "need" else "all"
+    eligible = main_ids if phase == "need" else []
+
+    chest_obj = {
+        "id": chest_id,
+        "auction_id": aid,
+        "guild_id": int(guild.id),
+        "item_id": str(item_id),
+        "item_name": item_name,
+        "status": "need_auction" if phase == "need" else "free_auction",
+        "dropped_at": _now_iso(),
+        "created_by": actor_id,
+        "expires_at": (_now() + timedelta(hours=SALE_HOURS + FREE_AUCTION_HOURS + (NEED_AUCTION_HOURS if phase == "need" else 0))).isoformat(),
+    }
+    _gchest(guild.id).setdefault("items", {})[chest_id] = chest_obj
+    save_chest()
+
+    auc = {
+        "id": aid,
+        "guild_id": int(guild.id),
+        "kind": "auction",
+        "phase": phase,
+        "chest_item_id": chest_id,
+        "item_id": str(item_id),
+        "item_name": item_name,
+        "created_at": _now_iso(),
+        "created_by": actor_id,
+        "source": "loot_drop_menu",
+        "ends_at": (_now() + timedelta(hours=hours)).isoformat(),
+        "start_bid": int(start_bid),
+        "min_increment": DEFAULT_MIN_INCREMENT,
+        "eligibility_mode": mode,
+        "eligible_user_ids": eligible,
+        "bids": [],
+        "status": "active",
+        "message_id": 0,
+        "channel_id": 0,
+    }
+    _gauctions(guild.id).setdefault("auctions", {})[aid] = auc
+    save_auctions()
+
+    ch = _auction_channel(inter.client, guild.id, inter.channel)
+    if ch:
+        msg = await ch.send(embed=_auction_embed(guild, auc), view=AuctionBidView(guild.id, aid))
+        auc["message_id"] = int(msg.id)
+        auc["channel_id"] = int(getattr(ch, "id", 0) or 0)
+        save_auctions()
+
+    log = _log_channel(inter.client, guild.id)
+    if log and log != ch:
+        try:
+            title = "🎯 Need-Auktion gestartet" if phase == "need" else "⚖️ Freie Auktion gestartet"
+            desc = (
+                f"**Item:** {item_name}\n"
+                f"**Startgebot:** {start_bid} EC\n"
+                f"**Dauer:** {hours} Stunden\n"
+                f"**Auktions-ID:** `{aid}`\n"
+            )
+            if phase == "need":
+                desc += "\nBerechtigt: " + (", ".join(f"<@{uid}>" for uid in eligible[:20]) if eligible else "—")
+            else:
+                desc += "\nKeine offenen Main-Needs gefunden. Das Item ist direkt in der freien Auktion."
+            await log.send(embed=discord.Embed(title=title, description=desc, color=discord.Color.gold(), timestamp=_now()))
+        except Exception:
+            pass
+
+    notified = 0
+    failed = 0
+    if phase == "need":
+        for uid in eligible:
+            ok = await _dm_user(
+                guild,
+                uid,
+                "🎁 **Dein Main-Need-Item ist gedroppt!**\n\n"
+                f"**Item:** {item_name}\n"
+                f"**Auktion:** Need-Auktion\n"
+                f"**Startgebot:** {start_bid} EC\n"
+                f"**Laufzeit:** 48 Stunden\n\n"
+                "Öffne dein **Gildenmenü → Auktion → Need-Auktion**, um mitzubieten."
+            )
+            notified += 1 if ok else 0
+            failed += 0 if ok else 1
+            await asyncio.sleep(0.08)
+
+    return {
+        "auction_id": aid,
+        "chest_item_id": chest_id,
+        "phase": phase,
+        "item_name": item_name,
+        "eligible_user_ids": eligible,
+        "notified": notified,
+        "failed": failed,
+        "channel_id": int(auc.get("channel_id", 0) or 0),
+    }
+
+
 async def setup_loot_auction(client: discord.Client, tree: app_commands.CommandTree):
     global _client_ref
     _client_ref = client
 
     # Re-register persistent views for active/closed auctions after restart.
+    try:
+        # Portal root views use guild/user-specific custom_ids when sent, but adding one generic view keeps the class loaded.
+        pass
+    except Exception:
+        pass
     for gid_str, g in list(auction_state.items()):
         try:
             gid = int(gid_str)
@@ -684,7 +1304,10 @@ async def setup_loot_auction(client: discord.Client, tree: app_commands.CommandT
         for aid, auc in auctions.items():
             try:
                 if str(auc.get("status", "")) == "active":
-                    client.add_view(AuctionBidView(gid, str(aid)), message_id=int(auc.get("message_id", 0) or 0) or None)
+                    if _auction_phase(auc) == "sale":
+                        client.add_view(SaleBuyView(gid, str(aid)), message_id=int(auc.get("message_id", 0) or 0) or None)
+                    else:
+                        client.add_view(AuctionBidView(gid, str(aid)), message_id=int(auc.get("message_id", 0) or 0) or None)
                 elif str(auc.get("status", "")) == "closed" and int(auc.get("delivery_message_id", 0) or 0):
                     client.add_view(AuctionDeliveryView(gid, str(aid)), message_id=int(auc.get("delivery_message_id", 0) or 0))
             except Exception:
@@ -747,6 +1370,7 @@ async def setup_loot_auction(client: discord.Client, tree: app_commands.CommandT
         auc = {
             "id": aid,
             "guild_id": int(guild.id),
+            "kind": "auction",
             "item_id": item_id,
             "item_name": item_name,
             "created_at": _now_iso(),
@@ -773,6 +1397,63 @@ async def setup_loot_auction(client: discord.Client, tree: app_commands.CommandT
         auc["channel_id"] = int(getattr(ch, "id", 0) or 0)
         save_auctions()
         await inter.response.send_message(f"✅ Auktion gestartet: `{aid}` in {ch.mention}", ephemeral=True)
+
+
+
+    @group.command(name="sale_start", description="Startet einen Sofortkauf/Sale-Kauf mit festem EC-Preis")
+    async def auction_sale_start(
+        inter: discord.Interaction,
+        item: str,
+        price: int,
+        duration_hours: int = 240,
+    ):
+        if inter.guild is None or not _is_leader_or_admin(inter):
+            await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
+            return
+        if price < 1 or duration_hours < 1 or duration_hours > 720:
+            await inter.response.send_message("❌ Ungültige Werte. Preis mindestens 1 EC, Dauer 1–720 Stunden.", ephemeral=True)
+            return
+        guild = inter.guild
+        item_id, item_name, matches = _find_item(guild.id, item)
+        if not item_id and len(matches) > 1:
+            lines = "\n".join(f"• `{mid}` – {name}" for mid, name in matches[:10])
+            await inter.response.send_message(
+                "❌ Mehrere Items gefunden. Bitte genauer schreiben oder die Item-ID nutzen:\n" + lines,
+                ephemeral=True,
+            )
+            return
+        aid = _new_auction_id()
+        ends = _now() + timedelta(hours=int(duration_hours))
+        auc = {
+            "id": aid,
+            "guild_id": int(guild.id),
+            "kind": "sale",
+            "item_id": item_id,
+            "item_name": item_name,
+            "created_at": _now_iso(),
+            "created_by": int(inter.user.id),
+            "ends_at": ends.isoformat(),
+            "fixed_price": int(price),
+            "start_bid": int(price),
+            "min_increment": 0,
+            "eligibility_mode": "all",
+            "eligible_user_ids": [],
+            "bids": [],
+            "status": "active",
+            "message_id": 0,
+            "channel_id": 0,
+        }
+        _gauctions(guild.id).setdefault("auctions", {})[aid] = auc
+        save_auctions()
+        ch = _auction_channel(client, guild.id, inter.channel)
+        if not ch:
+            await inter.response.send_message("❌ Kein Auktionskanal gefunden. Nutze `/auction set_channel`.", ephemeral=True)
+            return
+        msg = await ch.send(embed=_sale_embed(guild, auc), view=SaleBuyView(guild.id, aid))
+        auc["message_id"] = int(msg.id)
+        auc["channel_id"] = int(getattr(ch, "id", 0) or 0)
+        save_auctions()
+        await inter.response.send_message(f"✅ Sale-Kauf gestartet: `{aid}` in {ch.mention}", ephemeral=True)
 
     @group.command(name="list", description="Zeigt aktive Loot-Auktionen")
     async def auction_list(inter: discord.Interaction):
