@@ -2073,9 +2073,17 @@ async def _admin_create_alliance_raid_from_menu(
         await inter.followup.send("❌ Dieser Bereich ist nur für Gildenleitung, Berater oder Wächter.", ephemeral=True)
         return
 
-    ok, msg = rsvp._require_alliance_home_leader(inter)
-    if not ok:
-        await inter.followup.send(msg, ephemeral=True)
+    # Das Allianz-Menü läuft im privaten Gildenportal per DM.
+    # rsvp._require_alliance_home_leader(inter) kann hier nicht benutzt werden,
+    # weil inter.guild in DMs None ist und dann immer "Nur im Server nutzbar" liefert.
+    # Stattdessen prüfen wir gegen den bereits aufgelösten Home-/Ebolus-Server.
+    try:
+        home_id = int(rsvp._alliance_home_guild_id(default=int(guild.id)) or int(guild.id))
+    except Exception:
+        home_id = int(guild.id)
+
+    if int(guild.id) != int(home_id):
+        await inter.followup.send("❌ Allianz-Events können nur über den Home-/Ebolus-Server erstellt werden.", ephemeral=True)
         return
 
     normalized_event_type = rsvp._normalize_alliance_event_type(str(event_type))
