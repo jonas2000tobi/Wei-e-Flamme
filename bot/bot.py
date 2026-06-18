@@ -34,6 +34,7 @@ setup_member_portal = None
 setup_loot_needs = None
 setup_alliance_config = None
 setup_dkp_system = None
+setup_loot_auction = None
 store = {}
 
 
@@ -154,6 +155,15 @@ def _import_modules():
         from dkp_system import setup_dkp_system  # type: ignore
         print("✅ Import: dkp_system (root)")
 
+    global setup_loot_auction
+
+    try:
+        from bot.loot_auction import setup_loot_auction  # type: ignore
+        print("✅ Import: bot.loot_auction")
+    except ModuleNotFoundError:
+        from loot_auction import setup_loot_auction  # type: ignore
+        print("✅ Import: loot_auction (root)")
+
 
 def _get_token() -> str | None:
     for key in ("DISCORD_TOKEN", "DISCORD_BOT_TOKEN", "TOKEN"):
@@ -183,6 +193,7 @@ async def on_ready():
         await setup_loot_needs(bot, tree)
         await setup_alliance_config(bot, tree)
         await setup_dkp_system(bot, tree)
+        await setup_loot_auction(bot, tree)
 
         register_join_hook(bot, send_onboarding_dm, auto_resend_for_new_member)
 
