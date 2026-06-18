@@ -382,11 +382,10 @@ def _auction_embed(guild: discord.Guild, auction: dict, compact: bool = False) -
     phase = _auction_phase(auction)
     title_prefix = "🛒 Sale-Kauf" if phase == "sale" else ("🎯 Need-Auktion" if phase == "need" else "⚖️ Freie Auktion")
     emb = discord.Embed(title=f"{title_prefix}: {item_name}", color=color, timestamp=_now())
-    desc = [
-        f"Status: **{_status_label(status)}**",
-        f"Auktions-ID: `{auction_id}`",
-        f"Berechtigung: **{_eligibility_text(auction)}**",
-    ]
+    # Nutzeransicht bewusst schlank halten:
+    # Status, Auktions-ID und Berechtigung sind intern/logisch relevant,
+    # aber im Gildenmenü und in der Auktionskarte unnötig unübersichtlich.
+    desc = []
     if end_dt:
         desc.append(f"Ende: **{end_dt.strftime('%d.%m.%Y %H:%M')}**")
     desc.append(f"Startgebot: **{int(auction.get('start_bid', DEFAULT_START_BID) or DEFAULT_START_BID)} EC**")
@@ -402,7 +401,8 @@ def _auction_embed(guild: discord.Guild, auction: dict, compact: bool = False) -
     if not compact:
         bids = auction.get("bids") if isinstance(auction.get("bids"), list) else []
         if bids:
-            last = sorted(bids, key=lambda b: str(b.get("created_at", "")), reverse=True)[:8]
+            # Übersicht: nur die 3 letzten Gebote anzeigen.
+            last = sorted(bids, key=lambda b: str(b.get("created_at", "")), reverse=True)[:3]
             lines = [f"• <@{int(b.get('user_id',0) or 0)}> – **{int(b.get('amount',0) or 0)} EC**" for b in last]
             emb.add_field(name="Letzte Gebote", value="\n".join(lines), inline=False)
     emb.set_footer(text="Gebote prüfen beim Bieten deinen aktuellen EC-Kontostand. Abgebucht wird erst bei Übergabe-Bestätigung.")
@@ -468,6 +468,8 @@ async def _place_bid(inter: discord.Interaction, guild_id: int, auction_id: str,
     save_auctions()
 
     await _refresh_auction_message(inter.client, guild_id, auction)
+    # Die ursprünglichen Main-Need-DMs werden im Hintergrund aktualisiert, damit die Button-Reaktion nicht timeoutet.
+    asyncio.create_task(_refresh_auction_tracking_dms(inter.client, guild_id, auction))
 
     # Wenn das Gebot aus dem Gildenmenü/DM kommt, muss auch diese aktuelle DM-Nachricht
     # aktualisiert werden. Die normale Refresh-Funktion aktualisiert nur die öffentliche
@@ -700,6 +702,74 @@ async def _dm_user(guild: discord.Guild, user_id: int, text: str) -> bool:
         return False
 
 
+def _auction_dm_content(auction: dict, *, ended: bool = False, winner_id: int = 0) -> str:
+    item_name = str(auction.get("item_name", "Item") or "Item")
+    phase = _auction_phase(auction)
+    phase_name = "Need-Auktion" if phase == "need" else ("Freie Auktion" if phase == "free" else "Sale-Kauf")
+    if ended:
+        if winner_id:
+            return (
+                "🏁 **Auktion beendet**\n\n"
+                f"**Item:** {item_name}\n"
+                f"**Auktion:** {phase_name}\n"
+                f"**Gewinner:** <@{winner_id}>\n"
+            )
+        return (
+            "🏁 **Auktion beendet**\n\n"
+            f"**Item:** {item_name}\n"
+            f"**Auktion:** {phase_name}\n"
+        )
+    return (
+        "🎁 **Dein Main-Need-Item ist gedroppt!**\n\n"
+        "Diese Nachricht wird bei jedem Gebot aktualisiert, damit du den Stand direkt hier sehen kannst.\n"
+        "Bieten kannst du über **Gildenmenü → Auktion → Need-Auktion**."
+    )
+
+
+async def _send_auction_tracking_dm(guild: discord.Guild, user_id: int, auction: dict) -> Optional[dict]:
+    """Send a persistent Main-Need DM that can be edited after every bid."""
+    member = guild.get_member(int(user_id))
+    if not member or member.bot:
+        return None
+    try:
+        msg = await member.send(content=_auction_dm_content(auction), embed=_auction_embed(guild, auction))
+        return {
+            "user_id": int(user_id),
+            "channel_id": int(getattr(msg.channel, "id", 0) or 0),
+            "message_id": int(msg.id),
+        }
+    except Exception:
+        return None
+
+
+async def _refresh_auction_tracking_dms(client: discord.Client, guild_id: int, auction: dict, *, ended: bool = False, winner_id: int = 0) -> None:
+    """Update the original Main-Need DM messages so users can follow the auction without opening the menu."""
+    refs = auction.get("notify_message_refs")
+    if not isinstance(refs, list) or not refs:
+        return
+    guild = client.get_guild(int(guild_id))
+    if not guild:
+        return
+    content = _auction_dm_content(auction, ended=ended, winner_id=int(winner_id or 0))
+    embed = _auction_embed(guild, auction)
+    for ref in list(refs):
+        try:
+            uid = int(ref.get("user_id", 0) or 0)
+            cid = int(ref.get("channel_id", 0) or 0)
+            mid = int(ref.get("message_id", 0) or 0)
+            if not uid or not mid:
+                continue
+            ch = client.get_channel(cid) if cid else None
+            if ch is None:
+                user = client.get_user(uid) or await client.fetch_user(uid)
+                ch = await user.create_dm()
+            msg = await ch.fetch_message(mid)
+            await msg.edit(content=content, embed=embed, view=None)
+            await asyncio.sleep(0.05)
+        except Exception as e:
+            print(f"[loot_auction] tracking dm refresh failed: {e!r}")
+
+
 def _mark_chest_item_status(guild_id: int, auction: dict, status: str, extra: Optional[dict] = None) -> None:
     chest_id = str(auction.get("chest_item_id", "") or "")
     if not chest_id:
@@ -760,6 +830,7 @@ async def _transition_to_free_auction(client: discord.Client, guild_id: int, auc
     _mark_chest_item_status(guild_id, auction, "free_auction")
     save_auctions()
     await _refresh_auction_message(client, guild_id, auction)
+    await _refresh_auction_tracking_dms(client, guild_id, auction)
     await _announce_log(
         client, guild_id,
         "⚖️ Item jetzt in freier Auktion",
@@ -792,6 +863,7 @@ async def _transition_to_sale(client: discord.Client, guild_id: int, auction_id:
     _mark_chest_item_status(guild_id, auction, "sale")
     save_auctions()
     await _refresh_auction_message(client, guild_id, auction)
+    await _refresh_auction_tracking_dms(client, guild_id, auction)
     await _announce_log(
         client, guild_id,
         "🛒 Item jetzt im Sale-Kauf",
@@ -842,6 +914,7 @@ async def _close_auction(client: discord.Client, guild_id: int, auction_id: str,
     await _refresh_auction_message(client, guild_id, auction)
 
     winner = int(top.get("user_id", 0) or 0)
+    await _refresh_auction_tracking_dms(client, guild_id, auction, ended=True, winner_id=winner)
     amount = int(top.get("amount", 0) or 0)
     try:
         await _dm_user(
@@ -1142,7 +1215,6 @@ def _sale_embed(guild: discord.Guild, auction: dict) -> discord.Embed:
     emb = discord.Embed(
         title=f"🛒 Sale-Kauf: {auction.get('item_name','Item')}",
         description=(
-            f"Auktions-ID: `{auction.get('id')}`\n"
             f"Preis: **{price} EC**\n"
             f"Verfügbar bis: **{end_dt.strftime('%d.%m.%Y %H:%M') if end_dt else '?'}**\n\n"
             "Beim Kauf werden die EC sofort abgebucht."
@@ -1358,21 +1430,19 @@ async def start_loot_drop_auction(inter: discord.Interaction, guild: discord.Gui
 
     notified = 0
     failed = 0
+    notify_refs: list[dict] = []
     if phase == "need":
         for uid in eligible:
-            ok = await _dm_user(
-                guild,
-                uid,
-                "🎁 **Dein Main-Need-Item ist gedroppt!**\n\n"
-                f"**Item:** {item_name}\n"
-                f"**Auktion:** Need-Auktion\n"
-                f"**Startgebot:** {start_bid} EC\n"
-                f"**Laufzeit:** 48 Stunden\n\n"
-                "Öffne dein **Gildenmenü → Auktion → Need-Auktion**, um mitzubieten."
-            )
-            notified += 1 if ok else 0
-            failed += 0 if ok else 1
+            ref = await _send_auction_tracking_dm(guild, uid, auc)
+            if ref:
+                notify_refs.append(ref)
+                notified += 1
+            else:
+                failed += 1
             await asyncio.sleep(0.08)
+        if notify_refs:
+            auc["notify_message_refs"] = notify_refs
+            save_auctions()
 
     return {
         "auction_id": aid,
