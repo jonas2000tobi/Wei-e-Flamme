@@ -3,12 +3,15 @@ from __future__ import annotations
 import json
 import math
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, Any
 from zoneinfo import ZoneInfo
 
 import discord
 from discord import app_commands
+from discord.ext import tasks
+from discord.ui import View, button
+from discord.enums import ButtonStyle
 
 TZ = ZoneInfo("Europe/Berlin")
 
@@ -19,6 +22,7 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 DKP_CFG_FILE = DATA_DIR / "dkp_cfg.json"
 DKP_BALANCES_FILE = DATA_DIR / "dkp_balances.json"
 DKP_TX_FILE = DATA_DIR / "dkp_transactions.json"
+DKP_CHECK_FILE = DATA_DIR / "dkp_event_checks.json"
 MEMBER_PORTAL_CFG_FILE = DATA_DIR / "member_portal_cfg.json"
 LEADER_CONTACT_CFG_FILE = DATA_DIR / "leader_contact_cfg.json"
 
@@ -61,6 +65,7 @@ def _save_json(path: Path, obj) -> None:
 dkp_cfg: dict = _load_json(DKP_CFG_FILE, {})
 dkp_balances: dict = _load_json(DKP_BALANCES_FILE, {})
 dkp_transactions: dict = _load_json(DKP_TX_FILE, {})
+dkp_event_checks: dict = _load_json(DKP_CHECK_FILE, {})
 
 
 def save_cfg() -> None:
@@ -73,6 +78,10 @@ def save_balances() -> None:
 
 def save_transactions() -> None:
     _save_json(DKP_TX_FILE, dkp_transactions)
+
+
+def save_event_checks() -> None:
+    _save_json(DKP_CHECK_FILE, dkp_event_checks)
 
 
 def _now_iso() -> str:
@@ -263,6 +272,317 @@ async def _log_to_channel(client: discord.Client, guild_id: int, embed: discord.
             print(f"[dkp_system] Log-Post Fehler: {e!r}")
 
 
+
+
+
+def _gchecks(guild_id: int) -> dict:
+    gid = str(int(guild_id))
+    g = dkp_event_checks.get(gid) or {}
+    g.setdefault("events", {})
+    dkp_event_checks[gid] = g
+    return g
+
+
+def _event_check_state(guild_id: int, event_id: str) -> dict:
+    g = _gchecks(guild_id)
+    events = g.setdefault("events", {})
+    st = events.get(str(event_id)) or {}
+    st.setdefault("posted", False)
+    st.setdefault("posted_at", "")
+    st.setdefault("message_id", 0)
+    st.setdefault("channel_id", 0)
+    st.setdefault("awarded", False)
+    st.setdefault("awarded_at", "")
+    events[str(event_id)] = st
+    return st
+
+
+def _parse_when(value: str) -> Optional[datetime]:
+    try:
+        dt = datetime.fromisoformat(str(value or ""))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=TZ)
+        return dt.astimezone(TZ)
+    except Exception:
+        return None
+
+
+def _dkp_log_channel(client: discord.Client, guild_id: int) -> Optional[discord.TextChannel | discord.Thread]:
+    c = _gcfg(guild_id)
+    ch_id = int(c.get("log_channel_id", 0) or 0)
+    if not ch_id:
+        return None
+    guild = client.get_guild(int(guild_id))
+    if not guild:
+        return None
+    ch = guild.get_channel(ch_id)
+    return ch if isinstance(ch, (discord.TextChannel, discord.Thread)) else None
+
+
+def _event_title_and_time(event: dict) -> tuple[str, str]:
+    title = str(event.get("title", "Event") or "Event")
+    dt = _parse_when(str(event.get("when_iso", "") or ""))
+    when = dt.strftime("%d.%m.%Y %H:%M") if dt else "Unbekannt"
+    return title, when
+
+
+def _attendance_check_embed(client: discord.Client, home_guild_id: int, event: dict, event_id: str, event_type: str) -> discord.Embed:
+    present, reserve, skipped_partner, skipped_open = _attendance_summary_for_award(client, home_guild_id, event, event_type)
+    title, when = _event_title_and_time(event)
+    base = _event_points(home_guild_id, event_type)
+    res = _reserve_points(home_guild_id, event_type)
+    emb = discord.Embed(title="📋 EC-Anwesenheit bestätigen", color=discord.Color.blurple())
+    emb.description = (
+        f"**{title}**\n"
+        f"Zeit: **{when}**\n"
+        f"Event-ID: `{event_id}`\n"
+        f"EC-Typ: **{event_type}**\n"
+        f"Wert: **{base} EC** • Reserve: **{res} EC**\n\n"
+        "Die Anmeldung ist nur ein Vorschlag. Bitte bestätige die echte Anwesenheit, bevor EC vergeben werden."
+    )
+
+    participants = event.get("participants") or []
+    lines = []
+    for p in participants[:25]:
+        try:
+            uid = int(p.get("id", 0) or 0)
+        except Exception:
+            uid = 0
+        signup = str(p.get("signup", "") or "")
+        role = {"TANK": "Tank", "HEAL": "Heal", "DPS": "DPS", "BANK": "Reserve"}.get(signup, signup or "?")
+        if uid:
+            marker = "✅ EC" if _is_ebolus_member(client, home_guild_id, uid) else "🤝 Allianz"
+            lines.append(f"• {marker} <@{uid}> – {role}")
+    if len(participants) > 25:
+        lines.append(f"… {len(participants) - 25} weitere")
+    emb.add_field(name="Anmeldungen", value="\n".join(lines)[:1000] if lines else "—", inline=False)
+
+    emb.add_field(
+        name="Aktueller Status",
+        value=(
+            f"✅ War da: **{len(present) + len(reserve)}** Ebolus\n"
+            f"🤝 Partner ohne EC: **{len(skipped_partner)}**\n"
+            f"⚪ Noch offen / nicht bestätigt: **{len(skipped_open)}**"
+        ),
+        inline=False,
+    )
+    emb.set_footer(text="Buttons: erst Anwesenheit bestätigen, dann EC vergeben. Einzelkorrektur: Admin → Event → Anwesenheit")
+    return emb
+
+
+async def _award_event_now(
+    client: discord.Client,
+    guild_id: int,
+    event_id: str,
+    actor: discord.abc.User,
+) -> tuple[bool, str, Optional[discord.Embed]]:
+    rsvp = _import_rsvp()
+    if not rsvp:
+        return False, "RSVP-/Anwesenheitssystem nicht geladen.", None
+    event = rsvp.get_attendance_event(int(guild_id), str(event_id))
+    if not event:
+        return False, "Event nicht gefunden.", None
+    event_type = _dkp_type_from_event(event, str(event_id))
+    if not event_type:
+        return False, "Dieses Event ist nicht EC-relevant oder hat keinen gespeicherten EC-Typ.", None
+    if _event_has_dkp_already(int(guild_id), str(event_id), event_type):
+        return False, "Für dieses Event wurden bereits EC vergeben. Nutze bei Fehlern `/dkp adjust`.", None
+
+    present, reserve, skipped_partner, skipped_open = _attendance_summary_for_award(client, int(guild_id), event, event_type)
+    awarded = present + reserve
+    if not awarded:
+        return False, "Keine bestätigten Ebolus-Teilnehmer mit Status 'War da' gefunden.", None
+
+    for row in awarded:
+        _add_transaction(
+            int(guild_id),
+            int(row["user_id"]),
+            int(row["points"]),
+            f"Event-Teilnahme: {event.get('title', 'Event')} ({event_type})",
+            int(getattr(actor, "id", 0) or 0),
+            "event_award",
+            event_id=str(event_id),
+            meta={"event_type": event_type, "signup": row.get("signup", ""), "event_title": str(event.get("title", "Event") or "Event")},
+        )
+
+    st = _event_check_state(int(guild_id), str(event_id))
+    st["awarded"] = True
+    st["awarded_at"] = _now_iso()
+    save_event_checks()
+
+    emb = _award_log_embed(event, event_type, present, reserve, skipped_partner, skipped_open, actor)
+    await _log_to_channel(client, int(guild_id), emb)
+    return True, f"EC vergeben: {len(awarded)} Ebolus-Spieler.", emb
+
+
+class ECEventCheckView(View):
+    def __init__(self, guild_id: int, event_id: str):
+        super().__init__(timeout=None)
+        self.guild_id = int(guild_id)
+        self.event_id = str(event_id)
+
+    async def _guard(self, inter: discord.Interaction) -> bool:
+        if inter.guild is None:
+            await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
+            return False
+        if int(inter.guild.id) != int(self.guild_id):
+            await inter.response.send_message("❌ Falscher Server für dieses Event.", ephemeral=True)
+            return False
+        if not _is_leader_or_admin(inter):
+            await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
+            return False
+        return True
+
+    @button(label="Alle Anmeldungen bestätigen", style=ButtonStyle.success, custom_id="dkp_check_confirm_all")
+    async def confirm_all(self, inter: discord.Interaction, btn: discord.ui.Button):
+        if not await self._guard(inter):
+            return
+        rsvp = _import_rsvp()
+        if not rsvp:
+            await inter.response.send_message("❌ RSVP-System nicht geladen.", ephemeral=True)
+            return
+        event = rsvp.get_attendance_event(self.guild_id, self.event_id)
+        if not event:
+            # Snapshot aus Store nachziehen, falls möglich.
+            obj = (getattr(rsvp, "store", {}) or {}).get(str(self.event_id))
+            if isinstance(obj, dict):
+                event = rsvp.ensure_attendance_snapshot(inter.client, self.event_id, obj)
+        if not event:
+            await inter.response.send_message("❌ Event nicht gefunden.", ephemeral=True)
+            return
+        count = 0
+        for p in event.get("participants", []) or []:
+            try:
+                uid = int(p.get("id", 0) or 0)
+            except Exception:
+                uid = 0
+            if not uid:
+                continue
+            if rsvp.set_attendance_status(self.guild_id, self.event_id, uid, "present", int(inter.user.id)):
+                count += 1
+        event = rsvp.get_attendance_event(self.guild_id, self.event_id) or event
+        event_type = _dkp_type_from_event(event, self.event_id)
+        emb = _attendance_check_embed(inter.client, self.guild_id, event, self.event_id, event_type or "Unbekannt")
+        await inter.response.edit_message(embed=emb, view=self)
+        await inter.followup.send(f"✅ {count} angemeldete Spieler wurden als 'War da' bestätigt. Prüfe bei Bedarf Einzelkorrekturen über Admin → Event → Anwesenheit.", ephemeral=True)
+
+    @button(label="EC-Vorschau", style=ButtonStyle.secondary, custom_id="dkp_check_preview")
+    async def preview(self, inter: discord.Interaction, btn: discord.ui.Button):
+        if not await self._guard(inter):
+            return
+        rsvp = _import_rsvp()
+        event = rsvp.get_attendance_event(self.guild_id, self.event_id) if rsvp else None
+        if not event:
+            await inter.response.send_message("❌ Event nicht gefunden.", ephemeral=True)
+            return
+        event_type = _dkp_type_from_event(event, self.event_id)
+        if not event_type:
+            await inter.response.send_message("❌ Dieses Event hat keinen EC-Typ.", ephemeral=True)
+            return
+        present, reserve, skipped_partner, skipped_open = _attendance_summary_for_award(inter.client, self.guild_id, event, event_type)
+        emb = _award_preview_embed(event, event_type, present, reserve, skipped_partner, skipped_open, duplicate=_event_has_dkp_already(self.guild_id, self.event_id, event_type))
+        await inter.response.send_message(embed=emb, ephemeral=True)
+
+    @button(label="EC vergeben", style=ButtonStyle.primary, custom_id="dkp_check_award")
+    async def award(self, inter: discord.Interaction, btn: discord.ui.Button):
+        if not await self._guard(inter):
+            return
+        await inter.response.defer(ephemeral=True, thinking=True)
+        ok, msg, _emb = await _award_event_now(inter.client, self.guild_id, self.event_id, inter.user)
+        if ok:
+            # Hauptnachricht aktualisieren/entschärfen.
+            try:
+                rsvp = _import_rsvp()
+                event = rsvp.get_attendance_event(self.guild_id, self.event_id) if rsvp else None
+                if event:
+                    event_type = _dkp_type_from_event(event, self.event_id)
+                    emb = _attendance_check_embed(inter.client, self.guild_id, event, self.event_id, event_type or "Unbekannt")
+                    emb.title = "✅ EC-Vergabe abgeschlossen"
+                    emb.color = discord.Color.green()
+                    await inter.message.edit(embed=emb, view=None)
+            except Exception:
+                pass
+            await inter.followup.send(f"✅ {msg}", ephemeral=True)
+        else:
+            await inter.followup.send(f"❌ {msg}", ephemeral=True)
+
+    @button(label="Später / ignorieren", style=ButtonStyle.danger, custom_id="dkp_check_ignore")
+    async def ignore(self, inter: discord.Interaction, btn: discord.ui.Button):
+        if not await self._guard(inter):
+            return
+        st = _event_check_state(self.guild_id, self.event_id)
+        st["ignored"] = True
+        st["ignored_at"] = _now_iso()
+        save_event_checks()
+        emb = inter.message.embeds[0] if inter.message and inter.message.embeds else discord.Embed(title="EC-Check ignoriert")
+        emb.color = discord.Color.dark_grey()
+        emb.set_footer(text=f"Ignoriert von {inter.user} • {datetime.now(TZ).strftime('%d.%m.%Y %H:%M')}")
+        await inter.response.edit_message(embed=emb, view=None)
+
+
+async def _post_event_check(client: discord.Client, guild_id: int, event_id: str, obj: dict) -> bool:
+    rsvp = _import_rsvp()
+    if not rsvp:
+        return False
+    event = rsvp.ensure_attendance_snapshot(client, str(event_id), obj)
+    if not event:
+        return False
+    event_type = _dkp_type_from_event(event, str(event_id))
+    if not event_type:
+        return False
+    ch = _dkp_log_channel(client, int(guild_id))
+    if not ch:
+        return False
+    emb = _attendance_check_embed(client, int(guild_id), event, str(event_id), event_type)
+    msg = await ch.send(embed=emb, view=ECEventCheckView(int(guild_id), str(event_id)))
+    st = _event_check_state(int(guild_id), str(event_id))
+    st["posted"] = True
+    st["posted_at"] = _now_iso()
+    st["message_id"] = int(msg.id)
+    st["channel_id"] = int(ch.id)
+    save_event_checks()
+    return True
+
+
+@tasks.loop(minutes=5)
+async def dkp_event_check_loop():
+    client = getattr(dkp_event_check_loop, "_client", None)
+    if client is None:
+        return
+    rsvp = _import_rsvp()
+    if not rsvp:
+        return
+    store = getattr(rsvp, "store", {}) or {}
+    now = datetime.now(TZ)
+    for event_id, obj in list(store.items()):
+        if not isinstance(obj, dict):
+            continue
+        if not bool(obj.get("dkp_enabled", False)) and not str(obj.get("dkp_event_type", "") or "").strip():
+            continue
+        guild_id = int(obj.get("guild_id", 0) or 0)
+        if not guild_id:
+            continue
+        home_id = _home_guild_id(default=guild_id)
+        if int(guild_id) != int(home_id):
+            # EC ist Ebolus-intern. Allianz-Master liegt auf dem Home-Server.
+            continue
+        st = _event_check_state(int(home_id), str(event_id))
+        if st.get("posted") or st.get("ignored") or st.get("awarded"):
+            continue
+        if _event_has_dkp_already(int(home_id), str(event_id), _dkp_type_from_event(obj, str(event_id))):
+            st["awarded"] = True
+            save_event_checks()
+            continue
+        when = _parse_when(str(obj.get("when_iso", "") or ""))
+        if not when:
+            continue
+        # Da Events keine feste Dauer speichern und der normale Cleanup nach ca. 2h greift,
+        # wird der Leader-Check ca. 90 Minuten nach Eventbeginn gepostet.
+        if now >= when + timedelta(minutes=90):
+            try:
+                await _post_event_check(client, int(home_id), str(event_id), obj)
+            except Exception as e:
+                print(f"[dkp_system] EC-Eventcheck konnte nicht gepostet werden ({event_id}): {e!r}")
 def _import_rsvp():
     try:
         from bot import event_rsvp_dm as rsvp  # type: ignore
@@ -631,6 +951,11 @@ async def setup_dkp_system(client: discord.Client, tree: app_commands.CommandTre
         emb.set_footer(text=f"Ausgeführt von {inter.user} • {datetime.now(TZ).strftime('%d.%m.%Y %H:%M')}")
         await _log_to_channel(client, inter.guild.id, emb)
         await inter.followup.send(f"✅ EC-Verfall ausgeführt. Betroffene Konten: **{len(changed)}**", ephemeral=True)
+
+    if not dkp_event_check_loop.is_running():
+        dkp_event_check_loop._client = client  # type: ignore[attr-defined]
+        dkp_event_check_loop.start()
+        print("💰 EC-Eventcheck-Task gestartet.")
 
     tree.add_command(dkp)
     print("💰 DKP-System geladen: /dkp Command-Gruppe aktiv.")
