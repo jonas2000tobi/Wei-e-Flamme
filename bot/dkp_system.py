@@ -281,6 +281,42 @@ def _event_has_dkp_already(guild_id: int, event_id: str, event_type: str) -> boo
     return False
 
 
+def _dkp_type_from_event(event: dict | None, event_id: str = "") -> str:
+    if isinstance(event, dict):
+        if bool(event.get("dkp_enabled", False)):
+            value = str(event.get("dkp_event_type", "") or "").strip()
+            if value:
+                return value
+        value = str(event.get("dkp_event_type", "") or "").strip()
+        if value and value != "Nicht DKP-relevant":
+            return value
+
+    if event_id:
+        rsvp = _import_rsvp()
+        try:
+            obj = (getattr(rsvp, "store", {}) or {}).get(str(event_id)) if rsvp else None
+            if isinstance(obj, dict):
+                if bool(obj.get("dkp_enabled", False)):
+                    value = str(obj.get("dkp_event_type", "") or "").strip()
+                    if value:
+                        return value
+                value = str(obj.get("dkp_event_type", "") or "").strip()
+                if value and value != "Nicht DKP-relevant":
+                    return value
+        except Exception:
+            pass
+
+    return ""
+
+
+def _resolve_event_type(choice: Optional[app_commands.Choice[str]], event: dict | None, event_id: str) -> str:
+    if choice is not None:
+        value = str(choice.value or "").strip()
+        if value and value != "Nicht DKP-relevant":
+            return value
+    return _dkp_type_from_event(event, event_id)
+
+
 def _attendance_summary_for_award(client: discord.Client, home_guild_id: int, event: dict, event_type: str) -> tuple[list[dict], list[dict], list[dict], list[dict]]:
     participants = event.get("participants") or []
     attendance = event.get("attendance") or {}
@@ -472,9 +508,9 @@ async def setup_dkp_system(client: discord.Client, tree: app_commands.CommandTre
         save_cfg()
         await inter.response.send_message(f"✅ Wöchentlicher EC-Verfall gesetzt: **{percent:.1f}%**", ephemeral=True)
 
-    @dkp.command(name="event_preview", description="Leader: EC-Vorschau für bestätigte Event-Anwesenheit")
+    @dkp.command(name="event_preview", description="Leader: EC-Vorschau; Eventtyp wird automatisch erkannt")
     @app_commands.choices(event_type=_event_type_choices())
-    async def dkp_event_preview(inter: discord.Interaction, event_id: str, event_type: app_commands.Choice[str]):
+    async def dkp_event_preview(inter: discord.Interaction, event_id: str, event_type: Optional[app_commands.Choice[str]] = None):
         if inter.guild is None:
             await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
             return
@@ -490,13 +526,17 @@ async def setup_dkp_system(client: discord.Client, tree: app_commands.CommandTre
         if not event:
             await inter.response.send_message("❌ Event nicht gefunden. Öffne ggf. zuerst Admin → Event → Anwesenheit, damit ein Snapshot erstellt wird.", ephemeral=True)
             return
-        present, reserve, skipped_partner, skipped_open = _attendance_summary_for_award(client, int(home_id), event, event_type.value)
-        emb = _award_preview_embed(event, event_type.value, present, reserve, skipped_partner, skipped_open, duplicate=_event_has_dkp_already(int(home_id), str(event_id), event_type.value))
+        resolved_event_type = _resolve_event_type(event_type, event, str(event_id))
+        if not resolved_event_type:
+            await inter.response.send_message("❌ Dieses Event ist nicht EC/DKP-relevant oder hat keinen gespeicherten EC-/DKP-Typ. Gib optional `event_type` an oder erstelle neue Events mit DKP-Typ.", ephemeral=True)
+            return
+        present, reserve, skipped_partner, skipped_open = _attendance_summary_for_award(client, int(home_id), event, resolved_event_type)
+        emb = _award_preview_embed(event, resolved_event_type, present, reserve, skipped_partner, skipped_open, duplicate=_event_has_dkp_already(int(home_id), str(event_id), resolved_event_type))
         await inter.response.send_message(embed=emb, ephemeral=True)
 
-    @dkp.command(name="award_event", description="Leader: EC für bestätigte Event-Anwesenheit vergeben")
+    @dkp.command(name="award_event", description="Leader: EC vergeben; Eventtyp wird automatisch erkannt")
     @app_commands.choices(event_type=_event_type_choices())
-    async def dkp_award_event(inter: discord.Interaction, event_id: str, event_type: app_commands.Choice[str], confirm: bool = False):
+    async def dkp_award_event(inter: discord.Interaction, event_id: str, confirm: bool = False, event_type: Optional[app_commands.Choice[str]] = None):
         await inter.response.defer(ephemeral=True, thinking=True)
         if inter.guild is None:
             await inter.followup.send("❌ Nur im Server nutzbar.", ephemeral=True)
@@ -519,11 +559,15 @@ async def setup_dkp_system(client: discord.Client, tree: app_commands.CommandTre
         if not event:
             await inter.followup.send("❌ Event nicht gefunden. Öffne ggf. zuerst Admin → Event → Anwesenheit, damit ein Snapshot erstellt wird.", ephemeral=True)
             return
-        if _event_has_dkp_already(int(home_id), str(event_id), event_type.value):
+        resolved_event_type = _resolve_event_type(event_type, event, str(event_id))
+        if not resolved_event_type:
+            await inter.followup.send("❌ Dieses Event ist nicht EC/DKP-relevant oder hat keinen gespeicherten EC-/DKP-Typ. Gib optional `event_type` an oder erstelle neue Events mit DKP-Typ.", ephemeral=True)
+            return
+        if _event_has_dkp_already(int(home_id), str(event_id), resolved_event_type):
             await inter.followup.send("❌ Für dieses Event und diesen Eventtyp wurden bereits EC vergeben. Nutze bei Fehlern `/dkp adjust`.", ephemeral=True)
             return
 
-        present, reserve, skipped_partner, skipped_open = _attendance_summary_for_award(client, int(home_id), event, event_type.value)
+        present, reserve, skipped_partner, skipped_open = _attendance_summary_for_award(client, int(home_id), event, resolved_event_type)
         awarded = present + reserve
         if not awarded:
             await inter.followup.send("❌ Keine bestätigten Ebolus-Teilnehmer mit Status 'War da' gefunden.", ephemeral=True)
@@ -534,14 +578,14 @@ async def setup_dkp_system(client: discord.Client, tree: app_commands.CommandTre
                 int(home_id),
                 int(row["user_id"]),
                 int(row["points"]),
-                f"Event-Teilnahme: {event.get('title', 'Event')} ({event_type.value})",
+                f"Event-Teilnahme: {event.get('title', 'Event')} ({resolved_event_type})",
                 inter.user.id,
                 "event_award",
                 event_id=str(event_id),
-                meta={"event_type": event_type.value, "signup": row.get("signup", ""), "event_title": str(event.get("title", "Event") or "Event")},
+                meta={"event_type": resolved_event_type, "signup": row.get("signup", ""), "event_title": str(event.get("title", "Event") or "Event")},
             )
 
-        emb = _award_log_embed(event, event_type.value, present, reserve, skipped_partner, skipped_open, inter.user)
+        emb = _award_log_embed(event, resolved_event_type, present, reserve, skipped_partner, skipped_open, inter.user)
         await _log_to_channel(client, int(home_id), emb)
         await inter.followup.send(f"✅ EC vergeben: **{len(awarded)}** Ebolus-Spieler. Log wurde gepostet.", ephemeral=True)
 
