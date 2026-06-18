@@ -629,6 +629,16 @@ def _dkp_type_from_event(event: dict | None, event_id: str = "") -> str:
     return ""
 
 
+
+def _event_is_dkp_enabled(event: dict | None, event_id: str = "") -> bool:
+    """True, wenn ein Event einen gespeicherten EC-/DKP-Typ hat.
+
+    Wichtig für den Test-Command: Nicht nur dkp_enabled prüfen,
+    weil ältere/Allianz-Events manchmal nur dkp_event_type gespeichert haben.
+    """
+    return bool(_dkp_type_from_event(event, event_id))
+
+
 def _resolve_event_type(choice: Optional[app_commands.Choice[str]], event: dict | None, event_id: str) -> str:
     if choice is not None:
         value = str(choice.value or "").strip()
