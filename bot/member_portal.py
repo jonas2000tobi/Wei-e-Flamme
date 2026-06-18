@@ -1918,6 +1918,22 @@ EVENT_IMAGE_PRESETS = {
 }
 
 
+DKP_EVENT_TYPES = [
+    "Nicht DKP-relevant",
+    "Gildenboss",
+    "HM Raid",
+    "NM Raid",
+    "Normal Raid",
+    "Übungsrun HM Raid",
+    "Übungsrun Trials",
+    "Segensstein PvP",
+]
+
+
+def _dkp_enabled_from_type(value: str) -> bool:
+    return bool(value and value != "Nicht DKP-relevant")
+
+
 def _admin_active_rsvp_events(guild: Optional[discord.Guild]) -> list[tuple[str, dict]]:
     if guild is None:
         return []
@@ -1952,6 +1968,7 @@ async def _admin_create_regular_raid_from_menu(
     target_role_id: int,
     description: str,
     image_url: str | None = None,
+    dkp_event_type: str = "",
     reminders: list[dict] | None = None,
     voice_enabled: bool = False,
     voice_category_id: int = 0,
@@ -2003,6 +2020,8 @@ async def _admin_create_regular_raid_from_menu(
         "description": str(description or "").strip(),
         "when_iso": when.isoformat(),
         "image_url": str(image_url or "").strip() or None,
+        "dkp_enabled": _dkp_enabled_from_type(str(dkp_event_type or "")),
+        "dkp_event_type": str(dkp_event_type or "").strip() if _dkp_enabled_from_type(str(dkp_event_type or "")) else "",
         "yes": {"TANK": [], "HEAL": [], "DPS": [], "BANK": []},
         "maybe": {},
         "no": [],
@@ -2059,7 +2078,8 @@ async def _admin_create_regular_raid_from_menu(
         f"✉️ DMs versendet: **{sent}**\n"
         f"🔕 Opt-out übersprungen: **{skipped_opt_out}**\n"
         f"⏰ Reminder: **{len(reminders or [])}**\n"
-        f"🔊 Voice: **{'erstellt' if voice_channel_id else 'nein'}**",
+        f"🔊 Voice: **{'erstellt' if voice_channel_id else 'nein'}**\n"
+        f"🪙 EC/DKP: **{str(dkp_event_type or 'Nicht DKP-relevant')}**",
         ephemeral=True
     )
 
@@ -2075,6 +2095,7 @@ async def _admin_create_alliance_raid_from_menu(
     target_role_id: int,
     description: str,
     image_url: str | None = None,
+    dkp_event_type: str = "",
 ):
     """Allianz-Event über das Gildenmenü erstellen.
 
@@ -2174,6 +2195,8 @@ async def _admin_create_alliance_raid_from_menu(
         "description": str(description or "").strip(),
         "when_iso": when.isoformat(),
         "image_url": str(image_url or "").strip() or None,
+        "dkp_enabled": _dkp_enabled_from_type(str(dkp_event_type or "")),
+        "dkp_event_type": str(dkp_event_type or "").strip() if _dkp_enabled_from_type(str(dkp_event_type or "")) else "",
         "yes": {"TANK": [], "HEAL": [], "DPS": [], "BANK": []},
         "maybe": {},
         "no": [],
@@ -2278,7 +2301,8 @@ async def _admin_create_alliance_raid_from_menu(
         f"Eventtyp: **{normalized_event_type}**\n"
         f"Master-Message-ID: `{master_id}`\n"
         f"✉️ Home-DMs versendet: **{sent}**\n"
-        f"🔕 Home-Opt-out übersprungen: **{skipped_opt_out}**\n\n"
+        f"🔕 Home-Opt-out übersprungen: **{skipped_opt_out}**\n"
+        f"🪙 EC/DKP: **{str(dkp_event_type or 'Nicht DKP-relevant')}**\n\n"
         f"**Gepostet:**\n" + "\n".join(posted)
     )
     if failed:
@@ -2601,14 +2625,14 @@ class AdminAllianceRoleSelect(Select):
             role_id = 0
         self.data["target_role_id"] = int(role_id or 0)
         emb = discord.Embed(
-            title="🖼️ Allianz-Event-Bild wählen",
+            title="🪙 EC-/DKP-Typ wählen",
             description=(
-                "Wähle, welches Bild für dieses Allianz-Event verwendet werden soll.\n\n"
-                "Danach wird das Allianz-Event über das vorhandene Allianz-System erstellt und gespiegelt."
+                "Wähle, ob und als welcher EC-/DKP-Typ dieses Allianz-Event für Ebolus gewertet werden soll.\n\n"
+                "Partner-/Allianzspieler können teilnehmen, erhalten aber keine Ebolus Coins."
             ),
             color=discord.Color.gold(),
         )
-        await inter.response.edit_message(embed=emb, view=AdminEventImageSelectView(self.data))
+        await inter.response.edit_message(embed=emb, view=AdminEventDKPSelectView(self.data))
 
 
 class AdminEventChannelSelectView(View):
@@ -2797,16 +2821,81 @@ class AdminEventRoleSelect(Select):
                 role_text = role.mention
 
         emb = discord.Embed(
-            title="🖼️ Event-Bild wählen",
+            title="🪙 EC-/DKP-Typ wählen",
             description=(
                 f"Zielrolle: {role_text}\n\n"
-                "Wähle, welches Bild für dieses Event verwendet werden soll.\n\n"
-                "**Kein Bild** erstellt den Raid ohne Bild.\n"
-                "**Eigene URL** öffnet danach ein Eingabefeld für deinen Bildlink."
+                "Wähle, ob und als welcher EC-/DKP-Typ dieses Event gewertet werden soll.\n"
+                "Der Bot speichert den Typ direkt am Event und erkennt ihn später automatisch."
             ),
             color=discord.Color.gold()
         )
 
+        await inter.response.edit_message(embed=emb, view=AdminEventDKPSelectView(self.data))
+
+
+class AdminEventDKPSelectView(View):
+    def __init__(self, data: dict):
+        super().__init__(timeout=None)
+        self.data = dict(data)
+        self.add_item(AdminEventDKPSelect(self.data))
+
+    @button(label="❌ Abbrechen", style=ButtonStyle.secondary, custom_id="admin_event_dkp_cancel")
+    async def btn_cancel(self, inter: discord.Interaction, _):
+        await inter.response.edit_message(
+            embed=discord.Embed(
+                title="Abgebrochen",
+                description="Das Event wurde nicht erstellt.",
+                color=discord.Color.orange(),
+            ),
+            view=None,
+        )
+
+
+class AdminEventDKPSelect(Select):
+    def __init__(self, data: dict):
+        self.data = dict(data)
+        options = [
+            discord.SelectOption(
+                label="Nicht DKP-relevant",
+                value="Nicht DKP-relevant",
+                description="Für dieses Event werden später keine EC vergeben.",
+            ),
+            discord.SelectOption(label="Gildenboss", value="Gildenboss", description="Standard: 20 EC"),
+            discord.SelectOption(label="HM Raid", value="HM Raid", description="Standard: 12 EC"),
+            discord.SelectOption(label="NM Raid", value="NM Raid", description="Standard: 12 EC"),
+            discord.SelectOption(label="Normal Raid", value="Normal Raid", description="Standard: 12 EC"),
+            discord.SelectOption(label="Übungsrun HM Raid", value="Übungsrun HM Raid", description="Standard: 15 EC"),
+            discord.SelectOption(label="Übungsrun Trials", value="Übungsrun Trials", description="Standard: 15 EC"),
+            discord.SelectOption(label="Segensstein PvP", value="Segensstein PvP", description="Standard: 5 EC"),
+        ]
+        super().__init__(
+            placeholder="EC-/DKP-Typ wählen",
+            min_values=1,
+            max_values=1,
+            options=options[:25],
+            custom_id="admin_event_dkp_select",
+        )
+
+    async def callback(self, inter: discord.Interaction):
+        value = str(self.values[0])
+        self.data["dkp_event_type"] = value
+        self.data["dkp_enabled"] = _dkp_enabled_from_type(value)
+
+        emb = discord.Embed(
+            title="🖼️ Event-Bild wählen",
+            description=(
+                f"EC-/DKP-Typ: **{value}**\
+\
+"
+                "Wähle, welches Bild für dieses Event verwendet werden soll.\
+\
+"
+                "**Kein Bild** erstellt das Event ohne Bild.\
+"
+                "**Eigene URL** öffnet danach ein Eingabefeld für deinen Bildlink."
+            ),
+            color=discord.Color.gold(),
+        )
         await inter.response.edit_message(embed=emb, view=AdminEventImageSelectView(self.data))
 
 
@@ -2871,6 +2960,7 @@ class AdminEventImageSelect(Select):
                 int(self.data.get("target_role_id", 0) or 0),
                 str(self.data.get("description", "")),
                 image_url=(str(self.data.get("image_url", "") or "").strip() or None),
+                dkp_event_type=str(self.data.get("dkp_event_type", "") or ""),
             )
             return
 
@@ -3034,6 +3124,7 @@ class AdminEventVoiceSelect(Select):
             int(self.data.get("target_role_id", 0) or 0),
             str(self.data.get("description", "")),
             image_url=(str(self.data.get("image_url", "") or "").strip() or None),
+            dkp_event_type=str(self.data.get("dkp_event_type", "") or ""),
             reminders=list(self.data.get("reminders") or []),
             voice_enabled=voice_enabled,
             voice_category_id=int(c.get("event_voice_category_id", 0) or 0),
@@ -3075,6 +3166,7 @@ class AdminEventCustomImageModal(Modal):
                 int(self.data.get("target_role_id", 0) or 0),
                 str(self.data.get("description", "")),
                 image_url=image_url,
+                dkp_event_type=str(self.data.get("dkp_event_type", "") or ""),
             )
             return
 
