@@ -347,14 +347,25 @@ async def setup_dkp_system(client: discord.Client, tree: app_commands.CommandTre
         save_cfg()
         await inter.response.send_message(f"✅ DKP-/Loot-Log-Kanal gesetzt: {channel.mention}", ephemeral=True)
 
-    @tree.command(name="dkp_balance", description="Zeigt deinen oder einen Spieler-DKP-Stand")
+    @tree.command(name="dkp_balance", description="Zeigt deinen DKP-Stand privat")
     async def dkp_balance(inter: discord.Interaction, user: Optional[discord.Member] = None):
         if inter.guild is None:
             await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
             return
+
+        # Privacy-Regel:
+        # - Normale Member sehen nur den eigenen Stand.
+        # - Leader/Admins dürfen Spielerstände privat prüfen, aber niemals öffentlich posten.
         target = user or inter.user
+        if user is not None and int(user.id) != int(inter.user.id) and not _is_leader_or_admin(inter):
+            await inter.response.send_message("❌ Du kannst nur deinen eigenen DKP-Stand ansehen.", ephemeral=True)
+            return
+
         bal = get_balance(inter.guild.id, target.id)
-        await inter.response.send_message(f"💰 **{target.display_name}** hat aktuell **{bal} DKP**.", ephemeral=True)
+        if int(target.id) == int(inter.user.id):
+            await inter.response.send_message(f"💰 Dein aktueller DKP-Stand: **{bal} DKP**.", ephemeral=True)
+        else:
+            await inter.response.send_message(f"🔒 Privater Leader-Check: **{target.display_name}** hat aktuell **{bal} DKP**.", ephemeral=True)
 
     @tree.command(name="dkp_adjust", description="(Leader) DKP manuell geben/abziehen")
     async def dkp_adjust(inter: discord.Interaction, user: discord.Member, amount: int, reason: str):
@@ -379,7 +390,7 @@ async def setup_dkp_system(client: discord.Client, tree: app_commands.CommandTre
         emb = discord.Embed(title="💰 Manuelle DKP-Korrektur", color=discord.Color.gold())
         emb.add_field(name="Spieler", value=user.mention, inline=True)
         emb.add_field(name="Änderung", value=f"**{_format_amount(amount)} DKP**", inline=True)
-        emb.add_field(name="Stand", value=f"{tx['balance_before']} → **{tx['balance_after']}**", inline=True)
+        emb.add_field(name="Stand", value="🔒 Nicht öffentlich angezeigt", inline=True)
         emb.add_field(name="Grund", value=_safe_text(reason)[:1000], inline=False)
         emb.set_footer(text=f"Ausgeführt von {inter.user} • {datetime.now(TZ).strftime('%d.%m.%Y %H:%M')}")
         await _log_to_channel(client, inter.guild.id, emb)
@@ -541,14 +552,14 @@ async def setup_dkp_system(client: discord.Client, tree: app_commands.CommandTre
             if diff == 0:
                 continue
             tx = _add_transaction(inter.guild.id, uid, diff, f"Wöchentlicher DKP-Verfall ({percent:.1f}%)", inter.user.id, "weekly_decay")
-            changed.append((uid, old, tx["balance_after"], diff))
+            changed.append((uid, diff))
         emb = discord.Embed(title="📉 DKP-Verfall ausgeführt", color=discord.Color.orange())
         lines = []
-        for uid, old, new, diff in changed[:30]:
-            lines.append(f"• <@{uid}>: {old} → **{new}** ({diff})")
+        for uid, diff in changed[:30]:
+            lines.append(f"• <@{uid}>: **{_format_amount(diff)} DKP**")
         if not lines:
             lines = ["Keine Änderungen."]
-        emb.description = f"Regel: **-{percent:.1f}%**\n\n" + "\n".join(lines)
+        emb.description = f"Regel: **-{percent:.1f}%**\nÖffentliche Gesamtstände werden nicht angezeigt.\n\n" + "\n".join(lines)
         if len(changed) > 30:
             emb.description += f"\n… {len(changed) - 30} weitere"
         emb.set_footer(text=f"Ausgeführt von {inter.user} • {datetime.now(TZ).strftime('%d.%m.%Y %H:%M')}")
