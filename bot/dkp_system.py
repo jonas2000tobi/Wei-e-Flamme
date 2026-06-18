@@ -329,7 +329,29 @@ async def setup_dkp_system(client: discord.Client, tree: app_commands.CommandTre
         _gcfg(int(guild.id))
     save_cfg()
 
-    @tree.command(name="dkp_set_log_channel", description="(Leader) DKP-/Loot-Log-Kanal setzen")
+    # Wichtig: Discord erlaubt global maximal 100 Top-Level Slash-Commands.
+    # Darum laufen die DKP-Funktionen als eine Command-Gruppe `/dkp ...`,
+    # statt als viele einzelne `/dkp_*` Top-Level-Commands.
+    for old_name in (
+        "dkp",
+        "dkp_set_log_channel",
+        "dkp_balance",
+        "dkp_adjust",
+        "dkp_config_show",
+        "dkp_set_event_points",
+        "dkp_set_decay",
+        "dkp_event_preview",
+        "dkp_award_event",
+        "dkp_decay_run",
+    ):
+        try:
+            tree.remove_command(old_name)
+        except Exception:
+            pass
+
+    dkp = app_commands.Group(name="dkp", description="Ebolus Coins / DKP verwalten")
+
+    @dkp.command(name="set_log_channel", description="Leader: DKP-/Loot-Log-Kanal setzen")
     async def dkp_set_log_channel(inter: discord.Interaction, channel: discord.TextChannel):
         if inter.guild is None:
             await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
@@ -347,7 +369,7 @@ async def setup_dkp_system(client: discord.Client, tree: app_commands.CommandTre
         save_cfg()
         await inter.response.send_message(f"✅ DKP-/Loot-Log-Kanal gesetzt: {channel.mention}", ephemeral=True)
 
-    @tree.command(name="dkp_balance", description="Zeigt deinen DKP-Stand privat")
+    @dkp.command(name="balance", description="Zeigt deinen EC-/DKP-Stand privat")
     async def dkp_balance(inter: discord.Interaction, user: Optional[discord.Member] = None):
         if inter.guild is None:
             await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
@@ -358,16 +380,16 @@ async def setup_dkp_system(client: discord.Client, tree: app_commands.CommandTre
         # - Leader/Admins dürfen Spielerstände privat prüfen, aber niemals öffentlich posten.
         target = user or inter.user
         if user is not None and int(user.id) != int(inter.user.id) and not _is_leader_or_admin(inter):
-            await inter.response.send_message("❌ Du kannst nur deinen eigenen DKP-Stand ansehen.", ephemeral=True)
+            await inter.response.send_message("❌ Du kannst nur deinen eigenen EC-Stand ansehen.", ephemeral=True)
             return
 
         bal = get_balance(inter.guild.id, target.id)
         if int(target.id) == int(inter.user.id):
-            await inter.response.send_message(f"💰 Dein aktueller DKP-Stand: **{bal} DKP**.", ephemeral=True)
+            await inter.response.send_message(f"🪙 Dein aktueller EC-Stand: **{bal} EC**.", ephemeral=True)
         else:
-            await inter.response.send_message(f"🔒 Privater Leader-Check: **{target.display_name}** hat aktuell **{bal} DKP**.", ephemeral=True)
+            await inter.response.send_message(f"🔒 Privater Leader-Check: **{target.display_name}** hat aktuell **{bal} EC**.", ephemeral=True)
 
-    @tree.command(name="dkp_adjust", description="(Leader) DKP manuell geben/abziehen")
+    @dkp.command(name="adjust", description="Leader: EC/DKP manuell geben oder abziehen")
     async def dkp_adjust(inter: discord.Interaction, user: discord.Member, amount: int, reason: str):
         if inter.guild is None:
             await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
@@ -387,35 +409,35 @@ async def setup_dkp_system(client: discord.Client, tree: app_commands.CommandTre
             return
 
         tx = _add_transaction(inter.guild.id, user.id, int(amount), reason, inter.user.id, "manual_adjust")
-        emb = discord.Embed(title="💰 Manuelle DKP-Korrektur", color=discord.Color.gold())
+        emb = discord.Embed(title="🪙 Manuelle EC-Korrektur", color=discord.Color.gold())
         emb.add_field(name="Spieler", value=user.mention, inline=True)
-        emb.add_field(name="Änderung", value=f"**{_format_amount(amount)} DKP**", inline=True)
+        emb.add_field(name="Änderung", value=f"**{_format_amount(amount)} EC**", inline=True)
         emb.add_field(name="Stand", value="🔒 Nicht öffentlich angezeigt", inline=True)
         emb.add_field(name="Grund", value=_safe_text(reason)[:1000], inline=False)
         emb.set_footer(text=f"Ausgeführt von {inter.user} • {datetime.now(TZ).strftime('%d.%m.%Y %H:%M')}")
         await _log_to_channel(client, inter.guild.id, emb)
-        await inter.response.send_message(f"✅ DKP angepasst: {user.mention} { _format_amount(amount) } DKP. Neuer Stand: **{tx['balance_after']}**", ephemeral=True)
+        await inter.response.send_message(f"✅ EC angepasst: {user.mention} { _format_amount(amount) } EC. Neuer Stand: **{tx['balance_after']}**", ephemeral=True)
 
-    @tree.command(name="dkp_config_show", description="Zeigt DKP-Konfiguration")
+    @dkp.command(name="config", description="Zeigt die EC-/DKP-Konfiguration")
     async def dkp_config_show(inter: discord.Interaction):
         if inter.guild is None:
             await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
             return
         c = _gcfg(inter.guild.id)
         pts = c.get("event_points") or {}
-        lines = [f"• **{k}**: {int(pts.get(k, 0) or 0)} DKP" for k in EVENT_TYPE_CHOICES]
+        lines = [f"• **{k}**: {int(pts.get(k, 0) or 0)} EC" for k in EVENT_TYPE_CHOICES]
         emb = discord.Embed(
-            title="⚙️ DKP-Konfiguration",
+            title="⚙️ EC-/DKP-Konfiguration",
             description="\n".join(lines),
             color=discord.Color.blurple(),
         )
         log_id = int(c.get("log_channel_id", 0) or 0)
         emb.add_field(name="Reserve", value=f"{float(c.get('reserve_factor', DEFAULT_RESERVE_FACTOR)) * 100:.0f}% des Eventwertes, aufgerundet", inline=False)
         emb.add_field(name="Wöchentlicher Verfall", value=f"{float(c.get('decay_percent', DEFAULT_DECAY_PERCENT)):.1f}%", inline=True)
-        emb.add_field(name="Log-Kanal", value=f"<#${log_id}>" if False else (f"<#{log_id}>" if log_id else "Nicht gesetzt"), inline=True)
+        emb.add_field(name="Log-Kanal", value=(f"<#{log_id}>" if log_id else "Nicht gesetzt"), inline=True)
         await inter.response.send_message(embed=emb, ephemeral=True)
 
-    @tree.command(name="dkp_set_event_points", description="(Leader) DKP-Wert für Eventtyp setzen")
+    @dkp.command(name="set_points", description="Leader: EC-Wert für Eventtyp setzen")
     @app_commands.choices(event_type=_event_type_choices())
     async def dkp_set_event_points(inter: discord.Interaction, event_type: app_commands.Choice[str], points: int):
         if inter.guild is None:
@@ -431,9 +453,9 @@ async def setup_dkp_system(client: discord.Client, tree: app_commands.CommandTre
         c.setdefault("event_points", {})[event_type.value] = int(points)
         dkp_cfg[str(inter.guild.id)] = c
         save_cfg()
-        await inter.response.send_message(f"✅ **{event_type.value}** gibt jetzt **{points} DKP**.", ephemeral=True)
+        await inter.response.send_message(f"✅ **{event_type.value}** gibt jetzt **{points} EC**.", ephemeral=True)
 
-    @tree.command(name="dkp_set_decay", description="(Leader) Wöchentlichen DKP-Verfall konfigurieren")
+    @dkp.command(name="set_decay", description="Leader: Wöchentlichen EC-Verfall konfigurieren")
     async def dkp_set_decay(inter: discord.Interaction, percent: float):
         if inter.guild is None:
             await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
@@ -448,9 +470,9 @@ async def setup_dkp_system(client: discord.Client, tree: app_commands.CommandTre
         c["decay_percent"] = float(percent)
         dkp_cfg[str(inter.guild.id)] = c
         save_cfg()
-        await inter.response.send_message(f"✅ Wöchentlicher DKP-Verfall gesetzt: **{percent:.1f}%**", ephemeral=True)
+        await inter.response.send_message(f"✅ Wöchentlicher EC-Verfall gesetzt: **{percent:.1f}%**", ephemeral=True)
 
-    @tree.command(name="dkp_event_preview", description="(Leader) Zeigt DKP-Vorschau für bestätigte Event-Anwesenheit")
+    @dkp.command(name="event_preview", description="Leader: EC-Vorschau für bestätigte Event-Anwesenheit")
     @app_commands.choices(event_type=_event_type_choices())
     async def dkp_event_preview(inter: discord.Interaction, event_id: str, event_type: app_commands.Choice[str]):
         if inter.guild is None:
@@ -472,7 +494,7 @@ async def setup_dkp_system(client: discord.Client, tree: app_commands.CommandTre
         emb = _award_preview_embed(event, event_type.value, present, reserve, skipped_partner, skipped_open, duplicate=_event_has_dkp_already(int(home_id), str(event_id), event_type.value))
         await inter.response.send_message(embed=emb, ephemeral=True)
 
-    @tree.command(name="dkp_award_event", description="(Leader) DKP für bestätigte Event-Anwesenheit vergeben")
+    @dkp.command(name="award_event", description="Leader: EC für bestätigte Event-Anwesenheit vergeben")
     @app_commands.choices(event_type=_event_type_choices())
     async def dkp_award_event(inter: discord.Interaction, event_id: str, event_type: app_commands.Choice[str], confirm: bool = False):
         await inter.response.defer(ephemeral=True, thinking=True)
@@ -483,7 +505,7 @@ async def setup_dkp_system(client: discord.Client, tree: app_commands.CommandTre
             await inter.followup.send("❌ Nur Leader/Admins.", ephemeral=True)
             return
         if not confirm:
-            await inter.followup.send("❌ Sicherheitsabfrage: Setze `confirm:true`, wenn du die DKP wirklich vergeben willst.", ephemeral=True)
+            await inter.followup.send("❌ Sicherheitsabfrage: Setze `confirm:true`, wenn du die EC wirklich vergeben willst.", ephemeral=True)
             return
         rsvp = _import_rsvp()
         if not rsvp:
@@ -491,14 +513,14 @@ async def setup_dkp_system(client: discord.Client, tree: app_commands.CommandTre
             return
         home_id = _home_guild_id(default=inter.guild.id)
         if int(inter.guild.id) != int(home_id):
-            await inter.followup.send("❌ DKP wird nur auf dem Ebolus/Home-Server vergeben.", ephemeral=True)
+            await inter.followup.send("❌ EC/DKP wird nur auf dem Ebolus/Home-Server vergeben.", ephemeral=True)
             return
         event = rsvp.get_attendance_event(int(home_id), str(event_id))
         if not event:
             await inter.followup.send("❌ Event nicht gefunden. Öffne ggf. zuerst Admin → Event → Anwesenheit, damit ein Snapshot erstellt wird.", ephemeral=True)
             return
         if _event_has_dkp_already(int(home_id), str(event_id), event_type.value):
-            await inter.followup.send("❌ Für dieses Event und diesen Eventtyp wurden bereits DKP vergeben. Nutze bei Fehlern `/dkp_adjust`.", ephemeral=True)
+            await inter.followup.send("❌ Für dieses Event und diesen Eventtyp wurden bereits EC vergeben. Nutze bei Fehlern `/dkp adjust`.", ephemeral=True)
             return
 
         present, reserve, skipped_partner, skipped_open = _attendance_summary_for_award(client, int(home_id), event, event_type.value)
@@ -521,9 +543,9 @@ async def setup_dkp_system(client: discord.Client, tree: app_commands.CommandTre
 
         emb = _award_log_embed(event, event_type.value, present, reserve, skipped_partner, skipped_open, inter.user)
         await _log_to_channel(client, int(home_id), emb)
-        await inter.followup.send(f"✅ DKP vergeben: **{len(awarded)}** Ebolus-Spieler. Log wurde gepostet.", ephemeral=True)
+        await inter.followup.send(f"✅ EC vergeben: **{len(awarded)}** Ebolus-Spieler. Log wurde gepostet.", ephemeral=True)
 
-    @tree.command(name="dkp_decay_run", description="(Leader) Wöchentlichen DKP-Verfall manuell ausführen")
+    @dkp.command(name="decay_run", description="Leader: Wöchentlichen EC-Verfall manuell ausführen")
     async def dkp_decay_run(inter: discord.Interaction, confirm: bool = False):
         await inter.response.defer(ephemeral=True, thinking=True)
         if inter.guild is None:
@@ -538,7 +560,7 @@ async def setup_dkp_system(client: discord.Client, tree: app_commands.CommandTre
         percent = float(_gcfg(inter.guild.id).get("decay_percent", DEFAULT_DECAY_PERCENT) or 0)
         users = _gbal(inter.guild.id).setdefault("users", {})
         if not users:
-            await inter.followup.send("Keine DKP-Konten vorhanden.", ephemeral=True)
+            await inter.followup.send("Keine EC-Konten vorhanden.", ephemeral=True)
             return
         changed = []
         for uid_s, old_v in list(users.items()):
@@ -551,12 +573,12 @@ async def setup_dkp_system(client: discord.Client, tree: app_commands.CommandTre
             diff = new - old
             if diff == 0:
                 continue
-            tx = _add_transaction(inter.guild.id, uid, diff, f"Wöchentlicher DKP-Verfall ({percent:.1f}%)", inter.user.id, "weekly_decay")
+            _add_transaction(inter.guild.id, uid, diff, f"Wöchentlicher EC-Verfall ({percent:.1f}%)", inter.user.id, "weekly_decay")
             changed.append((uid, diff))
-        emb = discord.Embed(title="📉 DKP-Verfall ausgeführt", color=discord.Color.orange())
+        emb = discord.Embed(title="📉 EC-Verfall ausgeführt", color=discord.Color.orange())
         lines = []
         for uid, diff in changed[:30]:
-            lines.append(f"• <@{uid}>: **{_format_amount(diff)} DKP**")
+            lines.append(f"• <@{uid}>: **{_format_amount(diff)} EC**")
         if not lines:
             lines = ["Keine Änderungen."]
         emb.description = f"Regel: **-{percent:.1f}%**\nÖffentliche Gesamtstände werden nicht angezeigt.\n\n" + "\n".join(lines)
@@ -564,11 +586,10 @@ async def setup_dkp_system(client: discord.Client, tree: app_commands.CommandTre
             emb.description += f"\n… {len(changed) - 30} weitere"
         emb.set_footer(text=f"Ausgeführt von {inter.user} • {datetime.now(TZ).strftime('%d.%m.%Y %H:%M')}")
         await _log_to_channel(client, inter.guild.id, emb)
-        await inter.followup.send(f"✅ DKP-Verfall ausgeführt. Betroffene Konten: **{len(changed)}**", ephemeral=True)
+        await inter.followup.send(f"✅ EC-Verfall ausgeführt. Betroffene Konten: **{len(changed)}**", ephemeral=True)
 
-    print("💰 DKP-System geladen.")
-
-
+    tree.add_command(dkp)
+    print("💰 DKP-System geladen: /dkp Command-Gruppe aktiv.")
 def _award_preview_embed(event: dict, event_type: str, present: list[dict], reserve: list[dict], skipped_partner: list[dict], skipped_open: list[dict], duplicate: bool = False) -> discord.Embed:
     title = str(event.get("title", "Event") or "Event")
     try:
