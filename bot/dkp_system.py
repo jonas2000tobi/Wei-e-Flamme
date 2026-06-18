@@ -926,7 +926,7 @@ async def setup_dkp_system(client: discord.Client, tree: app_commands.CommandTre
             await inter.followup.send("❌ EC/DKP wird nur auf dem Ebolus/Home-Server verwaltet.", ephemeral=True)
             return
 
-        log_ch = _log_channel(client, int(home_id))
+        log_ch = _dkp_log_channel(client, int(home_id))
         if not log_ch:
             await inter.followup.send("❌ DKP-/Loot-Log-Kanal ist nicht gesetzt. Nutze zuerst `/dkp set_log_channel`.", ephemeral=True)
             return
