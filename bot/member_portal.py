@@ -2042,6 +2042,222 @@ async def _admin_create_regular_raid_from_menu(
     )
 
 
+async def _admin_create_alliance_raid_from_menu(
+    inter: discord.Interaction,
+    guild_id: int,
+    group: str,
+    event_type: str,
+    title: str,
+    date_text: str,
+    time_text: str,
+    target_role_id: int,
+    description: str,
+    image_url: str | None = None,
+):
+    """Allianz-Event über das Gildenmenü erstellen.
+
+    Nutzt bewusst das vorhandene Allianz-System aus alliance_config.py:
+    - Allianz-Gruppe
+    - Home-/Partner-Server
+    - Eventtyp-Channels
+    - Mirror-Posts
+    - Home-DMs
+    """
+    rsvp = _admin_event_module()
+    guild = inter.client.get_guild(int(guild_id))
+    if not guild:
+        await inter.followup.send("❌ Server nicht gefunden.", ephemeral=True)
+        return
+
+    if not _is_portal_admin(guild, guild.get_member(inter.user.id)):
+        await inter.followup.send("❌ Dieser Bereich ist nur für Gildenleitung, Berater oder Wächter.", ephemeral=True)
+        return
+
+    ok, msg = rsvp._require_alliance_home_leader(inter)
+    if not ok:
+        await inter.followup.send(msg, ephemeral=True)
+        return
+
+    normalized_event_type = rsvp._normalize_alliance_event_type(str(event_type))
+    if not normalized_event_type:
+        await inter.followup.send(
+            f"❌ Ungültiger Allianz-Eventtyp. Erlaubt: {rsvp._alliance_event_type_text()}",
+            ephemeral=True,
+        )
+        return
+
+    try:
+        yyyy, mm, dd = _admin_parse_event_date(date_text)
+        hh, mi = [int(x) for x in str(time_text).strip().split(":")]
+        when = datetime(yyyy, mm, dd, hh, mi, tzinfo=rsvp.TZ)
+    except Exception:
+        await inter.followup.send("❌ Datum/Zeit ungültig. Nutze z. B. `2026-06-20` oder `20.06.2026` und `20:30`.", ephemeral=True)
+        return
+
+    try:
+        get_alliance_group = rsvp._import_alliance_config()
+        group_obj = get_alliance_group(str(group))
+    except Exception as e:
+        await inter.followup.send(f"❌ Allianz-Konfiguration konnte nicht geladen werden: `{e}`", ephemeral=True)
+        return
+
+    if not group_obj:
+        await inter.followup.send("❌ Allianz-Gruppe nicht gefunden.", ephemeral=True)
+        return
+
+    servers = group_obj.get("servers") or {}
+    if not servers:
+        await inter.followup.send("❌ In dieser Allianz-Gruppe sind keine Server/Channels hinterlegt.", ephemeral=True)
+        return
+
+    home_server = servers.get(str(guild.id))
+    if not home_server:
+        await inter.followup.send(
+            "❌ Der Home-/Ebolus-Server ist in dieser Allianz-Gruppe nicht hinterlegt.\n"
+            "Nutze zuerst `/alliance_server_add_home`.",
+            ephemeral=True,
+        )
+        return
+
+    home_channel_id = rsvp._server_channel_id_for_event(home_server, normalized_event_type)
+    home_channel = guild.get_channel(home_channel_id)
+    if not isinstance(home_channel, (discord.TextChannel, discord.Thread)):
+        await inter.followup.send(
+            f"❌ Home-Zielchannel für **{normalized_event_type}** wurde nicht gefunden.\n"
+            f"Setze ihn mit `/alliance_event_channel_set group:{group} event_type:{normalized_event_type} channel:#channel`.",
+            ephemeral=True,
+        )
+        return
+
+    target_role = guild.get_role(int(target_role_id or 0)) if int(target_role_id or 0) else None
+    if int(target_role_id or 0) and target_role is None:
+        await inter.followup.send("❌ Zielrolle nicht gefunden.", ephemeral=True)
+        return
+
+    obj = {
+        "scope": "alliance",
+        "alliance_group": str(group_obj.get("name", group)),
+        "event_type": normalized_event_type,
+        "guild_id": int(guild.id),
+        "channel_id": int(home_channel.id),
+        "title": str(title).strip(),
+        "description": str(description or "").strip(),
+        "when_iso": when.isoformat(),
+        "image_url": str(image_url or "").strip() or None,
+        "yes": {"TANK": [], "HEAL": [], "DPS": [], "BANK": []},
+        "maybe": {},
+        "no": [],
+        "target_role_id": int(target_role.id) if target_role else 0,
+        "dm_messages": {},
+        "mirrors": [],
+    }
+
+    home_emb = rsvp.build_embed(guild, obj)
+    home_msg = await home_channel.send(embed=home_emb)
+    master_id = int(home_msg.id)
+    obj["message_id"] = master_id
+
+    obj["mirrors"].append({
+        "guild_id": int(guild.id),
+        "discord_name": guild.name,
+        "label": str(home_server.get("label", guild.name)),
+        "short_label": str(home_server.get("short_label", home_server.get("label", guild.name))),
+        "channel_id": int(home_channel.id),
+        "channel_name": getattr(home_channel, "name", ""),
+        "message_id": master_id,
+        "send_dm": bool(home_server.get("send_dm", True)),
+        "home": True,
+    })
+
+    rsvp.store[str(master_id)] = obj
+    rsvp.save_store()
+
+    try:
+        await home_msg.edit(view=rsvp.ServerRaidView(master_id))
+    except Exception:
+        pass
+
+    posted = [f"✅ **{guild.name}** → {home_channel.mention}"]
+    failed = []
+
+    for guild_id_str, server_cfg in servers.items():
+        try:
+            gid = int(guild_id_str)
+            if gid == guild.id:
+                continue
+
+            partner_guild = inter.client.get_guild(gid)
+            if not partner_guild:
+                failed.append(f"❌ `{server_cfg.get('label', guild_id_str)}` — Bot sieht den Server nicht")
+                continue
+
+            target_channel_id = rsvp._server_channel_id_for_event(server_cfg, normalized_event_type)
+            ch = partner_guild.get_channel(target_channel_id)
+            if not isinstance(ch, (discord.TextChannel, discord.Thread)):
+                failed.append(f"❌ `{server_cfg.get('label', partner_guild.name)}` — Channel für {normalized_event_type} nicht gefunden")
+                continue
+
+            emb = rsvp.build_embed(partner_guild, obj)
+            msg = await ch.send(embed=emb, view=rsvp.ServerRaidView(master_id))
+
+            obj["mirrors"].append({
+                "guild_id": int(partner_guild.id),
+                "discord_name": partner_guild.name,
+                "label": str(server_cfg.get("label", partner_guild.name)),
+                "short_label": str(server_cfg.get("short_label", server_cfg.get("label", partner_guild.name))),
+                "channel_id": int(ch.id),
+                "channel_name": getattr(ch, "name", ""),
+                "message_id": int(msg.id),
+                "send_dm": False,
+                "home": False,
+            })
+
+            posted.append(f"✅ **{server_cfg.get('label', partner_guild.name)}** → <#{ch.id}>")
+            await asyncio.sleep(0.15)
+
+        except Exception as e:
+            failed.append(f"❌ `{server_cfg.get('label', guild_id_str)}` — {e}")
+
+    sent = 0
+    skipped_opt_out = 0
+    if bool(home_server.get("send_dm", True)):
+        sent, skipped_opt_out = await rsvp._send_home_dms_for_alliance_event(
+            guild,
+            obj,
+            master_id,
+            f"Allianz-Übersicht im Server: #{getattr(home_channel, 'name', 'raid')}",
+        )
+
+    rsvp.store[str(master_id)] = obj
+    rsvp.save_store()
+
+    try:
+        await rsvp._push_overview(inter.client, str(master_id), obj)
+    except Exception:
+        pass
+
+    try:
+        rsvp._schedule_portal_refresh_for_event(inter.client, guild, obj)
+    except Exception:
+        pass
+
+    result = (
+        f"✅ Allianz-Event erstellt.\n"
+        f"Gruppe: **{group_obj.get('name', group)}**\n"
+        f"Eventtyp: **{normalized_event_type}**\n"
+        f"Master-Message-ID: `{master_id}`\n"
+        f"✉️ Home-DMs versendet: **{sent}**\n"
+        f"🔕 Home-Opt-out übersprungen: **{skipped_opt_out}**\n\n"
+        f"**Gepostet:**\n" + "\n".join(posted)
+    )
+    if failed:
+        result += "\n\n**Fehler:**\n" + "\n".join(failed)
+    if len(result) > 1900:
+        result = result[:1850] + "\n… gekürzt"
+
+    await inter.followup.send(result, ephemeral=True)
+
+
 async def _admin_resend_missing_from_menu(inter: discord.Interaction, guild_id: int, message_id: str):
     rsvp = _admin_event_module()
     guild = inter.client.get_guild(int(guild_id))
@@ -2187,6 +2403,181 @@ class AdminEventCreateModal(Modal):
         )
 
         await inter.response.send_message(embed=emb, view=AdminEventChannelSelectView(data, inter.client), ephemeral=True)
+
+
+class AdminAllianceEventCreateModal(Modal):
+    def __init__(self, guild_id: int, user_id: int):
+        super().__init__(title="Allianz-Event erstellen", timeout=None)
+        self.guild_id = int(guild_id)
+        self.user_id = int(user_id)
+        self.title_input = TextInput(label="Titel", placeholder="z. B. Allianz HM Raid", required=True, max_length=100)
+        self.date_input = TextInput(label="Datum", placeholder="YYYY-MM-DD oder TT.MM.JJJJ", required=True, max_length=20)
+        self.time_input = TextInput(label="Uhrzeit", placeholder="HH:MM", required=True, max_length=10)
+        self.description_input = TextInput(label="Beschreibung", placeholder="Optional", required=False, style=discord.TextStyle.paragraph, max_length=800)
+        self.add_item(self.title_input)
+        self.add_item(self.date_input)
+        self.add_item(self.time_input)
+        self.add_item(self.description_input)
+
+    async def on_submit(self, inter: discord.Interaction):
+        data = {
+            "scope": "alliance",
+            "guild_id": self.guild_id,
+            "user_id": self.user_id,
+            "title": str(self.title_input.value),
+            "date_text": str(self.date_input.value),
+            "time_text": str(self.time_input.value),
+            "description": str(self.description_input.value or ""),
+        }
+
+        emb = discord.Embed(
+            title="🌐 Allianz-Gruppe wählen",
+            description=(
+                "Wähle die vorhandene Allianz-Gruppe aus.\n\n"
+                "Die Zielkanäle werden aus dem bestehenden `alliance_config`-System genommen."
+            ),
+            color=discord.Color.gold(),
+        )
+        await inter.response.send_message(embed=emb, view=AdminAllianceGroupSelectView(data), ephemeral=True)
+
+
+class AdminAllianceGroupSelectView(View):
+    def __init__(self, data: dict):
+        super().__init__(timeout=None)
+        self.data = dict(data)
+        self.add_item(AdminAllianceGroupSelect(self.data))
+
+    @button(label="❌ Abbrechen", style=ButtonStyle.secondary, custom_id="admin_alliance_group_cancel")
+    async def btn_cancel(self, inter: discord.Interaction, _):
+        await inter.response.edit_message(
+            embed=discord.Embed(title="Abgebrochen", description="Das Allianz-Event wurde nicht erstellt.", color=discord.Color.orange()),
+            view=None,
+        )
+
+
+class AdminAllianceGroupSelect(Select):
+    def __init__(self, data: dict):
+        self.data = dict(data)
+        options: list[discord.SelectOption] = []
+        try:
+            try:
+                from bot.alliance_config import list_alliance_groups  # type: ignore
+            except ModuleNotFoundError:
+                from alliance_config import list_alliance_groups  # type: ignore
+            groups = list_alliance_groups() or {}
+            for key, obj in list(groups.items())[:25]:
+                name = str((obj or {}).get("name", key) or key)
+                servers = (obj or {}).get("servers") or {}
+                options.append(discord.SelectOption(
+                    label=name[:100],
+                    value=str(key)[:100],
+                    description=f"{len(servers)} Server hinterlegt"[:100],
+                ))
+        except Exception:
+            options = []
+
+        if not options:
+            options.append(discord.SelectOption(label="Keine Allianz-Gruppe gefunden", value="__none__", description="Erst alliance_config einrichten"))
+
+        super().__init__(placeholder="Allianz-Gruppe wählen", min_values=1, max_values=1, options=options, custom_id="admin_alliance_group_select")
+
+    async def callback(self, inter: discord.Interaction):
+        group = str(self.values[0])
+        if group == "__none__":
+            await inter.response.send_message("❌ Keine Allianz-Gruppe gefunden. Richte zuerst das Allianz-System ein.", ephemeral=True)
+            return
+        self.data["alliance_group"] = group
+        emb = discord.Embed(
+            title="🌐 Allianz-Eventtyp wählen",
+            description="Der Eventtyp entscheidet, in welche konfigurierten Allianz-Channels gepostet wird.",
+            color=discord.Color.gold(),
+        )
+        await inter.response.edit_message(embed=emb, view=AdminAllianceEventTypeSelectView(self.data))
+
+
+class AdminAllianceEventTypeSelectView(View):
+    def __init__(self, data: dict):
+        super().__init__(timeout=None)
+        self.data = dict(data)
+        self.add_item(AdminAllianceEventTypeSelect(self.data))
+
+    @button(label="Zurück", emoji=_menu_emoji(EMOJI_BACK), style=ButtonStyle.secondary, custom_id="admin_alliance_type_back", row=1)
+    async def btn_back(self, inter: discord.Interaction, _):
+        emb = discord.Embed(title="🌐 Allianz-Gruppe wählen", description="Wähle die vorhandene Allianz-Gruppe aus.", color=discord.Color.gold())
+        await inter.response.edit_message(embed=emb, view=AdminAllianceGroupSelectView(self.data))
+
+    @button(label="❌ Abbrechen", style=ButtonStyle.secondary, custom_id="admin_alliance_type_cancel", row=1)
+    async def btn_cancel(self, inter: discord.Interaction, _):
+        await inter.response.edit_message(embed=discord.Embed(title="Abgebrochen", description="Das Allianz-Event wurde nicht erstellt.", color=discord.Color.orange()), view=None)
+
+
+class AdminAllianceEventTypeSelect(Select):
+    def __init__(self, data: dict):
+        self.data = dict(data)
+        rsvp = _admin_event_module()
+        event_types = list(getattr(rsvp, "ALLIANCE_EVENT_TYPES", ["NM Raid", "HM Raid", "PvP Schlacht", "Dimensionsprüfung"]))
+        options = [discord.SelectOption(label=x, value=x) for x in event_types[:25]]
+        super().__init__(placeholder="Allianz-Eventtyp wählen", min_values=1, max_values=1, options=options, custom_id="admin_alliance_event_type_select")
+
+    async def callback(self, inter: discord.Interaction):
+        self.data["event_type"] = str(self.values[0])
+        emb = discord.Embed(
+            title=f"{EMOJI_TARGET} Home-Zielrolle wählen",
+            description=(
+                "Optional: Wähle eine Home-/Ebolus-Rolle, die DMs erhalten soll.\n\n"
+                "Oder wähle **Alle / keine Zielrolle**, wenn alle Ebolus-Mitglieder zählen sollen."
+            ),
+            color=discord.Color.gold(),
+        )
+        await inter.response.edit_message(embed=emb, view=AdminAllianceRoleSelectView(self.data, inter.client))
+
+
+class AdminAllianceRoleSelectView(View):
+    def __init__(self, data: dict, client: discord.Client | None = None):
+        super().__init__(timeout=None)
+        self.data = dict(data)
+        self.add_item(AdminAllianceRoleSelect(self.data, client))
+
+    @button(label="Zurück", emoji=_menu_emoji(EMOJI_BACK), style=ButtonStyle.secondary, custom_id="admin_alliance_role_back", row=1)
+    async def btn_back(self, inter: discord.Interaction, _):
+        emb = discord.Embed(title="🌐 Allianz-Eventtyp wählen", description="Wähle den Eventtyp.", color=discord.Color.gold())
+        await inter.response.edit_message(embed=emb, view=AdminAllianceEventTypeSelectView(self.data))
+
+    @button(label="❌ Abbrechen", style=ButtonStyle.secondary, custom_id="admin_alliance_role_cancel", row=1)
+    async def btn_cancel(self, inter: discord.Interaction, _):
+        await inter.response.edit_message(embed=discord.Embed(title="Abgebrochen", description="Das Allianz-Event wurde nicht erstellt.", color=discord.Color.orange()), view=None)
+
+
+class AdminAllianceRoleSelect(Select):
+    def __init__(self, data: dict, client: discord.Client | None = None):
+        self.data = dict(data)
+        guild_id = int(self.data.get("guild_id", 0) or 0)
+        guild = client.get_guild(guild_id) if client is not None else None
+        options = [discord.SelectOption(label="Alle / keine Zielrolle", value="0", description="Alle Ebolus-Mitglieder, die DMs aktiviert haben")]
+
+        if guild is not None:
+            roles = [r for r in guild.roles if not r.is_default()]
+            roles.sort(key=lambda r: r.position, reverse=True)
+            for role in roles[:24]:
+                options.append(discord.SelectOption(label=role.name[:100], value=str(role.id), description=f"{len(role.members)} Mitglieder"[:100]))
+
+        super().__init__(placeholder="Home-Zielrolle wählen", min_values=1, max_values=1, options=options, custom_id="admin_alliance_role_select")
+
+    async def callback(self, inter: discord.Interaction):
+        try:
+            role_id = int(self.values[0])
+        except Exception:
+            role_id = 0
+        self.data["target_role_id"] = int(role_id or 0)
+        emb = discord.Embed(
+            title="🖼️ Allianz-Event-Bild wählen",
+            description=(
+                "Wähle, welches Bild für dieses Allianz-Event verwendet werden soll.\n\n"
+                "Danach wird das Allianz-Event über das vorhandene Allianz-System erstellt und gespiegelt."
+            ),
+            color=discord.Color.gold(),
+        )
+        await inter.response.edit_message(embed=emb, view=AdminEventImageSelectView(self.data))
 
 
 class AdminEventChannelSelectView(View):
@@ -2435,6 +2826,23 @@ class AdminEventImageSelect(Select):
 
         image_url = None if value == "none" else EVENT_IMAGE_PRESETS.get(value)
         self.data["image_url"] = image_url or ""
+
+        if str(self.data.get("scope", "")) == "alliance":
+            await inter.response.defer(ephemeral=True, thinking=True)
+            await _admin_create_alliance_raid_from_menu(
+                inter,
+                int(self.data["guild_id"]),
+                str(self.data.get("alliance_group", "")),
+                str(self.data.get("event_type", "")),
+                str(self.data["title"]),
+                str(self.data["date_text"]),
+                str(self.data["time_text"]),
+                int(self.data.get("target_role_id", 0) or 0),
+                str(self.data.get("description", "")),
+                image_url=(str(self.data.get("image_url", "") or "").strip() or None),
+            )
+            return
+
         await _admin_show_reminder_select(inter, self.data)
 
 
@@ -2622,6 +3030,23 @@ class AdminEventCustomImageModal(Modal):
             return
 
         self.data["image_url"] = image_url
+
+        if str(self.data.get("scope", "")) == "alliance":
+            await inter.response.defer(ephemeral=True, thinking=True)
+            await _admin_create_alliance_raid_from_menu(
+                inter,
+                int(self.data["guild_id"]),
+                str(self.data.get("alliance_group", "")),
+                str(self.data.get("event_type", "")),
+                str(self.data["title"]),
+                str(self.data["date_text"]),
+                str(self.data["time_text"]),
+                int(self.data.get("target_role_id", 0) or 0),
+                str(self.data.get("description", "")),
+                image_url=image_url,
+            )
+            return
+
         await _admin_show_reminder_select(inter, self.data, send_new=True)
 
 
@@ -3164,10 +3589,13 @@ class AdminEventMenuView(View):
 
     @button(label="🌐 Allianz-Event", style=ButtonStyle.secondary, custom_id="portal_admin_event_alliance", row=0)
     async def btn_alliance(self, inter: discord.Interaction, _):
-        await inter.response.send_message(
-            "🌐 Allianz-Events bleiben vorerst über `/alliance_raid_create`, weil dort Allianz-Gruppe, Eventtyp und Partner-Channel-Konfigurationen sauber geprüft werden müssen. Normale Raids kannst du jetzt direkt hier im Menü erstellen.",
-            ephemeral=True
-        )
+        guild, member = await _resolve_guild_member_from_inter(inter)
+        if not _is_portal_admin(guild, member):
+            await inter.response.send_message("❌ Dieser Bereich ist nur für Gildenleitung, Berater oder Wächter.", ephemeral=True)
+            return
+        if guild and member and inter.message:
+            _mark_portal_sent(guild.id, member.id, inter.message.id)
+        await inter.response.send_modal(AdminAllianceEventCreateModal(guild.id, member.id))
 
     @button(label="🗑️ Event löschen", style=ButtonStyle.secondary, custom_id="portal_admin_event_delete", row=1)
     async def btn_delete(self, inter: discord.Interaction, _):
