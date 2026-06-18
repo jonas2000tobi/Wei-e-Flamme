@@ -26,6 +26,17 @@ except ModuleNotFoundError:
 TZ = ZoneInfo("Europe/Berlin")
 
 
+def _get_ec_balance_safe(guild_id: int, user_id: int) -> int:
+    try:
+        try:
+            from bot.dkp_system import get_balance  # type: ignore
+        except ModuleNotFoundError:
+            from dkp_system import get_balance  # type: ignore
+        return int(get_balance(int(guild_id), int(user_id)) or 0)
+    except Exception:
+        return 0
+
+
 # Custom Discord-Emojis für Rollen/RSVP
 EMOJI_TANK = "<:tank:1516465336054972456>"
 EMOJI_HEAL = "<:heal:1516478246001049690>"
@@ -153,6 +164,7 @@ def _gcfg(guild_id: int) -> dict:
     c.setdefault("events", [])
     c.setdefault("event_voice_category_id", 0)
     c.setdefault("event_voice_return_channel_id", 0)
+    c.setdefault("guild_info_text", "")
     cfg[str(guild_id)] = c
     return c
 
@@ -607,13 +619,23 @@ def _main_menu_embed(guild: discord.Guild, member: Optional[discord.Member] = No
     if member:
         event_block = _event_status_block(guild, member) + "\n\n"
 
+    c = _gcfg(guild.id)
+    guild_info = str(c.get("guild_info_text", "") or "").strip()
+    if not guild_info:
+        guild_info = "Keine aktuelle Mitteilung."
+
+    ec_block = ""
+    if member:
+        ec_balance = _get_ec_balance_safe(guild.id, member.id)
+        ec_block = f"\n\n🪙 **Ebolus Coins (EC)**\nDein Konto: **{ec_balance} EC**"
+
     emb = discord.Embed(
         title=f"{EMOJI_EBOLUS} Ebolus Kommandozentrale",
         description=(
             event_block +
             "Willkommen im privaten Gildenmenü.\n\n"
-            "Wähle unten im Menü einen Bereich aus.\n"
-            "Die Beschreibung steht direkt in der Auswahl."
+            f"📢 **Gildeninfo**\n{guild_info}" +
+            ec_block
         ),
         color=discord.Color.gold()
     )
@@ -4018,6 +4040,31 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
             f"Neue Mitglieder mit dieser Rolle bekommen automatisch das Gildenmenü per DM.",
             ephemeral=True
         )
+
+    @tree.command(name="portal_set_guild_info", description="(Admin) Mitteilung im Gildenmenü setzen oder leeren")
+    async def portal_set_guild_info(inter: discord.Interaction, text: str = ""):
+        if not _is_admin(inter):
+            await inter.response.send_message("❌ Nur Admins/Manage Guild.", ephemeral=True)
+            return
+
+        if not inter.guild_id:
+            await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
+            return
+
+        c = _gcfg(inter.guild_id)
+        cleaned = _safe_text(str(text or "").strip())
+
+        if len(cleaned) > 900:
+            await inter.response.send_message("❌ Die Gildeninfo ist zu lang. Bitte maximal ca. 900 Zeichen nutzen.", ephemeral=True)
+            return
+
+        c["guild_info_text"] = cleaned
+        save_cfg()
+
+        if cleaned:
+            await inter.response.send_message("✅ Gildeninfo für das Gildenmenü gesetzt. Nutze `/portal_send_all force:false`, um bestehende Menüs zu aktualisieren.", ephemeral=True)
+        else:
+            await inter.response.send_message("✅ Gildeninfo geleert. Nutze `/portal_send_all force:false`, um bestehende Menüs zu aktualisieren.", ephemeral=True)
 
     @tree.command(name="portal_send_all", description="(Admin) Öffnet/aktualisiert das Gildenmenü per DM bei allen mit Gildenmitglied-Rolle")
     async def portal_send_all(inter: discord.Interaction, force: bool = False):
