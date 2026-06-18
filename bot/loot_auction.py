@@ -393,6 +393,7 @@ def _auction_embed(guild: discord.Guild, auction: dict, compact: bool = False) -
     desc.append(f"Mindestschritt: **{int(auction.get('min_increment', DEFAULT_MIN_INCREMENT) or DEFAULT_MIN_INCREMENT)} EC**")
     if top:
         desc.append(f"Höchstgebot: **{current} EC** von <@{int(top.get('user_id', 0) or 0)}>")
+        desc.append(f"Nächstes Mindestgebot: **{min_next} EC**")
     else:
         desc.append("Höchstgebot: **noch keines**")
         desc.append(f"Nächstes Mindestgebot: **{min_next} EC**")
@@ -427,7 +428,7 @@ async def _refresh_auction_message(client: discord.Client, guild_id: int, auctio
         print(f"[loot_auction] refresh failed: {e!r}")
 
 
-async def _place_bid(inter: discord.Interaction, guild_id: int, auction_id: str, amount: int) -> None:
+async def _place_bid(inter: discord.Interaction, guild_id: int, auction_id: str, amount: int, portal_user_id: int | None = None) -> None:
     guild = inter.guild or inter.client.get_guild(int(guild_id))
     if guild is None:
         await inter.response.send_message("❌ Server konnte nicht zugeordnet werden.", ephemeral=True)
@@ -467,16 +468,28 @@ async def _place_bid(inter: discord.Interaction, guild_id: int, auction_id: str,
     save_auctions()
 
     await _refresh_auction_message(inter.client, guild_id, auction)
+
+    # Wenn das Gebot aus dem Gildenmenü/DM kommt, muss auch diese aktuelle DM-Nachricht
+    # aktualisiert werden. Die normale Refresh-Funktion aktualisiert nur die öffentliche
+    # Auktionsnachricht im Auktionskanal.
+    if portal_user_id is not None:
+        try:
+            if inter.message:
+                await inter.message.edit(embed=_auction_embed(guild, auction), view=PortalAuctionBidView(int(guild_id), int(portal_user_id), str(auction_id)))
+        except Exception as e:
+            print(f"[loot_auction] portal bid message refresh failed: {e!r}")
+
     await inter.response.send_message(f"✅ Gebot gesetzt: **{int(amount)} EC** für **{auction.get('item_name','Item')}**.", ephemeral=True)
 
 
 class CustomBidModal(Modal, title="Eigenes EC-Gebot"):
     amount = TextInput(label="Gebot in EC", placeholder="z. B. 50", required=True, max_length=8)
 
-    def __init__(self, guild_id: int, auction_id: str):
+    def __init__(self, guild_id: int, auction_id: str, portal_user_id: int | None = None):
         super().__init__(timeout=180)
         self.guild_id = int(guild_id)
         self.auction_id = str(auction_id)
+        self.portal_user_id = int(portal_user_id) if portal_user_id is not None else None
 
     async def on_submit(self, inter: discord.Interaction):
         try:
@@ -484,7 +497,7 @@ class CustomBidModal(Modal, title="Eigenes EC-Gebot"):
         except Exception:
             await inter.response.send_message("❌ Bitte gib eine ganze Zahl ein.", ephemeral=True)
             return
-        await _place_bid(inter, self.guild_id, self.auction_id, val)
+        await _place_bid(inter, self.guild_id, self.auction_id, val, self.portal_user_id)
 
 
 class AuctionBidView(View):
@@ -524,6 +537,60 @@ class AuctionBidView(View):
     async def balance(self, inter: discord.Interaction, btn: discord.ui.Button):
         bal = _ec_balance(self.guild_id, int(inter.user.id))
         await inter.response.send_message(f"🪙 Dein aktueller Kontostand: **{bal} EC**", ephemeral=True)
+
+
+
+class PortalAuctionBidView(View):
+    """Bietansicht im privaten Gildenmenü mit Zurück-Buttons."""
+    def __init__(self, guild_id: int, user_id: int, auction_id: str):
+        super().__init__(timeout=300)
+        self.guild_id = int(guild_id)
+        self.user_id = int(user_id)
+        self.auction_id = str(auction_id)
+        for child in self.children:
+            if isinstance(child, discord.ui.Button):
+                child.custom_id = f"portalauc:{self.guild_id}:{self.user_id}:{auction_id}:{child.custom_id or child.label}"
+
+    async def _quick(self, inter: discord.Interaction, add: int) -> None:
+        auction = _auction(self.guild_id, self.auction_id)
+        if not auction:
+            await inter.response.send_message("❌ Auktion nicht gefunden.", ephemeral=True)
+            return
+        amount = max(_min_next_bid(auction), _current_price(auction) + int(add))
+        await _place_bid(inter, self.guild_id, self.auction_id, amount, self.user_id)
+
+    @button(label="+5 EC", style=ButtonStyle.primary, custom_id="bid5")
+    async def bid5(self, inter: discord.Interaction, btn: discord.ui.Button):
+        await self._quick(inter, 5)
+
+    @button(label="+10 EC", style=ButtonStyle.primary, custom_id="bid10")
+    async def bid10(self, inter: discord.Interaction, btn: discord.ui.Button):
+        await self._quick(inter, 10)
+
+    @button(label="+25 EC", style=ButtonStyle.primary, custom_id="bid25")
+    async def bid25(self, inter: discord.Interaction, btn: discord.ui.Button):
+        await self._quick(inter, 25)
+
+    @button(label="Eigenes Gebot", style=ButtonStyle.secondary, custom_id="custom")
+    async def custom(self, inter: discord.Interaction, btn: discord.ui.Button):
+        await inter.response.send_modal(CustomBidModal(self.guild_id, self.auction_id, self.user_id))
+
+    @button(label="Mein EC", style=ButtonStyle.secondary, custom_id="balance")
+    async def balance(self, inter: discord.Interaction, btn: discord.ui.Button):
+        bal = _ec_balance(self.guild_id, int(inter.user.id))
+        await inter.response.send_message(f"🪙 Dein aktueller Kontostand: **{bal} EC**", ephemeral=True)
+
+    @button(label="Zurück zu Auktion", style=ButtonStyle.secondary, custom_id="back_auction")
+    async def back_auction(self, inter: discord.Interaction, btn: discord.ui.Button):
+        guild = inter.client.get_guild(self.guild_id)
+        if not guild:
+            await inter.response.send_message("❌ Server nicht gefunden.", ephemeral=True)
+            return
+        await inter.response.edit_message(embed=_auction_portal_embed(guild, self.user_id), view=AuctionPortalMenuView(self.guild_id, self.user_id))
+
+    @button(label="Gildenmenü", style=ButtonStyle.secondary, custom_id="back_main")
+    async def back_main(self, inter: discord.Interaction, btn: discord.ui.Button):
+        await _portal_back_to_main(inter, self.guild_id, self.user_id)
 
 
 class AuctionDeliveryView(View):
@@ -1012,8 +1079,9 @@ class AuctionPortalSubView(View):
 
 
 class AuctionSelect(discord.ui.Select):
-    def __init__(self, guild_id: int, mode: str):
+    def __init__(self, guild_id: int, user_id: int, mode: str):
         self.guild_id = int(guild_id)
+        self.user_id = int(user_id)
         self.mode = str(mode)
         auctions = _active_sale_items(guild_id) if mode == "sale" else (_active_need_auctions(guild_id) if mode == "need" else _active_free_auctions(guild_id))
         options = []
@@ -1046,9 +1114,9 @@ class AuctionSelect(discord.ui.Select):
             await inter.response.send_message("❌ Auktion nicht gefunden.", ephemeral=True)
             return
         if self.mode == "sale":
-            await inter.response.edit_message(embed=_sale_embed(guild, auc), view=SaleBuyView(self.guild_id, aid))
+            await inter.response.edit_message(embed=_sale_embed(guild, auc), view=PortalSaleBuyView(self.guild_id, self.user_id, aid))
         else:
-            await inter.response.edit_message(embed=_auction_embed(guild, auc), view=AuctionBidView(self.guild_id, aid))
+            await inter.response.edit_message(embed=_auction_embed(guild, auc), view=PortalAuctionBidView(self.guild_id, self.user_id, aid))
 
 
 class AuctionSelectView(View):
@@ -1057,7 +1125,7 @@ class AuctionSelectView(View):
         self.guild_id = int(guild_id)
         self.user_id = int(user_id)
         self.mode = str(mode)
-        self.add_item(AuctionSelect(self.guild_id, self.mode))
+        self.add_item(AuctionSelect(self.guild_id, self.user_id, self.mode))
 
     @button(label="Zurück zu Auktion", style=ButtonStyle.secondary)
     async def back_auction(self, inter: discord.Interaction, btn: discord.ui.Button):
@@ -1164,6 +1232,39 @@ class SaleBuyView(View):
     async def balance(self, inter: discord.Interaction, btn: discord.ui.Button):
         bal = _ec_balance(self.guild_id, int(inter.user.id))
         await inter.response.send_message(f"🪙 Dein aktueller Kontostand: **{bal} EC**", ephemeral=True)
+
+
+class PortalSaleBuyView(View):
+    """Sale-Kauf Ansicht im privaten Gildenmenü mit Zurück-Buttons."""
+    def __init__(self, guild_id: int, user_id: int, auction_id: str):
+        super().__init__(timeout=300)
+        self.guild_id = int(guild_id)
+        self.user_id = int(user_id)
+        self.auction_id = str(auction_id)
+        for child in self.children:
+            if isinstance(child, discord.ui.Button):
+                child.custom_id = f"portalsale:{self.guild_id}:{self.user_id}:{auction_id}:{child.custom_id or child.label}"
+
+    @button(label="Sofort kaufen", style=ButtonStyle.success, custom_id="buy")
+    async def buy(self, inter: discord.Interaction, btn: discord.ui.Button):
+        await _buy_sale_item(inter, self.guild_id, self.auction_id)
+
+    @button(label="Mein EC", style=ButtonStyle.secondary, custom_id="balance")
+    async def balance(self, inter: discord.Interaction, btn: discord.ui.Button):
+        bal = _ec_balance(self.guild_id, int(inter.user.id))
+        await inter.response.send_message(f"🪙 Dein aktueller Kontostand: **{bal} EC**", ephemeral=True)
+
+    @button(label="Zurück zu Auktion", style=ButtonStyle.secondary, custom_id="back_auction")
+    async def back_auction(self, inter: discord.Interaction, btn: discord.ui.Button):
+        guild = inter.client.get_guild(self.guild_id)
+        if not guild:
+            await inter.response.send_message("❌ Server nicht gefunden.", ephemeral=True)
+            return
+        await inter.response.edit_message(embed=_auction_portal_embed(guild, self.user_id), view=AuctionPortalMenuView(self.guild_id, self.user_id))
+
+    @button(label="Gildenmenü", style=ButtonStyle.secondary, custom_id="back_main")
+    async def back_main(self, inter: discord.Interaction, btn: discord.ui.Button):
+        await _portal_back_to_main(inter, self.guild_id, self.user_id)
 
 
 async def open_auction_menu(inter: discord.Interaction, guild_id: int, user_id: int):
