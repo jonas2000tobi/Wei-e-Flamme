@@ -909,6 +909,50 @@ async def setup_dkp_system(client: discord.Client, tree: app_commands.CommandTre
         await _log_to_channel(client, int(home_id), emb)
         await inter.followup.send(f"✅ EC vergeben: **{len(awarded)}** Ebolus-Spieler. Log wurde gepostet.", ephemeral=True)
 
+    @dkp.command(name="post_event_check", description="Leader: EC-Anwesenheitscheck sofort in den Log-Kanal posten")
+    async def dkp_post_event_check(inter: discord.Interaction, event_id: str):
+        await inter.response.defer(ephemeral=True, thinking=True)
+
+        if inter.guild is None:
+            await inter.followup.send("❌ Nur im Server nutzbar.", ephemeral=True)
+            return
+
+        if not _is_leader_or_admin(inter):
+            await inter.followup.send("❌ Nur Leader/Admins.", ephemeral=True)
+            return
+
+        home_id = _home_guild_id(default=inter.guild.id)
+        if int(inter.guild.id) != int(home_id):
+            await inter.followup.send("❌ EC/DKP wird nur auf dem Ebolus/Home-Server verwaltet.", ephemeral=True)
+            return
+
+        log_ch = _log_channel(client, int(home_id))
+        if not log_ch:
+            await inter.followup.send("❌ DKP-/Loot-Log-Kanal ist nicht gesetzt. Nutze zuerst `/dkp set_log_channel`.", ephemeral=True)
+            return
+
+        obj = None
+        try:
+            rsvp = _import_rsvp()
+            if rsvp and hasattr(rsvp, "store"):
+                obj = rsvp.store.get(str(event_id))
+        except Exception:
+            obj = None
+
+        if not isinstance(obj, dict):
+            await inter.followup.send("❌ Event nicht gefunden. Nutze die Message-/Event-ID aus der Raid-Ankündigung.", ephemeral=True)
+            return
+
+        if not _event_is_dkp_enabled(obj):
+            await inter.followup.send("❌ Dieses Event ist nicht EC/DKP-relevant oder hat keinen gespeicherten EC-/DKP-Typ.", ephemeral=True)
+            return
+
+        ok = await _post_event_check(client, int(home_id), str(event_id), obj)
+        if ok:
+            await inter.followup.send("✅ EC-Anwesenheitscheck wurde sofort in den DKP-/Loot-Log-Kanal gepostet.", ephemeral=True)
+        else:
+            await inter.followup.send("❌ EC-Anwesenheitscheck konnte nicht gepostet werden. Prüfe Log-Kanal, Event-ID und Bot-Rechte.", ephemeral=True)
+
     @dkp.command(name="decay_run", description="Leader: Wöchentlichen EC-Verfall manuell ausführen")
     async def dkp_decay_run(inter: discord.Interaction, confirm: bool = False):
         await inter.response.defer(ephemeral=True, thinking=True)
