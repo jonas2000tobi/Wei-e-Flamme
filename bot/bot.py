@@ -33,6 +33,7 @@ setup_weekly_report = None
 setup_member_portal = None
 setup_loot_needs = None
 setup_alliance_config = None
+setup_dkp_system = None
 store = {}
 
 
@@ -144,6 +145,15 @@ def _import_modules():
         from alliance_config import setup_alliance_config  # type: ignore
         print("✅ Import: alliance_config (root)")
 
+    global setup_dkp_system
+
+    try:
+        from bot.dkp_system import setup_dkp_system  # type: ignore
+        print("✅ Import: bot.dkp_system")
+    except ModuleNotFoundError:
+        from dkp_system import setup_dkp_system  # type: ignore
+        print("✅ Import: dkp_system (root)")
+
 
 def _get_token() -> str | None:
     for key in ("DISCORD_TOKEN", "DISCORD_BOT_TOKEN", "TOKEN"):
@@ -172,6 +182,7 @@ async def on_ready():
         await setup_member_portal(bot, tree)
         await setup_loot_needs(bot, tree)
         await setup_alliance_config(bot, tree)
+        await setup_dkp_system(bot, tree)
 
         register_join_hook(bot, send_onboarding_dm, auto_resend_for_new_member)
 
