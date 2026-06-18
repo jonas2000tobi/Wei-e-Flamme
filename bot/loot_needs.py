@@ -2483,8 +2483,50 @@ def _match_lines(matches: list[dict], limit: int = 30) -> str:
 
 
 async def _notify_main_need_drop(inter: discord.Interaction, guild: discord.Guild, item_id: str) -> None:
+    """Loot-drop confirmation.
+
+    New flow: a confirmed drop no longer only sends a simple DM. It creates a virtual
+    guild chest item and starts the EC auction chain:
+    Need-Auktion 48h -> Freie Auktion 24h -> Sale-Kauf.
+    """
     item_name = _item_name(guild.id, item_id, with_type=True)
     matches = _need_matches_for_item(guild, item_id, tab_filter="Main", received=False)
+
+    try:
+        try:
+            from bot import loot_auction as auction_mod  # type: ignore
+        except Exception:
+            import loot_auction as auction_mod  # type: ignore
+
+        if hasattr(auction_mod, "start_loot_drop_auction"):
+            result = await auction_mod.start_loot_drop_auction(inter, guild, item_id, actor_id=int(inter.user.id))  # type: ignore[attr-defined]
+            phase = str(result.get("phase", ""))
+            auction_id = str(result.get("auction_id", ""))
+            notified = int(result.get("notified", 0) or 0)
+            failed = int(result.get("failed", 0) or 0)
+            title = "🎯 Need-Auktion gestartet" if phase == "need" else "⚖️ Freie Auktion gestartet"
+            desc = (
+                f"**Item:** {item_name}\n\n"
+                f"**Auktions-ID:** `{auction_id}`\n"
+                f"**Ablauf:** {'Need-Auktion 48h → Freie Auktion 24h → Sale-Kauf' if phase == 'need' else 'Freie Auktion 24h → Sale-Kauf'}\n\n"
+                f"**Main-Need Treffer:**\n{_match_lines(matches)}\n\n"
+            )
+            if phase == "need":
+                desc += f"Benachrichtigt: **{notified}**\nNicht erreichbar: **{failed}**"
+            else:
+                desc += "Keine offenen Main-Needs gefunden. Das Item ist direkt in der freien Auktion."
+            emb = discord.Embed(title=title, description=desc, color=discord.Color.green(), timestamp=datetime.now(TZ))
+            if not inter.response.is_done():
+                await inter.response.send_message(embed=emb, ephemeral=True)
+            else:
+                await inter.followup.send(embed=emb, ephemeral=True)
+            return
+    except Exception as e:
+        # Fallback to the old notification flow if the auction module is missing/broken.
+        try:
+            await inter.followup.send(f"⚠️ Auktionssystem konnte nicht gestartet werden: `{e}`. Nutze vorübergehend die alte Benachrichtigung.", ephemeral=True)
+        except Exception:
+            pass
 
     notified = 0
     failed = 0
