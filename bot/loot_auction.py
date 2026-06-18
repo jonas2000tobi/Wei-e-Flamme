@@ -39,8 +39,8 @@ FREE_START_BID = 20
 SALE_PRICE = 10
 
 ELIGIBILITY_CHOICES = [
-    app_commands.Choice(name="Automatisch: Main-Need zuerst, sonst alle Ebolus", value="auto"),
-    app_commands.Choice(name="Nur Main-Need-Spieler", value="main_need"),
+    app_commands.Choice(name="Automatisch: Need zuerst, sonst alle Ebolus", value="auto"),
+    app_commands.Choice(name="Nur Need-Spieler", value="main_need"),
     app_commands.Choice(name="Alle Ebolus-Mitglieder", value="all"),
 ]
 
@@ -263,11 +263,11 @@ def _eligibility_text(auction: dict) -> str:
     ids = [int(x) for x in auction.get("eligible_user_ids", []) or []]
     if mode == "main_need":
         if not ids:
-            return "Nur Main-Need, aber aktuell keine berechtigten Spieler gefunden."
+            return "Nur Need, aber aktuell keine berechtigten Spieler gefunden."
         lines = ", ".join(f"<@{uid}>" for uid in ids[:12])
         if len(ids) > 12:
             lines += f" … +{len(ids)-12}"
-        return f"Nur offene Main-Need-Spieler: {lines}"
+        return f"Nur offene Need-Spieler: {lines}"
     return "Alle Ebolus-Mitglieder dürfen bieten."
 
 
@@ -451,7 +451,7 @@ async def _place_bid(inter: discord.Interaction, guild_id: int, auction_id: str,
     mode = str(auction.get("eligibility_mode", "all") or "all")
     eligible = [int(x) for x in auction.get("eligible_user_ids", []) or []]
     if mode == "main_need" and user_id not in eligible:
-        await inter.response.send_message("❌ Diese Auktion ist aktuell nur für berechtigte Main-Need-Spieler freigegeben.", ephemeral=True)
+        await inter.response.send_message("❌ Diese Auktion ist aktuell nur für berechtigte Need-Spieler freigegeben.", ephemeral=True)
         return
     min_bid = _min_next_bid(auction)
     if int(amount) < min_bid:
@@ -468,7 +468,7 @@ async def _place_bid(inter: discord.Interaction, guild_id: int, auction_id: str,
     save_auctions()
 
     await _refresh_auction_message(inter.client, guild_id, auction)
-    # Die ursprünglichen Main-Need-DMs werden im Hintergrund aktualisiert, damit die Button-Reaktion nicht timeoutet.
+    # Die ursprünglichen Need-DMs werden im Hintergrund aktualisiert, damit die Button-Reaktion nicht timeoutet.
     # Falls diese Auktion noch aus einer älteren Version stammt und keine DM-Message-IDs gespeichert hat,
     # wird einmalig eine neue Live-Tracking-DM gesendet und ab dann aktualisiert/bei Übergabe gelöscht.
     async def _repair_and_refresh_tracking_dm():
@@ -726,14 +726,14 @@ def _auction_dm_content(auction: dict, *, ended: bool = False, winner_id: int = 
             f"**Auktion:** {phase_name}\n"
         )
     return (
-        "🎁 **Dein Main-Need-Item ist gedroppt!**\n\n"
+        "🎁 **Dein Need-Item ist gedroppt!**\n\n"
         "Diese Nachricht wird bei jedem Gebot aktualisiert, damit du den Stand direkt hier sehen kannst.\n"
         "Bieten kannst du über **Gildenmenü → Auktion → Need-Auktion**."
     )
 
 
 async def _send_auction_tracking_dm(guild: discord.Guild, user_id: int, auction: dict) -> Optional[dict]:
-    """Send a persistent Main-Need DM that can be edited after every bid."""
+    """Send a persistent Need-DM that can be edited after every bid."""
     member = guild.get_member(int(user_id))
     if not member or member.bot:
         return None
@@ -749,7 +749,7 @@ async def _send_auction_tracking_dm(guild: discord.Guild, user_id: int, auction:
 
 
 async def _refresh_auction_tracking_dms(client: discord.Client, guild_id: int, auction: dict, *, ended: bool = False, winner_id: int = 0) -> None:
-    """Update the original Main-Need DM messages so users can follow the auction without opening the menu."""
+    """Update the original Need-DM messages so users can follow the auction without opening the menu."""
     refs = auction.get("notify_message_refs")
     if not isinstance(refs, list) or not refs:
         return
@@ -809,7 +809,7 @@ async def _ensure_auction_tracking_dms(client: discord.Client, guild_id: int, au
 
 
 async def _delete_auction_tracking_dms(client: discord.Client, auction: dict) -> None:
-    """Delete the persistent Main-Need tracking DMs after the item is actually distributed."""
+    """Delete the persistent Need-Tracking-DMs after the item is actually distributed."""
     refs = auction.get("notify_message_refs")
     if not isinstance(refs, list) or not refs:
         return
@@ -1106,7 +1106,7 @@ def _auction_portal_embed(guild: discord.Guild, user_id: int | None = None) -> d
         description=(
             "Hier findest du alle aktuellen EC-Lootangebote.\n\n"
             "**Need-Auktion**\n"
-            "Zeigt Auktionen, die aktuell nur für berechtigte Main-Need-Spieler laufen.\n\n"
+            "Zeigt Auktionen, die aktuell nur für berechtigte Need-Spieler laufen.\n\n"
             "**Freie Auktion**\n"
             "Hier kannst du freie Auktionen auswählen und mit EC mitbieten.\n\n"
             "**Sale-Kauf**\n"
@@ -1158,7 +1158,7 @@ class AuctionPortalMenuView(View):
             emb.description = "Aktuell gibt es keine aktiven Need-Auktionen."
             await inter.response.edit_message(embed=emb, view=AuctionPortalSubView(self.guild_id, self.user_id))
             return
-        emb.description = "Wähle eine Need-Auktion aus. Bieten können nur berechtigte Main-Need-Spieler.\n\n" + "\n".join(_short_auction_line(a) for a in auctions[:20])
+        emb.description = "Wähle eine Need-Auktion aus. Bieten können nur berechtigte Need-Spieler.\n\n" + "\n".join(_short_auction_line(a) for a in auctions[:20])
         await inter.response.edit_message(embed=emb, view=AuctionSelectView(self.guild_id, self.user_id, "need"))
 
     @button(label="Freie Auktion", style=ButtonStyle.primary, custom_id="free")
@@ -1417,7 +1417,7 @@ async def start_loot_drop_auction(inter: discord.Interaction, guild: discord.Gui
     """Called by loot_needs.py when Admin -> Loot -> Loot gedroppt is confirmed.
 
     Creates a virtual guild chest item and starts either a 48h Need auction or,
-    if no Main Need exists, a 24h Free auction.
+    if no Need exists, a 24h Free auction.
     """
     actor_id = int(actor_id or getattr(inter.user, "id", 0) or 0)
     item_name = _item_display(guild.id, item_id, fallback=str(item_id))
@@ -1488,7 +1488,7 @@ async def start_loot_drop_auction(inter: discord.Interaction, guild: discord.Gui
             if phase == "need":
                 desc += "\nBerechtigt: " + (", ".join(f"<@{uid}>" for uid in eligible[:20]) if eligible else "—")
             else:
-                desc += "\nKeine offenen Main-Needs gefunden. Das Item ist direkt in der freien Auktion."
+                desc += "\nKeine offenen Needs gefunden. Das Item ist direkt in der freien Auktion."
             await log.send(embed=discord.Embed(title=title, description=desc, color=discord.Color.gold(), timestamp=_now()))
         except Exception:
             pass
@@ -1599,7 +1599,7 @@ async def setup_loot_auction(client: discord.Client, tree: app_commands.CommandT
             return
         mode, eligible_ids = _eligible_user_ids(guild, item_id, eligibility.value)
         if eligibility.value == "main_need" and not eligible_ids:
-            await inter.response.send_message("❌ Für dieses Item gibt es aktuell keinen offenen Main-Need. Nutze eligibility = Alle Ebolus-Mitglieder.", ephemeral=True)
+            await inter.response.send_message("❌ Für dieses Item gibt es aktuell keinen offenen Need. Nutze eligibility = Alle Ebolus-Mitglieder.", ephemeral=True)
             return
         aid = _new_auction_id()
         ends = _now() + timedelta(hours=int(duration_hours))
