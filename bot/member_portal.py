@@ -1457,6 +1457,12 @@ class PortalMainSelect(Select):
                 emoji=_menu_emoji(EMOJI_LOOT)
             ),
             discord.SelectOption(
+                label="Auktion",
+                value="auction",
+                description="Need-Auktionen, freie Auktionen und Sale-Kauf",
+                emoji="🏷️"
+            ),
+            discord.SelectOption(
                 label="Gilde",
                 value="guild",
                 description="Kalender, Abwesenheiten und Mitgliederübersicht",
@@ -1537,6 +1543,18 @@ class PortalMainSelect(Select):
 
             await inter.response.edit_message(embed=emb, view=LootMenuView())
             return
+
+        if choice == "auction":
+            try:
+                try:
+                    from bot.loot_auction import open_auction_menu  # type: ignore
+                except ModuleNotFoundError:
+                    from loot_auction import open_auction_menu  # type: ignore
+                await open_auction_menu(inter, guild.id, member.id)
+                return
+            except Exception as e:
+                await inter.response.send_message(f"❌ Auktionsmenü konnte nicht geöffnet werden: `{e}`", ephemeral=True)
+                return
 
         if choice == "guild":
             emb = discord.Embed(
