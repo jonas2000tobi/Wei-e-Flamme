@@ -2226,15 +2226,16 @@ async def _admin_create_alliance_raid_from_menu(
         except Exception as e:
             failed.append(f"❌ `{server_cfg.get('label', guild_id_str)}` — {e}")
 
+    # Allianz-Events aus dem Gildenmenü sollen immer Home-/Ebolus-DMs senden.
+    # Die Partner-Server bekommen weiterhin nur Mirror-Posts mit Buttons, keine DMs.
     sent = 0
     skipped_opt_out = 0
-    if bool(home_server.get("send_dm", True)):
-        sent, skipped_opt_out = await rsvp._send_home_dms_for_alliance_event(
-            guild,
-            obj,
-            master_id,
-            f"Allianz-Übersicht im Server: #{getattr(home_channel, 'name', 'raid')}",
-        )
+    sent, skipped_opt_out = await rsvp._send_home_dms_for_alliance_event(
+        guild,
+        obj,
+        master_id,
+        f"Allianz-Übersicht im Server: #{getattr(home_channel, 'name', 'raid')}",
+    )
 
     rsvp.store[str(master_id)] = obj
     rsvp.save_store()
