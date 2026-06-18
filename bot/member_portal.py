@@ -1453,7 +1453,7 @@ class PortalMainSelect(Select):
             discord.SelectOption(
                 label="Loot & Bedarf",
                 value="loot",
-                description="Needliste für Main/Secondary und Lootregeln",
+                description="Deine 5 Needs verwalten",
                 emoji=_menu_emoji(EMOJI_LOOT)
             ),
             discord.SelectOption(
@@ -1529,20 +1529,20 @@ class PortalMainSelect(Select):
             return
 
         if choice == "loot":
-            emb = discord.Embed(
-                title=f"{EMOJI_LOOT} Loot & Bedarf",
-                description=(
-                    "Hier verwaltest du alles rund um Items und Loot.\n\n"
-                    "**Needliste**\n"
-                    "Trage ein, welche Items du für Main und Secondary brauchst.\n\n"
-                    "**Regeln & Loot**\n"
-                    "Zeigt die wichtigsten Regeln zum Lootsystem."
-                ),
-                color=discord.Color.gold()
-            )
+            try:
+                try:
+                    from bot.loot_needs import open_need_menu  # type: ignore
+                except ModuleNotFoundError:
+                    from loot_needs import open_need_menu  # type: ignore
 
-            await inter.response.edit_message(embed=emb, view=LootMenuView())
-            return
+                if inter.message:
+                    _mark_portal_sent(guild.id, member.id, inter.message.id)
+
+                await open_need_menu(inter, guild.id, member.id)
+                return
+            except Exception as e:
+                await inter.response.send_message(f"❌ Needliste konnte nicht geöffnet werden: `{e}`", ephemeral=True)
+                return
 
         if choice == "auction":
             try:
