@@ -1722,7 +1722,7 @@ async def setup_loot_auction(client: discord.Client, tree: app_commands.CommandT
         start_bid: int = DEFAULT_START_BID,
         min_increment: int = DEFAULT_MIN_INCREMENT,
         duration_hours: int = DEFAULT_DURATION_HOURS,
-        eligibility: app_commands.Choice[str] = ELIGIBILITY_CHOICES[0],
+        eligibility: str = "auto",
     ):
         if inter.guild is None or not _is_leader_or_admin(inter):
             await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
@@ -1739,8 +1739,8 @@ async def setup_loot_auction(client: discord.Client, tree: app_commands.CommandT
                 ephemeral=True,
             )
             return
-        mode, eligible_ids = _eligible_user_ids(guild, item_id, eligibility.value)
-        if eligibility.value in {"main_need", "secondary_need"} and not eligible_ids:
+        mode, eligible_ids = _eligible_user_ids(guild, item_id, eligibility)
+        if eligibility in {"main_need", "secondary_need"} and not eligible_ids:
             await inter.response.send_message("❌ Für dieses Item gibt es aktuell keinen passenden offenen Need. Nutze eligibility = Alle Ebolus-Mitglieder.", ephemeral=True)
             return
         aid = _new_auction_id()
