@@ -78,6 +78,7 @@ CFG_FILE = DATA_DIR / "member_portal_cfg.json"
 PROFILE_FILE = DATA_DIR / "member_profiles.json"
 SENT_FILE = DATA_DIR / "member_portal_sent.json"
 LEADER_CONTACT_CFG_FILE = DATA_DIR / "leader_contact_cfg.json"
+AUCTION_FILE = DATA_DIR / "loot_auctions.json"
 
 
 def _load_json(path: Path, default):
@@ -613,16 +614,32 @@ def _event_status_block(guild: discord.Guild, member: discord.Member) -> str:
         return f"{EMOJI_CALENDAR} **Deine kommenden Events:**\nKeine Übersicht verfügbar."
 
 
+
+def _active_market_item_count(guild_id: int) -> int:
+    """Zählt aktive Items aus Freier Auktion + Sale-Kauf für die Startseite."""
+    data = _load_json(AUCTION_FILE, {})
+    g = data.get(str(int(guild_id))) or {}
+    auctions = g.get("auctions") if isinstance(g.get("auctions"), dict) else {}
+    count = 0
+    for auc in auctions.values():
+        if not isinstance(auc, dict):
+            continue
+        if str(auc.get("status", "") or "") != "active":
+            continue
+        phase = str(auc.get("phase", "") or "")
+        kind = str(auc.get("kind", "") or "")
+        mode = str(auc.get("eligibility_mode", "") or "")
+        if phase in {"free", "sale"} or kind == "sale" or (not phase and mode == "all"):
+            count += 1
+    return count
+
 def _main_menu_embed(guild: discord.Guild, member: Optional[discord.Member] = None) -> discord.Embed:
     event_block = ""
 
     if member:
         event_block = _event_status_block(guild, member) + "\n\n"
 
-    c = _gcfg(guild.id)
-    guild_info = str(c.get("guild_info_text", "") or "").strip()
-    if not guild_info:
-        guild_info = "Keine aktuelle Mitteilung."
+    available_items = _active_market_item_count(guild.id)
 
     ec_block = ""
     if member:
@@ -634,7 +651,7 @@ def _main_menu_embed(guild: discord.Guild, member: Optional[discord.Member] = No
         description=(
             event_block +
             "Willkommen im privaten Gildenmenü.\n\n"
-            f"📢 **Gildeninfo**\n{guild_info}" +
+            f"**Items zum Kauf Verfügbar:**\n**{available_items}**" +
             ec_block
         ),
         color=discord.Color.gold()
