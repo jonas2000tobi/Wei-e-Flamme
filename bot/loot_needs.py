@@ -877,7 +877,7 @@ async def _send_received_request(
         await inter.response.edit_message(
             embed=discord.Embed(
                 title="❌ Kein Item eingetragen",
-                description=f"In **{slot}** ist aktuell kein Item eingetragen.",
+                description=f"In **{tab} – {slot}** ist aktuell kein Item eingetragen.",
                 color=discord.Color.orange()
             ),
             view=NeedMainView(guild.id, user_id)
@@ -888,7 +888,7 @@ async def _send_received_request(
         await inter.response.edit_message(
             embed=discord.Embed(
                 title="🔒 Bereits erhalten",
-                description=f"**{slot}** ist bereits als erhalten markiert.",
+                description=f"**{tab} – {slot}** ist bereits als erhalten markiert.",
                 color=discord.Color.orange()
             ),
             view=NeedMainView(guild.id, user_id)
@@ -903,6 +903,7 @@ async def _send_received_request(
         title="🎁 Item erhalten gemeldet",
         description=(
             f"**{player_name}** meldet ein Item als erhalten.\n\n"
+            f"**Bereich:** {tab}\n"
             f"**Slot:** {slot}\n"
             f"**Item:** {item_name}\n\n"
             "Bitte bestätigen oder ablehnen."
@@ -930,7 +931,7 @@ async def _send_received_request(
             title="✅ Erhalten-Meldung gesendet",
             description=(
                 f"Deine Meldung wurde an die Gildenleitung geschickt.\n\n"
-                f"**{slot}:** {item_name}\n\n"
+                f"**{tab} – {slot}:** {item_name}\n\n"
                 "Sobald die Gildenleitung bestätigt, wird das Item als ✅ Erhalten markiert."
             ),
             color=discord.Color.gold()
@@ -1129,7 +1130,7 @@ class NeedTabSelect(Select):
         self.action = action
 
         options = [
-            discord.SelectOption(label="Main", value="Main", description="Needliste"),
+            discord.SelectOption(label="Main", value="Main", description="Main-Needliste"),
             discord.SelectOption(label="Secondary", value="Secondary", description="Secondary-Needliste"),
         ]
 
@@ -1564,7 +1565,8 @@ class ReceivedReportReviewView(View):
             title="✅ Item erhalten bestätigt",
             description=(
                 f"**{player_name}** wurde bestätigt.\n\n"
-                    f"**Slot:** {slot}\n"
+                f"**Bereich:** {tab}\n"
+                f"**Slot:** {slot}\n"
                 f"**Item:** {item_name} ✅ Erhalten\n\n"
                 f"Bestätigt von: {inter.user.mention}"
             ),
@@ -1577,7 +1579,7 @@ class ReceivedReportReviewView(View):
             if member:
                 await member.send(
                     f"✅ Deine Meldung wurde bestätigt.\n"
-                    f"**{slot}:** {item_name} ✅ Erhalten\n\n"
+                    f"**{tab} – {slot}:** {item_name} ✅ Erhalten\n\n"
                     f"Das Item bleibt in deiner Needliste sichtbar, zählt aber nicht mehr als offener Need."
                 )
         except Exception:
@@ -1616,7 +1618,8 @@ class ReceivedReportReviewView(View):
             title="❌ Item-erhalten-Meldung abgelehnt",
             description=(
                 f"Die Meldung von **{player_name}** wurde abgelehnt.\n\n"
-                    f"**Slot:** {slot}\n"
+                f"**Bereich:** {tab}\n"
+                f"**Slot:** {slot}\n"
                 f"**Item:** {item_name}\n\n"
                 f"Abgelehnt von: {inter.user.mention}"
             ),
@@ -1629,7 +1632,7 @@ class ReceivedReportReviewView(View):
             if member:
                 await member.send(
                     f"❌ Deine Item-erhalten-Meldung wurde abgelehnt.\n"
-                    f"**{slot}:** {item_name}\n\n"
+                    f"**{tab} – {slot}:** {item_name}\n\n"
                     f"Deine Needliste wurde nicht geändert."
                 )
         except Exception:
@@ -1781,470 +1784,6 @@ async def auto_loot_need_eventstart():
     except Exception as e:
         print(f"[loot_needs] Auto-Loop Fehler: {e!r}")
 
-
-
-
-# =========================
-# Need-System V2: nur noch 5 Needs, kein Main/Secondary-Menü
-# =========================
-# Intern bleibt der Tab-Name "Main" erhalten, damit bestehende Auktionslogik
-# weiter funktioniert. Für Nutzer wird nur noch "Need" angezeigt.
-LEGACY_NEED_SLOTS = [
-    "Waffe 1", "Waffe 2", "Helm", "Brust", "Hose", "Handschuhe", "Schuhe",
-    "Brosche", "Ohrringe", "Kette", "Armband", "Ring 1", "Ring 2", "Gürtel", "Umhang",
-]
-NEED_SLOTS = [f"Need {i}" for i in range(1, 6)]
-TABS = ["Main"]
-
-
-def _normalize_tab(tab: str) -> str:
-    tab_l = (tab or "").strip().lower()
-    if tab_l in {"", "main", "need", "needs", "bedarf"}:
-        return "Main"
-    return ""
-
-
-def _normalize_need_slot(slot: str) -> str:
-    s = (slot or "").strip().lower()
-    for x in NEED_SLOTS:
-        if x.lower() == s:
-            return x
-    compact = s.replace(" ", "")
-    if compact.startswith("need"):
-        try:
-            n = int(compact.replace("need", ""))
-            if 1 <= n <= 5:
-                return f"Need {n}"
-        except Exception:
-            pass
-    return ""
-
-
-def _tab_choices():
-    return [app_commands.Choice(name="Need", value="Main")]
-
-
-def _need_slot_choices():
-    return [app_commands.Choice(name=s, value=s) for s in NEED_SLOTS]
-
-
-def _collect_existing_need_entries(u: dict) -> list[dict]:
-    """Sammelt alte Main/Secondary-Needs in stabiler Reihenfolge und gibt max. später 5 weiter."""
-    entries: list[dict] = []
-
-    def add_from(tab_name: str, slots: list[str]):
-        tab = u.get(tab_name) or {}
-        if not isinstance(tab, dict):
-            return
-        for slot in slots:
-            obj = _slot_obj(tab.get(slot))
-            if str(obj.get("item_id", "") or ""):
-                entries.append(obj)
-
-    # Falls die neue Struktur schon existiert, immer zuerst behalten.
-    add_from("Main", NEED_SLOTS)
-    # Danach alte Main-Slots, dann alte Secondary-Slots als Migration.
-    add_from("Main", LEGACY_NEED_SLOTS)
-    add_from("Secondary", LEGACY_NEED_SLOTS)
-    add_from("Secondary", NEED_SLOTS)
-    return entries
-
-
-def _user_needs(guild_id: int, user_id: int) -> dict:
-    g = _gneeds(guild_id)
-    users = g.setdefault("users", {})
-    u = users.get(str(user_id)) or {}
-    if not isinstance(u, dict):
-        u = {}
-
-    # Migration: aus alten Main/Secondary-Slots werden nur noch Need 1-5.
-    entries = _collect_existing_need_entries(u)
-    new_main = {slot: _blank_slot() for slot in NEED_SLOTS}
-    for slot, obj in zip(NEED_SLOTS, entries[:5]):
-        new_main[slot] = _slot_obj(obj)
-
-    old_main = u.get("Main") if isinstance(u.get("Main"), dict) else {}
-    old_secondary = u.get("Secondary") if isinstance(u.get("Secondary"), dict) else {}
-    migration_needed = (
-        set((old_main or {}).keys()) != set(NEED_SLOTS)
-        or any(_slot_item_id((old_main or {}).get(s)) != _slot_item_id(new_main.get(s)) for s in NEED_SLOTS)
-        or any(_slot_received((old_main or {}).get(s)) != _slot_received(new_main.get(s)) for s in NEED_SLOTS)
-        or bool(old_secondary)
-    )
-
-    u = {"Main": new_main}
-    users[str(user_id)] = u
-    loot_needs[str(guild_id)] = g
-    if migration_needed:
-        save_needs()
-    return u
-
-
-def _catalog_slot_for_need_slot(need_slot: str) -> str:
-    # Die 5 Need-Plätze sind generisch. Die Kategorie wird im Menü separat gewählt.
-    if need_slot in NEED_SLOTS:
-        return ""
-    if need_slot in ("Waffe 1", "Waffe 2"):
-        return "Waffe"
-    if need_slot in ("Ring 1", "Ring 2"):
-        return "Ring"
-    return need_slot
-
-
-def _items_for_catalog_slot(guild_id: int, catalog_slot: str, weapon_type: str | None = None) -> list[dict]:
-    catalog_slot = _normalize_catalog_slot(catalog_slot)
-    normalized_weapon_type = _normalize_weapon_type(weapon_type) if weapon_type else ""
-    out: list[dict] = []
-    for item_id, item in _all_items(guild_id).items():
-        item_slot = _normalize_catalog_slot(str(item.get("slot", "") or ""))
-        if item_slot != catalog_slot:
-            continue
-        if catalog_slot == "Waffe" and normalized_weapon_type:
-            if str(item.get("weapon_type", "") or "") != normalized_weapon_type:
-                continue
-        i = dict(item)
-        i["id"] = item_id
-        out.append(i)
-    out.sort(key=lambda x: (str(x.get("weapon_type", "")), str(x.get("name", "")).lower()))
-    return out
-
-
-def _need_embed(guild: discord.Guild, user_id: int, tab: str = "Main") -> discord.Embed:
-    data = _user_needs(guild.id, user_id)
-    member = guild.get_member(user_id)
-    name = _profile_name(guild, user_id, member.display_name if member else "Unbekannt")
-
-    emb = discord.Embed(
-        title="🎁 Needliste – ebolus",
-        description=(
-            f"**{name}**\n\n"
-            "Du kannst maximal **5 Needs** eintragen.\n"
-            "Erhaltene Items bleiben sichtbar, zählen aber nicht mehr als offener Need."
-        ),
-        color=discord.Color.gold()
-    )
-
-    lines = []
-    for slot in NEED_SLOTS:
-        slot_data = _slot_obj((data.get("Main") or {}).get(slot))
-        item_id = str(slot_data.get("item_id", "") or "")
-        if item_id:
-            item_name = _item_name(guild.id, item_id, with_type=True)
-            if bool(slot_data.get("received", False)):
-                item_name = f"{item_name} ✅ Erhalten"
-        else:
-            item_name = "—"
-        lines.append(f"**{slot}:** {item_name}")
-
-    emb.add_field(name="⭐ Deine Needs", value="\n".join(lines) or "—", inline=False)
-    emb.set_footer(text="Nur die ersten 5 vorhandenen alten Needs wurden übernommen; alles Weitere zählt nicht mehr als Need.")
-    return emb
-
-
-def _format_need_user_full(guild: discord.Guild, user_id: int) -> str:
-    data = _user_needs(guild.id, user_id)
-    name = _profile_name(guild, user_id)
-    lines = [f"**{name}**"]
-    used = []
-    for slot in NEED_SLOTS:
-        slot_data = _slot_obj((data.get("Main") or {}).get(slot))
-        item_id = str(slot_data.get("item_id", "") or "")
-        if item_id:
-            item_name = _item_name(guild.id, item_id, with_type=True)
-            if bool(slot_data.get("received", False)):
-                item_name = f"{item_name} ✅ Erhalten"
-            used.append(f"{slot}: {item_name}")
-    if used:
-        lines.extend(f"• {x}" for x in used)
-    else:
-        lines.append("— keine Einträge")
-    return "\n".join(lines)
-
-
-def _match_lines(matches: list[dict], limit: int = 30) -> str:
-    if not matches:
-        return "—"
-    lines = []
-    for m in matches[:limit]:
-        rec = " ✅ Erhalten" if m.get("received") else ""
-        lines.append(f"• **{m['name']}** — {m['slot']}{rec}")
-    if len(matches) > limit:
-        lines.append(f"… und {len(matches) - limit} weitere")
-    return "\n".join(lines)
-
-
-async def open_need_menu(inter: discord.Interaction, guild_id: int, user_id: int):
-    guild = inter.client.get_guild(guild_id)
-    if not guild:
-        await inter.response.send_message("❌ Server nicht gefunden.")
-        return
-    _user_needs(guild_id, user_id)
-    save_needs()
-    await inter.response.edit_message(embed=_need_embed(guild, user_id, "Main"), view=NeedMainView(guild_id, user_id))
-
-
-class NeedMainView(View):
-    def __init__(self, guild_id: int, user_id: int):
-        super().__init__(timeout=None)
-        self.guild_id = int(guild_id)
-        self.user_id = int(user_id)
-
-    @button(label="➕ Need setzen", style=ButtonStyle.secondary, custom_id="need_add_item_v2", row=0)
-    async def btn_add_item(self, inter: discord.Interaction, _):
-        emb = discord.Embed(
-            title="🎁 Need setzen",
-            description="Wähle den Need-Platz, den du setzen oder überschreiben möchtest.",
-            color=discord.Color.gold()
-        )
-        await inter.response.edit_message(embed=emb, view=NeedSlotSelectView(self.guild_id, self.user_id, action="set", tab="Main"))
-
-    @button(label="🗑️ Need entfernen", style=ButtonStyle.secondary, custom_id="need_remove_item_v2", row=0)
-    async def btn_remove_item(self, inter: discord.Interaction, _):
-        emb = discord.Embed(
-            title="🎁 Need entfernen",
-            description="Wähle den Need-Platz, den du entfernen möchtest. Erhaltene Needs kann nur die Gildenleitung freigeben.",
-            color=discord.Color.gold()
-        )
-        await inter.response.edit_message(embed=emb, view=NeedSlotSelectView(self.guild_id, self.user_id, action="clear", tab="Main"))
-
-    @button(label="✅ Erhalten melden", style=ButtonStyle.secondary, custom_id="need_report_received_v2", row=1)
-    async def btn_report_received(self, inter: discord.Interaction, _):
-        emb = discord.Embed(
-            title="🎁 Item erhalten melden",
-            description="Wähle den Need, den du als erhalten melden möchtest. Die Gildenleitung muss das bestätigen.",
-            color=discord.Color.gold()
-        )
-        await inter.response.edit_message(embed=emb, view=NeedSlotSelectView(self.guild_id, self.user_id, action="report_received", tab="Main"))
-
-    @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="need_back_portal_v2", row=2)
-    async def btn_back(self, inter: discord.Interaction, _):
-        try:
-            try:
-                from bot.member_portal import ensure_portal_menu_for_user  # type: ignore
-            except ModuleNotFoundError:
-                from member_portal import ensure_portal_menu_for_user  # type: ignore
-            await inter.response.defer()
-            await ensure_portal_menu_for_user(inter.client, self.guild_id, self.user_id, force_view="main")
-        except Exception:
-            await inter.response.edit_message(embed=discord.Embed(title="⚜️ Ebolus Kommandozentrale", description="Zurück zum Gildenmenü.", color=discord.Color.gold()), view=None)
-
-
-class NeedSlotSelectView(View):
-    def __init__(self, guild_id: int, user_id: int, action: str, tab: str = "Main"):
-        super().__init__(timeout=None)
-        self.guild_id = int(guild_id)
-        self.user_id = int(user_id)
-        self.action = action
-        self.tab = "Main"
-        self.add_item(NeedSlotSelect(guild_id, user_id, action, "Main"))
-
-    @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="need_slot_back_v2")
-    async def btn_back(self, inter: discord.Interaction, _):
-        guild = inter.client.get_guild(self.guild_id)
-        if not guild:
-            await inter.response.send_message("❌ Server nicht gefunden.")
-            return
-        await inter.response.edit_message(embed=_need_embed(guild, self.user_id, "Main"), view=NeedMainView(self.guild_id, self.user_id))
-
-
-class NeedSlotSelect(Select):
-    def __init__(self, guild_id: int, user_id: int, action: str, tab: str = "Main"):
-        self.guild_id = int(guild_id)
-        self.user_id = int(user_id)
-        self.action = action
-        self.tab = "Main"
-        options = [discord.SelectOption(label=slot, value=slot) for slot in NEED_SLOTS]
-        super().__init__(placeholder="Need-Platz wählen", min_values=1, max_values=1, options=options, custom_id=f"need_slot_select_v2_{action}")
-
-    async def callback(self, inter: discord.Interaction):
-        need_slot = self.values[0]
-        data = _user_needs(self.guild_id, self.user_id)
-        current_slot = _slot_obj((data.get("Main") or {}).get(need_slot))
-
-        if bool(current_slot.get("received", False)):
-            item_name = _item_name(self.guild_id, str(current_slot.get("item_id", "") or ""), with_type=True)
-            emb = discord.Embed(
-                title="🔒 Need gesperrt",
-                description=f"**{need_slot}** ist bereits als erhalten markiert.\n\nItem: **{item_name}** ✅ Erhalten\n\nDiesen Platz kann nur die Gildenleitung wieder freigeben.",
-                color=discord.Color.orange()
-            )
-            await inter.response.edit_message(embed=emb, view=NeedMainView(self.guild_id, self.user_id))
-            return
-
-        if self.action == "clear":
-            _clear_slot_item(data, "Main", need_slot)
-            save_needs()
-            guild = inter.client.get_guild(self.guild_id)
-            if guild:
-                await inter.response.edit_message(embed=_need_embed(guild, self.user_id, "Main"), view=NeedMainView(self.guild_id, self.user_id))
-            else:
-                await inter.response.send_message("✅ Need entfernt.")
-            return
-
-        if self.action == "report_received":
-            guild = inter.client.get_guild(self.guild_id)
-            if not guild:
-                await inter.response.send_message("❌ Server nicht gefunden.")
-                return
-            item_id = str(current_slot.get("item_id", "") or "")
-            if not item_id:
-                await inter.response.edit_message(embed=discord.Embed(title="❌ Kein Item eingetragen", description=f"In **{need_slot}** ist aktuell kein Item eingetragen.", color=discord.Color.orange()), view=NeedMainView(self.guild_id, self.user_id))
-                return
-            await _send_received_request(inter, guild, self.user_id, "Main", need_slot)
-            return
-
-        emb = discord.Embed(
-            title="🎁 Kategorie wählen",
-            description=f"Need-Platz: **{need_slot}**\n\nWähle die Item-Kategorie.",
-            color=discord.Color.gold()
-        )
-        await inter.response.edit_message(embed=emb, view=NeedCatalogSlotSelectView(self.guild_id, self.user_id, need_slot))
-
-
-class NeedCatalogSlotSelectView(View):
-    def __init__(self, guild_id: int, user_id: int, need_slot: str):
-        super().__init__(timeout=None)
-        self.guild_id = int(guild_id)
-        self.user_id = int(user_id)
-        self.need_slot = need_slot
-        self.add_item(NeedCatalogSlotSelect(guild_id, user_id, need_slot))
-
-    @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="need_catalog_back_v2")
-    async def btn_back(self, inter: discord.Interaction, _):
-        emb = discord.Embed(title="🎁 Need setzen", description="Wähle den Need-Platz.", color=discord.Color.gold())
-        await inter.response.edit_message(embed=emb, view=NeedSlotSelectView(self.guild_id, self.user_id, "set", "Main"))
-
-
-class NeedCatalogSlotSelect(Select):
-    def __init__(self, guild_id: int, user_id: int, need_slot: str):
-        self.guild_id = int(guild_id)
-        self.user_id = int(user_id)
-        self.need_slot = need_slot
-        options = [discord.SelectOption(label=s, value=s) for s in CATALOG_SLOTS]
-        super().__init__(placeholder="Item-Kategorie wählen", min_values=1, max_values=1, options=options, custom_id="need_catalog_select_v2")
-
-    async def callback(self, inter: discord.Interaction):
-        catalog_slot = self.values[0]
-        if catalog_slot == "Waffe":
-            emb = discord.Embed(
-                title="🎁 Waffentyp wählen",
-                description=f"Need-Platz: **{self.need_slot}**\nKategorie: **Waffe**\n\nWähle den Waffentyp.",
-                color=discord.Color.gold()
-            )
-            await inter.response.edit_message(embed=emb, view=NeedWeaponTypeSelectView(self.guild_id, self.user_id, "Main", self.need_slot, catalog_slot="Waffe"))
-            return
-
-        items = _items_for_catalog_slot(self.guild_id, catalog_slot)
-        if not items:
-            emb = discord.Embed(
-                title="🎁 Kein Item hinterlegt",
-                description=f"Für **{catalog_slot}** gibt es noch keine Items im Katalog.",
-                color=discord.Color.orange()
-            )
-            await inter.response.edit_message(embed=emb, view=NeedCatalogSlotSelectView(self.guild_id, self.user_id, self.need_slot))
-            return
-
-        emb = discord.Embed(
-            title="🎁 Item wählen",
-            description=f"Need-Platz: **{self.need_slot}**\nKategorie: **{catalog_slot}**\n\nWähle ein Item aus dem Katalog.",
-            color=discord.Color.gold()
-        )
-        await inter.response.edit_message(embed=emb, view=NeedItemSelectView(self.guild_id, self.user_id, "Main", self.need_slot, catalog_slot=catalog_slot))
-
-
-class NeedWeaponTypeSelectView(View):
-    def __init__(self, guild_id: int, user_id: int, tab: str, need_slot: str, catalog_slot: str = "Waffe"):
-        super().__init__(timeout=None)
-        self.guild_id = int(guild_id)
-        self.user_id = int(user_id)
-        self.tab = "Main"
-        self.need_slot = need_slot
-        self.catalog_slot = catalog_slot
-        self.add_item(NeedWeaponTypeSelect(guild_id, user_id, "Main", need_slot, catalog_slot=catalog_slot))
-
-    @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="need_weapon_back_v2")
-    async def btn_back(self, inter: discord.Interaction, _):
-        emb = discord.Embed(title="🎁 Kategorie wählen", description=f"Need-Platz: **{self.need_slot}**", color=discord.Color.gold())
-        await inter.response.edit_message(embed=emb, view=NeedCatalogSlotSelectView(self.guild_id, self.user_id, self.need_slot))
-
-
-class NeedWeaponTypeSelect(Select):
-    def __init__(self, guild_id: int, user_id: int, tab: str, need_slot: str, catalog_slot: str = "Waffe"):
-        self.guild_id = int(guild_id)
-        self.user_id = int(user_id)
-        self.tab = "Main"
-        self.need_slot = need_slot
-        self.catalog_slot = catalog_slot
-        options = [discord.SelectOption(label=w, value=w) for w in WEAPON_TYPES]
-        super().__init__(placeholder="Waffentyp wählen", min_values=1, max_values=1, options=options, custom_id="need_weapon_type_select_v2")
-
-    async def callback(self, inter: discord.Interaction):
-        weapon_type = self.values[0]
-        items = _items_for_catalog_slot(self.guild_id, "Waffe", weapon_type=weapon_type)
-        if not items:
-            emb = discord.Embed(title="🎁 Keine Waffe hinterlegt", description=f"Für **{weapon_type}** gibt es noch keine Waffen im Katalog.", color=discord.Color.orange())
-            await inter.response.edit_message(embed=emb, view=NeedWeaponTypeSelectView(self.guild_id, self.user_id, "Main", self.need_slot))
-            return
-        emb = discord.Embed(
-            title="🎁 Waffe wählen",
-            description=f"Need-Platz: **{self.need_slot}**\nWaffentyp: **{weapon_type}**\n\nWähle eine Waffe aus dem Katalog.",
-            color=discord.Color.gold()
-        )
-        await inter.response.edit_message(embed=emb, view=NeedItemSelectView(self.guild_id, self.user_id, "Main", self.need_slot, catalog_slot="Waffe", weapon_type=weapon_type))
-
-
-class NeedItemSelectView(View):
-    def __init__(self, guild_id: int, user_id: int, tab: str, need_slot: str, catalog_slot: str = "", weapon_type: str | None = None):
-        super().__init__(timeout=None)
-        self.guild_id = int(guild_id)
-        self.user_id = int(user_id)
-        self.tab = "Main"
-        self.need_slot = need_slot
-        self.catalog_slot = catalog_slot
-        self.weapon_type = weapon_type
-        self.add_item(NeedItemSelect(guild_id, user_id, "Main", need_slot, catalog_slot=catalog_slot, weapon_type=weapon_type))
-
-    @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="need_item_back_v2")
-    async def btn_back(self, inter: discord.Interaction, _):
-        if self.catalog_slot == "Waffe":
-            emb = discord.Embed(title="🎁 Waffentyp wählen", description=f"Need-Platz: **{self.need_slot}**", color=discord.Color.gold())
-            await inter.response.edit_message(embed=emb, view=NeedWeaponTypeSelectView(self.guild_id, self.user_id, "Main", self.need_slot))
-            return
-        emb = discord.Embed(title="🎁 Kategorie wählen", description=f"Need-Platz: **{self.need_slot}**", color=discord.Color.gold())
-        await inter.response.edit_message(embed=emb, view=NeedCatalogSlotSelectView(self.guild_id, self.user_id, self.need_slot))
-
-
-class NeedItemSelect(Select):
-    def __init__(self, guild_id: int, user_id: int, tab: str, need_slot: str, catalog_slot: str = "", weapon_type: str | None = None):
-        self.guild_id = int(guild_id)
-        self.user_id = int(user_id)
-        self.tab = "Main"
-        self.need_slot = need_slot
-        self.catalog_slot = catalog_slot
-        self.weapon_type = weapon_type
-        items = _items_for_catalog_slot(guild_id, catalog_slot, weapon_type=weapon_type)[:25]
-        options = [discord.SelectOption(label=str(item.get("name", item["id"]))[:100], value=str(item["id"])[:100], description=str(item.get("weapon_type", "") or item.get("slot", ""))[:100]) for item in items]
-        if not options:
-            options = [discord.SelectOption(label="Keine Items verfügbar", value="__none__", description="Bitte Katalog prüfen")]
-        super().__init__(placeholder="Item wählen", min_values=1, max_values=1, options=options, custom_id="need_item_select_v2")
-
-    async def callback(self, inter: discord.Interaction):
-        item_id = self.values[0]
-        if item_id == "__none__":
-            await inter.response.send_message("❌ Keine Items verfügbar.", ephemeral=True)
-            return
-        data = _user_needs(self.guild_id, self.user_id)
-        current_slot = _slot_obj((data.get("Main") or {}).get(self.need_slot))
-        if bool(current_slot.get("received", False)):
-            await inter.response.edit_message(embed=discord.Embed(title="🔒 Need gesperrt", description="Dieser Need ist bereits als erhalten markiert.", color=discord.Color.orange()), view=NeedMainView(self.guild_id, self.user_id))
-            return
-        _set_slot_item(data, "Main", self.need_slot, item_id)
-        save_needs()
-        guild = inter.client.get_guild(self.guild_id)
-        if not guild:
-            await inter.response.send_message("✅ Need gespeichert.")
-            return
-        await inter.response.edit_message(embed=_need_embed(guild, self.user_id, "Main"), view=NeedMainView(self.guild_id, self.user_id))
 
 async def setup_loot_needs(client: discord.Client, tree: app_commands.CommandTree):
     global _client_ref
@@ -2547,7 +2086,7 @@ async def setup_loot_needs(client: discord.Client, tree: app_commands.CommandTre
         if bool(current.get("received", False)):
             await inter.response.send_message(
                 f"ℹ️ Dieser Slot ist bereits als erhalten markiert.\n"
-                f"**{member.display_name}** — **{slot_name}** — {_item_name(inter.guild.id, item_id, with_type=True)}",
+                f"**{member.display_name}** — **{tab_name} – {slot_name}** — {_item_name(inter.guild.id, item_id, with_type=True)}",
                 ephemeral=True
             )
             return
@@ -2560,7 +2099,7 @@ async def setup_loot_needs(client: discord.Client, tree: app_commands.CommandTre
         try:
             await member.send(
                 f"✅ Dein Need **{item_name}** wurde von der Gildenleitung als **erhalten** markiert.\n"
-                f"Slot: **{slot_name}**\n\n"
+                f"Slot: **{tab_name} – {slot_name}**\n\n"
                 f"Der Slot bleibt sichtbar, zählt aber nicht mehr als offener Need."
             )
         except Exception:
@@ -2569,7 +2108,7 @@ async def setup_loot_needs(client: discord.Client, tree: app_commands.CommandTre
         await inter.response.send_message(
             f"✅ Als erhalten markiert:\n"
             f"**{member.display_name}**\n"
-            f"**{slot_name}:** {item_name} ✅ Erhalten",
+            f"**{tab_name} – {slot_name}:** {item_name} ✅ Erhalten",
             ephemeral=True
         )
 
@@ -2619,7 +2158,7 @@ async def setup_loot_needs(client: discord.Client, tree: app_commands.CommandTre
         await inter.response.send_message(
             f"✅ Erhalten-Markierung entfernt:\n"
             f"**{member.display_name}**\n"
-            f"**{slot_name}:** {item_name}",
+            f"**{tab_name} – {slot_name}:** {item_name}",
             ephemeral=True
         )
 
@@ -2951,7 +2490,9 @@ async def _notify_main_need_drop(inter: discord.Interaction, guild: discord.Guil
     Need-Auktion 48h -> Freie Auktion 24h -> Sale-Kauf.
     """
     item_name = _item_name(guild.id, item_id, with_type=True)
-    matches = _need_matches_for_item(guild, item_id, tab_filter="Main", received=False)
+    main_matches = _need_matches_for_item(guild, item_id, tab_filter="Main", received=False)
+    secondary_matches = _need_matches_for_item(guild, item_id, tab_filter="Secondary", received=False)
+    matches = main_matches or secondary_matches
 
     try:
         try:
@@ -2970,12 +2511,12 @@ async def _notify_main_need_drop(inter: discord.Interaction, guild: discord.Guil
                 f"**Item:** {item_name}\n\n"
                 f"**Auktions-ID:** `{auction_id}`\n"
                 f"**Ablauf:** {'Need-Auktion 48h → Freie Auktion 24h → Sale-Kauf' if phase == 'need' else 'Freie Auktion 24h → Sale-Kauf'}\n\n"
-                f"**Need-Treffer:**\n{_match_lines(matches)}\n\n"
+                f"**Main-Need Treffer:**\n{_match_lines(matches)}\n\n"
             )
             if phase == "need":
                 desc += f"Benachrichtigt: **{notified}**\nNicht erreichbar: **{failed}**"
             else:
-                desc += "Keine offenen Needs gefunden. Das Item ist direkt in der freien Auktion."
+                desc += "Keine offenen Main-Needs gefunden. Das Item ist direkt in der freien Auktion."
             emb = discord.Embed(title=title, description=desc, color=discord.Color.green(), timestamp=datetime.now(TZ))
             if not inter.response.is_done():
                 await inter.response.send_message(embed=emb, ephemeral=True)
@@ -2998,7 +2539,7 @@ async def _notify_main_need_drop(inter: discord.Interaction, guild: discord.Guil
             continue
         try:
             await member.send(
-                "🎁 **Dein Need-Item ist gedroppt!**\n\n"
+                "🎁 **Dein Main-Need-Item ist gedroppt!**\n\n"
                 f"**Item:** {item_name}\n"
                 f"**Slot:** {m['slot']}\n\n"
                 "Bitte melde dich bei der Gildenleitung, wenn du das Item kaufen/beanspruchen möchtest."
@@ -3012,8 +2553,8 @@ async def _notify_main_need_drop(inter: discord.Interaction, guild: discord.Guil
         title="📦 Loot gedroppt",
         description=(
             f"**Item:** {item_name}\n\n"
-            "**Benachrichtigt wurden nur offene Needs.**\n\n"
-            f"**Need:**\n{_match_lines(matches)}\n\n"
+            "**Benachrichtigt wurden offene Needs nach Priorität: Main vor Second.**\n\n"
+            f"**Main-Need:**\n{_match_lines(matches)}\n\n"
             f"Benachrichtigt: **{notified}**\n"
             f"Nicht erreichbar: **{failed}**"
         ),
@@ -3061,7 +2602,7 @@ async def open_admin_loot_drop_menu(inter: discord.Interaction, guild_id: int, u
         return
     emb = discord.Embed(
         title="📦 Loot gedroppt",
-        description="Wähle den Slot und danach das Item aus dem Katalog. Danach werden nur Spieler mit offenem **Need** benachrichtigt.",
+        description="Wähle den Slot und danach das Item aus dem Katalog. Danach startet der Bot automatisch Main-Need-, Second-Need- oder freie Auktion.",
         color=discord.Color.gold()
     )
     await inter.response.edit_message(embed=emb, view=AdminLootSlotSelectView(guild_id, user_id, action="drop"))
@@ -3400,7 +2941,7 @@ class AdminLootItemSelect(Select):
                 title="📦 Loot gedroppt – Vorschau",
                 description=(
                     f"**Item:** {item_name}\n\n"
-                    "Benachrichtigt werden nur Spieler mit offenem **Need**.\n\n"
+                    "Benachrichtigt werden Spieler mit offenem Need nach Priorität: **Main vor Second**.\n\n"
                     f"**Treffer:**\n{_match_lines(matches)}"
                 ),
                 color=discord.Color.gold()
