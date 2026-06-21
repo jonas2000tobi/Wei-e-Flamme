@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import threading
 import math
 import asyncio
 from pathlib import Path
@@ -34,9 +36,11 @@ DEFAULT_START_BID = 1
 NEED_AUCTION_HOURS = 48
 FREE_AUCTION_HOURS = 24
 SALE_HOURS = 240
-NEED_START_BID = 40
-FREE_START_BID = 20
-SALE_PRICE = 10
+MAIN_MAIN_NEED_START_BID = 30
+SECONDARY_MAIN_NEED_START_BID = 20
+FREE_START_BID = 15
+SALE_PRICE = 5
+WINNER_DM_TTL_HOURS = 24
 
 ELIGIBILITY_CHOICES = [
     app_commands.Choice(name="Automatisch: Main > Second > Frei", value="auto"),
@@ -48,16 +52,34 @@ ELIGIBILITY_CHOICES = [
 _client_ref: Optional[discord.Client] = None
 
 
+_JSON_LOCK = threading.RLock()
+
+
 def _load_json(path: Path, default):
     try:
+        if not path.exists():
+            return default
         data = json.loads(path.read_text(encoding="utf-8"))
         return data if isinstance(data, type(default)) else default
-    except Exception:
+    except Exception as e:
+        print(f"[{Path(__file__).stem}] JSON-Lesefehler {path.name}: {e!r}")
         return default
 
 
 def _save_json(path: Path, obj) -> None:
-    path.write_text(json.dumps(obj, indent=2, ensure_ascii=False), encoding="utf-8")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    payload = json.dumps(obj, indent=2, ensure_ascii=False)
+    with _JSON_LOCK:
+        try:
+            tmp.write_text(payload, encoding="utf-8")
+            os.replace(tmp, path)
+        finally:
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except Exception:
+                pass
 
 
 auction_state: dict = _load_json(AUCTION_FILE, {})
@@ -128,7 +150,7 @@ def _is_leader_or_admin(inter: discord.Interaction) -> bool:
     cfg = _load_leader_cfg().get(str(inter.guild.id)) or {}
     role_id = int(cfg.get("leader_role_id", 0) or 0)
     role = inter.guild.get_role(role_id) if role_id else None
-    return bool(role and role in inter.user.roles)
+    return bool(role and int(role.id) in {int(r.id) for r in inter.user.roles})
 
 
 def _gcfg(guild_id: int) -> dict:
@@ -762,6 +784,7 @@ class AuctionDeliveryView(View):
         _mark_need_received_for_winner(self.guild_id, winner, str(auction.get("item_id", "") or ""))
         await _delete_auction_tracking_dms(inter.client, auction)
         await _delete_market_message(inter.client, auction)
+        await _delete_winner_dm_ref(inter.client, auction)
         save_auctions()
 
         emb = discord.Embed(
@@ -813,6 +836,78 @@ async def _dm_user(guild: discord.Guild, user_id: int, text: str) -> bool:
         return True
     except Exception:
         return False
+
+
+async def _delete_winner_dm_ref(client: discord.Client, auction: dict) -> bool:
+    cid = int(auction.get("winner_dm_channel_id", 0) or 0)
+    mid = int(auction.get("winner_dm_message_id", 0) or 0)
+    if not mid:
+        return False
+    try:
+        ch = client.get_channel(cid) if cid else None
+        if ch is None and cid:
+            ch = await client.fetch_channel(cid)
+        if ch is not None:
+            msg = await ch.fetch_message(mid)
+            await msg.delete()
+    except discord.NotFound:
+        pass
+    except Exception as e:
+        print(f"[loot_auction] Gewinner-DM konnte nicht gelöscht werden: {e!r}")
+        return False
+    auction["winner_dm_message_id"] = 0
+    auction["winner_dm_channel_id"] = 0
+    auction["winner_dm_deleted_at"] = _now_iso()
+    save_auctions()
+    return True
+
+
+async def cleanup_winner_dms_for_user(client: discord.Client, user_id: int, *, scan_history: bool = True) -> int:
+    """Delete tracked and legacy winner messages when the member opens the portal."""
+    deleted = 0
+    for _gid, g in list(auction_state.items()):
+        auctions = g.get("auctions") if isinstance(g.get("auctions"), dict) else {}
+        for auc in auctions.values():
+            if int(auc.get("winner_id", 0) or 0) != int(user_id):
+                continue
+            if int(auc.get("winner_dm_message_id", 0) or 0):
+                if await _delete_winner_dm_ref(client, auc):
+                    deleted += 1
+
+    if scan_history:
+        try:
+            user = client.get_user(int(user_id)) or await client.fetch_user(int(user_id))
+            dm = user.dm_channel or await user.create_dm()
+            bot_id = int(getattr(client.user, "id", 0) or 0)
+            async for msg in dm.history(limit=150):
+                if bot_id and int(msg.author.id) != bot_id:
+                    continue
+                content = str(msg.content or "")
+                if content.startswith("🏁 **Du hast eine Loot-Auktion gewonnen!**"):
+                    try:
+                        await msg.delete()
+                        deleted += 1
+                        await asyncio.sleep(0.05)
+                    except Exception:
+                        pass
+        except Exception as e:
+            print(f"[loot_auction] Legacy-Gewinner-DM Cleanup fehlgeschlagen: {e!r}")
+    return deleted
+
+
+async def _cleanup_expired_winner_dms(client: discord.Client) -> int:
+    now = _now()
+    deleted = 0
+    for _gid, g in list(auction_state.items()):
+        auctions = g.get("auctions") if isinstance(g.get("auctions"), dict) else {}
+        for auc in auctions.values():
+            if not int(auc.get("winner_dm_message_id", 0) or 0):
+                continue
+            delete_at = _parse_dt(str(auc.get("winner_dm_delete_at", "") or ""))
+            if delete_at and now >= delete_at:
+                if await _delete_winner_dm_ref(client, auc):
+                    deleted += 1
+    return deleted
 
 
 def _auction_dm_content(auction: dict, *, ended: bool = False, winner_id: int = 0) -> str:
@@ -1098,16 +1193,21 @@ async def _close_auction(client: discord.Client, guild_id: int, auction_id: str,
     await _refresh_auction_tracking_dms(client, guild_id, auction, ended=True, winner_id=winner)
     amount = int(top.get("amount", 0) or 0)
     try:
-        await _dm_user(
-            guild,
-            winner,
+        member = guild.get_member(winner) or await guild.fetch_member(winner)
+        winner_msg = await member.send(
             "🏁 **Du hast eine Loot-Auktion gewonnen!**\n\n"
             f"**Item:** {auction.get('item_name','Item')}\n"
             f"**Gebot:** {amount} EC\n\n"
             "Die Gildenleitung wird dir das Item übergeben. EC werden erst nach bestätigter Übergabe abgebucht."
         )
-    except Exception:
-        pass
+        auction["winner_id"] = winner
+        auction["winner_dm_channel_id"] = int(getattr(winner_msg.channel, "id", 0) or 0)
+        auction["winner_dm_message_id"] = int(winner_msg.id)
+        auction["winner_dm_sent_at"] = _now_iso()
+        auction["winner_dm_delete_at"] = (_now() + timedelta(hours=WINNER_DM_TTL_HOURS)).isoformat()
+        save_auctions()
+    except Exception as e:
+        print(f"[loot_auction] Gewinner-DM fehlgeschlagen: {e!r}")
 
     ch = _log_channel(client, guild_id)
     if ch:
@@ -1137,6 +1237,10 @@ async def auction_close_loop():
     if not client:
         return
     now = _now()
+    try:
+        await _cleanup_expired_winner_dms(client)
+    except Exception as e:
+        print(f"[loot_auction] Gewinner-DM Cleanup-Fehler: {e!r}")
     for gid_str, g in list(auction_state.items()):
         try:
             gid = int(gid_str)
@@ -1557,7 +1661,11 @@ async def start_loot_drop_auction(inter: discord.Interaction, guild: discord.Gui
     aid = _new_auction_id()
     chest_id = f"C{aid[1:]}"
     hours = NEED_AUCTION_HOURS if phase == "need" else FREE_AUCTION_HOURS
-    start_bid = NEED_START_BID if phase == "need" else FREE_START_BID
+    start_bid = (
+        MAIN_NEED_START_BID if mode == "main_need"
+        else SECONDARY_NEED_START_BID if mode == "secondary_need"
+        else FREE_START_BID
+    )
 
     chest_obj = {
         "id": chest_id,
@@ -1679,8 +1787,8 @@ async def setup_loot_auction(client: discord.Client, tree: app_commands.CommandT
                         client.add_view(AuctionBidView(gid, str(aid)), message_id=int(auc.get("message_id", 0) or 0) or None)
                 elif str(auc.get("status", "")) == "closed" and int(auc.get("delivery_message_id", 0) or 0):
                     client.add_view(AuctionDeliveryView(gid, str(aid)), message_id=int(auc.get("delivery_message_id", 0) or 0))
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[loot_auction] Persistent View Fehler {gid}/{aid}: {e!r}")
 
     if not auction_close_loop.is_running():
         auction_close_loop.start()
