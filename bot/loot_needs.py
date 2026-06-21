@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
-import threading
 import re
 import asyncio
 from pathlib import Path
@@ -90,34 +88,16 @@ GILDENBOSS_KEYWORDS = [
 _client_ref: Optional[discord.Client] = None
 
 
-_JSON_LOCK = threading.RLock()
-
-
 def _load_json(path: Path, default):
     try:
-        if not path.exists():
-            return default
         data = json.loads(path.read_text(encoding="utf-8"))
         return data if isinstance(data, type(default)) else default
-    except Exception as e:
-        print(f"[{Path(__file__).stem}] JSON-Lesefehler {path.name}: {e!r}")
+    except Exception:
         return default
 
 
 def _save_json(path: Path, obj) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    payload = json.dumps(obj, indent=2, ensure_ascii=False)
-    with _JSON_LOCK:
-        try:
-            tmp.write_text(payload, encoding="utf-8")
-            os.replace(tmp, path)
-        finally:
-            try:
-                if tmp.exists():
-                    tmp.unlink()
-            except Exception:
-                pass
+    path.write_text(json.dumps(obj, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
 loot_items: dict = _load_json(ITEMS_FILE, {})
@@ -191,7 +171,7 @@ def _is_leader_or_admin(inter: discord.Interaction) -> bool:
 
     role = inter.guild.get_role(role_id)
 
-    return bool(role and int(role.id) in {int(r.id) for r in inter.user.roles})
+    return bool(role and role in inter.user.roles)
 
 
 def _gitems(guild_id: int) -> dict:
@@ -228,6 +208,7 @@ def _blank_slot() -> dict:
     return {
         "item_id": "",
         "received": False,
+        "locked": False,
         "received_at": "",
         "received_by": 0,
     }
@@ -238,8 +219,13 @@ def _slot_obj(value: Any) -> dict:
         obj = dict(value)
         obj.setdefault("item_id", "")
         obj.setdefault("received", False)
+        obj.setdefault("locked", bool(obj.get("received", False)))
         obj.setdefault("received_at", "")
         obj.setdefault("received_by", 0)
+        if bool(obj.get("locked", False)):
+            obj["received"] = True
+        if bool(obj.get("received", False)):
+            obj["locked"] = True
         return obj
 
     if isinstance(value, str):
@@ -249,6 +235,7 @@ def _slot_obj(value: Any) -> dict:
         return {
             "item_id": value,
             "received": False,
+            "locked": False,
             "received_at": "",
             "received_by": 0,
         }
@@ -269,6 +256,7 @@ def _set_slot_item(data: dict, tab: str, slot: str, item_id: str) -> None:
     data[tab][slot] = {
         "item_id": str(item_id),
         "received": False,
+        "locked": False,
         "received_at": "",
         "received_by": 0,
     }
@@ -287,6 +275,7 @@ def _mark_slot_received(data: dict, tab: str, slot: str, received_by: int) -> bo
         return False
 
     obj["received"] = True
+    obj["locked"] = True
     obj["received_at"] = _now_iso()
     obj["received_by"] = int(received_by)
     data[tab][slot] = obj
@@ -301,6 +290,7 @@ def _unmark_slot_received(data: dict, tab: str, slot: str) -> bool:
         return False
 
     obj["received"] = False
+    obj["locked"] = False
     obj["received_at"] = ""
     obj["received_by"] = 0
     data[tab][slot] = obj
@@ -622,7 +612,7 @@ def _need_embed(guild: discord.Guild, user_id: int, tab: str = "Main") -> discor
         description=(
             f"**{name}**\n"
             f"Bereich: **{tab}**\n\n"
-            "✅ Erhaltene Items bleiben sichtbar, zählen aber nicht mehr als offener Need."
+            "🔒 Erhaltene Items bleiben dauerhaft sichtbar, der Slot ist gesperrt und zählt nicht mehr als offener Need."
         ),
         color=discord.Color.gold()
     )
@@ -639,7 +629,7 @@ def _need_embed(guild: discord.Guild, user_id: int, tab: str = "Main") -> discor
         if item_id:
             item_name = _item_name(guild.id, item_id, with_type=True)
             if bool(slot_data.get("received", False)):
-                item_name = f"{item_name} ✅ Erhalten"
+                item_name = f"{item_name} 🔒 Erhalten"
         else:
             item_name = "—"
 
@@ -680,7 +670,7 @@ def _format_need_user_full(guild: discord.Guild, user_id: int) -> str:
             if item_id:
                 item_name = _item_name(guild.id, item_id, with_type=True)
                 if bool(slot_data.get("received", False)):
-                    item_name = f"{item_name} ✅ Erhalten"
+                    item_name = f"{item_name} 🔒 Erhalten"
 
                 used.append(f"{slot}: {item_name}")
 
@@ -1811,9 +1801,8 @@ async def setup_loot_needs(client: discord.Client, tree: app_commands.CommandTre
 
     try:
         client.add_view(ReceivedReportReviewView())
-        print("✅ Loot-Needs Persistent Review-View registriert.")
-    except Exception as e:
-        print(f"[loot_needs] Persistent Review-View Fehler: {e!r}")
+    except Exception:
+        pass
 
     if not auto_loot_need_eventstart.is_running():
         auto_loot_need_eventstart.start()
@@ -2871,7 +2860,7 @@ class AdminLootActionWeaponTypeSelect(Select):
 
 class AdminItemAddModal(Modal):
     def __init__(self, guild_id: int, user_id: int, slot: str, weapon_type: str):
-        super().__init__(title="Item hinzufügen", timeout=300)
+        super().__init__(title="Item hinzufügen", timeout=None)
         self.guild_id = int(guild_id)
         self.user_id = int(user_id)
         self.slot = slot
