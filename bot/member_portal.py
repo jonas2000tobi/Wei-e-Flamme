@@ -995,6 +995,17 @@ async def ensure_portal_menu_for_user(
     if not member or member.bot:
         return False
 
+    # Winner notifications are temporary. Cleanup runs in the background so
+    # opening the portal remains fast even with a longer DM history.
+    try:
+        try:
+            from bot.loot_auction import cleanup_winner_dms_for_user  # type: ignore
+        except ModuleNotFoundError:
+            from loot_auction import cleanup_winner_dms_for_user  # type: ignore
+        asyncio.create_task(cleanup_winner_dms_for_user(client, user_id, scan_history=True))
+    except Exception as e:
+        print(f"[member_portal] Gewinner-DM Cleanup konnte nicht gestartet werden: {e!r}")
+
     msg = await _fetch_portal_message(client, guild_id, user_id)
 
     try:
@@ -4126,6 +4137,83 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
         print(f"⚠️ Fehlende Persistent Views: {', '.join(failed_views)}")
 
     if hasattr(client, "add_listener"):
+        async def _portal_stale_component_recovery(inter: discord.Interaction):
+            """Recover components whose original View vanished after a restart.
+
+            Valid views normally answer first. If nothing has answered after
+            2.2 seconds, replace the stale page with a fresh page in the same
+            portal section instead of showing Discord's interaction failure.
+            """
+            try:
+                if inter.type is not discord.InteractionType.component:
+                    return
+                data = inter.data if isinstance(inter.data, dict) else {}
+                custom_id = str(data.get("custom_id", "") or "")
+                if not custom_id:
+                    return
+                await asyncio.sleep(2.2)
+                if inter.response.is_done():
+                    return
+
+                guild, member = await _resolve_guild_member_from_inter(inter)
+                if not guild or not member:
+                    await inter.response.send_message("❌ Dein Ebolus-Server konnte nicht zugeordnet werden.", ephemeral=True)
+                    return
+                if inter.message:
+                    _mark_portal_sent(guild.id, member.id, inter.message.id)
+
+                if custom_id.startswith("need_"):
+                    try:
+                        try:
+                            from bot.loot_needs import open_need_menu  # type: ignore
+                        except ModuleNotFoundError:
+                            from loot_needs import open_need_menu  # type: ignore
+                        await open_need_menu(inter, guild.id, member.id)
+                    except Exception as e:
+                        print(f"[member_portal] Need-Recovery Fehler: {e!r}")
+                        await inter.response.edit_message(embed=_main_menu_embed(guild, member), view=MemberPortalMainView())
+                    return
+
+                if custom_id.startswith(("portal_auction", "portalauc:", "portalsale:", "lootauc:", "lootsale:")):
+                    try:
+                        try:
+                            from bot.loot_auction import open_auction_menu  # type: ignore
+                        except ModuleNotFoundError:
+                            from loot_auction import open_auction_menu  # type: ignore
+                        await open_auction_menu(inter, guild.id, member.id)
+                    except Exception as e:
+                        print(f"[member_portal] Auktions-Recovery Fehler: {e!r}")
+                        await inter.response.edit_message(embed=_main_menu_embed(guild, member), view=MemberPortalMainView())
+                    return
+
+                if custom_id.startswith("portal_profile"):
+                    await inter.response.edit_message(embed=_profile_embed(guild, member), view=ProfileView())
+                    return
+                if custom_id.startswith(("portal_personal", "portal_dm_")):
+                    emb = discord.Embed(title=f"{EMOJI_PERSONAL} Persönlich", description="Profil, Abwesenheit und Raid-/Event-DMs.", color=discord.Color.gold())
+                    await inter.response.edit_message(embed=emb, view=PersonalMenuView())
+                    return
+                if custom_id.startswith(("portal_admin", "admin_")):
+                    if _is_portal_admin(guild, member):
+                        emb = discord.Embed(title=f"{EMOJI_ADMIN} Admin", description="Interner Verwaltungsbereich für die Gildenleitung.", color=discord.Color.gold())
+                        await inter.response.edit_message(embed=emb, view=AdminMenuView())
+                    else:
+                        await inter.response.send_message("❌ Keine Berechtigung für den Adminbereich.", ephemeral=True)
+                    return
+                if custom_id.startswith("portal_guild"):
+                    emb = discord.Embed(title=f"{EMOJI_GUILD} Gilde", description="Kalender, Abwesenheiten und Mitgliederübersicht.", color=discord.Color.gold())
+                    await inter.response.edit_message(embed=emb, view=GuildMenuView())
+                    return
+                if custom_id.startswith(("portal_", "rules_", "help_")):
+                    await inter.response.edit_message(embed=_main_menu_embed(guild, member), view=MemberPortalMainView())
+            except Exception as e:
+                print(f"[member_portal] Stale-Component-Recovery Fehler: {e!r}")
+                try:
+                    if not inter.response.is_done():
+                        await inter.response.send_message("🔄 Diese alte Ansicht wurde ungültig. Öffne das Gildenmenü bitte erneut.", ephemeral=True)
+                except Exception:
+                    pass
+
         async def _portal_on_member_update(before: discord.Member, after: discord.Member):
             try:
                 if after.bot:
@@ -4166,6 +4254,7 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
                 pass
 
         try:
+            client.add_listener(_portal_stale_component_recovery, "on_interaction")
             client.add_listener(_portal_on_member_update, "on_member_update")
             client.add_listener(_portal_on_member_join, "on_member_join")
             client.add_listener(_portal_on_member_remove, "on_member_remove")
