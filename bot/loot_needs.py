@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import threading
 import re
 import asyncio
 from pathlib import Path
@@ -88,16 +90,34 @@ GILDENBOSS_KEYWORDS = [
 _client_ref: Optional[discord.Client] = None
 
 
+_JSON_LOCK = threading.RLock()
+
+
 def _load_json(path: Path, default):
     try:
+        if not path.exists():
+            return default
         data = json.loads(path.read_text(encoding="utf-8"))
         return data if isinstance(data, type(default)) else default
-    except Exception:
+    except Exception as e:
+        print(f"[{Path(__file__).stem}] JSON-Lesefehler {path.name}: {e!r}")
         return default
 
 
 def _save_json(path: Path, obj) -> None:
-    path.write_text(json.dumps(obj, indent=2, ensure_ascii=False), encoding="utf-8")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    payload = json.dumps(obj, indent=2, ensure_ascii=False)
+    with _JSON_LOCK:
+        try:
+            tmp.write_text(payload, encoding="utf-8")
+            os.replace(tmp, path)
+        finally:
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except Exception:
+                pass
 
 
 loot_items: dict = _load_json(ITEMS_FILE, {})
@@ -171,7 +191,7 @@ def _is_leader_or_admin(inter: discord.Interaction) -> bool:
 
     role = inter.guild.get_role(role_id)
 
-    return bool(role and role in inter.user.roles)
+    return bool(role and int(role.id) in {int(r.id) for r in inter.user.roles})
 
 
 def _gitems(guild_id: int) -> dict:
@@ -1791,8 +1811,9 @@ async def setup_loot_needs(client: discord.Client, tree: app_commands.CommandTre
 
     try:
         client.add_view(ReceivedReportReviewView())
-    except Exception:
-        pass
+        print("✅ Loot-Needs Persistent Review-View registriert.")
+    except Exception as e:
+        print(f"[loot_needs] Persistent Review-View Fehler: {e!r}")
 
     if not auto_loot_need_eventstart.is_running():
         auto_loot_need_eventstart.start()
@@ -2850,7 +2871,7 @@ class AdminLootActionWeaponTypeSelect(Select):
 
 class AdminItemAddModal(Modal):
     def __init__(self, guild_id: int, user_id: int, slot: str, weapon_type: str):
-        super().__init__(title="Item hinzufügen", timeout=None)
+        super().__init__(title="Item hinzufügen", timeout=300)
         self.guild_id = int(guild_id)
         self.user_id = int(user_id)
         self.slot = slot
