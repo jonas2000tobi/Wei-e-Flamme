@@ -1,5 +1,7 @@
 from __future__ import annotations
 import json
+import os
+import threading
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
@@ -17,6 +19,7 @@ DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 CFG_FILE = DATA_DIR / "leader_contact_cfg.json"
+_JSON_LOCK = threading.RLock()
 
 
 def _load_cfg() -> dict:
@@ -27,7 +30,18 @@ def _load_cfg() -> dict:
 
 
 def _save_cfg(obj: dict) -> None:
-    CFG_FILE.write_text(json.dumps(obj, indent=2, ensure_ascii=False), encoding="utf-8")
+    tmp = CFG_FILE.with_name(f".{CFG_FILE.name}.{os.getpid()}.tmp")
+    payload = json.dumps(obj, indent=2, ensure_ascii=False)
+    with _JSON_LOCK:
+        try:
+            tmp.write_text(payload, encoding="utf-8")
+            os.replace(tmp, CFG_FILE)
+        finally:
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except Exception:
+                pass
 
 
 cfg: dict = _load_cfg()
@@ -78,7 +92,7 @@ def _is_leader_or_admin(inter: discord.Interaction) -> bool:
     role = _leader_role(inter.guild)
     if not role or not isinstance(inter.user, discord.Member):
         return False
-    return role in inter.user.roles
+    return int(role.id) in {int(r.id) for r in inter.user.roles}
 
 
 def _replace_status_field(embed: discord.Embed, text: str) -> discord.Embed:
@@ -153,7 +167,7 @@ class LeaderStatusView(View):
 class ContactModal(Modal):
     def __init__(self, anonymous: bool):
         title = "Anonyme Meldung" if anonymous else "Leader kontaktieren"
-        super().__init__(title=title, timeout=None)
+        super().__init__(title=title, timeout=300)
         self.anonymous = anonymous
 
         self.topic = TextInput(
