@@ -36,6 +36,7 @@ setup_alliance_config = None
 setup_dkp_system = None
 setup_loot_auction = None
 store = {}
+_modules_initialized = False
 
 
 def _import_modules():
@@ -179,34 +180,59 @@ def _get_token() -> str | None:
 
 @bot.event
 async def on_ready():
+    global _modules_initialized
     print(f"✅ Eingeloggt als {bot.user} (ID: {bot.user.id})")
 
-    try:
+    # on_ready can fire again after a gateway reconnect. Registering commands,
+    # listeners and persistent views more than once causes duplicate handlers.
+    if not _modules_initialized:
         _import_modules()
 
-        await setup_rsvp_dm(bot, tree)
-        await setup_onboarding(bot, tree)
-        await setup_leader_contact(bot, tree)
-        await setup_raid_templates(bot, tree)
-        await setup_weekly_report(bot, tree)
-        await setup_member_portal(bot, tree)
-        await setup_loot_needs(bot, tree)
-        await setup_alliance_config(bot, tree)
-        await setup_dkp_system(bot, tree)
-        await setup_loot_auction(bot, tree)
+        async def _safe_setup(name: str, setup_func):
+            if setup_func is None:
+                print(f"⚠️ Setup übersprungen: {name} ist nicht geladen")
+                return False
+            try:
+                await setup_func(bot, tree)
+                print(f"✅ Setup: {name}")
+                return True
+            except Exception as e:
+                print(f"❌ Setup-Fehler {name}: {e!r}")
+                return False
 
-        register_join_hook(bot, send_onboarding_dm, auto_resend_for_new_member)
+        # Alliance/Home-Server first, then the portal and its child modules.
+        setup_steps = [
+            ("alliance_config", setup_alliance_config),
+            ("event_rsvp_dm", setup_rsvp_dm),
+            ("onboarding", setup_onboarding),
+            ("leader_contact", setup_leader_contact),
+            ("raid_templates", setup_raid_templates),
+            ("weekly_report", setup_weekly_report),
+            ("dkp_system", setup_dkp_system),
+            ("loot_needs", setup_loot_needs),
+            ("loot_auction", setup_loot_auction),
+            ("member_portal", setup_member_portal),
+        ]
+        results = []
+        for module_name, setup_func in setup_steps:
+            results.append(await _safe_setup(module_name, setup_func))
 
-        print("✅ Module geladen.")
+        try:
+            register_join_hook(bot, send_onboarding_dm, auto_resend_for_new_member)
+            print("✅ Join-Hook registriert.")
+        except Exception as e:
+            print(f"❌ Join-Hook Setup-Fehler: {e!r}")
 
-    except Exception as e:
-        print(f"⚠️ Modul-Setup Fehler: {e}")
+        try:
+            synced = await tree.sync()
+            print(f"✅ Slash-Commands synchronisiert: {len(synced)}")
+        except Exception as e:
+            print(f"⚠️ Sync-Fehler: {e!r}")
 
-    try:
-        synced = await tree.sync()
-        print(f"✅ Slash-Commands synchronisiert: {len(synced)}")
-    except Exception as e:
-        print(f"⚠️ Sync-Fehler: {e}")
+        _modules_initialized = True
+        print(f"✅ Module einmalig initialisiert: {sum(results)}/{len(results)}")
+    else:
+        print("ℹ️ Gateway-Reconnect: Module werden nicht doppelt registriert.")
 
     if not cleanup_expired_events.is_running():
         cleanup_expired_events.start()
