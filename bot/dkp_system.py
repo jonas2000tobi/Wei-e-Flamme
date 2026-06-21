@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
-import threading
 import math
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -50,36 +48,23 @@ DEFAULT_EVENT_POINTS = {
 
 DEFAULT_DECAY_PERCENT = 15.0
 DEFAULT_RESERVE_FACTOR = 0.5
-
-
-_JSON_LOCK = threading.RLock()
+DEFAULT_WEEKLY_EVENT_LIMIT = 40
+DEFAULT_START_BALANCE = 20
+DEFAULT_DECAY_PROTECTED_BALANCE = 50
+WEEKLY_RESET_WEEKDAY = 3  # Donnerstag
+WEEKLY_RESET_HOUR = 10
 
 
 def _load_json(path: Path, default):
     try:
-        if not path.exists():
-            return default
         data = json.loads(path.read_text(encoding="utf-8"))
         return data if isinstance(data, type(default)) else default
-    except Exception as e:
-        print(f"[{Path(__file__).stem}] JSON-Lesefehler {path.name}: {e!r}")
+    except Exception:
         return default
 
 
 def _save_json(path: Path, obj) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    payload = json.dumps(obj, indent=2, ensure_ascii=False)
-    with _JSON_LOCK:
-        try:
-            tmp.write_text(payload, encoding="utf-8")
-            os.replace(tmp, path)
-        finally:
-            try:
-                if tmp.exists():
-                    tmp.unlink()
-            except Exception:
-                pass
+    path.write_text(json.dumps(obj, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
 dkp_cfg: dict = _load_json(DKP_CFG_FILE, {})
@@ -134,7 +119,7 @@ def _is_leader_or_admin(inter: discord.Interaction) -> bool:
     c = leader_cfg.get(str(inter.guild.id)) or {}
     role_id = int(c.get("leader_role_id", 0) or 0)
     role = inter.guild.get_role(role_id) if role_id else None
-    return bool(role and int(role.id) in {int(r.id) for r in inter.user.roles})
+    return bool(role and role in inter.user.roles)
 
 
 def _home_guild_id(default: int = 0) -> int:
@@ -154,6 +139,12 @@ def _gcfg(guild_id: int) -> dict:
     c.setdefault("log_channel_id", 0)
     c.setdefault("decay_percent", DEFAULT_DECAY_PERCENT)
     c.setdefault("reserve_factor", DEFAULT_RESERVE_FACTOR)
+    c.setdefault("weekly_event_limit", DEFAULT_WEEKLY_EVENT_LIMIT)
+    c.setdefault("start_balance", DEFAULT_START_BALANCE)
+    c.setdefault("decay_protected_balance", DEFAULT_DECAY_PROTECTED_BALANCE)
+    c.setdefault("weekly_reset_weekday", WEEKLY_RESET_WEEKDAY)
+    c.setdefault("weekly_reset_hour", WEEKLY_RESET_HOUR)
+    c.setdefault("last_decay_period", "")
     pts = c.get("event_points") if isinstance(c.get("event_points"), dict) else {}
     for k, v in DEFAULT_EVENT_POINTS.items():
         pts.setdefault(k, v)
@@ -179,12 +170,101 @@ def _gtx(guild_id: int) -> list:
     return arr
 
 
-def get_balance(guild_id: int, user_id: int) -> int:
-    users = _gbal(guild_id).setdefault("users", {})
+def _weekly_period_start(now: Optional[datetime] = None) -> datetime:
+    """Aktuelle EC-Woche: Donnerstag 10:00 bis Donnerstag 09:59:59."""
+    now = (now or datetime.now(TZ)).astimezone(TZ)
+    days_since_reset = (now.weekday() - WEEKLY_RESET_WEEKDAY) % 7
+    start_date = (now - timedelta(days=days_since_reset)).date()
+    start = datetime(
+        start_date.year,
+        start_date.month,
+        start_date.day,
+        WEEKLY_RESET_HOUR,
+        0,
+        0,
+        tzinfo=TZ,
+    )
+    if now < start:
+        start -= timedelta(days=7)
+    return start
+
+
+def _weekly_period_key(now: Optional[datetime] = None) -> str:
+    return _weekly_period_start(now).strftime("%Y-%m-%dT%H:%M%z")
+
+
+def _tx_datetime(tx: dict) -> Optional[datetime]:
     try:
-        return int(users.get(str(int(user_id)), 0) or 0)
+        dt = datetime.fromisoformat(str(tx.get("created_at", "") or ""))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=TZ)
+        return dt.astimezone(TZ)
     except Exception:
-        return 0
+        return None
+
+
+def weekly_event_earned(guild_id: int, user_id: int, now: Optional[datetime] = None) -> int:
+    start = _weekly_period_start(now)
+    total = 0
+    for tx in _gtx(guild_id):
+        if int(tx.get("user_id", 0) or 0) != int(user_id):
+            continue
+        if str(tx.get("type", "") or "") != "event_award":
+            continue
+        amount = int(tx.get("amount", 0) or 0)
+        if amount <= 0:
+            continue
+        created = _tx_datetime(tx)
+        if created and created >= start:
+            total += amount
+    return total
+
+
+def weekly_event_remaining(guild_id: int, user_id: int, now: Optional[datetime] = None) -> int:
+    limit = int(_gcfg(guild_id).get("weekly_event_limit", DEFAULT_WEEKLY_EVENT_LIMIT) or 0)
+    return max(0, limit - weekly_event_earned(guild_id, user_id, now))
+
+
+def _append_starting_balance_transaction(guild_id: int, user_id: int, amount: int) -> None:
+    tx = {
+        "id": f"{datetime.now(TZ).strftime('%Y%m%d%H%M%S%f')}-{int(user_id)}-start",
+        "created_at": _now_iso(),
+        "guild_id": int(guild_id),
+        "user_id": int(user_id),
+        "amount": int(amount),
+        "balance_before": 0,
+        "balance_after": int(amount),
+        "reason": "Startguthaben für neues Gildenmitglied",
+        "actor_id": 0,
+        "type": "starting_balance",
+        "event_id": "",
+        "meta": {"automatic": True},
+    }
+    _gtx(guild_id).append(tx)
+    save_transactions()
+
+
+def _ensure_start_balance(guild_id: int, user_id: int) -> int:
+    users = _gbal(guild_id).setdefault("users", {})
+    key = str(int(user_id))
+    if key in users:
+        try:
+            return int(users.get(key, 0) or 0)
+        except Exception:
+            users[key] = 0
+            save_balances()
+            return 0
+
+    amount = int(_gcfg(guild_id).get("start_balance", DEFAULT_START_BALANCE) or 0)
+    users[key] = amount
+    save_balances()
+    if amount:
+        _append_starting_balance_transaction(guild_id, user_id, amount)
+    return amount
+
+
+def get_balance(guild_id: int, user_id: int) -> int:
+    return _ensure_start_balance(guild_id, user_id)
 
 
 def set_balance(guild_id: int, user_id: int, value: int) -> None:
@@ -203,8 +283,26 @@ def _add_transaction(
     event_id: str = "",
     meta: Optional[dict] = None,
 ) -> dict:
+    requested_amount = int(amount)
+    actual_amount = requested_amount
+    tx_meta = dict(meta or {})
+
+    # Nur echte Eventgutschriften zählen in das Wochenlimit.
+    # Leader-/Admin-Gutschriften (manual_adjust) bleiben vollständig außerhalb.
+    if str(tx_type) == "event_award" and requested_amount > 0:
+        remaining = weekly_event_remaining(guild_id, user_id)
+        actual_amount = min(requested_amount, remaining)
+        tx_meta.update({
+            "requested_amount": requested_amount,
+            "weekly_limit": int(_gcfg(guild_id).get("weekly_event_limit", DEFAULT_WEEKLY_EVENT_LIMIT) or 0),
+            "weekly_earned_before": weekly_event_earned(guild_id, user_id),
+            "weekly_remaining_before": remaining,
+            "weekly_period_start": _weekly_period_start().isoformat(),
+            "limited": actual_amount < requested_amount,
+        })
+
     before = get_balance(guild_id, user_id)
-    after = before + int(amount)
+    after = before + actual_amount
     set_balance(guild_id, user_id, after)
 
     tx = {
@@ -212,18 +310,108 @@ def _add_transaction(
         "created_at": _now_iso(),
         "guild_id": int(guild_id),
         "user_id": int(user_id),
-        "amount": int(amount),
+        "amount": int(actual_amount),
         "balance_before": int(before),
         "balance_after": int(after),
         "reason": _safe_text(reason),
         "actor_id": int(actor_id),
         "type": str(tx_type),
         "event_id": str(event_id or ""),
-        "meta": meta or {},
+        "meta": tx_meta,
     }
     _gtx(guild_id).append(tx)
     save_transactions()
     return tx
+
+
+def _apply_weekly_decay(guild_id: int, actor_id: int = 0) -> list[tuple[int, int]]:
+    c = _gcfg(guild_id)
+    percent = float(c.get("decay_percent", DEFAULT_DECAY_PERCENT) or 0)
+    protected = int(c.get("decay_protected_balance", DEFAULT_DECAY_PROTECTED_BALANCE) or 0)
+    users = _gbal(guild_id).setdefault("users", {})
+    changed: list[tuple[int, int]] = []
+
+    for uid_s, old_v in list(users.items()):
+        try:
+            uid = int(uid_s)
+            old = int(old_v or 0)
+        except Exception:
+            continue
+
+        if old <= protected or percent <= 0:
+            continue
+
+        taxable = old - protected
+        kept_taxable = int(math.floor(taxable * (1.0 - percent / 100.0)))
+        new = protected + kept_taxable
+        diff = new - old
+        if diff == 0:
+            continue
+
+        _add_transaction(
+            guild_id,
+            uid,
+            diff,
+            f"Wöchentlicher EC-Verfall ({percent:.1f}% nur über {protected} EC)",
+            actor_id,
+            "weekly_decay",
+            meta={
+                "protected_balance": protected,
+                "decay_percent": percent,
+                "weekly_period": _weekly_period_key(),
+                "automatic": actor_id == 0,
+            },
+        )
+        changed.append((uid, diff))
+
+    return changed
+
+
+async def _run_scheduled_weekly_reset(client: discord.Client) -> None:
+    """Führt den Wochenreset einmal pro Donnerstag-10-Uhr-Periode aus.
+
+    Falls der Bot um 10:00 offline ist, wird der Reset beim nächsten Lauf nachgeholt.
+    Beim ersten Start wird nur die aktuelle Periode vermerkt, ohne sofortigen Verfall.
+    """
+    now = datetime.now(TZ)
+    current_key = _weekly_period_key(now)
+
+    for guild in getattr(client, "guilds", []) or []:
+        home_id = _home_guild_id(default=guild.id)
+        if int(guild.id) != int(home_id):
+            continue
+
+        c = _gcfg(guild.id)
+        last_key = str(c.get("last_decay_period", "") or "")
+
+        if not last_key:
+            c["last_decay_period"] = current_key
+            dkp_cfg[str(guild.id)] = c
+            save_cfg()
+            continue
+
+        if last_key == current_key:
+            continue
+
+        changed = _apply_weekly_decay(guild.id, actor_id=0)
+        c["last_decay_period"] = current_key
+        c["last_decay_at"] = now.isoformat()
+        dkp_cfg[str(guild.id)] = c
+        save_cfg()
+
+        emb = discord.Embed(
+            title="📉 Automatischer EC-Wochenreset",
+            description=(
+                f"Reset: **Donnerstag 10:00 Uhr**\n"
+                f"Event-Wochenlimit: **{int(c.get('weekly_event_limit', DEFAULT_WEEKLY_EVENT_LIMIT))} EC**\n"
+                f"Verfall: **{float(c.get('decay_percent', DEFAULT_DECAY_PERCENT)):.1f}%** "
+                f"nur auf den Anteil über **{int(c.get('decay_protected_balance', DEFAULT_DECAY_PROTECTED_BALANCE))} EC**\n"
+                f"Betroffene Konten: **{len(changed)}**"
+            ),
+            color=discord.Color.orange(),
+            timestamp=now,
+        )
+        await _log_to_channel(client, guild.id, emb)
 
 
 def _format_amount(amount: int) -> str:
@@ -414,16 +602,18 @@ async def _award_event_now(
         return False, "Keine bestätigten Ebolus-Teilnehmer mit Status 'War da' gefunden.", None
 
     for row in awarded:
-        _add_transaction(
+        tx = _add_transaction(
             int(guild_id),
             int(row["user_id"]),
-            int(row["points"]),
+            int(row["requested_points"]),
             f"Event-Teilnahme: {event.get('title', 'Event')} ({event_type})",
             int(getattr(actor, "id", 0) or 0),
             "event_award",
             event_id=str(event_id),
             meta={"event_type": event_type, "signup": row.get("signup", ""), "event_title": str(event.get("title", "Event") or "Event")},
         )
+        row["points"] = int(tx.get("amount", 0) or 0)
+        row["weekly_limited"] = row["points"] < int(row.get("requested_points", row["points"]) or 0)
 
     st = _event_check_state(int(guild_id), str(event_id))
     st["awarded"] = True
@@ -569,6 +759,11 @@ async def dkp_event_check_loop():
     client = getattr(dkp_event_check_loop, "_client", None)
     if client is None:
         return
+    try:
+        await _run_scheduled_weekly_reset(client)
+    except Exception as e:
+        print(f"[dkp_system] Automatischer Wochenreset fehlgeschlagen: {e!r}")
+
     rsvp = _import_rsvp()
     if not rsvp:
         return
@@ -699,11 +894,15 @@ def _attendance_summary_for_award(client: discord.Client, home_guild_id: int, ev
         if not _is_ebolus_member(client, home_guild_id, uid):
             skipped_not_ebolus.append(row)
             continue
+        requested = reserve_points if signup == "BANK" else base_points
+        remaining = weekly_event_remaining(home_guild_id, uid)
+        row["requested_points"] = requested
+        row["points"] = min(requested, remaining)
+        row["weekly_remaining_before"] = remaining
+        row["weekly_limited"] = row["points"] < requested
         if signup == "BANK":
-            row["points"] = reserve_points
             reserve.append(row)
         else:
-            row["points"] = base_points
             present.append(row)
 
     return present, reserve, skipped_not_ebolus, skipped_not_present
@@ -712,7 +911,10 @@ def _attendance_summary_for_award(client: discord.Client, home_guild_id: int, ev
 async def setup_dkp_system(client: discord.Client, tree: app_commands.CommandTree):
     # Initialisiert Defaults für alle aktuell bekannten Guilds.
     for guild in getattr(client, "guilds", []) or []:
-        _gcfg(int(guild.id))
+        c = _gcfg(int(guild.id))
+        if not str(c.get("last_decay_period", "") or ""):
+            c["last_decay_period"] = _weekly_period_key()
+            dkp_cfg[str(int(guild.id))] = c
     save_cfg()
 
     # Wichtig: Discord erlaubt global maximal 100 Top-Level Slash-Commands.
@@ -819,7 +1021,18 @@ async def setup_dkp_system(client: discord.Client, tree: app_commands.CommandTre
         )
         log_id = int(c.get("log_channel_id", 0) or 0)
         emb.add_field(name="Reserve", value=f"{float(c.get('reserve_factor', DEFAULT_RESERVE_FACTOR)) * 100:.0f}% des Eventwertes, aufgerundet", inline=False)
-        emb.add_field(name="Wöchentlicher Verfall", value=f"{float(c.get('decay_percent', DEFAULT_DECAY_PERCENT)):.1f}%", inline=True)
+        emb.add_field(name="Wochenlimit aus Events", value=f"{int(c.get('weekly_event_limit', DEFAULT_WEEKLY_EVENT_LIMIT))} EC", inline=True)
+        emb.add_field(name="Reset", value="Donnerstag 10:00 Uhr", inline=True)
+        emb.add_field(name="Startguthaben", value=f"{int(c.get('start_balance', DEFAULT_START_BALANCE))} EC", inline=True)
+        emb.add_field(
+            name="Wöchentlicher Verfall",
+            value=(
+                f"{float(c.get('decay_percent', DEFAULT_DECAY_PERCENT)):.1f}% "
+                f"nur über {int(c.get('decay_protected_balance', DEFAULT_DECAY_PROTECTED_BALANCE))} EC"
+            ),
+            inline=True,
+        )
+        emb.add_field(name="Leader-Gutschriften", value="Nicht Teil des Wochenlimits", inline=True)
         emb.add_field(name="Log-Kanal", value=(f"<#{log_id}>" if log_id else "Nicht gesetzt"), inline=True)
         await inter.response.send_message(embed=emb, ephemeral=True)
 
@@ -924,16 +1137,18 @@ async def setup_dkp_system(client: discord.Client, tree: app_commands.CommandTre
             return
 
         for row in awarded:
-            _add_transaction(
+            tx = _add_transaction(
                 int(home_id),
                 int(row["user_id"]),
-                int(row["points"]),
+                int(row["requested_points"]),
                 f"Event-Teilnahme: {event.get('title', 'Event')} ({resolved_event_type})",
                 inter.user.id,
                 "event_award",
                 event_id=str(event_id),
                 meta={"event_type": resolved_event_type, "signup": row.get("signup", ""), "event_title": str(event.get("title", "Event") or "Event")},
             )
+            row["points"] = int(tx.get("amount", 0) or 0)
+            row["weekly_limited"] = row["points"] < int(row.get("requested_points", row["points"]) or 0)
 
         emb = _award_log_embed(event, resolved_event_type, present, reserve, skipped_partner, skipped_open, inter.user)
         await _log_to_channel(client, int(home_id), emb)
@@ -995,31 +1210,24 @@ async def setup_dkp_system(client: discord.Client, tree: app_commands.CommandTre
         if not confirm:
             await inter.followup.send("❌ Sicherheitsabfrage: Setze `confirm:true`, wenn du den Verfall ausführen willst.", ephemeral=True)
             return
-        percent = float(_gcfg(inter.guild.id).get("decay_percent", DEFAULT_DECAY_PERCENT) or 0)
+        c = _gcfg(inter.guild.id)
+        percent = float(c.get("decay_percent", DEFAULT_DECAY_PERCENT) or 0)
+        protected = int(c.get("decay_protected_balance", DEFAULT_DECAY_PROTECTED_BALANCE) or 0)
         users = _gbal(inter.guild.id).setdefault("users", {})
         if not users:
             await inter.followup.send("Keine EC-Konten vorhanden.", ephemeral=True)
             return
-        changed = []
-        for uid_s, old_v in list(users.items()):
-            try:
-                uid = int(uid_s)
-                old = int(old_v or 0)
-            except Exception:
-                continue
-            new = int(math.floor(old * (1.0 - percent / 100.0)))
-            diff = new - old
-            if diff == 0:
-                continue
-            _add_transaction(inter.guild.id, uid, diff, f"Wöchentlicher EC-Verfall ({percent:.1f}%)", inter.user.id, "weekly_decay")
-            changed.append((uid, diff))
+        changed = _apply_weekly_decay(inter.guild.id, actor_id=int(inter.user.id))
         emb = discord.Embed(title="📉 EC-Verfall ausgeführt", color=discord.Color.orange())
         lines = []
         for uid, diff in changed[:30]:
             lines.append(f"• <@{uid}>: **{_format_amount(diff)} EC**")
         if not lines:
             lines = ["Keine Änderungen."]
-        emb.description = f"Regel: **-{percent:.1f}%**\nÖffentliche Gesamtstände werden nicht angezeigt.\n\n" + "\n".join(lines)
+        emb.description = (
+            f"Regel: **-{percent:.1f}% nur auf den Anteil über {protected} EC**\n"
+            "Öffentliche Gesamtstände werden nicht angezeigt.\n\n" + "\n".join(lines)
+        )
         if len(changed) > 30:
             emb.description += f"\n… {len(changed) - 30} weitere"
         emb.set_footer(text=f"Ausgeführt von {inter.user} • {datetime.now(TZ).strftime('%d.%m.%Y %H:%M')}")
@@ -1043,9 +1251,21 @@ def _award_preview_embed(event: dict, event_type: str, present: list[dict], rese
     emb.description = f"**{title}**\nZeit: {when}\nTyp: **{event_type}**"
     if duplicate:
         emb.add_field(name="⚠️ Hinweis", value="Für dieses Event und diesen Typ wurden bereits DKP vergeben.", inline=False)
-    lines = [f"• <@{x['user_id']}>: **+{x['points']} DKP**" for x in present]
+    lines = [
+        (
+            f"• <@{x['user_id']}>: **+{x['points']} EC**"
+            + (f" (Limit: statt {x.get('requested_points')} EC)" if x.get("weekly_limited") else "")
+        )
+        for x in present
+    ]
     emb.add_field(name="✅ Ebolus – Teilnahme", value="\n".join(lines)[:1000] if lines else "—", inline=False)
-    lines = [f"• <@{x['user_id']}>: **+{x['points']} DKP**" for x in reserve]
+    lines = [
+        (
+            f"• <@{x['user_id']}>: **+{x['points']} EC**"
+            + (f" (Limit: statt {x.get('requested_points')} EC)" if x.get("weekly_limited") else "")
+        )
+        for x in reserve
+    ]
     emb.add_field(name="🏦 Ebolus – Reserve", value="\n".join(lines)[:1000] if lines else "—", inline=False)
     lines = [f"• {x.get('name') or ('User ' + str(x['user_id']))}" for x in skipped_partner]
     emb.add_field(name="🤝 Allianz/Partner – keine DKP", value="\n".join(lines)[:1000] if lines else "—", inline=False)
@@ -1056,9 +1276,9 @@ def _award_preview_embed(event: dict, event_type: str, present: list[dict], rese
 
 def _award_log_embed(event: dict, event_type: str, present: list[dict], reserve: list[dict], skipped_partner: list[dict], skipped_open: list[dict], actor: discord.abc.User) -> discord.Embed:
     emb = _award_preview_embed(event, event_type, present, reserve, skipped_partner, skipped_open, duplicate=False)
-    emb.title = "💰 DKP vergeben"
+    emb.title = "💰 EC vergeben"
     emb.color = discord.Color.green()
     total = sum(int(x.get("points", 0) or 0) for x in present + reserve)
-    emb.add_field(name="Summe", value=f"**{total} DKP** an **{len(present) + len(reserve)}** Ebolus-Spieler", inline=False)
+    emb.add_field(name="Summe", value=f"**{total} EC** an **{len(present) + len(reserve)}** Ebolus-Spieler", inline=False)
     emb.set_footer(text=f"Bestätigt von {actor} • {datetime.now(TZ).strftime('%d.%m.%Y %H:%M')}")
     return emb
