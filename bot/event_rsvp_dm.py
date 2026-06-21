@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import threading
 import asyncio
 from pathlib import Path
 from typing import Dict, Optional, Iterable, List, Any
@@ -67,15 +69,34 @@ LEADER_CONTACT_CFG_FILE = DATA_DIR / "leader_contact_cfg.json"
 ATTENDANCE_FILE = DATA_DIR / "event_attendance.json"
 
 
+_JSON_LOCK = threading.RLock()
+
+
 def _load(p: Path, default):
     try:
-        return json.loads(p.read_text(encoding="utf-8"))
-    except Exception:
+        if not p.exists():
+            return default
+        data = json.loads(p.read_text(encoding="utf-8"))
+        return data if isinstance(data, type(default)) else default
+    except Exception as e:
+        print(f"[event_rsvp_dm] JSON-Lesefehler {p.name}: {e!r}")
         return default
 
 
 def _save(p: Path, obj):
-    p.write_text(json.dumps(obj, indent=2, ensure_ascii=False), encoding="utf-8")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_name(f".{p.name}.{os.getpid()}.tmp")
+    payload = json.dumps(obj, indent=2, ensure_ascii=False)
+    with _JSON_LOCK:
+        try:
+            tmp.write_text(payload, encoding="utf-8")
+            os.replace(tmp, p)
+        finally:
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except Exception:
+                pass
 
 
 store: Dict[str, dict] = _load(RSVP_FILE, {})
