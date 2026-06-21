@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -16,16 +18,34 @@ ALLIANCE_FILE = DATA_DIR / "alliance_config.json"
 LEADER_CONTACT_CFG_FILE = DATA_DIR / "leader_contact_cfg.json"
 
 
+_JSON_LOCK = threading.RLock()
+
+
 def _load_json(path: Path, default):
     try:
+        if not path.exists():
+            return default
         data = json.loads(path.read_text(encoding="utf-8"))
         return data if isinstance(data, type(default)) else default
-    except Exception:
+    except Exception as e:
+        print(f"[{Path(__file__).stem}] JSON-Lesefehler {path.name}: {e!r}")
         return default
 
 
 def _save_json(path: Path, obj) -> None:
-    path.write_text(json.dumps(obj, indent=2, ensure_ascii=False), encoding="utf-8")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    payload = json.dumps(obj, indent=2, ensure_ascii=False)
+    with _JSON_LOCK:
+        try:
+            tmp.write_text(payload, encoding="utf-8")
+            os.replace(tmp, path)
+        finally:
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except Exception:
+                pass
 
 
 alliance_cfg: dict = _load_json(ALLIANCE_FILE, {})
@@ -171,7 +191,7 @@ def _is_leader_or_admin(inter: discord.Interaction) -> bool:
         return False
 
     role = inter.guild.get_role(role_id)
-    return bool(role and role in inter.user.roles)
+    return bool(role and int(role.id) in {int(r.id) for r in inter.user.roles})
 
 
 def _is_home_guild(inter: discord.Interaction) -> bool:
