@@ -3,6 +3,9 @@ from __future__ import annotations
 import json
 import re
 import asyncio
+import os
+import threading
+import time
 from pathlib import Path
 from datetime import datetime, date, timedelta
 from typing import Optional, Any, Tuple
@@ -81,15 +84,37 @@ LEADER_CONTACT_CFG_FILE = DATA_DIR / "leader_contact_cfg.json"
 AUCTION_FILE = DATA_DIR / "loot_auctions.json"
 
 
+_JSON_WRITE_LOCK = threading.RLock()
+
+
 def _load_json(path: Path, default):
+    """Load JSON safely and log real corruption instead of hiding it."""
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
+        if not path.exists():
+            return default
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, type(default)) else default
+    except Exception as e:
+        print(f"[member_portal] JSON-Lesefehler in {path.name}: {e!r}")
         return default
 
 
 def _save_json(path: Path, obj) -> None:
-    path.write_text(json.dumps(obj, indent=2, ensure_ascii=False), encoding="utf-8")
+    """Atomic JSON write to avoid half-written files after restarts/crashes."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(obj, indent=2, ensure_ascii=False)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+
+    with _JSON_WRITE_LOCK:
+        try:
+            tmp.write_text(payload, encoding="utf-8")
+            os.replace(tmp, path)
+        finally:
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except Exception:
+                pass
 
 
 cfg: dict = _load_json(CFG_FILE, {})
@@ -114,7 +139,14 @@ def _is_admin(inter: discord.Interaction) -> bool:
     return bool(perms and (perms.administrator or perms.manage_guild))
 
 
+def _member_role_ids(member: Optional[discord.Member]) -> set[int]:
+    if member is None:
+        return set()
+    return {int(role.id) for role in getattr(member, "roles", [])}
+
+
 def _is_portal_admin(guild: Optional[discord.Guild], member: Optional[discord.Member]) -> bool:
+    """Portal rights for leader, advisor, guardian and Discord managers."""
     if guild is None or member is None:
         return False
 
@@ -122,30 +154,28 @@ def _is_portal_admin(guild: Optional[discord.Guild], member: Optional[discord.Me
     if perms and (perms.administrator or perms.manage_guild):
         return True
 
-    try:
-        c = _gcfg(guild.id)
-        roles = c.get("position_roles") or {}
-        for key in ("leader", "advisor", "guardian"):
-            role_id = int(roles.get(key, 0) or 0)
-            if not role_id:
-                continue
-            role = guild.get_role(role_id)
-            if role and role in member.roles:
-                return True
-    except Exception:
-        pass
+    member_role_ids = _member_role_ids(member)
 
     try:
-        leader_cfg = _get_leader_cfg(guild.id)
-        role_id = int(leader_cfg.get("leader_role_id", 0) or 0)
-        role = guild.get_role(role_id) if role_id else None
-        if role and role in member.roles:
+        roles = (_gcfg(guild.id).get("position_roles") or {})
+        allowed_ids = {
+            int(roles.get(key, 0) or 0)
+            for key in ("leader", "advisor", "guardian")
+        }
+        allowed_ids.discard(0)
+        if member_role_ids.intersection(allowed_ids):
             return True
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[member_portal] Positionsrollen-Prüfung fehlgeschlagen: {e!r}")
+
+    try:
+        leader_role_id = int(_get_leader_cfg(guild.id).get("leader_role_id", 0) or 0)
+        if leader_role_id and leader_role_id in member_role_ids:
+            return True
+    except Exception as e:
+        print(f"[member_portal] Leaderrollen-Prüfung fehlgeschlagen: {e!r}")
 
     return False
-
 
 def _safe_text(s: str) -> str:
     return (s or "").replace("@", "@\u200b").strip()
@@ -258,57 +288,8 @@ def _clear_portal_sent(guild_id: int, user_id: int) -> None:
 
 
 def _resolve_guild_for_user(client: discord.Client, user_id: int) -> Optional[discord.Guild]:
-    """
-    Wichtig bei Allianz-/Multi-Server-Betrieb:
-    Der Bot ist auf mehreren Discords. Für das private Gildenmenü müssen wir
-    den echten Ebolus/Home-Server nehmen, nicht irgendeinen Partner-Server,
-    auf dem der User zufällig auch ist.
-    """
+    """Resolve DM interactions to the Ebolus home guild deterministically."""
 
-    # 1. Bevorzugt: Server, auf dem der User die gesetzte Gildenmitglied-Rolle hat.
-    for guild in client.guilds:
-        try:
-            c = _gcfg(guild.id)
-            member_role_id = int(c.get("member_role_id", 0) or 0)
-
-            if not member_role_id:
-                continue
-
-            role = guild.get_role(member_role_id)
-
-            if not role:
-                continue
-
-            member = guild.get_member(user_id)
-
-            if member and not member.bot and role in member.roles:
-                return guild
-
-        except Exception:
-            continue
-
-    # 2. Bevorzugt: Server, für den bereits ein Portal-Menü für diesen User gespeichert ist.
-    for guild_id_str, g in list(sent_state.items()):
-        try:
-            guild_id = int(guild_id_str)
-            guild = client.get_guild(guild_id)
-
-            if not guild:
-                continue
-
-            sent_users = {str(x) for x in g.get("sent_users", [])}
-            users = g.get("users", {}) or {}
-
-            if str(user_id) in sent_users or str(user_id) in users:
-                member = guild.get_member(user_id)
-
-                if member and not member.bot:
-                    return guild
-
-        except Exception:
-            continue
-
-    # 3. Falls alliance_config vorhanden ist: Home-/Ebolus-Server bevorzugen.
     try:
         try:
             from bot.alliance_config import _home_guild_id  # type: ignore
@@ -316,42 +297,52 @@ def _resolve_guild_for_user(client: discord.Client, user_id: int) -> Optional[di
             from alliance_config import _home_guild_id  # type: ignore
 
         home_id = int(_home_guild_id() or 0)
-
         if home_id:
             guild = client.get_guild(home_id)
+            member = guild.get_member(user_id) if guild else None
+            if guild and member and not member.bot:
+                return guild
+    except Exception as e:
+        print(f"[member_portal] Home-Server-Auflösung fehlgeschlagen: {e!r}")
 
-            if guild:
-                member = guild.get_member(user_id)
+    for guild in client.guilds:
+        try:
+            member = guild.get_member(user_id)
+            member_role_id = int(_gcfg(guild.id).get("member_role_id", 0) or 0)
+            if member and not member.bot and member_role_id in _member_role_ids(member):
+                return guild
+        except Exception:
+            continue
 
-                if member and not member.bot:
-                    return guild
+    for guild_id_str, state in list(sent_state.items()):
+        try:
+            guild = client.get_guild(int(guild_id_str))
+            member = guild.get_member(user_id) if guild else None
+            if not guild or not member or member.bot:
+                continue
+            sent_users = {str(x) for x in state.get("sent_users", [])}
+            users = state.get("users", {}) or {}
+            if str(user_id) in sent_users or str(user_id) in users:
+                return guild
+        except Exception:
+            continue
 
-    except Exception:
-        pass
-
-    # 4. Fallback: altes Verhalten.
     for guild in client.guilds:
         member = guild.get_member(user_id)
-
         if member and not member.bot:
             return guild
 
     return None
 
-
 def _member_position(guild: discord.Guild, member: discord.Member) -> str:
-    c = _gcfg(guild.id)
-    roles = c.get("position_roles") or {}
+    roles = (_gcfg(guild.id).get("position_roles") or {})
+    ids = _member_role_ids(member)
 
-    leader = guild.get_role(int(roles.get("leader", 0) or 0))
-    advisor = guild.get_role(int(roles.get("advisor", 0) or 0))
-    guardian = guild.get_role(int(roles.get("guardian", 0) or 0))
-
-    if leader and leader in member.roles:
+    if int(roles.get("leader", 0) or 0) in ids:
         return "Anführer"
-    if advisor and advisor in member.roles:
+    if int(roles.get("advisor", 0) or 0) in ids:
         return "Gildenberater"
-    if guardian and guardian in member.roles:
+    if int(roles.get("guardian", 0) or 0) in ids:
         return "Wächter"
 
     return "Mitglied"
@@ -617,7 +608,7 @@ def _event_status_block(guild: discord.Guild, member: discord.Member) -> str:
 
 def _active_market_item_count(guild_id: int) -> int:
     """Zählt aktive Items aus Freier Auktion + Sale-Kauf für die Startseite."""
-    data = _load_json(AUCTION_FILE, {})
+    data = _cached_json(AUCTION_FILE)
     g = data.get(str(int(guild_id))) or {}
     auctions = g.get("auctions") if isinstance(g.get("auctions"), dict) else {}
     count = 0
@@ -1147,9 +1138,30 @@ async def _delete_old_bot_dms_for_member(
     return deleted
 
 
+_AUX_JSON_CACHE: dict[str, tuple[float, float, dict]] = {}
+_AUX_JSON_CACHE_TTL = 5.0
+
+
+def _cached_json(path: Path) -> dict:
+    key = str(path)
+    now = time.monotonic()
+    try:
+        mtime = path.stat().st_mtime if path.exists() else -1.0
+    except Exception:
+        mtime = -1.0
+
+    cached = _AUX_JSON_CACHE.get(key)
+    if cached and cached[0] == mtime and (now - cached[1]) < _AUX_JSON_CACHE_TTL:
+        return cached[2]
+
+    data = _load_json(path, {})
+    _AUX_JSON_CACHE[key] = (mtime, now, data)
+    return data
+
+
 def _get_leader_cfg(guild_id: int) -> dict:
-    data = _load_json(LEADER_CONTACT_CFG_FILE, {})
-    c = data.get(str(guild_id)) or {}
+    data = _cached_json(LEADER_CONTACT_CFG_FILE)
+    c = dict(data.get(str(guild_id)) or {})
     c.setdefault("internal_channel_id", 0)
     c.setdefault("leader_role_id", 0)
     return c
@@ -1188,7 +1200,7 @@ async def _resolve_guild_member_from_inter(inter: discord.Interaction) -> tuple[
 
 class ProfileEditModal(Modal):
     def __init__(self, guild_id: int, user_id: int):
-        super().__init__(title="Profil bearbeiten", timeout=None)
+        super().__init__(title="Profil bearbeiten", timeout=300)
         self.guild_id = guild_id
         self.user_id = user_id
 
@@ -1247,7 +1259,7 @@ class ProfileEditModal(Modal):
 
 class AbsenceModal(Modal):
     def __init__(self, guild_id: int, user_id: int):
-        super().__init__(title="Abwesenheit melden", timeout=None)
+        super().__init__(title="Abwesenheit melden", timeout=300)
         self.guild_id = guild_id
         self.user_id = user_id
 
@@ -1349,7 +1361,7 @@ class AbsenceModal(Modal):
 
 class PortalLeaderContactModal(Modal):
     def __init__(self, guild_id: int, user_id: int):
-        super().__init__(title="Leader kontaktieren", timeout=None)
+        super().__init__(title="Leader kontaktieren", timeout=300)
         self.guild_id = guild_id
         self.user_id = user_id
 
@@ -1447,7 +1459,8 @@ class PortalOpenView(View):
             await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
             return
 
-        ok = await ensure_portal_menu_for_user(inter.client, inter.guild.id, inter.user.id, force_view="main")
+        guild = _resolve_guild_for_user(inter.client, inter.user.id) or inter.guild
+        ok = await ensure_portal_menu_for_user(inter.client, guild.id, inter.user.id, force_view="main")
 
         if ok:
             await inter.response.send_message("✅ Ich habe dein Gildenmenü im Privatchat geöffnet oder aktualisiert.", ephemeral=True)
@@ -1470,7 +1483,7 @@ class PortalMainSelect(Select):
             discord.SelectOption(
                 label="Loot & Bedarf",
                 value="loot",
-                description="Deine 5 Needs verwalten",
+                description="Main- und Second-Needs verwalten",
                 emoji=_menu_emoji(EMOJI_LOOT)
             ),
             discord.SelectOption(
@@ -2464,7 +2477,7 @@ async def _admin_delete_event_from_menu(inter: discord.Interaction, guild_id: in
 
 class AdminEventCreateModal(Modal):
     def __init__(self, guild_id: int, user_id: int):
-        super().__init__(title="Event erstellen", timeout=None)
+        super().__init__(title="Event erstellen", timeout=300)
         self.guild_id = int(guild_id)
         self.user_id = int(user_id)
         self.title_input = TextInput(label="Titel", placeholder="z. B. Gildenbosse", required=True, max_length=100)
@@ -2497,7 +2510,7 @@ class AdminEventCreateModal(Modal):
 
 class AdminAllianceEventCreateModal(Modal):
     def __init__(self, guild_id: int, user_id: int):
-        super().__init__(title="Allianz-Event erstellen", timeout=None)
+        super().__init__(title="Allianz-Event erstellen", timeout=300)
         self.guild_id = int(guild_id)
         self.user_id = int(user_id)
         self.title_input = TextInput(label="Titel", placeholder="z. B. Allianz HM Raid", required=True, max_length=100)
@@ -2533,7 +2546,7 @@ class AdminAllianceEventCreateModal(Modal):
 
 class AdminAllianceGroupSelectView(View):
     def __init__(self, data: dict):
-        super().__init__(timeout=None)
+        super().__init__(timeout=900)
         self.data = dict(data)
         self.add_item(AdminAllianceGroupSelect(self.data))
 
@@ -2587,7 +2600,7 @@ class AdminAllianceGroupSelect(Select):
 
 class AdminAllianceEventTypeSelectView(View):
     def __init__(self, data: dict):
-        super().__init__(timeout=None)
+        super().__init__(timeout=900)
         self.data = dict(data)
         self.add_item(AdminAllianceEventTypeSelect(self.data))
 
@@ -2624,7 +2637,7 @@ class AdminAllianceEventTypeSelect(Select):
 
 class AdminAllianceRoleSelectView(View):
     def __init__(self, data: dict, client: discord.Client | None = None):
-        super().__init__(timeout=None)
+        super().__init__(timeout=900)
         self.data = dict(data)
         self.add_item(AdminAllianceRoleSelect(self.data, client))
 
@@ -2672,7 +2685,7 @@ class AdminAllianceRoleSelect(Select):
 
 class AdminEventChannelSelectView(View):
     def __init__(self, data: dict, client: discord.Client | None = None):
-        super().__init__(timeout=None)
+        super().__init__(timeout=900)
         self.data = dict(data)
         self.add_item(AdminEventChannelSelect(self.data, client))
 
@@ -2766,7 +2779,7 @@ class AdminEventChannelSelect(Select):
 
 class AdminEventRoleSelectView(View):
     def __init__(self, data: dict, client: discord.Client | None = None):
-        super().__init__(timeout=None)
+        super().__init__(timeout=900)
         self.data = dict(data)
         self.add_item(AdminEventRoleSelect(self.data, client))
 
@@ -2870,7 +2883,7 @@ class AdminEventRoleSelect(Select):
 
 class AdminEventDKPSelectView(View):
     def __init__(self, data: dict):
-        super().__init__(timeout=None)
+        super().__init__(timeout=900)
         self.data = dict(data)
         self.add_item(AdminEventDKPSelect(self.data))
 
@@ -2936,7 +2949,7 @@ class AdminEventDKPSelect(Select):
 
 class AdminEventImageSelectView(View):
     def __init__(self, data: dict):
-        super().__init__(timeout=None)
+        super().__init__(timeout=900)
         self.data = dict(data)
         self.add_item(AdminEventImageSelect(self.data))
 
@@ -3041,7 +3054,7 @@ async def _admin_show_reminder_select(inter: discord.Interaction, data: dict, se
 
 class AdminEventReminderSelectView(View):
     def __init__(self, data: dict):
-        super().__init__(timeout=None)
+        super().__init__(timeout=900)
         self.data = dict(data)
         self.add_item(AdminEventReminderSelect(self.data))
 
@@ -3116,7 +3129,7 @@ async def _admin_show_voice_select(inter: discord.Interaction, data: dict):
 
 class AdminEventVoiceSelectView(View):
     def __init__(self, data: dict):
-        super().__init__(timeout=None)
+        super().__init__(timeout=900)
         self.data = dict(data)
         self.add_item(AdminEventVoiceSelect(self.data))
 
@@ -3169,7 +3182,7 @@ class AdminEventVoiceSelect(Select):
 
 class AdminEventCustomImageModal(Modal):
     def __init__(self, data: dict):
-        super().__init__(title="Eigene Event-Bild-URL", timeout=None)
+        super().__init__(title="Eigene Event-Bild-URL", timeout=300)
         self.data = dict(data)
         self.url_input = TextInput(
             label="Bild-URL",
@@ -3319,7 +3332,7 @@ def _admin_attendance_embed(guild: discord.Guild, event: dict) -> discord.Embed:
 
 class AdminEventSelectView(View):
     def __init__(self, guild_id: int, user_id: int, action: str, events: list[tuple[str, dict]]):
-        super().__init__(timeout=None)
+        super().__init__(timeout=900)
         self.guild_id = int(guild_id)
         self.user_id = int(user_id)
         self.action = action
@@ -3365,7 +3378,7 @@ class AdminEventSelect(Select):
 
 class AdminEventDeleteConfirmView(View):
     def __init__(self, guild_id: int, user_id: int, message_id: str):
-        super().__init__(timeout=None)
+        super().__init__(timeout=900)
         self.guild_id = int(guild_id)
         self.user_id = int(user_id)
         self.message_id = str(message_id)
@@ -3384,7 +3397,7 @@ class AdminEventDeleteConfirmView(View):
 
 class AdminAttendanceEventSelectView(View):
     def __init__(self, guild_id: int, user_id: int, events: list[dict]):
-        super().__init__(timeout=None)
+        super().__init__(timeout=900)
         self.guild_id = int(guild_id)
         self.user_id = int(user_id)
         self.add_item(AdminAttendanceEventSelect(guild_id, user_id, events))
@@ -3429,7 +3442,7 @@ class AdminAttendanceEventSelect(Select):
 
 class AdminAttendanceMemberSelectView(View):
     def __init__(self, guild_id: int, user_id: int, event_id: str, event: dict, page: int = 0):
-        super().__init__(timeout=None)
+        super().__init__(timeout=900)
         self.guild_id = int(guild_id)
         self.user_id = int(user_id)
         self.event_id = str(event_id)
@@ -3518,7 +3531,7 @@ class AdminAttendanceMemberSelect(Select):
 
 class AdminAttendanceMarkView(View):
     def __init__(self, guild_id: int, user_id: int, event_id: str, target_user_id: int, page: int = 0):
-        super().__init__(timeout=None)
+        super().__init__(timeout=900)
         self.guild_id = int(guild_id)
         self.user_id = int(user_id)
         self.event_id = str(event_id)
@@ -3564,7 +3577,7 @@ class AdminAttendanceMarkView(View):
 
 class AdminVoiceSettingsView(View):
     def __init__(self, guild_id: int):
-        super().__init__(timeout=None)
+        super().__init__(timeout=900)
         self.guild_id = int(guild_id)
 
     @button(label="📁 Kategorie setzen", style=ButtonStyle.secondary, custom_id="admin_voice_set_category", row=0)
@@ -3597,7 +3610,7 @@ class AdminVoiceSettingsView(View):
 
 class AdminVoiceCategorySelectView(View):
     def __init__(self, guild_id: int, guild: discord.Guild):
-        super().__init__(timeout=None)
+        super().__init__(timeout=900)
         self.guild_id = int(guild_id)
         self.add_item(AdminVoiceCategorySelect(guild_id, guild))
 
@@ -3625,7 +3638,7 @@ class AdminVoiceCategorySelect(Select):
 
 class AdminVoiceReturnSelectView(View):
     def __init__(self, guild_id: int, guild: discord.Guild):
-        super().__init__(timeout=None)
+        super().__init__(timeout=900)
         self.guild_id = int(guild_id)
         self.add_item(AdminVoiceReturnSelect(guild_id, guild))
 
@@ -4073,22 +4086,44 @@ class BackOnlyView(View):
 
 
 async def setup_member_portal(client: discord.Client, tree: app_commands.CommandTree):
-    try:
-        client.add_view(PortalOpenView())
-        client.add_view(MemberPortalMainView())
-        client.add_view(PersonalMenuView())
-        client.add_view(DmSettingsView())
-        client.add_view(LootMenuView())
-        client.add_view(GuildMenuView())
-        client.add_view(AbsenceCalendarView())
-        client.add_view(SupportMenuView())
-        client.add_view(ProfileView())
-        client.add_view(EventsInfoView())
-        client.add_view(RulesLootView())
-        client.add_view(HelpView())
-        client.add_view(BackOnlyView())
-    except Exception:
-        pass
+    persistent_view_factories = [
+        PortalOpenView,
+        MemberPortalMainView,
+        PersonalMenuView,
+        DmSettingsView,
+        LootMenuView,
+        GuildMenuView,
+        AbsenceCalendarView,
+        SupportMenuView,
+        ProfileView,
+        EventsInfoView,
+        RulesLootView,
+        HelpView,
+        BackOnlyView,
+        AdminMenuView,
+        AdminEventMenuView,
+        AdminLootMenuView,
+    ]
+
+    registered_views = 0
+    failed_views: list[str] = []
+    for view_factory in persistent_view_factories:
+        try:
+            client.add_view(view_factory())
+            registered_views += 1
+        except Exception as e:
+            failed_views.append(view_factory.__name__)
+            print(
+                f"[member_portal] Persistent View "
+                f"{view_factory.__name__} konnte nicht registriert werden: {e!r}"
+            )
+
+    print(
+        f"✅ Member-Portal Persistent Views registriert: "
+        f"{registered_views}/{len(persistent_view_factories)}"
+    )
+    if failed_views:
+        print(f"⚠️ Fehlende Persistent Views: {', '.join(failed_views)}")
 
     if hasattr(client, "add_listener"):
         async def _portal_on_member_update(before: discord.Member, after: discord.Member):
