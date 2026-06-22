@@ -995,17 +995,6 @@ async def ensure_portal_menu_for_user(
     if not member or member.bot:
         return False
 
-    # Winner notifications are temporary. Cleanup runs in the background so
-    # opening the portal remains fast even with a longer DM history.
-    try:
-        try:
-            from bot.loot_auction import cleanup_winner_dms_for_user  # type: ignore
-        except ModuleNotFoundError:
-            from loot_auction import cleanup_winner_dms_for_user  # type: ignore
-        asyncio.create_task(cleanup_winner_dms_for_user(client, user_id, scan_history=True))
-    except Exception as e:
-        print(f"[member_portal] Gewinner-DM Cleanup konnte nicht gestartet werden: {e!r}")
-
     msg = await _fetch_portal_message(client, guild_id, user_id)
 
     try:
@@ -2017,6 +2006,85 @@ def _admin_active_rsvp_events(guild: Optional[discord.Guild]) -> list[tuple[str,
         return []
 
 
+class AdminEventCreatedView(View):
+    """Dauerhafte Navigation nach erfolgreicher Event-Erstellung."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @button(
+        label="Zurück zur Event-Verwaltung",
+        emoji=_menu_emoji(EMOJI_BACK),
+        style=ButtonStyle.secondary,
+        custom_id="portal_event_created_back_admin",
+    )
+    async def back_admin_events(self, inter: discord.Interaction, _):
+        guild, member = await _resolve_guild_member_from_inter(inter)
+        if not guild or not member:
+            await inter.response.send_message("❌ Ich konnte deinen Server nicht zuordnen.", ephemeral=True)
+            return
+        if not _is_portal_admin(guild, member):
+            await inter.response.send_message(
+                "❌ Dieser Bereich ist nur für Gildenleitung, Berater oder Wächter.",
+                ephemeral=True,
+            )
+            return
+        if inter.message:
+            _mark_portal_sent(guild.id, member.id, inter.message.id)
+        emb = discord.Embed(
+            title=f"{EMOJI_GUILD} Admin – Event",
+            description="Wähle eine Event-Aktion.",
+            color=discord.Color.gold(),
+        )
+        await inter.response.edit_message(embed=emb, view=AdminEventMenuView())
+
+    @button(
+        label="Gildenmenü",
+        emoji=_menu_emoji(EMOJI_EBOLUS),
+        style=ButtonStyle.primary,
+        custom_id="portal_event_created_home",
+    )
+    async def back_home(self, inter: discord.Interaction, _):
+        guild, member = await _resolve_guild_member_from_inter(inter)
+        if not guild or not member:
+            await inter.response.send_message("❌ Ich konnte deinen Server nicht zuordnen.", ephemeral=True)
+            return
+        if inter.message:
+            _mark_portal_sent(guild.id, member.id, inter.message.id)
+        await inter.response.edit_message(
+            embed=_main_menu_embed(guild, member),
+            view=MemberPortalMainView(),
+        )
+
+
+async def _show_event_created_portal(
+    inter: discord.Interaction,
+    *,
+    title: str,
+    jump_url: str = "",
+    alliance: bool = False,
+) -> None:
+    """Ersetzt das Assistenten-Menü durch eine stabile Abschlussansicht."""
+    if inter.message is None:
+        return
+
+    description = (
+        f"**{_safe_text(title)}** wurde erfolgreich erstellt.\n\n"
+        + (f"[Event im Server öffnen]({jump_url})\n\n" if jump_url else "")
+        + "Du kannst zurück zur Event-Verwaltung oder direkt ins Gildenmenü gehen."
+    )
+    emb = discord.Embed(
+        title="✅ Allianz-Event erstellt" if alliance else "✅ Event erstellt",
+        description=description,
+        color=discord.Color.green(),
+        timestamp=datetime.now(TZ),
+    )
+    try:
+        await inter.message.edit(embed=emb, view=AdminEventCreatedView())
+    except Exception as e:
+        print(f"[member_portal] Abschlussansicht nach Event-Erstellung fehlgeschlagen: {e!r}")
+
+
 async def _admin_create_regular_raid_from_menu(
     inter: discord.Interaction,
     guild_id: int,
@@ -2131,6 +2199,13 @@ async def _admin_create_regular_raid_from_menu(
         rsvp._schedule_portal_refresh_for_event(inter.client, guild, obj)
     except Exception:
         pass
+
+    await _show_event_created_portal(
+        inter,
+        title=str(title).strip(),
+        jump_url=msg.jump_url,
+        alliance=False,
+    )
 
     await inter.followup.send(
         f"✅ Event erstellt: {msg.jump_url}\n"
@@ -2369,6 +2444,12 @@ async def _admin_create_alliance_raid_from_menu(
     if len(result) > 1900:
         result = result[:1850] + "\n… gekürzt"
 
+    await _show_event_created_portal(
+        inter,
+        title=str(title).strip(),
+        jump_url=home_msg.jump_url,
+        alliance=True,
+    )
     await inter.followup.send(result, ephemeral=True)
 
 
@@ -2565,7 +2646,7 @@ class AdminAllianceGroupSelectView(View):
     async def btn_cancel(self, inter: discord.Interaction, _):
         await inter.response.edit_message(
             embed=discord.Embed(title="Abgebrochen", description="Das Allianz-Event wurde nicht erstellt.", color=discord.Color.orange()),
-            view=None,
+            view=AdminEventMenuView(),
         )
 
 
@@ -2622,7 +2703,7 @@ class AdminAllianceEventTypeSelectView(View):
 
     @button(label="❌ Abbrechen", style=ButtonStyle.secondary, custom_id="admin_alliance_type_cancel", row=1)
     async def btn_cancel(self, inter: discord.Interaction, _):
-        await inter.response.edit_message(embed=discord.Embed(title="Abgebrochen", description="Das Allianz-Event wurde nicht erstellt.", color=discord.Color.orange()), view=None)
+        await inter.response.edit_message(embed=discord.Embed(title="Abgebrochen", description="Das Allianz-Event wurde nicht erstellt.", color=discord.Color.orange()), view=AdminEventMenuView())
 
 
 class AdminAllianceEventTypeSelect(Select):
@@ -2659,7 +2740,7 @@ class AdminAllianceRoleSelectView(View):
 
     @button(label="❌ Abbrechen", style=ButtonStyle.secondary, custom_id="admin_alliance_role_cancel", row=1)
     async def btn_cancel(self, inter: discord.Interaction, _):
-        await inter.response.edit_message(embed=discord.Embed(title="Abgebrochen", description="Das Allianz-Event wurde nicht erstellt.", color=discord.Color.orange()), view=None)
+        await inter.response.edit_message(embed=discord.Embed(title="Abgebrochen", description="Das Allianz-Event wurde nicht erstellt.", color=discord.Color.orange()), view=AdminEventMenuView())
 
 
 class AdminAllianceRoleSelect(Select):
@@ -2708,7 +2789,7 @@ class AdminEventChannelSelectView(View):
                 description="Das Event wurde nicht erstellt.",
                 color=discord.Color.orange()
             ),
-            view=None
+            view=AdminEventMenuView()
         )
 
 
@@ -2824,7 +2905,7 @@ class AdminEventRoleSelectView(View):
                 description="Das Event wurde nicht erstellt.",
                 color=discord.Color.orange()
             ),
-            view=None
+            view=AdminEventMenuView()
         )
 
 
@@ -2906,7 +2987,7 @@ class AdminEventDKPSelectView(View):
                 description="Das Event wurde nicht erstellt.",
                 color=discord.Color.orange(),
             ),
-            view=None,
+            view=AdminEventMenuView(),
         )
 
 
@@ -2972,7 +3053,7 @@ class AdminEventImageSelectView(View):
                 description="Das Event wurde nicht erstellt.",
                 color=discord.Color.orange()
             ),
-            view=None
+            view=AdminEventMenuView()
         )
 
 
@@ -3077,7 +3158,7 @@ class AdminEventReminderSelectView(View):
                 description="Das Event wurde nicht erstellt.",
                 color=discord.Color.orange(),
             ),
-            view=None,
+            view=AdminEventMenuView(),
         )
 
 
@@ -3148,7 +3229,7 @@ class AdminEventVoiceSelectView(View):
     async def btn_cancel(self, inter: discord.Interaction, _):
         await inter.response.edit_message(
             embed=discord.Embed(title="Abgebrochen", description="Das Event wurde nicht erstellt.", color=discord.Color.orange()),
-            view=None,
+            view=AdminEventMenuView(),
         )
 
 
@@ -4113,6 +4194,7 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
         BackOnlyView,
         AdminMenuView,
         AdminEventMenuView,
+        AdminEventCreatedView,
         AdminLootMenuView,
     ]
 
@@ -4137,83 +4219,6 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
         print(f"⚠️ Fehlende Persistent Views: {', '.join(failed_views)}")
 
     if hasattr(client, "add_listener"):
-        async def _portal_stale_component_recovery(inter: discord.Interaction):
-            """Recover components whose original View vanished after a restart.
-
-            Valid views normally answer first. If nothing has answered after
-            2.2 seconds, replace the stale page with a fresh page in the same
-            portal section instead of showing Discord's interaction failure.
-            """
-            try:
-                if inter.type is not discord.InteractionType.component:
-                    return
-                data = inter.data if isinstance(inter.data, dict) else {}
-                custom_id = str(data.get("custom_id", "") or "")
-                if not custom_id:
-                    return
-                await asyncio.sleep(2.2)
-                if inter.response.is_done():
-                    return
-
-                guild, member = await _resolve_guild_member_from_inter(inter)
-                if not guild or not member:
-                    await inter.response.send_message("❌ Dein Ebolus-Server konnte nicht zugeordnet werden.", ephemeral=True)
-                    return
-                if inter.message:
-                    _mark_portal_sent(guild.id, member.id, inter.message.id)
-
-                if custom_id.startswith("need_"):
-                    try:
-                        try:
-                            from bot.loot_needs import open_need_menu  # type: ignore
-                        except ModuleNotFoundError:
-                            from loot_needs import open_need_menu  # type: ignore
-                        await open_need_menu(inter, guild.id, member.id)
-                    except Exception as e:
-                        print(f"[member_portal] Need-Recovery Fehler: {e!r}")
-                        await inter.response.edit_message(embed=_main_menu_embed(guild, member), view=MemberPortalMainView())
-                    return
-
-                if custom_id.startswith(("portal_auction", "portalauc:", "portalsale:", "lootauc:", "lootsale:")):
-                    try:
-                        try:
-                            from bot.loot_auction import open_auction_menu  # type: ignore
-                        except ModuleNotFoundError:
-                            from loot_auction import open_auction_menu  # type: ignore
-                        await open_auction_menu(inter, guild.id, member.id)
-                    except Exception as e:
-                        print(f"[member_portal] Auktions-Recovery Fehler: {e!r}")
-                        await inter.response.edit_message(embed=_main_menu_embed(guild, member), view=MemberPortalMainView())
-                    return
-
-                if custom_id.startswith("portal_profile"):
-                    await inter.response.edit_message(embed=_profile_embed(guild, member), view=ProfileView())
-                    return
-                if custom_id.startswith(("portal_personal", "portal_dm_")):
-                    emb = discord.Embed(title=f"{EMOJI_PERSONAL} Persönlich", description="Profil, Abwesenheit und Raid-/Event-DMs.", color=discord.Color.gold())
-                    await inter.response.edit_message(embed=emb, view=PersonalMenuView())
-                    return
-                if custom_id.startswith(("portal_admin", "admin_")):
-                    if _is_portal_admin(guild, member):
-                        emb = discord.Embed(title=f"{EMOJI_ADMIN} Admin", description="Interner Verwaltungsbereich für die Gildenleitung.", color=discord.Color.gold())
-                        await inter.response.edit_message(embed=emb, view=AdminMenuView())
-                    else:
-                        await inter.response.send_message("❌ Keine Berechtigung für den Adminbereich.", ephemeral=True)
-                    return
-                if custom_id.startswith("portal_guild"):
-                    emb = discord.Embed(title=f"{EMOJI_GUILD} Gilde", description="Kalender, Abwesenheiten und Mitgliederübersicht.", color=discord.Color.gold())
-                    await inter.response.edit_message(embed=emb, view=GuildMenuView())
-                    return
-                if custom_id.startswith(("portal_", "rules_", "help_")):
-                    await inter.response.edit_message(embed=_main_menu_embed(guild, member), view=MemberPortalMainView())
-            except Exception as e:
-                print(f"[member_portal] Stale-Component-Recovery Fehler: {e!r}")
-                try:
-                    if not inter.response.is_done():
-                        await inter.response.send_message("🔄 Diese alte Ansicht wurde ungültig. Öffne das Gildenmenü bitte erneut.", ephemeral=True)
-                except Exception:
-                    pass
-
         async def _portal_on_member_update(before: discord.Member, after: discord.Member):
             try:
                 if after.bot:
@@ -4254,7 +4259,6 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
                 pass
 
         try:
-            client.add_listener(_portal_stale_component_recovery, "on_interaction")
             client.add_listener(_portal_on_member_update, "on_member_update")
             client.add_listener(_portal_on_member_join, "on_member_join")
             client.add_listener(_portal_on_member_remove, "on_member_remove")
