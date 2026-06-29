@@ -122,8 +122,9 @@ profiles: dict = _load_json(PROFILE_FILE, {})
 sent_state: dict = _load_json(SENT_FILE, {})
 
 PORTAL_REPAIR_INTERVAL_SECONDS = max(900, int(os.getenv("PORTAL_REPAIR_INTERVAL_SECONDS", "3600") or "3600"))
-PORTAL_REPAIR_START_DELAY_SECONDS = max(5.0, float(os.getenv("PORTAL_REPAIR_START_DELAY_SECONDS", "30") or "30"))
+PORTAL_REPAIR_START_DELAY_SECONDS = max(1.0, float(os.getenv("PORTAL_REPAIR_START_DELAY_SECONDS", "5") or "5"))
 PORTAL_REPAIR_MEMBER_DELAY_SECONDS = max(0.05, float(os.getenv("PORTAL_REPAIR_MEMBER_DELAY_SECONDS", "0.25") or "0.25"))
+PORTAL_RESET_ON_START = str(os.getenv("PORTAL_RESET_ON_START", "true") or "true").strip().lower() not in {"0", "false", "no", "off"}
 NEW_MEMBER_LOOT_LOCK_DAYS = 7
 _portal_repair_task: Optional[asyncio.Task] = None
 
@@ -1214,9 +1215,88 @@ async def repair_all_portals_once(client: discord.Client) -> dict[str, int]:
     return total
 
 
+async def reset_portals_to_main_for_guild(
+    client: discord.Client,
+    guild_id: int,
+    delay: float = PORTAL_REPAIR_MEMBER_DELAY_SECONDS,
+) -> dict[str, int]:
+    """Edit saved portal DMs back to the registered main menu.
+
+    Dynamic admin/event wizard views cannot survive a deploy because their state
+    lives only in memory. Resetting to the main menu after startup prevents
+    users from being stuck on a dead DM with "Interaktion fehlgeschlagen".
+    """
+    guild = client.get_guild(int(guild_id))
+    summary = {"checked": 0, "updated": 0, "failed": 0, "skipped": 0}
+
+    if not guild:
+        summary["failed"] += 1
+        return summary
+
+    member_role_id = int(_gcfg(guild.id).get("member_role_id", 0) or 0)
+    role = guild.get_role(member_role_id) if member_role_id else None
+
+    if role is None:
+        summary["skipped"] += 1
+        return summary
+
+    for member in list(role.members):
+        if member.bot:
+            continue
+
+        summary["checked"] += 1
+
+        try:
+            ok = await ensure_portal_menu_for_user(client, guild.id, member.id, force_view="main")
+            if ok:
+                summary["updated"] += 1
+            else:
+                summary["failed"] += 1
+        except Exception as e:
+            summary["failed"] += 1
+            print(f"[member_portal] Portal-Startreset Fehler user={member.id}: {e!r}")
+
+        if delay > 0:
+            await asyncio.sleep(delay)
+
+    return summary
+
+
+async def reset_all_portals_to_main_once(client: discord.Client) -> dict[str, int]:
+    total = {"checked": 0, "updated": 0, "failed": 0, "skipped": 0}
+
+    for guild_id_str, guild_cfg in list(cfg.items()):
+        try:
+            if not int((guild_cfg or {}).get("member_role_id", 0) or 0):
+                continue
+
+            part = await reset_portals_to_main_for_guild(client, int(guild_id_str))
+            for key, value in part.items():
+                total[key] = total.get(key, 0) + int(value)
+        except Exception as e:
+            total["failed"] += 1
+            print(f"[member_portal] Portal-Startreset Guild Fehler guild={guild_id_str}: {e!r}")
+
+    return total
+
+
 async def _portal_repair_loop(client: discord.Client) -> None:
     await client.wait_until_ready()
     await asyncio.sleep(PORTAL_REPAIR_START_DELAY_SECONDS)
+
+    if PORTAL_RESET_ON_START:
+        try:
+            total = await reset_all_portals_to_main_once(client)
+            if total.get("checked") or total.get("updated") or total.get("failed"):
+                print(
+                    "[member_portal] Startreset: "
+                    f"geprüft={total.get('checked', 0)} "
+                    f"aktualisiert={total.get('updated', 0)} "
+                    f"fehler={total.get('failed', 0)} "
+                    f"übersprungen={total.get('skipped', 0)}"
+                )
+        except Exception as e:
+            print(f"[member_portal] Startreset Fehler: {e!r}")
 
     while not client.is_closed():
         try:
@@ -1679,7 +1759,59 @@ class PortalLeaderContactModal(Modal):
         await ensure_portal_menu_for_user(inter.client, self.guild_id, self.user_id, force_view="main")
 
 
-class PortalOpenView(View):
+async def _auto_reset_portal_after_view_error(inter: discord.Interaction, error: Exception) -> None:
+    """Best-effort rescue for broken/stale portal callbacks.
+
+    Discord does not always deliver a callback when a component is completely
+    unregistered after a deploy. For callbacks that do reach the bot but then
+    fail, reset the user's saved Gildenmenü to the stable main view.
+    """
+    try:
+        guild, member = await _resolve_guild_member_from_inter(inter)
+    except Exception:
+        guild, member = None, None
+
+    repaired = False
+    if guild and member:
+        try:
+            repaired = await ensure_portal_menu_for_user(inter.client, guild.id, member.id, force_view="main")
+        except Exception as repair_error:
+            print(
+                f"[member_portal] Auto-Reset nach View-Fehler fehlgeschlagen "
+                f"guild={getattr(guild, 'id', None)} user={getattr(member, 'id', None)}: {repair_error!r}"
+            )
+
+    try:
+        msg = (
+            "⚠️ Dieses Menü war veraltet und wurde automatisch auf die Startseite zurückgesetzt. "
+            "Bitte im Privatchat nochmal klicken."
+            if repaired
+            else "⚠️ Dieses Menü war veraltet. Ich konnte es nicht automatisch reparieren. Prüfe bitte deine Discord-DM-Einstellungen."
+        )
+
+        if not inter.response.is_done():
+            await inter.response.send_message(msg, ephemeral=True)
+        else:
+            await inter.followup.send(msg, ephemeral=True)
+    except Exception:
+        pass
+
+    print(f"[member_portal] View-Fehler abgefangen und Portal-Reset versucht: {error!r}")
+
+
+class PortalSafeView(View):
+    def __init__(self, *args, **kwargs):
+        # Portal-Menüs sollen nicht nach 3/5/15 Minuten sterben.
+        # Wenn eine Unterklasse kein eigenes Timeout setzt, bleibt die View aktiv,
+        # bis der Bot neu startet oder die Nachricht ersetzt wird.
+        kwargs.setdefault("timeout", None)
+        super().__init__(*args, **kwargs)
+
+    async def on_error(self, inter: discord.Interaction, error: Exception, item) -> None:
+        await _auto_reset_portal_after_view_error(inter, error)
+
+
+class PortalOpenView(PortalSafeView):
     def __init__(self):
         super().__init__(timeout=None)
 
@@ -1872,13 +2004,13 @@ class PortalMainSelect(Select):
             return
 
 
-class MemberPortalMainView(View):
+class MemberPortalMainView(PortalSafeView):
     def __init__(self):
         super().__init__(timeout=None)
         self.add_item(PortalMainSelect())
 
 
-class PersonalMenuView(View):
+class PersonalMenuView(PortalSafeView):
     def __init__(self):
         super().__init__(timeout=None)
 
@@ -1931,7 +2063,7 @@ class PersonalMenuView(View):
         await inter.response.edit_message(embed=_main_menu_embed(guild, member), view=MemberPortalMainView())
 
 
-class DmSettingsView(View):
+class DmSettingsView(PortalSafeView):
     def __init__(self):
         super().__init__(timeout=None)
 
@@ -1987,7 +2119,7 @@ class DmSettingsView(View):
         await inter.response.edit_message(embed=emb, view=PersonalMenuView())
 
 
-class LootMenuView(View):
+class LootMenuView(PortalSafeView):
     def __init__(self):
         super().__init__(timeout=None)
 
@@ -2037,7 +2169,7 @@ class LootMenuView(View):
         await inter.response.edit_message(embed=_main_menu_embed(guild, member), view=MemberPortalMainView())
 
 
-class GuildMenuView(View):
+class GuildMenuView(PortalSafeView):
     def __init__(self):
         super().__init__(timeout=None)
 
@@ -2090,7 +2222,7 @@ class GuildMenuView(View):
         await inter.response.edit_message(embed=_main_menu_embed(guild, member), view=MemberPortalMainView())
 
 
-class AbsenceCalendarView(View):
+class AbsenceCalendarView(PortalSafeView):
     def __init__(self):
         super().__init__(timeout=None)
 
@@ -2236,7 +2368,7 @@ def _admin_active_rsvp_events(guild: Optional[discord.Guild]) -> list[tuple[str,
         return []
 
 
-class AdminEventCreatedView(View):
+class AdminEventCreatedView(PortalSafeView):
     """Dauerhafte Navigation nach erfolgreicher Event-Erstellung."""
 
     def __init__(self):
@@ -2874,9 +3006,9 @@ class AdminAllianceEventCreateModal(Modal):
         await inter.response.send_message(embed=emb, view=AdminAllianceGroupSelectView(data), ephemeral=True)
 
 
-class AdminAllianceGroupSelectView(View):
+class AdminAllianceGroupSelectView(PortalSafeView):
     def __init__(self, data: dict):
-        super().__init__(timeout=900)
+        super().__init__(timeout=None)
         self.data = dict(data)
         self.add_item(AdminAllianceGroupSelect(self.data))
 
@@ -2928,9 +3060,9 @@ class AdminAllianceGroupSelect(Select):
         await inter.response.edit_message(embed=emb, view=AdminAllianceEventTypeSelectView(self.data))
 
 
-class AdminAllianceEventTypeSelectView(View):
+class AdminAllianceEventTypeSelectView(PortalSafeView):
     def __init__(self, data: dict):
-        super().__init__(timeout=900)
+        super().__init__(timeout=None)
         self.data = dict(data)
         self.add_item(AdminAllianceEventTypeSelect(self.data))
 
@@ -2965,9 +3097,9 @@ class AdminAllianceEventTypeSelect(Select):
         await inter.response.edit_message(embed=emb, view=AdminAllianceRoleSelectView(self.data, inter.client))
 
 
-class AdminAllianceRoleSelectView(View):
+class AdminAllianceRoleSelectView(PortalSafeView):
     def __init__(self, data: dict, client: discord.Client | None = None):
-        super().__init__(timeout=900)
+        super().__init__(timeout=None)
         self.data = dict(data)
         self.add_item(AdminAllianceRoleSelect(self.data, client))
 
@@ -3013,9 +3145,9 @@ class AdminAllianceRoleSelect(Select):
         await inter.response.edit_message(embed=emb, view=AdminEventDKPSelectView(self.data))
 
 
-class AdminEventChannelSelectView(View):
+class AdminEventChannelSelectView(PortalSafeView):
     def __init__(self, data: dict, client: discord.Client | None = None):
-        super().__init__(timeout=900)
+        super().__init__(timeout=None)
         self.data = dict(data)
         self.add_item(AdminEventChannelSelect(self.data, client))
 
@@ -3107,9 +3239,9 @@ class AdminEventChannelSelect(Select):
         await inter.response.edit_message(embed=emb, view=AdminEventRoleSelectView(self.data, inter.client))
 
 
-class AdminEventRoleSelectView(View):
+class AdminEventRoleSelectView(PortalSafeView):
     def __init__(self, data: dict, client: discord.Client | None = None):
-        super().__init__(timeout=900)
+        super().__init__(timeout=None)
         self.data = dict(data)
         self.add_item(AdminEventRoleSelect(self.data, client))
 
@@ -3211,9 +3343,9 @@ class AdminEventRoleSelect(Select):
         await inter.response.edit_message(embed=emb, view=AdminEventDKPSelectView(self.data))
 
 
-class AdminEventDKPSelectView(View):
+class AdminEventDKPSelectView(PortalSafeView):
     def __init__(self, data: dict):
-        super().__init__(timeout=900)
+        super().__init__(timeout=None)
         self.data = dict(data)
         self.add_item(AdminEventDKPSelect(self.data))
 
@@ -3277,9 +3409,9 @@ class AdminEventDKPSelect(Select):
         await inter.response.edit_message(embed=emb, view=AdminEventImageSelectView(self.data))
 
 
-class AdminEventImageSelectView(View):
+class AdminEventImageSelectView(PortalSafeView):
     def __init__(self, data: dict):
-        super().__init__(timeout=900)
+        super().__init__(timeout=None)
         self.data = dict(data)
         self.add_item(AdminEventImageSelect(self.data))
 
@@ -3382,9 +3514,9 @@ async def _admin_show_reminder_select(inter: discord.Interaction, data: dict, se
         await inter.response.edit_message(embed=emb, view=view)
 
 
-class AdminEventReminderSelectView(View):
+class AdminEventReminderSelectView(PortalSafeView):
     def __init__(self, data: dict):
-        super().__init__(timeout=900)
+        super().__init__(timeout=None)
         self.data = dict(data)
         self.add_item(AdminEventReminderSelect(self.data))
 
@@ -3457,9 +3589,9 @@ async def _admin_show_voice_select(inter: discord.Interaction, data: dict):
     await inter.response.edit_message(embed=emb, view=AdminEventVoiceSelectView(data))
 
 
-class AdminEventVoiceSelectView(View):
+class AdminEventVoiceSelectView(PortalSafeView):
     def __init__(self, data: dict):
-        super().__init__(timeout=900)
+        super().__init__(timeout=None)
         self.data = dict(data)
         self.add_item(AdminEventVoiceSelect(self.data))
 
@@ -3687,7 +3819,7 @@ def _admin_attendance_embed(guild: discord.Guild, event: dict) -> discord.Embed:
     return emb
 
 
-class AdminEventSelectView(View):
+class AdminEventSelectView(PortalSafeView):
     def __init__(self, guild_id: int, user_id: int, action: str, events: list[tuple[str, dict]]):
         super().__init__(timeout=None)
         self.guild_id = int(guild_id)
@@ -3733,7 +3865,7 @@ class AdminEventSelect(Select):
             return
 
 
-class AdminEventDeleteConfirmView(View):
+class AdminEventDeleteConfirmView(PortalSafeView):
     def __init__(self, guild_id: int, user_id: int, message_id: str):
         super().__init__(timeout=None)
         self.guild_id = int(guild_id)
@@ -3752,7 +3884,7 @@ class AdminEventDeleteConfirmView(View):
 
 
 
-class AdminAttendanceEventSelectView(View):
+class AdminAttendanceEventSelectView(PortalSafeView):
     def __init__(self, guild_id: int, user_id: int, events: list[dict]):
         super().__init__(timeout=None)
         self.guild_id = int(guild_id)
@@ -3797,7 +3929,7 @@ class AdminAttendanceEventSelect(Select):
         await inter.response.edit_message(embed=_admin_attendance_embed(guild, event), view=AdminAttendanceMemberSelectView(self.guild_id, self.user_id, event_id, event))
 
 
-class AdminAttendanceMemberSelectView(View):
+class AdminAttendanceMemberSelectView(PortalSafeView):
     def __init__(self, guild_id: int, user_id: int, event_id: str, event: dict, page: int = 0):
         super().__init__(timeout=None)
         self.guild_id = int(guild_id)
@@ -3924,7 +4056,7 @@ class AdminAttendanceMemberSelect(Select):
         await inter.response.edit_message(embed=emb, view=AdminAttendanceMarkView(self.guild_id, self.user_id, self.event_id, uid, self.page))
 
 
-class AdminAttendanceMarkView(View):
+class AdminAttendanceMarkView(PortalSafeView):
     def __init__(self, guild_id: int, user_id: int, event_id: str, target_user_id: int, page: int = 0):
         super().__init__(timeout=None)
         self.guild_id = int(guild_id)
@@ -3995,9 +4127,9 @@ class AdminAttendanceMarkView(View):
         await inter.response.edit_message(embed=_admin_attendance_embed(guild, event), view=AdminAttendanceMemberSelectView(self.guild_id, self.user_id, self.event_id, event, self.page))
 
 
-class AdminVoiceSettingsView(View):
+class AdminVoiceSettingsView(PortalSafeView):
     def __init__(self, guild_id: int):
-        super().__init__(timeout=900)
+        super().__init__(timeout=None)
         self.guild_id = int(guild_id)
 
     @button(label="📁 Kategorie setzen", style=ButtonStyle.secondary, custom_id="admin_voice_set_category", row=0)
@@ -4028,9 +4160,9 @@ class AdminVoiceSettingsView(View):
         await inter.response.edit_message(embed=emb, view=AdminEventMenuView())
 
 
-class AdminVoiceCategorySelectView(View):
+class AdminVoiceCategorySelectView(PortalSafeView):
     def __init__(self, guild_id: int, guild: discord.Guild):
-        super().__init__(timeout=900)
+        super().__init__(timeout=None)
         self.guild_id = int(guild_id)
         self.add_item(AdminVoiceCategorySelect(guild_id, guild))
 
@@ -4056,9 +4188,9 @@ class AdminVoiceCategorySelect(Select):
         await inter.response.send_message("✅ Event-Voice-Kategorie gespeichert.", ephemeral=True)
 
 
-class AdminVoiceReturnSelectView(View):
+class AdminVoiceReturnSelectView(PortalSafeView):
     def __init__(self, guild_id: int, guild: discord.Guild):
-        super().__init__(timeout=900)
+        super().__init__(timeout=None)
         self.guild_id = int(guild_id)
         self.add_item(AdminVoiceReturnSelect(guild_id, guild))
 
@@ -4115,7 +4247,7 @@ async def _admin_show_voice_settings(inter: discord.Interaction, guild_id: int):
     await inter.response.edit_message(embed=emb, view=AdminVoiceSettingsView(int(guild_id)))
 
 
-class AdminMenuView(View):
+class AdminMenuView(PortalSafeView):
     def __init__(self):
         super().__init__(timeout=None)
 
@@ -4166,7 +4298,7 @@ class AdminMenuView(View):
         await inter.response.edit_message(embed=_main_menu_embed(guild, member), view=MemberPortalMainView())
 
 
-class AdminEventMenuView(View):
+class AdminEventMenuView(PortalSafeView):
     def __init__(self):
         super().__init__(timeout=None)
 
@@ -4241,7 +4373,7 @@ class AdminEventMenuView(View):
         await inter.response.edit_message(embed=emb, view=AdminMenuView())
 
 
-class AdminLootMenuView(View):
+class AdminLootMenuView(PortalSafeView):
     def __init__(self):
         super().__init__(timeout=None)
 
@@ -4291,7 +4423,7 @@ class AdminLootMenuView(View):
         await inter.response.edit_message(embed=emb, view=AdminMenuView())
 
 
-class SupportMenuView(View):
+class SupportMenuView(PortalSafeView):
     def __init__(self):
         super().__init__(timeout=None)
 
@@ -4348,7 +4480,7 @@ class SupportMenuView(View):
         await inter.response.edit_message(embed=_main_menu_embed(guild, member), view=MemberPortalMainView())
 
 
-class ProfileView(View):
+class ProfileView(PortalSafeView):
     def __init__(self):
         super().__init__(timeout=None)
 
@@ -4388,7 +4520,7 @@ class ProfileView(View):
         await inter.response.edit_message(embed=_main_menu_embed(guild, member), view=MemberPortalMainView())
 
 
-class EventsInfoView(View):
+class EventsInfoView(PortalSafeView):
     def __init__(self):
         super().__init__(timeout=None)
 
@@ -4429,7 +4561,7 @@ class EventsInfoView(View):
         await inter.response.edit_message(embed=emb, view=GuildMenuView())
 
 
-class RulesLootView(View):
+class RulesLootView(PortalSafeView):
     def __init__(self):
         super().__init__(timeout=None)
 
@@ -4464,7 +4596,7 @@ class RulesLootView(View):
         await inter.response.edit_message(embed=_main_menu_embed(guild, member), view=MemberPortalMainView())
 
 
-class HelpView(View):
+class HelpView(PortalSafeView):
     def __init__(self):
         super().__init__(timeout=None)
 
@@ -4491,7 +4623,7 @@ class HelpView(View):
         await inter.response.edit_message(embed=_main_menu_embed(guild, member), view=MemberPortalMainView())
 
 
-class BackOnlyView(View):
+class BackOnlyView(PortalSafeView):
     def __init__(self):
         super().__init__(timeout=None)
 
@@ -4650,43 +4782,6 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
             await inter.response.send_message("✅ Gildeninfo für das Gildenmenü gesetzt. Nutze `/portal_send_all force:false`, um bestehende Menüs zu aktualisieren.", ephemeral=True)
         else:
             await inter.response.send_message("✅ Gildeninfo geleert. Nutze `/portal_send_all force:false`, um bestehende Menüs zu aktualisieren.", ephemeral=True)
-
-    @tree.command(name="portal_repair_user", description="(Admin) Prüft und repariert das Gildenmenü bei einem Mitglied")
-    async def portal_repair_user(inter: discord.Interaction, member: discord.Member):
-        await inter.response.defer(ephemeral=True, thinking=True)
-
-        if not _is_admin(inter):
-            await inter.followup.send("❌ Nur Admin/Manage Server.", ephemeral=True)
-            return
-
-        ok, status = await ensure_portal_exists_for_user(client, inter.guild_id, member.id)
-
-        if ok and status == "exists":
-            await inter.followup.send(f"✅ Gildenmenü bei **{member.display_name}** ist vorhanden.", ephemeral=True)
-        elif ok and status == "sent":
-            await inter.followup.send(f"✅ Gildenmenü bei **{member.display_name}** fehlte und wurde neu gesendet.", ephemeral=True)
-        else:
-            await inter.followup.send(f"❌ Gildenmenü bei **{member.display_name}** konnte nicht repariert werden: `{status}`", ephemeral=True)
-
-    @tree.command(name="portal_repair_all", description="(Admin) Prüft/repariert fehlende Gildenmenüs bei allen Gildenmitgliedern")
-    async def portal_repair_all(inter: discord.Interaction):
-        await inter.response.defer(ephemeral=True, thinking=True)
-
-        if not _is_admin(inter):
-            await inter.followup.send("❌ Nur Admin/Manage Server.", ephemeral=True)
-            return
-
-        result = await repair_portals_for_guild(client, inter.guild_id)
-
-        await inter.followup.send(
-            f"✅ Gildenmenü-Reparatur abgeschlossen.\n"
-            f"👥 Geprüft: **{result.get('checked', 0)}**\n"
-            f"🟢 Bereits vorhanden: **{result.get('exists', 0)}**\n"
-            f"✉️ Neu gesendet: **{result.get('sent', 0)}**\n"
-            f"❌ Fehlgeschlagen/DMs zu: **{result.get('failed', 0)}**\n"
-            f"↪️ Übersprungen: **{result.get('skipped', 0)}**",
-            ephemeral=True
-        )
 
     @tree.command(name="portal_send_all", description="(Admin) Öffnet/aktualisiert das Gildenmenü per DM bei allen mit Gildenmitglied-Rolle")
     async def portal_send_all(inter: discord.Interaction, force: bool = False):
