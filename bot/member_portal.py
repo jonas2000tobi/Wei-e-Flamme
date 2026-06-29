@@ -2291,6 +2291,52 @@ def _admin_event_module():
     return rsvp_mod
 
 
+def _admin_dkp_module():
+    try:
+        import bot.dkp_system as dkp_mod  # type: ignore
+    except ModuleNotFoundError:
+        import dkp_system as dkp_mod  # type: ignore
+    return dkp_mod
+
+
+def _admin_event_ec_type(event: dict | None, event_id: str = "") -> str:
+    try:
+        dkp = _admin_dkp_module()
+        return str(dkp._dkp_type_from_event(event, str(event_id)) or "")
+    except Exception:
+        if isinstance(event, dict):
+            value = str(event.get("dkp_event_type", "") or "").strip()
+            if value and value != "Nicht DKP-relevant":
+                return value
+        return ""
+
+
+def _admin_event_ec_awarded(guild_id: int, event_id: str, event: dict | None = None) -> bool:
+    try:
+        dkp = _admin_dkp_module()
+        event_type = _admin_event_ec_type(event, str(event_id))
+        return bool(event_type and dkp._event_has_dkp_already(int(guild_id), str(event_id), event_type))
+    except Exception:
+        return False
+
+
+def _admin_event_ec_points(guild_id: int, event_type: str) -> tuple[int, int]:
+    try:
+        dkp = _admin_dkp_module()
+        return int(dkp._event_points(int(guild_id), str(event_type)) or 0), int(dkp._reserve_points(int(guild_id), str(event_type)) or 0)
+    except Exception:
+        return 0, 0
+
+
+def _admin_event_award_preview_lines(client: discord.Client, guild_id: int, event_id: str, event: dict, event_type: str) -> tuple[int, int, int, int]:
+    try:
+        dkp = _admin_dkp_module()
+        present, reserve, skipped_partner, skipped_open = dkp._attendance_summary_for_award(client, int(guild_id), event, str(event_type))
+        return len(present), len(reserve), len(skipped_partner), len(skipped_open)
+    except Exception:
+        return 0, 0, 0, 0
+
+
 def _admin_clean_voice_name(title: str) -> str:
     raw = str(title or "Event").strip() or "Event"
     raw = re.sub(r"[#@`*_~|<>\n\r]+", "", raw).strip()
@@ -3792,9 +3838,23 @@ def _admin_attendance_embed(guild: discord.Guild, event: dict) -> discord.Embed:
     except Exception:
         when = "Unbekannt"
 
+    event_id = str(event.get("event_id", "") or event.get("message_id", "") or "")
+    ec_type = _admin_event_ec_type(event, event_id)
+    ec_line = ""
+    if ec_type:
+        base_ec, reserve_ec = _admin_event_ec_points(guild.id, ec_type)
+        awarded = _admin_event_ec_awarded(guild.id, event_id, event)
+        ec_line = (
+            f"🪙 EC-Typ: **{ec_type}** • Wert: **{base_ec} EC** • Reserve: **{reserve_ec} EC**\n"
+            f"EC-Status: **{'✅ bereits vergeben' if awarded else 'offen'}**\n"
+        )
+    else:
+        ec_line = "🪙 EC-Typ: **nicht EC-relevant**\n"
+
     desc = (
         f"**{title}**\n"
-        f"{EMOJI_TIME} {when}\n\n"
+        f"{EMOJI_TIME} {when}\n"
+        f"{ec_line}\n"
         f"✅ War da: **{counts['present']}**\n"
         f"❌ Nicht da: **{counts['absent']}**\n"
         f"🟡 Entschuldigt: **{counts['excused']}**\n"
@@ -3815,7 +3875,7 @@ def _admin_attendance_embed(guild: discord.Guild, event: dict) -> discord.Embed:
         description=desc[:3900],
         color=discord.Color.gold(),
     )
-    emb.set_footer(text="Du kannst angemeldete Spieler ändern, nachträglich hinzufügen oder entfernen.")
+    emb.set_footer(text="Du kannst Anwesenheit ändern, Spieler nachtragen und EC direkt aus diesem Menü vergeben.")
     return emb
 
 
@@ -3974,6 +4034,102 @@ class AdminAttendanceMemberSelectView(PortalSafeView):
     @button(label="➕ Spieler hinzufügen", style=ButtonStyle.success, custom_id="admin_attendance_add_player", row=2)
     async def btn_add_player(self, inter: discord.Interaction, _):
         await inter.response.send_modal(AdminAttendanceAddModal(self.guild_id, self.user_id, self.event_id, self.page))
+
+    @button(label="💰 EC vergeben", style=ButtonStyle.primary, custom_id="admin_attendance_award_ec", row=2)
+    async def btn_award_ec(self, inter: discord.Interaction, _):
+        resolved_guild, member = await _resolve_guild_member_from_inter(inter)
+        if not _is_portal_admin(resolved_guild, member):
+            await inter.response.send_message("❌ Dieser Bereich ist nur für Gildenleitung, Berater oder Wächter.", ephemeral=True)
+            return
+        rsvp = _admin_event_module()
+        guild = inter.client.get_guild(self.guild_id) or resolved_guild
+        event = rsvp.get_attendance_event(self.guild_id, self.event_id)
+        if not guild or not event:
+            await inter.response.send_message("❌ Event nicht gefunden.", ephemeral=True)
+            return
+
+        event_type = _admin_event_ec_type(event, self.event_id)
+        if not event_type:
+            await inter.response.send_message("❌ Dieses Event ist nicht EC-relevant oder hat keinen gespeicherten EC-Typ.", ephemeral=True)
+            return
+
+        if _admin_event_ec_awarded(self.guild_id, self.event_id, event):
+            await inter.response.send_message("❌ Für dieses Event wurden bereits EC vergeben. Korrekturen bitte über `/dkp adjust` machen.", ephemeral=True)
+            return
+
+        base_ec, reserve_ec = _admin_event_ec_points(self.guild_id, event_type)
+        present_count, reserve_count, partner_count, open_count = _admin_event_award_preview_lines(inter.client, self.guild_id, self.event_id, event, event_type)
+        title = str(event.get("title", "Event") or "Event")
+        emb = discord.Embed(
+            title="💰 EC vergeben – Bestätigung",
+            description=(
+                f"Event: **{title}**\n"
+                f"EC-Typ: **{event_type}**\n"
+                f"Wert: **{base_ec} EC** • Reserve: **{reserve_ec} EC**\n\n"
+                f"Würde vergeben an:\n"
+                f"✅ Volle Wertung: **{present_count}** Spieler\n"
+                f"🏦 Reserve: **{reserve_count}** Spieler\n"
+                f"🤝 Allianz/Partner ohne EC: **{partner_count}**\n"
+                f"⚪ Offen/nicht gewertet: **{open_count}**\n\n"
+                "Das schreibt echte EC-Transaktionen und kann nicht einfach nochmal gedrückt werden."
+            ),
+            color=discord.Color.gold(),
+        )
+        await inter.response.edit_message(embed=emb, view=AdminAttendanceAwardConfirmView(self.guild_id, self.user_id, self.event_id, self.page))
+
+
+class AdminAttendanceAwardConfirmView(PortalSafeView):
+    def __init__(self, guild_id: int, user_id: int, event_id: str, page: int = 0):
+        super().__init__(timeout=None)
+        self.guild_id = int(guild_id)
+        self.user_id = int(user_id)
+        self.event_id = str(event_id)
+        self.page = max(0, int(page))
+
+    @button(label="✅ EC wirklich vergeben", style=ButtonStyle.danger, custom_id="admin_attendance_award_confirm", row=0)
+    async def btn_confirm(self, inter: discord.Interaction, _):
+        guild, member = await _resolve_guild_member_from_inter(inter)
+        if not _is_portal_admin(guild, member):
+            await inter.response.send_message("❌ Dieser Bereich ist nur für Gildenleitung, Berater oder Wächter.", ephemeral=True)
+            return
+
+        await inter.response.defer(ephemeral=True, thinking=True)
+
+        try:
+            dkp = _admin_dkp_module()
+            ok, msg, _emb = await dkp._award_event_now(inter.client, self.guild_id, self.event_id, inter.user)
+        except Exception as e:
+            await inter.followup.send(f"❌ EC-Vergabe ist fehlgeschlagen: `{type(e).__name__}`", ephemeral=True)
+            print(f"[member_portal] EC-Vergabe über Gildenmenü fehlgeschlagen: {e!r}", flush=True)
+            return
+
+        rsvp = _admin_event_module()
+        event = rsvp.get_attendance_event(self.guild_id, self.event_id)
+        guild_obj = inter.client.get_guild(self.guild_id)
+
+        if ok and guild_obj and event and inter.message:
+            try:
+                await inter.message.edit(
+                    embed=_admin_attendance_embed(guild_obj, event),
+                    view=AdminAttendanceMemberSelectView(self.guild_id, self.user_id, self.event_id, event, self.page),
+                )
+            except Exception as e:
+                print(f"[member_portal] Anwesenheitsmenü nach EC-Vergabe nicht aktualisiert: {e!r}", flush=True)
+
+        await inter.followup.send(("✅ " if ok else "❌ ") + str(msg), ephemeral=True)
+
+    @button(label="Abbrechen", emoji=_menu_emoji(EMOJI_BACK), style=ButtonStyle.secondary, custom_id="admin_attendance_award_cancel", row=0)
+    async def btn_cancel(self, inter: discord.Interaction, _):
+        rsvp = _admin_event_module()
+        guild = inter.client.get_guild(self.guild_id)
+        event = rsvp.get_attendance_event(self.guild_id, self.event_id)
+        if not guild or not event:
+            await inter.response.send_message("❌ Event nicht gefunden.", ephemeral=True)
+            return
+        await inter.response.edit_message(
+            embed=_admin_attendance_embed(guild, event),
+            view=AdminAttendanceMemberSelectView(self.guild_id, self.user_id, self.event_id, event, self.page),
+        )
 
 
 class AdminAttendanceAddModal(Modal, title="Spieler zur Anwesenheit hinzufügen"):
