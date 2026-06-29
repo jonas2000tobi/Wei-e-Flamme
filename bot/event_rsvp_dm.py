@@ -2057,24 +2057,102 @@ async def _send_home_dms_for_alliance_event(
     return sent, skipped_opt_out
 
 
+def _register_event_view_once(
+    client: discord.Client,
+    view: discord.ui.View,
+    message_id: int | None,
+    label: str,
+) -> bool:
+    """Register a persistent view for exactly one already existing message.
+
+    RSVP buttons use the same custom_id labels for every event. After a deploy
+    they must therefore be registered with the concrete Discord message ID.
+    Without message_id scoping, one restored View can catch clicks from a
+    different event and users get a success message while the visible list does
+    not change.
+    """
+    if not message_id:
+        return False
+
+    try:
+        client.add_view(view, message_id=int(message_id))
+        return True
+    except Exception as e:
+        print(f"[event_rsvp_dm] View-Registrierung fehlgeschlagen ({label}, message_id={message_id}): {e!r}")
+        return False
+
+
+def _register_persistent_views_for_event(client: discord.Client, msg_id: str, obj: dict) -> tuple[int, int]:
+    """Restore server and DM RSVP buttons after a bot restart/deploy."""
+    _init_event_shape(obj)
+
+    registered_server = 0
+    registered_dm = 0
+
+    try:
+        master_id = int(obj.get("message_id", msg_id) or msg_id)
+    except Exception:
+        return 0, 0
+
+    server_message_ids: set[int] = set()
+
+    if _is_alliance_event(obj) and obj.get("mirrors"):
+        for mirror in list(obj.get("mirrors") or []):
+            try:
+                mid = int(mirror.get("message_id", 0) or 0)
+                if mid:
+                    server_message_ids.add(mid)
+            except Exception:
+                continue
+    else:
+        try:
+            server_message_ids.add(int(msg_id))
+        except Exception:
+            pass
+
+    for server_mid in server_message_ids:
+        if _register_event_view_once(
+            client,
+            ServerRaidView(master_id),
+            server_mid,
+            "server-rsvp",
+        ):
+            registered_server += 1
+
+    for uid_str, dm_mid_raw in list((obj.get("dm_messages") or {}).items()):
+        try:
+            dm_mid = int(dm_mid_raw or 0)
+        except Exception:
+            continue
+
+        if _register_event_view_once(
+            client,
+            RaidView(master_id),
+            dm_mid,
+            f"dm-rsvp user={uid_str}",
+        ):
+            registered_dm += 1
+
+    return registered_server, registered_dm
+
+
 async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
+    restored_server_views = 0
+    restored_dm_views = 0
+
     for msg_id, obj in list(store.items()):
         try:
-            _init_event_shape(obj)
-        except Exception:
-            pass
-
-        try:
-            client.add_view(RaidView(int(msg_id)))
-        except Exception:
-            pass
-
-        try:
-            client.add_view(ServerRaidView(int(msg_id)))
-        except Exception:
-            pass
+            srv_count, dm_count = _register_persistent_views_for_event(client, str(msg_id), obj)
+            restored_server_views += srv_count
+            restored_dm_views += dm_count
+        except Exception as e:
+            print(f"[event_rsvp_dm] Event-View Restore Fehler msg_id={msg_id}: {e!r}")
 
     save_store()
+    print(
+        "✅ RSVP Persistent Views registriert: "
+        f"Server={restored_server_views}, DM={restored_dm_views}"
+    )
 
     try:
         event_reminder_loop._client = client  # type: ignore[attr-defined]
