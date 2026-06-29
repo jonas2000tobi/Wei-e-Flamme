@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import asyncio
+import re
 from pathlib import Path
 from typing import Dict, Optional, Iterable, List, Any
 from datetime import datetime, timedelta
@@ -320,8 +321,11 @@ def _init_event_shape(obj: dict):
     obj.setdefault("scope", "single")
     obj.setdefault("voice_enabled", False)
     obj.setdefault("voice_channel_id", 0)
+    obj.setdefault("voice_category_id", 0)
     obj.setdefault("voice_return_channel_id", 0)
     obj.setdefault("voice_cleanup_done", False)
+    obj.setdefault("voice_created_at", "")
+    obj.setdefault("voice_name", "")
 
     migrated = False
 
@@ -591,6 +595,13 @@ def build_embed(guild: discord.Guild, obj: dict) -> discord.Embed:
         if role:
             emb.add_field(name=f"{EMOJI_TARGET} Zielgruppe", value=role.mention, inline=False)
 
+    if obj.get("voice_enabled"):
+        voice_id = int(obj.get("voice_channel_id", 0) or 0)
+        if voice_id:
+            emb.add_field(name="🔊 Voice", value=f"<#{voice_id}>", inline=False)
+        else:
+            emb.add_field(name="🔊 Voice", value="wird 1 Stunde vor Event automatisch erstellt", inline=False)
+
     if obj.get("image_url"):
         emb.set_image(url=obj["image_url"])
 
@@ -622,6 +633,15 @@ async def _delete_dm_message_for_user(client: discord.Client, obj: dict, user_id
         try:
             dm = user.dm_channel or await user.create_dm()
             msg = await dm.fetch_message(int(mid))
+
+            # Safety net: a broken/stale event dm_map must never be allowed to
+            # delete the user's current Gildenmenü. If such a wrong mapping ever
+            # appears, forget the mapping but keep the menu message alive.
+            if int(mid) in _portal_message_ids_to_keep(client, int(user_id)) or _is_portal_message(msg):
+                dm_map.pop(str(user_id), None)
+                obj["dm_messages"] = dm_map
+                return False
+
             await msg.delete()
             deleted = True
         except Exception:
@@ -671,6 +691,46 @@ def _is_portal_message(msg: discord.Message) -> bool:
 
     title = msg.embeds[0].title or ""
     return title in _portal_protected_titles()
+
+
+def _portal_message_ids_to_keep(client: discord.Client, user_id: int) -> set[int]:
+    """Return stored Gildenmenü message IDs for this user across all guilds.
+
+    The RSVP cleanup runs from the event module and used to decide mostly by
+    embed title. That was risky because the same saved portal DM can temporarily
+    show admin/event/auction/need wizard pages with titles that are not in the
+    static allow-list. Message-ID protection is the reliable source of truth.
+    """
+    keep: set[int] = set()
+
+    try:
+        try:
+            from bot import member_portal as mp  # type: ignore
+        except Exception:
+            try:
+                import member_portal as mp  # type: ignore
+            except Exception:
+                mp = None  # type: ignore
+
+        if mp is None:
+            return keep
+
+        for guild in getattr(client, "guilds", []) or []:
+            try:
+                member = guild.get_member(int(user_id))
+                if not member or member.bot:
+                    continue
+
+                mid = int(mp._portal_message_id(int(guild.id), int(user_id)) or 0)  # type: ignore[attr-defined]
+                if mid:
+                    keep.add(mid)
+            except Exception:
+                continue
+
+    except Exception:
+        pass
+
+    return keep
 
 
 def _pending_dm_message_ids_to_keep(user_id: int, current_msg_id: str | None = None) -> set[int]:
@@ -764,6 +824,7 @@ async def _delete_irrelevant_bot_dm_messages_for_user(
 
     keep_dm_ids = _pending_dm_message_ids_to_keep(user_id, current_msg_id=current_msg_id)
     known_dm_ids = _known_dm_message_ids_for_user(user_id)
+    portal_keep_ids = _portal_message_ids_to_keep(client, user_id)
 
     deleted = 0
     deleted_or_stale_dm_ids: set[int] = set()
@@ -776,7 +837,17 @@ async def _delete_irrelevant_bot_dm_messages_for_user(
                 if msg.author.id != client.user.id:
                     continue
 
+                if msg.id in portal_keep_ids:
+                    continue
+
                 if _is_portal_message(msg):
+                    continue
+
+                # Do not delete arbitrary bot DMs anymore. Only delete RSVP-DMs
+                # that are actually stored in event dm_messages. This prevents
+                # accidental deletion of the Gildenmenü while it shows an admin,
+                # auction or need subpage with a title not in the old allow-list.
+                if msg.id not in known_dm_ids:
                     continue
 
                 if msg.id in keep_dm_ids:
@@ -874,60 +945,10 @@ def _attendance_participants_from_event(obj: dict) -> list[dict]:
     return out
 
 
-def _merge_attendance_participants(signup_participants: list[dict], old_participants: list[dict]) -> list[dict]:
-    """
-    Baut die reine EC-Anwesenheitsliste.
-
-    Wichtig: Manuell nachgetragene Spieler bleiben im Attendance-Snapshot,
-    verändern aber NICHT die eigentliche Event-Anmeldung / RSVP-Liste.
-    """
-    merged: list[dict] = []
-    seen: set[int] = set()
-
-    for p in signup_participants or []:
-        try:
-            uid = int(p.get("id", 0) or 0)
-        except Exception:
-            uid = 0
-        if not uid or uid in seen:
-            continue
-        seen.add(uid)
-        merged.append({
-            "id": uid,
-            "name": str(p.get("name", "") or ""),
-            "signup": str(p.get("signup", "") or ""),
-            "source": "signup",
-        })
-
-    for p in old_participants or []:
-        try:
-            uid = int(p.get("id", 0) or 0)
-        except Exception:
-            uid = 0
-        if not uid or uid in seen:
-            continue
-        source = str(p.get("source", "") or "")
-        signup = str(p.get("signup", "") or "")
-        # Nur Einträge behalten, die eindeutig aus der EC-Anwesenheitskorrektur stammen.
-        if source == "manual" or signup == "MANUAL":
-            seen.add(uid)
-            merged.append({
-                "id": uid,
-                "name": str(p.get("name", "") or ""),
-                "signup": "MANUAL",
-                "source": "manual",
-            })
-
-    return merged
-
-
 def ensure_attendance_snapshot(client: discord.Client, msg_id: str, obj: dict) -> dict | None:
     """
     Speichert eine Event-/Teilnehmer-Kopie für die spätere Anwesenheitsprüfung.
     Dadurch bleibt die Anwesenheit auswertbar, auch wenn der normale RSVP-Post später bereinigt wird.
-
-    Diese Funktion verändert bewusst NICHT die normale Event-Anmeldung.
-    Manuelle Korrekturen landen nur in bot/data/event_attendance.json.
     """
     try:
         _init_event_shape(obj)
@@ -940,7 +961,7 @@ def ensure_attendance_snapshot(client: discord.Client, msg_id: str, obj: dict) -
         event_id = str(msg_id)
         snap = events.get(event_id)
 
-        signup_participants = _attendance_participants_from_event(obj)
+        participants = _attendance_participants_from_event(obj)
 
         if not isinstance(snap, dict):
             snap = {
@@ -952,21 +973,19 @@ def ensure_attendance_snapshot(client: discord.Client, msg_id: str, obj: dict) -
                 "description": str(obj.get("description", "") or ""),
                 "when_iso": str(obj.get("when_iso", "") or ""),
                 "created_at": datetime.now(TZ).isoformat(),
-                "participants": _merge_attendance_participants(signup_participants, []),
+                "participants": participants,
                 "attendance": {},
             }
         else:
-            # Teilnehmerliste aus RSVP aktualisieren, aber manuelle EC-Nachträge
-            # und bereits gesetzte Anwesenheitsstatus behalten.
+            # Teilnehmerliste aktualisieren, aber bereits gesetzte Anwesenheit behalten.
             old_att = snap.get("attendance") if isinstance(snap.get("attendance"), dict) else {}
-            old_parts = snap.get("participants") if isinstance(snap.get("participants"), list) else []
             snap["guild_id"] = guild_id
             snap["channel_id"] = int(obj.get("channel_id", 0) or 0)
             snap["message_id"] = event_id
             snap["title"] = str(obj.get("title", "Event") or "Event")
             snap["description"] = str(obj.get("description", "") or "")
             snap["when_iso"] = str(obj.get("when_iso", "") or "")
-            snap["participants"] = _merge_attendance_participants(signup_participants, old_parts)
+            snap["participants"] = participants
             snap["attendance"] = old_att
 
         events[event_id] = snap
@@ -998,57 +1017,12 @@ def get_attendance_event(guild_id: int, event_id: str) -> dict | None:
     return ev if isinstance(ev, dict) else None
 
 
-def add_attendance_participant(
-    guild_id: int,
-    event_id: str,
-    user_id: int,
-    name: str = "",
-    marked_by: int = 0,
-    status: str = "present",
-) -> bool:
-    """
-    Fügt einen Spieler NUR zur EC-Anwesenheitsprüfung hinzu.
-    Die eigentliche RSVP-/Event-Anmeldung bleibt unverändert.
-    """
-    ev = get_attendance_event(int(guild_id), str(event_id))
-    if not ev:
-        return False
-
-    uid = int(user_id)
-    participants = ev.setdefault("participants", [])
-    found = False
-    for p in participants:
-        try:
-            if int(p.get("id", 0) or 0) == uid:
-                found = True
-                if name and not str(p.get("name", "") or ""):
-                    p["name"] = str(name)
-                break
-        except Exception:
-            continue
-
-    if not found:
-        participants.append({
-            "id": uid,
-            "name": str(name or ""),
-            "signup": "MANUAL",
-            "source": "manual",
-        })
-
-    if status:
-        set_attendance_status(int(guild_id), str(event_id), uid, str(status), int(marked_by))
-    else:
-        save_attendance()
-    return True
-
-
 def set_attendance_status(guild_id: int, event_id: str, user_id: int, status: str, marked_by: int) -> bool:
     ev = get_attendance_event(int(guild_id), str(event_id))
     if not ev:
         return False
 
-    # Statuswerte gelten nur für die EC-Anwesenheitsprüfung, nicht für RSVP.
-    valid = {"present", "reserve", "maybe", "absent", "excused"}
+    valid = {"present", "absent", "excused"}
     attendance = ev.setdefault("attendance", {})
 
     if status == "clear":
@@ -1066,62 +1040,179 @@ def set_attendance_status(guild_id: int, event_id: str, user_id: int, status: st
     return True
 
 
+def _event_voice_name(title: str) -> str:
+    raw = str(title or "Event").strip() or "Event"
+    raw = re.sub(r"[#@`*_~|<>\n\r]+", "", raw).strip()
+    if len(raw) > 60:
+        raw = raw[:60].strip()
+    return f"🔊 {raw}"
+
+
+def _event_voice_window(obj: dict) -> tuple[datetime, datetime]:
+    when = datetime.fromisoformat(str(obj.get("when_iso", "")))
+    return when - timedelta(hours=1), when + timedelta(minutes=30)
+
+
+def _event_voice_category_and_anchor(guild: discord.Guild, obj: dict) -> tuple[Optional[discord.CategoryChannel], Optional[discord.VoiceChannel]]:
+    category = guild.get_channel(int(obj.get("voice_category_id", 0) or 0))
+    if category is not None and not isinstance(category, discord.CategoryChannel):
+        category = None
+
+    anchor = guild.get_channel(int(obj.get("voice_return_channel_id", 0) or 0))
+    if anchor is not None and not isinstance(anchor, discord.VoiceChannel):
+        anchor = None
+
+    if category is None and isinstance(anchor, discord.VoiceChannel) and anchor.category:
+        category = anchor.category
+
+    if category is None:
+        overview = guild.get_channel(int(obj.get("channel_id", 0) or 0))
+        if isinstance(overview, (discord.TextChannel, discord.Thread)):
+            parent = overview.parent if isinstance(overview, discord.Thread) else overview
+            if isinstance(parent, discord.TextChannel) and parent.category:
+                category = parent.category
+
+    return category, anchor
+
+
+async def _position_event_voice(channel: discord.VoiceChannel, anchor: Optional[discord.VoiceChannel]) -> None:
+    """Platziert den Event-Voice möglichst direkt bei den anderen Event-/Sammel-Voices."""
+    try:
+        if isinstance(anchor, discord.VoiceChannel) and anchor.category_id == channel.category_id:
+            await channel.edit(position=anchor.position + 1, reason="Event-Voice bei Sammel-Voice einsortiert")
+            return
+
+        if channel.category:
+            siblings = [c for c in channel.category.voice_channels if c.id != channel.id]
+            if siblings:
+                target = max(c.position for c in siblings) + 1
+                await channel.edit(position=target, reason="Event-Voice in Event-Voice-Kategorie einsortiert")
+    except Exception as e:
+        print(f"[event_rsvp_dm] Event-Voice konnte nicht einsortiert werden: {e!r}")
+
+
+async def _maybe_create_event_voice_for_obj(client: discord.Client, obj: dict) -> bool:
+    """Erstellt den Event-Voice frühestens 1 Stunde vor Eventbeginn."""
+    try:
+        _init_event_shape(obj)
+
+        if not bool(obj.get("voice_enabled", False)):
+            return False
+
+        if bool(obj.get("voice_cleanup_done", False)):
+            return False
+
+        create_at, delete_after = _event_voice_window(obj)
+        now = datetime.now(TZ)
+
+        if now < create_at:
+            return False
+
+        # Wenn der Bot erst nach dem Löschfenster startet, wird kein alter Voice mehr erstellt.
+        if now >= delete_after:
+            return False
+
+        guild_id = int(obj.get("guild_id", 0) or 0)
+        guild = client.get_guild(guild_id) if guild_id else None
+        if guild is None:
+            return False
+
+        existing_id = int(obj.get("voice_channel_id", 0) or 0)
+        if existing_id:
+            existing = guild.get_channel(existing_id)
+            if isinstance(existing, discord.VoiceChannel):
+                return False
+            obj["voice_channel_id"] = 0
+
+        category, anchor = _event_voice_category_and_anchor(guild, obj)
+        name = str(obj.get("voice_name", "") or "").strip() or _event_voice_name(str(obj.get("title", "Event")))
+
+        channel = await guild.create_voice_channel(
+            name=name,
+            category=category,
+            reason="Event-Voice automatisch 1 Stunde vor Event erstellt",
+        )
+        await _position_event_voice(channel, anchor)
+
+        obj["voice_channel_id"] = int(channel.id)
+        obj["voice_created_at"] = now.isoformat()
+        obj["voice_name"] = name
+        obj["voice_cleanup_done"] = False
+        print(f"[event_rsvp_dm] Event-Voice erstellt: {channel.id} für {obj.get('title')}")
+        return True
+
+    except Exception as e:
+        print(f"[event_rsvp_dm] Event-Voice Erstellung Fehler: {e!r}")
+        return False
+
+
 async def _cleanup_event_voice_for_obj(client: discord.Client, obj: dict) -> bool:
-    """
-    Verschiebt Mitglieder aus einem Event-Voice in den gespeicherten Sammel-Voice
-    und löscht danach den Event-Voice. Gibt True zurück, wenn der Event-Status
-    geändert wurde.
-    """
+    """Löscht den Event-Voice ab 30 Minuten nach Eventbeginn, sobald niemand mehr drin ist."""
     try:
         _init_event_shape(obj)
 
         if bool(obj.get("voice_cleanup_done", False)):
             return False
 
-        voice_channel_id = int(obj.get("voice_channel_id", 0) or 0)
-
-        if not voice_channel_id:
+        if not bool(obj.get("voice_enabled", False)):
             return False
+
+        _create_at, delete_after = _event_voice_window(obj)
+        now = datetime.now(TZ)
+        if now < delete_after:
+            return False
+
+        voice_channel_id = int(obj.get("voice_channel_id", 0) or 0)
+        if not voice_channel_id:
+            # Nach dem Löschfenster gibt es nichts mehr zu tun, wenn nie ein Voice erstellt wurde.
+            obj["voice_cleanup_done"] = True
+            return True
 
         guild_id = int(obj.get("guild_id", 0) or 0)
         guild = client.get_guild(guild_id) if guild_id else None
-
         if guild is None:
             return False
 
         channel = guild.get_channel(voice_channel_id)
-
         if not isinstance(channel, discord.VoiceChannel):
             obj["voice_cleanup_done"] = True
+            obj["voice_channel_id"] = 0
             return True
 
-        return_channel_id = int(obj.get("voice_return_channel_id", 0) or 0)
-        return_channel = guild.get_channel(return_channel_id) if return_channel_id else None
-
-        moved = 0
-
-        if isinstance(return_channel, discord.VoiceChannel):
-            for member in list(channel.members):
-                try:
-                    await member.move_to(return_channel, reason="Event-Voice wird automatisch geschlossen")
-                    moved += 1
-                    await asyncio.sleep(0.1)
-                except Exception:
-                    continue
+        if len(channel.members) > 0:
+            # Nicht verschieben, nicht kicken. Erst löschen, wenn alle raus sind.
+            return False
 
         try:
-            await channel.delete(reason="Event-Voice automatisch nach Eventende gelöscht")
+            await channel.delete(reason="Event-Voice automatisch gelöscht, nachdem er leer war")
         except Exception as e:
             print(f"[event_rsvp_dm] Event-Voice konnte nicht gelöscht werden: {e!r}")
             return False
 
         obj["voice_cleanup_done"] = True
-        print(f"[event_rsvp_dm] Event-Voice gelöscht: {voice_channel_id}, verschoben: {moved}")
+        obj["voice_channel_id"] = 0
+        print(f"[event_rsvp_dm] Event-Voice gelöscht: {voice_channel_id}")
         return True
 
     except Exception as e:
         print(f"[event_rsvp_dm] Event-Voice Cleanup Fehler: {e!r}")
         return False
+
+
+async def _cleanup_empty_event_voice_by_channel_id(client: discord.Client, channel_id: int) -> bool:
+    changed = False
+    for _msg_id, obj in list(store.items()):
+        try:
+            _init_event_shape(obj)
+            if int(obj.get("voice_channel_id", 0) or 0) != int(channel_id):
+                continue
+            if await _cleanup_event_voice_for_obj(client, obj):
+                changed = True
+        except Exception as e:
+            print(f"[event_rsvp_dm] Voice-State Cleanup Fehler: {e!r}")
+    if changed:
+        save_store()
+    return changed
 
 
 async def delete_pending_dm_messages_for_started_events(client: discord.Client) -> int:
@@ -1135,12 +1226,11 @@ async def delete_pending_dm_messages_for_started_events(client: discord.Client) 
         except Exception:
             continue
 
-        if now >= when + timedelta(hours=2):
-            try:
-                if await _cleanup_event_voice_for_obj(client, obj):
-                    changed += 1
-            except Exception as e:
-                print(f"[delete_pending_dm_messages_for_started_events] Voice-Cleanup Fehler: {e!r}")
+        try:
+            if await _cleanup_event_voice_for_obj(client, obj):
+                changed += 1
+        except Exception as e:
+            print(f"[delete_pending_dm_messages_for_started_events] Voice-Cleanup Fehler: {e!r}")
 
         if now < when:
             continue
@@ -1483,6 +1573,14 @@ async def event_reminder_loop():
         try:
             _init_event_shape(obj)
             when = datetime.fromisoformat(obj.get("when_iso", ""))
+            voice_changed = False
+
+            try:
+                if await _maybe_create_event_voice_for_obj(event_reminder_loop._client, obj):  # type: ignore[attr-defined]
+                    changed = True
+                    voice_changed = True
+            except Exception as e:
+                print(f"[event_reminder_loop] Voice-Erstellung Fehler: {e!r}")
 
             if now >= when:
                 try:
@@ -1491,12 +1589,18 @@ async def event_reminder_loop():
                 except Exception as e:
                     print(f"[event_reminder_loop] Attendance-Snapshot Fehler: {e!r}")
 
-            if now >= when + timedelta(hours=2):
+            try:
+                if await _cleanup_event_voice_for_obj(event_reminder_loop._client, obj):  # type: ignore[attr-defined]
+                    changed = True
+                    voice_changed = True
+            except Exception as e:
+                print(f"[event_reminder_loop] Voice-Cleanup Fehler: {e!r}")
+
+            if voice_changed:
                 try:
-                    if await _cleanup_event_voice_for_obj(event_reminder_loop._client, obj):  # type: ignore[attr-defined]
-                        changed = True
+                    await _push_overview(event_reminder_loop._client, str(msg_id), obj)  # type: ignore[attr-defined]
                 except Exception as e:
-                    print(f"[event_reminder_loop] Voice-Cleanup Fehler: {e!r}")
+                    print(f"[event_reminder_loop] Voice-Übersicht Update Fehler: {e!r}")
 
             reminders = obj.get("reminders") or []
 
@@ -1905,6 +2009,21 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
             print("⏰ Event-Reminder-Task gestartet.")
     except Exception as e:
         print(f"[event_rsvp_dm] Reminder-Task Startfehler: {e!r}")
+
+    try:
+        if not getattr(client, "_ebolus_event_voice_listener_added", False):
+            async def _ebolus_event_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
+                if before.channel is None:
+                    return
+                if after.channel is not None and before.channel.id == after.channel.id:
+                    return
+                await _cleanup_empty_event_voice_by_channel_id(client, int(before.channel.id))
+
+            client.add_listener(_ebolus_event_voice_state_update, "on_voice_state_update")
+            setattr(client, "_ebolus_event_voice_listener_added", True)
+            print("🔊 Event-Voice-State-Listener gestartet.")
+    except Exception as e:
+        print(f"[event_rsvp_dm] Voice-State-Listener Startfehler: {e!r}")
 
     @tree.command(name="raid_set_roles_dm", description="(Admin) Primärrollen (Tank/Heal/DPS) für Maybe-Label setzen")
     @app_commands.describe(tank_role="Rolle: Tank", heal_role="Rolle: Heal", dps_role="Rolle: DPS")
