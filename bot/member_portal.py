@@ -121,6 +121,12 @@ cfg: dict = _load_json(CFG_FILE, {})
 profiles: dict = _load_json(PROFILE_FILE, {})
 sent_state: dict = _load_json(SENT_FILE, {})
 
+PORTAL_REPAIR_INTERVAL_SECONDS = max(900, int(os.getenv("PORTAL_REPAIR_INTERVAL_SECONDS", "3600") or "3600"))
+PORTAL_REPAIR_START_DELAY_SECONDS = max(5.0, float(os.getenv("PORTAL_REPAIR_START_DELAY_SECONDS", "30") or "30"))
+PORTAL_REPAIR_MEMBER_DELAY_SECONDS = max(0.05, float(os.getenv("PORTAL_REPAIR_MEMBER_DELAY_SECONDS", "0.25") or "0.25"))
+NEW_MEMBER_LOOT_LOCK_DAYS = 7
+_portal_repair_task: Optional[asyncio.Task] = None
+
 
 def save_cfg() -> None:
     _save_json(CFG_FILE, cfg)
@@ -624,6 +630,51 @@ def _active_market_item_count(guild_id: int) -> int:
             count += 1
     return count
 
+
+def _loot_lock_until_for_member(member: Optional[discord.Member]) -> Optional[datetime]:
+    if not member or getattr(member, "bot", False):
+        return None
+
+    joined_at = getattr(member, "joined_at", None)
+    if joined_at is None:
+        return None
+
+    if joined_at.tzinfo is None:
+        joined_at = joined_at.replace(tzinfo=ZoneInfo("UTC"))
+
+    until = joined_at.astimezone(TZ) + timedelta(days=NEW_MEMBER_LOOT_LOCK_DAYS)
+    if datetime.now(TZ) >= until:
+        return None
+    return until
+
+
+def _format_timedelta_short(delta: timedelta) -> str:
+    seconds = max(0, int(delta.total_seconds()))
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes = max(1, rem // 60) if days == 0 and hours == 0 else rem // 60
+
+    parts: list[str] = []
+    if days:
+        parts.append(f"{days} Tag{'e' if days != 1 else ''}")
+    if hours:
+        parts.append(f"{hours} Std.")
+    if not parts:
+        parts.append(f"{minutes} Min.")
+    return " ".join(parts[:2])
+
+
+def _loot_lock_block(member: Optional[discord.Member]) -> str:
+    until = _loot_lock_until_for_member(member)
+    if not until:
+        return ""
+    remaining = _format_timedelta_short(until - datetime.now(TZ))
+    return (
+        f"\n\n⏳ **Lootsperre für neue Mitglieder**\n"
+        f"Bieten/Sale-Kauf möglich in: **{remaining}**\n"
+        f"Freischaltung: **{until.strftime('%d.%m.%Y %H:%M')}**"
+    )
+
 def _main_menu_embed(guild: discord.Guild, member: Optional[discord.Member] = None) -> discord.Embed:
     event_block = ""
 
@@ -633,9 +684,11 @@ def _main_menu_embed(guild: discord.Guild, member: Optional[discord.Member] = No
     available_items = _active_market_item_count(guild.id)
 
     ec_block = ""
+    loot_lock_block = ""
     if member:
         ec_balance = _get_ec_balance_safe(guild.id, member.id)
         ec_block = f"\n\n🪙 **Ebolus Coins (EC)**\nDein Konto: **{ec_balance} EC**"
+        loot_lock_block = _loot_lock_block(member)
 
     emb = discord.Embed(
         title=f"{EMOJI_EBOLUS} Ebolus Kommandozentrale",
@@ -643,7 +696,8 @@ def _main_menu_embed(guild: discord.Guild, member: Optional[discord.Member] = No
             event_block +
             "Willkommen im privaten Gildenmenü.\n\n"
             f"**Items zum Kauf Verfügbar:**\n**{available_items}**" +
-            ec_block
+            ec_block +
+            loot_lock_block
         ),
         color=discord.Color.gold()
     )
@@ -1024,6 +1078,150 @@ async def ensure_portal_menu_for_user(
         return sent is not None
 
 
+async def ensure_portal_exists_for_user(
+    client: discord.Client,
+    guild_id: int,
+    user_id: int,
+) -> tuple[bool, str]:
+    """Verify that the saved Gildenmenü DM still exists.
+
+    Important: this function does NOT edit an existing menu back to the main
+    page. It only fetches the stored message ID and sends a new menu when that
+    message is missing. That way users are not thrown out of profile, auction,
+    need or admin submenus by the background checker.
+    """
+    guild = client.get_guild(int(guild_id))
+    if not guild:
+        return False, "guild_missing"
+
+    member = guild.get_member(int(user_id))
+    if member is None:
+        try:
+            member = await guild.fetch_member(int(user_id))
+        except Exception:
+            member = None
+
+    if not member or member.bot:
+        return False, "member_missing"
+
+    if not _member_has_member_role(member):
+        return False, "no_member_role"
+
+    mid = _portal_message_id(guild.id, member.id)
+    if mid:
+        msg = await _fetch_portal_message(client, guild.id, member.id)
+        if msg is not None:
+            _mark_portal_sent(guild.id, member.id, msg.id)
+            return True, "exists"
+
+    msg = await _send_new_portal_menu(member, guild)
+    if msg is not None:
+        return True, "sent"
+
+    return False, "dm_failed"
+
+
+async def repair_portals_for_guild(
+    client: discord.Client,
+    guild_id: int,
+    delay: float = PORTAL_REPAIR_MEMBER_DELAY_SECONDS,
+) -> dict[str, int]:
+    guild = client.get_guild(int(guild_id))
+    summary = {"checked": 0, "exists": 0, "sent": 0, "failed": 0, "skipped": 0}
+
+    if not guild:
+        summary["failed"] += 1
+        return summary
+
+    member_role_id = int(_gcfg(guild.id).get("member_role_id", 0) or 0)
+    role = guild.get_role(member_role_id) if member_role_id else None
+
+    if role is None:
+        summary["skipped"] += 1
+        return summary
+
+    for member in list(role.members):
+        if member.bot:
+            continue
+
+        summary["checked"] += 1
+
+        try:
+            ok, status = await ensure_portal_exists_for_user(client, guild.id, member.id)
+            if ok and status == "exists":
+                summary["exists"] += 1
+            elif ok and status == "sent":
+                summary["sent"] += 1
+            elif status in {"no_member_role", "member_missing"}:
+                summary["skipped"] += 1
+            else:
+                summary["failed"] += 1
+        except Exception as e:
+            summary["failed"] += 1
+            print(f"[member_portal] Portal-Repair Fehler user={member.id}: {e!r}")
+
+        if delay > 0:
+            await asyncio.sleep(delay)
+
+    return summary
+
+
+async def repair_all_portals_once(client: discord.Client) -> dict[str, int]:
+    total = {"checked": 0, "exists": 0, "sent": 0, "failed": 0, "skipped": 0}
+
+    for guild_id_str, guild_cfg in list(cfg.items()):
+        try:
+            if not int((guild_cfg or {}).get("member_role_id", 0) or 0):
+                continue
+
+            part = await repair_portals_for_guild(client, int(guild_id_str))
+            for key, value in part.items():
+                total[key] = total.get(key, 0) + int(value)
+        except Exception as e:
+            total["failed"] += 1
+            print(f"[member_portal] Portal-Repair Guild Fehler guild={guild_id_str}: {e!r}")
+
+    return total
+
+
+async def _portal_repair_loop(client: discord.Client) -> None:
+    await client.wait_until_ready()
+    await asyncio.sleep(PORTAL_REPAIR_START_DELAY_SECONDS)
+
+    while not client.is_closed():
+        try:
+            total = await repair_all_portals_once(client)
+            if total.get("checked") or total.get("sent") or total.get("failed"):
+                print(
+                    "[member_portal] Auto-Repair: "
+                    f"geprüft={total.get('checked', 0)} "
+                    f"vorhanden={total.get('exists', 0)} "
+                    f"neu={total.get('sent', 0)} "
+                    f"fehler={total.get('failed', 0)} "
+                    f"übersprungen={total.get('skipped', 0)}"
+                )
+        except Exception as e:
+            print(f"[member_portal] Auto-Repair Loop Fehler: {e!r}")
+
+        await asyncio.sleep(PORTAL_REPAIR_INTERVAL_SECONDS)
+
+
+def _start_portal_repair_loop(client: discord.Client) -> None:
+    global _portal_repair_task
+
+    if _portal_repair_task is not None and not _portal_repair_task.done():
+        return
+
+    try:
+        _portal_repair_task = asyncio.create_task(_portal_repair_loop(client))
+        print(
+            "✅ Member-Portal Auto-Repair gestartet "
+            f"(alle {PORTAL_REPAIR_INTERVAL_SECONDS // 60} Minuten)."
+        )
+    except Exception as e:
+        print(f"[member_portal] Auto-Repair Start Fehler: {e!r}")
+
+
 async def _send_main_menu_to_member(member: discord.Member, force: bool = False) -> bool:
     if member.bot:
         return False
@@ -1118,11 +1316,13 @@ async def _delete_old_bot_dms_for_member(
                     if not active_menu_id:
                         _mark_portal_sent(member.guild.id, member.id, msg.id)
                         active_menu_id = msg.id
-                        continue
+                    continue
 
-                    await msg.delete()
-                    deleted += 1
-                    await asyncio.sleep(0.08)
+                # Safety: the Gildenmenü is one saved DM that can temporarily
+                # show many admin/loot/auction wizard pages. Those pages have
+                # buttons/selects, so manual cleanup must not delete interactive
+                # bot messages unless a feature deletes its own tracked message.
+                if getattr(msg, "components", None):
                     continue
 
                 await msg.delete()
@@ -2129,16 +2329,10 @@ async def _admin_create_regular_raid_from_menu(
         await inter.followup.send("❌ Zielrolle nicht gefunden.", ephemeral=True)
         return
 
+    # Event-Voice wird nicht mehr sofort erstellt.
+    # Der RSVP-Task erstellt ihn automatisch frühestens 1 Stunde vor Eventbeginn.
+    voice_requested = bool(voice_enabled)
     voice_channel_id = 0
-    if voice_enabled:
-        voice = await _admin_create_event_voice(guild, str(title).strip(), int(voice_category_id or 0))
-        if voice is None:
-            await inter.followup.send(
-                "⚠️ Event-Voice konnte nicht erstellt werden. Das Event wird trotzdem ohne Voice erstellt.",
-                ephemeral=True,
-            )
-        else:
-            voice_channel_id = int(voice.id)
 
     obj = {
         "guild_id": int(guild.id),
@@ -2155,10 +2349,13 @@ async def _admin_create_regular_raid_from_menu(
         "target_role_id": int(target_role_id),
         "reminders": reminders or [],
         "reminder_sent": {},
-        "voice_enabled": bool(voice_channel_id),
+        "voice_enabled": bool(voice_requested),
         "voice_channel_id": int(voice_channel_id),
+        "voice_category_id": int(voice_category_id or 0),
         "voice_return_channel_id": int(voice_return_channel_id or 0),
         "voice_cleanup_done": False,
+        "voice_created_at": "",
+        "voice_name": _admin_clean_voice_name(str(title).strip()),
         "dm_messages": {},
     }
 
@@ -2166,6 +2363,17 @@ async def _admin_create_regular_raid_from_menu(
     msg = await ch.send(embed=emb)
     rsvp.store[str(msg.id)] = obj
     rsvp.save_store()
+
+    if voice_requested:
+        try:
+            if await rsvp._maybe_create_event_voice_for_obj(inter.client, obj):
+                rsvp.save_store()
+                try:
+                    await rsvp._push_overview(inter.client, str(msg.id), obj)
+                except Exception:
+                    pass
+        except Exception as e:
+            print(f"[member_portal] Event-Voice Vorabprüfung fehlgeschlagen: {e!r}")
 
     try:
         await msg.edit(view=rsvp.ServerRaidView(int(msg.id)))
@@ -2212,7 +2420,7 @@ async def _admin_create_regular_raid_from_menu(
         f"✉️ DMs versendet: **{sent}**\n"
         f"🔕 Opt-out übersprungen: **{skipped_opt_out}**\n"
         f"⏰ Reminder: **{len(reminders or [])}**\n"
-        f"🔊 Voice: **{'erstellt' if voice_channel_id else 'nein'}**\n"
+        f"🔊 Voice: **{'geplant, 1h vor Event' if voice_requested else 'nein'}**\n"
         f"🪙 EC/DKP: **{str(dkp_event_type or 'Nicht DKP-relevant')}**",
         ephemeral=True
     )
@@ -3212,7 +3420,7 @@ async def _admin_show_voice_select(inter: discord.Interaction, data: dict):
             "Soll für dieses Event automatisch ein Voice-Channel erstellt werden?\n\n"
             f"Kategorie: **{category_txt}**\n"
             f"Sammel-Voice nach Event: **{return_txt}**\n\n"
-            "Der Event-Voice wird nach Eventende geschlossen. Wenn ein Sammel-Voice gesetzt ist, werden Mitglieder vorher dorthin verschoben."
+            "Der Event-Voice wird erst 1 Stunde vor Event automatisch erstellt und ab 30 Minuten nach Eventbeginn gelöscht, sobald niemand mehr drin ist."
         ),
         color=discord.Color.gold(),
     )
@@ -3780,7 +3988,7 @@ async def _admin_show_voice_settings(inter: discord.Interaction, guild_id: int):
         description=(
             f"Event-Voice-Kategorie: **{category_txt}**\n"
             f"Sammel-Voice nach Event: **{return_txt}**\n\n"
-            "Diese Einstellungen werden verwendet, wenn beim Event-Erstellen `Voice-Channel erstellen` gewählt wird."
+            "Diese Einstellungen werden verwendet, wenn beim Event-Erstellen `Voice-Channel erstellen` gewählt wird. Der Kanal wird 1 Stunde vor Eventbeginn erstellt und später gelöscht, sobald er leer ist."
         ),
         color=discord.Color.gold(),
     )
@@ -4266,6 +4474,8 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
         except Exception as e:
             print(f"[member_portal] Listener-Setup Fehler: {e!r}")
 
+    _start_portal_repair_loop(client)
+
     @tree.command(name="portal_set_absence_channel", description="(Admin) Abwesenheitskanal setzen")
     async def portal_set_absence_channel(inter: discord.Interaction, channel: discord.TextChannel):
         if not _is_admin(inter):
@@ -4320,6 +4530,43 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
             await inter.response.send_message("✅ Gildeninfo für das Gildenmenü gesetzt. Nutze `/portal_send_all force:false`, um bestehende Menüs zu aktualisieren.", ephemeral=True)
         else:
             await inter.response.send_message("✅ Gildeninfo geleert. Nutze `/portal_send_all force:false`, um bestehende Menüs zu aktualisieren.", ephemeral=True)
+
+    @tree.command(name="portal_repair_user", description="(Admin) Prüft und repariert das Gildenmenü bei einem Mitglied")
+    async def portal_repair_user(inter: discord.Interaction, member: discord.Member):
+        await inter.response.defer(ephemeral=True, thinking=True)
+
+        if not _is_admin(inter):
+            await inter.followup.send("❌ Nur Admin/Manage Server.", ephemeral=True)
+            return
+
+        ok, status = await ensure_portal_exists_for_user(client, inter.guild_id, member.id)
+
+        if ok and status == "exists":
+            await inter.followup.send(f"✅ Gildenmenü bei **{member.display_name}** ist vorhanden.", ephemeral=True)
+        elif ok and status == "sent":
+            await inter.followup.send(f"✅ Gildenmenü bei **{member.display_name}** fehlte und wurde neu gesendet.", ephemeral=True)
+        else:
+            await inter.followup.send(f"❌ Gildenmenü bei **{member.display_name}** konnte nicht repariert werden: `{status}`", ephemeral=True)
+
+    @tree.command(name="portal_repair_all", description="(Admin) Prüft/repariert fehlende Gildenmenüs bei allen Gildenmitgliedern")
+    async def portal_repair_all(inter: discord.Interaction):
+        await inter.response.defer(ephemeral=True, thinking=True)
+
+        if not _is_admin(inter):
+            await inter.followup.send("❌ Nur Admin/Manage Server.", ephemeral=True)
+            return
+
+        result = await repair_portals_for_guild(client, inter.guild_id)
+
+        await inter.followup.send(
+            f"✅ Gildenmenü-Reparatur abgeschlossen.\n"
+            f"👥 Geprüft: **{result.get('checked', 0)}**\n"
+            f"🟢 Bereits vorhanden: **{result.get('exists', 0)}**\n"
+            f"✉️ Neu gesendet: **{result.get('sent', 0)}**\n"
+            f"❌ Fehlgeschlagen/DMs zu: **{result.get('failed', 0)}**\n"
+            f"↪️ Übersprungen: **{result.get('skipped', 0)}**",
+            ephemeral=True
+        )
 
     @tree.command(name="portal_send_all", description="(Admin) Öffnet/aktualisiert das Gildenmenü per DM bei allen mit Gildenmitglied-Rolle")
     async def portal_send_all(inter: discord.Interaction, force: bool = False):
