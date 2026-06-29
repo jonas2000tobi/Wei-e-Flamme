@@ -34,9 +34,11 @@ DEFAULT_START_BID = 1
 NEED_AUCTION_HOURS = 48
 FREE_AUCTION_HOURS = 24
 SALE_HOURS = 240
-NEED_START_BID = 40
-FREE_START_BID = 20
-SALE_PRICE = 10
+MAIN_NEED_START_BID = 30
+SECOND_NEED_START_BID = 15
+FREE_START_BID = 5
+SALE_PRICE = 1
+FREE_MIN_INCREMENT = 1
 
 ELIGIBILITY_CHOICES = [
     app_commands.Choice(name="Automatisch: Main > Second > Frei", value="auto"),
@@ -137,6 +139,7 @@ def _gcfg(guild_id: int) -> dict:
     c.setdefault("auction_channel_id", 0)
     c.setdefault("log_channel_id", 0)
     c.setdefault("market_channel_id", 0)
+    c.setdefault("drop_notify_channel_id", 0)
     auction_cfg[gid] = c
     return c
 
@@ -389,6 +392,96 @@ def _log_channel(client: discord.Client, guild_id: int):
     except Exception:
         pass
     return _auction_channel(client, guild_id)
+
+
+def _drop_notify_channel(client: discord.Client, guild_id: int):
+    """Separater Kanal für die Meldung: Loot gedroppt + wer per DM benachrichtigt wurde."""
+    c = _gcfg(guild_id)
+    ch_id = int(c.get("drop_notify_channel_id", 0) or 0)
+    guild = client.get_guild(int(guild_id))
+    if guild and ch_id:
+        ch = guild.get_channel(ch_id)
+        if isinstance(ch, (discord.TextChannel, discord.Thread)):
+            return ch
+    return None
+
+
+async def _send_drop_notify_channel_message(
+    client: discord.Client,
+    guild: discord.Guild,
+    auction: dict,
+    eligible_user_ids: list[int],
+    notified_user_ids: list[int],
+    failed_user_ids: list[int],
+) -> None:
+    """Postet eine einzelne Drop-/Benachrichtigungs-Meldung in den separat gesetzten Kanal."""
+    ch = _drop_notify_channel(client, int(guild.id))
+    if not ch:
+        return
+    try:
+        mode = str(auction.get("eligibility_mode", "all") or "all")
+        phase = str(auction.get("phase", "") or "")
+        item_name = str(auction.get("item_name", "Unbekanntes Item") or "Unbekanntes Item")
+        aid = str(auction.get("id", "") or "")
+        start_bid = int(auction.get("start_bid", 0) or 0)
+        ends_at = str(auction.get("ends_at", "") or "")
+
+        if mode == "main_need":
+            title = "🎁 Loot gedroppt – Main-Need-Spieler benachrichtigt"
+            phase_text = "Main-Need-Auktion"
+        elif mode == "secondary_need":
+            title = "🎁 Loot gedroppt – Second-Need-Spieler benachrichtigt"
+            phase_text = "Second-Need-Auktion"
+        else:
+            title = "🎁 Loot gedroppt – freie Auktion gestartet"
+            phase_text = "Freie Auktion"
+
+        desc = (
+            f"**Item:** {item_name}\n"
+            f"**Auktion:** {phase_text}\n"
+            f"**Auktions-ID:** `{aid}`\n"
+            f"**Startgebot:** {start_bid} EC\n"
+        )
+        if ends_at:
+            desc += f"**Läuft bis:** `{ends_at}`\n"
+
+        if phase == "need":
+            if eligible_user_ids:
+                eligible_text = ", ".join(f"<@{uid}>" for uid in eligible_user_ids[:30])
+                if len(eligible_user_ids) > 30:
+                    eligible_text += f" … +{len(eligible_user_ids) - 30}"
+            else:
+                eligible_text = "—"
+
+            if notified_user_ids:
+                notified_text = ", ".join(f"<@{uid}>" for uid in notified_user_ids[:30])
+                if len(notified_user_ids) > 30:
+                    notified_text += f" … +{len(notified_user_ids) - 30}"
+            else:
+                notified_text = "—"
+
+            desc += (
+                f"\n**Berechtigte Spieler:** {eligible_text}\n"
+                f"**Per DM benachrichtigt:** {notified_text}\n"
+                f"**Erfolgreich:** {len(notified_user_ids)} / {len(eligible_user_ids)}"
+            )
+            if failed_user_ids:
+                failed_text = ", ".join(f"<@{uid}>" for uid in failed_user_ids[:20])
+                if len(failed_user_ids) > 20:
+                    failed_text += f" … +{len(failed_user_ids) - 20}"
+                desc += f"\n**DM fehlgeschlagen:** {failed_text}"
+        else:
+            desc += "\nKeine offenen Main-/Second-Needs gefunden. Es wurden keine Need-DMs verschickt."
+
+        embed = discord.Embed(
+            title=title,
+            description=desc,
+            color=discord.Color.gold(),
+            timestamp=_now(),
+        )
+        await ch.send(embed=embed)
+    except Exception as e:
+        print(f"[loot_auction] drop notify channel message failed: {e!r}")
 
 
 def _market_channel(client: discord.Client, guild_id: int):
@@ -1608,7 +1701,12 @@ async def start_loot_drop_auction(inter: discord.Interaction, guild: discord.Gui
     aid = _new_auction_id()
     chest_id = f"C{aid[1:]}"
     hours = NEED_AUCTION_HOURS if phase == "need" else FREE_AUCTION_HOURS
-    start_bid = NEED_START_BID if phase == "need" else FREE_START_BID
+    if mode == "main_need":
+        start_bid = MAIN_NEED_START_BID
+    elif mode == "secondary_need":
+        start_bid = SECOND_NEED_START_BID
+    else:
+        start_bid = FREE_START_BID
 
     chest_obj = {
         "id": chest_id,
@@ -1637,7 +1735,7 @@ async def start_loot_drop_auction(inter: discord.Interaction, guild: discord.Gui
         "source": "loot_drop_menu",
         "ends_at": (_now() + timedelta(hours=hours)).isoformat(),
         "start_bid": int(start_bid),
-        "min_increment": DEFAULT_MIN_INCREMENT,
+        "min_increment": (FREE_MIN_INCREMENT if phase == "free" else DEFAULT_MIN_INCREMENT),
         "eligibility_mode": mode,
         "eligible_user_ids": eligible,
         "bids": [],
@@ -1678,6 +1776,8 @@ async def start_loot_drop_auction(inter: discord.Interaction, guild: discord.Gui
 
     notified = 0
     failed = 0
+    notified_user_ids: list[int] = []
+    failed_user_ids: list[int] = []
     notify_refs: list[dict] = []
     if phase == "need":
         for uid in eligible:
@@ -1685,12 +1785,23 @@ async def start_loot_drop_auction(inter: discord.Interaction, guild: discord.Gui
             if ref:
                 notify_refs.append(ref)
                 notified += 1
+                notified_user_ids.append(int(uid))
             else:
                 failed += 1
+                failed_user_ids.append(int(uid))
             await asyncio.sleep(0.08)
         if notify_refs:
             auc["notify_message_refs"] = notify_refs
             save_auctions()
+
+    await _send_drop_notify_channel_message(
+        inter.client,
+        guild,
+        auc,
+        [int(uid) for uid in eligible],
+        notified_user_ids,
+        failed_user_ids,
+    )
 
     return {
         "auction_id": aid,
@@ -1703,6 +1814,41 @@ async def start_loot_drop_auction(inter: discord.Interaction, guild: discord.Gui
         "failed": failed,
         "channel_id": int(auc.get("channel_id", 0) or 0),
     }
+
+
+async def _delete_discord_message_ref(client: discord.Client, channel_id: int, message_id: int) -> bool:
+    if not channel_id or not message_id:
+        return False
+    try:
+        ch = client.get_channel(int(channel_id))
+        if ch is None:
+            ch = await client.fetch_channel(int(channel_id))
+        msg = await ch.fetch_message(int(message_id))
+        await msg.delete()
+        return True
+    except Exception:
+        return False
+
+
+async def _purge_auction_messages(client: discord.Client, auction: dict) -> int:
+    """Delete Discord messages that belong to one auction. Does not touch EC transactions."""
+    deleted = 0
+    refs = [
+        (int(auction.get("channel_id", 0) or 0), int(auction.get("message_id", 0) or 0)),
+        (int(auction.get("market_channel_id", 0) or 0), int(auction.get("market_message_id", 0) or 0)),
+        (int(auction.get("delivery_channel_id", 0) or 0), int(auction.get("delivery_message_id", 0) or 0)),
+    ]
+    seen = set()
+    for cid, mid in refs:
+        if not cid or not mid or (cid, mid) in seen:
+            continue
+        seen.add((cid, mid))
+        if await _delete_discord_message_ref(client, cid, mid):
+            deleted += 1
+    tracking_refs = list(auction.get("notify_message_refs") or [])
+    await _delete_auction_tracking_dms(client, auction)
+    deleted += len(tracking_refs)
+    return deleted
 
 
 async def setup_loot_auction(client: discord.Client, tree: app_commands.CommandTree):
@@ -1755,6 +1901,19 @@ async def setup_loot_auction(client: discord.Client, tree: app_commands.CommandT
         _gcfg(inter.guild.id)["log_channel_id"] = int(channel.id)
         save_cfg()
         await inter.response.send_message(f"✅ Auktions-Log-Kanal gesetzt: {channel.mention}", ephemeral=True)
+
+    @group.command(name="set_drop_notify_channel", description="Setzt den Kanal für Loot gedroppt + benachrichtigte Spieler")
+    async def auction_set_drop_notify_channel(inter: discord.Interaction, channel: discord.TextChannel):
+        if inter.guild is None or not _is_leader_or_admin(inter):
+            await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
+            return
+        _gcfg(inter.guild.id)["drop_notify_channel_id"] = int(channel.id)
+        save_cfg()
+        await inter.response.send_message(
+            f"✅ Drop-Benachrichtigungskanal gesetzt: {channel.mention}\n"
+            "Dort postet der Bot einzeln: Loot gedroppt + welche Spieler per DM benachrichtigt wurden.",
+            ephemeral=True,
+        )
 
     @group.command(name="set_market_channel", description="Setzt den öffentlichen Kanal für freie Auktionen und Sale-Käufe")
     async def auction_set_market_channel(inter: discord.Interaction, channel: discord.TextChannel):
@@ -1953,6 +2112,34 @@ async def setup_loot_auction(client: discord.Client, tree: app_commands.CommandT
             except Exception:
                 pass
         await inter.response.send_message("✅ Auktion abgebrochen.", ephemeral=True)
+
+    @group.command(name="delete", description="Löscht eine Auktion und ihre Bot-Nachrichten endgültig")
+    async def auction_delete(inter: discord.Interaction, auction_id: str, confirm: bool = False):
+        if inter.guild is None or not _is_leader_or_admin(inter):
+            await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
+            return
+        auc = _auction(inter.guild.id, auction_id)
+        if not auc:
+            await inter.response.send_message("❌ Auktion nicht gefunden.", ephemeral=True)
+            return
+        if not confirm:
+            await inter.response.send_message(
+                "⚠️ Diese Aktion löscht die Auktion und alle zugehörigen Bot-Nachrichten endgültig. "
+                "Bereits abgebuchte EC werden **nicht** automatisch zurückerstattet. "
+                "Führe den Befehl erneut mit `confirm: True` aus.",
+                ephemeral=True,
+            )
+            return
+        await inter.response.defer(ephemeral=True, thinking=True)
+        deleted_messages = await _purge_auction_messages(client, auc)
+        auctions = _gauctions(inter.guild.id).setdefault("auctions", {})
+        auctions.pop(str(auction_id), None)
+        save_auctions()
+        await inter.followup.send(
+            f"✅ Auktion `{auction_id}` endgültig gelöscht. Gelöschte Bot-Nachrichten: **{deleted_messages}**. "
+            "EC-Buchungen wurden nicht verändert.",
+            ephemeral=True,
+        )
 
     try:
         tree.add_command(group)
