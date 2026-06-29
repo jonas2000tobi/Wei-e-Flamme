@@ -874,10 +874,60 @@ def _attendance_participants_from_event(obj: dict) -> list[dict]:
     return out
 
 
+def _merge_attendance_participants(signup_participants: list[dict], old_participants: list[dict]) -> list[dict]:
+    """
+    Baut die reine EC-Anwesenheitsliste.
+
+    Wichtig: Manuell nachgetragene Spieler bleiben im Attendance-Snapshot,
+    verändern aber NICHT die eigentliche Event-Anmeldung / RSVP-Liste.
+    """
+    merged: list[dict] = []
+    seen: set[int] = set()
+
+    for p in signup_participants or []:
+        try:
+            uid = int(p.get("id", 0) or 0)
+        except Exception:
+            uid = 0
+        if not uid or uid in seen:
+            continue
+        seen.add(uid)
+        merged.append({
+            "id": uid,
+            "name": str(p.get("name", "") or ""),
+            "signup": str(p.get("signup", "") or ""),
+            "source": "signup",
+        })
+
+    for p in old_participants or []:
+        try:
+            uid = int(p.get("id", 0) or 0)
+        except Exception:
+            uid = 0
+        if not uid or uid in seen:
+            continue
+        source = str(p.get("source", "") or "")
+        signup = str(p.get("signup", "") or "")
+        # Nur Einträge behalten, die eindeutig aus der EC-Anwesenheitskorrektur stammen.
+        if source == "manual" or signup == "MANUAL":
+            seen.add(uid)
+            merged.append({
+                "id": uid,
+                "name": str(p.get("name", "") or ""),
+                "signup": "MANUAL",
+                "source": "manual",
+            })
+
+    return merged
+
+
 def ensure_attendance_snapshot(client: discord.Client, msg_id: str, obj: dict) -> dict | None:
     """
     Speichert eine Event-/Teilnehmer-Kopie für die spätere Anwesenheitsprüfung.
     Dadurch bleibt die Anwesenheit auswertbar, auch wenn der normale RSVP-Post später bereinigt wird.
+
+    Diese Funktion verändert bewusst NICHT die normale Event-Anmeldung.
+    Manuelle Korrekturen landen nur in bot/data/event_attendance.json.
     """
     try:
         _init_event_shape(obj)
@@ -890,7 +940,7 @@ def ensure_attendance_snapshot(client: discord.Client, msg_id: str, obj: dict) -
         event_id = str(msg_id)
         snap = events.get(event_id)
 
-        participants = _attendance_participants_from_event(obj)
+        signup_participants = _attendance_participants_from_event(obj)
 
         if not isinstance(snap, dict):
             snap = {
@@ -902,19 +952,21 @@ def ensure_attendance_snapshot(client: discord.Client, msg_id: str, obj: dict) -
                 "description": str(obj.get("description", "") or ""),
                 "when_iso": str(obj.get("when_iso", "") or ""),
                 "created_at": datetime.now(TZ).isoformat(),
-                "participants": participants,
+                "participants": _merge_attendance_participants(signup_participants, []),
                 "attendance": {},
             }
         else:
-            # Teilnehmerliste aktualisieren, aber bereits gesetzte Anwesenheit behalten.
+            # Teilnehmerliste aus RSVP aktualisieren, aber manuelle EC-Nachträge
+            # und bereits gesetzte Anwesenheitsstatus behalten.
             old_att = snap.get("attendance") if isinstance(snap.get("attendance"), dict) else {}
+            old_parts = snap.get("participants") if isinstance(snap.get("participants"), list) else []
             snap["guild_id"] = guild_id
             snap["channel_id"] = int(obj.get("channel_id", 0) or 0)
             snap["message_id"] = event_id
             snap["title"] = str(obj.get("title", "Event") or "Event")
             snap["description"] = str(obj.get("description", "") or "")
             snap["when_iso"] = str(obj.get("when_iso", "") or "")
-            snap["participants"] = participants
+            snap["participants"] = _merge_attendance_participants(signup_participants, old_parts)
             snap["attendance"] = old_att
 
         events[event_id] = snap
@@ -946,12 +998,57 @@ def get_attendance_event(guild_id: int, event_id: str) -> dict | None:
     return ev if isinstance(ev, dict) else None
 
 
+def add_attendance_participant(
+    guild_id: int,
+    event_id: str,
+    user_id: int,
+    name: str = "",
+    marked_by: int = 0,
+    status: str = "present",
+) -> bool:
+    """
+    Fügt einen Spieler NUR zur EC-Anwesenheitsprüfung hinzu.
+    Die eigentliche RSVP-/Event-Anmeldung bleibt unverändert.
+    """
+    ev = get_attendance_event(int(guild_id), str(event_id))
+    if not ev:
+        return False
+
+    uid = int(user_id)
+    participants = ev.setdefault("participants", [])
+    found = False
+    for p in participants:
+        try:
+            if int(p.get("id", 0) or 0) == uid:
+                found = True
+                if name and not str(p.get("name", "") or ""):
+                    p["name"] = str(name)
+                break
+        except Exception:
+            continue
+
+    if not found:
+        participants.append({
+            "id": uid,
+            "name": str(name or ""),
+            "signup": "MANUAL",
+            "source": "manual",
+        })
+
+    if status:
+        set_attendance_status(int(guild_id), str(event_id), uid, str(status), int(marked_by))
+    else:
+        save_attendance()
+    return True
+
+
 def set_attendance_status(guild_id: int, event_id: str, user_id: int, status: str, marked_by: int) -> bool:
     ev = get_attendance_event(int(guild_id), str(event_id))
     if not ev:
         return False
 
-    valid = {"present", "absent", "excused"}
+    # Statuswerte gelten nur für die EC-Anwesenheitsprüfung, nicht für RSVP.
+    valid = {"present", "reserve", "maybe", "absent", "excused"}
     attendance = ev.setdefault("attendance", {})
 
     if status == "clear":
