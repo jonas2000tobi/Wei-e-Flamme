@@ -18,6 +18,71 @@ LEADER_CONTACT_CFG_FILE = DATA_DIR / "leader_contact_cfg.json"
 VOICE_TRACK_FILE = DATA_DIR / "voice_creator_channels.json"
 VOICE_EMPTY_DELETE_DELAY_SECONDS = 60
 
+VOICE_ALLOWED_ROLE_NAMES = ("Ebolus", "Allianz", "Freunde")
+VOICE_BLOCKED_ROLE_NAMES = ("Raider", "Bewerber")
+
+
+def _norm_role_name(name: str) -> str:
+    return str(name or "").strip().casefold()
+
+
+def _find_role_by_name(guild: discord.Guild, role_name: str) -> Optional[discord.Role]:
+    target = _norm_role_name(role_name)
+    for role in guild.roles:
+        if _norm_role_name(role.name) == target:
+            return role
+    return None
+
+
+def _voice_channel_overwrites(guild: discord.Guild) -> dict:
+    """
+    Voice-Panel-Regel:
+    - Rollenlose sehen/beitreten nicht (@everyone denied)
+    - Raider/Bewerber sehen/beitreten nicht
+    - Ebolus/Allianz/Freunde sehen und treten bei, solange User-Limit nicht voll ist
+    """
+    overwrites: dict = {
+        guild.default_role: discord.PermissionOverwrite(
+            view_channel=False,
+            connect=False,
+        )
+    }
+
+    missing_allowed: list[str] = []
+    missing_blocked: list[str] = []
+
+    for role_name in VOICE_ALLOWED_ROLE_NAMES:
+        role = _find_role_by_name(guild, role_name)
+        if role is None:
+            missing_allowed.append(role_name)
+            continue
+        overwrites[role] = discord.PermissionOverwrite(
+            view_channel=True,
+            connect=True,
+            speak=True,
+            use_voice_activation=True,
+        )
+
+    for role_name in VOICE_BLOCKED_ROLE_NAMES:
+        role = _find_role_by_name(guild, role_name)
+        if role is None:
+            missing_blocked.append(role_name)
+            continue
+        overwrites[role] = discord.PermissionOverwrite(
+            view_channel=False,
+            connect=False,
+            speak=False,
+        )
+
+    if missing_allowed or missing_blocked:
+        print(
+            f"[VOICE-PANEL] role_config_warning guild={guild.id} "
+            f"missing_allowed={missing_allowed} missing_blocked={missing_blocked}",
+            flush=True,
+        )
+
+    return overwrites
+
 
 def _load_json(path: Path, default):
     try:
@@ -178,7 +243,7 @@ class VoiceCreateModal(Modal, title="Sprachkanal erstellen"):
 
         name = _clean_channel_name(str(self.channel_name.value))
         try:
-            overwrites = dict(source.overwrites) if hasattr(source, "overwrites") else None
+            overwrites = _voice_channel_overwrites(inter.guild)
             voice = await inter.guild.create_voice_channel(
                 name=name,
                 category=source.category,
@@ -266,7 +331,9 @@ async def setup_voice_creator(client: discord.Client, tree: app_commands.Command
             title="🔊 Sprachkanal erstellen",
             description=(
                 "Klicke auf den Button, gib einen Namen und eine Personenanzahl ein.\n"
-                "Der Sprachkanal wird in derselben Kategorie wie dieser Textkanal erstellt.\n\n"
+                "Der Sprachkanal wird in derselben Kategorie wie dieser Textkanal erstellt.\n"
+                "Sichtbar/beitretbar ist er für Ebolus, Allianz und Freunde.\n"
+                "Rollenlose, Raider und Bewerber werden ausgeschlossen.\n\n"
                 "Leere erstellte Sprachkanäle werden automatisch gelöscht, sobald der letzte Spieler raus ist."
             ),
             color=discord.Color.blurple(),
@@ -286,4 +353,4 @@ async def setup_voice_creator(client: discord.Client, tree: app_commands.Command
     except Exception:
         pass
 
-    print("🔊 Voice-Creator geladen: /voice_panel post + Auto-Löschung leerer Bot-Voice-Kanäle")
+    print("🔊 Voice-Creator geladen: /voice_panel post + Auto-Löschung + Rollenrechte")
