@@ -4,7 +4,7 @@ import json
 import math
 import asyncio
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Any
 from zoneinfo import ZoneInfo
 
@@ -38,6 +38,7 @@ MAIN_NEED_START_BID = 30
 SECOND_NEED_START_BID = 15
 FREE_START_BID = 5
 SALE_PRICE = 1
+NEW_MEMBER_LOOT_LOCK_DAYS = 7
 FREE_MIN_INCREMENT = 1
 
 ELIGIBILITY_CHOICES = [
@@ -139,7 +140,6 @@ def _gcfg(guild_id: int) -> dict:
     c.setdefault("auction_channel_id", 0)
     c.setdefault("log_channel_id", 0)
     c.setdefault("market_channel_id", 0)
-    c.setdefault("drop_notify_channel_id", 0)
     auction_cfg[gid] = c
     return c
 
@@ -170,6 +170,75 @@ def _is_ebolus_member(guild: discord.Guild, user_id: int) -> bool:
         return True
     role = guild.get_role(role_id)
     return bool(role and role in member.roles)
+
+
+def _loot_lock_until_for_member(member: Optional[discord.Member]) -> Optional[datetime]:
+    """Return the timestamp until which a member may not buy/bid on loot.
+
+    Uses Discord server join time. This is reliable without an extra database and
+    protects against brand-new accounts receiving guild loot immediately.
+    """
+    if not member or getattr(member, "bot", False):
+        return None
+
+    joined_at = getattr(member, "joined_at", None)
+    if joined_at is None:
+        return None
+
+    if joined_at.tzinfo is None:
+        joined_at = joined_at.replace(tzinfo=timezone.utc)
+
+    until = joined_at.astimezone(TZ) + timedelta(days=NEW_MEMBER_LOOT_LOCK_DAYS)
+    if _now() >= until:
+        return None
+    return until
+
+
+def _format_timedelta_short(delta: timedelta) -> str:
+    seconds = max(0, int(delta.total_seconds()))
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes = max(1, rem // 60) if days == 0 and hours == 0 else rem // 60
+
+    parts: list[str] = []
+    if days:
+        parts.append(f"{days} Tag{'e' if days != 1 else ''}")
+    if hours:
+        parts.append(f"{hours} Std.")
+    if not parts:
+        parts.append(f"{minutes} Min.")
+    return " ".join(parts[:2])
+
+
+def _loot_lock_text_for_member(member: Optional[discord.Member]) -> str:
+    until = _loot_lock_until_for_member(member)
+    if not until:
+        return ""
+    remaining = _format_timedelta_short(until - _now())
+    return f"Noch **{remaining}** bis **{until.strftime('%d.%m.%Y %H:%M')}**."
+
+
+async def _require_loot_unlocked(inter: discord.Interaction, guild: discord.Guild, user_id: int) -> bool:
+    member = guild.get_member(int(user_id))
+    if member is None:
+        try:
+            member = await guild.fetch_member(int(user_id))
+        except Exception:
+            member = None
+
+    until = _loot_lock_until_for_member(member)
+    if not until:
+        return True
+
+    remaining = _format_timedelta_short(until - _now())
+    await inter.response.send_message(
+        "⏳ **Lootsperre für neue Mitglieder**\n"
+        f"Du kannst erst nach **{NEW_MEMBER_LOOT_LOCK_DAYS} Tagen Gildenmitgliedschaft** auf Loot bieten oder Sale-Items kaufen.\n"
+        f"Freischaltung: **{until.strftime('%d.%m.%Y %H:%M')}**\n"
+        f"Restzeit: **{remaining}**",
+        ephemeral=True,
+    )
+    return False
 
 
 def _load_items() -> dict:
@@ -394,96 +463,6 @@ def _log_channel(client: discord.Client, guild_id: int):
     return _auction_channel(client, guild_id)
 
 
-def _drop_notify_channel(client: discord.Client, guild_id: int):
-    """Separater Kanal für die Meldung: Loot gedroppt + wer per DM benachrichtigt wurde."""
-    c = _gcfg(guild_id)
-    ch_id = int(c.get("drop_notify_channel_id", 0) or 0)
-    guild = client.get_guild(int(guild_id))
-    if guild and ch_id:
-        ch = guild.get_channel(ch_id)
-        if isinstance(ch, (discord.TextChannel, discord.Thread)):
-            return ch
-    return None
-
-
-async def _send_drop_notify_channel_message(
-    client: discord.Client,
-    guild: discord.Guild,
-    auction: dict,
-    eligible_user_ids: list[int],
-    notified_user_ids: list[int],
-    failed_user_ids: list[int],
-) -> None:
-    """Postet eine einzelne Drop-/Benachrichtigungs-Meldung in den separat gesetzten Kanal."""
-    ch = _drop_notify_channel(client, int(guild.id))
-    if not ch:
-        return
-    try:
-        mode = str(auction.get("eligibility_mode", "all") or "all")
-        phase = str(auction.get("phase", "") or "")
-        item_name = str(auction.get("item_name", "Unbekanntes Item") or "Unbekanntes Item")
-        aid = str(auction.get("id", "") or "")
-        start_bid = int(auction.get("start_bid", 0) or 0)
-        ends_at = str(auction.get("ends_at", "") or "")
-
-        if mode == "main_need":
-            title = "🎁 Loot gedroppt – Main-Need-Spieler benachrichtigt"
-            phase_text = "Main-Need-Auktion"
-        elif mode == "secondary_need":
-            title = "🎁 Loot gedroppt – Second-Need-Spieler benachrichtigt"
-            phase_text = "Second-Need-Auktion"
-        else:
-            title = "🎁 Loot gedroppt – freie Auktion gestartet"
-            phase_text = "Freie Auktion"
-
-        desc = (
-            f"**Item:** {item_name}\n"
-            f"**Auktion:** {phase_text}\n"
-            f"**Auktions-ID:** `{aid}`\n"
-            f"**Startgebot:** {start_bid} EC\n"
-        )
-        if ends_at:
-            desc += f"**Läuft bis:** `{ends_at}`\n"
-
-        if phase == "need":
-            if eligible_user_ids:
-                eligible_text = ", ".join(f"<@{uid}>" for uid in eligible_user_ids[:30])
-                if len(eligible_user_ids) > 30:
-                    eligible_text += f" … +{len(eligible_user_ids) - 30}"
-            else:
-                eligible_text = "—"
-
-            if notified_user_ids:
-                notified_text = ", ".join(f"<@{uid}>" for uid in notified_user_ids[:30])
-                if len(notified_user_ids) > 30:
-                    notified_text += f" … +{len(notified_user_ids) - 30}"
-            else:
-                notified_text = "—"
-
-            desc += (
-                f"\n**Berechtigte Spieler:** {eligible_text}\n"
-                f"**Per DM benachrichtigt:** {notified_text}\n"
-                f"**Erfolgreich:** {len(notified_user_ids)} / {len(eligible_user_ids)}"
-            )
-            if failed_user_ids:
-                failed_text = ", ".join(f"<@{uid}>" for uid in failed_user_ids[:20])
-                if len(failed_user_ids) > 20:
-                    failed_text += f" … +{len(failed_user_ids) - 20}"
-                desc += f"\n**DM fehlgeschlagen:** {failed_text}"
-        else:
-            desc += "\nKeine offenen Main-/Second-Needs gefunden. Es wurden keine Need-DMs verschickt."
-
-        embed = discord.Embed(
-            title=title,
-            description=desc,
-            color=discord.Color.gold(),
-            timestamp=_now(),
-        )
-        await ch.send(embed=embed)
-    except Exception as e:
-        print(f"[loot_auction] drop notify channel message failed: {e!r}")
-
-
 def _market_channel(client: discord.Client, guild_id: int):
     """Öffentlicher Marktplatz-Kanal für Freie Auktionen und Sale-Käufe."""
     c = _gcfg(guild_id)
@@ -649,6 +628,8 @@ async def _place_bid(inter: discord.Interaction, guild_id: int, auction_id: str,
     user_id = int(inter.user.id)
     if not _is_ebolus_member(guild, user_id):
         await inter.response.send_message("❌ Nur Ebolus-Mitglieder dürfen mit EC bieten.", ephemeral=True)
+        return
+    if not await _require_loot_unlocked(inter, guild, user_id):
         return
     mode = str(auction.get("eligibility_mode", "all") or "all")
     eligible = [int(x) for x in auction.get("eligible_user_ids", []) or []]
@@ -1370,7 +1351,15 @@ def _auction_portal_embed(guild: discord.Guild, user_id: int | None = None) -> d
         timestamp=_now(),
     )
     if user_id:
+        member = guild.get_member(int(user_id))
         emb.add_field(name="🪙 Dein EC", value=f"**{_ec_balance(guild.id, int(user_id))} EC**", inline=True)
+        lock_text = _loot_lock_text_for_member(member)
+        if lock_text:
+            emb.add_field(
+                name="⏳ Lootsperre",
+                value=f"Neue Mitglieder können erst nach **{NEW_MEMBER_LOOT_LOCK_DAYS} Tagen** bieten/kaufen.\n{lock_text}",
+                inline=False,
+            )
     emb.set_footer(text="Gebote und Käufe werden privat bestätigt. EC werden erst beim Kauf oder bei Übergabe abgebucht.")
     return emb
 
@@ -1559,6 +1548,8 @@ async def _buy_sale_item(inter: discord.Interaction, guild_id: int, auction_id: 
     user_id = int(inter.user.id)
     if not _is_ebolus_member(guild, user_id):
         await inter.response.send_message("❌ Nur Ebolus-Mitglieder können mit EC kaufen.", ephemeral=True)
+        return
+    if not await _require_loot_unlocked(inter, guild, user_id):
         return
     price = int(auc.get("fixed_price", auc.get("start_bid", 0)) or 0)
     bal = _ec_balance(guild_id, user_id)
@@ -1776,8 +1767,6 @@ async def start_loot_drop_auction(inter: discord.Interaction, guild: discord.Gui
 
     notified = 0
     failed = 0
-    notified_user_ids: list[int] = []
-    failed_user_ids: list[int] = []
     notify_refs: list[dict] = []
     if phase == "need":
         for uid in eligible:
@@ -1785,23 +1774,12 @@ async def start_loot_drop_auction(inter: discord.Interaction, guild: discord.Gui
             if ref:
                 notify_refs.append(ref)
                 notified += 1
-                notified_user_ids.append(int(uid))
             else:
                 failed += 1
-                failed_user_ids.append(int(uid))
             await asyncio.sleep(0.08)
         if notify_refs:
             auc["notify_message_refs"] = notify_refs
             save_auctions()
-
-    await _send_drop_notify_channel_message(
-        inter.client,
-        guild,
-        auc,
-        [int(uid) for uid in eligible],
-        notified_user_ids,
-        failed_user_ids,
-    )
 
     return {
         "auction_id": aid,
@@ -1901,19 +1879,6 @@ async def setup_loot_auction(client: discord.Client, tree: app_commands.CommandT
         _gcfg(inter.guild.id)["log_channel_id"] = int(channel.id)
         save_cfg()
         await inter.response.send_message(f"✅ Auktions-Log-Kanal gesetzt: {channel.mention}", ephemeral=True)
-
-    @group.command(name="set_drop_notify_channel", description="Setzt den Kanal für Loot gedroppt + benachrichtigte Spieler")
-    async def auction_set_drop_notify_channel(inter: discord.Interaction, channel: discord.TextChannel):
-        if inter.guild is None or not _is_leader_or_admin(inter):
-            await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
-            return
-        _gcfg(inter.guild.id)["drop_notify_channel_id"] = int(channel.id)
-        save_cfg()
-        await inter.response.send_message(
-            f"✅ Drop-Benachrichtigungskanal gesetzt: {channel.mention}\n"
-            "Dort postet der Bot einzeln: Loot gedroppt + welche Spieler per DM benachrichtigt wurden.",
-            ephemeral=True,
-        )
 
     @group.command(name="set_market_channel", description="Setzt den öffentlichen Kanal für freie Auktionen und Sale-Käufe")
     async def auction_set_market_channel(inter: discord.Interaction, channel: discord.TextChannel):
