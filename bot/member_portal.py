@@ -4707,6 +4707,84 @@ class AdminEventMenuView(PortalSafeView):
         await inter.response.edit_message(embed=emb, view=AdminMenuView())
 
 
+class AdminJunkDropModal(Modal, title="🧹 Müll gedroppt"):
+    def __init__(self, guild_id: int, user_id: int):
+        super().__init__(timeout=300)
+        self.guild_id = int(guild_id)
+        self.user_id = int(user_id)
+        self.item_title = TextInput(
+            label="Item-Titel",
+            placeholder="z. B. Talus Hose, Schrott-Ring, irgendwas aus der Truhe …",
+            min_length=2,
+            max_length=120,
+            required=True,
+        )
+        self.add_item(self.item_title)
+
+    async def on_submit(self, inter: discord.Interaction):
+        guild = inter.client.get_guild(self.guild_id) or inter.guild
+        if guild is None:
+            await inter.response.send_message("❌ Server konnte nicht zugeordnet werden.", ephemeral=True)
+            return
+
+        member = guild.get_member(int(inter.user.id))
+        if member is None:
+            try:
+                member = await guild.fetch_member(int(inter.user.id))
+            except Exception:
+                member = None
+
+        if int(inter.user.id) != self.user_id or not _is_portal_admin(guild, member):
+            await inter.response.send_message("❌ Dieser Bereich ist nur für Gildenleitung, Berater oder Wächter.", ephemeral=True)
+            return
+
+        title = str(self.item_title.value or "").strip()
+        if not title:
+            await inter.response.send_message("❌ Bitte einen Item-Titel eintragen.", ephemeral=True)
+            return
+
+        await inter.response.defer(ephemeral=True, thinking=True)
+        try:
+            try:
+                import bot.loot_auction as auction_mod  # type: ignore
+            except ModuleNotFoundError:
+                import loot_auction as auction_mod  # type: ignore
+
+            result = await auction_mod.start_junk_sale_drop(  # type: ignore[attr-defined]
+                inter,
+                int(guild.id),
+                title,
+                actor_id=int(inter.user.id),
+            )
+        except Exception as e:
+            await inter.followup.send(f"❌ Müll-Sale konnte nicht erstellt werden: `{e}`", ephemeral=True)
+            return
+
+        if not isinstance(result, dict) or not result.get("ok"):
+            await inter.followup.send(f"❌ Müll-Sale konnte nicht erstellt werden: {result.get('error', 'Unbekannter Fehler') if isinstance(result, dict) else 'Unbekannter Fehler'}", ephemeral=True)
+            return
+
+        aid = str(result.get("auction_id", ""))
+        auction_ch_id = int(result.get("auction_channel_id", 0) or 0)
+        market_ch_id = int(result.get("market_channel_id", 0) or 0)
+        places = []
+        if auction_ch_id:
+            places.append(f"Auktionskanal: <#{auction_ch_id}>")
+        if market_ch_id and market_ch_id != auction_ch_id:
+            places.append(f"Marktplatz: <#{market_ch_id}>")
+        if not places:
+            places.append("kein Auktions-/Marktplatzkanal gesetzt; das Item ist trotzdem im Sale-Kauf des Gildenmenüs sichtbar")
+
+        await inter.followup.send(
+            "✅ **Müll-Item kostenlos in den Sale gestellt**\n"
+            f"**Item:** {discord.utils.escape_markdown(title)}\n"
+            "**Preis:** Gratis / 0 EC\n"
+            f"**Sale-ID:** `{aid}`\n"
+            + "\n".join(places),
+            ephemeral=True,
+        )
+
+
 class AdminLootMenuView(PortalSafeView):
     def __init__(self):
         super().__init__(timeout=None)
@@ -4738,6 +4816,19 @@ class AdminLootMenuView(PortalSafeView):
     @button(label="📦 Loot gedroppt", style=ButtonStyle.secondary, custom_id="portal_admin_loot_drop", row=0)
     async def btn_drop(self, inter: discord.Interaction, _):
         await self._open(inter, "open_admin_loot_drop_menu")
+
+    @button(label="🧹 Müll gedroppt", style=ButtonStyle.secondary, custom_id="portal_admin_loot_junk_drop", row=0)
+    async def btn_junk_drop(self, inter: discord.Interaction, _):
+        guild, member = await _resolve_guild_member_from_inter(inter)
+        if not guild or not member:
+            await inter.response.send_message("❌ Ich konnte deinen Server nicht zuordnen.", ephemeral=True)
+            return
+        if not _is_portal_admin(guild, member):
+            await inter.response.send_message("❌ Dieser Bereich ist nur für Gildenleitung, Berater oder Wächter.", ephemeral=True)
+            return
+        if inter.message:
+            _mark_portal_sent(guild.id, member.id, inter.message.id)
+        await inter.response.send_modal(AdminJunkDropModal(guild.id, member.id))
 
     @button(label="✅ Item erhalten", style=ButtonStyle.secondary, custom_id="portal_admin_loot_mark", row=1)
     async def btn_mark(self, inter: discord.Interaction, _):
