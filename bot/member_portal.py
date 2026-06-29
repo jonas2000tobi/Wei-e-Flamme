@@ -382,6 +382,36 @@ def _display_name(member: discord.Member) -> str:
     return member.display_name
 
 
+def _profile_name(guild: discord.Guild, user_id: int, fallback: str = "Unbekannt") -> str:
+    """Robuster Anzeigename für Admin-/Anwesenheitslisten.
+
+    Nimmt zuerst den aktuellen Discord-Displaynamen, fällt dann auf den
+    gespeicherten Ingame-Namen aus dem Profil zurück und nutzt zuletzt den
+    im Event gespeicherten Namen.
+    """
+    try:
+        uid = int(user_id)
+    except Exception:
+        return str(fallback or "Unbekannt")
+
+    try:
+        member = guild.get_member(uid) if guild else None
+        if member:
+            return str(member.display_name or member.name or fallback or "Unbekannt")
+    except Exception:
+        pass
+
+    try:
+        prof = _user_profile(int(guild.id), uid) if guild else {}
+        ingame = str(prof.get("ingame_name") or "").strip()
+        if ingame:
+            return ingame
+    except Exception:
+        pass
+
+    return str(fallback or "Unbekannt")
+
+
 def _guild_join_date(member: discord.Member) -> str:
     if not member.joined_at:
         return "Unbekannt"
