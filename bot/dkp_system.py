@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 import discord
 from discord import app_commands
 from discord.ext import tasks
-from discord.ui import View, button
+from discord.ui import View, button, Select, UserSelect
 from discord.enums import ButtonStyle
 
 TZ = ZoneInfo("Europe/Berlin")
@@ -47,9 +47,10 @@ DEFAULT_EVENT_POINTS = {
 }
 
 DEFAULT_DECAY_PERCENT = 15.0
-DEFAULT_RESERVE_FACTOR = 0.5
+DEFAULT_RESERVE_FACTOR = 0.5  # Alt-Konfig bleibt lesbar, Reserve ist aber fix 5 EC.
+DEFAULT_RESERVE_POINTS = 5
 DEFAULT_WEEKLY_EVENT_LIMIT = 40
-DEFAULT_START_BALANCE = 20
+DEFAULT_START_BALANCE = 0
 DEFAULT_DECAY_PROTECTED_BALANCE = 50
 WEEKLY_RESET_WEEKDAY = 3  # Donnerstag
 WEEKLY_RESET_HOUR = 10
@@ -225,6 +226,33 @@ def weekly_event_remaining(guild_id: int, user_id: int, now: Optional[datetime] 
     return max(0, limit - weekly_event_earned(guild_id, user_id, now))
 
 
+def _railway_log_transaction(tx: dict) -> None:
+    """Einzeiliger Railway-Log für jede einzelne EC-Buchung/Korrektur."""
+    try:
+        meta = tx.get("meta") if isinstance(tx.get("meta"), dict) else {}
+        print(
+            "[EC-VERGABE] "
+            f"time={tx.get('created_at')} "
+            f"guild={tx.get('guild_id')} "
+            f"user={tx.get('user_id')} "
+            f"name={meta.get('target_name') or meta.get('name') or ''!r} "
+            f"amount={tx.get('amount')} "
+            f"before={tx.get('balance_before')} "
+            f"after={tx.get('balance_after')} "
+            f"type={tx.get('type')} "
+            f"event_id={tx.get('event_id')} "
+            f"event_type={meta.get('event_type', '')!r} "
+            f"event_title={meta.get('event_title', '')!r} "
+            f"requested={meta.get('requested_amount', '')} "
+            f"limited={meta.get('limited', '')} "
+            f"reason={tx.get('reason')!r} "
+            f"actor={tx.get('actor_id')}",
+            flush=True,
+        )
+    except Exception as e:
+        print(f"[dkp_system] EC-Railway-Log Fehler: {e!r}", flush=True)
+
+
 def _append_starting_balance_transaction(guild_id: int, user_id: int, amount: int) -> None:
     tx = {
         "id": f"{datetime.now(TZ).strftime('%Y%m%d%H%M%S%f')}-{int(user_id)}-start",
@@ -321,6 +349,11 @@ def _add_transaction(
     }
     _gtx(guild_id).append(tx)
     save_transactions()
+
+    # Railway-Konsole: jede relevante EC-Buchung einzeln sichtbar machen.
+    if str(tx_type) in {"event_award", "manual_adjust", "starting_balance", "loot_auction", "loot_sale", "weekly_decay"} or int(actual_amount) != 0:
+        _railway_log_transaction(tx)
+
     return tx
 
 
@@ -430,9 +463,8 @@ def _event_points(guild_id: int, event_type: str) -> int:
 
 
 def _reserve_points(guild_id: int, event_type: str) -> int:
-    base = _event_points(guild_id, event_type)
-    factor = float(_gcfg(guild_id).get("reserve_factor", DEFAULT_RESERVE_FACTOR) or DEFAULT_RESERVE_FACTOR)
-    return int(math.ceil(base * factor))
+    # Ebolus-Regel: Reserve bekommt immer fix 5 EC, unabhängig vom Eventwert.
+    return int(DEFAULT_RESERVE_POINTS)
 
 
 def _member_role_id(home_guild_id: int) -> int:
@@ -534,8 +566,88 @@ def _event_title_and_time(event: dict) -> tuple[str, str]:
     return title, when
 
 
+def _signup_label(signup: str) -> str:
+    signup = str(signup or "")
+    return {
+        "TANK": "Tank",
+        "HEAL": "Heal",
+        "DPS": "DPS",
+        "BANK": "Reserve",
+        "MANUAL": "nachgetragen",
+    }.get(signup, signup or "?")
+
+
+def _attendance_status_label(status: str) -> str:
+    status = str(status or "")
+    return {
+        "present": "✅ War da",
+        "reserve": "🪑 Reserve",
+        "maybe": "❔ Vielleicht",
+        "absent": "❌ Nicht da",
+        "excused": "🟡 Entschuldigt",
+        "open": "⚪ Offen",
+        "": "⚪ Offen",
+    }.get(status, "⚪ Offen")
+
+
+def _participant_display_name(client: discord.Client, guild_id: int, participant: dict) -> str:
+    try:
+        uid = int(participant.get("id", 0) or 0)
+    except Exception:
+        uid = 0
+    if uid:
+        return _display_member(client, guild_id, uid)
+    return str(participant.get("name", "Spieler") or "Spieler")
+
+
+def _attendance_status_counts(event: dict) -> dict[str, int]:
+    participants = event.get("participants") or []
+    attendance = event.get("attendance") or {}
+    counts = {"present": 0, "reserve": 0, "maybe": 0, "absent": 0, "excused": 0, "open": 0}
+    for p in participants:
+        try:
+            uid = int(p.get("id", 0) or 0)
+        except Exception:
+            uid = 0
+        if not uid:
+            continue
+        status = str((attendance.get(str(uid)) or {}).get("status", "") or "")
+        if not status:
+            status = "open"
+        if status not in counts:
+            status = "open"
+        counts[status] += 1
+    return counts
+
+
+async def _refresh_attendance_check_message(
+    client: discord.Client,
+    guild_id: int,
+    event_id: str,
+    channel_id: int,
+    message_id: int,
+) -> None:
+    if not channel_id or not message_id:
+        return
+    rsvp = _import_rsvp()
+    event = rsvp.get_attendance_event(int(guild_id), str(event_id)) if rsvp else None
+    if not event:
+        return
+    event_type = _dkp_type_from_event(event, str(event_id)) or "Unbekannt"
+    emb = _attendance_check_embed(client, int(guild_id), event, str(event_id), event_type)
+    ch = client.get_channel(int(channel_id))
+    if not isinstance(ch, (discord.TextChannel, discord.Thread)):
+        return
+    try:
+        msg = await ch.fetch_message(int(message_id))
+        await msg.edit(embed=emb, view=ECEventCheckView(int(guild_id), str(event_id)))
+    except Exception as e:
+        print(f"[dkp_system] EC-Anwesenheitscheck konnte nicht aktualisiert werden: {e!r}")
+
+
 def _attendance_check_embed(client: discord.Client, home_guild_id: int, event: dict, event_id: str, event_type: str) -> discord.Embed:
-    present, reserve, skipped_partner, skipped_open = _attendance_summary_for_award(client, home_guild_id, event, event_type)
+    present, reserve, skipped_partner, _skipped_open = _attendance_summary_for_award(client, home_guild_id, event, event_type)
+    counts = _attendance_status_counts(event)
     title, when = _event_title_and_time(event)
     base = _event_points(home_guild_id, event_type)
     res = _reserve_points(home_guild_id, event_type)
@@ -546,37 +658,46 @@ def _attendance_check_embed(client: discord.Client, home_guild_id: int, event: d
         f"Event-ID: `{event_id}`\n"
         f"EC-Typ: **{event_type}**\n"
         f"Wert: **{base} EC** • Reserve: **{res} EC**\n\n"
-        "Die Anmeldung ist nur ein Vorschlag. Bitte bestätige die echte Anwesenheit, bevor EC vergeben werden."
+        "Die Anmeldung ist nur ein Vorschlag. Bitte bestätige die echte Anwesenheit, bevor EC vergeben werden.\n"
+        "Nachgetragene Spieler werden **nur für diese EC-Anwesenheit** gespeichert und ändern keine Event-Anmeldung."
     )
 
     participants = event.get("participants") or []
+    attendance = event.get("attendance") or {}
     lines = []
     for p in participants[:25]:
         try:
             uid = int(p.get("id", 0) or 0)
         except Exception:
             uid = 0
+        if not uid:
+            continue
         signup = str(p.get("signup", "") or "")
-        role = {"TANK": "Tank", "HEAL": "Heal", "DPS": "DPS", "BANK": "Reserve"}.get(signup, signup or "?")
-        if uid:
-            marker = "✅ EC" if _is_ebolus_member(client, home_guild_id, uid) else "🤝 Allianz"
-            lines.append(f"• {marker} <@{uid}> – {role}")
+        status = str((attendance.get(str(uid)) or {}).get("status", "") or "")
+        status_label = _attendance_status_label(status)
+        role = _signup_label(signup)
+        manual = " *(nachgetragen)*" if str(p.get("source", "") or "") == "manual" or signup == "MANUAL" else ""
+        marker = "EC" if _is_ebolus_member(client, home_guild_id, uid) else "Allianz"
+        lines.append(f"• {status_label} {marker} <@{uid}> – {role}{manual}")
     if len(participants) > 25:
         lines.append(f"… {len(participants) - 25} weitere")
-    emb.add_field(name="Anmeldungen", value="\n".join(lines)[:1000] if lines else "—", inline=False)
+    emb.add_field(name="Anmeldungen / EC-Vorschlag", value="\n".join(lines)[:1000] if lines else "—", inline=False)
 
     emb.add_field(
         name="Aktueller Status",
         value=(
-            f"✅ War da: **{len(present) + len(reserve)}** Ebolus\n"
+            f"✅ War da: **{counts.get('present', 0)}**\n"
+            f"🪑 Reserve: **{counts.get('reserve', 0)}**\n"
+            f"❔ Vielleicht: **{counts.get('maybe', 0)}**\n"
+            f"❌ Nicht da / 🟡 Entschuldigt: **{counts.get('absent', 0) + counts.get('excused', 0)}**\n"
             f"🤝 Partner ohne EC: **{len(skipped_partner)}**\n"
-            f"⚪ Noch offen / nicht bestätigt: **{len(skipped_open)}**"
+            f"⚪ Noch offen / nicht bestätigt: **{counts.get('open', 0)}**\n\n"
+            f"EC bei Vergabe: **{len(present)}** volle Wertung, **{len(reserve)}** Reserve"
         ),
         inline=False,
     )
-    emb.set_footer(text="Buttons: erst Anwesenheit bestätigen, dann EC vergeben. Einzelkorrektur: Admin → Event → Anwesenheit")
+    emb.set_footer(text="Buttons: Anwesenheit bestätigen/ändern → EC-Vorschau → EC vergeben")
     return emb
-
 
 async def _award_event_now(
     client: discord.Client,
@@ -610,7 +731,7 @@ async def _award_event_now(
             int(getattr(actor, "id", 0) or 0),
             "event_award",
             event_id=str(event_id),
-            meta={"event_type": event_type, "signup": row.get("signup", ""), "event_title": str(event.get("title", "Event") or "Event")},
+            meta={"event_type": event_type, "signup": row.get("signup", ""), "event_title": str(event.get("title", "Event") or "Event"), "target_name": str(row.get("name", "") or "")},
         )
         row["points"] = int(tx.get("amount", 0) or 0)
         row["weekly_limited"] = row["points"] < int(row.get("requested_points", row["points"]) or 0)
@@ -623,6 +744,185 @@ async def _award_event_now(
     emb = _award_log_embed(event, event_type, present, reserve, skipped_partner, skipped_open, actor)
     await _log_to_channel(client, int(guild_id), emb)
     return True, f"EC vergeben: {len(awarded)} Ebolus-Spieler.", emb
+
+
+class ECAttendanceParticipantSelect(Select):
+    def __init__(self, guild_id: int, event_id: str, participants: list[dict], page: int, source_channel_id: int, source_message_id: int):
+        self.guild_id = int(guild_id)
+        self.event_id = str(event_id)
+        self.page = int(page)
+        self.source_channel_id = int(source_channel_id)
+        self.source_message_id = int(source_message_id)
+        start = self.page * 25
+        chunk = participants[start:start + 25]
+        options: list[discord.SelectOption] = []
+        for p in chunk:
+            try:
+                uid = int(p.get("id", 0) or 0)
+            except Exception:
+                uid = 0
+            if not uid:
+                continue
+            raw_name = str(p.get("name", "") or f"User {uid}")
+            label = raw_name[:90]
+            signup = _signup_label(str(p.get("signup", "") or ""))
+            manual = " • nachgetragen" if str(p.get("source", "") or "") == "manual" or str(p.get("signup", "") or "") == "MANUAL" else ""
+            options.append(discord.SelectOption(label=label, value=str(uid), description=(signup + manual)[:100]))
+        if not options:
+            options = [discord.SelectOption(label="Keine Spieler gefunden", value="0", description="Dieses Event hat keine Anwesenheitsliste")]
+        super().__init__(placeholder=f"Spieler wählen – Seite {self.page + 1}", min_values=1, max_values=1, options=options, custom_id="dkp_attendance_participant_select")
+
+    async def callback(self, inter: discord.Interaction):
+        if inter.guild is None or not _is_leader_or_admin(inter):
+            await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
+            return
+        try:
+            uid = int(self.values[0])
+        except Exception:
+            uid = 0
+        if not uid:
+            await inter.response.send_message("❌ Kein Spieler gewählt.", ephemeral=True)
+            return
+        await inter.response.edit_message(
+            content=f"Anwesenheit für <@{uid}> setzen:",
+            embed=None,
+            view=ECAttendanceStatusView(self.guild_id, self.event_id, uid, self.page, self.source_channel_id, self.source_message_id),
+        )
+
+
+class ECAttendanceParticipantView(View):
+    def __init__(self, guild_id: int, event_id: str, event: dict, page: int, source_channel_id: int, source_message_id: int):
+        super().__init__(timeout=300)
+        self.guild_id = int(guild_id)
+        self.event_id = str(event_id)
+        self.event = event
+        self.page = int(page)
+        self.source_channel_id = int(source_channel_id)
+        self.source_message_id = int(source_message_id)
+        self.participants = list(event.get("participants") or [])
+        self.add_item(ECAttendanceParticipantSelect(self.guild_id, self.event_id, self.participants, self.page, self.source_channel_id, self.source_message_id))
+
+    async def _show_page(self, inter: discord.Interaction, page: int):
+        rsvp = _import_rsvp()
+        event = rsvp.get_attendance_event(self.guild_id, self.event_id) if rsvp else None
+        if not event:
+            await inter.response.send_message("❌ Event nicht gefunden.", ephemeral=True)
+            return
+        await inter.response.edit_message(
+            content="Wähle einen Spieler aus der EC-Anwesenheitsliste. Das ändert keine Event-Anmeldung.",
+            embed=None,
+            view=ECAttendanceParticipantView(self.guild_id, self.event_id, event, page, self.source_channel_id, self.source_message_id),
+        )
+
+    @button(label="◀️", style=ButtonStyle.secondary, custom_id="dkp_attendance_page_prev", row=1)
+    async def prev_page(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        if inter.guild is None or not _is_leader_or_admin(inter):
+            await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
+            return
+        await self._show_page(inter, max(0, self.page - 1))
+
+    @button(label="▶️", style=ButtonStyle.secondary, custom_id="dkp_attendance_page_next", row=1)
+    async def next_page(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        if inter.guild is None or not _is_leader_or_admin(inter):
+            await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
+            return
+        max_page = max(0, (len(self.participants) - 1) // 25)
+        await self._show_page(inter, min(max_page, self.page + 1))
+
+
+class ECAttendanceStatusView(View):
+    def __init__(self, guild_id: int, event_id: str, target_user_id: int, page: int, source_channel_id: int, source_message_id: int):
+        super().__init__(timeout=300)
+        self.guild_id = int(guild_id)
+        self.event_id = str(event_id)
+        self.target_user_id = int(target_user_id)
+        self.page = int(page)
+        self.source_channel_id = int(source_channel_id)
+        self.source_message_id = int(source_message_id)
+
+    async def _set_status(self, inter: discord.Interaction, status: str):
+        if inter.guild is None or not _is_leader_or_admin(inter):
+            await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
+            return
+        rsvp = _import_rsvp()
+        if not rsvp:
+            await inter.response.send_message("❌ RSVP-/Anwesenheitssystem nicht geladen.", ephemeral=True)
+            return
+        ok = rsvp.set_attendance_status(self.guild_id, self.event_id, self.target_user_id, status, int(inter.user.id))
+        if not ok:
+            await inter.response.send_message("❌ Anwesenheit konnte nicht gespeichert werden.", ephemeral=True)
+            return
+        await _refresh_attendance_check_message(inter.client, self.guild_id, self.event_id, self.source_channel_id, self.source_message_id)
+        label = _attendance_status_label(status)
+        await inter.response.edit_message(content=f"✅ <@{self.target_user_id}> wurde gesetzt auf: **{label}**", embed=None, view=None)
+
+    @button(label="✅ War da", style=ButtonStyle.success, custom_id="dkp_attendance_status_present", row=0)
+    async def present(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        await self._set_status(inter, "present")
+
+    @button(label="🪑 Reserve", style=ButtonStyle.secondary, custom_id="dkp_attendance_status_reserve", row=0)
+    async def reserve(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        await self._set_status(inter, "reserve")
+
+    @button(label="❔ Vielleicht", style=ButtonStyle.secondary, custom_id="dkp_attendance_status_maybe", row=0)
+    async def maybe(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        await self._set_status(inter, "maybe")
+
+    @button(label="❌ Nicht da", style=ButtonStyle.danger, custom_id="dkp_attendance_status_absent", row=1)
+    async def absent(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        await self._set_status(inter, "absent")
+
+    @button(label="⚪ Offen", style=ButtonStyle.secondary, custom_id="dkp_attendance_status_clear", row=1)
+    async def clear(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        await self._set_status(inter, "clear")
+
+
+class ECAttendanceAddUserSelect(UserSelect):
+    def __init__(self, guild_id: int, event_id: str, source_channel_id: int, source_message_id: int):
+        self.guild_id = int(guild_id)
+        self.event_id = str(event_id)
+        self.source_channel_id = int(source_channel_id)
+        self.source_message_id = int(source_message_id)
+        super().__init__(placeholder="Spieler nachtragen – nur für EC-Anwesenheit", min_values=1, max_values=1, custom_id="dkp_attendance_add_user_select")
+
+    async def callback(self, inter: discord.Interaction):
+        if inter.guild is None or not _is_leader_or_admin(inter):
+            await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
+            return
+        rsvp = _import_rsvp()
+        if not rsvp:
+            await inter.response.send_message("❌ RSVP-/Anwesenheitssystem nicht geladen.", ephemeral=True)
+            return
+        user = self.values[0]
+        if not isinstance(user, discord.Member):
+            await inter.response.send_message("❌ Bitte ein Servermitglied auswählen.", ephemeral=True)
+            return
+        ok = rsvp.add_attendance_participant(
+            self.guild_id,
+            self.event_id,
+            int(user.id),
+            str(user.display_name or user.name),
+            int(inter.user.id),
+            "present",
+        )
+        if not ok:
+            await inter.response.send_message("❌ Spieler konnte nicht zur EC-Anwesenheit hinzugefügt werden.", ephemeral=True)
+            return
+        await _refresh_attendance_check_message(inter.client, self.guild_id, self.event_id, self.source_channel_id, self.source_message_id)
+        await inter.response.edit_message(
+            content=(
+                f"✅ {user.mention} wurde **nur zur EC-Anwesenheit** nachgetragen und erstmal auf **War da** gesetzt.\n"
+                "Die normale Event-Anmeldung wurde nicht verändert."
+            ),
+            embed=None,
+            view=ECAttendanceStatusView(self.guild_id, self.event_id, int(user.id), 0, self.source_channel_id, self.source_message_id),
+        )
+
+
+class ECAttendanceAddUserView(View):
+    def __init__(self, guild_id: int, event_id: str, source_channel_id: int, source_message_id: int):
+        super().__init__(timeout=300)
+        self.add_item(ECAttendanceAddUserSelect(guild_id, event_id, source_channel_id, source_message_id))
 
 
 class ECEventCheckView(View):
@@ -643,7 +943,7 @@ class ECEventCheckView(View):
             return False
         return True
 
-    @button(label="Alle Anmeldungen bestätigen", style=ButtonStyle.success, custom_id="dkp_check_confirm_all")
+    @button(label="Alle Anmeldungen bestätigen", style=ButtonStyle.success, custom_id="dkp_check_confirm_all", row=0)
     async def confirm_all(self, inter: discord.Interaction, btn: discord.ui.Button):
         if not await self._guard(inter):
             return
@@ -674,9 +974,38 @@ class ECEventCheckView(View):
         event_type = _dkp_type_from_event(event, self.event_id)
         emb = _attendance_check_embed(inter.client, self.guild_id, event, self.event_id, event_type or "Unbekannt")
         await inter.response.edit_message(embed=emb, view=self)
-        await inter.followup.send(f"✅ {count} angemeldete Spieler wurden als 'War da' bestätigt. Prüfe bei Bedarf Einzelkorrekturen über Admin → Event → Anwesenheit.", ephemeral=True)
+        await inter.followup.send(f"✅ {count} angemeldete Spieler wurden als 'War da' bestätigt. Nutze bei Bedarf „Einzel bearbeiten“ oder „Spieler nachtragen“.", ephemeral=True)
 
-    @button(label="EC-Vorschau", style=ButtonStyle.secondary, custom_id="dkp_check_preview")
+    @button(label="Einzel bearbeiten", style=ButtonStyle.secondary, custom_id="dkp_check_edit_one", row=0)
+    async def edit_one(self, inter: discord.Interaction, btn: discord.ui.Button):
+        if not await self._guard(inter):
+            return
+        rsvp = _import_rsvp()
+        event = rsvp.get_attendance_event(self.guild_id, self.event_id) if rsvp else None
+        if not event:
+            await inter.response.send_message("❌ Event nicht gefunden.", ephemeral=True)
+            return
+        source_channel_id = int(getattr(inter.channel, "id", 0) or 0)
+        source_message_id = int(getattr(inter.message, "id", 0) or 0) if inter.message else 0
+        await inter.response.send_message(
+            "Wähle einen Spieler aus der EC-Anwesenheitsliste. Das ändert keine Event-Anmeldung.",
+            view=ECAttendanceParticipantView(self.guild_id, self.event_id, event, 0, source_channel_id, source_message_id),
+            ephemeral=True,
+        )
+
+    @button(label="Spieler nachtragen", style=ButtonStyle.secondary, custom_id="dkp_check_add_user", row=0)
+    async def add_user(self, inter: discord.Interaction, btn: discord.ui.Button):
+        if not await self._guard(inter):
+            return
+        source_channel_id = int(getattr(inter.channel, "id", 0) or 0)
+        source_message_id = int(getattr(inter.message, "id", 0) or 0) if inter.message else 0
+        await inter.response.send_message(
+            "Wähle einen Spieler, der **nur für diese EC-Anwesenheit** nachgetragen werden soll. Die normale Event-Anmeldung bleibt unverändert.",
+            view=ECAttendanceAddUserView(self.guild_id, self.event_id, source_channel_id, source_message_id),
+            ephemeral=True,
+        )
+
+    @button(label="EC-Vorschau", style=ButtonStyle.secondary, custom_id="dkp_check_preview", row=1)
     async def preview(self, inter: discord.Interaction, btn: discord.ui.Button):
         if not await self._guard(inter):
             return
@@ -693,7 +1022,7 @@ class ECEventCheckView(View):
         emb = _award_preview_embed(event, event_type, present, reserve, skipped_partner, skipped_open, duplicate=_event_has_dkp_already(self.guild_id, self.event_id, event_type))
         await inter.response.send_message(embed=emb, ephemeral=True)
 
-    @button(label="EC vergeben", style=ButtonStyle.primary, custom_id="dkp_check_award")
+    @button(label="EC vergeben", style=ButtonStyle.primary, custom_id="dkp_check_award", row=1)
     async def award(self, inter: discord.Interaction, btn: discord.ui.Button):
         if not await self._guard(inter):
             return
@@ -716,7 +1045,7 @@ class ECEventCheckView(View):
         else:
             await inter.followup.send(f"❌ {msg}", ephemeral=True)
 
-    @button(label="Später / ignorieren", style=ButtonStyle.danger, custom_id="dkp_check_ignore")
+    @button(label="Später / ignorieren", style=ButtonStyle.danger, custom_id="dkp_check_ignore", row=1)
     async def ignore(self, inter: discord.Interaction, btn: discord.ui.Button):
         if not await self._guard(inter):
             return
@@ -882,31 +1211,31 @@ def _attendance_summary_for_award(client: discord.Client, home_guild_id: int, ev
             continue
         status = str((attendance.get(str(uid)) or {}).get("status", "") or "")
         signup = str(p.get("signup", "") or "")
+        is_reserve = status == "reserve" or (status == "present" and signup == "BANK")
         row = {
             "user_id": uid,
             "name": str(p.get("name", "") or _display_member(client, home_guild_id, uid)),
             "signup": signup,
             "status": status or "open",
         }
-        if status != "present":
+        if status not in {"present", "reserve"}:
             skipped_not_present.append(row)
             continue
         if not _is_ebolus_member(client, home_guild_id, uid):
             skipped_not_ebolus.append(row)
             continue
-        requested = reserve_points if signup == "BANK" else base_points
+        requested = reserve_points if is_reserve else base_points
         remaining = weekly_event_remaining(home_guild_id, uid)
         row["requested_points"] = requested
         row["points"] = min(requested, remaining)
         row["weekly_remaining_before"] = remaining
         row["weekly_limited"] = row["points"] < requested
-        if signup == "BANK":
+        if is_reserve:
             reserve.append(row)
         else:
             present.append(row)
 
     return present, reserve, skipped_not_ebolus, skipped_not_present
-
 
 async def setup_dkp_system(client: discord.Client, tree: app_commands.CommandTree):
     # Initialisiert Defaults für alle aktuell bekannten Guilds.
@@ -1020,7 +1349,7 @@ async def setup_dkp_system(client: discord.Client, tree: app_commands.CommandTre
             color=discord.Color.blurple(),
         )
         log_id = int(c.get("log_channel_id", 0) or 0)
-        emb.add_field(name="Reserve", value=f"{float(c.get('reserve_factor', DEFAULT_RESERVE_FACTOR)) * 100:.0f}% des Eventwertes, aufgerundet", inline=False)
+        emb.add_field(name="Reserve", value=f"Fix {int(DEFAULT_RESERVE_POINTS)} EC", inline=False)
         emb.add_field(name="Wochenlimit aus Events", value=f"{int(c.get('weekly_event_limit', DEFAULT_WEEKLY_EVENT_LIMIT))} EC", inline=True)
         emb.add_field(name="Reset", value="Donnerstag 10:00 Uhr", inline=True)
         emb.add_field(name="Startguthaben", value=f"{int(c.get('start_balance', DEFAULT_START_BALANCE))} EC", inline=True)
@@ -1145,7 +1474,7 @@ async def setup_dkp_system(client: discord.Client, tree: app_commands.CommandTre
                 inter.user.id,
                 "event_award",
                 event_id=str(event_id),
-                meta={"event_type": resolved_event_type, "signup": row.get("signup", ""), "event_title": str(event.get("title", "Event") or "Event")},
+                meta={"event_type": resolved_event_type, "signup": row.get("signup", ""), "event_title": str(event.get("title", "Event") or "Event"), "target_name": str(row.get("name", "") or "")},
             )
             row["points"] = int(tx.get("amount", 0) or 0)
             row["weekly_limited"] = row["points"] < int(row.get("requested_points", row["points"]) or 0)
