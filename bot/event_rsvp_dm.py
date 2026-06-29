@@ -975,6 +975,8 @@ def ensure_attendance_snapshot(client: discord.Client, msg_id: str, obj: dict) -
                 "created_at": datetime.now(TZ).isoformat(),
                 "participants": participants,
                 "attendance": {},
+                "dkp_enabled": bool(obj.get("dkp_enabled", False)),
+                "dkp_event_type": str(obj.get("dkp_event_type", "") or ""),
             }
         else:
             # Teilnehmerliste aktualisieren, aber bereits gesetzte Anwesenheit behalten.
@@ -987,6 +989,11 @@ def ensure_attendance_snapshot(client: discord.Client, msg_id: str, obj: dict) -
             snap["when_iso"] = str(obj.get("when_iso", "") or "")
             snap["participants"] = participants
             snap["attendance"] = old_att
+            # EC-/DKP-Metadaten müssen in den Attendance-Snapshot mitwandern.
+            # Sonst kann man im Gildenmenü später Anwesenheit bearbeiten,
+            # aber keine EC vergeben, obwohl das ursprüngliche Event EC-relevant war.
+            snap["dkp_enabled"] = bool(obj.get("dkp_enabled", False))
+            snap["dkp_event_type"] = str(obj.get("dkp_event_type", "") or "")
 
         events[event_id] = snap
         save_attendance()
