@@ -735,7 +735,7 @@ class AuctionBidView(View):
 class PortalAuctionBidView(View):
     """Bietansicht im privaten Gildenmenü mit Zurück-Buttons."""
     def __init__(self, guild_id: int, user_id: int, auction_id: str):
-        super().__init__(timeout=300)
+        super().__init__(timeout=None)
         self.guild_id = int(guild_id)
         self.user_id = int(user_id)
         self.auction_id = str(auction_id)
@@ -1441,7 +1441,7 @@ class AuctionPortalMenuView(View):
 
 class AuctionPortalSubView(View):
     def __init__(self, guild_id: int, user_id: int):
-        super().__init__(timeout=300)
+        super().__init__(timeout=None)
         self.guild_id = int(guild_id)
         self.user_id = int(user_id)
 
@@ -1501,7 +1501,7 @@ class AuctionSelect(discord.ui.Select):
 
 class AuctionSelectView(View):
     def __init__(self, guild_id: int, user_id: int, mode: str):
-        super().__init__(timeout=300)
+        super().__init__(timeout=None)
         self.guild_id = int(guild_id)
         self.user_id = int(user_id)
         self.mode = str(mode)
@@ -1628,7 +1628,7 @@ class SaleBuyView(View):
 class PortalSaleBuyView(View):
     """Sale-Kauf Ansicht im privaten Gildenmenü mit Zurück-Buttons."""
     def __init__(self, guild_id: int, user_id: int, auction_id: str):
-        super().__init__(timeout=300)
+        super().__init__(timeout=None)
         self.guild_id = int(guild_id)
         self.user_id = int(user_id)
         self.auction_id = str(auction_id)
