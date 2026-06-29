@@ -792,7 +792,7 @@ class ECAttendanceParticipantSelect(Select):
 
 class ECAttendanceParticipantView(View):
     def __init__(self, guild_id: int, event_id: str, event: dict, page: int, source_channel_id: int, source_message_id: int):
-        super().__init__(timeout=300)
+        super().__init__(timeout=None)
         self.guild_id = int(guild_id)
         self.event_id = str(event_id)
         self.event = event
@@ -832,7 +832,7 @@ class ECAttendanceParticipantView(View):
 
 class ECAttendanceStatusView(View):
     def __init__(self, guild_id: int, event_id: str, target_user_id: int, page: int, source_channel_id: int, source_message_id: int):
-        super().__init__(timeout=300)
+        super().__init__(timeout=None)
         self.guild_id = int(guild_id)
         self.event_id = str(event_id)
         self.target_user_id = int(target_user_id)
@@ -921,7 +921,7 @@ class ECAttendanceAddUserSelect(UserSelect):
 
 class ECAttendanceAddUserView(View):
     def __init__(self, guild_id: int, event_id: str, source_channel_id: int, source_message_id: int):
-        super().__init__(timeout=300)
+        super().__init__(timeout=None)
         self.add_item(ECAttendanceAddUserSelect(guild_id, event_id, source_channel_id, source_message_id))
 
 
