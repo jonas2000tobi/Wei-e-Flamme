@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import asyncio
+import json
 import re
+from pathlib import Path
 from typing import Optional
 
 import discord
@@ -8,13 +11,12 @@ from discord import app_commands
 from discord.enums import ButtonStyle
 from discord.ui import View, button, Modal, TextInput
 
-from pathlib import Path
-import json
-
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 LEADER_CONTACT_CFG_FILE = DATA_DIR / "leader_contact_cfg.json"
+VOICE_TRACK_FILE = DATA_DIR / "voice_creator_channels.json"
+VOICE_EMPTY_DELETE_DELAY_SECONDS = 60
 
 
 def _load_json(path: Path, default):
@@ -23,6 +25,52 @@ def _load_json(path: Path, default):
         return data if isinstance(data, type(default)) else default
     except Exception:
         return default
+
+
+def _save_json(path: Path, data) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(path)
+    except Exception as e:
+        print(f"[voice_creator] JSON speichern fehlgeschlagen: {path} {e!r}", flush=True)
+
+
+def _load_tracked_voice_channels() -> dict:
+    data = _load_json(VOICE_TRACK_FILE, {})
+    return data if isinstance(data, dict) else {}
+
+
+def _save_tracked_voice_channels(data: dict) -> None:
+    _save_json(VOICE_TRACK_FILE, data)
+
+
+def _track_voice_channel(voice: discord.VoiceChannel, *, source_channel_id: int, creator_id: int, user_limit: int) -> None:
+    data = _load_tracked_voice_channels()
+    data[str(voice.id)] = {
+        "guild_id": int(voice.guild.id),
+        "channel_id": int(voice.id),
+        "source_channel_id": int(source_channel_id),
+        "creator_id": int(creator_id),
+        "user_limit": int(user_limit),
+        "name": str(voice.name),
+    }
+    _save_tracked_voice_channels(data)
+
+
+def _untrack_voice_channel(channel_id: int) -> None:
+    data = _load_tracked_voice_channels()
+    if str(channel_id) in data:
+        data.pop(str(channel_id), None)
+        _save_tracked_voice_channels(data)
+
+
+def _is_tracked_voice_channel(channel_id: Optional[int]) -> bool:
+    if not channel_id:
+        return False
+    data = _load_tracked_voice_channels()
+    return str(channel_id) in data
 
 
 def _is_admin(inter: discord.Interaction) -> bool:
@@ -49,6 +97,40 @@ def _clean_channel_name(raw: str) -> str:
     value = re.sub(r"[\s_]+", "-", value)
     value = re.sub(r"-+", "-", value).strip("-")
     return value[:80] or "sprachkanal"
+
+
+async def _delete_tracked_voice_if_empty(channel: discord.abc.GuildChannel | None) -> None:
+    if not isinstance(channel, discord.VoiceChannel):
+        return
+    if not _is_tracked_voice_channel(int(channel.id)):
+        return
+
+    # Direkt vor dem Löschen erneut prüfen, damit niemand gelöscht wird, der wieder betreten wurde.
+    if len(getattr(channel, "members", []) or []) > 0:
+        return
+
+    channel_id = int(channel.id)
+    guild_id = int(channel.guild.id)
+    channel_name = str(channel.name)
+    try:
+        await channel.delete(reason="Ebolus Voice-Panel: automatisch gelöscht, weil leer")
+        _untrack_voice_channel(channel_id)
+        print(
+            f"[VOICE-PANEL] auto_delete guild={guild_id} channel={channel_id} name={channel_name} reason=empty",
+            flush=True,
+        )
+    except discord.NotFound:
+        _untrack_voice_channel(channel_id)
+    except discord.Forbidden:
+        print(
+            f"[VOICE-PANEL] auto_delete_failed guild={guild_id} channel={channel_id} name={channel_name} error=Forbidden",
+            flush=True,
+        )
+    except Exception as e:
+        print(
+            f"[VOICE-PANEL] auto_delete_failed guild={guild_id} channel={channel_id} name={channel_name} error={e!r}",
+            flush=True,
+        )
 
 
 class VoiceCreateModal(Modal, title="Sprachkanal erstellen"):
@@ -104,6 +186,8 @@ class VoiceCreateModal(Modal, title="Sprachkanal erstellen"):
                 overwrites=overwrites,
                 reason=f"Voice-Panel genutzt von {inter.user} ({inter.user.id})",
             )
+            _track_voice_channel(voice, source_channel_id=int(source.id), creator_id=int(inter.user.id), user_limit=limit)
+
             # Möglichst direkt unter den Textkanal einsortieren.
             try:
                 await voice.edit(position=int(source.position) + 1)
@@ -114,7 +198,8 @@ class VoiceCreateModal(Modal, title="Sprachkanal erstellen"):
                 flush=True,
             )
             await inter.response.send_message(
-                f"✅ Sprachkanal erstellt: {voice.mention} • Limit: **{limit}**",
+                f"✅ Sprachkanal erstellt: {voice.mention} • Limit: **{limit}**\n"
+                f"ℹ️ Der Kanal wird automatisch gelöscht, sobald der letzte Spieler raus ist.",
                 ephemeral=True,
             )
         except discord.Forbidden:
@@ -142,6 +227,30 @@ class VoiceCreatePanel(View):
 async def setup_voice_creator(client: discord.Client, tree: app_commands.CommandTree):
     client.add_view(VoiceCreatePanel())
 
+    if not getattr(client, "_ebolus_voice_autodelete_listener", False):
+        async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
+            before_channel = getattr(before, "channel", None)
+            after_channel = getattr(after, "channel", None)
+
+            # Nur reagieren, wenn jemand einen getrackten Bot-Voice-Channel wirklich verlässt/wechseln.
+            if not isinstance(before_channel, discord.VoiceChannel):
+                return
+            if isinstance(after_channel, discord.VoiceChannel) and int(after_channel.id) == int(before_channel.id):
+                return
+            if not _is_tracked_voice_channel(int(before_channel.id)):
+                return
+
+            await asyncio.sleep(VOICE_EMPTY_DELETE_DELAY_SECONDS)
+
+            fresh_channel = before_channel.guild.get_channel(int(before_channel.id))
+            if fresh_channel is None:
+                _untrack_voice_channel(int(before_channel.id))
+                return
+            await _delete_tracked_voice_if_empty(fresh_channel)
+
+        client.add_listener(on_voice_state_update, "on_voice_state_update")
+        setattr(client, "_ebolus_voice_autodelete_listener", True)
+
     voice_panel = app_commands.Group(name="voice_panel", description="Voice-Panel verwalten")
 
     @voice_panel.command(name="post", description="Leader: Panel zum Erstellen von Sprachkanälen posten")
@@ -157,7 +266,8 @@ async def setup_voice_creator(client: discord.Client, tree: app_commands.Command
             title="🔊 Sprachkanal erstellen",
             description=(
                 "Klicke auf den Button, gib einen Namen und eine Personenanzahl ein.\n"
-                "Der Sprachkanal wird in derselben Kategorie wie dieser Textkanal erstellt."
+                "Der Sprachkanal wird in derselben Kategorie wie dieser Textkanal erstellt.\n\n"
+                "Leere erstellte Sprachkanäle werden automatisch gelöscht, sobald der letzte Spieler raus ist."
             ),
             color=discord.Color.blurple(),
         )
@@ -176,4 +286,4 @@ async def setup_voice_creator(client: discord.Client, tree: app_commands.Command
     except Exception:
         pass
 
-    print("🔊 Voice-Creator geladen: /voice_panel post")
+    print("🔊 Voice-Creator geladen: /voice_panel post + Auto-Löschung leerer Bot-Voice-Kanäle")
