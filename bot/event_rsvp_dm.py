@@ -1017,12 +1017,86 @@ def get_attendance_event(guild_id: int, event_id: str) -> dict | None:
     return ev if isinstance(ev, dict) else None
 
 
+def _attendance_find_participant(ev: dict, user_id: int) -> dict | None:
+    participants = ev.setdefault("participants", [])
+    for p in participants:
+        try:
+            if int(p.get("id", 0) or 0) == int(user_id):
+                return p
+        except Exception:
+            continue
+    return None
+
+
+def add_attendance_participant(guild_id: int, event_id: str, user_id: int, name: str, signup: str = "DPS", status: str = "present", marked_by: int = 0) -> bool:
+    """Fügt einen Spieler nachträglich zur EC-Anwesenheitsliste hinzu.
+
+    signup: TANK/HEAL/DPS/BANK. BANK zählt später als Reserve.
+    status: present/absent/excused/maybe/clear. maybe/offen geben keine EC.
+    """
+    ev = get_attendance_event(int(guild_id), str(event_id))
+    if not ev:
+        return False
+    signup = str(signup or "DPS").upper().strip()
+    if signup not in {"TANK", "HEAL", "DPS", "BANK"}:
+        signup = "DPS"
+    p = _attendance_find_participant(ev, int(user_id))
+    if not p:
+        ev.setdefault("participants", []).append({
+            "id": int(user_id),
+            "name": str(name or f"User {user_id}"),
+            "signup": signup,
+            "manual": True,
+            "added_by": int(marked_by or 0),
+            "added_at": datetime.now(TZ).isoformat(),
+        })
+    else:
+        p["name"] = str(name or p.get("name") or f"User {user_id}")
+        p["signup"] = signup
+        p["manual"] = bool(p.get("manual", False)) or True
+        p["updated_by"] = int(marked_by or 0)
+        p["updated_at"] = datetime.now(TZ).isoformat()
+    return set_attendance_status(guild_id, event_id, user_id, status, marked_by)
+
+
+def remove_attendance_participant(guild_id: int, event_id: str, user_id: int, marked_by: int = 0) -> bool:
+    """Entfernt einen Spieler komplett aus der EC-Anwesenheitsliste."""
+    ev = get_attendance_event(int(guild_id), str(event_id))
+    if not ev:
+        return False
+    before = len(ev.get("participants") or [])
+    ev["participants"] = [p for p in (ev.get("participants") or []) if int(p.get("id", 0) or 0) != int(user_id)]
+    attendance = ev.setdefault("attendance", {})
+    attendance.pop(str(user_id), None)
+    ev["last_removed_by"] = int(marked_by or 0)
+    ev["last_removed_at"] = datetime.now(TZ).isoformat()
+    save_attendance()
+    return len(ev.get("participants") or []) != before
+
+
+def set_attendance_signup(guild_id: int, event_id: str, user_id: int, signup: str, marked_by: int = 0) -> bool:
+    ev = get_attendance_event(int(guild_id), str(event_id))
+    if not ev:
+        return False
+    p = _attendance_find_participant(ev, int(user_id))
+    if not p:
+        return False
+    signup = str(signup or "DPS").upper().strip()
+    if signup not in {"TANK", "HEAL", "DPS", "BANK"}:
+        signup = "DPS"
+    p["signup"] = signup
+    p["updated_by"] = int(marked_by or 0)
+    p["updated_at"] = datetime.now(TZ).isoformat()
+    save_attendance()
+    return True
+
+
 def set_attendance_status(guild_id: int, event_id: str, user_id: int, status: str, marked_by: int) -> bool:
     ev = get_attendance_event(int(guild_id), str(event_id))
     if not ev:
         return False
 
-    valid = {"present", "absent", "excused"}
+    valid = {"present", "absent", "excused", "maybe"}
     attendance = ev.setdefault("attendance", {})
 
     if status == "clear":
