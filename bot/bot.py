@@ -35,6 +35,7 @@ setup_loot_needs = None
 setup_alliance_config = None
 setup_dkp_system = None
 setup_loot_auction = None
+setup_voice_creator = None
 store = {}
 _modules_initialized = False
 
@@ -165,6 +166,19 @@ def _import_modules():
         from loot_auction import setup_loot_auction  # type: ignore
         print("✅ Import: loot_auction (root)")
 
+    global setup_voice_creator
+
+    try:
+        from bot.voice_creator import setup_voice_creator  # type: ignore
+        print("✅ Import: bot.voice_creator")
+    except ModuleNotFoundError:
+        try:
+            from voice_creator import setup_voice_creator  # type: ignore
+            print("✅ Import: voice_creator (root)")
+        except ModuleNotFoundError:
+            setup_voice_creator = None
+            print("⚠️ Voice-Creator nicht gefunden")
+
 
 def _get_token() -> str | None:
     for key in ("DISCORD_TOKEN", "DISCORD_BOT_TOKEN", "TOKEN"):
@@ -211,6 +225,7 @@ async def on_ready():
             ("dkp_system", setup_dkp_system),
             ("loot_needs", setup_loot_needs),
             ("loot_auction", setup_loot_auction),
+            ("voice_creator", setup_voice_creator),
             ("member_portal", setup_member_portal),
         ]
         results = []
