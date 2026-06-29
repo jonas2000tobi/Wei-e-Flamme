@@ -2320,6 +2320,98 @@ def _admin_event_ec_awarded(guild_id: int, event_id: str, event: dict | None = N
         return False
 
 
+def _admin_event_any_ec_awarded(guild_id: int, event_id: str) -> bool:
+    """True, sobald für dieses Event irgendeine EC-Eventvergabe existiert.
+
+    Wichtig beim nachträglichen Ändern des EC-Typs: Die bisherige Prüfung ist
+    typgebunden. Würde man nach einer Vergabe den Typ ändern, könnte man sonst
+    versehentlich ein zweites Mal vergeben.
+    """
+    try:
+        dkp = _admin_dkp_module()
+        for tx in dkp._gtx(int(guild_id)):
+            if str(tx.get("event_id", "")) != str(event_id):
+                continue
+            if str(tx.get("type", "") or "") == "event_award":
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _admin_ec_type_options(include_not_relevant: bool = True) -> list[discord.SelectOption]:
+    options: list[discord.SelectOption] = []
+    if include_not_relevant:
+        options.append(discord.SelectOption(
+            label="Nicht EC-relevant",
+            value="Nicht DKP-relevant",
+            description="Keine EC für dieses Event vergeben.",
+        ))
+    options.extend([
+        discord.SelectOption(label="Gildenboss", value="Gildenboss", description="Standard: 20 EC"),
+        discord.SelectOption(label="HM Raid", value="HM Raid", description="Standard: 12 EC"),
+        discord.SelectOption(label="NM Raid", value="NM Raid", description="Standard: 12 EC"),
+        discord.SelectOption(label="Normal Raid", value="Normal Raid", description="Standard: 12 EC"),
+        discord.SelectOption(label="Übungsrun HM Raid", value="Übungsrun HM Raid", description="Standard: 15 EC"),
+        discord.SelectOption(label="Übungsrun Trials", value="Übungsrun Trials", description="Standard: 15 EC"),
+        discord.SelectOption(label="Segensstein PvP", value="Segensstein PvP", description="Standard: 5 EC"),
+    ])
+    return options[:25]
+
+
+def _admin_set_event_ec_type(guild_id: int, event_id: str, event_type: str, actor_id: int = 0) -> tuple[bool, str, dict | None]:
+    """Setzt EC-Relevanz/Tpy nachträglich im Attendance-Snapshot und im RSVP-Event.
+
+    Das Gildenmenü arbeitet mit dem Attendance-Snapshot. Der Scheduler und alte
+    Event-Posts arbeiten aber über den RSVP-Store. Deshalb speichern wir es an
+    beiden Stellen, sofern beide existieren.
+    """
+    clean = str(event_type or "").strip()
+    enabled = bool(clean and clean != "Nicht DKP-relevant")
+    stored_type = clean if enabled else "Nicht DKP-relevant"
+
+    try:
+        rsvp = _admin_event_module()
+    except Exception:
+        return False, "RSVP-/Eventmodul nicht geladen.", None
+
+    event = rsvp.get_attendance_event(int(guild_id), str(event_id))
+    if not isinstance(event, dict):
+        return False, "Event nicht gefunden.", None
+
+    if _admin_event_any_ec_awarded(int(guild_id), str(event_id)):
+        return False, "Für dieses Event wurden bereits EC vergeben. EC-Typ wird deshalb nicht mehr geändert.", event
+
+    now = datetime.now(TZ).isoformat()
+
+    event["dkp_enabled"] = bool(enabled)
+    event["dkp_event_type"] = stored_type
+    event["dkp_changed_by"] = int(actor_id or 0)
+    event["dkp_changed_at"] = now
+
+    try:
+        if hasattr(rsvp, "save_attendance"):
+            rsvp.save_attendance()
+    except Exception as e:
+        print(f"[member_portal] Attendance-EC-Typ konnte nicht gespeichert werden: {e!r}", flush=True)
+
+    try:
+        obj = (getattr(rsvp, "store", {}) or {}).get(str(event_id))
+        if isinstance(obj, dict):
+            obj["dkp_enabled"] = bool(enabled)
+            obj["dkp_event_type"] = stored_type
+            obj["dkp_changed_by"] = int(actor_id or 0)
+            obj["dkp_changed_at"] = now
+            if hasattr(rsvp, "save_store"):
+                rsvp.save_store()
+    except Exception as e:
+        print(f"[member_portal] RSVP-Event-EC-Typ konnte nicht gespeichert werden: {e!r}", flush=True)
+
+    if enabled:
+        return True, f"EC-Typ wurde auf **{stored_type}** gesetzt.", event
+    return True, "Event wurde auf **nicht EC-relevant** gesetzt.", event
+
+
 def _admin_event_ec_points(guild_id: int, event_type: str) -> tuple[int, int]:
     try:
         dkp = _admin_dkp_module()
@@ -3410,20 +3502,7 @@ class AdminEventDKPSelectView(PortalSafeView):
 class AdminEventDKPSelect(Select):
     def __init__(self, data: dict):
         self.data = dict(data)
-        options = [
-            discord.SelectOption(
-                label="Nicht DKP-relevant",
-                value="Nicht DKP-relevant",
-                description="Für dieses Event werden später keine EC vergeben.",
-            ),
-            discord.SelectOption(label="Gildenboss", value="Gildenboss", description="Standard: 20 EC"),
-            discord.SelectOption(label="HM Raid", value="HM Raid", description="Standard: 12 EC"),
-            discord.SelectOption(label="NM Raid", value="NM Raid", description="Standard: 12 EC"),
-            discord.SelectOption(label="Normal Raid", value="Normal Raid", description="Standard: 12 EC"),
-            discord.SelectOption(label="Übungsrun HM Raid", value="Übungsrun HM Raid", description="Standard: 15 EC"),
-            discord.SelectOption(label="Übungsrun Trials", value="Übungsrun Trials", description="Standard: 15 EC"),
-            discord.SelectOption(label="Segensstein PvP", value="Segensstein PvP", description="Standard: 5 EC"),
-        ]
+        options = _admin_ec_type_options(include_not_relevant=True)
         super().__init__(
             placeholder="EC-/DKP-Typ wählen",
             min_values=1,
@@ -3849,7 +3928,7 @@ def _admin_attendance_embed(guild: discord.Guild, event: dict) -> discord.Embed:
             f"EC-Status: **{'✅ bereits vergeben' if awarded else 'offen'}**\n"
         )
     else:
-        ec_line = "🪙 EC-Typ: **nicht EC-relevant**\n"
+        ec_line = "🪙 EC-Typ: **nicht EC-relevant / nicht gesetzt**\n"
 
     desc = (
         f"**{title}**\n"
@@ -3875,7 +3954,7 @@ def _admin_attendance_embed(guild: discord.Guild, event: dict) -> discord.Embed:
         description=desc[:3900],
         color=discord.Color.gold(),
     )
-    emb.set_footer(text="Du kannst Anwesenheit ändern, Spieler nachtragen und EC direkt aus diesem Menü vergeben.")
+    emb.set_footer(text="Du kannst Anwesenheit ändern, Spieler nachtragen, den EC-Typ setzen und EC direkt vergeben.")
     return emb
 
 
@@ -4035,6 +4114,35 @@ class AdminAttendanceMemberSelectView(PortalSafeView):
     async def btn_add_player(self, inter: discord.Interaction, _):
         await inter.response.send_modal(AdminAttendanceAddModal(self.guild_id, self.user_id, self.event_id, self.page))
 
+    @button(label="⚙️ EC-Typ setzen", style=ButtonStyle.secondary, custom_id="admin_attendance_set_ec_type", row=2)
+    async def btn_set_ec_type(self, inter: discord.Interaction, _):
+        resolved_guild, member = await _resolve_guild_member_from_inter(inter)
+        if not _is_portal_admin(resolved_guild, member):
+            await inter.response.send_message("❌ Dieser Bereich ist nur für Gildenleitung, Berater oder Wächter.", ephemeral=True)
+            return
+        rsvp = _admin_event_module()
+        guild = inter.client.get_guild(self.guild_id) or resolved_guild
+        event = rsvp.get_attendance_event(self.guild_id, self.event_id)
+        if not guild or not event:
+            await inter.response.send_message("❌ Event nicht gefunden.", ephemeral=True)
+            return
+        if _admin_event_any_ec_awarded(self.guild_id, self.event_id):
+            await inter.response.send_message("❌ Für dieses Event wurden bereits EC vergeben. Der EC-Typ wird danach nicht mehr geändert.", ephemeral=True)
+            return
+        current = _admin_event_ec_type(event, self.event_id) or "nicht gesetzt"
+        title = str(event.get("title", "Event") or "Event")
+        emb = discord.Embed(
+            title="⚙️ EC-Typ nachträglich setzen",
+            description=(
+                f"Event: **{title}**\n"
+                f"Aktuell: **{current}**\n\n"
+                "Wähle hier den richtigen EC-Typ. Der Bot speichert das am Event und am Anwesenheits-Snapshot. "
+                "Danach kannst du direkt über **💰 EC vergeben** buchen."
+            ),
+            color=discord.Color.gold(),
+        )
+        await inter.response.edit_message(embed=emb, view=AdminAttendanceECTypeSetView(self.guild_id, self.user_id, self.event_id, self.page))
+
     @button(label="💰 EC vergeben", style=ButtonStyle.primary, custom_id="admin_attendance_award_ec", row=2)
     async def btn_award_ec(self, inter: discord.Interaction, _):
         resolved_guild, member = await _resolve_guild_member_from_inter(inter)
@@ -4050,7 +4158,17 @@ class AdminAttendanceMemberSelectView(PortalSafeView):
 
         event_type = _admin_event_ec_type(event, self.event_id)
         if not event_type:
-            await inter.response.send_message("❌ Dieses Event ist nicht EC-relevant oder hat keinen gespeicherten EC-Typ.", ephemeral=True)
+            title = str(event.get("title", "Event") or "Event")
+            emb = discord.Embed(
+                title="⚙️ EC-Typ fehlt",
+                description=(
+                    f"Event: **{title}**\n\n"
+                    "Dieses Event ist aktuell nicht EC-relevant oder hat keinen gespeicherten EC-Typ. "
+                    "Setze zuerst den richtigen EC-Typ, danach kannst du EC vergeben."
+                ),
+                color=discord.Color.orange(),
+            )
+            await inter.response.edit_message(embed=emb, view=AdminAttendanceECTypeSetView(self.guild_id, self.user_id, self.event_id, self.page))
             return
 
         if _admin_event_ec_awarded(self.guild_id, self.event_id, event):
@@ -4076,6 +4194,66 @@ class AdminAttendanceMemberSelectView(PortalSafeView):
             color=discord.Color.gold(),
         )
         await inter.response.edit_message(embed=emb, view=AdminAttendanceAwardConfirmView(self.guild_id, self.user_id, self.event_id, self.page))
+
+
+class AdminAttendanceECTypeSetView(PortalSafeView):
+    def __init__(self, guild_id: int, user_id: int, event_id: str, page: int = 0):
+        super().__init__(timeout=None)
+        self.guild_id = int(guild_id)
+        self.user_id = int(user_id)
+        self.event_id = str(event_id)
+        self.page = max(0, int(page))
+        self.add_item(AdminAttendanceECTypeSelect(self.guild_id, self.user_id, self.event_id, self.page))
+
+    @button(label="Abbrechen", emoji=_menu_emoji(EMOJI_BACK), style=ButtonStyle.secondary, custom_id="admin_attendance_ec_type_cancel", row=1)
+    async def btn_cancel(self, inter: discord.Interaction, _):
+        rsvp = _admin_event_module()
+        guild = inter.client.get_guild(self.guild_id)
+        event = rsvp.get_attendance_event(self.guild_id, self.event_id)
+        if not guild or not event:
+            await inter.response.send_message("❌ Event nicht gefunden.", ephemeral=True)
+            return
+        await inter.response.edit_message(
+            embed=_admin_attendance_embed(guild, event),
+            view=AdminAttendanceMemberSelectView(self.guild_id, self.user_id, self.event_id, event, self.page),
+        )
+
+
+class AdminAttendanceECTypeSelect(Select):
+    def __init__(self, guild_id: int, user_id: int, event_id: str, page: int = 0):
+        self.guild_id = int(guild_id)
+        self.user_id = int(user_id)
+        self.event_id = str(event_id)
+        self.page = max(0, int(page))
+        super().__init__(
+            placeholder="EC-Typ für dieses Event wählen",
+            min_values=1,
+            max_values=1,
+            options=_admin_ec_type_options(include_not_relevant=True),
+            custom_id="admin_attendance_ec_type_select",
+        )
+
+    async def callback(self, inter: discord.Interaction):
+        guild, member = await _resolve_guild_member_from_inter(inter)
+        if not _is_portal_admin(guild, member):
+            await inter.response.send_message("❌ Dieser Bereich ist nur für Gildenleitung, Berater oder Wächter.", ephemeral=True)
+            return
+
+        selected = str(self.values[0] or "").strip()
+        ok, msg, event = _admin_set_event_ec_type(self.guild_id, self.event_id, selected, int(inter.user.id))
+        guild_obj = inter.client.get_guild(self.guild_id) or guild
+        if not ok or not guild_obj or not event:
+            await inter.response.send_message(("❌ " + msg), ephemeral=True)
+            return
+
+        await inter.response.edit_message(
+            embed=_admin_attendance_embed(guild_obj, event),
+            view=AdminAttendanceMemberSelectView(self.guild_id, self.user_id, self.event_id, event, self.page),
+        )
+        try:
+            await inter.followup.send("✅ " + msg, ephemeral=True)
+        except Exception:
+            pass
 
 
 class AdminAttendanceAwardConfirmView(PortalSafeView):
