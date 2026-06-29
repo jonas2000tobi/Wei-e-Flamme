@@ -3531,7 +3531,33 @@ def _attendance_status_label(status: str) -> str:
         return "❌ Nicht da"
     if status == "excused":
         return "🟡 Entschuldigt"
+    if status == "maybe":
+        return "❔ Vielleicht"
     return "⚪ Offen"
+
+
+def _attendance_signup_label(signup: str) -> str:
+    s = str(signup or "").strip().upper()
+    return {"TANK": "Tank", "HEAL": "Heal", "DPS": "DPS", "BANK": "Reserve"}.get(s, s or "—")
+
+
+def _parse_user_id_from_text(text: str) -> int:
+    m = re.search(r"(\d{15,25})", str(text or ""))
+    return int(m.group(1)) if m else 0
+
+
+def _normalize_attendance_add_status(text: str) -> tuple[str, str]:
+    raw = str(text or "").strip().lower()
+    raw = raw.replace("ü", "ue").replace("ä", "ae").replace("ö", "oe")
+    if raw in {"reserve", "bank", "r"}:
+        return "present", "BANK"
+    if raw in {"vielleicht", "maybe", "v", "?"}:
+        return "maybe", "DPS"
+    if raw in {"nicht da", "nichtda", "absent", "nein", "no", "n"}:
+        return "absent", "DPS"
+    if raw in {"entschuldigt", "excused", "abgemeldet"}:
+        return "excused", "DPS"
+    return "present", "DPS"
 
 
 async def _admin_attendance_events(guild: Optional[discord.Guild]) -> list[dict]:
@@ -3578,7 +3604,7 @@ def _admin_attendance_embed(guild: discord.Guild, event: dict) -> discord.Embed:
     participants = event.get("participants") or []
     attendance = event.get("attendance") or {}
 
-    counts = {"present": 0, "absent": 0, "excused": 0, "open": 0}
+    counts = {"present": 0, "absent": 0, "excused": 0, "maybe": 0, "open": 0}
     lines = []
 
     for p in participants:
@@ -3588,14 +3614,14 @@ def _admin_attendance_embed(guild: discord.Guild, event: dict) -> discord.Embed:
             continue
 
         status = str((attendance.get(str(uid)) or {}).get("status", "") or "")
-        if status in ("present", "absent", "excused"):
+        if status in ("present", "absent", "excused", "maybe"):
             counts[status] += 1
         else:
             counts["open"] += 1
 
         name = _profile_name(guild, uid, str(p.get("name", "Unbekannt") or "Unbekannt"))
         signup = str(p.get("signup", "") or "")
-        suffix = f" — {signup}" if signup else ""
+        suffix = f" — {_attendance_signup_label(signup)}" if signup else ""
         lines.append(f"• **{name}**{suffix}: {_attendance_status_label(status)}")
 
     title = str(event.get("title", "Event") or "Event")
@@ -3610,6 +3636,7 @@ def _admin_attendance_embed(guild: discord.Guild, event: dict) -> discord.Embed:
         f"✅ War da: **{counts['present']}**\n"
         f"❌ Nicht da: **{counts['absent']}**\n"
         f"🟡 Entschuldigt: **{counts['excused']}**\n"
+        f"❔ Vielleicht: **{counts['maybe']}**\n"
         f"⚪ Offen: **{counts['open']}**\n"
     )
 
@@ -3626,13 +3653,13 @@ def _admin_attendance_embed(guild: discord.Guild, event: dict) -> discord.Embed:
         description=desc[:3900],
         color=discord.Color.gold(),
     )
-    emb.set_footer(text="Markiert werden nur Spieler, die beim Event angemeldet waren.")
+    emb.set_footer(text="Du kannst angemeldete Spieler ändern, nachträglich hinzufügen oder entfernen.")
     return emb
 
 
 class AdminEventSelectView(View):
     def __init__(self, guild_id: int, user_id: int, action: str, events: list[tuple[str, dict]]):
-        super().__init__(timeout=900)
+        super().__init__(timeout=None)
         self.guild_id = int(guild_id)
         self.user_id = int(user_id)
         self.action = action
@@ -3678,7 +3705,7 @@ class AdminEventSelect(Select):
 
 class AdminEventDeleteConfirmView(View):
     def __init__(self, guild_id: int, user_id: int, message_id: str):
-        super().__init__(timeout=900)
+        super().__init__(timeout=None)
         self.guild_id = int(guild_id)
         self.user_id = int(user_id)
         self.message_id = str(message_id)
@@ -3697,7 +3724,7 @@ class AdminEventDeleteConfirmView(View):
 
 class AdminAttendanceEventSelectView(View):
     def __init__(self, guild_id: int, user_id: int, events: list[dict]):
-        super().__init__(timeout=900)
+        super().__init__(timeout=None)
         self.guild_id = int(guild_id)
         self.user_id = int(user_id)
         self.add_item(AdminAttendanceEventSelect(guild_id, user_id, events))
@@ -3742,7 +3769,7 @@ class AdminAttendanceEventSelect(Select):
 
 class AdminAttendanceMemberSelectView(View):
     def __init__(self, guild_id: int, user_id: int, event_id: str, event: dict, page: int = 0):
-        super().__init__(timeout=900)
+        super().__init__(timeout=None)
         self.guild_id = int(guild_id)
         self.user_id = int(user_id)
         self.event_id = str(event_id)
@@ -3782,6 +3809,44 @@ class AdminAttendanceMemberSelectView(View):
         max_page = max(0, (len(participants) - 1) // 25)
         await inter.response.edit_message(embed=_admin_attendance_embed(guild, event), view=AdminAttendanceMemberSelectView(self.guild_id, self.user_id, self.event_id, event, min(max_page, self.page + 1)))
 
+    @button(label="➕ Spieler hinzufügen", style=ButtonStyle.success, custom_id="admin_attendance_add_player", row=2)
+    async def btn_add_player(self, inter: discord.Interaction, _):
+        await inter.response.send_modal(AdminAttendanceAddModal(self.guild_id, self.user_id, self.event_id, self.page))
+
+
+class AdminAttendanceAddModal(Modal, title="Spieler zur Anwesenheit hinzufügen"):
+    user_text = TextInput(label="Discord User-ID oder @Mention", placeholder="z. B. 123456789012345678", max_length=80, required=True)
+    status_text = TextInput(label="Status", placeholder="da / reserve / vielleicht / nicht da", default="da", max_length=30, required=True)
+
+    def __init__(self, guild_id: int, user_id: int, event_id: str, page: int = 0):
+        super().__init__(timeout=300)
+        self.guild_id = int(guild_id)
+        self.user_id = int(user_id)
+        self.event_id = str(event_id)
+        self.page = max(0, int(page))
+
+    async def on_submit(self, inter: discord.Interaction):
+        rsvp = _admin_event_module()
+        guild = inter.client.get_guild(self.guild_id)
+        event = rsvp.get_attendance_event(self.guild_id, self.event_id)
+        if not guild or not event:
+            await inter.response.send_message("❌ Event nicht gefunden.", ephemeral=True)
+            return
+        uid = _parse_user_id_from_text(str(self.user_text.value))
+        if not uid:
+            await inter.response.send_message("❌ Keine gültige Discord User-ID erkannt.", ephemeral=True)
+            return
+        member = guild.get_member(uid)
+        name = _profile_name(guild, uid, member.display_name if member else f"User {uid}")
+        status, signup = _normalize_attendance_add_status(str(self.status_text.value))
+        ok = rsvp.add_attendance_participant(self.guild_id, self.event_id, uid, name, signup=signup, status=status, marked_by=inter.user.id)
+        event = rsvp.get_attendance_event(self.guild_id, self.event_id)
+        if not ok or not event:
+            await inter.response.send_message("❌ Spieler konnte nicht hinzugefügt werden.", ephemeral=True)
+            return
+        await inter.response.edit_message(embed=_admin_attendance_embed(guild, event), view=AdminAttendanceMemberSelectView(self.guild_id, self.user_id, self.event_id, event, self.page))
+
+
 class AdminAttendanceMemberSelect(Select):
     def __init__(self, guild_id: int, user_id: int, event_id: str, event: dict, page: int = 0):
         self.guild_id = int(guild_id)
@@ -3802,7 +3867,7 @@ class AdminAttendanceMemberSelect(Select):
             name = str(p.get("name", f"User {uid}") or f"User {uid}")
             signup = str(p.get("signup", "") or "")
             status = str((attendance.get(str(uid)) or {}).get("status", "") or "")
-            desc = f"{signup} • {_attendance_status_label(status)}" if signup else _attendance_status_label(status)
+            desc = f"{_attendance_signup_label(signup)} • {_attendance_status_label(status)}" if signup else _attendance_status_label(status)
             options.append(discord.SelectOption(label=name[:100], value=str(uid), description=desc[:100]))
         if not options:
             options = [discord.SelectOption(label="Keine Teilnehmer gefunden", value="0")]
@@ -3831,20 +3896,33 @@ class AdminAttendanceMemberSelect(Select):
 
 class AdminAttendanceMarkView(View):
     def __init__(self, guild_id: int, user_id: int, event_id: str, target_user_id: int, page: int = 0):
-        super().__init__(timeout=900)
+        super().__init__(timeout=None)
         self.guild_id = int(guild_id)
         self.user_id = int(user_id)
         self.event_id = str(event_id)
         self.target_user_id = int(target_user_id)
         self.page = max(0, int(page))
 
-    async def _mark(self, inter: discord.Interaction, status: str):
+    async def _mark(self, inter: discord.Interaction, status: str, signup: Optional[str] = None):
         rsvp = _admin_event_module()
-        ok = rsvp.set_attendance_status(self.guild_id, self.event_id, self.target_user_id, status, inter.user.id)
+        ok = True
+        if signup:
+            ok = bool(rsvp.set_attendance_signup(self.guild_id, self.event_id, self.target_user_id, signup, inter.user.id))
+        ok = bool(rsvp.set_attendance_status(self.guild_id, self.event_id, self.target_user_id, status, inter.user.id)) and ok
         guild = inter.client.get_guild(self.guild_id)
         event = rsvp.get_attendance_event(self.guild_id, self.event_id)
         if not ok or not guild or not event:
             await inter.response.send_message("❌ Anwesenheit konnte nicht gespeichert werden.", ephemeral=True)
+            return
+        await inter.response.edit_message(embed=_admin_attendance_embed(guild, event), view=AdminAttendanceMemberSelectView(self.guild_id, self.user_id, self.event_id, event, self.page))
+
+    async def _remove(self, inter: discord.Interaction):
+        rsvp = _admin_event_module()
+        ok = bool(rsvp.remove_attendance_participant(self.guild_id, self.event_id, self.target_user_id, inter.user.id))
+        guild = inter.client.get_guild(self.guild_id)
+        event = rsvp.get_attendance_event(self.guild_id, self.event_id)
+        if not ok or not guild or not event:
+            await inter.response.send_message("❌ Spieler konnte nicht entfernt werden.", ephemeral=True)
             return
         await inter.response.edit_message(embed=_admin_attendance_embed(guild, event), view=AdminAttendanceMemberSelectView(self.guild_id, self.user_id, self.event_id, event, self.page))
 
@@ -3864,7 +3942,19 @@ class AdminAttendanceMarkView(View):
     async def btn_clear(self, inter: discord.Interaction, _):
         await self._mark(inter, "clear")
 
-    @button(label="Zurück", emoji=_menu_emoji(EMOJI_BACK), style=ButtonStyle.secondary, custom_id="admin_attendance_mark_back", row=2)
+    @button(label="🏦 Reserve", style=ButtonStyle.primary, custom_id="admin_attendance_mark_reserve", row=2)
+    async def btn_reserve(self, inter: discord.Interaction, _):
+        await self._mark(inter, "present", signup="BANK")
+
+    @button(label="❔ Vielleicht", style=ButtonStyle.secondary, custom_id="admin_attendance_mark_maybe", row=2)
+    async def btn_maybe(self, inter: discord.Interaction, _):
+        await self._mark(inter, "maybe")
+
+    @button(label="🗑️ Entfernen", style=ButtonStyle.danger, custom_id="admin_attendance_mark_remove", row=3)
+    async def btn_remove(self, inter: discord.Interaction, _):
+        await self._remove(inter)
+
+    @button(label="Zurück", emoji=_menu_emoji(EMOJI_BACK), style=ButtonStyle.secondary, custom_id="admin_attendance_mark_back", row=3)
     async def btn_back(self, inter: discord.Interaction, _):
         rsvp = _admin_event_module()
         guild = inter.client.get_guild(self.guild_id)
