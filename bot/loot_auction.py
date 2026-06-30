@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import random
 import asyncio
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
@@ -40,6 +41,7 @@ FREE_START_BID = 5
 SALE_PRICE = 1
 NEW_MEMBER_LOOT_LOCK_DAYS = 7
 FREE_MIN_INCREMENT = 1
+JUNK_INTEREST_HOURS = 8
 
 ELIGIBILITY_CHOICES = [
     app_commands.Choice(name="Automatisch: Main > Second > Frei", value="auto"),
@@ -599,7 +601,11 @@ def _active_auction_info_embed(guild: discord.Guild, auction: dict) -> discord.E
     if phase == "sale":
         price = int(auction.get("fixed_price", auction.get("start_bid", 0)) or 0)
         lines.append(f"**Preis:** {'Gratis' if price <= 0 else f'{price} EC'}")
-        lines.append("Kaufen über **Gildenmenü → Auktion → Sale-Kauf**.")
+        if _is_junk_interest_sale(auction):
+            lines.append(_junk_sale_line(auction))
+            lines.append("Aktion über **Gildenmenü → Auktion → Sale-Kauf**.")
+        else:
+            lines.append("Kaufen über **Gildenmenü → Auktion → Sale-Kauf**.")
     elif phase == "free":
         lines.append("Bieten über **Gildenmenü → Auktion → Freie Auktion**.")
     else:
@@ -740,9 +746,12 @@ def _market_embed(guild: discord.Guild, auction: dict, *, final: str = "") -> di
 
     if final == "sold":
         buyer = int(auction.get("sold_to", 0) or 0)
+        title = "✅ Sale-Kauf abgeschlossen"
+        if bool(auction.get("junk_drop", False)) and auction.get("junk_lottery_winner_id"):
+            title = "🎲 Müll-Item ausgelost"
         return discord.Embed(
-            title="✅ Sale-Kauf abgeschlossen",
-            description=f"**Item:** {item}\n**Käufer:** <@{buyer}>\n**Preis:** {price_text}",
+            title=title,
+            description=f"**Item:** {item}\n**Empfänger:** <@{buyer}>\n**Preis:** {price_text}",
             color=discord.Color.green(),
             timestamp=_now(),
         )
@@ -770,6 +779,11 @@ def _market_embed(guild: discord.Guild, auction: dict, *, final: str = "") -> di
         return discord.Embed(title="🏁 Freie Auktion beendet", description=desc, color=discord.Color.gold(), timestamp=_now())
 
     if phase == "sale":
+        if _is_junk_interest_sale(auction):
+            title = "🧹 Neues Müll-Item verfügbar"
+            action = "Interesse anmelden" if _junk_interest_open(auction) else "Gratis nehmen"
+            desc = f"**Item:** {item}\n**Preis:** {price_text}\n**Aktion:** {action} über **Gildenmenü → Auktion → Sale-Kauf**.\n\n{_junk_sale_line(auction)}"
+            return discord.Embed(title=title, description=desc, color=discord.Color.green(), timestamp=_now())
         title = "🛒 Neues Sale-Item verfügbar"
         desc = f"**Item:** {item}\n**Preis:** {price_text}\nKaufen über **Gildenmenü → Auktion → Sale-Kauf**."
         if end_dt:
@@ -829,7 +843,10 @@ async def _post_or_refresh_market_message(client: discord.Client, guild_id: int,
         return
 
     embed = _market_embed(guild, auction)
-    content = "🛒 **Neues Sale-Item verfügbar!**" if phase == "sale" else "⚖️ **Item ist jetzt in der freien Auktion verfügbar!**"
+    if phase == "sale" and _is_junk_interest_sale(auction):
+        content = "🧹 **Müll-Item verfügbar!**"
+    else:
+        content = "🛒 **Neues Sale-Item verfügbar!**" if phase == "sale" else "⚖️ **Item ist jetzt in der freien Auktion verfügbar!**"
 
     old_cid = int(auction.get("market_channel_id", 0) or 0)
     old_mid = int(auction.get("market_message_id", 0) or 0)
@@ -877,14 +894,11 @@ async def start_junk_sale_drop(
     if not title:
         return {"ok": False, "error": "Kein Item-Titel angegeben."}
 
-    try:
-        duration = int(duration_hours)
-    except Exception:
-        duration = SALE_HOURS
-    duration = max(1, min(duration, 720))
-
+    # Müll-/Restitems laufen anders als normale Sales:
+    # 0-8 Stunden Interesse sammeln, danach auslosen.
+    # Wenn bis dahin niemand Interesse anmeldet, bleibt das Item ohne Ablauf als Gratis-Sofortkauf offen.
     aid = _new_auction_id()
-    ends = _now() + timedelta(hours=duration)
+    interest_until = _now() + timedelta(hours=JUNK_INTEREST_HOURS)
     auc = {
         "id": aid,
         "guild_id": int(guild.id),
@@ -894,7 +908,10 @@ async def start_junk_sale_drop(
         "item_name": title,
         "created_at": _now_iso(),
         "created_by": int(actor_id or getattr(inter.user, "id", 0) or 0),
-        "ends_at": ends.isoformat(),
+        "ends_at": "",
+        "junk_interest_until": interest_until.isoformat(),
+        "junk_interest_user_ids": [],
+        "junk_interest_requests": {},
         "fixed_price": 0,
         "start_bid": 0,
         "min_increment": 0,
@@ -1606,6 +1623,14 @@ async def auction_close_loop():
         for aid, auc in list(auctions.items()):
             if str(auc.get("status", "")) != "active":
                 continue
+            if _is_junk_interest_sale(auc):
+                until = _junk_interest_until(auc)
+                if until and now >= until and not auc.get("junk_interest_processed_at"):
+                    try:
+                        await _process_junk_interest_window(client, gid, str(aid), auc, reason="time")
+                    except Exception as e:
+                        print(f"[loot_auction] junk interest process failed {gid}/{aid}: {e!r}")
+                    continue
             end_dt = _parse_dt(str(auc.get("ends_at", "") or ""))
             if end_dt and now >= end_dt:
                 try:
@@ -1653,6 +1678,164 @@ def _auction_phase(auction: dict) -> str:
     return "free"
 
 
+def _is_junk_interest_sale(auction: dict) -> bool:
+    return bool(auction.get("junk_drop", False)) and _auction_phase(auction) == "sale" and int(auction.get("fixed_price", auction.get("start_bid", 0)) or 0) <= 0
+
+
+def _junk_interest_until(auction: dict) -> Optional[datetime]:
+    return _parse_dt(str(auction.get("junk_interest_until", "") or ""))
+
+
+def _junk_interest_user_ids(auction: dict) -> list[int]:
+    raw = auction.get("junk_interest_user_ids")
+    if not isinstance(raw, list):
+        raw = []
+        auction["junk_interest_user_ids"] = raw
+    out: list[int] = []
+    for value in raw:
+        try:
+            uid = int(value)
+        except Exception:
+            continue
+        if uid not in out:
+            out.append(uid)
+    auction["junk_interest_user_ids"] = out
+    return out
+
+
+def _junk_interest_open(auction: dict) -> bool:
+    until = _junk_interest_until(auction)
+    return bool(until and _now() < until and not auction.get("junk_interest_processed_at"))
+
+
+def _junk_sale_line(auction: dict) -> str:
+    if not _is_junk_interest_sale(auction):
+        return ""
+    until = _junk_interest_until(auction)
+    count = len(_junk_interest_user_ids(auction))
+    if _junk_interest_open(auction) and until:
+        return (
+            f"Interesse bis **{until.strftime('%d.%m.%Y %H:%M')}** anmelden.\n"
+            f"Aktuelle Anfragen: **{count}**\n"
+            "Nach Ablauf wird unter allen Anfragen zufällig gelost. "
+            "Wenn niemand anfragt, bleibt es danach als Gratis-Sofortkauf offen."
+        )
+    if auction.get("junk_interest_processed_at") and int(auction.get("junk_interest_count", count) or count) > 0:
+        winner = int(auction.get("sold_to", 0) or auction.get("junk_lottery_winner_id", 0) or 0)
+        return f"Interessephase beendet. Gewinner: <@{winner}>."
+    return "Interessephase vorbei. Da niemand angefragt hat, ist das Item jetzt als **Gratis-Sofortkauf** verfügbar."
+
+
+async def _finalize_sale_delivery(
+    client: discord.Client,
+    guild: discord.Guild,
+    guild_id: int,
+    auction: dict,
+    auction_id: str,
+    user_id: int,
+    price: int,
+    *,
+    actor_id: int | None = None,
+    source: str = "sale",
+) -> discord.Embed:
+    actor = int(actor_id or user_id)
+    auction["status"] = "delivered"
+    auction["sold_at"] = _now_iso()
+    auction["sold_to"] = int(user_id)
+    auction["charged_amount"] = int(price)
+    auction["delivery_source"] = str(source)
+    _mark_chest_item_status(int(guild_id), auction, "delivered", {"delivered_to": int(user_id), "delivered_by": actor, "delivered_at": auction["sold_at"]})
+    locked_need = _mark_need_received_for_winner(
+        int(guild_id),
+        int(user_id),
+        str(auction.get("item_id", "") or ""),
+        eligibility_mode=str(auction.get("eligibility_mode", "all") or "all"),
+        auction_id=str(auction_id),
+    )
+    if locked_need:
+        auction["locked_need_slot"] = locked_need
+    await _delete_auction_tracking_dms(client, auction)
+    await _edit_market_message_final(client, int(guild_id), auction, final="sold")
+    await _delete_active_auction_message(client, auction)
+    save_auctions()
+    try:
+        await _refresh_auction_message(client, int(guild_id), auction)
+    except Exception:
+        pass
+    return discord.Embed(
+        title="✅ Sale-Kauf abgeschlossen",
+        description=f"**Item:** {auction.get('item_name','Item')}\n**Käufer:** <@{int(user_id)}>\n**Preis:** {'**Gratis**' if int(price) <= 0 else f'**{int(price)} EC**'}",
+        color=discord.Color.green(),
+        timestamp=_now(),
+    )
+
+
+async def _process_junk_interest_window(client: discord.Client, guild_id: int, auction_id: str, auction: dict, *, reason: str = "time") -> dict:
+    if not _is_junk_interest_sale(auction):
+        return {"processed": False, "delivered": False, "winner_id": 0, "count": 0}
+    if str(auction.get("status", "")) != "active":
+        return {"processed": False, "delivered": False, "winner_id": 0, "count": 0}
+    if auction.get("junk_interest_processed_at"):
+        return {
+            "processed": True,
+            "delivered": str(auction.get("status", "")) == "delivered",
+            "winner_id": int(auction.get("sold_to", 0) or auction.get("junk_lottery_winner_id", 0) or 0),
+            "count": int(auction.get("junk_interest_count", 0) or 0),
+        }
+    until = _junk_interest_until(auction)
+    if until and _now() < until:
+        return {"processed": False, "delivered": False, "winner_id": 0, "count": len(_junk_interest_user_ids(auction))}
+
+    guild = client.get_guild(int(guild_id))
+    if not guild:
+        return {"processed": False, "delivered": False, "winner_id": 0, "count": len(_junk_interest_user_ids(auction))}
+
+    interested = [uid for uid in _junk_interest_user_ids(auction) if _is_ebolus_member(guild, uid)]
+    auction["junk_interest_processed_at"] = _now_iso()
+    auction["junk_interest_process_reason"] = str(reason)
+    auction["junk_interest_count"] = len(interested)
+
+    if interested:
+        winner_id = int(random.choice(interested))
+        auction["junk_lottery_winner_id"] = winner_id
+        auction["junk_lottery_drawn_at"] = _now_iso()
+        auction["junk_lottery_pool"] = interested
+        emb = await _finalize_sale_delivery(client, guild, int(guild_id), auction, str(auction_id), winner_id, 0, actor_id=0, source="junk_lottery")
+        save_auctions()
+        try:
+            member = guild.get_member(winner_id) or await guild.fetch_member(winner_id)
+            if member and not member.bot:
+                await member.send(
+                    "🎲 **Müll-Item ausgelost**\n\n"
+                    f"Du hast **{auction.get('item_name','Item')}** kostenlos bekommen."
+                )
+        except Exception:
+            pass
+        await _announce_log(
+            client,
+            int(guild_id),
+            "🎲 Müll-Item ausgelost",
+            f"**Item:** {auction.get('item_name','Item')}\n**Anfragen:** {len(interested)}\n**Gewinner:** <@{winner_id}>\n**Auktions-ID:** `{auction_id}`",
+            discord.Color.green(),
+        )
+        return {"processed": True, "delivered": True, "winner_id": winner_id, "count": len(interested), "embed": emb}
+
+    auction["junk_direct_sale_open_at"] = _now_iso()
+    auction["ends_at"] = ""
+    save_auctions()
+    await _refresh_auction_message(client, int(guild_id), auction)
+    await _post_or_refresh_market_message(client, int(guild_id), auction)
+    await _post_or_refresh_active_auction_message(client, int(guild_id), auction)
+    await _announce_log(
+        client,
+        int(guild_id),
+        "🛒 Müll-Item jetzt Sofortkauf",
+        f"**Item:** {auction.get('item_name','Item')}\nNiemand hat innerhalb von {JUNK_INTEREST_HOURS} Stunden Interesse angemeldet. Das Item bleibt jetzt als **Gratis-Sofortkauf** offen.\n**Auktions-ID:** `{auction_id}`",
+        discord.Color.green(),
+    )
+    return {"processed": True, "delivered": False, "winner_id": 0, "count": 0}
+
+
 def _active_need_auctions(guild_id: int) -> list[dict]:
     return [a for a in _active_auctions(guild_id) if _auction_phase(a) == "need"]
 
@@ -1671,11 +1854,21 @@ def _short_auction_line(auction: dict) -> str:
     end_dt = _parse_dt(str(auction.get("ends_at", "") or ""))
     top = _highest_bid(auction)
     if _auction_phase(auction) == "sale":
-        bid = f"Preis **{int(auction.get('fixed_price', auction.get('start_bid', 0)) or 0)} EC**"
+        if _is_junk_interest_sale(auction):
+            until = _junk_interest_until(auction)
+            if _junk_interest_open(auction) and until:
+                bid = f"Interesse bis **{until.strftime('%d.%m. %H:%M')}**"
+                when = "Auslosung"
+            else:
+                bid = "**Gratis-Sofortkauf**"
+                when = "offen"
+        else:
+            bid = f"Preis **{int(auction.get('fixed_price', auction.get('start_bid', 0)) or 0)} EC**"
+            when = end_dt.strftime("%d.%m. %H:%M") if end_dt else "?"
     else:
         bid = f"Höchstgebot **{int(top.get('amount',0) or 0)} EC**" if top else "noch kein Gebot"
-    when = end_dt.strftime("%d.%m. %H:%M") if end_dt else "?"
-    return f"• `{auction.get('id')}` – **{auction.get('item_name','Item')}** – {bid} – bis {when}"
+        when = end_dt.strftime("%d.%m. %H:%M") if end_dt else "?"
+    return f"• `{auction.get('id')}` – **{auction.get('item_name','Item')}** – {bid} – {when}"
 
 
 def _auction_portal_embed(guild: discord.Guild, user_id: int | None = None) -> discord.Embed:
@@ -1813,7 +2006,14 @@ class AuctionSelect(discord.ui.Select):
             when = end_dt.strftime("%d.%m. %H:%M") if end_dt else "?"
             if mode == "sale":
                 price = int(a.get("fixed_price", a.get("start_bid", 0)) or 0)
-                desc = f"Direktkauf {price} EC • bis {when}"
+                if _is_junk_interest_sale(a):
+                    until = _junk_interest_until(a)
+                    if _junk_interest_open(a) and until:
+                        desc = f"Interesse bis {until.strftime('%d.%m. %H:%M')}"
+                    else:
+                        desc = "Gratis-Sofortkauf • offen"
+                else:
+                    desc = f"Direktkauf {price} EC • bis {when}"
             else:
                 top = _highest_bid(a)
                 bid = f"{int(top.get('amount',0) or 0)} EC" if top else "noch kein Gebot"
@@ -1874,9 +2074,12 @@ def _sale_embed(guild: discord.Guild, auction: dict) -> discord.Embed:
 
     if status == "delivered":
         buyer = int(auction.get("sold_to", 0) or auction.get("delivered_to", 0) or 0)
+        title = f"✅ Sale-Kauf abgeschlossen: {item}"
+        if bool(auction.get("junk_drop", False)) and auction.get("junk_lottery_winner_id"):
+            title = f"🎲 Müll-Item ausgelost: {item}"
         emb = discord.Embed(
-            title=f"✅ Sale-Kauf abgeschlossen: {item}",
-            description=f"**Item:** {item}\n**Käufer:** <@{buyer}>\n**Preis:** {price_text}",
+            title=title,
+            description=f"**Item:** {item}\n**Empfänger:** <@{buyer}>\n**Preis:** {price_text}",
             color=discord.Color.green(),
             timestamp=_now(),
         )
@@ -1896,6 +2099,17 @@ def _sale_embed(guild: discord.Guild, auction: dict) -> discord.Embed:
             timestamp=_now(),
         )
 
+    if _is_junk_interest_sale(auction):
+        desc = f"Preis: {price_text}\n\n{_junk_sale_line(auction)}"
+        emb = discord.Embed(
+            title=f"🧹 Müll-Item: {item}",
+            description=desc,
+            color=discord.Color.green(),
+            timestamp=_now(),
+        )
+        emb.set_footer(text="0-8 Stunden Interesse sammeln. Danach Auslosung oder, ohne Anfragen, Gratis-Sofortkauf ohne Ablauf.")
+        return emb
+
     buy_note = "Dieses Item ist kostenlos. Beim Kauf werden keine EC abgebucht." if price <= 0 else "Beim Kauf werden die EC sofort abgebucht."
     emb = discord.Embed(
         title=f"🛒 Sale-Kauf: {item}",
@@ -1907,9 +2121,66 @@ def _sale_embed(guild: discord.Guild, auction: dict) -> discord.Embed:
         color=discord.Color.green(),
         timestamp=_now(),
     )
-    if bool(auction.get("junk_drop", False)):
-        emb.set_footer(text="Müll-/Restitem aus der Gildentruhe. Wer es braucht, kann es direkt nehmen.")
     return emb
+
+
+async def _handle_junk_sale_click(inter: discord.Interaction, guild_id: int, auction_id: str, guild: discord.Guild, auc: dict, user_id: int) -> None:
+    until = _junk_interest_until(auc)
+
+    if until and _now() < until and not auc.get("junk_interest_processed_at"):
+        interested = _junk_interest_user_ids(auc)
+        if user_id in interested:
+            await inter.response.send_message(
+                f"ℹ️ Du bist für **{auc.get('item_name','Item')}** bereits angemeldet. Auslosung: **{until.strftime('%d.%m.%Y %H:%M')}**.",
+                ephemeral=True,
+            )
+            return
+        interested.append(int(user_id))
+        auc["junk_interest_user_ids"] = interested
+        requests = auc.get("junk_interest_requests") if isinstance(auc.get("junk_interest_requests"), dict) else {}
+        requests[str(user_id)] = _now_iso()
+        auc["junk_interest_requests"] = requests
+        auc["updated_at"] = _now_iso()
+        save_auctions()
+        try:
+            await _refresh_auction_message(inter.client, int(guild_id), auc)
+            await _post_or_refresh_market_message(inter.client, int(guild_id), auc)
+            await _post_or_refresh_active_auction_message(inter.client, int(guild_id), auc)
+            if inter.message:
+                view = PortalSaleBuyView(int(guild_id), int(user_id), str(auction_id)) if isinstance(inter.channel, discord.DMChannel) else SaleBuyView(int(guild_id), str(auction_id))
+                await inter.message.edit(embed=_sale_embed(guild, auc), view=view)
+        except Exception as e:
+            print(f"[loot_auction] junk interest refresh failed: {e!r}")
+        await inter.response.send_message(
+            f"✅ Interesse angemeldet für **{auc.get('item_name','Item')}**.\n"
+            f"Auslosung nach Ablauf der 8 Stunden: **{until.strftime('%d.%m.%Y %H:%M')}**.",
+            ephemeral=True,
+        )
+        return
+
+    if until and not auc.get("junk_interest_processed_at"):
+        result = await _process_junk_interest_window(inter.client, int(guild_id), str(auction_id), auc, reason="click_after_window")
+        if result.get("delivered"):
+            winner = int(result.get("winner_id", 0) or 0)
+            try:
+                if inter.message:
+                    await inter.message.edit(embed=_sale_embed(guild, auc), view=None)
+            except Exception:
+                pass
+            if winner == user_id:
+                await inter.response.send_message(f"🎲 Die Interessephase war vorbei. Ausgelost: **du** hast **{auc.get('item_name','Item')}** bekommen.", ephemeral=True)
+            else:
+                await inter.response.send_message(f"🎲 Die Interessephase war vorbei. Ausgelost wurde: <@{winner}>.", ephemeral=True)
+            return
+        # Keine Anfragen vor Ablauf: ab jetzt Sofortkauf, kein Ablauf. Danach weiter zur direkten Übergabe.
+
+    emb = await _finalize_sale_delivery(inter.client, guild, int(guild_id), auc, str(auction_id), int(user_id), 0, actor_id=int(user_id), source="junk_direct_claim")
+    try:
+        if inter.message:
+            await inter.message.edit(embed=emb, view=None)
+    except Exception:
+        pass
+    await inter.response.send_message(embed=emb, ephemeral=True)
 
 
 async def _buy_sale_item(inter: discord.Interaction, guild_id: int, auction_id: str):
@@ -1931,7 +2202,12 @@ async def _buy_sale_item(inter: discord.Interaction, guild_id: int, auction_id: 
         return
     if not await _require_loot_unlocked(inter, guild, user_id):
         return
+
     price = int(auc.get("fixed_price", auc.get("start_bid", 0)) or 0)
+    if _is_junk_interest_sale(auc) and price <= 0:
+        await _handle_junk_sale_click(inter, int(guild_id), str(auction_id), guild, auc, user_id)
+        return
+
     if price > 0:
         bal = _ec_balance(guild_id, user_id)
         if bal < price:
@@ -1946,34 +2222,8 @@ async def _buy_sale_item(inter: discord.Interaction, guild_id: int, auction_id: 
         if not ok:
             await inter.response.send_message("❌ DKP/EC-System konnte nicht geladen werden. Keine EC abgebucht.", ephemeral=True)
             return
-    auc["status"] = "delivered"
-    auc["sold_at"] = _now_iso()
-    auc["sold_to"] = user_id
-    auc["charged_amount"] = price
-    _mark_chest_item_status(int(guild_id), auc, "delivered", {"delivered_to": user_id, "delivered_by": user_id, "delivered_at": auc["sold_at"]})
-    locked_need = _mark_need_received_for_winner(
-        int(guild_id),
-        user_id,
-        str(auc.get("item_id", "") or ""),
-        eligibility_mode=str(auc.get("eligibility_mode", "all") or "all"),
-        auction_id=str(auction_id),
-    )
-    if locked_need:
-        auc["locked_need_slot"] = locked_need
-    await _delete_auction_tracking_dms(inter.client, auc)
-    await _edit_market_message_final(inter.client, int(guild_id), auc, final="sold")
-    await _delete_active_auction_message(inter.client, auc)
-    save_auctions()
-    try:
-        await _refresh_auction_message(inter.client, int(guild_id), auc)
-    except Exception:
-        pass
-    emb = discord.Embed(
-        title="✅ Sale-Kauf abgeschlossen",
-        description=f"**Item:** {auc.get('item_name','Item')}\n**Käufer:** <@{user_id}>\n**Preis:** {'**Gratis**' if price <= 0 else f'**{price} EC**'}",
-        color=discord.Color.green(),
-        timestamp=_now(),
-    )
+
+    emb = await _finalize_sale_delivery(inter.client, guild, int(guild_id), auc, str(auction_id), user_id, price, actor_id=user_id, source="sale_direct_buy")
     try:
         if inter.message:
             await inter.message.edit(embed=emb, view=None)
@@ -1991,8 +2241,11 @@ class SaleBuyView(View):
         is_free = int(auc.get("fixed_price", auc.get("start_bid", 0)) or 0) <= 0
         for child in self.children:
             if isinstance(child, discord.ui.Button):
-                if is_free and (child.custom_id == "buy" or child.label == "Sofort kaufen"):
-                    child.label = "Gratis nehmen"
+                if child.custom_id == "buy" or child.label == "Sofort kaufen":
+                    if _is_junk_interest_sale(auc) and _junk_interest_open(auc):
+                        child.label = "Interesse anmelden"
+                    elif is_free:
+                        child.label = "Gratis nehmen"
                 child.custom_id = f"lootsale:{auction_id}:{child.custom_id or child.label}"
 
     @button(label="Sofort kaufen", style=ButtonStyle.success, custom_id="buy")
@@ -2016,8 +2269,11 @@ class PortalSaleBuyView(View):
         is_free = int(auc.get("fixed_price", auc.get("start_bid", 0)) or 0) <= 0
         for child in self.children:
             if isinstance(child, discord.ui.Button):
-                if is_free and (child.custom_id == "buy" or child.label == "Sofort kaufen"):
-                    child.label = "Gratis nehmen"
+                if child.custom_id == "buy" or child.label == "Sofort kaufen":
+                    if _is_junk_interest_sale(auc) and _junk_interest_open(auc):
+                        child.label = "Interesse anmelden"
+                    elif is_free:
+                        child.label = "Gratis nehmen"
                 child.custom_id = f"portalsale:{self.guild_id}:{self.user_id}:{auction_id}:{child.custom_id or child.label}"
 
     @button(label="Sofort kaufen", style=ButtonStyle.success, custom_id="buy")
