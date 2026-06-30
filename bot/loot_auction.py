@@ -544,8 +544,10 @@ async def _refresh_auction_message(client: discord.Client, guild_id: int, auctio
         return
     try:
         msg = await ch.fetch_message(msg_id)
-        view = (SaleBuyView(int(guild_id), str(auction.get("id", ""))) if _auction_phase(auction) == "sale" else AuctionBidView(int(guild_id), str(auction.get("id", "")))) if auction.get("status") == "active" else None
-        await msg.edit(embed=_auction_embed(guild, auction), view=view)
+        phase = _auction_phase(auction)
+        view = (SaleBuyView(int(guild_id), str(auction.get("id", ""))) if phase == "sale" else AuctionBidView(int(guild_id), str(auction.get("id", "")))) if auction.get("status") == "active" else None
+        embed = _sale_embed(guild, auction) if phase == "sale" else _auction_embed(guild, auction)
+        await msg.edit(embed=embed, view=view)
     except Exception as e:
         print(f"[loot_auction] refresh failed: {e!r}")
 
@@ -570,8 +572,98 @@ async def _delete_market_message(client: discord.Client, auction: dict) -> None:
     auction["market_message_deleted_at"] = _now_iso()
 
 
+def _market_embed(guild: discord.Guild, auction: dict, *, final: str = "") -> discord.Embed:
+    """Schlanke öffentliche Marktplatzkarte für den Allgemein-Chat.
+
+    Der Allgemein-/Marktplatzkanal soll nur Verfügbarkeit zeigen. Details,
+    Gebote, Mindestschritte und Verwaltungsinfos bleiben im DKP-/Auktionskanal.
+    """
+    phase = _auction_phase(auction)
+    item = str(auction.get("item_name", "Item") or "Item")
+    end_dt = _parse_dt(str(auction.get("ends_at", "") or ""))
+    price = int(auction.get("fixed_price", auction.get("start_bid", 0)) or 0)
+    price_text = "Gratis" if price <= 0 else f"{price} EC"
+
+    if final == "sold":
+        buyer = int(auction.get("sold_to", 0) or 0)
+        return discord.Embed(
+            title="✅ Sale-Kauf abgeschlossen",
+            description=f"**Item:** {item}\n**Käufer:** <@{buyer}>\n**Preis:** {price_text}",
+            color=discord.Color.green(),
+            timestamp=_now(),
+        )
+    if final == "expired":
+        return discord.Embed(
+            title="⌛ Sale-Kauf abgelaufen",
+            description=f"**Item:** {item}\nDas Item ist nicht mehr verfügbar.",
+            color=discord.Color.dark_grey(),
+            timestamp=_now(),
+        )
+    if final == "cancelled":
+        return discord.Embed(
+            title="❌ Angebot beendet",
+            description=f"**Item:** {item}\nDieses Angebot ist nicht mehr verfügbar.",
+            color=discord.Color.red(),
+            timestamp=_now(),
+        )
+    if final == "auction_closed":
+        top = _highest_bid(auction)
+        winner = int(top.get("user_id", 0) or 0) if top else 0
+        amount = int(top.get("amount", 0) or 0) if top else 0
+        desc = f"**Item:** {item}\nDie freie Auktion ist beendet."
+        if winner:
+            desc += f"\n**Gewinner:** <@{winner}>\n**Gebot:** {amount} EC"
+        return discord.Embed(title="🏁 Freie Auktion beendet", description=desc, color=discord.Color.gold(), timestamp=_now())
+
+    if phase == "sale":
+        title = "🛒 Neues Sale-Item verfügbar"
+        desc = f"**Item:** {item}\n**Preis:** {price_text}\nKaufen über **Gildenmenü → Auktion → Sale-Kauf**."
+        if end_dt:
+            desc += f"\nVerfügbar bis: **{end_dt.strftime('%d.%m.%Y %H:%M')}**"
+        return discord.Embed(title=title, description=desc, color=discord.Color.green(), timestamp=_now())
+
+    title = "⚖️ Neues Item in der freien Auktion"
+    desc = f"**Item:** {item}\nBieten über **Gildenmenü → Auktion → Freie Auktion**."
+    if end_dt:
+        desc += f"\nEnde: **{end_dt.strftime('%d.%m.%Y %H:%M')}**"
+    return discord.Embed(title=title, description=desc, color=discord.Color.gold(), timestamp=_now())
+
+
+async def _edit_market_message_final(client: discord.Client, guild_id: int, auction: dict, *, final: str) -> None:
+    """Bearbeitet die eine öffentliche Allgemein-/Marktplatz-Nachricht statt neue Posts zu erzeugen."""
+    cid = int(auction.get("market_channel_id", 0) or 0)
+    mid = int(auction.get("market_message_id", 0) or 0)
+    if not cid or not mid:
+        return
+    guild = client.get_guild(int(guild_id))
+    if not guild:
+        return
+    try:
+        ch = client.get_channel(cid)
+        if ch is None:
+            ch = await client.fetch_channel(cid)
+        if isinstance(ch, (discord.TextChannel, discord.Thread, discord.DMChannel)):
+            msg = await ch.fetch_message(mid)
+            content = {
+                "sold": "✅ **Sale-Item wurde genommen.**",
+                "expired": "⌛ **Sale-Item ist abgelaufen.**",
+                "cancelled": "❌ **Angebot beendet.**",
+                "auction_closed": "🏁 **Freie Auktion beendet.**",
+            }.get(final, "ℹ️ **Angebot aktualisiert.**")
+            await msg.edit(content=content, embed=_market_embed(guild, auction, final=final), view=None)
+            auction["market_message_final_state"] = final
+            auction["market_message_final_at"] = _now_iso()
+            save_auctions()
+    except Exception as e:
+        print(f"[loot_auction] market final edit failed: {e!r}")
+
+
 async def _post_or_refresh_market_message(client: discord.Client, guild_id: int, auction: dict) -> None:
-    """Postet/aktualisiert die öffentliche Nachricht für Freie Auktion oder Sale-Kauf."""
+    """Postet/aktualisiert die kurze öffentliche Nachricht für Freie Auktion oder Sale-Kauf.
+
+    Wichtig: Der Allgemein-Chat bekommt bewusst nur eine schlanke Info ohne
+    Gebotsdetails und ohne extra Abschluss-Post. Details bleiben im DKP-/Auktionskanal.
+    """
     phase = _auction_phase(auction)
     if phase not in {"free", "sale"} or str(auction.get("status", "")) != "active":
         return
@@ -582,8 +674,7 @@ async def _post_or_refresh_market_message(client: discord.Client, guild_id: int,
     if not ch:
         return
 
-    view = SaleBuyView(int(guild_id), str(auction.get("id", ""))) if phase == "sale" else AuctionBidView(int(guild_id), str(auction.get("id", "")))
-    embed = _sale_embed(guild, auction) if phase == "sale" else _auction_embed(guild, auction)
+    embed = _market_embed(guild, auction)
     content = "🛒 **Neues Sale-Item verfügbar!**" if phase == "sale" else "⚖️ **Item ist jetzt in der freien Auktion verfügbar!**"
 
     old_cid = int(auction.get("market_channel_id", 0) or 0)
@@ -591,19 +682,21 @@ async def _post_or_refresh_market_message(client: discord.Client, guild_id: int,
     if old_mid and old_cid == int(getattr(ch, "id", 0) or 0):
         try:
             msg = await ch.fetch_message(old_mid)
-            await msg.edit(content=content, embed=embed, view=view)
+            await msg.edit(content=content, embed=embed, view=None)
             return
         except Exception as e:
             print(f"[loot_auction] market message refresh failed: {e!r}")
 
-    # Falls noch eine alte Marktplatz-Nachricht aus einer anderen Phase existiert, erst löschen.
+    # Falls noch eine alte Marktplatz-Nachricht aus einem anderen Kanal existiert, erst löschen.
     if old_mid:
         await _delete_market_message(client, auction)
     try:
-        msg = await ch.send(content=content, embed=embed, view=view)
+        msg = await ch.send(content=content, embed=embed, view=None)
         auction["market_channel_id"] = int(getattr(ch, "id", 0) or 0)
         auction["market_message_id"] = int(msg.id)
         auction["market_message_posted_at"] = _now_iso()
+        auction.pop("market_message_final_state", None)
+        auction.pop("market_message_final_at", None)
         save_auctions()
     except Exception as e:
         print(f"[loot_auction] market message post failed: {e!r}")
@@ -680,18 +773,6 @@ async def start_junk_sale_drop(
         await _post_or_refresh_market_message(client, guild.id, auc)
     except Exception as e:
         print(f"[loot_auction] junk sale market post failed: {e!r}")
-
-    try:
-        await _announce_log(
-            client, guild.id,
-            "🧹 Müll-Item im Gratis-Sale",
-            f"**Item:** {title}\n"
-            f"**Preis:** Gratis\n"
-            f"**Auktions-ID:** `{aid}`",
-            discord.Color.green(),
-        )
-    except Exception:
-        pass
 
     save_auctions()
     return {
@@ -943,7 +1024,8 @@ class AuctionDeliveryView(View):
         if locked_need:
             auction["locked_need_slot"] = locked_need
         await _delete_auction_tracking_dms(inter.client, auction)
-        await _delete_market_message(inter.client, auction)
+        if _auction_phase(auction) == "free":
+            await _edit_market_message_final(inter.client, self.guild_id, auction, final="auction_closed")
         save_auctions()
 
         emb = discord.Embed(
@@ -957,7 +1039,7 @@ class AuctionDeliveryView(View):
             color=discord.Color.green(),
             timestamp=_now(),
         )
-        ch = _log_channel(inter.client, self.guild_id)
+        ch = _auction_channel(inter.client, self.guild_id, None) or _log_channel(inter.client, self.guild_id)
         if ch:
             try:
                 await ch.send(embed=emb)
@@ -977,7 +1059,9 @@ class AuctionDeliveryView(View):
 
 
 async def _announce_log(client: discord.Client, guild_id: int, title: str, description: str, color: discord.Color = discord.Color.gold()) -> None:
-    ch = _log_channel(client, guild_id)
+    # Detail-/Verwaltungsinfos gehören in den DKP-/Auktionskanal.
+    # Der öffentliche Marktplatz/Allgemein-Chat bekommt nur _post_or_refresh_market_message().
+    ch = _auction_channel(client, guild_id, None) or _log_channel(client, guild_id)
     if not ch:
         return
     try:
@@ -1252,7 +1336,6 @@ async def _transition_to_sale(client: discord.Client, guild_id: int, auction_id:
     })
     _mark_chest_item_status(guild_id, auction, "sale")
     save_auctions()
-    await _delete_market_message(client, auction)
     await _refresh_auction_message(client, guild_id, auction)
     await _refresh_auction_tracking_dms(client, guild_id, auction)
     await _post_or_refresh_market_message(client, guild_id, auction)
@@ -1287,7 +1370,7 @@ async def _close_auction(client: discord.Client, guild_id: int, auction_id: str,
             auction["expired_at"] = _now_iso()
             auction["close_reason"] = reason
             _mark_chest_item_status(guild_id, auction, "expired")
-            await _delete_market_message(client, auction)
+            await _edit_market_message_final(client, guild_id, auction, final="expired")
             save_auctions()
             await _refresh_auction_message(client, guild_id, auction)
             await _announce_log(
@@ -1305,6 +1388,8 @@ async def _close_auction(client: discord.Client, guild_id: int, auction_id: str,
     _mark_chest_item_status(guild_id, auction, "waiting_delivery")
     save_auctions()
     await _refresh_auction_message(client, guild_id, auction)
+    if phase == "free":
+        await _edit_market_message_final(client, guild_id, auction, final="auction_closed")
 
     winner = int(top.get("user_id", 0) or 0)
     await _refresh_auction_tracking_dms(client, guild_id, auction, ended=True, winner_id=winner)
@@ -1321,7 +1406,7 @@ async def _close_auction(client: discord.Client, guild_id: int, auction_id: str,
     except Exception:
         pass
 
-    ch = _log_channel(client, guild_id)
+    ch = _auction_channel(client, guild_id, None) or _log_channel(client, guild_id)
     if ch:
         emb = discord.Embed(
             title="🏁 Loot-Auktion beendet",
@@ -1615,9 +1700,36 @@ def _sale_embed(guild: discord.Guild, auction: dict) -> discord.Embed:
     end_dt = _parse_dt(str(auction.get("ends_at", "") or ""))
     price = int(auction.get("fixed_price", auction.get("start_bid", 0)) or 0)
     price_text = "**Gratis**" if price <= 0 else f"**{price} EC**"
+    item = str(auction.get("item_name", "Item") or "Item")
+    status = str(auction.get("status", "active") or "active")
+
+    if status == "delivered":
+        buyer = int(auction.get("sold_to", 0) or auction.get("delivered_to", 0) or 0)
+        emb = discord.Embed(
+            title=f"✅ Sale-Kauf abgeschlossen: {item}",
+            description=f"**Item:** {item}\n**Käufer:** <@{buyer}>\n**Preis:** {price_text}",
+            color=discord.Color.green(),
+            timestamp=_now(),
+        )
+        return emb
+    if status == "expired":
+        return discord.Embed(
+            title=f"⌛ Sale-Kauf abgelaufen: {item}",
+            description=f"**Item:** {item}\nDas Item wurde nicht gekauft und ist nicht mehr verfügbar.",
+            color=discord.Color.dark_grey(),
+            timestamp=_now(),
+        )
+    if status == "cancelled":
+        return discord.Embed(
+            title=f"❌ Sale-Kauf abgebrochen: {item}",
+            description=f"**Item:** {item}\nDieses Angebot wurde beendet.",
+            color=discord.Color.red(),
+            timestamp=_now(),
+        )
+
     buy_note = "Dieses Item ist kostenlos. Beim Kauf werden keine EC abgebucht." if price <= 0 else "Beim Kauf werden die EC sofort abgebucht."
     emb = discord.Embed(
-        title=f"🛒 Sale-Kauf: {auction.get('item_name','Item')}",
+        title=f"🛒 Sale-Kauf: {item}",
         description=(
             f"Preis: {price_text}\n"
             f"Verfügbar bis: **{end_dt.strftime('%d.%m.%Y %H:%M') if end_dt else '?'}**\n\n"
@@ -1680,7 +1792,7 @@ async def _buy_sale_item(inter: discord.Interaction, guild_id: int, auction_id: 
     if locked_need:
         auc["locked_need_slot"] = locked_need
     await _delete_auction_tracking_dms(inter.client, auc)
-    await _delete_market_message(inter.client, auc)
+    await _edit_market_message_final(inter.client, int(guild_id), auc, final="sold")
     save_auctions()
     try:
         await _refresh_auction_message(inter.client, int(guild_id), auc)
@@ -1692,15 +1804,9 @@ async def _buy_sale_item(inter: discord.Interaction, guild_id: int, auction_id: 
         color=discord.Color.green(),
         timestamp=_now(),
     )
-    ch = _log_channel(inter.client, int(guild_id))
-    if ch:
-        try:
-            await ch.send(embed=emb)
-        except Exception:
-            pass
     try:
         if inter.message:
-            await inter.message.edit(view=None)
+            await inter.message.edit(embed=emb, view=None)
     except Exception:
         pass
     await inter.response.send_message(embed=emb, ephemeral=True)
@@ -1855,7 +1961,7 @@ async def start_loot_drop_auction(inter: discord.Interaction, guild: discord.Gui
     if phase == "free":
         await _post_or_refresh_market_message(inter.client, guild.id, auc)
 
-    log = _log_channel(inter.client, guild.id)
+    log = _auction_channel(inter.client, guild.id, None)
     if log and log != ch:
         try:
             title = (("🎯 Main-Need-Auktion gestartet" if mode == "main_need" else "🔁 Second-Need-Auktion gestartet") if phase == "need" else "⚖️ Freie Auktion gestartet")
@@ -2169,10 +2275,10 @@ async def setup_loot_auction(client: discord.Client, tree: app_commands.CommandT
         auc["cancelled_at"] = _now_iso()
         auc["cancelled_by"] = int(inter.user.id)
         auc["cancel_reason"] = _safe_text(reason)
-        await _delete_market_message(client, auc)
+        await _edit_market_message_final(client, inter.guild.id, auc, final="cancelled")
         save_auctions()
         await _refresh_auction_message(client, inter.guild.id, auc)
-        ch = _log_channel(client, inter.guild.id)
+        ch = _auction_channel(client, inter.guild.id, None) or _log_channel(client, inter.guild.id)
         if ch:
             emb = discord.Embed(
                 title="❌ Loot-Auktion abgebrochen",
