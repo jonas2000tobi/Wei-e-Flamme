@@ -48,7 +48,7 @@ EMOJI_BANK = "<:reserve:1516465611243520201>"
 EMOJI_MAYBE = "<:maybe:1516465379445047497>"
 EMOJI_NO = "<:no:1516465299359273070>"
 
-# Custom Discord-Emojis für das Gildenmenü
+# Custom Discord-Emojis für die Gildenzentrale
 EMOJI_EBOLUS = "<:ebolus:1516448234355163208>"
 EMOJI_PERSONAL = "<:persoenlich:1516459694997372949>"
 EMOJI_LOOT = "<:loot:1516459736659136672>"
@@ -570,6 +570,28 @@ def _rsvp_user_status(obj: dict, user_id: int) -> str:
     return ""
 
 
+
+
+def _bold_sans(text: str) -> str:
+    """Discord-sichere Unicode-Bold-Schrift für Menü-Überschriften.
+
+    Umlaute/Sonderzeichen bleiben normal, weil Unicode dafür keine sauberen
+    mathematischen Sans-Bold-Zeichen hat.
+    """
+    normal = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+    bold = (
+        "𝗔𝗕𝗖𝗗𝗘𝗙𝗚𝗛𝗜𝗝𝗞𝗟𝗠𝗡𝗢𝗣𝗤𝗥𝗦𝗧𝗨𝗩𝗪𝗫𝗬𝗭"
+        "𝗮𝗯𝗰𝗱𝗲𝗳𝗴𝗵𝗶𝗷𝗸𝗹𝗺𝗻𝗼𝗽𝗾𝗿𝘀𝘁𝘂𝘃𝘄𝘅𝘆𝘇"
+        "𝟬𝟭𝟮𝟯𝟰𝟱𝟲𝟳𝟴𝟵"
+    )
+    table = str.maketrans({a: b for a, b in zip(normal, bold)})
+    return str(text or "").translate(table)
+
+
+def _menu_sep() -> str:
+    return "━━━━━━━━━━━━━━"
+
+
 def _event_status_block(guild: discord.Guild, member: discord.Member) -> str:
     try:
         try:
@@ -626,20 +648,24 @@ def _event_status_block(guild: discord.Guild, member: discord.Member) -> str:
         parts = []
 
         if answered:
-            lines = [x[1] for x in answered[:3]]
-            parts.append(f"{EMOJI_CALENDAR} **Deine kommenden Events:**\n" + "\n".join(lines))
+            next_when, next_line = answered[0]
+            clean_line = next_line[2:] if next_line.startswith("• ") else next_line
+            lines = [clean_line]
+            if len(answered) > 1:
+                lines.append(f"Weitere Events: **{len(answered) - 1}**")
+            parts.append(f"{EMOJI_CALENDAR} {_bold_sans('Nächster Einsatz')}\n" + "\n".join(lines))
 
         if open_votes:
             lines = [x[1] for x in open_votes[:3]]
-            parts.append(f"{EMOJI_VOTED} **Offene Abstimmungen:**\n" + "\n".join(lines))
+            parts.append(f"{EMOJI_VOTED} {_bold_sans('Offene Abstimmungen')}\n" + "\n".join(lines))
 
         if not parts:
-            return f"{EMOJI_CALENDAR} **Deine kommenden Events:**\nKeine aktiven Anmeldungen oder offenen Abstimmungen."
+            return f"{EMOJI_CALENDAR} {_bold_sans('Nächster Einsatz')}\nKeine aktiven Anmeldungen oder offenen Abstimmungen."
 
         return "\n\n".join(parts)
 
     except Exception:
-        return f"{EMOJI_CALENDAR} **Deine kommenden Events:**\nKeine Übersicht verfügbar."
+        return f"{EMOJI_CALENDAR} {_bold_sans('Nächster Einsatz')}\nKeine Übersicht verfügbar."
 
 
 
@@ -710,27 +736,43 @@ def _main_menu_embed(guild: discord.Guild, member: Optional[discord.Member] = No
     event_block = ""
 
     if member:
-        event_block = _event_status_block(guild, member) + "\n\n"
+        event_block = _event_status_block(guild, member)
 
     available_items = _active_market_item_count(guild.id)
 
-    ec_block = ""
-    loot_lock_block = ""
+    ec_balance: Optional[int] = None
+    loot_lock_text = ""
     if member:
         ec_balance = _get_ec_balance_safe(guild.id, member.id)
-        ec_block = f"\n\n🪙 **Ebolus Coins (EC)**\nDein Konto: **{ec_balance} EC**"
-        loot_lock_block = _loot_lock_block(member)
+        loot_lock_text = _loot_lock_block(member)
+
+    item_word = "Item" if int(available_items) == 1 else "Items"
+    sections: list[str] = [
+        _menu_sep(),
+        event_block or f"{EMOJI_CALENDAR} {_bold_sans('Nächster Einsatz')}\nKeine aktiven Anmeldungen oder offenen Abstimmungen.",
+        _menu_sep(),
+        f"🎒 {_bold_sans('Gildenhandel')}\n**{available_items} {item_word} verfügbar**",
+    ]
+
+    if ec_balance is not None:
+        sections.extend([
+            _menu_sep(),
+            f"🪙 {_bold_sans('EC-Konto')}\n**{ec_balance} EC**",
+        ])
+
+    if loot_lock_text:
+        # Lootsperre bleibt bewusst normaler Discord-Markdown, damit Warnungen klar lesbar bleiben.
+        sections.append(loot_lock_text.strip())
+
+    sections.extend([
+        _menu_sep(),
+        _bold_sans('Bereich unten auswählen.'),
+    ])
 
     emb = discord.Embed(
-        title=f"{EMOJI_EBOLUS} Ebolus Kommandozentrale",
-        description=(
-            event_block +
-            "Willkommen im privaten Gildenmenü.\n\n"
-            f"**Items zum Kauf Verfügbar:**\n**{available_items}**" +
-            ec_block +
-            loot_lock_block
-        ),
-        color=discord.Color.gold()
+        title=f"{EMOJI_EBOLUS} {_bold_sans('Ebolus Gildenzentrale')}",
+        description="\n".join(sections),
+        color=discord.Color.gold(),
     )
 
     emb.set_footer(text=f"Server: {guild.name} • Ebolus Gildenbot")
@@ -972,7 +1014,7 @@ def _dm_settings_embed(guild: discord.Guild, member: discord.Member) -> discord.
         color=discord.Color.gold()
     )
 
-    emb.set_footer(text="Diese Einstellung betrifft nur Raid-/Event-DMs, nicht das Gildenmenü.")
+    emb.set_footer(text="Diese Einstellung betrifft nur Raid-/Event-DMs, nicht die Gildenzentrale.")
 
     return emb
 
@@ -1114,7 +1156,7 @@ async def ensure_portal_exists_for_user(
     guild_id: int,
     user_id: int,
 ) -> tuple[bool, str]:
-    """Verify that the saved Gildenmenü DM still exists.
+    """Verify that the saved Gildenzentrale DM still exists.
 
     Important: this function does NOT edit an existing menu back to the main
     page. It only fetches the stored message ID and sends a new menu when that
@@ -1368,9 +1410,9 @@ async def _delete_old_bot_dms_for_member(
     active_menu_id = _portal_message_id(member.guild.id, member.id)
 
     protected_titles = {
-        "⚜️ Ebolus Kommandozentrale",
-        f"{EMOJI_EBOLUS} Ebolus Kommandozentrale",
-        "🏰 ebolus – Gildenmenü",
+        "⚜️ Ebolus Gildenzentrale",
+        f"{EMOJI_EBOLUS} Ebolus Gildenzentrale",
+        "🏰 ebolus – Gildenzentrale",
         "👤 Dein Gildenprofil",
         f"{EMOJI_PERSONAL} Dein Gildenprofil",
         "📅 Ebolus Gildenkalender",
@@ -1428,7 +1470,7 @@ async def _delete_old_bot_dms_for_member(
                         active_menu_id = msg.id
                     continue
 
-                # Safety: the Gildenmenü is one saved DM that can temporarily
+                # Safety: the Gildenzentrale is one saved DM that can temporarily
                 # show many admin/loot/auction wizard pages. Those pages have
                 # buttons/selects, so manual cleanup must not delete interactive
                 # bot messages unless a feature deletes its own tracked message.
@@ -1764,7 +1806,7 @@ async def _auto_reset_portal_after_view_error(inter: discord.Interaction, error:
 
     Discord does not always deliver a callback when a component is completely
     unregistered after a deploy. For callbacks that do reach the bot but then
-    fail, reset the user's saved Gildenmenü to the stable main view.
+    fail, reset the user's saved Gildenzentrale to the stable main view.
     """
     try:
         guild, member = await _resolve_guild_member_from_inter(inter)
@@ -1815,7 +1857,7 @@ class PortalOpenView(PortalSafeView):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @button(label="⚜️ Gildenmenü im Privatchat öffnen", style=ButtonStyle.secondary, custom_id="portal_open_dm")
+    @button(label="⚜️ Gildenzentrale im Privatchat öffnen", style=ButtonStyle.secondary, custom_id="portal_open_dm")
     async def btn_open_dm(self, inter: discord.Interaction, _):
         if inter.guild is None:
             await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
@@ -1825,7 +1867,7 @@ class PortalOpenView(PortalSafeView):
         ok = await ensure_portal_menu_for_user(inter.client, guild.id, inter.user.id, force_view="main")
 
         if ok:
-            await inter.response.send_message("✅ Ich habe dein Gildenmenü im Privatchat geöffnet oder aktualisiert.", ephemeral=True)
+            await inter.response.send_message("✅ Ich habe deine Gildenzentrale im Privatchat geöffnet oder aktualisiert.", ephemeral=True)
         else:
             await inter.response.send_message(
                 "❌ Konnte dir keine Privatnachricht schicken. Prüfe deine Discord-DM-Einstellungen.",
@@ -2362,7 +2404,7 @@ def _admin_ec_type_options(include_not_relevant: bool = True) -> list[discord.Se
 def _admin_set_event_ec_type(guild_id: int, event_id: str, event_type: str, actor_id: int = 0) -> tuple[bool, str, dict | None]:
     """Setzt EC-Relevanz/Tpy nachträglich im Attendance-Snapshot und im RSVP-Event.
 
-    Das Gildenmenü arbeitet mit dem Attendance-Snapshot. Der Scheduler und alte
+    Die Gildenzentrale arbeitet mit dem Attendance-Snapshot. Der Scheduler und alte
     Event-Posts arbeiten aber über den RSVP-Store. Deshalb speichern wir es an
     beiden Stellen, sofern beide existieren.
     """
@@ -2450,7 +2492,7 @@ async def _admin_create_event_voice(
         return await guild.create_voice_channel(
             name=_admin_clean_voice_name(title),
             category=category,
-            reason="Event-Voice automatisch über Gildenmenü erstellt",
+            reason="Event-Voice automatisch über Gildenzentrale erstellt",
         )
     except Exception as e:
         print(f"[member_portal] Event-Voice konnte nicht erstellt werden: {e!r}")
@@ -2539,7 +2581,7 @@ class AdminEventCreatedView(PortalSafeView):
         await inter.response.edit_message(embed=emb, view=AdminEventMenuView())
 
     @button(
-        label="Gildenmenü",
+        label="Gildenzentrale",
         emoji=_menu_emoji(EMOJI_EBOLUS),
         style=ButtonStyle.primary,
         custom_id="portal_event_created_home",
@@ -2571,7 +2613,7 @@ async def _show_event_created_portal(
     description = (
         f"**{_safe_text(title)}** wurde erfolgreich erstellt.\n\n"
         + (f"[Event im Server öffnen]({jump_url})\n\n" if jump_url else "")
-        + "Du kannst zurück zur Event-Verwaltung oder direkt ins Gildenmenü gehen."
+        + "Du kannst zurück zur Event-Verwaltung oder direkt in die Gildenzentrale gehen."
     )
     emb = discord.Embed(
         title="✅ Allianz-Event erstellt" if alliance else "✅ Event erstellt",
@@ -2739,7 +2781,7 @@ async def _admin_create_alliance_raid_from_menu(
     image_url: str | None = None,
     dkp_event_type: str = "",
 ):
-    """Allianz-Event über das Gildenmenü erstellen.
+    """Allianz-Event über die Gildenzentrale erstellen.
 
     Nutzt bewusst das vorhandene Allianz-System aus alliance_config.py:
     - Allianz-Gruppe
@@ -2913,7 +2955,7 @@ async def _admin_create_alliance_raid_from_menu(
         except Exception as e:
             failed.append(f"❌ `{server_cfg.get('label', guild_id_str)}` — {e}")
 
-    # Allianz-Events aus dem Gildenmenü sollen immer Home-/Ebolus-DMs senden.
+    # Allianz-Events aus der Gildenzentrale sollen immer Home-/Ebolus-DMs senden.
     # Die Partner-Server bekommen weiterhin nur Mirror-Posts mit Buttons, keine DMs.
     sent = 0
     skipped_opt_out = 0
@@ -4278,7 +4320,7 @@ class AdminAttendanceAwardConfirmView(PortalSafeView):
             ok, msg, _emb = await dkp._award_event_now(inter.client, self.guild_id, self.event_id, inter.user)
         except Exception as e:
             await inter.followup.send(f"❌ EC-Vergabe ist fehlgeschlagen: `{type(e).__name__}`", ephemeral=True)
-            print(f"[member_portal] EC-Vergabe über Gildenmenü fehlgeschlagen: {e!r}", flush=True)
+            print(f"[member_portal] EC-Vergabe über Gildenzentrale fehlgeschlagen: {e!r}", flush=True)
             return
 
         rsvp = _admin_event_module()
@@ -4773,7 +4815,7 @@ class AdminJunkDropModal(Modal, title="🧹 Müll gedroppt"):
         if market_ch_id and market_ch_id != auction_ch_id:
             places.append(f"Marktplatz: <#{market_ch_id}>")
         if not places:
-            places.append("kein Auktions-/Marktplatzkanal gesetzt; das Item ist trotzdem im Sale-Kauf des Gildenmenüs sichtbar")
+            places.append("kein Auktions-/Marktplatzkanal gesetzt; das Item ist trotzdem im Sale-Kauf der Gildenzentrale sichtbar")
 
         await inter.followup.send(
             "✅ **Müll-Item kostenlos in den Sale gestellt**\n"
@@ -5166,7 +5208,7 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
 
         await inter.response.send_message(f"✅ Abwesenheitskanal gesetzt: {channel.mention}", ephemeral=True)
 
-    @tree.command(name="portal_set_member_role", description="(Admin) Rolle setzen, deren Mitglieder automatisch das Gildenmenü bekommen")
+    @tree.command(name="portal_set_member_role", description="(Admin) Rolle setzen, deren Mitglieder automatisch die Gildenzentrale bekommen")
     async def portal_set_member_role(inter: discord.Interaction, role: discord.Role):
         if not _is_admin(inter):
             await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True)
@@ -5179,11 +5221,11 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
 
         await inter.response.send_message(
             f"✅ Ebolus-/Gildenmitglied-Rolle gesetzt: {role.mention}\n"
-            f"Neue Mitglieder mit dieser Rolle bekommen automatisch das Gildenmenü per DM.",
+            f"Neue Mitglieder mit dieser Rolle bekommen automatisch die Gildenzentrale per DM.",
             ephemeral=True
         )
 
-    @tree.command(name="portal_set_guild_info", description="(Admin) Mitteilung im Gildenmenü setzen oder leeren")
+    @tree.command(name="portal_set_guild_info", description="(Admin) Mitteilung in der Gildenzentrale setzen oder leeren")
     async def portal_set_guild_info(inter: discord.Interaction, text: str = ""):
         if not _is_admin(inter):
             await inter.response.send_message("❌ Nur Admins/Manage Guild.", ephemeral=True)
@@ -5204,11 +5246,11 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
         save_cfg()
 
         if cleaned:
-            await inter.response.send_message("✅ Gildeninfo für das Gildenmenü gesetzt. Nutze `/portal_send_all force:false`, um bestehende Menüs zu aktualisieren.", ephemeral=True)
+            await inter.response.send_message("✅ Gildeninfo für die Gildenzentrale gesetzt. Nutze `/portal_send_all force:false`, um bestehende Menüs zu aktualisieren.", ephemeral=True)
         else:
             await inter.response.send_message("✅ Gildeninfo geleert. Nutze `/portal_send_all force:false`, um bestehende Menüs zu aktualisieren.", ephemeral=True)
 
-    @tree.command(name="portal_send_all", description="(Admin) Öffnet/aktualisiert das Gildenmenü per DM bei allen mit Gildenmitglied-Rolle")
+    @tree.command(name="portal_send_all", description="(Admin) Öffnet/aktualisiert die Gildenzentrale per DM bei allen mit Gildenmitglied-Rolle")
     async def portal_send_all(inter: discord.Interaction, force: bool = False):
         await inter.response.defer(ephemeral=True, thinking=True)
 
@@ -5252,7 +5294,7 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
             ephemeral=True
         )
 
-    @tree.command(name="portal_resend_user", description="(Admin) Öffnet/aktualisiert bei einem Spieler das Gildenmenü")
+    @tree.command(name="portal_resend_user", description="(Admin) Öffnet/aktualisiert bei einem Spieler die Gildenzentrale")
     async def portal_resend_user(inter: discord.Interaction, member: discord.Member):
         await inter.response.defer(ephemeral=True, thinking=True)
 
@@ -5263,11 +5305,11 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
         ok = await ensure_portal_menu_for_user(client, inter.guild_id, member.id)
 
         if ok:
-            await inter.followup.send(f"✅ Gildenmenü bei **{member.display_name}** geöffnet/aktualisiert.", ephemeral=True)
+            await inter.followup.send(f"✅ Gildenzentrale bei **{member.display_name}** geöffnet/aktualisiert.", ephemeral=True)
         else:
             await inter.followup.send(f"❌ Konnte **{member.display_name}** keine DM senden.", ephemeral=True)
 
-    @tree.command(name="portal_force_new_user", description="(Admin) Erzwingt ein komplett neues Gildenmenü per DM")
+    @tree.command(name="portal_force_new_user", description="(Admin) Erzwingt eine komplett neue Gildenzentrale per DM")
     async def portal_force_new_user(inter: discord.Interaction, member: discord.Member):
         await inter.response.defer(ephemeral=True, thinking=True)
 
@@ -5276,7 +5318,7 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
             return
 
         if member.bot:
-            await inter.followup.send("❌ Bots bekommen kein Gildenmenü.", ephemeral=True)
+            await inter.followup.send("❌ Bots bekommen keine Gildenzentrale.", ephemeral=True)
             return
 
         # Alte gespeicherte Portal-ID vergessen.
@@ -5288,7 +5330,7 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
 
         if msg:
             await inter.followup.send(
-                f"✅ Neues Gildenmenü bei **{member.display_name}** gesendet.\n"
+                f"✅ Neue Gildenzentrale bei **{member.display_name}** gesendet.\n"
                 f"Neue Menü-ID: `{msg.id}`",
                 ephemeral=True
             )
@@ -5299,7 +5341,7 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
                 ephemeral=True
             )
 
-    @tree.command(name="portal_force_new_all", description="(Admin) Erzwingt ein komplett neues Gildenmenü bei allen Gildenmitgliedern")
+    @tree.command(name="portal_force_new_all", description="(Admin) Erzwingt eine komplett neue Gildenzentrale bei allen Gildenmitgliedern")
     async def portal_force_new_all(inter: discord.Interaction):
         await inter.response.defer(ephemeral=True, thinking=True)
 
@@ -5359,7 +5401,7 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
             ephemeral=True
         )
 
-    @tree.command(name="portal_dm_cleanup_user", description="(Admin) Löscht alte Bot-DMs bei einem Mitglied, schützt aktives Gildenmenü")
+    @tree.command(name="portal_dm_cleanup_user", description="(Admin) Löscht alte Bot-DMs bei einem Mitglied, schützt aktive Gildenzentrale")
     async def portal_dm_cleanup_user(
         inter: discord.Interaction,
         member: discord.Member,
@@ -5380,11 +5422,11 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
         await inter.followup.send(
             f"✅ DM-Cleanup bei **{member.display_name}** abgeschlossen.\n"
             f"🧹 Gelöschte Bot-Nachrichten: **{deleted}**\n"
-            f"⚜️ Aktives Gildenmenü wurde geschützt.",
+            f"⚜️ Aktive Gildenzentrale wurde geschützt.",
             ephemeral=True
         )
 
-    @tree.command(name="portal_dm_cleanup_all", description="(Admin) Löscht alte Bot-DMs bei allen Gildenmitgliedern, schützt aktives Gildenmenü")
+    @tree.command(name="portal_dm_cleanup_all", description="(Admin) Löscht alte Bot-DMs bei allen Gildenmitgliedern, schützt aktive Gildenzentrale")
     async def portal_dm_cleanup_all(
         inter: discord.Interaction,
         limit: int = 300
@@ -5437,7 +5479,7 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
             f"👥 Geprüft: **{checked}**\n"
             f"🧹 Gelöschte Bot-Nachrichten: **{total_deleted}**\n"
             f"❌ Fehlgeschlagen: **{failed}**\n"
-            f"⚜️ Aktive Gildenmenüs wurden geschützt.",
+            f"⚜️ Aktive Gildenzentralen wurden geschützt.",
             ephemeral=True
         )
 
@@ -5470,7 +5512,7 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
             ephemeral=True
         )
 
-    @tree.command(name="portal_event_add", description="(Admin) Festes Event für das Gildenmenü hinzufügen")
+    @tree.command(name="portal_event_add", description="(Admin) Festes Event für die Gildenzentrale hinzufügen")
     async def portal_event_add(
         inter: discord.Interaction,
         weekday: str,
@@ -5499,7 +5541,7 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
             ephemeral=True
         )
 
-    @tree.command(name="portal_events_clear", description="(Admin) Alle festen Gildenmenü-Events löschen")
+    @tree.command(name="portal_events_clear", description="(Admin) Alle festen Gildenzentrale-Events löschen")
     async def portal_events_clear(inter: discord.Interaction):
         if not _is_admin(inter):
             await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True)
@@ -5510,9 +5552,9 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
         cfg[str(inter.guild_id)] = c
         save_cfg()
 
-        await inter.response.send_message("✅ Alle Gildenmenü-Events gelöscht.", ephemeral=True)
+        await inter.response.send_message("✅ Alle Gildenzentrale-Events gelöscht.", ephemeral=True)
 
-    @tree.command(name="portal_events_list", description="(Admin) Zeigt gespeicherte Gildenmenü-Events")
+    @tree.command(name="portal_events_list", description="(Admin) Zeigt gespeicherte Gildenzentrale-Events")
     async def portal_events_list(inter: discord.Interaction):
         if not _is_admin(inter):
             await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True)
@@ -5532,7 +5574,7 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
 
         await inter.response.send_message("\n".join(lines), ephemeral=True)
 
-    @tree.command(name="portal_post", description="(Admin) Postet den Button zum Öffnen des privaten Gildenmenüs")
+    @tree.command(name="portal_post", description="(Admin) Postet den Button zum Öffnen der privaten Gildenzentrale")
     async def portal_post(inter: discord.Interaction, channel: Optional[discord.TextChannel] = None):
         if not _is_admin(inter):
             await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True)
@@ -5547,7 +5589,7 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
         emb = discord.Embed(
             title="⚜️ Ebolus Gildenbot",
             description=(
-                "Öffne hier dein persönliches Gildenmenü im Privatchat.\n\n"
+                "Öffne hier deine persönliche Gildenzentrale im Privatchat.\n\n"
                 "Dort findest du:\n"
                 "• dein Profil\n"
                 "• deine Needliste\n"
