@@ -635,7 +635,7 @@ async def _delete_dm_message_for_user(client: discord.Client, obj: dict, user_id
             msg = await dm.fetch_message(int(mid))
 
             # Safety net: a broken/stale event dm_map must never be allowed to
-            # delete the user's current Gildenmenü. If such a wrong mapping ever
+            # delete the user's current Gildenzentrale. If such a wrong mapping ever
             # appears, forget the mapping but keep the menu message alive.
             if int(mid) in _portal_message_ids_to_keep(client, int(user_id)) or _is_portal_message(msg):
                 dm_map.pop(str(user_id), None)
@@ -655,9 +655,9 @@ async def _delete_dm_message_for_user(client: discord.Client, obj: dict, user_id
 
 def _portal_protected_titles() -> set[str]:
     return {
-        "⚜️ Ebolus Kommandozentrale",
-        f"{EMOJI_EBOLUS} Ebolus Kommandozentrale",
-        "🏰 ebolus – Gildenmenü",
+        "⚜️ Ebolus Gildenzentrale",
+        f"{EMOJI_EBOLUS} Ebolus Gildenzentrale",
+        "🏰 ebolus – Gildenzentrale",
 
         "👤 Persönlich",
         f"{EMOJI_PERSONAL} Persönlich",
@@ -694,7 +694,7 @@ def _is_portal_message(msg: discord.Message) -> bool:
 
 
 def _portal_message_ids_to_keep(client: discord.Client, user_id: int) -> set[int]:
-    """Return stored Gildenmenü message IDs for this user across all guilds.
+    """Return stored Gildenzentrale message IDs for this user across all guilds.
 
     The RSVP cleanup runs from the event module and used to decide mostly by
     embed title. That was risky because the same saved portal DM can temporarily
@@ -799,7 +799,7 @@ async def _delete_irrelevant_bot_dm_messages_for_user(
     """
     Löscht alte/erledigte Bot-DMs.
     Schützt:
-    - aktives Gildenmenü und Portal-Unterseiten
+    - aktive Gildenzentrale und Portal-Unterseiten
     - offene Raid-DMs anderer Events, bei denen der User noch nicht abgestimmt hat
 
     Löscht:
@@ -809,7 +809,7 @@ async def _delete_irrelevant_bot_dm_messages_for_user(
     - gestartete/veraltete Raid-DMs
 
     Wichtig:
-    Das Gildenmenü wird hier NICHT neu gesendet und NICHT editiert.
+    Die Gildenzentrale wird hier NICHT neu gesendet und NICHT editiert.
     """
     if client.user is None:
         return 0
@@ -845,7 +845,7 @@ async def _delete_irrelevant_bot_dm_messages_for_user(
 
                 # Do not delete arbitrary bot DMs anymore. Only delete RSVP-DMs
                 # that are actually stored in event dm_messages. This prevents
-                # accidental deletion of the Gildenmenü while it shows an admin,
+                # accidental deletion of the Gildenzentrale while it shows an admin,
                 # auction or need subpage with a title not in the old allow-list.
                 if msg.id not in known_dm_ids:
                     continue
@@ -990,7 +990,7 @@ def ensure_attendance_snapshot(client: discord.Client, msg_id: str, obj: dict) -
             snap["participants"] = participants
             snap["attendance"] = old_att
             # EC-/DKP-Metadaten müssen in den Attendance-Snapshot mitwandern.
-            # Sonst kann man im Gildenmenü später Anwesenheit bearbeiten,
+            # Sonst kann man in der Gildenzentrale später Anwesenheit bearbeiten,
             # aber keine EC vergeben, obwohl das ursprüngliche Event EC-relevant war.
             snap["dkp_enabled"] = bool(obj.get("dkp_enabled", False))
             snap["dkp_event_type"] = str(obj.get("dkp_event_type", "") or "")
@@ -1396,7 +1396,7 @@ async def _push_overview(client: discord.Client, msg_id: str, obj: dict):
 
 async def _refresh_existing_portal_for_user(client: discord.Client, guild_id: int, user_id: int) -> bool:
     """
-    Aktualisiert nur ein bereits vorhandenes Gildenmenü per msg.edit(...).
+    Aktualisiert nur eine bereits vorhandene Gildenzentrale per msg.edit(...).
     Wichtig: Diese Funktion sendet KEINE neue DM.
     """
     try:
@@ -1436,9 +1436,9 @@ async def _refresh_existing_portal_for_user(client: discord.Client, guild_id: in
             current_title = str(msg.embeds[0].title or "")
 
         main_titles = {
-            "⚜️ Ebolus Kommandozentrale",
-            f"{EMOJI_EBOLUS} Ebolus Kommandozentrale",
-            "🏰 ebolus – Gildenmenü",
+            "⚜️ Ebolus Gildenzentrale",
+            f"{EMOJI_EBOLUS} Ebolus Gildenzentrale",
+            "🏰 ebolus – Gildenzentrale",
         }
         if current_title not in main_titles:
             return False
@@ -1794,7 +1794,7 @@ async def apply_rsvp(inter: discord.Interaction, msg_id: str, group: str) -> tup
     record_response(int(obj["guild_id"]), uid, str(msg_id), response_key)
     await _push_overview(inter.client, str(msg_id), obj)
 
-    # Gildenmenü-Startseite aktualisieren, aber nur vorhandene Portal-DM bearbeiten.
+    # Gildenzentrale-Startseite aktualisieren, aber nur vorhandene Portal-DM bearbeiten.
     # Es wird keine neue Portal-DM gesendet.
     refresh_guild_ids = {int(obj.get("guild_id", 0) or 0)}
 
@@ -2331,7 +2331,7 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
             ephemeral=True
         )
 
-        # Bestehende Gildenmenüs der Zielgruppe aktualisieren, ohne neue Portal-DMs zu senden.
+        # Bestehende Gildenzentralen der Zielgruppe aktualisieren, ohne neue Portal-DMs zu senden.
         _schedule_portal_refresh_for_event(inter.client, inter.guild, obj)
 
     async def _create_alliance_raid_impl(
@@ -2532,7 +2532,7 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
 
         await inter.followup.send(result, ephemeral=True)
 
-        # Home-/Ebolus-Gildenmenüs aktualisieren, ohne neue Portal-DMs zu senden.
+        # Home-/Ebolus-Gildenzentralen aktualisieren, ohne neue Portal-DMs zu senden.
         _schedule_portal_refresh_for_event(inter.client, inter.guild, obj)
 
     @tree.command(name="alliance_raid_create", description="(Leader) Allianz-Raid auf alle Server einer Allianz-Gruppe posten")
@@ -2893,7 +2893,7 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
 
         await inter.followup.send(text, ephemeral=True)
 
-        # Nach dem Löschen bestehende Gildenmenüs aktualisieren, damit das Event dort verschwindet.
+        # Nach dem Löschen bestehende Gildenzentralen aktualisieren, damit das Event dort verschwindet.
         if inter.guild is not None and refresh_members:
             try:
                 asyncio.create_task(_refresh_existing_portals_for_members(inter.client, inter.guild, refresh_members))
@@ -2995,7 +2995,7 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
 
         await inter.followup.send(text, ephemeral=True)
 
-        # Nach dem Löschen bestehende Home-Gildenmenüs aktualisieren, damit der Allianz-Raid dort verschwindet.
+        # Nach dem Löschen bestehende Home-Gildenzentralen aktualisieren, damit der Allianz-Raid dort verschwindet.
         if inter.guild is not None and refresh_members:
             try:
                 asyncio.create_task(_refresh_existing_portals_for_members(inter.client, inter.guild, refresh_members))
