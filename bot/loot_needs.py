@@ -1139,8 +1139,8 @@ class NeedMainView(View):
             await ensure_portal_menu_for_user(inter.client, self.guild_id, self.user_id, force_view="main")
         except Exception:
             emb = discord.Embed(
-                title="⚜️ Ebolus Kommandozentrale",
-                description="Zurück zum Gildenmenü.",
+                title="⚜️ Ebolus Gildenzentrale",
+                description="Zurück zur Gildenzentrale.",
                 color=discord.Color.gold()
             )
             await inter.response.edit_message(embed=emb, view=None)
