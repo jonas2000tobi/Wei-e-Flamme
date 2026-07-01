@@ -526,7 +526,7 @@ def _auction_embed(guild: discord.Guild, auction: dict, compact: bool = False) -
     emb = discord.Embed(title=f"{title_prefix}: {item_name}", color=color, timestamp=_now())
     # Nutzeransicht bewusst schlank halten:
     # Status, Auktions-ID und Berechtigung sind intern/logisch relevant,
-    # aber im Gildenmenü und in der Auktionskarte unnötig unübersichtlich.
+    # aber in der Gildenzentrale und in der Auktionskarte unnötig unübersichtlich.
     desc = []
     if end_dt:
         desc.append(f"Ende: **{end_dt.strftime('%d.%m.%Y %H:%M')}**")
@@ -603,11 +603,11 @@ def _active_auction_info_embed(guild: discord.Guild, auction: dict) -> discord.E
         lines.append(f"**Preis:** {'Gratis' if price <= 0 else f'{price} EC'}")
         if _is_junk_interest_sale(auction):
             lines.append(_junk_sale_line(auction))
-            lines.append("Aktion über **Gildenmenü → Auktion → Sale-Kauf**.")
+            lines.append("Aktion über **Gildenzentrale → Auktion → Sale-Kauf**.")
         else:
-            lines.append("Kaufen über **Gildenmenü → Auktion → Sale-Kauf**.")
+            lines.append("Kaufen über **Gildenzentrale → Auktion → Sale-Kauf**.")
     elif phase == "free":
-        lines.append("Bieten über **Gildenmenü → Auktion → Freie Auktion**.")
+        lines.append("Bieten über **Gildenzentrale → Auktion → Freie Auktion**.")
     else:
         mode = str(auction.get("eligibility_mode", "all") or "all")
         if mode == "main_need":
@@ -615,7 +615,7 @@ def _active_auction_info_embed(guild: discord.Guild, auction: dict) -> discord.E
         elif mode == "secondary_need":
             lines.append("Bieten dürfen aktuell nur offene **Second-Need-Spieler**.")
         else:
-            lines.append("Bieten über **Gildenmenü → Auktion → Need-Auktion**.")
+            lines.append("Bieten über **Gildenzentrale → Auktion → Need-Auktion**.")
     if end_dt:
         lines.append(f"**Läuft bis:** {end_dt.strftime('%d.%m.%Y %H:%M')}")
     lines.append("\nDetails und Gebote stehen im DKP-/Auktionskanal.")
@@ -782,16 +782,16 @@ def _market_embed(guild: discord.Guild, auction: dict, *, final: str = "") -> di
         if _is_junk_interest_sale(auction):
             title = "🧹 Neues Müll-Item verfügbar"
             action = "Interesse anmelden" if _junk_interest_open(auction) else "Gratis nehmen"
-            desc = f"**Item:** {item}\n**Preis:** {price_text}\n**Aktion:** {action} über **Gildenmenü → Auktion → Sale-Kauf**.\n\n{_junk_sale_line(auction)}"
+            desc = f"**Item:** {item}\n**Preis:** {price_text}\n**Aktion:** {action} über **Gildenzentrale → Auktion → Sale-Kauf**.\n\n{_junk_sale_line(auction)}"
             return discord.Embed(title=title, description=desc, color=discord.Color.green(), timestamp=_now())
         title = "🛒 Neues Sale-Item verfügbar"
-        desc = f"**Item:** {item}\n**Preis:** {price_text}\nKaufen über **Gildenmenü → Auktion → Sale-Kauf**."
+        desc = f"**Item:** {item}\n**Preis:** {price_text}\nKaufen über **Gildenzentrale → Auktion → Sale-Kauf**."
         if end_dt:
             desc += f"\nVerfügbar bis: **{end_dt.strftime('%d.%m.%Y %H:%M')}**"
         return discord.Embed(title=title, description=desc, color=discord.Color.green(), timestamp=_now())
 
     title = "⚖️ Neues Item in der freien Auktion"
-    desc = f"**Item:** {item}\nBieten über **Gildenmenü → Auktion → Freie Auktion**."
+    desc = f"**Item:** {item}\nBieten über **Gildenzentrale → Auktion → Freie Auktion**."
     if end_dt:
         desc += f"\nEnde: **{end_dt.strftime('%d.%m.%Y %H:%M')}**"
     return discord.Embed(title=title, description=desc, color=discord.Color.gold(), timestamp=_now())
@@ -880,10 +880,10 @@ async def start_junk_sale_drop(
     actor_id: int | None = None,
     duration_hours: int = SALE_HOURS,
 ) -> dict:
-    """Startet ein kostenloses Sale-Item für Müll-/Restdrops aus dem Admin-Gildenmenü.
+    """Startet ein kostenloses Sale-Item für Müll-/Restdrops aus dem Adminbereich der Gildenzentrale.
 
     Das Item muss nicht im Loot-Katalog existieren. Es wird als normales aktives
-    Sale-Item gespeichert und erscheint dadurch im Sale-Kauf des Gildenmenüs.
+    Sale-Item gespeichert und erscheint dadurch im Sale-Kauf der Gildenzentrale.
     """
     client = inter.client
     guild = client.get_guild(int(guild_id)) or inter.guild
@@ -1013,7 +1013,7 @@ async def _place_bid(inter: discord.Interaction, guild_id: int, auction_id: str,
         await _refresh_auction_tracking_dms(inter.client, guild_id, auction)
     asyncio.create_task(_repair_and_refresh_tracking_dm())
 
-    # Wenn das Gebot aus dem Gildenmenü/DM kommt, muss auch diese aktuelle DM-Nachricht
+    # Wenn das Gebot aus der Gildenzentrale/DM kommt, muss auch diese aktuelle DM-Nachricht
     # aktualisiert werden. Die normale Refresh-Funktion aktualisiert nur die öffentliche
     # Auktionsnachricht im Auktionskanal.
     if portal_user_id is not None:
@@ -1085,7 +1085,7 @@ class AuctionBidView(View):
 
 
 class PortalAuctionBidView(View):
-    """Bietansicht im privaten Gildenmenü mit Zurück-Buttons."""
+    """Bietansicht in der privaten Gildenzentrale mit Zurück-Buttons."""
     def __init__(self, guild_id: int, user_id: int, auction_id: str):
         super().__init__(timeout=None)
         self.guild_id = int(guild_id)
@@ -1132,7 +1132,7 @@ class PortalAuctionBidView(View):
             return
         await inter.response.edit_message(embed=_auction_portal_embed(guild, self.user_id), view=AuctionPortalMenuView(self.guild_id, self.user_id))
 
-    @button(label="Gildenmenü", style=ButtonStyle.secondary, custom_id="back_main")
+    @button(label="Gildenzentrale", style=ButtonStyle.secondary, custom_id="back_main")
     async def back_main(self, inter: discord.Interaction, btn: discord.ui.Button):
         await _portal_back_to_main(inter, self.guild_id, self.user_id)
 
@@ -1281,7 +1281,7 @@ def _auction_dm_content(auction: dict, *, ended: bool = False, winner_id: int = 
     return (
         f"🎁 **Dein {phase_name}-Item ist gedroppt!**\n\n"
         "Diese Nachricht wird bei jedem Gebot aktualisiert, damit du den Stand direkt hier sehen kannst.\n"
-        "Bieten kannst du über **Gildenmenü → Auktion → Need-Auktion**."
+        "Bieten kannst du über **Gildenzentrale → Auktion → Need-Auktion**."
     )
 
 
@@ -1659,7 +1659,7 @@ def _active_auctions(guild_id: int) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Gildenmenü / Portal integration
+# Gildenzentrale / Portal integration
 # ---------------------------------------------------------------------------
 
 def _auction_kind(auction: dict) -> str:
@@ -1913,7 +1913,7 @@ async def _portal_back_to_main(inter: discord.Interaction, guild_id: int, user_i
             return
     except Exception:
         pass
-    await inter.response.edit_message(embed=discord.Embed(title="⚜️ Gildenmenü", description="Öffne das Gildenmenü bitte erneut über den Server-Button.", color=discord.Color.gold()), view=None)
+    await inter.response.edit_message(embed=discord.Embed(title="⚜️ Gildenzentrale", description="Öffne die Gildenzentrale bitte erneut über den Server-Button.", color=discord.Color.gold()), view=None)
 
 
 class AuctionPortalMenuView(View):
@@ -1989,7 +1989,7 @@ class AuctionPortalSubView(View):
             return
         await inter.response.edit_message(embed=_auction_portal_embed(guild, self.user_id), view=AuctionPortalMenuView(self.guild_id, self.user_id))
 
-    @button(label="Gildenmenü", style=ButtonStyle.secondary, custom_id="portal_auc_sub_back_main")
+    @button(label="Gildenzentrale", style=ButtonStyle.secondary, custom_id="portal_auc_sub_back_main")
     async def back_main(self, inter: discord.Interaction, btn: discord.ui.Button):
         await _portal_back_to_main(inter, self.guild_id, self.user_id)
 
@@ -2259,7 +2259,7 @@ class SaleBuyView(View):
 
 
 class PortalSaleBuyView(View):
-    """Sale-Kauf Ansicht im privaten Gildenmenü mit Zurück-Buttons."""
+    """Sale-Kauf Ansicht in der privaten Gildenzentrale mit Zurück-Buttons."""
     def __init__(self, guild_id: int, user_id: int, auction_id: str):
         super().__init__(timeout=None)
         self.guild_id = int(guild_id)
@@ -2293,7 +2293,7 @@ class PortalSaleBuyView(View):
             return
         await inter.response.edit_message(embed=_auction_portal_embed(guild, self.user_id), view=AuctionPortalMenuView(self.guild_id, self.user_id))
 
-    @button(label="Gildenmenü", style=ButtonStyle.secondary, custom_id="back_main")
+    @button(label="Gildenzentrale", style=ButtonStyle.secondary, custom_id="back_main")
     async def back_main(self, inter: discord.Interaction, btn: discord.ui.Button):
         await _portal_back_to_main(inter, self.guild_id, self.user_id)
 
