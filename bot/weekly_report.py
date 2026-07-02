@@ -6,6 +6,11 @@ from datetime import datetime, timedelta
 from typing import Optional, List
 
 import discord
+
+try:
+    from bot.channel_picker import send_text_channel_picker, send_voice_channel_picker  # type: ignore
+except Exception:
+    from channel_picker import send_text_channel_picker, send_voice_channel_picker  # type: ignore
 from discord import app_commands
 from discord.ext import tasks
 
@@ -422,17 +427,19 @@ async def setup_weekly_report(client: discord.Client, tree: app_commands.Command
     global _report_task_started
 
     @tree.command(name="weekly_report_set_channel", description="(Admin) Channel für Wochenbericht setzen")
-    async def weekly_report_set_channel(inter: discord.Interaction, channel: discord.TextChannel):
+    async def weekly_report_set_channel(inter: discord.Interaction):
         if not _is_admin(inter):
             await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True)
             return
 
-        c = _gcfg(inter.guild_id)
-        c["channel_id"] = int(channel.id)
-        cfg[str(inter.guild_id)] = c
-        _save_cfg()
+        async def _picked(pick_inter: discord.Interaction, channel: discord.TextChannel):
+            c = _gcfg(pick_inter.guild_id)
+            c["channel_id"] = int(channel.id)
+            cfg[str(pick_inter.guild_id)] = c
+            _save_cfg()
+            await pick_inter.response.edit_message(content=f"✅ Wochenbericht-Channel gesetzt: {channel.mention}", view=None)
 
-        await inter.response.send_message(f"✅ Wochenbericht-Channel gesetzt: {channel.mention}", ephemeral=True)
+        await send_text_channel_picker(inter, "📊 Wochenbericht-Channel auswählen", _picked)
 
     @tree.command(name="weekly_report_toggle", description="(Admin) Wochenbericht aktivieren/deaktivieren")
     async def weekly_report_toggle(inter: discord.Interaction, enabled: bool):
