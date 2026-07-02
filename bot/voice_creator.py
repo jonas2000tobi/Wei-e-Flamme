@@ -9,6 +9,11 @@ from typing import Optional
 import discord
 from discord import app_commands
 from discord.enums import ButtonStyle
+
+try:
+    from bot.channel_picker import send_text_channel_picker, send_voice_channel_picker, VoiceChannelPickerView  # type: ignore
+except Exception:
+    from channel_picker import send_text_channel_picker, send_voice_channel_picker, VoiceChannelPickerView  # type: ignore
 from discord.ui import View, button, Modal, TextInput
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -319,7 +324,7 @@ async def setup_voice_creator(client: discord.Client, tree: app_commands.Command
     voice_panel = app_commands.Group(name="voice_panel", description="Voice-Panel verwalten")
 
     @voice_panel.command(name="post", description="Leader: Panel zum Erstellen von Sprachkanälen posten")
-    async def post(inter: discord.Interaction, kanal: discord.TextChannel):
+    async def post(inter: discord.Interaction):
         if inter.guild is None:
             await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
             return
@@ -327,26 +332,104 @@ async def setup_voice_creator(client: discord.Client, tree: app_commands.Command
             await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
             return
 
-        emb = discord.Embed(
-            title="🔊 Sprachkanal erstellen",
-            description=(
-                "Klicke auf den Button, gib einen Namen und eine Personenanzahl ein.\n"
-                "Der Sprachkanal wird in derselben Kategorie wie dieser Textkanal erstellt.\n"
-                "Sichtbar/beitretbar ist er für Ebolus, Allianz und Freunde.\n"
-                "Rollenlose, Raider und Bewerber werden ausgeschlossen.\n\n"
-                "Leere erstellte Sprachkanäle werden automatisch gelöscht, sobald der letzte Spieler raus ist."
-            ),
-            color=discord.Color.blurple(),
+        async def _picked(pick_inter: discord.Interaction, kanal: discord.TextChannel):
+            emb = discord.Embed(
+                title="🔊 Sprachkanal erstellen",
+                description=(
+                    "Klicke auf den Button, gib einen Namen und eine Personenanzahl ein.\n"
+                    "Der Sprachkanal wird in derselben Kategorie wie dieser Textkanal erstellt.\n"
+                    "Sichtbar/beitretbar ist er für Ebolus, Allianz und Freunde.\n"
+                    "Rollenlose, Raider und Bewerber werden ausgeschlossen.\n\n"
+                    "Leere erstellte Sprachkanäle werden automatisch gelöscht, sobald der letzte Spieler raus ist."
+                ),
+                color=discord.Color.blurple(),
+            )
+            emb.set_footer(text="Ebolus Voice-Panel")
+            try:
+                await kanal.send(embed=emb, view=VoiceCreatePanel())
+                await pick_inter.response.edit_message(content=f"✅ Voice-Panel wurde in {kanal.mention} gepostet.", view=None)
+            except discord.Forbidden:
+                await pick_inter.response.edit_message(content="❌ Mir fehlen Rechte, um dort zu schreiben.", view=None)
+            except Exception as e:
+                print(f"[voice_creator] Panel-Post Fehler: {e!r}", flush=True)
+                await pick_inter.response.edit_message(content=f"❌ Panel konnte nicht gepostet werden: `{type(e).__name__}`", view=None)
+
+        await send_text_channel_picker(inter, "🔊 Textkanal fürs Voice-Panel auswählen", _picked)
+
+    async def _move_members(inter: discord.Interaction, source: discord.VoiceChannel, target: discord.VoiceChannel) -> None:
+        if inter.guild is None:
+            await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
+            return
+        if not _is_leader_or_admin(inter):
+            await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
+            return
+        me = inter.guild.me
+        if me is not None and not inter.guild.me.guild_permissions.move_members:
+            await inter.response.send_message("❌ Mir fehlt die Berechtigung **Mitglieder verschieben**.", ephemeral=True)
+            return
+        members = list(getattr(source, "members", []) or [])
+        if not members:
+            await inter.response.send_message(f"ℹ️ In {source.mention} ist niemand.", ephemeral=True)
+            return
+        await inter.response.edit_message(content=f"⏳ Verschiebe **{len(members)}** Nutzer von {source.mention} nach {target.mention} …", view=None)
+        moved = 0
+        failed = 0
+        for member in members:
+            try:
+                await member.move_to(target, reason=f"Voice-Move durch {inter.user}")
+                moved += 1
+                await asyncio.sleep(0.15)
+            except Exception as e:
+                print(f"[voice_creator] move failed {getattr(member, 'id', '?')}: {e!r}", flush=True)
+                failed += 1
+        await inter.followup.send(
+            f"✅ Voice-Move fertig.\nVon: {source.mention}\nNach: {target.mention}\nVerschoben: **{moved}**\nFehler: **{failed}**",
+            ephemeral=True,
         )
-        emb.set_footer(text="Ebolus Voice-Panel")
-        try:
-            await kanal.send(embed=emb, view=VoiceCreatePanel())
-            await inter.response.send_message(f"✅ Voice-Panel wurde in {kanal.mention} gepostet.", ephemeral=True)
-        except discord.Forbidden:
-            await inter.response.send_message("❌ Mir fehlen Rechte, um dort zu schreiben.", ephemeral=True)
-        except Exception as e:
-            print(f"[voice_creator] Panel-Post Fehler: {e!r}", flush=True)
-            await inter.response.send_message(f"❌ Panel konnte nicht gepostet werden: `{type(e).__name__}`", ephemeral=True)
+
+    @voice_panel.command(name="move_all", description="Leader: Alle Nutzer aus einem Voice in einen anderen Voice verschieben")
+    async def move_all(inter: discord.Interaction):
+        if inter.guild is None:
+            await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
+            return
+        if not _is_leader_or_admin(inter):
+            await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
+            return
+
+        async def _source_picked(source_inter: discord.Interaction, source: discord.VoiceChannel):
+            async def _target_picked(target_inter: discord.Interaction, target: discord.VoiceChannel):
+                if int(source.id) == int(target.id):
+                    await target_inter.response.edit_message(content="❌ Quelle und Ziel sind derselbe Voice-Kanal.", view=None)
+                    return
+                await _move_members(target_inter, source, target)
+
+            view_msg = f"Quelle gewählt: {source.mention}\nJetzt Ziel-Voice auswählen."
+            target_view = VoiceChannelPickerView(source_inter.guild, int(source_inter.user.id), _target_picked, title="🔊 Ziel-Voice auswählen")
+            await source_inter.response.edit_message(content=target_view.message_text() + "\n" + view_msg, view=target_view)
+
+        await send_voice_channel_picker(inter, "🔊 Quell-Voice auswählen", _source_picked)
+
+    @voice_panel.command(name="move_my_voice", description="Leader: Alle aus deinem aktuellen Voice in einen Ziel-Voice verschieben")
+    async def move_my_voice(inter: discord.Interaction):
+        if inter.guild is None:
+            await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
+            return
+        if not _is_leader_or_admin(inter):
+            await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
+            return
+        member = inter.user if isinstance(inter.user, discord.Member) else None
+        source = getattr(getattr(member, "voice", None), "channel", None)
+        if not isinstance(source, discord.VoiceChannel):
+            await inter.response.send_message("❌ Du bist aktuell in keinem Voice-Kanal.", ephemeral=True)
+            return
+
+        async def _target_picked(target_inter: discord.Interaction, target: discord.VoiceChannel):
+            if int(source.id) == int(target.id):
+                await target_inter.response.edit_message(content="❌ Quelle und Ziel sind derselbe Voice-Kanal.", view=None)
+                return
+            await _move_members(target_inter, source, target)
+
+        await send_voice_channel_picker(inter, f"🔊 Ziel-Voice auswählen für Quelle {source.name}", _target_picked)
 
     try:
         tree.add_command(voice_panel)
