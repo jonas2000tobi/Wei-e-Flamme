@@ -15,6 +15,11 @@ from discord.ui import View, button
 from discord.enums import ButtonStyle
 
 try:
+    from bot.channel_picker import send_text_channel_picker, send_voice_channel_picker  # type: ignore
+except Exception:
+    from channel_picker import send_text_channel_picker, send_voice_channel_picker  # type: ignore
+
+try:
     from bot.event_dm_prefs import is_dm_enabled  # type: ignore
 except ModuleNotFoundError:
     from event_dm_prefs import is_dm_enabled  # type: ignore
@@ -2211,19 +2216,19 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
         )
 
     @tree.command(name="raid_set_log_channel", description="(Admin) Log-Kanal für RSVP-DM (optional)")
-    async def raid_set_log_channel(inter: discord.Interaction, channel: discord.TextChannel):
-        await inter.response.defer(ephemeral=True, thinking=False)
-
+    async def raid_set_log_channel(inter: discord.Interaction):
         if not _is_admin(inter):
-            await inter.followup.send("❌ Nur Admin/Manage Server.", ephemeral=True)
+            await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True)
             return
 
-        c = cfg.get(str(inter.guild_id)) or {}
-        c["LOG_CH"] = int(channel.id)
-        cfg[str(inter.guild_id)] = c
-        save_cfg()
+        async def _picked(pick_inter: discord.Interaction, channel: discord.TextChannel):
+            c = cfg.get(str(pick_inter.guild_id)) or {}
+            c["LOG_CH"] = int(channel.id)
+            cfg[str(pick_inter.guild_id)] = c
+            save_cfg()
+            await pick_inter.response.edit_message(content=f"✅ Log-Kanal gesetzt: {channel.mention}", view=None)
 
-        await inter.followup.send(f"✅ Log-Kanal gesetzt: {channel.mention}", ephemeral=True)
+        await send_text_channel_picker(inter, "🧾 RSVP-Log-Kanal auswählen", _picked)
 
     @tree.command(name="raid_create_dm", description="(Admin) Raid/Anmeldung erzeugen + Übersicht posten")
     @app_commands.describe(
@@ -2231,7 +2236,6 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
         date="Datum YYYY-MM-DD",
         time="Zeit HH:MM (24h)",
         description="Kurzbeschreibung (optional)",
-        channel="Server-Channel für die Übersicht",
         target_role="(Optional) Nur an diese Rolle DMs versenden",
         image_url="Optionales Bild fürs Embed"
     )
@@ -2241,14 +2245,11 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
         date: str,
         time: str,
         description: Optional[str] = None,
-        channel: Optional[discord.TextChannel] = None,
         target_role: Optional[discord.Role] = None,
         image_url: Optional[str] = None
     ):
-        await inter.response.defer(ephemeral=True, thinking=True)
-
         if not _is_admin(inter):
-            await inter.followup.send("❌ Nur Admin/Manage Server.", ephemeral=True)
+            await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True)
             return
 
         try:
@@ -2256,83 +2257,80 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
             hh, mi = [int(x) for x in time.split(":")]
             when = datetime(yyyy, mm, dd, hh, mi, tzinfo=TZ)
         except Exception:
-            await inter.followup.send("❌ Datum/Zeit ungültig. (YYYY-MM-DD / HH:MM)", ephemeral=True)
+            await inter.response.send_message("❌ Datum/Zeit ungültig. (YYYY-MM-DD / HH:MM)", ephemeral=True)
             return
 
-        ch = channel or inter.channel
+        async def _picked(pick_inter: discord.Interaction, ch: discord.TextChannel):
+            await pick_inter.response.edit_message(content=f"⏳ Erstelle Raid in {ch.mention} …", view=None)
+            obj = {
+                "guild_id": int(pick_inter.guild_id),
+                "channel_id": int(ch.id),
+                "title": title.strip(),
+                "description": (description or "").strip(),
+                "when_iso": when.isoformat(),
+                "image_url": (image_url or "").strip() or None,
+                "yes": {"TANK": [], "HEAL": [], "DPS": [], "BANK": []},
+                "maybe": {},
+                "no": [],
+                "target_role_id": int(target_role.id) if target_role else 0,
+                "reminders": [],
+                "reminder_sent": {},
+                "dm_messages": {}
+            }
 
-        if not isinstance(ch, (discord.TextChannel, discord.Thread)):
-            await inter.followup.send("❌ Zielkanal ist kein Textkanal/Thread.", ephemeral=True)
-            return
+            emb = build_embed(pick_inter.guild, obj)
+            msg = await ch.send(embed=emb)
 
-        obj = {
-            "guild_id": int(inter.guild_id),
-            "channel_id": int(ch.id),
-            "title": title.strip(),
-            "description": (description or "").strip(),
-            "when_iso": when.isoformat(),
-            "image_url": (image_url or "").strip() or None,
-            "yes": {"TANK": [], "HEAL": [], "DPS": [], "BANK": []},
-            "maybe": {},
-            "no": [],
-            "target_role_id": int(target_role.id) if target_role else 0,
-            "reminders": [],
-            "reminder_sent": {},
-            "dm_messages": {}
-        }
-
-        emb = build_embed(inter.guild, obj)
-        msg = await ch.send(embed=emb)
-
-        store[str(msg.id)] = obj
-        save_store()
-
-        try:
-            await msg.edit(view=ServerRaidView(int(msg.id)))
-        except Exception:
-            pass
-
-        sent = 0
-        skipped_opt_out = 0
-        role_obj = inter.guild.get_role(int(obj.get("target_role_id", 0) or 0)) if obj.get("target_role_id") else None
-
-        for member in _eligible_members(inter.guild, obj):
-            if not is_dm_enabled(inter.guild_id, member.id):
-                skipped_opt_out += 1
-                continue
+            store[str(msg.id)] = obj
+            save_store()
 
             try:
-                dm_text = _format_dm_text(
-                    title=title,
-                    when=when,
-                    channel_name_or_ref=f"Übersicht im Server: #{ch.name}",
-                    description=description,
-                    intro_line="Wähle unten deine Teilnahme:"
-                )
-
-                dm_msg = await member.send(dm_text, view=RaidView(int(msg.id)))
-                obj["dm_messages"][str(member.id)] = int(dm_msg.id)
-                sent += 1
-                await asyncio.sleep(0.05)
-
+                await msg.edit(view=ServerRaidView(int(msg.id)))
             except Exception:
                 pass
 
-        save_store()
+            sent = 0
+            skipped_opt_out = 0
+            role_obj = pick_inter.guild.get_role(int(obj.get("target_role_id", 0) or 0)) if obj.get("target_role_id") else None
 
-        ziel = role_obj.mention if role_obj else "alle Mitglieder (ohne Bots)"
+            for member in _eligible_members(pick_inter.guild, obj):
+                if not is_dm_enabled(pick_inter.guild_id, member.id):
+                    skipped_opt_out += 1
+                    continue
 
-        await inter.followup.send(
-            f"✅ Raid erstellt: {msg.jump_url}\n"
-            f"{EMOJI_TARGET} Zielgruppe: {ziel}\n"
-            f"✉️ DMs versendet: {sent}\n"
-            f"🔕 Opt-out übersprungen: {skipped_opt_out}\n"
-            f"🖱️ Abstimmung ist zusätzlich direkt unter der Raid-Ankündigung per Button möglich.",
-            ephemeral=True
-        )
+                try:
+                    dm_text = _format_dm_text(
+                        title=title,
+                        when=when,
+                        channel_name_or_ref=f"Übersicht im Server: #{ch.name}",
+                        description=description,
+                        intro_line="Wähle unten deine Teilnahme:"
+                    )
 
-        # Bestehende Gildenzentralen der Zielgruppe aktualisieren, ohne neue Portal-DMs zu senden.
-        _schedule_portal_refresh_for_event(inter.client, inter.guild, obj)
+                    dm_msg = await member.send(dm_text, view=RaidView(int(msg.id)))
+                    obj["dm_messages"][str(member.id)] = int(dm_msg.id)
+                    sent += 1
+                    await asyncio.sleep(0.05)
+
+                except Exception:
+                    pass
+
+            save_store()
+
+            ziel = role_obj.mention if role_obj else "alle Mitglieder (ohne Bots)"
+
+            await pick_inter.followup.send(
+                f"✅ Raid erstellt: {msg.jump_url}\n"
+                f"{EMOJI_TARGET} Zielgruppe: {ziel}\n"
+                f"✉️ DMs versendet: {sent}\n"
+                f"🔕 Opt-out übersprungen: {skipped_opt_out}\n"
+                f"🖱️ Abstimmung ist zusätzlich direkt unter der Raid-Ankündigung per Button möglich.",
+                ephemeral=True
+            )
+
+            _schedule_portal_refresh_for_event(pick_inter.client, pick_inter.guild, obj)
+
+        await send_text_channel_picker(inter, "📢 Zielkanal für Raid-Ankündigung auswählen", _picked)
 
     async def _create_alliance_raid_impl(
         inter: discord.Interaction,
