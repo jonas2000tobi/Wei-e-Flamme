@@ -1,18 +1,17 @@
 from __future__ import annotations
 
 import json
-import math
-import random
+import re
 import asyncio
 from pathlib import Path
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 from typing import Optional, Any
 from zoneinfo import ZoneInfo
 
 import discord
 from discord import app_commands
 from discord.ext import tasks
-from discord.ui import View, button, Modal, TextInput
+from discord.ui import View, button, Select, Modal, TextInput
 from discord.enums import ButtonStyle
 
 TZ = ZoneInfo("Europe/Berlin")
@@ -21,37 +20,71 @@ BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-AUCTION_FILE = DATA_DIR / "loot_auctions.json"
-AUCTION_CFG_FILE = DATA_DIR / "loot_auction_cfg.json"
-GUILD_CHEST_FILE = DATA_DIR / "guild_chest.json"
-LOOT_ITEMS_FILE = DATA_DIR / "loot_items.json"
-LOOT_NEEDS_FILE = DATA_DIR / "loot_needs.json"
+ITEMS_FILE = DATA_DIR / "loot_items.json"
+NEEDS_FILE = DATA_DIR / "loot_needs.json"
+CFG_FILE = DATA_DIR / "loot_cfg.json"
+STATE_FILE = DATA_DIR / "loot_state.json"
+
 MEMBER_PORTAL_CFG_FILE = DATA_DIR / "member_portal_cfg.json"
+MEMBER_PROFILES_FILE = DATA_DIR / "member_profiles.json"
 LEADER_CONTACT_CFG_FILE = DATA_DIR / "leader_contact_cfg.json"
 
-DEFAULT_DURATION_HOURS = 24
-DEFAULT_MIN_INCREMENT = 5
-DEFAULT_START_BID = 1
-NEED_AUCTION_HOURS = 48
-FREE_AUCTION_HOURS = 24
-SALE_HOURS = 240
-MAIN_NEED_START_BID = 30
-SECOND_NEED_START_BID = 15
-FREE_START_BID = 5
-SALE_PRICE = 1
-NEW_MEMBER_LOOT_LOCK_DAYS = 7
-FREE_MIN_INCREMENT = 1
-JUNK_ROLL_HOURS = 24
-JUNK_ROLL_MAX_DEFAULT = 100
-JUNK_ROLL_MAX_EXPANDED = 200
-# Legacy alias, damit alte aktive Müll-Items nicht brechen.
-JUNK_INTEREST_HOURS = JUNK_ROLL_HOURS
 
-ELIGIBILITY_CHOICES = [
-    app_commands.Choice(name="Automatisch: Main > Second > Frei", value="auto"),
-    app_commands.Choice(name="Nur Main-Need-Spieler", value="main_need"),
-    app_commands.Choice(name="Nur Second-Need-Spieler", value="secondary_need"),
-    app_commands.Choice(name="Alle Ebolus-Mitglieder", value="all"),
+NEED_SLOTS = [
+    "Waffe 1",
+    "Waffe 2",
+    "Fähigkeitskern",
+    "Helm",
+    "Brust",
+    "Hose",
+    "Handschuhe",
+    "Schuhe",
+    "Brosche",
+    "Ohrringe",
+    "Kette",
+    "Armband",
+    "Ring 1",
+    "Ring 2",
+    "Gürtel",
+    "Umhang",
+]
+
+CATALOG_SLOTS = [
+    "Waffe",
+    "Fähigkeitskern",
+    "Helm",
+    "Brust",
+    "Hose",
+    "Handschuhe",
+    "Schuhe",
+    "Brosche",
+    "Ohrringe",
+    "Kette",
+    "Armband",
+    "Ring",
+    "Gürtel",
+    "Umhang",
+]
+
+WEAPON_TYPES = [
+    "Schwert & Schild",
+    "Großschwert",
+    "Dolche",
+    "Armbrust",
+    "Langbogen",
+    "Stab",
+    "Zauberstab",
+    "Speer",
+    "Kugel",
+    "Fäustlinge",
+]
+
+TABS = ["Main", "Secondary"]
+WEAPON_NEED_SLOTS = ["Waffe 1", "Waffe 2"]
+
+GILDENBOSS_KEYWORDS = [
+    "gildenboss",
+    "gildenbosse",
 ]
 
 _client_ref: Optional[discord.Client] = None
@@ -69,59 +102,42 @@ def _save_json(path: Path, obj) -> None:
     path.write_text(json.dumps(obj, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
-auction_state: dict = _load_json(AUCTION_FILE, {})
-auction_cfg: dict = _load_json(AUCTION_CFG_FILE, {})
-guild_chest: dict = _load_json(GUILD_CHEST_FILE, {})
+loot_items: dict = _load_json(ITEMS_FILE, {})
+loot_needs: dict = _load_json(NEEDS_FILE, {})
+loot_cfg: dict = _load_json(CFG_FILE, {})
+loot_state: dict = _load_json(STATE_FILE, {})
 
 
-def save_auctions() -> None:
-    _save_json(AUCTION_FILE, auction_state)
+def save_items() -> None:
+    _save_json(ITEMS_FILE, loot_items)
+
+
+def save_needs() -> None:
+    _save_json(NEEDS_FILE, loot_needs)
 
 
 def save_cfg() -> None:
-    _save_json(AUCTION_CFG_FILE, auction_cfg)
+    _save_json(CFG_FILE, loot_cfg)
 
 
-def save_chest() -> None:
-    _save_json(GUILD_CHEST_FILE, guild_chest)
+def save_state() -> None:
+    _save_json(STATE_FILE, loot_state)
 
 
-def _gchest(guild_id: int) -> dict:
-    gid = str(int(guild_id))
-    g = guild_chest.get(gid) or {}
-    g.setdefault("items", {})
-    guild_chest[gid] = g
-    return g
-
-
-def _now() -> datetime:
-    return datetime.now(TZ)
-
-
-def _now_iso() -> str:
-    return _now().isoformat()
+def _slug(text: str) -> str:
+    text = text.lower().strip()
+    text = text.replace("ä", "ae").replace("ö", "oe").replace("ü", "ue").replace("ß", "ss")
+    text = re.sub(r"[^a-z0-9]+", "-", text)
+    text = re.sub(r"-+", "-", text).strip("-")
+    return text or "item"
 
 
 def _safe_text(s: str) -> str:
     return (s or "").replace("@", "@\u200b").strip()
 
 
-def _parse_dt(value: str) -> Optional[datetime]:
-    try:
-        dt = datetime.fromisoformat(str(value or ""))
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=TZ)
-        return dt.astimezone(TZ)
-    except Exception:
-        return None
-
-
-def _load_leader_cfg() -> dict:
-    return _load_json(LEADER_CONTACT_CFG_FILE, {})
-
-
-def _load_portal_cfg() -> dict:
-    return _load_json(MEMBER_PORTAL_CFG_FILE, {})
+def _now_iso() -> str:
+    return datetime.now(TZ).isoformat()
 
 
 def _is_admin(inter: discord.Interaction) -> bool:
@@ -129,166 +145,75 @@ def _is_admin(inter: discord.Interaction) -> bool:
     return bool(perms and (perms.administrator or perms.manage_guild))
 
 
+def _load_portal_cfg() -> dict:
+    return _load_json(MEMBER_PORTAL_CFG_FILE, {})
+
+
+def _load_profiles() -> dict:
+    return _load_json(MEMBER_PROFILES_FILE, {})
+
+
+def _load_leader_cfg() -> dict:
+    return _load_json(LEADER_CONTACT_CFG_FILE, {})
+
+
 def _is_leader_or_admin(inter: discord.Interaction) -> bool:
     if _is_admin(inter):
         return True
+
     if inter.guild is None or not isinstance(inter.user, discord.Member):
         return False
-    cfg = _load_leader_cfg().get(str(inter.guild.id)) or {}
-    role_id = int(cfg.get("leader_role_id", 0) or 0)
-    role = inter.guild.get_role(role_id) if role_id else None
+
+    leader_cfg = _load_leader_cfg()
+    c = leader_cfg.get(str(inter.guild.id)) or {}
+    role_id = int(c.get("leader_role_id", 0) or 0)
+
+    if not role_id:
+        return False
+
+    role = inter.guild.get_role(role_id)
+
     return bool(role and role in inter.user.roles)
 
 
-def _gcfg(guild_id: int) -> dict:
-    gid = str(int(guild_id))
-    c = auction_cfg.get(gid) or {}
-    c.setdefault("auction_channel_id", 0)
-    c.setdefault("log_channel_id", 0)
-    c.setdefault("market_channel_id", 0)
-    c.setdefault("active_channel_id", 0)
-    auction_cfg[gid] = c
-    return c
-
-
-def _gauctions(guild_id: int) -> dict:
-    gid = str(int(guild_id))
-    g = auction_state.get(gid) or {}
-    g.setdefault("auctions", {})
-    auction_state[gid] = g
+def _gitems(guild_id: int) -> dict:
+    g = loot_items.get(str(guild_id)) or {}
+    g.setdefault("items", {})
+    loot_items[str(guild_id)] = g
     return g
 
 
-def _auction(guild_id: int, auction_id: str) -> Optional[dict]:
-    return (_gauctions(guild_id).get("auctions") or {}).get(str(auction_id))
+def _gneeds(guild_id: int) -> dict:
+    g = loot_needs.get(str(guild_id)) or {}
+    g.setdefault("users", {})
+    loot_needs[str(guild_id)] = g
+    return g
 
 
-def _member_role_id(guild_id: int) -> int:
-    c = _load_portal_cfg().get(str(int(guild_id))) or {}
-    return int(c.get("member_role_id", 0) or 0)
+def _gcfg(guild_id: int) -> dict:
+    g = loot_cfg.get(str(guild_id)) or {}
+    g.setdefault("leader_channel_id", 0)
+    g.setdefault("auto_enabled", True)
+    g.setdefault("title_keywords", GILDENBOSS_KEYWORDS.copy())
+    loot_cfg[str(guild_id)] = g
+    return g
 
 
-def _is_ebolus_member(guild: discord.Guild, user_id: int) -> bool:
-    member = guild.get_member(int(user_id))
-    if not member or member.bot:
-        return False
-    role_id = _member_role_id(guild.id)
-    if not role_id:
-        return True
-    role = guild.get_role(role_id)
-    return bool(role and role in member.roles)
+def _gstate(guild_id: int) -> dict:
+    g = loot_state.get(str(guild_id)) or {}
+    g.setdefault("posted_events", {})
+    loot_state[str(guild_id)] = g
+    return g
 
 
-def _loot_lock_until_for_member(member: Optional[discord.Member]) -> Optional[datetime]:
-    """Return the timestamp until which a member may not buy/bid on loot.
-
-    Uses Discord server join time. This is reliable without an extra database and
-    protects against brand-new accounts receiving guild loot immediately.
-    """
-    if not member or getattr(member, "bot", False):
-        return None
-
-    joined_at = getattr(member, "joined_at", None)
-    if joined_at is None:
-        return None
-
-    if joined_at.tzinfo is None:
-        joined_at = joined_at.replace(tzinfo=timezone.utc)
-
-    until = joined_at.astimezone(TZ) + timedelta(days=NEW_MEMBER_LOOT_LOCK_DAYS)
-    if _now() >= until:
-        return None
-    return until
-
-
-def _format_timedelta_short(delta: timedelta) -> str:
-    seconds = max(0, int(delta.total_seconds()))
-    days, rem = divmod(seconds, 86400)
-    hours, rem = divmod(rem, 3600)
-    minutes = max(1, rem // 60) if days == 0 and hours == 0 else rem // 60
-
-    parts: list[str] = []
-    if days:
-        parts.append(f"{days} Tag{'e' if days != 1 else ''}")
-    if hours:
-        parts.append(f"{hours} Std.")
-    if not parts:
-        parts.append(f"{minutes} Min.")
-    return " ".join(parts[:2])
-
-
-def _loot_lock_text_for_member(member: Optional[discord.Member]) -> str:
-    until = _loot_lock_until_for_member(member)
-    if not until:
-        return ""
-    remaining = _format_timedelta_short(until - _now())
-    return f"Noch **{remaining}** bis **{until.strftime('%d.%m.%Y %H:%M')}**."
-
-
-async def _require_loot_unlocked(inter: discord.Interaction, guild: discord.Guild, user_id: int) -> bool:
-    member = guild.get_member(int(user_id))
-    if member is None:
-        try:
-            member = await guild.fetch_member(int(user_id))
-        except Exception:
-            member = None
-
-    until = _loot_lock_until_for_member(member)
-    if not until:
-        return True
-
-    remaining = _format_timedelta_short(until - _now())
-    await inter.response.send_message(
-        "⏳ **Lootsperre für neue Mitglieder**\n"
-        f"Du kannst erst nach **{NEW_MEMBER_LOOT_LOCK_DAYS} Tagen Gildenmitgliedschaft** auf Loot bieten oder Sale-Items kaufen.\n"
-        f"Freischaltung: **{until.strftime('%d.%m.%Y %H:%M')}**\n"
-        f"Restzeit: **{remaining}**",
-        ephemeral=True,
-    )
-    return False
-
-
-def _load_items() -> dict:
-    return _load_json(LOOT_ITEMS_FILE, {})
-
-
-def _load_needs() -> dict:
-    return _load_json(LOOT_NEEDS_FILE, {})
-
-
-def _all_items(guild_id: int) -> dict:
-    g = _load_items().get(str(int(guild_id))) or {}
-    return g.get("items") if isinstance(g.get("items"), dict) else {}
-
-
-def _item_display(guild_id: int, item_id: str, fallback: str = "") -> str:
-    item = _all_items(guild_id).get(str(item_id)) or {}
-    if not item:
-        return fallback or str(item_id or "Unbekanntes Item")
-    name = str(item.get("name", item_id) or item_id)
-    slot = str(item.get("slot", "") or "")
-    wt = str(item.get("weapon_type", "") or "")
-    if slot == "Waffe" and wt:
-        return f"{name} ({wt})"
-    return name
-
-
-def _find_item(guild_id: int, query: str) -> tuple[str, str, list[tuple[str, str]]]:
-    q = str(query or "").strip().lower()
-    matches: list[tuple[str, str]] = []
-    exact: list[tuple[str, str]] = []
-    for item_id, item in _all_items(guild_id).items():
-        name = str(item.get("name", "") or "")
-        display = _item_display(guild_id, item_id, name)
-        if str(item_id).lower() == q or name.lower() == q or display.lower() == q:
-            exact.append((str(item_id), display))
-        elif q and (q in name.lower() or q in display.lower() or q in str(item_id).lower()):
-            matches.append((str(item_id), display))
-    if exact:
-        return exact[0][0], exact[0][1], exact + matches
-    if len(matches) == 1:
-        return matches[0][0], matches[0][1], matches
-    return "", str(query or "Unbekanntes Item"), matches
+def _blank_slot() -> dict:
+    return {
+        "item_id": "",
+        "received": False,
+        "locked": False,
+        "received_at": "",
+        "received_by": 0,
+    }
 
 
 def _slot_obj(value: Any) -> dict:
@@ -297,2683 +222,2883 @@ def _slot_obj(value: Any) -> dict:
         obj.setdefault("item_id", "")
         obj.setdefault("received", False)
         obj.setdefault("locked", bool(obj.get("received", False)))
+        obj.setdefault("received_at", "")
+        obj.setdefault("received_by", 0)
         if bool(obj.get("locked", False)):
             obj["received"] = True
         if bool(obj.get("received", False)):
             obj["locked"] = True
         return obj
+
     if isinstance(value, str):
-        return {"item_id": value, "received": False, "locked": False}
-    return {"item_id": "", "received": False, "locked": False}
+        if not value:
+            return _blank_slot()
 
-
-def _need_user_ids(guild: discord.Guild, item_id: str, tab: str) -> list[int]:
-    if not item_id:
-        return []
-    tab = "Secondary" if str(tab).lower().startswith("sec") else "Main"
-    needs = _load_needs().get(str(int(guild.id))) or {}
-    users = needs.get("users") if isinstance(needs.get("users"), dict) else {}
-    out: list[int] = []
-    for uid_str, data in users.items():
-        try:
-            uid = int(uid_str)
-        except Exception:
-            continue
-        if not _is_ebolus_member(guild, uid):
-            continue
-        bucket = data.get(tab) if isinstance(data, dict) else {}
-        if not isinstance(bucket, dict):
-            continue
-        for slot_val in bucket.values():
-            obj = _slot_obj(slot_val)
-            if str(obj.get("item_id", "") or "") == str(item_id) and not bool(obj.get("received", False)):
-                if uid not in out:
-                    out.append(uid)
-                break
-    return out
-
-
-def _main_need_user_ids(guild: discord.Guild, item_id: str) -> list[int]:
-    return _need_user_ids(guild, item_id, "Main")
-
-
-def _secondary_need_user_ids(guild: discord.Guild, item_id: str) -> list[int]:
-    return _need_user_ids(guild, item_id, "Secondary")
-
-
-def _need_mode_label(mode: str) -> str:
-    mode = str(mode or "all")
-    if mode == "main_need":
-        return "Main-Need"
-    if mode == "secondary_need":
-        return "Second-Need"
-    return "Freie Auktion"
-
-
-def _eligible_user_ids(guild: discord.Guild, item_id: str, mode: str) -> tuple[str, list[int]]:
-    mode = str(mode or "auto")
-    main_users = _main_need_user_ids(guild, item_id)
-    secondary_users = _secondary_need_user_ids(guild, item_id)
-    if mode == "main_need":
-        return "main_need", main_users
-    if mode == "secondary_need":
-        return "secondary_need", secondary_users
-    if mode == "all":
-        return "all", []
-    # Automatik: Main hat Priorität. Secondary kommt nur dran, wenn es keinen Main-Need gibt.
-    if main_users:
-        return "main_need", main_users
-    if secondary_users:
-        return "secondary_need", secondary_users
-    return "all", []
-
-
-def _eligibility_text(auction: dict) -> str:
-    mode = str(auction.get("eligibility_mode", "all") or "all")
-    ids = [int(x) for x in auction.get("eligible_user_ids", []) or []]
-    if mode in {"main_need", "secondary_need"}:
-        label = "Main-Need" if mode == "main_need" else "Second-Need"
-        if not ids:
-            return f"Nur {label}, aber aktuell keine berechtigten Spieler gefunden."
-        lines = ", ".join(f"<@{uid}>" for uid in ids[:12])
-        if len(ids) > 12:
-            lines += f" … +{len(ids)-12}"
-        return f"Nur offene {label}-Spieler: {lines}"
-    return "Alle Ebolus-Mitglieder dürfen bieten."
-
-
-def _highest_bid(auction: dict) -> Optional[dict]:
-    bids = auction.get("bids") if isinstance(auction.get("bids"), list) else []
-    if not bids:
-        return None
-    return max(bids, key=lambda b: int(b.get("amount", 0) or 0))
-
-
-def _current_price(auction: dict) -> int:
-    top = _highest_bid(auction)
-    if top:
-        return int(top.get("amount", 0) or 0)
-    return int(auction.get("start_bid", DEFAULT_START_BID) or DEFAULT_START_BID) - int(auction.get("min_increment", DEFAULT_MIN_INCREMENT) or DEFAULT_MIN_INCREMENT)
-
-
-def _min_next_bid(auction: dict) -> int:
-    top = _highest_bid(auction)
-    if top:
-        return int(top.get("amount", 0) or 0) + int(auction.get("min_increment", DEFAULT_MIN_INCREMENT) or DEFAULT_MIN_INCREMENT)
-    return int(auction.get("start_bid", DEFAULT_START_BID) or DEFAULT_START_BID)
-
-
-def _import_dkp():
-    try:
-        from bot import dkp_system as dkp  # type: ignore
-        return dkp
-    except Exception:
-        try:
-            import dkp_system as dkp  # type: ignore
-            return dkp
-        except Exception:
-            return None
-
-
-def _ec_balance(guild_id: int, user_id: int) -> int:
-    dkp = _import_dkp()
-    if dkp and hasattr(dkp, "get_balance"):
-        try:
-            return int(dkp.get_balance(int(guild_id), int(user_id)))
-        except Exception:
-            return 0
-    # Direct fallback: same file names used by dkp_system.py
-    data = _load_json(DATA_DIR / "dkp_balances.json", {})
-    g = data.get(str(int(guild_id))) or {}
-    users = g.get("users") if isinstance(g.get("users"), dict) else {}
-    return int(users.get(str(int(user_id)), 0) or 0)
-
-
-def _add_ec_transaction(guild_id: int, user_id: int, amount: int, reason: str, actor_id: int, auction_id: str, meta: Optional[dict] = None) -> bool:
-    dkp = _import_dkp()
-    if dkp and hasattr(dkp, "_add_transaction"):
-        dkp._add_transaction(  # type: ignore[attr-defined]
-            int(guild_id), int(user_id), int(amount), reason, int(actor_id), "loot_auction", event_id=str(auction_id), meta=meta or {}
-        )
-        return True
-    return False
-
-
-def _auction_channel(client: discord.Client, guild_id: int, fallback: Optional[discord.abc.GuildChannel] = None):
-    c = _gcfg(guild_id)
-    ch_id = int(c.get("auction_channel_id", 0) or 0)
-    guild = client.get_guild(int(guild_id))
-    if guild and ch_id:
-        ch = guild.get_channel(ch_id)
-        if isinstance(ch, (discord.TextChannel, discord.Thread)):
-            return ch
-    if isinstance(fallback, (discord.TextChannel, discord.Thread)):
-        return fallback
-    return None
-
-
-def _log_channel(client: discord.Client, guild_id: int):
-    c = _gcfg(guild_id)
-    ch_id = int(c.get("log_channel_id", 0) or 0)
-    guild = client.get_guild(int(guild_id))
-    if guild and ch_id:
-        ch = guild.get_channel(ch_id)
-        if isinstance(ch, (discord.TextChannel, discord.Thread)):
-            return ch
-    # fallback: DKP log channel
-    try:
-        dkp = _import_dkp()
-        if dkp and hasattr(dkp, "_dkp_log_channel"):
-            return dkp._dkp_log_channel(client, int(guild_id))  # type: ignore[attr-defined]
-    except Exception:
-        pass
-    return _auction_channel(client, guild_id)
-
-
-def _market_channel(client: discord.Client, guild_id: int):
-    """Öffentlicher Marktplatz-Kanal für Freie Auktionen und Sale-Käufe."""
-    c = _gcfg(guild_id)
-    ch_id = int(c.get("market_channel_id", 0) or 0)
-    guild = client.get_guild(int(guild_id))
-    if guild and ch_id:
-        ch = guild.get_channel(ch_id)
-        if isinstance(ch, (discord.TextChannel, discord.Thread)):
-            return ch
-    return None
-
-
-def _active_auction_channel(client: discord.Client, guild_id: int):
-    """Separater Kanal mit nur den aktuell verfügbaren Auktionen/Sales.
-
-    Dieser Kanal ist als saubere Übersicht gedacht: eine kurze Karte pro aktives
-    Item, keine Gebotsdetails, keine Abschlussmeldungen. Sobald das Item nicht
-    mehr verfügbar ist, wird die Karte gelöscht.
-    """
-    c = _gcfg(guild_id)
-    ch_id = int(c.get("active_channel_id", 0) or 0)
-    guild = client.get_guild(int(guild_id))
-    if guild and ch_id:
-        ch = guild.get_channel(ch_id)
-        if isinstance(ch, (discord.TextChannel, discord.Thread)):
-            return ch
-    return None
-
-
-def _status_label(status: str) -> str:
-    return {
-        "active": "🟢 Aktiv",
-        "closed": "🔒 Beendet",
-        "delivered": "✅ Übergeben / abgebucht",
-        "cancelled": "❌ Abgebrochen",
-        "expired": "⌛ Abgelaufen",
-    }.get(str(status or ""), str(status or "?"))
-
-
-def _auction_embed(guild: discord.Guild, auction: dict, compact: bool = False) -> discord.Embed:
-    status = str(auction.get("status", "active") or "active")
-    item_name = str(auction.get("item_name", "Item") or "Item")
-    auction_id = str(auction.get("id", "") or "")
-    end_dt = _parse_dt(str(auction.get("ends_at", "") or ""))
-    top = _highest_bid(auction)
-    current = int(top.get("amount", 0) or 0) if top else 0
-    min_next = _min_next_bid(auction)
-    color = discord.Color.gold() if status == "active" else discord.Color.dark_gold()
-    kind = str(auction.get("kind", "auction") or "auction")
-    phase = _auction_phase(auction)
-    mode = str(auction.get("eligibility_mode", "all") or "all")
-    if phase == "sale":
-        title_prefix = "🛒 Sale-Kauf"
-    elif phase == "need":
-        title_prefix = "🎯 Main-Need-Auktion" if mode == "main_need" else "🔁 Second-Need-Auktion"
-    else:
-        title_prefix = "⚖️ Freie Auktion"
-    emb = discord.Embed(title=f"{title_prefix}: {item_name}", color=color, timestamp=_now())
-    # Nutzeransicht bewusst schlank halten:
-    # Status, Auktions-ID und Berechtigung sind intern/logisch relevant,
-    # aber in der Gildenzentrale und in der Auktionskarte unnötig unübersichtlich.
-    desc = []
-    if end_dt:
-        desc.append(f"Ende: **{end_dt.strftime('%d.%m.%Y %H:%M')}**")
-    desc.append(f"Startgebot: **{int(auction.get('start_bid', DEFAULT_START_BID) or DEFAULT_START_BID)} EC**")
-    desc.append(f"Mindestschritt: **{int(auction.get('min_increment', DEFAULT_MIN_INCREMENT) or DEFAULT_MIN_INCREMENT)} EC**")
-    if top:
-        desc.append(f"Höchstgebot: **{current} EC** von <@{int(top.get('user_id', 0) or 0)}>")
-        desc.append(f"Nächstes Mindestgebot: **{min_next} EC**")
-    else:
-        desc.append("Höchstgebot: **noch keines**")
-        desc.append(f"Nächstes Mindestgebot: **{min_next} EC**")
-    emb.description = "\n".join(desc)
-
-    if not compact:
-        bids = auction.get("bids") if isinstance(auction.get("bids"), list) else []
-        if bids:
-            # Übersicht: nur die 3 letzten Gebote anzeigen.
-            last = sorted(bids, key=lambda b: str(b.get("created_at", "")), reverse=True)[:3]
-            lines = [f"• <@{int(b.get('user_id',0) or 0)}> – **{int(b.get('amount',0) or 0)} EC**" for b in last]
-            emb.add_field(name="Letzte Gebote", value="\n".join(lines), inline=False)
-    emb.set_footer(text="Gebote prüfen beim Bieten deinen aktuellen EC-Kontostand. Abgebucht wird erst bei Übergabe-Bestätigung.")
-    return emb
-
-
-async def _refresh_auction_message(client: discord.Client, guild_id: int, auction: dict) -> None:
-    ch_id = int(auction.get("channel_id", 0) or 0)
-    msg_id = int(auction.get("message_id", 0) or 0)
-    if not ch_id or not msg_id:
-        return
-    guild = client.get_guild(int(guild_id))
-    if not guild:
-        return
-    ch = guild.get_channel(ch_id)
-    if not isinstance(ch, (discord.TextChannel, discord.Thread)):
-        return
-    try:
-        msg = await ch.fetch_message(msg_id)
-        phase = _auction_phase(auction)
-        view = (SaleBuyView(int(guild_id), str(auction.get("id", ""))) if phase == "sale" else AuctionBidView(int(guild_id), str(auction.get("id", "")))) if auction.get("status") == "active" else None
-        embed = _sale_embed(guild, auction) if phase == "sale" else _auction_embed(guild, auction)
-        await msg.edit(embed=embed, view=view)
-    except Exception as e:
-        print(f"[loot_auction] refresh failed: {e!r}")
-
-
-def _active_auction_label(auction: dict) -> str:
-    phase = _auction_phase(auction)
-    mode = str(auction.get("eligibility_mode", "all") or "all")
-    if phase == "sale":
-        return "🛒 Sale"
-    if phase == "free":
-        return "⚖️ Freie Auktion"
-    if mode == "main_need":
-        return "🎯 Main-Need-Auktion"
-    if mode == "secondary_need":
-        return "🔁 Second-Need-Auktion"
-    return "🏷️ Need-Auktion"
-
-
-def _active_auction_info_embed(guild: discord.Guild, auction: dict) -> discord.Embed:
-    """Kurze Übersichtskarte für den Kanal der aktuellen Auktionen."""
-    phase = _auction_phase(auction)
-    item = str(auction.get("item_name", "Item") or "Item")
-    auction_id = str(auction.get("id", "") or "")
-    end_dt = _parse_dt(str(auction.get("ends_at", "") or ""))
-    label = _active_auction_label(auction)
-    lines = [
-        f"**Item:** {item}",
-        f"**Bereich:** {label}",
-        f"**Auktions-ID:** `{auction_id}`",
-    ]
-    if phase == "sale":
-        price = int(auction.get("fixed_price", auction.get("start_bid", 0)) or 0)
-        lines.append(f"**Preis:** {'Gratis' if price <= 0 else f'{price} EC'}")
-        if _is_junk_interest_sale(auction):
-            lines.append(_junk_sale_line(auction))
-            lines.append("Aktion über **Gildenzentrale → Auktion → Sale-Kauf**.")
-        else:
-            lines.append("Kaufen über **Gildenzentrale → Auktion → Sale-Kauf**.")
-    elif phase == "free":
-        lines.append("Bieten über **Gildenzentrale → Auktion → Freie Auktion**.")
-    else:
-        mode = str(auction.get("eligibility_mode", "all") or "all")
-        if mode == "main_need":
-            lines.append("Bieten dürfen aktuell nur offene **Main-Need-Spieler**.")
-        elif mode == "secondary_need":
-            lines.append("Bieten dürfen aktuell nur offene **Second-Need-Spieler**.")
-        else:
-            lines.append("Bieten über **Gildenzentrale → Auktion → Need-Auktion**.")
-    if end_dt:
-        lines.append(f"**Läuft bis:** {end_dt.strftime('%d.%m.%Y %H:%M')}")
-    lines.append("\nDetails und Gebote stehen im DKP-/Auktionskanal.")
-
-    color = discord.Color.green() if phase == "sale" else discord.Color.gold()
-    emb = discord.Embed(title=f"{label}: {item}", description="\n".join(lines), color=color, timestamp=_now())
-    emb.set_footer(text="Diese Übersicht wird automatisch gelöscht, sobald das Item nicht mehr verfügbar ist.")
-    return emb
-
-
-async def _delete_active_auction_message(client: discord.Client, auction: dict) -> None:
-    cid = int(auction.get("active_channel_id", 0) or 0)
-    mid = int(auction.get("active_message_id", 0) or 0)
-    if not cid or not mid:
-        return
-    try:
-        ch = client.get_channel(cid)
-        if ch is None:
-            ch = await client.fetch_channel(cid)
-        if isinstance(ch, (discord.TextChannel, discord.Thread, discord.DMChannel)):
-            msg = await ch.fetch_message(mid)
-            await msg.delete()
-    except Exception as e:
-        print(f"[loot_auction] active auction message delete failed: {e!r}")
-    auction["active_channel_id"] = 0
-    auction["active_message_id"] = 0
-    auction["active_message_deleted_at"] = _now_iso()
-
-
-async def _post_or_refresh_active_auction_message(client: discord.Client, guild_id: int, auction: dict) -> None:
-    """Postet/aktualisiert eine kurze Karte im separaten Aktuelle-Auktionen-Kanal."""
-    if str(auction.get("status", "")) != "active":
-        await _delete_active_auction_message(client, auction)
-        return
-    guild = client.get_guild(int(guild_id))
-    if not guild:
-        return
-    ch = _active_auction_channel(client, guild_id)
-    if not ch:
-        return
-
-    embed = _active_auction_info_embed(guild, auction)
-    content = "📌 **Aktuell verfügbar**"
-    old_cid = int(auction.get("active_channel_id", 0) or 0)
-    old_mid = int(auction.get("active_message_id", 0) or 0)
-    current_cid = int(getattr(ch, "id", 0) or 0)
-
-    if old_mid and old_cid == current_cid:
-        try:
-            msg = await ch.fetch_message(old_mid)
-            await msg.edit(content=content, embed=embed, view=market_view)
-            return
-        except Exception as e:
-            print(f"[loot_auction] active auction message refresh failed: {e!r}")
-
-    if old_mid:
-        await _delete_active_auction_message(client, auction)
-    try:
-        msg = await ch.send(content=content, embed=embed, view=market_view)
-        auction["active_channel_id"] = current_cid
-        auction["active_message_id"] = int(msg.id)
-        auction["active_message_posted_at"] = _now_iso()
-        save_auctions()
-    except Exception as e:
-        print(f"[loot_auction] active auction message post failed: {e!r}")
-
-
-async def _sync_active_auction_messages(client: discord.Client, guild_id: int | None = None) -> None:
-    """Erstellt/aktualisiert nach Start oder Kanalwechsel die Übersicht aktiver Items."""
-    gids = [str(int(guild_id))] if guild_id is not None else list(auction_state.keys())
-    for gid_str in gids:
-        try:
-            gid = int(gid_str)
-        except Exception:
-            continue
-        auctions = (_gauctions(gid).get("auctions") or {})
-        for auc in list(auctions.values()):
-            try:
-                if str(auc.get("status", "")) == "active":
-                    await _post_or_refresh_active_auction_message(client, gid, auc)
-                else:
-                    await _delete_active_auction_message(client, auc)
-                await asyncio.sleep(0.05)
-            except Exception as e:
-                print(f"[loot_auction] active auction sync failed {gid}: {e!r}")
-
-
-async def _sync_active_auction_messages_after_ready(client: discord.Client) -> None:
-    try:
-        await client.wait_until_ready()
-        await asyncio.sleep(3)
-        await _sync_active_auction_messages(client)
-    except Exception as e:
-        print(f"[loot_auction] active auction startup sync failed: {e!r}")
-
-
-async def _delete_market_message(client: discord.Client, auction: dict) -> None:
-    """Löscht die öffentliche Marktplatz-Nachricht, sobald ein Item nicht mehr verfügbar ist."""
-    cid = int(auction.get("market_channel_id", 0) or 0)
-    mid = int(auction.get("market_message_id", 0) or 0)
-    if not cid or not mid:
-        return
-    try:
-        ch = client.get_channel(cid)
-        if ch is None:
-            ch = await client.fetch_channel(cid)
-        if isinstance(ch, (discord.TextChannel, discord.Thread, discord.DMChannel)):
-            msg = await ch.fetch_message(mid)
-            await msg.delete()
-    except Exception as e:
-        print(f"[loot_auction] market message delete failed: {e!r}")
-    auction["market_channel_id"] = 0
-    auction["market_message_id"] = 0
-    auction["market_message_deleted_at"] = _now_iso()
-
-
-def _market_embed(guild: discord.Guild, auction: dict, *, final: str = "") -> discord.Embed:
-    """Schlanke öffentliche Marktplatzkarte für den Allgemein-Chat."""
-    phase = _auction_phase(auction)
-    item = str(auction.get("item_name", "Item") or "Item")
-    end_dt = _parse_dt(str(auction.get("ends_at", "") or ""))
-    price = int(auction.get("fixed_price", auction.get("start_bid", 0)) or 0)
-    price_text = "Gratis" if price <= 0 else f"{price} EC"
-
-    if final == "sold":
-        buyer = int(auction.get("sold_to", 0) or 0)
-        if bool(auction.get("junk_drop", False)) and (auction.get("junk_roll_winner_id") or auction.get("junk_lottery_winner_id")):
-            winner_roll = int(auction.get("junk_roll_winner_roll", 0) or 0)
-            desc = (
-                f"**Item:** {item}\n\n"
-                f"**Gewinner:**\n🏆 <@{buyer}> mit **{winner_roll}**\n\n"
-                "**Preis:** Gratis"
-            )
-            emb = discord.Embed(title="✅ Müll-Item Roll abgeschlossen", description=desc, color=discord.Color.green(), timestamp=_now())
-            return _add_junk_roll_fields(emb, auction)
-        return discord.Embed(
-            title="✅ Sale-Kauf abgeschlossen",
-            description=f"**Item:** {item}\n**Empfänger:** <@{buyer}>\n**Preis:** {price_text}",
-            color=discord.Color.green(),
-            timestamp=_now(),
-        )
-    if final == "expired":
-        return discord.Embed(
-            title="⌛ Sale-Kauf abgelaufen",
-            description=f"**Item:** {item}\nDas Item ist nicht mehr verfügbar.",
-            color=discord.Color.dark_grey(),
-            timestamp=_now(),
-        )
-    if final == "cancelled":
-        return discord.Embed(
-            title="❌ Angebot beendet",
-            description=f"**Item:** {item}\nDieses Angebot ist nicht mehr verfügbar.",
-            color=discord.Color.red(),
-            timestamp=_now(),
-        )
-    if final == "auction_closed":
-        top = _highest_bid(auction)
-        winner = int(top.get("user_id", 0) or 0) if top else 0
-        amount = int(top.get("amount", 0) or 0) if top else 0
-        desc = f"**Item:** {item}\nDie freie Auktion ist beendet."
-        if winner:
-            desc += f"\n**Gewinner:** <@{winner}>\n**Gebot:** {amount} EC"
-        return discord.Embed(title="🏁 Freie Auktion beendet", description=desc, color=discord.Color.gold(), timestamp=_now())
-
-    if phase == "sale":
-        if _is_junk_interest_sale(auction):
-            until = _junk_roll_until(auction)
-            if _junk_roll_open(auction) and until:
-                desc = (
-                    f"**Item:** {item}\n"
-                    f"**Ende:** {until.strftime('%d.%m.%Y %H:%M')}\n\n"
-                    "**Status:** Würfelphase\n\n"
-                    f"**Aktuell vorne:**\n{_junk_roll_summary(auction)}"
-                )
-                emb = discord.Embed(title="🧹 Müll-Item im Gratis-Roll", description=desc, color=discord.Color.green(), timestamp=_now())
-                return _add_junk_roll_fields(emb, auction)
-            desc = (
-                f"**Item:** {item}\n\n"
-                "**Status:** Gratis-Sofortkauf\n\n"
-                "Es hat niemand gewürfelt.\n"
-                "Der erste Spieler, der es nimmt, bekommt es direkt."
-            )
-            return discord.Embed(title="🛒 Müll-Item jetzt im Gratis-Sofortkauf", description=desc, color=discord.Color.green(), timestamp=_now())
-        title = "🛒 Neues Sale-Item verfügbar"
-        desc = f"**Item:** {item}\n**Preis:** {price_text}\nKaufen über **Gildenzentrale → Auktion → Sale-Kauf**."
-        if end_dt:
-            desc += f"\nVerfügbar bis: **{end_dt.strftime('%d.%m.%Y %H:%M')}**"
-        return discord.Embed(title=title, description=desc, color=discord.Color.green(), timestamp=_now())
-
-    title = "⚖️ Neues Item in der freien Auktion"
-    desc = f"**Item:** {item}\nBieten über **Gildenzentrale → Auktion → Freie Auktion**."
-    if end_dt:
-        desc += f"\nEnde: **{end_dt.strftime('%d.%m.%Y %H:%M')}**"
-    return discord.Embed(title=title, description=desc, color=discord.Color.gold(), timestamp=_now())
-
-
-async def _edit_market_message_final(client: discord.Client, guild_id: int, auction: dict, *, final: str) -> None:
-    """Bearbeitet die eine öffentliche Allgemein-/Marktplatz-Nachricht statt neue Posts zu erzeugen."""
-    cid = int(auction.get("market_channel_id", 0) or 0)
-    mid = int(auction.get("market_message_id", 0) or 0)
-    if not cid or not mid:
-        return
-    guild = client.get_guild(int(guild_id))
-    if not guild:
-        return
-    try:
-        ch = client.get_channel(cid)
-        if ch is None:
-            ch = await client.fetch_channel(cid)
-        if isinstance(ch, (discord.TextChannel, discord.Thread, discord.DMChannel)):
-            msg = await ch.fetch_message(mid)
-            sold_text = "✅ **Sale-Item wurde genommen.**"
-            if final == "sold" and bool(auction.get("junk_drop", False)) and (auction.get("junk_roll_winner_id") or auction.get("junk_lottery_winner_id")):
-                sold_text = "✅ **Müll-Item Roll abgeschlossen.**"
-            content = {
-                "sold": sold_text,
-                "expired": "⌛ **Sale-Item ist abgelaufen.**",
-                "cancelled": "❌ **Angebot beendet.**",
-                "auction_closed": "🏁 **Freie Auktion beendet.**",
-            }.get(final, "ℹ️ **Angebot aktualisiert.**")
-            await msg.edit(content=content, embed=_market_embed(guild, auction, final=final), view=None)
-            auction["market_message_final_state"] = final
-            auction["market_message_final_at"] = _now_iso()
-            save_auctions()
-    except Exception as e:
-        print(f"[loot_auction] market final edit failed: {e!r}")
-
-
-async def _post_or_refresh_market_message(client: discord.Client, guild_id: int, auction: dict) -> None:
-    """Postet/aktualisiert die kurze öffentliche Nachricht für Freie Auktion oder Sale-Kauf.
-
-    Wichtig: Der Allgemein-Chat bekommt bewusst nur eine schlanke Info ohne
-    Gebotsdetails und ohne extra Abschluss-Post. Details bleiben im DKP-/Auktionskanal.
-    """
-    phase = _auction_phase(auction)
-    if phase not in {"free", "sale"} or str(auction.get("status", "")) != "active":
-        return
-    guild = client.get_guild(int(guild_id))
-    if not guild:
-        return
-    ch = _market_channel(client, guild_id)
-    if not ch:
-        return
-
-    embed = _market_embed(guild, auction)
-    market_view = SaleBuyView(int(guild_id), str(auction.get("id", ""))) if phase == "sale" and _is_junk_interest_sale(auction) else None
-    if phase == "sale" and _is_junk_interest_sale(auction):
-        content = "🧹 **Müll-Item verfügbar!**"
-    else:
-        content = "🛒 **Neues Sale-Item verfügbar!**" if phase == "sale" else "⚖️ **Item ist jetzt in der freien Auktion verfügbar!**"
-
-    old_cid = int(auction.get("market_channel_id", 0) or 0)
-    old_mid = int(auction.get("market_message_id", 0) or 0)
-    if old_mid and old_cid == int(getattr(ch, "id", 0) or 0):
-        try:
-            msg = await ch.fetch_message(old_mid)
-            await msg.edit(content=content, embed=embed, view=market_view)
-            return
-        except Exception as e:
-            print(f"[loot_auction] market message refresh failed: {e!r}")
-
-    # Falls noch eine alte Marktplatz-Nachricht aus einem anderen Kanal existiert, erst löschen.
-    if old_mid:
-        await _delete_market_message(client, auction)
-    try:
-        msg = await ch.send(content=content, embed=embed, view=market_view)
-        auction["market_channel_id"] = int(getattr(ch, "id", 0) or 0)
-        auction["market_message_id"] = int(msg.id)
-        auction["market_message_posted_at"] = _now_iso()
-        auction.pop("market_message_final_state", None)
-        auction.pop("market_message_final_at", None)
-        save_auctions()
-    except Exception as e:
-        print(f"[loot_auction] market message post failed: {e!r}")
-
-
-async def start_junk_sale_drop(
-    inter: discord.Interaction,
-    guild_id: int,
-    item_title: str,
-    actor_id: int | None = None,
-    duration_hours: int = SALE_HOURS,
-) -> dict:
-    """Startet ein kostenloses Sale-Item für Müll-/Restdrops aus dem Adminbereich der Gildenzentrale.
-
-    Das Item muss nicht im Loot-Katalog existieren. Es wird als normales aktives
-    Sale-Item gespeichert und erscheint dadurch im Sale-Kauf der Gildenzentrale.
-    """
-    client = inter.client
-    guild = client.get_guild(int(guild_id)) or inter.guild
-    if guild is None:
-        return {"ok": False, "error": "Server konnte nicht zugeordnet werden."}
-
-    title = _safe_text(str(item_title or "").strip())[:120]
-    if not title:
-        return {"ok": False, "error": "Kein Item-Titel angegeben."}
-
-    # Müll-/Restitems laufen anders als normale Sales:
-    # 0-24 Stunden live würfeln, danach gewinnt der höchste eindeutige Wurf.
-    # Wenn bis dahin niemand würfelt, bleibt das Item ohne Ablauf als Gratis-Sofortkauf offen.
-    aid = _new_auction_id()
-    interest_until = _now() + timedelta(hours=JUNK_INTEREST_HOURS)
-    auc = {
-        "id": aid,
-        "guild_id": int(guild.id),
-        "kind": "sale",
-        "phase": "sale",
-        "item_id": f"junk:{aid}",
-        "item_name": title,
-        "created_at": _now_iso(),
-        "created_by": int(actor_id or getattr(inter.user, "id", 0) or 0),
-        "ends_at": "",
-        "junk_roll_until": interest_until.isoformat(),
-        "junk_rolls": {},
-        "junk_roll_max": JUNK_ROLL_MAX_DEFAULT,
-        # Legacy-Felder bleiben bewusst drin, damit alte Helfer/alte Daten nicht brechen.
-        "junk_interest_until": interest_until.isoformat(),
-        "junk_interest_user_ids": [],
-        "junk_interest_requests": {},
-        "fixed_price": 0,
-        "start_bid": 0,
-        "min_increment": 0,
-        "eligibility_mode": "all",
-        "eligible_user_ids": [],
-        "bids": [],
-        "status": "active",
-        "message_id": 0,
-        "channel_id": 0,
-        "source": "junk_drop_menu",
-        "junk_drop": True,
-        "created_note": "Kostenloses Müll-/Restitem",
-    }
-    _gauctions(guild.id).setdefault("auctions", {})[aid] = auc
-    save_auctions()
-
-    auction_channel_id = 0
-    try:
-        ch = _auction_channel(client, guild.id, None)
-        if ch:
-            msg = await ch.send(content="🧹 **Müll-Item kostenlos im Sale**", embed=_sale_embed(guild, auc), view=SaleBuyView(guild.id, aid))
-            auc["message_id"] = int(msg.id)
-            auc["channel_id"] = int(getattr(ch, "id", 0) or 0)
-            auction_channel_id = int(getattr(ch, "id", 0) or 0)
-            save_auctions()
-    except Exception as e:
-        print(f"[loot_auction] junk sale auction-channel post failed: {e!r}")
-
-    try:
-        await _post_or_refresh_market_message(client, guild.id, auc)
-    except Exception as e:
-        print(f"[loot_auction] junk sale market post failed: {e!r}")
-
-    try:
-        await _post_or_refresh_active_auction_message(client, guild.id, auc)
-    except Exception as e:
-        print(f"[loot_auction] junk sale active-channel post failed: {e!r}")
-
-    save_auctions()
-    return {
-        "ok": True,
-        "auction_id": aid,
-        "auction": auc,
-        "auction_channel_id": auction_channel_id,
-        "market_channel_id": int(auc.get("market_channel_id", 0) or 0),
-        "market_message_id": int(auc.get("market_message_id", 0) or 0),
-    }
-
-
-async def _place_bid(inter: discord.Interaction, guild_id: int, auction_id: str, amount: int, portal_user_id: int | None = None) -> None:
-    guild = inter.guild or inter.client.get_guild(int(guild_id))
-    if guild is None:
-        await inter.response.send_message("❌ Server konnte nicht zugeordnet werden.", ephemeral=True)
-        return
-    auction = _auction(guild_id, auction_id)
-    if not auction:
-        await inter.response.send_message("❌ Auktion nicht gefunden.", ephemeral=True)
-        return
-    if str(auction.get("status", "")) != "active":
-        await inter.response.send_message("❌ Diese Auktion ist nicht mehr aktiv.", ephemeral=True)
-        return
-    end_dt = _parse_dt(str(auction.get("ends_at", "") or ""))
-    if end_dt and _now() >= end_dt:
-        await inter.response.send_message("❌ Diese Auktion ist bereits abgelaufen. Die Abschlussrunde verarbeitet sie gleich.", ephemeral=True)
-        return
-    user_id = int(inter.user.id)
-    if not _is_ebolus_member(guild, user_id):
-        await inter.response.send_message("❌ Nur Ebolus-Mitglieder dürfen mit EC bieten.", ephemeral=True)
-        return
-    if not await _require_loot_unlocked(inter, guild, user_id):
-        return
-    mode = str(auction.get("eligibility_mode", "all") or "all")
-    eligible = [int(x) for x in auction.get("eligible_user_ids", []) or []]
-    if mode in {"main_need", "secondary_need"} and user_id not in eligible:
-        label = "Main-Need-Spieler" if mode == "main_need" else "Second-Need-Spieler"
-        await inter.response.send_message(f"❌ Diese Auktion ist aktuell nur für berechtigte {label} freigegeben.", ephemeral=True)
-        return
-    min_bid = _min_next_bid(auction)
-    if int(amount) < min_bid:
-        await inter.response.send_message(f"❌ Mindestgebot ist aktuell **{min_bid} EC**.", ephemeral=True)
-        return
-    balance = _ec_balance(guild_id, user_id)
-    if int(amount) > balance:
-        await inter.response.send_message(f"❌ Du hast aktuell nur **{balance} EC**.", ephemeral=True)
-        return
-
-    bids = auction.setdefault("bids", [])
-    bids.append({"user_id": user_id, "amount": int(amount), "created_at": _now_iso(), "name": getattr(inter.user, "display_name", str(user_id))})
-    auction["updated_at"] = _now_iso()
-    save_auctions()
-
-    await _refresh_auction_message(inter.client, guild_id, auction)
-    await _post_or_refresh_market_message(inter.client, guild_id, auction)
-    # Die ursprünglichen Need-DMs werden im Hintergrund aktualisiert, damit die Button-Reaktion nicht timeoutet.
-    # Falls diese Auktion noch aus einer älteren Version stammt und keine DM-Message-IDs gespeichert hat,
-    # wird einmalig eine neue Live-Tracking-DM gesendet und ab dann aktualisiert/bei Übergabe gelöscht.
-    async def _repair_and_refresh_tracking_dm():
-        await _ensure_auction_tracking_dms(inter.client, guild_id, auction)
-        await _refresh_auction_tracking_dms(inter.client, guild_id, auction)
-    asyncio.create_task(_repair_and_refresh_tracking_dm())
-
-    # Wenn das Gebot aus der Gildenzentrale/DM kommt, muss auch diese aktuelle DM-Nachricht
-    # aktualisiert werden. Die normale Refresh-Funktion aktualisiert nur die öffentliche
-    # Auktionsnachricht im Auktionskanal.
-    if portal_user_id is not None:
-        try:
-            if inter.message:
-                await inter.message.edit(embed=_auction_embed(guild, auction), view=PortalAuctionBidView(int(guild_id), int(portal_user_id), str(auction_id)))
-        except Exception as e:
-            print(f"[loot_auction] portal bid message refresh failed: {e!r}")
-
-    await inter.response.send_message(f"✅ Gebot gesetzt: **{int(amount)} EC** für **{auction.get('item_name','Item')}**.", ephemeral=True)
-
-
-class CustomBidModal(Modal, title="Eigenes EC-Gebot"):
-    amount = TextInput(label="Gebot in EC", placeholder="z. B. 50", required=True, max_length=8)
-
-    def __init__(self, guild_id: int, auction_id: str, portal_user_id: int | None = None):
-        super().__init__(timeout=180)
-        self.guild_id = int(guild_id)
-        self.auction_id = str(auction_id)
-        self.portal_user_id = int(portal_user_id) if portal_user_id is not None else None
-
-    async def on_submit(self, inter: discord.Interaction):
-        try:
-            val = int(str(self.amount.value).strip())
-        except Exception:
-            await inter.response.send_message("❌ Bitte gib eine ganze Zahl ein.", ephemeral=True)
-            return
-        await _place_bid(inter, self.guild_id, self.auction_id, val, self.portal_user_id)
-
-
-class AuctionBidView(View):
-    def __init__(self, guild_id: int, auction_id: str):
-        super().__init__(timeout=None)
-        self.guild_id = int(guild_id)
-        self.auction_id = str(auction_id)
-        for child in self.children:
-            if isinstance(child, discord.ui.Button):
-                child.custom_id = f"lootauc:{auction_id}:{child.custom_id or child.label}"
-
-    async def _quick(self, inter: discord.Interaction, add: int) -> None:
-        auction = _auction(self.guild_id, self.auction_id)
-        if not auction:
-            await inter.response.send_message("❌ Auktion nicht gefunden.", ephemeral=True)
-            return
-        amount = max(_min_next_bid(auction), _current_price(auction) + int(add))
-        await _place_bid(inter, self.guild_id, self.auction_id, amount)
-
-    @button(label="+5 EC", style=ButtonStyle.primary, custom_id="bid5")
-    async def bid5(self, inter: discord.Interaction, btn: discord.ui.Button):
-        await self._quick(inter, 5)
-
-    @button(label="+10 EC", style=ButtonStyle.primary, custom_id="bid10")
-    async def bid10(self, inter: discord.Interaction, btn: discord.ui.Button):
-        await self._quick(inter, 10)
-
-    @button(label="+25 EC", style=ButtonStyle.primary, custom_id="bid25")
-    async def bid25(self, inter: discord.Interaction, btn: discord.ui.Button):
-        await self._quick(inter, 25)
-
-    @button(label="Eigenes Gebot", style=ButtonStyle.secondary, custom_id="custom")
-    async def custom(self, inter: discord.Interaction, btn: discord.ui.Button):
-        await inter.response.send_modal(CustomBidModal(self.guild_id, self.auction_id))
-
-    @button(label="Mein EC", style=ButtonStyle.secondary, custom_id="balance")
-    async def balance(self, inter: discord.Interaction, btn: discord.ui.Button):
-        bal = _ec_balance(self.guild_id, int(inter.user.id))
-        await inter.response.send_message(f"🪙 Dein aktueller Kontostand: **{bal} EC**", ephemeral=True)
-
-
-
-class PortalAuctionBidView(View):
-    """Bietansicht in der privaten Gildenzentrale mit Zurück-Buttons."""
-    def __init__(self, guild_id: int, user_id: int, auction_id: str):
-        super().__init__(timeout=None)
-        self.guild_id = int(guild_id)
-        self.user_id = int(user_id)
-        self.auction_id = str(auction_id)
-        for child in self.children:
-            if isinstance(child, discord.ui.Button):
-                child.custom_id = f"portalauc:{self.guild_id}:{self.user_id}:{auction_id}:{child.custom_id or child.label}"
-
-    async def _quick(self, inter: discord.Interaction, add: int) -> None:
-        auction = _auction(self.guild_id, self.auction_id)
-        if not auction:
-            await inter.response.send_message("❌ Auktion nicht gefunden.", ephemeral=True)
-            return
-        amount = max(_min_next_bid(auction), _current_price(auction) + int(add))
-        await _place_bid(inter, self.guild_id, self.auction_id, amount, self.user_id)
-
-    @button(label="+5 EC", style=ButtonStyle.primary, custom_id="bid5")
-    async def bid5(self, inter: discord.Interaction, btn: discord.ui.Button):
-        await self._quick(inter, 5)
-
-    @button(label="+10 EC", style=ButtonStyle.primary, custom_id="bid10")
-    async def bid10(self, inter: discord.Interaction, btn: discord.ui.Button):
-        await self._quick(inter, 10)
-
-    @button(label="+25 EC", style=ButtonStyle.primary, custom_id="bid25")
-    async def bid25(self, inter: discord.Interaction, btn: discord.ui.Button):
-        await self._quick(inter, 25)
-
-    @button(label="Eigenes Gebot", style=ButtonStyle.secondary, custom_id="custom")
-    async def custom(self, inter: discord.Interaction, btn: discord.ui.Button):
-        await inter.response.send_modal(CustomBidModal(self.guild_id, self.auction_id, self.user_id))
-
-    @button(label="Mein EC", style=ButtonStyle.secondary, custom_id="balance")
-    async def balance(self, inter: discord.Interaction, btn: discord.ui.Button):
-        bal = _ec_balance(self.guild_id, int(inter.user.id))
-        await inter.response.send_message(f"🪙 Dein aktueller Kontostand: **{bal} EC**", ephemeral=True)
-
-    @button(label="Zurück zu Auktion", style=ButtonStyle.secondary, custom_id="back_auction")
-    async def back_auction(self, inter: discord.Interaction, btn: discord.ui.Button):
-        guild = inter.client.get_guild(self.guild_id)
-        if not guild:
-            await inter.response.send_message("❌ Server nicht gefunden.", ephemeral=True)
-            return
-        await inter.response.edit_message(embed=_auction_portal_embed(guild, self.user_id), view=AuctionPortalMenuView(self.guild_id, self.user_id))
-
-    @button(label="Gildenzentrale", style=ButtonStyle.secondary, custom_id="back_main")
-    async def back_main(self, inter: discord.Interaction, btn: discord.ui.Button):
-        await _portal_back_to_main(inter, self.guild_id, self.user_id)
-
-
-class AuctionDeliveryView(View):
-    def __init__(self, guild_id: int, auction_id: str):
-        super().__init__(timeout=None)
-        self.guild_id = int(guild_id)
-        self.auction_id = str(auction_id)
-        for child in self.children:
-            if isinstance(child, discord.ui.Button):
-                child.custom_id = f"lootdel:{auction_id}:{child.custom_id or child.label}"
-
-    async def _guard(self, inter: discord.Interaction) -> bool:
-        if not _is_leader_or_admin(inter):
-            await inter.response.send_message("❌ Nur Leader/Admins dürfen das bestätigen.", ephemeral=True)
-            return False
-        return True
-
-    @button(label="Übergabe erledigt / EC abbuchen", style=ButtonStyle.success, custom_id="confirm")
-    async def confirm(self, inter: discord.Interaction, btn: discord.ui.Button):
-        if not await self._guard(inter):
-            return
-        auction = _auction(self.guild_id, self.auction_id)
-        if not auction:
-            await inter.response.send_message("❌ Auktion nicht gefunden.", ephemeral=True)
-            return
-        if str(auction.get("status", "")) == "delivered":
-            await inter.response.send_message("ℹ️ Diese Auktion wurde bereits abgerechnet.", ephemeral=True)
-            return
-        top = _highest_bid(auction)
-        if not top:
-            await inter.response.send_message("❌ Kein Gewinner vorhanden.", ephemeral=True)
-            return
-        winner = int(top.get("user_id", 0) or 0)
-        amount = int(top.get("amount", 0) or 0)
-        bal = _ec_balance(self.guild_id, winner)
-        if bal < amount:
-            await inter.response.send_message(f"❌ Gewinner hat aktuell nur **{bal} EC**, benötigt aber **{amount} EC**. Bitte manuell klären.", ephemeral=True)
-            return
-        ok = _add_ec_transaction(
-            self.guild_id,
-            winner,
-            -amount,
-            f"Loot-Auktion gewonnen: {auction.get('item_name','Item')}",
-            int(inter.user.id),
-            self.auction_id,
-            meta={"auction_id": self.auction_id, "item_id": auction.get("item_id", ""), "item_name": auction.get("item_name", "")},
-        )
-        if not ok:
-            await inter.response.send_message("❌ DKP/EC-System konnte nicht geladen werden. Keine EC abgebucht.", ephemeral=True)
-            return
-        auction["status"] = "delivered"
-        auction["delivered_at"] = _now_iso()
-        auction["delivered_by"] = int(inter.user.id)
-        auction["charged_amount"] = amount
-        _mark_chest_item_status(self.guild_id, auction, "delivered", {"delivered_to": winner, "delivered_by": int(inter.user.id), "delivered_at": auction["delivered_at"]})
-        locked_need = _mark_need_received_for_winner(
-            self.guild_id,
-            winner,
-            str(auction.get("item_id", "") or ""),
-            eligibility_mode=str(auction.get("eligibility_mode", "all") or "all"),
-            auction_id=self.auction_id,
-        )
-        if locked_need:
-            auction["locked_need_slot"] = locked_need
-        await _delete_auction_tracking_dms(inter.client, auction)
-        if _auction_phase(auction) == "free":
-            await _edit_market_message_final(inter.client, self.guild_id, auction, final="auction_closed")
-        save_auctions()
-
-        emb = discord.Embed(
-            title="✅ Loot übergeben und EC abgebucht",
-            description=(
-                f"**Item:** {auction.get('item_name','Item')}\n"
-                f"**Gewinner:** <@{winner}>\n"
-                f"**Abgebucht:** **{amount} EC**\n"
-                f"**Auktion:** `{self.auction_id}`"
-            ),
-            color=discord.Color.green(),
-            timestamp=_now(),
-        )
-        ch = _auction_channel(inter.client, self.guild_id, None) or _log_channel(inter.client, self.guild_id)
-        if ch:
-            try:
-                await ch.send(embed=emb)
-            except Exception:
-                pass
-        try:
-            await inter.message.edit(view=None)
-        except Exception:
-            pass
-        await inter.response.send_message(embed=emb, ephemeral=True)
-
-    @button(label="Keine Übergabe / offen lassen", style=ButtonStyle.secondary, custom_id="skip")
-    async def skip(self, inter: discord.Interaction, btn: discord.ui.Button):
-        if not await self._guard(inter):
-            return
-        await inter.response.send_message("ℹ️ Okay, die Auktion bleibt ohne EC-Abbuchung offen. Du kannst später erneut bestätigen.", ephemeral=True)
-
-
-async def _announce_log(client: discord.Client, guild_id: int, title: str, description: str, color: discord.Color = discord.Color.gold()) -> None:
-    # Detail-/Verwaltungsinfos gehören in den DKP-/Auktionskanal.
-    # Der öffentliche Marktplatz/Allgemein-Chat bekommt nur _post_or_refresh_market_message().
-    ch = _auction_channel(client, guild_id, None) or _log_channel(client, guild_id)
-    if not ch:
-        return
-    try:
-        await ch.send(embed=discord.Embed(title=title, description=description, color=color, timestamp=_now()))
-    except Exception:
-        pass
-
-
-async def _dm_user(guild: discord.Guild, user_id: int, text: str) -> bool:
-    member = guild.get_member(int(user_id))
-    if not member or member.bot:
-        return False
-    try:
-        await member.send(text)
-        return True
-    except Exception:
-        return False
-
-
-def _auction_dm_content(auction: dict, *, ended: bool = False, winner_id: int = 0) -> str:
-    item_name = str(auction.get("item_name", "Item") or "Item")
-    phase = _auction_phase(auction)
-    mode = str(auction.get("eligibility_mode", "all") or "all")
-    if phase == "need":
-        phase_name = "Main-Need-Auktion" if mode == "main_need" else "Second-Need-Auktion"
-    else:
-        phase_name = "Freie Auktion" if phase == "free" else "Sale-Kauf"
-    if ended:
-        if winner_id:
-            return (
-                "🏁 **Auktion beendet**\n\n"
-                f"**Item:** {item_name}\n"
-                f"**Auktion:** {phase_name}\n"
-                f"**Gewinner:** <@{winner_id}>\n"
-            )
-        return (
-            "🏁 **Auktion beendet**\n\n"
-            f"**Item:** {item_name}\n"
-            f"**Auktion:** {phase_name}\n"
-        )
-    return (
-        f"🎁 **Dein {phase_name}-Item ist gedroppt!**\n\n"
-        "Diese Nachricht wird bei jedem Gebot aktualisiert, damit du den Stand direkt hier sehen kannst.\n"
-        "Bieten kannst du über **Gildenzentrale → Auktion → Need-Auktion**."
-    )
-
-
-async def _send_auction_tracking_dm(guild: discord.Guild, user_id: int, auction: dict) -> Optional[dict]:
-    """Send a persistent Need-DM that can be edited after every bid."""
-    member = guild.get_member(int(user_id))
-    if not member or member.bot:
-        return None
-    try:
-        msg = await member.send(content=_auction_dm_content(auction), embed=_auction_embed(guild, auction))
         return {
-            "user_id": int(user_id),
-            "channel_id": int(getattr(msg.channel, "id", 0) or 0),
-            "message_id": int(msg.id),
+            "item_id": value,
+            "received": False,
+            "locked": False,
+            "received_at": "",
+            "received_by": 0,
         }
-    except Exception:
-        return None
+
+    return _blank_slot()
 
 
-async def _refresh_auction_tracking_dms(client: discord.Client, guild_id: int, auction: dict, *, ended: bool = False, winner_id: int = 0) -> None:
-    """Update the original Need-DM messages so users can follow the auction without opening the menu."""
-    refs = auction.get("notify_message_refs")
-    if not isinstance(refs, list) or not refs:
-        return
-    guild = client.get_guild(int(guild_id))
-    if not guild:
-        return
-    content = _auction_dm_content(auction, ended=ended, winner_id=int(winner_id or 0))
-    embed = _auction_embed(guild, auction)
-    for ref in list(refs):
-        try:
-            uid = int(ref.get("user_id", 0) or 0)
-            cid = int(ref.get("channel_id", 0) or 0)
-            mid = int(ref.get("message_id", 0) or 0)
-            if not uid or not mid:
+def _slot_item_id(value: Any) -> str:
+    return str(_slot_obj(value).get("item_id", "") or "")
+
+
+def _slot_received(value: Any) -> bool:
+    return bool(_slot_obj(value).get("received", False))
+
+
+def _set_slot_item(data: dict, tab: str, slot: str, item_id: str) -> None:
+    data.setdefault(tab, {})
+    data[tab][slot] = {
+        "item_id": str(item_id),
+        "received": False,
+        "locked": False,
+        "received_at": "",
+        "received_by": 0,
+    }
+
+
+def _clear_slot_item(data: dict, tab: str, slot: str) -> None:
+    data.setdefault(tab, {})
+    data[tab][slot] = _blank_slot()
+
+
+def _mark_slot_received(data: dict, tab: str, slot: str, received_by: int) -> bool:
+    data.setdefault(tab, {})
+    obj = _slot_obj(data[tab].get(slot))
+
+    if not obj.get("item_id"):
+        return False
+
+    obj["received"] = True
+    obj["locked"] = True
+    obj["received_at"] = _now_iso()
+    obj["received_by"] = int(received_by)
+    data[tab][slot] = obj
+    return True
+
+
+def _unmark_slot_received(data: dict, tab: str, slot: str) -> bool:
+    data.setdefault(tab, {})
+    obj = _slot_obj(data[tab].get(slot))
+
+    if not obj.get("item_id"):
+        return False
+
+    obj["received"] = False
+    obj["locked"] = False
+    obj["received_at"] = ""
+    obj["received_by"] = 0
+    data[tab][slot] = obj
+    return True
+
+
+def _user_needs(guild_id: int, user_id: int) -> dict:
+    g = _gneeds(guild_id)
+    users = g.setdefault("users", {})
+    u = users.get(str(user_id)) or {}
+    u.setdefault("Main", {})
+    u.setdefault("Secondary", {})
+
+    changed = False
+
+    for tab in TABS:
+        if tab not in u or not isinstance(u[tab], dict):
+            u[tab] = {}
+            changed = True
+
+        for slot in NEED_SLOTS:
+            if slot not in u[tab]:
+                u[tab][slot] = _blank_slot()
+                changed = True
+            else:
+                old = u[tab][slot]
+                new = _slot_obj(old)
+
+                if old != new:
+                    u[tab][slot] = new
+                    changed = True
+
+    users[str(user_id)] = u
+
+    if changed:
+        loot_needs[str(guild_id)] = g
+
+    return u
+
+
+def _normalize_catalog_slot(slot: str) -> str:
+    slot = (slot or "").strip().lower()
+
+    for s in CATALOG_SLOTS:
+        if s.lower() == slot:
+            return s
+
+    compact = slot.replace(" ", "")
+
+    aliases = {
+        "waffe1": "Waffe",
+        "waffe2": "Waffe",
+        "weapon": "Waffe",
+        "weapons": "Waffe",
+        "faehigkeitskern": "Fähigkeitskern",
+        "fähigkeitskern": "Fähigkeitskern",
+        "fahigkeitskern": "Fähigkeitskern",
+        "skillcore": "Fähigkeitskern",
+        "skill-core": "Fähigkeitskern",
+        "skillkern": "Fähigkeitskern",
+        "ring1": "Ring",
+        "ring2": "Ring",
+    }
+
+    return aliases.get(compact, "")
+
+
+def _normalize_need_slot(slot: str) -> str:
+    s = (slot or "").strip().lower()
+
+    for x in NEED_SLOTS:
+        if x.lower() == s:
+            return x
+
+    compact = s.replace(" ", "")
+
+    aliases = {
+        "waffe1": "Waffe 1",
+        "waffe2": "Waffe 2",
+        "faehigkeitskern": "Fähigkeitskern",
+        "fähigkeitskern": "Fähigkeitskern",
+        "fahigkeitskern": "Fähigkeitskern",
+        "skillcore": "Fähigkeitskern",
+        "skill-core": "Fähigkeitskern",
+        "skillkern": "Fähigkeitskern",
+        "ring1": "Ring 1",
+        "ring2": "Ring 2",
+    }
+
+    return aliases.get(compact, "")
+
+
+def _normalize_weapon_type(value: str | None) -> str:
+    value = (value or "").strip().lower()
+
+    if not value:
+        return ""
+
+    for w in WEAPON_TYPES:
+        if w.lower() == value:
+            return w
+
+    aliases = {
+        "sns": "Schwert & Schild",
+        "schwert": "Schwert & Schild",
+        "schild": "Schwert & Schild",
+        "schwert und schild": "Schwert & Schild",
+        "sword": "Schwert & Schild",
+        "sword shield": "Schwert & Schild",
+        "sword and shield": "Schwert & Schild",
+        "greatsword": "Großschwert",
+        "gs": "Großschwert",
+        "grossschwert": "Großschwert",
+        "großschwert": "Großschwert",
+        "dagger": "Dolche",
+        "daggers": "Dolche",
+        "dolch": "Dolche",
+        "dolche": "Dolche",
+        "crossbow": "Armbrust",
+        "xbow": "Armbrust",
+        "armbrust": "Armbrust",
+        "longbow": "Langbogen",
+        "bow": "Langbogen",
+        "bogen": "Langbogen",
+        "langbogen": "Langbogen",
+        "staff": "Stab",
+        "stab": "Stab",
+        "wand": "Zauberstab",
+        "zauberstab": "Zauberstab",
+        "spear": "Speer",
+        "speer": "Speer",
+        "orb": "Kugel",
+        "kugel": "Kugel",
+        "gauntlet": "Fäustlinge",
+        "gauntlets": "Fäustlinge",
+        "faeustlinge": "Fäustlinge",
+        "fäustlinge": "Fäustlinge",
+    }
+
+    return aliases.get(value, "")
+
+
+def _catalog_slot_for_need_slot(need_slot: str) -> str:
+    if need_slot in ("Waffe 1", "Waffe 2"):
+        return "Waffe"
+
+    if need_slot in ("Ring 1", "Ring 2"):
+        return "Ring"
+
+    return need_slot
+
+
+def _normalize_tab(tab: str) -> str:
+    tab = (tab or "").strip().lower()
+
+    if tab == "main":
+        return "Main"
+
+    if tab in {"secondary", "sec", "zweite", "zweitspec"}:
+        return "Secondary"
+
+    return ""
+
+
+def _all_items(guild_id: int) -> dict:
+    return _gitems(guild_id).setdefault("items", {})
+
+
+def _item_weapon_type(guild_id: int, item_id: str) -> str:
+    item = _all_items(guild_id).get(str(item_id)) or {}
+    return str(item.get("weapon_type", "") or "").strip()
+
+
+def _items_for_need_slot(guild_id: int, need_slot: str, weapon_type: str | None = None) -> list[dict]:
+    catalog_slot = _catalog_slot_for_need_slot(need_slot)
+    items = _all_items(guild_id)
+    out = []
+
+    legacy_slots = {catalog_slot}
+
+    if catalog_slot == "Waffe":
+        legacy_slots.update({"Waffe 1", "Waffe 2"})
+
+    if catalog_slot == "Ring":
+        legacy_slots.update({"Ring 1", "Ring 2"})
+
+    normalized_weapon_type = _normalize_weapon_type(weapon_type) if weapon_type else ""
+
+    for item_id, item in items.items():
+        item_slot = str(item.get("slot", ""))
+
+        if item_slot not in legacy_slots:
+            continue
+
+        if catalog_slot == "Waffe" and normalized_weapon_type:
+            if str(item.get("weapon_type", "") or "") != normalized_weapon_type:
                 continue
-            ch = client.get_channel(cid) if cid else None
-            if ch is None:
-                user = client.get_user(uid) or await client.fetch_user(uid)
-                ch = await user.create_dm()
-            msg = await ch.fetch_message(mid)
-            await msg.edit(content=content, embed=embed, view=None)
-            await asyncio.sleep(0.05)
-        except Exception as e:
-            print(f"[loot_auction] tracking dm refresh failed: {e!r}")
+
+        i = dict(item)
+        i["id"] = item_id
+        out.append(i)
+
+    out.sort(key=lambda x: str(x.get("name", "")).lower())
+    return out
 
 
-
-
-async def _ensure_auction_tracking_dms(client: discord.Client, guild_id: int, auction: dict) -> None:
-    """Ensure active Need auctions have stored DM message refs.
-
-    Older auctions created before the live-DM feature do not have refs, so their old
-    DM cannot be edited/deleted. For those, send a new live tracking DM once and
-    store its message id for all future updates/deletion.
-    """
-    if _auction_phase(auction) != "need" or str(auction.get("status", "")) != "active":
-        return
-    refs = auction.get("notify_message_refs")
-    if isinstance(refs, list) and refs:
-        return
-    guild = client.get_guild(int(guild_id))
-    if not guild:
-        return
-    eligible = [int(x) for x in auction.get("eligible_user_ids", []) or []]
-    if not eligible:
-        return
-    new_refs: list[dict] = []
-    for uid in eligible:
-        ref = await _send_auction_tracking_dm(guild, uid, auction)
-        if ref:
-            new_refs.append(ref)
-        await asyncio.sleep(0.08)
-    if new_refs:
-        auction["notify_message_refs"] = new_refs
-        auction["tracking_dm_repaired_at"] = _now_iso()
-        save_auctions()
-
-
-async def _delete_auction_tracking_dms(client: discord.Client, auction: dict) -> None:
-    """Delete the persistent Need-Tracking-DMs after the item is actually distributed."""
-    refs = auction.get("notify_message_refs")
-    if not isinstance(refs, list) or not refs:
-        return
-    for ref in list(refs):
-        try:
-            uid = int(ref.get("user_id", 0) or 0)
-            cid = int(ref.get("channel_id", 0) or 0)
-            mid = int(ref.get("message_id", 0) or 0)
-            if not uid or not mid:
-                continue
-            ch = client.get_channel(cid) if cid else None
-            if ch is None:
-                user = client.get_user(uid) or await client.fetch_user(uid)
-                ch = await user.create_dm()
-            msg = await ch.fetch_message(mid)
-            await msg.delete()
-            await asyncio.sleep(0.05)
-        except Exception as e:
-            # The member may have deleted the DM manually or blocked DMs. That should not break delivery.
-            print(f"[loot_auction] tracking dm delete failed: {e!r}")
-    auction["notify_message_refs"] = []
-    auction["tracking_dms_deleted_at"] = _now_iso()
-
-
-def _mark_chest_item_status(guild_id: int, auction: dict, status: str, extra: Optional[dict] = None) -> None:
-    chest_id = str(auction.get("chest_item_id", "") or "")
-    if not chest_id:
-        return
-    items = _gchest(guild_id).setdefault("items", {})
-    item = items.get(chest_id)
-    if isinstance(item, dict):
-        item["status"] = status
-        item["updated_at"] = _now_iso()
-        if extra:
-            item.update(extra)
-        save_chest()
-
-
-def _mark_need_received_for_winner(
-    guild_id: int,
-    user_id: int,
-    item_id: str,
-    eligibility_mode: str = "all",
-    auction_id: str = "",
-) -> Optional[dict]:
-    """Markiert genau EINEN passenden Need-Slot als erhalten und sperrt ihn.
-
-    Main-Need-Auktionen sperren zuerst einen Main-Slot, Second-Need-Auktionen
-    zuerst einen Secondary-Slot. Bei freien Auktionen/Sale wird Main vor
-    Secondary geprüft. Doppelte Einträge desselben Items werden nicht alle
-    gleichzeitig verbraucht.
-    """
+def _item_name(guild_id: int, item_id: str, with_type: bool = False) -> str:
     if not item_id:
-        return None
+        return "—"
 
-    data = _load_json(LOOT_NEEDS_FILE, {})
-    g = data.get(str(int(guild_id))) or {}
-    users = g.get("users") if isinstance(g.get("users"), dict) else {}
-    u = users.get(str(int(user_id)))
-    if not isinstance(u, dict):
-        return None
+    item = _all_items(guild_id).get(str(item_id))
 
-    mode = str(eligibility_mode or "all")
-    if mode == "main_need":
-        tab_order = ("Main",)
-    elif mode == "secondary_need":
-        tab_order = ("Secondary",)
-    else:
-        tab_order = ("Main", "Secondary")
+    if not item:
+        return f"Unbekanntes Item ({item_id})"
 
-    for tab in tab_order:
-        bucket = u.get(tab) if isinstance(u.get(tab), dict) else {}
-        for slot, val in list(bucket.items()):
-            obj = _slot_obj(val)
-            if str(obj.get("item_id", "") or "") != str(item_id):
-                continue
-            if bool(obj.get("received", False)) or bool(obj.get("locked", False)):
-                continue
+    name = str(item.get("name", item_id))
+    slot = str(item.get("slot", ""))
 
-            obj["received"] = True
-            obj["locked"] = True
-            obj["received_at"] = _now_iso()
-            obj["received_by"] = int(user_id)
-            obj["received_source"] = "loot_auction"
-            obj["received_auction_id"] = str(auction_id or "")
-            bucket[slot] = obj
-            u[tab] = bucket
-            users[str(int(user_id))] = u
-            g["users"] = users
-            data[str(int(guild_id))] = g
-            _save_json(LOOT_NEEDS_FILE, data)
-            return {"tab": tab, "slot": slot, "item_id": str(item_id)}
+    if with_type and slot == "Waffe":
+        wt = str(item.get("weapon_type", "") or "").strip()
+        if wt:
+            return f"{name} ({wt})"
+        return f"{name} (Unbekannt)"
+
+    return name
+
+
+def _member_role_id(guild_id: int) -> int:
+    portal_cfg = _load_portal_cfg()
+    c = portal_cfg.get(str(guild_id)) or {}
+    return int(c.get("member_role_id", 0) or 0)
+
+
+def _member_has_guild_role(guild: discord.Guild, user_id: int) -> bool:
+    role_id = _member_role_id(guild.id)
+
+    if not role_id:
+        return False
+
+    role = guild.get_role(role_id)
+
+    if not role:
+        return False
+
+    member = guild.get_member(user_id)
+
+    return bool(member and role in member.roles and not member.bot)
+
+
+def _current_guild_role_members(guild: discord.Guild) -> list[discord.Member]:
+    role_id = _member_role_id(guild.id)
+
+    if not role_id:
+        return []
+
+    role = guild.get_role(role_id)
+
+    if not role:
+        return []
+
+    return [m for m in role.members if not m.bot]
+
+
+def _profile_name(guild: discord.Guild, user_id: int, fallback: str = "Unbekannt") -> str:
+    profiles = _load_profiles()
+    g = profiles.get(str(guild.id)) or {}
+    users = g.get("users") or {}
+    p = users.get(str(user_id)) or {}
+
+    member = guild.get_member(user_id)
+    return str(p.get("ingame_name") or (member.display_name if member else fallback))
+
+
+def _cleanup_needs_without_guild_role(guild: discord.Guild) -> int:
+    g = _gneeds(guild.id)
+    users = g.setdefault("users", {})
+
+    remove = []
+
+    for uid_str in list(users.keys()):
+        try:
+            uid = int(uid_str)
+        except Exception:
+            remove.append(uid_str)
+            continue
+
+        if not _member_has_guild_role(guild, uid):
+            remove.append(uid_str)
+
+    for uid_str in remove:
+        users.pop(uid_str, None)
+
+    if remove:
+        save_needs()
+
+    return len(remove)
+
+
+def _find_item_by_name(guild_id: int, catalog_slot: str, name: str) -> Optional[tuple[str, dict]]:
+    name_l = name.strip().lower()
+
+    for item_id, item in _all_items(guild_id).items():
+        if str(item.get("slot", "")).lower() == catalog_slot.lower() and str(item.get("name", "")).lower() == name_l:
+            return item_id, item
 
     return None
 
 
-async def _transition_to_free_auction(client: discord.Client, guild_id: int, auction_id: str, auction: dict) -> bool:
-    guild = client.get_guild(int(guild_id))
-    if not guild:
-        return False
-    auction.update({
-        "kind": "auction",
-        "phase": "free",
-        "eligibility_mode": "all",
-        "eligible_user_ids": [],
-        "start_bid": FREE_START_BID,
-        "min_increment": DEFAULT_MIN_INCREMENT,
-        "bids": [],
-        "status": "active",
-        "ends_at": (_now() + timedelta(hours=FREE_AUCTION_HOURS)).isoformat(),
-        "transitioned_to_free_at": _now_iso(),
-        "updated_at": _now_iso(),
-    })
-    _mark_chest_item_status(guild_id, auction, "free_auction")
-    save_auctions()
-    await _refresh_auction_message(client, guild_id, auction)
-    await _refresh_auction_tracking_dms(client, guild_id, auction)
-    await _post_or_refresh_market_message(client, guild_id, auction)
-    await _post_or_refresh_active_auction_message(client, guild_id, auction)
-    await _announce_log(
-        client, guild_id,
-        "⚖️ Item jetzt in freier Auktion",
-        f"**Item:** {auction.get('item_name','Item')}\n"
-        f"Die Need-Auktion hatte keine Gebote. Das Item ist jetzt für alle Ebolus-Mitglieder in der **Freien Auktion** verfügbar.\n"
-        f"Startgebot: **{FREE_START_BID} EC**\nDauer: **24 Stunden**\nAuktions-ID: `{auction_id}`",
-        discord.Color.gold(),
+def _make_item_id(guild_id: int, catalog_slot: str, name: str) -> str:
+    base = _slug(f"{catalog_slot}-{name}")
+    item_id = base
+    items = _all_items(guild_id)
+    n = 2
+
+    while item_id in items:
+        item_id = f"{base}-{n}"
+        n += 1
+
+    return item_id
+
+
+def _need_embed(guild: discord.Guild, user_id: int, tab: str = "Main") -> discord.Embed:
+    tab = _normalize_tab(tab) or "Main"
+    data = _user_needs(guild.id, user_id)
+
+    member = guild.get_member(user_id)
+    name = _profile_name(guild, user_id, member.display_name if member else "Unbekannt")
+
+    emb = discord.Embed(
+        title="🎁 Needliste – ebolus",
+        description=(
+            f"**{name}**\n"
+            f"Bereich: **{tab}**\n\n"
+            "🔒 Erhaltene Items bleiben dauerhaft sichtbar, der Slot ist gesperrt und zählt nicht mehr als offener Need."
+        ),
+        color=discord.Color.gold()
     )
-    return True
+
+    weapon_lines = []
+    ability_core_lines = []
+    armor_lines = []
+    jewelry_lines = []
+    other_lines = []
+
+    for slot in NEED_SLOTS:
+        slot_data = _slot_obj(data.get(tab, {}).get(slot))
+        item_id = str(slot_data.get("item_id", "") or "")
+
+        if item_id:
+            item_name = _item_name(guild.id, item_id, with_type=True)
+            if bool(slot_data.get("received", False)):
+                item_name = f"{item_name} 🔒 Erhalten"
+        else:
+            item_name = "—"
+
+        line = f"**{slot}:** {item_name}"
+
+        if slot in ("Waffe 1", "Waffe 2"):
+            weapon_lines.append(line)
+        elif slot == "Fähigkeitskern":
+            ability_core_lines.append(line)
+        elif slot in ("Helm", "Brust", "Hose", "Handschuhe", "Schuhe"):
+            armor_lines.append(line)
+        elif slot in ("Brosche", "Ohrringe", "Kette", "Armband", "Ring 1", "Ring 2"):
+            jewelry_lines.append(line)
+        else:
+            other_lines.append(line)
+
+    emb.add_field(name="⚔️ Waffen", value="\n".join(weapon_lines) or "—", inline=False)
+    emb.add_field(name="✨ Fähigkeitskern", value="\n".join(ability_core_lines) or "—", inline=False)
+    emb.add_field(name="🛡️ Rüstung", value="\n".join(armor_lines) or "—", inline=False)
+    emb.add_field(name="💍 Schmuck", value="\n".join(jewelry_lines) or "—", inline=False)
+    emb.add_field(name="🧥 Sonstiges", value="\n".join(other_lines) or "—", inline=False)
+
+    emb.set_footer(text="Erhaltene Slots können nur durch die Gildenleitung wieder freigegeben werden.")
+
+    return emb
 
 
-async def _transition_to_sale(client: discord.Client, guild_id: int, auction_id: str, auction: dict) -> bool:
-    guild = client.get_guild(int(guild_id))
-    if not guild:
-        return False
-    auction.update({
-        "kind": "sale",
-        "phase": "sale",
-        "eligibility_mode": "all",
-        "eligible_user_ids": [],
-        "fixed_price": SALE_PRICE,
-        "start_bid": SALE_PRICE,
-        "min_increment": 0,
-        "bids": [],
-        "status": "active",
-        "ends_at": (_now() + timedelta(hours=SALE_HOURS)).isoformat(),
-        "transitioned_to_sale_at": _now_iso(),
-        "updated_at": _now_iso(),
-    })
-    _mark_chest_item_status(guild_id, auction, "sale")
-    save_auctions()
-    await _refresh_auction_message(client, guild_id, auction)
-    await _refresh_auction_tracking_dms(client, guild_id, auction)
-    await _post_or_refresh_market_message(client, guild_id, auction)
-    await _post_or_refresh_active_auction_message(client, guild_id, auction)
-    await _announce_log(
-        client, guild_id,
-        "🛒 Item jetzt im Sale-Kauf",
-        f"**Item:** {auction.get('item_name','Item')}\n"
-        f"Die freie Auktion hatte keine Gebote. Das Item ist jetzt im **Sale-Kauf** verfügbar.\n"
-        f"Sofortkauf: **{SALE_PRICE} EC**\nAuktions-ID: `{auction_id}`",
-        discord.Color.green(),
-    )
-    return True
+def _format_need_user_full(guild: discord.Guild, user_id: int) -> str:
+    data = _user_needs(guild.id, user_id)
+    name = _profile_name(guild, user_id)
 
+    lines = [f"**{name}**"]
 
-async def _close_auction(client: discord.Client, guild_id: int, auction_id: str, reason: str = "time") -> bool:
-    guild = client.get_guild(int(guild_id))
-    auction = _auction(guild_id, auction_id)
-    if not guild or not auction or str(auction.get("status", "")) != "active":
-        return False
+    for tab in TABS:
+        used = []
 
-    phase = _auction_phase(auction)
-    top = _highest_bid(auction)
+        for slot in NEED_SLOTS:
+            slot_data = _slot_obj(data.get(tab, {}).get(slot))
+            item_id = str(slot_data.get("item_id", "") or "")
 
-    # No bid: automatic chain Need -> Free -> Sale -> Expired.
-    if not top:
-        if phase == "need":
-            return await _transition_to_free_auction(client, guild_id, auction_id, auction)
-        if phase == "free":
-            return await _transition_to_sale(client, guild_id, auction_id, auction)
-        if phase == "sale":
-            auction["status"] = "expired"
-            auction["expired_at"] = _now_iso()
-            auction["close_reason"] = reason
-            _mark_chest_item_status(guild_id, auction, "expired")
-            await _edit_market_message_final(client, guild_id, auction, final="expired")
-            await _delete_active_auction_message(client, auction)
-            save_auctions()
-            await _refresh_auction_message(client, guild_id, auction)
-            await _announce_log(
-                client, guild_id,
-                "⌛ Sale-Kauf abgelaufen",
-                f"**Item:** {auction.get('item_name','Item')}\nDas Item wurde nicht gekauft und ist jetzt abgelaufen.\nAuktions-ID: `{auction_id}`",
-                discord.Color.dark_grey(),
-            )
-            return True
+            if item_id:
+                item_name = _item_name(guild.id, item_id, with_type=True)
+                if bool(slot_data.get("received", False)):
+                    item_name = f"{item_name} 🔒 Erhalten"
 
-    # Bid exists: close and ask leaders to deliver.
-    auction["status"] = "closed"
-    auction["closed_at"] = _now_iso()
-    auction["close_reason"] = reason
-    _mark_chest_item_status(guild_id, auction, "waiting_delivery")
-    save_auctions()
-    await _refresh_auction_message(client, guild_id, auction)
-    await _delete_active_auction_message(client, auction)
-    if phase == "free":
-        await _edit_market_message_final(client, guild_id, auction, final="auction_closed")
+                used.append(f"{slot}: {item_name}")
 
-    winner = int(top.get("user_id", 0) or 0)
-    await _refresh_auction_tracking_dms(client, guild_id, auction, ended=True, winner_id=winner)
-    amount = int(top.get("amount", 0) or 0)
-    try:
-        await _dm_user(
-            guild,
-            winner,
-            "🏁 **Du hast eine Loot-Auktion gewonnen!**\n\n"
-            f"**Item:** {auction.get('item_name','Item')}\n"
-            f"**Gebot:** {amount} EC\n\n"
-            "Die Gildenleitung wird dir das Item übergeben. EC werden erst nach bestätigter Übergabe abgebucht."
-        )
-    except Exception:
-        pass
+        if used:
+            lines.append(f"__{tab}__")
+            lines.extend(f"• {x}" for x in used)
 
-    ch = _auction_channel(client, guild_id, None) or _log_channel(client, guild_id)
-    if ch:
-        emb = discord.Embed(
-            title="🏁 Loot-Auktion beendet",
-            description=(
-                f"**Item:** {auction.get('item_name','Item')}\n"
-                f"**Gewinner:** <@{winner}>\n"
-                f"**Gebot:** **{amount} EC**\n"
-                f"**Phase:** {_need_mode_label(str(auction.get('eligibility_mode','all'))) if phase == 'need' else 'Freie Auktion'}\n"
-                f"**Auktions-ID:** `{auction_id}`\n\n"
-                "Bitte Item übergeben und danach bestätigen, damit EC abgebucht werden und das Item aus der virtuellen Gildentruhe entfernt wird."
-            ),
-            color=discord.Color.gold(),
-            timestamp=_now(),
-        )
-        msg = await ch.send(embed=emb, view=AuctionDeliveryView(guild_id, auction_id))
-        auction["delivery_message_id"] = int(msg.id)
-        auction["delivery_channel_id"] = int(getattr(ch, "id", 0) or 0)
-        save_auctions()
-    return True
+    if len(lines) == 1:
+        lines.append("— keine Einträge")
 
-
-@tasks.loop(minutes=1)
-async def auction_close_loop():
-    client = _client_ref
-    if not client:
-        return
-    now = _now()
-    for gid_str, g in list(auction_state.items()):
-        try:
-            gid = int(gid_str)
-        except Exception:
-            continue
-        auctions = g.get("auctions") if isinstance(g.get("auctions"), dict) else {}
-        for aid, auc in list(auctions.items()):
-            if str(auc.get("status", "")) != "active":
-                continue
-            if _is_junk_interest_sale(auc):
-                until = _junk_interest_until(auc)
-                if until and now >= until and not auc.get("junk_interest_processed_at"):
-                    try:
-                        await _process_junk_interest_window(client, gid, str(aid), auc, reason="time")
-                    except Exception as e:
-                        print(f"[loot_auction] junk interest process failed {gid}/{aid}: {e!r}")
-                    continue
-            end_dt = _parse_dt(str(auc.get("ends_at", "") or ""))
-            if end_dt and now >= end_dt:
-                try:
-                    await _close_auction(client, gid, str(aid), reason="time")
-                except Exception as e:
-                    print(f"[loot_auction] close failed {gid}/{aid}: {e!r}")
-
-
-@auction_close_loop.before_loop
-async def before_auction_close_loop():
-    if _client_ref:
-        await _client_ref.wait_until_ready()
-
-
-def _new_auction_id() -> str:
-    return datetime.now(TZ).strftime("A%Y%m%d%H%M%S%f")[:-3]
-
-
-def _active_auctions(guild_id: int) -> list[dict]:
-    auctions = (_gauctions(guild_id).get("auctions") or {}).values()
-    out = [a for a in auctions if str(a.get("status", "")) == "active"]
-    out.sort(key=lambda a: str(a.get("ends_at", "")))
-    return out
-
-
-
-
-# ---------------------------------------------------------------------------
-# Gildenzentrale / Portal integration
-# ---------------------------------------------------------------------------
-
-def _auction_kind(auction: dict) -> str:
-    return str(auction.get("kind", "auction") or "auction")
-
-
-def _auction_phase(auction: dict) -> str:
-    phase = str(auction.get("phase", "") or "")
-    if phase:
-        return phase
-    kind = str(auction.get("kind", "") or "")
-    if kind == "sale" or str(auction.get("status", "")) == "sale":
-        return "sale"
-    if str(auction.get("eligibility_mode", "")) in {"main_need", "secondary_need"}:
-        return "need"
-    return "free"
-
-
-def _is_junk_interest_sale(auction: dict) -> bool:
-    return bool(auction.get("junk_drop", False)) and _auction_phase(auction) == "sale" and int(auction.get("fixed_price", auction.get("start_bid", 0)) or 0) <= 0
-
-
-def _junk_interest_until(auction: dict) -> Optional[datetime]:
-    return _parse_dt(str(auction.get("junk_interest_until", "") or ""))
-
-
-def _junk_roll_until(auction: dict) -> Optional[datetime]:
-    return _parse_dt(str(auction.get("junk_roll_until", auction.get("junk_interest_until", "")) or ""))
-
-
-def _junk_interest_until(auction: dict) -> Optional[datetime]:
-    # Legacy-Name: neue Logik ist Würfelphase.
-    return _junk_roll_until(auction)
-
-
-def _junk_rolls(auction: dict) -> dict[str, dict]:
-    raw = auction.get("junk_rolls")
-    if not isinstance(raw, dict):
-        raw = {}
-    cleaned: dict[str, dict] = {}
-    used: set[int] = set()
-    changed = False
-    max_seen = JUNK_ROLL_MAX_DEFAULT
-
-    for uid_str, entry in list(raw.items()):
-        try:
-            uid = int(uid_str)
-        except Exception:
-            changed = True
-            continue
-        if not isinstance(entry, dict):
-            entry = {"roll": entry, "created_at": _now_iso()}
-            changed = True
-        try:
-            roll = int(entry.get("roll", 0) or 0)
-        except Exception:
-            changed = True
-            continue
-        if roll <= 0:
-            changed = True
-            continue
-        if roll in used:
-            # Alte/kaputte Daten mit doppelten Würfen werden nicht angezeigt.
-            # Neue Würfe sind durch _next_unique_junk_roll eindeutig.
-            changed = True
-            continue
-        max_seen = max(max_seen, roll)
-        used.add(roll)
-        cleaned[str(uid)] = {
-            "user_id": uid,
-            "roll": roll,
-            "created_at": str(entry.get("created_at", "") or _now_iso()),
-        }
-
-    auction["junk_rolls"] = cleaned
-    if max_seen > int(auction.get("junk_roll_max", JUNK_ROLL_MAX_DEFAULT) or JUNK_ROLL_MAX_DEFAULT):
-        auction["junk_roll_max"] = min(max_seen, JUNK_ROLL_MAX_EXPANDED)
-        changed = True
-    return cleaned
-
-
-def _junk_interest_user_ids(auction: dict) -> list[int]:
-    # Legacy-Name: gibt jetzt die Spieler zurück, die bereits gewürfelt haben.
-    out: list[int] = []
-    for uid_str in _junk_rolls(auction).keys():
-        try:
-            out.append(int(uid_str))
-        except Exception:
-            pass
-    return out
-
-
-def _junk_roll_open(auction: dict) -> bool:
-    until = _junk_roll_until(auction)
-    return bool(until and _now() < until and not auction.get("junk_roll_processed_at") and not auction.get("junk_interest_processed_at"))
-
-
-def _junk_interest_open(auction: dict) -> bool:
-    # Legacy-Name: neue Logik ist Würfelphase.
-    return _junk_roll_open(auction)
-
-
-def _junk_roll_range(auction: dict) -> int:
-    rolls = _junk_rolls(auction)
-    configured = int(auction.get("junk_roll_max", JUNK_ROLL_MAX_DEFAULT) or JUNK_ROLL_MAX_DEFAULT)
-    max_val = max(JUNK_ROLL_MAX_DEFAULT, configured)
-    if len(rolls) >= JUNK_ROLL_MAX_DEFAULT:
-        max_val = JUNK_ROLL_MAX_EXPANDED
-    max_val = min(max_val, JUNK_ROLL_MAX_EXPANDED)
-    auction["junk_roll_max"] = max_val
-    return max_val
-
-
-def _next_unique_junk_roll(auction: dict) -> tuple[int, int]:
-    rolls = _junk_rolls(auction)
-    max_val = _junk_roll_range(auction)
-    used = {int(v.get("roll", 0) or 0) for v in rolls.values()}
-    available = [n for n in range(1, max_val + 1) if n not in used]
-    if not available and max_val < JUNK_ROLL_MAX_EXPANDED:
-        max_val = JUNK_ROLL_MAX_EXPANDED
-        auction["junk_roll_max"] = max_val
-        available = [n for n in range(1, max_val + 1) if n not in used]
-    if not available:
-        raise RuntimeError("Keine freien Müll-Roll-Werte mehr verfügbar.")
-    return int(random.choice(available)), int(max_val)
-
-
-def _junk_roll_entries(auction: dict) -> list[tuple[int, int, str]]:
-    entries: list[tuple[int, int, str]] = []
-    for uid_str, entry in _junk_rolls(auction).items():
-        try:
-            uid = int(uid_str)
-            roll = int(entry.get("roll", 0) or 0)
-            created = str(entry.get("created_at", "") or "")
-        except Exception:
-            continue
-        entries.append((uid, roll, created))
-    entries.sort(key=lambda x: x[2] or "")
-    return entries
-
-
-def _junk_roll_leader(auction: dict) -> Optional[tuple[int, int]]:
-    entries = _junk_roll_entries(auction)
-    if not entries:
-        return None
-    uid, roll, _created = max(entries, key=lambda x: x[1])
-    return int(uid), int(roll)
-
-
-def _junk_roll_lines(auction: dict, *, limit: int = 20) -> str:
-    entries = _junk_roll_entries(auction)
-    if not entries:
-        return "Noch niemand hat gewürfelt."
-    lines = [f"{idx}. <@{uid}> – 🎲 **{roll}**" for idx, (uid, roll, _created) in enumerate(entries[:limit], start=1)]
-    if len(entries) > limit:
-        lines.append(f"… +{len(entries) - limit} weitere")
     return "\n".join(lines)
 
 
-def _junk_roll_field_values(auction: dict, *, limit: int = 20) -> tuple[str, str, int]:
-    """Bereitet die Würfe als zwei Discord-Embed-Spalten vor."""
-    entries = _junk_roll_entries(auction)
-    if not entries:
-        return "Noch niemand hat gewürfelt.", "", 0
+def _event_participant_ids(obj: dict) -> list[int]:
+    ids: list[int] = []
 
-    shown = entries[:limit]
-    lines = [f"{idx}. <@{uid}> – 🎲 **{roll}**" for idx, (uid, roll, _created) in enumerate(shown, start=1)]
-    split_at = (len(lines) + 1) // 2
-    left = "\n".join(lines[:split_at]) or "—"
-    right = "\n".join(lines[split_at:])
-    hidden = max(0, len(entries) - limit)
-    return left, right, hidden
+    yes = obj.get("yes") or {}
+
+    for key in ("TANK", "HEAL", "DPS", "BANK"):
+        for entry in yes.get(key, []) or []:
+            try:
+                if isinstance(entry, dict):
+                    uid = int(entry.get("id", 0) or 0)
+                else:
+                    uid = int(entry)
+
+                if uid and uid not in ids:
+                    ids.append(uid)
+            except Exception:
+                continue
+
+    return ids
 
 
-def _add_junk_roll_fields(emb: discord.Embed, auction: dict, *, limit: int = 20) -> discord.Embed:
-    left, right, hidden = _junk_roll_field_values(auction, limit=limit)
-    if right:
-        emb.add_field(name="Würfe", value=left, inline=True)
-        emb.add_field(name="\u200b", value=right, inline=True)
-    else:
-        emb.add_field(name="Würfe", value=left, inline=False)
-    if hidden:
-        emb.add_field(name="Weitere Würfe", value=f"… +{hidden} weitere", inline=False)
+def _weapon_summary_embed(
+    guild: discord.Guild,
+    user_ids: list[int],
+    title: str,
+    subtitle: str
+) -> discord.Embed:
+    grouped: dict[str, dict[str, dict[str, list[str]]]] = {
+        "Main": {},
+        "Secondary": {},
+    }
+
+    for uid in user_ids:
+        if not _member_has_guild_role(guild, uid):
+            continue
+
+        data = _user_needs(guild.id, uid)
+        name = _profile_name(guild, uid)
+
+        for tab in TABS:
+            for slot in WEAPON_NEED_SLOTS:
+                slot_data = _slot_obj(data.get(tab, {}).get(slot))
+
+                if bool(slot_data.get("received", False)):
+                    continue
+
+                item_id = str(slot_data.get("item_id", "") or "")
+
+                if not item_id:
+                    continue
+
+                item_name = _item_name(guild.id, item_id, with_type=False)
+
+                if item_name.startswith("Unbekanntes Item"):
+                    continue
+
+                weapon_type = _item_weapon_type(guild.id, item_id) or "Unbekannt"
+
+                grouped[tab].setdefault(weapon_type, {})
+                grouped[tab][weapon_type].setdefault(item_name, [])
+
+                if name not in grouped[tab][weapon_type][item_name]:
+                    grouped[tab][weapon_type][item_name].append(name)
+
+    emb = discord.Embed(
+        title=title,
+        description=subtitle,
+        color=discord.Color.red()
+    )
+
+    for tab in TABS:
+        type_map = grouped.get(tab) or {}
+
+        if not type_map:
+            emb.add_field(name=f"{tab.upper()}-NEED", value="—", inline=False)
+            continue
+
+        lines = []
+
+        sorted_types = sorted(
+            type_map.items(),
+            key=lambda kv: (WEAPON_TYPES.index(kv[0]) if kv[0] in WEAPON_TYPES else 999, kv[0])
+        )
+
+        for weapon_type, item_map in sorted_types:
+            lines.append(f"**{weapon_type}**")
+
+            sorted_items = sorted(
+                item_map.items(),
+                key=lambda kv: (-len(kv[1]), kv[0].lower())
+            )
+
+            for item_name, names in sorted_items:
+                lines.append(f"• {item_name} — **{len(names)}x**")
+                lines.append(f"  {', '.join(names)}")
+
+            lines.append("")
+
+        value = "\n".join(lines).strip()
+
+        if len(value) > 1024:
+            value = value[:1000] + "\n… gekürzt"
+
+        emb.add_field(name=f"{tab.upper()}-NEED", value=value or "—", inline=False)
+
+    emb.set_footer(text="Erhaltene Items werden nicht mehr als offener Need gezählt.")
+
     return emb
 
 
-def _junk_roll_summary(auction: dict) -> str:
-    leader = _junk_roll_leader(auction)
-    if not leader:
-        return "—"
-    uid, roll = leader
-    return f"🏆 <@{uid}> mit **{roll}**"
-
-
-def _junk_sale_line(auction: dict) -> str:
-    if not _is_junk_interest_sale(auction):
-        return ""
-    until = _junk_roll_until(auction)
-    count = len(_junk_roll_entries(auction))
-    if _junk_roll_open(auction) and until:
-        return (
-            f"**Ende:** {until.strftime('%d.%m.%Y %H:%M')}\n"
-            "**Status:** Würfelphase\n"
-            f"**Würfe:** {count}\n"
-            f"**Aktuell vorne:** {_junk_roll_summary(auction)}"
-        )
-    if auction.get("junk_roll_processed_at") or auction.get("junk_interest_processed_at"):
-        if int(auction.get("junk_interest_count", count) or count) > 0:
-            winner = int(auction.get("sold_to", 0) or auction.get("junk_roll_winner_id", 0) or auction.get("junk_lottery_winner_id", 0) or 0)
-            roll = int(auction.get("junk_roll_winner_roll", 0) or 0)
-            return f"Roll abgeschlossen. Gewinner: <@{winner}> mit **{roll}**."
-        return "Keine Würfe. Das Item ist jetzt als **Gratis-Sofortkauf** verfügbar."
-    return "Würfelphase vorbei. Das Item ist jetzt als **Gratis-Sofortkauf** verfügbar."
-
-
-async def _finalize_sale_delivery(
-    client: discord.Client,
-    guild: discord.Guild,
-    guild_id: int,
-    auction: dict,
-    auction_id: str,
-    user_id: int,
-    price: int,
-    *,
-    actor_id: int | None = None,
-    source: str = "sale",
-) -> discord.Embed:
-    actor = int(actor_id or user_id)
-    auction["status"] = "delivered"
-    auction["sold_at"] = _now_iso()
-    auction["sold_to"] = int(user_id)
-    auction["charged_amount"] = int(price)
-    auction["delivery_source"] = str(source)
-    _mark_chest_item_status(int(guild_id), auction, "delivered", {"delivered_to": int(user_id), "delivered_by": actor, "delivered_at": auction["sold_at"]})
-    locked_need = _mark_need_received_for_winner(
-        int(guild_id),
-        int(user_id),
-        str(auction.get("item_id", "") or ""),
-        eligibility_mode=str(auction.get("eligibility_mode", "all") or "all"),
-        auction_id=str(auction_id),
-    )
-    if locked_need:
-        auction["locked_need_slot"] = locked_need
-    await _delete_auction_tracking_dms(client, auction)
-    await _edit_market_message_final(client, int(guild_id), auction, final="sold")
-    await _delete_active_auction_message(client, auction)
-    save_auctions()
-    try:
-        await _refresh_auction_message(client, int(guild_id), auction)
-    except Exception:
-        pass
-    return discord.Embed(
-        title="✅ Sale-Kauf abgeschlossen",
-        description=f"**Item:** {auction.get('item_name','Item')}\n**Käufer:** <@{int(user_id)}>\n**Preis:** {'**Gratis**' if int(price) <= 0 else f'**{int(price)} EC**'}",
-        color=discord.Color.green(),
-        timestamp=_now(),
-    )
-
-
-async def _process_junk_interest_window(client: discord.Client, guild_id: int, auction_id: str, auction: dict, *, reason: str = "time") -> dict:
-    # Legacy-Name: verarbeitet die Müll-Würfelphase.
-    if not _is_junk_interest_sale(auction):
-        return {"processed": False, "delivered": False, "winner_id": 0, "count": 0}
-    if str(auction.get("status", "")) != "active":
-        return {"processed": False, "delivered": False, "winner_id": 0, "count": 0}
-    if auction.get("junk_roll_processed_at") or auction.get("junk_interest_processed_at"):
-        return {
-            "processed": True,
-            "delivered": str(auction.get("status", "")) == "delivered",
-            "winner_id": int(auction.get("sold_to", 0) or auction.get("junk_roll_winner_id", 0) or auction.get("junk_lottery_winner_id", 0) or 0),
-            "count": int(auction.get("junk_interest_count", 0) or len(_junk_roll_entries(auction))),
-        }
-    until = _junk_roll_until(auction)
-    if until and _now() < until:
-        return {"processed": False, "delivered": False, "winner_id": 0, "count": len(_junk_roll_entries(auction))}
-
-    guild = client.get_guild(int(guild_id))
-    if not guild:
-        return {"processed": False, "delivered": False, "winner_id": 0, "count": len(_junk_roll_entries(auction))}
-
-    valid_entries = [(uid, roll, created) for uid, roll, created in _junk_roll_entries(auction) if _is_ebolus_member(guild, uid)]
-    auction["junk_roll_processed_at"] = _now_iso()
-    auction["junk_interest_processed_at"] = auction["junk_roll_processed_at"]
-    auction["junk_interest_process_reason"] = str(reason)
-    auction["junk_interest_count"] = len(valid_entries)
-
-    if valid_entries:
-        winner_id, winner_roll, _created = max(valid_entries, key=lambda x: x[1])
-        auction["junk_roll_winner_id"] = int(winner_id)
-        auction["junk_roll_winner_roll"] = int(winner_roll)
-        auction["junk_lottery_winner_id"] = int(winner_id)  # Legacy-Feld für bestehende Anzeigen
-        auction["junk_lottery_drawn_at"] = _now_iso()
-        auction["junk_lottery_pool"] = [int(uid) for uid, _roll, _created in valid_entries]
-        emb = await _finalize_sale_delivery(client, guild, int(guild_id), auction, str(auction_id), int(winner_id), 0, actor_id=0, source="junk_roll")
-        save_auctions()
-        try:
-            member = guild.get_member(int(winner_id)) or await guild.fetch_member(int(winner_id))
-            if member and not member.bot:
-                await member.send(
-                    "🎲 **Müll-Item Roll gewonnen**\n\n"
-                    f"Du hast **{auction.get('item_name','Item')}** kostenlos bekommen.\n"
-                    f"Dein Gewinnerwurf: **{int(winner_roll)}**"
-                )
-        except Exception:
-            pass
-        await _announce_log(
-            client,
-            int(guild_id),
-            "🎲 Müll-Item Roll abgeschlossen",
-            f"**Item:** {auction.get('item_name','Item')}\n"
-            f"**Würfe:** {len(valid_entries)}\n"
-            f"**Gewinner:** <@{int(winner_id)}> mit **{int(winner_roll)}**\n"
-            f"**Auktions-ID:** `{auction_id}`",
-            discord.Color.green(),
-        )
-        return {"processed": True, "delivered": True, "winner_id": int(winner_id), "count": len(valid_entries), "embed": emb}
-
-    auction["junk_direct_sale_open_at"] = _now_iso()
-    auction["ends_at"] = ""
-    save_auctions()
-    await _refresh_auction_message(client, int(guild_id), auction)
-    await _post_or_refresh_market_message(client, int(guild_id), auction)
-    await _post_or_refresh_active_auction_message(client, int(guild_id), auction)
-    await _announce_log(
-        client,
-        int(guild_id),
-        "🛒 Müll-Item jetzt Sofortkauf",
-        f"**Item:** {auction.get('item_name','Item')}\nNiemand hat innerhalb von {JUNK_ROLL_HOURS} Stunden gewürfelt. Das Item bleibt jetzt als **Gratis-Sofortkauf** offen.\n**Auktions-ID:** `{auction_id}`",
-        discord.Color.green(),
-    )
-    return {"processed": True, "delivered": False, "winner_id": 0, "count": 0}
-
-
-def _active_need_auctions(guild_id: int) -> list[dict]:
-    return [a for a in _active_auctions(guild_id) if _auction_phase(a) == "need"]
-
-
-def _active_free_auctions(guild_id: int) -> list[dict]:
-    return [a for a in _active_auctions(guild_id) if _auction_phase(a) == "free"]
-
-
-def _active_sale_items(guild_id: int) -> list[dict]:
-    items = [a for a in _active_auctions(guild_id) if _auction_phase(a) == "sale"]
-    items.sort(key=lambda a: str(a.get("ends_at", "")))
-    return items
-
-
-def _short_auction_line(auction: dict) -> str:
-    end_dt = _parse_dt(str(auction.get("ends_at", "") or ""))
-    top = _highest_bid(auction)
-    if _auction_phase(auction) == "sale":
-        if _is_junk_interest_sale(auction):
-            until = _junk_interest_until(auction)
-            if _junk_interest_open(auction) and until:
-                bid = f"Würfeln bis **{until.strftime('%d.%m. %H:%M')}**"
-                when = "Roll"
-            else:
-                bid = "**Gratis-Sofortkauf**"
-                when = "offen"
-        else:
-            bid = f"Preis **{int(auction.get('fixed_price', auction.get('start_bid', 0)) or 0)} EC**"
-            when = end_dt.strftime("%d.%m. %H:%M") if end_dt else "?"
+async def _send_embed_response(
+    inter: discord.Interaction,
+    embed: discord.Embed,
+    public: bool = False
+):
+    if not inter.response.is_done():
+        await inter.response.send_message(embed=embed, ephemeral=not public)
     else:
-        bid = f"Höchstgebot **{int(top.get('amount',0) or 0)} EC**" if top else "noch kein Gebot"
-        when = end_dt.strftime("%d.%m. %H:%M") if end_dt else "?"
-    return f"• `{auction.get('id')}` – **{auction.get('item_name','Item')}** – {bid} – {when}"
+        await inter.followup.send(embed=embed, ephemeral=not public)
 
 
-def _auction_portal_embed(guild: discord.Guild, user_id: int | None = None) -> discord.Embed:
+def _loot_leader_channel(guild: discord.Guild) -> Optional[discord.abc.Messageable]:
+    c = _gcfg(guild.id)
+    ch_id = int(c.get("leader_channel_id", 0) or 0)
+
+    if not ch_id:
+        leader_cfg = _load_leader_cfg()
+        lc = leader_cfg.get(str(guild.id)) or {}
+        ch_id = int(lc.get("internal_channel_id", 0) or 0)
+
+    if not ch_id:
+        return None
+
+    ch = guild.get_channel(ch_id)
+
+    if isinstance(ch, (discord.TextChannel, discord.Thread)):
+        return ch
+
+    return None
+
+
+def _received_request_footer(guild_id: int, user_id: int, tab: str, slot: str) -> str:
+    return f"loot_received_request|{int(guild_id)}|{int(user_id)}|{tab}|{slot}"
+
+
+def _parse_received_request_footer(text: str) -> Optional[tuple[int, int, str, str]]:
+    raw = str(text or "").strip()
+
+    if not raw.startswith("loot_received_request|"):
+        return None
+
+    parts = raw.split("|")
+
+    if len(parts) != 5:
+        return None
+
+    try:
+        guild_id = int(parts[1])
+        user_id = int(parts[2])
+        tab = _normalize_tab(parts[3])
+        slot = _normalize_need_slot(parts[4])
+
+        if not tab or not slot:
+            return None
+
+        return guild_id, user_id, tab, slot
+
+    except Exception:
+        return None
+
+
+async def _send_received_request(
+    inter: discord.Interaction,
+    guild: discord.Guild,
+    user_id: int,
+    tab: str,
+    slot: str
+) -> bool:
+    ch = _loot_leader_channel(guild)
+
+    if not ch:
+        await inter.response.edit_message(
+            embed=discord.Embed(
+                title="❌ Leaderkanal fehlt",
+                description=(
+                    "Es ist kein Leader-/Loot-Kanal gesetzt.\n\n"
+                    "Die Gildenleitung muss zuerst einen Kanal setzen:\n"
+                    "`/loot_set_leader_channel channel:#gildenleitung`"
+                ),
+                color=discord.Color.red()
+            ),
+            view=NeedMainView(guild.id, user_id, tab)
+        )
+        return False
+
+    data = _user_needs(guild.id, user_id)
+    slot_data = _slot_obj(data.get(tab, {}).get(slot))
+    item_id = str(slot_data.get("item_id", "") or "")
+
+    if not item_id:
+        await inter.response.edit_message(
+            embed=discord.Embed(
+                title="❌ Kein Item eingetragen",
+                description=f"In **{tab} – {slot}** ist aktuell kein Item eingetragen.",
+                color=discord.Color.orange()
+            ),
+            view=NeedMainView(guild.id, user_id, tab)
+        )
+        return False
+
+    if bool(slot_data.get("received", False)):
+        await inter.response.edit_message(
+            embed=discord.Embed(
+                title="🔒 Bereits erhalten",
+                description=f"**{tab} – {slot}** ist bereits als erhalten markiert.",
+                color=discord.Color.orange()
+            ),
+            view=NeedMainView(guild.id, user_id, tab)
+        )
+        return False
+
+    member = guild.get_member(user_id)
+    player_name = _profile_name(guild, user_id, member.display_name if member else "Unbekannt")
+    item_name = _item_name(guild.id, item_id, with_type=True)
+
     emb = discord.Embed(
-        title="🏷️ Auktion",
+        title="🎁 Item erhalten gemeldet",
         description=(
-            "Hier findest du alle aktuellen EC-Lootangebote.\n\n"
-            "**Need-Auktion**\n"
-            "Zeigt Auktionen, die aktuell nur für berechtigte Need-Spieler laufen.\n\n"
-            "**Freie Auktion**\n"
-            "Hier kannst du freie Auktionen auswählen und mit EC mitbieten.\n\n"
-            "**Sale-Kauf**\n"
-            "Hier kannst du Items direkt kaufen, die bald auslaufen oder günstiger verkauft werden."
+            f"**{player_name}** meldet ein Item als erhalten.\n\n"
+            f"**Bereich:** {tab}\n"
+            f"**Slot:** {slot}\n"
+            f"**Item:** {item_name}\n\n"
+            "Bitte bestätigen oder ablehnen."
         ),
         color=discord.Color.gold(),
-        timestamp=_now(),
+        timestamp=datetime.now(TZ)
     )
-    if user_id:
-        member = guild.get_member(int(user_id))
-        emb.add_field(name="🪙 Dein EC", value=f"**{_ec_balance(guild.id, int(user_id))} EC**", inline=True)
-        lock_text = _loot_lock_text_for_member(member)
-        if lock_text:
-            emb.add_field(
-                name="⏳ Lootsperre",
-                value=f"Neue Mitglieder können erst nach **{NEW_MEMBER_LOOT_LOCK_DAYS} Tagen** bieten/kaufen.\n{lock_text}",
-                inline=False,
-            )
-    emb.set_footer(text="Gebote und Käufe werden privat bestätigt. EC werden erst beim Kauf oder bei Übergabe abgebucht.")
-    return emb
+    emb.set_footer(text=_received_request_footer(guild.id, user_id, tab, slot))
 
-
-async def _portal_back_to_main(inter: discord.Interaction, guild_id: int, user_id: int):
     try:
-        try:
-            from bot import member_portal as mp  # type: ignore
-        except Exception:
-            import member_portal as mp  # type: ignore
-        guild = inter.client.get_guild(int(guild_id))
-        member = guild.get_member(int(user_id)) if guild else None
-        if guild and member and hasattr(mp, "_main_menu_embed") and hasattr(mp, "MemberPortalMainView"):
-            await inter.response.edit_message(embed=mp._main_menu_embed(guild, member), view=mp.MemberPortalMainView())  # type: ignore[attr-defined]
-            return
-    except Exception:
-        pass
-    await inter.response.edit_message(embed=discord.Embed(title="⚜️ Gildenzentrale", description="Öffne die Gildenzentrale bitte erneut über den Server-Button.", color=discord.Color.gold()), view=None)
+        await ch.send(embed=emb, view=ReceivedReportReviewView())
+    except Exception as e:
+        await inter.response.edit_message(
+            embed=discord.Embed(
+                title="❌ Meldung konnte nicht gesendet werden",
+                description=f"Fehler: `{e}`",
+                color=discord.Color.red()
+            ),
+            view=NeedMainView(guild.id, user_id, tab)
+        )
+        return False
+
+    await inter.response.edit_message(
+        embed=discord.Embed(
+            title="✅ Erhalten-Meldung gesendet",
+            description=(
+                f"Deine Meldung wurde an die Gildenleitung geschickt.\n\n"
+                f"**{tab} – {slot}:** {item_name}\n\n"
+                "Sobald die Gildenleitung bestätigt, wird das Item als ✅ Erhalten markiert."
+            ),
+            color=discord.Color.gold()
+        ),
+        view=NeedMainView(guild.id, user_id, tab)
+    )
+    return True
 
 
-class AuctionPortalMenuView(View):
-    def __init__(self, guild_id: int, user_id: int):
+async def _send_long_need_list(
+    inter: discord.Interaction,
+    guild: discord.Guild,
+    user_ids: list[int],
+    public: bool = False
+):
+    chunks: list[str] = []
+    current = ""
+
+    for uid in user_ids:
+        block = _format_need_user_full(guild, uid)
+
+        if len(current) + len(block) + 2 > 3800:
+            if current.strip():
+                chunks.append(current.strip())
+            current = block + "\n\n"
+        else:
+            current += block + "\n\n"
+
+    if current.strip():
+        chunks.append(current.strip())
+
+    if not chunks:
+        emb = discord.Embed(
+            title="🎁 Gesamte Needliste – ebolus",
+            description="Keine Needlisten gefunden.",
+            color=discord.Color.gold()
+        )
+        await _send_embed_response(inter, emb, public=public)
+        return
+
+    first = True
+
+    for i, chunk in enumerate(chunks, start=1):
+        emb = discord.Embed(
+            title="🎁 Gesamte Needliste – ebolus",
+            description=chunk,
+            color=discord.Color.gold()
+        )
+        emb.set_footer(text=f"Seite {i}/{len(chunks)}")
+
+        if first and not inter.response.is_done():
+            await inter.response.send_message(embed=emb, ephemeral=not public)
+            first = False
+        else:
+            await inter.followup.send(embed=emb, ephemeral=not public)
+
+
+async def open_need_menu(inter: discord.Interaction, guild_id: int, user_id: int):
+    guild = inter.client.get_guild(guild_id)
+
+    if not guild:
+        await inter.response.send_message("❌ Server nicht gefunden.")
+        return
+
+    _user_needs(guild_id, user_id)
+    save_needs()
+
+    await inter.response.edit_message(
+        embed=_need_embed(guild, user_id, "Main"),
+        view=NeedMainView(guild_id, user_id, "Main")
+    )
+
+
+class NeedMainView(View):
+    def __init__(self, guild_id: int, user_id: int, active_tab: str = "Main"):
         super().__init__(timeout=None)
         self.guild_id = int(guild_id)
         self.user_id = int(user_id)
+        self.active_tab = _normalize_tab(active_tab) or "Main"
+
+        # Sichtbar machen, welcher Bereich gerade offen ist.
+        # Vorher waren Main und Secondary beide grau, obwohl z. B. Main aktiv war.
         for child in self.children:
-            if isinstance(child, discord.ui.Button):
-                child.custom_id = f"portal_auction:{self.guild_id}:{self.user_id}:{child.custom_id or child.label}"
+            cid = getattr(child, "custom_id", "")
+            if cid == "need_show_main":
+                child.style = ButtonStyle.success if self.active_tab == "Main" else ButtonStyle.secondary
+                child.label = "⭐ Main ✓" if self.active_tab == "Main" else "⭐ Main"
+            elif cid == "need_show_secondary":
+                child.style = ButtonStyle.success if self.active_tab == "Secondary" else ButtonStyle.secondary
+                child.label = "🔁 Secondary ✓" if self.active_tab == "Secondary" else "🔁 Secondary"
 
-    @button(label="Need-Auktion", style=ButtonStyle.secondary, custom_id="need")
-    async def need(self, inter: discord.Interaction, btn: discord.ui.Button):
+    @button(label="⭐ Main", style=ButtonStyle.secondary, custom_id="need_show_main", row=0)
+    async def btn_show_main(self, inter: discord.Interaction, _):
         guild = inter.client.get_guild(self.guild_id)
-        if not guild:
-            await inter.response.send_message("❌ Server nicht gefunden.", ephemeral=True)
-            return
-        auctions = _active_need_auctions(self.guild_id)
-        emb = discord.Embed(title="🏷️ Need-Auktionen", color=discord.Color.gold(), timestamp=_now())
-        if not auctions:
-            emb.description = "Aktuell gibt es keine aktiven Need-Auktionen."
-            await inter.response.edit_message(embed=emb, view=AuctionPortalSubView(self.guild_id, self.user_id))
-            return
-        emb.description = "Wähle eine Need-Auktion aus. Main- und Second-Need werden nie gemischt; bieten können nur die jeweils berechtigten Spieler.\n\n" + "\n".join(_short_auction_line(a) for a in auctions[:20])
-        await inter.response.edit_message(embed=emb, view=AuctionSelectView(self.guild_id, self.user_id, "need"))
 
-    @button(label="Freie Auktion", style=ButtonStyle.primary, custom_id="free")
-    async def free(self, inter: discord.Interaction, btn: discord.ui.Button):
+        if not guild:
+            await inter.response.send_message("❌ Server nicht gefunden.")
+            return
+
+        await inter.response.edit_message(
+            embed=_need_embed(guild, self.user_id, "Main"),
+            view=NeedMainView(self.guild_id, self.user_id, "Main")
+        )
+
+    @button(label="🔁 Secondary", style=ButtonStyle.secondary, custom_id="need_show_secondary", row=0)
+    async def btn_show_secondary(self, inter: discord.Interaction, _):
         guild = inter.client.get_guild(self.guild_id)
+
         if not guild:
-            await inter.response.send_message("❌ Server nicht gefunden.", ephemeral=True)
+            await inter.response.send_message("❌ Server nicht gefunden.")
             return
-        auctions = _active_free_auctions(self.guild_id)
-        emb = discord.Embed(title="⚖️ Freie Auktionen", color=discord.Color.gold(), timestamp=_now())
-        if not auctions:
-            emb.description = "Aktuell gibt es keine freien Auktionen."
-            await inter.response.edit_message(embed=emb, view=AuctionPortalSubView(self.guild_id, self.user_id))
-            return
-        emb.description = "Wähle eine freie Auktion aus, um mitzubieten.\n\n" + "\n".join(_short_auction_line(a) for a in auctions[:20])
-        await inter.response.edit_message(embed=emb, view=AuctionSelectView(self.guild_id, self.user_id, "free"))
 
-    @button(label="Sale-Kauf", style=ButtonStyle.success, custom_id="sale")
-    async def sale(self, inter: discord.Interaction, btn: discord.ui.Button):
-        guild = inter.client.get_guild(self.guild_id)
-        if not guild:
-            await inter.response.send_message("❌ Server nicht gefunden.", ephemeral=True)
-            return
-        sales = _active_sale_items(self.guild_id)
-        emb = discord.Embed(title="🛒 Sale-Kauf", color=discord.Color.gold(), timestamp=_now())
-        if not sales:
-            emb.description = "Aktuell gibt es keine Sale-Käufe."
-            await inter.response.edit_message(embed=emb, view=AuctionPortalSubView(self.guild_id, self.user_id))
-            return
-        emb.description = "Wähle ein Sale-Item aus, um es direkt mit EC zu kaufen.\n\n" + "\n".join(_short_auction_line(a) for a in sales[:20])
-        await inter.response.edit_message(embed=emb, view=AuctionSelectView(self.guild_id, self.user_id, "sale"))
+        await inter.response.edit_message(
+            embed=_need_embed(guild, self.user_id, "Secondary"),
+            view=NeedMainView(self.guild_id, self.user_id, "Secondary")
+        )
 
-    @button(label="Zurück", style=ButtonStyle.secondary, custom_id="back")
-    async def back(self, inter: discord.Interaction, btn: discord.ui.Button):
-        await _portal_back_to_main(inter, self.guild_id, self.user_id)
+    @button(label="➕ Item setzen", style=ButtonStyle.secondary, custom_id="need_add_item", row=1)
+    async def btn_add_item(self, inter: discord.Interaction, _):
+        tab = self.active_tab
+        emb = discord.Embed(
+            title="🎁 Needliste – Item setzen",
+            description=f"Bereich: **{tab}**\n\nWähle den Slot, den du setzen möchtest.",
+            color=discord.Color.gold()
+        )
+
+        await inter.response.edit_message(
+            embed=emb,
+            view=NeedSlotSelectView(self.guild_id, self.user_id, "set", tab)
+        )
+
+    @button(label="🗑️ Item entfernen", style=ButtonStyle.secondary, custom_id="need_remove_item", row=1)
+    async def btn_remove_item(self, inter: discord.Interaction, _):
+        tab = self.active_tab
+        emb = discord.Embed(
+            title="🎁 Needliste – Item entfernen",
+            description=(
+                f"Bereich: **{tab}**\n\n"
+                "Wähle den Slot, den du entfernen möchtest.\n"
+                "Erhaltene Slots können nur durch die Gildenleitung geändert werden."
+            ),
+            color=discord.Color.gold()
+        )
+
+        await inter.response.edit_message(
+            embed=emb,
+            view=NeedSlotSelectView(self.guild_id, self.user_id, "clear", tab)
+        )
+
+    @button(label="✅ Erhalten melden", style=ButtonStyle.secondary, custom_id="need_report_received", row=2)
+    async def btn_report_received(self, inter: discord.Interaction, _):
+        tab = self.active_tab
+        emb = discord.Embed(
+            title="🎁 Item erhalten melden",
+            description=(
+                f"Bereich: **{tab}**\n\n"
+                "Wähle den Slot, den du als erhalten melden möchtest.\n"
+                "Die Meldung geht zur Gildenleitung und wird erst nach Bestätigung übernommen."
+            ),
+            color=discord.Color.gold()
+        )
+
+        await inter.response.edit_message(
+            embed=emb,
+            view=NeedSlotSelectView(self.guild_id, self.user_id, "report_received", tab)
+        )
+
+    @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="need_back_portal", row=3)
+    async def btn_back(self, inter: discord.Interaction, _):
+        try:
+            try:
+                from bot.member_portal import ensure_portal_menu_for_user  # type: ignore
+            except ModuleNotFoundError:
+                from member_portal import ensure_portal_menu_for_user  # type: ignore
+
+            await inter.response.defer()
+            await ensure_portal_menu_for_user(inter.client, self.guild_id, self.user_id, force_view="main")
+        except Exception:
+            emb = discord.Embed(
+                title="⚜️ Ebolus Gildenzentrale",
+                description="Zurück zur Gildenzentrale.",
+                color=discord.Color.gold()
+            )
+            await inter.response.edit_message(embed=emb, view=None)
 
 
-class AuctionPortalSubView(View):
-    def __init__(self, guild_id: int, user_id: int):
+class NeedTabSelectView(View):
+    def __init__(self, guild_id: int, user_id: int, action: str):
         super().__init__(timeout=None)
         self.guild_id = int(guild_id)
         self.user_id = int(user_id)
+        self.action = action
+        self.add_item(NeedTabSelect(guild_id, user_id, action))
 
-    @button(label="Zurück zu Auktion", style=ButtonStyle.secondary, custom_id="portal_auc_sub_back_auction")
-    async def back_auction(self, inter: discord.Interaction, btn: discord.ui.Button):
+    @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="need_tab_back")
+    async def btn_back(self, inter: discord.Interaction, _):
         guild = inter.client.get_guild(self.guild_id)
+
         if not guild:
-            await inter.response.send_message("❌ Server nicht gefunden.", ephemeral=True)
+            await inter.response.send_message("❌ Server nicht gefunden.")
             return
-        await inter.response.edit_message(embed=_auction_portal_embed(guild, self.user_id), view=AuctionPortalMenuView(self.guild_id, self.user_id))
 
-    @button(label="Gildenzentrale", style=ButtonStyle.secondary, custom_id="portal_auc_sub_back_main")
-    async def back_main(self, inter: discord.Interaction, btn: discord.ui.Button):
-        await _portal_back_to_main(inter, self.guild_id, self.user_id)
+        await inter.response.edit_message(
+            embed=_need_embed(guild, self.user_id, "Main"),
+            view=NeedMainView(self.guild_id, self.user_id, "Main")
+        )
 
 
-class AuctionSelect(discord.ui.Select):
-    def __init__(self, guild_id: int, user_id: int, mode: str):
+class NeedTabSelect(Select):
+    def __init__(self, guild_id: int, user_id: int, action: str):
         self.guild_id = int(guild_id)
         self.user_id = int(user_id)
-        self.mode = str(mode)
-        auctions = _active_sale_items(guild_id) if mode == "sale" else (_active_need_auctions(guild_id) if mode == "need" else _active_free_auctions(guild_id))
-        options = []
-        for a in auctions[:25]:
-            end_dt = _parse_dt(str(a.get("ends_at", "") or ""))
-            when = end_dt.strftime("%d.%m. %H:%M") if end_dt else "?"
-            if mode == "sale":
-                price = int(a.get("fixed_price", a.get("start_bid", 0)) or 0)
-                if _is_junk_interest_sale(a):
-                    until = _junk_interest_until(a)
-                    if _junk_interest_open(a) and until:
-                        desc = f"Würfeln bis {until.strftime('%d.%m. %H:%M')}"
-                    else:
-                        desc = "Gratis-Sofortkauf • offen"
-                else:
-                    desc = f"Direktkauf {price} EC • bis {when}"
-            else:
-                top = _highest_bid(a)
-                bid = f"{int(top.get('amount',0) or 0)} EC" if top else "noch kein Gebot"
-                desc = f"{bid} • bis {when}"
-            options.append(discord.SelectOption(label=str(a.get("item_name", "Item"))[:100], value=str(a.get("id")), description=desc[:100]))
-        if not options:
-            options.append(discord.SelectOption(label="Keine Einträge", value="none", description="Aktuell nichts vorhanden"))
+        self.action = action
+
+        options = [
+            discord.SelectOption(label="Main", value="Main", description="Main-Needliste"),
+            discord.SelectOption(label="Secondary", value="Secondary", description="Secondary-Needliste"),
+        ]
+
         super().__init__(
-            placeholder=("Need-Auktion auswählen …" if mode == "need" else ("Auktion auswählen …" if mode != "sale" else "Sale-Item auswählen …")),
+            placeholder="Bereich wählen",
             min_values=1,
             max_values=1,
             options=options,
-            custom_id=f"portal_auc_select_{self.mode}",
+            custom_id=f"need_tab_select_{action}"
         )
 
     async def callback(self, inter: discord.Interaction):
-        if self.values[0] == "none":
-            await inter.response.send_message("Aktuell gibt es hier nichts auszuwählen.", ephemeral=True)
-            return
-        guild = inter.client.get_guild(self.guild_id)
-        if not guild:
-            await inter.response.send_message("❌ Server nicht gefunden.", ephemeral=True)
-            return
-        aid = self.values[0]
-        auc = _auction(self.guild_id, aid)
-        if not auc:
-            await inter.response.send_message("❌ Auktion nicht gefunden.", ephemeral=True)
-            return
-        if self.mode == "sale":
-            await inter.response.edit_message(embed=_sale_embed(guild, auc), view=PortalSaleBuyView(self.guild_id, self.user_id, aid))
+        tab = self.values[0]
+        if self.action == "set":
+            action_text = "Item setzen"
+        elif self.action == "clear":
+            action_text = "Item entfernen"
+        elif self.action == "report_received":
+            action_text = "Item erhalten melden"
         else:
-            await inter.response.edit_message(embed=_auction_embed(guild, auc), view=PortalAuctionBidView(self.guild_id, self.user_id, aid))
+            action_text = "Aktion auswählen"
+
+        emb = discord.Embed(
+            title="🎁 Needliste – Slot wählen",
+            description=f"Bereich: **{tab}**\nAktion: **{action_text}**",
+            color=discord.Color.gold()
+        )
+
+        await inter.response.edit_message(
+            embed=emb,
+            view=NeedSlotSelectView(self.guild_id, self.user_id, self.action, tab)
+        )
 
 
-class AuctionSelectView(View):
-    def __init__(self, guild_id: int, user_id: int, mode: str):
+class NeedSlotSelectView(View):
+    def __init__(self, guild_id: int, user_id: int, action: str, tab: str):
         super().__init__(timeout=None)
         self.guild_id = int(guild_id)
         self.user_id = int(user_id)
-        self.mode = str(mode)
-        self.add_item(AuctionSelect(self.guild_id, self.user_id, self.mode))
+        self.action = action
+        self.tab = tab
+        self.add_item(NeedSlotSelect(guild_id, user_id, action, tab))
 
-    @button(label="Zurück zu Auktion", style=ButtonStyle.secondary, custom_id="portal_auc_select_back_auction")
-    async def back_auction(self, inter: discord.Interaction, btn: discord.ui.Button):
+    @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="need_slot_back")
+    async def btn_back(self, inter: discord.Interaction, _):
         guild = inter.client.get_guild(self.guild_id)
+
         if not guild:
-            await inter.response.send_message("❌ Server nicht gefunden.", ephemeral=True)
+            await inter.response.send_message("❌ Server nicht gefunden.")
             return
-        await inter.response.edit_message(embed=_auction_portal_embed(guild, self.user_id), view=AuctionPortalMenuView(self.guild_id, self.user_id))
 
-
-def _sale_embed(guild: discord.Guild, auction: dict) -> discord.Embed:
-    end_dt = _parse_dt(str(auction.get("ends_at", "") or ""))
-    price = int(auction.get("fixed_price", auction.get("start_bid", 0)) or 0)
-    price_text = "**Gratis**" if price <= 0 else f"**{price} EC**"
-    item = str(auction.get("item_name", "Item") or "Item")
-    status = str(auction.get("status", "active") or "active")
-
-    if status == "delivered":
-        buyer = int(auction.get("sold_to", 0) or auction.get("delivered_to", 0) or 0)
-        if bool(auction.get("junk_drop", False)) and (auction.get("junk_roll_winner_id") or auction.get("junk_lottery_winner_id")):
-            roll = int(auction.get("junk_roll_winner_roll", 0) or 0)
-            desc = f"**Item:** {item}\n**Empfänger:** <@{buyer}>\n**Gewinnerwurf:** **{roll}**\n**Preis:** {price_text}"
-            emb = discord.Embed(title=f"✅ Müll-Item Roll abgeschlossen: {item}", description=desc, color=discord.Color.green(), timestamp=_now())
-            return _add_junk_roll_fields(emb, auction)
-        emb = discord.Embed(
-            title=f"✅ Sale-Kauf abgeschlossen: {item}",
-            description=f"**Item:** {item}\n**Empfänger:** <@{buyer}>\n**Preis:** {price_text}",
-            color=discord.Color.green(),
-            timestamp=_now(),
-        )
-        return emb
-    if status == "expired":
-        return discord.Embed(
-            title=f"⌛ Sale-Kauf abgelaufen: {item}",
-            description=f"**Item:** {item}\nDas Item wurde nicht gekauft und ist nicht mehr verfügbar.",
-            color=discord.Color.dark_grey(),
-            timestamp=_now(),
-        )
-    if status == "cancelled":
-        return discord.Embed(
-            title=f"❌ Sale-Kauf abgebrochen: {item}",
-            description=f"**Item:** {item}\nDieses Angebot wurde beendet.",
-            color=discord.Color.red(),
-            timestamp=_now(),
+        await inter.response.edit_message(
+            embed=_need_embed(guild, self.user_id, self.tab),
+            view=NeedMainView(self.guild_id, self.user_id, self.tab)
         )
 
-    if _is_junk_interest_sale(auction):
-        until = _junk_roll_until(auction)
-        if _junk_roll_open(auction) and until:
-            desc = (
-                f"**Item:** {item}\n"
-                f"**Ende:** {until.strftime('%d.%m.%Y %H:%M')}\n\n"
-                "**Status:** Würfelphase\n\n"
-                f"**Aktuell vorne:**\n{_junk_roll_summary(auction)}"
+
+class NeedSlotSelect(Select):
+    def __init__(self, guild_id: int, user_id: int, action: str, tab: str):
+        self.guild_id = int(guild_id)
+        self.user_id = int(user_id)
+        self.action = action
+        self.tab = tab
+
+        options = [
+            discord.SelectOption(label=slot, value=slot)
+            for slot in NEED_SLOTS
+        ]
+
+        super().__init__(
+            placeholder="Slot wählen",
+            min_values=1,
+            max_values=1,
+            options=options,
+            custom_id=f"need_slot_select_{action}"
+        )
+
+    async def callback(self, inter: discord.Interaction):
+        need_slot = self.values[0]
+        data = _user_needs(self.guild_id, self.user_id)
+        current_slot = _slot_obj(data.get(self.tab, {}).get(need_slot))
+
+        if bool(current_slot.get("received", False)):
+            guild = inter.client.get_guild(self.guild_id)
+            item_name = _item_name(self.guild_id, str(current_slot.get("item_id", "") or ""), with_type=True)
+
+            emb = discord.Embed(
+                title="🔒 Slot gesperrt",
+                description=(
+                    f"Der Slot **{self.tab} – {need_slot}** ist bereits als erhalten markiert.\n\n"
+                    f"Item: **{item_name}** ✅ Erhalten\n\n"
+                    "Diesen Slot kann nur die Gildenleitung wieder freigeben."
+                ),
+                color=discord.Color.orange()
             )
-            emb = discord.Embed(title="🧹 Müll-Item im Gratis-Roll", description=desc, color=discord.Color.green(), timestamp=_now())
-            return _add_junk_roll_fields(emb, auction)
-        desc = (
-            f"**Item:** {item}\n\n"
-            "**Status:** Gratis-Sofortkauf\n\n"
-            "Es hat niemand gewürfelt.\n"
-            "Der erste Spieler, der es nimmt, bekommt es direkt."
+
+            await inter.response.edit_message(
+                embed=emb,
+                view=NeedMainView(self.guild_id, self.user_id, self.tab)
+            )
+            return
+
+        if self.action == "clear":
+            _clear_slot_item(data, self.tab, need_slot)
+            save_needs()
+
+            guild = inter.client.get_guild(self.guild_id)
+
+            if guild:
+                await inter.response.edit_message(
+                    embed=_need_embed(guild, self.user_id, self.tab),
+                    view=NeedMainView(self.guild_id, self.user_id, self.tab)
+                )
+            else:
+                await inter.response.send_message("✅ Eintrag entfernt.")
+            return
+
+        if self.action == "report_received":
+            guild = inter.client.get_guild(self.guild_id)
+
+            if not guild:
+                await inter.response.send_message("❌ Server nicht gefunden.")
+                return
+
+            item_id = str(current_slot.get("item_id", "") or "")
+
+            if not item_id:
+                await inter.response.edit_message(
+                    embed=discord.Embed(
+                        title="❌ Kein Item eingetragen",
+                        description=f"In **{self.tab} – {need_slot}** ist aktuell kein Item eingetragen.",
+                        color=discord.Color.orange()
+                    ),
+                    view=NeedMainView(self.guild_id, self.user_id, self.tab)
+                )
+                return
+
+            await _send_received_request(inter, guild, self.user_id, self.tab, need_slot)
+            return
+
+        if _catalog_slot_for_need_slot(need_slot) == "Waffe":
+            emb = discord.Embed(
+                title="🎁 Needliste – Waffentyp wählen",
+                description=(
+                    f"Bereich: **{self.tab}**\n"
+                    f"Slot: **{need_slot}**\n\n"
+                    "Wähle zuerst den Waffentyp."
+                ),
+                color=discord.Color.gold()
+            )
+
+            await inter.response.edit_message(
+                embed=emb,
+                view=NeedWeaponTypeSelectView(self.guild_id, self.user_id, self.tab, need_slot)
+            )
+            return
+
+        items = _items_for_need_slot(self.guild_id, need_slot)
+
+        if not items:
+            catalog_slot = _catalog_slot_for_need_slot(need_slot)
+
+            emb = discord.Embed(
+                title="🎁 Needliste – kein Item hinterlegt",
+                description=(
+                    f"Für den Slot **{need_slot}** gibt es noch keine passenden Items im Katalog.\n\n"
+                    f"Ein Leader muss zuerst ein Item hinzufügen:\n"
+                    f"`/loot_item_add slot:{catalog_slot} name:Itemname`"
+                ),
+                color=discord.Color.orange()
+            )
+
+            await inter.response.edit_message(
+                embed=emb,
+                view=NeedMainView(self.guild_id, self.user_id, self.tab)
+            )
+            return
+
+        emb = discord.Embed(
+            title="🎁 Needliste – Item wählen",
+            description=(
+                f"Bereich: **{self.tab}**\n"
+                f"Slot: **{need_slot}**\n"
+                f"Item-Katalog: **{_catalog_slot_for_need_slot(need_slot)}**\n\n"
+                f"Wähle ein Item aus dem Katalog."
+            ),
+            color=discord.Color.gold()
         )
-        return discord.Embed(title="🛒 Müll-Item jetzt im Gratis-Sofortkauf", description=desc, color=discord.Color.green(), timestamp=_now())
 
-    buy_note = "Dieses Item ist kostenlos. Beim Kauf werden keine EC abgebucht." if price <= 0 else "Beim Kauf werden die EC sofort abgebucht."
-    emb = discord.Embed(
-        title=f"🛒 Sale-Kauf: {item}",
-        description=(
-            f"Preis: {price_text}\n"
-            f"Verfügbar bis: **{end_dt.strftime('%d.%m.%Y %H:%M') if end_dt else '?'}**\n\n"
-            f"{buy_note}"
-        ),
-        color=discord.Color.green(),
-        timestamp=_now(),
-    )
-    return emb
+        await inter.response.edit_message(
+            embed=emb,
+            view=NeedItemSelectView(self.guild_id, self.user_id, self.tab, need_slot)
+        )
 
 
-async def _handle_junk_sale_click(inter: discord.Interaction, guild_id: int, auction_id: str, guild: discord.Guild, auc: dict, user_id: int) -> None:
-    until = _junk_roll_until(auc)
+class NeedWeaponTypeSelectView(View):
+    def __init__(self, guild_id: int, user_id: int, tab: str, need_slot: str):
+        super().__init__(timeout=None)
+        self.guild_id = int(guild_id)
+        self.user_id = int(user_id)
+        self.tab = tab
+        self.need_slot = need_slot
+        self.add_item(NeedWeaponTypeSelect(guild_id, user_id, tab, need_slot))
 
-    if until and _now() < until and not auc.get("junk_roll_processed_at") and not auc.get("junk_interest_processed_at"):
-        rolls = _junk_rolls(auc)
-        existing = rolls.get(str(int(user_id)))
+    @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="need_weapon_type_back")
+    async def btn_back(self, inter: discord.Interaction, _):
+        emb = discord.Embed(
+            title="🎁 Needliste – Slot wählen",
+            description=f"Bereich: **{self.tab}**",
+            color=discord.Color.gold()
+        )
+
+        await inter.response.edit_message(
+            embed=emb,
+            view=NeedSlotSelectView(self.guild_id, self.user_id, "set", self.tab)
+        )
+
+
+class NeedWeaponTypeSelect(Select):
+    def __init__(self, guild_id: int, user_id: int, tab: str, need_slot: str):
+        self.guild_id = int(guild_id)
+        self.user_id = int(user_id)
+        self.tab = tab
+        self.need_slot = need_slot
+
+        options = [
+            discord.SelectOption(label=w, value=w)
+            for w in WEAPON_TYPES
+        ]
+
+        super().__init__(
+            placeholder="Waffentyp wählen",
+            min_values=1,
+            max_values=1,
+            options=options,
+            custom_id="need_weapon_type_select"
+        )
+
+    async def callback(self, inter: discord.Interaction):
+        weapon_type = self.values[0]
+        items = _items_for_need_slot(self.guild_id, self.need_slot, weapon_type=weapon_type)
+
+        if not items:
+            emb = discord.Embed(
+                title="🎁 Needliste – kein Item hinterlegt",
+                description=(
+                    f"Für **{weapon_type}** gibt es noch keine Waffen im Katalog.\n\n"
+                    f"Ein Leader muss zuerst ein Item hinzufügen:\n"
+                    f"`/loot_item_add slot:Waffe weapon_type:{weapon_type} name:Itemname`"
+                ),
+                color=discord.Color.orange()
+            )
+
+            await inter.response.edit_message(
+                embed=emb,
+                view=NeedWeaponTypeSelectView(self.guild_id, self.user_id, self.tab, self.need_slot)
+            )
+            return
+
+        emb = discord.Embed(
+            title="🎁 Needliste – Waffe wählen",
+            description=(
+                f"Bereich: **{self.tab}**\n"
+                f"Slot: **{self.need_slot}**\n"
+                f"Waffentyp: **{weapon_type}**\n\n"
+                "Wähle eine Waffe aus dem Katalog."
+            ),
+            color=discord.Color.gold()
+        )
+
+        await inter.response.edit_message(
+            embed=emb,
+            view=NeedItemSelectView(self.guild_id, self.user_id, self.tab, self.need_slot, weapon_type=weapon_type)
+        )
+
+
+class NeedItemSelectView(View):
+    def __init__(self, guild_id: int, user_id: int, tab: str, need_slot: str, weapon_type: str | None = None):
+        super().__init__(timeout=None)
+        self.guild_id = int(guild_id)
+        self.user_id = int(user_id)
+        self.tab = tab
+        self.need_slot = need_slot
+        self.weapon_type = weapon_type
+        self.add_item(NeedItemSelect(guild_id, user_id, tab, need_slot, weapon_type=weapon_type))
+
+    @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="need_item_back")
+    async def btn_back(self, inter: discord.Interaction, _):
+        if _catalog_slot_for_need_slot(self.need_slot) == "Waffe":
+            emb = discord.Embed(
+                title="🎁 Needliste – Waffentyp wählen",
+                description=(
+                    f"Bereich: **{self.tab}**\n"
+                    f"Slot: **{self.need_slot}**"
+                ),
+                color=discord.Color.gold()
+            )
+
+            await inter.response.edit_message(
+                embed=emb,
+                view=NeedWeaponTypeSelectView(self.guild_id, self.user_id, self.tab, self.need_slot)
+            )
+            return
+
+        emb = discord.Embed(
+            title="🎁 Needliste – Slot wählen",
+            description=f"Bereich: **{self.tab}**",
+            color=discord.Color.gold()
+        )
+
+        await inter.response.edit_message(
+            embed=emb,
+            view=NeedSlotSelectView(self.guild_id, self.user_id, "set", self.tab)
+        )
+
+
+class NeedItemSelect(Select):
+    def __init__(self, guild_id: int, user_id: int, tab: str, need_slot: str, weapon_type: str | None = None):
+        self.guild_id = int(guild_id)
+        self.user_id = int(user_id)
+        self.tab = tab
+        self.need_slot = need_slot
+        self.weapon_type = weapon_type
+
+        items = _items_for_need_slot(guild_id, need_slot, weapon_type=weapon_type)[:25]
+
+        options = [
+            discord.SelectOption(
+                label=str(item.get("name", item["id"]))[:100],
+                value=str(item["id"])[:100],
+                description=str(item.get("weapon_type", "") or item.get("slot", ""))[:100]
+            )
+            for item in items
+        ]
+
+        super().__init__(
+            placeholder="Item wählen",
+            min_values=1,
+            max_values=1,
+            options=options,
+            custom_id="need_item_select"
+        )
+
+    async def callback(self, inter: discord.Interaction):
+        item_id = self.values[0]
+        data = _user_needs(self.guild_id, self.user_id)
+
+        current_slot = _slot_obj(data.get(self.tab, {}).get(self.need_slot))
+
+        if bool(current_slot.get("received", False)):
+            emb = discord.Embed(
+                title="🔒 Slot gesperrt",
+                description="Dieser Slot ist bereits als erhalten markiert und kann nur durch die Gildenleitung geändert werden.",
+                color=discord.Color.orange()
+            )
+
+            await inter.response.edit_message(
+                embed=emb,
+                view=NeedMainView(self.guild_id, self.user_id, self.tab)
+            )
+            return
+
+        _set_slot_item(data, self.tab, self.need_slot, item_id)
+        save_needs()
+
+        guild = inter.client.get_guild(self.guild_id)
+
+        if not guild:
+            await inter.response.send_message("✅ Need gespeichert.")
+            return
+
+        await inter.response.edit_message(
+            embed=_need_embed(guild, self.user_id, self.tab),
+            view=NeedMainView(self.guild_id, self.user_id, self.tab)
+        )
+
+
+class ReceivedReportReviewView(View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    def _get_request_data(self, inter: discord.Interaction) -> Optional[tuple[int, int, str, str]]:
+        try:
+            if not inter.message or not inter.message.embeds:
+                return None
+
+            footer = inter.message.embeds[0].footer.text or ""
+            return _parse_received_request_footer(footer)
+        except Exception:
+            return None
+
+    @button(label="✅ Bestätigen", style=ButtonStyle.success, custom_id="loot_received_confirm")
+    async def btn_confirm(self, inter: discord.Interaction, _):
+        data = self._get_request_data(inter)
+
+        if not data:
+            await inter.response.send_message("❌ Diese Meldung konnte nicht gelesen werden.", ephemeral=True)
+            return
+
+        guild_id, user_id, tab, slot = data
+
+        if inter.guild is None or inter.guild.id != guild_id:
+            await inter.response.send_message("❌ Falscher Server.", ephemeral=True)
+            return
+
+        if not _is_leader_or_admin(inter):
+            await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
+            return
+
+        guild = inter.guild
+        needs = _user_needs(guild.id, user_id)
+        slot_data = _slot_obj(needs.get(tab, {}).get(slot))
+        item_id = str(slot_data.get("item_id", "") or "")
+
+        if not item_id:
+            await inter.response.send_message("❌ Der Spieler hat in diesem Slot kein Item mehr eingetragen.", ephemeral=True)
+            return
+
+        item_name = _item_name(guild.id, item_id, with_type=True)
+
+        if bool(slot_data.get("received", False)):
+            await inter.response.send_message("ℹ️ Dieses Item ist bereits als erhalten markiert.", ephemeral=True)
+            return
+
+        _mark_slot_received(needs, tab, slot, inter.user.id)
+        save_needs()
+
+        member = guild.get_member(user_id)
+        player_name = _profile_name(guild, user_id, member.display_name if member else "Unbekannt")
+
+        emb = discord.Embed(
+            title="✅ Item erhalten bestätigt",
+            description=(
+                f"**{player_name}** wurde bestätigt.\n\n"
+                f"**Bereich:** {tab}\n"
+                f"**Slot:** {slot}\n"
+                f"**Item:** {item_name} ✅ Erhalten\n\n"
+                f"Bestätigt von: {inter.user.mention}"
+            ),
+            color=discord.Color.green(),
+            timestamp=datetime.now(TZ)
+        )
+        emb.set_footer(text=f"Bestätigt am {datetime.now(TZ).strftime('%d.%m.%Y %H:%M')}")
+
+        try:
+            if member:
+                await member.send(
+                    f"✅ Deine Meldung wurde bestätigt.\n"
+                    f"**{tab} – {slot}:** {item_name} ✅ Erhalten\n\n"
+                    f"Das Item bleibt in deiner Needliste sichtbar, zählt aber nicht mehr als offener Need."
+                )
+        except Exception:
+            pass
+
+        await inter.response.edit_message(embed=emb, view=None)
+
+    @button(label="❌ Ablehnen", style=ButtonStyle.danger, custom_id="loot_received_deny")
+    async def btn_deny(self, inter: discord.Interaction, _):
+        data = self._get_request_data(inter)
+
+        if not data:
+            await inter.response.send_message("❌ Diese Meldung konnte nicht gelesen werden.", ephemeral=True)
+            return
+
+        guild_id, user_id, tab, slot = data
+
+        if inter.guild is None or inter.guild.id != guild_id:
+            await inter.response.send_message("❌ Falscher Server.", ephemeral=True)
+            return
+
+        if not _is_leader_or_admin(inter):
+            await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
+            return
+
+        guild = inter.guild
+        needs = _user_needs(guild.id, user_id)
+        slot_data = _slot_obj(needs.get(tab, {}).get(slot))
+        item_id = str(slot_data.get("item_id", "") or "")
+        item_name = _item_name(guild.id, item_id, with_type=True) if item_id else "—"
+
+        member = guild.get_member(user_id)
+        player_name = _profile_name(guild, user_id, member.display_name if member else "Unbekannt")
+
+        emb = discord.Embed(
+            title="❌ Item-erhalten-Meldung abgelehnt",
+            description=(
+                f"Die Meldung von **{player_name}** wurde abgelehnt.\n\n"
+                f"**Bereich:** {tab}\n"
+                f"**Slot:** {slot}\n"
+                f"**Item:** {item_name}\n\n"
+                f"Abgelehnt von: {inter.user.mention}"
+            ),
+            color=discord.Color.red(),
+            timestamp=datetime.now(TZ)
+        )
+        emb.set_footer(text=f"Abgelehnt am {datetime.now(TZ).strftime('%d.%m.%Y %H:%M')}")
+
+        try:
+            if member:
+                await member.send(
+                    f"❌ Deine Item-erhalten-Meldung wurde abgelehnt.\n"
+                    f"**{tab} – {slot}:** {item_name}\n\n"
+                    f"Deine Needliste wurde nicht geändert."
+                )
+        except Exception:
+            pass
+
+        await inter.response.edit_message(embed=emb, view=None)
+
+
+def _catalog_slot_choices():
+    return [
+        app_commands.Choice(name=s, value=s)
+        for s in CATALOG_SLOTS
+    ]
+
+
+def _weapon_type_choices():
+    return [
+        app_commands.Choice(name=s, value=s)
+        for s in WEAPON_TYPES
+    ]
+
+
+def _tab_choices():
+    return [
+        app_commands.Choice(name=s, value=s)
+        for s in TABS
+    ]
+
+
+def _need_slot_choices():
+    return [
+        app_commands.Choice(name=s, value=s)
+        for s in NEED_SLOTS
+    ]
+
+
+async def _post_auto_event_summary(client: discord.Client, msg_id: str, obj: dict) -> bool:
+    try:
+        guild_id = int(obj.get("guild_id", 0) or 0)
+
+        if not guild_id:
+            return False
+
+        guild = client.get_guild(guild_id)
+
+        if not guild:
+            return False
+
+        c = _gcfg(guild_id)
+        ch_id = int(c.get("leader_channel_id", 0) or 0)
+
+        if not ch_id:
+            leader_cfg = _load_leader_cfg()
+            lc = leader_cfg.get(str(guild_id)) or {}
+            ch_id = int(lc.get("internal_channel_id", 0) or 0)
+
+        if not ch_id:
+            return False
+
+        ch = guild.get_channel(ch_id)
+
+        if not isinstance(ch, (discord.TextChannel, discord.Thread)):
+            return False
+
+        user_ids = _event_participant_ids(obj)
+
+        if not user_ids:
+            emb = discord.Embed(
+                title="🎯 Waffenbedarf – Gildenbosse",
+                description=f"Event: **{obj.get('title', 'Event')}**\nKeine angemeldeten Teilnehmer gefunden.",
+                color=discord.Color.orange()
+            )
+        else:
+            emb = _weapon_summary_embed(
+                guild,
+                user_ids,
+                title="🎯 Waffenbedarf – Gildenbosse",
+                subtitle=(
+                    f"Event: **{obj.get('title', 'Event')}**\n"
+                    f"Quelle: Event-Anmeldung\n"
+                    f"Teilnehmer: **{len(user_ids)}**"
+                )
+            )
+
+        await ch.send(embed=emb)
+        return True
+
+    except Exception as e:
+        print(f"[loot_needs] Auto-Post Fehler: {e!r}")
+        return False
+
+
+def _event_matches_auto(obj: dict) -> bool:
+    title = str(obj.get("title", "") or "").lower()
+    guild_id = int(obj.get("guild_id", 0) or 0)
+    keywords = (_gcfg(guild_id).get("title_keywords") or GILDENBOSS_KEYWORDS)
+
+    return any(str(k).lower() in title for k in keywords)
+
+
+@tasks.loop(minutes=1)
+async def auto_loot_need_eventstart():
+    if _client_ref is None:
+        return
+
+    try:
+        try:
+            from bot.event_rsvp_dm import store as event_store  # type: ignore
+        except ModuleNotFoundError:
+            from event_rsvp_dm import store as event_store  # type: ignore
+
+        now = datetime.now(TZ)
+
+        for msg_id, obj in list(event_store.items()):
+            try:
+                guild_id = int(obj.get("guild_id", 0) or 0)
+
+                if not guild_id:
+                    continue
+
+                c = _gcfg(guild_id)
+
+                if not bool(c.get("auto_enabled", True)):
+                    continue
+
+                if not _event_matches_auto(obj):
+                    continue
+
+                state = _gstate(guild_id)
+                posted = state.setdefault("posted_events", {})
+
+                if str(msg_id) in posted:
+                    continue
+
+                when = datetime.fromisoformat(obj.get("when_iso"))
+
+                if now < when:
+                    continue
+
+                ok = await _post_auto_event_summary(_client_ref, str(msg_id), obj)
+
+                if ok:
+                    posted[str(msg_id)] = _now_iso()
+                    save_state()
+
+            except Exception as e:
+                print(f"[loot_needs] Auto-Loop Event Fehler: {e!r}")
+
+    except Exception as e:
+        print(f"[loot_needs] Auto-Loop Fehler: {e!r}")
+
+
+async def setup_loot_needs(client: discord.Client, tree: app_commands.CommandTree):
+    global _client_ref
+    _client_ref = client
+
+    try:
+        client.add_view(ReceivedReportReviewView())
+    except Exception:
+        pass
+
+    if not auto_loot_need_eventstart.is_running():
+        auto_loot_need_eventstart.start()
+        print("🎁 Loot-Need Auto-Task gestartet.")
+
+    @tree.command(name="loot_set_leader_channel", description="(Leader) Kanal für automatische Loot-/Need-Übersichten setzen")
+    async def loot_set_leader_channel(inter: discord.Interaction, channel: discord.TextChannel):
+        if inter.guild is None:
+            await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
+            return
+
+        if not _is_leader_or_admin(inter):
+            await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
+            return
+
+        c = _gcfg(inter.guild.id)
+        c["leader_channel_id"] = int(channel.id)
+        loot_cfg[str(inter.guild.id)] = c
+        save_cfg()
+
+        await inter.response.send_message(
+            f"✅ Loot-/Need-Channel gesetzt: {channel.mention}",
+            ephemeral=True
+        )
+
+    @tree.command(name="loot_item_add", description="(Leader) Item zum Need-Katalog hinzufügen")
+    @app_commands.choices(slot=_catalog_slot_choices(), weapon_type=_weapon_type_choices())
+    async def loot_item_add(
+        inter: discord.Interaction,
+        slot: app_commands.Choice[str],
+        name: str,
+        weapon_type: Optional[app_commands.Choice[str]] = None
+    ):
+        if inter.guild is None:
+            await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
+            return
+
+        if not _is_leader_or_admin(inter):
+            await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
+            return
+
+        catalog_slot = _normalize_catalog_slot(slot.value)
+
+        if not catalog_slot:
+            await inter.response.send_message("❌ Ungültiger Slot.", ephemeral=True)
+            return
+
+        clean_name = _safe_text(name)
+
+        if not clean_name:
+            await inter.response.send_message("❌ Itemname fehlt.", ephemeral=True)
+            return
+
+        wt = ""
+
+        if catalog_slot == "Waffe":
+            if weapon_type is None:
+                await inter.response.send_message(
+                    "❌ Bei Slot **Waffe** musst du zusätzlich `weapon_type` setzen.",
+                    ephemeral=True
+                )
+                return
+
+            wt = _normalize_weapon_type(weapon_type.value)
+
+            if not wt:
+                await inter.response.send_message("❌ Ungültiger Waffentyp.", ephemeral=True)
+                return
+
+        existing = _find_item_by_name(inter.guild.id, catalog_slot, clean_name)
+
         if existing:
             await inter.response.send_message(
-                f"ℹ️ Du hast für **{auc.get('item_name','Item')}** bereits gewürfelt: 🎲 **{int(existing.get('roll', 0) or 0)}**.",
-                ephemeral=True,
+                f"⚠️ Dieses Item existiert für **{catalog_slot}** bereits.",
+                ephemeral=True
             )
             return
-        try:
-            roll, roll_max = _next_unique_junk_roll(auc)
-        except Exception:
-            await inter.response.send_message("❌ Es konnte kein freier Würfelwert mehr erzeugt werden. Bitte Leader informieren.", ephemeral=True)
-            return
-        rolls[str(int(user_id))] = {"user_id": int(user_id), "roll": int(roll), "created_at": _now_iso()}
-        auc["junk_rolls"] = rolls
-        auc["junk_roll_max"] = int(roll_max)
-        # Legacy-Felder mitführen, damit alte Anzeigen/Tools nicht brechen.
-        auc["junk_interest_user_ids"] = [int(uid) for uid in _junk_rolls(auc).keys()]
-        requests = auc.get("junk_interest_requests") if isinstance(auc.get("junk_interest_requests"), dict) else {}
-        requests[str(user_id)] = _now_iso()
-        auc["junk_interest_requests"] = requests
-        auc["updated_at"] = _now_iso()
-        save_auctions()
-        try:
-            await _refresh_auction_message(inter.client, int(guild_id), auc)
-            await _post_or_refresh_market_message(inter.client, int(guild_id), auc)
-            await _post_or_refresh_active_auction_message(inter.client, int(guild_id), auc)
-            if inter.message:
-                view = PortalSaleBuyView(int(guild_id), int(user_id), str(auction_id)) if isinstance(inter.channel, discord.DMChannel) else SaleBuyView(int(guild_id), str(auction_id))
-                await inter.message.edit(embed=_sale_embed(guild, auc), view=view)
-        except Exception as e:
-            print(f"[loot_auction] junk roll refresh failed: {e!r}")
+
+        item_id = _make_item_id(inter.guild.id, catalog_slot, clean_name)
+        items = _all_items(inter.guild.id)
+        obj = {
+            "name": clean_name,
+            "slot": catalog_slot,
+            "created_at": _now_iso(),
+            "created_by": int(inter.user.id),
+        }
+
+        if catalog_slot == "Waffe":
+            obj["weapon_type"] = wt
+
+        items[item_id] = obj
+
+        save_items()
+
+        extra = f"\nWaffentyp: **{wt}**" if wt else ""
+
         await inter.response.send_message(
-            f"🎲 Du hast für **{auc.get('item_name','Item')}** gewürfelt: **{int(roll)}**.",
-            ephemeral=True,
+            f"✅ Item hinzugefügt:\n**{clean_name}**\nSlot: **{catalog_slot}**{extra}\nID: `{item_id}`",
+            ephemeral=True
         )
-        return
 
-    if until and not auc.get("junk_roll_processed_at") and not auc.get("junk_interest_processed_at"):
-        result = await _process_junk_interest_window(inter.client, int(guild_id), str(auction_id), auc, reason="click_after_window")
-        if result.get("delivered"):
-            winner = int(result.get("winner_id", 0) or 0)
-            try:
-                if inter.message:
-                    await inter.message.edit(embed=_sale_embed(guild, auc), view=None)
-            except Exception:
-                pass
-            if winner == user_id:
-                await inter.response.send_message(f"🎲 Die Würfelphase war vorbei. Gewinner: **du** hast **{auc.get('item_name','Item')}** bekommen.", ephemeral=True)
-            else:
-                await inter.response.send_message(f"🎲 Die Würfelphase war vorbei. Gewinner: <@{winner}>.", ephemeral=True)
+    @tree.command(name="loot_item_set_weapon_type", description="(Leader) Waffentyp bei bestehender Waffe nachtragen/ändern")
+    @app_commands.choices(weapon_type=_weapon_type_choices())
+    async def loot_item_set_weapon_type(
+        inter: discord.Interaction,
+        name: str,
+        weapon_type: app_commands.Choice[str]
+    ):
+        if inter.guild is None:
+            await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
             return
-        # Keine Würfe vor Ablauf: ab jetzt Sofortkauf, kein Ablauf. Danach weiter zur direkten Übergabe.
 
-    emb = await _finalize_sale_delivery(inter.client, guild, int(guild_id), auc, str(auction_id), int(user_id), 0, actor_id=int(user_id), source="junk_direct_claim")
-    try:
-        if inter.message:
-            await inter.message.edit(embed=emb, view=None)
-    except Exception:
-        pass
-    await inter.response.send_message(embed=emb, ephemeral=True)
-
-
-async def _buy_sale_item(inter: discord.Interaction, guild_id: int, auction_id: str):
-    guild = inter.guild or inter.client.get_guild(int(guild_id))
-    if guild is None:
-        await inter.response.send_message("❌ Server konnte nicht zugeordnet werden.", ephemeral=True)
-        return
-    auc = _auction(guild_id, auction_id)
-    if not auc or str(auc.get("status", "")) != "active" or _auction_phase(auc) != "sale":
-        await inter.response.send_message("❌ Sale-Kauf nicht gefunden oder nicht mehr aktiv.", ephemeral=True)
-        return
-    end_dt = _parse_dt(str(auc.get("ends_at", "") or ""))
-    if end_dt and _now() >= end_dt:
-        await inter.response.send_message("❌ Dieses Sale-Item ist bereits abgelaufen.", ephemeral=True)
-        return
-    user_id = int(inter.user.id)
-    if not _is_ebolus_member(guild, user_id):
-        await inter.response.send_message("❌ Nur Ebolus-Mitglieder können mit EC kaufen.", ephemeral=True)
-        return
-    if not await _require_loot_unlocked(inter, guild, user_id):
-        return
-
-    price = int(auc.get("fixed_price", auc.get("start_bid", 0)) or 0)
-    if _is_junk_interest_sale(auc) and price <= 0:
-        await _handle_junk_sale_click(inter, int(guild_id), str(auction_id), guild, auc, user_id)
-        return
-
-    if price > 0:
-        bal = _ec_balance(guild_id, user_id)
-        if bal < price:
-            await inter.response.send_message(f"❌ Du hast aktuell nur **{bal} EC**, benötigst aber **{price} EC**.", ephemeral=True)
+        if not _is_leader_or_admin(inter):
+            await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
             return
-        ok = _add_ec_transaction(
-            int(guild_id), user_id, -price,
-            f"Sale-Kauf: {auc.get('item_name','Item')}",
-            user_id, str(auction_id),
-            meta={"auction_id": str(auction_id), "item_id": auc.get("item_id", ""), "item_name": auc.get("item_name", ""), "kind": "sale"},
+
+        found = _find_item_by_name(inter.guild.id, "Waffe", name)
+
+        if not found:
+            await inter.response.send_message(
+                f"❌ Waffe **{name}** nicht gefunden.",
+                ephemeral=True
+            )
+            return
+
+        wt = _normalize_weapon_type(weapon_type.value)
+
+        if not wt:
+            await inter.response.send_message("❌ Ungültiger Waffentyp.", ephemeral=True)
+            return
+
+        item_id, item = found
+        item["slot"] = "Waffe"
+        item["weapon_type"] = wt
+        _all_items(inter.guild.id)[item_id] = item
+        save_items()
+
+        await inter.response.send_message(
+            f"✅ Waffentyp gesetzt:\n**{item.get('name')}** → **{wt}**",
+            ephemeral=True
         )
-        if not ok:
-            await inter.response.send_message("❌ DKP/EC-System konnte nicht geladen werden. Keine EC abgebucht.", ephemeral=True)
+
+    @tree.command(name="loot_item_list", description="Zeigt Items aus dem Need-Katalog")
+    @app_commands.choices(slot=_catalog_slot_choices(), weapon_type=_weapon_type_choices())
+    async def loot_item_list(
+        inter: discord.Interaction,
+        slot: Optional[app_commands.Choice[str]] = None,
+        weapon_type: Optional[app_commands.Choice[str]] = None
+    ):
+        if inter.guild is None:
+            await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
             return
 
-    emb = await _finalize_sale_delivery(inter.client, guild, int(guild_id), auc, str(auction_id), user_id, price, actor_id=user_id, source="sale_direct_buy")
-    try:
-        if inter.message:
-            await inter.message.edit(embed=emb, view=None)
-    except Exception:
-        pass
-    await inter.response.send_message(embed=emb, ephemeral=True)
+        catalog_slot = _normalize_catalog_slot(slot.value) if slot else ""
+        wt = _normalize_weapon_type(weapon_type.value) if weapon_type else ""
 
+        items = []
 
-class SaleBuyView(View):
-    def __init__(self, guild_id: int, auction_id: str):
-        super().__init__(timeout=None)
-        self.guild_id = int(guild_id)
-        self.auction_id = str(auction_id)
-        auc = _auction(self.guild_id, self.auction_id) or {}
-        is_free = int(auc.get("fixed_price", auc.get("start_bid", 0)) or 0) <= 0
-        for child in self.children:
-            if isinstance(child, discord.ui.Button):
-                if child.custom_id == "buy" or child.label == "Sofort kaufen":
-                    if _is_junk_interest_sale(auc) and _junk_interest_open(auc):
-                        child.label = "Würfeln"
-                    elif is_free:
-                        child.label = "Gratis nehmen"
-                child.custom_id = f"lootsale:{auction_id}:{child.custom_id or child.label}"
+        for item_id, item in _all_items(inter.guild.id).items():
+            if catalog_slot and str(item.get("slot", "")) != catalog_slot:
+                continue
 
-    @button(label="Sofort kaufen", style=ButtonStyle.success, custom_id="buy")
-    async def buy(self, inter: discord.Interaction, btn: discord.ui.Button):
-        await _buy_sale_item(inter, self.guild_id, self.auction_id)
+            if wt and str(item.get("weapon_type", "") or "") != wt:
+                continue
 
-    @button(label="Mein EC", style=ButtonStyle.secondary, custom_id="balance")
-    async def balance(self, inter: discord.Interaction, btn: discord.ui.Button):
-        bal = _ec_balance(self.guild_id, int(inter.user.id))
-        await inter.response.send_message(f"🪙 Dein aktueller Kontostand: **{bal} EC**", ephemeral=True)
+            x = dict(item)
+            x["id"] = item_id
+            items.append(x)
 
+        items.sort(key=lambda x: (str(x.get("slot", "")), str(x.get("weapon_type", "")), str(x.get("name", "")).lower()))
 
-class PortalSaleBuyView(View):
-    """Sale-Kauf Ansicht in der privaten Gildenzentrale mit Zurück-Buttons."""
-    def __init__(self, guild_id: int, user_id: int, auction_id: str):
-        super().__init__(timeout=None)
-        self.guild_id = int(guild_id)
-        self.user_id = int(user_id)
-        self.auction_id = str(auction_id)
-        auc = _auction(self.guild_id, self.auction_id) or {}
-        is_free = int(auc.get("fixed_price", auc.get("start_bid", 0)) or 0) <= 0
-        for child in self.children:
-            if isinstance(child, discord.ui.Button):
-                if child.custom_id == "buy" or child.label == "Sofort kaufen":
-                    if _is_junk_interest_sale(auc) and _junk_interest_open(auc):
-                        child.label = "Gewürfelt" if str(self.user_id) in _junk_rolls(auc) else "Würfeln"
-                    elif is_free:
-                        child.label = "Gratis nehmen"
-                child.custom_id = f"portalsale:{self.guild_id}:{self.user_id}:{auction_id}:{child.custom_id or child.label}"
+        if catalog_slot and wt:
+            title = f"🎁 Item-Katalog – {catalog_slot} / {wt}"
+        elif catalog_slot:
+            title = f"🎁 Item-Katalog – {catalog_slot}"
+        else:
+            title = "🎁 Item-Katalog – alle Items"
 
-    @button(label="Sofort kaufen", style=ButtonStyle.success, custom_id="buy")
-    async def buy(self, inter: discord.Interaction, btn: discord.ui.Button):
-        await _buy_sale_item(inter, self.guild_id, self.auction_id)
-
-    @button(label="Mein EC", style=ButtonStyle.secondary, custom_id="balance")
-    async def balance(self, inter: discord.Interaction, btn: discord.ui.Button):
-        bal = _ec_balance(self.guild_id, int(inter.user.id))
-        await inter.response.send_message(f"🪙 Dein aktueller Kontostand: **{bal} EC**", ephemeral=True)
-
-    @button(label="Zurück zu Auktion", style=ButtonStyle.secondary, custom_id="back_auction")
-    async def back_auction(self, inter: discord.Interaction, btn: discord.ui.Button):
-        guild = inter.client.get_guild(self.guild_id)
-        if not guild:
-            await inter.response.send_message("❌ Server nicht gefunden.", ephemeral=True)
+        if not items:
+            await inter.response.send_message("Keine Items gefunden.", ephemeral=True)
             return
-        await inter.response.edit_message(embed=_auction_portal_embed(guild, self.user_id), view=AuctionPortalMenuView(self.guild_id, self.user_id))
 
-    @button(label="Gildenzentrale", style=ButtonStyle.secondary, custom_id="back_main")
-    async def back_main(self, inter: discord.Interaction, btn: discord.ui.Button):
-        await _portal_back_to_main(inter, self.guild_id, self.user_id)
+        lines = []
 
+        for item in items[:100]:
+            slot_txt = str(item.get("slot", ""))
+            wt_txt = str(item.get("weapon_type", "") or "")
+            extra = f" / {wt_txt}" if wt_txt else ""
+            lines.append(f"• **{item.get('name')}** — {slot_txt}{extra}")
 
-async def open_auction_menu(inter: discord.Interaction, guild_id: int, user_id: int):
-    guild = inter.client.get_guild(int(guild_id))
-    if not guild:
-        await inter.response.send_message("❌ Server nicht gefunden.", ephemeral=True)
-        return
-    await inter.response.edit_message(embed=_auction_portal_embed(guild, int(user_id)), view=AuctionPortalMenuView(int(guild_id), int(user_id)))
+        desc = "\n".join(lines)
 
+        if len(desc) > 3900:
+            desc = desc[:3800] + "\n… gekürzt"
 
+        emb = discord.Embed(
+            title=title,
+            description=desc,
+            color=discord.Color.gold()
+        )
 
-async def start_loot_drop_auction(inter: discord.Interaction, guild: discord.Guild, item_id: str, actor_id: int | None = None) -> dict:
-    """Called by loot_needs.py when Admin -> Loot -> Loot gedroppt is confirmed.
+        emb.set_footer(text=f"Items: {len(items)}")
 
-    Creates a virtual guild chest item and starts either a 48h Need auction or,
-    if no Need exists, a 24h Free auction.
-    """
-    actor_id = int(actor_id or getattr(inter.user, "id", 0) or 0)
-    item_name = _item_display(guild.id, item_id, fallback=str(item_id))
-    main_ids = _main_need_user_ids(guild, item_id)
-    secondary_ids = _secondary_need_user_ids(guild, item_id)
-    if main_ids:
-        phase = "need"
-        mode = "main_need"
-        eligible = main_ids
-    elif secondary_ids:
-        phase = "need"
-        mode = "secondary_need"
-        eligible = secondary_ids
-    else:
-        phase = "free"
-        mode = "all"
-        eligible = []
-    aid = _new_auction_id()
-    chest_id = f"C{aid[1:]}"
-    hours = NEED_AUCTION_HOURS if phase == "need" else FREE_AUCTION_HOURS
-    if mode == "main_need":
-        start_bid = MAIN_NEED_START_BID
-    elif mode == "secondary_need":
-        start_bid = SECOND_NEED_START_BID
-    else:
-        start_bid = FREE_START_BID
+        await inter.response.send_message(embed=emb, ephemeral=True)
 
-    chest_obj = {
-        "id": chest_id,
-        "auction_id": aid,
-        "guild_id": int(guild.id),
-        "item_id": str(item_id),
-        "item_name": item_name,
-        "status": "need_auction" if phase == "need" else "free_auction",
-        "dropped_at": _now_iso(),
-        "created_by": actor_id,
-        "expires_at": (_now() + timedelta(hours=SALE_HOURS + FREE_AUCTION_HOURS + (NEED_AUCTION_HOURS if phase == "need" else 0))).isoformat(),
-    }
-    _gchest(guild.id).setdefault("items", {})[chest_id] = chest_obj
-    save_chest()
+    @tree.command(name="loot_item_remove", description="(Leader) Item aus dem Need-Katalog entfernen")
+    @app_commands.choices(slot=_catalog_slot_choices())
+    async def loot_item_remove(inter: discord.Interaction, slot: app_commands.Choice[str], name: str):
+        if inter.guild is None:
+            await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
+            return
 
-    auc = {
-        "id": aid,
-        "guild_id": int(guild.id),
-        "kind": "auction",
-        "phase": phase,
-        "chest_item_id": chest_id,
-        "item_id": str(item_id),
-        "item_name": item_name,
-        "created_at": _now_iso(),
-        "created_by": actor_id,
-        "source": "loot_drop_menu",
-        "ends_at": (_now() + timedelta(hours=hours)).isoformat(),
-        "start_bid": int(start_bid),
-        "min_increment": (FREE_MIN_INCREMENT if phase == "free" else DEFAULT_MIN_INCREMENT),
-        "eligibility_mode": mode,
-        "eligible_user_ids": eligible,
-        "bids": [],
-        "status": "active",
-        "message_id": 0,
-        "channel_id": 0,
-    }
-    _gauctions(guild.id).setdefault("auctions", {})[aid] = auc
-    save_auctions()
+        if not _is_leader_or_admin(inter):
+            await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
+            return
 
-    ch = _auction_channel(inter.client, guild.id, inter.channel)
-    if ch:
-        msg = await ch.send(embed=_auction_embed(guild, auc), view=AuctionBidView(guild.id, aid))
-        auc["message_id"] = int(msg.id)
-        auc["channel_id"] = int(getattr(ch, "id", 0) or 0)
-        save_auctions()
+        catalog_slot = _normalize_catalog_slot(slot.value)
+        found = _find_item_by_name(inter.guild.id, catalog_slot, name)
 
-    await _post_or_refresh_active_auction_message(inter.client, guild.id, auc)
+        if not found:
+            await inter.response.send_message(
+                f"❌ Item **{name}** im Slot **{catalog_slot}** nicht gefunden.",
+                ephemeral=True
+            )
+            return
 
-    if phase == "free":
-        await _post_or_refresh_market_message(inter.client, guild.id, auc)
+        item_id, item = found
+        _all_items(inter.guild.id).pop(item_id, None)
 
-    log = _auction_channel(inter.client, guild.id, None)
-    if log and log != ch:
+        changed_users = 0
+
+        g = _gneeds(inter.guild.id)
+
+        for _uid, data in (g.get("users") or {}).items():
+            changed = False
+
+            for tab in TABS:
+                for s in NEED_SLOTS:
+                    obj = _slot_obj(data.get(tab, {}).get(s))
+
+                    if obj.get("item_id") == item_id:
+                        data[tab][s] = _blank_slot()
+                        changed = True
+
+            if changed:
+                changed_users += 1
+
+        save_items()
+        save_needs()
+
+        await inter.response.send_message(
+            f"✅ Item entfernt: **{item.get('name')}**\n"
+            f"Bereinigte Spieler-Needlisten: **{changed_users}**",
+            ephemeral=True
+        )
+
+    @tree.command(name="loot_mark_received", description="(Leader) Markiert einen Need-Slot als erhalten und sperrt ihn")
+    @app_commands.choices(tab=_tab_choices(), slot=_need_slot_choices())
+    async def loot_mark_received(
+        inter: discord.Interaction,
+        member: discord.Member,
+        tab: app_commands.Choice[str],
+        slot: app_commands.Choice[str],
+    ):
+        if inter.guild is None:
+            await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
+            return
+
+        if not _is_leader_or_admin(inter):
+            await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
+            return
+
+        tab_name = _normalize_tab(tab.value)
+        slot_name = _normalize_need_slot(slot.value)
+
+        if not tab_name or not slot_name:
+            await inter.response.send_message("❌ Tab oder Slot ungültig.", ephemeral=True)
+            return
+
+        data = _user_needs(inter.guild.id, member.id)
+        current = _slot_obj(data.get(tab_name, {}).get(slot_name))
+        item_id = str(current.get("item_id", "") or "")
+
+        if not item_id:
+            await inter.response.send_message(
+                f"❌ Bei **{member.display_name}** ist in **{tab_name} – {slot_name}** kein Item eingetragen.",
+                ephemeral=True
+            )
+            return
+
+        if bool(current.get("received", False)):
+            await inter.response.send_message(
+                f"ℹ️ Dieser Slot ist bereits als erhalten markiert.\n"
+                f"**{member.display_name}** — **{tab_name} – {slot_name}** — {_item_name(inter.guild.id, item_id, with_type=True)}",
+                ephemeral=True
+            )
+            return
+
+        _mark_slot_received(data, tab_name, slot_name, inter.user.id)
+        save_needs()
+
+        item_name = _item_name(inter.guild.id, item_id, with_type=True)
+
         try:
-            title = (("🎯 Main-Need-Auktion gestartet" if mode == "main_need" else "🔁 Second-Need-Auktion gestartet") if phase == "need" else "⚖️ Freie Auktion gestartet")
+            await member.send(
+                f"✅ Dein Need **{item_name}** wurde von der Gildenleitung als **erhalten** markiert.\n"
+                f"Slot: **{tab_name} – {slot_name}**\n\n"
+                f"Der Slot bleibt sichtbar, zählt aber nicht mehr als offener Need."
+            )
+        except Exception:
+            pass
+
+        await inter.response.send_message(
+            f"✅ Als erhalten markiert:\n"
+            f"**{member.display_name}**\n"
+            f"**{tab_name} – {slot_name}:** {item_name} ✅ Erhalten",
+            ephemeral=True
+        )
+
+    @tree.command(name="loot_unmark_received", description="(Leader) Gibt einen erhaltenen Need-Slot wieder frei")
+    @app_commands.choices(tab=_tab_choices(), slot=_need_slot_choices())
+    async def loot_unmark_received(
+        inter: discord.Interaction,
+        member: discord.Member,
+        tab: app_commands.Choice[str],
+        slot: app_commands.Choice[str],
+    ):
+        if inter.guild is None:
+            await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
+            return
+
+        if not _is_leader_or_admin(inter):
+            await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
+            return
+
+        tab_name = _normalize_tab(tab.value)
+        slot_name = _normalize_need_slot(slot.value)
+
+        if not tab_name or not slot_name:
+            await inter.response.send_message("❌ Tab oder Slot ungültig.", ephemeral=True)
+            return
+
+        data = _user_needs(inter.guild.id, member.id)
+        current = _slot_obj(data.get(tab_name, {}).get(slot_name))
+        item_id = str(current.get("item_id", "") or "")
+
+        if not item_id:
+            await inter.response.send_message(
+                f"❌ Bei **{member.display_name}** ist in **{tab_name} – {slot_name}** kein Item eingetragen.",
+                ephemeral=True
+            )
+            return
+
+        if not bool(current.get("received", False)):
+            await inter.response.send_message("ℹ️ Dieser Slot war nicht als erhalten markiert.", ephemeral=True)
+            return
+
+        _unmark_slot_received(data, tab_name, slot_name)
+        save_needs()
+
+        item_name = _item_name(inter.guild.id, item_id, with_type=True)
+
+        await inter.response.send_message(
+            f"✅ Erhalten-Markierung entfernt:\n"
+            f"**{member.display_name}**\n"
+            f"**{tab_name} – {slot_name}:** {item_name}",
+            ephemeral=True
+        )
+
+    @tree.command(name="loot_reset_all_needs", description="(Leader) Setzt alle Needlisten zurück, z.B. für T4")
+    async def loot_reset_all_needs(
+        inter: discord.Interaction,
+        confirm: str,
+        only_guild_role: bool = True,
+    ):
+        if inter.guild is None:
+            await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
+            return
+
+        if not _is_leader_or_admin(inter):
+            await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
+            return
+
+        if confirm != "RESET":
+            await inter.response.send_message(
+                "❌ Sicherheitswort falsch.\n"
+                "Nutze: `/loot_reset_all_needs confirm:RESET`",
+                ephemeral=True
+            )
+            return
+
+        g = _gneeds(inter.guild.id)
+        users = g.setdefault("users", {})
+
+        if only_guild_role:
+            allowed_ids = {str(m.id) for m in _current_guild_role_members(inter.guild)}
+        else:
+            allowed_ids = set(users.keys())
+
+        affected = 0
+
+        for uid_str, data in list(users.items()):
+            if uid_str not in allowed_ids:
+                continue
+
+            changed = False
+
+            for tab in TABS:
+                data.setdefault(tab, {})
+                for slot in NEED_SLOTS:
+                    if _slot_item_id(data.get(tab, {}).get(slot)):
+                        data[tab][slot] = _blank_slot()
+                        changed = True
+                    else:
+                        data[tab][slot] = _blank_slot()
+
+            if changed:
+                affected += 1
+
+        save_needs()
+
+        await inter.response.send_message(
+            f"✅ Alle Needlisten wurden zurückgesetzt.\n"
+            f"Betroffene Spieler: **{affected}**\n"
+            f"Scope: **{'Nur aktuelle Ebolus-/Gildenrolle' if only_guild_role else 'Alle gespeicherten Spieler'}**",
+            ephemeral=True
+        )
+
+    @tree.command(name="loot_cleanup", description="(Leader) Entfernt Needlisten von Leuten ohne Ebolus-/Gildenmitglied-Rolle")
+    async def loot_cleanup(inter: discord.Interaction):
+        if inter.guild is None:
+            await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
+            return
+
+        if not _is_leader_or_admin(inter):
+            await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
+            return
+
+        removed = _cleanup_needs_without_guild_role(inter.guild)
+
+        await inter.response.send_message(
+            f"✅ Loot-Need-Cleanup abgeschlossen.\nEntfernte Needlisten: **{removed}**",
+            ephemeral=True
+        )
+
+    @tree.command(name="loot_need_all", description="(Leader) Gesamte Needliste aller aktuellen Ebolus-Mitglieder anzeigen")
+    async def loot_need_all(inter: discord.Interaction, public: bool = False):
+        if inter.guild is None:
+            await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
+            return
+
+        if not _is_leader_or_admin(inter):
+            await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
+            return
+
+        removed = _cleanup_needs_without_guild_role(inter.guild)
+
+        g = _gneeds(inter.guild.id)
+        users = g.get("users") or {}
+
+        role_members = _current_guild_role_members(inter.guild)
+        role_ids = {m.id for m in role_members}
+
+        user_ids = []
+
+        for uid_str in users.keys():
+            try:
+                uid = int(uid_str)
+            except Exception:
+                continue
+
+            if uid in role_ids:
+                user_ids.append(uid)
+
+        user_ids.sort(key=lambda uid: _profile_name(inter.guild, uid).lower())
+
+        await _send_long_need_list(inter, inter.guild, user_ids, public=public)
+
+        if removed:
+            await inter.followup.send(
+                f"🧹 Bereinigt: **{removed}** Needliste(n) von Leuten ohne Ebolus-/Gildenmitglied-Rolle entfernt.",
+                ephemeral=True
+            )
+
+    @tree.command(name="loot_weapon_all", description="(Leader) Waffenbedarf aller aktuellen Ebolus-Mitglieder zusammenfassen")
+    async def loot_weapon_all(inter: discord.Interaction, public: bool = False):
+        if inter.guild is None:
+            await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
+            return
+
+        if not _is_leader_or_admin(inter):
+            await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
+            return
+
+        removed = _cleanup_needs_without_guild_role(inter.guild)
+        members = _current_guild_role_members(inter.guild)
+        user_ids = [m.id for m in members]
+
+        emb = _weapon_summary_embed(
+            inter.guild,
+            user_ids,
+            title="🎯 Waffenbedarf – alle Ebolus-Mitglieder",
+            subtitle=f"Quelle: alle Mitglieder mit Ebolus-/Gildenmitglied-Rolle\nMitglieder: **{len(user_ids)}**"
+        )
+
+        await _send_embed_response(inter, emb, public=public)
+
+        if removed:
+            await inter.followup.send(
+                f"🧹 Bereinigt: **{removed}** Needliste(n) von Leuten ohne Ebolus-/Gildenmitglied-Rolle entfernt.",
+                ephemeral=True
+            )
+
+    @tree.command(name="loot_need_event", description="(Leader) Waffenbedarf aus Raid-/Event-Anmeldung anzeigen")
+    async def loot_need_event(inter: discord.Interaction, message_id: str, public: bool = False):
+        if inter.guild is None:
+            await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
+            return
+
+        if not _is_leader_or_admin(inter):
+            await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
+            return
+
+        try:
+            try:
+                from bot.event_rsvp_dm import store as event_store  # type: ignore
+            except ModuleNotFoundError:
+                from event_rsvp_dm import store as event_store  # type: ignore
+        except Exception:
+            await inter.response.send_message("❌ Event-System nicht geladen.", ephemeral=True)
+            return
+
+        obj = event_store.get(str(message_id))
+
+        if not obj or int(obj.get("guild_id", 0) or 0) != inter.guild.id:
+            await inter.response.send_message("❌ Event nicht gefunden oder falscher Server.", ephemeral=True)
+            return
+
+        user_ids = _event_participant_ids(obj)
+
+        emb = _weapon_summary_embed(
+            inter.guild,
+            user_ids,
+            title="🎯 Waffenbedarf – Event-Anmeldung",
+            subtitle=(
+                f"Event: **{obj.get('title', 'Event')}**\n"
+                f"Quelle: Tank/Heal/DPS/Bank aus Raid-Anmeldung\n"
+                f"Teilnehmer: **{len(user_ids)}**"
+            )
+        )
+
+        await _send_embed_response(inter, emb, public=public)
+
+    @tree.command(name="loot_auto_status", description="(Leader) Zeigt Auto-Loot-Need-Status")
+    async def loot_auto_status(inter: discord.Interaction):
+        if inter.guild is None:
+            await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
+            return
+
+        if not _is_leader_or_admin(inter):
+            await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
+            return
+
+        c = _gcfg(inter.guild.id)
+        ch_id = int(c.get("leader_channel_id", 0) or 0)
+        keywords = c.get("title_keywords") or GILDENBOSS_KEYWORDS
+        state = _gstate(inter.guild.id)
+        posted = state.get("posted_events") or {}
+
+        emb = discord.Embed(
+            title="🎁 Loot-Need Auto-Status",
+            color=discord.Color.gold()
+        )
+
+        emb.add_field(name="Aktiv", value="Ja" if c.get("auto_enabled", True) else "Nein", inline=True)
+        emb.add_field(name="Channel", value=f"<#{ch_id}>" if ch_id else "Nicht gesetzt / Fallback Leader-Internal", inline=True)
+        emb.add_field(name="Keywords", value=", ".join(str(x) for x in keywords), inline=False)
+        emb.add_field(name="Bereits automatisch gepostet", value=str(len(posted)), inline=True)
+
+        await inter.response.send_message(embed=emb, ephemeral=True)
+
+    @tree.command(name="loot_auto_toggle", description="(Leader) Automatische Waffenübersicht bei Gildenboss-Eventstart an/aus")
+    async def loot_auto_toggle(inter: discord.Interaction, enabled: bool):
+        if inter.guild is None:
+            await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
+            return
+
+        if not _is_leader_or_admin(inter):
+            await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
+            return
+
+        c = _gcfg(inter.guild.id)
+        c["auto_enabled"] = bool(enabled)
+        loot_cfg[str(inter.guild.id)] = c
+        save_cfg()
+
+        await inter.response.send_message(
+            f"✅ Auto-Waffenübersicht ist jetzt: **{'AN' if enabled else 'AUS'}**",
+            ephemeral=True
+        )
+
+# ===== ADMIN PORTAL LOOT MENU EXTENSIONS =====
+
+
+def _is_loot_admin_user(client: discord.Client, guild_id: int, user_id: int) -> bool:
+    guild = client.get_guild(int(guild_id))
+    if not guild:
+        return False
+    member = guild.get_member(int(user_id))
+    if not member or member.bot:
+        return False
+    perms = getattr(member, "guild_permissions", None)
+    if perms and (perms.administrator or perms.manage_guild):
+        return True
+    try:
+        leader_cfg = _load_leader_cfg()
+        lc = leader_cfg.get(str(guild_id)) or {}
+        role_id = int(lc.get("leader_role_id", 0) or 0)
+        role = guild.get_role(role_id) if role_id else None
+        if role and role in member.roles:
+            return True
+    except Exception:
+        pass
+    try:
+        portal_cfg = _load_portal_cfg()
+        pc = portal_cfg.get(str(guild_id)) or {}
+        roles = pc.get("position_roles") or {}
+        for key in ("leader", "advisor", "guardian"):
+            role_id = int(roles.get(key, 0) or 0)
+            role = guild.get_role(role_id) if role_id else None
+            if role and role in member.roles:
+                return True
+    except Exception:
+        pass
+    return False
+
+def _need_matches_for_item(guild: discord.Guild, item_id: str, tab_filter: str | None = None, received: bool | None = None) -> list[dict]:
+    """Findet Spieler/Slots, die ein bestimmtes Item in der Needliste haben."""
+    out: list[dict] = []
+    g = _gneeds(guild.id)
+    users = g.get("users") or {}
+
+    for uid_str, data in list(users.items()):
+        try:
+            uid = int(uid_str)
+        except Exception:
+            continue
+
+        if not _member_has_guild_role(guild, uid):
+            continue
+
+        member = guild.get_member(uid)
+        name = _profile_name(guild, uid, member.display_name if member else f"User {uid}")
+
+        tabs = [tab_filter] if tab_filter else TABS
+        for tab in tabs:
+            if tab not in TABS:
+                continue
+            for slot in NEED_SLOTS:
+                slot_data = _slot_obj((data.get(tab) or {}).get(slot))
+                if str(slot_data.get("item_id", "") or "") != str(item_id):
+                    continue
+                is_received = bool(slot_data.get("received", False))
+                if received is not None and is_received != bool(received):
+                    continue
+                out.append({
+                    "user_id": uid,
+                    "name": name,
+                    "tab": tab,
+                    "slot": slot,
+                    "received": is_received,
+                })
+
+    out.sort(key=lambda x: (str(x.get("tab")), str(x.get("slot")), str(x.get("name", "")).lower()))
+    return out
+
+
+def _match_lines(matches: list[dict], limit: int = 30) -> str:
+    if not matches:
+        return "—"
+    lines = []
+    for m in matches[:limit]:
+        rec = " ✅ Erhalten" if m.get("received") else ""
+        lines.append(f"• **{m['name']}** — {m['tab']} — {m['slot']}{rec}")
+    if len(matches) > limit:
+        lines.append(f"… und {len(matches) - limit} weitere")
+    return "\n".join(lines)
+
+
+async def _notify_main_need_drop(inter: discord.Interaction, guild: discord.Guild, item_id: str) -> None:
+    """Loot-drop confirmation.
+
+    New flow: a confirmed drop no longer only sends a simple DM. It creates a virtual
+    guild chest item and starts the EC auction chain:
+    Need-Auktion 48h -> Freie Auktion 24h -> Sale-Kauf.
+    """
+    item_name = _item_name(guild.id, item_id, with_type=True)
+    main_matches = _need_matches_for_item(guild, item_id, tab_filter="Main", received=False)
+    secondary_matches = _need_matches_for_item(guild, item_id, tab_filter="Secondary", received=False)
+    matches = main_matches or secondary_matches
+
+    try:
+        try:
+            from bot import loot_auction as auction_mod  # type: ignore
+        except Exception:
+            import loot_auction as auction_mod  # type: ignore
+
+        if hasattr(auction_mod, "start_loot_drop_auction"):
+            result = await auction_mod.start_loot_drop_auction(inter, guild, item_id, actor_id=int(inter.user.id))  # type: ignore[attr-defined]
+            phase = str(result.get("phase", ""))
+            auction_id = str(result.get("auction_id", ""))
+            notified = int(result.get("notified", 0) or 0)
+            failed = int(result.get("failed", 0) or 0)
+            title = "🎯 Need-Auktion gestartet" if phase == "need" else "⚖️ Freie Auktion gestartet"
             desc = (
-                f"**Item:** {item_name}\n"
-                f"**Startgebot:** {start_bid} EC\n"
-                f"**Dauer:** {hours} Stunden\n"
-                f"**Auktions-ID:** `{aid}`\n"
+                f"**Item:** {item_name}\n\n"
+                f"**Auktions-ID:** `{auction_id}`\n"
+                f"**Ablauf:** {'Need-Auktion 48h → Freie Auktion 24h → Sale-Kauf' if phase == 'need' else 'Freie Auktion 24h → Sale-Kauf'}\n\n"
+                f"**Main-Need Treffer:**\n{_match_lines(matches)}\n\n"
             )
             if phase == "need":
-                desc += "\nBerechtigt: " + (", ".join(f"<@{uid}>" for uid in eligible[:20]) if eligible else "—")
+                desc += f"Benachrichtigt: **{notified}**\nNicht erreichbar: **{failed}**"
             else:
-                desc += "\nKeine offenen Needs gefunden. Das Item ist direkt in der freien Auktion."
-            await log.send(embed=discord.Embed(title=title, description=desc, color=discord.Color.gold(), timestamp=_now()))
+                desc += "Keine offenen Main-Needs gefunden. Das Item ist direkt in der freien Auktion."
+            emb = discord.Embed(title=title, description=desc, color=discord.Color.green(), timestamp=datetime.now(TZ))
+            if not inter.response.is_done():
+                await inter.response.send_message(embed=emb, ephemeral=True)
+            else:
+                await inter.followup.send(embed=emb, ephemeral=True)
+            return
+    except Exception as e:
+        # Fallback to the old notification flow if the auction module is missing/broken.
+        try:
+            await inter.followup.send(f"⚠️ Auktionssystem konnte nicht gestartet werden: `{e}`. Nutze vorübergehend die alte Benachrichtigung.", ephemeral=True)
         except Exception:
             pass
 
     notified = 0
     failed = 0
-    notify_refs: list[dict] = []
-    if phase == "need":
-        for uid in eligible:
-            ref = await _send_auction_tracking_dm(guild, uid, auc)
-            if ref:
-                notify_refs.append(ref)
-                notified += 1
-            else:
-                failed += 1
-            await asyncio.sleep(0.08)
-        if notify_refs:
-            auc["notify_message_refs"] = notify_refs
-            save_auctions()
-
-    return {
-        "auction_id": aid,
-        "chest_item_id": chest_id,
-        "phase": phase,
-        "eligibility_mode": mode,
-        "item_name": item_name,
-        "eligible_user_ids": eligible,
-        "notified": notified,
-        "failed": failed,
-        "channel_id": int(auc.get("channel_id", 0) or 0),
-    }
-
-
-async def _delete_discord_message_ref(client: discord.Client, channel_id: int, message_id: int) -> bool:
-    if not channel_id or not message_id:
-        return False
-    try:
-        ch = client.get_channel(int(channel_id))
-        if ch is None:
-            ch = await client.fetch_channel(int(channel_id))
-        msg = await ch.fetch_message(int(message_id))
-        await msg.delete()
-        return True
-    except Exception:
-        return False
-
-
-async def _purge_auction_messages(client: discord.Client, auction: dict) -> int:
-    """Delete Discord messages that belong to one auction. Does not touch EC transactions."""
-    deleted = 0
-    refs = [
-        (int(auction.get("channel_id", 0) or 0), int(auction.get("message_id", 0) or 0)),
-        (int(auction.get("market_channel_id", 0) or 0), int(auction.get("market_message_id", 0) or 0)),
-        (int(auction.get("active_channel_id", 0) or 0), int(auction.get("active_message_id", 0) or 0)),
-        (int(auction.get("delivery_channel_id", 0) or 0), int(auction.get("delivery_message_id", 0) or 0)),
-    ]
-    seen = set()
-    for cid, mid in refs:
-        if not cid or not mid or (cid, mid) in seen:
+    for m in matches:
+        member = guild.get_member(int(m["user_id"]))
+        if not member or member.bot:
+            failed += 1
             continue
-        seen.add((cid, mid))
-        if await _delete_discord_message_ref(client, cid, mid):
-            deleted += 1
-    tracking_refs = list(auction.get("notify_message_refs") or [])
-    await _delete_auction_tracking_dms(client, auction)
-    deleted += len(tracking_refs)
-    return deleted
-
-
-async def setup_loot_auction(client: discord.Client, tree: app_commands.CommandTree):
-    global _client_ref
-    _client_ref = client
-
-    # Re-register persistent views for active/closed auctions after restart.
-    try:
-        # Portal root views use guild/user-specific custom_ids when sent, but adding one generic view keeps the class loaded.
-        pass
-    except Exception:
-        pass
-    for gid_str, g in list(auction_state.items()):
         try:
-            gid = int(gid_str)
+            await member.send(
+                "🎁 **Dein Main-Need-Item ist gedroppt!**\n\n"
+                f"**Item:** {item_name}\n"
+                f"**Slot:** {m['slot']}\n\n"
+                "Bitte melde dich bei der Gildenleitung, wenn du das Item kaufen/beanspruchen möchtest."
+            )
+            notified += 1
+            await asyncio.sleep(0.08)
         except Exception:
-            continue
-        auctions = g.get("auctions") if isinstance(g.get("auctions"), dict) else {}
-        for aid, auc in auctions.items():
+            failed += 1
+
+    emb = discord.Embed(
+        title="📦 Loot gedroppt",
+        description=(
+            f"**Item:** {item_name}\n\n"
+            "**Benachrichtigt wurden offene Needs nach Priorität: Main vor Second.**\n\n"
+            f"**Main-Need:**\n{_match_lines(matches)}\n\n"
+            f"Benachrichtigt: **{notified}**\n"
+            f"Nicht erreichbar: **{failed}**"
+        ),
+        color=discord.Color.gold(),
+        timestamp=datetime.now(TZ)
+    )
+    emb.set_footer(text=f"Ausgelöst von {getattr(inter.user, 'display_name', inter.user.name)}")
+
+    ch = _loot_leader_channel(guild)
+    if ch:
+        try:
+            await ch.send(embed=emb)
+        except Exception:
+            pass
+
+    if not inter.response.is_done():
+        await inter.response.send_message(embed=emb, ephemeral=True)
+    else:
+        await inter.followup.send(embed=emb, ephemeral=True)
+
+
+async def open_admin_item_add_menu(inter: discord.Interaction, guild_id: int, user_id: int):
+    guild = inter.client.get_guild(guild_id)
+    if not guild:
+        await inter.response.send_message("❌ Server nicht gefunden.", ephemeral=True)
+        return
+    if inter.guild is not None and not _is_leader_or_admin(inter):
+        await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
+        return
+    emb = discord.Embed(
+        title="➕ Item hinzufügen",
+        description="Wähle zuerst den Slot. Bei Waffen wird danach der Waffentyp abgefragt.",
+        color=discord.Color.gold()
+    )
+    await inter.response.edit_message(embed=emb, view=AdminLootSlotSelectView(guild_id, user_id, action="add"))
+
+
+async def open_admin_loot_drop_menu(inter: discord.Interaction, guild_id: int, user_id: int):
+    guild = inter.client.get_guild(guild_id)
+    if not guild:
+        await inter.response.send_message("❌ Server nicht gefunden.", ephemeral=True)
+        return
+    if inter.guild is not None and not _is_leader_or_admin(inter):
+        await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
+        return
+    emb = discord.Embed(
+        title="📦 Loot gedroppt",
+        description="Wähle den Slot und danach das Item aus dem Katalog. Danach startet der Bot automatisch Main-Need-, Second-Need- oder freie Auktion.",
+        color=discord.Color.gold()
+    )
+    await inter.response.edit_message(embed=emb, view=AdminLootSlotSelectView(guild_id, user_id, action="drop"))
+
+
+async def open_admin_mark_received_menu(inter: discord.Interaction, guild_id: int, user_id: int):
+    guild = inter.client.get_guild(guild_id)
+    if not guild:
+        await inter.response.send_message("❌ Server nicht gefunden.", ephemeral=True)
+        return
+    if inter.guild is not None and not _is_leader_or_admin(inter):
+        await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
+        return
+    emb = discord.Embed(
+        title="✅ Item erhalten markieren",
+        description="Wähle Slot → Item → Spieler. Danach wird dieser Need-Slot als erhalten markiert.",
+        color=discord.Color.gold()
+    )
+    await inter.response.edit_message(embed=emb, view=AdminLootSlotSelectView(guild_id, user_id, action="mark"))
+
+
+async def open_admin_unmark_received_menu(inter: discord.Interaction, guild_id: int, user_id: int):
+    guild = inter.client.get_guild(guild_id)
+    if not guild:
+        await inter.response.send_message("❌ Server nicht gefunden.", ephemeral=True)
+        return
+    if inter.guild is not None and not _is_leader_or_admin(inter):
+        await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
+        return
+    emb = discord.Embed(
+        title="❌ Erhalten-Markierung entfernen",
+        description="Wähle Slot → Item → Spieler. Danach wird die Erhalten-Markierung wieder freigegeben.",
+        color=discord.Color.gold()
+    )
+    await inter.response.edit_message(embed=emb, view=AdminLootSlotSelectView(guild_id, user_id, action="unmark"))
+
+
+async def open_admin_item_catalog_menu(inter: discord.Interaction, guild_id: int, user_id: int):
+    guild = inter.client.get_guild(guild_id)
+    if not guild:
+        await inter.response.send_message("❌ Server nicht gefunden.", ephemeral=True)
+        return
+    emb = discord.Embed(
+        title="📋 Item-Katalog",
+        description="Wähle einen Slot, um die Items aus dem Katalog anzuzeigen.",
+        color=discord.Color.gold()
+    )
+    await inter.response.edit_message(embed=emb, view=AdminLootSlotSelectView(guild_id, user_id, action="catalog"))
+
+
+class AdminLootBackView(View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="admin_loot_back_to_portal")
+    async def btn_back(self, inter: discord.Interaction, _):
+        try:
             try:
-                if str(auc.get("status", "")) == "active":
-                    if _auction_phase(auc) == "sale":
-                        client.add_view(SaleBuyView(gid, str(aid)), message_id=int(auc.get("message_id", 0) or 0) or None)
-                        if int(auc.get("market_message_id", 0) or 0):
-                            client.add_view(SaleBuyView(gid, str(aid)), message_id=int(auc.get("market_message_id", 0) or 0))
-                    else:
-                        client.add_view(AuctionBidView(gid, str(aid)), message_id=int(auc.get("message_id", 0) or 0) or None)
-                elif str(auc.get("status", "")) == "closed" and int(auc.get("delivery_message_id", 0) or 0):
-                    client.add_view(AuctionDeliveryView(gid, str(aid)), message_id=int(auc.get("delivery_message_id", 0) or 0))
-            except Exception:
-                pass
-
-    if not auction_close_loop.is_running():
-        auction_close_loop.start()
-
-    try:
-        asyncio.create_task(_sync_active_auction_messages_after_ready(client))
-    except Exception as e:
-        print(f"[loot_auction] active auction startup sync scheduling failed: {e!r}")
-
-    group = app_commands.Group(name="auction", description="Loot-Auktionen mit Ebolus Coins")
-
-    @group.command(name="set_channel", description="Setzt den Kanal für neue Loot-Auktionen")
-    async def auction_set_channel(inter: discord.Interaction, channel: discord.TextChannel):
-        if inter.guild is None or not _is_leader_or_admin(inter):
-            await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
-            return
-        _gcfg(inter.guild.id)["auction_channel_id"] = int(channel.id)
-        save_cfg()
-        await inter.response.send_message(f"✅ Auktionskanal gesetzt: {channel.mention}", ephemeral=True)
-
-    @group.command(name="set_log_channel", description="Setzt optional den Log-Kanal für Auktionsabschluss/Übergabe")
-    async def auction_set_log_channel(inter: discord.Interaction, channel: discord.TextChannel):
-        if inter.guild is None or not _is_leader_or_admin(inter):
-            await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
-            return
-        _gcfg(inter.guild.id)["log_channel_id"] = int(channel.id)
-        save_cfg()
-        await inter.response.send_message(f"✅ Auktions-Log-Kanal gesetzt: {channel.mention}", ephemeral=True)
-
-    @group.command(name="set_market_channel", description="Setzt den öffentlichen Kanal für freie Auktionen und Sale-Käufe")
-    async def auction_set_market_channel(inter: discord.Interaction, channel: discord.TextChannel):
-        if inter.guild is None or not _is_leader_or_admin(inter):
-            await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
-            return
-        _gcfg(inter.guild.id)["market_channel_id"] = int(channel.id)
-        save_cfg()
-        await inter.response.send_message(f"✅ Marktplatz-Kanal gesetzt: {channel.mention}", ephemeral=True)
-
-    @group.command(name="set_active_channel", description="Setzt den Kanal für die Übersicht aktueller Auktionen/Sales")
-    async def auction_set_active_channel(inter: discord.Interaction, channel: discord.TextChannel):
-        if inter.guild is None or not _is_leader_or_admin(inter):
-            await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
-            return
-        _gcfg(inter.guild.id)["active_channel_id"] = int(channel.id)
-        save_cfg()
-        await inter.response.defer(ephemeral=True, thinking=True)
-        await _sync_active_auction_messages(client, inter.guild.id)
-        await inter.followup.send(f"✅ Aktuelle-Auktionen-Kanal gesetzt: {channel.mention}\nAktive Items wurden synchronisiert.", ephemeral=True)
-
-    @group.command(name="start", description="Startet eine EC-Loot-Auktion")
-    @app_commands.choices(eligibility=ELIGIBILITY_CHOICES)
-    async def auction_start(
-        inter: discord.Interaction,
-        item: str,
-        start_bid: int = DEFAULT_START_BID,
-        min_increment: int = DEFAULT_MIN_INCREMENT,
-        duration_hours: int = DEFAULT_DURATION_HOURS,
-        eligibility: str = "auto",
-    ):
-        if inter.guild is None or not _is_leader_or_admin(inter):
-            await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
-            return
-        if start_bid < 0 or min_increment < 1 or duration_hours < 1 or duration_hours > 240:
-            await inter.response.send_message("❌ Ungültige Werte. Dauer: 1–240 Stunden, Mindestschritt mindestens 1.", ephemeral=True)
-            return
-        guild = inter.guild
-        item_id, item_name, matches = _find_item(guild.id, item)
-        if not item_id and len(matches) > 1:
-            lines = "\n".join(f"• `{mid}` – {name}" for mid, name in matches[:10])
-            await inter.response.send_message(
-                "❌ Mehrere Items gefunden. Bitte genauer schreiben oder die Item-ID nutzen:\n" + lines,
-                ephemeral=True,
-            )
-            return
-        mode, eligible_ids = _eligible_user_ids(guild, item_id, eligibility)
-        if eligibility in {"main_need", "secondary_need"} and not eligible_ids:
-            await inter.response.send_message("❌ Für dieses Item gibt es aktuell keinen passenden offenen Need. Nutze eligibility = Alle Ebolus-Mitglieder.", ephemeral=True)
-            return
-        aid = _new_auction_id()
-        ends = _now() + timedelta(hours=int(duration_hours))
-        auc = {
-            "id": aid,
-            "guild_id": int(guild.id),
-            "kind": "auction",
-            "item_id": item_id,
-            "item_name": item_name,
-            "created_at": _now_iso(),
-            "created_by": int(inter.user.id),
-            "ends_at": ends.isoformat(),
-            "start_bid": int(start_bid),
-            "min_increment": int(min_increment),
-            "eligibility_mode": mode,
-            "eligible_user_ids": eligible_ids,
-            "bids": [],
-            "status": "active",
-            "message_id": 0,
-            "channel_id": 0,
-        }
-        _gauctions(guild.id).setdefault("auctions", {})[aid] = auc
-        save_auctions()
-
-        ch = _auction_channel(client, guild.id, inter.channel)
-        if not ch:
-            await inter.response.send_message("❌ Kein Auktionskanal gefunden. Nutze `/auction set_channel`.", ephemeral=True)
-            return
-        msg = await ch.send(embed=_auction_embed(guild, auc), view=AuctionBidView(guild.id, aid))
-        auc["message_id"] = int(msg.id)
-        auc["channel_id"] = int(getattr(ch, "id", 0) or 0)
-        save_auctions()
-        await _post_or_refresh_active_auction_message(client, guild.id, auc)
-        if _auction_phase(auc) == "free":
-            await _post_or_refresh_market_message(client, guild.id, auc)
-        await inter.response.send_message(f"✅ Auktion gestartet: `{aid}` in {ch.mention}", ephemeral=True)
-
-
-
-    @group.command(name="sale_start", description="Startet einen Sofortkauf/Sale-Kauf mit festem EC-Preis")
-    async def auction_sale_start(
-        inter: discord.Interaction,
-        item: str,
-        price: int,
-        duration_hours: int = 240,
-    ):
-        if inter.guild is None or not _is_leader_or_admin(inter):
-            await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
-            return
-        if price < 1 or duration_hours < 1 or duration_hours > 720:
-            await inter.response.send_message("❌ Ungültige Werte. Preis mindestens 1 EC, Dauer 1–720 Stunden.", ephemeral=True)
-            return
-        guild = inter.guild
-        item_id, item_name, matches = _find_item(guild.id, item)
-        if not item_id and len(matches) > 1:
-            lines = "\n".join(f"• `{mid}` – {name}" for mid, name in matches[:10])
-            await inter.response.send_message(
-                "❌ Mehrere Items gefunden. Bitte genauer schreiben oder die Item-ID nutzen:\n" + lines,
-                ephemeral=True,
-            )
-            return
-        aid = _new_auction_id()
-        ends = _now() + timedelta(hours=int(duration_hours))
-        auc = {
-            "id": aid,
-            "guild_id": int(guild.id),
-            "kind": "sale",
-            "item_id": item_id,
-            "item_name": item_name,
-            "created_at": _now_iso(),
-            "created_by": int(inter.user.id),
-            "ends_at": ends.isoformat(),
-            "fixed_price": int(price),
-            "start_bid": int(price),
-            "min_increment": 0,
-            "eligibility_mode": "all",
-            "eligible_user_ids": [],
-            "bids": [],
-            "status": "active",
-            "message_id": 0,
-            "channel_id": 0,
-        }
-        _gauctions(guild.id).setdefault("auctions", {})[aid] = auc
-        save_auctions()
-        ch = _auction_channel(client, guild.id, inter.channel)
-        if not ch:
-            await inter.response.send_message("❌ Kein Auktionskanal gefunden. Nutze `/auction set_channel`.", ephemeral=True)
-            return
-        msg = await ch.send(embed=_sale_embed(guild, auc), view=SaleBuyView(guild.id, aid))
-        auc["message_id"] = int(msg.id)
-        auc["channel_id"] = int(getattr(ch, "id", 0) or 0)
-        save_auctions()
-        await _post_or_refresh_active_auction_message(client, guild.id, auc)
-        await _post_or_refresh_market_message(client, guild.id, auc)
-        await inter.response.send_message(f"✅ Sale-Kauf gestartet: `{aid}` in {ch.mention}", ephemeral=True)
-
-    @group.command(name="list", description="Zeigt aktive Loot-Auktionen")
-    async def auction_list(inter: discord.Interaction):
-        if inter.guild is None:
-            await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
-            return
-        active = _active_auctions(inter.guild.id)
-        if not active:
-            await inter.response.send_message("Aktuell keine aktiven Auktionen.", ephemeral=True)
-            return
-        lines = []
-        for a in active[:20]:
-            end_dt = _parse_dt(str(a.get("ends_at", "") or ""))
-            top = _highest_bid(a)
-            bid = f"{int(top.get('amount',0) or 0)} EC" if top else "kein Gebot"
-            when = end_dt.strftime("%d.%m. %H:%M") if end_dt else "?"
-            lines.append(f"• `{a.get('id')}` – **{a.get('item_name')}** – {bid} – Ende {when}")
-        await inter.response.send_message("\n".join(lines), ephemeral=True)
-
-    @group.command(name="status", description="Zeigt den Status einer Auktion")
-    async def auction_status(inter: discord.Interaction, auction_id: str):
-        if inter.guild is None:
-            await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
-            return
-        auc = _auction(inter.guild.id, auction_id)
-        if not auc:
-            await inter.response.send_message("❌ Auktion nicht gefunden.", ephemeral=True)
-            return
-        await inter.response.send_message(embed=_auction_embed(inter.guild, auc), ephemeral=True)
-
-    @group.command(name="end", description="Beendet eine Auktion sofort")
-    async def auction_end(inter: discord.Interaction, auction_id: str):
-        if inter.guild is None or not _is_leader_or_admin(inter):
-            await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
-            return
-        ok = await _close_auction(client, inter.guild.id, auction_id, reason="manual")
-        await inter.response.send_message("✅ Auktion beendet." if ok else "❌ Auktion nicht gefunden oder nicht aktiv.", ephemeral=True)
-
-    @group.command(name="cancel", description="Bricht eine Auktion ohne Gewinner/Abbuchung ab")
-    async def auction_cancel(inter: discord.Interaction, auction_id: str, reason: str = ""):
-        if inter.guild is None or not _is_leader_or_admin(inter):
-            await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
-            return
-        auc = _auction(inter.guild.id, auction_id)
-        if not auc or str(auc.get("status", "")) not in {"active", "closed"}:
-            await inter.response.send_message("❌ Auktion nicht gefunden oder kann nicht abgebrochen werden.", ephemeral=True)
-            return
-        auc["status"] = "cancelled"
-        auc["cancelled_at"] = _now_iso()
-        auc["cancelled_by"] = int(inter.user.id)
-        auc["cancel_reason"] = _safe_text(reason)
-        await _edit_market_message_final(client, inter.guild.id, auc, final="cancelled")
-        await _delete_active_auction_message(client, auc)
-        save_auctions()
-        await _refresh_auction_message(client, inter.guild.id, auc)
-        ch = _auction_channel(client, inter.guild.id, None) or _log_channel(client, inter.guild.id)
-        if ch:
+                from bot.member_portal import AdminLootMenuView  # type: ignore
+            except ModuleNotFoundError:
+                from member_portal import AdminLootMenuView  # type: ignore
             emb = discord.Embed(
-                title="❌ Loot-Auktion abgebrochen",
-                description=f"**Item:** {auc.get('item_name','Item')}\n**Auktion:** `{auction_id}`\n**Grund:** {_safe_text(reason) or '—'}",
-                color=discord.Color.red(),
-                timestamp=_now(),
+                title="🎁 Admin – Loot",
+                description="Wähle eine Loot-Aktion.",
+                color=discord.Color.gold()
             )
-            try:
-                await ch.send(embed=emb)
-            except Exception:
-                pass
-        await inter.response.send_message("✅ Auktion abgebrochen.", ephemeral=True)
+            await inter.response.edit_message(embed=emb, view=AdminLootMenuView())
+        except Exception:
+            await inter.response.send_message("✅ Aktion abgeschlossen.", ephemeral=True)
 
-    @group.command(name="delete", description="Löscht eine Auktion und ihre Bot-Nachrichten endgültig")
-    async def auction_delete(inter: discord.Interaction, auction_id: str, confirm: bool = False):
-        if inter.guild is None or not _is_leader_or_admin(inter):
-            await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
+
+class AdminLootSlotSelectView(View):
+    def __init__(self, guild_id: int, user_id: int, action: str):
+        super().__init__(timeout=None)
+        self.guild_id = int(guild_id)
+        self.user_id = int(user_id)
+        self.action = action
+        self.add_item(AdminLootSlotSelect(guild_id, user_id, action))
+
+    @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="admin_loot_slot_back")
+    async def btn_back(self, inter: discord.Interaction, _):
+        try:
+            try:
+                from bot.member_portal import AdminLootMenuView  # type: ignore
+            except ModuleNotFoundError:
+                from member_portal import AdminLootMenuView  # type: ignore
+            emb = discord.Embed(title="🎁 Admin – Loot", description="Wähle eine Loot-Aktion.", color=discord.Color.gold())
+            await inter.response.edit_message(embed=emb, view=AdminLootMenuView())
+        except Exception:
+            await inter.response.send_message("Zurück.", ephemeral=True)
+
+
+class AdminLootSlotSelect(Select):
+    def __init__(self, guild_id: int, user_id: int, action: str):
+        self.guild_id = int(guild_id)
+        self.user_id = int(user_id)
+        self.action = action
+        options = [discord.SelectOption(label=s, value=s) for s in CATALOG_SLOTS]
+        super().__init__(placeholder="Slot wählen", min_values=1, max_values=1, options=options, custom_id=f"admin_loot_slot_{action}")
+
+    async def callback(self, inter: discord.Interaction):
+        slot = self.values[0]
+        if self.action == "add":
+            if slot == "Waffe":
+                emb = discord.Embed(title="➕ Item hinzufügen – Waffentyp", description="Wähle den Waffentyp.", color=discord.Color.gold())
+                await inter.response.edit_message(embed=emb, view=AdminLootWeaponTypeSelectView(self.guild_id, self.user_id, slot))
+                return
+            await inter.response.send_modal(AdminItemAddModal(self.guild_id, self.user_id, slot, ""))
             return
-        auc = _auction(inter.guild.id, auction_id)
-        if not auc:
-            await inter.response.send_message("❌ Auktion nicht gefunden.", ephemeral=True)
-            return
-        if not confirm:
-            await inter.response.send_message(
-                "⚠️ Diese Aktion löscht die Auktion und alle zugehörigen Bot-Nachrichten endgültig. "
-                "Bereits abgebuchte EC werden **nicht** automatisch zurückerstattet. "
-                "Führe den Befehl erneut mit `confirm: True` aus.",
-                ephemeral=True,
+
+        if slot == "Waffe" and self.action in {"drop", "mark", "unmark"}:
+            emb = discord.Embed(
+                title="🎁 Waffentyp wählen",
+                description=(
+                    f"Aktion: **{self.action}**\n"
+                    "Wähle zuerst den Waffentyp, damit auch bei mehr als 25 Waffen alle Items erreichbar bleiben."
+                ),
+                color=discord.Color.gold()
+            )
+            await inter.response.edit_message(
+                embed=emb,
+                view=AdminLootActionWeaponTypeSelectView(self.guild_id, self.user_id, self.action, slot)
             )
             return
-        await inter.response.defer(ephemeral=True, thinking=True)
-        deleted_messages = await _purge_auction_messages(client, auc)
-        auctions = _gauctions(inter.guild.id).setdefault("auctions", {})
-        auctions.pop(str(auction_id), None)
-        save_auctions()
-        await inter.followup.send(
-            f"✅ Auktion `{auction_id}` endgültig gelöscht. Gelöschte Bot-Nachrichten: **{deleted_messages}**. "
-            "EC-Buchungen wurden nicht verändert.",
-            ephemeral=True,
+
+        if self.action == "catalog":
+            items = [dict(v, id=k) for k, v in _all_items(self.guild_id).items() if str(v.get("slot", "")) == slot]
+            items.sort(key=lambda x: (str(x.get("weapon_type", "")), str(x.get("name", "")).lower()))
+            lines = []
+            for item in items[:80]:
+                wt = str(item.get("weapon_type", "") or "")
+                extra = f" — {wt}" if wt else ""
+                lines.append(f"• **{item.get('name')}**{extra}")
+            desc = "\n".join(lines) if lines else "Keine Items in diesem Slot."
+            if len(desc) > 3900:
+                desc = desc[:3800] + "\n… gekürzt"
+            emb = discord.Embed(title=f"📋 Item-Katalog – {slot}", description=desc, color=discord.Color.gold())
+            emb.set_footer(text=f"Items: {len(items)}")
+            await inter.response.edit_message(embed=emb, view=AdminLootSlotSelectView(self.guild_id, self.user_id, "catalog"))
+            return
+
+        items = _items_for_need_slot(self.guild_id, slot)
+        if not items:
+            emb = discord.Embed(
+                title="❌ Kein Item im Katalog",
+                description=f"Für **{slot}** sind noch keine Items hinterlegt. Füge zuerst ein Item hinzu.",
+                color=discord.Color.orange()
+            )
+            await inter.response.edit_message(embed=emb, view=AdminLootSlotSelectView(self.guild_id, self.user_id, self.action))
+            return
+
+        emb = discord.Embed(
+            title="🎁 Item wählen",
+            description=f"Slot: **{slot}**",
+            color=discord.Color.gold()
+        )
+        await inter.response.edit_message(embed=emb, view=AdminLootItemSelectView(self.guild_id, self.user_id, self.action, slot))
+
+
+class AdminLootWeaponTypeSelectView(View):
+    def __init__(self, guild_id: int, user_id: int, slot: str):
+        super().__init__(timeout=None)
+        self.guild_id = int(guild_id)
+        self.user_id = int(user_id)
+        self.slot = slot
+        self.add_item(AdminLootWeaponTypeSelect(guild_id, user_id, slot))
+
+    @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="admin_loot_weapon_back")
+    async def btn_back(self, inter: discord.Interaction, _):
+        emb = discord.Embed(title="➕ Item hinzufügen", description="Wähle den Slot.", color=discord.Color.gold())
+        await inter.response.edit_message(embed=emb, view=AdminLootSlotSelectView(self.guild_id, self.user_id, "add"))
+
+
+class AdminLootWeaponTypeSelect(Select):
+    def __init__(self, guild_id: int, user_id: int, slot: str):
+        self.guild_id = int(guild_id)
+        self.user_id = int(user_id)
+        self.slot = slot
+        options = [discord.SelectOption(label=w, value=w) for w in WEAPON_TYPES]
+        super().__init__(placeholder="Waffentyp wählen", min_values=1, max_values=1, options=options, custom_id="admin_loot_weapon_type")
+
+    async def callback(self, inter: discord.Interaction):
+        await inter.response.send_modal(AdminItemAddModal(self.guild_id, self.user_id, self.slot, self.values[0]))
+
+
+class AdminLootActionWeaponTypeSelectView(View):
+    def __init__(self, guild_id: int, user_id: int, action: str, slot: str):
+        super().__init__(timeout=None)
+        self.guild_id = int(guild_id)
+        self.user_id = int(user_id)
+        self.action = action
+        self.slot = slot
+        self.add_item(AdminLootActionWeaponTypeSelect(guild_id, user_id, action, slot))
+
+    @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="admin_loot_action_weapon_back")
+    async def btn_back(self, inter: discord.Interaction, _):
+        if self.slot == "Waffe" and self.weapon_type:
+            emb = discord.Embed(title="🎁 Waffentyp wählen", description="Wähle den Waffentyp.", color=discord.Color.gold())
+            await inter.response.edit_message(embed=emb, view=AdminLootActionWeaponTypeSelectView(self.guild_id, self.user_id, self.action, self.slot))
+            return
+        emb = discord.Embed(title="🎁 Slot wählen", description="Wähle den Slot.", color=discord.Color.gold())
+        await inter.response.edit_message(embed=emb, view=AdminLootSlotSelectView(self.guild_id, self.user_id, self.action))
+
+
+class AdminLootActionWeaponTypeSelect(Select):
+    def __init__(self, guild_id: int, user_id: int, action: str, slot: str):
+        self.guild_id = int(guild_id)
+        self.user_id = int(user_id)
+        self.action = action
+        self.slot = slot
+        options = [discord.SelectOption(label=w, value=w) for w in WEAPON_TYPES]
+        super().__init__(
+            placeholder="Waffentyp wählen",
+            min_values=1,
+            max_values=1,
+            options=options,
+            custom_id=f"admin_loot_action_weapon_type_{action}"
         )
 
-    try:
-        tree.add_command(group)
-        print("✅ /auction Command-Gruppe registriert")
-    except app_commands.CommandAlreadyRegistered:
-        pass
+    async def callback(self, inter: discord.Interaction):
+        weapon_type = self.values[0]
+        items = _items_for_need_slot(self.guild_id, self.slot, weapon_type=weapon_type)
+        if not items:
+            emb = discord.Embed(
+                title="❌ Kein Item im Katalog",
+                description=f"Für **{weapon_type}** sind noch keine Waffen hinterlegt.",
+                color=discord.Color.orange()
+            )
+            await inter.response.edit_message(
+                embed=emb,
+                view=AdminLootActionWeaponTypeSelectView(self.guild_id, self.user_id, self.action, self.slot)
+            )
+            return
+
+        emb = discord.Embed(
+            title="🎁 Item wählen",
+            description=f"Slot: **{self.slot}**\nWaffentyp: **{weapon_type}**",
+            color=discord.Color.gold()
+        )
+        await inter.response.edit_message(
+            embed=emb,
+            view=AdminLootItemSelectView(self.guild_id, self.user_id, self.action, self.slot, weapon_type=weapon_type)
+        )
+
+
+class AdminItemAddModal(Modal):
+    def __init__(self, guild_id: int, user_id: int, slot: str, weapon_type: str):
+        super().__init__(title="Item hinzufügen", timeout=None)
+        self.guild_id = int(guild_id)
+        self.user_id = int(user_id)
+        self.slot = slot
+        self.weapon_type = weapon_type
+        self.name = TextInput(label="Itemname im Bot", placeholder="z. B. Hut Sprosses", required=True, max_length=100)
+        self.add_item(self.name)
+
+    async def on_submit(self, inter: discord.Interaction):
+        if not _is_loot_admin_user(inter.client, self.guild_id, inter.user.id):
+            await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
+            return
+        catalog_slot = _normalize_catalog_slot(self.slot)
+        clean_name = _safe_text(str(self.name.value or ""))
+        if not catalog_slot or not clean_name:
+            await inter.response.send_message("❌ Slot oder Itemname ungültig.", ephemeral=True)
+            return
+        wt = _normalize_weapon_type(self.weapon_type) if catalog_slot == "Waffe" else ""
+        if catalog_slot == "Waffe" and not wt:
+            await inter.response.send_message("❌ Waffentyp fehlt.", ephemeral=True)
+            return
+        existing = _find_item_by_name(self.guild_id, catalog_slot, clean_name)
+        if existing:
+            await inter.response.send_message(f"⚠️ Dieses Item existiert bereits: **{clean_name}**", ephemeral=True)
+            return
+        item_id = _make_item_id(self.guild_id, catalog_slot, clean_name)
+        obj = {"name": clean_name, "slot": catalog_slot, "created_at": _now_iso(), "created_by": int(inter.user.id)}
+        if wt:
+            obj["weapon_type"] = wt
+        _all_items(self.guild_id)[item_id] = obj
+        save_items()
+        extra = f"\nWaffentyp: **{wt}**" if wt else ""
+        emb = discord.Embed(
+            title="✅ Item hinzugefügt",
+            description=f"**{clean_name}**\nSlot: **{catalog_slot}**{extra}\nID: `{item_id}`",
+            color=discord.Color.green()
+        )
+        await inter.response.send_message(embed=emb, ephemeral=True)
+
+
+class AdminLootItemSelectView(View):
+    def __init__(self, guild_id: int, user_id: int, action: str, slot: str, weapon_type: str | None = None):
+        super().__init__(timeout=None)
+        self.guild_id = int(guild_id)
+        self.user_id = int(user_id)
+        self.action = action
+        self.slot = slot
+        self.weapon_type = weapon_type
+        self.add_item(AdminLootItemSelect(guild_id, user_id, action, slot, weapon_type=weapon_type))
+
+    @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="admin_loot_item_back")
+    async def btn_back(self, inter: discord.Interaction, _):
+        if self.slot == "Waffe" and self.weapon_type:
+            emb = discord.Embed(title="🎁 Waffentyp wählen", description="Wähle den Waffentyp.", color=discord.Color.gold())
+            await inter.response.edit_message(embed=emb, view=AdminLootActionWeaponTypeSelectView(self.guild_id, self.user_id, self.action, self.slot))
+            return
+        emb = discord.Embed(title="🎁 Slot wählen", description="Wähle den Slot.", color=discord.Color.gold())
+        await inter.response.edit_message(embed=emb, view=AdminLootSlotSelectView(self.guild_id, self.user_id, self.action))
+
+
+class AdminLootItemSelect(Select):
+    def __init__(self, guild_id: int, user_id: int, action: str, slot: str, weapon_type: str | None = None):
+        self.guild_id = int(guild_id)
+        self.user_id = int(user_id)
+        self.action = action
+        self.slot = slot
+        self.weapon_type = weapon_type
+        items = _items_for_need_slot(guild_id, slot, weapon_type=weapon_type)[:25]
+        options = [
+            discord.SelectOption(
+                label=str(item.get("name", item["id"]))[:100],
+                value=str(item["id"])[:100],
+                description=str(item.get("weapon_type", "") or item.get("slot", ""))[:100]
+            )
+            for item in items
+        ]
+        super().__init__(placeholder="Item wählen", min_values=1, max_values=1, options=options, custom_id=f"admin_loot_item_{action}")
+
+    async def callback(self, inter: discord.Interaction):
+        guild = inter.client.get_guild(self.guild_id)
+        if not guild:
+            await inter.response.send_message("❌ Server nicht gefunden.", ephemeral=True)
+            return
+        item_id = self.values[0]
+        item_name = _item_name(self.guild_id, item_id, with_type=True)
+        if self.action == "drop":
+            matches = _need_matches_for_item(guild, item_id, tab_filter="Main", received=False)
+            emb = discord.Embed(
+                title="📦 Loot gedroppt – Vorschau",
+                description=(
+                    f"**Item:** {item_name}\n\n"
+                    "Benachrichtigt werden Spieler mit offenem Need nach Priorität: **Main vor Second**.\n\n"
+                    f"**Treffer:**\n{_match_lines(matches)}"
+                ),
+                color=discord.Color.gold()
+            )
+            await inter.response.edit_message(embed=emb, view=AdminLootDropConfirmView(self.guild_id, self.user_id, item_id))
+            return
+
+        if self.action in {"mark", "unmark"}:
+            matches = _need_matches_for_item(guild, item_id, tab_filter=None, received=(self.action == "unmark"))
+            if not matches:
+                txt = "offenen" if self.action == "mark" else "als erhalten markierten"
+                emb = discord.Embed(title="Keine Treffer", description=f"Keine {txt} Need-Einträge für **{item_name}** gefunden.", color=discord.Color.orange())
+                await inter.response.edit_message(embed=emb, view=AdminLootBackView())
+                return
+            emb = discord.Embed(title="👤 Spieler wählen", description=f"Item: **{item_name}**", color=discord.Color.gold())
+            await inter.response.edit_message(embed=emb, view=AdminLootUserSelectView(self.guild_id, self.user_id, self.action, item_id, matches))
+
+
+class AdminLootDropConfirmView(View):
+    def __init__(self, guild_id: int, user_id: int, item_id: str):
+        super().__init__(timeout=None)
+        self.guild_id = int(guild_id)
+        self.user_id = int(user_id)
+        self.item_id = str(item_id)
+
+    @button(label="✅ Benachrichtigen", style=ButtonStyle.success, custom_id="admin_loot_drop_confirm")
+    async def btn_confirm(self, inter: discord.Interaction, _):
+        guild = inter.client.get_guild(self.guild_id)
+        if not guild:
+            await inter.response.send_message("❌ Server nicht gefunden.", ephemeral=True)
+            return
+        if inter.guild is not None and not _is_leader_or_admin(inter):
+            await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
+            return
+        await _notify_main_need_drop(inter, guild, self.item_id)
+
+    @button(label="❌ Abbrechen", style=ButtonStyle.danger, custom_id="admin_loot_drop_cancel")
+    async def btn_cancel(self, inter: discord.Interaction, _):
+        emb = discord.Embed(title="Abgebrochen", description="Es wurden keine Spieler benachrichtigt.", color=discord.Color.orange())
+        await inter.response.edit_message(embed=emb, view=AdminLootBackView())
+
+
+class AdminLootUserSelectView(View):
+    def __init__(self, guild_id: int, user_id: int, action: str, item_id: str, matches: list[dict]):
+        super().__init__(timeout=None)
+        self.guild_id = int(guild_id)
+        self.user_id = int(user_id)
+        self.action = action
+        self.item_id = str(item_id)
+        self.matches = matches[:25]
+        self.add_item(AdminLootUserSelect(guild_id, user_id, action, item_id, self.matches))
+
+    @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="admin_loot_user_back")
+    async def btn_back(self, inter: discord.Interaction, _):
+        emb = discord.Embed(title="🎁 Item wählen", description="Wähle erneut ein Item.", color=discord.Color.gold())
+        await inter.response.edit_message(embed=emb, view=AdminLootItemSelectView(self.guild_id, self.user_id, self.action, _catalog_slot_for_need_slot(self.matches[0]['slot']) if self.matches else "Waffe"))
+
+
+class AdminLootUserSelect(Select):
+    def __init__(self, guild_id: int, user_id: int, action: str, item_id: str, matches: list[dict]):
+        self.guild_id = int(guild_id)
+        self.user_id = int(user_id)
+        self.action = action
+        self.item_id = str(item_id)
+        options = []
+        for m in matches[:25]:
+            value = f"{m['user_id']}|{m['tab']}|{m['slot']}"
+            options.append(discord.SelectOption(label=str(m['name'])[:100], value=value[:100], description=f"{m['tab']} – {m['slot']}"[:100]))
+        super().__init__(placeholder="Spieler wählen", min_values=1, max_values=1, options=options, custom_id=f"admin_loot_user_{action}")
+
+    async def callback(self, inter: discord.Interaction):
+        guild = inter.client.get_guild(self.guild_id)
+        if not guild:
+            await inter.response.send_message("❌ Server nicht gefunden.", ephemeral=True)
+            return
+        if inter.guild is not None and not _is_leader_or_admin(inter):
+            await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
+            return
+        try:
+            uid_s, tab, slot = self.values[0].split("|", 2)
+            uid = int(uid_s)
+        except Exception:
+            await inter.response.send_message("❌ Auswahl konnte nicht gelesen werden.", ephemeral=True)
+            return
+        data = _user_needs(guild.id, uid)
+        slot_data = _slot_obj((data.get(tab) or {}).get(slot))
+        if str(slot_data.get("item_id", "") or "") != self.item_id:
+            await inter.response.send_message("❌ Der Need-Eintrag hat sich inzwischen geändert.", ephemeral=True)
+            return
+        item_name = _item_name(guild.id, self.item_id, with_type=True)
+        member = guild.get_member(uid)
+        name = _profile_name(guild, uid, member.display_name if member else f"User {uid}")
+        if self.action == "mark":
+            if bool(slot_data.get("received", False)):
+                await inter.response.send_message("ℹ️ Dieser Slot ist bereits als erhalten markiert.", ephemeral=True)
+                return
+            _mark_slot_received(data, tab, slot, inter.user.id)
+            save_needs()
+            try:
+                if member:
+                    await member.send(f"✅ Dein Need **{item_name}** wurde von der Gildenleitung als **erhalten** markiert.\nSlot: **{tab} – {slot}**")
+            except Exception:
+                pass
+            emb = discord.Embed(title="✅ Item erhalten markiert", description=f"**{name}**\n**{tab} – {slot}:** {item_name} ✅ Erhalten", color=discord.Color.green())
+            await inter.response.edit_message(embed=emb, view=AdminLootBackView())
+            return
+        if self.action == "unmark":
+            if not bool(slot_data.get("received", False)):
+                await inter.response.send_message("ℹ️ Dieser Slot ist nicht als erhalten markiert.", ephemeral=True)
+                return
+            _unmark_slot_received(data, tab, slot)
+            save_needs()
+            emb = discord.Embed(title="✅ Erhalten-Markierung entfernt", description=f"**{name}**\n**{tab} – {slot}:** {item_name}", color=discord.Color.green())
+            await inter.response.edit_message(embed=emb, view=AdminLootBackView())
+            return
