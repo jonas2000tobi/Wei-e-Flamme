@@ -15,6 +15,11 @@ from discord.ext import tasks
 from discord.ui import View, button, Modal, TextInput
 from discord.enums import ButtonStyle
 
+try:
+    from bot.channel_picker import send_text_channel_picker, send_voice_channel_picker  # type: ignore
+except Exception:
+    from channel_picker import send_text_channel_picker, send_voice_channel_picker  # type: ignore
+
 TZ = ZoneInfo("Europe/Berlin")
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -745,7 +750,7 @@ async def _post_or_refresh_active_auction_message(client: discord.Client, guild_
     if old_mid and old_cid == current_cid:
         try:
             msg = await ch.fetch_message(old_mid)
-            await msg.edit(content=content, embed=embed, view=market_view)
+            await msg.edit(content=content, embed=embed, view=None)
             return
         except Exception as e:
             print(f"[loot_auction] active auction message refresh failed: {e!r}")
@@ -753,7 +758,7 @@ async def _post_or_refresh_active_auction_message(client: discord.Client, guild_
     if old_mid:
         await _delete_active_auction_message(client, auction)
     try:
-        msg = await ch.send(content=content, embed=embed, view=market_view)
+        msg = await ch.send(content=content, embed=embed, view=None)
         auction["active_channel_id"] = current_cid
         auction["active_message_id"] = int(msg.id)
         auction["active_message_posted_at"] = _now_iso()
@@ -2807,54 +2812,69 @@ async def setup_loot_auction(client: discord.Client, tree: app_commands.CommandT
     group = app_commands.Group(name="auction", description="Loot-Auktionen mit Ebolus Coins")
 
     @group.command(name="set_channel", description="Setzt den Kanal für neue Loot-Auktionen")
-    async def auction_set_channel(inter: discord.Interaction, channel: discord.TextChannel):
+    async def auction_set_channel(inter: discord.Interaction):
         if inter.guild is None or not _is_leader_or_admin(inter):
             await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
             return
-        _gcfg(inter.guild.id)["auction_channel_id"] = int(channel.id)
-        save_cfg()
-        await inter.response.send_message(f"✅ Auktionskanal gesetzt: {channel.mention}", ephemeral=True)
+
+        async def _picked(pick_inter: discord.Interaction, channel: discord.TextChannel):
+            _gcfg(pick_inter.guild.id)["auction_channel_id"] = int(channel.id)
+            save_cfg()
+            await pick_inter.response.edit_message(content=f"✅ Auktionskanal gesetzt: {channel.mention}", view=None)
+
+        await send_text_channel_picker(inter, "📌 Auktionskanal auswählen", _picked)
 
     @group.command(name="set_channel_id", description="Setzt den Auktionskanal per Kanal-ID, falls Discord ihn nicht vorschlägt")
     async def auction_set_channel_id(inter: discord.Interaction, channel_id: str):
         await _set_auction_cfg_channel_by_id(inter, "auction_channel_id", channel_id, "Auktionskanal")
 
     @group.command(name="set_log_channel", description="Setzt optional den Log-Kanal für Auktionsabschluss/Übergabe")
-    async def auction_set_log_channel(inter: discord.Interaction, channel: discord.TextChannel):
+    async def auction_set_log_channel(inter: discord.Interaction):
         if inter.guild is None or not _is_leader_or_admin(inter):
             await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
             return
-        _gcfg(inter.guild.id)["log_channel_id"] = int(channel.id)
-        save_cfg()
-        await inter.response.send_message(f"✅ Auktions-Log-Kanal gesetzt: {channel.mention}", ephemeral=True)
+
+        async def _picked(pick_inter: discord.Interaction, channel: discord.TextChannel):
+            _gcfg(pick_inter.guild.id)["log_channel_id"] = int(channel.id)
+            save_cfg()
+            await pick_inter.response.edit_message(content=f"✅ Auktions-Log-Kanal gesetzt: {channel.mention}", view=None)
+
+        await send_text_channel_picker(inter, "🧾 Auktions-Log-Kanal auswählen", _picked)
 
     @group.command(name="set_log_channel_id", description="Setzt den Log-Kanal per Kanal-ID, falls Discord ihn nicht vorschlägt")
     async def auction_set_log_channel_id(inter: discord.Interaction, channel_id: str):
         await _set_auction_cfg_channel_by_id(inter, "log_channel_id", channel_id, "Auktions-Log-Kanal")
 
     @group.command(name="set_market_channel", description="Setzt den öffentlichen Kanal für freie Auktionen und Sale-Käufe")
-    async def auction_set_market_channel(inter: discord.Interaction, channel: discord.TextChannel):
+    async def auction_set_market_channel(inter: discord.Interaction):
         if inter.guild is None or not _is_leader_or_admin(inter):
             await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
             return
-        _gcfg(inter.guild.id)["market_channel_id"] = int(channel.id)
-        save_cfg()
-        await inter.response.send_message(f"✅ Marktplatz-Kanal gesetzt: {channel.mention}", ephemeral=True)
+
+        async def _picked(pick_inter: discord.Interaction, channel: discord.TextChannel):
+            _gcfg(pick_inter.guild.id)["market_channel_id"] = int(channel.id)
+            save_cfg()
+            await pick_inter.response.edit_message(content=f"✅ Marktplatz-Kanal gesetzt: {channel.mention}", view=None)
+
+        await send_text_channel_picker(inter, "📣 Marktplatz-Kanal auswählen", _picked)
 
     @group.command(name="set_market_channel_id", description="Setzt den Marktplatz-Kanal per Kanal-ID, falls Discord ihn nicht vorschlägt")
     async def auction_set_market_channel_id(inter: discord.Interaction, channel_id: str):
         await _set_auction_cfg_channel_by_id(inter, "market_channel_id", channel_id, "Marktplatz-Kanal")
 
     @group.command(name="set_active_channel", description="Setzt den Kanal für die Übersicht aktueller Auktionen/Sales")
-    async def auction_set_active_channel(inter: discord.Interaction, channel: discord.TextChannel):
+    async def auction_set_active_channel(inter: discord.Interaction):
         if inter.guild is None or not _is_leader_or_admin(inter):
             await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
             return
-        _gcfg(inter.guild.id)["active_channel_id"] = int(channel.id)
-        save_cfg()
-        await inter.response.defer(ephemeral=True, thinking=True)
-        await _sync_active_auction_messages(client, inter.guild.id)
-        await inter.followup.send(f"✅ Aktuelle-Auktionen-Kanal gesetzt: {channel.mention}\nAktive Items wurden synchronisiert.", ephemeral=True)
+
+        async def _picked(pick_inter: discord.Interaction, channel: discord.TextChannel):
+            _gcfg(pick_inter.guild.id)["active_channel_id"] = int(channel.id)
+            save_cfg()
+            await _sync_active_auction_messages(client, pick_inter.guild.id)
+            await pick_inter.response.edit_message(content=f"✅ Aktuelle-Auktionen-Kanal gesetzt: {channel.mention}\nAktive Items wurden synchronisiert.", view=None)
+
+        await send_text_channel_picker(inter, "📋 Aktuelle-Auktionen-Kanal auswählen", _picked)
 
     @group.command(name="set_active_channel_id", description="Setzt den Aktuelle-Items-Kanal per Kanal-ID, falls Discord ihn nicht vorschlägt")
     async def auction_set_active_channel_id(inter: discord.Interaction, channel_id: str):
