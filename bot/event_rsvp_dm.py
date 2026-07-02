@@ -543,7 +543,7 @@ def build_embed(guild: discord.Guild, obj: dict) -> discord.Embed:
     else:
         eligible = _eligible_members(guild, obj)
         vote_line = f"{EMOJI_VOTED} Abgestimmt: **{len(voted)}** / **{len(eligible)}**"
-        hint_line = ""
+        hint_line = "💡 Wenn du keine DM bekommst oder sie deaktiviert hast: nutze die Buttons direkt unter dieser Ankündigung."
 
     emb = discord.Embed(
         title=f"{EMOJI_CALENDAR} {obj['title']}",
