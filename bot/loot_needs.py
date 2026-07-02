@@ -14,6 +14,11 @@ from discord.ext import tasks
 from discord.ui import View, button, Select, Modal, TextInput
 from discord.enums import ButtonStyle
 
+try:
+    from bot.channel_picker import send_text_channel_picker, send_voice_channel_picker  # type: ignore
+except Exception:
+    from channel_picker import send_text_channel_picker, send_voice_channel_picker  # type: ignore
+
 TZ = ZoneInfo("Europe/Berlin")
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -889,7 +894,7 @@ async def _send_received_request(
                 description=(
                     "Es ist kein Leader-/Loot-Kanal gesetzt.\n\n"
                     "Die Gildenleitung muss zuerst einen Kanal setzen:\n"
-                    "`/loot_set_leader_channel channel:#gildenleitung`"
+                    "`/loot_set_leader_channel`"
                 ),
                 color=discord.Color.red()
             ),
@@ -1844,7 +1849,7 @@ async def setup_loot_needs(client: discord.Client, tree: app_commands.CommandTre
         print("🎁 Loot-Need Auto-Task gestartet.")
 
     @tree.command(name="loot_set_leader_channel", description="(Leader) Kanal für automatische Loot-/Need-Übersichten setzen")
-    async def loot_set_leader_channel(inter: discord.Interaction, channel: discord.TextChannel):
+    async def loot_set_leader_channel(inter: discord.Interaction):
         if inter.guild is None:
             await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
             return
@@ -1853,15 +1858,14 @@ async def setup_loot_needs(client: discord.Client, tree: app_commands.CommandTre
             await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
             return
 
-        c = _gcfg(inter.guild.id)
-        c["leader_channel_id"] = int(channel.id)
-        loot_cfg[str(inter.guild.id)] = c
-        save_cfg()
+        async def _picked(pick_inter: discord.Interaction, channel: discord.TextChannel):
+            c = _gcfg(pick_inter.guild.id)
+            c["leader_channel_id"] = int(channel.id)
+            loot_cfg[str(pick_inter.guild.id)] = c
+            save_cfg()
+            await pick_inter.response.edit_message(content=f"✅ Loot-/Need-Channel gesetzt: {channel.mention}", view=None)
 
-        await inter.response.send_message(
-            f"✅ Loot-/Need-Channel gesetzt: {channel.mention}",
-            ephemeral=True
-        )
+        await send_text_channel_picker(inter, "🎁 Loot-/Need-Channel auswählen", _picked)
 
     @tree.command(name="loot_item_add", description="(Leader) Item zum Need-Katalog hinzufügen")
     @app_commands.choices(slot=_catalog_slot_choices(), weapon_type=_weapon_type_choices())
