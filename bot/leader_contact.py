@@ -10,6 +10,11 @@ import discord
 from discord import app_commands
 from discord.ui import View, button, Modal, TextInput
 from discord.enums import ButtonStyle
+
+try:
+    from bot.channel_picker import send_text_channel_picker, send_voice_channel_picker  # type: ignore
+except Exception:
+    from channel_picker import send_text_channel_picker, send_voice_channel_picker  # type: ignore
 from zoneinfo import ZoneInfo
 
 TZ = ZoneInfo("Europe/Berlin")
@@ -274,30 +279,34 @@ async def setup_leader_contact(client: discord.Client, tree: app_commands.Comman
         pass
 
     @tree.command(name="leadercontact_public", description="(Admin) Öffentlichen Kontakt-Channel setzen")
-    async def leadercontact_public(inter: discord.Interaction, channel: discord.TextChannel):
+    async def leadercontact_public(inter: discord.Interaction):
         if not _is_admin(inter):
             await inter.response.send_message("❌ Nur Admins.", ephemeral=True)
             return
 
-        c = _gcfg(inter.guild_id)
-        c["public_channel_id"] = int(channel.id)
-        cfg[str(inter.guild_id)] = c
-        _save_cfg(cfg)
+        async def _picked(pick_inter: discord.Interaction, channel: discord.TextChannel):
+            c = _gcfg(pick_inter.guild_id)
+            c["public_channel_id"] = int(channel.id)
+            cfg[str(pick_inter.guild_id)] = c
+            _save_cfg(cfg)
+            await pick_inter.response.edit_message(content=f"✅ Öffentlicher Kontakt-Channel gesetzt: {channel.mention}", view=None)
 
-        await inter.response.send_message(f"✅ Öffentlicher Kontakt-Channel gesetzt: {channel.mention}", ephemeral=True)
+        await send_text_channel_picker(inter, "📣 Öffentlichen Kontakt-Channel auswählen", _picked)
 
     @tree.command(name="leadercontact_internal", description="(Admin) Internen Leader-Channel setzen")
-    async def leadercontact_internal(inter: discord.Interaction, channel: discord.TextChannel):
+    async def leadercontact_internal(inter: discord.Interaction):
         if not _is_admin(inter):
             await inter.response.send_message("❌ Nur Admins.", ephemeral=True)
             return
 
-        c = _gcfg(inter.guild_id)
-        c["internal_channel_id"] = int(channel.id)
-        cfg[str(inter.guild_id)] = c
-        _save_cfg(cfg)
+        async def _picked(pick_inter: discord.Interaction, channel: discord.TextChannel):
+            c = _gcfg(pick_inter.guild_id)
+            c["internal_channel_id"] = int(channel.id)
+            cfg[str(pick_inter.guild_id)] = c
+            _save_cfg(cfg)
+            await pick_inter.response.edit_message(content=f"✅ Interner Leader-Channel gesetzt: {channel.mention}", view=None)
 
-        await inter.response.send_message(f"✅ Interner Leader-Channel gesetzt: {channel.mention}", ephemeral=True)
+        await send_text_channel_picker(inter, "🔒 Internen Leader-Channel auswählen", _picked)
 
     @tree.command(name="leadercontact_role", description="(Admin) Leader-Rolle setzen")
     async def leadercontact_role(inter: discord.Interaction, role: discord.Role):
