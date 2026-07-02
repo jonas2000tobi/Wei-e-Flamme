@@ -499,6 +499,81 @@ def _active_auction_channel(client: discord.Client, guild_id: int):
     return None
 
 
+def _parse_channel_id(raw: str) -> int:
+    text = str(raw or "").strip()
+    # erlaubt: 123456789, <#123456789>, discord://... grob rausfiltern
+    digits = "".join(ch for ch in text if ch.isdigit())
+    try:
+        return int(digits)
+    except Exception:
+        return 0
+
+
+async def _resolve_text_channel_by_id(client: discord.Client, guild: discord.Guild, raw_channel_id: str):
+    """Löst eine Kanal-ID robust auf, auch wenn Discord den Kanal im Slash-Dropdown nicht vorschlägt."""
+    channel_id = _parse_channel_id(raw_channel_id)
+    if not channel_id:
+        return None, "Ungültige Kanal-ID. Rechtsklick auf Kanal → ID kopieren."
+
+    ch = guild.get_channel(channel_id) or client.get_channel(channel_id)
+    if ch is None:
+        try:
+            ch = await client.fetch_channel(channel_id)
+        except Exception:
+            ch = None
+
+    if not isinstance(ch, (discord.TextChannel, discord.Thread)):
+        return None, "Die ID gehört nicht zu einem normalen Textkanal oder Thread. Forum/Kategorie/Voice geht dafür nicht direkt."
+
+    me = guild.me
+    if me is not None:
+        try:
+            perms = ch.permissions_for(me)
+            missing: list[str] = []
+            if not getattr(perms, "view_channel", False):
+                missing.append("Kanal anzeigen")
+            if isinstance(ch, discord.Thread):
+                if not getattr(perms, "send_messages_in_threads", False):
+                    missing.append("Nachrichten in Threads senden")
+            elif not getattr(perms, "send_messages", False):
+                missing.append("Nachrichten senden")
+            if not getattr(perms, "embed_links", False):
+                missing.append("Embed-Links")
+            if not getattr(perms, "read_message_history", False):
+                missing.append("Nachrichtenverlauf lesen")
+            if missing:
+                return None, "Bot hat dort nicht genug Rechte: " + ", ".join(missing)
+        except Exception:
+            pass
+
+    return ch, ""
+
+
+async def _set_auction_cfg_channel_by_id(
+    inter: discord.Interaction,
+    cfg_key: str,
+    channel_id: str,
+    success_label: str,
+    *,
+    sync_active: bool = False,
+) -> None:
+    if inter.guild is None or not _is_leader_or_admin(inter):
+        await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
+        return
+    ch, err = await _resolve_text_channel_by_id(inter.client, inter.guild, channel_id)
+    if ch is None:
+        await inter.response.send_message(f"❌ {err}", ephemeral=True)
+        return
+    _gcfg(inter.guild.id)[cfg_key] = int(ch.id)
+    save_cfg()
+    if sync_active:
+        await inter.response.defer(ephemeral=True, thinking=True)
+        await _sync_active_auction_messages(inter.client, inter.guild.id)
+        await inter.followup.send(f"✅ {success_label} gesetzt: {ch.mention}\nAktive Items wurden synchronisiert.", ephemeral=True)
+    else:
+        await inter.response.send_message(f"✅ {success_label} gesetzt: {ch.mention}", ephemeral=True)
+
+
 def _status_label(status: str) -> str:
     return {
         "active": "🟢 Aktiv",
@@ -2653,24 +2728,41 @@ async def _delete_discord_message_ref(client: discord.Client, channel_id: int, m
 
 
 async def _purge_auction_messages(client: discord.Client, auction: dict) -> int:
-    """Delete Discord messages that belong to one auction. Does not touch EC transactions."""
+    """Delete Discord messages that belong to one auction. Does not touch EC transactions.
+
+    Wichtig: Diese Bereinigung darf niemals die Auktionskanal-Konfiguration anfassen.
+    Sie löscht nur die konkreten Nachrichten-Referenzen dieser einen Auktion und
+    setzt danach die Message-IDs im Auktionsobjekt zurück, damit spätere Start-/Sync-
+    Läufe nicht mehr versuchen, gelöschte Nachrichten zu bearbeiten.
+    """
     deleted = 0
     refs = [
-        (int(auction.get("channel_id", 0) or 0), int(auction.get("message_id", 0) or 0)),
-        (int(auction.get("market_channel_id", 0) or 0), int(auction.get("market_message_id", 0) or 0)),
-        (int(auction.get("active_channel_id", 0) or 0), int(auction.get("active_message_id", 0) or 0)),
-        (int(auction.get("delivery_channel_id", 0) or 0), int(auction.get("delivery_message_id", 0) or 0)),
+        ("channel_id", "message_id"),
+        ("market_channel_id", "market_message_id"),
+        ("active_channel_id", "active_message_id"),
+        ("delivery_channel_id", "delivery_message_id"),
     ]
-    seen = set()
-    for cid, mid in refs:
+    seen: set[tuple[int, int]] = set()
+    for cid_key, mid_key in refs:
+        cid = int(auction.get(cid_key, 0) or 0)
+        mid = int(auction.get(mid_key, 0) or 0)
         if not cid or not mid or (cid, mid) in seen:
             continue
         seen.add((cid, mid))
         if await _delete_discord_message_ref(client, cid, mid):
             deleted += 1
+        # Egal ob Discord die Nachricht noch gefunden hat: Die Referenz ist ab jetzt
+        # für diese Auktion erledigt und darf nicht wieder gesynct werden.
+        auction[cid_key] = 0
+        auction[mid_key] = 0
+
     tracking_refs = list(auction.get("notify_message_refs") or [])
     await _delete_auction_tracking_dms(client, auction)
-    deleted += len(tracking_refs)
+    # Tracking-DMs können vom User längst gelöscht sein. Deshalb nicht blind als
+    # Discord-Erfolg zählen, aber die Refs werden sauber entfernt.
+    auction["notify_message_refs"] = []
+    auction["purged_message_refs_at"] = _now_iso()
+    save_auctions()
     return deleted
 
 
@@ -2723,6 +2815,10 @@ async def setup_loot_auction(client: discord.Client, tree: app_commands.CommandT
         save_cfg()
         await inter.response.send_message(f"✅ Auktionskanal gesetzt: {channel.mention}", ephemeral=True)
 
+    @group.command(name="set_channel_id", description="Setzt den Auktionskanal per Kanal-ID, falls Discord ihn nicht vorschlägt")
+    async def auction_set_channel_id(inter: discord.Interaction, channel_id: str):
+        await _set_auction_cfg_channel_by_id(inter, "auction_channel_id", channel_id, "Auktionskanal")
+
     @group.command(name="set_log_channel", description="Setzt optional den Log-Kanal für Auktionsabschluss/Übergabe")
     async def auction_set_log_channel(inter: discord.Interaction, channel: discord.TextChannel):
         if inter.guild is None or not _is_leader_or_admin(inter):
@@ -2732,6 +2828,10 @@ async def setup_loot_auction(client: discord.Client, tree: app_commands.CommandT
         save_cfg()
         await inter.response.send_message(f"✅ Auktions-Log-Kanal gesetzt: {channel.mention}", ephemeral=True)
 
+    @group.command(name="set_log_channel_id", description="Setzt den Log-Kanal per Kanal-ID, falls Discord ihn nicht vorschlägt")
+    async def auction_set_log_channel_id(inter: discord.Interaction, channel_id: str):
+        await _set_auction_cfg_channel_by_id(inter, "log_channel_id", channel_id, "Auktions-Log-Kanal")
+
     @group.command(name="set_market_channel", description="Setzt den öffentlichen Kanal für freie Auktionen und Sale-Käufe")
     async def auction_set_market_channel(inter: discord.Interaction, channel: discord.TextChannel):
         if inter.guild is None or not _is_leader_or_admin(inter):
@@ -2740,6 +2840,10 @@ async def setup_loot_auction(client: discord.Client, tree: app_commands.CommandT
         _gcfg(inter.guild.id)["market_channel_id"] = int(channel.id)
         save_cfg()
         await inter.response.send_message(f"✅ Marktplatz-Kanal gesetzt: {channel.mention}", ephemeral=True)
+
+    @group.command(name="set_market_channel_id", description="Setzt den Marktplatz-Kanal per Kanal-ID, falls Discord ihn nicht vorschlägt")
+    async def auction_set_market_channel_id(inter: discord.Interaction, channel_id: str):
+        await _set_auction_cfg_channel_by_id(inter, "market_channel_id", channel_id, "Marktplatz-Kanal")
 
     @group.command(name="set_active_channel", description="Setzt den Kanal für die Übersicht aktueller Auktionen/Sales")
     async def auction_set_active_channel(inter: discord.Interaction, channel: discord.TextChannel):
@@ -2751,6 +2855,10 @@ async def setup_loot_auction(client: discord.Client, tree: app_commands.CommandT
         await inter.response.defer(ephemeral=True, thinking=True)
         await _sync_active_auction_messages(client, inter.guild.id)
         await inter.followup.send(f"✅ Aktuelle-Auktionen-Kanal gesetzt: {channel.mention}\nAktive Items wurden synchronisiert.", ephemeral=True)
+
+    @group.command(name="set_active_channel_id", description="Setzt den Aktuelle-Items-Kanal per Kanal-ID, falls Discord ihn nicht vorschlägt")
+    async def auction_set_active_channel_id(inter: discord.Interaction, channel_id: str):
+        await _set_auction_cfg_channel_by_id(inter, "active_channel_id", channel_id, "Aktuelle-Auktionen-Kanal", sync_active=True)
 
     @group.command(name="start", description="Startet eine EC-Loot-Auktion")
     @app_commands.choices(eligibility=ELIGIBILITY_CHOICES)
@@ -2962,13 +3070,21 @@ async def setup_loot_auction(client: discord.Client, tree: app_commands.CommandT
             )
             return
         await inter.response.defer(ephemeral=True, thinking=True)
+        # Früher wurde die Auktion komplett aus der JSON entfernt. Das ist riskant,
+        # weil alte Button-Views, Start-Syncs oder Logs danach ins Leere laufen können.
+        # Sicherer: Discord-Nachrichten löschen, aber einen gelöschten Tombstone behalten.
+        auc["status"] = "deleted"
+        auc["deleted_at"] = _now_iso()
+        auc["deleted_by"] = int(inter.user.id)
         deleted_messages = await _purge_auction_messages(client, auc)
-        auctions = _gauctions(inter.guild.id).setdefault("auctions", {})
-        auctions.pop(str(auction_id), None)
         save_auctions()
+        try:
+            await _sync_active_auction_messages(client, inter.guild.id)
+        except Exception as e:
+            print(f"[loot_auction] active sync after delete failed: {e!r}")
         await inter.followup.send(
-            f"✅ Auktion `{auction_id}` endgültig gelöscht. Gelöschte Bot-Nachrichten: **{deleted_messages}**. "
-            "EC-Buchungen wurden nicht verändert.",
+            f"✅ Auktion `{auction_id}` gelöscht/archiviert. Gelöschte Bot-Nachrichten: **{deleted_messages}**. "
+            "EC-Buchungen und Kanal-Einstellungen wurden nicht verändert.",
             ephemeral=True,
         )
 
