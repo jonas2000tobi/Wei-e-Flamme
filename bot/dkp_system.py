@@ -13,6 +13,11 @@ from discord.ext import tasks
 from discord.ui import View, button, Select, UserSelect
 from discord.enums import ButtonStyle
 
+try:
+    from bot.channel_picker import send_text_channel_picker, send_voice_channel_picker  # type: ignore
+except Exception:
+    from channel_picker import send_text_channel_picker, send_voice_channel_picker  # type: ignore
+
 TZ = ZoneInfo("Europe/Berlin")
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -1269,7 +1274,7 @@ async def setup_dkp_system(client: discord.Client, tree: app_commands.CommandTre
     dkp = app_commands.Group(name="dkp", description="Ebolus Coins / DKP verwalten")
 
     @dkp.command(name="set_log_channel", description="Leader: DKP-/Loot-Log-Kanal setzen")
-    async def dkp_set_log_channel(inter: discord.Interaction, channel: discord.TextChannel):
+    async def dkp_set_log_channel(inter: discord.Interaction):
         if inter.guild is None:
             await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
             return
@@ -1280,11 +1285,15 @@ async def setup_dkp_system(client: discord.Client, tree: app_commands.CommandTre
         if int(inter.guild.id) != int(home_id):
             await inter.response.send_message("❌ DKP wird nur auf dem Ebolus/Home-Server verwaltet.", ephemeral=True)
             return
-        c = _gcfg(inter.guild.id)
-        c["log_channel_id"] = int(channel.id)
-        dkp_cfg[str(inter.guild.id)] = c
-        save_cfg()
-        await inter.response.send_message(f"✅ DKP-/Loot-Log-Kanal gesetzt: {channel.mention}", ephemeral=True)
+
+        async def _picked(pick_inter: discord.Interaction, channel: discord.TextChannel):
+            c = _gcfg(pick_inter.guild.id)
+            c["log_channel_id"] = int(channel.id)
+            dkp_cfg[str(pick_inter.guild.id)] = c
+            save_cfg()
+            await pick_inter.response.edit_message(content=f"✅ DKP-/Loot-Log-Kanal gesetzt: {channel.mention}", view=None)
+
+        await send_text_channel_picker(inter, "🧾 DKP-/Loot-Log-Kanal auswählen", _picked)
 
     @dkp.command(name="balance", description="Zeigt deinen EC-/DKP-Stand privat")
     async def dkp_balance(inter: discord.Interaction, user: Optional[discord.Member] = None):
