@@ -14,6 +14,11 @@ import discord
 from discord import app_commands
 from discord.ui import View, button, Modal, TextInput, Select, ChannelSelect, RoleSelect
 from discord.enums import ButtonStyle
+
+try:
+    from bot.channel_picker import send_text_channel_picker, send_voice_channel_picker  # type: ignore
+except Exception:
+    from channel_picker import send_text_channel_picker, send_voice_channel_picker  # type: ignore
 from zoneinfo import ZoneInfo
 
 try:
@@ -5196,17 +5201,19 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
     _start_portal_repair_loop(client)
 
     @tree.command(name="portal_set_absence_channel", description="(Admin) Abwesenheitskanal setzen")
-    async def portal_set_absence_channel(inter: discord.Interaction, channel: discord.TextChannel):
+    async def portal_set_absence_channel(inter: discord.Interaction):
         if not _is_admin(inter):
             await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True)
             return
 
-        c = _gcfg(inter.guild_id)
-        c["absence_channel_id"] = int(channel.id)
-        cfg[str(inter.guild_id)] = c
-        save_cfg()
+        async def _picked(pick_inter: discord.Interaction, channel: discord.TextChannel):
+            c = _gcfg(pick_inter.guild_id)
+            c["absence_channel_id"] = int(channel.id)
+            cfg[str(pick_inter.guild_id)] = c
+            save_cfg()
+            await pick_inter.response.edit_message(content=f"✅ Abwesenheitskanal gesetzt: {channel.mention}", view=None)
 
-        await inter.response.send_message(f"✅ Abwesenheitskanal gesetzt: {channel.mention}", ephemeral=True)
+        await send_text_channel_picker(inter, "📅 Abwesenheitskanal auswählen", _picked)
 
     @tree.command(name="portal_set_member_role", description="(Admin) Rolle setzen, deren Mitglieder automatisch die Gildenzentrale bekommen")
     async def portal_set_member_role(inter: discord.Interaction, role: discord.Role):
@@ -5575,49 +5582,44 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
         await inter.response.send_message("\n".join(lines), ephemeral=True)
 
     @tree.command(name="portal_post", description="(Admin) Postet den Button zum Öffnen der privaten Gildenzentrale")
-    async def portal_post(inter: discord.Interaction, channel: Optional[discord.TextChannel] = None):
+    async def portal_post(inter: discord.Interaction):
         if not _is_admin(inter):
             await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True)
             return
 
-        ch = channel or inter.channel
+        async def _picked(pick_inter: discord.Interaction, ch: discord.TextChannel):
+            emb = discord.Embed(
+                title="⚜️ Ebolus Gildenbot",
+                description=(
+                    "Öffne hier deine persönliche Gildenzentrale im Privatchat.\n\n"
+                    "Dort findest du:\n"
+                    "• dein Profil\n"
+                    "• deine Needliste\n"
+                    "• Raid-DM Einstellungen\n"
+                    "• feste Gilden-Events\n"
+                    "• Abwesenheit melden\n"
+                    "• Abwesenheitskalender\n"
+                    "• Leader kontaktieren\n"
+                    "• Regeln & Loot\n"
+                    "• Mitgliederübersicht\n"
+                    "• Hilfe"
+                ),
+                color=discord.Color.gold()
+            )
+            try:
+                msg = await ch.send(embed=emb, view=PortalOpenView())
+            except Exception as e:
+                await pick_inter.response.edit_message(content=f"❌ Konnte Portal-Post nicht senden: {e}", view=None)
+                return
 
-        if not isinstance(ch, discord.TextChannel):
-            await inter.response.send_message("❌ Ungültiger Channel.", ephemeral=True)
-            return
+            c = _gcfg(pick_inter.guild_id)
+            c["portal_post_channel_id"] = int(ch.id)
+            c["portal_post_message_id"] = int(msg.id)
+            cfg[str(pick_inter.guild_id)] = c
+            save_cfg()
+            await pick_inter.response.edit_message(content=f"✅ Gildenzentrale-Post erstellt in {ch.mention}", view=None)
 
-        emb = discord.Embed(
-            title="⚜️ Ebolus Gildenbot",
-            description=(
-                "Öffne hier deine persönliche Gildenzentrale im Privatchat.\n\n"
-                "Dort findest du:\n"
-                "• dein Profil\n"
-                "• deine Needliste\n"
-                "• Raid-DM Einstellungen\n"
-                "• feste Gilden-Events\n"
-                "• Abwesenheit melden\n"
-                "• Abwesenheitskalender\n"
-                "• Leader kontaktieren\n"
-                "• Regeln & Loot\n"
-                "• Mitgliederübersicht\n"
-                "• Hilfe"
-            ),
-            color=discord.Color.gold()
-        )
-
-        try:
-            msg = await ch.send(embed=emb, view=PortalOpenView())
-        except Exception as e:
-            await inter.response.send_message(f"❌ Konnte Portal-Post nicht senden: {e}", ephemeral=True)
-            return
-
-        c = _gcfg(inter.guild_id)
-        c["portal_post_channel_id"] = int(ch.id)
-        c["portal_post_message_id"] = int(msg.id)
-        cfg[str(inter.guild_id)] = c
-        save_cfg()
-
-        await inter.response.send_message(f"✅ Portal-Post erstellt: {msg.jump_url}", ephemeral=True)
+        await send_text_channel_picker(inter, "⚜️ Kanal für Gildenzentrale-Post auswählen", _picked)
 
     @tree.command(name="portal_status", description="(Admin) Zeigt Portal-Konfiguration")
     async def portal_status(inter: discord.Interaction):
