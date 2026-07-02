@@ -7,6 +7,11 @@ from typing import Optional, List
 from datetime import datetime, timedelta, date
 
 import discord
+
+try:
+    from bot.channel_picker import send_text_channel_picker, send_voice_channel_picker  # type: ignore
+except Exception:
+    from channel_picker import send_text_channel_picker, send_voice_channel_picker  # type: ignore
 from discord import app_commands
 from discord.ext import tasks
 
@@ -437,7 +442,6 @@ async def setup_raid_templates(client: discord.Client, tree: app_commands.Comman
         title="Titel des Events",
         weekday="Wochentag, z.B. Donnerstag/Freitag/Samstag oder 0-6",
         time="Uhrzeit HH:MM",
-        channel="Channel für den Serverpost",
         target_role="Optionale Zielrolle für DMs und Abstimmquote",
         description="Beschreibung",
         duration_min="Dauer in Minuten",
@@ -452,7 +456,6 @@ async def setup_raid_templates(client: discord.Client, tree: app_commands.Comman
         title: str,
         weekday: str,
         time: str,
-        channel: discord.TextChannel,
         target_role: Optional[discord.Role] = None,
         description: Optional[str] = None,
         duration_min: int = 120,
@@ -461,10 +464,8 @@ async def setup_raid_templates(client: discord.Client, tree: app_commands.Comman
         auto_weekly: bool = False,
         post_before_hours: int = 24,
     ):
-        await inter.response.defer(ephemeral=True, thinking=True)
-
         if not _is_admin(inter):
-            await inter.followup.send("❌ Nur Admin/Manage Server.", ephemeral=True)
+            await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True)
             return
 
         try:
@@ -472,59 +473,60 @@ async def setup_raid_templates(client: discord.Client, tree: app_commands.Comman
             _parse_time_hhmm(time)
             post_before_hours = max(0, int(post_before_hours))
         except Exception as e:
-            await inter.followup.send(f"❌ {e}", ephemeral=True)
+            await inter.response.send_message(f"❌ {e}", ephemeral=True)
             return
 
         key = _normalize_name(name)
-        g = _gcfg(inter.guild_id)
 
-        g["templates"][key] = {
-            "name": key,
-            "title": title.strip(),
-            "description": (description or "").strip(),
-            "weekday": wd,
-            "time": time.strip(),
-            "duration_min": int(duration_min),
-            "channel_id": int(channel.id),
-            "target_role_id": int(target_role.id) if target_role else 0,
-            "image_url": (image_url or "").strip(),
-            "media_channel_id": 0,
-            "media_message_id": 0,
-            "attachment_index": 0,
-            "pre_reminders": [],
-            "send_dm": bool(send_dm),
-            "post_server": True,
-            "auto_weekly": bool(auto_weekly),
-            "post_before_hours": int(post_before_hours),
-            "post_before_minutes": int(post_before_hours) * 60,
-        }
+        async def _picked(pick_inter: discord.Interaction, channel: discord.TextChannel):
+            g = _gcfg(pick_inter.guild_id)
+            g["templates"][key] = {
+                "name": key,
+                "title": title.strip(),
+                "description": (description or "").strip(),
+                "weekday": wd,
+                "time": time.strip(),
+                "duration_min": int(duration_min),
+                "channel_id": int(channel.id),
+                "target_role_id": int(target_role.id) if target_role else 0,
+                "image_url": (image_url or "").strip(),
+                "media_channel_id": 0,
+                "media_message_id": 0,
+                "attachment_index": 0,
+                "pre_reminders": [],
+                "send_dm": bool(send_dm),
+                "post_server": True,
+                "auto_weekly": bool(auto_weekly),
+                "post_before_hours": int(post_before_hours),
+                "post_before_minutes": int(post_before_hours) * 60,
+            }
 
-        templates[str(inter.guild_id)] = g
-        _save(templates)
+            templates[str(pick_inter.guild_id)] = g
+            _save(templates)
+            await pick_inter.response.edit_message(
+                content=(
+                    f"✅ Vorlage `{key}` erstellt.\n"
+                    f"📅 Wochentag: `{wd}` ({_weekday_name(wd)})\n"
+                    f"🕒 Zeit: `{time}`\n"
+                    f"📢 Channel: {channel.mention}\n"
+                    f"🎯 Zielrolle: {target_role.mention if target_role else '—'}\n"
+                    f"🔁 Automatisch wöchentlich: **{'Ja' if auto_weekly else 'Nein'}**\n"
+                    f"⏰ Auto-Post: **{post_before_hours}h vorher**"
+                ),
+                view=None,
+            )
 
-        await inter.followup.send(
-            f"✅ Vorlage `{key}` erstellt.\n"
-            f"📅 Wochentag: `{wd}` ({_weekday_name(wd)})\n"
-            f"🕒 Zeit: `{time}`\n"
-            f"📢 Channel: {channel.mention}\n"
-            f"🎯 Zielrolle: {target_role.mention if target_role else '—'}\n"
-            f"🔁 Automatisch wöchentlich: **{'Ja' if auto_weekly else 'Nein'}**\n"
-            f"⏰ Auto-Post: **{post_before_hours}h vorher**",
-            ephemeral=True
-        )
+        await send_text_channel_picker(inter, "📢 Zielchannel für Vorlage auswählen", _picked)
 
     @tree.command(name="raid_template_set_media", description="(Admin) Speichert Mediennachricht/Bild für eine Vorlage")
     async def raid_template_set_media(
         inter: discord.Interaction,
         name: str,
         message_id: str,
-        channel: Optional[discord.TextChannel] = None,
         attachment_index: int = 0,
     ):
-        await inter.response.defer(ephemeral=True, thinking=True)
-
         if not _is_admin(inter):
-            await inter.followup.send("❌ Nur Admin/Manage Server.", ephemeral=True)
+            await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True)
             return
 
         key = _normalize_name(name)
@@ -532,42 +534,35 @@ async def setup_raid_templates(client: discord.Client, tree: app_commands.Comman
         tpl = g["templates"].get(key)
 
         if not tpl:
-            await inter.followup.send("❌ Vorlage nicht gefunden.", ephemeral=True)
+            await inter.response.send_message("❌ Vorlage nicht gefunden.", ephemeral=True)
             return
 
-        ch = channel or inter.channel
+        async def _picked(pick_inter: discord.Interaction, ch: discord.TextChannel):
+            try:
+                msg = await ch.fetch_message(int(message_id))
+            except Exception:
+                await pick_inter.response.edit_message(content="❌ Nachricht nicht gefunden.", view=None)
+                return
 
-        if not isinstance(ch, (discord.TextChannel, discord.Thread)):
-            await inter.followup.send("❌ Channel ungültig.", ephemeral=True)
-            return
+            if not msg.attachments:
+                await pick_inter.response.edit_message(content="❌ Diese Nachricht hat kein Attachment/Bild.", view=None)
+                return
 
-        try:
-            msg = await ch.fetch_message(int(message_id))
-        except Exception:
-            await inter.followup.send("❌ Nachricht nicht gefunden.", ephemeral=True)
-            return
+            idx = int(attachment_index)
+            if idx < 0 or idx >= len(msg.attachments):
+                idx = 0
 
-        if not msg.attachments:
-            await inter.followup.send("❌ Diese Nachricht hat kein Attachment/Bild.", ephemeral=True)
-            return
+            tpl["media_channel_id"] = int(ch.id)
+            tpl["media_message_id"] = int(msg.id)
+            tpl["attachment_index"] = int(idx)
+            tpl["image_url"] = ""
+            _save(templates)
+            await pick_inter.response.edit_message(
+                content=f"✅ Medium für `{key}` gespeichert.\nChannel: <#{ch.id}>\nMessage-ID: `{msg.id}`\nAttachment: `{idx}`",
+                view=None,
+            )
 
-        if attachment_index < 0 or attachment_index >= len(msg.attachments):
-            attachment_index = 0
-
-        tpl["media_channel_id"] = int(ch.id)
-        tpl["media_message_id"] = int(msg.id)
-        tpl["attachment_index"] = int(attachment_index)
-        tpl["image_url"] = ""
-
-        _save(templates)
-
-        await inter.followup.send(
-            f"✅ Medium für `{key}` gespeichert.\n"
-            f"Channel: <#{ch.id}>\n"
-            f"Message-ID: `{msg.id}`\n"
-            f"Attachment: `{attachment_index}`",
-            ephemeral=True
-        )
+        await send_text_channel_picker(inter, "🖼️ Kanal der Mediennachricht auswählen", _picked)
 
     @tree.command(name="raid_template_set_description", description="(Admin) Ändert Beschreibung einer Vorlage")
     async def raid_template_set_description(inter: discord.Interaction, name: str, description: str):
@@ -615,11 +610,9 @@ async def setup_raid_templates(client: discord.Client, tree: app_commands.Comman
         )
 
     @tree.command(name="raid_template_set_channel", description="(Admin) Setzt Zielchannel einer Vorlage")
-    async def raid_template_set_channel(inter: discord.Interaction, name: str, channel: discord.TextChannel):
-        await inter.response.defer(ephemeral=True, thinking=False)
-
+    async def raid_template_set_channel(inter: discord.Interaction, name: str):
         if not _is_admin(inter):
-            await inter.followup.send("❌ Nur Admin/Manage Server.", ephemeral=True)
+            await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True)
             return
 
         key = _normalize_name(name)
@@ -627,13 +620,15 @@ async def setup_raid_templates(client: discord.Client, tree: app_commands.Comman
         tpl = g["templates"].get(key)
 
         if not tpl:
-            await inter.followup.send("❌ Vorlage nicht gefunden.", ephemeral=True)
+            await inter.response.send_message("❌ Vorlage nicht gefunden.", ephemeral=True)
             return
 
-        tpl["channel_id"] = int(channel.id)
-        _save(templates)
+        async def _picked(pick_inter: discord.Interaction, channel: discord.TextChannel):
+            tpl["channel_id"] = int(channel.id)
+            _save(templates)
+            await pick_inter.response.edit_message(content=f"✅ Channel für `{key}` gesetzt: {channel.mention}", view=None)
 
-        await inter.followup.send(f"✅ Channel für `{key}` gesetzt: {channel.mention}", ephemeral=True)
+        await send_text_channel_picker(inter, "📢 Zielchannel für Vorlage auswählen", _picked)
 
     @tree.command(name="raid_template_set_reminders", description="(Admin) Setzt Reminder-Minuten, z.B. 1440,180,60")
     async def raid_template_set_reminders(inter: discord.Interaction, name: str, minutes: str):
@@ -758,19 +753,15 @@ async def setup_raid_templates(client: discord.Client, tree: app_commands.Comman
     @tree.command(name="raid_template_run", description="(Admin) Erstellt ein Event aus Vorlage")
     @app_commands.describe(
         name="Vorlagenname",
-        date_override="Optional: YYYY-MM-DD",
-        channel_override="Optional anderer Zielchannel"
+        date_override="Optional: YYYY-MM-DD"
     )
     async def raid_template_run(
         inter: discord.Interaction,
         name: str,
         date_override: Optional[str] = None,
-        channel_override: Optional[discord.TextChannel] = None,
     ):
-        await inter.response.defer(ephemeral=True, thinking=True)
-
         if not _is_admin(inter):
-            await inter.followup.send("❌ Nur Admin/Manage Server.", ephemeral=True)
+            await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True)
             return
 
         key = _normalize_name(name)
@@ -778,30 +769,34 @@ async def setup_raid_templates(client: discord.Client, tree: app_commands.Comman
         tpl = g["templates"].get(key)
 
         if not tpl:
-            await inter.followup.send("❌ Vorlage nicht gefunden.", ephemeral=True)
+            await inter.response.send_message("❌ Vorlage nicht gefunden.", ephemeral=True)
             return
 
-        try:
-            event_date = _parse_date(date_override, int(tpl.get("weekday", 4)))
-            msg, sent, skipped = await _create_event_from_template(
-                client=client,
-                guild=inter.guild,
-                tpl=tpl,
-                event_date=event_date,
-                override_channel=channel_override,
+        async def _picked(pick_inter: discord.Interaction, channel: discord.TextChannel):
+            await pick_inter.response.edit_message(content=f"⏳ Erstelle Event aus `{key}` in {channel.mention} …", view=None)
+            try:
+                event_date = _parse_date(date_override, int(tpl.get("weekday", 4)))
+                msg, sent, skipped = await _create_event_from_template(
+                    client=client,
+                    guild=pick_inter.guild,
+                    tpl=tpl,
+                    event_date=event_date,
+                    override_channel=channel,
+                )
+            except Exception as e:
+                await pick_inter.followup.send(f"❌ Event konnte nicht erstellt werden: {e}", ephemeral=True)
+                return
+
+            await pick_inter.followup.send(
+                f"✅ Event aus Vorlage `{key}` erstellt.\n"
+                f"📅 Datum: `{event_date.strftime('%d.%m.%Y')}`\n"
+                f"🔗 {msg.jump_url if msg else 'Kein Link'}\n"
+                f"✉️ DMs versendet: {sent}\n"
+                f"🔕 Opt-out übersprungen: {skipped}",
+                ephemeral=True,
             )
-        except Exception as e:
-            await inter.followup.send(f"❌ Event konnte nicht erstellt werden: {e}", ephemeral=True)
-            return
 
-        await inter.followup.send(
-            f"✅ Event aus Vorlage `{key}` erstellt.\n"
-            f"📅 Datum: `{event_date.strftime('%d.%m.%Y')}`\n"
-            f"🔗 {msg.jump_url if msg else 'Kein Link'}\n"
-            f"✉️ DMs versendet: {sent}\n"
-            f"🔕 Opt-out übersprungen: {skipped}",
-            ephemeral=True
-        )
+        await send_text_channel_picker(inter, "📢 Zielchannel für Event aus Vorlage auswählen", _picked)
 
     @tree.command(name="raid_template_list", description="Zeigt alle Raid-/Event-Vorlagen")
     async def raid_template_list(inter: discord.Interaction):
