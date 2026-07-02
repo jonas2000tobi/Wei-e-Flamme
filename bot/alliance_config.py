@@ -7,6 +7,11 @@ from pathlib import Path
 from typing import Optional
 
 import discord
+
+try:
+    from bot.channel_picker import send_text_channel_picker, send_voice_channel_picker  # type: ignore
+except Exception:
+    from channel_picker import send_text_channel_picker, send_voice_channel_picker  # type: ignore
 from discord import app_commands
 
 
@@ -381,7 +386,6 @@ async def setup_alliance_config(client: discord.Client, tree: app_commands.Comma
         group: str,
         label: str,
         short_label: str,
-        channel: discord.TextChannel,
         send_dm: bool = True
     ):
         ok, msg = _require_home_leader(inter)
@@ -400,44 +404,47 @@ async def setup_alliance_config(client: discord.Client, tree: app_commands.Comma
             await inter.response.send_message("❌ Allianz-Gruppe nicht gefunden.", ephemeral=True)
             return
 
-        target_guild = channel.guild
-        if target_guild.id != inter.guild.id:
-            await inter.response.send_message("❌ Für Home-Add muss der Channel auf diesem Server liegen.", ephemeral=True)
-            return
+        async def _picked(pick_inter: discord.Interaction, channel: discord.TextChannel):
+            target_guild = channel.guild
+            if target_guild.id != pick_inter.guild.id:
+                await pick_inter.response.edit_message(content="❌ Für Home-Add muss der Channel auf diesem Server liegen.", view=None)
+                return
+            groups[key].setdefault("servers", {})
+            groups[key]["servers"][str(target_guild.id)] = {
+                "guild_id": int(target_guild.id),
+                "discord_name": target_guild.name,
+                "label": label.strip() or target_guild.name,
+                "short_label": short,
+                "channel_id": int(channel.id),
+                "channel_name": channel.name,
+                "send_dm": bool(send_dm),
+                "home": True,
+                "partner_registered": False,
+                "added_by": int(pick_inter.user.id),
+                "event_channels": {},
+            }
+            save_alliance_cfg()
+            await pick_inter.response.edit_message(
+                content=(
+                    f"✅ Home-Server zur Allianz-Gruppe hinzugefügt:\n"
+                    f"Gruppe: **{groups[key].get('name', key)}**\n"
+                    f"Label: **{label.strip() or target_guild.name}**\n"
+                    f"Kürzel: **{short}**\n"
+                    f"Discord: **{target_guild.name}**\n"
+                    f"Channel: {channel.mention}\n"
+                    f"DMs: **{'AN' if send_dm else 'AUS'}**"
+                ),
+                view=None,
+            )
 
-        groups[key].setdefault("servers", {})
-        groups[key]["servers"][str(target_guild.id)] = {
-            "guild_id": int(target_guild.id),
-            "discord_name": target_guild.name,
-            "label": label.strip() or target_guild.name,
-            "short_label": short,
-            "channel_id": int(channel.id),
-            "channel_name": channel.name,
-            "send_dm": bool(send_dm),
-            "home": True,
-            "partner_registered": False,
-            "added_by": int(inter.user.id),
-            "event_channels": {},
-        }
-        save_alliance_cfg()
-        await inter.response.send_message(
-            f"✅ Home-Server zur Allianz-Gruppe hinzugefügt:\n"
-            f"Gruppe: **{groups[key].get('name', key)}**\n"
-            f"Label: **{label.strip() or target_guild.name}**\n"
-            f"Kürzel: **{short}**\n"
-            f"Discord: **{target_guild.name}**\n"
-            f"Channel: {channel.mention}\n"
-            f"DMs: **{'AN' if send_dm else 'AUS'}**",
-            ephemeral=True
-        )
+        await send_text_channel_picker(inter, "🤝 Home-Allianz-Channel auswählen", _picked)
 
     @tree.command(name="alliance_partner_register", description="(Partner-Admin) Diesen Discord für eine Allianz-Gruppe registrieren")
     async def alliance_partner_register(
         inter: discord.Interaction,
         group: str,
         label: str,
-        short_label: str,
-        channel: discord.TextChannel
+        short_label: str
     ):
         ok, msg = _require_partner_admin(inter)
         if not ok:
@@ -463,34 +470,39 @@ async def setup_alliance_config(client: discord.Client, tree: app_commands.Comma
             await inter.response.send_message("❌ Allianz-Gruppe nicht gefunden. Die Gruppe muss zuerst auf dem Ebolus-Server angelegt werden.", ephemeral=True)
             return
 
-        if channel.guild.id != inter.guild.id:
-            await inter.response.send_message("❌ Der Channel muss auf diesem Discord-Server liegen.", ephemeral=True)
-            return
+        async def _picked(pick_inter: discord.Interaction, channel: discord.TextChannel):
+            if channel.guild.id != pick_inter.guild.id:
+                await pick_inter.response.edit_message(content="❌ Der Channel muss auf diesem Discord-Server liegen.", view=None)
+                return
 
-        groups[key].setdefault("servers", {})
-        groups[key]["servers"][str(inter.guild.id)] = {
-            "guild_id": int(inter.guild.id),
-            "discord_name": inter.guild.name,
-            "label": label.strip() or inter.guild.name,
-            "short_label": short,
-            "channel_id": int(channel.id),
-            "channel_name": channel.name,
-            "send_dm": False,
-            "home": int(inter.guild.id) == int(home_id),
-            "partner_registered": True,
-            "registered_by": int(inter.user.id),
-            "event_channels": {},
-        }
-        save_alliance_cfg()
-        await inter.response.send_message(
-            f"✅ Partner-Discord registriert:\n"
-            f"Gruppe: **{groups[key].get('name', key)}**\n"
-            f"Label: **{label.strip() or inter.guild.name}**\n"
-            f"Kürzel: **{short}**\n"
-            f"Channel: {channel.mention}\n\n"
-            f"DMs sind für Partner-Server automatisch **AUS**.",
-            ephemeral=True
-        )
+            groups[key].setdefault("servers", {})
+            groups[key]["servers"][str(pick_inter.guild.id)] = {
+                "guild_id": int(pick_inter.guild.id),
+                "discord_name": pick_inter.guild.name,
+                "label": label.strip() or pick_inter.guild.name,
+                "short_label": short,
+                "channel_id": int(channel.id),
+                "channel_name": channel.name,
+                "send_dm": False,
+                "home": int(pick_inter.guild.id) == int(home_id),
+                "partner_registered": True,
+                "registered_by": int(pick_inter.user.id),
+                "event_channels": {},
+            }
+            save_alliance_cfg()
+            await pick_inter.response.edit_message(
+                content=(
+                    f"✅ Partner-Discord registriert:\n"
+                    f"Gruppe: **{groups[key].get('name', key)}**\n"
+                    f"Label: **{label.strip() or pick_inter.guild.name}**\n"
+                    f"Kürzel: **{short}**\n"
+                    f"Channel: {channel.mention}\n\n"
+                    f"DMs sind für Partner-Server automatisch **AUS**."
+                ),
+                view=None,
+            )
+
+        await send_text_channel_picker(inter, "🤝 Partner-Allianz-Channel auswählen", _picked)
 
     @tree.command(name="alliance_partner_unregister", description="(Partner-Admin) Diesen Discord aus einer Allianz-Gruppe entfernen")
     async def alliance_partner_unregister(inter: discord.Interaction, group: str, confirm: str):
@@ -614,7 +626,7 @@ async def setup_alliance_config(client: discord.Client, tree: app_commands.Comma
         await inter.response.send_message(f"✅ Allianz-Server umbenannt:\n`{guild_id}` → **{new_label.strip()}** ({short})", ephemeral=True)
 
     @tree.command(name="alliance_server_set_channel_home", description="(Leader) Zielchannel des Home-Servers ändern")
-    async def alliance_server_set_channel_home(inter: discord.Interaction, group: str, channel: discord.TextChannel):
+    async def alliance_server_set_channel_home(inter: discord.Interaction, group: str):
         ok, msg = _require_home_leader(inter)
         if not ok:
             await inter.response.send_message(msg, ephemeral=True)
@@ -625,23 +637,23 @@ async def setup_alliance_config(client: discord.Client, tree: app_commands.Comma
         if not obj:
             await inter.response.send_message("❌ Allianz-Gruppe nicht gefunden.", ephemeral=True)
             return
-        if channel.guild.id != inter.guild.id:
-            await inter.response.send_message("❌ Dieser Befehl kann nur den Home-Server-Channel ändern.", ephemeral=True)
-            return
 
         servers = obj.setdefault("servers", {})
         if str(inter.guild.id) not in servers:
             await inter.response.send_message("❌ Home-Server ist noch nicht in dieser Allianz-Gruppe. Nutze zuerst `/alliance_server_add_home`.", ephemeral=True)
             return
 
-        servers[str(inter.guild.id)]["channel_id"] = int(channel.id)
-        servers[str(inter.guild.id)]["channel_name"] = channel.name
-        servers[str(inter.guild.id)]["discord_name"] = inter.guild.name
-        save_alliance_cfg()
-        await inter.response.send_message(f"✅ Home-Zielchannel geändert:\nServer: **{inter.guild.name}**\nChannel: {channel.mention}", ephemeral=True)
+        async def _picked(pick_inter: discord.Interaction, channel: discord.TextChannel):
+            servers[str(pick_inter.guild.id)]["channel_id"] = int(channel.id)
+            servers[str(pick_inter.guild.id)]["channel_name"] = channel.name
+            servers[str(pick_inter.guild.id)]["discord_name"] = pick_inter.guild.name
+            save_alliance_cfg()
+            await pick_inter.response.edit_message(content=f"✅ Home-Zielchannel geändert:\nServer: **{pick_inter.guild.name}**\nChannel: {channel.mention}", view=None)
+
+        await send_text_channel_picker(inter, "🤝 Home-Zielchannel auswählen", _picked)
 
     @tree.command(name="alliance_event_channel_set", description="(Leader) Eventtyp-Channel für den Home-/Ebolus-Server setzen")
-    async def alliance_event_channel_set(inter: discord.Interaction, group: str, event_type: str, channel: discord.TextChannel):
+    async def alliance_event_channel_set(inter: discord.Interaction, group: str, event_type: str):
         ok, msg = _require_home_leader(inter)
         if not ok:
             await inter.response.send_message(msg, ephemeral=True)
@@ -658,30 +670,28 @@ async def setup_alliance_config(client: discord.Client, tree: app_commands.Comma
             await inter.response.send_message("❌ Allianz-Gruppe nicht gefunden.", ephemeral=True)
             return
 
-        if channel.guild.id != inter.guild.id:
-            await inter.response.send_message("❌ Der Channel muss auf dem Home-/Ebolus-Server liegen.", ephemeral=True)
-            return
-
         servers = obj.setdefault("servers", {})
         server = servers.get(str(inter.guild.id))
         if not server:
             await inter.response.send_message("❌ Home-Server ist noch nicht in dieser Gruppe. Nutze zuerst `/alliance_server_add_home`.", ephemeral=True)
             return
 
-        event_channels = server.setdefault("event_channels", {})
-        event_channels[normalized] = {
-            "channel_id": int(channel.id),
-            "channel_name": channel.name,
-        }
-        save_alliance_cfg()
+        async def _picked(pick_inter: discord.Interaction, channel: discord.TextChannel):
+            event_channels = server.setdefault("event_channels", {})
+            event_channels[normalized] = {
+                "channel_id": int(channel.id),
+                "channel_name": channel.name,
+            }
+            save_alliance_cfg()
+            await pick_inter.response.edit_message(
+                content=f"✅ Event-Channel gesetzt:\nGruppe: **{obj.get('name', key)}**\nEventtyp: **{normalized}**\nServer: **{pick_inter.guild.name}**\nChannel: {channel.mention}",
+                view=None,
+            )
 
-        await inter.response.send_message(
-            f"✅ Event-Channel gesetzt:\nGruppe: **{obj.get('name', key)}**\nEventtyp: **{normalized}**\nServer: **{inter.guild.name}**\nChannel: {channel.mention}",
-            ephemeral=True
-        )
+        await send_text_channel_picker(inter, "🤝 Allianz-Event-Channel auswählen", _picked)
 
     @tree.command(name="alliance_partner_channel_set", description="(Partner-Admin) Eventtyp-Channel für diesen Partner-Server setzen")
-    async def alliance_partner_event_channel_set(inter: discord.Interaction, group: str, event_type: str, channel: discord.TextChannel):
+    async def alliance_partner_event_channel_set(inter: discord.Interaction, group: str, event_type: str):
         ok, msg = _require_partner_admin(inter)
         if not ok:
             await inter.response.send_message(msg, ephemeral=True)
@@ -696,10 +706,6 @@ async def setup_alliance_config(client: discord.Client, tree: app_commands.Comma
             await inter.response.send_message(f"❌ Ungültiger Eventtyp. Erlaubt: {_event_type_text()}", ephemeral=True)
             return
 
-        if channel.guild.id != inter.guild.id:
-            await inter.response.send_message("❌ Der Channel muss auf diesem Partner-Server liegen.", ephemeral=True)
-            return
-
         key = _normalize_key(group)
         obj = _group_obj(key)
         if not obj:
@@ -712,17 +718,19 @@ async def setup_alliance_config(client: discord.Client, tree: app_commands.Comma
             await inter.response.send_message("❌ Dieser Discord ist noch nicht registriert. Nutze zuerst `/alliance_partner_register`.", ephemeral=True)
             return
 
-        event_channels = server.setdefault("event_channels", {})
-        event_channels[normalized] = {
-            "channel_id": int(channel.id),
-            "channel_name": channel.name,
-        }
-        save_alliance_cfg()
+        async def _picked(pick_inter: discord.Interaction, channel: discord.TextChannel):
+            event_channels = server.setdefault("event_channels", {})
+            event_channels[normalized] = {
+                "channel_id": int(channel.id),
+                "channel_name": channel.name,
+            }
+            save_alliance_cfg()
+            await pick_inter.response.edit_message(
+                content=f"✅ Partner-Event-Channel gesetzt:\nGruppe: **{obj.get('name', key)}**\nEventtyp: **{normalized}**\nServer: **{pick_inter.guild.name}**\nChannel: {channel.mention}",
+                view=None,
+            )
 
-        await inter.response.send_message(
-            f"✅ Partner-Event-Channel gesetzt:\nGruppe: **{obj.get('name', key)}**\nEventtyp: **{normalized}**\nServer: **{inter.guild.name}**\nChannel: {channel.mention}",
-            ephemeral=True
-        )
+        await send_text_channel_picker(inter, "🤝 Partner-Event-Channel auswählen", _picked)
 
     @tree.command(name="alliance_event_channel_list", description="(Leader) Eventtyp-Channels einer Allianz-Gruppe anzeigen")
     async def alliance_event_channel_list(inter: discord.Interaction, group: str):
