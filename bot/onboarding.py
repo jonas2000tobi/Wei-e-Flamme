@@ -8,6 +8,11 @@ from discord import app_commands
 from discord.ui import View, button
 from discord.enums import ButtonStyle
 
+try:
+    from bot.channel_picker import send_text_channel_picker, send_voice_channel_picker  # type: ignore
+except Exception:
+    from channel_picker import send_text_channel_picker, send_voice_channel_picker  # type: ignore
+
 DATA_DIR = Path(__file__).resolve().parent / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 CFG_FILE = DATA_DIR / "onboarding_cfg.json"
@@ -425,17 +430,19 @@ async def setup_onboarding(client: discord.Client, tree: app_commands.CommandTre
         )
 
     @tree.command(name="onboarding_set_review_channel", description="(Admin) Kanal für Review/Logs setzen")
-    async def onboarding_set_review_channel(inter: discord.Interaction, channel: discord.TextChannel):
+    async def onboarding_set_review_channel(inter: discord.Interaction):
         if not _is_admin(inter):
             await inter.response.send_message("Nur Admins.", ephemeral=True)
             return
 
-        c = _gcfg(inter.guild)
-        c["review_channel"] = int(channel.id)
-        cfg[str(inter.guild_id)] = c
-        _save_cfg(cfg)
+        async def _picked(pick_inter: discord.Interaction, channel: discord.TextChannel):
+            c = _gcfg(pick_inter.guild)
+            c["review_channel"] = int(channel.id)
+            cfg[str(pick_inter.guild_id)] = c
+            save_cfg()
+            await pick_inter.response.edit_message(content=f"✅ Review-/Log-Kanal gesetzt: {channel.mention}", view=None)
 
-        await inter.response.send_message(f"✅ Review/Log-Kanal gesetzt: {channel.mention}", ephemeral=True)
+        await send_text_channel_picker(inter, "📝 Onboarding-Review-Kanal auswählen", _picked)
 
     @tree.command(name="onboarding_require_review", description="(Admin) Review durch Staff erzwingen")
     async def onboarding_require_review(inter: discord.Interaction, require: bool):
