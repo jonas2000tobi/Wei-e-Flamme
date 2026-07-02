@@ -1,8 +1,18 @@
 from __future__ import annotations
 
 import os
+import sys
+from pathlib import Path
 from datetime import datetime, timedelta
 from typing import List, Tuple
+
+# Railway/Script-Start-Hotfix:
+# Wenn der Bot als `python bot/bot.py` gestartet wird, liegt /app/bot vor /app im Importpfad.
+# Dann wird `bot.py` als Modul `bot` gefunden und `from bot.xyz` bricht mit
+# "bot is not a package". Deshalb immer den Projekt-Root zuerst in sys.path setzen.
+ROOT_DIR = Path(__file__).resolve().parent.parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
 
 import discord
 from discord.ext import commands, tasks
