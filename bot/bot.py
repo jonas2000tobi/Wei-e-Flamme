@@ -46,6 +46,7 @@ setup_alliance_config = None
 setup_dkp_system = None
 setup_loot_auction = None
 setup_voice_creator = None
+setup_audit_system = None
 store = {}
 _modules_initialized = False
 
@@ -189,6 +190,15 @@ def _import_modules():
             setup_voice_creator = None
             print("⚠️ Voice-Creator nicht gefunden")
 
+    global setup_audit_system
+
+    try:
+        from bot.audit_system import setup_audit_system  # type: ignore
+        print("✅ Import: bot.audit_system")
+    except ModuleNotFoundError:
+        from audit_system import setup_audit_system  # type: ignore
+        print("✅ Import: audit_system (root)")
+
 
 def _get_token() -> str | None:
     for key in ("DISCORD_TOKEN", "DISCORD_BOT_TOKEN", "TOKEN"):
@@ -226,6 +236,7 @@ async def on_ready():
 
         # Alliance/Home-Server first, then the portal and its child modules.
         setup_steps = [
+            ("audit_system", setup_audit_system),
             ("alliance_config", setup_alliance_config),
             ("event_rsvp_dm", setup_rsvp_dm),
             ("onboarding", setup_onboarding),
