@@ -642,6 +642,13 @@ async def _refresh_attendance_check_message(
     emb = _attendance_check_embed(client, int(guild_id), event, str(event_id), event_type)
     ch = client.get_channel(int(channel_id))
     if not isinstance(ch, (discord.TextChannel, discord.Thread)):
+        try:
+            fetched = await client.fetch_channel(int(channel_id))
+            ch = fetched if isinstance(fetched, (discord.TextChannel, discord.Thread)) else None
+        except Exception:
+            ch = None
+    if not isinstance(ch, (discord.TextChannel, discord.Thread)):
+        print(f"[dkp_system] EC-Anwesenheitscheck Update: Kanal nicht gefunden channel_id={channel_id}")
         return
     try:
         msg = await ch.fetch_message(int(message_id))
@@ -681,7 +688,7 @@ def _attendance_check_embed(client: discord.Client, home_guild_id: int, event: d
         status = str((attendance.get(str(uid)) or {}).get("status", "") or "")
         status_label = _attendance_status_label(status)
         role = _signup_label(signup)
-        manual = " *(nachgetragen)*" if str(p.get("source", "") or "") == "manual" or signup == "MANUAL" else ""
+        manual = " *(nachgetragen)*" if bool(p.get("manual")) or str(p.get("source", "") or "") == "manual" or signup == "MANUAL" else ""
         marker = "EC" if _is_ebolus_member(client, home_guild_id, uid) else "Allianz"
         lines.append(f"• {status_label} {marker} <@{uid}> – {role}{manual}")
     if len(participants) > 25:
@@ -771,7 +778,7 @@ class ECAttendanceParticipantSelect(Select):
             raw_name = str(p.get("name", "") or f"User {uid}")
             label = raw_name[:90]
             signup = _signup_label(str(p.get("signup", "") or ""))
-            manual = " • nachgetragen" if str(p.get("source", "") or "") == "manual" or str(p.get("signup", "") or "") == "MANUAL" else ""
+            manual = " • nachgetragen" if bool(p.get("manual")) or str(p.get("source", "") or "") == "manual" or str(p.get("signup", "") or "") == "MANUAL" else ""
             options.append(discord.SelectOption(label=label, value=str(uid), description=(signup + manual)[:100]))
         if not options:
             options = [discord.SelectOption(label="Keine Spieler gefunden", value="0", description="Dieses Event hat keine Anwesenheitsliste")]
@@ -849,17 +856,18 @@ class ECAttendanceStatusView(View):
         if inter.guild is None or not _is_leader_or_admin(inter):
             await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
             return
+        await inter.response.defer(ephemeral=True, thinking=True)
         rsvp = _import_rsvp()
         if not rsvp:
-            await inter.response.send_message("❌ RSVP-/Anwesenheitssystem nicht geladen.", ephemeral=True)
+            await inter.edit_original_response(content="❌ RSVP-/Anwesenheitssystem nicht geladen.", embed=None, view=None)
             return
         ok = rsvp.set_attendance_status(self.guild_id, self.event_id, self.target_user_id, status, int(inter.user.id))
         if not ok:
-            await inter.response.send_message("❌ Anwesenheit konnte nicht gespeichert werden.", ephemeral=True)
+            await inter.edit_original_response(content="❌ Anwesenheit konnte nicht gespeichert werden.", embed=None, view=None)
             return
         await _refresh_attendance_check_message(inter.client, self.guild_id, self.event_id, self.source_channel_id, self.source_message_id)
         label = _attendance_status_label(status)
-        await inter.response.edit_message(content=f"✅ <@{self.target_user_id}> wurde gesetzt auf: **{label}**", embed=None, view=None)
+        await inter.edit_original_response(content=f"✅ <@{self.target_user_id}> wurde gesetzt auf: **{label}**", embed=None, view=None)
 
     @button(label="✅ War da", style=ButtonStyle.success, custom_id="dkp_attendance_status_present", row=0)
     async def present(self, inter: discord.Interaction, _btn: discord.ui.Button):
@@ -881,6 +889,23 @@ class ECAttendanceStatusView(View):
     async def clear(self, inter: discord.Interaction, _btn: discord.ui.Button):
         await self._set_status(inter, "clear")
 
+    @button(label="🗑️ Aus EC-Liste entfernen", style=ButtonStyle.danger, custom_id="dkp_attendance_status_remove", row=2)
+    async def remove(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        if inter.guild is None or not _is_leader_or_admin(inter):
+            await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
+            return
+        await inter.response.defer(ephemeral=True, thinking=True)
+        rsvp = _import_rsvp()
+        if not rsvp:
+            await inter.edit_original_response(content="❌ RSVP-/Anwesenheitssystem nicht geladen.", embed=None, view=None)
+            return
+        ok = rsvp.remove_attendance_participant(self.guild_id, self.event_id, self.target_user_id, int(inter.user.id))
+        if not ok:
+            await inter.edit_original_response(content="❌ Spieler konnte nicht aus der EC-Anwesenheitsliste entfernt werden.", embed=None, view=None)
+            return
+        await _refresh_attendance_check_message(inter.client, self.guild_id, self.event_id, self.source_channel_id, self.source_message_id)
+        await inter.edit_original_response(content=f"✅ <@{self.target_user_id}> wurde aus der EC-Anwesenheitsliste entfernt.", embed=None, view=None)
+
 
 class ECAttendanceAddUserSelect(UserSelect):
     def __init__(self, guild_id: int, event_id: str, source_channel_id: int, source_message_id: int):
@@ -894,33 +919,51 @@ class ECAttendanceAddUserSelect(UserSelect):
         if inter.guild is None or not _is_leader_or_admin(inter):
             await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
             return
+        await inter.response.defer(ephemeral=True, thinking=True)
         rsvp = _import_rsvp()
         if not rsvp:
-            await inter.response.send_message("❌ RSVP-/Anwesenheitssystem nicht geladen.", ephemeral=True)
+            await inter.edit_original_response(content="❌ RSVP-/Anwesenheitssystem nicht geladen.", embed=None, view=None)
             return
-        user = self.values[0]
-        if not isinstance(user, discord.Member):
-            await inter.response.send_message("❌ Bitte ein Servermitglied auswählen.", ephemeral=True)
+
+        selected = self.values[0] if self.values else None
+        uid = int(getattr(selected, "id", 0) or 0)
+        if not uid:
+            await inter.edit_original_response(content="❌ Bitte ein Servermitglied auswählen.", embed=None, view=None)
             return
+
+        member = selected if isinstance(selected, discord.Member) else inter.guild.get_member(uid)
+        if member is None:
+            try:
+                member = await inter.guild.fetch_member(uid)
+            except Exception:
+                member = None
+
+        display_name = (
+            str(getattr(member, "display_name", "") or "")
+            or str(getattr(selected, "display_name", "") or "")
+            or str(getattr(selected, "name", "") or f"User {uid}")
+        )
+
         ok = rsvp.add_attendance_participant(
             self.guild_id,
             self.event_id,
-            int(user.id),
-            str(user.display_name or user.name),
-            int(inter.user.id),
-            "present",
+            uid,
+            display_name,
+            signup="DPS",
+            status="present",
+            marked_by=int(inter.user.id),
         )
         if not ok:
-            await inter.response.send_message("❌ Spieler konnte nicht zur EC-Anwesenheit hinzugefügt werden.", ephemeral=True)
+            await inter.edit_original_response(content="❌ Spieler konnte nicht zur EC-Anwesenheit hinzugefügt werden. Event-Snapshot fehlt oder Event-ID ist ungültig.", embed=None, view=None)
             return
         await _refresh_attendance_check_message(inter.client, self.guild_id, self.event_id, self.source_channel_id, self.source_message_id)
-        await inter.response.edit_message(
+        await inter.edit_original_response(
             content=(
-                f"✅ {user.mention} wurde **nur zur EC-Anwesenheit** nachgetragen und erstmal auf **War da** gesetzt.\n"
+                f"✅ <@{uid}> wurde **nur zur EC-Anwesenheit** nachgetragen und erstmal auf **War da** gesetzt.\n"
                 "Die normale Event-Anmeldung wurde nicht verändert."
             ),
             embed=None,
-            view=ECAttendanceStatusView(self.guild_id, self.event_id, int(user.id), 0, self.source_channel_id, self.source_message_id),
+            view=ECAttendanceStatusView(self.guild_id, self.event_id, uid, 0, self.source_channel_id, self.source_message_id),
         )
 
 
@@ -928,6 +971,16 @@ class ECAttendanceAddUserView(View):
     def __init__(self, guild_id: int, event_id: str, source_channel_id: int, source_message_id: int):
         super().__init__(timeout=None)
         self.add_item(ECAttendanceAddUserSelect(guild_id, event_id, source_channel_id, source_message_id))
+
+    async def on_error(self, inter: discord.Interaction, error: Exception, item: discord.ui.Item[Any]) -> None:
+        print(f"[dkp_system] ECAttendanceAddUserView Fehler event={getattr(item, 'event_id', '?')}: {error!r}")
+        try:
+            if inter.response.is_done():
+                await inter.followup.send("❌ Spieler konnte nicht nachgetragen werden. Bitte erneut versuchen.", ephemeral=True)
+            else:
+                await inter.response.send_message("❌ Spieler konnte nicht nachgetragen werden. Bitte erneut versuchen.", ephemeral=True)
+        except Exception:
+            pass
 
 
 class ECEventCheckView(View):
@@ -962,9 +1015,10 @@ class ECEventCheckView(View):
     async def confirm_all(self, inter: discord.Interaction, btn: discord.ui.Button):
         if not await self._guard(inter):
             return
+        await inter.response.defer(ephemeral=True, thinking=True)
         rsvp = _import_rsvp()
         if not rsvp:
-            await inter.response.send_message("❌ RSVP-System nicht geladen.", ephemeral=True)
+            await inter.edit_original_response(content="❌ RSVP-System nicht geladen.", embed=None, view=None)
             return
         event = rsvp.get_attendance_event(self.guild_id, self.event_id)
         if not event:
@@ -973,7 +1027,7 @@ class ECEventCheckView(View):
             if isinstance(obj, dict):
                 event = rsvp.ensure_attendance_snapshot(inter.client, self.event_id, obj)
         if not event:
-            await inter.response.send_message("❌ Event nicht gefunden.", ephemeral=True)
+            await inter.edit_original_response(content="❌ Event nicht gefunden.", embed=None, view=None)
             return
         count = 0
         for p in event.get("participants", []) or []:
@@ -988,8 +1042,11 @@ class ECEventCheckView(View):
         event = rsvp.get_attendance_event(self.guild_id, self.event_id) or event
         event_type = _dkp_type_from_event(event, self.event_id)
         emb = _attendance_check_embed(inter.client, self.guild_id, event, self.event_id, event_type or "Unbekannt")
-        await inter.response.edit_message(embed=emb, view=self)
-        await inter.followup.send(f"✅ {count} angemeldete Spieler wurden als 'War da' bestätigt. Nutze bei Bedarf „Einzel bearbeiten“ oder „Spieler nachtragen“.", ephemeral=True)
+        try:
+            await inter.message.edit(embed=emb, view=self)
+        except Exception as e:
+            print(f"[dkp_system] EC-Check confirm_all Message-Update fehlgeschlagen: {e!r}")
+        await inter.edit_original_response(content=f"✅ {count} angemeldete Spieler wurden als 'War da' bestätigt. Nutze bei Bedarf „Einzel bearbeiten“ oder „Spieler nachtragen“.", embed=None, view=None)
 
     @button(label="Einzel bearbeiten", style=ButtonStyle.secondary, custom_id="dkp_check_edit_one", row=0)
     async def edit_one(self, inter: discord.Interaction, btn: discord.ui.Button):
