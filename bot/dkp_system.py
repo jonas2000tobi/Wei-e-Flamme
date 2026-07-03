@@ -936,6 +936,16 @@ class ECEventCheckView(View):
         self.guild_id = int(guild_id)
         self.event_id = str(event_id)
 
+    async def on_error(self, inter: discord.Interaction, error: Exception, item: discord.ui.Item[Any]) -> None:
+        print(f"[dkp_system] ECEventCheckView Fehler event={self.event_id}: {error!r}")
+        try:
+            if inter.response.is_done():
+                await inter.followup.send("❌ EC-Anwesenheitscheck konnte nicht verarbeitet werden. Bitte kurz erneut versuchen oder den Check neu posten.", ephemeral=True)
+            else:
+                await inter.response.send_message("❌ EC-Anwesenheitscheck konnte nicht verarbeitet werden. Bitte kurz erneut versuchen oder den Check neu posten.", ephemeral=True)
+        except Exception:
+            pass
+
     async def _guard(self, inter: discord.Interaction) -> bool:
         if inter.guild is None:
             await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
@@ -1242,6 +1252,39 @@ def _attendance_summary_for_award(client: discord.Client, home_guild_id: int, ev
 
     return present, reserve, skipped_not_ebolus, skipped_not_present
 
+def _register_persistent_event_check_views(client: discord.Client) -> int:
+    """Registriert offene EC-Anwesenheitscheck-Buttons nach Restart/Deploy neu.
+
+    Ohne diese Registrierung sind alte Check-Nachrichten im Server zwar sichtbar,
+    aber ihre Buttons laufen nach einem Deploy in „Interaktion fehlgeschlagen“.
+    """
+    count = 0
+    for gid_str, g in list((dkp_event_checks or {}).items()):
+        try:
+            gid = int(gid_str)
+        except Exception:
+            continue
+        events = g.get("events") if isinstance(g, dict) else {}
+        if not isinstance(events, dict):
+            continue
+        for event_id, st in list(events.items()):
+            if not isinstance(st, dict):
+                continue
+            if not bool(st.get("posted", False)):
+                continue
+            if bool(st.get("ignored", False)) or bool(st.get("awarded", False)):
+                continue
+            mid = int(st.get("message_id", 0) or 0)
+            if not mid:
+                continue
+            try:
+                client.add_view(ECEventCheckView(gid, str(event_id)), message_id=mid)
+                count += 1
+            except Exception as e:
+                print(f"[dkp_system] EC-Check Persistent View konnte nicht registriert werden {gid}/{event_id}/{mid}: {e!r}")
+    return count
+
+
 async def setup_dkp_system(client: discord.Client, tree: app_commands.CommandTree):
     # Initialisiert Defaults für alle aktuell bekannten Guilds.
     for guild in getattr(client, "guilds", []) or []:
@@ -1250,6 +1293,12 @@ async def setup_dkp_system(client: discord.Client, tree: app_commands.CommandTre
             c["last_decay_period"] = _weekly_period_key()
             dkp_cfg[str(int(guild.id))] = c
     save_cfg()
+
+    try:
+        registered_checks = _register_persistent_event_check_views(client)
+        print(f"💰 EC-Anwesenheitscheck Persistent Views registriert: {registered_checks}")
+    except Exception as e:
+        print(f"[dkp_system] EC-Anwesenheitscheck Persistent Views Fehler: {e!r}")
 
     # Wichtig: Discord erlaubt global maximal 100 Top-Level Slash-Commands.
     # Darum laufen die DKP-Funktionen als eine Command-Gruppe `/dkp ...`,
