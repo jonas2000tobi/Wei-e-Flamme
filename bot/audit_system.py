@@ -76,7 +76,11 @@ async def setup_audit_system(client: discord.Client, tree: app_commands.CommandT
         emb.add_field(name="DATABASE_URL", value="gesetzt" if st.get("database_url_configured") else "nicht gesetzt", inline=True)
         emb.add_field(name="Audit-Logs Server", value=str(guild_count), inline=True)
         emb.add_field(name="Audit-Logs Gesamt", value=str(total_count), inline=True)
-        emb.add_field(name="Datei", value=f"`{st.get('path')}`", inline=False)
+        emb.add_field(name="Speicher", value=f"`{st.get('path')}`", inline=False)
+        if st.get("database_url_kind"):
+            emb.add_field(name="DATABASE_URL-Typ", value=str(st.get("database_url_kind")), inline=True)
+        if st.get("postgres_error"):
+            emb.add_field(name="Postgres-Fehler", value=f"```{str(st.get('postgres_error'))[:900]}```", inline=False)
         await inter.response.send_message(embed=emb, ephemeral=True)
 
     @tree.command(name="audit_last", description="Admin: Letzte Audit-Einträge anzeigen")
