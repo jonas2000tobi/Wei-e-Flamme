@@ -326,6 +326,7 @@ def _init_event_shape(obj: dict):
     obj.setdefault("scope", "single")
     obj.setdefault("voice_enabled", False)
     obj.setdefault("voice_channel_id", 0)
+    obj.setdefault("voice_last_channel_id", 0)
     obj.setdefault("voice_category_id", 0)
     obj.setdefault("voice_return_channel_id", 0)
     obj.setdefault("voice_cleanup_done", False)
@@ -982,10 +983,40 @@ def ensure_attendance_snapshot(client: discord.Client, msg_id: str, obj: dict) -
                 "attendance": {},
                 "dkp_enabled": bool(obj.get("dkp_enabled", False)),
                 "dkp_event_type": str(obj.get("dkp_event_type", "") or ""),
+                "voice_channel_id": int(obj.get("voice_channel_id", 0) or 0),
+                "voice_last_channel_id": int(obj.get("voice_last_channel_id", obj.get("voice_channel_id", 0)) or 0),
+                "voice_name": str(obj.get("voice_name", "") or ""),
             }
         else:
             # Teilnehmerliste aktualisieren, aber bereits gesetzte Anwesenheit behalten.
+            # Wichtig: manuell nachgetragene EC-Teilnehmer dürfen dabei nicht verschwinden,
+            # wenn der Snapshot später noch einmal aus der ursprünglichen RSVP-Liste erneuert wird.
             old_att = snap.get("attendance") if isinstance(snap.get("attendance"), dict) else {}
+            old_participants = snap.get("participants") if isinstance(snap.get("participants"), list) else []
+            seen_ids = set()
+            for _p in participants:
+                try:
+                    _uid = int(_p.get("id", 0) or 0)
+                except Exception:
+                    _uid = 0
+                if _uid:
+                    seen_ids.add(_uid)
+            for _p in old_participants:
+                try:
+                    _uid = int(_p.get("id", 0) or 0)
+                except Exception:
+                    _uid = 0
+                if not _uid or _uid in seen_ids:
+                    continue
+                is_manual = bool(_p.get("manual")) or str(_p.get("source", "") or "") == "manual" or str(_p.get("signup", "") or "") == "MANUAL"
+                has_marked_attendance = str(_uid) in old_att
+                if is_manual or has_marked_attendance:
+                    _copy = dict(_p)
+                    _copy.setdefault("manual", True)
+                    _copy.setdefault("source", "manual")
+                    participants.append(_copy)
+                    seen_ids.add(_uid)
+
             snap["guild_id"] = guild_id
             snap["channel_id"] = int(obj.get("channel_id", 0) or 0)
             snap["message_id"] = event_id
@@ -999,6 +1030,9 @@ def ensure_attendance_snapshot(client: discord.Client, msg_id: str, obj: dict) -
             # aber keine EC vergeben, obwohl das ursprüngliche Event EC-relevant war.
             snap["dkp_enabled"] = bool(obj.get("dkp_enabled", False))
             snap["dkp_event_type"] = str(obj.get("dkp_event_type", "") or "")
+            snap["voice_channel_id"] = int(obj.get("voice_channel_id", 0) or 0)
+            snap["voice_last_channel_id"] = int(obj.get("voice_last_channel_id", obj.get("voice_channel_id", 0)) or 0)
+            snap["voice_name"] = str(obj.get("voice_name", "") or "")
 
         events[event_id] = snap
         save_attendance()
@@ -1059,6 +1093,7 @@ def add_attendance_participant(guild_id: int, event_id: str, user_id: int, name:
             "name": str(name or f"User {user_id}"),
             "signup": signup,
             "manual": True,
+            "source": "manual",
             "added_by": int(marked_by or 0),
             "added_at": datetime.now(TZ).isoformat(),
         })
@@ -1066,6 +1101,7 @@ def add_attendance_participant(guild_id: int, event_id: str, user_id: int, name:
         p["name"] = str(name or p.get("name") or f"User {user_id}")
         p["signup"] = signup
         p["manual"] = bool(p.get("manual", False)) or True
+        p["source"] = str(p.get("source", "") or "manual")
         p["updated_by"] = int(marked_by or 0)
         p["updated_at"] = datetime.now(TZ).isoformat()
     return set_attendance_status(guild_id, event_id, user_id, status, marked_by)
@@ -1221,6 +1257,7 @@ async def _maybe_create_event_voice_for_obj(client: discord.Client, obj: dict) -
         await _position_event_voice(channel, anchor)
 
         obj["voice_channel_id"] = int(channel.id)
+        obj["voice_last_channel_id"] = int(channel.id)
         obj["voice_created_at"] = now.isoformat()
         obj["voice_name"] = name
         obj["voice_cleanup_done"] = False
@@ -1262,6 +1299,8 @@ async def _cleanup_event_voice_for_obj(client: discord.Client, obj: dict) -> boo
         channel = guild.get_channel(voice_channel_id)
         if not isinstance(channel, discord.VoiceChannel):
             obj["voice_cleanup_done"] = True
+            if voice_channel_id:
+                obj["voice_last_channel_id"] = int(voice_channel_id)
             obj["voice_channel_id"] = 0
             return True
 
@@ -1276,6 +1315,7 @@ async def _cleanup_event_voice_for_obj(client: discord.Client, obj: dict) -> boo
             return False
 
         obj["voice_cleanup_done"] = True
+        obj["voice_last_channel_id"] = int(voice_channel_id)
         obj["voice_channel_id"] = 0
         print(f"[event_rsvp_dm] Event-Voice gelöscht: {voice_channel_id}")
         return True
