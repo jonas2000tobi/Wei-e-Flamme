@@ -2078,6 +2078,7 @@ def _sidebar_html() -> str:
         <div class="brand-mark"><img src="{_asset('logo_128.png')}" alt="Ebolus"></div>
         <div><strong>Ebolus</strong><span>Gilden-Dashboard</span></div>
       </div>
+      <button class="mobile-nav-toggle" type="button" onclick="document.body.classList.toggle('nav-open')">☰ Menü</button>
 
       <nav class="side-nav">
         <a href="/" data-nav="home">🏰 Kommando</a>
@@ -2152,14 +2153,17 @@ def _html_shell(title: str, body: str) -> str:
   <style>
     :root {{ --bg:#0f1014; --panel:#181a22; --panel2:#20232d; --text:#f1eadb; --muted:#a8a193; --gold:#d6a84f; --line:#333746; --red:#d96868; --green:#81c784; --side:#11121a; --side2:#171824; }}
     * {{ box-sizing:border-box; }} html {{ scroll-behavior:smooth; }}
-    body {{ margin:0; font-family:Inter, system-ui, Segoe UI, sans-serif; background:linear-gradient(180deg,rgba(15,16,20,.78),rgba(15,16,20,.98)), url("{_asset('dashboard_bg.webp')}") center top / cover fixed no-repeat; color:var(--text); }}
+    body {{ margin:0; font-family:Inter, system-ui, Segoe UI, sans-serif; background:linear-gradient(180deg,rgba(15,16,20,.78),rgba(15,16,20,.98)), url("{_asset('dashboard_bg.webp')}") center top / cover fixed no-repeat; color:var(--text); overflow-x:hidden; }}
     .app-shell {{ display:grid; grid-template-columns:260px minmax(0,1fr); min-height:100vh; }}
-    .sidebar {{ position:sticky; top:0; height:100vh; overflow:auto; padding:18px 14px; background:linear-gradient(180deg,rgba(17,18,26,.97),rgba(11,12,18,.97)); border-right:1px solid rgba(214,168,79,.16); box-shadow:16px 0 45px rgba(0,0,0,.35); }}
+    .sidebar {{ position:sticky; top:0; height:100vh; overflow:auto; scrollbar-width:none; -ms-overflow-style:none; padding:18px 14px; background:linear-gradient(180deg,rgba(17,18,26,.97),rgba(11,12,18,.97)); border-right:1px solid rgba(214,168,79,.16); box-shadow:16px 0 45px rgba(0,0,0,.35); }}
+    .sidebar::-webkit-scrollbar {{ width:0; height:0; display:none; }}
+    .mobile-nav-toggle {{ display:none; border:1px solid rgba(214,168,79,.24); border-radius:12px; background:linear-gradient(180deg,rgba(32,35,45,.92),rgba(13,14,20,.86)); color:var(--text); font-weight:800; padding:10px 12px; cursor:pointer; }}
     .brand {{ display:flex; align-items:center; gap:12px; padding:8px 8px 18px; margin-bottom:8px; border-bottom:1px solid rgba(214,168,79,.14); }}
     .brand-mark {{ width:46px; height:46px; border-radius:14px; background:radial-gradient(circle at 35% 30%,rgba(214,168,79,.28),rgba(32,35,45,.9)); border:1px solid rgba(214,168,79,.24); display:grid; place-items:center; }}
     .brand-mark img {{ width:34px; height:34px; object-fit:contain; filter:drop-shadow(0 2px 8px rgba(0,0,0,.75)); }}
     .brand strong {{ display:block; font-size:18px; }} .brand span {{ display:block; color:var(--muted); font-size:12px; }}
-    .side-nav {{ display:flex; flex-direction:column; gap:6px; }}
+    .side-nav {{ display:flex; flex-direction:column; gap:6px; scrollbar-width:none; -ms-overflow-style:none; }}
+    .side-nav::-webkit-scrollbar, .sidebar-footer::-webkit-scrollbar {{ width:0; height:0; display:none; }}
     .side-nav a, .side-nav summary {{ color:var(--text); text-decoration:none; padding:10px 12px; border-radius:12px; display:flex; align-items:center; gap:9px; font-size:14px; cursor:pointer; }}
     .side-nav a:hover, .side-nav summary:hover {{ background:rgba(214,168,79,.09); color:var(--gold); }}
     .side-nav a.active {{ background:linear-gradient(90deg,rgba(214,168,79,.18),rgba(214,168,79,.06)); color:var(--gold); border:1px solid rgba(214,168,79,.24); }}
@@ -2239,7 +2243,43 @@ def _html_shell(title: str, body: str) -> str:
     .authbar {{ display:flex; gap:10px; align-items:center; justify-content:flex-end; background:rgba(24,26,34,.78); border:1px solid var(--line); border-radius:12px; padding:10px 12px; margin-bottom:14px; color:var(--muted); font-size:13px; }} .authbar a {{ color:var(--gold); text-decoration:none; font-weight:700; }}
     @media(max-width:1100px) {{ .app-shell {{ grid-template-columns:1fr; }} .sidebar {{ position:relative; height:auto; border-right:0; border-bottom:1px solid rgba(214,168,79,.16); }} .side-nav {{ display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); }} .side-nav details {{ margin-top:0; }} .home-layout {{ grid-template-columns:1fr; }} }}
     @media(max-width:1000px) {{ .grid,.analytics-grid {{ grid-template-columns:repeat(2,minmax(0,1fr)); }} .split {{ grid-template-columns:1fr; }} .hero {{ flex-direction:column; align-items:flex-start; }} }}
-    @media(max-width:560px) {{ main.content {{ padding:16px 12px 50px; }} .grid,.analytics-grid,.side-nav {{ grid-template-columns:1fr; }} .bar-row {{ grid-template-columns:90px 1fr 38px; }} .home-item {{ grid-template-columns:38px minmax(0,1fr); }} .home-item .pill {{ grid-column:2; justify-self:start; }} }}
+    @media(max-width:760px) {{
+      body {{ background-attachment:scroll; }}
+      .app-shell {{ display:block; min-height:100vh; }}
+      .sidebar {{ position:sticky; top:0; z-index:60; height:auto; max-height:none; overflow:visible; padding:10px 12px; border-right:0; border-bottom:1px solid rgba(214,168,79,.18); box-shadow:0 14px 28px rgba(0,0,0,.38); backdrop-filter:blur(12px); }}
+      .brand {{ padding:0; margin:0; border-bottom:0; padding-right:112px; min-height:46px; }}
+      .brand-mark {{ width:42px; height:42px; border-radius:13px; }} .brand-mark img {{ width:31px; height:31px; }}
+      .mobile-nav-toggle {{ display:inline-flex; align-items:center; gap:6px; position:absolute; right:12px; top:10px; }}
+      .side-nav, .sidebar-footer {{ display:none; }}
+      body.nav-open .side-nav {{ display:grid; grid-template-columns:1fr; gap:6px; max-height:calc(100vh - 86px); overflow:auto; scrollbar-width:none; -ms-overflow-style:none; padding-top:12px; margin-top:10px; border-top:1px solid rgba(214,168,79,.12); }}
+      body.nav-open .side-nav::-webkit-scrollbar {{ width:0; height:0; display:none; }}
+      body.nav-open .sidebar-footer {{ display:grid; grid-template-columns:1fr 1fr; margin-top:10px; padding-top:10px; }}
+      .side-nav details {{ margin-top:4px; padding-top:6px; }}
+      .side-nav details a {{ margin-left:0; padding:10px 12px; }}
+      main.content {{ padding:12px 10px 46px; }}
+      .authbar {{ justify-content:flex-start; flex-wrap:wrap; font-size:12px; }}
+      .hero {{ padding:18px; border-radius:16px; margin-bottom:12px; }}
+      .hero h1 {{ font-size:28px; line-height:1.1; }}
+      .hero h1::before {{ width:30px; height:30px; margin-right:8px; vertical-align:-6px; }}
+      .hero .btn, .hero a.btn {{ width:100%; text-align:center; margin-top:4px; }}
+      .grid,.analytics-grid {{ grid-template-columns:1fr; gap:10px; }}
+      .card {{ padding:14px; }} .card-value {{ font-size:25px; }}
+      .home-layout {{ grid-template-columns:1fr; gap:12px; }}
+      .panel {{ padding:14px; border-radius:15px; margin:12px 0; }}
+      .home-item {{ grid-template-columns:38px minmax(0,1fr); gap:10px; padding:12px; }}
+      .home-icon {{ width:38px; height:38px; font-size:18px; }}
+      .home-title {{ overflow-wrap:anywhere; }}
+      .home-meta {{ overflow-wrap:anywhere; font-size:12px; }}
+      .home-item .pill {{ grid-column:2; justify-self:start; }}
+      .action-list .btn {{ padding:11px 12px; }}
+      .table-search {{ max-width:100%; }}
+      .table-wrap {{ width:100%; overflow-x:auto; -webkit-overflow-scrolling:touch; }}
+      table {{ font-size:13px; min-width:640px; }}
+      th,td {{ padding:9px 7px; }}
+      .btn {{ width:auto; max-width:100%; white-space:normal; text-align:center; }}
+      .queue-badge,.pill {{ white-space:normal; }}
+    }}
+    @media(max-width:560px) {{ main.content {{ padding:12px 10px 42px; }} .grid,.analytics-grid,.side-nav {{ grid-template-columns:1fr; }} .bar-row {{ grid-template-columns:90px 1fr 38px; }} .home-item {{ grid-template-columns:38px minmax(0,1fr); }} .home-item .pill {{ grid-column:2; justify-self:start; }} .split {{ grid-template-columns:1fr; }} }}
   </style>
 </head>
 <body><div class="app-shell">{_sidebar_html()}<main class="content">{auth_note}{body}</main></div><script>
@@ -2265,6 +2305,10 @@ function filterNextTable(input) {{
     }}
   }}
   if (best) {{ best.classList.add('active'); const d = best.closest('details'); if (d) d.open = true; }}
+}})();
+(function mobileNavCleanup() {{
+  document.querySelectorAll('.side-nav a').forEach(a => a.addEventListener('click', () => document.body.classList.remove('nav-open')));
+  document.addEventListener('keydown', ev => {{ if (ev.key === 'Escape') document.body.classList.remove('nav-open'); }});
 }})();
 </script></body>
 </html>"""
