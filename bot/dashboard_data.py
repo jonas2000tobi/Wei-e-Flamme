@@ -921,13 +921,53 @@ def _summarize_event_checks(data: Any, guild_id: int, *, limit: int = 200) -> di
 
 def _voice_summary(guild_id: int) -> dict[str, Any]:
     try:
+        # Für das Dashboard/Analytics laden wir mehr als nur die letzten 20 Sessions.
+        # Das ist weiterhin read-only und verändert keine Voice- oder Eventdaten.
+        sessions = runtime_db.fetch_voice_sessions(guild_id, limit=1000)
+        by_user: dict[int, dict[str, Any]] = {}
+        for sess in sessions or []:
+            if not isinstance(sess, dict):
+                continue
+            try:
+                uid = int(sess.get("user_id") or sess.get("member_id") or 0)
+            except Exception:
+                uid = 0
+            if not uid:
+                continue
+            try:
+                dur = int(float(sess.get("duration_seconds") or sess.get("duration") or 0))
+            except Exception:
+                dur = 0
+            bucket = by_user.setdefault(uid, {
+                "user_id": uid,
+                "sessions": 0,
+                "total_seconds": 0,
+                "last_joined_at": "",
+                "last_left_at": "",
+            })
+            bucket["sessions"] += 1
+            bucket["total_seconds"] += max(0, dur)
+            joined = str(sess.get("joined_at") or "")
+            left = str(sess.get("left_at") or "")
+            if joined and joined > str(bucket.get("last_joined_at") or ""):
+                bucket["last_joined_at"] = joined
+            if left and left > str(bucket.get("last_left_at") or ""):
+                bucket["last_left_at"] = left
+
+        by_user_rows = list(by_user.values())
+        by_user_rows.sort(key=lambda x: int(x.get("total_seconds") or 0), reverse=True)
+        total_seconds = sum(int(x.get("total_seconds") or 0) for x in by_user_rows)
         return {
             "sessions_total": runtime_db.count_voice_sessions(guild_id),
             "sessions_open": runtime_db.count_voice_sessions(guild_id, open_only=True),
-            "recent_sessions": runtime_db.fetch_voice_sessions(guild_id, limit=20),
+            "recent_sessions": sessions[:250],
+            "loaded_sessions": len(sessions or []),
+            "total_seconds_loaded": total_seconds,
+            "total_hours_loaded": round(total_seconds / 3600, 2),
+            "by_user": by_user_rows[:500],
         }
     except Exception as exc:
-        return {"error": f"{type(exc).__name__}: {exc}", "sessions_total": 0, "sessions_open": 0, "recent_sessions": []}
+        return {"error": f"{type(exc).__name__}: {exc}", "sessions_total": 0, "sessions_open": 0, "recent_sessions": [], "by_user": []}
 
 
 def _audit_summary(guild_id: int) -> dict[str, Any]:
