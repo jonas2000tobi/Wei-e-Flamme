@@ -12,6 +12,7 @@ import hmac
 import time
 import urllib.parse
 import urllib.request
+import urllib.error
 from collections import Counter
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -55,6 +56,7 @@ def _pg_connect():
 SESSION_COOKIE = "ebo_dashboard_session"
 STATE_COOKIE = "ebo_dashboard_state"
 DISCORD_API_BASE = "https://discord.com/api/v10"
+DISCORD_OAUTH_TOKEN_URL = "https://discord.com/api/oauth2/token"
 
 
 def _env(name: str, default: str = "") -> str:
@@ -220,15 +222,27 @@ def _auth(request: Request, credentials: Optional[HTTPBasicCredentials] = Depend
 
 def _request_json(url: str, *, method: str = "GET", data: Optional[dict[str, Any]] = None, token: str = "") -> dict[str, Any]:
     body = None
-    headers = {"Accept": "application/json"}
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "Ebo-Dashboard/1.0 (+https://dashboardweb-production-2933.up.railway.app)",
+    }
     if data is not None:
         body = urllib.parse.urlencode(data).encode("utf-8")
         headers["Content-Type"] = "application/x-www-form-urlencoded"
     if token:
         headers["Authorization"] = f"Bearer {token}"
     req = urllib.request.Request(url, data=body, headers=headers, method=method)
-    with urllib.request.urlopen(req, timeout=12) as resp:  # nosec - Discord API URL only from constants
-        return json.loads(resp.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(req, timeout=12) as resp:  # nosec - Discord API URL only from constants
+            raw = resp.read().decode("utf-8")
+            return json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as exc:
+        try:
+            detail = exc.read().decode("utf-8")[:800]
+        except Exception:
+            detail = ""
+        safe_url = url.replace(_env("DASHBOARD_DISCORD_CLIENT_SECRET"), "<secret>")
+        raise RuntimeError(f"Discord HTTP {exc.code} bei {safe_url}: {detail or exc.reason}") from exc
 
 
 
@@ -3002,6 +3016,9 @@ def discord_debug(request: Request):
         <tr><td>Redirect URI, die diese Website an Discord sendet</td><td><code>{_e(redirect_uri)}</code></td></tr>
         <tr><td>Discord Developer Portal → Redirects</td><td><code>{_e(redirect_uri)}</code></td></tr>
         <tr><td>Railway Variable DASHBOARD_DISCORD_REDIRECT_URI</td><td><code>{_e(_env('DASHBOARD_DISCORD_REDIRECT_URI') or 'nicht gesetzt')}</code></td></tr>
+        <tr><td>Client ID gesetzt</td><td><code>{_e('ja' if _env('DASHBOARD_DISCORD_CLIENT_ID') else 'nein')}</code></td></tr>
+        <tr><td>Client Secret gesetzt</td><td><code>{_e('ja · Länge ' + str(len(_env('DASHBOARD_DISCORD_CLIENT_SECRET'))) if _env('DASHBOARD_DISCORD_CLIENT_SECRET') else 'nein')}</code></td></tr>
+        <tr><td>Token Endpoint</td><td><code>{_e(DISCORD_OAUTH_TOKEN_URL)}</code></td></tr>
         <tr><td>Scope</td><td><code>identify</code></td></tr>
       </table>
       <p><a class='btn' href='/login'>Zurück</a> <a class='btn secondary' href='{_e(authorize_url)}'>Test-Authorize-URL öffnen</a></p>
@@ -3040,7 +3057,7 @@ def discord_callback(request: Request, code: str = "", state: str = "", error: s
 
     try:
         token_data = _request_json(
-            f"{DISCORD_API_BASE}/oauth2/token",
+            DISCORD_OAUTH_TOKEN_URL,
             method="POST",
             data={
                 "client_id": _env("DASHBOARD_DISCORD_CLIENT_ID"),
@@ -3051,6 +3068,8 @@ def discord_callback(request: Request, code: str = "", state: str = "", error: s
             },
         )
         access_token = str(token_data.get("access_token") or "")
+        if not access_token:
+            raise RuntimeError(f"Discord OAuth hat keinen access_token geliefert: {token_data}")
         user = _request_json(f"{DISCORD_API_BASE}/users/@me", token=access_token)
         uid = str(user.get("id") or "")
         username = str(user.get("global_name") or user.get("username") or uid)
