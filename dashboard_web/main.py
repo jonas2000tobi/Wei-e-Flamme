@@ -231,18 +231,45 @@ def _request_json(url: str, *, method: str = "GET", data: Optional[dict[str, Any
         return json.loads(resp.read().decode("utf-8"))
 
 
+
+def _clean_external_url(value: str) -> str:
+    """Railway/Discord-OAuth URL robust bereinigen.
+
+    Schutz gegen typische Copy-Paste-Fehler:
+    - https://https://...
+    - Slash am Ende bei Base URL
+    - doppelte Slashes im Pfad
+    """
+    value = str(value or "").strip()
+    if value.startswith("https://https://"):
+        value = "https://" + value[len("https://https://"):]
+    if value.startswith("http://https://"):
+        value = "https://" + value[len("http://https://"):]
+    if value.startswith("https://http://"):
+        value = "http://" + value[len("https://http://"):]
+    # Doppelte Slashes im Pfad reduzieren, Scheme behalten.
+    if "://" in value:
+        scheme, rest = value.split("://", 1)
+        while "//" in rest:
+            rest = rest.replace("//", "/")
+        value = f"{scheme}://{rest}"
+    return value.rstrip("/")
+
 def _base_url(request: Request) -> str:
     # Railway setzt üblicherweise Host/Proto korrekt. Bei Custom Domain sonst per Env überschreiben.
-    forced = _env("DASHBOARD_PUBLIC_BASE_URL").rstrip("/")
+    forced = _clean_external_url(_env("DASHBOARD_PUBLIC_BASE_URL"))
     if forced:
         return forced
     proto = request.headers.get("x-forwarded-proto") or request.url.scheme
     host = request.headers.get("x-forwarded-host") or request.headers.get("host") or request.url.netloc
-    return f"{proto}://{host}".rstrip("/")
+    return _clean_external_url(f"{proto}://{host}")
 
 
 def _redirect_uri(request: Request) -> str:
-    return _env("DASHBOARD_DISCORD_REDIRECT_URI") or f"{_base_url(request)}/auth/discord/callback"
+    forced = _clean_external_url(_env("DASHBOARD_DISCORD_REDIRECT_URI"))
+    if forced:
+        return forced
+    return f"{_base_url(request)}/auth/discord/callback"
 
 
 def _e(value: Any) -> str:
@@ -2953,6 +2980,36 @@ def login_page(request: Request, next: str = "/"):
     return HTMLResponse(_html_shell("Login · Ebo Dashboard", body))
 
 
+@app.get("/auth/discord/debug")
+def discord_debug(request: Request):
+    redirect_uri = _redirect_uri(request)
+    base_url = _base_url(request)
+    authorize_params = {
+        "client_id": _env("DASHBOARD_DISCORD_CLIENT_ID"),
+        "redirect_uri": redirect_uri,
+        "response_type": "code",
+        "scope": "identify",
+        "state": "debug",
+    }
+    authorize_url = "https://discord.com/oauth2/authorize?" + urllib.parse.urlencode(authorize_params)
+    body = f"""
+    <section class='panel'>
+      <h1>🔐 Discord Login Debug</h1>
+      <p class='muted'>Diese Werte müssen exakt zu Discord Developer Portal und Railway passen.</p>
+      <table>
+        <tr><th>Wert</th><th>Inhalt</th></tr>
+        <tr><td>DASHBOARD_PUBLIC_BASE_URL / erkannt</td><td><code>{_e(base_url)}</code></td></tr>
+        <tr><td>Redirect URI, die diese Website an Discord sendet</td><td><code>{_e(redirect_uri)}</code></td></tr>
+        <tr><td>Discord Developer Portal → Redirects</td><td><code>{_e(redirect_uri)}</code></td></tr>
+        <tr><td>Railway Variable DASHBOARD_DISCORD_REDIRECT_URI</td><td><code>{_e(_env('DASHBOARD_DISCORD_REDIRECT_URI') or 'nicht gesetzt')}</code></td></tr>
+        <tr><td>Scope</td><td><code>identify</code></td></tr>
+      </table>
+      <p><a class='btn' href='/login'>Zurück</a> <a class='btn secondary' href='{_e(authorize_url)}'>Test-Authorize-URL öffnen</a></p>
+    </section>
+    """
+    return HTMLResponse(_html_shell("Discord Login Debug", body))
+
+
 @app.get("/auth/discord/start")
 def discord_start(request: Request, next: str = "/"):
     if not _discord_oauth_enabled():
@@ -2965,7 +3022,6 @@ def discord_start(request: Request, next: str = "/"):
         "response_type": "code",
         "scope": "identify",
         "state": state,
-        "prompt": "none",
     }
     url = "https://discord.com/oauth2/authorize?" + urllib.parse.urlencode(params)
     resp = RedirectResponse(url, status_code=303)
