@@ -14,7 +14,7 @@ from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
-app = FastAPI(title="Ebo Dashboard", version="0.8.0")
+app = FastAPI(title="Ebo Dashboard", version="0.8.1")
 security = HTTPBasic(auto_error=False)
 
 
@@ -1941,6 +1941,309 @@ def export_fairness_csv(_: bool = Depends(_auth)):
     return _csv_response("fairness.csv", ["user_id","display_name","role","ec","earned","spent","loot_won","main_needs","secondary_needs","event_yes","voice_hours","hinweise"], rows)
 
 
+
+
+# ---------------------------------------------------------------------------
+# Step 3.11: Führungsstartseite / Kommandoübersicht
+# ---------------------------------------------------------------------------
+
+def _dt_obj(value: Any) -> Optional[datetime]:
+    s = str(value or "").strip()
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _is_active_auction(auction: dict[str, Any]) -> bool:
+    status = str(auction.get("status") or "").lower()
+    phase = str(auction.get("phase") or "").lower()
+    if any(x in status for x in ("deleted", "cancel", "abbruch", "closed", "finished", "done", "ended", "abgeschlossen")):
+        return False
+    active_words = ("open", "active", "running", "bidding", "roll", "sale", "free", "main", "secondary", "müll", "muell", "junk")
+    return any(x in status for x in active_words) or any(x in phase for x in active_words)
+
+
+def _auction_leader_text(auction: dict[str, Any], names: dict[int, str]) -> str:
+    uid = _user_id(auction.get("top_bid_user_id") or auction.get("leader_user_id") or auction.get("winner_user_id"))
+    amount = auction.get("top_bid_amount") if auction.get("top_bid_amount") is not None else auction.get("current_bid")
+    if uid and amount is not None:
+        return f"{names.get(uid, f'User {uid}')} mit {_fmt_ec(amount)} EC"
+    if uid:
+        return names.get(uid, f"User {uid}")
+    winner = auction.get("winner_name") or auction.get("recipient_name")
+    return str(winner or "niemand")
+
+
+def _leadership_insights(snap: dict[str, Any]) -> dict[str, Any]:
+    analytics = _analytics_from_snapshot(snap)
+    planning = _planning_analytics(snap)
+    fairness = _fairness_analytics(snap)
+    activity = _activity_analytics(snap)
+    names = _profile_name_map(snap)
+    guild = snap.get("guild") or {}
+    member_filter = guild.get("member_filter") if isinstance(guild.get("member_filter"), dict) else {}
+    role_member_count = int(_num(member_filter.get("eligible_count"), analytics.get("role_member_count", 0)))
+
+    events = planning.get("events") if isinstance(planning.get("events"), list) else []
+    event_rows = []
+    for ev in events:
+        if not isinstance(ev, dict):
+            continue
+        dt = _dt_obj(ev.get("when_iso"))
+        issues = [str(x) for x in (ev.get("issues") or [])]
+        readiness = int(_num(ev.get("readiness"), 0))
+        if readiness < 80 or issues:
+            event_rows.append({**ev, "_dt": dt, "issues_text": ", ".join(issues) or "—"})
+    event_rows.sort(key=lambda x: (x.get("_dt") is None, x.get("_dt") or datetime.max.replace(tzinfo=timezone.utc)))
+
+    auctions = (((snap.get("loot") or {}).get("auctions") or {}).get("items") or [])
+    active_auctions = []
+    for a in auctions:
+        if not isinstance(a, dict) or not _is_active_auction(a):
+            continue
+        active_auctions.append({**a, "_dt": _dt_obj(a.get("ends_at") or a.get("end_at") or a.get("expires_at"))})
+    active_auctions.sort(key=lambda x: (x.get("_dt") is None, x.get("_dt") or datetime.max.replace(tzinfo=timezone.utc)))
+
+    quality = (_insights(snap).get("quality") if isinstance(_insights(snap).get("quality"), dict) else {})
+    missing_profile = int(_num(quality.get("missing_profile"), analytics.get("missing_profiles", 0)))
+    missing_ec = int(_num(quality.get("missing_ec"), analytics.get("missing_ec", 0)))
+    missing_needs = int(_num(quality.get("missing_needs"), analytics.get("missing_needs", 0)))
+    no_event_response = int(_num(quality.get("no_event_response"), 0))
+    no_voice_time = int(_num(quality.get("no_voice_time"), 0))
+
+    flagged_members = fairness.get("flagged") if isinstance(fairness.get("flagged"), list) else []
+    risk_members = _insights(snap).get("risk_members") if isinstance(_insights(snap).get("risk_members"), list) else []
+    if not flagged_members and risk_members:
+        flagged_members = risk_members
+
+    tasks: list[dict[str, Any]] = []
+    if not member_filter or member_filter.get("mode") != "discord_role":
+        tasks.append({"prio": "hoch", "area": "Setup", "task": "Gildenrolle festlegen", "detail": "Ohne Gildenrolle sind Dashboard-Zahlen nicht massentauglich.", "link": "/settings"})
+    if missing_needs:
+        tasks.append({"prio": "mittel", "area": "Needs", "task": f"{missing_needs} Mitglieder ohne Needliste", "detail": "Für Lootplanung und Fairness nachpflegen lassen.", "link": "/needs"})
+    if missing_profile:
+        tasks.append({"prio": "mittel", "area": "Profile", "task": f"{missing_profile} Mitglieder ohne Profil", "detail": "Rolle/GS fehlen für Planung und Analytics.", "link": "/members"})
+    if missing_ec:
+        tasks.append({"prio": "niedrig", "area": "EC", "task": f"{missing_ec} Mitglieder ohne EC-Konto", "detail": "Kann normal sein, sollte aber geprüft werden.", "link": "/ec"})
+    if int(planning.get("events_at_risk") or 0):
+        tasks.append({"prio": "hoch", "area": "Events", "task": f"{planning.get('events_at_risk')} Event(s) mit Rollen-/Teilnehmer-Risiko", "detail": "Tank/Heiler/Teilnehmer prüfen.", "link": "/planning"})
+    if active_auctions:
+        tasks.append({"prio": "mittel", "area": "Loot", "task": f"{len(active_auctions)} aktive Auktion(en)", "detail": "Endzeiten und Führende prüfen.", "link": "/loot"})
+    if flagged_members:
+        tasks.append({"prio": "mittel", "area": "Fairness", "task": f"{len(flagged_members)} Fairness-/Datenhinweis(e)", "detail": "Keine automatische Bewertung, nur Leitungs-Hinweis.", "link": "/fairness"})
+    if no_event_response:
+        tasks.append({"prio": "mittel", "area": "Aktivität", "task": f"{no_event_response} Mitglieder ohne Eventantwort", "detail": "Anmeldedisziplin prüfen.", "link": "/analytics"})
+    if no_voice_time:
+        tasks.append({"prio": "niedrig", "area": "Voice", "task": f"{no_voice_time} Mitglieder ohne gemessene Voice-Zeit", "detail": "Nur relevant, wenn Voice-Attendance genutzt wird.", "link": "/analytics"})
+
+    prio_order = {"hoch": 0, "mittel": 1, "niedrig": 2}
+    tasks.sort(key=lambda x: (prio_order.get(str(x.get("prio")), 9), str(x.get("area"))))
+
+    return {
+        "member_count": role_member_count,
+        "tasks": tasks,
+        "event_risks": event_rows[:12],
+        "active_auctions": active_auctions[:12],
+        "flagged_members": flagged_members[:12],
+        "planning": planning,
+        "fairness": fairness,
+        "activity": activity,
+        "analytics": analytics,
+        "quality": {
+            "missing_profile": missing_profile,
+            "missing_ec": missing_ec,
+            "missing_needs": missing_needs,
+            "no_event_response": no_event_response,
+            "no_voice_time": no_voice_time,
+        },
+        "names": names,
+    }
+
+
+def _prio_pill(priority: Any) -> dict[str, str]:
+    p = str(priority or "").lower()
+    label = {"hoch": "🔴 hoch", "mittel": "🟡 mittel", "niedrig": "⚪ niedrig"}.get(p, p or "—")
+    return _raw(f"<span class='pill'>{_e(label)}</span>")
+
+
+def _render_leadership_dashboard(data: dict[str, Any]) -> str:
+    if not data.get("ok"):
+        return _html_shell(
+            "Ebo Dashboard",
+            f"""
+            <section class="panel">
+              <h1>🏰 Gildenleitung</h1>
+              <p class="muted">{_e(data.get('error'))}</p>
+              <p>Starte den Bot mit der aktuellen Version und warte bis zu 5 Minuten. Oder nutze im Discord <code>/dashboard_status</code>, damit direkt ein Snapshot veröffentlicht wird.</p>
+            </section>
+            """,
+        )
+
+    snap: dict[str, Any] = data.get("snapshot") or {}
+    guild = snap.get("guild") or {}
+    li = _leadership_insights(snap)
+    analytics = li.get("analytics") or {}
+    quality = li.get("quality") or {}
+    names = li.get("names") or {}
+    member_filter = (guild.get("member_filter") or {}) if isinstance(guild.get("member_filter"), dict) else {}
+    role_line = "Gildenrolle nicht gesetzt"
+    if member_filter.get("mode") == "discord_role":
+        role_line = f"Rolle: {member_filter.get('role_name')} · {member_filter.get('eligible_count', 0)} Mitglieder"
+
+    tasks = li.get("tasks") or []
+    urgent_count = sum(1 for t in tasks if str(t.get("prio")) == "hoch")
+    event_risks = li.get("event_risks") or []
+    active_auctions = li.get("active_auctions") or []
+    flagged_members = li.get("flagged_members") or []
+
+    cards = "".join([
+        _card("Offene Aufgaben", len(tasks), f"hoch: {urgent_count}"),
+        _card("Rollenmitglieder", li.get("member_count", 0), role_line),
+        _card("Risiko-Events", len(event_risks), "Rollen/Teilnehmer prüfen"),
+        _card("Aktive Auktionen", len(active_auctions), "Auktionshaus/DKP-Log"),
+        _card("ohne Needliste", quality.get("missing_needs", 0), "nachpflegen lassen"),
+        _card("EC gesamt", _fmt_ec(analytics.get("total_ec")), f"Ø {_fmt_ec(analytics.get('avg_ec'))}"),
+        _card("Voice-Stunden", f"{_num(analytics.get('recent_voice_hours'), 0):.1f} h", "geladene Sessions"),
+        _card("Snapshot", _dt(data.get("published_at")), "read-only"),
+    ])
+
+    task_rows = []
+    for t in tasks:
+        link = str(t.get("link") or "/")
+        task_rows.append([
+            _prio_pill(t.get("prio")),
+            t.get("area"),
+            _raw(f"<a class='link' href='{_e(link)}'>{_e(t.get('task'))}</a>"),
+            t.get("detail"),
+        ])
+
+    event_rows = []
+    for ev in event_risks:
+        if not isinstance(ev, dict):
+            continue
+        event_rows.append([
+            _event_link(ev.get("event_id"), ev.get("title")),
+            _dt(ev.get("when_iso")),
+            ev.get("participants"),
+            ev.get("tank"),
+            ev.get("healer"),
+            ev.get("dps"),
+            f"{int(_num(ev.get('readiness'), 0))}%",
+            ev.get("issues_text") or ", ".join(str(x) for x in (ev.get("issues") or [])) or "—",
+        ])
+
+    auction_rows = []
+    for a in active_auctions:
+        if not isinstance(a, dict):
+            continue
+        auction_rows.append([
+            _auction_link(a.get("auction_id"), a.get("item_name") or a.get("title")),
+            a.get("status") or "—",
+            a.get("phase") or "—",
+            _auction_leader_text(a, names),
+            _dt(a.get("ends_at") or a.get("end_at") or a.get("expires_at")),
+        ])
+
+    member_rows = []
+    for m in flagged_members:
+        if not isinstance(m, dict):
+            continue
+        flags = m.get("flags") if isinstance(m.get("flags"), list) else m.get("risk_flags") if isinstance(m.get("risk_flags"), list) else []
+        member_rows.append([
+            _member_link(m.get("user_id"), m.get("display_name")),
+            m.get("role") or m.get("main_role") or "—",
+            _fmt_ec(m.get("ec_balance")) if m.get("ec_balance") is not None else "—",
+            m.get("main_needs") if m.get("main_needs") is not None else m.get("main_need_count", "—"),
+            m.get("loot_won") if m.get("loot_won") is not None else m.get("loot_won_count", "—"),
+            ", ".join(str(x) for x in flags) or "—",
+        ])
+
+    quick_links = _table([
+        "Bereich", "Wofür"
+    ], [
+        [_raw('<a class="link" href="/planning">📅 Planung</a>'), "Events mit Rollen-/Teilnehmer-Hinweisen"],
+        [_raw('<a class="link" href="/members">👥 Mitglieder</a>'), "Roster, Profile, Datenqualität"],
+        [_raw('<a class="link" href="/needs">🎁 Needs</a>'), "Top-Needs und Mitglieder ohne Needliste"],
+        [_raw('<a class="link" href="/loot">🏆 Loot</a>'), "Aktive Auktionen, Gewinner, Roll-/Bid-Historie"],
+        [_raw('<a class="link" href="/fairness">⚖️ Fairness</a>'), "Need/EC/Loot-Hinweise"],
+        [_raw('<a class="link" href="/audit">🧾 Audit</a>'), "Wer hat was gemacht"],
+        [_raw('<a class="link" href="/overview">📊 Gesamtübersicht</a>'), "alte Tabellen-Startseite"],
+    ], searchable=False)
+
+    body = f"""
+    <nav class="topnav">
+      <a href="/">Kommando</a>
+      <a href="/planning">Planung</a>
+      <a href="/members">Mitglieder</a>
+      <a href="/needs">Needs</a>
+      <a href="/loot">Loot</a>
+      <a href="/fairness">Fairness</a>
+      <a href="/analytics">Analytics</a>
+      <a href="/ec">EC</a>
+      <a href="/audit">Audit</a>
+      <a href="/settings">Einstellungen</a>
+      <a href="/system">System</a>
+      <a href="/exports">Exports</a>
+    </nav>
+
+    <section class="hero">
+      <div>
+        <div class="eyebrow">Führungsstartseite · read-only</div>
+        <h1>🏰 {_e(guild.get('name') or data.get('guild_name') or 'Gilde')}</h1>
+        <p>Was heute Aufmerksamkeit braucht: Aufgaben, Risiko-Events, aktive Auktionen und auffällige Mitglieder.</p>
+        <p class="muted">{_e(role_line)} · Snapshot: {_e(_dt(data.get('published_at')))}</p>
+      </div>
+      <a class="btn" href="/overview">Gesamtübersicht</a>
+    </section>
+
+    <section class="grid">{cards}</section>
+
+    <section class="panel">
+      <h2>✅ Offene Aufgaben</h2>
+      <p class="muted">Priorisierte Leitungs-Hinweise. Es wird nichts automatisch geändert.</p>
+      {_table(['Priorität','Bereich','Aufgabe','Details'], task_rows, placeholder='Aufgaben durchsuchen…')}
+    </section>
+
+    <section class="split">
+      <div class="panel">
+        <h2>📅 Events mit Aufmerksamkeit</h2>
+        {_table(['Event','Zeit','Teilnehmer','Tank','Heiler','DPS','Score','Hinweis'], event_rows, placeholder='Events durchsuchen…')}
+      </div>
+      <div class="panel">
+        <h2>🎁 Aktive Auktionen</h2>
+        {_table(['Item','Status','Phase','Führend','Ende'], auction_rows, placeholder='Auktionen durchsuchen…')}
+      </div>
+    </section>
+
+    <section class="split">
+      <div class="panel">
+        <h2>⚠️ Mitglieder mit Hinweisen</h2>
+        {_table(['Spieler','Rolle','EC','Main','Loot','Hinweise'], member_rows, placeholder='Mitglieder durchsuchen…')}
+      </div>
+      <div class="panel">
+        <h2>🧭 Schnellzugriff</h2>
+        {quick_links}
+      </div>
+    </section>
+    """
+    return _html_shell("Kommando · Ebo Dashboard", body)
+
+
+@app.get("/api/leadership")
+def api_leadership(_: bool = Depends(_auth)):
+    payload = _snapshot_payload()
+    if not payload.get("ok"):
+        return JSONResponse(payload, status_code=404)
+    snap = payload.get("snapshot") or {}
+    return JSONResponse({"ok": True, "leadership": _leadership_insights(snap)})
+
+
 @app.get("/healthz")
 def healthz():
     return {"ok": True, "database_url": bool(_database_url())}
@@ -2115,10 +2418,21 @@ def api_system(_: bool = Depends(_auth)):
     snap = payload.get("snapshot") or {}
     return JSONResponse({"ok": True, "guild": snap.get("guild") or {}, "storage": snap.get("storage") or {}, "source_health": snap.get("source_health") or {}})
 
+@app.get("/overview", response_class=HTMLResponse)
+def overview(_: bool = Depends(_auth)):
+    try:
+        return HTMLResponse(_render_dashboard(_snapshot_payload()))
+    except Exception as exc:
+        return HTMLResponse(
+            _html_shell("Ebo Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
+            status_code=500,
+        )
+
+
 @app.get("/", response_class=HTMLResponse)
 def index(_: bool = Depends(_auth)):
     try:
-        return HTMLResponse(_render_dashboard(_snapshot_payload()))
+        return HTMLResponse(_render_leadership_dashboard(_snapshot_payload()))
     except Exception as exc:
         return HTMLResponse(
             _html_shell("Ebo Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
