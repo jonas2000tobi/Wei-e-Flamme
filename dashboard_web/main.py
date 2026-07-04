@@ -3665,3 +3665,411 @@ def index(_: bool = Depends(_auth)):
             _html_shell("Ebo Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
             status_code=500,
         )
+
+
+# ---------------------------------------------------------------------------
+# Ebene 3 / Schritt 2: Attendance Review im Dashboard
+# ---------------------------------------------------------------------------
+# Sicherer Zwischenschritt: Admins können auf Basis von Anmeldung + Voice einen
+# Anwesenheits-Review speichern. Es wird noch KEIN EC gebucht und KEINE Bot-JSON
+# wird verändert. Diese Daten liegen nur in der Dashboard-Postgres-Tabelle.
+
+
+def _ensure_attendance_review_tables() -> None:
+    if not _database_url():
+        return
+    conn = _pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS dashboard_event_attendance_review (
+                    guild_id BIGINT NOT NULL,
+                    event_id TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'draft',
+                    payload_json TEXT NOT NULL DEFAULT '{}',
+                    updated_by_id TEXT,
+                    updated_by_name TEXT,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY (guild_id, event_id)
+                )
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS dashboard_admin_action_log (
+                    id BIGSERIAL PRIMARY KEY,
+                    guild_id BIGINT NOT NULL,
+                    action_type TEXT NOT NULL,
+                    target_type TEXT NOT NULL,
+                    target_id TEXT NOT NULL,
+                    actor_id TEXT,
+                    actor_name TEXT,
+                    payload_json TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+                """
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _attendance_review_load(guild_id: int, event_id: str) -> dict[str, Any]:
+    if not _database_url() or not guild_id or not event_id:
+        return {}
+    _ensure_attendance_review_tables()
+    conn = _pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT guild_id, event_id, status, payload_json, updated_by_id, updated_by_name, updated_at
+                FROM dashboard_event_attendance_review
+                WHERE guild_id = %s AND event_id = %s
+                """,
+                (guild_id, str(event_id)),
+            )
+            row = cur.fetchone()
+            if not row:
+                return {}
+            out = dict(row)
+            try:
+                out["payload"] = json.loads(out.get("payload_json") or "{}")
+            except Exception:
+                out["payload"] = {}
+            return out
+    finally:
+        conn.close()
+
+
+def _attendance_review_save(guild_id: int, event_id: str, payload: dict[str, Any], actor: dict[str, Any], status: str = "draft") -> None:
+    if not _database_url() or not guild_id or not event_id:
+        raise RuntimeError("DATABASE_URL/Guild/Event fehlt")
+    status = str(status or "draft").strip().lower()
+    if status not in {"draft", "reviewed", "locked"}:
+        status = "draft"
+    actor_id = str(actor.get("user_id") or "")
+    actor_name = str(actor.get("username") or actor.get("user_id") or "")
+    raw = json.dumps(payload or {}, ensure_ascii=False, separators=(",", ":"))
+    _ensure_attendance_review_tables()
+    conn = _pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO dashboard_event_attendance_review
+                    (guild_id, event_id, status, payload_json, updated_by_id, updated_by_name, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, NOW())
+                ON CONFLICT (guild_id, event_id) DO UPDATE SET
+                    status = EXCLUDED.status,
+                    payload_json = EXCLUDED.payload_json,
+                    updated_by_id = EXCLUDED.updated_by_id,
+                    updated_by_name = EXCLUDED.updated_by_name,
+                    updated_at = NOW()
+                """,
+                (guild_id, str(event_id), status, raw, actor_id, actor_name),
+            )
+            cur.execute(
+                """
+                INSERT INTO dashboard_admin_action_log
+                    (guild_id, action_type, target_type, target_id, actor_id, actor_name, payload_json)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """,
+                (guild_id, "attendance_review_save", "event", str(event_id), actor_id, actor_name, json.dumps({"status": status, "items": len((payload or {}).get("items") or [])}, ensure_ascii=False)),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _attendance_status_label(value: Any) -> str:
+    v = str(value or "open").lower()
+    return {
+        "present": "✅ War da",
+        "partial": "🟡 Teilweise / prüfen",
+        "absent": "❌ Nicht da",
+        "ignore": "⚪ Ignorieren",
+        "open": "— offen",
+    }.get(v, "— offen")
+
+
+def _attendance_candidate_map(snap: dict[str, Any], event: dict[str, Any]) -> dict[int, dict[str, Any]]:
+    names = _profile_name_map(snap)
+    voice = _voice_event_analysis(snap, event)
+    candidates: dict[int, dict[str, Any]] = {}
+
+    def add(uid: int, name: str = "", signup: str = "", default_status: str = "open", source: str = "") -> None:
+        if not uid:
+            return
+        entry = candidates.setdefault(uid, {"user_id": uid, "display_name": names.get(uid, name or f"User {uid}"), "signup": "", "source": set(), "voice_minutes": 0.0, "voice_sessions": 0, "suggested_status": "open"})
+        if name and str(entry.get("display_name", "")).startswith("User "):
+            entry["display_name"] = name
+        if signup and not entry.get("signup"):
+            entry["signup"] = signup
+        if source:
+            entry["source"].add(source)
+        if default_status != "open" and entry.get("suggested_status") in {"open", "absent"}:
+            entry["suggested_status"] = default_status
+
+    parts = event.get("participants") or {}
+    for group in parts.get("yes") or []:
+        if not isinstance(group, dict):
+            continue
+        role = str(group.get("role") or "Zusage")
+        for p in group.get("participants") or []:
+            if isinstance(p, dict):
+                add(_user_id(p.get("user_id")), str(p.get("display_name") or ""), role, "present", "Zusage")
+    for key, label, status in (("maybe", "Vielleicht", "partial"), ("no", "Abgemeldet", "absent")):
+        for p in parts.get(key) or []:
+            if isinstance(p, dict):
+                add(_user_id(p.get("user_id")), str(p.get("display_name") or ""), label, status, label)
+
+    for r in voice.get("voice_by_user") or []:
+        if not isinstance(r, dict):
+            continue
+        uid = _user_id(r.get("user_id"))
+        add(uid, str(r.get("display_name") or ""), "", "partial", "Voice")
+        if uid in candidates:
+            candidates[uid]["voice_minutes"] = _num(r.get("minutes"), 0)
+            candidates[uid]["voice_sessions"] = int(_num(r.get("sessions"), 0))
+            # Dashboard-Vorschlag bewusst konservativ: mit Voice und Zusage = war da,
+            # Voice ohne Anmeldung = teilweise prüfen.
+            if candidates[uid].get("signup") and candidates[uid].get("signup") not in {"Abgemeldet"}:
+                candidates[uid]["suggested_status"] = "present"
+            elif _num(r.get("minutes"), 0) >= 20:
+                candidates[uid]["suggested_status"] = "partial"
+
+    for uid, entry in candidates.items():
+        if isinstance(entry.get("source"), set):
+            entry["source"] = ", ".join(sorted(entry["source"]))
+    return candidates
+
+
+def _attendance_review_payload_from_event(snap: dict[str, Any], event: dict[str, Any], mode: str = "voice") -> dict[str, Any]:
+    candidates = _attendance_candidate_map(snap, event)
+    items = []
+    for uid, c in sorted(candidates.items(), key=lambda kv: str(kv[1].get("display_name") or kv[0]).lower()):
+        status = c.get("suggested_status") or "open"
+        if mode == "signup":
+            signup = str(c.get("signup") or "")
+            if signup == "Abgemeldet":
+                status = "absent"
+            elif signup == "Vielleicht":
+                status = "partial"
+            elif signup:
+                status = "present"
+        items.append({
+            "user_id": uid,
+            "display_name": c.get("display_name"),
+            "signup": c.get("signup") or "—",
+            "voice_minutes": c.get("voice_minutes") or 0,
+            "voice_sessions": c.get("voice_sessions") or 0,
+            "source": c.get("source") or "—",
+            "status": status,
+            "note": "",
+        })
+    return {
+        "event_id": str(event.get("event_id") or event.get("id") or ""),
+        "event_title": event.get("title") or "Event",
+        "event_when": event.get("when_iso"),
+        "mode": mode,
+        "items": items,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _render_attendance_list(data: dict[str, Any]) -> str:
+    if not data.get("ok"):
+        return _html_shell("Anwesenheit · Ebo Dashboard", f"<section class='panel'><h1>📝 Anwesenheit</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+    snap: dict[str, Any] = data.get("snapshot") or {}
+    guild_id = _safe_guild_id(data)
+    events = [e for e in ((snap.get("events") or {}).get("items") or []) if isinstance(e, dict)]
+    rows = []
+    for ev in events:
+        eid = str(ev.get("event_id") or ev.get("id") or "")
+        voice = _voice_event_analysis(snap, ev)
+        review = _attendance_review_load(guild_id, eid) if eid else {}
+        payload = review.get("payload") or {}
+        items = payload.get("items") or []
+        rows.append([
+            _raw(f'<a class="link" href="/attendance/{_e(eid)}">{_e(ev.get("title") or eid)}</a>'),
+            _dt(ev.get("when_iso")),
+            ev.get("participant_count", 0),
+            "ja" if ev.get("voice_enabled") else "nein",
+            voice.get("voice_user_count", 0),
+            _attendance_status_label(review.get("status") or ("reviewed" if items else "open")),
+            len(items),
+        ])
+    body = f"""
+    <nav class="topnav"><a href="/">Kommando</a><a href="/planning">Planung</a><a href="/voice">Voice</a><a href="/admin">Leitung</a></nav>
+    <section class="hero">
+      <div>
+        <div class="eyebrow">Ebene 3 · sichere Admin-Aktion</div>
+        <h1>📝 Anwesenheits-Review</h1>
+        <p>Hier kann die Leitung Anmeldung und Voice-Zeit vergleichen und einen Review speichern. Es wird noch kein EC gebucht.</p>
+        <p class="muted">Snapshot: {_e(_dt(data.get('published_at')))}</p>
+      </div>
+      <a class="btn" href="/planning">Planung</a>
+    </section>
+    <section class="panel">
+      <h2>📅 Events</h2>
+      {_table(['Event','Zeit','Anmeldungen','Voice','Voice-User','Review','Review-Zeilen'], rows, placeholder='Events durchsuchen…')}
+    </section>
+    """
+    return _html_shell("Anwesenheit · Ebo Dashboard", body)
+
+
+def _render_attendance_event(data: dict[str, Any], event_id: str, saved: bool = False) -> str:
+    if not data.get("ok"):
+        return _html_shell("Anwesenheit · Ebo Dashboard", f"<section class='panel'><h1>📝 Anwesenheit</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+    snap: dict[str, Any] = data.get("snapshot") or {}
+    event = _event_by_id(snap, event_id)
+    if not event:
+        return _html_shell("Event nicht gefunden", "<section class='panel'><h1>❌ Event nicht gefunden</h1><p><a class='btn' href='/attendance'>Zurück</a></p></section>")
+    guild_id = _safe_guild_id(data)
+    review = _attendance_review_load(guild_id, event_id)
+    payload = review.get("payload") or {}
+    if not payload.get("items"):
+        payload = _attendance_review_payload_from_event(snap, event, mode="voice")
+    items = payload.get("items") or []
+    present = sum(1 for i in items if str(i.get("status")) == "present")
+    partial = sum(1 for i in items if str(i.get("status")) == "partial")
+    absent = sum(1 for i in items if str(i.get("status")) == "absent")
+    ignored = sum(1 for i in items if str(i.get("status")) == "ignore")
+    cards = "".join([
+        _card("War da", present, "Review-Status"),
+        _card("Teilweise", partial, "prüfen/korrigieren"),
+        _card("Nicht da", absent, "Review-Status"),
+        _card("Ignoriert", ignored, "nicht EC-relevant"),
+    ])
+    rows_html = []
+    for i in items:
+        uid = _user_id(i.get("user_id"))
+        status = str(i.get("status") or "open")
+        note = str(i.get("note") or "")
+        options = []
+        for val, label in [("present", "War da"), ("partial", "Teilweise"), ("absent", "Nicht da"), ("ignore", "Ignorieren")]:
+            sel = " selected" if status == val else ""
+            options.append(f'<option value="{val}"{sel}>{label}</option>')
+        rows_html.append(f"""
+        <tr>
+          <td>{_member_link(uid, i.get('display_name')).get('__html__')}</td>
+          <td>{_e(i.get('signup') or '—')}</td>
+          <td>{_e(i.get('voice_minutes') or 0)} min · {_e(i.get('voice_sessions') or 0)}x</td>
+          <td>{_e(i.get('source') or '—')}</td>
+          <td>
+            <input type="hidden" name="user_id" value="{uid}">
+            <input type="hidden" name="display_name_{uid}" value="{_e(i.get('display_name') or '')}">
+            <input type="hidden" name="signup_{uid}" value="{_e(i.get('signup') or '')}">
+            <input type="hidden" name="voice_minutes_{uid}" value="{_e(i.get('voice_minutes') or 0)}">
+            <input type="hidden" name="voice_sessions_{uid}" value="{_e(i.get('voice_sessions') or 0)}">
+            <input type="hidden" name="source_{uid}" value="{_e(i.get('source') or '')}">
+            <select name="status_{uid}">{''.join(options)}</select>
+          </td>
+          <td><input name="note_{uid}" value="{_e(note)}" placeholder="Notiz optional" style="width:100%;min-width:180px"></td>
+        </tr>
+        """)
+    saved_note = "<div class='warn'>✅ Review gespeichert. EC wurde nicht automatisch gebucht.</div>" if saved else ""
+    updated = ""
+    if review:
+        updated = f"<p class='muted'>Letzte Speicherung: {_e(_dt(review.get('updated_at')))} durch {_e(review.get('updated_by_name') or '—')} · Status: {_e(review.get('status') or 'draft')}</p>"
+    body = f"""
+    <nav class="topnav"><a href="/attendance">← Anwesenheit</a><a href="/event/{_e(event_id)}">Eventdetails</a><a href="/voice">Voice</a><a href="/ec">EC</a></nav>
+    <section class="hero">
+      <div>
+        <div class="eyebrow">Anwesenheits-Review · keine EC-Buchung</div>
+        <h1>📝 {_e(event.get('title') or event_id)}</h1>
+        <p class="muted">Event-ID: {_e(event_id)} · Zeit: {_e(_dt(event.get('when_iso')))} · Voice: {_e(event.get('voice_channel_id') or event.get('voice_last_channel_id') or 'kein Voice')}</p>
+        {updated}
+      </div>
+      <form method="post" action="/admin/attendance/{_e(event_id)}/voice-suggest"><button class="btn" type="submit">🎙️ Voice-Vorschlag neu laden</button></form>
+    </section>
+    {saved_note}
+    <section class="grid">{cards}</section>
+    <section class="panel">
+      <h2>👥 Review-Liste</h2>
+      <p class="muted">Diese Speicherung ist ein Dashboard-Review für die Leitung. Sie verändert noch keine EC-Konten und nicht die Discord-Anwesenheitskarte.</p>
+      <form method="post" action="/admin/attendance/{_e(event_id)}/save">
+        <div class='table-wrap'><table><thead><tr><th>Spieler</th><th>Anmeldung</th><th>Voice</th><th>Quelle</th><th>Status</th><th>Notiz</th></tr></thead><tbody>{''.join(rows_html)}</tbody></table></div>
+        <p style="margin-top:14px"><button class="btn" type="submit">Review speichern</button></p>
+      </form>
+    </section>
+    """
+    return _html_shell(f"Anwesenheit · {event.get('title') or event_id}", body)
+
+
+@app.get("/attendance", response_class=HTMLResponse)
+def attendance_dashboard(_: bool = Depends(_auth)):
+    try:
+        return HTMLResponse(_render_attendance_list(_snapshot_payload()))
+    except Exception as exc:
+        return HTMLResponse(_html_shell("Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"), status_code=500)
+
+
+@app.get("/attendance/{event_id}", response_class=HTMLResponse)
+def attendance_event_page(event_id: str, saved: int = 0, _: bool = Depends(_auth)):
+    try:
+        return HTMLResponse(_render_attendance_event(_snapshot_payload(), str(event_id), saved=bool(saved)))
+    except Exception as exc:
+        return HTMLResponse(_html_shell("Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"), status_code=500)
+
+
+@app.post("/admin/attendance/{event_id}/voice-suggest")
+async def admin_attendance_voice_suggest(event_id: str, request: Request, _: bool = Depends(_admin_auth)):
+    payload = _snapshot_payload()
+    snap: dict[str, Any] = payload.get("snapshot") or {}
+    event = _event_by_id(snap, str(event_id))
+    if not event:
+        raise HTTPException(status_code=404, detail="Event nicht gefunden")
+    guild_id = _safe_guild_id(payload)
+    review_payload = _attendance_review_payload_from_event(snap, event, mode="voice")
+    _attendance_review_save(guild_id, str(event_id), review_payload, _current_user(request) or {}, status="draft")
+    return RedirectResponse(f"/attendance/{urllib.parse.quote(str(event_id))}?saved=1", status_code=303)
+
+
+@app.post("/admin/attendance/{event_id}/save")
+async def admin_attendance_save(event_id: str, request: Request, _: bool = Depends(_admin_auth)):
+    raw = (await request.body()).decode("utf-8", errors="replace")
+    form = urllib.parse.parse_qs(raw, keep_blank_values=True)
+    user_ids = [_user_id(x) for x in form.get("user_id", [])]
+    items = []
+    for uid in user_ids:
+        if not uid:
+            continue
+        status = (form.get(f"status_{uid}") or ["open"])[0]
+        if status not in {"present", "partial", "absent", "ignore"}:
+            status = "open"
+        items.append({
+            "user_id": uid,
+            "display_name": (form.get(f"display_name_{uid}") or [f"User {uid}"])[0],
+            "signup": (form.get(f"signup_{uid}") or ["—"])[0],
+            "voice_minutes": _num((form.get(f"voice_minutes_{uid}") or [0])[0], 0),
+            "voice_sessions": int(_num((form.get(f"voice_sessions_{uid}") or [0])[0], 0)),
+            "source": (form.get(f"source_{uid}") or ["—"])[0],
+            "status": status,
+            "note": (form.get(f"note_{uid}") or [""])[0][:800],
+        })
+    payload = _snapshot_payload()
+    snap: dict[str, Any] = payload.get("snapshot") or {}
+    event = _event_by_id(snap, str(event_id)) or {}
+    review_payload = {
+        "event_id": str(event_id),
+        "event_title": event.get("title") or str(event_id),
+        "event_when": event.get("when_iso"),
+        "mode": "manual_review",
+        "items": items,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    guild_id = _safe_guild_id(payload)
+    _attendance_review_save(guild_id, str(event_id), review_payload, _current_user(request) or {}, status="reviewed")
+    return RedirectResponse(f"/attendance/{urllib.parse.quote(str(event_id))}?saved=1", status_code=303)
+
+
+@app.get("/api/attendance/{event_id}")
+def api_attendance_review(event_id: str, _: bool = Depends(_auth)):
+    payload = _snapshot_payload()
+    if not payload.get("ok"):
+        return JSONResponse(payload, status_code=404)
+    guild_id = _safe_guild_id(payload)
+    return JSONResponse({"ok": True, "event_id": str(event_id), "review": _attendance_review_load(guild_id, str(event_id))})
