@@ -1047,6 +1047,7 @@ def _render_dashboard(data: dict[str, Any]) -> str:
       <a href="/fairness">Fairness</a>
       <a href="/analytics">Analytics</a><a href="/voice">Voice</a>
       <a href="/ec">EC-Verlauf</a>
+      <a href="/attendance">Anwesenheit</a>
       <a href="/settings">Einstellungen</a>
       <a href="/audit">Audit</a>
       <a href="/system">System</a>
@@ -2303,7 +2304,7 @@ def _render_planning_dashboard(data: dict[str, Any]) -> str:
     plan = _planning_analytics(snap)
     cards = "".join([
         _card("Events", plan.get("events_total", 0), "im Snapshot"),
-        _card("Risiko-Events", plan.get("events_at_risk", 0), "wenig/fehlende Rollen"),
+        _card("Event-Hinweise", plan.get("events_at_risk", 0), "wenig/fehlende Rollen"),
         _card("Ø Bereitschaft", f"{round(_num(plan.get('avg_readiness'), 0))}%", "Faustregel"),
         _card("Snapshot", _dt(data.get("published_at")), "read-only"),
     ])
@@ -3001,12 +3002,74 @@ def _dt_obj(value: Any) -> Optional[datetime]:
 
 
 def _is_active_auction(auction: dict[str, Any]) -> bool:
-    status = str(auction.get("status") or "").lower()
-    phase = str(auction.get("phase") or "").lower()
-    if any(x in status for x in ("deleted", "cancel", "abbruch", "closed", "finished", "done", "ended", "abgeschlossen")):
+    status = str(auction.get("status") or "").strip().lower()
+    phase = str(auction.get("phase") or "").strip().lower()
+
+    # Status schlägt Phase. Eine gelieferte/geschlossene Auktion darf nicht
+    # nur wegen phase="free" oder phase="sale" weiter als aktiv zählen.
+    closed_words = (
+        "delivered", "sold", "closed", "expired", "done", "ended", "finished",
+        "cancelled", "canceled", "deleted", "abbruch", "abgebrochen",
+        "abgeschlossen", "completed",
+    )
+    if any(x in status for x in closed_words):
         return False
-    active_words = ("open", "active", "running", "bidding", "roll", "sale", "free", "main", "secondary", "müll", "muell", "junk")
-    return any(x in status for x in active_words) or any(x in phase for x in active_words)
+
+    active_statuses = {"active", "open", "running", "bidding", "pending", "roll"}
+    if status in active_statuses:
+        return True
+
+    # Nur wenn kein aussagekräftiger Status gesetzt ist, darf die Phase helfen.
+    if not status:
+        active_phases = {"need", "free", "sale", "roll", "main", "secondary", "müll", "muell", "junk"}
+        return phase in active_phases
+
+    return False
+
+
+def _is_running_event(event: dict[str, Any]) -> bool:
+    """Dashboard-Definition: erstellt und nicht beendet/gelöscht/abgebrochen."""
+    if not isinstance(event, dict):
+        return False
+
+    status = str(
+        event.get("status")
+        or event.get("state")
+        or event.get("phase")
+        or event.get("event_status")
+        or ""
+    ).strip().lower()
+
+    closed_statuses = {
+        "done", "ended", "finished", "closed", "cancelled", "canceled",
+        "deleted", "archived", "completed", "aborted", "expired",
+        "beendet", "gelöscht", "geloescht", "abgebrochen",
+    }
+    if status in closed_statuses:
+        return False
+
+    for key in (
+        "is_done", "done", "ended", "is_ended", "closed", "is_closed",
+        "cancelled", "canceled", "deleted", "archived", "aborted",
+    ):
+        if bool(event.get(key)):
+            return False
+
+    if event.get("ended_at") or event.get("deleted_at") or event.get("cancelled_at") or event.get("canceled_at"):
+        return False
+
+    return True
+
+
+def _running_events_from_snapshot(snap: dict[str, Any], *, limit: int = 12) -> list[dict[str, Any]]:
+    events = ((snap.get("events") or {}).get("items") or [])
+    out: list[dict[str, Any]] = []
+    for ev in events:
+        if not isinstance(ev, dict) or not _is_running_event(ev):
+            continue
+        out.append({**ev, "_dt": _dt_obj(ev.get("when_iso") or ev.get("start_at") or ev.get("created_at"))})
+    out.sort(key=lambda x: (x.get("_dt") is None, x.get("_dt") or datetime.max.replace(tzinfo=timezone.utc)))
+    return out[:limit]
 
 
 def _auction_leader_text(auction: dict[str, Any], names: dict[int, str]) -> str:
@@ -3030,17 +3093,7 @@ def _leadership_insights(snap: dict[str, Any]) -> dict[str, Any]:
     member_filter = guild.get("member_filter") if isinstance(guild.get("member_filter"), dict) else {}
     role_member_count = int(_num(member_filter.get("eligible_count"), analytics.get("role_member_count", 0)))
 
-    events = planning.get("events") if isinstance(planning.get("events"), list) else []
-    event_rows = []
-    for ev in events:
-        if not isinstance(ev, dict):
-            continue
-        dt = _dt_obj(ev.get("when_iso"))
-        issues = [str(x) for x in (ev.get("issues") or [])]
-        readiness = int(_num(ev.get("readiness"), 0))
-        if readiness < 80 or issues:
-            event_rows.append({**ev, "_dt": dt, "issues_text": ", ".join(issues) or "—"})
-    event_rows.sort(key=lambda x: (x.get("_dt") is None, x.get("_dt") or datetime.max.replace(tzinfo=timezone.utc)))
+    running_events = _running_events_from_snapshot(snap, limit=12)
 
     auctions = (((snap.get("loot") or {}).get("auctions") or {}).get("items") or [])
     active_auctions = []
@@ -3088,7 +3141,7 @@ def _leadership_insights(snap: dict[str, Any]) -> dict[str, Any]:
     return {
         "member_count": role_member_count,
         "tasks": tasks,
-        "event_risks": event_rows[:12],
+        "running_events": running_events,
         "active_auctions": active_auctions[:12],
         "flagged_members": flagged_members[:12],
         "planning": planning,
@@ -3138,14 +3191,14 @@ def _render_leadership_dashboard(data: dict[str, Any]) -> str:
 
     tasks = li.get("tasks") or []
     urgent_count = sum(1 for t in tasks if str(t.get("prio")) == "hoch")
-    event_risks = li.get("event_risks") or []
+    running_events = li.get("running_events") or []
     active_auctions = li.get("active_auctions") or []
     flagged_members = li.get("flagged_members") or []
 
     cards = "".join([
         _card("Offene Aufgaben", len(tasks), f"hoch: {urgent_count}"),
         _card("Rollenmitglieder", li.get("member_count", 0), role_line),
-        _card("Risiko-Events", len(event_risks), "Rollen/Teilnehmer prüfen"),
+        _card("Laufende Events", len(running_events), "erstellt / nicht beendet"),
         _card("Aktive Auktionen", len(active_auctions), "Auktionshaus/DKP-Log"),
         _card("ohne Needliste", quality.get("missing_needs", 0), "nachpflegen lassen"),
         _card("EC gesamt", _fmt_ec(analytics.get("total_ec")), f"Ø {_fmt_ec(analytics.get('avg_ec'))}"),
@@ -3164,18 +3217,16 @@ def _render_leadership_dashboard(data: dict[str, Any]) -> str:
         ])
 
     event_rows = []
-    for ev in event_risks:
+    for ev in running_events:
         if not isinstance(ev, dict):
             continue
         event_rows.append([
-            _event_link(ev.get("event_id"), ev.get("title")),
-            _dt(ev.get("when_iso")),
-            ev.get("participants"),
-            ev.get("tank"),
-            ev.get("healer"),
-            ev.get("dps"),
-            f"{int(_num(ev.get('readiness'), 0))}%",
-            ev.get("issues_text") or ", ".join(str(x) for x in (ev.get("issues") or [])) or "—",
+            _event_link(ev.get("event_id"), ev.get("title") or ev.get("name")),
+            _dt(ev.get("when_iso") or ev.get("start_at") or ev.get("created_at")),
+            ev.get("participant_count", ev.get("participants", "—")),
+            ev.get("maybe_count", ev.get("maybe", "—")),
+            ev.get("no_count", ev.get("no", "—")),
+            "ja" if ev.get("voice_enabled") else "nein",
         ])
 
     auction_rows = []
@@ -3212,6 +3263,7 @@ def _render_leadership_dashboard(data: dict[str, Any]) -> str:
         [_raw('<a class="link" href="/needs">🎁 Needs</a>'), "Top-Needs und Mitglieder ohne Needliste"],
         [_raw('<a class="link" href="/loot">🏆 Loot</a>'), "Aktive Auktionen, Gewinner, Roll-/Bid-Historie"],
         [_raw('<a class="link" href="/fairness">⚖️ Fairness</a>'), "Need/EC/Loot-Hinweise"],
+        [_raw('<a class="link" href="/attendance">✅ Anwesenheit</a>'), "Event-Review und EC-Buchung"],
         [_raw('<a class="link" href="/audit">🧾 Audit</a>'), "Wer hat was gemacht"],
         [_raw('<a class="link" href="/admin">🛡️ Leitung</a>'), "interne Notizen und Prüfmarkierungen"],
         [_raw('<a class="link" href="/overview">📊 Gesamtübersicht</a>'), "alte Tabellen-Startseite"],
@@ -3227,6 +3279,7 @@ def _render_leadership_dashboard(data: dict[str, Any]) -> str:
       <a href="/fairness">Fairness</a>
       <a href="/analytics">Analytics</a><a href="/voice">Voice</a>
       <a href="/ec">EC</a>
+      <a href="/attendance">Anwesenheit</a>
       <a href="/audit">Audit</a>
       <a href="/admin">Leitung</a>
       <a href="/settings">Einstellungen</a>
@@ -3238,7 +3291,7 @@ def _render_leadership_dashboard(data: dict[str, Any]) -> str:
       <div>
         <div class="eyebrow">Führungsstartseite · read-only</div>
         <h1>🏰 {_e(guild.get('name') or data.get('guild_name') or 'Gilde')}</h1>
-        <p>Was heute Aufmerksamkeit braucht: Aufgaben, Risiko-Events, aktive Auktionen und auffällige Mitglieder.</p>
+        <p>Was heute wichtig ist: offene Aufgaben, laufende Events, aktive Auktionen und auffällige Mitglieder.</p>
         <p class="muted">{_e(role_line)} · Snapshot: {_e(_dt(data.get('published_at')))}</p>
       </div>
       <a class="btn" href="/overview">Gesamtübersicht</a>
@@ -3254,8 +3307,8 @@ def _render_leadership_dashboard(data: dict[str, Any]) -> str:
 
     <section class="split">
       <div class="panel">
-        <h2>📅 Events mit Aufmerksamkeit</h2>
-        {_table(['Event','Zeit','Teilnehmer','Tank','Heiler','DPS','Score','Hinweis'], event_rows, placeholder='Events durchsuchen…')}
+        <h2>📅 Laufende Events</h2>
+        {_table(['Event','Zeit','Teilnehmer','Vielleicht','Abgemeldet','Voice'], event_rows, placeholder='Laufende Events durchsuchen…')}
       </div>
       <div class="panel">
         <h2>🎁 Aktive Auktionen</h2>
