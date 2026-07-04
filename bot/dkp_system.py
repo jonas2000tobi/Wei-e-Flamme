@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import math
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Any
 from zoneinfo import ZoneInfo
 
@@ -17,6 +17,22 @@ try:
     from bot.channel_picker import send_text_channel_picker, send_voice_channel_picker  # type: ignore
 except Exception:
     from channel_picker import send_text_channel_picker, send_voice_channel_picker  # type: ignore
+
+try:
+    from bot.runtime_db import aggregate_voice_seconds  # type: ignore
+except Exception:
+    try:
+        from runtime_db import aggregate_voice_seconds  # type: ignore
+    except Exception:
+        aggregate_voice_seconds = None  # type: ignore
+
+try:
+    from bot.audit_system import audit_log  # type: ignore
+except Exception:
+    try:
+        from audit_system import audit_log  # type: ignore
+    except Exception:
+        audit_log = None  # type: ignore
 
 TZ = ZoneInfo("Europe/Berlin")
 
@@ -708,8 +724,257 @@ def _attendance_check_embed(client: discord.Client, home_guild_id: int, event: d
         ),
         inline=False,
     )
-    emb.set_footer(text="Buttons: Anwesenheit bestätigen/ändern → EC-Vorschau → EC vergeben")
+
+    voice_id = _event_voice_channel_id(event)
+    if voice_id:
+        st = _event_check_state(int(home_guild_id), str(event_id))
+        if st.get("voice_suggest_applied_at"):
+            counts_voice = st.get("voice_suggest_counts") if isinstance(st.get("voice_suggest_counts"), dict) else {}
+            actor_id = int(st.get("voice_suggest_applied_by", 0) or 0)
+            actor_txt = f"<@{actor_id}>" if actor_id else "unbekannt"
+            emb.add_field(
+                name="🎙️ Voice-Vorschlag",
+                value=(
+                    f"Optional angewendet von {actor_txt}.\n"
+                    f"✅ {counts_voice.get('present', 0)} · 🟡 {counts_voice.get('partial', 0)} · ❌ {counts_voice.get('absent', 0)} · ↪️ {counts_voice.get('skipped_existing', 0)} behalten"
+                ),
+                inline=False,
+            )
+        else:
+            emb.add_field(
+                name="🎙️ Voice-Vorschlag",
+                value=f"Optional verfügbar über Button. Zählt nur den Event-Voice <#{voice_id}>.",
+                inline=False,
+            )
+
+    emb.set_footer(text="Buttons: Anwesenheit bestätigen/ändern → optional Voice-Vorschlag → EC-Vorschau → EC vergeben")
     return emb
+
+
+def _iso_utc(dt: datetime) -> str:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=TZ)
+    return dt.astimezone(timezone.utc).isoformat()
+
+
+def _fmt_voice_minutes(seconds: int) -> str:
+    minutes = max(0, int(round(int(seconds or 0) / 60)))
+    if minutes < 60:
+        return f"{minutes} Min"
+    h = minutes // 60
+    m = minutes % 60
+    return f"{h}h {m:02d}m"
+
+
+def _event_voice_channel_id(event: dict) -> int:
+    # voice_last_channel_id bleibt erhalten, auch wenn der temporäre Event-Voice nach dem Event gelöscht wurde.
+    for key in ("voice_channel_id", "voice_last_channel_id", "event_voice_channel_id"):
+        try:
+            value = int(event.get(key, 0) or 0)
+            if value:
+                return value
+        except Exception:
+            continue
+    return 0
+
+
+def _voice_suggestion_settings(guild_id: int) -> dict[str, int]:
+    # Noch bewusst einfache Defaults. Später wandert das ins Dashboard / guild_settings.
+    c = _gcfg(int(guild_id))
+    voice_cfg = c.get("voice_attendance") if isinstance(c.get("voice_attendance"), dict) else {}
+    return {
+        "duration_min": max(15, min(int(voice_cfg.get("duration_min", 120) or 120), 600)),
+        "pre_min": max(0, min(int(voice_cfg.get("pre_min", 15) or 15), 180)),
+        "full_pct": max(1, min(int(voice_cfg.get("full_pct", 70) or 70), 100)),
+        "partial_pct": max(0, min(int(voice_cfg.get("partial_pct", 20) or 20), 100)),
+    }
+
+
+async def _apply_voice_attendance_suggestion(
+    client: discord.Client,
+    guild_id: int,
+    event_id: str,
+    actor: discord.abc.User,
+) -> tuple[bool, str, Optional[discord.Embed]]:
+    """Übernimmt Voice-Zeiten optional in den EC-Anwesenheitscheck.
+
+    Wichtig: Das läuft nur auf Button-Klick. Es wird nicht automatisch bei Events aktiviert.
+    Bestehende manuelle Status bleiben erhalten und werden nicht überschrieben.
+    """
+    if aggregate_voice_seconds is None:
+        return False, "Voice-Attendance-Datenbankfunktion ist nicht geladen.", None
+
+    rsvp = _import_rsvp()
+    if not rsvp:
+        return False, "RSVP-/Anwesenheitssystem nicht geladen.", None
+
+    event = rsvp.get_attendance_event(int(guild_id), str(event_id))
+    if not event:
+        return False, "Event nicht gefunden.", None
+
+    voice_id = _event_voice_channel_id(event)
+    if not voice_id:
+        return False, "Dieses Event hat keinen gespeicherten Event-Voice. Voice-Vorschlag bleibt optional und ist hier nicht aktiv.", None
+
+    when = _parse_when(str(event.get("when_iso", "") or ""))
+    if not when:
+        return False, "Event hat keine gültige Startzeit.", None
+
+    participants = list(event.get("participants") or [])
+    if not participants:
+        return False, "Dieses Event hat keine EC-Anwesenheitsliste.", None
+
+    cfg = _voice_suggestion_settings(int(guild_id))
+    # partial darf nicht größer als full sein.
+    if cfg["partial_pct"] > cfg["full_pct"]:
+        cfg["partial_pct"] = cfg["full_pct"]
+
+    window_start = when - timedelta(minutes=cfg["pre_min"])
+    window_end = when + timedelta(minutes=cfg["duration_min"])
+    event_seconds = max(1, cfg["duration_min"] * 60)
+
+    participant_ids: list[int] = []
+    for p in participants:
+        try:
+            uid = int(p.get("id", 0) or 0)
+            if uid:
+                participant_ids.append(uid)
+        except Exception:
+            continue
+
+    totals = aggregate_voice_seconds(
+        int(guild_id),
+        since_iso=_iso_utc(window_start),
+        until_iso=_iso_utc(window_end),
+        channel_ids=[int(voice_id)],
+        user_ids=participant_ids or None,
+    )
+
+    attendance = event.get("attendance") if isinstance(event.get("attendance"), dict) else {}
+    changed_present = 0
+    changed_partial = 0
+    changed_absent = 0
+    skipped_existing = 0
+    failed = 0
+    preview_lines: list[str] = []
+
+    for p in participants:
+        try:
+            uid = int(p.get("id", 0) or 0)
+        except Exception:
+            uid = 0
+        if not uid:
+            continue
+
+        current = str((attendance.get(str(uid)) or {}).get("status", "") or "")
+        seconds = int(totals.get(uid, 0) or 0)
+        pct = int(round((seconds / event_seconds) * 100)) if event_seconds else 0
+        name = _participant_display_name(client, int(guild_id), p)
+        signup = _signup_label(str(p.get("signup", "") or ""))
+
+        if pct >= cfg["full_pct"]:
+            target_status = "present"
+            bucket = "✅"
+        elif pct >= cfg["partial_pct"]:
+            target_status = "maybe"
+            bucket = "🟡"
+        else:
+            target_status = "absent"
+            bucket = "❌"
+
+        if current:
+            skipped_existing += 1
+            if len(preview_lines) < 12:
+                preview_lines.append(f"↪️ {name} – bereits gesetzt: {_attendance_status_label(current)}")
+            continue
+
+        ok = False
+        try:
+            ok = bool(rsvp.set_attendance_status(int(guild_id), str(event_id), uid, target_status, int(getattr(actor, "id", 0) or 0)))
+        except Exception:
+            ok = False
+
+        if not ok:
+            failed += 1
+            continue
+
+        if target_status == "present":
+            changed_present += 1
+        elif target_status == "maybe":
+            changed_partial += 1
+        elif target_status == "absent":
+            changed_absent += 1
+
+        if len(preview_lines) < 12:
+            preview_lines.append(f"{bucket} {name} – {signup} – {_fmt_voice_minutes(seconds)} ({pct}%) → {_attendance_status_label(target_status)}")
+
+    st = _event_check_state(int(guild_id), str(event_id))
+    st["voice_suggest_applied_at"] = _now_iso()
+    st["voice_suggest_applied_by"] = int(getattr(actor, "id", 0) or 0)
+    st["voice_suggest_voice_channel_id"] = int(voice_id)
+    st["voice_suggest_counts"] = {
+        "present": changed_present,
+        "partial": changed_partial,
+        "absent": changed_absent,
+        "skipped_existing": skipped_existing,
+        "failed": failed,
+    }
+    save_event_checks()
+
+    title, _when_txt = _event_title_and_time(event)
+    emb = discord.Embed(
+        title="🎙️ Voice-Vorschlag übernommen",
+        description=(
+            f"**Event:** {title}\n"
+            f"**Event-ID:** `{event_id}`\n"
+            f"**Voice:** <#{voice_id}>\n"
+            f"**Fenster:** {window_start.strftime('%d.%m.%Y %H:%M')} – {window_end.strftime('%H:%M')}\n\n"
+            "Das war **optional** und wurde nur durch diesen Button-Klick angewendet. "
+            "Bestehende manuelle Status wurden nicht überschrieben."
+        ),
+        color=discord.Color.green(),
+    )
+    emb.add_field(
+        name="Übernommen",
+        value=(
+            f"✅ War da: **{changed_present}**\n"
+            f"🟡 Teilweise / prüfen: **{changed_partial}**\n"
+            f"❌ Nicht erkannt: **{changed_absent}**\n"
+            f"↪️ Schon manuell gesetzt: **{skipped_existing}**\n"
+            f"⚠️ Fehlgeschlagen: **{failed}**"
+        ),
+        inline=False,
+    )
+    if preview_lines:
+        emb.add_field(name="Auszug", value="\n".join(preview_lines)[:1024], inline=False)
+    emb.set_footer(text=f"Schwellen: voll ab {cfg['full_pct']}%, teilweise ab {cfg['partial_pct']}%, Dauer {cfg['duration_min']} Min, Vorlauf {cfg['pre_min']} Min")
+
+    if audit_log:
+        try:
+            audit_log(
+                guild_id=int(guild_id),
+                actor_id=int(getattr(actor, "id", 0) or 0),
+                action="ec_attendance_voice_suggestion_apply",
+                target_type="event",
+                target_id=str(event_id),
+                summary=f"Voice-Vorschlag in EC-Anwesenheit übernommen: {title}",
+                metadata={
+                    "voice_channel_id": int(voice_id),
+                    "counts": st["voice_suggest_counts"],
+                    "duration_min": cfg["duration_min"],
+                    "pre_min": cfg["pre_min"],
+                    "full_pct": cfg["full_pct"],
+                    "partial_pct": cfg["partial_pct"],
+                },
+            )
+        except Exception:
+            pass
+
+    msg = f"✅ Voice-Vorschlag übernommen: {changed_present} war da, {changed_partial} teilweise, {changed_absent} nicht erkannt."
+    if skipped_existing:
+        msg += f" {skipped_existing} vorhandene manuelle Status wurden nicht überschrieben."
+    return True, msg, emb
+
 
 async def _award_event_now(
     client: discord.Client,
@@ -1076,6 +1341,23 @@ class ECEventCheckView(View):
             view=ECAttendanceAddUserView(self.guild_id, self.event_id, source_channel_id, source_message_id),
             ephemeral=True,
         )
+
+    @button(label="🎙️ Voice-Vorschlag übernehmen", style=ButtonStyle.secondary, custom_id="dkp_check_voice_suggest", row=1)
+    async def voice_suggest(self, inter: discord.Interaction, btn: discord.ui.Button):
+        if not await self._guard(inter):
+            return
+        await inter.response.defer(ephemeral=True, thinking=True)
+        ok, msg, emb = await _apply_voice_attendance_suggestion(inter.client, self.guild_id, self.event_id, inter.user)
+        if not ok:
+            await inter.edit_original_response(content=f"❌ {msg}", embed=None, view=None)
+            return
+        try:
+            source_channel_id = int(getattr(inter.channel, "id", 0) or 0)
+            source_message_id = int(getattr(inter.message, "id", 0) or 0) if inter.message else 0
+            await _refresh_attendance_check_message(inter.client, self.guild_id, self.event_id, source_channel_id, source_message_id)
+        except Exception as e:
+            print(f"[dkp_system] EC-Check Voice-Vorschlag Message-Update fehlgeschlagen: {e!r}")
+        await inter.edit_original_response(content=msg, embed=emb, view=None)
 
     @button(label="EC-Vorschau", style=ButtonStyle.secondary, custom_id="dkp_check_preview", row=1)
     async def preview(self, inter: discord.Interaction, btn: discord.ui.Button):
