@@ -166,6 +166,14 @@ def _event_link(event_id: Any, label: Any) -> dict[str, str]:
     return _raw(f'<a class="link" href="/event/{_e(eid)}">{text}</a>')
 
 
+def _auction_link(auction_id: Any, label: Any) -> dict[str, str]:
+    aid = str(auction_id or "").strip()
+    text = _e(label or aid or "Auktion")
+    if not aid:
+        return _raw(text)
+    return _raw(f'<a class="link" href="/auction/{_e(aid)}">{text}</a>')
+
+
 def _table(headers: list[str], rows: list[list[Any]], *, searchable: bool = True, placeholder: str = "Tabelle durchsuchen…") -> str:
     if not rows:
         return '<div class="empty">Keine Daten vorhanden.</div>'
@@ -442,7 +450,7 @@ def _render_dashboard(data: dict[str, Any]) -> str:
         uid = int(_num(a.get("top_bid_user_id"), 0))
         if a.get("top_bid_amount") is not None:
             leader = f"{names.get(uid, f'User {uid}')} / {_fmt_ec(a.get('top_bid_amount'))} EC"
-        auction_rows.append([a.get("item_name"), a.get("status"), a.get("phase"), a.get("bid_count"), leader, _dt(a.get("ends_at"))])
+        auction_rows.append([_auction_link(a.get("auction_id"), a.get("item_name")), a.get("status"), a.get("phase"), a.get("bid_count"), leader, _dt(a.get("ends_at"))])
 
     voice_rows = []
     for v in voice.get("recent_sessions") or []:
@@ -671,6 +679,121 @@ def _render_event_detail(data: dict[str, Any], event_id: str) -> str:
     return _html_shell(f"{event.get('title') or 'Event'} · Ebo Dashboard", body)
 
 
+def _auction_by_id(snap: dict[str, Any], auction_id: str) -> Optional[dict[str, Any]]:
+    for auc in (((snap.get("loot") or {}).get("auctions") or {}).get("items") or []):
+        if isinstance(auc, dict) and str(auc.get("auction_id") or "") == str(auction_id):
+            return auc
+    return None
+
+
+def _phase_label(auction: dict[str, Any]) -> str:
+    phase = str(auction.get("phase") or "").strip()
+    mode = str(auction.get("eligibility_mode") or "").strip()
+    if phase == "need" and mode == "main_need":
+        return "Main-Need-Auktion"
+    if phase == "need" and mode == "secondary_need":
+        return "Second-Need-Auktion"
+    if phase == "free":
+        return "Freie Auktion"
+    if phase == "sale":
+        return "Sale / Müll" if auction.get("junk_drop") else "Sale"
+    return phase or mode or "Auktion"
+
+
+def _bid_rows(auction: dict[str, Any]) -> list[list[Any]]:
+    rows: list[list[Any]] = []
+    for b in auction.get("bids") or []:
+        if not isinstance(b, dict):
+            continue
+        rows.append([_member_link(b.get("user_id"), b.get("display_name")), _fmt_ec(b.get("amount")), _dt(b.get("created_at"))])
+    return rows
+
+
+def _eligible_rows(auction: dict[str, Any]) -> list[list[Any]]:
+    rows: list[list[Any]] = []
+    for u in auction.get("eligible_users") or []:
+        if not isinstance(u, dict):
+            continue
+        rows.append([_member_link(u.get("user_id"), u.get("display_name"))])
+    return rows
+
+
+def _junk_roll_rows(auction: dict[str, Any]) -> list[list[Any]]:
+    rows: list[list[Any]] = []
+    for r in auction.get("junk_rolls") or []:
+        if not isinstance(r, dict):
+            continue
+        rows.append([_member_link(r.get("user_id"), r.get("display_name")), r.get("roll")])
+    return rows
+
+
+def _render_auction_detail(data: dict[str, Any], auction_id: str) -> str:
+    if not data.get("ok"):
+        return _html_shell("Ebo Dashboard", f"<section class='panel'><h1>📊 Ebo Dashboard</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+    snap: dict[str, Any] = data.get("snapshot") or {}
+    auction = _auction_by_id(snap, auction_id)
+    if not auction:
+        return _html_shell(
+            "Auktion nicht gefunden",
+            "<section class='panel'><h1>❌ Auktion nicht gefunden</h1><p class='muted'>Diese Auktion ist nicht im aktuellen Dashboard-Snapshot.</p><p><a class='btn' href='/#loot'>Zurück</a></p></section>",
+        )
+
+    leader = "—"
+    if auction.get("top_bid_amount") is not None:
+        uid = _user_id(auction.get("top_bid_user_id"))
+        leader = f"{auction.get('top_bid_user_name') or f'User {uid}'} · {_fmt_ec(auction.get('top_bid_amount'))} EC"
+    winner = "—"
+    if auction.get("winner_user_id"):
+        winner = f"{auction.get('winner_name') or ('User ' + str(auction.get('winner_user_id')))}"
+
+    cards = "".join([
+        _card("Status", auction.get("status") or "—", _phase_label(auction)),
+        _card("Gebote", auction.get("bid_count", 0), f"Führend: {leader}"),
+        _card("Gewinner", winner, _dt(auction.get("delivered_at")) if auction.get("delivered_at") else "noch offen"),
+        _card("Ende", _dt(auction.get("ends_at")), f"Start: {_dt(auction.get('created_at'))}"),
+        _card("Startgebot", _fmt_ec(auction.get("start_bid")), "EC"),
+        _card("Mindestschritt", _fmt_ec(auction.get("min_increment")), "EC"),
+        _card("Festpreis", _fmt_ec(auction.get("fixed_price")), "Sale"),
+        _card("Berechtigt", auction.get("eligible_count", 0), auction.get("eligibility_mode") or "alle"),
+    ])
+
+    bid_rows = _bid_rows(auction)
+    eligible_rows = _eligible_rows(auction)
+    roll_rows = _junk_roll_rows(auction)
+    channel_info = [
+        ["Auktions-/Log-Nachricht", auction.get("channel_id") or "—", auction.get("message_id") or "—"],
+        ["Auktionshaus-Nachricht", "—", auction.get("market_message_id") or auction.get("active_message_id") or "—"],
+    ]
+
+    extra_roll_section = ""
+    if auction.get("junk_drop") or roll_rows:
+        extra_roll_section = f"""
+        <section class="panel" id="rolls">
+          <h2>🎲 Müll-Würfe</h2>
+          <p class="muted">Würfelphase bis: {_e(_dt(auction.get('junk_roll_until')))} · Gewinnerwurf: {_e(auction.get('junk_roll_winner_roll') or '—')}</p>
+          {_table(['Spieler','Wurf'], roll_rows, placeholder='Würfe durchsuchen…')}
+        </section>
+        """
+
+    body = f"""
+    <nav class="topnav"><a href="/">← Übersicht</a><a href="#bids">Gebote</a><a href="#eligible">Berechtigte</a><a href="#tech">Technik</a><a href="/api/snapshot">JSON</a></nav>
+    <section class="hero">
+      <div>
+        <div class="eyebrow">Auktion</div>
+        <h1>🎁 {_e(auction.get('item_name') or auction_id)}</h1>
+        <p class="muted">Auktions-ID: {_e(auction_id)} · {_e(_phase_label(auction))} · Snapshot: {_e(_dt(data.get('published_at')))}</p>
+      </div>
+      <a class="btn" href="/#loot">Zurück</a>
+    </section>
+    <section class="grid">{cards}</section>
+    <section class="panel" id="bids"><h2>💰 Gebotshistorie</h2>{_table(['Spieler','Gebot','Zeit'], bid_rows, placeholder='Gebote durchsuchen…')}</section>
+    {extra_roll_section}
+    <section class="panel" id="eligible"><h2>✅ Berechtigte Spieler</h2><p class="muted">Bei freien Auktionen/Sale kann die Liste leer sein, weil dann alle berechtigt sind.</p>{_table(['Spieler'], eligible_rows, placeholder='Berechtigte durchsuchen…')}</section>
+    <section class="panel" id="tech"><h2>🧾 Technische Infos</h2>{_table(['Bereich','Kanal-ID','Nachricht-ID'], channel_info, searchable=False)}</section>
+    """
+    return _html_shell(f"{auction.get('item_name') or 'Auktion'} · Ebo Dashboard", body)
+
+
 def _html_shell(title: str, body: str) -> str:
     auth_note = ""
     if not str(os.getenv("DASHBOARD_PASSWORD") or "").strip():
@@ -770,6 +893,28 @@ def api_quality(_: bool = Depends(_auth)):
         "ec_coverage": analytics.get("ec_coverage"),
         "need_coverage": analytics.get("need_coverage"),
     })
+
+
+@app.get("/auction/{auction_id}", response_class=HTMLResponse)
+def auction_detail(auction_id: str, _: bool = Depends(_auth)):
+    try:
+        return HTMLResponse(_render_auction_detail(_snapshot_payload(), str(auction_id)))
+    except Exception as exc:
+        return HTMLResponse(
+            _html_shell("Ebo Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
+            status_code=500,
+        )
+
+
+@app.get("/api/auction/{auction_id}")
+def api_auction(auction_id: str, _: bool = Depends(_auth)):
+    payload = _snapshot_payload()
+    if not payload.get("ok"):
+        return JSONResponse(payload, status_code=404)
+    auc = _auction_by_id(payload.get("snapshot") or {}, str(auction_id))
+    if not auc:
+        return JSONResponse({"ok": False, "error": "Auktion nicht gefunden"}, status_code=404)
+    return JSONResponse({"ok": True, "auction": auc})
 
 
 @app.get("/event/{event_id}", response_class=HTMLResponse)
