@@ -1262,6 +1262,7 @@ def _render_event_detail(data: dict[str, Any], event_id: str) -> str:
     <section class="panel" id="signups"><h2>✅ Zusagen nach Rolle</h2>{_role_signup_html(event)}</section>
     <section class="panel" id="maybe"><h2>🟡 Vielleicht</h2>{_table(['Spieler','Gildenrolle'], maybe_rows, placeholder='Vielleicht durchsuchen…')}</section>
     <section class="panel" id="no"><h2>❌ Abgemeldet</h2>{_table(['Spieler','Gildenrolle'], no_rows, placeholder='Abmeldungen durchsuchen…')}</section>
+    {_raw(_event_ec_queue_panel(_safe_guild_id(data), str(event_id)))}
     """
     return _html_shell(f"{event.get('title') or 'Event'} · Ebo Dashboard", body)
 
@@ -1450,6 +1451,11 @@ def _html_shell(title: str, body: str) -> str:
     .btn {{ display:inline-block; padding:10px 14px; border-radius:10px; background:var(--gold); color:#111; font-weight:800; text-decoration:none; white-space:nowrap; }}
     .link {{ color:var(--gold); text-decoration:none; font-weight:700; }} .link:hover {{ text-decoration:underline; }}
     .pill {{ display:inline-block; padding:2px 8px; border:1px solid var(--line); border-radius:999px; color:var(--gold); font-size:12px; vertical-align:middle; }}
+    .queue-badge {{ display:inline-flex; align-items:center; gap:7px; padding:4px 9px; border:1px solid rgba(214,168,79,.30); border-radius:999px; color:var(--gold); background:rgba(214,168,79,.08); text-decoration:none; font-size:12px; font-weight:800; white-space:nowrap; }}
+    .queue-badge small {{ color:var(--muted); font-weight:700; }}
+    .queue-badge.ok {{ color:#b7f2bd; border-color:rgba(129,199,132,.42); background:rgba(129,199,132,.10); }}
+    .queue-badge.wait {{ color:#ffe0a3; border-color:rgba(214,168,79,.46); background:rgba(214,168,79,.12); }}
+    .queue-badge.bad {{ color:#ffb3b3; border-color:rgba(217,104,104,.42); background:rgba(217,104,104,.10); }}
     .need-list {{ margin:8px 0 16px; padding-left:22px; color:var(--text); }} .need-list li {{ margin:5px 0; }}
     code {{ background:#05060a; border:1px solid var(--line); padding:2px 5px; border-radius:6px; }}
     .empty {{ color:var(--muted); padding:18px 16px 18px 58px; min-height:58px; display:flex; align-items:center; border:1px dashed rgba(214,168,79,.18); border-radius:14px; background:linear-gradient(90deg,rgba(10,11,15,.70),rgba(24,26,34,.54)); position:relative; }}
@@ -4462,6 +4468,7 @@ def _render_attendance_list(data: dict[str, Any]) -> str:
         review = _attendance_review_load(guild_id, eid) if eid else {}
         payload = review.get("payload") or {}
         items = payload.get("items") or []
+        queue_badge = _event_ec_queue_badge(guild_id, eid) if eid else _raw("<span class='pill'>—</span>")
         rows.append([
             _raw(f'<a class="link" href="/attendance/{_e(eid)}">{_e(ev.get("title") or eid)}</a>'),
             _dt(ev.get("when_iso")),
@@ -4470,6 +4477,7 @@ def _render_attendance_list(data: dict[str, Any]) -> str:
             voice.get("voice_user_count", 0),
             _attendance_status_label(review.get("status") or ("reviewed" if items else "open")),
             len(items),
+            queue_badge,
         ])
     body = f"""
     <nav class="topnav"><a href="/">Kommando</a><a href="/planning">Planung</a><a href="/voice">Voice</a><a href="/admin">Leitung</a></nav>
@@ -4484,7 +4492,7 @@ def _render_attendance_list(data: dict[str, Any]) -> str:
     </section>
     <section class="panel">
       <h2>📅 Events</h2>
-      {_table(['Event','Zeit','Anmeldungen','Voice','Voice-User','Review','Review-Zeilen'], rows, placeholder='Events durchsuchen…')}
+      {_table(['Event','Zeit','Anmeldungen','Voice','Voice-User','Review','Review-Zeilen','EC-Queue'], rows, placeholder='Events durchsuchen…')}
     </section>
     """
     return _html_shell("Anwesenheit · Ebo Dashboard", body)
@@ -4545,7 +4553,7 @@ def _render_attendance_event(data: dict[str, Any], event_id: str, saved: bool = 
     if review:
         updated = f"<p class='muted'>Letzte Speicherung: {_e(_dt(review.get('updated_at')))} durch {_e(review.get('updated_by_name') or '—')} · Status: {_e(review.get('status') or 'draft')}</p>"
     body = f"""
-    <nav class="topnav"><a href="/attendance">← Anwesenheit</a><a href="/event/{_e(event_id)}">Eventdetails</a><a href="/attendance/{_e(event_id)}/ec-preview">EC-Vorschau</a><a href="/voice">Voice</a><a href="/ec">EC</a></nav>
+    <nav class="topnav"><a href="/attendance">← Anwesenheit</a><a href="/event/{_e(event_id)}">Eventdetails</a><a href="/attendance/{_e(event_id)}/ec-preview">EC-Vorschau</a><a href="#event-ec-queue">EC-Queue</a><a href="/voice">Voice</a><a href="/ec">EC</a></nav>
     <section class="hero">
       <div>
         <div class="eyebrow">Anwesenheits-Review · keine EC-Buchung</div>
@@ -4565,6 +4573,7 @@ def _render_attendance_event(data: dict[str, Any], event_id: str, saved: bool = 
         <p style="margin-top:14px"><button class="btn" type="submit">Review speichern</button></p>
       </form>
     </section>
+    {_raw(_event_ec_queue_panel(guild_id, str(event_id)))}
     """
     return _html_shell(f"Anwesenheit · {event.get('title') or event_id}", body)
 
@@ -4737,6 +4746,96 @@ def _latest_ec_award_request(guild_id: int, event_id: str) -> dict[str, Any]:
             return out
     finally:
         conn.close()
+
+
+def _ec_award_requests_for_event(guild_id: int, event_id: str, limit: int = 12) -> list[dict[str, Any]]:
+    if not _database_url() or not guild_id or not event_id:
+        return []
+    try:
+        _ensure_admin_tables()
+    except Exception:
+        return []
+    conn = _pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, request_id, guild_id, event_id, event_type, status, full_ec, partial_ec,
+                       actor_id, actor_name, requested_at, claimed_at, processed_at, result_json, payload_json
+                FROM dashboard_ec_award_requests
+                WHERE guild_id = %s AND event_id = %s
+                ORDER BY requested_at DESC, id DESC
+                LIMIT %s
+                """,
+                (int(guild_id), str(event_id), int(limit)),
+            )
+            rows: list[dict[str, Any]] = []
+            for row in cur.fetchall() or []:
+                out = dict(row)
+                try:
+                    out["result"] = json.loads(out.get("result_json") or "{}")
+                except Exception:
+                    out["result"] = {}
+                try:
+                    out["payload"] = json.loads(out.get("payload_json") or "{}")
+                except Exception:
+                    out["payload"] = {}
+                rows.append(out)
+            return rows
+    finally:
+        conn.close()
+
+
+def _event_ec_queue_status(guild_id: int, event_id: str) -> dict[str, Any]:
+    rows = _ec_award_requests_for_event(guild_id, event_id, limit=20)
+    latest = rows[0] if rows else {}
+    has_active = any(str(r.get("status") or "").lower() in {"pending", "processing"} for r in rows)
+    has_done = any(str(r.get("status") or "").lower() == "done" for r in rows)
+    has_problem = any(str(r.get("status") or "").lower() in {"failed", "rejected"} for r in rows)
+    return {"rows": rows, "latest": latest, "has_active": has_active, "has_done": has_done, "has_problem": has_problem, "count": len(rows)}
+
+
+def _event_ec_queue_badge(guild_id: int, event_id: str) -> dict[str, str]:
+    latest = (_event_ec_queue_status(guild_id, event_id).get("latest") or {})
+    if not latest:
+        return _raw("<span class='pill'>—</span>")
+    status = str(latest.get("status") or "").lower()
+    css = "queue-badge"
+    if status == "done":
+        css += " ok"
+    elif status in {"failed", "rejected"}:
+        css += " bad"
+    elif status in {"pending", "processing"}:
+        css += " wait"
+    label = _ec_award_status_label(status)
+    rid = _short(latest.get("request_id") or "", 10)
+    return _raw(f"<a class='{css}' href='/ec-queue' title='Request {_e(latest.get('request_id') or '')}'>{_e(label)}<small>{_e(rid)}</small></a>")
+
+
+def _event_ec_queue_panel(guild_id: int, event_id: str) -> str:
+    rows = _ec_award_requests_for_event(guild_id, event_id, limit=12)
+    if not rows:
+        return "<section class='panel'><h2>🌐 EC-Queue für dieses Event</h2><div class='empty'>Noch keine Dashboard-EC-Anfrage für dieses Event.</div></section>"
+    table_rows: list[list[Any]] = []
+    for r in rows:
+        payload = r.get("payload") if isinstance(r.get("payload"), dict) else {}
+        result = r.get("result") if isinstance(r.get("result"), dict) else {}
+        status = str(r.get("status") or "")
+        total = result.get("total_ec") if result.get("total_ec") is not None else payload.get("total_ec")
+        applied = result.get("applied_count") if result.get("applied_count") is not None else payload.get("recipient_count")
+        skipped = result.get("skipped_count") if result.get("skipped_count") is not None else "—"
+        detail = result.get("error") or r.get("request_id") or "—"
+        if _ec_award_request_is_stale(r):
+            detail = f"HÄNGT? {detail}"
+        table_rows.append([_dt(r.get("requested_at")), _ec_award_status_label(status), r.get("event_type") or "—", _fmt_ec(total), applied, skipped, r.get("actor_name") or r.get("actor_id") or "—", _short(detail, 140)])
+    return f"""
+    <section class="panel" id="event-ec-queue">
+      <h2>🌐 EC-Queue für dieses Event</h2>
+      <p class="muted">Direkter Status der Dashboard-Buchungen für genau dieses Event. Retry/Abbrechen läuft über die Queue-Zentrale.</p>
+      {_table(['Angefragt','Status','Typ','EC','Gebucht','Übersprungen','Admin','Details'], table_rows, placeholder='Event-Queue durchsuchen…')}
+      <p><a class="btn" href="/ec-queue">EC-Queue öffnen</a></p>
+    </section>
+    """
 
 
 def _active_ec_award_request(guild_id: int, event_id: str) -> dict[str, Any]:
@@ -4946,6 +5045,7 @@ def _render_attendance_ec_preview(data: dict[str, Any], event_id: str, full_ec: 
         return _html_shell("EC-Vorschau", f"<section class='panel'><h1>❌ EC-Vorschau</h1><p>{_e(preview.get('error'))}</p><p><a class='btn' href='/attendance'>Zurück</a></p></section>")
     event = preview.get("event") or {}
     rows = preview.get("rows") or []
+    guild_id = _safe_guild_id(data)
     fe = _num(preview.get("full_ec"), 0)
     pe = _num(preview.get("partial_ec"), 0)
     total = _num(preview.get("total_ec"), 0)
@@ -4988,7 +5088,7 @@ def _render_attendance_ec_preview(data: dict[str, Any], event_id: str, full_ec: 
     if latest_request:
         notice += f"<div class='warn'>📌 Letzte Dashboard-EC-Anfrage: <strong>{_e(latest_request.get('status'))}</strong> · Request <code>{_e(latest_request.get('request_id'))}</code> · {_e(_dt(latest_request.get('requested_at')))}</div>"
     body = f"""
-    <nav class="topnav"><a href="/attendance/{_e(event_id)}">← Review</a><a href="/attendance">Anwesenheit</a><a href="/ec">EC-Verlauf</a><a href="/event/{_e(event_id)}">Eventdetails</a></nav>
+    <nav class="topnav"><a href="/attendance/{_e(event_id)}">← Review</a><a href="/attendance">Anwesenheit</a><a href="/ec">EC-Verlauf</a><a href="/ec-queue">EC-Queue</a><a href="/event/{_e(event_id)}">Eventdetails</a></nav>
     <section class="hero">
       <div>
         <div class="eyebrow">EC-Vorschau + Bot-Buchung über sichere Queue</div>
@@ -4998,6 +5098,7 @@ def _render_attendance_ec_preview(data: dict[str, Any], event_id: str, full_ec: 
       <a class="btn" href="/export/attendance/{_e(event_id)}.csv?full_ec={_e(fe)}&partial_ec={_e(pe)}">CSV herunterladen</a>
     </section>
     {notice}
+    {_raw(_event_ec_queue_panel(guild_id, str(event_id)))}
     <section class="grid">
       {_card('Empfänger', recipients, 'bekommen EC laut Review')}
       {_card('Gesamt-EC', _fmt_ec(total), 'würde insgesamt vergeben')}
