@@ -1417,6 +1417,7 @@ def _html_shell(title: str, body: str) -> str:
     .topnav a[href="/analytics"]::before {{ display:block; background-image:url("{_asset('nav_analytics.png')}"); }}
     .topnav a[href="/voice"]::before {{ display:block; background-image:url("{_asset('nav_voice.png')}"); }}
     .topnav a[href="/ec"]::before {{ display:block; background-image:url("{_asset('nav_ec.png')}"); }}
+    .topnav a[href="/ec-queue"]::before {{ display:block; background-image:url("{_asset('nav_ec.png')}"); }}
     .topnav a[href="/attendance"]::before {{ display:block; background-image:url("{_asset('nav_anwesenheit.png')}"); }}
     .topnav a[href="/audit"]::before {{ display:block; background-image:url("{_asset('nav_audit.png')}"); }}
     .topnav a[href="/admin"]::before {{ display:block; background-image:url("{_asset('nav_leitung.png')}"); }}
@@ -1568,6 +1569,229 @@ def _ec_award_request_table_rows(rows: list[dict[str, Any]], snap: dict[str, Any
     return out
 
 
+
+
+def _ec_award_request_by_request_id(guild_id: int, request_id: str) -> dict[str, Any]:
+    if not _database_url() or not guild_id or not request_id:
+        return {}
+    try:
+        _ensure_admin_tables()
+    except Exception:
+        return {}
+    conn = _pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, request_id, guild_id, event_id, event_type, status, full_ec, partial_ec,
+                       actor_id, actor_name, requested_at, claimed_at, processed_at, result_json, payload_json
+                FROM dashboard_ec_award_requests
+                WHERE guild_id = %s AND request_id = %s
+                LIMIT 1
+                """,
+                (int(guild_id), str(request_id)),
+            )
+            row = cur.fetchone()
+            if not row:
+                return {}
+            out = dict(row)
+            try:
+                out["result"] = json.loads(out.get("result_json") or "{}")
+            except Exception:
+                out["result"] = {}
+            try:
+                out["payload"] = json.loads(out.get("payload_json") or "{}")
+            except Exception:
+                out["payload"] = {}
+            return out
+    finally:
+        conn.close()
+
+
+def _dt_obj(value: Any) -> Optional[datetime]:
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        try:
+            dt = datetime.fromisoformat(str(value or "").replace("Z", "+00:00"))
+        except Exception:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _ec_award_request_is_stale(row: dict[str, Any], minutes: int = 15) -> bool:
+    if str(row.get("status") or "").lower() != "processing":
+        return False
+    claimed = _dt_obj(row.get("claimed_at"))
+    if not claimed:
+        return False
+    return (datetime.now(timezone.utc) - claimed).total_seconds() > int(minutes) * 60
+
+
+def _ec_queue_counts(rows: list[dict[str, Any]]) -> dict[str, int]:
+    counts = {"pending": 0, "processing": 0, "done": 0, "failed": 0, "rejected": 0, "cancelled": 0, "stale": 0}
+    for r in rows:
+        st = str(r.get("status") or "").lower()
+        if st in counts:
+            counts[st] += 1
+        if _ec_award_request_is_stale(r):
+            counts["stale"] += 1
+    return counts
+
+
+def _ec_request_action_forms(row: dict[str, Any], *, allow_admin: bool) -> dict[str, str]:
+    if not allow_admin:
+        return _raw("<span class='muted'>nur Admin</span>")
+    request_id = _e(row.get("request_id") or "")
+    status = str(row.get("status") or "").lower()
+    forms: list[str] = []
+    if status == "pending":
+        forms.append(
+            f"<form method=\"post\" action=\"/admin/ec-award-requests/{request_id}/cancel\" style=\"display:inline\" onsubmit=\"return confirm('Offene EC-Buchungsanfrage abbrechen?');\"><button class=\"btn mini-btn danger-btn\" type=\"submit\">Abbrechen</button></form>"
+        )
+    if status in {"failed", "rejected", "cancelled"}:
+        forms.append(
+            f"<form method=\"post\" action=\"/admin/ec-award-requests/{request_id}/retry\" style=\"display:inline\" onsubmit=\"return confirm('EC-Buchungsanfrage wieder auf offen setzen? Der Bot prüft Doppelbuchungen erneut.');\"><button class=\"btn mini-btn\" type=\"submit\">Neu versuchen</button></form>"
+        )
+    if status == "processing" and _ec_award_request_is_stale(row):
+        forms.append(
+            f"<form method=\"post\" action=\"/admin/ec-award-requests/{request_id}/requeue\" style=\"display:inline\" onsubmit=\"return confirm('Diese Verarbeitung wirkt veraltet. Wieder auf offen setzen?');\"><button class=\"btn mini-btn\" type=\"submit\">Wieder öffnen</button></form>"
+        )
+    if not forms:
+        return _raw("<span class='muted'>—</span>")
+    return _raw("<div class='queue-actions'>" + " ".join(forms) + "</div>")
+
+
+def _ec_award_request_control_rows(rows: list[dict[str, Any]], snap: dict[str, Any], *, allow_admin: bool = False) -> list[list[Any]]:
+    event_name_by_id = {
+        str(ev.get("event_id") or ""): str(ev.get("title") or ev.get("event_id") or "Event")
+        for ev in ((snap.get("events") or {}).get("items") or [])
+        if isinstance(ev, dict)
+    }
+    out: list[list[Any]] = []
+    for r in rows:
+        payload = r.get("payload") if isinstance(r.get("payload"), dict) else {}
+        result = r.get("result") if isinstance(r.get("result"), dict) else {}
+        event_id = str(r.get("event_id") or "")
+        event_title = payload.get("event_title") or event_name_by_id.get(event_id) or event_id
+        status = str(r.get("status") or "")
+        total = result.get("total_ec") if result.get("total_ec") is not None else payload.get("total_ec")
+        applied = result.get("applied_count") if result.get("applied_count") is not None else payload.get("recipient_count")
+        skipped = result.get("skipped_count") if result.get("skipped_count") is not None else "—"
+        error = ""
+        if result and not result.get("ok", status == "done"):
+            error = str(result.get("error") or "")
+        stale = " · alt" if _ec_award_request_is_stale(r) else ""
+        out.append([
+            _dt(r.get("requested_at")),
+            _ec_award_status_label(status) + stale,
+            _event_link(event_id, event_title),
+            r.get("event_type") or "—",
+            _fmt_ec(total),
+            applied,
+            skipped,
+            r.get("actor_name") or r.get("actor_id") or "—",
+            _short(error or r.get("request_id"), 140),
+            _ec_request_action_forms(r, allow_admin=allow_admin),
+        ])
+    return out
+
+
+def _update_ec_award_request_status(guild_id: int, request_id: str, new_status: str, actor: dict[str, Any], *, allowed_current: set[str], result_patch: Optional[dict[str, Any]] = None) -> tuple[bool, str]:
+    if not _database_url() or not guild_id or not request_id:
+        return False, "DATABASE_URL/Guild/Request fehlt."
+    current = _ec_award_request_by_request_id(int(guild_id), str(request_id))
+    if not current:
+        return False, "EC-Buchungsanfrage nicht gefunden."
+    old_status = str(current.get("status") or "").lower()
+    if old_status not in allowed_current:
+        return False, f"Status {old_status or '—'} kann hier nicht geändert werden."
+    actor_id = str(actor.get("user_id") or "")
+    actor_name = str(actor.get("username") or actor.get("user_id") or "Dashboard")
+    payload = current.get("payload") if isinstance(current.get("payload"), dict) else {}
+    result = current.get("result") if isinstance(current.get("result"), dict) else {}
+    if result_patch:
+        result.update(result_patch)
+    _ensure_admin_tables()
+    conn = _pg_connect()
+    try:
+        with conn.cursor() as cur:
+            if new_status == "pending":
+                cur.execute(
+                    """
+                    UPDATE dashboard_ec_award_requests
+                    SET status = 'pending', claimed_at = NULL, processed_at = NULL, result_json = %s
+                    WHERE guild_id = %s AND request_id = %s
+                    """,
+                    (json.dumps(result, ensure_ascii=False, separators=(",", ":")), int(guild_id), str(request_id)),
+                )
+            else:
+                cur.execute(
+                    """
+                    UPDATE dashboard_ec_award_requests
+                    SET status = %s, processed_at = CASE WHEN %s IN ('cancelled','failed','rejected') THEN NOW() ELSE processed_at END, result_json = %s
+                    WHERE guild_id = %s AND request_id = %s
+                    """,
+                    (str(new_status), str(new_status), json.dumps(result, ensure_ascii=False, separators=(",", ":")), int(guild_id), str(request_id)),
+                )
+            cur.execute(
+                """
+                INSERT INTO dashboard_admin_action_log
+                    (guild_id, action_type, target_type, target_id, actor_id, actor_name, payload_json)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """,
+                (int(guild_id), f"ec_award_request_{new_status}", "ec_award_request", str(request_id), actor_id, actor_name, json.dumps({"old_status": old_status, "new_status": new_status, "event_id": current.get("event_id"), "event_title": payload.get("event_title")}, ensure_ascii=False)),
+            )
+        conn.commit()
+        return True, f"EC-Buchungsanfrage wurde auf {new_status} gesetzt."
+    finally:
+        conn.close()
+
+
+def _render_ec_queue_dashboard(data: dict[str, Any], current_user: Optional[dict[str, Any]] = None, msg: str = "") -> str:
+    if not data.get("ok"):
+        return _html_shell("EC-Queue · Ebo Dashboard", f"<section class='panel'><h1>🌐 EC-Queue</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+    snap: dict[str, Any] = data.get("snapshot") or {}
+    guild_id = _safe_guild_id(data)
+    rows = _ec_award_requests_for_dashboard(guild_id, limit=200) if guild_id else []
+    counts = _ec_queue_counts(rows)
+    allow_admin = bool(current_user and str(current_user.get("role") or "") == "admin")
+    table_rows = _ec_award_request_control_rows(rows, snap, allow_admin=allow_admin)
+    total_ec_waiting = sum(_num((r.get("payload") or {}).get("total_ec"), 0) for r in rows if isinstance(r.get("payload"), dict) and str(r.get("status") or "").lower() in {"pending", "processing"})
+    cards = "".join([
+        _card("Offen", counts.get("pending", 0), "wartet auf Bot"),
+        _card("In Arbeit", counts.get("processing", 0), f"alt: {counts.get('stale', 0)}"),
+        _card("Erledigt", counts.get("done", 0), "vom Bot gebucht"),
+        _card("Probleme", counts.get("failed", 0) + counts.get("rejected", 0), "fehlgeschlagen/blockiert"),
+        _card("Abgebrochen", counts.get("cancelled", 0), "manuell gestoppt"),
+        _card("Wartende EC", _fmt_ec(total_ec_waiting), "pending + processing"),
+    ])
+    notice = f"<div class='warn'>{_e(msg)}</div>" if msg else ""
+    admin_note = "Admin-Aktionen aktiv." if allow_admin else "Nur Dashboard-Admins sehen Aktionen."
+    body = f"""
+    <nav class="topnav"><a href="/">← Kommando</a><a href="/ec">EC-Verlauf</a><a href="/ec-queue">EC-Queue</a><a href="/attendance">Anwesenheit</a><a href="/audit">Audit</a><a href="/api/ec-award-requests">API</a></nav>
+    <section class="hero">
+      <div>
+        <div class="eyebrow">Dashboard → Bot</div>
+        <h1>🌐 EC-Buchungsqueue</h1>
+        <p>Kontrolle für EC-Anfragen aus dem Attendance Review. Das Dashboard schreibt weiterhin keine JSON-Daten; der Bot verarbeitet diese Queue.</p>
+        <p class="muted">{_e(admin_note)} · Snapshot: {_e(_dt(data.get('published_at')))}</p>
+      </div>
+      <a class="btn" href="/ec">EC-Verlauf</a>
+    </section>
+    {notice}
+    <section class="grid mini-grid">{cards}</section>
+    <section class="panel">
+      <h2>📋 Letzte EC-Anfragen</h2>
+      <p class="muted">Abbrechen geht nur bei offenen Anfragen. Fehlgeschlagene/blockierte/abgebrochene Anfragen können neu geöffnet werden. Alte Processing-Anfragen können wieder geöffnet werden, wenn der Bot hängen geblieben ist.</p>
+      {_table(['Angefragt','Status','Event','Typ','EC','Gebucht','Übersprungen','Admin','Details','Aktion'], table_rows, placeholder='EC-Queue durchsuchen…')}
+    </section>
+    """
+    return _html_shell("EC-Queue · Ebo Dashboard", body)
+
+
 def _render_ec_dashboard(data: dict[str, Any]) -> str:
     if not data.get("ok"):
         return _html_shell("Ebo Dashboard", f"<section class='panel'><h1>🪙 EC-Verlauf</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
@@ -1640,6 +1864,7 @@ def _render_ec_dashboard(data: dict[str, Any]) -> str:
     <section class="panel" id="queue">
       <h2>🌐 Dashboard-EC-Buchungen</h2>
       <p class="muted">Hier siehst du nach „EC wirklich buchen“, ob die Postgres-Anfrage noch offen ist, vom Bot verarbeitet wird oder fertig/abgelehnt wurde. Die Seite schreibt nichts direkt in JSON.</p>
+      <p><a class="btn" href="/ec-queue">EC-Queue öffnen</a></p>
       {_table(['Angefragt','Status','Event','Typ','EC','Gebucht','Übersprungen','Admin','Details'], award_request_rows, placeholder='Dashboard-Buchungen durchsuchen…')}
     </section>
     <section class="panel" id="top">
@@ -3331,6 +3556,10 @@ def _render_leadership_dashboard(data: dict[str, Any]) -> str:
     running_events = li.get("running_events") or []
     active_auctions = li.get("active_auctions") or []
     flagged_members = li.get("flagged_members") or []
+    guild_id = _safe_guild_id(data)
+    queue_rows = _ec_award_requests_for_dashboard(guild_id, limit=40) if guild_id else []
+    queue_counts = _ec_queue_counts(queue_rows)
+    queue_open = queue_counts.get("pending", 0) + queue_counts.get("processing", 0)
 
     cards = "".join([
         _card("Offene Aufgaben", len(tasks), f"hoch: {urgent_count}"),
@@ -3339,6 +3568,7 @@ def _render_leadership_dashboard(data: dict[str, Any]) -> str:
         _card("Aktive Auktionen", len(active_auctions), "Auktionshaus/DKP-Log"),
         _card("ohne Needliste", quality.get("missing_needs", 0), "nachpflegen lassen"),
         _card("EC gesamt", _fmt_ec(analytics.get("total_ec")), f"Ø {_fmt_ec(analytics.get('avg_ec'))}"),
+        _card("EC-Queue", queue_open, f"offen/verarbeitend · erledigt: {queue_counts.get('done', 0)}"),
         _card("Voice-Stunden", f"{_num(analytics.get('recent_voice_hours'), 0):.1f} h", "geladene Sessions"),
         _card("Snapshot", _dt(data.get("published_at")), "read-only"),
     ])
@@ -3401,6 +3631,7 @@ def _render_leadership_dashboard(data: dict[str, Any]) -> str:
         [_raw('<a class="link" href="/loot">🏆 Loot</a>'), "Aktive Auktionen, Gewinner, Roll-/Bid-Historie"],
         [_raw('<a class="link" href="/fairness">⚖️ Fairness</a>'), "Need/EC/Loot-Hinweise"],
         [_raw('<a class="link" href="/attendance">✅ Anwesenheit</a>'), "Event-Review und EC-Buchung"],
+        [_raw('<a class="link" href="/ec-queue">🌐 EC-Queue</a>'), "Dashboard-Buchungen prüfen, abbrechen oder neu öffnen"],
         [_raw('<a class="link" href="/audit">🧾 Audit</a>'), "Wer hat was gemacht"],
         [_raw('<a class="link" href="/admin">🛡️ Leitung</a>'), "interne Notizen und Prüfmarkierungen"],
         [_raw('<a class="link" href="/overview">📊 Gesamtübersicht</a>'), "alte Tabellen-Startseite"],
@@ -3416,6 +3647,7 @@ def _render_leadership_dashboard(data: dict[str, Any]) -> str:
       <a href="/fairness">Fairness</a>
       <a href="/analytics">Analytics</a><a href="/voice">Voice</a>
       <a href="/ec">EC</a>
+      <a href="/ec-queue">EC-Queue</a>
       <a href="/attendance">Anwesenheit</a>
       <a href="/audit">Audit</a>
       <a href="/admin">Leitung</a>
@@ -3803,6 +4035,71 @@ def admin_actions_page(_: bool = Depends(_admin_auth)):
             _html_shell("Ebo Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
             status_code=500,
         )
+
+
+
+
+@app.get("/ec-queue", response_class=HTMLResponse)
+def ec_queue_dashboard(request: Request, _: bool = Depends(_auth)):
+    try:
+        return HTMLResponse(_render_ec_queue_dashboard(_snapshot_payload(), _current_user(request), str(request.query_params.get("msg") or "")))
+    except Exception as exc:
+        return HTMLResponse(
+            _html_shell("Ebo Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
+            status_code=500,
+        )
+
+
+@app.post("/admin/ec-award-requests/{request_id}/cancel")
+def admin_ec_award_request_cancel(request_id: str, request: Request, _: bool = Depends(_admin_auth)):
+    payload = _snapshot_payload()
+    guild_id = _safe_guild_id(payload)
+    _ok, msg = _update_ec_award_request_status(
+        guild_id,
+        request_id,
+        "cancelled",
+        _current_user(request) or {},
+        allowed_current={"pending"},
+        result_patch={"ok": False, "cancelled_by_dashboard": True, "message": "Durch Dashboard-Admin abgebrochen."},
+    )
+    suffix = urllib.parse.urlencode({"msg": msg})
+    return RedirectResponse(f"/ec-queue?{suffix}", status_code=303)
+
+
+@app.post("/admin/ec-award-requests/{request_id}/retry")
+def admin_ec_award_request_retry(request_id: str, request: Request, _: bool = Depends(_admin_auth)):
+    payload = _snapshot_payload()
+    guild_id = _safe_guild_id(payload)
+    _ok, msg = _update_ec_award_request_status(
+        guild_id,
+        request_id,
+        "pending",
+        _current_user(request) or {},
+        allowed_current={"failed", "rejected", "cancelled"},
+        result_patch={"ok": False, "requeued_by_dashboard": True, "message": "Durch Dashboard-Admin erneut geöffnet."},
+    )
+    suffix = urllib.parse.urlencode({"msg": msg})
+    return RedirectResponse(f"/ec-queue?{suffix}", status_code=303)
+
+
+@app.post("/admin/ec-award-requests/{request_id}/requeue")
+def admin_ec_award_request_requeue(request_id: str, request: Request, _: bool = Depends(_admin_auth)):
+    payload = _snapshot_payload()
+    guild_id = _safe_guild_id(payload)
+    current = _ec_award_request_by_request_id(guild_id, request_id) if guild_id else {}
+    if current and not _ec_award_request_is_stale(current):
+        msg = "Processing-Anfrage ist noch nicht alt genug. Nicht erneut geöffnet."
+    else:
+        _ok, msg = _update_ec_award_request_status(
+            guild_id,
+            request_id,
+            "pending",
+            _current_user(request) or {},
+            allowed_current={"processing"},
+            result_patch={"ok": False, "requeued_stale_by_dashboard": True, "message": "Stale processing durch Dashboard-Admin erneut geöffnet."},
+        )
+    suffix = urllib.parse.urlencode({"msg": msg})
+    return RedirectResponse(f"/ec-queue?{suffix}", status_code=303)
 
 
 @app.post("/admin/member/{user_id}/save")
