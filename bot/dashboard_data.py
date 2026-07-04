@@ -446,37 +446,123 @@ def _summarize_transactions(data: Any, guild_id: int, *, limit: int = 200) -> di
     return {"count": len(arr), "recent": items}
 
 
-def _summarize_auctions(data: Any, guild_id: int, *, limit: int = 300) -> dict[str, Any]:
+def _summarize_auctions(data: Any, guild: discord.Guild, *, limit: int = 300) -> dict[str, Any]:
+    """Auktionsdaten fürs Dashboard normalisieren.
+
+    Neu: nicht nur Übersicht, sondern genug Detaildaten für Auktions-Detailseiten:
+    - Gebotshistorie
+    - Gewinner/Empfänger
+    - Startgebot/Mindestschritt/Festpreis
+    - berechtigte Spieler
+    - Müll-Würfe
+    """
+    guild_id = int(guild.id)
     g = _guild_dict(data, guild_id)
     auctions = g.get("auctions") if isinstance(g.get("auctions"), dict) else {}
     items: list[dict[str, Any]] = []
     counts: dict[str, int] = {}
+
+    def member_name(uid: Any, fallback: str = "") -> str:
+        try:
+            user_id = int(uid or 0)
+        except Exception:
+            user_id = 0
+        if user_id:
+            m = guild.get_member(user_id)
+            if m is not None:
+                return _safe_text(getattr(m, "display_name", "") or getattr(m, "name", "") or f"User {user_id}", 120)
+        return _safe_text(fallback or (f"User {user_id}" if user_id else ""), 120)
+
     for aid, auc in auctions.items():
         if not isinstance(auc, dict):
             continue
         status = str(auc.get("status") or "unknown")
         counts[status] = counts.get(status, 0) + 1
-        bids = auc.get("bids") if isinstance(auc.get("bids"), list) else []
-        top_bid = None
-        if bids:
+        bids_raw = auc.get("bids") if isinstance(auc.get("bids"), list) else []
+        bids: list[dict[str, Any]] = []
+        for b in bids_raw:
+            if not isinstance(b, dict):
+                continue
+            uid = int(b.get("user_id", 0) or 0)
+            bids.append({
+                "user_id": uid,
+                "display_name": member_name(uid, str(b.get("name") or "")),
+                "amount": b.get("amount"),
+                "created_at": str(b.get("created_at") or b.get("at") or ""),
+            })
+        bids.sort(key=lambda x: (float(x.get("amount") or 0), str(x.get("created_at") or "")), reverse=True)
+        top_bid = bids[0] if bids else None
+
+        winner_id = int(
+            auc.get("winner_user_id", 0)
+            or auc.get("delivered_to", 0)
+            or auc.get("sold_to", 0)
+            or auc.get("junk_roll_winner_id", 0)
+            or auc.get("junk_lottery_winner_id", 0)
+            or 0
+        )
+        if not winner_id and status in {"delivered", "sold", "ended"} and top_bid:
+            winner_id = int(top_bid.get("user_id") or 0)
+
+        eligible_raw = auc.get("eligible_user_ids") if isinstance(auc.get("eligible_user_ids"), list) else []
+        eligible = []
+        for uid in eligible_raw[:250]:
             try:
-                top_bid = max(bids, key=lambda b: float((b or {}).get("amount") or 0))
+                iuid = int(uid or 0)
             except Exception:
-                top_bid = None
+                iuid = 0
+            if iuid:
+                eligible.append({"user_id": iuid, "display_name": member_name(iuid)})
+
+        junk_rolls_raw = auc.get("junk_rolls") if isinstance(auc.get("junk_rolls"), dict) else {}
+        junk_rolls = []
+        for uid_raw, roll_raw in junk_rolls_raw.items():
+            try:
+                iuid = int(uid_raw or 0)
+                roll = int(roll_raw or 0)
+            except Exception:
+                continue
+            junk_rolls.append({"user_id": iuid, "display_name": member_name(iuid), "roll": roll})
+        junk_rolls.sort(key=lambda x: int(x.get("roll") or 0), reverse=True)
+
         items.append({
             "auction_id": str(aid),
+            "item_id": str(auc.get("item_id") or ""),
             "item_name": _safe_text(auc.get("item_name") or auc.get("item") or auc.get("title"), 180),
             "status": status,
+            "kind": _safe_text(auc.get("kind") or "", 80),
             "phase": _safe_text(auc.get("phase") or auc.get("mode") or auc.get("auction_type") or "", 80),
+            "eligibility_mode": _safe_text(auc.get("eligibility_mode") or "", 80),
             "created_at": str(auc.get("created_at") or ""),
+            "created_by": int(auc.get("created_by", 0) or 0),
+            "created_by_name": member_name(auc.get("created_by")),
             "ends_at": str(auc.get("ends_at") or auc.get("end_at") or ""),
+            "start_bid": auc.get("start_bid"),
+            "min_increment": auc.get("min_increment"),
+            "fixed_price": auc.get("fixed_price"),
             "bid_count": len(bids),
+            "bids": bids[:100],
             "top_bid_user_id": int((top_bid or {}).get("user_id", 0) or 0) if isinstance(top_bid, dict) else 0,
+            "top_bid_user_name": (top_bid or {}).get("display_name") if isinstance(top_bid, dict) else "",
             "top_bid_amount": (top_bid or {}).get("amount") if isinstance(top_bid, dict) else None,
+            "winner_user_id": winner_id,
+            "winner_name": member_name(winner_id) if winner_id else "",
+            "delivered_at": str(auc.get("delivered_at") or auc.get("sold_at") or ""),
+            "delivered_by": int(auc.get("delivered_by", 0) or 0),
+            "delivered_by_name": member_name(auc.get("delivered_by")),
+            "message_id": int(auc.get("message_id", 0) or 0),
+            "channel_id": int(auc.get("channel_id", 0) or 0),
+            "market_message_id": int(auc.get("market_message_id", 0) or 0),
+            "active_message_id": int(auc.get("active_message_id", 0) or 0),
+            "eligible_count": len(eligible_raw),
+            "eligible_users": eligible,
+            "junk_drop": bool(auc.get("junk_drop")),
+            "junk_roll_until": str(auc.get("junk_roll_until") or auc.get("junk_interest_until") or ""),
+            "junk_rolls": junk_rolls[:150],
+            "junk_roll_winner_roll": int(auc.get("junk_roll_winner_roll", 0) or 0),
         })
     items.sort(key=lambda x: str(x.get("created_at") or x.get("ends_at") or ""), reverse=True)
     return {"count": len(auctions), "by_status": counts, "items": items[:limit]}
-
 
 def _catalog_items_for_guild(data: Any, guild_id: int) -> dict[str, Any]:
     """Item-Katalog dieser Gilde normalisieren.
