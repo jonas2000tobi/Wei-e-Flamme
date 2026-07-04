@@ -12,7 +12,7 @@ from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
-app = FastAPI(title="Ebo Dashboard", version="0.6.0")
+app = FastAPI(title="Ebo Dashboard", version="0.7.0")
 security = HTTPBasic(auto_error=False)
 
 
@@ -479,6 +479,9 @@ def _render_dashboard(data: dict[str, Any]) -> str:
       <a href="#overview">Übersicht</a>
       <a href="/analytics">Analytics</a>
       <a href="/ec">EC-Verlauf</a>
+      <a href="/settings">Einstellungen</a>
+      <a href="/audit">Audit</a>
+      <a href="/system">System</a>
       <a href="#quality">Datenqualität</a>
       <a href="#members">Mitglieder</a>
       <a href="#events">Events</a>
@@ -1178,6 +1181,145 @@ def _render_activity_analytics(data: dict[str, Any]) -> str:
     return _html_shell("Analytics · Ebo Dashboard", body)
 
 
+
+
+def _source_health_rows(snap: dict[str, Any]) -> list[list[Any]]:
+    rows: list[list[Any]] = []
+    for key, info in ((snap.get("source_health") or {}).items() if isinstance(snap.get("source_health"), dict) else []):
+        if not isinstance(info, dict):
+            continue
+        rows.append([
+            key,
+            info.get("file"),
+            "ja" if info.get("exists") else "nein",
+            "OK" if info.get("ok") else _short(info.get("error"), 120),
+            info.get("size_bytes", 0),
+            _dt(info.get("modified_at")),
+        ])
+    return rows
+
+
+def _render_settings_dashboard(data: dict[str, Any]) -> str:
+    if not data.get("ok"):
+        return _html_shell("Ebo Dashboard", f"<section class='panel'><h1>⚙️ Einstellungen</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+    snap: dict[str, Any] = data.get("snapshot") or {}
+    guild = snap.get("guild") or {}
+    settings = snap.get("settings") or {}
+    member_filter = settings.get("member_filter") or ((guild.get("member_filter") or {}))
+    counts = settings.get("counts") or {}
+
+    role_text = "nicht gesetzt"
+    if isinstance(member_filter, dict) and member_filter.get("mode") == "discord_role":
+        role_text = f"{member_filter.get('role_name')} ({member_filter.get('role_id')})"
+
+    cards = "".join([
+        _card("Gildenrolle", role_text, f"Mitglieder: {member_filter.get('eligible_count', 0) if isinstance(member_filter, dict) else 0}"),
+        _card("Module", counts.get("modules", 0), "gefundene Config-Bereiche"),
+        _card("Kanäle", counts.get("channels", 0), "aus Configs erkannt"),
+        _card("Rollen", counts.get("roles", 0), "aus Configs erkannt"),
+        _card("Settings", counts.get("settings", 0), "wichtige Schlüssel"),
+        _card("Backend", (snap.get("storage") or {}).get("runtime_backend"), "Runtime-Datenbank"),
+    ])
+
+    module_rows = []
+    for m in settings.get("modules") or []:
+        if isinstance(m, dict):
+            module_rows.append([m.get("module"), "ja" if m.get("configured") else "nein", "ja" if m.get("source_exists") else "nein", m.get("top_level_keys")])
+
+    channel_rows = []
+    for ch in settings.get("channels") or []:
+        if isinstance(ch, dict):
+            channel_rows.append([ch.get("source"), ch.get("key"), ch.get("name") or "nicht aufgelöst", ch.get("channel_id")])
+
+    role_rows = []
+    for r in settings.get("roles") or []:
+        if isinstance(r, dict):
+            role_rows.append([r.get("source"), r.get("key"), r.get("name") or "nicht aufgelöst", r.get("role_id")])
+
+    setting_rows = []
+    for row in settings.get("settings") or []:
+        if isinstance(row, dict):
+            setting_rows.append([row.get("source"), row.get("key"), row.get("value")])
+
+    body = f"""
+    <nav class="topnav"><a href="/">← Übersicht</a><a href="/analytics">Analytics</a><a href="/ec">EC-Verlauf</a><a href="/audit">Audit</a><a href="/system">System</a><a href="/api/settings">API</a></nav>
+    <section class="hero">
+      <div>
+        <div class="eyebrow">Read-only Setup</div>
+        <h1>⚙️ Einstellungen & Setup</h1>
+        <p class="muted">Zeigt die aktuelle Bot-/Server-Konfiguration aus dem Snapshot. Es wird nichts verändert.</p>
+      </div>
+      <a class="btn" href="/">Zurück</a>
+    </section>
+    <section class="grid">{cards}</section>
+    <section class="panel"><h2>🧩 Module</h2>{_table(['Bereich','konfiguriert','Quelle vorhanden','Keys'], module_rows, placeholder='Module durchsuchen…')}</section>
+    <section class="panel"><h2>📺 Kanäle</h2>{_table(['Quelle','Setting','Kanal','ID'], channel_rows, placeholder='Kanäle durchsuchen…')}</section>
+    <section class="panel"><h2>🎭 Rollen</h2>{_table(['Quelle','Setting','Rolle','ID'], role_rows, placeholder='Rollen durchsuchen…')}</section>
+    <section class="panel"><h2>🔧 Erkannte Einstellungen</h2>{_table(['Quelle','Key','Wert'], setting_rows, placeholder='Settings durchsuchen…')}</section>
+    """
+    return _html_shell("Einstellungen · Ebo Dashboard", body)
+
+
+def _render_audit_dashboard(data: dict[str, Any]) -> str:
+    if not data.get("ok"):
+        return _html_shell("Ebo Dashboard", f"<section class='panel'><h1>🧾 Audit</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+    snap: dict[str, Any] = data.get("snapshot") or {}
+    audit = snap.get("audit") or {}
+    logs = [x for x in (audit.get("recent_logs") or []) if isinstance(x, dict)]
+    by_action = Counter(str(x.get("action") or "Unbekannt") for x in logs)
+    by_actor = Counter(str(x.get("actor_id") or "Unbekannt") for x in logs)
+    cards = "".join([
+        _card("Audit gesamt", audit.get("logs_total", 0), "in Runtime-DB"),
+        _card("geladen", len(logs), "im Snapshot"),
+        _card("Aktionen", len(by_action), "unterschiedliche Typen"),
+        _card("Akteure", len(by_actor), "unterschiedliche IDs"),
+    ])
+    log_rows = []
+    for a in logs:
+        log_rows.append([_dt(a.get("created_at")), a.get("action"), a.get("actor_id"), _short(a.get("summary"), 180)])
+    action_rows = [[k, v] for k, v in by_action.most_common(80)]
+    actor_rows = [[k, v] for k, v in by_actor.most_common(80)]
+    body = f"""
+    <nav class="topnav"><a href="/">← Übersicht</a><a href="/settings">Einstellungen</a><a href="/system">System</a><a href="#logs">Logs</a><a href="/api/audit">API</a></nav>
+    <section class="hero"><div><div class="eyebrow">Audit Trail</div><h1>🧾 Audit-Log</h1><p class="muted">Read-only Protokoll der wichtigsten Bot-Aktionen. Snapshot: {_e(_dt(data.get('published_at')))}</p></div><a class="btn" href="/">Zurück</a></section>
+    <section class="grid">{cards}</section>
+    <section class="split"><div class="panel"><h2>Aktionen</h2>{_bars(by_action.most_common(12), max_items=12)}</div><div class="panel"><h2>Akteure</h2>{_bars(by_actor.most_common(12), max_items=12)}</div></section>
+    <section class="panel"><h2>Aktionen als Tabelle</h2>{_table(['Aktion','Anzahl'], action_rows, placeholder='Aktionen durchsuchen…')}</section>
+    <section class="panel"><h2>Akteure als Tabelle</h2>{_table(['Actor ID','Anzahl'], actor_rows, placeholder='Akteure durchsuchen…')}</section>
+    <section class="panel" id="logs"><h2>Letzte Audit-Einträge</h2>{_table(['Zeit','Aktion','Actor','Zusammenfassung'], log_rows, placeholder='Audit durchsuchen…')}</section>
+    """
+    return _html_shell("Audit · Ebo Dashboard", body)
+
+
+def _render_system_dashboard(data: dict[str, Any]) -> str:
+    if not data.get("ok"):
+        return _html_shell("Ebo Dashboard", f"<section class='panel'><h1>🛠️ System</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+    snap: dict[str, Any] = data.get("snapshot") or {}
+    storage = snap.get("storage") or {}
+    guild = snap.get("guild") or {}
+    source_rows = _source_health_rows(snap)
+    source_ok = sum(1 for r in source_rows if str(r[3]) == "OK")
+    source_bad = len(source_rows) - source_ok
+    cards = "".join([
+        _card("Snapshot ID", data.get("id"), "Postgres"),
+        _card("Schema", snap.get("schema_version"), "Dashboard-Schema"),
+        _card("Backend", storage.get("runtime_backend"), storage.get("database_url_kind")),
+        _card("Quellen OK", source_ok, f"Fehler/fehlen: {source_bad}"),
+        _card("Discord Cache", guild.get("cached_members_loaded"), "geladene Members"),
+        _card("Guild ID", guild.get("id"), guild.get("name")),
+    ])
+    storage_rows = [[k, v] for k, v in storage.items()]
+    guild_rows = [[k, v] for k, v in guild.items() if k != "member_filter"]
+    body = f"""
+    <nav class="topnav"><a href="/">← Übersicht</a><a href="/settings">Einstellungen</a><a href="/audit">Audit</a><a href="/api/system">API</a></nav>
+    <section class="hero"><div><div class="eyebrow">System</div><h1>🛠️ System & Datenquellen</h1><p class="muted">Nur Diagnose. Keine Schreibzugriffe.</p></div><a class="btn" href="/">Zurück</a></section>
+    <section class="grid">{cards}</section>
+    <section class="panel"><h2>Speicher</h2>{_table(['Key','Wert'], storage_rows, placeholder='Speicher durchsuchen…')}</section>
+    <section class="panel"><h2>Guild</h2>{_table(['Key','Wert'], guild_rows, placeholder='Guild durchsuchen…')}</section>
+    <section class="panel"><h2>JSON-Quellen</h2>{_table(['Key','Datei','vorhanden','Status','Bytes','Geändert'], source_rows, placeholder='Quellen durchsuchen…')}</section>
+    """
+    return _html_shell("System · Ebo Dashboard", body)
+
 @app.get("/healthz")
 def healthz():
     return {"ok": True, "database_url": bool(_database_url())}
@@ -1291,6 +1433,66 @@ def member_detail(user_id: int, _: bool = Depends(_auth)):
             status_code=500,
         )
 
+
+
+@app.get("/settings", response_class=HTMLResponse)
+def settings_page(_: bool = Depends(_auth)):
+    try:
+        return HTMLResponse(_render_settings_dashboard(_snapshot_payload()))
+    except Exception as exc:
+        return HTMLResponse(
+            _html_shell("Ebo Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
+            status_code=500,
+        )
+
+
+@app.get("/audit", response_class=HTMLResponse)
+def audit_page(_: bool = Depends(_auth)):
+    try:
+        return HTMLResponse(_render_audit_dashboard(_snapshot_payload()))
+    except Exception as exc:
+        return HTMLResponse(
+            _html_shell("Ebo Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
+            status_code=500,
+        )
+
+
+@app.get("/system", response_class=HTMLResponse)
+def system_page(_: bool = Depends(_auth)):
+    try:
+        return HTMLResponse(_render_system_dashboard(_snapshot_payload()))
+    except Exception as exc:
+        return HTMLResponse(
+            _html_shell("Ebo Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
+            status_code=500,
+        )
+
+
+@app.get("/api/settings")
+def api_settings(_: bool = Depends(_auth)):
+    payload = _snapshot_payload()
+    if not payload.get("ok"):
+        return JSONResponse(payload, status_code=404)
+    snap = payload.get("snapshot") or {}
+    return JSONResponse({"ok": True, "settings": snap.get("settings") or {}})
+
+
+@app.get("/api/audit")
+def api_audit(_: bool = Depends(_auth)):
+    payload = _snapshot_payload()
+    if not payload.get("ok"):
+        return JSONResponse(payload, status_code=404)
+    snap = payload.get("snapshot") or {}
+    return JSONResponse({"ok": True, "audit": snap.get("audit") or {}})
+
+
+@app.get("/api/system")
+def api_system(_: bool = Depends(_auth)):
+    payload = _snapshot_payload()
+    if not payload.get("ok"):
+        return JSONResponse(payload, status_code=404)
+    snap = payload.get("snapshot") or {}
+    return JSONResponse({"ok": True, "guild": snap.get("guild") or {}, "storage": snap.get("storage") or {}, "source_health": snap.get("source_health") or {}})
 
 @app.get("/", response_class=HTMLResponse)
 def index(_: bool = Depends(_auth)):
