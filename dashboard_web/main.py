@@ -1420,6 +1420,7 @@ def _html_shell(title: str, body: str) -> str:
     .topnav a[href="/ec"]::before {{ display:block; background-image:url("{_asset('nav_ec.png')}"); }}
     .topnav a[href="/ec-queue"]::before {{ display:block; background-image:url("{_asset('nav_ec.png')}"); }}
     .topnav a[href="/attendance"]::before {{ display:block; background-image:url("{_asset('nav_anwesenheit.png')}"); }}
+    .topnav a[href="/attendance-stats"]::before {{ display:block; background-image:url("{_asset('nav_anwesenheit.png')}"); }}
     .topnav a[href="/audit"]::before {{ display:block; background-image:url("{_asset('nav_audit.png')}"); }}
     .topnav a[href="/admin"]::before {{ display:block; background-image:url("{_asset('nav_leitung.png')}"); }}
     .topnav a[href="/settings"]::before {{ display:block; background-image:url("{_asset('nav_einstellungen.png')}"); }}
@@ -3637,6 +3638,7 @@ def _render_leadership_dashboard(data: dict[str, Any]) -> str:
         [_raw('<a class="link" href="/loot">🏆 Loot</a>'), "Aktive Auktionen, Gewinner, Roll-/Bid-Historie"],
         [_raw('<a class="link" href="/fairness">⚖️ Fairness</a>'), "Need/EC/Loot-Hinweise"],
         [_raw('<a class="link" href="/attendance">✅ Anwesenheit</a>'), "Event-Review und EC-Buchung"],
+        [_raw('<a class="link" href="/attendance-stats">📊 Anwesenheit-Stats</a>'), "Spielerquoten, offene Reviews und CSV-Export"],
         [_raw('<a class="link" href="/ec-queue">🌐 EC-Queue</a>'), "Dashboard-Buchungen prüfen, abbrechen oder neu öffnen"],
         [_raw('<a class="link" href="/audit">🧾 Audit</a>'), "Wer hat was gemacht"],
         [_raw('<a class="link" href="/admin">🛡️ Leitung</a>'), "interne Notizen und Prüfmarkierungen"],
@@ -3655,6 +3657,7 @@ def _render_leadership_dashboard(data: dict[str, Any]) -> str:
       <a href="/ec">EC</a>
       <a href="/ec-queue">EC-Queue</a>
       <a href="/attendance">Anwesenheit</a>
+      <a href="/attendance-stats">Anwesenheit-Stats</a>
       <a href="/audit">Audit</a>
       <a href="/admin">Leitung</a>
       <a href="/settings">Einstellungen</a>
@@ -4455,6 +4458,273 @@ def _attendance_review_payload_from_event(snap: dict[str, Any], event: dict[str,
     }
 
 
+# ---------------------------------------------------------------------------
+# Attendance-Statistik / Review-Historie
+# ---------------------------------------------------------------------------
+# Read-only Auswertung der gespeicherten Dashboard-Reviews. Keine EC-Buchung,
+# keine Bot-JSON-Schreiberei. Dient nur der Leitungskontrolle.
+
+
+def _attendance_all_reviews(guild_id: int, limit: int = 500) -> list[dict[str, Any]]:
+    if not _database_url() or not guild_id:
+        return []
+    _ensure_attendance_review_tables()
+    conn = _pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT guild_id, event_id, status, payload_json, updated_by_id, updated_by_name, updated_at
+                FROM dashboard_event_attendance_review
+                WHERE guild_id = %s
+                ORDER BY updated_at DESC
+                LIMIT %s
+                """,
+                (int(guild_id), int(limit)),
+            )
+            rows = []
+            for r in (cur.fetchall() or []):
+                row = dict(r)
+                try:
+                    payload = json.loads(row.get("payload_json") or "{}")
+                except Exception:
+                    payload = {}
+                row["payload"] = payload if isinstance(payload, dict) else {}
+                rows.append(row)
+            return rows
+    finally:
+        conn.close()
+
+
+def _norm_attendance_status(value: Any) -> str:
+    v = str(value or "open").strip().lower()
+    if v in {"present", "partial", "absent", "ignore"}:
+        return v
+    return "open"
+
+
+def _attendance_rate(present: int, partial: int, absent: int) -> str:
+    total = int(present) + int(partial) + int(absent)
+    if total <= 0:
+        return "—"
+    # Teilweise zählt bewusst halb. Das ist nur ein Leitungswert, keine EC-Regel.
+    rate = ((int(present) + int(partial) * 0.5) / total) * 100.0
+    return f"{rate:.0f} %"
+
+
+def _attendance_stats_payload(data: dict[str, Any]) -> dict[str, Any]:
+    snap: dict[str, Any] = data.get("snapshot") or {}
+    guild_id = _safe_guild_id(data)
+    reviews = _attendance_all_reviews(guild_id)
+    event_map: dict[str, dict[str, Any]] = {}
+    for ev in ((snap.get("events") or {}).get("items") or []):
+        if isinstance(ev, dict):
+            eid = str(ev.get("event_id") or ev.get("id") or "")
+            if eid:
+                event_map[eid] = ev
+
+    players: dict[int, dict[str, Any]] = {}
+    event_rows: list[dict[str, Any]] = []
+    total_lines = 0
+    open_lines = 0
+    locked_count = 0
+    reviewed_count = 0
+    draft_count = 0
+
+    for rev in reviews:
+        eid = str(rev.get("event_id") or "")
+        payload = rev.get("payload") if isinstance(rev.get("payload"), dict) else {}
+        ev = event_map.get(eid) or {}
+        items = [x for x in (payload.get("items") or []) if isinstance(x, dict)]
+        counts = {"present": 0, "partial": 0, "absent": 0, "ignore": 0, "open": 0}
+        status_review = str(rev.get("status") or "draft").lower()
+        if status_review == "locked":
+            locked_count += 1
+        elif status_review == "reviewed":
+            reviewed_count += 1
+        else:
+            draft_count += 1
+
+        for item in items:
+            total_lines += 1
+            uid = _user_id(item.get("user_id"))
+            st = _norm_attendance_status(item.get("status"))
+            counts[st] = counts.get(st, 0) + 1
+            if st == "open":
+                open_lines += 1
+            if not uid:
+                continue
+            p = players.setdefault(uid, {
+                "user_id": uid,
+                "display_name": str(item.get("display_name") or f"User {uid}"),
+                "reviews": 0,
+                "present": 0,
+                "partial": 0,
+                "absent": 0,
+                "ignore": 0,
+                "open": 0,
+                "voice_minutes": 0.0,
+                "last_event_id": "",
+                "last_event_title": "",
+                "last_status": "",
+                "last_updated_at": "",
+                "notes": 0,
+            })
+            name = str(item.get("display_name") or "")
+            if name and str(p.get("display_name") or "").startswith("User "):
+                p["display_name"] = name
+            p["reviews"] += 1
+            p[st] = int(p.get(st, 0) or 0) + 1
+            p["voice_minutes"] = float(p.get("voice_minutes", 0) or 0) + _num(item.get("voice_minutes"), 0)
+            if str(item.get("note") or "").strip():
+                p["notes"] += 1
+            # Reviews kommen sortiert DESC, erster Treffer je Spieler ist der aktuellste.
+            if not p.get("last_updated_at"):
+                p["last_event_id"] = eid
+                p["last_event_title"] = str(payload.get("event_title") or ev.get("title") or eid)
+                p["last_status"] = st
+                p["last_updated_at"] = str(rev.get("updated_at") or "")
+
+        event_title = str(payload.get("event_title") or ev.get("title") or eid or "Event")
+        event_when = payload.get("event_when") or ev.get("when_iso")
+        queue = _event_ec_queue_status(guild_id, eid) if eid else {}
+        event_rows.append({
+            "event_id": eid,
+            "event_title": event_title,
+            "event_when": event_when,
+            "review_status": status_review,
+            "updated_at": rev.get("updated_at"),
+            "updated_by": rev.get("updated_by_name") or rev.get("updated_by_id") or "—",
+            "rows": len(items),
+            "present": counts.get("present", 0),
+            "partial": counts.get("partial", 0),
+            "absent": counts.get("absent", 0),
+            "ignore": counts.get("ignore", 0),
+            "open": counts.get("open", 0),
+            "rate": _attendance_rate(counts.get("present", 0), counts.get("partial", 0), counts.get("absent", 0)),
+            "queue_status": queue.get("status") or "—",
+        })
+
+    player_rows = []
+    for p in players.values():
+        p = dict(p)
+        p["rate"] = _attendance_rate(p.get("present", 0), p.get("partial", 0), p.get("absent", 0))
+        p["voice_hours"] = float(p.get("voice_minutes", 0) or 0) / 60.0
+        player_rows.append(p)
+    player_rows.sort(key=lambda x: (-int(x.get("present", 0) or 0), str(x.get("display_name") or "").lower()))
+
+    problem_rows = []
+    for p in player_rows:
+        notes = []
+        if int(p.get("open", 0) or 0) > 0:
+            notes.append(f"{int(p.get('open', 0))} offen")
+        if int(p.get("absent", 0) or 0) >= 2:
+            notes.append(f"{int(p.get('absent', 0))}× nicht da")
+        present = int(p.get("present", 0) or 0)
+        partial = int(p.get("partial", 0) or 0)
+        absent = int(p.get("absent", 0) or 0)
+        denom = present + partial + absent
+        if denom >= 3 and present == 0:
+            notes.append("keine bestätigte Teilnahme")
+        if notes:
+            row = dict(p)
+            row["hint"] = ", ".join(notes)
+            problem_rows.append(row)
+    problem_rows = problem_rows[:40]
+
+    return {
+        "guild_id": guild_id,
+        "snapshot_at": data.get("published_at"),
+        "review_count": len(reviews),
+        "locked_count": locked_count,
+        "reviewed_count": reviewed_count,
+        "draft_count": draft_count,
+        "total_lines": total_lines,
+        "open_lines": open_lines,
+        "player_count": len(player_rows),
+        "event_rows": event_rows,
+        "player_rows": player_rows,
+        "problem_rows": problem_rows,
+    }
+
+
+def _render_attendance_stats_dashboard(data: dict[str, Any]) -> str:
+    if not data.get("ok"):
+        return _html_shell("Anwesenheit-Stats · Ebo Dashboard", f"<section class='panel'><h1>📊 Anwesenheit-Stats</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+    payload = _attendance_stats_payload(data)
+    cards = "".join([
+        _card("Reviews", payload.get("review_count", 0), f"locked: {payload.get('locked_count', 0)} · reviewed: {payload.get('reviewed_count', 0)}"),
+        _card("Review-Zeilen", payload.get("total_lines", 0), f"offen: {payload.get('open_lines', 0)}"),
+        _card("Spieler", payload.get("player_count", 0), "in gespeicherten Reviews"),
+        _card("Drafts", payload.get("draft_count", 0), "noch nicht abgeschlossen"),
+    ])
+
+    event_table = []
+    for ev in payload.get("event_rows") or []:
+        event_table.append([
+            _event_link(ev.get("event_id"), ev.get("event_title")),
+            _dt(ev.get("event_when")),
+            ev.get("review_status"),
+            ev.get("rows", 0),
+            ev.get("present", 0),
+            ev.get("partial", 0),
+            ev.get("absent", 0),
+            ev.get("open", 0),
+            ev.get("rate"),
+            ev.get("queue_status"),
+            _dt(ev.get("updated_at")),
+        ])
+
+    player_table = []
+    for p in payload.get("player_rows") or []:
+        uid = _user_id(p.get("user_id"))
+        player_table.append([
+            _member_link(uid, p.get("display_name")),
+            p.get("reviews", 0),
+            p.get("present", 0),
+            p.get("partial", 0),
+            p.get("absent", 0),
+            p.get("ignore", 0),
+            p.get("open", 0),
+            p.get("rate"),
+            f"{_num(p.get('voice_minutes'), 0):.0f} min",
+            _attendance_status_label(p.get("last_status")),
+            _event_link(p.get("last_event_id"), p.get("last_event_title") or p.get("last_event_id")),
+        ])
+
+    problem_table = []
+    for p in payload.get("problem_rows") or []:
+        uid = _user_id(p.get("user_id"))
+        problem_table.append([
+            _member_link(uid, p.get("display_name")),
+            p.get("hint"),
+            p.get("reviews", 0),
+            p.get("present", 0),
+            p.get("partial", 0),
+            p.get("absent", 0),
+            p.get("open", 0),
+            p.get("rate"),
+        ])
+
+    body = f"""
+    <nav class="topnav"><a href="/">Kommando</a><a href="/attendance">Anwesenheit</a><a href="/ec-queue">EC-Queue</a><a href="/planning">Planung</a><a href="/voice">Voice</a><a href="/export/attendance_stats.csv">CSV</a><a href="/api/attendance-stats">API</a></nav>
+    <section class="hero">
+      <div>
+        <div class="eyebrow">Read-only · gespeicherte Attendance Reviews</div>
+        <h1>📊 Anwesenheit-Stats</h1>
+        <p>Auswertung aller gespeicherten Dashboard-Reviews. Keine EC-Buchung, keine Bot-JSON-Änderung.</p>
+        <p class="muted">Snapshot: {_e(_dt(data.get('published_at')))}</p>
+      </div>
+      <a class="btn" href="/export/attendance_stats.csv">CSV Export</a>
+    </section>
+    <section class="grid">{cards}</section>
+    <section class="panel"><h2>⚠️ Prüfen</h2><p class="muted">Nur Leitungs-Hinweise aus gespeicherten Reviews. Keine automatische Bewertung.</p>{_table(['Spieler','Hinweis','Reviews','War da','Teilweise','Nicht da','Offen','Quote'], problem_table, placeholder='Hinweise durchsuchen…')}</section>
+    <section class="panel"><h2>👥 Spieler-Statistik</h2>{_table(['Spieler','Reviews','War da','Teilweise','Nicht da','Ignoriert','Offen','Quote','Voice','Letzter Status','Letztes Event'], player_table, placeholder='Spieler durchsuchen…')}</section>
+    <section class="panel"><h2>📅 Event-Reviews</h2>{_table(['Event','Zeit','Review','Zeilen','War da','Teilweise','Nicht da','Offen','Quote','Queue','Geändert'], event_table, placeholder='Events durchsuchen…')}</section>
+    """
+    return _html_shell("Anwesenheit-Stats · Ebo Dashboard", body)
+
+
 def _render_attendance_list(data: dict[str, Any]) -> str:
     if not data.get("ok"):
         return _html_shell("Anwesenheit · Ebo Dashboard", f"<section class='panel'><h1>📝 Anwesenheit</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
@@ -4480,7 +4750,7 @@ def _render_attendance_list(data: dict[str, Any]) -> str:
             queue_badge,
         ])
     body = f"""
-    <nav class="topnav"><a href="/">Kommando</a><a href="/planning">Planung</a><a href="/voice">Voice</a><a href="/admin">Leitung</a></nav>
+    <nav class="topnav"><a href="/">Kommando</a><a href="/planning">Planung</a><a href="/attendance-stats">Anwesenheit-Stats</a><a href="/voice">Voice</a><a href="/ec-queue">EC-Queue</a><a href="/admin">Leitung</a></nav>
     <section class="hero">
       <div>
         <div class="eyebrow">Ebene 3 · sichere Admin-Aktion</div>
@@ -4555,7 +4825,7 @@ def _render_attendance_event(data: dict[str, Any], event_id: str, saved: bool = 
     if review:
         updated = f"<p class='muted'>Letzte Speicherung: {_e(_dt(review.get('updated_at')))} durch {_e(review.get('updated_by_name') or '—')} · Status: {_e(review.get('status') or 'draft')}</p>"
     body = f"""
-    <nav class="topnav"><a href="/attendance">← Anwesenheit</a><a href="/event/{_e(event_id)}">Eventdetails</a><a href="/attendance/{_e(event_id)}/ec-preview">EC-Vorschau</a><a href="/attendance/{_e(event_id)}/report">Abschlussbericht</a><a href="#event-ec-queue">EC-Queue</a><a href="/voice">Voice</a><a href="/ec">EC</a></nav>
+    <nav class="topnav"><a href="/attendance">← Anwesenheit</a><a href="/attendance-stats">Stats</a><a href="/event/{_e(event_id)}">Eventdetails</a><a href="/attendance/{_e(event_id)}/ec-preview">EC-Vorschau</a><a href="/attendance/{_e(event_id)}/report">Abschlussbericht</a><a href="#event-ec-queue">EC-Queue</a><a href="/voice">Voice</a><a href="/ec">EC</a></nav>
     <section class="hero">
       <div>
         <div class="eyebrow">Anwesenheits-Review · keine EC-Buchung</div>
@@ -4602,6 +4872,63 @@ def _render_attendance_event(data: dict[str, Any], event_id: str, saved: bool = 
     {_raw(_event_ec_queue_panel(guild_id, str(event_id)))}
     """
     return _html_shell(f"Anwesenheit · {event.get('title') or event_id}", body)
+
+
+
+@app.get("/attendance-stats", response_class=HTMLResponse)
+def attendance_stats_dashboard(_: bool = Depends(_auth)):
+    return _render_attendance_stats_dashboard(_snapshot_payload())
+
+
+@app.get("/api/attendance-stats")
+def api_attendance_stats(_: bool = Depends(_auth)):
+    data = _snapshot_payload()
+    if not data.get("ok"):
+        return JSONResponse(data, status_code=404)
+    return JSONResponse(_attendance_stats_payload(data))
+
+
+@app.get("/export/attendance_stats.csv")
+def export_attendance_stats_csv(_: bool = Depends(_auth)):
+    data = _snapshot_payload()
+    payload = _attendance_stats_payload(data) if data.get("ok") else {"player_rows": [], "event_rows": []}
+    out = io.StringIO()
+    writer = csv.writer(out)
+    writer.writerow(["Spieler", "User-ID", "Reviews", "War da", "Teilweise", "Nicht da", "Ignoriert", "Offen", "Quote", "Voice-Minuten", "Letzter Status", "Letztes Event"])
+    for p in payload.get("player_rows") or []:
+        writer.writerow([
+            p.get("display_name"),
+            p.get("user_id"),
+            p.get("reviews", 0),
+            p.get("present", 0),
+            p.get("partial", 0),
+            p.get("absent", 0),
+            p.get("ignore", 0),
+            p.get("open", 0),
+            p.get("rate"),
+            f"{_num(p.get('voice_minutes'), 0):.1f}",
+            p.get("last_status"),
+            p.get("last_event_title") or p.get("last_event_id"),
+        ])
+    writer.writerow([])
+    writer.writerow(["Event", "Event-ID", "Zeit", "Review", "Zeilen", "War da", "Teilweise", "Nicht da", "Ignoriert", "Offen", "Quote", "Queue", "Geändert"])
+    for ev in payload.get("event_rows") or []:
+        writer.writerow([
+            ev.get("event_title"),
+            ev.get("event_id"),
+            ev.get("event_when"),
+            ev.get("review_status"),
+            ev.get("rows", 0),
+            ev.get("present", 0),
+            ev.get("partial", 0),
+            ev.get("absent", 0),
+            ev.get("ignore", 0),
+            ev.get("open", 0),
+            ev.get("rate"),
+            ev.get("queue_status"),
+            ev.get("updated_at"),
+        ])
+    return Response(out.getvalue(), media_type="text/csv; charset=utf-8", headers={"Content-Disposition": "attachment; filename=attendance_stats.csv"})
 
 
 @app.get("/attendance", response_class=HTMLResponse)
