@@ -3975,7 +3975,7 @@ def _render_attendance_event(data: dict[str, Any], event_id: str, saved: bool = 
     if review:
         updated = f"<p class='muted'>Letzte Speicherung: {_e(_dt(review.get('updated_at')))} durch {_e(review.get('updated_by_name') or '—')} · Status: {_e(review.get('status') or 'draft')}</p>"
     body = f"""
-    <nav class="topnav"><a href="/attendance">← Anwesenheit</a><a href="/event/{_e(event_id)}">Eventdetails</a><a href="/voice">Voice</a><a href="/ec">EC</a></nav>
+    <nav class="topnav"><a href="/attendance">← Anwesenheit</a><a href="/event/{_e(event_id)}">Eventdetails</a><a href="/attendance/{_e(event_id)}/ec-preview">EC-Vorschau</a><a href="/voice">Voice</a><a href="/ec">EC</a></nav>
     <section class="hero">
       <div>
         <div class="eyebrow">Anwesenheits-Review · keine EC-Buchung</div>
@@ -3983,7 +3983,7 @@ def _render_attendance_event(data: dict[str, Any], event_id: str, saved: bool = 
         <p class="muted">Event-ID: {_e(event_id)} · Zeit: {_e(_dt(event.get('when_iso')))} · Voice: {_e(event.get('voice_channel_id') or event.get('voice_last_channel_id') or 'kein Voice')}</p>
         {updated}
       </div>
-      <form method="post" action="/admin/attendance/{_e(event_id)}/voice-suggest"><button class="btn" type="submit">🎙️ Voice-Vorschlag neu laden</button></form>
+      <div style="display:flex;gap:8px;flex-wrap:wrap"><form method="post" action="/admin/attendance/{_e(event_id)}/voice-suggest"><button class="btn" type="submit">🎙️ Voice-Vorschlag neu laden</button></form><a class="btn" href="/attendance/{_e(event_id)}/ec-preview">🪙 EC-Vorschau</a></div>
     </section>
     {saved_note}
     <section class="grid">{cards}</section>
@@ -4073,3 +4073,258 @@ def api_attendance_review(event_id: str, _: bool = Depends(_auth)):
         return JSONResponse(payload, status_code=404)
     guild_id = _safe_guild_id(payload)
     return JSONResponse({"ok": True, "event_id": str(event_id), "review": _attendance_review_load(guild_id, str(event_id))})
+
+
+# ---------------------------------------------------------------------------
+# Ebene 3 / Schritt 3: EC-Vorschau aus Anwesenheits-Review
+# ---------------------------------------------------------------------------
+# Weiterhin sicher: Das Dashboard berechnet nur eine Vorschau und CSV/Copy-Text.
+# Es wird KEIN EC gebucht, KEINE Bot-JSON verändert und KEINE Discord-Message editiert.
+
+
+def _event_ec_defaults(snap: dict[str, Any], event: dict[str, Any]) -> dict[str, Any]:
+    """Versucht einen EC-Wert aus Snapshot/Event zu erkennen, bleibt aber konservativ.
+
+    Viele Bot-Versionen speichern EC-Werte unterschiedlich. Für die Web-Vorschau ist
+    ein manuell überschreibbarer Default sicherer als blind falsche Punkte zu buchen.
+    """
+    candidates: list[Any] = []
+    for key in ("ec_value", "dkp_value", "points", "reward_points", "attendance_points", "full_ec", "ec_full", "dkp_points"):
+        if isinstance(event, dict) and event.get(key) not in (None, ""):
+            candidates.append(event.get(key))
+    full = 0.0
+    detected_from = "manuell"
+    for val in candidates:
+        n = _num(val, 0)
+        if n > 0:
+            full = n
+            detected_from = "Eventdaten"
+            break
+    partial = round(full * 0.5, 2) if full > 0 else 0.0
+    return {"full_ec": full, "partial_ec": partial, "detected_from": detected_from}
+
+
+def _attendance_items_for_preview(snap: dict[str, Any], event: dict[str, Any], guild_id: int) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    event_id = str(event.get("event_id") or "")
+    review = _attendance_review_load(guild_id, event_id) if event_id else {}
+    payload = review.get("payload") or {}
+    if not payload.get("items"):
+        payload = _attendance_review_payload_from_event(snap, event, mode="voice")
+    items = [x for x in (payload.get("items") or []) if isinstance(x, dict)]
+    return review, items
+
+
+def _ec_gain_for_status(status: Any, full_ec: float, partial_ec: float) -> float:
+    s = str(status or "").lower()
+    if s == "present":
+        return float(full_ec or 0)
+    if s == "partial":
+        return float(partial_ec or 0)
+    return 0.0
+
+
+def _attendance_ec_preview_payload(data: dict[str, Any], event_id: str, full_ec: Optional[float] = None, partial_ec: Optional[float] = None) -> dict[str, Any]:
+    if not data.get("ok"):
+        return {"ok": False, "error": data.get("error") or "Kein Snapshot"}
+    snap: dict[str, Any] = data.get("snapshot") or {}
+    event = _event_by_id(snap, str(event_id))
+    if not event:
+        return {"ok": False, "error": "Event nicht gefunden"}
+    guild_id = _safe_guild_id(data)
+    review, items = _attendance_items_for_preview(snap, event, guild_id)
+    defaults = _event_ec_defaults(snap, event)
+    fe = _num(full_ec if full_ec is not None else defaults.get("full_ec"), 0)
+    pe = _num(partial_ec if partial_ec is not None else defaults.get("partial_ec"), 0)
+    balances = _balance_map(snap)
+    rows: list[dict[str, Any]] = []
+    total = 0.0
+    counts = {"present": 0, "partial": 0, "absent": 0, "ignore": 0, "open": 0}
+    for item in items:
+        uid = _user_id(item.get("user_id"))
+        status = str(item.get("status") or "open").lower()
+        if status not in counts:
+            status = "open"
+        counts[status] = counts.get(status, 0) + 1
+        before = balances.get(uid, 0.0)
+        gain = _ec_gain_for_status(status, fe, pe)
+        total += gain
+        rows.append({
+            "user_id": uid,
+            "display_name": str(item.get("display_name") or f"User {uid}"),
+            "signup": str(item.get("signup") or "—"),
+            "status": status,
+            "status_label": _attendance_status_label(status),
+            "voice_minutes": _num(item.get("voice_minutes"), 0),
+            "voice_sessions": int(_num(item.get("voice_sessions"), 0)),
+            "ec_before": before,
+            "ec_gain": gain,
+            "ec_after": before + gain,
+            "note": str(item.get("note") or ""),
+            "source": str(item.get("source") or ""),
+        })
+    rows.sort(key=lambda r: (0 if _num(r.get("ec_gain"), 0) > 0 else 1, str(r.get("display_name") or "").lower()))
+    recipients = sum(1 for r in rows if _num(r.get("ec_gain"), 0) > 0)
+    return {
+        "ok": True,
+        "event": event,
+        "event_id": str(event_id),
+        "review_status": review.get("status") or ("draft" if rows else "open"),
+        "review_updated_at": str(review.get("updated_at") or ""),
+        "defaults": defaults,
+        "full_ec": fe,
+        "partial_ec": pe,
+        "counts": counts,
+        "rows": rows,
+        "recipient_count": recipients,
+        "total_ec": total,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _render_attendance_ec_preview(data: dict[str, Any], event_id: str, full_ec: Optional[float] = None, partial_ec: Optional[float] = None, saved: bool = False, locked: bool = False) -> str:
+    preview = _attendance_ec_preview_payload(data, str(event_id), full_ec=full_ec, partial_ec=partial_ec)
+    if not preview.get("ok"):
+        return _html_shell("EC-Vorschau", f"<section class='panel'><h1>❌ EC-Vorschau</h1><p>{_e(preview.get('error'))}</p><p><a class='btn' href='/attendance'>Zurück</a></p></section>")
+    event = preview.get("event") or {}
+    rows = preview.get("rows") or []
+    fe = _num(preview.get("full_ec"), 0)
+    pe = _num(preview.get("partial_ec"), 0)
+    total = _num(preview.get("total_ec"), 0)
+    recipients = int(_num(preview.get("recipient_count"), 0))
+    review_status = str(preview.get("review_status") or "open")
+    row_data = []
+    for r in rows:
+        gain = _num(r.get("ec_gain"), 0)
+        row_data.append([
+            _member_link(_user_id(r.get("user_id")), r.get("display_name")),
+            r.get("signup") or "—",
+            r.get("status_label") or _attendance_status_label(r.get("status")),
+            f"{_fmt_ec(r.get('voice_minutes'))} min",
+            _fmt_ec(r.get("ec_before")),
+            _raw(f"<strong>+{_fmt_ec(gain)}</strong>" if gain else "0"),
+            _fmt_ec(r.get("ec_after")),
+            _short(r.get("note") or "", 120),
+        ])
+    copy_lines = [
+        f"EC-Vorschau: {event.get('title') or event_id}",
+        f"War da: +{_fmt_ec(fe)} EC · Teilweise: +{_fmt_ec(pe)} EC",
+        f"Empfänger: {recipients} · Gesamt: { _fmt_ec(total) } EC",
+        "",
+    ]
+    for r in rows:
+        gain = _num(r.get("ec_gain"), 0)
+        if gain > 0:
+            copy_lines.append(f"+{_fmt_ec(gain)} EC — {r.get('display_name')} ({_attendance_status_label(r.get('status'))})")
+    copy_text = "\n".join(copy_lines)
+    notice = ""
+    if saved:
+        notice = "<div class='warn'>✅ Review wurde gesperrt/freigegeben. Es wurde kein EC gebucht.</div>"
+    if locked:
+        notice = "<div class='warn'>🔒 Review ist als freigegeben markiert. EC muss weiterhin über den Bot/Discord vergeben werden.</div>"
+    body = f"""
+    <nav class="topnav"><a href="/attendance/{_e(event_id)}">← Review</a><a href="/attendance">Anwesenheit</a><a href="/ec">EC-Verlauf</a><a href="/event/{_e(event_id)}">Eventdetails</a></nav>
+    <section class="hero">
+      <div>
+        <div class="eyebrow">EC-Vorschau · keine echte Buchung</div>
+        <h1>🪙 {_e(event.get('title') or event_id)}</h1>
+        <p class="muted">Review-Status: {_e(review_status)} · Event: {_e(_dt(event.get('when_iso')))} · Erkennung: {_e((preview.get('defaults') or {}).get('detected_from') or 'manuell')}</p>
+      </div>
+      <a class="btn" href="/export/attendance/{_e(event_id)}.csv?full_ec={_e(fe)}&partial_ec={_e(pe)}">CSV herunterladen</a>
+    </section>
+    {notice}
+    <section class="grid">
+      {_card('Empfänger', recipients, 'bekommen EC laut Review')}
+      {_card('Gesamt-EC', _fmt_ec(total), 'würde insgesamt vergeben')}
+      {_card('War da', (preview.get('counts') or {}).get('present', 0), f'+{_fmt_ec(fe)} EC')}
+      {_card('Teilweise', (preview.get('counts') or {}).get('partial', 0), f'+{_fmt_ec(pe)} EC')}
+    </section>
+    <section class="panel">
+      <h2>⚙️ Werte für Vorschau</h2>
+      <p class="muted">Hier wird nur gerechnet. Der Bot bucht dadurch noch keine EC und verändert keine produktiven Daten.</p>
+      <form method="get" action="/attendance/{_e(event_id)}/ec-preview" style="display:flex;gap:12px;flex-wrap:wrap;align-items:end">
+        <label>War da EC<br><input name="full_ec" value="{_e(fe)}" style="width:120px"></label>
+        <label>Teilweise EC<br><input name="partial_ec" value="{_e(pe)}" style="width:120px"></label>
+        <button class="btn" type="submit">Vorschau berechnen</button>
+      </form>
+    </section>
+    <section class="panel">
+      <h2>👥 EC-Vorschau pro Spieler</h2>
+      {_table(['Spieler','Anmeldung','Review','Voice','EC vorher','Plus','EC danach','Notiz'], row_data, placeholder='EC-Vorschau durchsuchen…')}
+    </section>
+    <section class="panel">
+      <h2>📋 Copy-Text für DKP-Log</h2>
+      <textarea readonly style="width:100%;min-height:180px;background:#101116;color:#f2ead7;border:1px solid var(--line);border-radius:12px;padding:12px">{_e(copy_text)}</textarea>
+      <form method="post" action="/admin/attendance/{_e(event_id)}/lock" style="margin-top:12px">
+        <input type="hidden" name="full_ec" value="{_e(fe)}"><input type="hidden" name="partial_ec" value="{_e(pe)}">
+        <button class="btn" type="submit">🔒 Review als freigegeben markieren</button>
+      </form>
+    </section>
+    """
+    return _html_shell(f"EC-Vorschau · {event.get('title') or event_id}", body)
+
+
+@app.get("/attendance/{event_id}/ec-preview", response_class=HTMLResponse)
+def attendance_ec_preview_page(event_id: str, full_ec: Optional[float] = None, partial_ec: Optional[float] = None, saved: int = 0, _: bool = Depends(_auth)):
+    try:
+        return HTMLResponse(_render_attendance_ec_preview(_snapshot_payload(), str(event_id), full_ec=full_ec, partial_ec=partial_ec, saved=bool(saved)))
+    except Exception as exc:
+        return HTMLResponse(_html_shell("Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"), status_code=500)
+
+
+@app.post("/admin/attendance/{event_id}/lock")
+async def admin_attendance_lock(event_id: str, request: Request, _: bool = Depends(_admin_auth)):
+    payload = _snapshot_payload()
+    snap: dict[str, Any] = payload.get("snapshot") or {}
+    event = _event_by_id(snap, str(event_id))
+    if not event:
+        raise HTTPException(status_code=404, detail="Event nicht gefunden")
+    raw = (await request.body()).decode("utf-8", errors="replace")
+    form = urllib.parse.parse_qs(raw, keep_blank_values=True)
+    full_ec = _num((form.get("full_ec") or [0])[0], 0)
+    partial_ec = _num((form.get("partial_ec") or [0])[0], 0)
+    guild_id = _safe_guild_id(payload)
+    review, items = _attendance_items_for_preview(snap, event, guild_id)
+    review_payload = review.get("payload") if isinstance(review.get("payload"), dict) else {}
+    if not review_payload.get("items"):
+        review_payload = _attendance_review_payload_from_event(snap, event, mode="voice")
+    review_payload["ec_preview"] = {
+        "full_ec": full_ec,
+        "partial_ec": partial_ec,
+        "locked_at": datetime.now(timezone.utc).isoformat(),
+        "note": "Freigabe im Dashboard. Keine automatische EC-Buchung.",
+    }
+    _attendance_review_save(guild_id, str(event_id), review_payload, _current_user(request) or {}, status="locked")
+    return RedirectResponse(f"/attendance/{urllib.parse.quote(str(event_id))}/ec-preview?full_ec={urllib.parse.quote(str(full_ec))}&partial_ec={urllib.parse.quote(str(partial_ec))}&saved=1", status_code=303)
+
+
+@app.get("/api/attendance/{event_id}/ec-preview")
+def api_attendance_ec_preview(event_id: str, full_ec: Optional[float] = None, partial_ec: Optional[float] = None, _: bool = Depends(_auth)):
+    payload = _attendance_ec_preview_payload(_snapshot_payload(), str(event_id), full_ec=full_ec, partial_ec=partial_ec)
+    status = 200 if payload.get("ok") else 404
+    return JSONResponse(payload, status_code=status)
+
+
+@app.get("/export/attendance/{event_id}.csv")
+def export_attendance_ec_preview_csv(event_id: str, full_ec: Optional[float] = None, partial_ec: Optional[float] = None, _: bool = Depends(_auth)):
+    payload = _attendance_ec_preview_payload(_snapshot_payload(), str(event_id), full_ec=full_ec, partial_ec=partial_ec)
+    if not payload.get("ok"):
+        return Response("error\n" + str(payload.get("error") or "unknown"), media_type="text/csv", status_code=404)
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["event_id", "event_title", "user_id", "display_name", "signup", "review_status", "voice_minutes", "ec_before", "ec_gain", "ec_after", "note"])
+    event = payload.get("event") or {}
+    for r in payload.get("rows") or []:
+        writer.writerow([
+            payload.get("event_id"),
+            event.get("title") or payload.get("event_id"),
+            r.get("user_id"),
+            r.get("display_name"),
+            r.get("signup"),
+            r.get("status_label"),
+            r.get("voice_minutes"),
+            r.get("ec_before"),
+            r.get("ec_gain"),
+            r.get("ec_after"),
+            r.get("note"),
+        ])
+    return Response(output.getvalue(), media_type="text/csv; charset=utf-8", headers={"Content-Disposition": f"attachment; filename=attendance_ec_preview_{event_id}.csv"})
