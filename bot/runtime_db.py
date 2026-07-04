@@ -126,6 +126,19 @@ def _init_sqlite() -> dict[str, Any]:
                 ON voice_sessions (guild_id, channel_id, joined_at DESC);
             CREATE INDEX IF NOT EXISTS idx_voice_sessions_event
                 ON voice_sessions (guild_id, event_id);
+            
+            CREATE TABLE IF NOT EXISTS dashboard_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                guild_name TEXT,
+                schema_version INTEGER NOT NULL,
+                generated_at TEXT NOT NULL,
+                published_at TEXT NOT NULL,
+                snapshot_json TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_dashboard_snapshots_guild_published
+                ON dashboard_snapshots (guild_id, published_at DESC);
             """
         )
         conn.execute(
@@ -244,6 +257,25 @@ def _init_postgres() -> dict[str, Any]:
                 """
                 CREATE INDEX IF NOT EXISTS idx_voice_sessions_event
                     ON voice_sessions (guild_id, event_id)
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS dashboard_snapshots (
+                    id BIGSERIAL PRIMARY KEY,
+                    guild_id BIGINT NOT NULL,
+                    guild_name TEXT,
+                    schema_version INTEGER NOT NULL,
+                    generated_at TEXT NOT NULL,
+                    published_at TEXT NOT NULL,
+                    snapshot_json TEXT NOT NULL
+                )
+                """
+            )
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_dashboard_snapshots_guild_published
+                    ON dashboard_snapshots (guild_id, published_at DESC)
                 """
             )
             cur.execute(
@@ -725,3 +757,167 @@ def aggregate_voice_seconds(
             continue
     return totals
 
+
+
+def save_dashboard_snapshot(*, guild_id: int, guild_name: str, snapshot: Any) -> int:
+    """Speichert den read-only Dashboard-Snapshot in der Runtime-DB.
+
+    Das ist bewusst KEINE Migration produktiver Bot-Daten. Alte JSON-Systeme bleiben
+    die Quelle. Diese Tabelle ist nur die Brücke für den separaten Web-Service.
+    """
+    if not _INITIALIZED:
+        init_runtime_db()
+
+    schema_version = 0
+    generated_at = _now_iso()
+    if isinstance(snapshot, dict):
+        try:
+            schema_version = int(snapshot.get("schema_version") or 0)
+        except Exception:
+            schema_version = 0
+        generated_at = str(snapshot.get("generated_at") or generated_at)
+
+    values = (
+        int(guild_id),
+        str(guild_name or "")[:200],
+        int(schema_version),
+        generated_at,
+        _now_iso(),
+        _json_dumps(snapshot),
+    )
+
+    with _DB_LOCK:
+        if _BACKEND == "postgres":
+            conn = _pg_connect()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO dashboard_snapshots(
+                            guild_id, guild_name, schema_version, generated_at, published_at, snapshot_json
+                        ) VALUES (%s, %s, %s, %s, %s, %s)
+                        RETURNING id
+                        """,
+                        values,
+                    )
+                    row = cur.fetchone()
+                    # Kleine Aufräumung: pro Gilde die letzten 50 Snapshots behalten.
+                    cur.execute(
+                        """
+                        DELETE FROM dashboard_snapshots
+                        WHERE guild_id = %s
+                          AND id NOT IN (
+                            SELECT id FROM dashboard_snapshots
+                            WHERE guild_id = %s
+                            ORDER BY published_at DESC, id DESC
+                            LIMIT 50
+                          )
+                        """,
+                        (int(guild_id), int(guild_id)),
+                    )
+                conn.commit()
+                return int((row or {}).get("id") or 0)
+            finally:
+                conn.close()
+
+        conn = _sqlite_connect()
+        try:
+            cur = conn.execute(
+                """
+                INSERT INTO dashboard_snapshots(
+                    guild_id, guild_name, schema_version, generated_at, published_at, snapshot_json
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                values,
+            )
+            conn.execute(
+                """
+                DELETE FROM dashboard_snapshots
+                WHERE guild_id = ?
+                  AND id NOT IN (
+                    SELECT id FROM dashboard_snapshots
+                    WHERE guild_id = ?
+                    ORDER BY published_at DESC, id DESC
+                    LIMIT 50
+                  )
+                """,
+                (int(guild_id), int(guild_id)),
+            )
+            conn.commit()
+            return int(cur.lastrowid or 0)
+        finally:
+            conn.close()
+
+
+def fetch_latest_dashboard_snapshot(guild_id: Optional[int] = None) -> Optional[dict[str, Any]]:
+    if not _INITIALIZED:
+        init_runtime_db()
+
+    with _DB_LOCK:
+        if _BACKEND == "postgres":
+            conn = _pg_connect()
+            try:
+                with conn.cursor() as cur:
+                    if guild_id is None:
+                        cur.execute(
+                            "SELECT * FROM dashboard_snapshots ORDER BY published_at DESC, id DESC LIMIT 1"
+                        )
+                    else:
+                        cur.execute(
+                            "SELECT * FROM dashboard_snapshots WHERE guild_id = %s ORDER BY published_at DESC, id DESC LIMIT 1",
+                            (int(guild_id),),
+                        )
+                    row = cur.fetchone()
+            finally:
+                conn.close()
+        else:
+            conn = _sqlite_connect()
+            try:
+                if guild_id is None:
+                    row = conn.execute(
+                        "SELECT * FROM dashboard_snapshots ORDER BY published_at DESC, id DESC LIMIT 1"
+                    ).fetchone()
+                else:
+                    row = conn.execute(
+                        "SELECT * FROM dashboard_snapshots WHERE guild_id = ? ORDER BY published_at DESC, id DESC LIMIT 1",
+                        (int(guild_id),),
+                    ).fetchone()
+            finally:
+                conn.close()
+
+    if not row:
+        return None
+    d = dict(row)
+    try:
+        d["snapshot"] = json.loads(d.get("snapshot_json") or "{}")
+    except Exception:
+        d["snapshot"] = {}
+    d.pop("snapshot_json", None)
+    return d
+
+
+def count_dashboard_snapshots(guild_id: Optional[int] = None) -> int:
+    if not _INITIALIZED:
+        init_runtime_db()
+    with _DB_LOCK:
+        if _BACKEND == "postgres":
+            conn = _pg_connect()
+            try:
+                with conn.cursor() as cur:
+                    if guild_id is None:
+                        cur.execute("SELECT COUNT(*) AS c FROM dashboard_snapshots")
+                    else:
+                        cur.execute("SELECT COUNT(*) AS c FROM dashboard_snapshots WHERE guild_id = %s", (int(guild_id),))
+                    row = cur.fetchone()
+                    return int((row or {}).get("c") or 0)
+            finally:
+                conn.close()
+        conn = _sqlite_connect()
+        try:
+            if guild_id is None:
+                row = conn.execute("SELECT COUNT(*) AS c FROM dashboard_snapshots").fetchone()
+            else:
+                row = conn.execute("SELECT COUNT(*) AS c FROM dashboard_snapshots WHERE guild_id = ?", (int(guild_id),)).fetchone()
+            return int(row["c"] if row else 0)
+        finally:
+            conn.close()
