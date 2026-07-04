@@ -14,7 +14,7 @@ import urllib.parse
 import urllib.request
 import urllib.error
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -3020,6 +3020,84 @@ def _auction_leader_text(auction: dict[str, Any], names: dict[int, str]) -> str:
     return str(winner or "niemand")
 
 
+def _minutes_text(minutes: float | int | None) -> str:
+    try:
+        mins = max(0, int(round(float(minutes or 0))))
+    except Exception:
+        return "—"
+    if mins < 60:
+        return f"{mins} Min"
+    hours = mins // 60
+    rest = mins % 60
+    return f"{hours} h {rest} Min" if rest else f"{hours} h"
+
+
+def _event_duration_minutes(event: dict[str, Any]) -> int:
+    """Geplante Eventdauer fürs Dashboard.
+
+    Alte Event-JSONs speichern nicht immer eine Dauer. Dann nimmt das Dashboard
+    bewusst 120 Minuten an, damit laufende Events trotzdem erkannt werden.
+    """
+    for key in (
+        "duration_min",
+        "duration_minutes",
+        "dauer_minuten",
+        "planned_duration_min",
+        "event_duration_min",
+        "duration",
+    ):
+        raw = event.get(key)
+        if raw not in (None, ""):
+            try:
+                value = int(float(raw))
+                return max(15, min(value, 600))
+            except Exception:
+                pass
+    return 120
+
+
+def _running_events(snap: dict[str, Any], planning_events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    now = datetime.now(timezone.utc)
+    plan_by_id = {str(ev.get("event_id")): ev for ev in planning_events if isinstance(ev, dict)}
+    out: list[dict[str, Any]] = []
+
+    for event in (((snap.get("events") or {}).get("items") or [])):
+        if not isinstance(event, dict):
+            continue
+        start = _dt_obj(event.get("when_iso"))
+        if not start:
+            continue
+        duration_min = _event_duration_minutes(event)
+        end = start + timedelta(minutes=duration_min)
+        if not (start <= now <= end):
+            continue
+
+        plan = plan_by_id.get(str(event.get("event_id"))) or {}
+        elapsed_min = max(0, int((now - start).total_seconds() // 60))
+        remaining_min = max(0, int((end - now).total_seconds() // 60))
+        progress = min(100, max(0, int((elapsed_min / max(1, duration_min)) * 100)))
+        out.append({
+            "event_id": event.get("event_id"),
+            "title": event.get("title") or plan.get("title") or "Event",
+            "start_iso": start.isoformat(),
+            "end_iso": end.isoformat(),
+            "duration_min": duration_min,
+            "elapsed_min": elapsed_min,
+            "remaining_min": remaining_min,
+            "progress": progress,
+            "participants": event.get("participant_count", plan.get("participants", 0)),
+            "tank": plan.get("tank", 0),
+            "healer": plan.get("healer", 0),
+            "dps": plan.get("dps", 0),
+            "reserve": plan.get("reserve", 0),
+            "voice": bool(event.get("voice_enabled") or event.get("voice_channel_id") or event.get("voice_last_channel_id")),
+            "voice_channel_id": event.get("voice_channel_id") or event.get("voice_last_channel_id") or "",
+        })
+
+    out.sort(key=lambda x: str(x.get("start_iso") or ""))
+    return out
+
+
 def _leadership_insights(snap: dict[str, Any]) -> dict[str, Any]:
     analytics = _analytics_from_snapshot(snap)
     planning = _planning_analytics(snap)
@@ -3031,6 +3109,7 @@ def _leadership_insights(snap: dict[str, Any]) -> dict[str, Any]:
     role_member_count = int(_num(member_filter.get("eligible_count"), analytics.get("role_member_count", 0)))
 
     events = planning.get("events") if isinstance(planning.get("events"), list) else []
+    running_events = _running_events(snap, events)
     event_rows = []
     for ev in events:
         if not isinstance(ev, dict):
@@ -3088,6 +3167,7 @@ def _leadership_insights(snap: dict[str, Any]) -> dict[str, Any]:
     return {
         "member_count": role_member_count,
         "tasks": tasks,
+        "running_events": running_events[:12],
         "event_risks": event_rows[:12],
         "active_auctions": active_auctions[:12],
         "flagged_members": flagged_members[:12],
@@ -3138,6 +3218,7 @@ def _render_leadership_dashboard(data: dict[str, Any]) -> str:
 
     tasks = li.get("tasks") or []
     urgent_count = sum(1 for t in tasks if str(t.get("prio")) == "hoch")
+    running_events = li.get("running_events") or []
     event_risks = li.get("event_risks") or []
     active_auctions = li.get("active_auctions") or []
     flagged_members = li.get("flagged_members") or []
@@ -3145,6 +3226,7 @@ def _render_leadership_dashboard(data: dict[str, Any]) -> str:
     cards = "".join([
         _card("Offene Aufgaben", len(tasks), f"hoch: {urgent_count}"),
         _card("Rollenmitglieder", li.get("member_count", 0), role_line),
+        _card("Laufende Events", len(running_events), "gerade aktiv"),
         _card("Risiko-Events", len(event_risks), "Rollen/Teilnehmer prüfen"),
         _card("Aktive Auktionen", len(active_auctions), "Auktionshaus/DKP-Log"),
         _card("ohne Needliste", quality.get("missing_needs", 0), "nachpflegen lassen"),
@@ -3161,6 +3243,24 @@ def _render_leadership_dashboard(data: dict[str, Any]) -> str:
             t.get("area"),
             _raw(f"<a class='link' href='{_e(link)}'>{_e(t.get('task'))}</a>"),
             t.get("detail"),
+        ])
+
+    running_rows = []
+    for ev in running_events:
+        if not isinstance(ev, dict):
+            continue
+        running_rows.append([
+            _event_link(ev.get("event_id"), ev.get("title")),
+            _dt(ev.get("start_iso")),
+            _dt(ev.get("end_iso")),
+            _minutes_text(ev.get("elapsed_min")),
+            _minutes_text(ev.get("remaining_min")),
+            f"{int(_num(ev.get('progress'), 0))}%",
+            ev.get("participants"),
+            ev.get("tank"),
+            ev.get("healer"),
+            ev.get("dps"),
+            "ja" if ev.get("voice") else "nein",
         ])
 
     event_rows = []
@@ -3238,7 +3338,7 @@ def _render_leadership_dashboard(data: dict[str, Any]) -> str:
       <div>
         <div class="eyebrow">Führungsstartseite · read-only</div>
         <h1>🏰 {_e(guild.get('name') or data.get('guild_name') or 'Gilde')}</h1>
-        <p>Was heute Aufmerksamkeit braucht: Aufgaben, Risiko-Events, aktive Auktionen und auffällige Mitglieder.</p>
+        <p>Was gerade läuft und was Aufmerksamkeit braucht: laufende Events, Aufgaben, Auktionen und auffällige Mitglieder.</p>
         <p class="muted">{_e(role_line)} · Snapshot: {_e(_dt(data.get('published_at')))}</p>
       </div>
       <a class="btn" href="/overview">Gesamtübersicht</a>
@@ -3252,9 +3352,15 @@ def _render_leadership_dashboard(data: dict[str, Any]) -> str:
       {_table(['Priorität','Bereich','Aufgabe','Details'], task_rows, placeholder='Aufgaben durchsuchen…')}
     </section>
 
+    <section class="panel">
+      <h2>📅 Laufende Events</h2>
+      <p class="muted">Zeigt Events, deren Startzeit erreicht ist und deren geplante Dauer noch läuft. Ohne gespeicherte Dauer rechnet das Dashboard mit 120 Minuten.</p>
+      {_table(['Event','Start','Ende','läuft seit','Restzeit','Fortschritt','Teilnehmer','Tank','Heiler','DPS','Voice'], running_rows, placeholder='Laufende Events durchsuchen…')}
+    </section>
+
     <section class="split">
       <div class="panel">
-        <h2>📅 Events mit Aufmerksamkeit</h2>
+        <h2>📅 Risiko-Events</h2>
         {_table(['Event','Zeit','Teilnehmer','Tank','Heiler','DPS','Score','Hinweis'], event_rows, placeholder='Events durchsuchen…')}
       </div>
       <div class="panel">
