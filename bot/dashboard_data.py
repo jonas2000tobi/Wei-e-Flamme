@@ -67,6 +67,69 @@ def _member_is_active(guild: discord.Guild, user_id: int) -> bool:
         return False
 
 
+def _dashboard_member_role(guild: discord.Guild) -> Optional[discord.Role]:
+    """Rolle, die fürs Dashboard als echte Gildenmitgliedschaft zählt.
+
+    Standard ist die Rolle `Ebolus`. Für andere Gilden/Vermietung kann später
+    per Railway-Variable überschrieben werden:
+    - DASHBOARD_MEMBER_ROLE_ID=123...
+    - DASHBOARD_MEMBER_ROLE_NAME=Gildenmitglied
+
+    Wenn die Rolle nicht gefunden wird, fällt das Dashboard auf aktuelle
+    Servermitglieder zurück, damit es nicht leer bleibt.
+    """
+    raw_role_id = os.getenv("DASHBOARD_MEMBER_ROLE_ID", "").strip()
+    if raw_role_id:
+        try:
+            role = guild.get_role(int(raw_role_id))
+            if role is not None:
+                return role
+        except Exception:
+            pass
+
+    role_name = os.getenv("DASHBOARD_MEMBER_ROLE_NAME", "Ebolus").strip().lower()
+    if role_name:
+        for role in getattr(guild, "roles", []):
+            try:
+                if str(getattr(role, "name", "")).strip().lower() == role_name:
+                    return role
+            except Exception:
+                continue
+    return None
+
+
+def _dashboard_member_ids(guild: discord.Guild) -> set[int]:
+    role = _dashboard_member_role(guild)
+    if role is not None:
+        return {int(m.id) for m in getattr(role, "members", []) if getattr(m, "id", None)}
+    return _active_member_ids(guild)
+
+
+def _dashboard_member_filter_info(guild: discord.Guild) -> dict[str, Any]:
+    role = _dashboard_member_role(guild)
+    ids = _dashboard_member_ids(guild)
+    if role is not None:
+        return {
+            "mode": "discord_role",
+            "role_id": int(role.id),
+            "role_name": str(role.name),
+            "eligible_count": len(ids),
+        }
+    return {
+        "mode": "active_discord_members_fallback",
+        "role_id": 0,
+        "role_name": "",
+        "eligible_count": len(ids),
+    }
+
+
+def _is_dashboard_member(guild: discord.Guild, user_id: int) -> bool:
+    try:
+        return int(user_id) in _dashboard_member_ids(guild)
+    except Exception:
+        return False
+
+
 def _active_member_ids(guild: discord.Guild) -> set[int]:
     try:
         return {int(m.id) for m in getattr(guild, "members", []) if getattr(m, "id", None)}
@@ -213,12 +276,12 @@ def _summarize_profiles(data: Any, guild: discord.Guild, *, limit: int = 50) -> 
         except Exception:
             continue
         member = guild.get_member(user_id)
-        if member is None:
+        if not _is_dashboard_member(guild, user_id):
             stale_count += 1
             continue
         items.append({
             "user_id": user_id,
-            "display_name": _safe_text(getattr(member, "display_name", "") or profile.get("ingame_name") or f"User {user_id}", 120),
+            "display_name": _safe_text(getattr(member, "display_name", "") if member is not None else profile.get("ingame_name") or f"User {user_id}", 120),
             "ingame_name": _safe_text(profile.get("ingame_name"), 120),
             "main_role": _safe_text(profile.get("main_role"), 80),
             "gearscore": _safe_text(profile.get("gearscore"), 40),
@@ -232,7 +295,7 @@ def _summarize_profiles(data: Any, guild: discord.Guild, *, limit: int = 50) -> 
         "stale_count": stale_count,
         "absences_count": len(absences),
         "items": items[:limit],
-        "filter": "active_discord_members_only",
+        "filter": "dashboard_member_role_only",
     }
 
 
@@ -247,7 +310,7 @@ def _summarize_balances(data: Any, guild: discord.Guild, *, limit: int = 50) -> 
         except Exception:
             continue
         member = guild.get_member(user_id)
-        if member is None:
+        if not _is_dashboard_member(guild, user_id):
             stale_count += 1
             continue
         bal = raw
@@ -268,7 +331,7 @@ def _summarize_balances(data: Any, guild: discord.Guild, *, limit: int = 50) -> 
         "total_json_count": len(users),
         "stale_count": stale_count,
         "top": items[:limit],
-        "filter": "active_discord_members_only",
+        "filter": "dashboard_member_role_only",
     }
 
 
@@ -335,7 +398,7 @@ def _summarize_needs(data: Any, guild: discord.Guild, *, limit: int = 50) -> dic
                 user_id = int(uid)
             except Exception:
                 user_id = 0
-            if not user_id or guild.get_member(user_id) is None:
+            if not user_id or not _is_dashboard_member(guild, user_id):
                 stale_count += 1
                 continue
             active_user_count += 1
@@ -362,7 +425,7 @@ def _summarize_needs(data: Any, guild: discord.Guild, *, limit: int = 50) -> dic
         "stale_count": stale_count,
         "need_entries_estimated": total_entries,
         "sample": sample,
-        "filter": "active_discord_members_only",
+        "filter": "dashboard_member_role_only",
     }
 
 
@@ -429,7 +492,7 @@ def build_dashboard_snapshot(bot: commands.Bot, guild: discord.Guild) -> dict[st
             "name": guild.name,
             "member_count_cache": getattr(guild, "member_count", None),
             "cached_members_loaded": len(_active_member_ids(guild)),
-            "member_filter": "active_discord_members_only",
+            "member_filter": _dashboard_member_filter_info(guild),
             "bot_user_id": int(getattr(getattr(bot, "user", None), "id", 0) or 0),
         },
         "storage": {
@@ -547,7 +610,12 @@ async def setup_dashboard_data(bot: commands.Bot, tree: app_commands.CommandTree
         emb.add_field(name="Backend", value=str(snap["storage"].get("runtime_backend")), inline=True)
         emb.add_field(name="DATABASE_URL", value="gesetzt" if snap["storage"].get("database_url_configured") else "nicht gesetzt", inline=True)
         emb.add_field(name="Guild", value=f"{inter.guild.name}\n`{inter.guild.id}`", inline=False)
-        emb.add_field(name="Filter", value=f"Nur aktuelle Discord-Servermitglieder\nAlt/archiviert: Profile {snap['profiles'].get('stale_count', 0)} · EC {snap['ec']['balances'].get('stale_count', 0)} · Needs {snap['loot']['needs'].get('stale_count', 0)}", inline=False)
+        mf = snap.get("guild", {}).get("member_filter") or {}
+        if isinstance(mf, dict) and mf.get("mode") == "discord_role":
+            filter_head = f"Nur Mitglieder mit Rolle: {mf.get('role_name')} (`{mf.get('role_id')}`)\nRollenmitglieder: {mf.get('eligible_count', 0)}"
+        else:
+            filter_head = f"Nur aktuelle Discord-Servermitglieder fallback\nGefunden: {mf.get('eligible_count', 0) if isinstance(mf, dict) else '?'}"
+        emb.add_field(name="Filter", value=f"{filter_head}\nAlt/ausgefiltert: Profile {snap['profiles'].get('stale_count', 0)} · EC {snap['ec']['balances'].get('stale_count', 0)} · Needs {snap['loot']['needs'].get('stale_count', 0)}", inline=False)
         emb.add_field(name="Profile", value=str(snap["profiles"].get("count", 0)), inline=True)
         emb.add_field(name="Events", value=str(snap["events"].get("count", 0)), inline=True)
         emb.add_field(name="EC-Konten", value=str(snap["ec"]["balances"].get("count", 0)), inline=True)
