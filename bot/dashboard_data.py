@@ -55,6 +55,25 @@ def _safe_text(value: Any, limit: int = 300) -> str:
     return txt
 
 
+def _member_is_active(guild: discord.Guild, user_id: int) -> bool:
+    """True, wenn der User aktuell auf diesem Discord-Server gefunden wird.
+
+    Alte JSON-Daten behalten wir bewusst, aber fürs Dashboard sollen
+    ehemalige Mitglieder standardmäßig nicht mehr in Listen/Counts auftauchen.
+    """
+    try:
+        return guild.get_member(int(user_id)) is not None
+    except Exception:
+        return False
+
+
+def _active_member_ids(guild: discord.Guild) -> set[int]:
+    try:
+        return {int(m.id) for m in getattr(guild, "members", []) if getattr(m, "id", None)}
+    except Exception:
+        return set()
+
+
 def _load_json_file(name: str, default: Any) -> Any:
     path = DATA_DIR / name
     if not path.exists():
@@ -185,6 +204,7 @@ def _summarize_profiles(data: Any, guild: discord.Guild, *, limit: int = 50) -> 
     users = g.get("users") if isinstance(g.get("users"), dict) else {}
     absences = g.get("absences") if isinstance(g.get("absences"), dict) else {}
     items: list[dict[str, Any]] = []
+    stale_count = 0
     for uid, profile in users.items():
         if not isinstance(profile, dict):
             continue
@@ -193,6 +213,9 @@ def _summarize_profiles(data: Any, guild: discord.Guild, *, limit: int = 50) -> 
         except Exception:
             continue
         member = guild.get_member(user_id)
+        if member is None:
+            stale_count += 1
+            continue
         items.append({
             "user_id": user_id,
             "display_name": _safe_text(getattr(member, "display_name", "") or profile.get("ingame_name") or f"User {user_id}", 120),
@@ -200,13 +223,16 @@ def _summarize_profiles(data: Any, guild: discord.Guild, *, limit: int = 50) -> 
             "main_role": _safe_text(profile.get("main_role"), 80),
             "gearscore": _safe_text(profile.get("gearscore"), 40),
             "created_at": str(profile.get("created_at") or ""),
-            "in_discord_cache": member is not None,
+            "in_discord_cache": True,
         })
     items.sort(key=lambda x: (str(x.get("display_name") or "")).lower())
     return {
-        "count": len(users),
+        "count": len(items),
+        "total_json_count": len(users),
+        "stale_count": stale_count,
         "absences_count": len(absences),
         "items": items[:limit],
+        "filter": "active_discord_members_only",
     }
 
 
@@ -214,10 +240,15 @@ def _summarize_balances(data: Any, guild: discord.Guild, *, limit: int = 50) -> 
     g = _guild_dict(data, guild.id)
     users = g.get("users") if isinstance(g.get("users"), dict) else {}
     items: list[dict[str, Any]] = []
+    stale_count = 0
     for uid, raw in users.items():
         try:
             user_id = int(uid)
         except Exception:
+            continue
+        member = guild.get_member(user_id)
+        if member is None:
+            stale_count += 1
             continue
         bal = raw
         if isinstance(raw, dict):
@@ -226,7 +257,6 @@ def _summarize_balances(data: Any, guild: discord.Guild, *, limit: int = 50) -> 
             balance = float(bal or 0)
         except Exception:
             balance = 0.0
-        member = guild.get_member(user_id)
         items.append({
             "user_id": user_id,
             "display_name": _safe_text(getattr(member, "display_name", "") or f"User {user_id}", 120),
@@ -234,8 +264,11 @@ def _summarize_balances(data: Any, guild: discord.Guild, *, limit: int = 50) -> 
         })
     items.sort(key=lambda x: float(x.get("balance") or 0), reverse=True)
     return {
-        "count": len(users),
+        "count": len(items),
+        "total_json_count": len(users),
+        "stale_count": stale_count,
         "top": items[:limit],
+        "filter": "active_discord_members_only",
     }
 
 
@@ -286,16 +319,26 @@ def _summarize_auctions(data: Any, guild_id: int, *, limit: int = 50) -> dict[st
     return {"count": len(auctions), "by_status": counts, "items": items[:limit]}
 
 
-def _summarize_needs(data: Any, guild_id: int, *, limit: int = 50) -> dict[str, Any]:
-    g = _guild_dict(data, guild_id)
+def _summarize_needs(data: Any, guild: discord.Guild, *, limit: int = 50) -> dict[str, Any]:
+    g = _guild_dict(data, guild.id)
     users = g.get("users") if isinstance(g.get("users"), dict) else g
-    user_count = len(users) if isinstance(users, dict) else 0
+    total_json_users = len(users) if isinstance(users, dict) else 0
+    stale_count = 0
+    active_user_count = 0
     total_entries = 0
     sample: list[dict[str, Any]] = []
     if isinstance(users, dict):
         for uid, raw in users.items():
             if not isinstance(raw, dict):
                 continue
+            try:
+                user_id = int(uid)
+            except Exception:
+                user_id = 0
+            if not user_id or guild.get_member(user_id) is None:
+                stale_count += 1
+                continue
+            active_user_count += 1
             cnt = 0
             for key in ("main", "secondary", "Main", "Secondary", "needs"):
                 v = raw.get(key)
@@ -312,12 +355,15 @@ def _summarize_needs(data: Any, guild_id: int, *, limit: int = 50) -> dict[str, 
                         cnt += len([x for x in v.values() if x])
             total_entries += cnt
             if len(sample) < limit:
-                try:
-                    user_id = int(uid)
-                except Exception:
-                    user_id = 0
                 sample.append({"user_id": user_id, "need_entries_estimated": cnt})
-    return {"user_count": user_count, "need_entries_estimated": total_entries, "sample": sample}
+    return {
+        "user_count": active_user_count,
+        "total_json_user_count": total_json_users,
+        "stale_count": stale_count,
+        "need_entries_estimated": total_entries,
+        "sample": sample,
+        "filter": "active_discord_members_only",
+    }
 
 
 def _summarize_event_checks(data: Any, guild_id: int, *, limit: int = 50) -> dict[str, Any]:
@@ -382,6 +428,8 @@ def build_dashboard_snapshot(bot: commands.Bot, guild: discord.Guild) -> dict[st
             "id": guild_id,
             "name": guild.name,
             "member_count_cache": getattr(guild, "member_count", None),
+            "cached_members_loaded": len(_active_member_ids(guild)),
+            "member_filter": "active_discord_members_only",
             "bot_user_id": int(getattr(getattr(bot, "user", None), "id", 0) or 0),
         },
         "storage": {
@@ -399,7 +447,7 @@ def build_dashboard_snapshot(bot: commands.Bot, guild: discord.Guild) -> dict[st
             "transactions": _summarize_transactions(sources.get("dkp_transactions"), guild_id),
         },
         "loot": {
-            "needs": _summarize_needs(sources.get("loot_needs"), guild_id),
+            "needs": _summarize_needs(sources.get("loot_needs"), guild),
             "auctions": _summarize_auctions(sources.get("loot_auctions"), guild_id),
             "items_known": len(sources.get("loot_items") or {}) if isinstance(sources.get("loot_items"), dict) else 0,
         },
@@ -499,6 +547,7 @@ async def setup_dashboard_data(bot: commands.Bot, tree: app_commands.CommandTree
         emb.add_field(name="Backend", value=str(snap["storage"].get("runtime_backend")), inline=True)
         emb.add_field(name="DATABASE_URL", value="gesetzt" if snap["storage"].get("database_url_configured") else "nicht gesetzt", inline=True)
         emb.add_field(name="Guild", value=f"{inter.guild.name}\n`{inter.guild.id}`", inline=False)
+        emb.add_field(name="Filter", value=f"Nur aktuelle Discord-Servermitglieder\nAlt/archiviert: Profile {snap['profiles'].get('stale_count', 0)} · EC {snap['ec']['balances'].get('stale_count', 0)} · Needs {snap['loot']['needs'].get('stale_count', 0)}", inline=False)
         emb.add_field(name="Profile", value=str(snap["profiles"].get("count", 0)), inline=True)
         emb.add_field(name="Events", value=str(snap["events"].get("count", 0)), inline=True)
         emb.add_field(name="EC-Konten", value=str(snap["ec"]["balances"].get("count", 0)), inline=True)
