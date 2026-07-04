@@ -12,7 +12,7 @@ from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
-app = FastAPI(title="Ebo Dashboard", version="0.3.0")
+app = FastAPI(title="Ebo Dashboard", version="0.4.0")
 security = HTTPBasic(auto_error=False)
 
 
@@ -140,11 +140,29 @@ def _card(title: str, value: Any, sub: str = "") -> str:
     """
 
 
+def _raw(html_value: str) -> dict[str, str]:
+    return {"__html__": str(html_value or "")}
+
+
+def _cell(value: Any) -> str:
+    if isinstance(value, dict) and "__html__" in value:
+        return str(value.get("__html__") or "")
+    return _e(value)
+
+
+def _member_link(user_id: Any, label: Any) -> dict[str, str]:
+    uid = _user_id(user_id)
+    text = _e(label or f"User {uid}")
+    if not uid:
+        return _raw(text)
+    return _raw(f'<a class="link" href="/member/{uid}">{text}</a>')
+
+
 def _table(headers: list[str], rows: list[list[Any]], *, searchable: bool = True, placeholder: str = "Tabelle durchsuchen…") -> str:
     if not rows:
         return '<div class="empty">Keine Daten vorhanden.</div>'
     head = "".join(f"<th>{_e(h)}</th>" for h in headers)
-    body = "".join("<tr>" + "".join(f"<td>{_e(c)}</td>" for c in row) + "</tr>" for row in rows)
+    body = "".join("<tr>" + "".join(f"<td>{_cell(c)}</td>" for c in row) + "</tr>" for row in rows)
     search = f'<input class="table-search" type="search" placeholder="{_e(placeholder)}" oninput="filterNextTable(this)">' if searchable else ""
     return f"{search}<div class='table-wrap'><table class='searchable-table'><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div>"
 
@@ -200,6 +218,63 @@ def _need_user_ids(snap: dict[str, Any]) -> set[int]:
         if uid:
             ids.add(uid)
     return ids
+
+
+def _needs_by_user(snap: dict[str, Any]) -> dict[int, dict[str, Any]]:
+    needs = ((snap.get("loot") or {}).get("needs") or {})
+    rows = needs.get("items") or needs.get("sample") or []
+    out: dict[int, dict[str, Any]] = {}
+    for n in rows:
+        if not isinstance(n, dict):
+            continue
+        uid = _user_id(n.get("user_id") or n.get("member_id") or n.get("discord_id"))
+        if uid:
+            out[uid] = n
+    return out
+
+
+def _tx_for_user(snap: dict[str, Any], user_id: int, *, limit: int = 30) -> list[dict[str, Any]]:
+    txs = (((snap.get("ec") or {}).get("transactions") or {}).get("recent") or [])
+    out = []
+    for tx in txs:
+        if not isinstance(tx, dict):
+            continue
+        uid = _user_id(tx.get("user_id") or tx.get("target_user_id") or tx.get("member_id"))
+        if uid == int(user_id):
+            out.append(tx)
+    return out[:limit]
+
+
+def _voice_for_user(snap: dict[str, Any], user_id: int, *, limit: int = 30) -> list[dict[str, Any]]:
+    sessions = ((snap.get("voice") or {}).get("recent_sessions") or [])
+    out = []
+    for v in sessions:
+        if not isinstance(v, dict):
+            continue
+        uid = _user_id(v.get("user_id") or v.get("member_id"))
+        if uid == int(user_id):
+            out.append(v)
+    return out[:limit]
+
+
+def _auctions_for_user(snap: dict[str, Any], user_id: int, *, limit: int = 30) -> list[dict[str, Any]]:
+    auctions = (((snap.get("loot") or {}).get("auctions") or {}).get("items") or [])
+    out = []
+    for a in auctions:
+        if not isinstance(a, dict):
+            continue
+        if _user_id(a.get("top_bid_user_id")) == int(user_id) or _user_id(a.get("winner_user_id")) == int(user_id):
+            out.append(a)
+    return out[:limit]
+
+
+def _need_list_html(title: str, items: Any) -> str:
+    arr = items if isinstance(items, list) else []
+    if not arr:
+        return f"<h3>{_e(title)}</h3><div class='empty'>Keine Einträge.</div>"
+    lis = "".join(f"<li>{_e(x)}</li>" for x in arr[:80])
+    more = f"<p class='muted'>+ {len(arr) - 80} weitere</p>" if len(arr) > 80 else ""
+    return f"<h3>{_e(title)} <span class='pill'>{len(arr)}</span></h3><ul class='need-list'>{lis}</ul>{more}"
 
 
 def _safe_percent(part: float, total: float) -> str:
@@ -312,6 +387,7 @@ def _render_dashboard(data: dict[str, Any]) -> str:
     names = _profile_name_map(snap)
     balances_by_user = _balance_map(snap)
     need_user_ids = _need_user_ids(snap)
+    needs_by_user = _needs_by_user(snap)
 
     role_line = "Gildenrolle nicht gesetzt"
     if isinstance(member_filter, dict) and member_filter.get("mode") == "discord_role":
@@ -335,9 +411,9 @@ def _render_dashboard(data: dict[str, Any]) -> str:
         ec_value = balances_by_user.get(uid)
         need_state = "ja" if uid in need_user_ids else "nein"
         gs = _num(p.get("gearscore"), 0)
-        profile_rows.append([p.get("display_name"), p.get("ingame_name"), p.get("main_role"), p.get("gearscore"), _fmt_ec(ec_value) if ec_value is not None else "—", need_state])
+        profile_rows.append([_member_link(uid, p.get("display_name")), p.get("ingame_name"), p.get("main_role"), p.get("gearscore"), _fmt_ec(ec_value) if ec_value is not None else "—", need_state])
         if gs <= 0 or not p.get("main_role") or ec_value is None:
-            low_profile_rows.append([p.get("display_name"), p.get("ingame_name"), p.get("main_role") or "—", p.get("gearscore") or "—", _fmt_ec(ec_value) if ec_value is not None else "kein EC-Konto"])
+            low_profile_rows.append([_member_link(uid, p.get("display_name")), p.get("ingame_name"), p.get("main_role") or "—", p.get("gearscore") or "—", _fmt_ec(ec_value) if ec_value is not None else "kein EC-Konto"])
 
     event_rows = []
     for ev in events.get("items") or []:
@@ -347,10 +423,10 @@ def _render_dashboard(data: dict[str, Any]) -> str:
     sorted_balances = sorted(all_balances, key=lambda b: _num(b.get("balance"), 0), reverse=True)
     balance_rows = []
     for b in sorted_balances:
-        balance_rows.append([b.get("display_name"), _fmt_ec(b.get("balance"))])
+        balance_rows.append([_member_link(b.get("user_id"), b.get("display_name")), _fmt_ec(b.get("balance"))])
     bottom_balance_rows = []
     for b in list(reversed(sorted_balances))[:12]:
-        bottom_balance_rows.append([b.get("display_name"), _fmt_ec(b.get("balance"))])
+        bottom_balance_rows.append([_member_link(b.get("user_id"), b.get("display_name")), _fmt_ec(b.get("balance"))])
 
     auction_rows = []
     for a in (loot.get("auctions") or {}).get("items") or []:
@@ -438,6 +514,76 @@ def _render_dashboard(data: dict[str, Any]) -> str:
     return _html_shell("Ebo Dashboard", body)
 
 
+def _render_member_detail(data: dict[str, Any], user_id: int) -> str:
+    if not data.get("ok"):
+        return _html_shell("Ebo Dashboard", f"<section class='panel'><h1>📊 Ebo Dashboard</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+    snap: dict[str, Any] = data.get("snapshot") or {}
+    profiles = ((snap.get("profiles") or {}).get("items") or [])
+    balances = _balance_map(snap)
+    needs_by_user = _needs_by_user(snap)
+    profile = None
+    for p in profiles:
+        if isinstance(p, dict) and _user_id(p.get("user_id")) == int(user_id):
+            profile = p
+            break
+    if not profile:
+        return _html_shell(
+            "Mitglied nicht gefunden",
+            "<section class='panel'><h1>❌ Mitglied nicht gefunden</h1><p class='muted'>Dieses Mitglied ist nicht im aktuellen Dashboard-Snapshot oder hat nicht die gesetzte Gildenrolle.</p><p><a class='btn' href='/'>Zurück</a></p></section>",
+        )
+
+    display = profile.get("display_name") or profile.get("ingame_name") or f"User {user_id}"
+    ec_value = balances.get(int(user_id))
+    need_info = needs_by_user.get(int(user_id), {})
+    main_needs = need_info.get("main") if isinstance(need_info, dict) else []
+    secondary_needs = need_info.get("secondary") if isinstance(need_info, dict) else []
+
+    tx_rows = []
+    for tx in _tx_for_user(snap, user_id):
+        tx_rows.append([_dt(tx.get("created_at")), _fmt_ec(tx.get("amount")), tx.get("raw_type"), _short(tx.get("reason"), 140)])
+
+    voice_rows = []
+    for v in _voice_for_user(snap, user_id):
+        seconds = int(_num(v.get("duration_seconds"), 0))
+        minutes = round(seconds / 60, 1) if seconds else "—"
+        voice_rows.append([v.get("channel_name") or v.get("channel_id"), _dt(v.get("joined_at")), _dt(v.get("left_at")), minutes])
+
+    auction_rows = []
+    for a in _auctions_for_user(snap, user_id):
+        auction_rows.append([a.get("item_name"), a.get("status"), a.get("phase"), _fmt_ec(a.get("top_bid_amount")) if a.get("top_bid_amount") is not None else "—", _dt(a.get("ends_at"))])
+
+    cards = "".join([
+        _card("Ingame", profile.get("ingame_name") or "—", "Profil"),
+        _card("Rolle", profile.get("main_role") or "—", "Main-Rolle"),
+        _card("Gearscore", profile.get("gearscore") or "—", "Profilwert"),
+        _card("EC", _fmt_ec(ec_value) if ec_value is not None else "—", "aktueller Kontostand"),
+    ])
+
+    body = f"""
+    <nav class="topnav"><a href="/">← Übersicht</a><a href="#needs">Needs</a><a href="#ec">EC</a><a href="#voice">Voice</a><a href="/api/snapshot">JSON</a></nav>
+    <section class="hero">
+      <div>
+        <div class="eyebrow">Mitglied</div>
+        <h1>👤 {_e(display)}</h1>
+        <p class="muted">User-ID: {_e(user_id)} · Snapshot: {_e(_dt(data.get('published_at')))}</p>
+      </div>
+      <a class="btn" href="/">Zurück</a>
+    </section>
+    <section class="grid">{cards}</section>
+    <section class="panel" id="needs">
+      <h2>🎁 Needliste</h2>
+      <div class="split">
+        <div>{_need_list_html('Main-Needs', main_needs)}</div>
+        <div>{_need_list_html('Secondary-Needs', secondary_needs)}</div>
+      </div>
+    </section>
+    <section class="panel" id="ec"><h2>🪙 Letzte EC-Buchungen</h2>{_table(['Zeit','Betrag','Typ','Grund'], tx_rows, placeholder='Buchungen durchsuchen…')}</section>
+    <section class="panel"><h2>🎁 Auktionen mit aktueller Führung/Gewinn</h2>{_table(['Item','Status','Phase','Gebot','Ende'], auction_rows, placeholder='Auktionen durchsuchen…')}</section>
+    <section class="panel" id="voice"><h2>🎙️ Voice-Sessions</h2>{_table(['Kanal','Rein','Raus','Minuten'], voice_rows, placeholder='Voice durchsuchen…')}</section>
+    """
+    return _html_shell(f"{display} · Ebo Dashboard", body)
+
+
 def _html_shell(title: str, body: str) -> str:
     auth_note = ""
     if not str(os.getenv("DASHBOARD_PASSWORD") or "").strip():
@@ -475,6 +621,9 @@ def _html_shell(title: str, body: str) -> str:
     .table-search:focus {{ border-color:var(--gold); }}
     .table-wrap {{ overflow-x:auto; }} table {{ width:100%; border-collapse:collapse; font-size:14px; }} th,td {{ padding:10px 8px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; }} th {{ color:var(--gold); font-size:12px; text-transform:uppercase; letter-spacing:.05em; }} tr:hover td {{ background:rgba(255,255,255,.025); }}
     .btn {{ display:inline-block; padding:10px 14px; border-radius:10px; background:var(--gold); color:#111; font-weight:800; text-decoration:none; white-space:nowrap; }}
+    .link {{ color:var(--gold); text-decoration:none; font-weight:700; }} .link:hover {{ text-decoration:underline; }}
+    .pill {{ display:inline-block; padding:2px 8px; border:1px solid var(--line); border-radius:999px; color:var(--gold); font-size:12px; vertical-align:middle; }}
+    .need-list {{ margin:8px 0 16px; padding-left:22px; color:var(--text); }} .need-list li {{ margin:5px 0; }}
     code {{ background:#05060a; border:1px solid var(--line); padding:2px 5px; border-radius:6px; }}
     .empty {{ color:var(--muted); padding:10px 0; }} .warn {{ background:#3a250d; border:1px solid #8a5b18; padding:12px 14px; border-radius:12px; margin-bottom:14px; color:#ffe0a3; }}
     @media(max-width:1000px) {{ .grid,.analytics-grid {{ grid-template-columns:repeat(2,minmax(0,1fr)); }} .split {{ grid-template-columns:1fr; }} .hero {{ flex-direction:column; align-items:flex-start; }} }}
@@ -533,6 +682,17 @@ def api_quality(_: bool = Depends(_auth)):
         "ec_coverage": analytics.get("ec_coverage"),
         "need_coverage": analytics.get("need_coverage"),
     })
+
+
+@app.get("/member/{user_id}", response_class=HTMLResponse)
+def member_detail(user_id: int, _: bool = Depends(_auth)):
+    try:
+        return HTMLResponse(_render_member_detail(_snapshot_payload(), int(user_id)))
+    except Exception as exc:
+        return HTMLResponse(
+            _html_shell("Ebo Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
+            status_code=500,
+        )
 
 
 @app.get("/", response_class=HTMLResponse)
