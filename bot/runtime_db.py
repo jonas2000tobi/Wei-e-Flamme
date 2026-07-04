@@ -438,3 +438,290 @@ def count_audit_logs(guild_id: Optional[int] = None) -> int:
             return int(row["c"] if row else 0)
         finally:
             conn.close()
+
+def _parse_iso_utc(value: str) -> datetime:
+    try:
+        dt = datetime.fromisoformat(str(value or ""))
+    except Exception:
+        return datetime.now(timezone.utc)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _duration_seconds(joined_at: str, left_at: str) -> int:
+    start = _parse_iso_utc(joined_at)
+    end = _parse_iso_utc(left_at)
+    return max(0, int((end - start).total_seconds()))
+
+
+def start_voice_session(*, guild_id: int, user_id: int, channel_id: int, member_name: str = "", channel_name: str = "", metadata: Any = None) -> int:
+    """Startet eine Voice-Session und schließt vorher offene Alt-Sessions dieses Users.
+
+    Dadurch entstehen nach Gateway-Reconnects oder verpassten Voice-Events keine
+    dauerhaft offenen Doppel-Sessions.
+    """
+    if not _INITIALIZED:
+        init_runtime_db()
+
+    joined_at = _now_iso()
+    meta = {"member_name": member_name or "", "channel_name": channel_name or ""}
+    if isinstance(metadata, dict):
+        meta.update(metadata)
+
+    with _DB_LOCK:
+        # Erst alle offenen Sessions des Users im Server sauber beenden.
+        close_open_voice_sessions_for_user(int(guild_id), int(user_id), left_at=joined_at)
+
+        if _BACKEND == "postgres":
+            conn = _pg_connect()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO voice_sessions(
+                            guild_id, user_id, channel_id, joined_at, left_at, duration_seconds,
+                            event_id, source, metadata_json
+                        ) VALUES (%s, %s, %s, %s, NULL, NULL, NULL, %s, %s)
+                        RETURNING id
+                        """,
+                        (int(guild_id), int(user_id), int(channel_id), joined_at, "voice_state", _json_dumps(meta)),
+                    )
+                    row = cur.fetchone()
+                conn.commit()
+                return int((row or {}).get("id") or 0)
+            finally:
+                conn.close()
+
+        conn = _sqlite_connect()
+        try:
+            cur = conn.execute(
+                """
+                INSERT INTO voice_sessions(
+                    guild_id, user_id, channel_id, joined_at, left_at, duration_seconds,
+                    event_id, source, metadata_json
+                ) VALUES (?, ?, ?, ?, NULL, NULL, NULL, ?, ?)
+                """,
+                (int(guild_id), int(user_id), int(channel_id), joined_at, "voice_state", _json_dumps(meta)),
+            )
+            conn.commit()
+            return int(cur.lastrowid or 0)
+        finally:
+            conn.close()
+
+
+def close_open_voice_sessions_for_user(guild_id: int, user_id: int, *, left_at: Optional[str] = None, channel_id: Optional[int] = None) -> int:
+    """Schließt offene Voice-Sessions eines Users und trägt duration_seconds nach."""
+    if not _INITIALIZED:
+        init_runtime_db()
+    closed_at = str(left_at or _now_iso())
+
+    with _DB_LOCK:
+        if _BACKEND == "postgres":
+            conn = _pg_connect()
+            try:
+                with conn.cursor() as cur:
+                    if channel_id is None:
+                        cur.execute(
+                            "SELECT id, joined_at FROM voice_sessions WHERE guild_id = %s AND user_id = %s AND left_at IS NULL",
+                            (int(guild_id), int(user_id)),
+                        )
+                    else:
+                        cur.execute(
+                            "SELECT id, joined_at FROM voice_sessions WHERE guild_id = %s AND user_id = %s AND channel_id = %s AND left_at IS NULL",
+                            (int(guild_id), int(user_id), int(channel_id)),
+                        )
+                    rows = [dict(row) for row in cur.fetchall()]
+                    for row in rows:
+                        cur.execute(
+                            "UPDATE voice_sessions SET left_at = %s, duration_seconds = %s WHERE id = %s",
+                            (closed_at, _duration_seconds(str(row.get("joined_at", "")), closed_at), int(row.get("id") or 0)),
+                        )
+                conn.commit()
+                return len(rows)
+            finally:
+                conn.close()
+
+        conn = _sqlite_connect()
+        try:
+            if channel_id is None:
+                rows = conn.execute(
+                    "SELECT id, joined_at FROM voice_sessions WHERE guild_id = ? AND user_id = ? AND left_at IS NULL",
+                    (int(guild_id), int(user_id)),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT id, joined_at FROM voice_sessions WHERE guild_id = ? AND user_id = ? AND channel_id = ? AND left_at IS NULL",
+                    (int(guild_id), int(user_id), int(channel_id)),
+                ).fetchall()
+            for row in rows:
+                conn.execute(
+                    "UPDATE voice_sessions SET left_at = ?, duration_seconds = ? WHERE id = ?",
+                    (closed_at, _duration_seconds(str(row["joined_at"]), closed_at), int(row["id"])),
+                )
+            conn.commit()
+            return len(rows)
+        finally:
+            conn.close()
+
+
+def fetch_voice_sessions(
+    guild_id: int,
+    *,
+    since_iso: Optional[str] = None,
+    until_iso: Optional[str] = None,
+    channel_ids: Optional[list[int]] = None,
+    user_ids: Optional[list[int]] = None,
+    limit: int = 500,
+) -> list[dict[str, Any]]:
+    """Liest Voice-Sessions, die ein Zeitfenster überlappen.
+
+    Overlap-Logik: joined_at < until AND (left_at IS NULL OR left_at > since).
+    """
+    if not _INITIALIZED:
+        init_runtime_db()
+    limit = max(1, min(int(limit or 500), 5000))
+    since = str(since_iso or "1970-01-01T00:00:00+00:00")
+    until = str(until_iso or _now_iso())
+    channel_ids = [int(x) for x in (channel_ids or []) if int(x or 0)]
+    user_ids = [int(x) for x in (user_ids or []) if int(x or 0)]
+
+    def _filter_py(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        out = []
+        ch_set = set(channel_ids) if channel_ids else None
+        u_set = set(user_ids) if user_ids else None
+        for r in rows:
+            try:
+                if ch_set is not None and int(r.get("channel_id") or 0) not in ch_set:
+                    continue
+                if u_set is not None and int(r.get("user_id") or 0) not in u_set:
+                    continue
+                out.append(r)
+            except Exception:
+                continue
+        return out
+
+    with _DB_LOCK:
+        if _BACKEND == "postgres":
+            conn = _pg_connect()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT * FROM voice_sessions
+                        WHERE guild_id = %s
+                          AND joined_at < %s
+                          AND (left_at IS NULL OR left_at > %s)
+                        ORDER BY joined_at DESC, id DESC
+                        LIMIT %s
+                        """,
+                        (int(guild_id), until, since, limit),
+                    )
+                    return _filter_py([dict(row) for row in cur.fetchall()])
+            finally:
+                conn.close()
+
+        conn = _sqlite_connect()
+        try:
+            rows = conn.execute(
+                """
+                SELECT * FROM voice_sessions
+                WHERE guild_id = ?
+                  AND joined_at < ?
+                  AND (left_at IS NULL OR left_at > ?)
+                ORDER BY joined_at DESC, id DESC
+                LIMIT ?
+                """,
+                (int(guild_id), until, since, limit),
+            ).fetchall()
+            return _filter_py([dict(row) for row in rows])
+        finally:
+            conn.close()
+
+
+def count_voice_sessions(guild_id: Optional[int] = None, *, open_only: bool = False) -> int:
+    if not _INITIALIZED:
+        init_runtime_db()
+    clauses = []
+    params_pg: list[Any] = []
+    params_sqlite: list[Any] = []
+    if guild_id is not None:
+        clauses.append("guild_id = {}")
+        params_pg.append(int(guild_id))
+        params_sqlite.append(int(guild_id))
+    if open_only:
+        clauses.append("left_at IS NULL")
+    where = ""
+    if clauses:
+        pg_parts = []
+        sqlite_parts = []
+        pgi = 0
+        for c in clauses:
+            if "{}" in c:
+                pg_parts.append(c.format("%s"))
+                sqlite_parts.append(c.format("?"))
+                pgi += 1
+            else:
+                pg_parts.append(c)
+                sqlite_parts.append(c)
+        where_pg = " WHERE " + " AND ".join(pg_parts)
+        where_sqlite = " WHERE " + " AND ".join(sqlite_parts)
+    else:
+        where_pg = where_sqlite = ""
+
+    with _DB_LOCK:
+        if _BACKEND == "postgres":
+            conn = _pg_connect()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT COUNT(*) AS c FROM voice_sessions" + where_pg, tuple(params_pg))
+                    row = cur.fetchone()
+                    return int((row or {}).get("c") or 0)
+            finally:
+                conn.close()
+        conn = _sqlite_connect()
+        try:
+            row = conn.execute("SELECT COUNT(*) AS c FROM voice_sessions" + where_sqlite, tuple(params_sqlite)).fetchone()
+            return int(row["c"] if row else 0)
+        finally:
+            conn.close()
+
+
+def aggregate_voice_seconds(
+    guild_id: int,
+    *,
+    since_iso: str,
+    until_iso: str,
+    channel_ids: Optional[list[int]] = None,
+    user_ids: Optional[list[int]] = None,
+) -> dict[int, int]:
+    """Summiert Voice-Zeit pro User im Zeitfenster, auf das Fenster gekürzt."""
+    rows = fetch_voice_sessions(
+        int(guild_id),
+        since_iso=since_iso,
+        until_iso=until_iso,
+        channel_ids=channel_ids,
+        user_ids=user_ids,
+        limit=5000,
+    )
+    start = _parse_iso_utc(since_iso)
+    end = _parse_iso_utc(until_iso)
+    now = datetime.now(timezone.utc)
+    totals: dict[int, int] = {}
+    for r in rows:
+        try:
+            uid = int(r.get("user_id") or 0)
+            if not uid:
+                continue
+            a = _parse_iso_utc(str(r.get("joined_at") or ""))
+            b_raw = r.get("left_at")
+            b = _parse_iso_utc(str(b_raw)) if b_raw else min(now, end)
+            overlap_start = max(start, a)
+            overlap_end = min(end, b)
+            sec = max(0, int((overlap_end - overlap_start).total_seconds()))
+            if sec > 0:
+                totals[uid] = totals.get(uid, 0) + sec
+        except Exception:
+            continue
+    return totals
+
