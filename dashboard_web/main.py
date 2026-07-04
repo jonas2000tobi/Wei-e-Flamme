@@ -1189,7 +1189,7 @@ def _render_member_detail(data: dict[str, Any], user_id: int, current_user: Opti
     ])
 
     body = f"""
-    <nav class="topnav"><a href="/">← Übersicht</a><a href="/ec">EC-Verlauf</a><a href="#needs">Needs</a><a href="#ec">EC</a><a href="#voice">Voice</a><a href="/api/snapshot">JSON</a></nav>
+    <nav class="topnav"><a href="/">← Übersicht</a><a href="/ec">EC-Verlauf</a><a href="/member/{_e(user_id)}/loot">Loot-Verlauf</a><a href="#needs">Needs</a><a href="#ec">EC</a><a href="#voice">Voice</a><a href="/api/snapshot">JSON</a></nav>
     <section class="hero">
       <div>
         <div class="eyebrow">Mitglied</div>
@@ -3463,8 +3463,8 @@ def _render_loot_center(data: dict[str, Any]) -> str:
         ])
 
     body = f"""
-    <nav class="topnav"><a href="/">← Übersicht</a><a href="/loot">Loot</a><a href="/loot-check">Truhencheck</a><a href="/needs">Needs</a><a href="/members">Mitglieder</a><a href="/fairness">Fairness</a><a href="/exports">Exports</a><a href="/api/loot-center">API</a></nav>
-    <section class="hero"><div><div class="eyebrow">Loot-Zentrale</div><h1>🎁 Loot / Auktionen</h1><p class="muted">Kontrollzentrum für aktive Auktionen, offene Übergaben, Gebote und Need-Spieler. Read-only, keine Bot-Daten werden verändert.</p></div><a class="btn" href="/export/loot_center.csv">CSV herunterladen</a></section>
+    <nav class="topnav"><a href="/">← Übersicht</a><a href="/loot">Loot</a><a href="/loot-history">Loot-Verlauf</a><a href="/loot-check">Truhencheck</a><a href="/needs">Needs</a><a href="/members">Mitglieder</a><a href="/fairness">Fairness</a><a href="/exports">Exports</a><a href="/api/loot-center">API</a></nav>
+    <section class="hero"><div><div class="eyebrow">Loot-Zentrale</div><h1>🎁 Loot / Auktionen</h1><p class="muted">Kontrollzentrum für aktive Auktionen, offene Übergaben, Gebote und Need-Spieler. Read-only, keine Bot-Daten werden verändert.</p></div><div style="display:flex;gap:10px;flex-wrap:wrap"><a class="btn" href="/loot-history">Loot-Verlauf</a><a class="btn" href="/export/loot_center.csv">CSV herunterladen</a></div></section>
     <section class="grid">{cards}</section>
     <section class="panel"><h2>🔎 Schneller Truhencheck</h2><form method="get" action="/loot-check" style="display:flex;gap:10px;flex-wrap:wrap;align-items:center"><input name="item" placeholder="Itemname eingeben, z. B. Aridus Stab" style="min-width:280px;flex:1;padding:12px;border-radius:12px;border:1px solid rgba(255,255,255,.16);background:rgba(0,0,0,.22);color:inherit"><button class="btn" type="submit">Need prüfen</button></form><p class="muted">Prüft Main-/Second-Needs und ob dazu schon eine Auktion läuft.</p></section>
     <section class="panel"><h2>🔥 Nächste Loot-Aktionen</h2><p class="muted">Das ist die Arbeitsliste: Übergaben, offene Auktionen, Sale/Freie-Auktion-Kandidaten und aktive Auktionen ohne Gebote.</p>{_table(['Item','Bereich','Status','Gebote','Führend','Gewinner','Ende','Nächster Schritt'], action_rows, placeholder='Aktionen durchsuchen…')}</section>
@@ -3474,6 +3474,389 @@ def _render_loot_center(data: dict[str, Any]) -> str:
     <section class="panel"><h2>📜 Auktionshistorie</h2>{_table(['Item','Bereich','Status','Gebote','Führend','Gewinner','Ende'], history_rows, placeholder='Historie durchsuchen…')}</section>
     """
     return _html_shell("Loot · Ebo Dashboard", body)
+
+
+# ---------------------------------------------------------------------------
+# Step 2: Loot-Verlauf / Transparenz
+# ---------------------------------------------------------------------------
+
+def _loot_action_requests_all(guild_id: int, limit: int = 300) -> list[dict[str, Any]]:
+    """Letzte Dashboard-Loot-Aktionen aus Postgres für Transparenz anzeigen."""
+    if not _database_url() or not guild_id:
+        return []
+    try:
+        _ensure_admin_tables()
+        conn = _pg_connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT id, request_id, guild_id, auction_id, action_type, amount, status,
+                           payload_json, actor_id, actor_name, requested_at, claimed_at, processed_at, result_json
+                    FROM dashboard_loot_action_requests
+                    WHERE guild_id = %s
+                    ORDER BY requested_at DESC
+                    LIMIT %s
+                    """,
+                    (int(guild_id), int(limit)),
+                )
+                rows = [dict(r) for r in (cur.fetchall() or [])]
+        finally:
+            conn.close()
+        for row in rows:
+            try:
+                row["payload"] = json.loads(row.get("payload_json") or "{}")
+            except Exception:
+                row["payload"] = {}
+            try:
+                row["result"] = json.loads(row.get("result_json") or "{}")
+            except Exception:
+                row["result"] = {}
+        return rows
+    except Exception:
+        return []
+
+
+def _loot_bid_user_id(bid: dict[str, Any]) -> int:
+    for key in ("user_id", "bidder_user_id", "bidder_id", "discord_id", "member_id", "actor_id"):
+        uid = _user_id(bid.get(key))
+        if uid:
+            return uid
+    return 0
+
+
+def _loot_bid_user_name(bid: dict[str, Any], names: dict[int, str]) -> str:
+    uid = _loot_bid_user_id(bid)
+    for key in ("display_name", "user_name", "username", "bidder_name", "name", "actor_name"):
+        value = str(bid.get(key) or "").strip()
+        if value:
+            return value
+    return names.get(uid, f"User {uid}" if uid else "Unbekannt")
+
+
+def _loot_bid_amount(bid: dict[str, Any]) -> int:
+    for key in ("amount", "bid_amount", "ec", "value", "price"):
+        if bid.get(key) not in (None, ""):
+            return int(_num(bid.get(key), 0))
+    return 0
+
+
+def _loot_bid_time(bid: dict[str, Any]) -> Any:
+    for key in ("created_at", "timestamp", "time", "bid_at", "placed_at", "updated_at"):
+        if bid.get(key):
+            return bid.get(key)
+    return ""
+
+
+def _loot_winning_amount(auction: dict[str, Any]) -> int:
+    for key in ("winning_bid", "winner_bid", "top_bid_amount", "leader_bid", "highest_bid", "fixed_price", "sale_price", "price"):
+        if auction.get(key) not in (None, ""):
+            return int(_num(auction.get(key), 0))
+    # Fallback: höchste Gebotssumme aus der Liste.
+    amounts = [_loot_bid_amount(b) for b in (auction.get("bids") or []) if isinstance(b, dict)]
+    return max(amounts) if amounts else 0
+
+
+def _loot_winner_user_id(auction: dict[str, Any]) -> int:
+    for key in ("winner_user_id", "delivered_to_user_id", "sold_to_user_id", "buyer_user_id"):
+        uid = _user_id(auction.get(key))
+        if uid:
+            return uid
+    # Wenn die Auktion erledigt ist, aber nur der Top-Bidder gespeichert ist.
+    if _loot_is_done(auction):
+        return _user_id(auction.get("top_bid_user_id") or auction.get("leader_user_id"))
+    return 0
+
+
+def _loot_winner_name_text(auction: dict[str, Any], names: dict[int, str]) -> str:
+    uid = _loot_winner_user_id(auction)
+    for key in ("winner_name", "delivered_to_name", "sold_to_name", "buyer_name"):
+        value = str(auction.get(key) or "").strip()
+        if value:
+            return value
+    return names.get(uid, f"User {uid}" if uid else "—")
+
+
+def _loot_history_event_time(auction: dict[str, Any]) -> Any:
+    for key in ("delivered_at", "closed_at", "ended_at", "processed_at", "ends_at", "created_at"):
+        if auction.get(key):
+            return auction.get(key)
+    return ""
+
+
+def _loot_bid_status(auction: dict[str, Any], bid: dict[str, Any]) -> str:
+    uid = _loot_bid_user_id(bid)
+    amount = _loot_bid_amount(bid)
+    top_uid = _loot_top_bid_user_id(auction)
+    top_amount = int(_num(auction.get("top_bid_amount") or auction.get("leader_bid") or auction.get("highest_bid"), 0))
+    winner_uid = _loot_winner_user_id(auction)
+    if _loot_is_done(auction) and uid and winner_uid and uid == winner_uid and amount == _loot_winning_amount(auction):
+        return "gewonnen"
+    if uid and top_uid and uid == top_uid and (not top_amount or amount == top_amount):
+        return "führt"
+    return "überboten" if amount else "—"
+
+
+def _loot_history_payload_from_snapshot(snap: dict[str, Any], guild_id: int = 0) -> dict[str, Any]:
+    names = _profile_name_map(snap)
+    auctions = [a for a in ((((snap.get("loot") or {}).get("auctions") or {}).get("items") or [])) if isinstance(a, dict)]
+    action_rows = _loot_action_requests_all(int(guild_id), limit=300) if guild_id else []
+
+    auction_rows: list[dict[str, Any]] = []
+    winner_rows: list[dict[str, Any]] = []
+    bid_rows: list[dict[str, Any]] = []
+    players: dict[int, dict[str, Any]] = {}
+
+    def player(uid: int, name: str = "") -> dict[str, Any]:
+        uid = int(uid or 0)
+        p = players.setdefault(uid, {"user_id": uid, "display_name": name or names.get(uid, f"User {uid}" if uid else "Unbekannt"), "won_count": 0, "spent_ec": 0, "bid_count": 0, "highest_bid_count": 0, "sale_count": 0, "junk_count": 0, "last_activity": ""})
+        if name and (not p.get("display_name") or str(p.get("display_name")).startswith("User ")):
+            p["display_name"] = name
+        return p
+
+    for a in auctions:
+        aid = str(a.get("auction_id") or a.get("id") or "").strip()
+        item = _loot_text(a.get("item_name") or a.get("item") or a.get("name") or aid)
+        mode = _loot_mode_bucket(a)
+        status_raw = str(a.get("status") or "—")
+        bid_count = _loot_bid_count(a)
+        win_uid = _loot_winner_user_id(a)
+        win_name = _loot_winner_name_text(a, names)
+        win_amount = _loot_winning_amount(a)
+        event_time = _loot_history_event_time(a)
+        auction_entry = {
+            "auction_id": aid,
+            "item": item or aid or "—",
+            "mode": mode,
+            "status": status_raw,
+            "status_label": _loot_status_label(status_raw),
+            "bid_count": bid_count,
+            "leader": _loot_leader_text(a, names),
+            "winner_user_id": win_uid,
+            "winner_name": win_name,
+            "winning_amount": win_amount,
+            "created_at": a.get("created_at"),
+            "ends_at": a.get("ends_at") or a.get("expires_at") or a.get("end_at"),
+            "closed_at": event_time,
+            "active": _loot_is_active(a),
+            "done": _loot_is_done(a),
+            "raw": a,
+        }
+        auction_rows.append(auction_entry)
+
+        if win_uid or (win_name and win_name != "—"):
+            winner_rows.append(auction_entry)
+            if win_uid:
+                p = player(win_uid, win_name)
+                p["won_count"] += 1
+                p["spent_ec"] += int(win_amount or 0)
+                if "sale" in str(mode).lower():
+                    p["sale_count"] += 1
+                if "müll" in str(mode).lower() or bool(a.get("junk_drop")):
+                    p["junk_count"] += 1
+                if event_time and str(event_time) > str(p.get("last_activity") or ""):
+                    p["last_activity"] = event_time
+
+        bids = [b for b in (a.get("bids") or []) if isinstance(b, dict)]
+        for b in bids:
+            uid = _loot_bid_user_id(b)
+            bname = _loot_bid_user_name(b, names)
+            amount = _loot_bid_amount(b)
+            btime = _loot_bid_time(b) or a.get("created_at") or a.get("ends_at")
+            bstatus = _loot_bid_status(a, b)
+            bid_entry = {
+                "auction_id": aid,
+                "item": item or aid or "—",
+                "mode": mode,
+                "user_id": uid,
+                "display_name": bname,
+                "amount": amount,
+                "created_at": btime,
+                "status": bstatus,
+            }
+            bid_rows.append(bid_entry)
+            if uid:
+                p = player(uid, bname)
+                p["bid_count"] += 1
+                if bstatus in {"führt", "gewonnen"}:
+                    p["highest_bid_count"] += 1
+                if btime and str(btime) > str(p.get("last_activity") or ""):
+                    p["last_activity"] = btime
+
+    auction_rows.sort(key=lambda r: str(r.get("closed_at") or r.get("ends_at") or r.get("created_at") or ""), reverse=True)
+    winner_rows.sort(key=lambda r: str(r.get("closed_at") or r.get("ends_at") or r.get("created_at") or ""), reverse=True)
+    bid_rows.sort(key=lambda r: str(r.get("created_at") or ""), reverse=True)
+    player_rows = [p for uid, p in players.items() if uid]
+    player_rows.sort(key=lambda p: (-int(p.get("won_count") or 0), -int(p.get("spent_ec") or 0), -int(p.get("bid_count") or 0), str(p.get("display_name") or "").lower()))
+
+    return {
+        "auctions_total": len(auction_rows),
+        "winners_total": len(winner_rows),
+        "bids_total": len(bid_rows),
+        "actions_total": len(action_rows),
+        "auction_rows": auction_rows,
+        "winner_rows": winner_rows,
+        "bid_rows": bid_rows,
+        "player_rows": player_rows,
+        "action_rows": action_rows,
+    }
+
+
+def _loot_result_text(row: dict[str, Any]) -> str:
+    result = row.get("result") if isinstance(row.get("result"), dict) else {}
+    if result:
+        for key in ("message", "error", "reason", "status"):
+            if result.get(key):
+                return _short(result.get(key), 140)
+    return _short(row.get("result_json") or "", 140) or "—"
+
+
+def _render_loot_history(data: dict[str, Any]) -> str:
+    if not data.get("ok"):
+        return _html_shell("Loot-Verlauf · Ebo Dashboard", f"<section class='panel'><h1>📜 Loot-Verlauf</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+    snap: dict[str, Any] = data.get("snapshot") or {}
+    guild_id = _safe_guild_id(data)
+    hist = _loot_history_payload_from_snapshot(snap, int(guild_id or 0))
+
+    cards = "".join([
+        _card("Auktionen", hist.get("auctions_total", 0), "gesamt im Snapshot"),
+        _card("Gewonnene Items", hist.get("winners_total", 0), "mit Gewinner"),
+        _card("Gebote", hist.get("bids_total", 0), "einzelne Gebote"),
+        _card("Dashboard-Aktionen", hist.get("actions_total", 0), "Queue-Anfragen"),
+    ])
+
+    winner_rows = []
+    for r in hist.get("winner_rows") or []:
+        aid = r.get("auction_id")
+        winner_rows.append([
+            _auction_link(aid, r.get("item")) if aid else r.get("item"),
+            r.get("mode"),
+            _member_link(r.get("winner_user_id"), r.get("winner_name")) if r.get("winner_user_id") else r.get("winner_name"),
+            _fmt_ec(r.get("winning_amount")),
+            r.get("bid_count"),
+            _loot_status_label(r.get("status")),
+            _dt(r.get("closed_at")),
+        ])
+
+    bid_rows = []
+    for b in (hist.get("bid_rows") or [])[:500]:
+        aid = b.get("auction_id")
+        bid_rows.append([
+            _dt(b.get("created_at")),
+            _auction_link(aid, b.get("item")) if aid else b.get("item"),
+            b.get("mode"),
+            _member_link(b.get("user_id"), b.get("display_name")) if b.get("user_id") else b.get("display_name"),
+            _fmt_ec(b.get("amount")),
+            b.get("status"),
+        ])
+
+    player_rows = []
+    for p in hist.get("player_rows") or []:
+        player_rows.append([
+            _member_link(p.get("user_id"), p.get("display_name")),
+            p.get("won_count"),
+            _fmt_ec(p.get("spent_ec")),
+            p.get("bid_count"),
+            p.get("highest_bid_count"),
+            p.get("sale_count"),
+            p.get("junk_count"),
+            _dt(p.get("last_activity")),
+        ])
+
+    action_rows = []
+    for a in hist.get("action_rows") or []:
+        payload = a.get("payload") if isinstance(a.get("payload"), dict) else {}
+        item = payload.get("item_name") or payload.get("item") or a.get("auction_id")
+        aid = str(a.get("auction_id") or payload.get("auction_id") or "")
+        action_rows.append([
+            _dt(a.get("requested_at")),
+            a.get("actor_name") or a.get("actor_id") or "—",
+            _loot_action_type_label(a.get("action_type")),
+            _auction_link(aid, item) if aid else item,
+            _fmt_ec(a.get("amount")),
+            _loot_action_status_label(a.get("status")),
+            _loot_result_text(a),
+        ])
+
+    all_auction_rows = []
+    for r in hist.get("auction_rows") or []:
+        aid = r.get("auction_id")
+        all_auction_rows.append([
+            _auction_link(aid, r.get("item")) if aid else r.get("item"),
+            r.get("mode"),
+            _loot_status_label(r.get("status")),
+            r.get("bid_count"),
+            r.get("leader"),
+            _member_link(r.get("winner_user_id"), r.get("winner_name")) if r.get("winner_user_id") else r.get("winner_name"),
+            _fmt_ec(r.get("winning_amount")),
+            _dt(r.get("closed_at") or r.get("ends_at")),
+        ])
+
+    body = f"""
+    <nav class="topnav"><a href="/">← Übersicht</a><a href="/loot">Loot</a><a href="/loot-check">Truhencheck</a><a href="/members">Mitglieder</a><a href="/exports">Exports</a><a href="/api/loot-history">API</a></nav>
+    <section class="hero"><div><div class="eyebrow">Loot-Transparenz</div><h1>📜 Loot-Verlauf</h1><p class="muted">Gewinner, Gebote und Dashboard-Aktionen an einem Ort. Read-only – hier wird nichts am Bot verändert.</p></div><a class="btn" href="/export/loot_history.csv">CSV herunterladen</a></section>
+    <section class="grid">{cards}</section>
+    <section class="panel"><h2>🏆 Gewonnene Items</h2>{_table(['Item','Bereich','Gewinner','EC','Gebote','Status','Zeit'], winner_rows, placeholder='Gewinner/Item suchen…')}</section>
+    <section class="panel"><h2>🪙 Gebotsverlauf</h2><p class="muted">Zeigt die einzelnen bekannten Gebote aus dem Snapshot. Wenn alte Bot-Snapshots keine Gebotsliste enthalten, steht hier entsprechend weniger.</p>{_table(['Zeit','Item','Bereich','Spieler','Gebot','Status'], bid_rows, placeholder='Gebote durchsuchen…')}</section>
+    <section class="panel"><h2>👥 Spielerübersicht</h2>{_table(['Spieler','Gewonnen','EC ausgegeben','Gebote','Führend/Gewonnen','Sale','Müll','Letzte Aktivität'], player_rows, placeholder='Spieler suchen…')}</section>
+    <section class="panel"><h2>📨 Dashboard-Aktionen</h2><p class="muted">Queue-Anfragen aus dem Dashboard: Bieten, Sale kaufen oder Müll-Wurf. Hilft beim Nachvollziehen, wenn etwas blockiert/fehlgeschlagen ist.</p>{_table(['Zeit','Spieler','Aktion','Item','EC','Status','Ergebnis'], action_rows, placeholder='Aktionen durchsuchen…')}</section>
+    <section class="panel"><h2>📦 Alle Auktionen</h2>{_table(['Item','Bereich','Status','Gebote','Führend','Gewinner','EC','Zeit'], all_auction_rows, placeholder='Auktionen durchsuchen…')}</section>
+    """
+    return _html_shell("Loot-Verlauf · Ebo Dashboard", body)
+
+
+def _loot_member_payload_from_snapshot(snap: dict[str, Any], user_id: int, guild_id: int = 0) -> dict[str, Any]:
+    hist = _loot_history_payload_from_snapshot(snap, int(guild_id or 0))
+    uid = int(user_id or 0)
+    wins = [r for r in hist.get("winner_rows") or [] if int(r.get("winner_user_id") or 0) == uid]
+    bids = [b for b in hist.get("bid_rows") or [] if int(b.get("user_id") or 0) == uid]
+    actions = [a for a in hist.get("action_rows") or [] if str(a.get("actor_id") or "") == str(uid)]
+    return {"wins": wins, "bids": bids, "actions": actions, "spent_ec": sum(int(_num(r.get("winning_amount"), 0)) for r in wins), "bid_count": len(bids), "won_count": len(wins)}
+
+
+def _render_member_loot_history(data: dict[str, Any], user_id: int) -> str:
+    if not data.get("ok"):
+        return _html_shell("Mitglied-Loot · Ebo Dashboard", f"<section class='panel'><h1>🎁 Mitglied-Loot</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+    snap: dict[str, Any] = data.get("snapshot") or {}
+    names = _profile_name_map(snap)
+    guild_id = _safe_guild_id(data)
+    user_id = int(user_id or 0)
+    display = names.get(user_id, f"User {user_id}")
+    payload = _loot_member_payload_from_snapshot(snap, user_id, int(guild_id or 0))
+
+    cards = "".join([
+        _card("Gewonnen", payload.get("won_count", 0), "Items"),
+        _card("Ausgegeben", _fmt_ec(payload.get("spent_ec", 0)), "EC"),
+        _card("Gebote", payload.get("bid_count", 0), "bekannte Gebote"),
+        _card("Aktionen", len(payload.get("actions") or []), "Dashboard-Queue"),
+    ])
+
+    win_rows = []
+    for r in payload.get("wins") or []:
+        aid = r.get("auction_id")
+        win_rows.append([_auction_link(aid, r.get("item")) if aid else r.get("item"), r.get("mode"), _fmt_ec(r.get("winning_amount")), r.get("bid_count"), _dt(r.get("closed_at"))])
+
+    bid_rows = []
+    for b in payload.get("bids") or []:
+        aid = b.get("auction_id")
+        bid_rows.append([_dt(b.get("created_at")), _auction_link(aid, b.get("item")) if aid else b.get("item"), b.get("mode"), _fmt_ec(b.get("amount")), b.get("status")])
+
+    action_rows = []
+    for a in payload.get("actions") or []:
+        p = a.get("payload") if isinstance(a.get("payload"), dict) else {}
+        item = p.get("item_name") or p.get("item") or a.get("auction_id")
+        aid = str(a.get("auction_id") or p.get("auction_id") or "")
+        action_rows.append([_dt(a.get("requested_at")), _loot_action_type_label(a.get("action_type")), _auction_link(aid, item) if aid else item, _fmt_ec(a.get("amount")), _loot_action_status_label(a.get("status")), _loot_result_text(a)])
+
+    body = f"""
+    <nav class="topnav"><a href="/member/{_e(user_id)}">← Mitglied</a><a href="/loot-history">Loot-Verlauf</a><a href="/loot">Loot</a><a href="/ec">EC</a></nav>
+    <section class="hero"><div><div class="eyebrow">Spieler-Loot</div><h1>🎁 {_e(display)}</h1><p class="muted">Persönlicher Loot-, Gebots- und Dashboard-Aktionsverlauf.</p></div><a class="btn" href="/export/member_{_e(user_id)}_loot.csv">CSV herunterladen</a></section>
+    <section class="grid">{cards}</section>
+    <section class="panel"><h2>🏆 Gewonnene Items</h2>{_table(['Item','Bereich','EC','Gebote','Zeit'], win_rows, placeholder='Gewinne durchsuchen…')}</section>
+    <section class="panel"><h2>🪙 Gebote</h2>{_table(['Zeit','Item','Bereich','EC','Status'], bid_rows, placeholder='Gebote durchsuchen…')}</section>
+    <section class="panel"><h2>📨 Dashboard-Aktionen</h2>{_table(['Zeit','Aktion','Item','EC','Status','Ergebnis'], action_rows, placeholder='Aktionen durchsuchen…')}</section>
+    """
+    return _html_shell(f"{display} Loot · Ebo Dashboard", body)
 
 
 def _render_exports_dashboard(data: dict[str, Any]) -> str:
@@ -3491,6 +3874,7 @@ def _render_exports_dashboard(data: dict[str, Any]) -> str:
         ["EC", _raw('<a class="link" href="/export/ec.csv">ec.csv</a>'), "EC-Konten"],
         ["Needs", _raw('<a class="link" href="/export/needs.csv">needs.csv</a>'), "Main/Secondary je Spieler"],
         ["Auktionen", _raw('<a class="link" href="/export/auctions.csv">auctions.csv</a>'), "Auktionsübersicht"],
+        ["Loot-Verlauf", _raw('<a class="link" href="/export/loot_history.csv">loot_history.csv</a>'), "Gewinner, Gebote, Dashboard-Aktionen"],
         ["Fairness", _raw('<a class="link" href="/export/fairness.csv">fairness.csv</a>'), "Loot/EC/Need-Hinweise"],
         ["JSON Snapshot", _raw('<a class="link" href="/api/snapshot">api/snapshot</a>'), "voller Snapshot"],
     ]
@@ -4353,6 +4737,86 @@ def api_loot_center(_: bool = Depends(_auth)):
             safe[key] = value
     return JSONResponse({"ok": True, "loot_center": safe})
 
+
+
+@app.get("/loot-history", response_class=HTMLResponse)
+def loot_history_page(_: bool = Depends(_auth)):
+    try:
+        return HTMLResponse(_render_loot_history(_snapshot_payload()))
+    except Exception as exc:
+        return HTMLResponse(_html_shell("Ebo Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"), status_code=500)
+
+
+@app.get("/api/loot-history")
+def api_loot_history(_: bool = Depends(_auth)):
+    payload = _snapshot_payload()
+    if not payload.get("ok"):
+        return JSONResponse(payload, status_code=404)
+    guild_id = _safe_guild_id(payload)
+    hist = _loot_history_payload_from_snapshot(payload.get("snapshot") or {}, int(guild_id or 0))
+    safe = {}
+    for key, value in hist.items():
+        if isinstance(value, list):
+            safe[key] = [{k: v for k, v in row.items() if k not in {"raw", "status_label"}} if isinstance(row, dict) else row for row in value]
+        else:
+            safe[key] = value
+    return JSONResponse({"ok": True, "loot_history": safe})
+
+
+@app.get("/export/loot_history.csv")
+def export_loot_history_csv(_: bool = Depends(_auth)):
+    payload = _snapshot_payload()
+    snap = payload.get("snapshot") or {}
+    guild_id = _safe_guild_id(payload)
+    hist = _loot_history_payload_from_snapshot(snap, int(guild_id or 0))
+    rows = []
+    for r in hist.get("winner_rows") or []:
+        rows.append([
+            "winner",
+            r.get("auction_id"),
+            r.get("item"),
+            r.get("mode"),
+            r.get("status"),
+            r.get("winner_user_id"),
+            r.get("winner_name"),
+            r.get("winning_amount"),
+            r.get("bid_count"),
+            _dt(r.get("closed_at")),
+            "",
+            "",
+        ])
+    for b in hist.get("bid_rows") or []:
+        rows.append([
+            "bid",
+            b.get("auction_id"),
+            b.get("item"),
+            b.get("mode"),
+            b.get("status"),
+            b.get("user_id"),
+            b.get("display_name"),
+            b.get("amount"),
+            "",
+            _dt(b.get("created_at")),
+            "",
+            "",
+        ])
+    for a in hist.get("action_rows") or []:
+        p = a.get("payload") if isinstance(a.get("payload"), dict) else {}
+        rows.append([
+            "dashboard_action",
+            a.get("auction_id"),
+            p.get("item_name") or p.get("item") or "",
+            p.get("phase") or "",
+            a.get("status"),
+            a.get("actor_id"),
+            a.get("actor_name"),
+            a.get("amount"),
+            "",
+            _dt(a.get("requested_at")),
+            a.get("action_type"),
+            _loot_result_text(a),
+        ])
+    return _csv_response("loot_history.csv", ["typ","auction_id","item","bereich","status","user_id","spieler","ec","gebote","zeit","aktion","ergebnis"], rows)
 
 
 
@@ -5435,6 +5899,39 @@ def event_detail(event_id: str, _: bool = Depends(_auth)):
             _html_shell("Ebo Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
             status_code=500,
         )
+
+
+@app.get("/member/{user_id}/loot", response_class=HTMLResponse)
+def member_loot_page(user_id: int, _: bool = Depends(_auth)):
+    try:
+        return HTMLResponse(_render_member_loot_history(_snapshot_payload(), int(user_id)))
+    except Exception as exc:
+        return HTMLResponse(_html_shell("Ebo Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"), status_code=500)
+
+
+@app.get("/api/member/{user_id}/loot")
+def api_member_loot(user_id: int, _: bool = Depends(_auth)):
+    payload = _snapshot_payload()
+    if not payload.get("ok"):
+        return JSONResponse(payload, status_code=404)
+    guild_id = _safe_guild_id(payload)
+    return JSONResponse({"ok": True, "member_loot": _loot_member_payload_from_snapshot(payload.get("snapshot") or {}, int(user_id), int(guild_id or 0))})
+
+
+@app.get("/export/member_{user_id}_loot.csv")
+def export_member_loot_csv(user_id: int, _: bool = Depends(_auth)):
+    payload = _snapshot_payload()
+    guild_id = _safe_guild_id(payload)
+    p = _loot_member_payload_from_snapshot(payload.get("snapshot") or {}, int(user_id), int(guild_id or 0))
+    rows = []
+    for r in p.get("wins") or []:
+        rows.append(["winner", r.get("auction_id"), r.get("item"), r.get("mode"), r.get("winning_amount"), _dt(r.get("closed_at")), ""])
+    for b in p.get("bids") or []:
+        rows.append(["bid", b.get("auction_id"), b.get("item"), b.get("mode"), b.get("amount"), _dt(b.get("created_at")), b.get("status")])
+    for a in p.get("actions") or []:
+        payload_json = a.get("payload") if isinstance(a.get("payload"), dict) else {}
+        rows.append(["dashboard_action", a.get("auction_id"), payload_json.get("item_name") or payload_json.get("item") or "", a.get("action_type"), a.get("amount"), _dt(a.get("requested_at")), str(a.get("status") or "") + " " + _loot_result_text(a)])
+    return _csv_response(f"member_{int(user_id)}_loot.csv", ["typ","auction_id","item","bereich_aktion","ec","zeit","status_ergebnis"], rows)
 
 
 @app.get("/member/{user_id}", response_class=HTMLResponse)
