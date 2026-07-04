@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import asyncio
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -1065,7 +1066,10 @@ async def _dashboard_publish_loop(bot: commands.Bot):
         return
     for guild in list(bot.guilds):
         try:
-            sid = publish_dashboard_snapshot(bot, guild)
+            # Snapshot-Erstellung liest viele JSON-/DB-Daten. Im Thread ausführen,
+            # damit Discord-Interaktionen nicht blockieren und nicht mit
+            # "Die Anwendung reagiert nicht" enden.
+            sid = await asyncio.to_thread(publish_dashboard_snapshot, bot, guild)
             print(f"📊 Dashboard-Snapshot veröffentlicht: {guild.name} ({guild.id}) snapshot_id={sid}")
         except Exception as exc:
             print(f"⚠️ Dashboard-Snapshot für {getattr(guild, 'id', '?')} fehlgeschlagen: {exc!r}")
@@ -1116,9 +1120,9 @@ async def setup_dashboard_data(bot: commands.Bot, tree: app_commands.CommandTree
                 )
             except Exception:
                 pass
-            snap = build_dashboard_snapshot(bot, inter.guild)
+            snap = await asyncio.to_thread(build_dashboard_snapshot, bot, inter.guild)
             try:
-                runtime_db.save_dashboard_snapshot(guild_id=int(inter.guild.id), guild_name=inter.guild.name, snapshot=snap)
+                await asyncio.to_thread(runtime_db.save_dashboard_snapshot, guild_id=int(inter.guild.id), guild_name=inter.guild.name, snapshot=snap)
             except Exception:
                 pass
             count = (snap.get("guild", {}).get("member_filter") or {}).get("eligible_count", len(getattr(role, "members", []) or []))
@@ -1140,10 +1144,16 @@ async def setup_dashboard_data(bot: commands.Bot, tree: app_commands.CommandTree
             await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True)
             return
 
-        await inter.response.defer(ephemeral=True)
-        snap = build_dashboard_snapshot(bot, inter.guild)
+        await inter.response.defer(ephemeral=True, thinking=True)
         try:
-            runtime_db.save_dashboard_snapshot(guild_id=int(inter.guild.id), guild_name=inter.guild.name, snapshot=snap)
+            # Nicht im Discord-Eventloop bauen: der Snapshot kann bei vielen
+            # Profilen/Needs/Auktionen/Voice-Sessions kurz dauern.
+            snap = await asyncio.to_thread(build_dashboard_snapshot, bot, inter.guild)
+        except Exception as exc:
+            await inter.followup.send(f"❌ Dashboard-Status fehlgeschlagen: `{type(exc).__name__}: {exc}`", ephemeral=True)
+            return
+        try:
+            await asyncio.to_thread(runtime_db.save_dashboard_snapshot, guild_id=int(inter.guild.id), guild_name=inter.guild.name, snapshot=snap)
         except Exception as exc:
             print(f"⚠️ Dashboard-Status Snapshot-Publish fehlgeschlagen: {exc!r}")
         bad_sources = [k for k, v in snap.get("source_health", {}).items() if v.get("exists") and not v.get("ok")]
@@ -1192,9 +1202,9 @@ async def setup_dashboard_data(bot: commands.Bot, tree: app_commands.CommandTree
             await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True)
             return
 
-        await inter.response.defer(ephemeral=True)
+        await inter.response.defer(ephemeral=True, thinking=True)
         try:
-            path = write_dashboard_export(bot, inter.guild)
+            path = await asyncio.to_thread(write_dashboard_export, bot, inter.guild)
             await inter.followup.send(
                 "✅ Dashboard-Snapshot erstellt. Das ist nur ein Export/Lesemodell, keine Datenmigration.",
                 file=discord.File(str(path), filename=path.name),
