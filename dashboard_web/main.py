@@ -3658,6 +3658,28 @@ def _attendance_events_with_review_fallbacks(snap: dict[str, Any], guild_id: int
     return list(by_id.values())
 
 
+def _open_attendance_review_events_for_homepage(snap: dict[str, Any], guild_id: int, *, limit: int = 12) -> list[dict[str, Any]]:
+    """Review-Fallbacks für die Startseite.
+
+    Wenn ein Discord-Event aus dem Snapshot verschwunden ist, der gespeicherte
+    Attendance-Review aber noch EC braucht, bleibt es auf der Startseite sichtbar.
+    """
+    out: list[dict[str, Any]] = []
+    if not guild_id:
+        return out
+    for review in _attendance_all_reviews(guild_id, limit=300):
+        if not _attendance_review_still_needs_ec(snap, guild_id, review):
+            continue
+        eid = str(review.get("event_id") or ((review.get("payload") or {}).get("event_id")) or "").strip()
+        if not eid:
+            continue
+        stub = _event_stub_from_attendance_review(guild_id, eid)
+        if stub:
+            out.append({**stub, "_dt": _dt_obj(stub.get("when_iso") or stub.get("created_at"))})
+    out.sort(key=lambda x: (x.get("_dt") is None, x.get("_dt") or datetime.max.replace(tzinfo=timezone.utc)))
+    return out[:limit]
+
+
 def _running_events_from_snapshot(snap: dict[str, Any], *, limit: int = 12) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for ev in _events_with_pending_ec_checks(snap):
@@ -3789,10 +3811,17 @@ def _render_leadership_dashboard(data: dict[str, Any]) -> str:
 
     tasks = li.get("tasks") or []
     urgent_count = sum(1 for t in tasks if str(t.get("prio")) == "hoch")
-    running_events = li.get("running_events") or []
+    running_events = list(li.get("running_events") or [])
     active_auctions = li.get("active_auctions") or []
     flagged_members = li.get("flagged_members") or []
     guild_id = _safe_guild_id(data)
+    if guild_id:
+        seen_event_ids = {str(ev.get("event_id") or ev.get("id") or "") for ev in running_events if isinstance(ev, dict)}
+        for ev in _open_attendance_review_events_for_homepage(snap, guild_id, limit=12):
+            eid = str(ev.get("event_id") or ev.get("id") or "")
+            if eid and eid not in seen_event_ids:
+                running_events.append(ev)
+                seen_event_ids.add(eid)
     queue_rows = _ec_award_requests_for_dashboard(guild_id, limit=40) if guild_id else []
     queue_counts = _ec_queue_counts(queue_rows)
     queue_open = queue_counts.get("pending", 0) + queue_counts.get("processing", 0)
@@ -3800,7 +3829,7 @@ def _render_leadership_dashboard(data: dict[str, Any]) -> str:
     cards = "".join([
         _card("Offene Aufgaben", len(tasks), f"hoch: {urgent_count}"),
         _card("Rollenmitglieder", li.get("member_count", 0), role_line),
-        _card("Laufende Events", len(running_events), "erstellt / nicht beendet"),
+        _card("Laufende Events", len(running_events), "inkl. offener Reviews"),
         _card("Aktive Auktionen", len(active_auctions), "Auktionshaus/DKP-Log"),
         _card("ohne Needliste", quality.get("missing_needs", 0), "nachpflegen lassen"),
         _card("EC gesamt", _fmt_ec(analytics.get("total_ec")), f"Ø {_fmt_ec(analytics.get('avg_ec'))}"),
@@ -3823,8 +3852,13 @@ def _render_leadership_dashboard(data: dict[str, Any]) -> str:
     for ev in running_events:
         if not isinstance(ev, dict):
             continue
+        eid = str(ev.get("event_id") or ev.get("id") or "")
+        if ev.get("_attendance_review_only"):
+            title_cell = _raw(f'<a class="link" href="/attendance/{_e(eid)}">{_e(ev.get("title") or ev.get("name") or eid)}</a> <span class="pill">aus Review</span>')
+        else:
+            title_cell = _event_link(eid, ev.get("title") or ev.get("name"))
         event_rows.append([
-            _event_link(ev.get("event_id"), ev.get("title") or ev.get("name")),
+            title_cell,
             _dt(ev.get("when_iso") or ev.get("start_at") or ev.get("created_at")),
             ev.get("participant_count", ev.get("participants", "—")),
             ev.get("maybe_count", ev.get("maybe", "—")),
@@ -3869,6 +3903,7 @@ def _render_leadership_dashboard(data: dict[str, Any]) -> str:
         [_raw('<a class="link" href="/fairness">⚖️ Fairness</a>'), "Need/EC/Loot-Hinweise"],
         [_raw('<a class="link" href="/attendance">✅ Anwesenheit</a>'), "Event-Review und EC-Buchung"],
         [_raw('<a class="link" href="/attendance-stats">📊 Anwesenheit-Stats</a>'), "Spielerquoten, offene Reviews und CSV-Export"],
+        [_raw('<a class="link" href="/attendance-archive">📦 Attendance-Archiv</a>'), "Reviews abschließen, öffnen und alte Events wiederfinden"],
         [_raw('<a class="link" href="/ec-queue">🌐 EC-Queue</a>'), "Dashboard-Buchungen prüfen, abbrechen oder neu öffnen"],
         [_raw('<a class="link" href="/audit">🧾 Audit</a>'), "Wer hat was gemacht"],
         [_raw('<a class="link" href="/admin">🛡️ Leitung</a>'), "interne Notizen und Prüfmarkierungen"],
@@ -3888,6 +3923,7 @@ def _render_leadership_dashboard(data: dict[str, Any]) -> str:
       <a href="/ec-queue">EC-Queue</a>
       <a href="/attendance">Anwesenheit</a>
       <a href="/attendance-stats">Anwesenheit-Stats</a>
+      <a href="/attendance-archive">Attendance-Archiv</a>
       <a href="/audit">Audit</a>
       <a href="/admin">Leitung</a>
       <a href="/settings">Einstellungen</a>
@@ -4556,7 +4592,7 @@ def _attendance_review_save(guild_id: int, event_id: str, payload: dict[str, Any
     if not _database_url() or not guild_id or not event_id:
         raise RuntimeError("DATABASE_URL/Guild/Event fehlt")
     status = str(status or "draft").strip().lower()
-    if status not in {"draft", "reviewed", "locked"}:
+    if status not in {"draft", "reviewed", "locked", "closed", "archived"}:
         status = "draft"
     actor_id = str(actor.get("user_id") or "")
     actor_name = str(actor.get("username") or actor.get("user_id") or "")
@@ -4593,13 +4629,20 @@ def _attendance_review_save(guild_id: int, event_id: str, payload: dict[str, Any
 
 
 def _attendance_status_label(value: Any) -> str:
-    v = str(value or "open").lower()
+    v = str(value or "open").strip().lower()
     return {
+        # Spieler-Zeilen
         "present": "✅ War da",
         "partial": "🟡 Teilweise / prüfen",
         "absent": "❌ Nicht da",
         "ignore": "⚪ Ignorieren",
         "open": "— offen",
+        # Review-Status
+        "draft": "📝 Entwurf",
+        "reviewed": "✅ Review gespeichert",
+        "locked": "🔒 Freigegeben",
+        "closed": "📦 Abgeschlossen",
+        "archived": "📚 Archiviert",
     }.get(v, "— offen")
 
 
@@ -4760,6 +4803,7 @@ def _attendance_stats_payload(data: dict[str, Any]) -> dict[str, Any]:
     locked_count = 0
     reviewed_count = 0
     draft_count = 0
+    closed_count = 0
 
     for rev in reviews:
         eid = str(rev.get("event_id") or "")
@@ -4772,6 +4816,8 @@ def _attendance_stats_payload(data: dict[str, Any]) -> dict[str, Any]:
             locked_count += 1
         elif status_review == "reviewed":
             reviewed_count += 1
+        elif status_review in {"closed", "archived"}:
+            closed_count += 1
         else:
             draft_count += 1
 
@@ -4818,6 +4864,8 @@ def _attendance_stats_payload(data: dict[str, Any]) -> dict[str, Any]:
         event_title = str(payload.get("event_title") or ev.get("title") or eid or "Event")
         event_when = payload.get("event_when") or ev.get("when_iso")
         queue = _event_ec_queue_status(guild_id, eid) if eid else {}
+        queue_latest = queue.get("latest") if isinstance(queue, dict) else {}
+        queue_status_value = str((queue_latest or {}).get("status") or "") or ("pending" if (queue or {}).get("has_active") else "done" if (queue or {}).get("has_done") else "—")
         event_rows.append({
             "event_id": eid,
             "event_title": event_title,
@@ -4832,7 +4880,7 @@ def _attendance_stats_payload(data: dict[str, Any]) -> dict[str, Any]:
             "ignore": counts.get("ignore", 0),
             "open": counts.get("open", 0),
             "rate": _attendance_rate(counts.get("present", 0), counts.get("partial", 0), counts.get("absent", 0)),
-            "queue_status": queue.get("status") or "—",
+            "queue_status": queue_status_value,
         })
 
     player_rows = []
@@ -4869,6 +4917,7 @@ def _attendance_stats_payload(data: dict[str, Any]) -> dict[str, Any]:
         "locked_count": locked_count,
         "reviewed_count": reviewed_count,
         "draft_count": draft_count,
+        "closed_count": closed_count,
         "total_lines": total_lines,
         "open_lines": open_lines,
         "player_count": len(player_rows),
@@ -4887,12 +4936,13 @@ def _render_attendance_stats_dashboard(data: dict[str, Any]) -> str:
         _card("Review-Zeilen", payload.get("total_lines", 0), f"offen: {payload.get('open_lines', 0)}"),
         _card("Spieler", payload.get("player_count", 0), "in gespeicherten Reviews"),
         _card("Drafts", payload.get("draft_count", 0), "noch nicht abgeschlossen"),
+        _card("Abgeschlossen", payload.get("closed_count", 0), "im Archiv"),
     ])
 
     event_table = []
     for ev in payload.get("event_rows") or []:
         event_table.append([
-            _event_link(ev.get("event_id"), ev.get("event_title")),
+            _raw(f'<a class="link" href="/attendance/{_e(str(ev.get("event_id") or ""))}">{_e(ev.get("event_title") or ev.get("event_id") or "Event")}</a>'),
             _dt(ev.get("event_when")),
             ev.get("review_status"),
             ev.get("rows", 0),
@@ -4937,7 +4987,7 @@ def _render_attendance_stats_dashboard(data: dict[str, Any]) -> str:
         ])
 
     body = f"""
-    <nav class="topnav"><a href="/">Kommando</a><a href="/attendance">Anwesenheit</a><a href="/ec-queue">EC-Queue</a><a href="/planning">Planung</a><a href="/voice">Voice</a><a href="/export/attendance_stats.csv">CSV</a><a href="/api/attendance-stats">API</a></nav>
+    <nav class="topnav"><a href="/">Kommando</a><a href="/attendance">Anwesenheit</a><a href="/attendance-archive">Archiv</a><a href="/ec-queue">EC-Queue</a><a href="/planning">Planung</a><a href="/voice">Voice</a><a href="/export/attendance_stats.csv">CSV</a><a href="/api/attendance-stats">API</a></nav>
     <section class="hero">
       <div>
         <div class="eyebrow">Read-only · gespeicherte Attendance Reviews</div>
@@ -4981,7 +5031,7 @@ def _render_attendance_list(data: dict[str, Any]) -> str:
             _pending_ec_check_label(ev),
         ])
     body = f"""
-    <nav class="topnav"><a href="/">Kommando</a><a href="/planning">Planung</a><a href="/attendance-stats">Anwesenheit-Stats</a><a href="/voice">Voice</a><a href="/ec-queue">EC-Queue</a><a href="/admin">Leitung</a></nav>
+    <nav class="topnav"><a href="/">Kommando</a><a href="/planning">Planung</a><a href="/attendance-stats">Anwesenheit-Stats</a><a href="/attendance-archive">Archiv</a><a href="/voice">Voice</a><a href="/ec-queue">EC-Queue</a><a href="/admin">Leitung</a></nav>
     <section class="hero">
       <div>
         <div class="eyebrow">Ebene 3 · sichere Admin-Aktion</div>
@@ -4997,6 +5047,37 @@ def _render_attendance_list(data: dict[str, Any]) -> str:
     </section>
     """
     return _html_shell("Anwesenheit · Ebo Dashboard", body)
+
+
+def _attendance_review_control_panel(guild_id: int, event_id: str, review: dict[str, Any]) -> str:
+    status = str((review or {}).get("status") or "draft").strip().lower()
+    queue = _event_ec_queue_status(guild_id, event_id) if guild_id and event_id else {}
+    latest = queue.get("latest") or {}
+    queue_label = _ec_award_status_label(str(latest.get("status") or "")) if latest else "keine Anfrage"
+    if status in {"closed", "archived"}:
+        return f"""
+        <section class="panel">
+          <h2>📦 Review abgeschlossen</h2>
+          <p class="muted">Dieser Review ist abgeschlossen und wird nicht mehr in der normalen Anwesenheitsliste angezeigt. Er bleibt in Stats/Archiv erhalten.</p>
+          <p>Queue: <strong>{_e(queue_label)}</strong></p>
+          <form method="post" action="/admin/attendance/{_e(event_id)}/reopen" onsubmit="return confirm('Review wieder in Anwesenheit öffnen?');">
+            <button class="btn" type="submit">🔓 Wieder öffnen</button>
+          </form>
+        </section>
+        """
+    return f"""
+    <section class="panel">
+      <h2>📦 Abschlusssteuerung</h2>
+      <p class="muted">Solange dieser Review offen ist und EC noch nicht erledigt wurde, bleibt er in Anwesenheit/Homepage sichtbar. Nach Abschluss landet er nur noch in Stats/Archiv.</p>
+      <p>Aktueller Review-Status: <strong>{_e(_attendance_status_label(status))}</strong> · Queue: <strong>{_e(queue_label)}</strong></p>
+      <div style="display:flex;gap:10px;flex-wrap:wrap">
+        <form method="post" action="/admin/attendance/{_e(event_id)}/close" onsubmit="return confirm('Review abschließen und aus der normalen Anwesenheitsliste ausblenden?');">
+          <button class="btn" type="submit">✅ Review abschließen</button>
+        </form>
+        <a class="btn" href="/attendance-archive">📚 Archiv öffnen</a>
+      </div>
+    </section>
+    """
 
 
 def _render_attendance_event(data: dict[str, Any], event_id: str, saved: bool = False) -> str:
@@ -5056,7 +5137,7 @@ def _render_attendance_event(data: dict[str, Any], event_id: str, saved: bool = 
     if review:
         updated = f"<p class='muted'>Letzte Speicherung: {_e(_dt(review.get('updated_at')))} durch {_e(review.get('updated_by_name') or '—')} · Status: {_e(review.get('status') or 'draft')}</p>"
     body = f"""
-    <nav class="topnav"><a href="/attendance">← Anwesenheit</a><a href="/attendance-stats">Stats</a><a href="/event/{_e(event_id)}">Eventdetails</a><a href="/attendance/{_e(event_id)}/ec-preview">EC-Vorschau</a><a href="/attendance/{_e(event_id)}/report">Abschlussbericht</a><a href="#event-ec-queue">EC-Queue</a><a href="/voice">Voice</a><a href="/ec">EC</a></nav>
+    <nav class="topnav"><a href="/attendance">← Anwesenheit</a><a href="/attendance-stats">Stats</a><a href="/attendance-archive">Archiv</a><a href="/event/{_e(event_id)}">Eventdetails</a><a href="/attendance/{_e(event_id)}/ec-preview">EC-Vorschau</a><a href="/attendance/{_e(event_id)}/report">Abschlussbericht</a><a href="#event-ec-queue">EC-Queue</a><a href="/voice">Voice</a><a href="/ec">EC</a></nav>
     <section class="hero">
       <div>
         <div class="eyebrow">Anwesenheits-Review · keine EC-Buchung</div>
@@ -5067,6 +5148,7 @@ def _render_attendance_event(data: dict[str, Any], event_id: str, saved: bool = 
       <div style="display:flex;gap:8px;flex-wrap:wrap"><form method="post" action="/admin/attendance/{_e(event_id)}/voice-suggest"><button class="btn" type="submit">🎙️ Voice-Vorschlag neu laden</button></form><a class="btn" href="/attendance/{_e(event_id)}/ec-preview">🪙 EC-Vorschau</a><a class="btn" href="/attendance/{_e(event_id)}/report">📋 Abschlussbericht</a></div>
     </section>
     {saved_note}
+    {_raw(_attendance_review_control_panel(guild_id, str(event_id), review))}
     <section class="grid">{cards}</section>
     <section class="panel">
       <h2>⚙️ Schnellaktionen</h2>
@@ -5104,6 +5186,126 @@ def _render_attendance_event(data: dict[str, Any], event_id: str, saved: bool = 
     """
     return _html_shell(f"Anwesenheit · {event.get('title') or event_id}", body)
 
+
+
+def _attendance_review_counts(payload: dict[str, Any]) -> dict[str, int]:
+    items = [x for x in ((payload or {}).get("items") or []) if isinstance(x, dict)]
+    counts = {"present": 0, "partial": 0, "absent": 0, "ignore": 0, "open": 0}
+    for item in items:
+        st = _norm_attendance_status(item.get("status"))
+        counts[st] = counts.get(st, 0) + 1
+    counts["rows"] = len(items)
+    return counts
+
+
+def _render_attendance_archive(data: dict[str, Any]) -> str:
+    if not data.get("ok"):
+        return _html_shell("Attendance-Archiv · Ebo Dashboard", f"<section class='panel'><h1>📦 Attendance-Archiv</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+    snap: dict[str, Any] = data.get("snapshot") or {}
+    guild_id = _safe_guild_id(data)
+    reviews = _attendance_all_reviews(guild_id, limit=500) if guild_id else []
+    rows: list[list[Any]] = []
+    open_count = 0
+    closed_count = 0
+    queue_pending = 0
+    for rev in reviews:
+        eid = str(rev.get("event_id") or "")
+        payload = rev.get("payload") if isinstance(rev.get("payload"), dict) else {}
+        counts = _attendance_review_counts(payload)
+        status = str(rev.get("status") or "draft").strip().lower()
+        still_needs = _attendance_review_still_needs_ec(snap, guild_id, rev)
+        if still_needs:
+            open_count += 1
+        if status in {"closed", "archived"}:
+            closed_count += 1
+        queue = _event_ec_queue_status(guild_id, eid) if eid else {}
+        latest = queue.get("latest") or {}
+        qstatus = str(latest.get("status") or "")
+        if qstatus in {"pending", "processing"}:
+            queue_pending += 1
+        action = _raw(f'<a class="btn mini-btn" href="/attendance/{_e(eid)}">Öffnen</a>')
+        if status in {"closed", "archived"}:
+            action = _raw(f"<form method=\"post\" action=\"/admin/attendance/{_e(eid)}/reopen\" style=\"display:inline\" onsubmit=\"return confirm('Review wieder öffnen?');\"><button class=\"btn mini-btn\" type=\"submit\">Wieder öffnen</button></form>")
+        rows.append([
+            _raw(f'<a class="link" href="/attendance/{_e(eid)}">{_e(payload.get("event_title") or eid)}</a>' + (" <span class='pill'>offen</span>" if still_needs else "")),
+            _dt(payload.get("event_when") or rev.get("updated_at")),
+            _attendance_status_label(status),
+            _ec_award_status_label(qstatus) if qstatus else "—",
+            counts.get("rows", 0),
+            counts.get("present", 0),
+            counts.get("partial", 0),
+            counts.get("absent", 0),
+            counts.get("open", 0),
+            _dt(rev.get("updated_at")),
+            action,
+        ])
+    cards = "".join([
+        _card("Reviews", len(reviews), "gespeichert"),
+        _card("Offen", open_count, "braucht noch EC/Abschluss"),
+        _card("Abgeschlossen", closed_count, "aus normaler Liste raus"),
+        _card("Queue offen", queue_pending, "pending/processing"),
+    ])
+    body = f"""
+    <nav class="topnav"><a href="/">Kommando</a><a href="/attendance">Anwesenheit</a><a href="/attendance-stats">Stats</a><a href="/ec-queue">EC-Queue</a><a href="/audit">Audit</a></nav>
+    <section class="hero">
+      <div>
+        <div class="eyebrow">Attendance-Archiv · Steuerung</div>
+        <h1>📦 Attendance-Archiv</h1>
+        <p>Hier bleiben alte Reviews auffindbar. Offene Reviews können wieder geöffnet oder abgeschlossen werden.</p>
+        <p class="muted">Snapshot: {_e(_dt(data.get('published_at')))}</p>
+      </div>
+      <a class="btn" href="/attendance">Offene Anwesenheit</a>
+    </section>
+    <section class="grid">{cards}</section>
+    <section class="panel">
+      <h2>📋 Alle gespeicherten Reviews</h2>
+      {_table(['Event','Zeit','Review','Queue','Zeilen','War da','Teilweise','Nicht da','Offen','Geändert','Aktion'], rows, placeholder='Archiv durchsuchen…')}
+    </section>
+    """
+    return _html_shell("Attendance-Archiv · Ebo Dashboard", body)
+
+
+@app.get("/attendance-archive", response_class=HTMLResponse)
+def attendance_archive_page(_: bool = Depends(_auth)):
+    try:
+        return HTMLResponse(_render_attendance_archive(_snapshot_payload()))
+    except Exception as exc:
+        return HTMLResponse(_html_shell("Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"), status_code=500)
+
+
+@app.post("/admin/attendance/{event_id}/close")
+def admin_attendance_close(event_id: str, request: Request, _: bool = Depends(_admin_auth)):
+    payload = _snapshot_payload()
+    snap: dict[str, Any] = payload.get("snapshot") or {}
+    guild_id = _safe_guild_id(payload)
+    event = _event_by_id(snap, str(event_id)) or _event_stub_from_attendance_review(guild_id, str(event_id))
+    review = _attendance_review_load(guild_id, str(event_id))
+    review_payload = review.get("payload") if isinstance(review.get("payload"), dict) else {}
+    if not review_payload.get("items") and event:
+        review_payload = _attendance_review_payload_from_event(snap, event, mode="voice")
+    if not review_payload:
+        raise HTTPException(status_code=404, detail="Kein Review zum Abschließen gefunden")
+    actor = _current_user(request) or {}
+    review_payload["closed_at"] = datetime.now(timezone.utc).isoformat()
+    review_payload["closed_by"] = {"id": str(actor.get("user_id") or ""), "name": str(actor.get("username") or actor.get("user_id") or "Dashboard")}
+    review_payload.setdefault("event_id", str(event_id))
+    _attendance_review_save(guild_id, str(event_id), review_payload, actor, status="closed")
+    return RedirectResponse("/attendance-archive", status_code=303)
+
+
+@app.post("/admin/attendance/{event_id}/reopen")
+def admin_attendance_reopen(event_id: str, request: Request, _: bool = Depends(_admin_auth)):
+    payload = _snapshot_payload()
+    guild_id = _safe_guild_id(payload)
+    review = _attendance_review_load(guild_id, str(event_id))
+    review_payload = review.get("payload") if isinstance(review.get("payload"), dict) else {}
+    if not review_payload:
+        raise HTTPException(status_code=404, detail="Kein Review zum Öffnen gefunden")
+    actor = _current_user(request) or {}
+    review_payload["reopened_at"] = datetime.now(timezone.utc).isoformat()
+    review_payload["reopened_by"] = {"id": str(actor.get("user_id") or ""), "name": str(actor.get("username") or actor.get("user_id") or "Dashboard")}
+    _attendance_review_save(guild_id, str(event_id), review_payload, actor, status="reviewed")
+    return RedirectResponse(f"/attendance/{urllib.parse.quote(str(event_id))}?saved=1", status_code=303)
 
 
 @app.get("/attendance-stats", response_class=HTMLResponse)
@@ -5741,7 +5943,7 @@ def _render_attendance_ec_preview(data: dict[str, Any], event_id: str, full_ec: 
     if latest_request:
         notice += f"<div class='warn'>📌 Letzte Dashboard-EC-Anfrage: <strong>{_e(latest_request.get('status'))}</strong> · Request <code>{_e(latest_request.get('request_id'))}</code> · {_e(_dt(latest_request.get('requested_at')))}</div>"
     body = f"""
-    <nav class="topnav"><a href="/attendance/{_e(event_id)}">← Review</a><a href="/attendance/{_e(event_id)}/report">Abschlussbericht</a><a href="/attendance">Anwesenheit</a><a href="/ec">EC-Verlauf</a><a href="/ec-queue">EC-Queue</a><a href="/event/{_e(event_id)}">Eventdetails</a></nav>
+    <nav class="topnav"><a href="/attendance/{_e(event_id)}">← Review</a><a href="/attendance/{_e(event_id)}/report">Abschlussbericht</a><a href="/attendance">Anwesenheit</a><a href="/attendance-archive">Archiv</a><a href="/ec">EC-Verlauf</a><a href="/ec-queue">EC-Queue</a><a href="/event/{_e(event_id)}">Eventdetails</a></nav>
     <section class="hero">
       <div>
         <div class="eyebrow">EC-Vorschau + Bot-Buchung über sichere Queue</div>
@@ -5905,7 +6107,7 @@ def _render_attendance_report(data: dict[str, Any], event_id: str, full_ec: Opti
             copy_lines.append(f"- {r.get('display_name')}: {r.get('warning')}")
     copy_text = "\n".join(copy_lines)
     body = f"""
-    <nav class="topnav"><a href="/attendance/{_e(event_id)}">← Review</a><a href="/attendance/{_e(event_id)}/ec-preview">EC-Vorschau</a><a href="/attendance">Anwesenheit</a><a href="/ec-queue">EC-Queue</a><a href="/event/{_e(event_id)}">Eventdetails</a></nav>
+    <nav class="topnav"><a href="/attendance/{_e(event_id)}">← Review</a><a href="/attendance/{_e(event_id)}/ec-preview">EC-Vorschau</a><a href="/attendance">Anwesenheit</a><a href="/attendance-archive">Archiv</a><a href="/ec-queue">EC-Queue</a><a href="/event/{_e(event_id)}">Eventdetails</a></nav>
     <section class="hero">
       <div>
         <div class="eyebrow">Attendance-Abschlussbericht · read-only</div>
