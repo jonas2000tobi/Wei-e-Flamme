@@ -67,17 +67,38 @@ def _member_is_active(guild: discord.Guild, user_id: int) -> bool:
         return False
 
 
+DASHBOARD_MEMBER_ROLE_SETTING = "dashboard_member_role_id"
+
+
+def _dashboard_member_role_config_value(guild_id: int) -> Any:
+    """Serverbezogene Dashboard-Gildenrolle aus Postgres/Runtime-DB lesen."""
+    try:
+        return runtime_db.get_guild_setting(int(guild_id), DASHBOARD_MEMBER_ROLE_SETTING, None)
+    except Exception:
+        return None
+
+
 def _dashboard_member_role(guild: discord.Guild) -> Optional[discord.Role]:
     """Rolle, die fürs Dashboard als echte Gildenmitgliedschaft zählt.
 
-    Standard ist die Rolle `Ebolus`. Für andere Gilden/Vermietung kann später
-    per Railway-Variable überschrieben werden:
+    Für Vermietung/Multi-Guild gibt es keinen festen Default wie `Ebolus`.
+    Jede Gilde setzt ihre Mitgliederrolle aktiv über:
+
+        /dashboard_set_member_role role:<Rolle>
+
+    Optionaler Notfall-Fallback per Railway:
     - DASHBOARD_MEMBER_ROLE_ID=123...
     - DASHBOARD_MEMBER_ROLE_NAME=Gildenmitglied
-
-    Wenn die Rolle nicht gefunden wird, fällt das Dashboard auf aktuelle
-    Servermitglieder zurück, damit es nicht leer bleibt.
     """
+    raw_setting = _dashboard_member_role_config_value(guild.id)
+    if raw_setting not in (None, ""):
+        try:
+            role = guild.get_role(int(raw_setting))
+            if role is not None:
+                return role
+        except Exception:
+            pass
+
     raw_role_id = os.getenv("DASHBOARD_MEMBER_ROLE_ID", "").strip()
     if raw_role_id:
         try:
@@ -87,7 +108,8 @@ def _dashboard_member_role(guild: discord.Guild) -> Optional[discord.Role]:
         except Exception:
             pass
 
-    role_name = os.getenv("DASHBOARD_MEMBER_ROLE_NAME", "Ebolus").strip().lower()
+    # Kein Ebolus-Default mehr. Rollenname nur, wenn Betreiber ihn bewusst setzt.
+    role_name = os.getenv("DASHBOARD_MEMBER_ROLE_NAME", "").strip().lower()
     if role_name:
         for role in getattr(guild, "roles", []):
             try:
@@ -102,24 +124,32 @@ def _dashboard_member_ids(guild: discord.Guild) -> set[int]:
     role = _dashboard_member_role(guild)
     if role is not None:
         return {int(m.id) for m in getattr(role, "members", []) if getattr(m, "id", None)}
-    return _active_member_ids(guild)
+    # Absichtlich kein Fallback auf alle Servermitglieder. Für Massentauglichkeit
+    # muss eine Gildenrolle gesetzt sein.
+    return set()
 
 
 def _dashboard_member_filter_info(guild: discord.Guild) -> dict[str, Any]:
     role = _dashboard_member_role(guild)
     ids = _dashboard_member_ids(guild)
+    configured = _dashboard_member_role_config_value(guild.id)
     if role is not None:
         return {
             "mode": "discord_role",
             "role_id": int(role.id),
             "role_name": str(role.name),
             "eligible_count": len(ids),
+            "configured": True,
+            "setting_value": str(configured or os.getenv("DASHBOARD_MEMBER_ROLE_ID") or os.getenv("DASHBOARD_MEMBER_ROLE_NAME") or ""),
         }
     return {
-        "mode": "active_discord_members_fallback",
+        "mode": "role_not_configured",
         "role_id": 0,
         "role_name": "",
-        "eligible_count": len(ids),
+        "eligible_count": 0,
+        "configured": False,
+        "setting_value": str(configured or ""),
+        "hint": "Mit /dashboard_set_member_role role:<Rolle> eine Gildenrolle setzen.",
     }
 
 
@@ -584,6 +614,46 @@ def start_dashboard_publisher(bot: commands.Bot) -> None:
 
 async def setup_dashboard_data(bot: commands.Bot, tree: app_commands.CommandTree):
     start_dashboard_publisher(bot)
+    @tree.command(name="dashboard_set_member_role", description="Legt die Gildenrolle fest, die im Dashboard als Mitglied zählt.")
+    @app_commands.describe(role="Rolle, die echte Gildenmitglieder haben müssen")
+    async def dashboard_set_member_role(inter: discord.Interaction, role: discord.Role):
+        if inter.guild is None:
+            await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
+            return
+        if not _is_admin(inter):
+            await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True)
+            return
+
+        await inter.response.defer(ephemeral=True)
+        try:
+            runtime_db.set_guild_setting(int(inter.guild.id), DASHBOARD_MEMBER_ROLE_SETTING, int(role.id))
+            try:
+                runtime_db.write_audit_log(
+                    guild_id=int(inter.guild.id),
+                    actor_id=int(inter.user.id),
+                    action="dashboard_member_role_set",
+                    target_type="role",
+                    target_id=str(role.id),
+                    summary=f"Dashboard-Gildenrolle gesetzt: {role.name}",
+                    new_value={"role_id": int(role.id), "role_name": role.name},
+                )
+            except Exception:
+                pass
+            snap = build_dashboard_snapshot(bot, inter.guild)
+            try:
+                runtime_db.save_dashboard_snapshot(guild_id=int(inter.guild.id), guild_name=inter.guild.name, snapshot=snap)
+            except Exception:
+                pass
+            count = (snap.get("guild", {}).get("member_filter") or {}).get("eligible_count", len(getattr(role, "members", []) or []))
+            await inter.followup.send(
+                f"✅ Dashboard-Gildenrolle gesetzt: {role.mention}\n"
+                f"Rollenmitglieder im Dashboard: **{count}**\n"
+                "Dashboard wurde aktualisiert.",
+                ephemeral=True,
+            )
+        except Exception as exc:
+            await inter.followup.send(f"❌ Konnte Rolle nicht speichern: `{type(exc).__name__}: {exc}`", ephemeral=True)
+
     @tree.command(name="dashboard_status", description="Zeigt den Status der read-only Dashboard-Datenbasis.")
     async def dashboard_status(inter: discord.Interaction):
         if inter.guild is None:
@@ -682,4 +752,4 @@ async def setup_dashboard_data(bot: commands.Bot, tree: app_commands.CommandTree
         emb = discord.Embed(title="📁 Dashboard-Quellen", description=txt, color=0xD6A84F)
         await inter.response.send_message(embed=emb, ephemeral=True)
 
-    print("📊 Dashboard-Datenlayer registriert: /dashboard_status, /dashboard_export, /dashboard_sources")
+    print("📊 Dashboard-Datenlayer registriert: /dashboard_set_member_role, /dashboard_status, /dashboard_export, /dashboard_sources")
