@@ -6,15 +6,21 @@ import os
 import secrets
 import csv
 import io
+import base64
+import hashlib
+import hmac
+import time
+import urllib.parse
+import urllib.request
 from collections import Counter
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from fastapi import Depends, FastAPI, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse, Response
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse, JSONResponse, Response, RedirectResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
-app = FastAPI(title="Ebo Dashboard", version="0.8.2")
+app = FastAPI(title="Ebo Dashboard", version="0.9.0")
 security = HTTPBasic(auto_error=False)
 
 
@@ -36,12 +42,134 @@ def _pg_connect():
     return psycopg.connect(_normalized_database_url(), row_factory=dict_row, connect_timeout=10)
 
 
-def _auth(credentials: Optional[HTTPBasicCredentials] = Depends(security)) -> bool:
-    password = str(os.getenv("DASHBOARD_PASSWORD") or "").strip()
+# ---------------------------------------------------------------------------
+# Auth
+# ---------------------------------------------------------------------------
+# Das Dashboard unterstützt jetzt zwei Modi:
+# 1) Basic Auth über DASHBOARD_USERNAME / DASHBOARD_PASSWORD (Fallback/Test)
+# 2) Discord OAuth über DASHBOARD_DISCORD_CLIENT_ID / DASHBOARD_DISCORD_CLIENT_SECRET
+#
+# Discord OAuth ist bewusst optional. Wenn es nicht konfiguriert ist, bleibt dein
+# bisheriger Passwort-Login unverändert.
+
+SESSION_COOKIE = "ebo_dashboard_session"
+STATE_COOKIE = "ebo_dashboard_state"
+DISCORD_API_BASE = "https://discord.com/api/v10"
+
+
+def _env(name: str, default: str = "") -> str:
+    return str(os.getenv(name) or default).strip()
+
+
+def _discord_oauth_enabled() -> bool:
+    return bool(_env("DASHBOARD_DISCORD_CLIENT_ID") and _env("DASHBOARD_DISCORD_CLIENT_SECRET"))
+
+
+def _auth_mode() -> str:
+    mode = _env("DASHBOARD_AUTH_MODE", "hybrid").lower()
+    if mode not in {"basic", "discord", "hybrid"}:
+        return "hybrid"
+    return mode
+
+
+def _session_secret() -> str:
+    # Eigene Variable ist besser. Fallback auf Dashboard-Passwort, damit bestehende Setups nicht brechen.
+    return _env("DASHBOARD_SESSION_SECRET") or _env("DASHBOARD_PASSWORD") or "dev-dashboard-secret-change-me"
+
+
+def _b64e(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _b64d(value: str) -> bytes:
+    value = value + "=" * (-len(value) % 4)
+    return base64.urlsafe_b64decode(value.encode("ascii"))
+
+
+def _sign(value: str) -> str:
+    return hmac.new(_session_secret().encode("utf-8"), value.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def _make_token(payload: dict[str, Any]) -> str:
+    raw = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    body = _b64e(raw)
+    return f"{body}.{_sign(body)}"
+
+
+def _read_token(token: str) -> Optional[dict[str, Any]]:
+    try:
+        body, sig = str(token or "").split(".", 1)
+        if not hmac.compare_digest(sig, _sign(body)):
+            return None
+        payload = json.loads(_b64d(body).decode("utf-8"))
+        exp = int(payload.get("exp") or 0)
+        if exp and exp < int(time.time()):
+            return None
+        return payload if isinstance(payload, dict) else None
+    except Exception:
+        return None
+
+
+def _current_user(request: Request) -> Optional[dict[str, Any]]:
+    return _read_token(request.cookies.get(SESSION_COOKIE, ""))
+
+
+def _csv_ids(value: str) -> set[str]:
+    return {x.strip() for x in str(value or "").replace(";", ",").split(",") if x.strip()}
+
+
+def _configured_member_role_id_from_snapshot() -> str:
+    try:
+        payload = _snapshot_payload()
+        snap = payload.get("snapshot") or {}
+        member_filter = ((snap.get("settings") or {}).get("member_filter") or (snap.get("guild") or {}).get("member_filter") or {})
+        if isinstance(member_filter, dict):
+            return str(member_filter.get("role_id") or "").strip()
+    except Exception:
+        return ""
+    return ""
+
+
+def _configured_member_role_name_from_snapshot() -> str:
+    try:
+        payload = _snapshot_payload()
+        snap = payload.get("snapshot") or {}
+        member_filter = ((snap.get("settings") or {}).get("member_filter") or (snap.get("guild") or {}).get("member_filter") or {})
+        if isinstance(member_filter, dict):
+            return str(member_filter.get("role_name") or "").strip()
+    except Exception:
+        return ""
+    return ""
+
+
+def _allowed_role_ids() -> set[str]:
+    explicit = _csv_ids(_env("DASHBOARD_ALLOWED_ROLE_IDS"))
+    admin = _csv_ids(_env("DASHBOARD_ADMIN_ROLE_IDS"))
+    member = _csv_ids(_env("DASHBOARD_MEMBER_ROLE_IDS"))
+    configured = _env("DASHBOARD_MEMBER_ROLE_ID") or _configured_member_role_id_from_snapshot()
+    out = set()
+    out.update(explicit)
+    out.update(admin)
+    out.update(member)
+    if configured:
+        out.add(str(configured))
+    return out
+
+
+def _admin_role_ids() -> set[str]:
+    return _csv_ids(_env("DASHBOARD_ADMIN_ROLE_IDS"))
+
+
+def _cookie_secure() -> bool:
+    return _env("DASHBOARD_COOKIE_SECURE", "1") not in {"0", "false", "False", "nein", "no"}
+
+
+def _basic_auth(credentials: Optional[HTTPBasicCredentials]) -> bool:
+    password = _env("DASHBOARD_PASSWORD")
     if not password:
-        # Für den allerersten Test erlaubt. Auf Railway danach unbedingt setzen.
+        # Für den allerersten Test erlaubt. Auf Railway danach unbedingt setzen oder Discord OAuth nutzen.
         return True
-    username = str(os.getenv("DASHBOARD_USERNAME") or "admin").strip() or "admin"
+    username = _env("DASHBOARD_USERNAME", "admin") or "admin"
     if not credentials:
         raise HTTPException(status_code=401, detail="Auth required", headers={"WWW-Authenticate": "Basic"})
     ok_user = secrets.compare_digest(credentials.username, username)
@@ -49,6 +177,50 @@ def _auth(credentials: Optional[HTTPBasicCredentials] = Depends(security)) -> bo
     if not (ok_user and ok_pw):
         raise HTTPException(status_code=401, detail="Auth required", headers={"WWW-Authenticate": "Basic"})
     return True
+
+
+def _auth(request: Request, credentials: Optional[HTTPBasicCredentials] = Depends(security)) -> bool:
+    mode = _auth_mode()
+
+    if mode in {"discord", "hybrid"} and _discord_oauth_enabled():
+        user = _current_user(request)
+        if user:
+            return True
+        if mode == "discord":
+            raise HTTPException(status_code=303, detail="Login required", headers={"Location": f"/login?next={urllib.parse.quote(str(request.url.path))}"})
+
+    # Hybrid/Basic-Fallback bleibt absichtlich erhalten, damit du dich nicht aussperrst.
+    if mode in {"basic", "hybrid"}:
+        return _basic_auth(credentials)
+
+    raise HTTPException(status_code=303, detail="Login required", headers={"Location": "/login"})
+
+
+def _request_json(url: str, *, method: str = "GET", data: Optional[dict[str, Any]] = None, token: str = "") -> dict[str, Any]:
+    body = None
+    headers = {"Accept": "application/json"}
+    if data is not None:
+        body = urllib.parse.urlencode(data).encode("utf-8")
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(url, data=body, headers=headers, method=method)
+    with urllib.request.urlopen(req, timeout=12) as resp:  # nosec - Discord API URL only from constants
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _base_url(request: Request) -> str:
+    # Railway setzt üblicherweise Host/Proto korrekt. Bei Custom Domain sonst per Env überschreiben.
+    forced = _env("DASHBOARD_PUBLIC_BASE_URL").rstrip("/")
+    if forced:
+        return forced
+    proto = request.headers.get("x-forwarded-proto") or request.url.scheme
+    host = request.headers.get("x-forwarded-host") or request.headers.get("host") or request.url.netloc
+    return f"{proto}://{host}".rstrip("/")
+
+
+def _redirect_uri(request: Request) -> str:
+    return _env("DASHBOARD_DISCORD_REDIRECT_URI") or f"{_base_url(request)}/auth/discord/callback"
 
 
 def _e(value: Any) -> str:
@@ -808,8 +980,12 @@ def _render_auction_detail(data: dict[str, Any], auction_id: str) -> str:
 
 def _html_shell(title: str, body: str) -> str:
     auth_note = ""
-    if not str(os.getenv("DASHBOARD_PASSWORD") or "").strip():
+    if _discord_oauth_enabled():
+        auth_note = '<div class="authbar">🔐 Discord-Login aktiv · <a href="/me">Mein Login</a> · <a href="/logout">Logout</a></div>'
+    elif not _env("DASHBOARD_PASSWORD"):
         auth_note = '<div class="warn">⚠️ DASHBOARD_PASSWORD ist nicht gesetzt. Dashboard ist aktuell ohne Login erreichbar.</div>'
+    else:
+        auth_note = '<div class="authbar">🔐 Passwort-Login aktiv</div>'
     return f"""<!doctype html>
 <html lang="de">
 <head>
@@ -849,6 +1025,7 @@ def _html_shell(title: str, body: str) -> str:
     .need-list {{ margin:8px 0 16px; padding-left:22px; color:var(--text); }} .need-list li {{ margin:5px 0; }}
     code {{ background:#05060a; border:1px solid var(--line); padding:2px 5px; border-radius:6px; }}
     .empty {{ color:var(--muted); padding:10px 0; }} .warn {{ background:#3a250d; border:1px solid #8a5b18; padding:12px 14px; border-radius:12px; margin-bottom:14px; color:#ffe0a3; }}
+    .authbar {{ display:flex; gap:10px; align-items:center; justify-content:flex-end; background:rgba(24,26,34,.9); border:1px solid var(--line); border-radius:12px; padding:10px 12px; margin-bottom:14px; color:var(--muted); font-size:13px; }} .authbar a {{ color:var(--gold); text-decoration:none; font-weight:700; }}
     @media(max-width:1000px) {{ .grid,.analytics-grid {{ grid-template-columns:repeat(2,minmax(0,1fr)); }} .split {{ grid-template-columns:1fr; }} .hero {{ flex-direction:column; align-items:flex-start; }} }}
     @media(max-width:560px) {{ .grid,.analytics-grid {{ grid-template-columns:1fr; }} .bar-row {{ grid-template-columns:90px 1fr 38px; }} }}
   </style>
@@ -1220,12 +1397,17 @@ def _render_settings_dashboard(data: dict[str, Any]) -> str:
     if isinstance(member_filter, dict) and member_filter.get("mode") == "discord_role":
         role_text = f"{member_filter.get('role_name')} ({member_filter.get('role_id')})"
 
+    auth_mode = _auth_mode()
+    discord_state = "aktiv" if _discord_oauth_enabled() else "nicht eingerichtet"
+    allowed_roles = ", ".join(sorted(_allowed_role_ids())) or "—"
+    admin_roles = ", ".join(sorted(_admin_role_ids())) or "—"
+
     cards = "".join([
         _card("Gildenrolle", role_text, f"Mitglieder: {member_filter.get('eligible_count', 0) if isinstance(member_filter, dict) else 0}"),
+        _card("Login", auth_mode, f"Discord: {discord_state}"),
         _card("Module", counts.get("modules", 0), "gefundene Config-Bereiche"),
         _card("Kanäle", counts.get("channels", 0), "aus Configs erkannt"),
         _card("Rollen", counts.get("roles", 0), "aus Configs erkannt"),
-        _card("Settings", counts.get("settings", 0), "wichtige Schlüssel"),
         _card("Backend", (snap.get("storage") or {}).get("runtime_backend"), "Runtime-Datenbank"),
     ])
 
@@ -1249,6 +1431,17 @@ def _render_settings_dashboard(data: dict[str, Any]) -> str:
         if isinstance(row, dict):
             setting_rows.append([row.get("source"), row.get("key"), row.get("value")])
 
+    auth_rows = [
+        ["DASHBOARD_AUTH_MODE", auth_mode, "basic / hybrid / discord"],
+        ["Discord OAuth", discord_state, "Client ID + Secret gesetzt"],
+        ["Gildenrolle", role_text, "Fallback für erlaubte Dashboard-Rolle"],
+        ["Allowed Role IDs", allowed_roles, "DASHBOARD_ALLOWED_ROLE_IDS / MEMBER_ROLE_ID(S)"],
+        ["Admin Role IDs", admin_roles, "DASHBOARD_ADMIN_ROLE_IDS"],
+        ["Public Base URL", _env("DASHBOARD_PUBLIC_BASE_URL") or "auto", "für Redirect URI / Custom Domain"],
+        ["Redirect URI", _env("DASHBOARD_DISCORD_REDIRECT_URI") or "auto: /auth/discord/callback", "muss im Discord Developer Portal stehen"],
+        ["Session Secret", "gesetzt" if _env("DASHBOARD_SESSION_SECRET") else "Fallback", "für signiertes Dashboard-Cookie"],
+    ]
+
     body = f"""
     <nav class="topnav"><a href="/">← Übersicht</a><a href="/analytics">Analytics</a><a href="/voice">Voice</a><a href="/ec">EC-Verlauf</a><a href="/audit">Audit</a><a href="/system">System</a><a href="/api/settings">API</a></nav>
     <section class="hero">
@@ -1260,6 +1453,7 @@ def _render_settings_dashboard(data: dict[str, Any]) -> str:
       <a class="btn" href="/">Zurück</a>
     </section>
     <section class="grid">{cards}</section>
+    <section class="panel"><h2>🔐 Login & Rechte</h2><p class="muted">Read-only Anzeige. Änderungen machst du aktuell über Railway-Variablen oder Discord-Commands.</p>{_table(['Setting','Wert','Hinweis'], auth_rows, placeholder='Login-Settings durchsuchen…')}</section>
     <section class="panel"><h2>🧩 Module</h2>{_table(['Bereich','konfiguriert','Quelle vorhanden','Keys'], module_rows, placeholder='Module durchsuchen…')}</section>
     <section class="panel"><h2>📺 Kanäle</h2>{_table(['Quelle','Setting','Kanal','ID'], channel_rows, placeholder='Kanäle durchsuchen…')}</section>
     <section class="panel"><h2>🎭 Rollen</h2>{_table(['Quelle','Setting','Rolle','ID'], role_rows, placeholder='Rollen durchsuchen…')}</section>
@@ -2698,6 +2892,140 @@ def api_leadership(_: bool = Depends(_auth)):
     snap = payload.get("snapshot") or {}
     return JSONResponse({"ok": True, "leadership": _leadership_insights(snap)})
 
+
+
+@app.get("/login", response_class=HTMLResponse)
+def login_page(request: Request, next: str = "/"):
+    discord_ready = _discord_oauth_enabled()
+    basic_ready = bool(_env("DASHBOARD_PASSWORD"))
+    role_id = _env("DASHBOARD_MEMBER_ROLE_ID") or _configured_member_role_id_from_snapshot()
+    role_name = _configured_member_role_name_from_snapshot() or "gesetzte Gildenrolle"
+    discord_block = ""
+    if discord_ready:
+        discord_block = f"""
+        <div class="panel">
+          <h2>Discord Login</h2>
+          <p class="muted">Zugriff wird über die Discord-Mitgliedschaft und Rollen geprüft.</p>
+          <p>Erlaubte Rolle: <strong>{_e(role_name)}</strong> <span class="muted">{_e(role_id or 'keine Rollen-ID erkannt')}</span></p>
+          <a class="btn" href="/auth/discord/start?next={_e(next or '/')}">Mit Discord einloggen</a>
+        </div>
+        """
+    else:
+        discord_block = """
+        <div class="warn">Discord Login ist noch nicht eingerichtet. Setze DASHBOARD_DISCORD_CLIENT_ID und DASHBOARD_DISCORD_CLIENT_SECRET beim Dashboard-Service.</div>
+        """
+    basic_block = ""
+    if basic_ready:
+        basic_block = """
+        <div class="panel">
+          <h2>Passwort-Fallback</h2>
+          <p class="muted">Der alte Basic-Auth Login bleibt als Fallback aktiv, solange DASHBOARD_AUTH_MODE nicht auf <code>discord</code> steht.</p>
+          <p>Wenn der Browser nach Benutzer/Passwort fragt: <code>DASHBOARD_USERNAME</code> und <code>DASHBOARD_PASSWORD</code> nutzen.</p>
+        </div>
+        """
+    body = f"""
+    <section class="hero"><div><div class="eyebrow">Ebo Dashboard</div><h1>🔐 Login</h1><p class="muted">Read-only Dashboard für Gildenleitung und berechtigte Mitglieder.</p></div></section>
+    {discord_block}
+    {basic_block}
+    """
+    return HTMLResponse(_html_shell("Login · Ebo Dashboard", body))
+
+
+@app.get("/auth/discord/start")
+def discord_start(request: Request, next: str = "/"):
+    if not _discord_oauth_enabled():
+        return RedirectResponse("/login", status_code=303)
+    state_payload = {"nonce": secrets.token_urlsafe(24), "next": next or "/", "exp": int(time.time()) + 600}
+    state = _make_token(state_payload)
+    params = {
+        "client_id": _env("DASHBOARD_DISCORD_CLIENT_ID"),
+        "redirect_uri": _redirect_uri(request),
+        "response_type": "code",
+        "scope": "identify guilds.members.read",
+        "state": state,
+        "prompt": "none",
+    }
+    url = "https://discord.com/oauth2/authorize?" + urllib.parse.urlencode(params)
+    resp = RedirectResponse(url, status_code=303)
+    resp.set_cookie(STATE_COOKIE, state, max_age=600, httponly=True, secure=_cookie_secure(), samesite="lax")
+    return resp
+
+
+@app.get("/auth/discord/callback")
+def discord_callback(request: Request, code: str = "", state: str = "", error: str = ""):
+    if error:
+        return HTMLResponse(_html_shell("Discord Login", f"<section class='panel'><h1>❌ Discord Login abgebrochen</h1><p>{_e(error)}</p><p><a class='btn' href='/login'>Zurück</a></p></section>"), status_code=400)
+    stored = request.cookies.get(STATE_COOKIE, "")
+    state_data = _read_token(state)
+    if not code or not state or not stored or stored != state or not state_data:
+        return HTMLResponse(_html_shell("Discord Login", "<section class='panel'><h1>❌ Ungültiger Login-State</h1><p class='muted'>Bitte Login erneut starten.</p><p><a class='btn' href='/login'>Zum Login</a></p></section>"), status_code=400)
+
+    try:
+        token_data = _request_json(
+            f"{DISCORD_API_BASE}/oauth2/token",
+            method="POST",
+            data={
+                "client_id": _env("DASHBOARD_DISCORD_CLIENT_ID"),
+                "client_secret": _env("DASHBOARD_DISCORD_CLIENT_SECRET"),
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": _redirect_uri(request),
+            },
+        )
+        access_token = str(token_data.get("access_token") or "")
+        user = _request_json(f"{DISCORD_API_BASE}/users/@me", token=access_token)
+        guild_id = _env("DASHBOARD_GUILD_ID")
+        if not guild_id:
+            payload = _snapshot_payload()
+            guild_id = str(payload.get("guild_id") or ((payload.get("snapshot") or {}).get("guild") or {}).get("id") or "")
+        if not guild_id:
+            raise RuntimeError("DASHBOARD_GUILD_ID ist nicht gesetzt und konnte nicht aus dem Snapshot gelesen werden.")
+        member = _request_json(f"{DISCORD_API_BASE}/users/@me/guilds/{int(guild_id)}/member", token=access_token)
+        roles = {str(r) for r in (member.get("roles") or [])}
+        allowed_roles = _allowed_role_ids()
+        admin_roles = _admin_role_ids()
+        is_admin = bool(admin_roles and roles.intersection(admin_roles))
+        is_allowed = bool(roles.intersection(allowed_roles)) if allowed_roles else True
+        if not (is_admin or is_allowed):
+            role_hint = ", ".join(sorted(allowed_roles)) or "keine Rolle konfiguriert"
+            return HTMLResponse(_html_shell("Kein Zugriff", f"<section class='panel'><h1>⛔ Kein Zugriff</h1><p class='muted'>Du bist im Discord-Server, hast aber keine erlaubte Dashboard-Rolle.</p><p>Erlaubte Rollen-IDs: <code>{_e(role_hint)}</code></p><p><a class='btn' href='/logout'>Logout</a></p></section>"), status_code=403)
+
+        uid = str(user.get("id") or "")
+        username = str(user.get("global_name") or user.get("username") or uid)
+        session = {
+            "user_id": uid,
+            "username": username,
+            "role": "admin" if is_admin else "member",
+            "roles": sorted(roles),
+            "guild_id": str(guild_id),
+            "iat": int(time.time()),
+            "exp": int(time.time()) + 7 * 24 * 3600,
+        }
+        resp = RedirectResponse(str(state_data.get("next") or "/"), status_code=303)
+        resp.delete_cookie(STATE_COOKIE)
+        resp.set_cookie(SESSION_COOKIE, _make_token(session), max_age=7 * 24 * 3600, httponly=True, secure=_cookie_secure(), samesite="lax")
+        return resp
+    except Exception as exc:
+        return HTMLResponse(_html_shell("Discord Login Fehler", f"<section class='panel'><h1>❌ Discord Login fehlgeschlagen</h1><p><strong>{_e(type(exc).__name__)}</strong>: {_e(exc)}</p><p class='muted'>Prüfe Redirect URI, Client Secret und Rollen-ID.</p><p><a class='btn' href='/login'>Zurück</a></p></section>"), status_code=500)
+
+
+@app.get("/logout")
+def logout():
+    resp = RedirectResponse("/login", status_code=303)
+    resp.delete_cookie(SESSION_COOKIE)
+    resp.delete_cookie(STATE_COOKIE)
+    return resp
+
+
+@app.get("/me", response_class=HTMLResponse)
+def me(request: Request, _: bool = Depends(_auth)):
+    user = _current_user(request)
+    if not user:
+        body = "<section class='panel'><h1>🔐 Login</h1><p class='muted'>Du nutzt aktuell den Basic-Auth Fallback.</p><p><a class='btn' href='/login'>Login-Seite</a></p></section>"
+    else:
+        rows = [[k, v if k != "roles" else ", ".join(v[:12]) + (" …" if len(v) > 12 else "")] for k, v in user.items()]
+        body = f"<nav class='topnav'><a href='/'>← Übersicht</a><a href='/logout'>Logout</a></nav><section class='panel'><h1>👤 Mein Dashboard-Login</h1>{_table(['Key','Wert'], rows, searchable=False)}</section>"
+    return HTMLResponse(_html_shell("Mein Login · Ebo Dashboard", body))
 
 @app.get("/healthz")
 def healthz():
