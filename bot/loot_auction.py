@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import math
 import random
 import asyncio
@@ -1765,6 +1766,311 @@ async def _close_auction(client: discord.Client, guild_id: int, auction_id: str,
     return True
 
 
+
+# ---------------------------------------------------------------------------
+# Dashboard Loot-Aktionsqueue: verarbeitet Gebote/Käufe aus dashboard_web
+# ---------------------------------------------------------------------------
+
+def _dashboard_database_url() -> str:
+    return str(os.getenv("DATABASE_URL") or os.getenv("DASHBOARD_DATABASE_URL") or "").strip()
+
+
+def _dashboard_normalized_database_url() -> str:
+    url = _dashboard_database_url()
+    if url.startswith("postgres://"):
+        return "postgresql://" + url[len("postgres://"):]
+    return url
+
+
+def _dashboard_pg_connect():
+    import psycopg  # type: ignore
+    from psycopg.rows import dict_row  # type: ignore
+    return psycopg.connect(_dashboard_normalized_database_url(), row_factory=dict_row, connect_timeout=10)
+
+
+def _ensure_dashboard_loot_action_table() -> None:
+    if not _dashboard_database_url():
+        return
+    conn = _dashboard_pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS dashboard_loot_action_requests (
+                    id BIGSERIAL PRIMARY KEY,
+                    request_id TEXT NOT NULL UNIQUE,
+                    guild_id BIGINT NOT NULL,
+                    auction_id TEXT NOT NULL,
+                    action_type TEXT NOT NULL,
+                    amount INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    payload_json TEXT NOT NULL DEFAULT '{}',
+                    actor_id TEXT,
+                    actor_name TEXT,
+                    requested_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    claimed_at TIMESTAMPTZ,
+                    processed_at TIMESTAMPTZ,
+                    result_json TEXT
+                )
+                """
+            )
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_dashboard_loot_action_requests_lookup
+                ON dashboard_loot_action_requests (guild_id, auction_id, status, requested_at DESC)
+                """
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _dashboard_claim_loot_action() -> Optional[dict]:
+    if not _dashboard_database_url():
+        return None
+    _ensure_dashboard_loot_action_table()
+    conn = _dashboard_pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                WITH next_row AS (
+                    SELECT id
+                    FROM dashboard_loot_action_requests
+                    WHERE status = 'pending'
+                    ORDER BY requested_at ASC, id ASC
+                    LIMIT 1
+                    FOR UPDATE SKIP LOCKED
+                )
+                UPDATE dashboard_loot_action_requests AS r
+                SET status = 'processing', claimed_at = NOW()
+                FROM next_row
+                WHERE r.id = next_row.id
+                RETURNING r.id, r.request_id, r.guild_id, r.auction_id, r.action_type, r.amount,
+                          r.status, r.actor_id, r.actor_name, r.payload_json, r.requested_at
+                """
+            )
+            row = cur.fetchone()
+        conn.commit()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def _dashboard_finish_loot_action(row: dict, status: str, result: dict) -> None:
+    if not _dashboard_database_url() or not row:
+        return
+    conn = _dashboard_pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE dashboard_loot_action_requests
+                SET status = %s, processed_at = NOW(), result_json = %s
+                WHERE id = %s
+                """,
+                (str(status), json.dumps(result or {}, ensure_ascii=False, separators=(",", ":")), int(row.get("id"))),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _dashboard_row_payload(row: dict) -> dict:
+    try:
+        payload = json.loads(row.get("payload_json") or "{}")
+        return payload if isinstance(payload, dict) else {}
+    except Exception:
+        return {}
+
+
+async def _dashboard_member(guild: discord.Guild, user_id: int) -> Optional[discord.Member]:
+    member = guild.get_member(int(user_id))
+    if member is not None:
+        return member
+    try:
+        return await guild.fetch_member(int(user_id))
+    except Exception:
+        return None
+
+
+async def _dashboard_apply_bid(client: discord.Client, guild: discord.Guild, row: dict, auc: dict, user_id: int, actor_name: str, amount: int) -> dict:
+    auction_id = str(row.get("auction_id") or auc.get("id") or "")
+    if _auction_phase(auc) == "sale":
+        return {"ok": False, "status": "rejected", "error": "Diese Auktion ist ein Sale/Müll-Item, kein Gebot."}
+    end_dt = _parse_dt(str(auc.get("ends_at", "") or ""))
+    if end_dt and _now() >= end_dt:
+        return {"ok": False, "status": "rejected", "error": "Auktion ist bereits abgelaufen."}
+    mode = str(auc.get("eligibility_mode", "all") or "all")
+    eligible = [int(x) for x in auc.get("eligible_user_ids", []) or []]
+    if mode in {"main_need", "secondary_need"} and int(user_id) not in eligible:
+        label = "Main-Need-Spieler" if mode == "main_need" else "Second-Need-Spieler"
+        return {"ok": False, "status": "rejected", "error": f"Aktuell nur für berechtigte {label}."}
+    min_bid = _min_next_bid(auc)
+    if int(amount) < min_bid:
+        return {"ok": False, "status": "rejected", "error": f"Mindestgebot ist aktuell {min_bid} EC."}
+    balance = _ec_balance(int(guild.id), int(user_id))
+    if int(amount) > balance:
+        return {"ok": False, "status": "rejected", "error": f"Spieler hat nur {balance} EC."}
+
+    bids = auc.setdefault("bids", [])
+    bids.append({
+        "user_id": int(user_id),
+        "amount": int(amount),
+        "created_at": _now_iso(),
+        "name": actor_name or f"User {user_id}",
+        "source": "dashboard",
+        "dashboard_request_id": str(row.get("request_id") or ""),
+    })
+    auc["updated_at"] = _now_iso()
+    save_auctions()
+    await _refresh_auction_message(client, int(guild.id), auc)
+    await _post_or_refresh_active_auction_message(client, int(guild.id), auc)
+    await _post_or_refresh_market_message(client, int(guild.id), auc)
+    await _announce_bid_log(client, int(guild.id), auc, int(user_id), int(amount))
+    try:
+        await _ensure_auction_tracking_dms(client, int(guild.id), auc)
+        await _refresh_auction_tracking_dms(client, int(guild.id), auc)
+    except Exception as e:
+        print(f"[loot_auction] dashboard bid tracking refresh failed: {e!r}")
+    return {"ok": True, "status": "done", "message": f"Gebot {int(amount)} EC gesetzt.", "auction_id": auction_id, "amount": int(amount)}
+
+
+async def _dashboard_apply_sale_or_junk(client: discord.Client, guild: discord.Guild, row: dict, auc: dict, user_id: int, action_type: str) -> dict:
+    auction_id = str(row.get("auction_id") or auc.get("id") or "")
+    if _auction_phase(auc) != "sale":
+        return {"ok": False, "status": "rejected", "error": "Diese Auktion ist kein Sale/Müll-Item."}
+    end_dt = _parse_dt(str(auc.get("ends_at", "") or ""))
+    if end_dt and _now() >= end_dt and not _is_junk_interest_sale(auc):
+        return {"ok": False, "status": "rejected", "error": "Sale-Item ist bereits abgelaufen."}
+
+    price = int(auc.get("fixed_price", auc.get("start_bid", 0)) or 0)
+    if _is_junk_interest_sale(auc) and price <= 0:
+        until = _junk_roll_until(auc)
+        if until and _now() < until and not auc.get("junk_roll_processed_at") and not auc.get("junk_interest_processed_at"):
+            rolls = _junk_rolls(auc)
+            if str(int(user_id)) in rolls:
+                return {"ok": False, "status": "rejected", "error": "Spieler hat für dieses Müll-Item bereits gewürfelt."}
+            try:
+                roll, roll_max = _next_unique_junk_roll(auc)
+            except Exception:
+                return {"ok": False, "status": "failed", "error": "Kein freier Würfelwert konnte erzeugt werden."}
+            rolls[str(int(user_id))] = {"user_id": int(user_id), "roll": int(roll), "created_at": _now_iso(), "source": "dashboard", "dashboard_request_id": str(row.get("request_id") or "")}
+            auc["junk_rolls"] = rolls
+            auc["junk_roll_max"] = int(roll_max)
+            auc["junk_interest_user_ids"] = [int(uid) for uid in _junk_rolls(auc).keys()]
+            requests = auc.get("junk_interest_requests") if isinstance(auc.get("junk_interest_requests"), dict) else {}
+            requests[str(user_id)] = _now_iso()
+            auc["junk_interest_requests"] = requests
+            auc["updated_at"] = _now_iso()
+            save_auctions()
+            await _refresh_auction_message(client, int(guild.id), auc)
+            await _post_or_refresh_market_message(client, int(guild.id), auc)
+            await _post_or_refresh_active_auction_message(client, int(guild.id), auc)
+            ch = _log_channel(client, int(guild.id)) or _auction_channel(client, int(guild.id), None)
+            if ch:
+                try:
+                    emb = discord.Embed(
+                        title="🎲 Dashboard-Müllwurf",
+                        description=f"**Item:** {auc.get('item_name','Item')}\n**Spieler:** <@{int(user_id)}>\n**Wurf:** **{int(roll)}**\n**Auktions-ID:** `{auction_id}`",
+                        color=discord.Color.green(),
+                        timestamp=_now(),
+                    )
+                    await ch.send(embed=emb)
+                except Exception:
+                    pass
+            return {"ok": True, "status": "done", "message": f"Müll-Wurf gesetzt: {int(roll)}.", "roll": int(roll), "auction_id": auction_id}
+
+        if until and not auc.get("junk_roll_processed_at") and not auc.get("junk_interest_processed_at"):
+            result = await _process_junk_interest_window(client, int(guild.id), auction_id, auc, reason="dashboard_after_window")
+            return {"ok": True, "status": "done", "message": "Müll-Würfelphase verarbeitet.", "result": result, "auction_id": auction_id}
+
+        emb = await _finalize_sale_delivery(client, guild, int(guild.id), auc, auction_id, int(user_id), 0, actor_id=int(user_id), source="dashboard_junk_direct_claim")
+        return {"ok": True, "status": "done", "message": "Müll-Item direkt vergeben.", "auction_id": auction_id, "embed_title": getattr(emb, "title", "")}
+
+    if price > 0:
+        bal = _ec_balance(int(guild.id), int(user_id))
+        if bal < price:
+            return {"ok": False, "status": "rejected", "error": f"Spieler hat nur {bal} EC, benötigt aber {price} EC."}
+        ok = _add_ec_transaction(
+            int(guild.id), int(user_id), -price,
+            f"Sale-Kauf: {auc.get('item_name','Item')}",
+            int(user_id), auction_id,
+            meta={"auction_id": auction_id, "item_id": auc.get("item_id", ""), "item_name": auc.get("item_name", ""), "kind": "sale", "source": "dashboard"},
+        )
+        if not ok:
+            return {"ok": False, "status": "failed", "error": "DKP/EC-System konnte nicht geladen werden. Keine EC abgebucht."}
+
+    emb = await _finalize_sale_delivery(client, guild, int(guild.id), auc, auction_id, int(user_id), price, actor_id=int(user_id), source="dashboard_sale_buy")
+    return {"ok": True, "status": "done", "message": f"Sale-Kauf erledigt ({price} EC).", "auction_id": auction_id, "price": int(price), "embed_title": getattr(emb, "title", "")}
+
+
+async def _process_dashboard_loot_action(client: discord.Client, row: dict) -> dict:
+    guild_id = int(row.get("guild_id") or 0)
+    auction_id = str(row.get("auction_id") or "")
+    action_type = str(row.get("action_type") or "").strip().lower()
+    amount = int(row.get("amount") or 0)
+    actor_id = int(str(row.get("actor_id") or "0") or 0)
+    actor_name = str(row.get("actor_name") or f"User {actor_id}")
+
+    guild = client.get_guild(guild_id) if guild_id else None
+    if guild is None:
+        return {"ok": False, "status": "failed", "error": "Guild konnte vom Bot nicht gefunden werden."}
+    if not actor_id:
+        return {"ok": False, "status": "rejected", "error": "Actor/User-ID fehlt."}
+    member = await _dashboard_member(guild, actor_id)
+    if not member or getattr(member, "bot", False):
+        return {"ok": False, "status": "rejected", "error": "Spieler ist nicht auf dem Server gefunden worden."}
+    if not _is_ebolus_member(guild, actor_id):
+        return {"ok": False, "status": "rejected", "error": "Nur Ebolus-Mitglieder dürfen Loot-Aktionen nutzen."}
+    until = _loot_lock_until_for_member(member)
+    if until:
+        return {"ok": False, "status": "rejected", "error": f"Lootsperre aktiv bis {until.strftime('%d.%m.%Y %H:%M')}."}
+
+    auc = _auction(guild_id, auction_id)
+    if not auc:
+        return {"ok": False, "status": "rejected", "error": "Auktion nicht gefunden."}
+    if str(auc.get("status", "")) != "active":
+        return {"ok": False, "status": "rejected", "error": "Auktion ist nicht mehr aktiv."}
+
+    if action_type == "bid":
+        return await _dashboard_apply_bid(client, guild, row, auc, actor_id, actor_name, amount)
+    if action_type in {"sale_buy", "junk_roll"}:
+        return await _dashboard_apply_sale_or_junk(client, guild, row, auc, actor_id, action_type)
+    return {"ok": False, "status": "rejected", "error": f"Unbekannte Aktion: {action_type}"}
+
+
+@tasks.loop(seconds=20)
+async def dashboard_loot_action_loop():
+    client = _client_ref
+    if not client or not _dashboard_database_url():
+        return
+    for _ in range(5):
+        row = None
+        try:
+            row = _dashboard_claim_loot_action()
+            if not row:
+                return
+            result = await _process_dashboard_loot_action(client, row)
+            status = str(result.get("status") or ("done" if result.get("ok") else "failed"))
+            if status not in {"done", "rejected", "failed"}:
+                status = "done" if result.get("ok") else "failed"
+            _dashboard_finish_loot_action(row, status, result)
+        except Exception as e:
+            print(f"[loot_auction] dashboard loot action failed: {e!r}")
+            if row:
+                try:
+                    _dashboard_finish_loot_action(row, "failed", {"ok": False, "error": f"{type(e).__name__}: {e}"})
+                except Exception as inner:
+                    print(f"[loot_auction] failed to write dashboard loot action error: {inner!r}")
+            return
+
+
+@dashboard_loot_action_loop.before_loop
+async def before_dashboard_loot_action_loop():
+    if _client_ref:
+        await _client_ref.wait_until_ready()
+
 @tasks.loop(minutes=1)
 async def auction_close_loop():
     client = _client_ref
@@ -2854,6 +3160,8 @@ async def setup_loot_auction(client: discord.Client, tree: app_commands.CommandT
 
     if not auction_close_loop.is_running():
         auction_close_loop.start()
+    if not dashboard_loot_action_loop.is_running():
+        dashboard_loot_action_loop.start()
 
     try:
         asyncio.create_task(_sync_active_auction_messages_after_ready(client))
