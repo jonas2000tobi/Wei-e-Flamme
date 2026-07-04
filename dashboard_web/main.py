@@ -1234,11 +1234,12 @@ def _render_event_detail(data: dict[str, Any], event_id: str) -> str:
     if not data.get("ok"):
         return _html_shell("Ebo Dashboard", f"<section class='panel'><h1>📊 Ebo Dashboard</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
     snap: dict[str, Any] = data.get("snapshot") or {}
-    event = _event_by_id(snap, event_id)
+    guild_id = _safe_guild_id(data)
+    event = _event_by_id(snap, event_id) or _event_stub_from_attendance_review(guild_id, event_id)
     if not event:
         return _html_shell(
             "Event nicht gefunden",
-            "<section class='panel'><h1>❌ Event nicht gefunden</h1><p class='muted'>Dieses Event ist nicht im aktuellen Dashboard-Snapshot.</p><p><a class='btn' href='/#events'>Zurück</a></p></section>",
+            "<section class='panel'><h1>❌ Event nicht gefunden</h1><p class='muted'>Dieses Event ist nicht im aktuellen Dashboard-Snapshot und hat keinen Review-Fallback.</p><p><a class='btn' href='/attendance'>Zur Anwesenheit</a></p></section>",
         )
 
     participants = event.get("participants") or {}
@@ -3041,11 +3042,12 @@ def _render_event_detail(data: dict[str, Any], event_id: str) -> str:
     if not data.get("ok"):
         return _html_shell("Ebo Dashboard", f"<section class='panel'><h1>📊 Ebo Dashboard</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
     snap: dict[str, Any] = data.get("snapshot") or {}
-    event = _event_by_id(snap, event_id)
+    guild_id = _safe_guild_id(data)
+    event = _event_by_id(snap, event_id) or _event_stub_from_attendance_review(guild_id, event_id)
     if not event:
         return _html_shell(
             "Event nicht gefunden",
-            "<section class='panel'><h1>❌ Event nicht gefunden</h1><p class='muted'>Dieses Event ist nicht im aktuellen Dashboard-Snapshot.</p><p><a class='btn' href='/planning'>Zurück</a></p></section>",
+            "<section class='panel'><h1>❌ Event nicht gefunden</h1><p class='muted'>Dieses Event ist nicht im aktuellen Dashboard-Snapshot und hat keinen Review-Fallback.</p><p><a class='btn' href='/attendance'>Zur Anwesenheit</a></p></section>",
         )
 
     participants = event.get("participants") or {}
@@ -3502,6 +3504,8 @@ def _pending_ec_check_by_event(snap: dict[str, Any]) -> dict[str, dict[str, Any]
 def _pending_ec_check_label(event: dict[str, Any]) -> dict[str, str]:
     if event.get("_pending_ec_check"):
         return _raw("<span class='pill'>EC offen</span>")
+    if event.get("_attendance_review_only"):
+        return _raw("<span class='pill'>Review offen</span>")
     return _raw("<span class='pill'>—</span>")
 
 
@@ -3535,6 +3539,122 @@ def _events_with_pending_ec_checks(snap: dict[str, Any]) -> list[dict[str, Any]]
             "_pending_ec_check": True,
             "_pending_ec_check_status": str(chk.get("status") or "posted"),
         }
+    return list(by_id.values())
+
+
+def _event_stub_from_attendance_review(guild_id: int, event_id: str) -> Optional[dict[str, Any]]:
+    """Erzeugt ein kleines Event aus einem gespeicherten Attendance-Review.
+
+    Das ist der Fallback für genau den Fall, dass Discord/Bot das eigentliche
+    Event schon aus dem Snapshot entfernt hat, der Dashboard-Review aber noch
+    existiert und EC noch nicht gebucht wurde.
+    """
+    if not guild_id or not event_id:
+        return None
+    review = _attendance_review_load(guild_id, str(event_id))
+    payload = review.get("payload") if isinstance(review.get("payload"), dict) else {}
+    if not payload:
+        return None
+    items = [x for x in (payload.get("items") or []) if isinstance(x, dict)]
+    if not items:
+        return None
+
+    yes_people: list[dict[str, Any]] = []
+    maybe_people: list[dict[str, Any]] = []
+    no_people: list[dict[str, Any]] = []
+    for item in items:
+        uid = _user_id(item.get("user_id"))
+        person = {
+            "user_id": uid,
+            "display_name": item.get("display_name") or f"User {uid}",
+            "is_dashboard_member": True,
+        }
+        status = str(item.get("status") or "open").strip().lower()
+        signup = str(item.get("signup") or "").strip().lower()
+        if status == "ignore":
+            continue
+        if status == "absent" or "abgemeldet" in signup:
+            no_people.append(person)
+        elif status == "partial" or "vielleicht" in signup:
+            maybe_people.append(person)
+        else:
+            yes_people.append(person)
+
+    title = payload.get("event_title") or payload.get("title") or f"Review offen: {event_id}"
+    when_iso = payload.get("event_when") or payload.get("when_iso") or review.get("updated_at") or payload.get("updated_at") or payload.get("created_at") or ""
+    return {
+        "event_id": str(event_id),
+        "id": str(event_id),
+        "title": title,
+        "when_iso": when_iso,
+        "created_at": payload.get("created_at") or review.get("updated_at") or "",
+        "participant_count": len(items),
+        "maybe_count": len(maybe_people),
+        "no_count": len(no_people),
+        "voice_enabled": any(_num(i.get("voice_minutes"), 0) > 0 for i in items),
+        "participants": {
+            "yes": [{"role": "Review", "participants": yes_people}] if yes_people else [],
+            "maybe": maybe_people,
+            "no": no_people,
+        },
+        "yes_counts": {"Review": len(yes_people)},
+        "source": "attendance_review",
+        "_attendance_review_only": True,
+        "_attendance_review_status": review.get("status") or "reviewed",
+    }
+
+
+def _attendance_review_still_needs_ec(snap: dict[str, Any], guild_id: int, review: dict[str, Any]) -> bool:
+    """Soll ein gespeicherter Review wieder unter /attendance auftauchen?"""
+    if not guild_id or not isinstance(review, dict):
+        return False
+    eid = str(review.get("event_id") or ((review.get("payload") or {}).get("event_id")) or "").strip()
+    if not eid:
+        return False
+    payload = review.get("payload") if isinstance(review.get("payload"), dict) else {}
+    if not (payload.get("items") or []):
+        return False
+    status = str(review.get("status") or "").strip().lower()
+    if status not in {"draft", "open", "reviewed", "locked"}:
+        return False
+    # Wenn bereits echte EC-Buchungen oder eine erledigte Queue-Anfrage existieren,
+    # ist der Review abgeschlossen und soll nicht wieder die normale Attendance-Liste füllen.
+    try:
+        if (_event_award_state(snap, eid) or {}).get("awarded"):
+            return False
+    except Exception:
+        pass
+    try:
+        latest = _latest_ec_award_request(guild_id, eid) or {}
+        if str(latest.get("status") or "").strip().lower() == "done":
+            return False
+    except Exception:
+        pass
+    return True
+
+
+def _attendance_events_with_review_fallbacks(snap: dict[str, Any], guild_id: int) -> list[dict[str, Any]]:
+    """Events für /attendance: aktuelle Events + offene EC-Checks + Review-Fallbacks."""
+    events = _events_with_pending_ec_checks(snap)
+    by_id: dict[str, dict[str, Any]] = {}
+    for ev in events:
+        if not isinstance(ev, dict):
+            continue
+        eid = str(ev.get("event_id") or ev.get("id") or "").strip()
+        if eid:
+            by_id[eid] = ev
+
+    if guild_id:
+        for review in _attendance_all_reviews(guild_id, limit=300):
+            if not _attendance_review_still_needs_ec(snap, guild_id, review):
+                continue
+            eid = str(review.get("event_id") or ((review.get("payload") or {}).get("event_id")) or "").strip()
+            if not eid or eid in by_id:
+                continue
+            stub = _event_stub_from_attendance_review(guild_id, eid)
+            if stub:
+                by_id[eid] = stub
+
     return list(by_id.values())
 
 
@@ -4840,7 +4960,7 @@ def _render_attendance_list(data: dict[str, Any]) -> str:
         return _html_shell("Anwesenheit · Ebo Dashboard", f"<section class='panel'><h1>📝 Anwesenheit</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
     snap: dict[str, Any] = data.get("snapshot") or {}
     guild_id = _safe_guild_id(data)
-    events = _events_with_pending_ec_checks(snap)
+    events = _attendance_events_with_review_fallbacks(snap, guild_id)
     rows = []
     for ev in events:
         eid = str(ev.get("event_id") or ev.get("id") or "")
@@ -4850,7 +4970,7 @@ def _render_attendance_list(data: dict[str, Any]) -> str:
         items = payload.get("items") or []
         queue_badge = _event_ec_queue_badge(guild_id, eid) if eid else _raw("<span class='pill'>—</span>")
         rows.append([
-            _raw(f'<a class="link" href="/attendance/{_e(eid)}">{_e(ev.get("title") or eid)}</a>'),
+            _raw(f'<a class="link" href="/attendance/{_e(eid)}">{_e(ev.get("title") or eid)}</a>' + (" <span class='pill'>aus Review</span>" if ev.get("_attendance_review_only") else "")),
             _dt(ev.get("when_iso")),
             ev.get("participant_count", 0),
             "ja" if ev.get("voice_enabled") else "nein",
@@ -4867,7 +4987,7 @@ def _render_attendance_list(data: dict[str, Any]) -> str:
         <div class="eyebrow">Ebene 3 · sichere Admin-Aktion</div>
         <h1>📝 Anwesenheits-Review</h1>
         <p>Hier kann die Leitung Anmeldung und Voice-Zeit vergleichen und einen Review speichern. Es wird noch kein EC gebucht.</p>
-        <p class="muted">Snapshot: {_e(_dt(data.get('published_at')))}</p>
+        <p class="muted">Snapshot: {_e(_dt(data.get('published_at')))} · Alte Events mit gespeichertem Review bleiben sichtbar, solange EC noch nicht als erledigt erkannt wurde.</p>
       </div>
       <a class="btn" href="/planning">Planung</a>
     </section>
@@ -4883,10 +5003,10 @@ def _render_attendance_event(data: dict[str, Any], event_id: str, saved: bool = 
     if not data.get("ok"):
         return _html_shell("Anwesenheit · Ebo Dashboard", f"<section class='panel'><h1>📝 Anwesenheit</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
     snap: dict[str, Any] = data.get("snapshot") or {}
-    event = _event_by_id(snap, event_id)
-    if not event:
-        return _html_shell("Event nicht gefunden", "<section class='panel'><h1>❌ Event nicht gefunden</h1><p><a class='btn' href='/attendance'>Zurück</a></p></section>")
     guild_id = _safe_guild_id(data)
+    event = _event_by_id(snap, event_id) or _event_stub_from_attendance_review(guild_id, event_id)
+    if not event:
+        return _html_shell("Event nicht gefunden", "<section class='panel'><h1>❌ Event nicht gefunden</h1><p>Dieses Event ist nicht im aktuellen Snapshot und es gibt keinen gespeicherten Review-Fallback.</p><p><a class='btn' href='/attendance'>Zurück</a></p></section>")
     review = _attendance_review_load(guild_id, event_id)
     payload = review.get("payload") or {}
     if not payload.get("items"):
@@ -5095,16 +5215,18 @@ async def admin_attendance_save(event_id: str, request: Request, _: bool = Depen
         })
     payload = _snapshot_payload()
     snap: dict[str, Any] = payload.get("snapshot") or {}
-    event = _event_by_id(snap, str(event_id)) or {}
+    guild_id = _safe_guild_id(payload)
+    old_review = _attendance_review_load(guild_id, str(event_id))
+    old_payload = old_review.get("payload") if isinstance(old_review.get("payload"), dict) else {}
+    event = _event_by_id(snap, str(event_id)) or _event_stub_from_attendance_review(guild_id, str(event_id)) or {}
     review_payload = {
         "event_id": str(event_id),
-        "event_title": event.get("title") or str(event_id),
-        "event_when": event.get("when_iso"),
+        "event_title": event.get("title") or old_payload.get("event_title") or str(event_id),
+        "event_when": event.get("when_iso") or old_payload.get("event_when"),
         "mode": "manual_review",
         "items": items,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
-    guild_id = _safe_guild_id(payload)
     _attendance_review_save(guild_id, str(event_id), review_payload, _current_user(request) or {}, status="reviewed")
     return RedirectResponse(f"/attendance/{urllib.parse.quote(str(event_id))}?saved=1", status_code=303)
 
@@ -5119,11 +5241,11 @@ async def admin_attendance_bulk(event_id: str, request: Request, _: bool = Depen
 
     payload = _snapshot_payload()
     snap: dict[str, Any] = payload.get("snapshot") or {}
-    event = _event_by_id(snap, str(event_id))
-    if not event:
-        raise HTTPException(status_code=404, detail="Event nicht gefunden")
-
     guild_id = _safe_guild_id(payload)
+    event = _event_by_id(snap, str(event_id)) or _event_stub_from_attendance_review(guild_id, str(event_id))
+    if not event:
+        raise HTTPException(status_code=404, detail="Event nicht gefunden und kein gespeicherter Review-Fallback vorhanden")
+
     review = _attendance_review_load(guild_id, str(event_id))
     review_payload = review.get("payload") if isinstance(review.get("payload"), dict) else {}
     if not review_payload.get("items"):
@@ -5510,10 +5632,10 @@ def _attendance_ec_preview_payload(data: dict[str, Any], event_id: str, full_ec:
     if not data.get("ok"):
         return {"ok": False, "error": data.get("error") or "Kein Snapshot"}
     snap: dict[str, Any] = data.get("snapshot") or {}
-    event = _event_by_id(snap, str(event_id))
-    if not event:
-        return {"ok": False, "error": "Event nicht gefunden"}
     guild_id = _safe_guild_id(data)
+    event = _event_by_id(snap, str(event_id)) or _event_stub_from_attendance_review(guild_id, str(event_id))
+    if not event:
+        return {"ok": False, "error": "Event nicht gefunden und kein gespeicherter Attendance-Review vorhanden"}
     review, items = _attendance_items_for_preview(snap, event, guild_id)
     defaults = _event_ec_defaults(snap, event)
     event_type = str(defaults.get("event_type") or _event_dkp_type(event))
@@ -5878,14 +6000,14 @@ def attendance_ec_preview_page(event_id: str, full_ec: Optional[float] = None, p
 async def admin_attendance_lock(event_id: str, request: Request, _: bool = Depends(_admin_auth)):
     payload = _snapshot_payload()
     snap: dict[str, Any] = payload.get("snapshot") or {}
-    event = _event_by_id(snap, str(event_id))
+    guild_id = _safe_guild_id(payload)
+    event = _event_by_id(snap, str(event_id)) or _event_stub_from_attendance_review(guild_id, str(event_id))
     if not event:
-        raise HTTPException(status_code=404, detail="Event nicht gefunden")
+        raise HTTPException(status_code=404, detail="Event nicht gefunden und kein gespeicherter Review-Fallback vorhanden")
     raw = (await request.body()).decode("utf-8", errors="replace")
     form = urllib.parse.parse_qs(raw, keep_blank_values=True)
     full_ec = _num((form.get("full_ec") or [0])[0], 0)
     partial_ec = _num((form.get("partial_ec") or [0])[0], 0)
-    guild_id = _safe_guild_id(payload)
     review, items = _attendance_items_for_preview(snap, event, guild_id)
     review_payload = review.get("payload") if isinstance(review.get("payload"), dict) else {}
     if not review_payload.get("items"):
@@ -5911,10 +6033,10 @@ async def admin_attendance_ec_award(event_id: str, request: Request, _: bool = D
 
     payload = _snapshot_payload()
     snap: dict[str, Any] = payload.get("snapshot") or {}
-    event = _event_by_id(snap, str(event_id))
-    if not event:
-        raise HTTPException(status_code=404, detail="Event nicht gefunden")
     guild_id = _safe_guild_id(payload)
+    event = _event_by_id(snap, str(event_id)) or _event_stub_from_attendance_review(guild_id, str(event_id))
+    if not event:
+        raise HTTPException(status_code=404, detail="Event nicht gefunden und kein gespeicherter Review-Fallback vorhanden")
     review = _attendance_review_load(guild_id, str(event_id))
     review_status = str(review.get("status") or "").lower()
     if review_status not in {"reviewed", "locked"}:
