@@ -5253,8 +5253,9 @@ async def auction_dashboard_bid(request: Request, auction_id: str, _: bool = Dep
     auction = _auction_by_id(snap, str(auction_id)) if payload.get("ok") else None
     msg = ""
     try:
-        form = await request.form()
-        amount = int(str(form.get("quick_amount") or form.get("amount") or "0").strip())
+        raw = (await request.body()).decode("utf-8", errors="replace")
+        form = urllib.parse.parse_qs(raw, keep_blank_values=True)
+        amount = int(str((form.get("quick_amount") or form.get("amount") or ["0"])[0]).strip())
         if not auction:
             msg = "❌ Auktion nicht im Snapshot gefunden."
         elif _loot_is_sale_like(auction):
@@ -5278,8 +5279,9 @@ async def auction_dashboard_sale(request: Request, auction_id: str, _: bool = De
     auction = _auction_by_id(snap, str(auction_id)) if payload.get("ok") else None
     msg = ""
     try:
-        form = await request.form()
-        action_type = str(form.get("action_type") or "sale_buy").strip().lower()
+        raw = (await request.body()).decode("utf-8", errors="replace")
+        form = urllib.parse.parse_qs(raw, keep_blank_values=True)
+        action_type = str((form.get("action_type") or ["sale_buy"])[0]).strip().lower()
         if action_type not in {"sale_buy", "junk_roll"}:
             action_type = "sale_buy"
         if not auction:
