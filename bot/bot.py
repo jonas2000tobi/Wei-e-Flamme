@@ -208,8 +208,17 @@ def _import_modules():
         from bot.voice_attendance import setup_voice_attendance  # type: ignore
         print("✅ Import: bot.voice_attendance")
     except ModuleNotFoundError:
-        from voice_attendance import setup_voice_attendance  # type: ignore
-        print("✅ Import: voice_attendance (root)")
+        try:
+            from voice_attendance import setup_voice_attendance  # type: ignore
+            print("✅ Import: voice_attendance (root)")
+        except Exception as e:
+            setup_voice_attendance = None
+            print(f"❌ Voice-Attendance Import deaktiviert: {e!r}")
+    except Exception as e:
+        # Wichtig: ein kaputter optionaler Runtime-/Voice-Import darf nicht verhindern,
+        # dass andere Module wie Dashboard, DKP, Loot und Slash-Command-Sync starten.
+        setup_voice_attendance = None
+        print(f"❌ Voice-Attendance Import deaktiviert: {e!r}")
 
     global setup_dashboard_data
 
@@ -217,8 +226,15 @@ def _import_modules():
         from bot.dashboard_data import setup_dashboard_data  # type: ignore
         print("✅ Import: bot.dashboard_data")
     except ModuleNotFoundError:
-        from dashboard_data import setup_dashboard_data  # type: ignore
-        print("✅ Import: dashboard_data (root)")
+        try:
+            from dashboard_data import setup_dashboard_data  # type: ignore
+            print("✅ Import: dashboard_data (root)")
+        except Exception as e:
+            setup_dashboard_data = None
+            print(f"❌ Dashboard-Datenlayer Import deaktiviert: {e!r}")
+    except Exception as e:
+        setup_dashboard_data = None
+        print(f"❌ Dashboard-Datenlayer Import deaktiviert: {e!r}")
 
 
 def _get_token() -> str | None:
