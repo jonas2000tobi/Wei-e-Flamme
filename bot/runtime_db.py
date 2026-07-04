@@ -338,6 +338,126 @@ def _json_dumps(value: Any) -> str:
         return json.dumps(str(value), ensure_ascii=False)
 
 
+
+def get_guild_setting(guild_id: int, key: str, default: Any = None) -> Any:
+    """Liest eine serverbezogene Einstellung aus der Runtime-DB.
+
+    Wird u.a. fürs spätere Multi-Guild-/Dashboard-Setup genutzt.
+    Werte werden als JSON gespeichert, damit Zahlen, Strings und Dicts sauber
+    erhalten bleiben. Gibt `default` zurück, wenn kein Wert existiert oder JSON
+    defekt ist.
+    """
+    if not _INITIALIZED:
+        init_runtime_db()
+    key = str(key or "").strip()
+    if not key:
+        return default
+    with _DB_LOCK:
+        if _BACKEND == "postgres":
+            conn = _pg_connect()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT value_json FROM guild_settings WHERE guild_id = %s AND key = %s",
+                        (int(guild_id), key),
+                    )
+                    row = cur.fetchone()
+            finally:
+                conn.close()
+        else:
+            conn = _sqlite_connect()
+            try:
+                row = conn.execute(
+                    "SELECT value_json FROM guild_settings WHERE guild_id = ? AND key = ?",
+                    (int(guild_id), key),
+                ).fetchone()
+            finally:
+                conn.close()
+    if not row:
+        return default
+    try:
+        return json.loads(dict(row).get("value_json") or "null")
+    except Exception:
+        return default
+
+
+def set_guild_setting(guild_id: int, key: str, value: Any) -> bool:
+    """Speichert eine serverbezogene Einstellung in der Runtime-DB."""
+    if not _INITIALIZED:
+        init_runtime_db()
+    key = str(key or "").strip()
+    if not key:
+        return False
+    value_json = _json_dumps(value)
+    updated_at = _now_iso()
+    with _DB_LOCK:
+        if _BACKEND == "postgres":
+            conn = _pg_connect()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO guild_settings(guild_id, key, value_json, updated_at)
+                        VALUES (%s, %s, %s, %s)
+                        ON CONFLICT (guild_id, key)
+                        DO UPDATE SET value_json = EXCLUDED.value_json, updated_at = EXCLUDED.updated_at
+                        """,
+                        (int(guild_id), key, value_json, updated_at),
+                    )
+                conn.commit()
+                return True
+            finally:
+                conn.close()
+
+        conn = _sqlite_connect()
+        try:
+            conn.execute(
+                """
+                INSERT INTO guild_settings(guild_id, key, value_json, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(guild_id, key)
+                DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at
+                """,
+                (int(guild_id), key, value_json, updated_at),
+            )
+            conn.commit()
+            return True
+        finally:
+            conn.close()
+
+
+def delete_guild_setting(guild_id: int, key: str) -> bool:
+    """Löscht eine serverbezogene Einstellung."""
+    if not _INITIALIZED:
+        init_runtime_db()
+    key = str(key or "").strip()
+    if not key:
+        return False
+    with _DB_LOCK:
+        if _BACKEND == "postgres":
+            conn = _pg_connect()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "DELETE FROM guild_settings WHERE guild_id = %s AND key = %s",
+                        (int(guild_id), key),
+                    )
+                conn.commit()
+                return True
+            finally:
+                conn.close()
+        conn = _sqlite_connect()
+        try:
+            conn.execute(
+                "DELETE FROM guild_settings WHERE guild_id = ? AND key = ?",
+                (int(guild_id), key),
+            )
+            conn.commit()
+            return True
+        finally:
+            conn.close()
+
+
 def write_audit_log(
     *,
     guild_id: Optional[int],
