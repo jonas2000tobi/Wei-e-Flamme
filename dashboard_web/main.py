@@ -5,6 +5,7 @@ import json
 import os
 import secrets
 import csv
+import re
 import io
 import base64
 import hashlib
@@ -2476,6 +2477,383 @@ def _render_loot_dashboard(data: dict[str, Any]) -> str:
     return _html_shell("Loot · Ebo Dashboard", body)
 
 
+
+_LOOT_ACTIVE_STATUSES = {"open", "active", "running", "bidding", "roll", "rolling", "sale", "free", "main", "secondary", "pending", "need"}
+_LOOT_DONE_STATUSES = {"done", "closed", "finished", "ended", "delivered", "completed", "sold", "awarded", "winner"}
+_LOOT_CANCELLED_STATUSES = {"cancelled", "canceled", "deleted", "aborted", "ignored"}
+
+
+def _loot_text(value: Any) -> str:
+    """Robuste Text-Extraktion für Item-/Need-/Auktionswerte aus älteren und neueren Snapshots."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, dict):
+        for key in (
+            "item_name", "item", "name", "label", "title", "display_name", "short_name",
+            "ingame_name", "value", "text", "query", "loot_name",
+        ):
+            v = value.get(key)
+            if isinstance(v, (str, int, float)) and str(v).strip():
+                return str(v).strip()
+        # Manche Need-Einträge liegen als {slot: item} vor.
+        for v in value.values():
+            if isinstance(v, (str, int, float)) and str(v).strip():
+                return str(v).strip()
+    return str(value).strip()
+
+
+def _loot_key(value: Any) -> str:
+    label = _loot_text(value).lower()
+    label = re.sub(r"\s+", " ", label).strip()
+    label = re.sub(r"[^a-z0-9äöüß ._+\-/]", "", label)
+    return label
+
+
+def _loot_status(value: Any) -> str:
+    return str(value or "").strip().lower()
+
+
+def _loot_status_label(status: Any) -> dict[str, str]:
+    raw = str(status or "—").strip() or "—"
+    s = raw.lower()
+    if s in _LOOT_ACTIVE_STATUSES:
+        return _raw(f"<span class='pill'>offen</span>")
+    if s in _LOOT_DONE_STATUSES:
+        return _raw(f"<span class='pill'>erledigt</span>")
+    if s in _LOOT_CANCELLED_STATUSES:
+        return _raw(f"<span class='pill'>abgebrochen</span>")
+    return _raw(f"<span class='pill'>{_e(raw)}</span>")
+
+
+def _loot_is_active(auction: dict[str, Any]) -> bool:
+    s = _loot_status(auction.get("status"))
+    phase = _loot_status(auction.get("phase"))
+    return s in _LOOT_ACTIVE_STATUSES or (not s and phase in {"need", "free", "sale", "roll"})
+
+
+def _loot_is_done(auction: dict[str, Any]) -> bool:
+    s = _loot_status(auction.get("status"))
+    return s in _LOOT_DONE_STATUSES or bool(auction.get("delivered_at"))
+
+
+def _loot_bid_count(auction: dict[str, Any]) -> int:
+    if auction.get("bid_count") is not None:
+        return int(_num(auction.get("bid_count"), 0))
+    bids = auction.get("bids")
+    if isinstance(bids, list):
+        return len(bids)
+    return 0
+
+
+def _loot_leader_text(auction: dict[str, Any], names: dict[int, str]) -> str:
+    uid = _user_id(auction.get("top_bid_user_id") or auction.get("leader_user_id"))
+    amount = auction.get("top_bid_amount")
+    if amount is None:
+        amount = auction.get("leader_bid") or auction.get("highest_bid")
+    if uid and amount is not None:
+        return f"{names.get(uid, auction.get('top_bid_user_name') or auction.get('leader_name') or f'User {uid}')} · {_fmt_ec(amount)} EC"
+    if auction.get("top_bid_user_name") or auction.get("leader_name"):
+        return str(auction.get("top_bid_user_name") or auction.get("leader_name"))
+    return "—"
+
+
+def _loot_winner_cell(auction: dict[str, Any], names: dict[int, str]) -> Any:
+    uid = _user_id(auction.get("winner_user_id") or auction.get("delivered_to_user_id"))
+    if uid:
+        return _member_link(uid, auction.get("winner_name") or names.get(uid, f"User {uid}"))
+    return auction.get("winner_name") or "—"
+
+
+def _loot_need_index(snap: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Index: normalisierter Itemname -> Spieler mit Main-/Second-Need."""
+    rows = (((snap.get("loot") or {}).get("needs") or {}).get("items") or [])
+    names = _profile_name_map(snap)
+    idx: dict[str, dict[str, Any]] = {}
+
+    def add(kind: str, entry: Any, user_id: int, display_name: str) -> None:
+        label = _loot_text(entry)
+        key = _loot_key(label)
+        if not key:
+            return
+        bucket = idx.setdefault(key, {"item": label, "main": [], "secondary": []})
+        if len(label) > len(str(bucket.get("item") or "")):
+            bucket["item"] = label
+        person = {"user_id": user_id, "display_name": display_name}
+        arr = bucket.setdefault(kind, [])
+        if not any(_user_id(x.get("user_id")) == user_id for x in arr if isinstance(x, dict)):
+            arr.append(person)
+
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        uid = _user_id(row.get("user_id") or row.get("discord_id") or row.get("member_id"))
+        name = str(row.get("display_name") or row.get("name") or names.get(uid, f"User {uid}" if uid else "Unbekannt"))
+        for entry in (row.get("main") or row.get("main_needs") or row.get("main_items") or []):
+            add("main", entry, uid, name)
+        for entry in (row.get("secondary") or row.get("secondary_needs") or row.get("secondary_items") or row.get("second") or []):
+            add("secondary", entry, uid, name)
+    return idx
+
+
+def _loot_people_html(people: list[dict[str, Any]], *, limit: int = 5) -> dict[str, str]:
+    if not people:
+        return _raw("—")
+    parts = []
+    for p in people[:limit]:
+        uid = _user_id(p.get("user_id"))
+        label = _e(p.get("display_name") or f"User {uid}")
+        if uid:
+            parts.append(f'<a class="link" href="/member/{uid}">{label}</a>')
+        else:
+            parts.append(label)
+    more = len(people) - limit
+    if more > 0:
+        parts.append(f"+{more}")
+    return _raw(", ".join(parts))
+
+
+def _loot_mode_bucket(auction: dict[str, Any]) -> str:
+    phase = _loot_status(auction.get("phase"))
+    mode = _loot_status(auction.get("eligibility_mode"))
+    text = f"{phase} {mode}"
+    if "main" in text:
+        return "Main-Need"
+    if "secondary" in text or "second" in text:
+        return "Second-Need"
+    if "sale" in text or auction.get("fixed_price") is not None:
+        return "Sale"
+    if "free" in text or "all" in text:
+        return "Freie Auktion"
+    if auction.get("junk_drop"):
+        return "Müll/Sale"
+    return _phase_label(auction)
+
+
+def _loot_next_step(auction: dict[str, Any], need_info: Optional[dict[str, Any]] = None) -> str:
+    s = _loot_status(auction.get("status"))
+    bids = _loot_bid_count(auction)
+    winner = bool(auction.get("winner_user_id") or auction.get("winner_name"))
+    delivered = bool(auction.get("delivered_at"))
+    phase = _loot_status(auction.get("phase"))
+    mode = _loot_mode_bucket(auction).lower()
+    main_need_count = len((need_info or {}).get("main") or [])
+    sec_need_count = len((need_info or {}).get("secondary") or [])
+
+    if delivered:
+        return "fertig"
+    if winner and not delivered:
+        return "Übergabe markieren / prüfen"
+    if s in _LOOT_CANCELLED_STATUSES:
+        return "abgebrochen"
+    if s in _LOOT_DONE_STATUSES:
+        return "Ergebnis prüfen"
+    if bids > 0:
+        return "läuft: Gebote beobachten"
+    if "sale" in mode:
+        return "Sale ohne Käufer prüfen"
+    if "freie" in mode or phase == "free":
+        return "freie Auktion offen"
+    if main_need_count <= 0 and sec_need_count <= 0:
+        return "kein Need sichtbar → freie Auktion/Sale prüfen"
+    if main_need_count > 0:
+        return "Main-Need-Spieler warten auf Gebot"
+    if sec_need_count > 0:
+        return "Second-Need-Spieler warten auf Gebot"
+    return "prüfen"
+
+
+def _loot_center_payload_from_snapshot(snap: dict[str, Any]) -> dict[str, Any]:
+    names = _profile_name_map(snap)
+    loot = snap.get("loot") or {}
+    auction_items = (((loot.get("auctions") or {}).get("items") or []))
+    auctions = [a for a in auction_items if isinstance(a, dict)]
+    need_index = _loot_need_index(snap)
+
+    active: list[dict[str, Any]] = []
+    history: list[dict[str, Any]] = []
+    handover: list[dict[str, Any]] = []
+    no_bid: list[dict[str, Any]] = []
+    sale_free: list[dict[str, Any]] = []
+    next_actions: list[dict[str, Any]] = []
+
+    for a in auctions:
+        item = _loot_text(a.get("item_name") or a.get("item") or a.get("name") or a.get("label") or a.get("auction_id"))
+        key = _loot_key(item)
+        need_info = need_index.get(key, {"main": [], "secondary": []})
+        bids = _loot_bid_count(a)
+        mode = _loot_mode_bucket(a)
+        entry = {
+            "auction_id": str(a.get("auction_id") or a.get("id") or ""),
+            "item": item or str(a.get("auction_id") or "—"),
+            "status": str(a.get("status") or "—"),
+            "phase": str(a.get("phase") or "—"),
+            "mode": mode,
+            "bid_count": bids,
+            "leader": _loot_leader_text(a, names),
+            "winner_user_id": _user_id(a.get("winner_user_id") or a.get("delivered_to_user_id")),
+            "winner_name": str(a.get("winner_name") or ""),
+            "ends_at": a.get("ends_at") or a.get("expires_at") or a.get("end_at"),
+            "created_at": a.get("created_at") or a.get("started_at"),
+            "delivered_at": a.get("delivered_at"),
+            "fixed_price": a.get("fixed_price"),
+            "start_bid": a.get("start_bid"),
+            "min_increment": a.get("min_increment"),
+            "main_need_count": len(need_info.get("main") or []),
+            "secondary_need_count": len(need_info.get("secondary") or []),
+            "next_step": _loot_next_step(a, need_info),
+            "raw": a,
+        }
+        if _loot_is_active(a):
+            active.append(entry)
+            next_actions.append(entry)
+            if bids <= 0:
+                no_bid.append(entry)
+            if mode.lower() in {"sale", "freie auktion", "müll/sale"}:
+                sale_free.append(entry)
+        else:
+            history.append(entry)
+        if (a.get("winner_user_id") or a.get("winner_name")) and not a.get("delivered_at"):
+            handover.append(entry)
+            if entry not in next_actions:
+                next_actions.append(entry)
+
+    need_rows: list[dict[str, Any]] = []
+    for key, info in need_index.items():
+        main = info.get("main") or []
+        sec = info.get("secondary") or []
+        linked_active = [a for a in active if _loot_key(a.get("item")) == key]
+        need_rows.append({
+            "item": info.get("item") or key,
+            "main_count": len(main),
+            "secondary_count": len(sec),
+            "total": len(main) + len(sec),
+            "main": main,
+            "secondary": sec,
+            "active_auction_count": len(linked_active),
+        })
+    need_rows.sort(key=lambda x: (-int(x.get("main_count") or 0), -int(x.get("secondary_count") or 0), str(x.get("item") or "").lower()))
+
+    next_actions.sort(key=lambda x: (0 if "Übergabe" in str(x.get("next_step")) else 1, _dt(x.get("ends_at")), str(x.get("item") or "").lower()))
+    active.sort(key=lambda x: (_dt(x.get("ends_at")), str(x.get("item") or "").lower()))
+    history.sort(key=lambda x: (_dt(x.get("ends_at")), str(x.get("item") or "").lower()), reverse=True)
+
+    return {
+        "auctions_total": len(auctions),
+        "active": active,
+        "history": history,
+        "handover": handover,
+        "no_bid": no_bid,
+        "sale_free": sale_free,
+        "next_actions": next_actions,
+        "needs": need_rows,
+        "raw_loot": loot,
+    }
+
+
+def _render_loot_center(data: dict[str, Any]) -> str:
+    if not data.get("ok"):
+        return _html_shell("Loot · Ebo Dashboard", f"<section class='panel'><h1>🎁 Loot</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+    snap: dict[str, Any] = data.get("snapshot") or {}
+    names = _profile_name_map(snap)
+    center = _loot_center_payload_from_snapshot(snap)
+
+    cards = "".join([
+        _card("Aktive Auktionen", len(center["active"]), "offen/läuft"),
+        _card("Übergabe offen", len(center["handover"]), "Gewinner ohne Übergabe"),
+        _card("Ohne Gebot", len(center["no_bid"]), "aktive Auktionen"),
+        _card("Need-Items", len(center["needs"]), "aus Needlisten"),
+    ])
+
+    action_rows = []
+    for a in center["next_actions"][:80]:
+        aid = a.get("auction_id")
+        action_rows.append([
+            _auction_link(aid, a.get("item")) if aid else a.get("item"),
+            a.get("mode"),
+            _loot_status_label(a.get("status")),
+            a.get("bid_count"),
+            a.get("leader"),
+            _loot_winner_cell(a.get("raw") or {}, names),
+            _dt(a.get("ends_at")),
+            a.get("next_step"),
+        ])
+
+    active_rows = []
+    for a in center["active"]:
+        aid = a.get("auction_id")
+        active_rows.append([
+            _auction_link(aid, a.get("item")) if aid else a.get("item"),
+            a.get("mode"),
+            _loot_status_label(a.get("status")),
+            a.get("bid_count"),
+            a.get("leader"),
+            f"{a.get('main_need_count', 0)} / {a.get('secondary_need_count', 0)}",
+            _dt(a.get("ends_at")),
+        ])
+
+    handover_rows = []
+    for a in center["handover"]:
+        aid = a.get("auction_id")
+        handover_rows.append([
+            _auction_link(aid, a.get("item")) if aid else a.get("item"),
+            _loot_winner_cell(a.get("raw") or {}, names),
+            a.get("leader"),
+            _dt(a.get("ends_at")),
+            a.get("next_step"),
+        ])
+
+    no_bid_rows = []
+    for a in center["no_bid"][:80]:
+        aid = a.get("auction_id")
+        no_bid_rows.append([
+            _auction_link(aid, a.get("item")) if aid else a.get("item"),
+            a.get("mode"),
+            f"{a.get('main_need_count', 0)} / {a.get('secondary_need_count', 0)}",
+            _dt(a.get("ends_at")),
+            a.get("next_step"),
+        ])
+
+    need_rows = []
+    for n in center["needs"][:150]:
+        need_rows.append([
+            n.get("item"),
+            n.get("main_count"),
+            _loot_people_html(n.get("main") or []),
+            n.get("secondary_count"),
+            _loot_people_html(n.get("secondary") or []),
+            n.get("active_auction_count"),
+        ])
+
+    history_rows = []
+    for a in center["history"][:250]:
+        aid = a.get("auction_id")
+        history_rows.append([
+            _auction_link(aid, a.get("item")) if aid else a.get("item"),
+            a.get("mode"),
+            _loot_status_label(a.get("status")),
+            a.get("bid_count"),
+            a.get("leader"),
+            _loot_winner_cell(a.get("raw") or {}, names),
+            _dt(a.get("ends_at")),
+        ])
+
+    body = f"""
+    <nav class="topnav"><a href="/">← Übersicht</a><a href="/loot">Loot</a><a href="/needs">Needs</a><a href="/members">Mitglieder</a><a href="/fairness">Fairness</a><a href="/exports">Exports</a><a href="/api/loot-center">API</a></nav>
+    <section class="hero"><div><div class="eyebrow">Loot-Zentrale</div><h1>🎁 Loot / Auktionen</h1><p class="muted">Kontrollzentrum für aktive Auktionen, offene Übergaben, Gebote und Need-Spieler. Read-only, keine Bot-Daten werden verändert.</p></div><a class="btn" href="/export/loot_center.csv">CSV herunterladen</a></section>
+    <section class="grid">{cards}</section>
+    <section class="panel"><h2>🔥 Nächste Loot-Aktionen</h2><p class="muted">Das ist die Arbeitsliste: Übergaben, offene Auktionen, Sale/Freie-Auktion-Kandidaten und aktive Auktionen ohne Gebote.</p>{_table(['Item','Bereich','Status','Gebote','Führend','Gewinner','Ende','Nächster Schritt'], action_rows, placeholder='Aktionen durchsuchen…')}</section>
+    <section class="panel"><h2>🟢 Aktive Auktionen</h2>{_table(['Item','Bereich','Status','Gebote','Führend','Main/Second Need','Ende'], active_rows, placeholder='Aktive Auktionen durchsuchen…')}</section>
+    <section class="split"><div class="panel"><h2>🏁 Übergabe offen</h2>{_table(['Item','Gewinner','Führend','Ende','Nächster Schritt'], handover_rows, placeholder='Übergaben durchsuchen…')}</div><div class="panel"><h2>🟡 Ohne Gebot / Sale prüfen</h2>{_table(['Item','Bereich','Main/Second Need','Ende','Hinweis'], no_bid_rows, placeholder='Ohne Gebot durchsuchen…')}</div></section>
+    <section class="panel"><h2>🎯 Need-Spieler pro Item</h2><p class="muted">Damit sieht man direkt, ob ein Drop Main-/Second-Need-Spieler hat und ob schon eine Auktion dazu läuft.</p>{_table(['Item','Main','Main-Spieler','Second','Second-Spieler','aktive Auktionen'], need_rows, placeholder='Need-Item suchen…')}</section>
+    <section class="panel"><h2>📜 Auktionshistorie</h2>{_table(['Item','Bereich','Status','Gebote','Führend','Gewinner','Ende'], history_rows, placeholder='Historie durchsuchen…')}</section>
+    """
+    return _html_shell("Loot · Ebo Dashboard", body)
+
+
 def _render_exports_dashboard(data: dict[str, Any]) -> str:
     if not data.get("ok"):
         return _html_shell("Exports · Ebo Dashboard", f"<section class='panel'><h1>⬇️ Exports</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
@@ -3232,7 +3610,7 @@ def needs_page(_: bool = Depends(_auth)):
 @app.get("/loot", response_class=HTMLResponse)
 def loot_page(_: bool = Depends(_auth)):
     try:
-        return HTMLResponse(_render_loot_dashboard(_snapshot_payload()))
+        return HTMLResponse(_render_loot_center(_snapshot_payload()))
     except Exception as exc:
         return HTMLResponse(_html_shell("Ebo Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"), status_code=500)
 
@@ -3310,6 +3688,45 @@ def export_auctions_csv(_: bool = Depends(_auth)):
             rows.append([a.get("auction_id"), a.get("item_name"), _phase_label(a), a.get("status"), a.get("bid_count"), a.get("top_bid_user_name"), a.get("top_bid_amount"), a.get("winner_name"), a.get("ends_at")])
     return _csv_response("auctions.csv", ["auction_id","item","phase","status","bids","leader","leader_bid","winner","ends_at"], rows)
 
+
+@app.get("/api/loot-center")
+def api_loot_center(_: bool = Depends(_auth)):
+    payload = _snapshot_payload()
+    if not payload.get("ok"):
+        return JSONResponse(payload, status_code=404)
+    snap = payload.get("snapshot") or {}
+    center = _loot_center_payload_from_snapshot(snap)
+    # JSON-tauglich machen: raw Auktionsobjekte rausnehmen, weil /api/loot sie schon vollständig liefert.
+    safe = {}
+    for key, value in center.items():
+        if isinstance(value, list):
+            safe[key] = [{k: v for k, v in row.items() if k != "raw"} if isinstance(row, dict) else row for row in value]
+        elif key != "raw_loot":
+            safe[key] = value
+    return JSONResponse({"ok": True, "loot_center": safe})
+
+
+@app.get("/export/loot_center.csv")
+def export_loot_center_csv(_: bool = Depends(_auth)):
+    payload = _snapshot_payload()
+    snap = payload.get("snapshot") or {}
+    center = _loot_center_payload_from_snapshot(snap)
+    rows = []
+    for a in center.get("next_actions") or []:
+        rows.append([
+            a.get("auction_id"),
+            a.get("item"),
+            a.get("mode"),
+            a.get("status"),
+            a.get("bid_count"),
+            a.get("leader"),
+            a.get("winner_name") or a.get("winner_user_id") or "",
+            _dt(a.get("ends_at")),
+            a.get("main_need_count"),
+            a.get("secondary_need_count"),
+            a.get("next_step"),
+        ])
+    return _csv_response("loot_center.csv", ["auction_id","item","bereich","status","gebote","fuehrend","gewinner","ende","main_needs","secondary_needs","naechster_schritt"], rows)
 
 
 @app.get("/planning", response_class=HTMLResponse)
