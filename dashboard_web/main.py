@@ -16,21 +16,13 @@ import urllib.error
 from collections import Counter
 from datetime import datetime, timezone
 from typing import Any, Optional
-from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, RedirectResponse
-from fastapi.staticfiles import StaticFiles
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
 app = FastAPI(title="Ebo Dashboard", version="0.9.0")
 security = HTTPBasic(auto_error=False)
-
-STATIC_DIR = Path(__file__).resolve().parent / "static"
-if STATIC_DIR.exists():
-    app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
-
-ASSET_VER = "ebo-theme-root-1"
 
 
 def _database_url() -> str:
@@ -296,10 +288,6 @@ def _redirect_uri(request: Request) -> str:
 
 def _e(value: Any) -> str:
     return html.escape(str(value if value is not None else ""))
-
-
-def _asset(name: str) -> str:
-    return f"/static/{name}?v={ASSET_VER}"
 
 
 def _dt(value: Any) -> str:
@@ -1059,7 +1047,6 @@ def _render_dashboard(data: dict[str, Any]) -> str:
       <a href="/fairness">Fairness</a>
       <a href="/analytics">Analytics</a><a href="/voice">Voice</a>
       <a href="/ec">EC-Verlauf</a>
-      <a href="/attendance">Anwesenheit</a>
       <a href="/settings">Einstellungen</a>
       <a href="/audit">Audit</a>
       <a href="/system">System</a>
@@ -1395,45 +1382,21 @@ def _html_shell(title: str, body: str) -> str:
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{_e(title)}</title>
-  <link rel="icon" type="image/png" href="{_asset('favicon.png')}">
-  <meta property="og:title" content="{_e(title)}">
-  <meta property="og:image" content="{_asset('opengraph.webp')}">
-  <meta name="theme-color" content="#0f1014">
   <style>
     :root {{ --bg:#0f1014; --panel:#181a22; --panel2:#20232d; --text:#f1eadb; --muted:#a8a193; --gold:#d6a84f; --line:#333746; --red:#d96868; --green:#81c784; }}
     * {{ box-sizing:border-box; }} html {{ scroll-behavior:smooth; }}
-    body {{ margin:0; font-family:Inter, system-ui, Segoe UI, sans-serif; background:linear-gradient(180deg,rgba(15,16,20,.80),rgba(15,16,20,.96)), url("{_asset('dashboard_bg.webp')}") center top / cover fixed no-repeat; color:var(--text); }}
+    body {{ margin:0; font-family:Inter, system-ui, Segoe UI, sans-serif; background:radial-gradient(circle at top,#27212a 0,#0f1014 42%); color:var(--text); }}
     main {{ max-width:1240px; margin:0 auto; padding:22px 18px 60px; }}
-    .topnav {{ position:sticky; top:0; z-index:5; display:flex; gap:8px; flex-wrap:wrap; padding:10px; margin:-22px -18px 18px; background:rgba(10,11,15,.86); backdrop-filter:blur(12px); border-bottom:1px solid rgba(214,168,79,.24); box-shadow:0 10px 30px rgba(0,0,0,.35); }}
-    .topnav a {{ color:var(--text); text-decoration:none; padding:9px 12px; border:1px solid var(--line); border-radius:999px; background:linear-gradient(180deg,rgba(32,35,45,.95),rgba(13,14,20,.92)); font-size:13px; display:inline-flex; align-items:center; gap:8px; box-shadow:inset 0 1px 0 rgba(255,255,255,.04); }}
-    .topnav a::before {{ content:""; width:22px; height:22px; flex:0 0 22px; background:center / contain no-repeat; filter:drop-shadow(0 1px 3px rgba(0,0,0,.7)); display:none; }}
-    .topnav a[href="/"]::before {{ display:block; background-image:url("{_asset('nav_kommando.png')}"); }}
-    .topnav a[href="/overview"]::before {{ display:block; background-image:url("{_asset('nav_kommando.png')}"); }}
-    .topnav a[href="/planning"]::before {{ display:block; background-image:url("{_asset('nav_planung.png')}"); }}
-    .topnav a[href="/members"]::before {{ display:block; background-image:url("{_asset('nav_mitglieder.png')}"); }}
-    .topnav a[href="/needs"]::before {{ display:block; background-image:url("{_asset('nav_needs.png')}"); }}
-    .topnav a[href="/loot"]::before {{ display:block; background-image:url("{_asset('nav_loot.png')}"); }}
-    .topnav a[href="/fairness"]::before {{ display:block; background-image:url("{_asset('nav_fairness.png')}"); }}
-    .topnav a[href="/analytics"]::before {{ display:block; background-image:url("{_asset('nav_analytics.png')}"); }}
-    .topnav a[href="/voice"]::before {{ display:block; background-image:url("{_asset('nav_voice.png')}"); }}
-    .topnav a[href="/ec"]::before {{ display:block; background-image:url("{_asset('nav_ec.png')}"); }}
-    .topnav a[href="/attendance"]::before {{ display:block; background-image:url("{_asset('nav_anwesenheit.png')}"); }}
-    .topnav a[href="/audit"]::before {{ display:block; background-image:url("{_asset('nav_audit.png')}"); }}
-    .topnav a[href="/admin"]::before {{ display:block; background-image:url("{_asset('nav_leitung.png')}"); }}
-    .topnav a[href="/settings"]::before {{ display:block; background-image:url("{_asset('nav_einstellungen.png')}"); }}
-    .topnav a[href="/system"]::before {{ display:block; background-image:url("{_asset('nav_system.png')}"); }}
-    .topnav a[href="/exports"]::before {{ display:block; background-image:url("{_asset('nav_exports.png')}"); }}
-    .topnav a:hover {{ border-color:var(--gold); color:var(--gold); transform:translateY(-1px); }}
-    .hero {{ position:relative; overflow:hidden; display:flex; justify-content:space-between; gap:18px; align-items:center; padding:30px; border:1px solid rgba(214,168,79,.32); background:linear-gradient(90deg,rgba(10,11,15,.90),rgba(24,26,34,.78)), url("{_asset('hero_banner.webp')}") center / cover no-repeat; border-radius:20px; margin-bottom:18px; box-shadow:0 18px 44px rgba(0,0,0,.42); }}
-    .hero::after {{ content:""; position:absolute; inset:0; pointer-events:none; background:radial-gradient(circle at 76% 50%,rgba(214,168,79,.16),transparent 34%), linear-gradient(180deg,transparent,rgba(0,0,0,.24)); }}
-    .hero > * {{ position:relative; z-index:1; }}
-    .hero h1::before {{ content:""; display:inline-block; width:38px; height:38px; margin-right:10px; vertical-align:-8px; background:url("{_asset('logo_128.png')}") center / contain no-repeat; filter:drop-shadow(0 2px 7px rgba(0,0,0,.8)); }}
+    .topnav {{ position:sticky; top:0; z-index:5; display:flex; gap:8px; flex-wrap:wrap; padding:10px; margin:-22px -18px 18px; background:rgba(15,16,20,.88); backdrop-filter:blur(10px); border-bottom:1px solid var(--line); }}
+    .topnav a {{ color:var(--text); text-decoration:none; padding:8px 10px; border:1px solid var(--line); border-radius:999px; background:rgba(24,26,34,.85); font-size:13px; }}
+    .topnav a:hover {{ border-color:var(--gold); color:var(--gold); }}
+    .hero {{ display:flex; justify-content:space-between; gap:18px; align-items:center; padding:26px; border:1px solid var(--line); background:linear-gradient(135deg,rgba(214,168,79,.16),rgba(24,26,34,.94)); border-radius:18px; margin-bottom:18px; }}
     .eyebrow {{ color:var(--gold); text-transform:uppercase; letter-spacing:.12em; font-size:12px; font-weight:700; }}
     h1,h2,h3 {{ margin:0 0 8px; }} p {{ color:var(--muted); }}
     .muted {{ color:var(--muted); }}
     .grid {{ display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:12px; margin:18px 0; }}
     .mini-grid {{ margin:12px 0 18px; }}
-    .card,.panel {{ background:linear-gradient(180deg,rgba(24,26,34,.94),rgba(16,18,25,.94)), url("{_asset('panel_texture.webp')}") center / cover; border:1px solid rgba(214,168,79,.16); border-radius:16px; box-shadow:0 10px 30px rgba(0,0,0,.32), inset 0 1px 0 rgba(255,255,255,.03); }}
+    .card,.panel {{ background:rgba(24,26,34,.92); border:1px solid var(--line); border-radius:16px; box-shadow:0 10px 30px rgba(0,0,0,.25); }}
     .card {{ padding:16px; }} .card-title {{ color:var(--muted); font-size:13px; }} .card-value {{ font-size:28px; font-weight:800; color:var(--gold); }} .card-sub {{ color:var(--muted); font-size:12px; }}
     .panel {{ padding:18px; margin:14px 0; scroll-margin-top:70px; }}
     .subpanel {{ background:rgba(32,35,45,.72); border:1px solid var(--line); border-radius:14px; padding:14px; margin:12px 0; }}
@@ -1451,9 +1414,7 @@ def _html_shell(title: str, body: str) -> str:
     .pill {{ display:inline-block; padding:2px 8px; border:1px solid var(--line); border-radius:999px; color:var(--gold); font-size:12px; vertical-align:middle; }}
     .need-list {{ margin:8px 0 16px; padding-left:22px; color:var(--text); }} .need-list li {{ margin:5px 0; }}
     code {{ background:#05060a; border:1px solid var(--line); padding:2px 5px; border-radius:6px; }}
-    .empty {{ color:var(--muted); padding:18px 16px 18px 58px; min-height:58px; display:flex; align-items:center; border:1px dashed rgba(214,168,79,.18); border-radius:14px; background:linear-gradient(90deg,rgba(10,11,15,.70),rgba(24,26,34,.54)); position:relative; }}
-    .empty::before {{ content:""; position:absolute; left:16px; top:50%; width:30px; height:30px; transform:translateY(-50%); background:url("{_asset('status_ec_offen.png')}") center / contain no-repeat; opacity:.78; }}
-    .warn {{ background:#3a250d; border:1px solid #8a5b18; padding:12px 14px; border-radius:12px; margin-bottom:14px; color:#ffe0a3; }}
+    .empty {{ color:var(--muted); padding:10px 0; }} .warn {{ background:#3a250d; border:1px solid #8a5b18; padding:12px 14px; border-radius:12px; margin-bottom:14px; color:#ffe0a3; }}
     .authbar {{ display:flex; gap:10px; align-items:center; justify-content:flex-end; background:rgba(24,26,34,.9); border:1px solid var(--line); border-radius:12px; padding:10px 12px; margin-bottom:14px; color:var(--muted); font-size:13px; }} .authbar a {{ color:var(--gold); text-decoration:none; font-weight:700; }}
     @media(max-width:1000px) {{ .grid,.analytics-grid {{ grid-template-columns:repeat(2,minmax(0,1fr)); }} .split {{ grid-template-columns:1fr; }} .hero {{ flex-direction:column; align-items:flex-start; }} }}
     @media(max-width:560px) {{ .grid,.analytics-grid {{ grid-template-columns:1fr; }} .bar-row {{ grid-template-columns:90px 1fr 38px; }} }}
@@ -2342,7 +2303,7 @@ def _render_planning_dashboard(data: dict[str, Any]) -> str:
     plan = _planning_analytics(snap)
     cards = "".join([
         _card("Events", plan.get("events_total", 0), "im Snapshot"),
-        _card("Event-Hinweise", plan.get("events_at_risk", 0), "wenig/fehlende Rollen"),
+        _card("Risiko-Events", plan.get("events_at_risk", 0), "wenig/fehlende Rollen"),
         _card("Ø Bereitschaft", f"{round(_num(plan.get('avg_readiness'), 0))}%", "Faustregel"),
         _card("Snapshot", _dt(data.get("published_at")), "read-only"),
     ])
@@ -3040,74 +3001,12 @@ def _dt_obj(value: Any) -> Optional[datetime]:
 
 
 def _is_active_auction(auction: dict[str, Any]) -> bool:
-    status = str(auction.get("status") or "").strip().lower()
-    phase = str(auction.get("phase") or "").strip().lower()
-
-    # Status schlägt Phase. Eine gelieferte/geschlossene Auktion darf nicht
-    # nur wegen phase="free" oder phase="sale" weiter als aktiv zählen.
-    closed_words = (
-        "delivered", "sold", "closed", "expired", "done", "ended", "finished",
-        "cancelled", "canceled", "deleted", "abbruch", "abgebrochen",
-        "abgeschlossen", "completed",
-    )
-    if any(x in status for x in closed_words):
+    status = str(auction.get("status") or "").lower()
+    phase = str(auction.get("phase") or "").lower()
+    if any(x in status for x in ("deleted", "cancel", "abbruch", "closed", "finished", "done", "ended", "abgeschlossen")):
         return False
-
-    active_statuses = {"active", "open", "running", "bidding", "pending", "roll"}
-    if status in active_statuses:
-        return True
-
-    # Nur wenn kein aussagekräftiger Status gesetzt ist, darf die Phase helfen.
-    if not status:
-        active_phases = {"need", "free", "sale", "roll", "main", "secondary", "müll", "muell", "junk"}
-        return phase in active_phases
-
-    return False
-
-
-def _is_running_event(event: dict[str, Any]) -> bool:
-    """Dashboard-Definition: erstellt und nicht beendet/gelöscht/abgebrochen."""
-    if not isinstance(event, dict):
-        return False
-
-    status = str(
-        event.get("status")
-        or event.get("state")
-        or event.get("phase")
-        or event.get("event_status")
-        or ""
-    ).strip().lower()
-
-    closed_statuses = {
-        "done", "ended", "finished", "closed", "cancelled", "canceled",
-        "deleted", "archived", "completed", "aborted", "expired",
-        "beendet", "gelöscht", "geloescht", "abgebrochen",
-    }
-    if status in closed_statuses:
-        return False
-
-    for key in (
-        "is_done", "done", "ended", "is_ended", "closed", "is_closed",
-        "cancelled", "canceled", "deleted", "archived", "aborted",
-    ):
-        if bool(event.get(key)):
-            return False
-
-    if event.get("ended_at") or event.get("deleted_at") or event.get("cancelled_at") or event.get("canceled_at"):
-        return False
-
-    return True
-
-
-def _running_events_from_snapshot(snap: dict[str, Any], *, limit: int = 12) -> list[dict[str, Any]]:
-    events = ((snap.get("events") or {}).get("items") or [])
-    out: list[dict[str, Any]] = []
-    for ev in events:
-        if not isinstance(ev, dict) or not _is_running_event(ev):
-            continue
-        out.append({**ev, "_dt": _dt_obj(ev.get("when_iso") or ev.get("start_at") or ev.get("created_at"))})
-    out.sort(key=lambda x: (x.get("_dt") is None, x.get("_dt") or datetime.max.replace(tzinfo=timezone.utc)))
-    return out[:limit]
+    active_words = ("open", "active", "running", "bidding", "roll", "sale", "free", "main", "secondary", "müll", "muell", "junk")
+    return any(x in status for x in active_words) or any(x in phase for x in active_words)
 
 
 def _auction_leader_text(auction: dict[str, Any], names: dict[int, str]) -> str:
@@ -3131,7 +3030,17 @@ def _leadership_insights(snap: dict[str, Any]) -> dict[str, Any]:
     member_filter = guild.get("member_filter") if isinstance(guild.get("member_filter"), dict) else {}
     role_member_count = int(_num(member_filter.get("eligible_count"), analytics.get("role_member_count", 0)))
 
-    running_events = _running_events_from_snapshot(snap, limit=12)
+    events = planning.get("events") if isinstance(planning.get("events"), list) else []
+    event_rows = []
+    for ev in events:
+        if not isinstance(ev, dict):
+            continue
+        dt = _dt_obj(ev.get("when_iso"))
+        issues = [str(x) for x in (ev.get("issues") or [])]
+        readiness = int(_num(ev.get("readiness"), 0))
+        if readiness < 80 or issues:
+            event_rows.append({**ev, "_dt": dt, "issues_text": ", ".join(issues) or "—"})
+    event_rows.sort(key=lambda x: (x.get("_dt") is None, x.get("_dt") or datetime.max.replace(tzinfo=timezone.utc)))
 
     auctions = (((snap.get("loot") or {}).get("auctions") or {}).get("items") or [])
     active_auctions = []
@@ -3179,7 +3088,7 @@ def _leadership_insights(snap: dict[str, Any]) -> dict[str, Any]:
     return {
         "member_count": role_member_count,
         "tasks": tasks,
-        "running_events": running_events,
+        "event_risks": event_rows[:12],
         "active_auctions": active_auctions[:12],
         "flagged_members": flagged_members[:12],
         "planning": planning,
@@ -3229,14 +3138,14 @@ def _render_leadership_dashboard(data: dict[str, Any]) -> str:
 
     tasks = li.get("tasks") or []
     urgent_count = sum(1 for t in tasks if str(t.get("prio")) == "hoch")
-    running_events = li.get("running_events") or []
+    event_risks = li.get("event_risks") or []
     active_auctions = li.get("active_auctions") or []
     flagged_members = li.get("flagged_members") or []
 
     cards = "".join([
         _card("Offene Aufgaben", len(tasks), f"hoch: {urgent_count}"),
         _card("Rollenmitglieder", li.get("member_count", 0), role_line),
-        _card("Laufende Events", len(running_events), "erstellt / nicht beendet"),
+        _card("Risiko-Events", len(event_risks), "Rollen/Teilnehmer prüfen"),
         _card("Aktive Auktionen", len(active_auctions), "Auktionshaus/DKP-Log"),
         _card("ohne Needliste", quality.get("missing_needs", 0), "nachpflegen lassen"),
         _card("EC gesamt", _fmt_ec(analytics.get("total_ec")), f"Ø {_fmt_ec(analytics.get('avg_ec'))}"),
@@ -3255,16 +3164,18 @@ def _render_leadership_dashboard(data: dict[str, Any]) -> str:
         ])
 
     event_rows = []
-    for ev in running_events:
+    for ev in event_risks:
         if not isinstance(ev, dict):
             continue
         event_rows.append([
-            _event_link(ev.get("event_id"), ev.get("title") or ev.get("name")),
-            _dt(ev.get("when_iso") or ev.get("start_at") or ev.get("created_at")),
-            ev.get("participant_count", ev.get("participants", "—")),
-            ev.get("maybe_count", ev.get("maybe", "—")),
-            ev.get("no_count", ev.get("no", "—")),
-            "ja" if ev.get("voice_enabled") else "nein",
+            _event_link(ev.get("event_id"), ev.get("title")),
+            _dt(ev.get("when_iso")),
+            ev.get("participants"),
+            ev.get("tank"),
+            ev.get("healer"),
+            ev.get("dps"),
+            f"{int(_num(ev.get('readiness'), 0))}%",
+            ev.get("issues_text") or ", ".join(str(x) for x in (ev.get("issues") or [])) or "—",
         ])
 
     auction_rows = []
@@ -3301,7 +3212,6 @@ def _render_leadership_dashboard(data: dict[str, Any]) -> str:
         [_raw('<a class="link" href="/needs">🎁 Needs</a>'), "Top-Needs und Mitglieder ohne Needliste"],
         [_raw('<a class="link" href="/loot">🏆 Loot</a>'), "Aktive Auktionen, Gewinner, Roll-/Bid-Historie"],
         [_raw('<a class="link" href="/fairness">⚖️ Fairness</a>'), "Need/EC/Loot-Hinweise"],
-        [_raw('<a class="link" href="/attendance">✅ Anwesenheit</a>'), "Event-Review und EC-Buchung"],
         [_raw('<a class="link" href="/audit">🧾 Audit</a>'), "Wer hat was gemacht"],
         [_raw('<a class="link" href="/admin">🛡️ Leitung</a>'), "interne Notizen und Prüfmarkierungen"],
         [_raw('<a class="link" href="/overview">📊 Gesamtübersicht</a>'), "alte Tabellen-Startseite"],
@@ -3317,7 +3227,6 @@ def _render_leadership_dashboard(data: dict[str, Any]) -> str:
       <a href="/fairness">Fairness</a>
       <a href="/analytics">Analytics</a><a href="/voice">Voice</a>
       <a href="/ec">EC</a>
-      <a href="/attendance">Anwesenheit</a>
       <a href="/audit">Audit</a>
       <a href="/admin">Leitung</a>
       <a href="/settings">Einstellungen</a>
@@ -3329,7 +3238,7 @@ def _render_leadership_dashboard(data: dict[str, Any]) -> str:
       <div>
         <div class="eyebrow">Führungsstartseite · read-only</div>
         <h1>🏰 {_e(guild.get('name') or data.get('guild_name') or 'Gilde')}</h1>
-        <p>Was heute wichtig ist: offene Aufgaben, laufende Events, aktive Auktionen und auffällige Mitglieder.</p>
+        <p>Was heute Aufmerksamkeit braucht: Aufgaben, Risiko-Events, aktive Auktionen und auffällige Mitglieder.</p>
         <p class="muted">{_e(role_line)} · Snapshot: {_e(_dt(data.get('published_at')))}</p>
       </div>
       <a class="btn" href="/overview">Gesamtübersicht</a>
@@ -3345,8 +3254,8 @@ def _render_leadership_dashboard(data: dict[str, Any]) -> str:
 
     <section class="split">
       <div class="panel">
-        <h2>📅 Laufende Events</h2>
-        {_table(['Event','Zeit','Teilnehmer','Vielleicht','Abgemeldet','Voice'], event_rows, placeholder='Laufende Events durchsuchen…')}
+        <h2>📅 Events mit Aufmerksamkeit</h2>
+        {_table(['Event','Zeit','Teilnehmer','Tank','Heiler','DPS','Score','Hinweis'], event_rows, placeholder='Events durchsuchen…')}
       </div>
       <div class="panel">
         <h2>🎁 Aktive Auktionen</h2>
