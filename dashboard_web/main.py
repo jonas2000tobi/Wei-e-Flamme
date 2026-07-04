@@ -732,6 +732,245 @@ def _render_admin_actions_dashboard(data: dict[str, Any]) -> str:
     return _html_shell("Leitung · Ebo Dashboard", body)
 
 
+# ---------------------------------------------------------------------------
+# Step 4: Admin- und Einstellungszentrale
+# ---------------------------------------------------------------------------
+
+def _loot_action_requests_for_dashboard(guild_id: int, limit: int = 120) -> list[dict[str, Any]]:
+    """Letzte Dashboard-Loot-Aktionen über alle Auktionen.
+
+    Nur Diagnose/Transparenz für die Admin-Zentrale. Keine Schreibzugriffe.
+    """
+    if not _database_url() or not guild_id:
+        return []
+    try:
+        _ensure_admin_tables()
+    except Exception:
+        return []
+    conn = _pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, request_id, guild_id, auction_id, action_type, amount, status,
+                       actor_id, actor_name, requested_at, claimed_at, processed_at, payload_json, result_json
+                FROM dashboard_loot_action_requests
+                WHERE guild_id = %s
+                ORDER BY requested_at DESC, id DESC
+                LIMIT %s
+                """,
+                (int(guild_id), int(limit)),
+            )
+            rows: list[dict[str, Any]] = []
+            for row in cur.fetchall() or []:
+                out = dict(row)
+                try:
+                    out["payload"] = json.loads(out.get("payload_json") or "{}")
+                except Exception:
+                    out["payload"] = {}
+                try:
+                    out["result"] = json.loads(out.get("result_json") or "{}")
+                except Exception:
+                    out["result"] = {}
+                rows.append(out)
+            return rows
+    finally:
+        conn.close()
+
+
+def _admin_flat_settings(snap: dict[str, Any]) -> list[dict[str, Any]]:
+    settings = snap.get("settings") or {}
+    out: list[dict[str, Any]] = []
+    for row in settings.get("settings") or []:
+        if isinstance(row, dict):
+            out.append({
+                "source": str(row.get("source") or "settings"),
+                "key": str(row.get("key") or ""),
+                "value": row.get("value"),
+            })
+    for row in settings.get("channels") or []:
+        if isinstance(row, dict):
+            out.append({"source": str(row.get("source") or "channels"), "key": str(row.get("key") or "channel"), "value": row.get("name") or row.get("channel_id")})
+    for row in settings.get("roles") or []:
+        if isinstance(row, dict):
+            out.append({"source": str(row.get("source") or "roles"), "key": str(row.get("key") or "role"), "value": row.get("name") or row.get("role_id")})
+    return out
+
+
+def _admin_relevant_rule_rows(snap: dict[str, Any]) -> list[list[Any]]:
+    terms = ("ec", "dkp", "loot", "auction", "auktion", "bid", "gebot", "sale", "müll", "trash", "weekly", "week", "limit", "cap", "decay", "verfall", "event", "attendance", "anwesen")
+    rows: list[list[Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for item in _admin_flat_settings(snap):
+        key = str(item.get("key") or "")
+        source = str(item.get("source") or "")
+        hay = (source + " " + key + " " + str(item.get("value") or "")).lower()
+        if not any(t in hay for t in terms):
+            continue
+        ident = (source, key)
+        if ident in seen:
+            continue
+        seen.add(ident)
+        rows.append([source, key, _short(item.get("value"), 180)])
+    return rows[:220]
+
+
+def _queue_status_counts(rows: list[dict[str, Any]]) -> Counter:
+    return Counter(str(r.get("status") or "unknown").lower() for r in rows if isinstance(r, dict))
+
+
+def _queue_status_cards(prefix: str, counts: Counter) -> str:
+    return "".join([
+        _card(f"{prefix} offen", counts.get("pending", 0), "wartet auf Bot"),
+        _card(f"{prefix} läuft", counts.get("processing", 0), "wird verarbeitet"),
+        _card(f"{prefix} erledigt", counts.get("done", 0), "erfolgreich"),
+        _card(f"{prefix} Fehler", counts.get("failed", 0) + counts.get("rejected", 0), "failed/rejected"),
+    ])
+
+
+def _admin_center_payload(data: dict[str, Any]) -> dict[str, Any]:
+    snap: dict[str, Any] = data.get("snapshot") or {}
+    guild_id = _safe_guild_id(data)
+    settings = snap.get("settings") or {}
+    guild = snap.get("guild") or {}
+    storage = snap.get("storage") or {}
+    source_rows = _source_health_rows(snap)
+    source_ok = sum(1 for r in source_rows if str(r[3]) == "OK")
+    source_bad = len(source_rows) - source_ok
+    ec_requests = _ec_award_requests_for_dashboard(guild_id, limit=120) if guild_id else []
+    loot_requests = _loot_action_requests_for_dashboard(guild_id, limit=120) if guild_id else []
+    ec_counts = _queue_status_counts(ec_requests)
+    loot_counts = _queue_status_counts(loot_requests)
+    admin_states = _all_member_admin_states(guild_id) if guild_id else []
+    admin_log = _admin_action_log(guild_id, limit=160) if guild_id else []
+
+    member_filter = settings.get("member_filter") or ((guild.get("member_filter") or {}))
+    if isinstance(member_filter, dict) and member_filter.get("mode") == "discord_role":
+        member_filter_text = f"{member_filter.get('role_name')} ({member_filter.get('role_id')})"
+    else:
+        member_filter_text = "nicht gesetzt"
+
+    auth_rows = [
+        {"setting": "DASHBOARD_AUTH_MODE", "value": _auth_mode(), "hint": "basic / hybrid / discord"},
+        {"setting": "Discord OAuth", "value": "aktiv" if _discord_oauth_enabled() else "nicht eingerichtet", "hint": "Client ID + Secret"},
+        {"setting": "Gildenrolle", "value": member_filter_text, "hint": "Mitgliederfilter"},
+        {"setting": "Allowed Role IDs", "value": ", ".join(sorted(_allowed_role_ids())) or "—", "hint": "Login erlaubt"},
+        {"setting": "Admin Role IDs", "value": ", ".join(sorted(_admin_role_ids())) or "—", "hint": "Adminrechte"},
+        {"setting": "Public Base URL", "value": _env("DASHBOARD_PUBLIC_BASE_URL") or "auto", "hint": "Railway/Domain"},
+        {"setting": "Redirect URI", "value": _env("DASHBOARD_DISCORD_REDIRECT_URI") or "auto: /auth/discord/callback", "hint": "Discord Developer Portal"},
+        {"setting": "Session Secret", "value": "gesetzt" if _env("DASHBOARD_SESSION_SECRET") else "Fallback", "hint": "Cookie-Signatur"},
+    ]
+
+    next_steps = []
+    if ec_counts.get("pending", 0):
+        next_steps.append("EC-Queue hat offene Anfragen. Bot-Verarbeitung prüfen.")
+    if loot_counts.get("pending", 0):
+        next_steps.append("Loot-Queue hat offene Dashboard-Aktionen. Bot-Verarbeitung prüfen.")
+    if source_bad:
+        next_steps.append("Mindestens eine Datenquelle fehlt oder hat Fehler.")
+    if not _discord_oauth_enabled():
+        next_steps.append("Discord OAuth nicht vollständig eingerichtet. Dashboard-Bieten braucht Discord-Login.")
+    if not next_steps:
+        next_steps.append("Keine akuten Admin-Warnungen erkannt.")
+
+    return {
+        "ok": True,
+        "guild_id": guild_id,
+        "snapshot_id": data.get("id"),
+        "published_at": data.get("published_at"),
+        "schema_version": snap.get("schema_version"),
+        "backend": storage.get("runtime_backend"),
+        "database_url_kind": storage.get("database_url_kind"),
+        "source_ok": source_ok,
+        "source_bad": source_bad,
+        "source_rows": source_rows,
+        "auth_rows": auth_rows,
+        "rule_rows": _admin_relevant_rule_rows(snap),
+        "ec_requests": ec_requests,
+        "loot_requests": loot_requests,
+        "ec_counts": dict(ec_counts),
+        "loot_counts": dict(loot_counts),
+        "admin_states": admin_states,
+        "admin_log": admin_log,
+        "next_steps": next_steps,
+        "counts": settings.get("counts") or {},
+    }
+
+
+def _render_admin_center_dashboard(data: dict[str, Any]) -> str:
+    if not data.get("ok"):
+        return _html_shell("Admin · Ebo Dashboard", f"<section class='panel'><h1>🛡️ Admin-Zentrale</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+    snap: dict[str, Any] = data.get("snapshot") or {}
+    names = _profile_name_map(snap)
+    p = _admin_center_payload(data)
+    guild_id = p.get("guild_id")
+    ec_counts = Counter(p.get("ec_counts") or {})
+    loot_counts = Counter(p.get("loot_counts") or {})
+
+    overview_cards = "".join([
+        _card("Guild-ID", guild_id or "—", "Dashboard-Kontext"),
+        _card("Snapshot", p.get("snapshot_id") or "—", _dt(p.get("published_at"))),
+        _card("Backend", p.get("backend") or "—", p.get("database_url_kind") or "—"),
+        _card("Quellen OK", p.get("source_ok", 0), f"Fehler/fehlen: {p.get('source_bad', 0)}"),
+        _card("Admin-Markierungen", len(p.get("admin_states") or []), "interne Leitungsnotizen"),
+        _card("Admin-Log", len(p.get("admin_log") or []), "letzte Web-Aktionen"),
+    ])
+    queue_cards = _queue_status_cards("EC", ec_counts) + _queue_status_cards("Loot", loot_counts)
+
+    auth_rows = [[r.get("setting"), r.get("value"), r.get("hint")] for r in p.get("auth_rows") or []]
+    rule_rows = p.get("rule_rows") or []
+    source_rows = p.get("source_rows") or []
+
+    ec_rows = []
+    for r in p.get("ec_requests") or []:
+        result = r.get("result") if isinstance(r.get("result"), dict) else {}
+        payload = r.get("payload") if isinstance(r.get("payload"), dict) else {}
+        title = payload.get("event_title") or r.get("event_id")
+        ec_rows.append([_dt(r.get("requested_at")), _ec_award_status_label(r.get("status")), _event_link(r.get("event_id"), title), _fmt_ec(result.get("total_ec") if result.get("total_ec") is not None else payload.get("total_ec")), r.get("actor_name") or r.get("actor_id") or "—", _short(result.get("error") or r.get("request_id"), 100)])
+
+    loot_rows = []
+    for r in p.get("loot_requests") or []:
+        payload = r.get("payload") if isinstance(r.get("payload"), dict) else {}
+        result = r.get("result") if isinstance(r.get("result"), dict) else {}
+        item = payload.get("item_name") or payload.get("item") or r.get("auction_id")
+        status = _ec_award_status_label(r.get("status")).replace("EC", "")
+        loot_rows.append([_dt(r.get("requested_at")), status, _auction_link(r.get("auction_id"), item), r.get("action_type"), _fmt_ec(r.get("amount")), r.get("actor_name") or r.get("actor_id") or "—", _short(result.get("error") or result.get("message") or r.get("request_id"), 100)])
+
+    state_rows = []
+    for st in p.get("admin_states") or []:
+        uid = _user_id(st.get("member_user_id"))
+        state_rows.append([_member_link(uid, names.get(uid, f"User {uid}")), _status_label(st.get("status")), _short(st.get("note"), 160) or "—", st.get("updated_by_name") or st.get("updated_by_id") or "—", _dt(st.get("updated_at"))])
+
+    log_rows = []
+    for lg in p.get("admin_log") or []:
+        uid = _user_id(lg.get("target_id"))
+        log_rows.append([_dt(lg.get("created_at")), lg.get("action_type"), _member_link(uid, names.get(uid, f"User {uid}")) if uid else lg.get("target_id"), lg.get("actor_name") or lg.get("actor_id") or "—"])
+
+    next_rows = [[x] for x in p.get("next_steps") or []]
+    body = f"""
+    <nav class="topnav"><a href="/">Kommando</a><a href="/members">Mitglieder</a><a href="/loot">Loot</a><a href="/ec">EC</a><a href="/ec-queue">EC-Queue</a><a href="/settings">Setup</a><a href="/system">System</a><a href="/audit">Audit</a><a href="/api/admin-center">API</a></nav>
+    <section class="hero">
+      <div>
+        <div class="eyebrow">Schritt 4 · Admin & Einstellungen</div>
+        <h1>🛡️ Admin-Zentrale</h1>
+        <p class="muted">Ein Ort für Rechte, Bot-Setup, Quellenstatus, Dashboard-Queues und Leitungsnotizen. Keine Bot-JSON-Schreiberei.</p>
+      </div>
+      <a class="btn" href="/export/admin_center.csv">CSV</a>
+    </section>
+    <section class="grid">{overview_cards}</section>
+    <section class="grid mini-grid">{queue_cards}</section>
+    <section class="panel"><h2>🚦 Nächste Prüfpunkte</h2>{_table(['Hinweis'], next_rows, placeholder='Hinweise durchsuchen…')}</section>
+    <section class="panel"><h2>🔐 Login & Rollen</h2><p class="muted">Diese Werte kommen aus Railway-Variablen bzw. dem Snapshot. Änderungen weiter über Railway/Discord, nicht direkt über diese Seite.</p>{_table(['Setting','Wert','Hinweis'], auth_rows, placeholder='Login durchsuchen…')}</section>
+    <section class="panel"><h2>🧾 Erkannte EC-/Loot-/Event-Regeln</h2><p class="muted">Gefilterte Snapshot-Settings. Wenn hier eine Regel fehlt, exportiert der Bot sie aktuell nicht ins Dashboard.</p>{_table(['Quelle','Key','Wert'], rule_rows, placeholder='Regeln durchsuchen…')}</section>
+    <section class="panel"><h2>🪙 EC-Queue zuletzt</h2>{_table(['Zeit','Status','Event','EC','Akteur','Resultat'], ec_rows, placeholder='EC-Queue durchsuchen…')}</section>
+    <section class="panel"><h2>🎁 Loot-Dashboard-Aktionen zuletzt</h2>{_table(['Zeit','Status','Auktion/Item','Aktion','EC','Akteur','Resultat'], loot_rows, placeholder='Loot-Aktionen durchsuchen…')}</section>
+    <section class="panel"><h2>👥 Markierte Mitglieder</h2>{_table(['Mitglied','Status','Notiz','Geändert von','Geändert am'], state_rows, placeholder='Mitglieder durchsuchen…')}</section>
+    <section class="panel"><h2>🧩 Datenquellen</h2>{_table(['Key','Datei','vorhanden','Status','Bytes','Geändert'], source_rows, placeholder='Quellen durchsuchen…')}</section>
+    <section class="panel"><h2>🧾 Web-Admin-Aktionslog</h2>{_table(['Zeit','Aktion','Ziel','Akteur'], log_rows, placeholder='Adminlog durchsuchen…')}</section>
+    """
+    return _html_shell("Admin-Zentrale · Ebo Dashboard", body)
+
+
 def _card(title: str, value: Any, sub: str = "") -> str:
     return f"""
     <div class="card">
@@ -2653,7 +2892,7 @@ def _render_settings_dashboard(data: dict[str, Any]) -> str:
     ]
 
     body = f"""
-    <nav class="topnav"><a href="/">← Übersicht</a><a href="/analytics">Analytics</a><a href="/voice">Voice</a><a href="/ec">EC-Verlauf</a><a href="/audit">Audit</a><a href="/system">System</a><a href="/api/settings">API</a></nav>
+    <nav class="topnav"><a href="/">← Übersicht</a><a href="/admin">Admin-Zentrale</a><a href="/analytics">Analytics</a><a href="/voice">Voice</a><a href="/ec">EC-Verlauf</a><a href="/audit">Audit</a><a href="/system">System</a><a href="/api/settings">API</a></nav>
     <section class="hero">
       <div>
         <div class="eyebrow">Read-only Setup</div>
@@ -2723,7 +2962,7 @@ def _render_system_dashboard(data: dict[str, Any]) -> str:
     storage_rows = [[k, v] for k, v in storage.items()]
     guild_rows = [[k, v] for k, v in guild.items() if k != "member_filter"]
     body = f"""
-    <nav class="topnav"><a href="/">← Übersicht</a><a href="/settings">Einstellungen</a><a href="/audit">Audit</a><a href="/api/system">API</a></nav>
+    <nav class="topnav"><a href="/">← Übersicht</a><a href="/admin">Admin-Zentrale</a><a href="/settings">Einstellungen</a><a href="/audit">Audit</a><a href="/api/system">API</a></nav>
     <section class="hero"><div><div class="eyebrow">System</div><h1>🛠️ System & Datenquellen</h1><p class="muted">Nur Diagnose. Keine Schreibzugriffe.</p></div><a class="btn" href="/">Zurück</a></section>
     <section class="grid">{cards}</section>
     <section class="panel"><h2>Speicher</h2>{_table(['Key','Wert'], storage_rows, placeholder='Speicher durchsuchen…')}</section>
@@ -6170,6 +6409,17 @@ def member_detail(user_id: int, request: Request, _: bool = Depends(_auth)):
 @app.get("/admin", response_class=HTMLResponse)
 def admin_actions_page(_: bool = Depends(_admin_auth)):
     try:
+        return HTMLResponse(_render_admin_center_dashboard(_snapshot_payload()))
+    except Exception as exc:
+        return HTMLResponse(
+            _html_shell("Ebo Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
+            status_code=500,
+        )
+
+
+@app.get("/admin-legacy", response_class=HTMLResponse)
+def admin_legacy_page(_: bool = Depends(_admin_auth)):
+    try:
         return HTMLResponse(_render_admin_actions_dashboard(_snapshot_payload()))
     except Exception as exc:
         return HTMLResponse(
@@ -6177,6 +6427,33 @@ def admin_actions_page(_: bool = Depends(_admin_auth)):
             status_code=500,
         )
 
+
+@app.get("/api/admin-center")
+def api_admin_center(_: bool = Depends(_admin_auth)):
+    payload = _snapshot_payload()
+    if not payload.get("ok"):
+        return JSONResponse(payload, status_code=404)
+    return JSONResponse(_admin_center_payload(payload))
+
+
+@app.get("/export/admin_center.csv")
+def export_admin_center_csv(_: bool = Depends(_admin_auth)):
+    payload = _snapshot_payload()
+    if not payload.get("ok"):
+        return Response("error\n" + str(payload.get("error") or "unknown"), media_type="text/csv", status_code=404)
+    p = _admin_center_payload(payload)
+    rows = []
+    for r in p.get("auth_rows") or []:
+        rows.append(["auth", r.get("setting"), r.get("value"), r.get("hint")])
+    for r in p.get("rule_rows") or []:
+        rows.append(["rule", r[0], r[1], r[2]])
+    for r in p.get("source_rows") or []:
+        rows.append(["source", r[0], r[1], r[3]])
+    for k, v in (p.get("ec_counts") or {}).items():
+        rows.append(["ec_queue", k, v, ""])
+    for k, v in (p.get("loot_counts") or {}).items():
+        rows.append(["loot_queue", k, v, ""])
+    return _csv_response("admin_center.csv", ["bereich","key","wert","hinweis"], rows)
 
 
 
