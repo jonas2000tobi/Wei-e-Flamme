@@ -477,7 +477,7 @@ def _render_dashboard(data: dict[str, Any]) -> str:
     body = f"""
     <nav class="topnav">
       <a href="#overview">Übersicht</a>
-      <a href="#analytics">Analytics</a>
+      <a href="/analytics">Analytics</a>
       <a href="/ec">EC-Verlauf</a>
       <a href="#quality">Datenqualität</a>
       <a href="#members">Mitglieder</a>
@@ -916,7 +916,7 @@ def _render_ec_dashboard(data: dict[str, Any]) -> str:
         balance_rows.append([_member_link(b.get("user_id"), b.get("display_name")), _fmt_ec(b.get("balance"))])
 
     body = f"""
-    <nav class="topnav"><a href="/">← Übersicht</a><a href="#recent">Buchungen</a><a href="#top">Toplisten</a><a href="#balances">Konten</a><a href="/api/ec">API</a></nav>
+    <nav class="topnav"><a href="/">← Übersicht</a><a href="/analytics">Analytics</a><a href="#recent">Buchungen</a><a href="#top">Toplisten</a><a href="#balances">Konten</a><a href="/api/ec">API</a></nav>
     <section class="hero">
       <div>
         <div class="eyebrow">Analytics</div>
@@ -940,6 +940,244 @@ def _render_ec_dashboard(data: dict[str, Any]) -> str:
     return _html_shell("EC-Verlauf · Ebo Dashboard", body)
 
 
+
+
+def _participant_ids(participants: dict[str, Any]) -> tuple[set[int], set[int], set[int]]:
+    yes_ids: set[int] = set()
+    for grp in participants.get("yes") or []:
+        if not isinstance(grp, dict):
+            continue
+        for p in grp.get("participants") or []:
+            if not isinstance(p, dict):
+                continue
+            uid = _user_id(p.get("user_id") or p.get("id") or p.get("member_id"))
+            if uid:
+                yes_ids.add(uid)
+    maybe_ids = {_user_id(p.get("user_id") or p.get("id") or p.get("member_id")) for p in (participants.get("maybe") or []) if isinstance(p, dict)}
+    no_ids = {_user_id(p.get("user_id") or p.get("id") or p.get("member_id")) for p in (participants.get("no") or []) if isinstance(p, dict)}
+    maybe_ids.discard(0)
+    no_ids.discard(0)
+    return yes_ids, maybe_ids, no_ids
+
+
+def _activity_analytics(snap: dict[str, Any]) -> dict[str, Any]:
+    profiles = ((snap.get("profiles") or {}).get("items") or [])
+    events = ((snap.get("events") or {}).get("items") or [])
+    names = _profile_name_map(snap)
+    member_ids = [_user_id(p.get("user_id")) for p in profiles if isinstance(p, dict) and _user_id(p.get("user_id"))]
+    member_set = set(member_ids)
+    by_user: dict[int, dict[str, Any]] = {}
+    for uid in member_ids:
+        by_user[uid] = {
+            "user_id": uid,
+            "display_name": names.get(uid, f"User {uid}"),
+            "yes": 0,
+            "maybe": 0,
+            "no": 0,
+            "missing": 0,
+            "events_total": 0,
+            "participation_rate": 0.0,
+            "response_rate": 0.0,
+        }
+
+    event_rows: list[dict[str, Any]] = []
+    role_totals: Counter[str] = Counter()
+    for ev in events:
+        if not isinstance(ev, dict):
+            continue
+        participants = ev.get("participants") if isinstance(ev.get("participants"), dict) else {}
+        yes_ids, maybe_ids, no_ids = _participant_ids(participants)
+        responded = (yes_ids | maybe_ids | no_ids) & member_set
+        yes_m = yes_ids & member_set
+        maybe_m = maybe_ids & member_set
+        no_m = no_ids & member_set
+        for role, count in (ev.get("yes_counts") or {}).items():
+            role_totals[str(role or "Unbekannt")] += int(_num(count, 0))
+        for uid, bucket in by_user.items():
+            bucket["events_total"] += 1
+            if uid in yes_m:
+                bucket["yes"] += 1
+            elif uid in maybe_m:
+                bucket["maybe"] += 1
+            elif uid in no_m:
+                bucket["no"] += 1
+            else:
+                bucket["missing"] += 1
+        member_count = len(member_set)
+        event_rows.append({
+            "event_id": ev.get("event_id"),
+            "title": ev.get("title") or ev.get("event_id") or "Event",
+            "when_iso": ev.get("when_iso"),
+            "yes": len(yes_m),
+            "maybe": len(maybe_m),
+            "no": len(no_m),
+            "responded": len(responded),
+            "missing": max(0, member_count - len(responded)),
+            "response_rate": (len(responded) / member_count * 100) if member_count else 0,
+            "participation_rate": (len(yes_m) / member_count * 100) if member_count else 0,
+        })
+
+    for bucket in by_user.values():
+        total = int(bucket.get("events_total") or 0)
+        yes = int(bucket.get("yes") or 0)
+        responded = yes + int(bucket.get("maybe") or 0) + int(bucket.get("no") or 0)
+        bucket["participation_rate"] = (yes / total * 100) if total else 0
+        bucket["response_rate"] = (responded / total * 100) if total else 0
+
+    user_rows = list(by_user.values())
+    most_participation = sorted(user_rows, key=lambda x: (float(x.get("participation_rate") or 0), int(x.get("yes") or 0)), reverse=True)
+    most_missing = sorted(user_rows, key=lambda x: (int(x.get("missing") or 0), -int(x.get("yes") or 0)), reverse=True)
+    event_rows.sort(key=lambda x: str(x.get("when_iso") or ""), reverse=True)
+
+    voice = snap.get("voice") or {}
+    voice_by_user: list[dict[str, Any]] = []
+    raw_voice = voice.get("by_user") if isinstance(voice.get("by_user"), list) else []
+    if raw_voice:
+        for row in raw_voice:
+            if not isinstance(row, dict):
+                continue
+            uid = _user_id(row.get("user_id"))
+            if not uid or uid not in member_set:
+                continue
+            voice_by_user.append({
+                "user_id": uid,
+                "display_name": names.get(uid, f"User {uid}"),
+                "sessions": int(_num(row.get("sessions"), 0)),
+                "total_seconds": int(_num(row.get("total_seconds"), 0)),
+                "last_left_at": row.get("last_left_at") or row.get("last_joined_at") or "",
+            })
+    else:
+        temp: dict[int, dict[str, Any]] = {}
+        for sess in voice.get("recent_sessions") or []:
+            if not isinstance(sess, dict):
+                continue
+            uid = _user_id(sess.get("user_id") or sess.get("member_id"))
+            if not uid or uid not in member_set:
+                continue
+            bucket = temp.setdefault(uid, {"user_id": uid, "display_name": names.get(uid, f"User {uid}"), "sessions": 0, "total_seconds": 0, "last_left_at": ""})
+            bucket["sessions"] += 1
+            bucket["total_seconds"] += int(_num(sess.get("duration_seconds"), 0))
+            left = str(sess.get("left_at") or sess.get("joined_at") or "")
+            if left and left > str(bucket.get("last_left_at") or ""):
+                bucket["last_left_at"] = left
+        voice_by_user = list(temp.values())
+    voice_by_user.sort(key=lambda x: int(x.get("total_seconds") or 0), reverse=True)
+
+    total_events = len(events)
+    total_slots = total_events * len(member_set)
+    total_yes = sum(int(x.get("yes") or 0) for x in user_rows)
+    total_responded = sum(int(x.get("yes") or 0) + int(x.get("maybe") or 0) + int(x.get("no") or 0) for x in user_rows)
+    total_missing = max(0, total_slots - total_responded)
+    total_voice_seconds = sum(int(x.get("total_seconds") or 0) for x in voice_by_user)
+
+    return {
+        "member_count": len(member_set),
+        "event_count": total_events,
+        "total_slots": total_slots,
+        "total_yes": total_yes,
+        "total_responded": total_responded,
+        "total_missing": total_missing,
+        "participation_rate": (total_yes / total_slots * 100) if total_slots else 0,
+        "response_rate": (total_responded / total_slots * 100) if total_slots else 0,
+        "most_participation": most_participation,
+        "most_missing": most_missing,
+        "events": event_rows,
+        "role_totals": role_totals.most_common(),
+        "voice_by_user": voice_by_user,
+        "total_voice_hours": total_voice_seconds / 3600,
+    }
+
+
+def _render_activity_analytics(data: dict[str, Any]) -> str:
+    if not data.get("ok"):
+        return _html_shell("Analytics · Ebo Dashboard", f"<section class='panel'><h1>📈 Analytics</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+    snap: dict[str, Any] = data.get("snapshot") or {}
+    act = _activity_analytics(snap)
+    base = _analytics_from_snapshot(snap)
+
+    cards = "".join([
+        _card("Events", act.get("event_count", 0), "im Snapshot"),
+        _card("Mitglieder", act.get("member_count", 0), "Gildenrolle"),
+        _card("Teilnahmequote", f"{act.get('participation_rate', 0):.0f} %", "Zusagen / mögliche Plätze"),
+        _card("Antwortquote", f"{act.get('response_rate', 0):.0f} %", "Zusage/Vielleicht/Nein"),
+        _card("Nicht abgestimmt", act.get("total_missing", 0), "über alle Events"),
+        _card("Voice-Stunden", f"{act.get('total_voice_hours', 0):.1f}", "geladene Sessions"),
+        _card("EC gesamt", _fmt_ec(base.get("total_ec", 0)), f"Ø {_fmt_ec(base.get('avg_ec', 0))}"),
+        _card("Aktive Auktionen", base.get("active_auctions", 0), "aktuell offen"),
+    ])
+
+    top_rows = []
+    for r in act.get("most_participation") or []:
+        if not isinstance(r, dict):
+            continue
+        top_rows.append([
+            _member_link(r.get("user_id"), r.get("display_name")),
+            f"{float(r.get('participation_rate') or 0):.0f} %",
+            r.get("yes"),
+            r.get("maybe"),
+            r.get("no"),
+            r.get("missing"),
+        ])
+
+    missing_rows = []
+    for r in act.get("most_missing") or []:
+        if not isinstance(r, dict):
+            continue
+        missing_rows.append([
+            _member_link(r.get("user_id"), r.get("display_name")),
+            r.get("missing"),
+            f"{float(r.get('response_rate') or 0):.0f} %",
+            r.get("yes"),
+            r.get("maybe"),
+            r.get("no"),
+        ])
+
+    event_rows = []
+    for ev in act.get("events") or []:
+        if not isinstance(ev, dict):
+            continue
+        event_rows.append([
+            _event_link(ev.get("event_id"), ev.get("title")),
+            _dt(ev.get("when_iso")),
+            ev.get("yes"),
+            ev.get("maybe"),
+            ev.get("no"),
+            ev.get("missing"),
+            f"{float(ev.get('response_rate') or 0):.0f} %",
+        ])
+
+    voice_rows = []
+    for v in act.get("voice_by_user") or []:
+        if not isinstance(v, dict):
+            continue
+        seconds = int(_num(v.get("total_seconds"), 0))
+        voice_rows.append([
+            _member_link(v.get("user_id"), v.get("display_name")),
+            f"{seconds / 3600:.1f} h",
+            v.get("sessions"),
+            _dt(v.get("last_left_at")),
+        ])
+
+    body = f"""
+    <nav class="topnav"><a href="/">← Übersicht</a><a href="/ec">EC-Verlauf</a><a href="#activity">Teilnahme</a><a href="#missing">Nicht abgestimmt</a><a href="#voice">Voice</a><a href="/api/analytics">API</a></nav>
+    <section class="hero">
+      <div>
+        <div class="eyebrow">Analytics</div>
+        <h1>📈 Aktivität & Teilnahme</h1>
+        <p class="muted">Read-only Auswertung aus dem aktuellen Dashboard-Snapshot. Es wird nichts verändert. Snapshot: {_e(_dt(data.get('published_at')))}</p>
+      </div>
+      <a class="btn" href="/">Zurück</a>
+    </section>
+    <section class="grid">{cards}</section>
+    <section class="panel"><h2>🎭 Rollenverteilung in Zusagen</h2>{_bars(act.get('role_totals') or [], max_items=12)}</section>
+    <section class="panel" id="activity"><h2>✅ Aktivste Teilnehmer</h2>{_table(['Spieler','Quote','Zusagen','Vielleicht','Nein','Nicht abgestimmt'], top_rows[:80], placeholder='Teilnahme durchsuchen…')}</section>
+    <section class="panel" id="missing"><h2>⚠️ Meiste Nicht-Abstimmungen</h2>{_table(['Spieler','Nicht abgestimmt','Antwortquote','Zusagen','Vielleicht','Nein'], missing_rows[:80], placeholder='Nicht-Abstimmer durchsuchen…')}</section>
+    <section class="panel"><h2>📅 Events im Vergleich</h2>{_table(['Event','Zeit','Zusagen','Vielleicht','Nein','Nicht abgestimmt','Antwortquote'], event_rows[:200], placeholder='Events durchsuchen…')}</section>
+    <section class="panel" id="voice"><h2>🎙️ Voice-Zeit</h2>{_table(['Spieler','Voice-Zeit','Sessions','zuletzt'], voice_rows[:120], placeholder='Voice durchsuchen…')}</section>
+    """
+    return _html_shell("Analytics · Ebo Dashboard", body)
+
+
 @app.get("/healthz")
 def healthz():
     return {"ok": True, "database_url": bool(_database_url())}
@@ -956,7 +1194,18 @@ def api_analytics(_: bool = Depends(_auth)):
     if not payload.get("ok"):
         return JSONResponse(payload, status_code=404)
     snap = payload.get("snapshot") or {}
-    return JSONResponse({"ok": True, "analytics": _analytics_from_snapshot(snap)})
+    return JSONResponse({"ok": True, "analytics": _analytics_from_snapshot(snap), "activity": _activity_analytics(snap)})
+
+
+@app.get("/analytics", response_class=HTMLResponse)
+def analytics_page(_: bool = Depends(_auth)):
+    try:
+        return HTMLResponse(_render_activity_analytics(_snapshot_payload()))
+    except Exception as exc:
+        return HTMLResponse(
+            _html_shell("Ebo Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
+            status_code=500,
+        )
 
 
 
