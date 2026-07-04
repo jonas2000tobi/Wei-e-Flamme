@@ -1613,8 +1613,10 @@ async def setup_dashboard_data(bot: commands.Bot, tree: app_commands.CommandTree
         except Exception as exc:
             await inter.followup.send(f"❌ Konnte Rolle nicht speichern: `{type(exc).__name__}: {exc}`", ephemeral=True)
 
-    @tree.command(name="dashboard_set_admin_role", description="Legt die Discord-Rolle fest, die im Web-Dashboard Admin ist.")
-    @app_commands.describe(role="Rolle, die Dashboard-Adminrechte haben soll")
+
+
+    @tree.command(name="dashboard_set_admin_role", description="Legt die Dashboard-Adminrolle fest.")
+    @app_commands.describe(role="Rolle, die im Dashboard als Admin/Leitung zählt")
     async def dashboard_set_admin_role(inter: discord.Interaction, role: discord.Role):
         if inter.guild is None:
             await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
@@ -1625,6 +1627,7 @@ async def setup_dashboard_data(bot: commands.Bot, tree: app_commands.CommandTree
 
         await inter.response.defer(ephemeral=True)
         try:
+            # Als Liste speichern, damit später mehrere Adminrollen möglich sind.
             runtime_db.set_guild_setting(int(inter.guild.id), DASHBOARD_ADMIN_ROLE_SETTING, [int(role.id)])
             try:
                 runtime_db.write_audit_log(
@@ -1634,7 +1637,7 @@ async def setup_dashboard_data(bot: commands.Bot, tree: app_commands.CommandTree
                     target_type="role",
                     target_id=str(role.id),
                     summary=f"Dashboard-Adminrolle gesetzt: {role.name}",
-                    new_value={"role_id": int(role.id), "role_name": role.name},
+                    new_value={"role_ids": [int(role.id)], "role_name": role.name},
                 )
             except Exception:
                 pass
@@ -1643,10 +1646,10 @@ async def setup_dashboard_data(bot: commands.Bot, tree: app_commands.CommandTree
                 await asyncio.to_thread(runtime_db.save_dashboard_snapshot, guild_id=int(inter.guild.id), guild_name=inter.guild.name, snapshot=snap)
             except Exception:
                 pass
-            count = len(getattr(role, "members", []) or [])
+            admin_info = (snap.get("auth") or {}).get("counts") or {}
             await inter.followup.send(
                 f"✅ Dashboard-Adminrolle gesetzt: {role.mention}\n"
-                f"Admin-User im Dashboard-Snapshot: **{count}**\n"
+                f"Admin-Mitglieder im Dashboard: **{admin_info.get('admin_members', len(getattr(role, 'members', []) or []))}**\n"
                 "Dashboard wurde aktualisiert.",
                 ephemeral=True,
             )
