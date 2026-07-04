@@ -8,7 +8,7 @@ from typing import Any, Optional
 
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 
 try:
     from bot import runtime_db  # type: ignore
@@ -409,8 +409,24 @@ def build_dashboard_snapshot(bot: commands.Bot, guild: discord.Guild) -> dict[st
     return snapshot
 
 
+def publish_dashboard_snapshot(bot: commands.Bot, guild: discord.Guild) -> int:
+    """Schreibt den aktuellen read-only Snapshot in Postgres/Runtime-DB.
+
+    Der separate Web-Service liest genau diese Tabelle. Produktive Bot-Daten werden
+    nicht verändert; die JSON-Dateien bleiben weiterhin Quelle der alten Systeme.
+    """
+    snapshot = build_dashboard_snapshot(bot, guild)
+    return int(runtime_db.save_dashboard_snapshot(guild_id=int(guild.id), guild_name=guild.name, snapshot=snapshot) or 0)
+
+
 def write_dashboard_export(bot: commands.Bot, guild: discord.Guild) -> Path:
     snapshot = build_dashboard_snapshot(bot, guild)
+    # Zusätzlich in die Runtime-DB schreiben, damit das separate Web-Dashboard
+    # nach einem manuellen Export sofort aktuelle Daten bekommt.
+    try:
+        runtime_db.save_dashboard_snapshot(guild_id=int(guild.id), guild_name=guild.name, snapshot=snapshot)
+    except Exception as exc:
+        print(f"⚠️ Dashboard-Snapshot konnte nicht in Runtime-DB veröffentlicht werden: {exc!r}")
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     path = EXPORT_DIR / f"dashboard_snapshot_{guild.id}_{ts}.json"
     tmp = path.with_name(f".{path.name}.tmp")
@@ -424,7 +440,39 @@ def _is_admin(inter: discord.Interaction) -> bool:
     return bool(perms and (perms.administrator or perms.manage_guild))
 
 
+@tasks.loop(minutes=5)
+async def _dashboard_publish_loop(bot: commands.Bot):
+    await bot.wait_until_ready()
+    if not bot.guilds:
+        return
+    for guild in list(bot.guilds):
+        try:
+            sid = publish_dashboard_snapshot(bot, guild)
+            print(f"📊 Dashboard-Snapshot veröffentlicht: {guild.name} ({guild.id}) snapshot_id={sid}")
+        except Exception as exc:
+            print(f"⚠️ Dashboard-Snapshot für {getattr(guild, 'id', '?')} fehlgeschlagen: {exc!r}")
+
+
+@_dashboard_publish_loop.before_loop
+async def _dashboard_publish_before_loop():
+    # Kurz warten, damit andere Module/JSON-Lader nach on_ready vollständig stehen.
+    import asyncio
+    await asyncio.sleep(20)
+
+
+def start_dashboard_publisher(bot: commands.Bot) -> None:
+    if getattr(bot, "_ebo_dashboard_publisher_started", False):
+        return
+    try:
+        _dashboard_publish_loop.start(bot)
+        setattr(bot, "_ebo_dashboard_publisher_started", True)
+        print("📊 Dashboard-Snapshot-Publisher gestartet: alle 5 Minuten.")
+    except RuntimeError:
+        pass
+
+
 async def setup_dashboard_data(bot: commands.Bot, tree: app_commands.CommandTree):
+    start_dashboard_publisher(bot)
     @tree.command(name="dashboard_status", description="Zeigt den Status der read-only Dashboard-Datenbasis.")
     async def dashboard_status(inter: discord.Interaction):
         if inter.guild is None:
@@ -436,6 +484,10 @@ async def setup_dashboard_data(bot: commands.Bot, tree: app_commands.CommandTree
 
         await inter.response.defer(ephemeral=True)
         snap = build_dashboard_snapshot(bot, inter.guild)
+        try:
+            runtime_db.save_dashboard_snapshot(guild_id=int(inter.guild.id), guild_name=inter.guild.name, snapshot=snap)
+        except Exception as exc:
+            print(f"⚠️ Dashboard-Status Snapshot-Publish fehlgeschlagen: {exc!r}")
         bad_sources = [k for k, v in snap.get("source_health", {}).items() if v.get("exists") and not v.get("ok")]
         missing_sources = [k for k, v in snap.get("source_health", {}).items() if not v.get("exists")]
 
@@ -454,6 +506,13 @@ async def setup_dashboard_data(bot: commands.Bot, tree: app_commands.CommandTree
         emb.add_field(name="Need-User", value=str(snap["loot"]["needs"].get("user_count", 0)), inline=True)
         emb.add_field(name="Voice-Sessions", value=str(snap["voice"].get("sessions_total", 0)), inline=True)
         emb.add_field(name="Audit-Logs", value=str(snap["audit"].get("logs_total", 0)), inline=True)
+        try:
+            latest_pub = runtime_db.fetch_latest_dashboard_snapshot(inter.guild.id)
+            pub_count = runtime_db.count_dashboard_snapshots(inter.guild.id)
+            pub_txt = f"Snapshots: {pub_count}\nLetzter: {(latest_pub or {}).get('published_at') or 'noch keiner'}"
+        except Exception as exc:
+            pub_txt = f"Fehler: {type(exc).__name__}"
+        emb.add_field(name="Web-Dashboard", value=pub_txt, inline=True)
         emb.add_field(name="JSON-Quellen", value=f"OK: {len(snap.get('source_health', {})) - len(bad_sources)}\nFehler: {len(bad_sources)}\nFehlen: {len(missing_sources)}", inline=True)
         if bad_sources:
             emb.add_field(name="Fehlerhafte Quellen", value="\n".join(f"• {x}" for x in bad_sources[:10]), inline=False)
