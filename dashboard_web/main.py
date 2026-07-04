@@ -12,7 +12,7 @@ from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
-app = FastAPI(title="Ebo Dashboard", version="0.5.0")
+app = FastAPI(title="Ebo Dashboard", version="0.6.0")
 security = HTTPBasic(auto_error=False)
 
 
@@ -478,6 +478,7 @@ def _render_dashboard(data: dict[str, Any]) -> str:
     <nav class="topnav">
       <a href="#overview">Übersicht</a>
       <a href="#analytics">Analytics</a>
+      <a href="/ec">EC-Verlauf</a>
       <a href="#quality">Datenqualität</a>
       <a href="#members">Mitglieder</a>
       <a href="#events">Events</a>
@@ -576,7 +577,7 @@ def _render_member_detail(data: dict[str, Any], user_id: int) -> str:
     ])
 
     body = f"""
-    <nav class="topnav"><a href="/">← Übersicht</a><a href="#needs">Needs</a><a href="#ec">EC</a><a href="#voice">Voice</a><a href="/api/snapshot">JSON</a></nav>
+    <nav class="topnav"><a href="/">← Übersicht</a><a href="/ec">EC-Verlauf</a><a href="#needs">Needs</a><a href="#ec">EC</a><a href="#voice">Voice</a><a href="/api/snapshot">JSON</a></nav>
     <section class="hero">
       <div>
         <div class="eyebrow">Mitglied</div>
@@ -857,6 +858,88 @@ function filterNextTable(input) {{
 </html>"""
 
 
+
+def _ec_transactions(snap: dict[str, Any]) -> dict[str, Any]:
+    return ((snap.get("ec") or {}).get("transactions") or {}) if isinstance((snap.get("ec") or {}).get("transactions"), dict) else {}
+
+
+def _render_ec_dashboard(data: dict[str, Any]) -> str:
+    if not data.get("ok"):
+        return _html_shell("Ebo Dashboard", f"<section class='panel'><h1>🪙 EC-Verlauf</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+    snap: dict[str, Any] = data.get("snapshot") or {}
+    names = _profile_name_map(snap)
+    txs = _ec_transactions(snap)
+    balances = (((snap.get("ec") or {}).get("balances") or {}).get("top") or [])
+    recent = txs.get("items") or txs.get("recent") or []
+    top_earned = txs.get("top_earned") or []
+    top_spent = txs.get("top_spent") or []
+    top_activity = txs.get("top_activity") or []
+
+    total_ec = sum(_num(b.get("balance"), 0) for b in balances if isinstance(b, dict))
+    avg_ec = total_ec / len(balances) if balances else 0
+    total_earned = _num(txs.get("total_earned"), 0)
+    total_spent = _num(txs.get("total_spent"), 0)
+    net_loaded = _num(txs.get("net_loaded"), total_earned - total_spent)
+
+    cards = "".join([
+        _card("EC gesamt", _fmt_ec(total_ec), f"über {len(balances)} Konten"),
+        _card("Ø EC", _fmt_ec(avg_ec), "Durchschnitt pro Konto"),
+        _card("Verdient", _fmt_ec(total_earned), "geladene Buchungen"),
+        _card("Ausgegeben", _fmt_ec(total_spent), "geladene Buchungen"),
+        _card("Netto", _fmt_ec(net_loaded), "Verdient minus ausgegeben"),
+        _card("Buchungen", txs.get("count", len(recent)), f"geladen: {txs.get('loaded_count', len(recent))}"),
+    ])
+
+    recent_rows = []
+    for tx in recent[:250]:
+        if not isinstance(tx, dict):
+            continue
+        uid = _user_id(tx.get("user_id"))
+        amount = _num(tx.get("amount"), 0)
+        recent_rows.append([
+            _dt(tx.get("created_at")),
+            _member_link(uid, tx.get("display_name") or names.get(uid, f"User {uid}")),
+            _fmt_ec(amount),
+            tx.get("raw_type") or "—",
+            _short(tx.get("reason"), 180),
+            tx.get("event_id") or tx.get("auction_id") or "—",
+        ])
+
+    earned_rows = [[_member_link(r.get("user_id"), r.get("display_name")), _fmt_ec(r.get("earned")), _fmt_ec(r.get("net")), r.get("count")] for r in top_earned[:25] if isinstance(r, dict)]
+    spent_rows = [[_member_link(r.get("user_id"), r.get("display_name")), _fmt_ec(r.get("spent")), _fmt_ec(r.get("net")), r.get("count")] for r in top_spent[:25] if isinstance(r, dict)]
+    activity_rows = [[_member_link(r.get("user_id"), r.get("display_name")), r.get("count"), _fmt_ec(r.get("earned")), _fmt_ec(r.get("spent")), _fmt_ec(r.get("net"))] for r in top_activity[:25] if isinstance(r, dict)]
+
+    balance_rows = []
+    for b in balances:
+        if not isinstance(b, dict):
+            continue
+        balance_rows.append([_member_link(b.get("user_id"), b.get("display_name")), _fmt_ec(b.get("balance"))])
+
+    body = f"""
+    <nav class="topnav"><a href="/">← Übersicht</a><a href="#recent">Buchungen</a><a href="#top">Toplisten</a><a href="#balances">Konten</a><a href="/api/ec">API</a></nav>
+    <section class="hero">
+      <div>
+        <div class="eyebrow">Analytics</div>
+        <h1>🪙 EC-Verlauf</h1>
+        <p class="muted">Read-only Auswertung. Es wird nichts verändert. Snapshot: {_e(_dt(data.get('published_at')))}</p>
+      </div>
+      <a class="btn" href="/">Zurück</a>
+    </section>
+    <section class="grid">{cards}</section>
+    <section class="panel" id="top">
+      <h2>🏆 EC-Toplisten</h2>
+      <div class="split">
+        <div><h3>Meiste EC verdient</h3>{_table(['Spieler','Verdient','Netto','Buchungen'], earned_rows, placeholder='Verdienst durchsuchen…')}</div>
+        <div><h3>Meiste EC ausgegeben</h3>{_table(['Spieler','Ausgegeben','Netto','Buchungen'], spent_rows, placeholder='Ausgaben durchsuchen…')}</div>
+      </div>
+      <h3>Meiste Buchungen</h3>{_table(['Spieler','Buchungen','Verdient','Ausgegeben','Netto'], activity_rows, placeholder='Aktivität durchsuchen…')}
+    </section>
+    <section class="panel" id="recent"><h2>🧾 Letzte EC-Buchungen</h2>{_table(['Zeit','Spieler','Betrag','Typ','Grund','Quelle'], recent_rows, placeholder='Buchungen durchsuchen…')}</section>
+    <section class="panel" id="balances"><h2>🪙 Alle EC-Konten</h2>{_table(['Spieler','EC'], balance_rows, placeholder='EC-Konten durchsuchen…')}</section>
+    """
+    return _html_shell("EC-Verlauf · Ebo Dashboard", body)
+
+
 @app.get("/healthz")
 def healthz():
     return {"ok": True, "database_url": bool(_database_url())}
@@ -874,6 +957,27 @@ def api_analytics(_: bool = Depends(_auth)):
         return JSONResponse(payload, status_code=404)
     snap = payload.get("snapshot") or {}
     return JSONResponse({"ok": True, "analytics": _analytics_from_snapshot(snap)})
+
+
+
+@app.get("/ec", response_class=HTMLResponse)
+def ec_dashboard(_: bool = Depends(_auth)):
+    try:
+        return HTMLResponse(_render_ec_dashboard(_snapshot_payload()))
+    except Exception as exc:
+        return HTMLResponse(
+            _html_shell("Ebo Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
+            status_code=500,
+        )
+
+
+@app.get("/api/ec")
+def api_ec(_: bool = Depends(_auth)):
+    payload = _snapshot_payload()
+    if not payload.get("ok"):
+        return JSONResponse(payload, status_code=404)
+    snap = payload.get("snapshot") or {}
+    return JSONResponse({"ok": True, "ec": (snap.get("ec") or {})})
 
 
 @app.get("/api/quality")
