@@ -2778,54 +2778,232 @@ def _risk_flags_text(m: dict[str, Any]) -> str:
     return ", ".join(str(x) for x in flags) if flags else "—"
 
 
+# ---------------------------------------------------------------------------
+# Schritt 3: Mitgliederzentrale
+# ---------------------------------------------------------------------------
+# Read-only Leitungsübersicht. Zieht Daten aus Snapshot + bereits vorhandenen
+# Dashboard-Reviews/Queues. Keine EC-, Loot-, Need- oder Bot-JSON-Schreiberei.
+
+
+def _member_center_role_bucket(value: Any) -> str:
+    txt = str(value or "").strip().lower()
+    if any(x in txt for x in ("tank", "wächter", "waechter")):
+        return "Tank"
+    if any(x in txt for x in ("heal", "heiler", "support")):
+        return "Heiler"
+    if any(x in txt for x in ("dps", "dd", "damage", "schaden")):
+        return "DPS"
+    if any(x in txt for x in ("reserve", "bank")):
+        return "Reserve"
+    return str(value or "Unklar") or "Unklar"
+
+
+def _member_center_last_seen(m: dict[str, Any], att: dict[str, Any], loot: dict[str, Any]) -> str:
+    candidates = []
+    for key in ("last_updated_at", "last_event_when", "last_event_time"):
+        if att.get(key):
+            candidates.append(str(att.get(key)))
+    if loot.get("last_activity"):
+        candidates.append(str(loot.get("last_activity")))
+    for key in ("updated_at", "last_seen", "last_active", "joined_at"):
+        if m.get(key):
+            candidates.append(str(m.get(key)))
+    if not candidates:
+        return ""
+    return max(candidates)
+
+
+def _member_center_hint(row: dict[str, Any]) -> str:
+    hints: list[str] = []
+    if row.get("admin_status") and row.get("admin_status") != "ok":
+        hints.append(_status_label(row.get("admin_status")))
+    if not row.get("has_profile"):
+        hints.append("kein Profil")
+    if row.get("ec_balance") is None:
+        hints.append("kein EC-Stand")
+    if int(row.get("main_need_count") or 0) == 0 and int(row.get("secondary_need_count") or 0) == 0:
+        hints.append("keine Needs")
+    if int(row.get("attendance_open") or 0) > 0:
+        hints.append(f"{int(row.get('attendance_open') or 0)} Review offen")
+    if int(row.get("attendance_absent") or 0) >= 2:
+        hints.append(f"{int(row.get('attendance_absent') or 0)}× nicht da")
+    if int(row.get("bid_count") or 0) > 0 and int(row.get("won_count") or 0) == 0:
+        hints.append("bietet, gewinnt nicht")
+    risk = str(row.get("risk_flags_text") or "").strip()
+    if risk and risk != "—":
+        hints.append(risk)
+    return ", ".join(hints) if hints else "—"
+
+
+def _member_center_payload(data: dict[str, Any]) -> dict[str, Any]:
+    snap: dict[str, Any] = data.get("snapshot") or {}
+    guild_id = _safe_guild_id(data)
+    members = _insight_members(snap)
+    profiles = { _user_id(p.get("user_id")): p for p in (((snap.get("profiles") or {}).get("items") or [])) if isinstance(p, dict) and _user_id(p.get("user_id")) }
+    balances = _balance_map(snap)
+    needs_by_user = _needs_by_user(snap)
+    quality = (_insights(snap).get("quality") or {}) if isinstance(_insights(snap).get("quality"), dict) else {}
+
+    try:
+        att_payload = _attendance_stats_payload(data)
+    except Exception:
+        att_payload = {"player_rows": [], "problem_rows": [], "review_count": 0}
+    att_by_user = {int(p.get("user_id") or 0): p for p in (att_payload.get("player_rows") or []) if isinstance(p, dict) and int(p.get("user_id") or 0)}
+
+    try:
+        loot_payload = _loot_history_payload_from_snapshot(snap, int(guild_id or 0))
+    except Exception:
+        loot_payload = {"player_rows": []}
+    loot_by_user = {int(p.get("user_id") or 0): p for p in (loot_payload.get("player_rows") or []) if isinstance(p, dict) and int(p.get("user_id") or 0)}
+
+    state_rows = _all_member_admin_states(guild_id) if guild_id else []
+    state_by_user = {int(s.get("member_user_id") or 0): s for s in state_rows if isinstance(s, dict) and int(s.get("member_user_id") or 0)}
+
+    # Alle bekannten User zusammenführen: Gildenrolle/Snapshot, Attendance, Loot, Admin-Notizen.
+    ids: set[int] = set()
+    for m in members:
+        uid = _user_id(m.get("user_id") or m.get("member_id") or m.get("discord_id"))
+        if uid:
+            ids.add(uid)
+    ids.update(att_by_user.keys())
+    ids.update(loot_by_user.keys())
+    ids.update(state_by_user.keys())
+
+    rows: list[dict[str, Any]] = []
+    for uid in sorted(ids):
+        base = next((m for m in members if _user_id(m.get("user_id") or m.get("member_id") or m.get("discord_id")) == uid), {}) or {}
+        prof = profiles.get(uid, {})
+        att = att_by_user.get(uid, {})
+        loot = loot_by_user.get(uid, {})
+        st = state_by_user.get(uid, {})
+        need_info = needs_by_user.get(uid, {}) if isinstance(needs_by_user.get(uid, {}), dict) else {}
+        main_needs = need_info.get("main") if isinstance(need_info.get("main"), list) else []
+        sec_needs = need_info.get("secondary") if isinstance(need_info.get("secondary"), list) else []
+        display = str(base.get("display_name") or prof.get("display_name") or att.get("display_name") or loot.get("display_name") or f"User {uid}")
+        ingame = str(base.get("ingame_name") or prof.get("ingame_name") or "")
+        role = str(base.get("main_role") or prof.get("main_role") or "")
+        ec_balance = base.get("ec_balance") if base.get("ec_balance") is not None else balances.get(uid)
+        present = int(att.get("present") or 0)
+        partial = int(att.get("partial") or 0)
+        absent = int(att.get("absent") or 0)
+        open_count = int(att.get("open") or 0)
+        attendance_total = present + partial + absent
+        row = {
+            "user_id": uid,
+            "display_name": display,
+            "ingame_name": ingame,
+            "role": role,
+            "role_bucket": _member_center_role_bucket(role),
+            "gearscore": base.get("gearscore") or prof.get("gearscore") or "",
+            "ec_balance": ec_balance,
+            "main_need_count": int(base.get("main_need_count") if base.get("main_need_count") is not None else len(main_needs)),
+            "secondary_need_count": int(base.get("secondary_need_count") if base.get("secondary_need_count") is not None else len(sec_needs)),
+            "attendance_rate": att.get("rate") or _attendance_rate(present, partial, absent),
+            "attendance_present": present,
+            "attendance_partial": partial,
+            "attendance_absent": absent,
+            "attendance_open": open_count,
+            "attendance_total": attendance_total,
+            "last_event_title": att.get("last_event_title") or "",
+            "last_status": att.get("last_status") or "",
+            "voice_hours": float(att.get("voice_hours") or base.get("voice_hours") or 0),
+            "won_count": int(loot.get("won_count") or base.get("loot_won_count") or 0),
+            "spent_ec": int(_num(loot.get("spent_ec"), 0)),
+            "bid_count": int(loot.get("bid_count") or 0),
+            "has_profile": bool(base.get("has_profile", True if prof else False)),
+            "has_ec": ec_balance is not None,
+            "has_needs": (len(main_needs) + len(sec_needs)) > 0 or bool(base.get("has_needs")),
+            "admin_status": str(st.get("status") or "ok").lower(),
+            "admin_note": str(st.get("note") or ""),
+            "admin_updated_at": st.get("updated_at") or "",
+            "risk_score": int(_num(base.get("risk_score"), 0)),
+            "risk_flags_text": _risk_flags_text(base) if isinstance(base, dict) else "—",
+        }
+        row["last_seen"] = _member_center_last_seen(base, att, loot)
+        row["hint"] = _member_center_hint(row)
+        rows.append(row)
+
+    rows.sort(key=lambda r: (0 if r.get("admin_status") in {"critical", "watch", "check"} else 1, -int(r.get("risk_score") or 0), str(r.get("display_name") or "").lower()))
+
+    by_role = Counter(str(r.get("role_bucket") or "Unklar") for r in rows)
+    admin_open = sum(1 for r in rows if str(r.get("admin_status") or "ok") != "ok")
+    active_attendance = sum(1 for r in rows if int(r.get("attendance_total") or 0) > 0)
+    with_loot = sum(1 for r in rows if int(r.get("won_count") or 0) > 0 or int(r.get("bid_count") or 0) > 0)
+    problem_rows = [r for r in rows if str(r.get("hint") or "—") != "—"][:120]
+
+    return {
+        "guild_id": guild_id,
+        "snapshot_at": data.get("published_at"),
+        "rows": rows,
+        "problem_rows": problem_rows,
+        "by_role": by_role,
+        "quality": quality,
+        "admin_marked": admin_open,
+        "active_attendance": active_attendance,
+        "with_loot": with_loot,
+        "attendance_reviews": att_payload.get("review_count", 0),
+    }
+
+
 def _render_members_dashboard(data: dict[str, Any]) -> str:
     if not data.get("ok"):
         return _html_shell("Mitglieder · Ebo Dashboard", f"<section class='panel'><h1>👥 Mitglieder</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
-    snap: dict[str, Any] = data.get("snapshot") or {}
-    ins = _insights(snap)
-    members = _insight_members(snap)
-    quality = ins.get("quality") if isinstance(ins.get("quality"), dict) else {}
+    payload = _member_center_payload(data)
+    rows = payload.get("rows") or []
 
-    rows = []
-    for m in members:
-        uid = _user_id(m.get("user_id"))
-        rows.append([
-            _member_link(uid, m.get("display_name")),
-            m.get("ingame_name") or "—",
-            m.get("main_role") or "—",
-            m.get("gearscore") or "—",
-            _fmt_ec(m.get("ec_balance")) if m.get("ec_balance") is not None else "—",
-            m.get("main_need_count", "—"),
-            m.get("secondary_need_count", "—"),
-            m.get("event_responses", "—"),
-            f"{_num(m.get('voice_hours'), 0):.1f} h",
-            m.get("loot_won_count", "—"),
-            _risk_flags_text(m),
+    member_rows = []
+    for r in rows:
+        uid = _user_id(r.get("user_id"))
+        member_rows.append([
+            _member_link(uid, r.get("display_name")),
+            r.get("ingame_name") or "—",
+            r.get("role") or "—",
+            r.get("gearscore") or "—",
+            _fmt_ec(r.get("ec_balance")) if r.get("ec_balance") is not None else "—",
+            f"{r.get('main_need_count', 0)} / {r.get('secondary_need_count', 0)}",
+            r.get("attendance_rate") or "—",
+            f"✅ {r.get('attendance_present',0)} · 🟡 {r.get('attendance_partial',0)} · ❌ {r.get('attendance_absent',0)}",
+            f"{_num(r.get('voice_hours'), 0):.1f} h",
+            f"{r.get('won_count',0)} / {_fmt_ec(r.get('spent_ec',0))} EC",
+            _status_label(r.get("admin_status")),
+            _member_center_hint(r),
+            _raw(f'<a class="link" href="/member/{uid}/loot">Loot</a>') if uid else "—",
         ])
 
-    risk_rows = []
-    for m in (ins.get("risk_members") or [])[:120]:
-        if not isinstance(m, dict):
-            continue
-        risk_rows.append([_member_link(m.get("user_id"), m.get("display_name")), m.get("risk_score"), _risk_flags_text(m)])
+    problem_rows = []
+    for r in payload.get("problem_rows") or []:
+        uid = _user_id(r.get("user_id"))
+        problem_rows.append([
+            _member_link(uid, r.get("display_name")),
+            _status_label(r.get("admin_status")),
+            r.get("attendance_rate") or "—",
+            _fmt_ec(r.get("ec_balance")) if r.get("ec_balance") is not None else "—",
+            r.get("hint") or "—",
+            _dt(r.get("last_seen")),
+        ])
+
+    role_rows = [[role, count] for role, count in (payload.get("by_role") or Counter()).most_common()]
+    top_ec = sorted([r for r in rows if r.get("ec_balance") is not None], key=lambda r: _num(r.get("ec_balance"), 0), reverse=True)[:20]
+    ec_rows = [[_member_link(r.get("user_id"), r.get("display_name")), _fmt_ec(r.get("ec_balance")), r.get("role") or "—", r.get("attendance_rate") or "—", r.get("hint") or "—"] for r in top_ec]
 
     cards = "".join([
-        _card("Mitglieder", len(members), "gesetzte Gildenrolle"),
-        _card("ohne Profil", quality.get("missing_profile", 0), "Datenqualität"),
-        _card("ohne EC", quality.get("missing_ec", 0), "Datenqualität"),
-        _card("ohne Needs", quality.get("missing_needs", 0), "Needliste"),
-        _card("keine Eventantwort", quality.get("no_event_response", 0), "im Snapshot"),
-        _card("keine Voice-Zeit", quality.get("no_voice_time", 0), "gemessen"),
+        _card("Mitglieder", len(rows), "alle bekannten Spieler"),
+        _card("Review-Spieler", payload.get("active_attendance", 0), "in Attendance-Historie"),
+        _card("Loot-Aktiv", payload.get("with_loot", 0), "Gebote/Gewinne"),
+        _card("Markiert", payload.get("admin_marked", 0), "Leitungsnotizen"),
+        _card("Reviews", payload.get("attendance_reviews", 0), "gespeicherte Events"),
+        _card("Snapshot", _dt(payload.get("snapshot_at")), "letzter Stand"),
     ])
-    body = f"""
-    <nav class="topnav"><a href="/">← Übersicht</a><a href="/needs">Needs</a><a href="/loot">Loot</a><a href="/analytics">Analytics</a><a href="/voice">Voice</a><a href="/exports">Exports</a><a href="/api/members">API</a></nav>
-    <section class="hero"><div><div class="eyebrow">Roster & Datenqualität</div><h1>👥 Mitglieder</h1><p class="muted">Alle Mitglieder aus der gesetzten Gildenrolle. Read-only.</p></div><a class="btn" href="/export/members.csv">CSV herunterladen</a></section>
-    <section class="grid">{cards}</section>
-    <section class="panel"><h2>⚠️ Auffällige Mitglieder</h2>{_table(['Spieler','Score','Hinweise'], risk_rows, placeholder='Auffälligkeiten durchsuchen…')}</section>
-    <section class="panel"><h2>👥 Mitgliederliste</h2>{_table(['Name','Ingame','Rolle','GS','EC','Main','Secondary','Eventantworten','Voice','Loot','Hinweise'], rows, placeholder='Mitglieder durchsuchen…')}</section>
-    """
-    return _html_shell("Mitglieder · Ebo Dashboard", body)
 
+    body = f"""
+    <nav class="topnav"><a href="/">← Übersicht</a><a href="/attendance-stats">Anwesenheit-Stats</a><a href="/loot-history">Loot-Verlauf</a><a href="/ec">EC</a><a href="/admin">Leitung</a><a href="/export/member_center.csv">CSV</a><a href="/api/member-center">API</a></nav>
+    <section class="hero"><div><div class="eyebrow">Mitgliederzentrale</div><h1>👥 Mitglieder</h1><p class="muted">Kombiniert Profil, EC, Needliste, Attendance-Reviews, Loot-Verlauf und Leitungsmarkierungen. Read-only – hier wird nichts am Bot verändert.</p></div><a class="btn" href="/export/member_center.csv">CSV herunterladen</a></section>
+    <section class="grid">{cards}</section>
+    <section class="split"><div class="panel"><h2>Rollenverteilung</h2>{_bars(role_rows, max_items=8)}</div><div class="panel"><h2>Top EC</h2>{_table(['Spieler','EC','Rolle','Anwesenheit','Hinweis'], ec_rows, placeholder='Top EC durchsuchen…')}</div></section>
+    <section class="panel"><h2>⚠️ Prüfliste</h2><p class="muted">Auffällige Mitglieder aus Profil-/EC-/Need-Daten, Attendance-Historie, Loot-Verlauf und internen Leitungsnotizen.</p>{_table(['Spieler','Leitung','Attendance','EC','Hinweis','Letzte Aktivität'], problem_rows, placeholder='Prüfliste durchsuchen…')}</section>
+    <section class="panel"><h2>👥 Alle Mitglieder</h2>{_table(['Name','Ingame','Rolle','GS','EC','Needs M/S','Anwesenheit','Review-Zähler','Voice','Loot/EC','Leitung','Hinweise','Loot'], member_rows, placeholder='Mitglieder durchsuchen…')}</section>
+    """
+    return _html_shell("Mitgliederzentrale · Ebo Dashboard", body)
 
 def _render_needs_dashboard(data: dict[str, Any]) -> str:
     if not data.get("ok"):
@@ -4396,7 +4574,7 @@ def _render_member_detail(data: dict[str, Any], user_id: int, current_user: Opti
     ])
 
     body = f"""
-    <nav class="topnav"><a href="/members">← Mitglieder</a><a href="/analytics">Analytics</a><a href="/voice">Voice</a><a href="#needs">Needs</a><a href="#events">Events</a><a href="#ec">EC</a><a href="#voice">Voice</a></nav>
+    <nav class="topnav"><a href="/members">← Mitglieder</a><a href="/member/{_e(user_id)}/loot">Loot-Verlauf</a><a href="/attendance-stats">Anwesenheit-Stats</a><a href="/analytics">Analytics</a><a href="/voice">Voice</a><a href="#needs">Needs</a><a href="#events">Events</a><a href="#ec">EC</a><a href="#voice">Voice</a></nav>
     <section class="hero">
       <div>
         <div class="eyebrow">Mitglied · Tiefenauswertung</div>
@@ -4646,6 +4824,48 @@ def api_members(_: bool = Depends(_auth)):
     snap = payload.get("snapshot") or {}
     return JSONResponse({"ok": True, "members": _insight_members(snap), "quality": (_insights(snap).get("quality") or {})})
 
+
+
+
+@app.get("/api/member-center")
+def api_member_center(_: bool = Depends(_auth)):
+    payload = _snapshot_payload()
+    if not payload.get("ok"):
+        return JSONResponse(payload, status_code=404)
+    return JSONResponse({"ok": True, "member_center": _member_center_payload(payload)})
+
+
+@app.get("/export/member_center.csv")
+def export_member_center_csv(_: bool = Depends(_auth)):
+    payload = _snapshot_payload()
+    if not payload.get("ok"):
+        return _csv_response("member_center.csv", ["error"], [[payload.get("error")]])
+    center = _member_center_payload(payload)
+    rows = []
+    for r in center.get("rows") or []:
+        rows.append([
+            r.get("user_id"),
+            r.get("display_name"),
+            r.get("ingame_name"),
+            r.get("role"),
+            r.get("gearscore"),
+            r.get("ec_balance"),
+            r.get("main_need_count"),
+            r.get("secondary_need_count"),
+            r.get("attendance_rate"),
+            r.get("attendance_present"),
+            r.get("attendance_partial"),
+            r.get("attendance_absent"),
+            r.get("attendance_open"),
+            r.get("voice_hours"),
+            r.get("won_count"),
+            r.get("spent_ec"),
+            r.get("bid_count"),
+            r.get("admin_status"),
+            r.get("hint"),
+            r.get("last_seen"),
+        ])
+    return _csv_response("member_center.csv", ["user_id","display_name","ingame_name","role","gearscore","ec","main_needs","secondary_needs","attendance_rate","present","partial","absent","open","voice_hours","loot_won","loot_spent_ec","bid_count","admin_status","hint","last_seen"], rows)
 
 @app.get("/api/needs")
 def api_needs(_: bool = Depends(_auth)):
