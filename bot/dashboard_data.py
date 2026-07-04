@@ -431,19 +431,154 @@ def _summarize_balances(data: Any, guild: discord.Guild, *, limit: int = 500) ->
     }
 
 
-def _summarize_transactions(data: Any, guild_id: int, *, limit: int = 200) -> dict[str, Any]:
-    arr = _guild_list(data, guild_id)
-    items = []
-    for tx in reversed(arr[-limit:]):
-        if isinstance(tx, dict):
-            items.append({
-                "created_at": str(tx.get("created_at") or tx.get("at") or ""),
-                "user_id": int(tx.get("user_id", 0) or tx.get("target_user_id", 0) or 0),
-                "amount": tx.get("amount", tx.get("delta", "")),
-                "reason": _safe_text(tx.get("reason") or tx.get("summary") or tx.get("type") or "", 240),
-                "raw_type": _safe_text(tx.get("type") or tx.get("kind") or "", 80),
-            })
-    return {"count": len(arr), "recent": items}
+def _parse_amount(value: Any) -> float:
+    try:
+        if value in (None, ""):
+            return 0.0
+        if isinstance(value, str):
+            txt = value.strip().replace(" ", "")
+            # Deutsch/Discord-tolerant: "1.234,5" -> 1234.5, "12,5" -> 12.5
+            if "," in txt and "." in txt:
+                txt = txt.replace(".", "").replace(",", ".")
+            elif "," in txt:
+                txt = txt.replace(",", ".")
+            return float(txt)
+        return float(value)
+    except Exception:
+        return 0.0
+
+
+def _tx_user_id(tx: dict[str, Any]) -> int:
+    for key in ("user_id", "target_user_id", "member_id", "discord_id", "to_user_id", "recipient_id"):
+        try:
+            if tx.get(key) not in (None, ""):
+                return int(tx.get(key) or 0)
+        except Exception:
+            continue
+    return 0
+
+
+def _transactions_for_guild(data: Any, guild_id: int) -> list[Any]:
+    """Tolerant gegen alte DKP-JSON-Strukturen.
+
+    Unterstützt u. a.:
+    - {guild_id: [tx, tx]}
+    - {guild_id: {"transactions": [tx]}}
+    - {guild_id: {"items": [tx]}}
+    - {"transactions": {guild_id: [tx]}}
+    """
+    if isinstance(data, list):
+        return data
+    if not isinstance(data, dict):
+        return []
+    gid = str(int(guild_id))
+    g = data.get(gid)
+    if isinstance(g, list):
+        return g
+    if isinstance(g, dict):
+        for key in ("transactions", "items", "logs", "history"):
+            if isinstance(g.get(key), list):
+                return g.get(key) or []
+    for top_key in ("transactions", "items", "logs", "history"):
+        top = data.get(top_key)
+        if isinstance(top, dict):
+            x = top.get(gid)
+            if isinstance(x, list):
+                return x
+            if isinstance(x, dict):
+                for key in ("transactions", "items", "logs", "history"):
+                    if isinstance(x.get(key), list):
+                        return x.get(key) or []
+        elif isinstance(top, list):
+            return top
+    return []
+
+
+def _summarize_transactions(data: Any, guild: discord.Guild, *, limit: int = 1000) -> dict[str, Any]:
+    arr = _transactions_for_guild(data, guild.id)
+    items: list[dict[str, Any]] = []
+    stale_count = 0
+
+    def member_name(uid: int, tx: dict[str, Any]) -> str:
+        member = guild.get_member(int(uid)) if uid else None
+        if member is not None:
+            return _safe_text(getattr(member, "display_name", "") or getattr(member, "name", "") or f"User {uid}", 120)
+        for key in ("display_name", "target_name", "member_name", "name", "username"):
+            if tx.get(key):
+                return _safe_text(tx.get(key), 120)
+        return f"User {uid}" if uid else "Unbekannt"
+
+    # Neuste Einträge zuerst, weil alte Dateien meist append-only sind.
+    for idx, tx in enumerate(reversed(arr)):
+        if not isinstance(tx, dict):
+            continue
+        uid = _tx_user_id(tx)
+        if uid and not _is_dashboard_member(guild, uid):
+            stale_count += 1
+            continue
+        amount_raw = tx.get("amount", tx.get("delta", tx.get("change", tx.get("value", 0))))
+        amount = _parse_amount(amount_raw)
+        created_at = str(tx.get("created_at") or tx.get("at") or tx.get("timestamp") or tx.get("time") or "")
+        item = {
+            "created_at": created_at,
+            "user_id": uid,
+            "display_name": member_name(uid, tx),
+            "amount": amount,
+            "amount_raw": amount_raw,
+            "reason": _safe_text(tx.get("reason") or tx.get("summary") or tx.get("note") or tx.get("description") or tx.get("type") or "", 300),
+            "raw_type": _safe_text(tx.get("type") or tx.get("kind") or tx.get("action") or "", 80),
+            "actor_id": int(tx.get("actor_id", 0) or tx.get("admin_id", 0) or tx.get("created_by", 0) or 0),
+            "event_id": str(tx.get("event_id") or tx.get("source_event_id") or ""),
+            "auction_id": str(tx.get("auction_id") or tx.get("source_auction_id") or ""),
+        }
+        items.append(item)
+        if len(items) >= limit:
+            # Für Dashboard reichen 1000 neueste; Count unten bleibt aber echter Rohcount.
+            break
+
+    by_user: dict[int, dict[str, Any]] = {}
+    for item in items:
+        uid = int(item.get("user_id") or 0)
+        if not uid:
+            continue
+        bucket = by_user.setdefault(uid, {
+            "user_id": uid,
+            "display_name": item.get("display_name") or f"User {uid}",
+            "earned": 0.0,
+            "spent": 0.0,
+            "net": 0.0,
+            "count": 0,
+        })
+        amount = _parse_amount(item.get("amount"))
+        bucket["net"] += amount
+        bucket["count"] += 1
+        if amount >= 0:
+            bucket["earned"] += amount
+        else:
+            bucket["spent"] += abs(amount)
+
+    user_rows = list(by_user.values())
+    top_earned = sorted(user_rows, key=lambda x: float(x.get("earned") or 0), reverse=True)[:25]
+    top_spent = sorted(user_rows, key=lambda x: float(x.get("spent") or 0), reverse=True)[:25]
+    top_activity = sorted(user_rows, key=lambda x: int(x.get("count") or 0), reverse=True)[:25]
+    total_earned = sum(float(x.get("earned") or 0) for x in user_rows)
+    total_spent = sum(float(x.get("spent") or 0) for x in user_rows)
+
+    return {
+        "count": len(arr),
+        "loaded_count": len(items),
+        "stale_count": stale_count,
+        "recent": items[:250],
+        "items": items,
+        "total_earned": total_earned,
+        "total_spent": total_spent,
+        "net_loaded": total_earned - total_spent,
+        "by_user": user_rows,
+        "top_earned": top_earned,
+        "top_spent": top_spent,
+        "top_activity": top_activity,
+        "filter": "dashboard_member_role_only",
+    }
 
 
 def _summarize_auctions(data: Any, guild: discord.Guild, *, limit: int = 300) -> dict[str, Any]:
@@ -839,11 +974,11 @@ def build_dashboard_snapshot(bot: commands.Bot, guild: discord.Guild) -> dict[st
         "event_checks": _summarize_event_checks(sources.get("dkp_event_checks"), guild_id),
         "ec": {
             "balances": _summarize_balances(sources.get("dkp_balances"), guild),
-            "transactions": _summarize_transactions(sources.get("dkp_transactions"), guild_id),
+            "transactions": _summarize_transactions(sources.get("dkp_transactions"), guild),
         },
         "loot": {
             "needs": _summarize_needs(sources.get("loot_needs"), guild, sources.get("loot_items")),
-            "auctions": _summarize_auctions(sources.get("loot_auctions"), guild_id),
+            "auctions": _summarize_auctions(sources.get("loot_auctions"), guild),
             "items_known": len(_catalog_items_for_guild(sources.get("loot_items"), guild_id)),
         },
         "voice": _voice_summary(guild_id),
