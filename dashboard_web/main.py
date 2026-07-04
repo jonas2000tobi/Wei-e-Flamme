@@ -1405,8 +1405,8 @@ def _html_shell(title: str, body: str) -> str:
     body {{ margin:0; font-family:Inter, system-ui, Segoe UI, sans-serif; background:linear-gradient(180deg,rgba(15,16,20,.80),rgba(15,16,20,.96)), url("{_asset('dashboard_bg.webp')}") center top / cover fixed no-repeat; color:var(--text); }}
     main {{ max-width:1240px; margin:0 auto; padding:22px 18px 60px; }}
     .topnav {{ position:sticky; top:0; z-index:5; display:flex; gap:8px; flex-wrap:wrap; padding:10px; margin:-22px -18px 18px; background:rgba(10,11,15,.86); backdrop-filter:blur(12px); border-bottom:1px solid rgba(214,168,79,.24); box-shadow:0 10px 30px rgba(0,0,0,.35); }}
-    .topnav a {{ color:var(--text); text-decoration:none; padding:8px 11px; border:1px solid var(--line); border-radius:999px; background:linear-gradient(180deg,rgba(32,35,45,.95),rgba(13,14,20,.92)); font-size:13px; display:inline-flex; align-items:center; gap:7px; box-shadow:inset 0 1px 0 rgba(255,255,255,.04); }}
-    .topnav a::before {{ content:""; width:18px; height:18px; flex:0 0 18px; background:center / contain no-repeat; filter:drop-shadow(0 1px 3px rgba(0,0,0,.7)); display:none; }}
+    .topnav a {{ color:var(--text); text-decoration:none; padding:9px 12px; border:1px solid var(--line); border-radius:999px; background:linear-gradient(180deg,rgba(32,35,45,.95),rgba(13,14,20,.92)); font-size:13px; display:inline-flex; align-items:center; gap:8px; box-shadow:inset 0 1px 0 rgba(255,255,255,.04); }}
+    .topnav a::before {{ content:""; width:22px; height:22px; flex:0 0 22px; background:center / contain no-repeat; filter:drop-shadow(0 1px 3px rgba(0,0,0,.7)); display:none; }}
     .topnav a[href="/"]::before {{ display:block; background-image:url("{_asset('nav_kommando.png')}"); }}
     .topnav a[href="/overview"]::before {{ display:block; background-image:url("{_asset('nav_kommando.png')}"); }}
     .topnav a[href="/planning"]::before {{ display:block; background-image:url("{_asset('nav_planung.png')}"); }}
