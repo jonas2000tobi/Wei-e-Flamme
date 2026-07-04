@@ -471,6 +471,32 @@ def _ensure_admin_tables() -> None:
                 ON dashboard_ec_award_requests (guild_id, event_id, status, requested_at DESC)
                 """
             )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS dashboard_loot_action_requests (
+                    id BIGSERIAL PRIMARY KEY,
+                    request_id TEXT NOT NULL UNIQUE,
+                    guild_id BIGINT NOT NULL,
+                    auction_id TEXT NOT NULL,
+                    action_type TEXT NOT NULL,
+                    amount INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    payload_json TEXT NOT NULL DEFAULT '{}',
+                    actor_id TEXT,
+                    actor_name TEXT,
+                    requested_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    claimed_at TIMESTAMPTZ,
+                    processed_at TIMESTAMPTZ,
+                    result_json TEXT
+                )
+                """
+            )
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_dashboard_loot_action_requests_lookup
+                ON dashboard_loot_action_requests (guild_id, auction_id, status, requested_at DESC)
+                """
+            )
         conn.commit()
     finally:
         conn.close()
@@ -1325,7 +1351,305 @@ def _junk_roll_rows(auction: dict[str, Any]) -> list[list[Any]]:
     return rows
 
 
-def _render_auction_detail(data: dict[str, Any], auction_id: str) -> str:
+
+# ---------------------------------------------------------------------------
+# Dashboard Loot-Aktionsqueue: Bieten / Sale / Müll
+# ---------------------------------------------------------------------------
+
+def _loot_action_status_label(value: Any) -> str:
+    v = str(value or "").strip().lower()
+    return {
+        "pending": "🟡 offen",
+        "processing": "🔵 wird verarbeitet",
+        "done": "✅ erledigt",
+        "failed": "❌ Fehler",
+        "rejected": "⛔ blockiert",
+        "cancelled": "⚫ abgebrochen",
+    }.get(v, v or "—")
+
+
+def _loot_action_type_label(value: Any) -> str:
+    v = str(value or "").strip().lower()
+    return {
+        "bid": "Gebot",
+        "sale_buy": "Sofortkauf",
+        "junk_roll": "Müll-Wurf",
+    }.get(v, v or "—")
+
+
+def _loot_current_price(auction: dict[str, Any]) -> int:
+    values: list[int] = []
+    for b in auction.get("bids") or []:
+        if isinstance(b, dict):
+            try:
+                values.append(int(_num(b.get("amount"), 0)))
+            except Exception:
+                pass
+    if auction.get("top_bid_amount") is not None:
+        try:
+            values.append(int(_num(auction.get("top_bid_amount"), 0)))
+        except Exception:
+            pass
+    if values:
+        return max(values)
+    try:
+        return max(0, int(_num(auction.get("start_bid"), 0)) - int(_num(auction.get("min_increment"), 5)))
+    except Exception:
+        return 0
+
+
+def _loot_min_next_bid(auction: dict[str, Any]) -> int:
+    step = int(_num(auction.get("min_increment"), 5) or 5)
+    current = _loot_current_price(auction)
+    start = int(_num(auction.get("start_bid"), 1) or 1)
+    if current > 0:
+        return current + max(1, step)
+    return max(0, start)
+
+
+def _loot_is_sale_like(auction: dict[str, Any]) -> bool:
+    phase = _loot_status(auction.get("phase"))
+    kind = _loot_status(auction.get("kind"))
+    return phase == "sale" or kind == "sale" or auction.get("fixed_price") is not None
+
+
+def _loot_auction_eligible_user_ids(auction: dict[str, Any]) -> set[int]:
+    ids: set[int] = set()
+    for raw in auction.get("eligible_user_ids") or []:
+        uid = _user_id(raw)
+        if uid:
+            ids.add(uid)
+    for raw in auction.get("eligible_users") or []:
+        if isinstance(raw, dict):
+            uid = _user_id(raw.get("user_id") or raw.get("id") or raw.get("member_id"))
+            if uid:
+                ids.add(uid)
+    return ids
+
+
+def _loot_action_requests_for_auction(guild_id: int, auction_id: str, limit: int = 20) -> list[dict[str, Any]]:
+    if not _database_url() or not guild_id or not auction_id:
+        return []
+    try:
+        _ensure_admin_tables()
+    except Exception:
+        return []
+    conn = _pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, request_id, guild_id, auction_id, action_type, amount, status,
+                       actor_id, actor_name, requested_at, claimed_at, processed_at, payload_json, result_json
+                FROM dashboard_loot_action_requests
+                WHERE guild_id = %s AND auction_id = %s
+                ORDER BY requested_at DESC, id DESC
+                LIMIT %s
+                """,
+                (int(guild_id), str(auction_id), int(limit)),
+            )
+            rows: list[dict[str, Any]] = []
+            for row in cur.fetchall() or []:
+                out = dict(row)
+                try:
+                    out["payload"] = json.loads(out.get("payload_json") or "{}")
+                except Exception:
+                    out["payload"] = {}
+                try:
+                    out["result"] = json.loads(out.get("result_json") or "{}")
+                except Exception:
+                    out["result"] = {}
+                rows.append(out)
+            return rows
+    finally:
+        conn.close()
+
+
+def _loot_action_active_for_actor(guild_id: int, auction_id: str, actor_id: str) -> dict[str, Any]:
+    if not _database_url() or not guild_id or not auction_id or not actor_id:
+        return {}
+    try:
+        _ensure_admin_tables()
+    except Exception:
+        return {}
+    conn = _pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT request_id, status, action_type, amount, requested_at
+                FROM dashboard_loot_action_requests
+                WHERE guild_id = %s AND auction_id = %s AND actor_id = %s AND status IN ('pending','processing')
+                ORDER BY requested_at DESC, id DESC
+                LIMIT 1
+                """,
+                (int(guild_id), str(auction_id), str(actor_id)),
+            )
+            row = cur.fetchone()
+            return dict(row) if row else {}
+    finally:
+        conn.close()
+
+
+def _loot_action_rows(rows: list[dict[str, Any]]) -> list[list[Any]]:
+    out: list[list[Any]] = []
+    for r in rows:
+        result = r.get("result") if isinstance(r.get("result"), dict) else {}
+        info = result.get("message") or result.get("error") or r.get("request_id")
+        out.append([
+            _dt(r.get("requested_at")),
+            _loot_action_status_label(r.get("status")),
+            _loot_action_type_label(r.get("action_type")),
+            _fmt_ec(r.get("amount")) if r.get("amount") is not None else "—",
+            r.get("actor_name") or r.get("actor_id") or "—",
+            _short(info, 140),
+        ])
+    return out
+
+
+def _loot_action_queue_panel(guild_id: int, auction_id: str) -> str:
+    rows = _loot_action_requests_for_auction(int(guild_id), str(auction_id), limit=20)
+    return f"""
+    <section class="panel" id="loot-actions">
+      <h2>🧾 Dashboard-Aktionen</h2>
+      <p class="muted">Gebote/Käufe aus dem Dashboard gehen zuerst in diese Queue. Der Bot verarbeitet sie und schreibt dann in die echten Loot-/EC-Daten.</p>
+      {_table(['Zeit','Status','Aktion','EC','Spieler','Info'], _loot_action_rows(rows), placeholder='Aktionen durchsuchen…')}
+    </section>
+    """
+
+
+def _loot_dashboard_action_panel(guild_id: int, auction: dict[str, Any], current_user: Optional[dict[str, Any]], snap: dict[str, Any]) -> str:
+    auction_id = str(auction.get("auction_id") or auction.get("id") or "").strip()
+    if not auction_id:
+        return ""
+    status = _loot_status(auction.get("status"))
+    if not _loot_is_active(auction) or status in {"closed", "done", "delivered", "cancelled", "deleted"}:
+        return """
+        <section class="panel"><h2>🛒 Bieten / Kaufen</h2><div class="empty">Diese Auktion ist nicht mehr aktiv.</div></section>
+        """
+    if not current_user or not _user_id(current_user.get("user_id")):
+        return f"""
+        <section class="panel"><h2>🛒 Bieten / Kaufen</h2>
+          <p class="muted">Zum Bieten muss das Dashboard über Discord-Login wissen, welcher Spieler du bist.</p>
+          <a class="btn" href="/auth/discord/start?next={urllib.parse.quote('/auction/' + auction_id)}">Mit Discord einloggen</a>
+        </section>
+        """
+
+    user_id = _user_id(current_user.get("user_id"))
+    names = _profile_name_map(snap)
+    balances = _balance_map(snap)
+    balance = balances.get(user_id)
+    actor_name = current_user.get("username") or names.get(user_id) or f"User {user_id}"
+    mode = _loot_status(auction.get("eligibility_mode"))
+    eligible = _loot_auction_eligible_user_ids(auction)
+    warnings: list[str] = []
+    if mode in {"main_need", "secondary_need"} and eligible and user_id not in eligible:
+        warnings.append("Du bist laut Snapshot für diese Need-Phase nicht berechtigt. Der Bot prüft das endgültig.")
+    active_req = _loot_action_active_for_actor(int(guild_id), auction_id, str(user_id))
+    if active_req:
+        warnings.append(f"Du hast bereits eine offene Dashboard-Aktion: {_loot_action_type_label(active_req.get('action_type'))} · {_loot_action_status_label(active_req.get('status'))}.")
+    warn_html = "".join(f"<p class='muted'>⚠️ {_e(w)}</p>" for w in warnings)
+    bal_text = _fmt_ec(balance) + " EC" if balance is not None else "im Snapshot nicht geladen"
+
+    if _loot_is_sale_like(auction):
+        price = int(_num(auction.get("fixed_price") if auction.get("fixed_price") is not None else auction.get("start_bid"), 0))
+        is_junk = bool(auction.get("junk_drop")) and price <= 0
+        action = "junk_roll" if is_junk else "sale_buy"
+        label = "🎲 Müll würfeln" if is_junk else ("Gratis nehmen" if price <= 0 else f"Sofort kaufen für {price} EC")
+        disabled = "disabled" if active_req else ""
+        confirm = "Müll-Wurf im Dashboard anfragen?" if is_junk else "Sale-Kauf im Dashboard anfragen?"
+        return f"""
+        <section class="panel" id="bid">
+          <h2>🛒 Kaufen / Müll</h2>
+          <p class="muted">Angemeldet als <strong>{_e(actor_name)}</strong> · EC: <strong>{_e(bal_text)}</strong></p>
+          {warn_html}
+          <form method="post" action="/admin/auction/{_e(auction_id)}/sale" onsubmit="return confirm('{_e(confirm)}');">
+            <input type="hidden" name="action_type" value="{_e(action)}">
+            <button class="btn" type="submit" {disabled}>{_e(label)}</button>
+          </form>
+          <p class="muted">Der Bot verarbeitet die Anfrage, prüft Mitgliedschaft/EC und aktualisiert Discord-Nachrichten.</p>
+        </section>
+        """
+
+    current = _loot_current_price(auction)
+    min_next = _loot_min_next_bid(auction)
+    quick = [min_next, max(min_next, current + 10), max(min_next, current + 25)]
+    quick = list(dict.fromkeys(int(x) for x in quick if int(x) >= min_next))
+    quick_buttons = "".join(
+        f"<button class='btn mini-btn' type='submit' name='quick_amount' value='{int(q)}'>{int(q)} EC</button>" for q in quick[:3]
+    )
+    disabled = "disabled" if active_req else ""
+    return f"""
+    <section class="panel" id="bid">
+      <h2>💰 Dashboard-Gebot</h2>
+      <p class="muted">Angemeldet als <strong>{_e(actor_name)}</strong> · EC: <strong>{_e(bal_text)}</strong> · Mindestgebot: <strong>{_e(min_next)} EC</strong></p>
+      {warn_html}
+      <form method="post" action="/admin/auction/{_e(auction_id)}/bid" style="display:grid; gap:12px; max-width:720px;" onsubmit="return confirm('Gebot über Dashboard an den Bot senden?');">
+        <div style="display:flex; flex-wrap:wrap; gap:8px;">{quick_buttons}</div>
+        <label>Eigenes Gebot in EC<br><input name="amount" type="number" min="{int(min_next)}" step="1" placeholder="z. B. {int(min_next)}" style="width:220px; padding:10px; border-radius:10px;"></label>
+        <button class="btn" type="submit" {disabled}>Gebot senden</button>
+      </form>
+      <p class="muted">Abgebucht wird nicht beim Bieten, sondern wie bisher erst bei Übergabe/Gewinner-Bestätigung.</p>
+    </section>
+    """
+
+
+def _enqueue_loot_action_request(guild_id: int, auction: dict[str, Any], action_type: str, amount: int, actor: dict[str, Any]) -> dict[str, Any]:
+    if not _database_url():
+        return {"ok": False, "error": "DATABASE_URL fehlt. Ohne Postgres kann das Dashboard keine Bot-Aktion anstoßen."}
+    auction_id = str(auction.get("auction_id") or auction.get("id") or "").strip()
+    if not guild_id or not auction_id:
+        return {"ok": False, "error": "Guild/Auktion fehlt."}
+    actor_id = str(actor.get("user_id") or "").strip()
+    actor_name = str(actor.get("username") or actor_id or "Dashboard")
+    if not actor_id:
+        return {"ok": False, "error": "Discord-Login erforderlich. Mit Basic-Login kann das Dashboard nicht wissen, wer bietet."}
+    active = _loot_action_active_for_actor(int(guild_id), auction_id, actor_id)
+    if active:
+        return {"ok": False, "error": f"Du hast bereits eine offene Aktion für diese Auktion ({active.get('status')}). Bitte kurz warten."}
+    action = str(action_type or "").strip().lower()
+    if action not in {"bid", "sale_buy", "junk_roll"}:
+        return {"ok": False, "error": "Unbekannte Loot-Aktion."}
+    request_id = f"dash-loot-{int(time.time())}-{secrets.token_hex(6)}"
+    payload = {
+        "auction_id": auction_id,
+        "item_name": str(auction.get("item_name") or auction.get("item") or auction_id),
+        "action_type": action,
+        "amount": int(amount or 0),
+        "phase": str(auction.get("phase") or ""),
+        "eligibility_mode": str(auction.get("eligibility_mode") or ""),
+        "requested_by": {"id": actor_id, "name": actor_name},
+        "requested_at": datetime.now(timezone.utc).isoformat(),
+        "source": "dashboard_loot_action",
+    }
+    _ensure_admin_tables()
+    conn = _pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO dashboard_loot_action_requests
+                    (request_id, guild_id, auction_id, action_type, amount, status, payload_json, actor_id, actor_name, requested_at)
+                VALUES (%s, %s, %s, %s, %s, 'pending', %s, %s, %s, NOW())
+                RETURNING id, request_id, status
+                """,
+                (request_id, int(guild_id), auction_id, action, int(amount or 0), json.dumps(payload, ensure_ascii=False, separators=(",", ":")), actor_id, actor_name),
+            )
+            row = dict(cur.fetchone() or {})
+            cur.execute(
+                """
+                INSERT INTO dashboard_admin_action_log
+                    (guild_id, action_type, target_type, target_id, actor_id, actor_name, payload_json)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """,
+                (int(guild_id), f"loot_action_{action}_create", "auction", auction_id, actor_id, actor_name, json.dumps(payload, ensure_ascii=False)),
+            )
+        conn.commit()
+        return {"ok": True, "request": row, "request_id": request_id}
+    finally:
+        conn.close()
+
+def _render_auction_detail(data: dict[str, Any], auction_id: str, current_user: Optional[dict[str, Any]] = None, msg: str = "") -> str:
     if not data.get("ok"):
         return _html_shell("Ebo Dashboard", f"<section class='panel'><h1>📊 Ebo Dashboard</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
     snap: dict[str, Any] = data.get("snapshot") or {}
@@ -1373,8 +1697,13 @@ def _render_auction_detail(data: dict[str, Any], auction_id: str) -> str:
         </section>
         """
 
+    guild_id = _safe_guild_id(data)
+    action_panel = _loot_dashboard_action_panel(int(guild_id), auction, current_user, snap) if guild_id else ""
+    queue_panel = _loot_action_queue_panel(int(guild_id), auction_id) if guild_id else ""
+    msg_panel = f"<section class='panel'><p>{_e(msg)}</p></section>" if msg else ""
+
     body = f"""
-    <nav class="topnav"><a href="/">← Übersicht</a><a href="#bids">Gebote</a><a href="#eligible">Berechtigte</a><a href="#tech">Technik</a><a href="/api/snapshot">JSON</a></nav>
+    <nav class="topnav"><a href="/">← Übersicht</a><a href="/loot">Loot</a><a href="#bid">Bieten/Kaufen</a><a href="#loot-actions">Queue</a><a href="#bids">Gebote</a><a href="#eligible">Berechtigte</a><a href="#tech">Technik</a><a href="/api/snapshot">JSON</a></nav>
     <section class="hero">
       <div>
         <div class="eyebrow">Auktion</div>
@@ -1383,7 +1712,10 @@ def _render_auction_detail(data: dict[str, Any], auction_id: str) -> str:
       </div>
       <a class="btn" href="/#loot">Zurück</a>
     </section>
+    {msg_panel}
     <section class="grid">{cards}</section>
+    {action_panel}
+    {queue_panel}
     <section class="panel" id="bids"><h2>💰 Gebotshistorie</h2>{_table(['Spieler','Gebot','Zeit'], bid_rows, placeholder='Gebote durchsuchen…')}</section>
     {extra_roll_section}
     <section class="panel" id="eligible"><h2>✅ Berechtigte Spieler</h2><p class="muted">Bei freien Auktionen/Sale kann die Liste leer sein, weil dann alle berechtigt sind.</p>{_table(['Spieler'], eligible_rows, placeholder='Berechtigte durchsuchen…')}</section>
@@ -4903,14 +5235,65 @@ def api_quality(_: bool = Depends(_auth)):
 
 
 @app.get("/auction/{auction_id}", response_class=HTMLResponse)
-def auction_detail(auction_id: str, _: bool = Depends(_auth)):
+def auction_detail(request: Request, auction_id: str, msg: str = "", _: bool = Depends(_auth)):
     try:
-        return HTMLResponse(_render_auction_detail(_snapshot_payload(), str(auction_id)))
+        return HTMLResponse(_render_auction_detail(_snapshot_payload(), str(auction_id), _current_user(request), msg=msg))
     except Exception as exc:
         return HTMLResponse(
             _html_shell("Ebo Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
             status_code=500,
         )
+
+
+@app.post("/admin/auction/{auction_id}/bid")
+async def auction_dashboard_bid(request: Request, auction_id: str, _: bool = Depends(_auth)):
+    payload = _snapshot_payload()
+    guild_id = _safe_guild_id(payload)
+    snap = payload.get("snapshot") or {}
+    auction = _auction_by_id(snap, str(auction_id)) if payload.get("ok") else None
+    msg = ""
+    try:
+        form = await request.form()
+        amount = int(str(form.get("quick_amount") or form.get("amount") or "0").strip())
+        if not auction:
+            msg = "❌ Auktion nicht im Snapshot gefunden."
+        elif _loot_is_sale_like(auction):
+            msg = "❌ Diese Auktion ist ein Sale/Müll-Item. Nutze Kaufen/Würfeln."
+        elif amount < _loot_min_next_bid(auction):
+            msg = f"❌ Mindestgebot ist aktuell {_loot_min_next_bid(auction)} EC."
+        else:
+            actor = _current_user(request) or {}
+            result = _enqueue_loot_action_request(int(guild_id), auction, "bid", int(amount), actor)
+            msg = "✅ Gebot wurde an den Bot gesendet." if result.get("ok") else f"❌ {result.get('error') or 'Gebot konnte nicht gesendet werden.'}"
+    except Exception as exc:
+        msg = f"❌ Fehler: {type(exc).__name__}: {exc}"
+    return RedirectResponse(f"/auction/{urllib.parse.quote(str(auction_id))}?msg={urllib.parse.quote(msg)}", status_code=303)
+
+
+@app.post("/admin/auction/{auction_id}/sale")
+async def auction_dashboard_sale(request: Request, auction_id: str, _: bool = Depends(_auth)):
+    payload = _snapshot_payload()
+    guild_id = _safe_guild_id(payload)
+    snap = payload.get("snapshot") or {}
+    auction = _auction_by_id(snap, str(auction_id)) if payload.get("ok") else None
+    msg = ""
+    try:
+        form = await request.form()
+        action_type = str(form.get("action_type") or "sale_buy").strip().lower()
+        if action_type not in {"sale_buy", "junk_roll"}:
+            action_type = "sale_buy"
+        if not auction:
+            msg = "❌ Auktion nicht im Snapshot gefunden."
+        elif not _loot_is_sale_like(auction):
+            msg = "❌ Diese Auktion ist kein Sale/Müll-Item."
+        else:
+            price = int(_num(auction.get("fixed_price") if auction.get("fixed_price") is not None else auction.get("start_bid"), 0))
+            actor = _current_user(request) or {}
+            result = _enqueue_loot_action_request(int(guild_id), auction, action_type, price, actor)
+            msg = "✅ Aktion wurde an den Bot gesendet." if result.get("ok") else f"❌ {result.get('error') or 'Aktion konnte nicht gesendet werden.'}"
+    except Exception as exc:
+        msg = f"❌ Fehler: {type(exc).__name__}: {exc}"
+    return RedirectResponse(f"/auction/{urllib.parse.quote(str(auction_id))}?msg={urllib.parse.quote(msg)}", status_code=303)
 
 
 @app.get("/api/auction/{auction_id}")
@@ -4922,6 +5305,13 @@ def api_auction(auction_id: str, _: bool = Depends(_auth)):
     if not auc:
         return JSONResponse({"ok": False, "error": "Auktion nicht gefunden"}, status_code=404)
     return JSONResponse({"ok": True, "auction": auc})
+
+
+@app.get("/api/auction/{auction_id}/dashboard-actions")
+def api_auction_dashboard_actions(auction_id: str, _: bool = Depends(_auth)):
+    payload = _snapshot_payload()
+    guild_id = _safe_guild_id(payload)
+    return JSONResponse({"ok": True, "items": _loot_action_requests_for_auction(int(guild_id), str(auction_id), limit=50)})
 
 
 @app.get("/event/{event_id}", response_class=HTMLResponse)
