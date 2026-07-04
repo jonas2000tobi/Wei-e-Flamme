@@ -1126,32 +1126,15 @@ async def _place_bid(inter: discord.Interaction, guild_id: int, auction_id: str,
     if not auction:
         await inter.response.send_message("❌ Auktion nicht gefunden.", ephemeral=True)
         return
-    if str(auction.get("status", "")) != "active":
-        await inter.response.send_message("❌ Diese Auktion ist nicht mehr aktiv.", ephemeral=True)
-        return
-    end_dt = _parse_dt(str(auction.get("ends_at", "") or ""))
-    if end_dt and _now() >= end_dt:
-        await inter.response.send_message("❌ Diese Auktion ist bereits abgelaufen. Die Abschlussrunde verarbeitet sie gleich.", ephemeral=True)
-        return
     user_id = int(inter.user.id)
     if not _is_ebolus_member(guild, user_id):
         await inter.response.send_message("❌ Nur Ebolus-Mitglieder dürfen mit EC bieten.", ephemeral=True)
         return
     if not await _require_loot_unlocked(inter, guild, user_id):
         return
-    mode = str(auction.get("eligibility_mode", "all") or "all")
-    eligible = [int(x) for x in auction.get("eligible_user_ids", []) or []]
-    if mode in {"main_need", "secondary_need"} and user_id not in eligible:
-        label = "Main-Need-Spieler" if mode == "main_need" else "Second-Need-Spieler"
-        await inter.response.send_message(f"❌ Diese Auktion ist aktuell nur für berechtigte {label} freigegeben.", ephemeral=True)
-        return
-    min_bid = _min_next_bid(auction)
-    if int(amount) < min_bid:
-        await inter.response.send_message(f"❌ Mindestgebot ist aktuell **{min_bid} EC**.", ephemeral=True)
-        return
-    balance = _ec_balance(guild_id, user_id)
-    if int(amount) > balance:
-        await inter.response.send_message(f"❌ Du hast aktuell nur **{balance} EC**.", ephemeral=True)
+    reason = _bid_rejection_reason(guild, auction, user_id, int(amount))
+    if reason:
+        await inter.response.send_message(f"❌ {reason}", ephemeral=True)
         return
 
     bids = auction.setdefault("bids", [])
@@ -1894,24 +1877,77 @@ async def _dashboard_member(guild: discord.Guild, user_id: int) -> Optional[disc
         return None
 
 
+def _safe_bid_amount(value: Any) -> int:
+    try:
+        amount = int(value)
+    except Exception:
+        return 0
+    return amount
+
+
+def _dashboard_request_already_applied(auction: dict, row: dict) -> bool:
+    request_id = str((row or {}).get("request_id") or "").strip()
+    if not request_id:
+        return False
+    for bid in auction.get("bids") or []:
+        if isinstance(bid, dict) and str(bid.get("dashboard_request_id") or "") == request_id:
+            return True
+    return False
+
+
+def _bid_rejection_reason(guild: discord.Guild, auction: dict, user_id: int, amount: int) -> str:
+    """Zentrale Sicherheitsprüfung für Discord- und Dashboard-Gebote.
+
+    Das Dashboard darf nur anfragen. Diese Bot-Prüfung ist die verbindliche
+    Quelle, damit Snapshot-Verzögerungen, manipulierte Formulare oder doppelte
+    Requests keinen falschen Loot-Zustand erzeugen.
+    """
+    amount = _safe_bid_amount(amount)
+    if amount <= 0:
+        return "Gebot muss größer als 0 EC sein."
+    if amount > 1_000_000:
+        return "Gebot ist unplausibel hoch."
+    if not auction:
+        return "Auktion nicht gefunden."
+    if str(auction.get("status", "")) != "active":
+        return "Auktion ist nicht mehr aktiv."
+    if _auction_phase(auction) == "sale":
+        return "Diese Auktion ist ein Sale/Müll-Item, kein Gebot."
+    end_dt = _parse_dt(str(auction.get("ends_at", "") or ""))
+    if end_dt and _now() >= end_dt:
+        return "Auktion ist bereits abgelaufen."
+
+    mode = str(auction.get("eligibility_mode", "all") or "all")
+    eligible = [int(x) for x in auction.get("eligible_user_ids", []) or []]
+    if mode in {"main_need", "secondary_need"}:
+        label = "Main-Need-Spieler" if mode == "main_need" else "Second-Need-Spieler"
+        if not eligible:
+            return f"Diese Need-Auktion hat aktuell keine berechtigten {label}."
+        if int(user_id) not in eligible:
+            return f"Aktuell nur für berechtigte {label}."
+
+    top = _highest_bid(auction)
+    if top and int(top.get("user_id", 0) or 0) == int(user_id):
+        return "Du bist bereits führend. Warte, bis dich jemand überbietet."
+
+    min_bid = _min_next_bid(auction)
+    if amount < min_bid:
+        return f"Mindestgebot ist aktuell {min_bid} EC."
+
+    balance = _ec_balance(int(guild.id), int(user_id))
+    if amount > balance:
+        return f"Spieler hat nur {balance} EC."
+
+    return ""
+
+
 async def _dashboard_apply_bid(client: discord.Client, guild: discord.Guild, row: dict, auc: dict, user_id: int, actor_name: str, amount: int) -> dict:
     auction_id = str(row.get("auction_id") or auc.get("id") or "")
-    if _auction_phase(auc) == "sale":
-        return {"ok": False, "status": "rejected", "error": "Diese Auktion ist ein Sale/Müll-Item, kein Gebot."}
-    end_dt = _parse_dt(str(auc.get("ends_at", "") or ""))
-    if end_dt and _now() >= end_dt:
-        return {"ok": False, "status": "rejected", "error": "Auktion ist bereits abgelaufen."}
-    mode = str(auc.get("eligibility_mode", "all") or "all")
-    eligible = [int(x) for x in auc.get("eligible_user_ids", []) or []]
-    if mode in {"main_need", "secondary_need"} and int(user_id) not in eligible:
-        label = "Main-Need-Spieler" if mode == "main_need" else "Second-Need-Spieler"
-        return {"ok": False, "status": "rejected", "error": f"Aktuell nur für berechtigte {label}."}
-    min_bid = _min_next_bid(auc)
-    if int(amount) < min_bid:
-        return {"ok": False, "status": "rejected", "error": f"Mindestgebot ist aktuell {min_bid} EC."}
-    balance = _ec_balance(int(guild.id), int(user_id))
-    if int(amount) > balance:
-        return {"ok": False, "status": "rejected", "error": f"Spieler hat nur {balance} EC."}
+    if _dashboard_request_already_applied(auc, row):
+        return {"ok": True, "status": "done", "message": "Dashboard-Gebot war bereits verarbeitet.", "auction_id": auction_id, "amount": int(amount or 0)}
+    reason = _bid_rejection_reason(guild, auc, int(user_id), int(amount))
+    if reason:
+        return {"ok": False, "status": "rejected", "error": reason}
 
     bids = auc.setdefault("bids", [])
     bids.append({
@@ -2021,6 +2057,7 @@ async def _process_dashboard_loot_action(client: discord.Client, row: dict) -> d
     member = await _dashboard_member(guild, actor_id)
     if not member or getattr(member, "bot", False):
         return {"ok": False, "status": "rejected", "error": "Spieler ist nicht auf dem Server gefunden worden."}
+    actor_name = getattr(member, "display_name", None) or actor_name
     if not _is_ebolus_member(guild, actor_id):
         return {"ok": False, "status": "rejected", "error": "Nur Ebolus-Mitglieder dürfen Loot-Aktionen nutzen."}
     until = _loot_lock_until_for_member(member)
