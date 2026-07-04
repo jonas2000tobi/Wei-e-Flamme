@@ -14,7 +14,7 @@ from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
-app = FastAPI(title="Ebo Dashboard", version="0.8.1")
+app = FastAPI(title="Ebo Dashboard", version="0.8.2")
 security = HTTPBasic(auto_error=False)
 
 
@@ -484,7 +484,7 @@ def _render_dashboard(data: dict[str, Any]) -> str:
       <a href="/loot">Loot</a>
       <a href="/planning">Planung</a>
       <a href="/fairness">Fairness</a>
-      <a href="/analytics">Analytics</a>
+      <a href="/analytics">Analytics</a><a href="/voice">Voice</a>
       <a href="/ec">EC-Verlauf</a>
       <a href="/settings">Einstellungen</a>
       <a href="/audit">Audit</a>
@@ -927,7 +927,7 @@ def _render_ec_dashboard(data: dict[str, Any]) -> str:
         balance_rows.append([_member_link(b.get("user_id"), b.get("display_name")), _fmt_ec(b.get("balance"))])
 
     body = f"""
-    <nav class="topnav"><a href="/">← Übersicht</a><a href="/analytics">Analytics</a><a href="#recent">Buchungen</a><a href="#top">Toplisten</a><a href="#balances">Konten</a><a href="/api/ec">API</a></nav>
+    <nav class="topnav"><a href="/">← Übersicht</a><a href="/analytics">Analytics</a><a href="/voice">Voice</a><a href="#recent">Buchungen</a><a href="#top">Toplisten</a><a href="#balances">Konten</a><a href="/api/ec">API</a></nav>
     <section class="hero">
       <div>
         <div class="eyebrow">Analytics</div>
@@ -1250,7 +1250,7 @@ def _render_settings_dashboard(data: dict[str, Any]) -> str:
             setting_rows.append([row.get("source"), row.get("key"), row.get("value")])
 
     body = f"""
-    <nav class="topnav"><a href="/">← Übersicht</a><a href="/analytics">Analytics</a><a href="/ec">EC-Verlauf</a><a href="/audit">Audit</a><a href="/system">System</a><a href="/api/settings">API</a></nav>
+    <nav class="topnav"><a href="/">← Übersicht</a><a href="/analytics">Analytics</a><a href="/voice">Voice</a><a href="/ec">EC-Verlauf</a><a href="/audit">Audit</a><a href="/system">System</a><a href="/api/settings">API</a></nav>
     <section class="hero">
       <div>
         <div class="eyebrow">Read-only Setup</div>
@@ -1414,7 +1414,7 @@ def _render_members_dashboard(data: dict[str, Any]) -> str:
         _card("keine Voice-Zeit", quality.get("no_voice_time", 0), "gemessen"),
     ])
     body = f"""
-    <nav class="topnav"><a href="/">← Übersicht</a><a href="/needs">Needs</a><a href="/loot">Loot</a><a href="/analytics">Analytics</a><a href="/exports">Exports</a><a href="/api/members">API</a></nav>
+    <nav class="topnav"><a href="/">← Übersicht</a><a href="/needs">Needs</a><a href="/loot">Loot</a><a href="/analytics">Analytics</a><a href="/voice">Voice</a><a href="/exports">Exports</a><a href="/api/members">API</a></nav>
     <section class="hero"><div><div class="eyebrow">Roster & Datenqualität</div><h1>👥 Mitglieder</h1><p class="muted">Alle Mitglieder aus der gesetzten Gildenrolle. Read-only.</p></div><a class="btn" href="/export/members.csv">CSV herunterladen</a></section>
     <section class="grid">{cards}</section>
     <section class="panel"><h2>⚠️ Auffällige Mitglieder</h2>{_table(['Spieler','Score','Hinweise'], risk_rows, placeholder='Auffälligkeiten durchsuchen…')}</section>
@@ -1450,7 +1450,7 @@ def _render_needs_dashboard(data: dict[str, Any]) -> str:
         _card("ohne Needliste", len(without_rows), "Gildenrolle"),
     ])
     body = f"""
-    <nav class="topnav"><a href="/">← Übersicht</a><a href="/members">Mitglieder</a><a href="/loot">Loot</a><a href="/analytics">Analytics</a><a href="/exports">Exports</a><a href="/api/needs">API</a></nav>
+    <nav class="topnav"><a href="/">← Übersicht</a><a href="/members">Mitglieder</a><a href="/loot">Loot</a><a href="/analytics">Analytics</a><a href="/voice">Voice</a><a href="/exports">Exports</a><a href="/api/needs">API</a></nav>
     <section class="hero"><div><div class="eyebrow">Needlisten</div><h1>🎁 Need-Analytics</h1><p class="muted">Zeigt, welche Items wie oft gebraucht werden. Read-only.</p></div><a class="btn" href="/export/needs.csv">CSV herunterladen</a></section>
     <section class="grid">{cards}</section>
     <section class="split"><div class="panel"><h2>Top Main-Needs</h2>{_table(['Item','Anzahl'], top_main_rows, placeholder='Main-Needs durchsuchen…')}</div><div class="panel"><h2>Top Secondary-Needs</h2>{_table(['Item','Anzahl'], top_secondary_rows, placeholder='Secondary-Needs durchsuchen…')}</div></section>
@@ -1503,7 +1503,7 @@ def _render_loot_dashboard(data: dict[str, Any]) -> str:
         _card("Gewinner", len(winner_rows), "Spieler mit Loot"),
     ])
     body = f"""
-    <nav class="topnav"><a href="/">← Übersicht</a><a href="/members">Mitglieder</a><a href="/needs">Needs</a><a href="/analytics">Analytics</a><a href="/exports">Exports</a><a href="/api/loot">API</a></nav>
+    <nav class="topnav"><a href="/">← Übersicht</a><a href="/members">Mitglieder</a><a href="/needs">Needs</a><a href="/analytics">Analytics</a><a href="/voice">Voice</a><a href="/exports">Exports</a><a href="/api/loot">API</a></nav>
     <section class="hero"><div><div class="eyebrow">Loot & Auktionen</div><h1>🎁 Loot-Dashboard</h1><p class="muted">Aktive Auktionen, Gewinnerverteilung und Auktionshistorie. Read-only.</p></div><a class="btn" href="/export/auctions.csv">CSV herunterladen</a></section>
     <section class="grid">{cards}</section>
     <section class="split"><div class="panel"><h2>🏆 Loot-Gewinner</h2>{_table(['Spieler','Items'], winner_rows, placeholder='Gewinner durchsuchen…')}</div><div class="panel"><h2>📈 Aktuell führend</h2>{_table(['Spieler','Führungen'], leader_rows, placeholder='Führungen durchsuchen…')}</div></section>
@@ -1743,7 +1743,7 @@ def _render_planning_dashboard(data: dict[str, Any]) -> str:
     main_rows = [[x.get("label"), x.get("count")] for x in plan.get("top_main_needs") or [] if isinstance(x, dict)]
     sec_rows = [[x.get("label"), x.get("count")] for x in plan.get("top_secondary_needs") or [] if isinstance(x, dict)]
     body = f"""
-    <nav class="topnav"><a href="/">← Übersicht</a><a href="/analytics">Analytics</a><a href="/fairness">Fairness</a><a href="/needs">Needs</a><a href="/api/planning">API</a></nav>
+    <nav class="topnav"><a href="/">← Übersicht</a><a href="/analytics">Analytics</a><a href="/voice">Voice</a><a href="/fairness">Fairness</a><a href="/needs">Needs</a><a href="/api/planning">API</a></nav>
     <section class="hero"><div><div class="eyebrow">Planung</div><h1>📅 Event-/Raid-Planung</h1><p class="muted">Schnellprüfung für Rolle, Teilnehmer, Voice und häufige Needs. Read-only.</p></div><a class="btn" href="/api/planning">API</a></section>
     <section class="grid">{cards}</section>
     <section class="panel"><h2>Rollen-Summen über Events</h2>{_bars(plan.get('role_totals') or [])}</section>
@@ -1792,6 +1792,461 @@ def _render_fairness_dashboard(data: dict[str, Any]) -> str:
     """
     return _html_shell("Fairness · Ebo Dashboard", body)
 
+
+
+
+# ---------------------------------------------------------------------------
+# Step 3.12: Tiefere Auswertung für Mitglieder, Events, Voice und Audit
+# ---------------------------------------------------------------------------
+
+def _all_member_ids_from_snapshot(snap: dict[str, Any]) -> set[int]:
+    ids: set[int] = set()
+    for p in ((snap.get("profiles") or {}).get("items") or []):
+        if isinstance(p, dict):
+            uid = _user_id(p.get("user_id"))
+            if uid:
+                ids.add(uid)
+    for b in (((snap.get("ec") or {}).get("balances") or {}).get("top") or []):
+        if isinstance(b, dict):
+            uid = _user_id(b.get("user_id") or b.get("member_id") or b.get("discord_id"))
+            if uid:
+                ids.add(uid)
+    for n in (((snap.get("loot") or {}).get("needs") or {}).get("items") or []):
+        if isinstance(n, dict):
+            uid = _user_id(n.get("user_id") or n.get("member_id") or n.get("discord_id"))
+            if uid:
+                ids.add(uid)
+    for v in ((snap.get("voice") or {}).get("by_user") or []):
+        if isinstance(v, dict):
+            uid = _user_id(v.get("user_id"))
+            if uid:
+                ids.add(uid)
+    return ids
+
+
+def _event_registered_ids(event: dict[str, Any]) -> set[int]:
+    ids: set[int] = set()
+    participants = event.get("participants") or {}
+    for group in participants.get("yes") or []:
+        if not isinstance(group, dict):
+            continue
+        for p in group.get("participants") or []:
+            if isinstance(p, dict):
+                uid = _user_id(p.get("user_id"))
+                if uid:
+                    ids.add(uid)
+    for key in ("maybe", "no"):
+        for p in participants.get(key) or []:
+            if isinstance(p, dict):
+                uid = _user_id(p.get("user_id"))
+                if uid:
+                    ids.add(uid)
+    return ids
+
+
+def _event_yes_ids(event: dict[str, Any]) -> set[int]:
+    ids: set[int] = set()
+    participants = event.get("participants") or {}
+    for group in participants.get("yes") or []:
+        if not isinstance(group, dict):
+            continue
+        for p in group.get("participants") or []:
+            if isinstance(p, dict):
+                uid = _user_id(p.get("user_id"))
+                if uid:
+                    ids.add(uid)
+    return ids
+
+
+def _event_response_counts_for_user(snap: dict[str, Any], user_id: int) -> dict[str, int]:
+    counts = {"yes": 0, "maybe": 0, "no": 0, "total": 0, "events": 0, "no_response": 0}
+    events = [e for e in ((snap.get("events") or {}).get("items") or []) if isinstance(e, dict)]
+    counts["events"] = len(events)
+    uid = int(user_id)
+    for ev in events:
+        seen = False
+        participants = ev.get("participants") or {}
+        for group in participants.get("yes") or []:
+            if not isinstance(group, dict):
+                continue
+            for p in group.get("participants") or []:
+                if isinstance(p, dict) and _user_id(p.get("user_id")) == uid:
+                    counts["yes"] += 1
+                    seen = True
+                    break
+            if seen:
+                break
+        if not seen:
+            for p in participants.get("maybe") or []:
+                if isinstance(p, dict) and _user_id(p.get("user_id")) == uid:
+                    counts["maybe"] += 1
+                    seen = True
+                    break
+        if not seen:
+            for p in participants.get("no") or []:
+                if isinstance(p, dict) and _user_id(p.get("user_id")) == uid:
+                    counts["no"] += 1
+                    seen = True
+                    break
+        if seen:
+            counts["total"] += 1
+        else:
+            counts["no_response"] += 1
+    return counts
+
+
+def _voice_sessions_for_event(snap: dict[str, Any], event: dict[str, Any]) -> list[dict[str, Any]]:
+    sessions = [v for v in ((snap.get("voice") or {}).get("recent_sessions") or []) if isinstance(v, dict)]
+    if not sessions:
+        return []
+    channel_ids = set()
+    for key in ("voice_channel_id", "voice_last_channel_id"):
+        cid = _user_id(event.get(key))
+        if cid:
+            channel_ids.add(cid)
+    if not channel_ids:
+        return []
+
+    ev_start = _dt_obj(event.get("when_iso"))
+    out: list[dict[str, Any]] = []
+    for sess in sessions:
+        cid = _user_id(sess.get("channel_id") or sess.get("voice_channel_id"))
+        if cid not in channel_ids:
+            continue
+        # Wenn ein Event-Zeitpunkt vorhanden ist, nicht irgendwelche Sessions von Monaten davor anzeigen.
+        if ev_start:
+            joined = _dt_obj(sess.get("joined_at"))
+            left = _dt_obj(sess.get("left_at")) or joined
+            if joined:
+                delta_start = abs((joined - ev_start).total_seconds())
+                delta_end = abs(((left or joined) - ev_start).total_seconds()) if left else delta_start
+                # 8h Fenster um Eventstart reicht für normale Raids/Events und verhindert alte Treffer.
+                if min(delta_start, delta_end) > 8 * 3600:
+                    continue
+        out.append(sess)
+    out.sort(key=lambda x: int(_num(x.get("duration_seconds"), 0)), reverse=True)
+    return out
+
+
+def _voice_event_analysis(snap: dict[str, Any], event: dict[str, Any]) -> dict[str, Any]:
+    names = _profile_name_map(snap)
+    sessions = _voice_sessions_for_event(snap, event)
+    voice_by_user: dict[int, int] = {}
+    session_count: dict[int, int] = {}
+    for sess in sessions:
+        uid = _user_id(sess.get("user_id") or sess.get("member_id"))
+        if not uid:
+            continue
+        voice_by_user[uid] = voice_by_user.get(uid, 0) + int(_num(sess.get("duration_seconds"), 0))
+        session_count[uid] = session_count.get(uid, 0) + 1
+
+    registered = _event_registered_ids(event)
+    yes = _event_yes_ids(event)
+    voice_ids = set(voice_by_user.keys())
+    registered_not_voice = sorted(registered - voice_ids, key=lambda uid: names.get(uid, f"User {uid}").lower())
+    yes_not_voice = sorted(yes - voice_ids, key=lambda uid: names.get(uid, f"User {uid}").lower())
+    voice_not_registered = sorted(voice_ids - registered, key=lambda uid: names.get(uid, f"User {uid}").lower())
+    rows = []
+    for uid, seconds in sorted(voice_by_user.items(), key=lambda x: -x[1]):
+        rows.append({
+            "user_id": uid,
+            "display_name": names.get(uid, f"User {uid}"),
+            "minutes": round(seconds / 60, 1),
+            "sessions": session_count.get(uid, 0),
+            "registered": uid in registered,
+            "signed_yes": uid in yes,
+        })
+    return {
+        "voice_sessions": sessions,
+        "voice_by_user": rows,
+        "registered_not_voice": registered_not_voice,
+        "yes_not_voice": yes_not_voice,
+        "voice_not_registered": voice_not_registered,
+        "voice_user_count": len(voice_ids),
+        "registered_count": len(registered),
+        "yes_count": len(yes),
+    }
+
+
+def _name_rows_from_ids(ids: list[int] | set[int], names: dict[int, str]) -> list[list[Any]]:
+    return [[_member_link(uid, names.get(uid, f"User {uid}"))] for uid in ids]
+
+
+def _member_event_rows(snap: dict[str, Any], user_id: int) -> list[list[Any]]:
+    rows: list[list[Any]] = []
+    uid = int(user_id)
+    for ev in ((snap.get("events") or {}).get("items") or []):
+        if not isinstance(ev, dict):
+            continue
+        status = "—"
+        participants = ev.get("participants") or {}
+        for group in participants.get("yes") or []:
+            if not isinstance(group, dict):
+                continue
+            role = group.get("role") or "Zusage"
+            if any(isinstance(p, dict) and _user_id(p.get("user_id")) == uid for p in group.get("participants") or []):
+                status = f"✅ {role}"
+                break
+        if status == "—" and any(isinstance(p, dict) and _user_id(p.get("user_id")) == uid for p in participants.get("maybe") or []):
+            status = "🟡 Vielleicht"
+        if status == "—" and any(isinstance(p, dict) and _user_id(p.get("user_id")) == uid for p in participants.get("no") or []):
+            status = "❌ Abgemeldet"
+        if status != "—":
+            rows.append([_event_link(ev.get("event_id"), ev.get("title")), _dt(ev.get("when_iso")), status])
+    return rows[:80]
+
+
+def _render_member_detail(data: dict[str, Any], user_id: int) -> str:
+    if not data.get("ok"):
+        return _html_shell("Ebo Dashboard", f"<section class='panel'><h1>📊 Ebo Dashboard</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+    snap: dict[str, Any] = data.get("snapshot") or {}
+    profiles = ((snap.get("profiles") or {}).get("items") or [])
+    balances = _balance_map(snap)
+    needs_by_user = _needs_by_user(snap)
+    names = _profile_name_map(snap)
+    profile = None
+    for p in profiles:
+        if isinstance(p, dict) and _user_id(p.get("user_id")) == int(user_id):
+            profile = p
+            break
+    if not profile:
+        return _html_shell(
+            "Mitglied nicht gefunden",
+            "<section class='panel'><h1>❌ Mitglied nicht gefunden</h1><p class='muted'>Dieses Mitglied ist nicht im aktuellen Dashboard-Snapshot oder hat nicht die gesetzte Gildenrolle.</p><p><a class='btn' href='/members'>Zurück</a></p></section>",
+        )
+
+    display = profile.get("display_name") or profile.get("ingame_name") or f"User {user_id}"
+    ec_value = balances.get(int(user_id))
+    need_info = needs_by_user.get(int(user_id), {})
+    main_needs = need_info.get("main") if isinstance(need_info, dict) else []
+    secondary_needs = need_info.get("secondary") if isinstance(need_info, dict) else []
+    response = _event_response_counts_for_user(snap, int(user_id))
+    voice_user = next((v for v in ((snap.get("voice") or {}).get("by_user") or []) if isinstance(v, dict) and _user_id(v.get("user_id")) == int(user_id)), {})
+    total_voice_seconds = int(_num(voice_user.get("total_seconds"), 0))
+
+    tx_rows = []
+    for tx in _tx_for_user(snap, user_id, limit=80):
+        tx_rows.append([_dt(tx.get("created_at")), _fmt_ec(tx.get("amount")), tx.get("raw_type"), _short(tx.get("reason"), 160)])
+
+    voice_rows = []
+    for v in _voice_for_user(snap, user_id, limit=80):
+        seconds = int(_num(v.get("duration_seconds"), 0))
+        minutes = round(seconds / 60, 1) if seconds else "—"
+        voice_rows.append([v.get("channel_name") or v.get("channel_id"), _dt(v.get("joined_at")), _dt(v.get("left_at")), minutes])
+
+    auction_rows = []
+    for a in _auctions_for_user(snap, user_id, limit=80):
+        auction_rows.append([_auction_link(a.get("auction_id"), a.get("item_name")), a.get("status"), _phase_label(a), _fmt_ec(a.get("top_bid_amount")) if a.get("top_bid_amount") is not None else "—", _dt(a.get("ends_at"))])
+
+    event_rows = _member_event_rows(snap, int(user_id))
+    cards = "".join([
+        _card("Ingame", profile.get("ingame_name") or "—", "Profil"),
+        _card("Rolle", profile.get("main_role") or "—", "Main-Rolle"),
+        _card("Gearscore", profile.get("gearscore") or "—", "Profilwert"),
+        _card("EC", _fmt_ec(ec_value) if ec_value is not None else "—", "aktueller Kontostand"),
+        _card("Eventantworten", f"{response['total']}/{response['events']}", f"Ja {response['yes']} · Vielleicht {response['maybe']} · Nein {response['no']}"),
+        _card("Voice-Zeit", f"{round(total_voice_seconds/3600, 1)} h", f"{int(voice_user.get('sessions') or 0)} Sessions"),
+    ])
+
+    body = f"""
+    <nav class="topnav"><a href="/members">← Mitglieder</a><a href="/analytics">Analytics</a><a href="/voice">Voice</a><a href="#needs">Needs</a><a href="#events">Events</a><a href="#ec">EC</a><a href="#voice">Voice</a></nav>
+    <section class="hero">
+      <div>
+        <div class="eyebrow">Mitglied · Tiefenauswertung</div>
+        <h1>👤 {_e(display)}</h1>
+        <p class="muted">User-ID: {_e(user_id)} · Snapshot: {_e(_dt(data.get('published_at')))}</p>
+      </div>
+      <a class="btn" href="/members">Zurück</a>
+    </section>
+    <section class="grid">{cards}</section>
+    <section class="panel" id="needs">
+      <h2>🎁 Needliste</h2>
+      <div class="split">
+        <div>{_need_list_html('Main-Needs', main_needs)}</div>
+        <div>{_need_list_html('Secondary-Needs', secondary_needs)}</div>
+      </div>
+    </section>
+    <section class="panel" id="events"><h2>📅 Eventantworten</h2>{_table(['Event','Zeit','Status'], event_rows, placeholder='Events durchsuchen…')}</section>
+    <section class="panel" id="ec"><h2>🪙 Letzte EC-Buchungen</h2>{_table(['Zeit','Betrag','Typ','Grund'], tx_rows, placeholder='Buchungen durchsuchen…')}</section>
+    <section class="panel"><h2>🎁 Auktionen mit aktueller Führung/Gewinn</h2>{_table(['Item','Status','Phase','Gebot','Ende'], auction_rows, placeholder='Auktionen durchsuchen…')}</section>
+    <section class="panel" id="voice"><h2>🎙️ Voice-Sessions</h2>{_table(['Kanal','Rein','Raus','Minuten'], voice_rows, placeholder='Voice durchsuchen…')}</section>
+    """
+    return _html_shell(f"{display} · Ebo Dashboard", body)
+
+
+def _render_event_detail(data: dict[str, Any], event_id: str) -> str:
+    if not data.get("ok"):
+        return _html_shell("Ebo Dashboard", f"<section class='panel'><h1>📊 Ebo Dashboard</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+    snap: dict[str, Any] = data.get("snapshot") or {}
+    event = _event_by_id(snap, event_id)
+    if not event:
+        return _html_shell(
+            "Event nicht gefunden",
+            "<section class='panel'><h1>❌ Event nicht gefunden</h1><p class='muted'>Dieses Event ist nicht im aktuellen Dashboard-Snapshot.</p><p><a class='btn' href='/planning'>Zurück</a></p></section>",
+        )
+
+    participants = event.get("participants") or {}
+    maybe_rows = _participant_rows(participants.get("maybe") or [])
+    no_rows = _participant_rows(participants.get("no") or [])
+    yes_counts = event.get("yes_counts") or {}
+    role_items = sorted([(str(k), int(_num(v))) for k, v in yes_counts.items()], key=lambda x: x[0].lower())
+    names = _profile_name_map(snap)
+    voice = _voice_event_analysis(snap, event)
+    voice_rows = [[_member_link(r.get("user_id"), r.get("display_name")), r.get("minutes"), r.get("sessions"), "ja" if r.get("registered") else "nein", "ja" if r.get("signed_yes") else "nein"] for r in voice.get("voice_by_user") or []]
+    missing_voice_rows = _name_rows_from_ids(voice.get("yes_not_voice") or [], names)
+    extra_voice_rows = _name_rows_from_ids(voice.get("voice_not_registered") or [], names)
+
+    cards = "".join([
+        _card("Teilnehmer", event.get("participant_count", 0), "alle Rückmeldungen"),
+        _card("Zusagen", voice.get("yes_count", 0), "für Voice-Abgleich"),
+        _card("im Voice erkannt", voice.get("voice_user_count", 0), "gleicher Event-Voice"),
+        _card("angemeldet ohne Voice", len(voice.get("yes_not_voice") or []), "zu prüfen"),
+        _card("Voice ohne Anmeldung", len(voice.get("voice_not_registered") or []), "zu prüfen"),
+        _card("Voice", "ja" if event.get("voice_enabled") else "nein", event.get("voice_channel_id") or event.get("voice_last_channel_id") or "kein Voice"),
+    ])
+
+    body = f"""
+    <nav class="topnav"><a href="/planning">← Planung</a><a href="#signups">Zusagen</a><a href="#voicecheck">Voice-Abgleich</a><a href="#maybe">Vielleicht</a><a href="#no">Abgemeldet</a></nav>
+    <section class="hero">
+      <div>
+        <div class="eyebrow">Event · Voice-/Teilnahme-Abgleich</div>
+        <h1>📅 {_e(event.get('title') or event_id)}</h1>
+        <p class="muted">Event-ID: {_e(event_id)} · Zeit: {_e(_dt(event.get('when_iso')))} · Snapshot: {_e(_dt(data.get('published_at')))}</p>
+        {f"<p>{_e(event.get('description'))}</p>" if event.get('description') else ""}
+      </div>
+      <a class="btn" href="/planning">Zurück</a>
+    </section>
+    <section class="grid">{cards}</section>
+    <section class="panel"><h2>📊 Rollenverteilung</h2>{_bars(role_items, max_items=12)}</section>
+    <section class="panel" id="voicecheck">
+      <h2>🎙️ Voice-Abgleich</h2>
+      <div class="split">
+        <div><h3>Angemeldet/Zusage, aber nicht im Voice erkannt</h3>{_table(['Spieler'], missing_voice_rows, placeholder='fehlende Voice durchsuchen…')}</div>
+        <div><h3>Im Voice, aber nicht angemeldet</h3>{_table(['Spieler'], extra_voice_rows, placeholder='Extra Voice durchsuchen…')}</div>
+      </div>
+      <h3>Erkannte Voice-Zeiten</h3>
+      {_table(['Spieler','Minuten','Sessions','angemeldet','Zusage'], voice_rows, placeholder='Voice-Zeiten durchsuchen…')}
+      <p class="muted">Hinweis: Der Abgleich ist read-only und nutzt den gespeicherten Event-Voice bzw. letzten Event-Voice. EC wird dadurch nicht automatisch vergeben.</p>
+    </section>
+    <section class="panel" id="signups"><h2>✅ Zusagen nach Rolle</h2>{_role_signup_html(event)}</section>
+    <section class="panel" id="maybe"><h2>🟡 Vielleicht</h2>{_table(['Spieler','Gildenrolle'], maybe_rows, placeholder='Vielleicht durchsuchen…')}</section>
+    <section class="panel" id="no"><h2>❌ Abgemeldet</h2>{_table(['Spieler','Gildenrolle'], no_rows, placeholder='Abmeldungen durchsuchen…')}</section>
+    """
+    return _html_shell(f"{event.get('title') or 'Event'} · Ebo Dashboard", body)
+
+
+def _render_voice_dashboard(data: dict[str, Any]) -> str:
+    if not data.get("ok"):
+        return _html_shell("Ebo Dashboard", f"<section class='panel'><h1>🎙️ Voice</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+    snap: dict[str, Any] = data.get("snapshot") or {}
+    names = _profile_name_map(snap)
+    voice = snap.get("voice") or {}
+    by_user = [x for x in (voice.get("by_user") or []) if isinstance(x, dict)]
+    sessions = [x for x in (voice.get("recent_sessions") or []) if isinstance(x, dict)]
+    user_rows = []
+    for v in by_user[:500]:
+        uid = _user_id(v.get("user_id"))
+        total = int(_num(v.get("total_seconds"), 0))
+        user_rows.append([_member_link(uid, names.get(uid, f"User {uid}")), round(total/3600, 2), v.get("sessions"), _dt(v.get("last_joined_at")), _dt(v.get("last_left_at"))])
+    session_rows = []
+    for s in sessions[:500]:
+        uid = _user_id(s.get("user_id") or s.get("member_id"))
+        seconds = int(_num(s.get("duration_seconds"), 0))
+        session_rows.append([_member_link(uid, names.get(uid, f"User {uid}")), s.get("channel_name") or s.get("channel_id"), _dt(s.get("joined_at")), _dt(s.get("left_at")), round(seconds/60, 1)])
+    cards = "".join([
+        _card("Sessions gesamt", voice.get("sessions_total", 0), "Runtime-DB"),
+        _card("offene Sessions", voice.get("sessions_open", 0), "gerade laufend"),
+        _card("geladen", voice.get("loaded_sessions", len(sessions)), "im Snapshot"),
+        _card("Voice-Stunden", voice.get("total_hours_loaded", 0), "geladene Sessions"),
+    ])
+    body = f"""
+    <nav class="topnav"><a href="/">← Start</a><a href="/analytics">Analytics</a><a href="/voice">Voice</a><a href="#users">Spieler</a><a href="#sessions">Sessions</a></nav>
+    <section class="hero"><div><div class="eyebrow">Voice-Attendance</div><h1>🎙️ Voice-Auswertung</h1><p class="muted">Read-only Übersicht der gemessenen Voice-Sessions. Snapshot: {_e(_dt(data.get('published_at')))}</p></div><a class="btn" href="/analytics">Analytics</a></section>
+    <section class="grid">{cards}</section>
+    <section class="panel" id="users"><h2>Voice-Zeit pro Spieler</h2>{_table(['Spieler','Stunden','Sessions','letzter Join','letztes Ende'], user_rows, placeholder='Spieler durchsuchen…')}</section>
+    <section class="panel" id="sessions"><h2>Letzte Sessions</h2>{_table(['Spieler','Kanal','Rein','Raus','Minuten'], session_rows, placeholder='Sessions durchsuchen…')}</section>
+    """
+    return _html_shell("Voice · Ebo Dashboard", body)
+
+
+def _audit_filtered_logs(logs: list[dict[str, Any]], action: str = "", actor: str = "", q: str = "") -> list[dict[str, Any]]:
+    action = action.strip().lower()
+    actor = actor.strip().lower()
+    q = q.strip().lower()
+    out = []
+    for item in logs:
+        if not isinstance(item, dict):
+            continue
+        if action and action not in str(item.get("action") or "").lower():
+            continue
+        if actor and actor not in str(item.get("actor_id") or "").lower() and actor not in str(item.get("actor_name") or "").lower():
+            continue
+        hay = " ".join(str(item.get(k) or "") for k in ("action", "summary", "actor_id", "actor_name", "target_id"))
+        if q and q not in hay.lower():
+            continue
+        out.append(item)
+    return out
+
+
+def _render_audit_dashboard(data: dict[str, Any], *, action: str = "", actor: str = "", q: str = "") -> str:
+    if not data.get("ok"):
+        return _html_shell("Ebo Dashboard", f"<section class='panel'><h1>🧾 Audit</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+    snap: dict[str, Any] = data.get("snapshot") or {}
+    audit = snap.get("audit") or {}
+    all_logs = [x for x in (audit.get("recent_logs") or []) if isinstance(x, dict)]
+    logs = _audit_filtered_logs(all_logs, action=action, actor=actor, q=q)
+    by_action = Counter(str(x.get("action") or "Unbekannt") for x in logs)
+    by_actor = Counter(str(x.get("actor_id") or "Unbekannt") for x in logs)
+    cards = "".join([
+        _card("Audit gesamt", audit.get("logs_total", 0), "in Runtime-DB"),
+        _card("geladen", len(all_logs), "im Snapshot"),
+        _card("gefiltert", len(logs), "aktuelle Ansicht"),
+        _card("Aktionen", len(by_action), "unterschiedliche Typen"),
+    ])
+    log_rows = []
+    for a in logs:
+        log_rows.append([_dt(a.get("created_at")), a.get("action"), a.get("actor_id"), _short(a.get("summary"), 220)])
+    action_rows = [[k, v] for k, v in by_action.most_common(120)]
+    actor_rows = [[k, v] for k, v in by_actor.most_common(120)]
+    body = f"""
+    <nav class="topnav"><a href="/">← Übersicht</a><a href="/settings">Einstellungen</a><a href="/system">System</a><a href="#logs">Logs</a><a href="/api/audit">API</a></nav>
+    <section class="hero"><div><div class="eyebrow">Audit Trail · Filterbar</div><h1>🧾 Audit-Log</h1><p class="muted">Read-only Protokoll. Snapshot: {_e(_dt(data.get('published_at')))}</p></div><a class="btn" href="/">Zurück</a></section>
+    <section class="panel">
+      <h2>Filter</h2>
+      <form method="get" class="filter-form">
+        <input name="q" value="{_e(q)}" placeholder="Textsuche: EC, Auktion, Spieler…">
+        <input name="action" value="{_e(action)}" placeholder="Aktion, z. B. slash_command">
+        <input name="actor" value="{_e(actor)}" placeholder="Actor-ID oder Name">
+        <button class="btn" type="submit">Filtern</button>
+        <a class="btn ghost" href="/audit">Zurücksetzen</a>
+      </form>
+    </section>
+    <section class="grid">{cards}</section>
+    <section class="split"><div class="panel"><h2>Aktionen</h2>{_bars(by_action.most_common(12), max_items=12)}</div><div class="panel"><h2>Akteure</h2>{_bars(by_actor.most_common(12), max_items=12)}</div></section>
+    <section class="panel"><h2>Aktionen als Tabelle</h2>{_table(['Aktion','Anzahl'], action_rows, placeholder='Aktionen durchsuchen…')}</section>
+    <section class="panel"><h2>Akteure als Tabelle</h2>{_table(['Actor ID','Anzahl'], actor_rows, placeholder='Akteure durchsuchen…')}</section>
+    <section class="panel" id="logs"><h2>Letzte Audit-Einträge</h2>{_table(['Zeit','Aktion','Actor','Zusammenfassung'], log_rows, placeholder='Audit durchsuchen…')}</section>
+    """
+    return _html_shell("Audit · Ebo Dashboard", body)
+
+
+@app.get("/voice", response_class=HTMLResponse)
+def voice_page(_: bool = Depends(_auth)):
+    try:
+        return HTMLResponse(_render_voice_dashboard(_snapshot_payload()))
+    except Exception as exc:
+        return HTMLResponse(
+            _html_shell("Ebo Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
+            status_code=500,
+        )
+
+
+@app.get("/api/voice")
+def api_voice(_: bool = Depends(_auth)):
+    payload = _snapshot_payload()
+    if not payload.get("ok"):
+        return JSONResponse(payload, status_code=404)
+    return JSONResponse({"ok": True, "voice": ((payload.get("snapshot") or {}).get("voice") or {})})
 
 @app.get("/members", response_class=HTMLResponse)
 def members_page(_: bool = Depends(_auth)):
@@ -2184,7 +2639,7 @@ def _render_leadership_dashboard(data: dict[str, Any]) -> str:
       <a href="/needs">Needs</a>
       <a href="/loot">Loot</a>
       <a href="/fairness">Fairness</a>
-      <a href="/analytics">Analytics</a>
+      <a href="/analytics">Analytics</a><a href="/voice">Voice</a>
       <a href="/ec">EC</a>
       <a href="/audit">Audit</a>
       <a href="/settings">Einstellungen</a>
@@ -2371,9 +2826,9 @@ def settings_page(_: bool = Depends(_auth)):
 
 
 @app.get("/audit", response_class=HTMLResponse)
-def audit_page(_: bool = Depends(_auth)):
+def audit_page(q: str = "", action: str = "", actor: str = "", _: bool = Depends(_auth)):
     try:
-        return HTMLResponse(_render_audit_dashboard(_snapshot_payload()))
+        return HTMLResponse(_render_audit_dashboard(_snapshot_payload(), q=q, action=action, actor=actor))
     except Exception as exc:
         return HTMLResponse(
             _html_shell("Ebo Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
