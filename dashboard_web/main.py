@@ -12,7 +12,7 @@ from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
-app = FastAPI(title="Ebo Dashboard", version="0.4.0")
+app = FastAPI(title="Ebo Dashboard", version="0.5.0")
 security = HTTPBasic(auto_error=False)
 
 
@@ -156,6 +156,14 @@ def _member_link(user_id: Any, label: Any) -> dict[str, str]:
     if not uid:
         return _raw(text)
     return _raw(f'<a class="link" href="/member/{uid}">{text}</a>')
+
+
+def _event_link(event_id: Any, label: Any) -> dict[str, str]:
+    eid = str(event_id or "").strip()
+    text = _e(label or eid or "Event")
+    if not eid:
+        return _raw(text)
+    return _raw(f'<a class="link" href="/event/{_e(eid)}">{text}</a>')
 
 
 def _table(headers: list[str], rows: list[list[Any]], *, searchable: bool = True, placeholder: str = "Tabelle durchsuchen…") -> str:
@@ -417,7 +425,7 @@ def _render_dashboard(data: dict[str, Any]) -> str:
 
     event_rows = []
     for ev in events.get("items") or []:
-        event_rows.append([ev.get("title"), _dt(ev.get("when_iso")), ev.get("participant_count"), ev.get("maybe_count"), ev.get("no_count"), "ja" if ev.get("voice_enabled") else "nein"])
+        event_rows.append([_event_link(ev.get("event_id"), ev.get("title")), _dt(ev.get("when_iso")), ev.get("participant_count"), ev.get("maybe_count"), ev.get("no_count"), "ja" if ev.get("voice_enabled") else "nein"])
 
     all_balances = [b for b in ((ec.get("balances") or {}).get("top") or []) if isinstance(b, dict)]
     sorted_balances = sorted(all_balances, key=lambda b: _num(b.get("balance"), 0), reverse=True)
@@ -584,6 +592,85 @@ def _render_member_detail(data: dict[str, Any], user_id: int) -> str:
     return _html_shell(f"{display} · Ebo Dashboard", body)
 
 
+def _event_by_id(snap: dict[str, Any], event_id: str) -> Optional[dict[str, Any]]:
+    for ev in ((snap.get("events") or {}).get("items") or []):
+        if isinstance(ev, dict) and str(ev.get("event_id") or "") == str(event_id):
+            return ev
+    return None
+
+
+def _participant_rows(people: Any) -> list[list[Any]]:
+    rows: list[list[Any]] = []
+    for p in people or []:
+        if not isinstance(p, dict):
+            continue
+        rows.append([_member_link(p.get("user_id"), p.get("display_name")), "ja" if p.get("is_dashboard_member") else "nein"])
+    return rows
+
+
+def _role_signup_html(event: dict[str, Any]) -> str:
+    parts = ((event.get("participants") or {}).get("yes") or [])
+    if not parts:
+        return "<div class='empty'>Keine Zusagen vorhanden.</div>"
+    blocks: list[str] = []
+    for group in parts:
+        if not isinstance(group, dict):
+            continue
+        role = group.get("role") or "Unbekannt"
+        people = group.get("participants") or []
+        blocks.append(f"""
+        <div class="subpanel">
+          <h3>{_e(role)} <span class='pill'>{_e(len(people))}</span></h3>
+          {_table(['Spieler','Gildenrolle'], _participant_rows(people), placeholder=f'{role} durchsuchen…')}
+        </div>
+        """)
+    return "".join(blocks)
+
+
+def _render_event_detail(data: dict[str, Any], event_id: str) -> str:
+    if not data.get("ok"):
+        return _html_shell("Ebo Dashboard", f"<section class='panel'><h1>📊 Ebo Dashboard</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+    snap: dict[str, Any] = data.get("snapshot") or {}
+    event = _event_by_id(snap, event_id)
+    if not event:
+        return _html_shell(
+            "Event nicht gefunden",
+            "<section class='panel'><h1>❌ Event nicht gefunden</h1><p class='muted'>Dieses Event ist nicht im aktuellen Dashboard-Snapshot.</p><p><a class='btn' href='/#events'>Zurück</a></p></section>",
+        )
+
+    participants = event.get("participants") or {}
+    maybe_rows = _participant_rows(participants.get("maybe") or [])
+    no_rows = _participant_rows(participants.get("no") or [])
+    yes_counts = event.get("yes_counts") or {}
+    role_items = sorted([(str(k), int(_num(v))) for k, v in yes_counts.items()], key=lambda x: x[0].lower())
+
+    cards = "".join([
+        _card("Teilnehmer", event.get("participant_count", 0), "alle Rückmeldungen"),
+        _card("Vielleicht", event.get("maybe_count", 0), "unsicher"),
+        _card("Abgemeldet", event.get("no_count", 0), "Nein/abgemeldet"),
+        _card("Voice", "ja" if event.get("voice_enabled") else "nein", event.get("voice_channel_id") or event.get("voice_last_channel_id") or "kein Voice"),
+    ])
+
+    body = f"""
+    <nav class="topnav"><a href="/">← Übersicht</a><a href="#signups">Zusagen</a><a href="#maybe">Vielleicht</a><a href="#no">Abgemeldet</a><a href="/api/snapshot">JSON</a></nav>
+    <section class="hero">
+      <div>
+        <div class="eyebrow">Event</div>
+        <h1>📅 {_e(event.get('title') or event_id)}</h1>
+        <p class="muted">Event-ID: {_e(event_id)} · Zeit: {_e(_dt(event.get('when_iso')))} · Snapshot: {_e(_dt(data.get('published_at')))}</p>
+        {f"<p>{_e(event.get('description'))}</p>" if event.get('description') else ""}
+      </div>
+      <a class="btn" href="/#events">Zurück</a>
+    </section>
+    <section class="grid">{cards}</section>
+    <section class="panel"><h2>📊 Rollenverteilung</h2>{_bars(role_items, max_items=12)}</section>
+    <section class="panel" id="signups"><h2>✅ Zusagen nach Rolle</h2>{_role_signup_html(event)}</section>
+    <section class="panel" id="maybe"><h2>🟡 Vielleicht</h2>{_table(['Spieler','Gildenrolle'], maybe_rows, placeholder='Vielleicht durchsuchen…')}</section>
+    <section class="panel" id="no"><h2>❌ Abgemeldet</h2>{_table(['Spieler','Gildenrolle'], no_rows, placeholder='Abmeldungen durchsuchen…')}</section>
+    """
+    return _html_shell(f"{event.get('title') or 'Event'} · Ebo Dashboard", body)
+
+
 def _html_shell(title: str, body: str) -> str:
     auth_note = ""
     if not str(os.getenv("DASHBOARD_PASSWORD") or "").strip():
@@ -611,6 +698,7 @@ def _html_shell(title: str, body: str) -> str:
     .card,.panel {{ background:rgba(24,26,34,.92); border:1px solid var(--line); border-radius:16px; box-shadow:0 10px 30px rgba(0,0,0,.25); }}
     .card {{ padding:16px; }} .card-title {{ color:var(--muted); font-size:13px; }} .card-value {{ font-size:28px; font-weight:800; color:var(--gold); }} .card-sub {{ color:var(--muted); font-size:12px; }}
     .panel {{ padding:18px; margin:14px 0; scroll-margin-top:70px; }}
+    .subpanel {{ background:rgba(32,35,45,.72); border:1px solid var(--line); border-radius:14px; padding:14px; margin:12px 0; }}
     .analytics-grid {{ display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:12px; margin:12px 0 18px; }}
     .metric {{ background:var(--panel2); border:1px solid var(--line); border-radius:14px; padding:14px; }}
     .metric span {{ display:block; color:var(--muted); font-size:13px; }} .metric strong {{ display:block; color:var(--gold); font-size:28px; }} .metric small {{ color:var(--muted); }}
@@ -682,6 +770,17 @@ def api_quality(_: bool = Depends(_auth)):
         "ec_coverage": analytics.get("ec_coverage"),
         "need_coverage": analytics.get("need_coverage"),
     })
+
+
+@app.get("/event/{event_id}", response_class=HTMLResponse)
+def event_detail(event_id: str, _: bool = Depends(_auth)):
+    try:
+        return HTMLResponse(_render_event_detail(_snapshot_payload(), str(event_id)))
+    except Exception as exc:
+        return HTMLResponse(
+            _html_shell("Ebo Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
+            status_code=500,
+        )
 
 
 @app.get("/member/{user_id}", response_class=HTMLResponse)
