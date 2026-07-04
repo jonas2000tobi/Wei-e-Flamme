@@ -160,6 +160,28 @@ def _admin_role_ids() -> set[str]:
     return _csv_ids(_env("DASHBOARD_ADMIN_ROLE_IDS"))
 
 
+def _snapshot_auth_lists() -> dict[str, Any]:
+    """Auth-Listen aus dem aktuellen Bot-Snapshot.
+
+    Der Bot schreibt erlaubte Member-IDs und Admin-Member-IDs in Postgres.
+    Dadurch muss das Web-Dashboard beim Discord-Login keine Rollen direkt
+    über identify abfragen. Das vermeidet Discord-403-Probleme
+    und ist für Railway/Custom-Domains robuster.
+    """
+    payload = _snapshot_payload()
+    snap = payload.get("snapshot") or {}
+    auth = snap.get("auth") or {}
+    allowed = {str(x) for x in (auth.get("allowed_member_ids") or []) if str(x).strip()}
+    admins = {str(x) for x in (auth.get("admin_member_ids") or []) if str(x).strip()}
+    return {
+        "ok": bool(payload.get("ok")),
+        "auth": auth,
+        "allowed_member_ids": allowed,
+        "admin_member_ids": admins,
+        "guild_id": str(payload.get("guild_id") or ((snap.get("guild") or {}).get("id") or "")),
+    }
+
+
 def _cookie_secure() -> bool:
     return _env("DASHBOARD_COOKIE_SECURE", "1") not in {"0", "false", "False", "nein", "no"}
 
@@ -2941,7 +2963,7 @@ def discord_start(request: Request, next: str = "/"):
         "client_id": _env("DASHBOARD_DISCORD_CLIENT_ID"),
         "redirect_uri": _redirect_uri(request),
         "response_type": "code",
-        "scope": "identify guilds.members.read",
+        "scope": "identify",
         "state": state,
         "prompt": "none",
     }
@@ -2974,29 +2996,34 @@ def discord_callback(request: Request, code: str = "", state: str = "", error: s
         )
         access_token = str(token_data.get("access_token") or "")
         user = _request_json(f"{DISCORD_API_BASE}/users/@me", token=access_token)
-        guild_id = _env("DASHBOARD_GUILD_ID")
-        if not guild_id:
-            payload = _snapshot_payload()
-            guild_id = str(payload.get("guild_id") or ((payload.get("snapshot") or {}).get("guild") or {}).get("id") or "")
-        if not guild_id:
-            raise RuntimeError("DASHBOARD_GUILD_ID ist nicht gesetzt und konnte nicht aus dem Snapshot gelesen werden.")
-        member = _request_json(f"{DISCORD_API_BASE}/users/@me/guilds/{int(guild_id)}/member", token=access_token)
-        roles = {str(r) for r in (member.get("roles") or [])}
-        allowed_roles = _allowed_role_ids()
-        admin_roles = _admin_role_ids()
-        is_admin = bool(admin_roles and roles.intersection(admin_roles))
-        is_allowed = bool(roles.intersection(allowed_roles)) if allowed_roles else True
-        if not (is_admin or is_allowed):
-            role_hint = ", ".join(sorted(allowed_roles)) or "keine Rolle konfiguriert"
-            return HTMLResponse(_html_shell("Kein Zugriff", f"<section class='panel'><h1>⛔ Kein Zugriff</h1><p class='muted'>Du bist im Discord-Server, hast aber keine erlaubte Dashboard-Rolle.</p><p>Erlaubte Rollen-IDs: <code>{_e(role_hint)}</code></p><p><a class='btn' href='/logout'>Logout</a></p></section>"), status_code=403)
-
         uid = str(user.get("id") or "")
         username = str(user.get("global_name") or user.get("username") or uid)
+        auth_lists = _snapshot_auth_lists()
+        guild_id = _env("DASHBOARD_GUILD_ID") or str(auth_lists.get("guild_id") or "")
+        if not uid:
+            raise RuntimeError("Discord hat keine User-ID zurückgegeben.")
+        if not guild_id:
+            raise RuntimeError("DASHBOARD_GUILD_ID ist nicht gesetzt und konnte nicht aus dem Snapshot gelesen werden.")
+
+        allowed_ids = set(auth_lists.get("allowed_member_ids") or set())
+        admin_ids = set(auth_lists.get("admin_member_ids") or set())
+        require_admin = _env("DASHBOARD_REQUIRE_ADMIN", "0").lower() in {"1", "true", "yes", "ja"}
+        is_admin = uid in admin_ids
+        is_allowed = uid in allowed_ids
+
+        if require_admin and not is_admin:
+            return HTMLResponse(_html_shell("Kein Zugriff", "<section class='panel'><h1>⛔ Kein Zugriff</h1><p class='muted'>Dieses Dashboard erlaubt aktuell nur die gesetzte Dashboard-Adminrolle.</p><p><a class='btn' href='/logout'>Logout</a></p></section>"), status_code=403)
+        if not (is_admin or is_allowed):
+            auth = auth_lists.get("auth") or {}
+            member_role = (auth.get("member_role") or {}) if isinstance(auth, dict) else {}
+            role_hint = member_role.get("role_name") or member_role.get("role_id") or "keine Gildenrolle im Snapshot"
+            return HTMLResponse(_html_shell("Kein Zugriff", f"<section class='panel'><h1>⛔ Kein Zugriff</h1><p class='muted'>Deine Discord-ID ist im aktuellen Dashboard-Snapshot nicht als Gildenmitglied/Admin enthalten.</p><p>Erlaubte Gildenrolle laut Snapshot: <code>{_e(role_hint)}</code></p><p class='muted'>Falls du die Rolle gerade erst gesetzt hast: im Discord <code>/dashboard_status</code> ausführen und dann erneut einloggen.</p><p><a class='btn' href='/logout'>Logout</a></p></section>"), status_code=403)
+
         session = {
             "user_id": uid,
             "username": username,
             "role": "admin" if is_admin else "member",
-            "roles": sorted(roles),
+            "roles": ["snapshot_admin"] if is_admin else ["snapshot_member"],
             "guild_id": str(guild_id),
             "iat": int(time.time()),
             "exp": int(time.time()) + 7 * 24 * 3600,
@@ -3006,7 +3033,7 @@ def discord_callback(request: Request, code: str = "", state: str = "", error: s
         resp.set_cookie(SESSION_COOKIE, _make_token(session), max_age=7 * 24 * 3600, httponly=True, secure=_cookie_secure(), samesite="lax")
         return resp
     except Exception as exc:
-        return HTMLResponse(_html_shell("Discord Login Fehler", f"<section class='panel'><h1>❌ Discord Login fehlgeschlagen</h1><p><strong>{_e(type(exc).__name__)}</strong>: {_e(exc)}</p><p class='muted'>Prüfe Redirect URI, Client Secret und Rollen-ID.</p><p><a class='btn' href='/login'>Zurück</a></p></section>"), status_code=500)
+        return HTMLResponse(_html_shell("Discord Login Fehler", f"<section class='panel'><h1>❌ Discord Login fehlgeschlagen</h1><p><strong>{_e(type(exc).__name__)}</strong>: {_e(exc)}</p><p class='muted'>Prüfe Client Secret, Snapshot und gesetzte Dashboard-Rollen. Rollen werden jetzt aus dem Bot-Snapshot gelesen.</p><p><a class='btn' href='/login'>Zurück</a></p></section>"), status_code=500)
 
 
 @app.get("/logout")
