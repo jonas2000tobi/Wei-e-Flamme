@@ -1407,6 +1407,106 @@ def _loot_min_next_bid(auction: dict[str, Any]) -> int:
     return max(0, start)
 
 
+def _loot_is_ended(auction: dict[str, Any]) -> bool:
+    end_dt = _dt_obj(auction.get("ends_at"))
+    if not end_dt:
+        return False
+    return datetime.now(timezone.utc) >= end_dt
+
+
+def _loot_top_bid_user_id(auction: dict[str, Any]) -> int:
+    top_amount = None
+    top_user = 0
+    if auction.get("top_bid_user_id") is not None:
+        top_user = _user_id(auction.get("top_bid_user_id"))
+        try:
+            top_amount = int(_num(auction.get("top_bid_amount"), 0))
+        except Exception:
+            top_amount = None
+    for b in auction.get("bids") or []:
+        if not isinstance(b, dict):
+            continue
+        try:
+            amount = int(_num(b.get("amount"), 0))
+        except Exception:
+            continue
+        if top_amount is None or amount > top_amount:
+            top_amount = amount
+            top_user = _user_id(b.get("user_id") or b.get("member_id") or b.get("discord_id"))
+    return int(top_user or 0)
+
+
+def _loot_bid_precheck(guild_id: int, auction: dict[str, Any], amount: int, actor: Optional[dict[str, Any]], snap: dict[str, Any]) -> list[str]:
+    errors: list[str] = []
+    auction_id = str(auction.get("auction_id") or auction.get("id") or "").strip()
+    uid = _user_id((actor or {}).get("user_id"))
+    if not uid:
+        errors.append("Discord-Login erforderlich. Mit Basic-Login kann das Dashboard nicht wissen, wer bietet.")
+    if not auction_id:
+        errors.append("Auktion fehlt.")
+    if not _loot_is_active(auction):
+        errors.append("Auktion ist nicht mehr aktiv.")
+    if _loot_is_sale_like(auction):
+        errors.append("Diese Auktion ist ein Sale/Müll-Item. Nutze Kaufen/Würfeln.")
+    if _loot_is_ended(auction):
+        errors.append("Auktion ist bereits abgelaufen.")
+    try:
+        amount = int(amount)
+    except Exception:
+        amount = 0
+    if amount <= 0:
+        errors.append("Gebot muss größer als 0 EC sein.")
+    if amount > 1_000_000:
+        errors.append("Gebot ist unplausibel hoch.")
+    min_next = _loot_min_next_bid(auction)
+    if amount < min_next:
+        errors.append(f"Mindestgebot ist aktuell {min_next} EC.")
+    mode = _loot_status(auction.get("eligibility_mode"))
+    eligible = _loot_auction_eligible_user_ids(auction)
+    if uid and mode in {"main_need", "secondary_need"}:
+        label = "Main-Need-Spieler" if mode == "main_need" else "Second-Need-Spieler"
+        if not eligible:
+            errors.append(f"Diese Need-Auktion hat aktuell keine berechtigten {label} im Snapshot.")
+        elif uid not in eligible:
+            errors.append(f"Aktuell nur für berechtigte {label}.")
+    top_uid = _loot_top_bid_user_id(auction)
+    if uid and top_uid and top_uid == uid:
+        errors.append("Du bist bereits führend. Warte, bis dich jemand überbietet.")
+    balances = _balance_map(snap)
+    if uid and uid in balances and amount > balances.get(uid, 0):
+        errors.append(f"Du hast aktuell nur {_fmt_ec(balances.get(uid, 0))} EC.")
+    if uid:
+        active_req = _loot_action_active_for_actor(int(guild_id), str(auction_id), str(uid))
+        if active_req:
+            errors.append(f"Du hast bereits eine offene Dashboard-Aktion: {_loot_action_type_label(active_req.get('action_type'))} · {_loot_action_status_label(active_req.get('status'))}.")
+    return errors
+
+
+def _loot_sale_precheck(guild_id: int, auction: dict[str, Any], actor: Optional[dict[str, Any]], snap: dict[str, Any]) -> list[str]:
+    errors: list[str] = []
+    auction_id = str(auction.get("auction_id") or auction.get("id") or "").strip()
+    uid = _user_id((actor or {}).get("user_id"))
+    if not uid:
+        errors.append("Discord-Login erforderlich. Mit Basic-Login kann das Dashboard nicht wissen, wer kauft/würfelt.")
+    if not auction_id:
+        errors.append("Auktion fehlt.")
+    if not _loot_is_active(auction):
+        errors.append("Auktion ist nicht mehr aktiv.")
+    if not _loot_is_sale_like(auction):
+        errors.append("Diese Auktion ist kein Sale/Müll-Item.")
+    if _loot_is_ended(auction) and not bool(auction.get("junk_drop")):
+        errors.append("Sale-Item ist bereits abgelaufen.")
+    price = int(_num(auction.get("fixed_price") if auction.get("fixed_price") is not None else auction.get("start_bid"), 0))
+    balances = _balance_map(snap)
+    if uid and price > 0 and uid in balances and balances.get(uid, 0) < price:
+        errors.append(f"Du hast aktuell nur {_fmt_ec(balances.get(uid, 0))} EC, benötigt werden {price} EC.")
+    if uid:
+        active_req = _loot_action_active_for_actor(int(guild_id), str(auction_id), str(uid))
+        if active_req:
+            errors.append(f"Du hast bereits eine offene Dashboard-Aktion: {_loot_action_type_label(active_req.get('action_type'))} · {_loot_action_status_label(active_req.get('status'))}.")
+    return errors
+
+
 def _loot_is_sale_like(auction: dict[str, Any]) -> bool:
     phase = _loot_status(auction.get("phase"))
     kind = _loot_status(auction.get("kind"))
@@ -1544,7 +1644,9 @@ def _loot_dashboard_action_panel(guild_id: int, auction: dict[str, Any], current
     eligible = _loot_auction_eligible_user_ids(auction)
     warnings: list[str] = []
     if mode in {"main_need", "secondary_need"} and eligible and user_id not in eligible:
-        warnings.append("Du bist laut Snapshot für diese Need-Phase nicht berechtigt. Der Bot prüft das endgültig.")
+        warnings.append("Du bist laut Snapshot für diese Need-Phase nicht berechtigt.")
+    if _loot_is_ended(auction):
+        warnings.append("Diese Auktion ist laut Snapshot bereits abgelaufen.")
     active_req = _loot_action_active_for_actor(int(guild_id), auction_id, str(user_id))
     if active_req:
         warnings.append(f"Du hast bereits eine offene Dashboard-Aktion: {_loot_action_type_label(active_req.get('action_type'))} · {_loot_action_status_label(active_req.get('status'))}.")
@@ -1556,7 +1658,10 @@ def _loot_dashboard_action_panel(guild_id: int, auction: dict[str, Any], current
         is_junk = bool(auction.get("junk_drop")) and price <= 0
         action = "junk_roll" if is_junk else "sale_buy"
         label = "🎲 Müll würfeln" if is_junk else ("Gratis nehmen" if price <= 0 else f"Sofort kaufen für {price} EC")
-        disabled = "disabled" if active_req else ""
+        sale_errors = _loot_sale_precheck(int(guild_id), auction, current_user, snap)
+        if sale_errors:
+            warn_html += "".join(f"<p class='muted'>⛔ {_e(w)}</p>" for w in sale_errors if w not in warnings)
+        disabled = "disabled" if sale_errors else ""
         confirm = "Müll-Wurf im Dashboard anfragen?" if is_junk else "Sale-Kauf im Dashboard anfragen?"
         return f"""
         <section class="panel" id="bid">
@@ -1578,7 +1683,10 @@ def _loot_dashboard_action_panel(guild_id: int, auction: dict[str, Any], current
     quick_buttons = "".join(
         f"<button class='btn mini-btn' type='submit' name='quick_amount' value='{int(q)}'>{int(q)} EC</button>" for q in quick[:3]
     )
-    disabled = "disabled" if active_req else ""
+    bid_errors = _loot_bid_precheck(int(guild_id), auction, int(min_next), current_user, snap)
+    if bid_errors:
+        warn_html += "".join(f"<p class='muted'>⛔ {_e(w)}</p>" for w in bid_errors if w not in warnings)
+    disabled = "disabled" if bid_errors else ""
     return f"""
     <section class="panel" id="bid">
       <h2>💰 Dashboard-Gebot</h2>
@@ -5256,16 +5364,16 @@ async def auction_dashboard_bid(request: Request, auction_id: str, _: bool = Dep
         raw = (await request.body()).decode("utf-8", errors="replace")
         form = urllib.parse.parse_qs(raw, keep_blank_values=True)
         amount = int(str((form.get("quick_amount") or form.get("amount") or ["0"])[0]).strip())
+        actor = _current_user(request) or {}
         if not auction:
             msg = "❌ Auktion nicht im Snapshot gefunden."
-        elif _loot_is_sale_like(auction):
-            msg = "❌ Diese Auktion ist ein Sale/Müll-Item. Nutze Kaufen/Würfeln."
-        elif amount < _loot_min_next_bid(auction):
-            msg = f"❌ Mindestgebot ist aktuell {_loot_min_next_bid(auction)} EC."
         else:
-            actor = _current_user(request) or {}
-            result = _enqueue_loot_action_request(int(guild_id), auction, "bid", int(amount), actor)
-            msg = "✅ Gebot wurde an den Bot gesendet." if result.get("ok") else f"❌ {result.get('error') or 'Gebot konnte nicht gesendet werden.'}"
+            errors = _loot_bid_precheck(int(guild_id), auction, int(amount), actor, snap)
+            if errors:
+                msg = "❌ " + " ".join(str(e) for e in errors[:3])
+            else:
+                result = _enqueue_loot_action_request(int(guild_id), auction, "bid", int(amount), actor)
+                msg = "✅ Gebot wurde an den Bot gesendet." if result.get("ok") else f"❌ {result.get('error') or 'Gebot konnte nicht gesendet werden.'}"
     except Exception as exc:
         msg = f"❌ Fehler: {type(exc).__name__}: {exc}"
     return RedirectResponse(f"/auction/{urllib.parse.quote(str(auction_id))}?msg={urllib.parse.quote(msg)}", status_code=303)
@@ -5284,15 +5392,17 @@ async def auction_dashboard_sale(request: Request, auction_id: str, _: bool = De
         action_type = str((form.get("action_type") or ["sale_buy"])[0]).strip().lower()
         if action_type not in {"sale_buy", "junk_roll"}:
             action_type = "sale_buy"
+        actor = _current_user(request) or {}
         if not auction:
             msg = "❌ Auktion nicht im Snapshot gefunden."
-        elif not _loot_is_sale_like(auction):
-            msg = "❌ Diese Auktion ist kein Sale/Müll-Item."
         else:
             price = int(_num(auction.get("fixed_price") if auction.get("fixed_price") is not None else auction.get("start_bid"), 0))
-            actor = _current_user(request) or {}
-            result = _enqueue_loot_action_request(int(guild_id), auction, action_type, price, actor)
-            msg = "✅ Aktion wurde an den Bot gesendet." if result.get("ok") else f"❌ {result.get('error') or 'Aktion konnte nicht gesendet werden.'}"
+            errors = _loot_sale_precheck(int(guild_id), auction, actor, snap)
+            if errors:
+                msg = "❌ " + " ".join(str(e) for e in errors[:3])
+            else:
+                result = _enqueue_loot_action_request(int(guild_id), auction, action_type, price, actor)
+                msg = "✅ Aktion wurde an den Bot gesendet." if result.get("ok") else f"❌ {result.get('error') or 'Aktion konnte nicht gesendet werden.'}"
     except Exception as exc:
         msg = f"❌ Fehler: {type(exc).__name__}: {exc}"
     return RedirectResponse(f"/auction/{urllib.parse.quote(str(auction_id))}?msg={urllib.parse.quote(msg)}", status_code=303)
