@@ -1188,8 +1188,16 @@ def _render_member_detail(data: dict[str, Any], user_id: int, current_user: Opti
 
 
 def _event_by_id(snap: dict[str, Any], event_id: str) -> Optional[dict[str, Any]]:
-    for ev in ((snap.get("events") or {}).get("items") or []):
-        if isinstance(ev, dict) and str(ev.get("event_id") or "") == str(event_id):
+    """Event suchen – inklusive offener DKP-/EC-Anwesenheitschecks.
+
+    Wichtig für Ebolus: Ein Event darf im Dashboard nicht verschwinden, solange
+    im DKP-Log noch ein EC-Anwesenheitscheck offen ist. Deshalb durchsuchen wir
+    nicht nur snapshot["events"], sondern auch event_checks und erzeugen bei
+    Bedarf einen kleinen Platzhalter-Eintrag.
+    """
+    target = str(event_id or "")
+    for ev in _events_with_pending_ec_checks(snap):
+        if isinstance(ev, dict) and str(ev.get("event_id") or "") == target:
             return ev
     return None
 
@@ -3430,11 +3438,112 @@ def _is_running_event(event: dict[str, Any]) -> bool:
     return True
 
 
-def _running_events_from_snapshot(snap: dict[str, Any], *, limit: int = 12) -> list[dict[str, Any]]:
-    events = ((snap.get("events") or {}).get("items") or [])
+def _event_check_items(snap: dict[str, Any]) -> list[dict[str, Any]]:
+    """Robust geladene EC-/DKP-Anwesenheitschecks aus dem Snapshot.
+
+    Unterstützt den neuen Dashboard-Snapshot (`event_checks.items`) und alte
+    Zwischenstände (`event_checks.events`).
+    """
+    raw = snap.get("event_checks") or {}
+    items = raw.get("items") if isinstance(raw, dict) else []
     out: list[dict[str, Any]] = []
+    if isinstance(items, list):
+        out.extend([x for x in items if isinstance(x, dict)])
+
+    legacy_events = raw.get("events") if isinstance(raw, dict) and isinstance(raw.get("events"), dict) else {}
+    for eid, chk in legacy_events.items():
+        if not isinstance(chk, dict):
+            continue
+        row = dict(chk)
+        row.setdefault("event_id", str(eid))
+        out.append(row)
+    return out
+
+
+def _is_pending_ec_check(chk: dict[str, Any]) -> bool:
+    if not isinstance(chk, dict):
+        return False
+    status = str(chk.get("status") or chk.get("state") or "").strip().lower()
+    closed = {"done", "awarded", "finished", "closed", "ignored", "cancelled", "canceled", "deleted", "rejected"}
+    if status in closed:
+        return False
+    if bool(chk.get("awarded") or chk.get("ec_awarded") or chk.get("ignored") or chk.get("deleted")):
+        return False
+
+    # Idealfall: Bot-Snapshot liefert ausdrücklich, dass der DKP-/EC-Check gepostet wurde.
+    if bool(chk.get("posted")) or chk.get("message_id") or chk.get("channel_id"):
+        return True
+    if status in {"open", "pending", "posted", "processing", "review", "check"}:
+        return True
+
+    # Dashboard-only Fallback:
+    # Ältere bot/dashboard_data.py-Versionen exportieren bei dkp_event_checks oft nur
+    # event_id/check_id, title, created_at, attendee_count und ec_awarded. Wenn ec_awarded
+    # false ist und kein geschlossener Status gesetzt ist, behandeln wir den Check als offen,
+    # damit das Event nicht verschwindet, bevor EC gebucht/ignoriert wurde.
+    has_check_identity = bool(chk.get("event_id") or chk.get("check_id"))
+    has_check_content = bool(chk.get("title") or chk.get("event_title") or chk.get("created_at") or chk.get("attendee_count"))
+    if has_check_identity and has_check_content:
+        return True
+    return False
+
+
+def _pending_ec_check_by_event(snap: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    out: dict[str, dict[str, Any]] = {}
+    for chk in _event_check_items(snap):
+        if not _is_pending_ec_check(chk):
+            continue
+        eid = str(chk.get("event_id") or chk.get("check_id") or "").strip()
+        if eid:
+            out[eid] = chk
+    return out
+
+
+def _pending_ec_check_label(event: dict[str, Any]) -> dict[str, str]:
+    if event.get("_pending_ec_check"):
+        return _raw("<span class='pill'>EC offen</span>")
+    return _raw("<span class='pill'>—</span>")
+
+
+def _events_with_pending_ec_checks(snap: dict[str, Any]) -> list[dict[str, Any]]:
+    events = [e for e in ((snap.get("events") or {}).get("items") or []) if isinstance(e, dict)]
+    by_id: dict[str, dict[str, Any]] = {}
     for ev in events:
-        if not isinstance(ev, dict) or not _is_running_event(ev):
+        eid = str(ev.get("event_id") or ev.get("id") or "").strip()
+        if eid:
+            by_id[eid] = dict(ev)
+
+    pending = _pending_ec_check_by_event(snap)
+    for eid, chk in pending.items():
+        if eid in by_id:
+            by_id[eid]["_pending_ec_check"] = True
+            by_id[eid]["_pending_ec_check_status"] = str(chk.get("status") or "posted")
+            # Falls das Event selbst als beendet markiert ist, hält der offene
+            # EC-Check es trotzdem sichtbar, bis EC vergeben/ignoriert wurde.
+            continue
+        by_id[eid] = {
+            "event_id": eid,
+            "title": chk.get("title") or chk.get("event_title") or "EC-Anwesenheit offen",
+            "when_iso": chk.get("when_iso") or chk.get("event_when") or chk.get("created_at") or chk.get("posted_at") or "",
+            "created_at": chk.get("created_at") or chk.get("posted_at") or "",
+            "participant_count": chk.get("attendee_count") or chk.get("participant_count") or "—",
+            "maybe_count": "—",
+            "no_count": "—",
+            "voice_enabled": False,
+            "participants": {"yes": [], "maybe": [], "no": []},
+            "source": "event_check",
+            "_pending_ec_check": True,
+            "_pending_ec_check_status": str(chk.get("status") or "posted"),
+        }
+    return list(by_id.values())
+
+
+def _running_events_from_snapshot(snap: dict[str, Any], *, limit: int = 12) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for ev in _events_with_pending_ec_checks(snap):
+        if not isinstance(ev, dict):
+            continue
+        if not _is_running_event(ev) and not ev.get("_pending_ec_check"):
             continue
         out.append({**ev, "_dt": _dt_obj(ev.get("when_iso") or ev.get("start_at") or ev.get("created_at"))})
     out.sort(key=lambda x: (x.get("_dt") is None, x.get("_dt") or datetime.max.replace(tzinfo=timezone.utc)))
@@ -3601,6 +3710,7 @@ def _render_leadership_dashboard(data: dict[str, Any]) -> str:
             ev.get("maybe_count", ev.get("maybe", "—")),
             ev.get("no_count", ev.get("no", "—")),
             "ja" if ev.get("voice_enabled") else "nein",
+            _pending_ec_check_label(ev),
         ])
 
     auction_rows = []
@@ -3686,7 +3796,7 @@ def _render_leadership_dashboard(data: dict[str, Any]) -> str:
     <section class="split">
       <div class="panel">
         <h2>📅 Laufende Events</h2>
-        {_table(['Event','Zeit','Teilnehmer','Vielleicht','Abgemeldet','Voice'], event_rows, placeholder='Laufende Events durchsuchen…')}
+        {_table(['Event','Zeit','Teilnehmer','Vielleicht','Abgemeldet','Voice','EC-Check'], event_rows, placeholder='Laufende Events durchsuchen…')}
       </div>
       <div class="panel">
         <h2>🎁 Aktive Auktionen</h2>
@@ -4730,7 +4840,7 @@ def _render_attendance_list(data: dict[str, Any]) -> str:
         return _html_shell("Anwesenheit · Ebo Dashboard", f"<section class='panel'><h1>📝 Anwesenheit</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
     snap: dict[str, Any] = data.get("snapshot") or {}
     guild_id = _safe_guild_id(data)
-    events = [e for e in ((snap.get("events") or {}).get("items") or []) if isinstance(e, dict)]
+    events = _events_with_pending_ec_checks(snap)
     rows = []
     for ev in events:
         eid = str(ev.get("event_id") or ev.get("id") or "")
@@ -4748,6 +4858,7 @@ def _render_attendance_list(data: dict[str, Any]) -> str:
             _attendance_status_label(review.get("status") or ("reviewed" if items else "open")),
             len(items),
             queue_badge,
+            _pending_ec_check_label(ev),
         ])
     body = f"""
     <nav class="topnav"><a href="/">Kommando</a><a href="/planning">Planung</a><a href="/attendance-stats">Anwesenheit-Stats</a><a href="/voice">Voice</a><a href="/ec-queue">EC-Queue</a><a href="/admin">Leitung</a></nav>
@@ -4762,7 +4873,7 @@ def _render_attendance_list(data: dict[str, Any]) -> str:
     </section>
     <section class="panel">
       <h2>📅 Events</h2>
-      {_table(['Event','Zeit','Anmeldungen','Voice','Voice-User','Review','Review-Zeilen','EC-Queue'], rows, placeholder='Events durchsuchen…')}
+      {_table(['Event','Zeit','Anmeldungen','Voice','Voice-User','Review','Review-Zeilen','EC-Queue','EC-Check'], rows, placeholder='Events durchsuchen…')}
     </section>
     """
     return _html_shell("Anwesenheit · Ebo Dashboard", body)
