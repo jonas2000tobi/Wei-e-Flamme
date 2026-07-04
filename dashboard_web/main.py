@@ -4,15 +4,17 @@ import html
 import json
 import os
 import secrets
+import csv
+import io
 from collections import Counter
 from datetime import datetime, timezone
 from typing import Any, Optional
 
 from fastapi import Depends, FastAPI, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
-app = FastAPI(title="Ebo Dashboard", version="0.7.0")
+app = FastAPI(title="Ebo Dashboard", version="0.8.0")
 security = HTTPBasic(auto_error=False)
 
 
@@ -477,11 +479,17 @@ def _render_dashboard(data: dict[str, Any]) -> str:
     body = f"""
     <nav class="topnav">
       <a href="#overview">Übersicht</a>
+      <a href="/members">Mitglieder</a>
+      <a href="/needs">Needs</a>
+      <a href="/loot">Loot</a>
+      <a href="/planning">Planung</a>
+      <a href="/fairness">Fairness</a>
       <a href="/analytics">Analytics</a>
       <a href="/ec">EC-Verlauf</a>
       <a href="/settings">Einstellungen</a>
       <a href="/audit">Audit</a>
       <a href="/system">System</a>
+      <a href="/exports">Exports</a>
       <a href="#quality">Datenqualität</a>
       <a href="#members">Mitglieder</a>
       <a href="#events">Events</a>
@@ -1319,6 +1327,619 @@ def _render_system_dashboard(data: dict[str, Any]) -> str:
     <section class="panel"><h2>JSON-Quellen</h2>{_table(['Key','Datei','vorhanden','Status','Bytes','Geändert'], source_rows, placeholder='Quellen durchsuchen…')}</section>
     """
     return _html_shell("System · Ebo Dashboard", body)
+
+
+
+def _insights(snap: dict[str, Any]) -> dict[str, Any]:
+    return (snap.get("insights") or {}) if isinstance(snap.get("insights"), dict) else {}
+
+
+def _insight_members(snap: dict[str, Any]) -> list[dict[str, Any]]:
+    ins = _insights(snap)
+    members = ins.get("members") if isinstance(ins.get("members"), list) else []
+    if members:
+        return [m for m in members if isinstance(m, dict)]
+
+    # Fallback für ältere Snapshots: aus Profilen/EC/Needs zusammenbauen.
+    profiles = ((snap.get("profiles") or {}).get("items") or [])
+    balances = _balance_map(snap)
+    need_ids = _need_user_ids(snap)
+    rows: list[dict[str, Any]] = []
+    for p in profiles:
+        if not isinstance(p, dict):
+            continue
+        uid = _user_id(p.get("user_id"))
+        rows.append({
+            "user_id": uid,
+            "display_name": p.get("display_name") or p.get("ingame_name") or f"User {uid}",
+            "ingame_name": p.get("ingame_name"),
+            "main_role": p.get("main_role"),
+            "gearscore": p.get("gearscore"),
+            "ec_balance": balances.get(uid),
+            "has_profile": True,
+            "has_ec": uid in balances,
+            "has_needs": uid in need_ids,
+            "risk_score": 0,
+            "risk_flags": [],
+        })
+    return rows
+
+
+def _yesno(value: Any) -> str:
+    return "ja" if bool(value) else "nein"
+
+
+def _risk_flags_text(m: dict[str, Any]) -> str:
+    flags = m.get("risk_flags") if isinstance(m.get("risk_flags"), list) else []
+    return ", ".join(str(x) for x in flags) if flags else "—"
+
+
+def _render_members_dashboard(data: dict[str, Any]) -> str:
+    if not data.get("ok"):
+        return _html_shell("Mitglieder · Ebo Dashboard", f"<section class='panel'><h1>👥 Mitglieder</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+    snap: dict[str, Any] = data.get("snapshot") or {}
+    ins = _insights(snap)
+    members = _insight_members(snap)
+    quality = ins.get("quality") if isinstance(ins.get("quality"), dict) else {}
+
+    rows = []
+    for m in members:
+        uid = _user_id(m.get("user_id"))
+        rows.append([
+            _member_link(uid, m.get("display_name")),
+            m.get("ingame_name") or "—",
+            m.get("main_role") or "—",
+            m.get("gearscore") or "—",
+            _fmt_ec(m.get("ec_balance")) if m.get("ec_balance") is not None else "—",
+            m.get("main_need_count", "—"),
+            m.get("secondary_need_count", "—"),
+            m.get("event_responses", "—"),
+            f"{_num(m.get('voice_hours'), 0):.1f} h",
+            m.get("loot_won_count", "—"),
+            _risk_flags_text(m),
+        ])
+
+    risk_rows = []
+    for m in (ins.get("risk_members") or [])[:120]:
+        if not isinstance(m, dict):
+            continue
+        risk_rows.append([_member_link(m.get("user_id"), m.get("display_name")), m.get("risk_score"), _risk_flags_text(m)])
+
+    cards = "".join([
+        _card("Mitglieder", len(members), "gesetzte Gildenrolle"),
+        _card("ohne Profil", quality.get("missing_profile", 0), "Datenqualität"),
+        _card("ohne EC", quality.get("missing_ec", 0), "Datenqualität"),
+        _card("ohne Needs", quality.get("missing_needs", 0), "Needliste"),
+        _card("keine Eventantwort", quality.get("no_event_response", 0), "im Snapshot"),
+        _card("keine Voice-Zeit", quality.get("no_voice_time", 0), "gemessen"),
+    ])
+    body = f"""
+    <nav class="topnav"><a href="/">← Übersicht</a><a href="/needs">Needs</a><a href="/loot">Loot</a><a href="/analytics">Analytics</a><a href="/exports">Exports</a><a href="/api/members">API</a></nav>
+    <section class="hero"><div><div class="eyebrow">Roster & Datenqualität</div><h1>👥 Mitglieder</h1><p class="muted">Alle Mitglieder aus der gesetzten Gildenrolle. Read-only.</p></div><a class="btn" href="/export/members.csv">CSV herunterladen</a></section>
+    <section class="grid">{cards}</section>
+    <section class="panel"><h2>⚠️ Auffällige Mitglieder</h2>{_table(['Spieler','Score','Hinweise'], risk_rows, placeholder='Auffälligkeiten durchsuchen…')}</section>
+    <section class="panel"><h2>👥 Mitgliederliste</h2>{_table(['Name','Ingame','Rolle','GS','EC','Main','Secondary','Eventantworten','Voice','Loot','Hinweise'], rows, placeholder='Mitglieder durchsuchen…')}</section>
+    """
+    return _html_shell("Mitglieder · Ebo Dashboard", body)
+
+
+def _render_needs_dashboard(data: dict[str, Any]) -> str:
+    if not data.get("ok"):
+        return _html_shell("Needs · Ebo Dashboard", f"<section class='panel'><h1>🎁 Needs</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+    snap: dict[str, Any] = data.get("snapshot") or {}
+    ins = _insights(snap)
+    need_ins = ins.get("needs") if isinstance(ins.get("needs"), dict) else {}
+    needs = (((snap.get("loot") or {}).get("needs") or {}).get("items") or [])
+
+    top_main_rows = [[x.get("label"), x.get("count")] for x in (need_ins.get("top_main") or []) if isinstance(x, dict)]
+    top_secondary_rows = [[x.get("label"), x.get("count")] for x in (need_ins.get("top_secondary") or []) if isinstance(x, dict)]
+    without_rows = [[_member_link(x.get("user_id"), x.get("display_name")), x.get("main_role") or "—", x.get("gearscore") or "—"] for x in (need_ins.get("users_without_needs") or []) if isinstance(x, dict)]
+
+    all_rows = []
+    for n in needs:
+        if not isinstance(n, dict):
+            continue
+        main = ", ".join(str(x) for x in (n.get("main") or [])) or "—"
+        sec = ", ".join(str(x) for x in (n.get("secondary") or [])) or "—"
+        all_rows.append([_member_link(n.get("user_id"), n.get("display_name")), n.get("main_count"), n.get("secondary_count"), _short(main, 260), _short(sec, 260)])
+
+    cards = "".join([
+        _card("Main-Needs", need_ins.get("main_total", sum(_num(x[1]) for x in top_main_rows)), "offene Einträge"),
+        _card("Secondary-Needs", need_ins.get("secondary_total", sum(_num(x[1]) for x in top_secondary_rows)), "offene Einträge"),
+        _card("Need-User", (snap.get("loot") or {}).get("needs", {}).get("user_count", len(all_rows)), "mit Einträgen"),
+        _card("ohne Needliste", len(without_rows), "Gildenrolle"),
+    ])
+    body = f"""
+    <nav class="topnav"><a href="/">← Übersicht</a><a href="/members">Mitglieder</a><a href="/loot">Loot</a><a href="/analytics">Analytics</a><a href="/exports">Exports</a><a href="/api/needs">API</a></nav>
+    <section class="hero"><div><div class="eyebrow">Needlisten</div><h1>🎁 Need-Analytics</h1><p class="muted">Zeigt, welche Items wie oft gebraucht werden. Read-only.</p></div><a class="btn" href="/export/needs.csv">CSV herunterladen</a></section>
+    <section class="grid">{cards}</section>
+    <section class="split"><div class="panel"><h2>Top Main-Needs</h2>{_table(['Item','Anzahl'], top_main_rows, placeholder='Main-Needs durchsuchen…')}</div><div class="panel"><h2>Top Secondary-Needs</h2>{_table(['Item','Anzahl'], top_secondary_rows, placeholder='Secondary-Needs durchsuchen…')}</div></section>
+    <section class="panel"><h2>🧹 Mitglieder ohne Needliste</h2>{_table(['Spieler','Rolle','GS'], without_rows, placeholder='Ohne Needliste durchsuchen…')}</section>
+    <section class="panel"><h2>Alle Needlisten</h2>{_table(['Spieler','Main','Secondary','Main-Needs','Secondary-Needs'], all_rows, placeholder='Needlisten durchsuchen…')}</section>
+    """
+    return _html_shell("Needs · Ebo Dashboard", body)
+
+
+def _render_loot_dashboard(data: dict[str, Any]) -> str:
+    if not data.get("ok"):
+        return _html_shell("Loot · Ebo Dashboard", f"<section class='panel'><h1>🎁 Loot</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+    snap: dict[str, Any] = data.get("snapshot") or {}
+    ins = _insights(snap)
+    loot_ins = ins.get("loot") if isinstance(ins.get("loot"), dict) else {}
+    names = _profile_name_map(snap)
+    auctions = (((snap.get("loot") or {}).get("auctions") or {}).get("items") or [])
+
+    active_rows = []
+    closed_rows = []
+    for a in auctions:
+        if not isinstance(a, dict):
+            continue
+        leader = "—"
+        uid = _user_id(a.get("top_bid_user_id"))
+        if uid and a.get("top_bid_amount") is not None:
+            leader = f"{names.get(uid, a.get('top_bid_user_name') or f'User {uid}')} · {_fmt_ec(a.get('top_bid_amount'))} EC"
+        row = [_auction_link(a.get("auction_id"), a.get("item_name")), _phase_label(a), a.get("status"), a.get("bid_count"), leader, _member_link(a.get("winner_user_id"), a.get("winner_name")) if a.get("winner_user_id") else "—", _dt(a.get("ends_at"))]
+        if str(a.get("status") or "").lower() in {"open", "active", "running", "bidding", "roll", "sale", "free", "main", "secondary"}:
+            active_rows.append(row)
+        else:
+            closed_rows.append(row)
+
+    winner_rows = []
+    for w in loot_ins.get("winner_rows") or []:
+        if not isinstance(w, dict):
+            continue
+        winner_rows.append([_member_link(w.get("user_id"), names.get(_user_id(w.get("user_id"),), f"User {w.get('user_id')}")), w.get("won_count")])
+
+    leader_rows = []
+    for l in loot_ins.get("active_leaders") or []:
+        if not isinstance(l, dict):
+            continue
+        leader_rows.append([_member_link(l.get("user_id"), names.get(_user_id(l.get("user_id")), f"User {l.get('user_id')}")), l.get("lead_count")])
+
+    cards = "".join([
+        _card("Auktionen", len(auctions), "im Snapshot"),
+        _card("Aktiv", len(active_rows), "läuft/offen"),
+        _card("Abgeschlossen", len(closed_rows), "nicht aktiv"),
+        _card("Gewinner", len(winner_rows), "Spieler mit Loot"),
+    ])
+    body = f"""
+    <nav class="topnav"><a href="/">← Übersicht</a><a href="/members">Mitglieder</a><a href="/needs">Needs</a><a href="/analytics">Analytics</a><a href="/exports">Exports</a><a href="/api/loot">API</a></nav>
+    <section class="hero"><div><div class="eyebrow">Loot & Auktionen</div><h1>🎁 Loot-Dashboard</h1><p class="muted">Aktive Auktionen, Gewinnerverteilung und Auktionshistorie. Read-only.</p></div><a class="btn" href="/export/auctions.csv">CSV herunterladen</a></section>
+    <section class="grid">{cards}</section>
+    <section class="split"><div class="panel"><h2>🏆 Loot-Gewinner</h2>{_table(['Spieler','Items'], winner_rows, placeholder='Gewinner durchsuchen…')}</div><div class="panel"><h2>📈 Aktuell führend</h2>{_table(['Spieler','Führungen'], leader_rows, placeholder='Führungen durchsuchen…')}</div></section>
+    <section class="panel"><h2>🟢 Aktive Auktionen</h2>{_table(['Item','Bereich','Status','Gebote','Führend','Gewinner','Ende'], active_rows, placeholder='Aktive Auktionen durchsuchen…')}</section>
+    <section class="panel"><h2>📜 Auktionshistorie</h2>{_table(['Item','Bereich','Status','Gebote','Führend','Gewinner','Ende'], closed_rows[:250], placeholder='Auktionshistorie durchsuchen…')}</section>
+    """
+    return _html_shell("Loot · Ebo Dashboard", body)
+
+
+def _render_exports_dashboard(data: dict[str, Any]) -> str:
+    if not data.get("ok"):
+        return _html_shell("Exports · Ebo Dashboard", f"<section class='panel'><h1>⬇️ Exports</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+    snap: dict[str, Any] = data.get("snapshot") or {}
+    cards = "".join([
+        _card("Snapshot", data.get("id"), _dt(data.get("published_at"))),
+        _card("Mitglieder", len(_insight_members(snap)), "CSV"),
+        _card("EC-Konten", len((((snap.get("ec") or {}).get("balances") or {}).get("top") or [])), "CSV"),
+        _card("Auktionen", len((((snap.get("loot") or {}).get("auctions") or {}).get("items") or [])), "CSV"),
+    ])
+    rows = [
+        ["Mitglieder", _raw('<a class="link" href="/export/members.csv">members.csv</a>'), "Roster, Qualität, EC, Voice, Loot"],
+        ["EC", _raw('<a class="link" href="/export/ec.csv">ec.csv</a>'), "EC-Konten"],
+        ["Needs", _raw('<a class="link" href="/export/needs.csv">needs.csv</a>'), "Main/Secondary je Spieler"],
+        ["Auktionen", _raw('<a class="link" href="/export/auctions.csv">auctions.csv</a>'), "Auktionsübersicht"],
+        ["Fairness", _raw('<a class="link" href="/export/fairness.csv">fairness.csv</a>'), "Loot/EC/Need-Hinweise"],
+        ["JSON Snapshot", _raw('<a class="link" href="/api/snapshot">api/snapshot</a>'), "voller Snapshot"],
+    ]
+    body = f"""
+    <nav class="topnav"><a href="/">← Übersicht</a><a href="/members">Mitglieder</a><a href="/needs">Needs</a><a href="/loot">Loot</a><a href="/system">System</a></nav>
+    <section class="hero"><div><div class="eyebrow">Read-only Download</div><h1>⬇️ Exports</h1><p class="muted">CSV/JSON für Kontrolle, Excel oder spätere Migration. Es wird nichts verändert.</p></div><a class="btn" href="/api/snapshot">JSON ansehen</a></section>
+    <section class="grid">{cards}</section>
+    <section class="panel"><h2>Downloads</h2>{_table(['Bereich','Datei','Inhalt'], rows, searchable=False)}</section>
+    """
+    return _html_shell("Exports · Ebo Dashboard", body)
+
+
+def _csv_response(filename: str, headers: list[str], rows: list[list[Any]]) -> Response:
+    buf = io.StringIO()
+    writer = csv.writer(buf, delimiter=';')
+    writer.writerow(headers)
+    for row in rows:
+        writer.writerow([str(x.get('__html__') if isinstance(x, dict) and '__html__' in x else x if x is not None else '') for x in row])
+    return Response(content=buf.getvalue(), media_type="text/csv; charset=utf-8", headers={"Content-Disposition": f"attachment; filename={filename}"})
+
+
+
+
+# ---------------------------------------------------------------------------
+# Step 3.10: Planung, Fairness, Compare
+# ---------------------------------------------------------------------------
+
+def _role_bucket(label: Any) -> str:
+    txt = str(label or "").strip().lower()
+    if any(x in txt for x in ("tank", "wächter", "waechter")):
+        return "Tank"
+    if any(x in txt for x in ("heal", "heiler", "support")):
+        return "Heiler"
+    if any(x in txt for x in ("dps", "dd", "damage", "schaden")):
+        return "DPS"
+    if any(x in txt for x in ("reserve", "bank")):
+        return "Reserve"
+    return str(label or "Andere") or "Andere"
+
+
+def _event_role_summary(ev: dict[str, Any]) -> dict[str, int]:
+    out: dict[str, int] = {"Tank": 0, "Heiler": 0, "DPS": 0, "Reserve": 0, "Andere": 0}
+    for role, count in (ev.get("yes_counts") or {}).items():
+        bucket = _role_bucket(role)
+        if bucket not in out:
+            out[bucket] = 0
+        out[bucket] += int(_num(count, 0))
+    return out
+
+
+def _event_readiness_score(role_counts: dict[str, int], participant_count: int) -> tuple[int, list[str]]:
+    """Kleine Faustregel, bewusst nicht spielmechanisch hart.
+
+    Ziel ist kein automatisches Urteil, sondern ein schneller Leitungs-Hinweis.
+    """
+    issues: list[str] = []
+    score = 100
+    if role_counts.get("Tank", 0) <= 0:
+        score -= 30
+        issues.append("kein Tank")
+    if role_counts.get("Heiler", 0) <= 0:
+        score -= 30
+        issues.append("kein Heiler")
+    if role_counts.get("DPS", 0) <= 0:
+        score -= 20
+        issues.append("kein DPS")
+    if participant_count < 6:
+        score -= 15
+        issues.append("wenig Teilnehmer")
+    if participant_count < 3:
+        score -= 20
+        issues.append("kritisch wenige Teilnehmer")
+    return max(0, min(100, score)), issues
+
+
+def _planning_analytics(snap: dict[str, Any]) -> dict[str, Any]:
+    events = ((snap.get("events") or {}).get("items") or [])
+    insights = _insights(snap)
+    needs = (insights.get("needs") or {}) if isinstance(insights, dict) else {}
+    top_main = needs.get("top_main") if isinstance(needs.get("top_main"), list) else []
+    top_secondary = needs.get("top_secondary") if isinstance(needs.get("top_secondary"), list) else []
+
+    event_rows: list[dict[str, Any]] = []
+    role_totals: Counter[str] = Counter()
+    risk_count = 0
+    for ev in events:
+        if not isinstance(ev, dict):
+            continue
+        counts = _event_role_summary(ev)
+        participant_count = int(_num(ev.get("participant_count"), 0))
+        score, issues = _event_readiness_score(counts, participant_count)
+        if score < 70:
+            risk_count += 1
+        for k, v in counts.items():
+            role_totals[k] += int(v)
+        event_rows.append({
+            "event_id": ev.get("event_id"),
+            "title": ev.get("title") or ev.get("event_id") or "Event",
+            "when_iso": ev.get("when_iso"),
+            "participants": participant_count,
+            "maybe": int(_num(ev.get("maybe_count"), 0)),
+            "no": int(_num(ev.get("no_count"), 0)),
+            "tank": counts.get("Tank", 0),
+            "healer": counts.get("Heiler", 0),
+            "dps": counts.get("DPS", 0),
+            "reserve": counts.get("Reserve", 0),
+            "readiness": score,
+            "issues": issues,
+            "voice": bool(ev.get("voice_enabled") or ev.get("voice_channel_id") or ev.get("voice_last_channel_id")),
+        })
+    event_rows.sort(key=lambda x: str(x.get("when_iso") or ""), reverse=True)
+
+    return {
+        "events_total": len(event_rows),
+        "events_at_risk": risk_count,
+        "avg_readiness": (sum(int(x.get("readiness") or 0) for x in event_rows) / len(event_rows)) if event_rows else 0,
+        "role_totals": role_totals.most_common(),
+        "events": event_rows,
+        "top_main_needs": top_main[:40],
+        "top_secondary_needs": top_secondary[:40],
+    }
+
+
+def _fairness_analytics(snap: dict[str, Any]) -> dict[str, Any]:
+    members = _insight_members(snap)
+    rows: list[dict[str, Any]] = []
+    for m in members:
+        if not isinstance(m, dict):
+            continue
+        main_needs = int(_num(m.get("main_need_count"), 0))
+        sec_needs = int(_num(m.get("secondary_need_count"), 0))
+        loot_won = int(_num(m.get("loot_won_count"), 0))
+        ec_balance = _num(m.get("ec_balance"), 0)
+        earned = _num(m.get("ec_earned_loaded"), 0)
+        spent = _num(m.get("ec_spent_loaded"), 0)
+        voice_hours = _num(m.get("voice_hours"), 0)
+        yes = int(_num(m.get("event_yes"), 0))
+        need_total = main_needs + sec_needs
+        flags: list[str] = []
+        if need_total >= 3 and loot_won <= 0:
+            flags.append("viel Bedarf, kein Loot")
+        if ec_balance >= 100 and loot_won <= 0:
+            flags.append("viel EC, kein Loot")
+        if loot_won >= 3 and spent <= 0:
+            flags.append("viel Loot, kaum Ausgaben")
+        if yes <= 0 and loot_won > 0:
+            flags.append("Loot ohne Eventzusagen im Snapshot")
+        if voice_hours <= 0 and yes > 0:
+            flags.append("Zusagen ohne Voice-Zeit")
+        pressure = need_total * 2 + max(0, 2 - loot_won) + (1 if ec_balance > 0 else 0)
+        rows.append({
+            "user_id": m.get("user_id"),
+            "display_name": m.get("display_name"),
+            "role": m.get("main_role"),
+            "ec_balance": ec_balance,
+            "ec_earned": earned,
+            "ec_spent": spent,
+            "loot_won": loot_won,
+            "main_needs": main_needs,
+            "secondary_needs": sec_needs,
+            "need_total": need_total,
+            "event_yes": yes,
+            "voice_hours": voice_hours,
+            "pressure": pressure,
+            "flags": flags,
+            "flag_count": len(flags),
+        })
+    rows.sort(key=lambda x: (-int(x.get("flag_count") or 0), -float(x.get("pressure") or 0), str(x.get("display_name") or "").lower()))
+    top_pressure = sorted(rows, key=lambda x: (-float(x.get("pressure") or 0), str(x.get("display_name") or "").lower()))[:60]
+    loot_winners = sorted(rows, key=lambda x: (-int(x.get("loot_won") or 0), str(x.get("display_name") or "").lower()))[:60]
+    high_ec = sorted(rows, key=lambda x: (-float(x.get("ec_balance") or 0), str(x.get("display_name") or "").lower()))[:60]
+    return {
+        "member_count": len(rows),
+        "flagged_count": sum(1 for r in rows if int(r.get("flag_count") or 0) > 0),
+        "total_loot_won": sum(int(r.get("loot_won") or 0) for r in rows),
+        "total_need_count": sum(int(r.get("need_total") or 0) for r in rows),
+        "rows": rows[:800],
+        "flagged": [r for r in rows if int(r.get("flag_count") or 0) > 0][:200],
+        "top_pressure": top_pressure,
+        "loot_winners": loot_winners,
+        "high_ec": high_ec,
+    }
+
+
+def _render_planning_dashboard(data: dict[str, Any]) -> str:
+    if not data.get("ok"):
+        return _html_shell("Planung · Ebo Dashboard", f"<section class='panel'><h1>📅 Planung</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+    snap: dict[str, Any] = data.get("snapshot") or {}
+    plan = _planning_analytics(snap)
+    cards = "".join([
+        _card("Events", plan.get("events_total", 0), "im Snapshot"),
+        _card("Risiko-Events", plan.get("events_at_risk", 0), "wenig/fehlende Rollen"),
+        _card("Ø Bereitschaft", f"{round(_num(plan.get('avg_readiness'), 0))}%", "Faustregel"),
+        _card("Snapshot", _dt(data.get("published_at")), "read-only"),
+    ])
+    event_rows = []
+    for ev in plan.get("events") or []:
+        if not isinstance(ev, dict):
+            continue
+        issues = ", ".join(str(x) for x in (ev.get("issues") or [])) or "—"
+        event_rows.append([
+            _event_link(ev.get("event_id"), ev.get("title")),
+            _dt(ev.get("when_iso")),
+            ev.get("participants"),
+            ev.get("tank"),
+            ev.get("healer"),
+            ev.get("dps"),
+            ev.get("reserve"),
+            f"{int(_num(ev.get('readiness'), 0))}%",
+            issues,
+            "ja" if ev.get("voice") else "nein",
+        ])
+    main_rows = [[x.get("label"), x.get("count")] for x in plan.get("top_main_needs") or [] if isinstance(x, dict)]
+    sec_rows = [[x.get("label"), x.get("count")] for x in plan.get("top_secondary_needs") or [] if isinstance(x, dict)]
+    body = f"""
+    <nav class="topnav"><a href="/">← Übersicht</a><a href="/analytics">Analytics</a><a href="/fairness">Fairness</a><a href="/needs">Needs</a><a href="/api/planning">API</a></nav>
+    <section class="hero"><div><div class="eyebrow">Planung</div><h1>📅 Event-/Raid-Planung</h1><p class="muted">Schnellprüfung für Rolle, Teilnehmer, Voice und häufige Needs. Read-only.</p></div><a class="btn" href="/api/planning">API</a></section>
+    <section class="grid">{cards}</section>
+    <section class="panel"><h2>Rollen-Summen über Events</h2>{_bars(plan.get('role_totals') or [])}</section>
+    <section class="panel"><h2>Event-Bereitschaft</h2>{_table(['Event','Zeit','Teilnehmer','Tank','Heiler','DPS','Reserve','Score','Hinweise','Voice'], event_rows, placeholder='Events durchsuchen…')}</section>
+    <section class="panel"><h2>Bedarfs-Hotspots</h2><div class="split"><div><h3>Main-Needs</h3>{_table(['Item','Anzahl'], main_rows, placeholder='Main-Needs durchsuchen…')}</div><div><h3>Secondary-Needs</h3>{_table(['Item','Anzahl'], sec_rows, placeholder='Secondary-Needs durchsuchen…')}</div></div></section>
+    """
+    return _html_shell("Planung · Ebo Dashboard", body)
+
+
+def _render_fairness_dashboard(data: dict[str, Any]) -> str:
+    if not data.get("ok"):
+        return _html_shell("Fairness · Ebo Dashboard", f"<section class='panel'><h1>⚖️ Fairness</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+    snap: dict[str, Any] = data.get("snapshot") or {}
+    fair = _fairness_analytics(snap)
+    cards = "".join([
+        _card("Mitglieder", fair.get("member_count", 0), "aus Gildenrolle"),
+        _card("Hinweise", fair.get("flagged_count", 0), "prüfen, nicht automatisch urteilen"),
+        _card("Loot erhalten", fair.get("total_loot_won", 0), "geladene Historie"),
+        _card("Offene Needs", fair.get("total_need_count", 0), "Main + Secondary"),
+    ])
+    flagged_rows = []
+    for r in fair.get("flagged") or []:
+        if not isinstance(r, dict):
+            continue
+        flagged_rows.append([
+            _member_link(r.get("user_id"), r.get("display_name")),
+            r.get("role") or "—",
+            _fmt_ec(r.get("ec_balance")),
+            r.get("loot_won"),
+            r.get("main_needs"),
+            r.get("secondary_needs"),
+            round(_num(r.get("voice_hours"), 0), 1),
+            ", ".join(str(x) for x in (r.get("flags") or [])),
+        ])
+    pressure_rows = [[_member_link(r.get("user_id"), r.get("display_name")), r.get("pressure"), r.get("main_needs"), r.get("secondary_needs"), r.get("loot_won"), _fmt_ec(r.get("ec_balance"))] for r in fair.get("top_pressure") or [] if isinstance(r, dict)]
+    loot_rows = [[_member_link(r.get("user_id"), r.get("display_name")), r.get("loot_won"), _fmt_ec(r.get("ec_spent")), _fmt_ec(r.get("ec_balance")), r.get("event_yes"), round(_num(r.get("voice_hours"), 0), 1)] for r in fair.get("loot_winners") or [] if isinstance(r, dict)]
+    ec_rows = [[_member_link(r.get("user_id"), r.get("display_name")), _fmt_ec(r.get("ec_balance")), _fmt_ec(r.get("ec_earned")), _fmt_ec(r.get("ec_spent")), r.get("loot_won"), r.get("need_total")] for r in fair.get("high_ec") or [] if isinstance(r, dict)]
+    body = f"""
+    <nav class="topnav"><a href="/">← Übersicht</a><a href="/planning">Planung</a><a href="/loot">Loot</a><a href="/ec">EC-Verlauf</a><a href="/api/fairness">API</a></nav>
+    <section class="hero"><div><div class="eyebrow">Loot/EC</div><h1>⚖️ Fairness-Check</h1><p class="muted">Hinweise für Leitung. Kein automatisches Urteil und keine Datenänderung.</p></div><a class="btn" href="/api/fairness">API</a></section>
+    <section class="grid">{cards}</section>
+    <section class="panel"><h2>Prüf-Hinweise</h2>{_table(['Spieler','Rolle','EC','Loot','Main','Secondary','Voice h','Hinweise'], flagged_rows, placeholder='Hinweise durchsuchen…')}</section>
+    <section class="panel"><h2>Bedarfsdruck</h2>{_table(['Spieler','Score','Main','Secondary','Loot','EC'], pressure_rows, placeholder='Bedarfsdruck durchsuchen…')}</section>
+    <section class="panel"><h2>Loot-Gewinner</h2>{_table(['Spieler','Loot','EC ausgegeben','EC aktuell','Zusagen','Voice h'], loot_rows, placeholder='Loot-Gewinner durchsuchen…')}</section>
+    <section class="panel"><h2>Hohe EC-Konten</h2>{_table(['Spieler','EC','Verdient','Ausgegeben','Loot','Needs'], ec_rows, placeholder='EC durchsuchen…')}</section>
+    """
+    return _html_shell("Fairness · Ebo Dashboard", body)
+
+
+@app.get("/members", response_class=HTMLResponse)
+def members_page(_: bool = Depends(_auth)):
+    try:
+        return HTMLResponse(_render_members_dashboard(_snapshot_payload()))
+    except Exception as exc:
+        return HTMLResponse(_html_shell("Ebo Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"), status_code=500)
+
+
+@app.get("/needs", response_class=HTMLResponse)
+def needs_page(_: bool = Depends(_auth)):
+    try:
+        return HTMLResponse(_render_needs_dashboard(_snapshot_payload()))
+    except Exception as exc:
+        return HTMLResponse(_html_shell("Ebo Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"), status_code=500)
+
+
+@app.get("/loot", response_class=HTMLResponse)
+def loot_page(_: bool = Depends(_auth)):
+    try:
+        return HTMLResponse(_render_loot_dashboard(_snapshot_payload()))
+    except Exception as exc:
+        return HTMLResponse(_html_shell("Ebo Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"), status_code=500)
+
+
+@app.get("/exports", response_class=HTMLResponse)
+def exports_page(_: bool = Depends(_auth)):
+    try:
+        return HTMLResponse(_render_exports_dashboard(_snapshot_payload()))
+    except Exception as exc:
+        return HTMLResponse(_html_shell("Ebo Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"), status_code=500)
+
+
+@app.get("/api/members")
+def api_members(_: bool = Depends(_auth)):
+    payload = _snapshot_payload()
+    if not payload.get("ok"):
+        return JSONResponse(payload, status_code=404)
+    snap = payload.get("snapshot") or {}
+    return JSONResponse({"ok": True, "members": _insight_members(snap), "quality": (_insights(snap).get("quality") or {})})
+
+
+@app.get("/api/needs")
+def api_needs(_: bool = Depends(_auth)):
+    payload = _snapshot_payload()
+    if not payload.get("ok"):
+        return JSONResponse(payload, status_code=404)
+    snap = payload.get("snapshot") or {}
+    return JSONResponse({"ok": True, "needs": ((snap.get("loot") or {}).get("needs") or {}), "insights": (_insights(snap).get("needs") or {})})
+
+
+@app.get("/api/loot")
+def api_loot(_: bool = Depends(_auth)):
+    payload = _snapshot_payload()
+    if not payload.get("ok"):
+        return JSONResponse(payload, status_code=404)
+    snap = payload.get("snapshot") or {}
+    return JSONResponse({"ok": True, "loot": (snap.get("loot") or {}), "insights": (_insights(snap).get("loot") or {})})
+
+
+@app.get("/export/members.csv")
+def export_members_csv(_: bool = Depends(_auth)):
+    payload = _snapshot_payload(); snap = payload.get("snapshot") or {}
+    rows = []
+    for m in _insight_members(snap):
+        rows.append([m.get("user_id"), m.get("display_name"), m.get("ingame_name"), m.get("main_role"), m.get("gearscore"), m.get("ec_balance"), m.get("main_need_count"), m.get("secondary_need_count"), m.get("event_responses"), m.get("voice_hours"), m.get("loot_won_count"), _risk_flags_text(m)])
+    return _csv_response("members.csv", ["user_id","display_name","ingame_name","role","gearscore","ec","main_needs","secondary_needs","event_responses","voice_hours","loot_won","hinweise"], rows)
+
+
+@app.get("/export/ec.csv")
+def export_ec_csv(_: bool = Depends(_auth)):
+    payload = _snapshot_payload(); snap = payload.get("snapshot") or {}
+    rows = []
+    for b in ((((snap.get("ec") or {}).get("balances") or {}).get("top") or [])):
+        if isinstance(b, dict):
+            rows.append([b.get("user_id"), b.get("display_name"), b.get("balance")])
+    return _csv_response("ec.csv", ["user_id","display_name","ec"], rows)
+
+
+@app.get("/export/needs.csv")
+def export_needs_csv(_: bool = Depends(_auth)):
+    payload = _snapshot_payload(); snap = payload.get("snapshot") or {}
+    rows = []
+    for n in ((((snap.get("loot") or {}).get("needs") or {}).get("items") or [])):
+        if isinstance(n, dict):
+            rows.append([n.get("user_id"), n.get("display_name"), n.get("main_count"), n.get("secondary_count"), " | ".join(str(x) for x in (n.get("main") or [])), " | ".join(str(x) for x in (n.get("secondary") or []))])
+    return _csv_response("needs.csv", ["user_id","display_name","main_count","secondary_count","main_needs","secondary_needs"], rows)
+
+
+@app.get("/export/auctions.csv")
+def export_auctions_csv(_: bool = Depends(_auth)):
+    payload = _snapshot_payload(); snap = payload.get("snapshot") or {}
+    rows = []
+    for a in ((((snap.get("loot") or {}).get("auctions") or {}).get("items") or [])):
+        if isinstance(a, dict):
+            rows.append([a.get("auction_id"), a.get("item_name"), _phase_label(a), a.get("status"), a.get("bid_count"), a.get("top_bid_user_name"), a.get("top_bid_amount"), a.get("winner_name"), a.get("ends_at")])
+    return _csv_response("auctions.csv", ["auction_id","item","phase","status","bids","leader","leader_bid","winner","ends_at"], rows)
+
+
+
+@app.get("/planning", response_class=HTMLResponse)
+def planning_page(_: bool = Depends(_auth)):
+    try:
+        return HTMLResponse(_render_planning_dashboard(_snapshot_payload()))
+    except Exception as exc:
+        return HTMLResponse(
+            _html_shell("Ebo Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
+            status_code=500,
+        )
+
+
+@app.get("/fairness", response_class=HTMLResponse)
+def fairness_page(_: bool = Depends(_auth)):
+    try:
+        return HTMLResponse(_render_fairness_dashboard(_snapshot_payload()))
+    except Exception as exc:
+        return HTMLResponse(
+            _html_shell("Ebo Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
+            status_code=500,
+        )
+
+
+@app.get("/api/planning")
+def api_planning(_: bool = Depends(_auth)):
+    payload = _snapshot_payload()
+    if not payload.get("ok"):
+        return JSONResponse(payload, status_code=404)
+    return JSONResponse({"ok": True, "planning": _planning_analytics(payload.get("snapshot") or {})})
+
+
+@app.get("/api/fairness")
+def api_fairness(_: bool = Depends(_auth)):
+    payload = _snapshot_payload()
+    if not payload.get("ok"):
+        return JSONResponse(payload, status_code=404)
+    return JSONResponse({"ok": True, "fairness": _fairness_analytics(payload.get("snapshot") or {})})
+
+
+@app.get("/export/fairness.csv")
+def export_fairness_csv(_: bool = Depends(_auth)):
+    payload = _snapshot_payload(); snap = payload.get("snapshot") or {}
+    fair = _fairness_analytics(snap)
+    rows = []
+    for r in fair.get("rows") or []:
+        if isinstance(r, dict):
+            rows.append([r.get("user_id"), r.get("display_name"), r.get("role"), r.get("ec_balance"), r.get("ec_earned"), r.get("ec_spent"), r.get("loot_won"), r.get("main_needs"), r.get("secondary_needs"), r.get("event_yes"), r.get("voice_hours"), " | ".join(str(x) for x in (r.get("flags") or []))])
+    return _csv_response("fairness.csv", ["user_id","display_name","role","ec","earned","spent","loot_won","main_needs","secondary_needs","event_yes","voice_hours","hinweise"], rows)
+
 
 @app.get("/healthz")
 def healthz():
