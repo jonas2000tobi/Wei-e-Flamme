@@ -897,6 +897,152 @@ def _summarize_needs(data: Any, guild: discord.Guild, item_catalog_data: Any = N
     }
 
 
+
+
+def _looks_like_id(value: Any) -> bool:
+    try:
+        txt = str(value or "").strip()
+        return txt.isdigit() and len(txt) >= 15
+    except Exception:
+        return False
+
+
+def _resolve_channel_name(guild: discord.Guild, raw: Any) -> str:
+    try:
+        cid = int(str(raw).strip())
+        ch = guild.get_channel(cid)
+        if ch is not None:
+            return _safe_text(getattr(ch, "name", "") or str(cid), 120)
+    except Exception:
+        pass
+    return ""
+
+
+def _resolve_role_name(guild: discord.Guild, raw: Any) -> str:
+    try:
+        rid = int(str(raw).strip())
+        role = guild.get_role(rid)
+        if role is not None:
+            return _safe_text(getattr(role, "name", "") or str(rid), 120)
+    except Exception:
+        pass
+    return ""
+
+
+def _flatten_config(data: Any, prefix: str = "", *, max_depth: int = 4) -> list[tuple[str, Any]]:
+    """Kleine read-only Flatten-Hilfe für Settings-Seiten.
+
+    Keine Daten werden verändert. Die Funktion ist bewusst defensiv,
+    weil die alten JSON-Dateien je nach Modul unterschiedlich aufgebaut sind.
+    """
+    out: list[tuple[str, Any]] = []
+    if max_depth < 0:
+        return out
+    if isinstance(data, dict):
+        for key, value in data.items():
+            k = f"{prefix}.{key}" if prefix else str(key)
+            if isinstance(value, (dict, list)):
+                out.extend(_flatten_config(value, k, max_depth=max_depth - 1))
+            else:
+                out.append((k, value))
+    elif isinstance(data, list):
+        for idx, value in enumerate(data[:80]):
+            k = f"{prefix}[{idx}]" if prefix else f"[{idx}]"
+            if isinstance(value, (dict, list)):
+                out.extend(_flatten_config(value, k, max_depth=max_depth - 1))
+            else:
+                out.append((k, value))
+    return out
+
+
+def _interesting_setting_key(key: str) -> bool:
+    k = key.lower()
+    needles = (
+        "channel", "role", "admin", "leader", "officer", "member",
+        "dkp", "ec", "point", "decay", "verfall", "auction", "market",
+        "log", "loot", "need", "voice", "event", "enabled", "active",
+        "template", "alliance", "weekly", "report", "contact", "price",
+        "bid", "roll", "sale", "guild"
+    )
+    return any(n in k for n in needles)
+
+
+def _summarize_settings(sources: dict[str, Any], guild: discord.Guild) -> dict[str, Any]:
+    guild_id = int(guild.id)
+    member_filter = _dashboard_member_filter_info(guild)
+    config_keys = [
+        "member_portal_cfg",
+        "dkp_cfg",
+        "loot_cfg",
+        "loot_auction_cfg",
+        "raid_templates",
+        "alliance_config",
+        "weekly_report_cfg",
+        "leader_contact_cfg",
+        "guild_chest",
+    ]
+    channels: dict[str, dict[str, Any]] = {}
+    roles: dict[str, dict[str, Any]] = {}
+    settings_rows: list[dict[str, Any]] = []
+    module_rows: list[dict[str, Any]] = []
+
+    for source_key in config_keys:
+        raw = sources.get(source_key)
+        scoped = _guild_dict(raw, guild_id)
+        if not scoped and isinstance(raw, dict):
+            # Fallback für ältere Configs, die nicht nach guild_id gruppiert sind.
+            scoped = raw
+        exists = not (raw in ({}, [], None))
+        module_rows.append({
+            "module": source_key,
+            "configured": bool(scoped),
+            "source_exists": bool(exists),
+            "top_level_keys": len(scoped) if isinstance(scoped, dict) else (len(scoped) if isinstance(scoped, list) else 0),
+        })
+        if not isinstance(scoped, (dict, list)):
+            continue
+        flat = _flatten_config(scoped, source_key, max_depth=4)
+        for key, value in flat:
+            lk = key.lower()
+            if not _interesting_setting_key(key):
+                continue
+            text_value = _safe_text(value, 240)
+            row = {"source": source_key, "key": key, "value": text_value}
+            settings_rows.append(row)
+            if "channel" in lk and _looks_like_id(value):
+                channels[key] = {
+                    "source": source_key,
+                    "key": key,
+                    "channel_id": str(value),
+                    "name": _resolve_channel_name(guild, value),
+                    "resolved": bool(_resolve_channel_name(guild, value)),
+                }
+            if "role" in lk and _looks_like_id(value):
+                roles[key] = {
+                    "source": source_key,
+                    "key": key,
+                    "role_id": str(value),
+                    "name": _resolve_role_name(guild, value),
+                    "resolved": bool(_resolve_role_name(guild, value)),
+                }
+
+    channels_rows = list(channels.values())[:250]
+    roles_rows = list(roles.values())[:250]
+    settings_rows = settings_rows[:600]
+    return {
+        "member_filter": member_filter,
+        "modules": module_rows,
+        "channels": channels_rows,
+        "roles": roles_rows,
+        "settings": settings_rows,
+        "counts": {
+            "modules": len(module_rows),
+            "channels": len(channels_rows),
+            "roles": len(roles_rows),
+            "settings": len(settings_rows),
+        },
+    }
+
 def _summarize_event_checks(data: Any, guild_id: int, *, limit: int = 200) -> dict[str, Any]:
     g = _guild_dict(data, guild_id)
     checks = g.get("checks") if isinstance(g.get("checks"), dict) else g
@@ -975,7 +1121,7 @@ def _audit_summary(guild_id: int) -> dict[str, Any]:
     try:
         return {
             "logs_total": runtime_db.count_audit_logs(guild_id),
-            "recent_logs": runtime_db.fetch_audit_logs(guild_id, limit=20),
+            "recent_logs": runtime_db.fetch_audit_logs(guild_id, limit=300),
         }
     except Exception as exc:
         return {"error": f"{type(exc).__name__}: {exc}", "logs_total": 0, "recent_logs": []}
@@ -1022,6 +1168,7 @@ def build_dashboard_snapshot(bot: commands.Bot, guild: discord.Guild) -> dict[st
             "auctions": _summarize_auctions(sources.get("loot_auctions"), guild),
             "items_known": len(_catalog_items_for_guild(sources.get("loot_items"), guild_id)),
         },
+        "settings": _summarize_settings(sources, guild),
         "voice": _voice_summary(guild_id),
         "audit": _audit_summary(guild_id),
     }
