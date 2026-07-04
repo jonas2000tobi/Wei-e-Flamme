@@ -69,6 +69,7 @@ def _member_is_active(guild: discord.Guild, user_id: int) -> bool:
 
 
 DASHBOARD_MEMBER_ROLE_SETTING = "dashboard_member_role_id"
+DASHBOARD_ADMIN_ROLE_SETTING = "dashboard_admin_role_ids"
 
 
 def _dashboard_member_role_config_value(guild_id: int) -> Any:
@@ -128,6 +129,99 @@ def _dashboard_member_ids(guild: discord.Guild) -> set[int]:
     # Absichtlich kein Fallback auf alle Servermitglieder. Für Massentauglichkeit
     # muss eine Gildenrolle gesetzt sein.
     return set()
+
+
+def _dashboard_admin_role_config_values(guild_id: int) -> list[int]:
+    """Admin-/Leitungsrollen fürs Dashboard aus Postgres/Runtime-DB lesen."""
+    raw = None
+    try:
+        raw = runtime_db.get_guild_setting(int(guild_id), DASHBOARD_ADMIN_ROLE_SETTING, None)
+    except Exception:
+        raw = None
+
+    values: list[int] = []
+    if isinstance(raw, list):
+        seq = raw
+    elif isinstance(raw, str):
+        # unterstützt JSON-Listen und einfache CSV-Strings
+        try:
+            loaded = json.loads(raw)
+            seq = loaded if isinstance(loaded, list) else [raw]
+        except Exception:
+            seq = [x.strip() for x in raw.split(",") if x.strip()]
+    elif raw not in (None, ""):
+        seq = [raw]
+    else:
+        seq = []
+
+    for item in seq:
+        try:
+            rid = int(item)
+            if rid and rid not in values:
+                values.append(rid)
+        except Exception:
+            continue
+
+    # optionaler Railway-Fallback beim Bot-Service
+    env_ids = os.getenv("DASHBOARD_ADMIN_ROLE_IDS", "").strip()
+    if env_ids:
+        for part in env_ids.replace(";", ",").split(","):
+            try:
+                rid = int(part.strip())
+                if rid and rid not in values:
+                    values.append(rid)
+            except Exception:
+                continue
+    return values
+
+
+def _dashboard_admin_roles(guild: discord.Guild) -> list[discord.Role]:
+    out: list[discord.Role] = []
+    for rid in _dashboard_admin_role_config_values(guild.id):
+        role = guild.get_role(int(rid))
+        if role is not None and role not in out:
+            out.append(role)
+    return out
+
+
+def _dashboard_auth_info(guild: discord.Guild) -> dict[str, Any]:
+    """Auth-Lesemodell fürs Web-Dashboard.
+
+    Wichtig: Die Website muss damit für den Discord-Login keine Rollen direkt
+    über Discord OAuth abfragen. Der Bot ist ohnehin im Server und schreibt
+    die erlaubten User-IDs in den Snapshot. Das ist robuster und vermeidet
+    403-Probleme bei guilds.members.read.
+    """
+    member_role = _dashboard_member_role(guild)
+    allowed_ids = sorted(str(x) for x in _dashboard_member_ids(guild))
+    admin_roles = _dashboard_admin_roles(guild)
+    admin_ids: set[int] = set()
+    admin_role_rows: list[dict[str, Any]] = []
+    for role in admin_roles:
+        members = [m for m in getattr(role, "members", []) if getattr(m, "id", None)]
+        admin_ids.update(int(m.id) for m in members)
+        admin_role_rows.append({
+            "role_id": str(role.id),
+            "role_name": str(role.name),
+            "member_count": len(members),
+        })
+    return {
+        "mode": "snapshot_role_check",
+        "member_role": {
+            "role_id": str(member_role.id) if member_role else "",
+            "role_name": str(member_role.name) if member_role else "",
+            "member_count": len(allowed_ids),
+            "configured": member_role is not None,
+        },
+        "admin_roles": admin_role_rows,
+        "allowed_member_ids": allowed_ids,
+        "admin_member_ids": sorted(str(x) for x in admin_ids),
+        "counts": {
+            "allowed_members": len(allowed_ids),
+            "admin_members": len(admin_ids),
+            "admin_roles": len(admin_role_rows),
+        },
+    }
 
 
 def _dashboard_member_filter_info(guild: discord.Guild) -> dict[str, Any]:
@@ -1127,6 +1221,241 @@ def _audit_summary(guild_id: int) -> dict[str, Any]:
         return {"error": f"{type(exc).__name__}: {exc}", "logs_total": 0, "recent_logs": []}
 
 
+
+
+def _dashboard_insights(guild: discord.Guild, snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Zusätzliche read-only Auswertungen für Dashboard/Vertrieb/Massennutzung.
+
+    Wichtig: Diese Funktion verändert keine Bot-Daten. Sie nutzt nur den gerade
+    gebauten Snapshot plus die gesetzte Dashboard-Gildenrolle.
+    """
+    try:
+        role_ids = sorted(_dashboard_member_ids(guild))
+    except Exception:
+        role_ids = []
+
+    profiles = ((snapshot.get("profiles") or {}).get("items") or [])
+    balances = (((snapshot.get("ec") or {}).get("balances") or {}).get("top") or [])
+    needs_items = (((snapshot.get("loot") or {}).get("needs") or {}).get("items") or [])
+    events = ((snapshot.get("events") or {}).get("items") or [])
+    auctions = (((snapshot.get("loot") or {}).get("auctions") or {}).get("items") or [])
+    tx_items = ((((snapshot.get("ec") or {}).get("transactions") or {}).get("items") or [])
+                or (((snapshot.get("ec") or {}).get("transactions") or {}).get("recent") or []))
+    voice_by_user = ((snapshot.get("voice") or {}).get("by_user") or [])
+
+    profile_by_uid: dict[int, dict[str, Any]] = {}
+    for p in profiles:
+        if isinstance(p, dict):
+            try:
+                profile_by_uid[int(p.get("user_id") or 0)] = p
+            except Exception:
+                pass
+
+    balance_by_uid: dict[int, float] = {}
+    for b in balances:
+        if not isinstance(b, dict):
+            continue
+        try:
+            balance_by_uid[int(b.get("user_id") or 0)] = float(b.get("balance") or 0)
+        except Exception:
+            continue
+
+    need_by_uid: dict[int, dict[str, Any]] = {}
+    main_need_counter: dict[str, int] = {}
+    secondary_need_counter: dict[str, int] = {}
+    for n in needs_items:
+        if not isinstance(n, dict):
+            continue
+        try:
+            uid = int(n.get("user_id") or 0)
+        except Exception:
+            uid = 0
+        if uid:
+            need_by_uid[uid] = n
+        for label in n.get("main") or []:
+            key = str(label or "").strip()
+            if key:
+                main_need_counter[key] = main_need_counter.get(key, 0) + 1
+        for label in n.get("secondary") or []:
+            key = str(label or "").strip()
+            if key:
+                secondary_need_counter[key] = secondary_need_counter.get(key, 0) + 1
+
+    event_stats: dict[int, dict[str, Any]] = {}
+    def touch_event_user(uid: int) -> dict[str, Any]:
+        return event_stats.setdefault(uid, {"responses": 0, "yes": 0, "maybe": 0, "no": 0})
+
+    for ev in events:
+        if not isinstance(ev, dict):
+            continue
+        parts = ev.get("participants") or {}
+        for group in (parts.get("yes") or []):
+            if not isinstance(group, dict):
+                continue
+            for p in group.get("participants") or []:
+                if not isinstance(p, dict):
+                    continue
+                try:
+                    uid = int(p.get("user_id") or 0)
+                except Exception:
+                    uid = 0
+                if uid:
+                    st = touch_event_user(uid)
+                    st["responses"] += 1
+                    st["yes"] += 1
+        for key, field in (("maybe", "maybe"), ("no", "no")):
+            for p in parts.get(key) or []:
+                if not isinstance(p, dict):
+                    continue
+                try:
+                    uid = int(p.get("user_id") or 0)
+                except Exception:
+                    uid = 0
+                if uid:
+                    st = touch_event_user(uid)
+                    st["responses"] += 1
+                    st[field] += 1
+
+    voice_by_uid: dict[int, dict[str, Any]] = {}
+    for v in voice_by_user:
+        if isinstance(v, dict):
+            try:
+                voice_by_uid[int(v.get("user_id") or 0)] = v
+            except Exception:
+                pass
+
+    won_by_uid: dict[int, dict[str, Any]] = {}
+    leading_by_uid: dict[int, int] = {}
+    active_statuses = {"open", "active", "running", "bidding", "roll", "sale", "free", "main", "secondary"}
+    for a in auctions:
+        if not isinstance(a, dict):
+            continue
+        try:
+            winner_id = int(a.get("winner_user_id") or 0)
+        except Exception:
+            winner_id = 0
+        if winner_id:
+            bucket = won_by_uid.setdefault(winner_id, {"user_id": winner_id, "won_count": 0, "items": []})
+            bucket["won_count"] += 1
+            if len(bucket["items"]) < 30:
+                bucket["items"].append({"auction_id": a.get("auction_id"), "item_name": a.get("item_name"), "status": a.get("status")})
+        status = str(a.get("status") or "").lower()
+        if status in active_statuses:
+            try:
+                leader_id = int(a.get("top_bid_user_id") or 0)
+            except Exception:
+                leader_id = 0
+            if leader_id:
+                leading_by_uid[leader_id] = leading_by_uid.get(leader_id, 0) + 1
+
+    tx_by_uid: dict[int, dict[str, Any]] = {}
+    for tx in tx_items:
+        if not isinstance(tx, dict):
+            continue
+        try:
+            uid = int(tx.get("user_id") or 0)
+        except Exception:
+            uid = 0
+        if not uid:
+            continue
+        amount = _parse_amount(tx.get("amount"))
+        b = tx_by_uid.setdefault(uid, {"earned": 0.0, "spent": 0.0, "transactions": 0})
+        b["transactions"] += 1
+        if amount >= 0:
+            b["earned"] += amount
+        else:
+            b["spent"] += abs(amount)
+
+    members: list[dict[str, Any]] = []
+    for uid in role_ids:
+        member = guild.get_member(uid)
+        p = profile_by_uid.get(uid, {})
+        n = need_by_uid.get(uid, {})
+        evs = event_stats.get(uid, {"responses": 0, "yes": 0, "maybe": 0, "no": 0})
+        voice = voice_by_uid.get(uid, {})
+        won = won_by_uid.get(uid, {"won_count": 0})
+        txs = tx_by_uid.get(uid, {"earned": 0.0, "spent": 0.0, "transactions": 0})
+        main_count = int(n.get("main_count") or len(n.get("main") or []) or 0) if isinstance(n, dict) else 0
+        secondary_count = int(n.get("secondary_count") or len(n.get("secondary") or []) or 0) if isinstance(n, dict) else 0
+        has_profile = uid in profile_by_uid
+        has_ec = uid in balance_by_uid
+        has_needs = uid in need_by_uid
+        voice_seconds = int(voice.get("total_seconds") or 0) if isinstance(voice, dict) else 0
+        risk_flags: list[str] = []
+        if not has_profile:
+            risk_flags.append("kein Profil")
+        if not has_ec:
+            risk_flags.append("kein EC-Konto")
+        if not has_needs:
+            risk_flags.append("keine Needliste")
+        if int(evs.get("responses") or 0) <= 0:
+            risk_flags.append("keine Eventantwort")
+        if voice_seconds <= 0:
+            risk_flags.append("keine Voice-Zeit")
+        members.append({
+            "user_id": uid,
+            "display_name": _safe_text(getattr(member, "display_name", "") or p.get("display_name") or p.get("ingame_name") or f"User {uid}", 120),
+            "ingame_name": _safe_text(p.get("ingame_name") if isinstance(p, dict) else "", 120),
+            "main_role": _safe_text(p.get("main_role") if isinstance(p, dict) else "", 80),
+            "gearscore": _safe_text(p.get("gearscore") if isinstance(p, dict) else "", 40),
+            "ec_balance": balance_by_uid.get(uid),
+            "has_profile": has_profile,
+            "has_ec": has_ec,
+            "has_needs": has_needs,
+            "main_need_count": main_count,
+            "secondary_need_count": secondary_count,
+            "event_responses": int(evs.get("responses") or 0),
+            "event_yes": int(evs.get("yes") or 0),
+            "event_maybe": int(evs.get("maybe") or 0),
+            "event_no": int(evs.get("no") or 0),
+            "voice_seconds": voice_seconds,
+            "voice_hours": round(voice_seconds / 3600, 2),
+            "voice_sessions": int(voice.get("sessions") or 0) if isinstance(voice, dict) else 0,
+            "ec_earned_loaded": round(float(txs.get("earned") or 0), 2),
+            "ec_spent_loaded": round(float(txs.get("spent") or 0), 2),
+            "ec_transactions_loaded": int(txs.get("transactions") or 0),
+            "loot_won_count": int(won.get("won_count") or 0),
+            "active_leads": int(leading_by_uid.get(uid, 0)),
+            "risk_flags": risk_flags,
+            "risk_score": len(risk_flags),
+        })
+
+    members.sort(key=lambda x: (-int(x.get("risk_score") or 0), str(x.get("display_name") or "").lower()))
+    top_main = sorted(main_need_counter.items(), key=lambda x: (-x[1], x[0].lower()))[:80]
+    top_secondary = sorted(secondary_need_counter.items(), key=lambda x: (-x[1], x[0].lower()))[:80]
+    winners = list(won_by_uid.values())
+    winners.sort(key=lambda x: (-int(x.get("won_count") or 0), str(x.get("user_id"))))
+    missing_profile = sum(1 for m in members if not m.get("has_profile"))
+    missing_ec = sum(1 for m in members if not m.get("has_ec"))
+    missing_needs = sum(1 for m in members if not m.get("has_needs"))
+    no_event_response = sum(1 for m in members if int(m.get("event_responses") or 0) <= 0)
+    no_voice = sum(1 for m in members if int(m.get("voice_seconds") or 0) <= 0)
+
+    return {
+        "generated_at": _now_iso(),
+        "member_count": len(members),
+        "quality": {
+            "missing_profile": missing_profile,
+            "missing_ec": missing_ec,
+            "missing_needs": missing_needs,
+            "no_event_response": no_event_response,
+            "no_voice_time": no_voice,
+        },
+        "members": members[:800],
+        "risk_members": [m for m in members if int(m.get("risk_score") or 0) > 0][:200],
+        "needs": {
+            "top_main": [{"label": k, "count": v} for k, v in top_main],
+            "top_secondary": [{"label": k, "count": v} for k, v in top_secondary],
+            "users_without_needs": [m for m in members if not m.get("has_needs")][:200],
+            "main_total": sum(main_need_counter.values()),
+            "secondary_total": sum(secondary_need_counter.values()),
+        },
+        "loot": {
+            "winner_rows": winners[:200],
+            "active_leaders": [{"user_id": uid, "lead_count": cnt} for uid, cnt in sorted(leading_by_uid.items(), key=lambda x: -x[1])[:100]],
+        },
+    }
+
 def build_dashboard_snapshot(bot: commands.Bot, guild: discord.Guild) -> dict[str, Any]:
     """Read-only Daten-Snapshot für das spätere Web-Dashboard.
 
@@ -1156,6 +1485,7 @@ def build_dashboard_snapshot(bot: commands.Bot, guild: discord.Guild) -> dict[st
             "database_url_kind": status.get("database_url_kind"),
         },
         "source_health": _source_health(),
+        "auth": _dashboard_auth_info(guild),
         "profiles": _summarize_profiles(sources.get("member_profiles"), guild),
         "events": _summarize_events(sources.get("events"), guild),
         "event_checks": _summarize_event_checks(sources.get("dkp_event_checks"), guild_id),
@@ -1172,6 +1502,7 @@ def build_dashboard_snapshot(bot: commands.Bot, guild: discord.Guild) -> dict[st
         "voice": _voice_summary(guild_id),
         "audit": _audit_summary(guild_id),
     }
+    snapshot["insights"] = _dashboard_insights(guild, snapshot)
     return snapshot
 
 
@@ -1282,6 +1613,46 @@ async def setup_dashboard_data(bot: commands.Bot, tree: app_commands.CommandTree
         except Exception as exc:
             await inter.followup.send(f"❌ Konnte Rolle nicht speichern: `{type(exc).__name__}: {exc}`", ephemeral=True)
 
+    @tree.command(name="dashboard_set_admin_role", description="Legt die Discord-Rolle fest, die im Web-Dashboard Admin ist.")
+    @app_commands.describe(role="Rolle, die Dashboard-Adminrechte haben soll")
+    async def dashboard_set_admin_role(inter: discord.Interaction, role: discord.Role):
+        if inter.guild is None:
+            await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
+            return
+        if not _is_admin(inter):
+            await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True)
+            return
+
+        await inter.response.defer(ephemeral=True)
+        try:
+            runtime_db.set_guild_setting(int(inter.guild.id), DASHBOARD_ADMIN_ROLE_SETTING, [int(role.id)])
+            try:
+                runtime_db.write_audit_log(
+                    guild_id=int(inter.guild.id),
+                    actor_id=int(inter.user.id),
+                    action="dashboard_admin_role_set",
+                    target_type="role",
+                    target_id=str(role.id),
+                    summary=f"Dashboard-Adminrolle gesetzt: {role.name}",
+                    new_value={"role_id": int(role.id), "role_name": role.name},
+                )
+            except Exception:
+                pass
+            snap = await asyncio.to_thread(build_dashboard_snapshot, bot, inter.guild)
+            try:
+                await asyncio.to_thread(runtime_db.save_dashboard_snapshot, guild_id=int(inter.guild.id), guild_name=inter.guild.name, snapshot=snap)
+            except Exception:
+                pass
+            count = len(getattr(role, "members", []) or [])
+            await inter.followup.send(
+                f"✅ Dashboard-Adminrolle gesetzt: {role.mention}\n"
+                f"Admin-User im Dashboard-Snapshot: **{count}**\n"
+                "Dashboard wurde aktualisiert.",
+                ephemeral=True,
+            )
+        except Exception as exc:
+            await inter.followup.send(f"❌ Konnte Adminrolle nicht speichern: `{type(exc).__name__}: {exc}`", ephemeral=True)
+
     @tree.command(name="dashboard_status", description="Zeigt den Status der read-only Dashboard-Datenbasis.")
     async def dashboard_status(inter: discord.Interaction):
         if inter.guild is None:
@@ -1386,4 +1757,4 @@ async def setup_dashboard_data(bot: commands.Bot, tree: app_commands.CommandTree
         emb = discord.Embed(title="📁 Dashboard-Quellen", description=txt, color=0xD6A84F)
         await inter.response.send_message(embed=emb, ephemeral=True)
 
-    print("📊 Dashboard-Datenlayer registriert: /dashboard_set_member_role, /dashboard_status, /dashboard_export, /dashboard_sources")
+    print("📊 Dashboard-Datenlayer registriert: /dashboard_set_member_role, /dashboard_set_admin_role, /dashboard_status, /dashboard_export, /dashboard_sources")
