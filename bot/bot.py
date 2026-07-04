@@ -23,6 +23,7 @@ intents.guilds = True
 intents.members = True
 intents.dm_messages = True
 intents.message_content = False
+intents.voice_states = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
@@ -47,6 +48,8 @@ setup_dkp_system = None
 setup_loot_auction = None
 setup_voice_creator = None
 setup_audit_system = None
+setup_voice_attendance = None
+setup_dashboard_data = None
 store = {}
 _modules_initialized = False
 
@@ -199,6 +202,24 @@ def _import_modules():
         from audit_system import setup_audit_system  # type: ignore
         print("✅ Import: audit_system (root)")
 
+    global setup_voice_attendance
+
+    try:
+        from bot.voice_attendance import setup_voice_attendance  # type: ignore
+        print("✅ Import: bot.voice_attendance")
+    except ModuleNotFoundError:
+        from voice_attendance import setup_voice_attendance  # type: ignore
+        print("✅ Import: voice_attendance (root)")
+
+    global setup_dashboard_data
+
+    try:
+        from bot.dashboard_data import setup_dashboard_data  # type: ignore
+        print("✅ Import: bot.dashboard_data")
+    except ModuleNotFoundError:
+        from dashboard_data import setup_dashboard_data  # type: ignore
+        print("✅ Import: dashboard_data (root)")
+
 
 def _get_token() -> str | None:
     for key in ("DISCORD_TOKEN", "DISCORD_BOT_TOKEN", "TOKEN"):
@@ -237,6 +258,8 @@ async def on_ready():
         # Alliance/Home-Server first, then the portal and its child modules.
         setup_steps = [
             ("audit_system", setup_audit_system),
+            ("voice_attendance", setup_voice_attendance),
+            ("dashboard_data", setup_dashboard_data),
             ("alliance_config", setup_alliance_config),
             ("event_rsvp_dm", setup_rsvp_dm),
             ("onboarding", setup_onboarding),
