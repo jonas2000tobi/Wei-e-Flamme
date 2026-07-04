@@ -30,7 +30,7 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
-ASSET_VER = "ebo-theme-2"
+ASSET_VER = "ebo-theme-root-1"
 
 
 def _database_url() -> str:
@@ -299,7 +299,7 @@ def _e(value: Any) -> str:
 
 
 def _asset(name: str) -> str:
-    return f"/static/ebo_theme/{name}?v={ASSET_VER}"
+    return f"/static/{name}?v={ASSET_VER}"
 
 
 def _dt(value: Any) -> str:
