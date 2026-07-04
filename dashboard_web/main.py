@@ -2754,6 +2754,187 @@ def _loot_center_payload_from_snapshot(snap: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+
+def _loot_words(value: Any) -> set[str]:
+    key = _loot_key(value)
+    return {t for t in re.split(r"[^a-z0-9äöüß]+", key) if len(t) >= 2}
+
+
+def _loot_match_score(query: str, candidate: Any) -> int:
+    """Einfacher robuster Item-Match für Truhen-/Drop-Checks."""
+    q = _loot_key(query)
+    c = _loot_key(candidate)
+    if not q or not c:
+        return 0
+    if q == c:
+        return 100
+    if q in c or c in q:
+        # "Aridus Stab" findet auch längere Ingame-Namen.
+        return 92
+    qw = _loot_words(q)
+    cw = _loot_words(c)
+    if not qw or not cw:
+        return 0
+    inter = len(qw & cw)
+    if inter <= 0:
+        return 0
+    # Wichtigere Wertung: wie viel vom Suchbegriff wurde getroffen?
+    coverage = inter / max(1, len(qw))
+    precision = inter / max(1, len(cw))
+    score = int(round((coverage * 0.75 + precision * 0.25) * 88))
+    # Bonus, wenn mindestens zwei Wörter übereinstimmen.
+    if inter >= 2:
+        score += 8
+    return min(score, 89)
+
+
+def _loot_check_payload_from_snapshot(snap: dict[str, Any], item_query: str = "") -> dict[str, Any]:
+    """Read-only Drop-/Truhencheck: Wer braucht ein Item und läuft dazu schon eine Auktion?"""
+    names = _profile_name_map(snap)
+    query = str(item_query or "").strip()
+    need_index = _loot_need_index(snap)
+    auctions_raw = [a for a in ((((snap.get("loot") or {}).get("auctions") or {}).get("items") or [])) if isinstance(a, dict)]
+
+    need_matches: list[dict[str, Any]] = []
+    for key, info in need_index.items():
+        item = info.get("item") or key
+        score = _loot_match_score(query, item) if query else 0
+        if query and score < 40:
+            continue
+        need_matches.append({
+            "item": item,
+            "score": score,
+            "main_count": len(info.get("main") or []),
+            "secondary_count": len(info.get("secondary") or []),
+            "main": info.get("main") or [],
+            "secondary": info.get("secondary") or [],
+        })
+
+    if query:
+        need_matches.sort(key=lambda r: (-int(r.get("score") or 0), -int(r.get("main_count") or 0), -int(r.get("secondary_count") or 0), str(r.get("item") or "").lower()))
+    else:
+        need_matches.sort(key=lambda r: (-int(r.get("main_count") or 0), -int(r.get("secondary_count") or 0), str(r.get("item") or "").lower()))
+        need_matches = need_matches[:50]
+
+    auction_matches: list[dict[str, Any]] = []
+    for a in auctions_raw:
+        item = _loot_text(a.get("item_name") or a.get("item") or a.get("name") or a.get("label") or a.get("auction_id"))
+        score = _loot_match_score(query, item) if query else 0
+        if query and score < 40:
+            continue
+        auction_matches.append({
+            "auction_id": str(a.get("auction_id") or a.get("id") or ""),
+            "item": item or str(a.get("auction_id") or "—"),
+            "score": score,
+            "status": str(a.get("status") or "—"),
+            "phase": str(a.get("phase") or "—"),
+            "mode": _loot_mode_bucket(a),
+            "active": _loot_is_active(a),
+            "bid_count": _loot_bid_count(a),
+            "leader": _loot_leader_text(a, names),
+            "winner": _loot_winner_cell(a, names),
+            "ends_at": a.get("ends_at") or a.get("expires_at") or a.get("end_at"),
+            "next_step": _loot_next_step(a, need_index.get(_loot_key(item))),
+            "raw": a,
+        })
+    auction_matches.sort(key=lambda r: (not bool(r.get("active")), -int(r.get("score") or 0), _dt(r.get("ends_at")), str(r.get("item") or "").lower()))
+
+    best = need_matches[0] if need_matches else None
+    active_auction_count = sum(1 for a in auction_matches if a.get("active"))
+    main_total = sum(int(m.get("main_count") or 0) for m in need_matches[:5]) if query else 0
+    sec_total = sum(int(m.get("secondary_count") or 0) for m in need_matches[:5]) if query else 0
+
+    if not query:
+        verdict = "Item eingeben"
+        next_step = "Gib oben ein gedropptes Item ein, z. B. Aridus Stab."
+    elif active_auction_count > 0:
+        verdict = "Auktion läuft bereits"
+        next_step = "Erst vorhandene Auktion prüfen, bevor du eine neue Aktion startest."
+    elif best and int(best.get("score") or 0) >= 70 and int(best.get("main_count") or 0) > 0:
+        verdict = "Main-Need vorhanden"
+        next_step = "Nicht frei verkaufen. Main-Need-Spieler/Auktion prüfen."
+    elif best and int(best.get("score") or 0) >= 70 and int(best.get("secondary_count") or 0) > 0:
+        verdict = "Nur Second-Need sichtbar"
+        next_step = "Second-Need oder freie Auktion nach euren Regeln prüfen."
+    elif need_matches:
+        verdict = "Ähnliche Treffer prüfen"
+        next_step = "Name weicht ab. Bitte Treffer manuell vergleichen, bevor du Sale/freie Auktion machst."
+    else:
+        verdict = "Kein Need gefunden"
+        next_step = "Nach Snapshot aktuell kein Main-/Second-Need sichtbar. Freie Auktion/Sale möglich, wenn eure Regeln passen."
+
+    return {
+        "query": query,
+        "verdict": verdict,
+        "next_step": next_step,
+        "main_total_top_matches": main_total,
+        "secondary_total_top_matches": sec_total,
+        "active_auction_count": active_auction_count,
+        "need_matches": need_matches,
+        "auction_matches": auction_matches,
+    }
+
+
+def _render_loot_check(data: dict[str, Any], item_query: str = "") -> str:
+    if not data.get("ok"):
+        return _html_shell("Truhencheck · Ebo Dashboard", f"<section class='panel'><h1>🔎 Truhencheck</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+    snap: dict[str, Any] = data.get("snapshot") or {}
+    check = _loot_check_payload_from_snapshot(snap, item_query)
+    names = _profile_name_map(snap)
+
+    q = check.get("query") or ""
+    cards = "".join([
+        _card("Ergebnis", check.get("verdict"), check.get("next_step")),
+        _card("Main", check.get("main_total_top_matches", 0), "in besten Treffern"),
+        _card("Second", check.get("secondary_total_top_matches", 0), "in besten Treffern"),
+        _card("Aktive Auktion", check.get("active_auction_count", 0), "passend zum Item"),
+    ])
+
+    need_rows = []
+    for n in check.get("need_matches") or []:
+        need_rows.append([
+            n.get("item"),
+            n.get("score") if q else "—",
+            n.get("main_count"),
+            _loot_people_html(n.get("main") or [], limit=12),
+            n.get("secondary_count"),
+            _loot_people_html(n.get("secondary") or [], limit=12),
+        ])
+
+    auction_rows = []
+    for a in check.get("auction_matches") or []:
+        aid = a.get("auction_id")
+        auction_rows.append([
+            _auction_link(aid, a.get("item")) if aid else a.get("item"),
+            a.get("score") if q else "—",
+            a.get("mode"),
+            _loot_status_label(a.get("status")),
+            a.get("bid_count"),
+            a.get("leader"),
+            a.get("winner") if isinstance(a.get("winner"), dict) else a.get("winner"),
+            _dt(a.get("ends_at")),
+            a.get("next_step"),
+        ])
+
+    form_value = _e(q)
+    csv_link = f"/export/loot_check.csv?item={urllib.parse.quote(q)}" if q else "/export/loot_check.csv"
+    body = f"""
+    <nav class="topnav"><a href="/">← Übersicht</a><a href="/loot">Loot</a><a href="/needs">Needs</a><a href="/members">Mitglieder</a><a href="/api/loot-check?item={urllib.parse.quote(q)}">API</a></nav>
+    <section class="hero"><div><div class="eyebrow">Loot-Truhencheck</div><h1>🔎 Item prüfen</h1><p class="muted">Prüft ein gedropptes Item gegen Main-/Second-Needs und laufende Auktionen. Read-only, keine Bot-Daten werden verändert.</p></div><a class="btn" href="{_e(csv_link)}">CSV herunterladen</a></section>
+    <section class="panel">
+      <h2>Item suchen</h2>
+      <form method="get" action="/loot-check" style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
+        <input name="item" value="{form_value}" placeholder="z. B. Aridus Stab" style="min-width:280px;flex:1;padding:12px;border-radius:12px;border:1px solid rgba(255,255,255,.16);background:rgba(0,0,0,.22);color:inherit">
+        <button class="btn" type="submit">Prüfen</button>
+      </form>
+      <p class="muted">Tipp: Teilnamen gehen auch. Bei abweichenden Ingame-Namen zeigt der Check ähnliche Treffer zur manuellen Prüfung.</p>
+    </section>
+    <section class="grid">{cards}</section>
+    <section class="panel"><h2>🎯 Need-Treffer</h2>{_table(['Item','Match','Main','Main-Spieler','Second','Second-Spieler'], need_rows, placeholder='Need-Treffer durchsuchen…')}</section>
+    <section class="panel"><h2>🏷️ Passende Auktionen</h2>{_table(['Item','Match','Bereich','Status','Gebote','Führend','Gewinner','Ende','Nächster Schritt'], auction_rows, placeholder='Auktionen durchsuchen…')}</section>
+    """
+    return _html_shell("Truhencheck · Ebo Dashboard", body)
+
 def _render_loot_center(data: dict[str, Any]) -> str:
     if not data.get("ok"):
         return _html_shell("Loot · Ebo Dashboard", f"<section class='panel'><h1>🎁 Loot</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
@@ -2842,9 +3023,10 @@ def _render_loot_center(data: dict[str, Any]) -> str:
         ])
 
     body = f"""
-    <nav class="topnav"><a href="/">← Übersicht</a><a href="/loot">Loot</a><a href="/needs">Needs</a><a href="/members">Mitglieder</a><a href="/fairness">Fairness</a><a href="/exports">Exports</a><a href="/api/loot-center">API</a></nav>
+    <nav class="topnav"><a href="/">← Übersicht</a><a href="/loot">Loot</a><a href="/loot-check">Truhencheck</a><a href="/needs">Needs</a><a href="/members">Mitglieder</a><a href="/fairness">Fairness</a><a href="/exports">Exports</a><a href="/api/loot-center">API</a></nav>
     <section class="hero"><div><div class="eyebrow">Loot-Zentrale</div><h1>🎁 Loot / Auktionen</h1><p class="muted">Kontrollzentrum für aktive Auktionen, offene Übergaben, Gebote und Need-Spieler. Read-only, keine Bot-Daten werden verändert.</p></div><a class="btn" href="/export/loot_center.csv">CSV herunterladen</a></section>
     <section class="grid">{cards}</section>
+    <section class="panel"><h2>🔎 Schneller Truhencheck</h2><form method="get" action="/loot-check" style="display:flex;gap:10px;flex-wrap:wrap;align-items:center"><input name="item" placeholder="Itemname eingeben, z. B. Aridus Stab" style="min-width:280px;flex:1;padding:12px;border-radius:12px;border:1px solid rgba(255,255,255,.16);background:rgba(0,0,0,.22);color:inherit"><button class="btn" type="submit">Need prüfen</button></form><p class="muted">Prüft Main-/Second-Needs und ob dazu schon eine Auktion läuft.</p></section>
     <section class="panel"><h2>🔥 Nächste Loot-Aktionen</h2><p class="muted">Das ist die Arbeitsliste: Übergaben, offene Auktionen, Sale/Freie-Auktion-Kandidaten und aktive Auktionen ohne Gebote.</p>{_table(['Item','Bereich','Status','Gebote','Führend','Gewinner','Ende','Nächster Schritt'], action_rows, placeholder='Aktionen durchsuchen…')}</section>
     <section class="panel"><h2>🟢 Aktive Auktionen</h2>{_table(['Item','Bereich','Status','Gebote','Führend','Main/Second Need','Ende'], active_rows, placeholder='Aktive Auktionen durchsuchen…')}</section>
     <section class="split"><div class="panel"><h2>🏁 Übergabe offen</h2>{_table(['Item','Gewinner','Führend','Ende','Nächster Schritt'], handover_rows, placeholder='Übergaben durchsuchen…')}</div><div class="panel"><h2>🟡 Ohne Gebot / Sale prüfen</h2>{_table(['Item','Bereich','Main/Second Need','Ende','Hinweis'], no_bid_rows, placeholder='Ohne Gebot durchsuchen…')}</div></section>
@@ -3615,6 +3797,15 @@ def loot_page(_: bool = Depends(_auth)):
         return HTMLResponse(_html_shell("Ebo Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"), status_code=500)
 
 
+
+
+@app.get("/loot-check", response_class=HTMLResponse)
+def loot_check_page(item: str = "", _: bool = Depends(_auth)):
+    try:
+        return HTMLResponse(_render_loot_check(_snapshot_payload(), item))
+    except Exception as exc:
+        return HTMLResponse(_html_shell("Ebo Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"), status_code=500)
+
 @app.get("/exports", response_class=HTMLResponse)
 def exports_page(_: bool = Depends(_auth)):
     try:
@@ -3689,6 +3880,23 @@ def export_auctions_csv(_: bool = Depends(_auth)):
     return _csv_response("auctions.csv", ["auction_id","item","phase","status","bids","leader","leader_bid","winner","ends_at"], rows)
 
 
+
+
+@app.get("/api/loot-check")
+def api_loot_check(item: str = "", _: bool = Depends(_auth)):
+    payload = _snapshot_payload()
+    if not payload.get("ok"):
+        return JSONResponse(payload, status_code=404)
+    snap = payload.get("snapshot") or {}
+    check = _loot_check_payload_from_snapshot(snap, item)
+    safe = {}
+    for key, value in check.items():
+        if isinstance(value, list):
+            safe[key] = [{k: v for k, v in row.items() if k != "raw"} if isinstance(row, dict) else row for row in value]
+        else:
+            safe[key] = value
+    return JSONResponse({"ok": True, "loot_check": safe})
+
 @app.get("/api/loot-center")
 def api_loot_center(_: bool = Depends(_auth)):
     payload = _snapshot_payload()
@@ -3705,6 +3913,28 @@ def api_loot_center(_: bool = Depends(_auth)):
             safe[key] = value
     return JSONResponse({"ok": True, "loot_center": safe})
 
+
+
+
+@app.get("/export/loot_check.csv")
+def export_loot_check_csv(item: str = "", _: bool = Depends(_auth)):
+    payload = _snapshot_payload()
+    snap = payload.get("snapshot") or {}
+    check = _loot_check_payload_from_snapshot(snap, item)
+    rows = []
+    for n in check.get("need_matches") or []:
+        rows.append([
+            check.get("query") or "",
+            n.get("item"),
+            n.get("score") if check.get("query") else "",
+            n.get("main_count"),
+            ", ".join(str(p.get("display_name") or p.get("user_id") or "") for p in (n.get("main") or []) if isinstance(p, dict)),
+            n.get("secondary_count"),
+            ", ".join(str(p.get("display_name") or p.get("user_id") or "") for p in (n.get("secondary") or []) if isinstance(p, dict)),
+            check.get("verdict"),
+            check.get("next_step"),
+        ])
+    return _csv_response("loot_check.csv", ["suche","item","match","main_count","main_spieler","secondary_count","secondary_spieler","ergebnis","naechster_schritt"], rows)
 
 @app.get("/export/loot_center.csv")
 def export_loot_center_csv(_: bool = Depends(_auth)):
