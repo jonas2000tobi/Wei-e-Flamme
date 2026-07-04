@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Any
@@ -1437,6 +1438,283 @@ async def _post_event_check(client: discord.Client, guild_id: int, event_id: str
     return True
 
 
+
+# ---------------------------------------------------------------------------
+# Dashboard → Bot EC-Buchungsqueue
+# ---------------------------------------------------------------------------
+# Dashboard-Web schreibt nur Postgres-Anfragen. Nur dieser Bot schreibt echte
+# dkp_balances.json / dkp_transactions.json. Damit bleiben produktive JSON-Daten
+# beim Bot und werden nicht vom Web-Service lokal kaputtgeschrieben.
+
+
+def _dash_database_url() -> str:
+    return str(os.getenv("DATABASE_URL") or "").strip()
+
+
+def _dash_normalized_database_url() -> str:
+    url = _dash_database_url()
+    if url.startswith("postgres://"):
+        return "postgresql://" + url[len("postgres://"):]
+    return url
+
+
+def _dash_pg_connect():
+    import psycopg  # type: ignore
+    from psycopg.rows import dict_row  # type: ignore
+    return psycopg.connect(_dash_normalized_database_url(), row_factory=dict_row, connect_timeout=10)
+
+
+def _dashboard_queue_enabled() -> bool:
+    url = _dash_database_url().lower()
+    return url.startswith("postgres://") or url.startswith("postgresql://")
+
+
+def _ensure_dashboard_ec_award_table() -> None:
+    if not _dashboard_queue_enabled():
+        return
+    conn = _dash_pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS dashboard_ec_award_requests (
+                    id BIGSERIAL PRIMARY KEY,
+                    request_id TEXT NOT NULL UNIQUE,
+                    guild_id BIGINT NOT NULL,
+                    event_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    full_ec DOUBLE PRECISION NOT NULL DEFAULT 0,
+                    partial_ec DOUBLE PRECISION NOT NULL DEFAULT 0,
+                    payload_json TEXT NOT NULL DEFAULT '{}',
+                    actor_id TEXT,
+                    actor_name TEXT,
+                    requested_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    claimed_at TIMESTAMPTZ,
+                    processed_at TIMESTAMPTZ,
+                    result_json TEXT
+                )
+                """
+            )
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_dashboard_ec_award_requests_lookup
+                ON dashboard_ec_award_requests (guild_id, event_id, status, requested_at DESC)
+                """
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _claim_dashboard_ec_award_requests(limit: int = 3) -> list[dict]:
+    if not _dashboard_queue_enabled():
+        return []
+    _ensure_dashboard_ec_award_table()
+    conn = _dash_pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE dashboard_ec_award_requests
+                SET status = 'processing', claimed_at = NOW()
+                WHERE id IN (
+                    SELECT id
+                    FROM dashboard_ec_award_requests
+                    WHERE status = 'pending'
+                    ORDER BY requested_at ASC, id ASC
+                    LIMIT %s
+                    FOR UPDATE SKIP LOCKED
+                )
+                RETURNING *
+                """,
+                (int(limit),),
+            )
+            rows = [dict(r) for r in (cur.fetchall() or [])]
+        conn.commit()
+        return rows
+    finally:
+        conn.close()
+
+
+def _finish_dashboard_ec_award_request(request_id: str, status: str, result: dict) -> None:
+    if not _dashboard_queue_enabled() or not request_id:
+        return
+    _ensure_dashboard_ec_award_table()
+    conn = _dash_pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE dashboard_ec_award_requests
+                SET status = %s, processed_at = NOW(), result_json = %s
+                WHERE request_id = %s
+                """,
+                (str(status), json.dumps(result or {}, ensure_ascii=False, separators=(",", ":")), str(request_id)),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+class _DashboardActor:
+    def __init__(self, actor_id: int, name: str):
+        self.id = int(actor_id or 0)
+        self.name = str(name or "Dashboard")
+        self.display_name = self.name
+
+    def __str__(self) -> str:
+        return self.name
+
+
+def _dashboard_ec_award_embed(payload: dict, applied: list[dict], skipped: list[dict], actor_name: str) -> discord.Embed:
+    event_title = str(payload.get("event_title") or payload.get("event_id") or "Event")
+    event_type = str(payload.get("event_type") or "Dashboard Attendance")
+    emb = discord.Embed(title="🌐 EC über Dashboard gebucht", color=discord.Color.green())
+    emb.description = f"**{event_title}**\nTyp: **{event_type}**\nQuelle: Attendance Review im Web-Dashboard"
+    total = sum(int(x.get("amount", 0) or 0) for x in applied)
+    lines = []
+    for row in applied[:25]:
+        uid = int(row.get("user_id", 0) or 0)
+        amount = int(row.get("amount", 0) or 0)
+        requested = int(row.get("requested_amount", amount) or amount)
+        suffix = f" (Limit: statt {requested} EC)" if amount < requested else ""
+        lines.append(f"• <@{uid}>: **+{amount} EC**{suffix}")
+    if len(applied) > 25:
+        lines.append(f"… {len(applied) - 25} weitere")
+    emb.add_field(name="Gebucht", value="\n".join(lines)[:1000] if lines else "—", inline=False)
+    if skipped:
+        slines = []
+        for row in skipped[:20]:
+            name = str(row.get("display_name") or row.get("user_id") or "Unbekannt")
+            reason = str(row.get("reason") or "übersprungen")
+            slines.append(f"• {name}: {reason}")
+        emb.add_field(name="Übersprungen", value="\n".join(slines)[:1000], inline=False)
+    emb.add_field(name="Summe", value=f"**{total} EC** an **{len(applied)}** Spieler", inline=False)
+    emb.set_footer(text=f"Ausgeführt von {actor_name or 'Dashboard'} • {datetime.now(TZ).strftime('%d.%m.%Y %H:%M')}")
+    return emb
+
+
+async def _process_dashboard_ec_award_request(client: discord.Client, row: dict) -> None:
+    request_id = str(row.get("request_id") or "")
+    try:
+        guild_id = int(row.get("guild_id", 0) or 0)
+        event_id = str(row.get("event_id") or "")
+        event_type = str(row.get("event_type") or "Dashboard Attendance").strip() or "Dashboard Attendance"
+        payload = json.loads(row.get("payload_json") or "{}")
+        if not isinstance(payload, dict):
+            raise RuntimeError("payload_json ist kein Objekt")
+        rows = [x for x in (payload.get("rows") or []) if isinstance(x, dict)]
+        actor_raw = payload.get("requested_by") if isinstance(payload.get("requested_by"), dict) else {}
+        actor_id = int(actor_raw.get("id") or row.get("actor_id") or 0)
+        actor_name = str(actor_raw.get("name") or row.get("actor_name") or "Dashboard")
+
+        home_id = _home_guild_id(default=guild_id)
+        if int(guild_id) != int(home_id):
+            _finish_dashboard_ec_award_request(request_id, "rejected", {"ok": False, "error": "EC wird nur auf dem Ebolus/Home-Server gebucht.", "guild_id": guild_id, "home_id": home_id})
+            return
+
+        if _event_has_ec_award_for_event(int(home_id), event_id):
+            _finish_dashboard_ec_award_request(request_id, "rejected", {"ok": False, "error": "Doppelbuchung blockiert: Für dieses Event gibt es bereits event_award-Transaktionen.", "event_id": event_id})
+            return
+
+        applied: list[dict] = []
+        skipped: list[dict] = []
+        for item in rows:
+            try:
+                uid = int(item.get("user_id", 0) or 0)
+            except Exception:
+                uid = 0
+            requested_amount = int(round(float(item.get("ec_gain", 0) or 0)))
+            if not uid:
+                skipped.append({**item, "reason": "keine User-ID"})
+                continue
+            if requested_amount <= 0:
+                skipped.append({**item, "reason": "0 EC"})
+                continue
+            if not _is_ebolus_member(client, int(home_id), uid):
+                skipped.append({**item, "reason": "keine Ebolus-Gildenrolle / nicht im Home-Server"})
+                continue
+            tx = _add_transaction(
+                int(home_id),
+                uid,
+                requested_amount,
+                f"Dashboard Attendance Review: {payload.get('event_title', 'Event')} ({event_type})",
+                actor_id,
+                "event_award",
+                event_id=event_id,
+                meta={
+                    "event_type": event_type,
+                    "event_title": str(payload.get("event_title") or "Event"),
+                    "target_name": str(item.get("display_name") or ""),
+                    "signup": str(item.get("signup") or ""),
+                    "review_status": str(item.get("status") or ""),
+                    "voice_minutes": item.get("voice_minutes"),
+                    "dashboard_request_id": request_id,
+                    "source": "dashboard_attendance_review",
+                },
+            )
+            actual = int(tx.get("amount", 0) or 0)
+            applied.append({
+                "user_id": uid,
+                "display_name": str(item.get("display_name") or f"User {uid}"),
+                "requested_amount": requested_amount,
+                "amount": actual,
+                "balance_before": int(tx.get("balance_before", 0) or 0),
+                "balance_after": int(tx.get("balance_after", 0) or 0),
+                "tx_id": str(tx.get("id") or ""),
+                "limited": actual < requested_amount,
+            })
+
+        if not applied:
+            _finish_dashboard_ec_award_request(request_id, "failed", {"ok": False, "error": "Keine EC-Buchung angewendet.", "skipped": skipped})
+            return
+
+        st = _event_check_state(int(home_id), event_id)
+        st["awarded"] = True
+        st["awarded_at"] = _now_iso()
+        st["awarded_source"] = "dashboard"
+        st["dashboard_request_id"] = request_id
+        _gchecks(int(home_id)).setdefault("events", {})[str(event_id)] = st
+        save_event_checks()
+
+        try:
+            emb = _dashboard_ec_award_embed(payload, applied, skipped, actor_name)
+            await _log_to_channel(client, int(home_id), emb)
+        except Exception as e:
+            print(f"[dkp_system] Dashboard-EC Log-Embed Fehler: {e!r}", flush=True)
+
+        _finish_dashboard_ec_award_request(request_id, "done", {
+            "ok": True,
+            "event_id": event_id,
+            "event_type": event_type,
+            "applied_count": len(applied),
+            "skipped_count": len(skipped),
+            "total_ec": sum(int(x.get("amount", 0) or 0) for x in applied),
+            "applied": applied,
+            "skipped": skipped,
+        })
+    except Exception as e:
+        print(f"[dkp_system] Dashboard-EC Request Fehler {request_id}: {e!r}", flush=True)
+        _finish_dashboard_ec_award_request(request_id, "failed", {"ok": False, "error": repr(e)})
+
+
+@tasks.loop(minutes=1)
+async def dashboard_ec_award_request_loop():
+    client = getattr(dashboard_ec_award_request_loop, "_client", None)
+    if client is None:
+        return
+    if not _dashboard_queue_enabled():
+        return
+    try:
+        rows = _claim_dashboard_ec_award_requests(limit=3)
+    except Exception as e:
+        print(f"[dkp_system] Dashboard-EC Queue konnte nicht gelesen werden: {e!r}", flush=True)
+        return
+    for row in rows:
+        await _process_dashboard_ec_award_request(client, row)
+
+
 @tasks.loop(minutes=5)
 async def dkp_event_check_loop():
     client = getattr(dkp_event_check_loop, "_client", None)
@@ -1495,6 +1773,13 @@ def _import_rsvp():
 def _event_has_dkp_already(guild_id: int, event_id: str, event_type: str) -> bool:
     for tx in _gtx(guild_id):
         if str(tx.get("event_id", "")) == str(event_id) and str((tx.get("meta") or {}).get("event_type", "")) == str(event_type) and str(tx.get("type")) == "event_award":
+            return True
+    return False
+
+
+def _event_has_ec_award_for_event(guild_id: int, event_id: str) -> bool:
+    for tx in _gtx(guild_id):
+        if str(tx.get("event_id", "")) == str(event_id) and str(tx.get("type")) == "event_award":
             return True
     return False
 
@@ -1964,6 +2249,11 @@ async def setup_dkp_system(client: discord.Client, tree: app_commands.CommandTre
         dkp_event_check_loop._client = client  # type: ignore[attr-defined]
         dkp_event_check_loop.start()
         print("💰 EC-Eventcheck-Task gestartet.")
+
+    if not dashboard_ec_award_request_loop.is_running():
+        dashboard_ec_award_request_loop._client = client  # type: ignore[attr-defined]
+        dashboard_ec_award_request_loop.start()
+        print("🌐 Dashboard-EC-Buchungsqueue gestartet.")
 
     tree.add_command(dkp)
     print("💰 DKP-System geladen: /dkp Command-Gruppe aktiv.")
