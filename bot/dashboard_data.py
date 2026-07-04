@@ -439,6 +439,8 @@ def _summarize_events(data: Any, guild: discord.Guild, *, limit: int = 200) -> d
                 "voice_enabled": bool(ev.get("voice_enabled")),
                 "voice_channel_id": int(ev.get("voice_channel_id", 0) or 0),
                 "voice_last_channel_id": int(ev.get("voice_last_channel_id", 0) or 0),
+                "dkp_enabled": bool(ev.get("dkp_enabled", False)),
+                "dkp_event_type": _safe_text(ev.get("dkp_event_type") or ev.get("event_type") or ev.get("dkp_type") or "", 80),
                 "yes_counts": role_counts,
                 "maybe_count": len(participant_detail.get("maybe") or []),
                 "no_count": len(participant_detail.get("no") or []),
