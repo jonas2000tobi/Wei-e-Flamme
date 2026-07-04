@@ -431,6 +431,33 @@ def _ensure_admin_tables() -> None:
                 )
                 """
             )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS dashboard_ec_award_requests (
+                    id BIGSERIAL PRIMARY KEY,
+                    request_id TEXT NOT NULL UNIQUE,
+                    guild_id BIGINT NOT NULL,
+                    event_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    full_ec DOUBLE PRECISION NOT NULL DEFAULT 0,
+                    partial_ec DOUBLE PRECISION NOT NULL DEFAULT 0,
+                    payload_json TEXT NOT NULL DEFAULT '{}',
+                    actor_id TEXT,
+                    actor_name TEXT,
+                    requested_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    claimed_at TIMESTAMPTZ,
+                    processed_at TIMESTAMPTZ,
+                    result_json TEXT
+                )
+                """
+            )
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_dashboard_ec_award_requests_lookup
+                ON dashboard_ec_award_requests (guild_id, event_id, status, requested_at DESC)
+                """
+            )
         conn.commit()
     finally:
         conn.close()
@@ -4076,32 +4103,215 @@ def api_attendance_review(event_id: str, _: bool = Depends(_auth)):
 
 
 # ---------------------------------------------------------------------------
-# Ebene 3 / Schritt 3: EC-Vorschau aus Anwesenheits-Review
+# Ebene 3 / Schritt 3+4: EC-Vorschau + echte EC-Buchung über Bot-Queue
 # ---------------------------------------------------------------------------
-# Weiterhin sicher: Das Dashboard berechnet nur eine Vorschau und CSV/Copy-Text.
-# Es wird KEIN EC gebucht, KEINE Bot-JSON verändert und KEINE Discord-Message editiert.
+# Wichtig: Dashboard-Web und Discord-Bot laufen als getrennte Railway-Services.
+# Darum schreibt das Dashboard NICHT direkt in Bot-JSON-Dateien.
+# Stattdessen legt es eine geprüfte Buchungsanfrage in Postgres ab.
+# Der Bot verarbeitet diese Anfrage und bucht dann in seinem echten EC-/DKP-System.
 
+
+
+def _event_dkp_type(event: dict[str, Any]) -> str:
+    for key in ("dkp_event_type", "event_type", "dkp_type", "ec_event_type"):
+        value = str((event or {}).get(key) or "").strip()
+        if value and value != "Nicht DKP-relevant":
+            return value
+    return "Dashboard Attendance"
+
+
+def _snapshot_event_points(snap: dict[str, Any]) -> dict[str, float]:
+    out: dict[str, float] = {}
+    settings = ((snap.get("settings") or {}).get("settings") or [])
+    if isinstance(settings, list):
+        for row in settings:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("source") or "") != "dkp_cfg":
+                continue
+            key = str(row.get("key") or "")
+            if ".event_points." not in key:
+                continue
+            event_type = key.rsplit(".event_points.", 1)[-1].strip()
+            if not event_type:
+                continue
+            amount = _num(row.get("value"), 0)
+            if amount > 0:
+                out[event_type] = amount
+    # Fallbacks aus dem aktuellen Bot-Default. Bleibt rein als UI-Vorschlag.
+    out.setdefault("Gildenboss", 20.0)
+    out.setdefault("HM Raid", 12.0)
+    out.setdefault("NM Raid", 12.0)
+    out.setdefault("Normal Raid", 12.0)
+    out.setdefault("Übungsrun HM Raid", 15.0)
+    out.setdefault("Übungsrun Trials", 15.0)
+    out.setdefault("Segensstein PvP", 5.0)
+    return out
+
+
+def _event_award_state(snap: dict[str, Any], event_id: str) -> dict[str, Any]:
+    txs = _ec_transactions(snap)
+    recent = txs.get("items") or txs.get("recent") or []
+    hits = []
+    for tx in recent:
+        if not isinstance(tx, dict):
+            continue
+        if str(tx.get("event_id") or "") != str(event_id):
+            continue
+        if str(tx.get("raw_type") or "") != "event_award":
+            continue
+        hits.append(tx)
+    total = sum(_num(tx.get("amount"), 0) for tx in hits)
+    return {"awarded": bool(hits), "count": len(hits), "total": total, "latest": hits[0] if hits else {}}
+
+
+def _latest_ec_award_request(guild_id: int, event_id: str) -> dict[str, Any]:
+    if not _database_url() or not guild_id or not event_id:
+        return {}
+    _ensure_attendance_review_tables()
+    conn = _pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, request_id, guild_id, event_id, event_type, status, full_ec, partial_ec,
+                       actor_id, actor_name, requested_at, claimed_at, processed_at, result_json
+                FROM dashboard_ec_award_requests
+                WHERE guild_id = %s AND event_id = %s
+                ORDER BY requested_at DESC, id DESC
+                LIMIT 1
+                """,
+                (int(guild_id), str(event_id)),
+            )
+            row = cur.fetchone()
+            if not row:
+                return {}
+            out = dict(row)
+            try:
+                out["result"] = json.loads(out.get("result_json") or "{}")
+            except Exception:
+                out["result"] = {}
+            return out
+    finally:
+        conn.close()
+
+
+def _active_ec_award_request(guild_id: int, event_id: str) -> dict[str, Any]:
+    if not _database_url() or not guild_id or not event_id:
+        return {}
+    _ensure_attendance_review_tables()
+    conn = _pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, request_id, guild_id, event_id, event_type, status, full_ec, partial_ec,
+                       actor_id, actor_name, requested_at, claimed_at, processed_at, result_json
+                FROM dashboard_ec_award_requests
+                WHERE guild_id = %s AND event_id = %s AND status IN ('pending', 'processing', 'done')
+                ORDER BY requested_at DESC, id DESC
+                LIMIT 1
+                """,
+                (int(guild_id), str(event_id)),
+            )
+            row = cur.fetchone()
+            return dict(row) if row else {}
+    finally:
+        conn.close()
+
+
+def _enqueue_ec_award_request(guild_id: int, event_id: str, event_type: str, preview: dict[str, Any], actor: dict[str, Any]) -> dict[str, Any]:
+    if not _database_url():
+        return {"ok": False, "error": "DATABASE_URL fehlt. Ohne Postgres kann das Dashboard keine Bot-Buchung anstoßen."}
+    if not guild_id or not event_id:
+        return {"ok": False, "error": "Guild/Event fehlt."}
+    rows = [r for r in (preview.get("rows") or []) if isinstance(r, dict) and _num(r.get("ec_gain"), 0) > 0 and _user_id(r.get("user_id"))]
+    if not rows:
+        return {"ok": False, "error": "Keine Spieler mit EC-Gutschrift in der Vorschau."}
+    existing = _active_ec_award_request(guild_id, event_id)
+    if existing:
+        return {"ok": False, "error": f"Für dieses Event gibt es bereits eine EC-Anfrage mit Status {existing.get('status')}. Keine Doppelbuchung."}
+    request_id = f"dash-ec-{int(time.time())}-{secrets.token_hex(6)}"
+    actor_id = str(actor.get("user_id") or "")
+    actor_name = str(actor.get("username") or actor.get("user_id") or "Dashboard")
+    payload = {
+        "event_id": str(event_id),
+        "event_type": str(event_type or "Dashboard Attendance"),
+        "event_title": str((preview.get("event") or {}).get("title") or event_id),
+        "full_ec": _num(preview.get("full_ec"), 0),
+        "partial_ec": _num(preview.get("partial_ec"), 0),
+        "total_ec": _num(preview.get("total_ec"), 0),
+        "recipient_count": len(rows),
+        "review_status": str(preview.get("review_status") or ""),
+        "review_updated_at": str(preview.get("review_updated_at") or ""),
+        "rows": rows,
+        "requested_by": {"id": actor_id, "name": actor_name},
+        "requested_at": datetime.now(timezone.utc).isoformat(),
+        "source": "dashboard_attendance_review",
+    }
+    _ensure_attendance_review_tables()
+    conn = _pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO dashboard_ec_award_requests
+                    (request_id, guild_id, event_id, event_type, status, full_ec, partial_ec, payload_json, actor_id, actor_name, requested_at)
+                VALUES (%s, %s, %s, %s, 'pending', %s, %s, %s, %s, %s, NOW())
+                RETURNING id, request_id, status
+                """,
+                (
+                    request_id,
+                    int(guild_id),
+                    str(event_id),
+                    str(event_type or "Dashboard Attendance"),
+                    float(preview.get("full_ec") or 0),
+                    float(preview.get("partial_ec") or 0),
+                    json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                    actor_id,
+                    actor_name,
+                ),
+            )
+            row = dict(cur.fetchone() or {})
+            cur.execute(
+                """
+                INSERT INTO dashboard_admin_action_log
+                    (guild_id, action_type, target_type, target_id, actor_id, actor_name, payload_json)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """,
+                (int(guild_id), "ec_award_request_create", "event", str(event_id), actor_id, actor_name, json.dumps({"request_id": request_id, "event_type": event_type, "recipients": len(rows), "total_ec": preview.get("total_ec")}, ensure_ascii=False)),
+            )
+        conn.commit()
+        return {"ok": True, "request": row, "request_id": request_id}
+    finally:
+        conn.close()
 
 def _event_ec_defaults(snap: dict[str, Any], event: dict[str, Any]) -> dict[str, Any]:
-    """Versucht einen EC-Wert aus Snapshot/Event zu erkennen, bleibt aber konservativ.
+    """Versucht den EC-Wert aus Eventtyp/Snapshot/Eventfeldern zu erkennen.
 
-    Viele Bot-Versionen speichern EC-Werte unterschiedlich. Für die Web-Vorschau ist
-    ein manuell überschreibbarer Default sicherer als blind falsche Punkte zu buchen.
+    Der Wert bleibt in der UI überschreibbar. Echte Buchung läuft später über
+    die Bot-Queue und wird dort erneut gegen Doppelbuchung geprüft.
     """
-    candidates: list[Any] = []
-    for key in ("ec_value", "dkp_value", "points", "reward_points", "attendance_points", "full_ec", "ec_full", "dkp_points"):
-        if isinstance(event, dict) and event.get(key) not in (None, ""):
-            candidates.append(event.get(key))
-    full = 0.0
-    detected_from = "manuell"
-    for val in candidates:
-        n = _num(val, 0)
-        if n > 0:
-            full = n
-            detected_from = "Eventdaten"
-            break
-    partial = round(full * 0.5, 2) if full > 0 else 0.0
-    return {"full_ec": full, "partial_ec": partial, "detected_from": detected_from}
+    event_type = _event_dkp_type(event)
+    event_points = _snapshot_event_points(snap)
+    full = float(event_points.get(event_type, 0.0) or 0.0)
+    detected_from = "DKP-Konfig" if full > 0 else "manuell"
+
+    if full <= 0:
+        candidates: list[Any] = []
+        for key in ("ec_value", "dkp_value", "points", "reward_points", "attendance_points", "full_ec", "ec_full", "dkp_points"):
+            if isinstance(event, dict) and event.get(key) not in (None, ""):
+                candidates.append(event.get(key))
+        for val in candidates:
+            n = _num(val, 0)
+            if n > 0:
+                full = n
+                detected_from = "Eventdaten"
+                break
+
+    partial = 5.0 if full > 0 else 0.0
+    # Ebolus-Regel aus dem Bot: Reserve/Teilweise bekommt fix 5 EC.
+    return {"full_ec": full, "partial_ec": partial, "detected_from": detected_from, "event_type": event_type}
 
 
 def _attendance_items_for_preview(snap: dict[str, Any], event: dict[str, Any], guild_id: int) -> tuple[dict[str, Any], list[dict[str, Any]]]:
@@ -4133,6 +4343,9 @@ def _attendance_ec_preview_payload(data: dict[str, Any], event_id: str, full_ec:
     guild_id = _safe_guild_id(data)
     review, items = _attendance_items_for_preview(snap, event, guild_id)
     defaults = _event_ec_defaults(snap, event)
+    event_type = str(defaults.get("event_type") or _event_dkp_type(event))
+    award_state = _event_award_state(snap, str(event_id))
+    latest_request = _latest_ec_award_request(guild_id, str(event_id)) if guild_id else {}
     fe = _num(full_ec if full_ec is not None else defaults.get("full_ec"), 0)
     pe = _num(partial_ec if partial_ec is not None else defaults.get("partial_ec"), 0)
     balances = _balance_map(snap)
@@ -4171,6 +4384,9 @@ def _attendance_ec_preview_payload(data: dict[str, Any], event_id: str, full_ec:
         "review_status": review.get("status") or ("draft" if rows else "open"),
         "review_updated_at": str(review.get("updated_at") or ""),
         "defaults": defaults,
+        "event_type": event_type,
+        "award_state": award_state,
+        "latest_request": latest_request,
         "full_ec": fe,
         "partial_ec": pe,
         "counts": counts,
@@ -4216,18 +4432,25 @@ def _render_attendance_ec_preview(data: dict[str, Any], event_id: str, full_ec: 
         if gain > 0:
             copy_lines.append(f"+{_fmt_ec(gain)} EC — {r.get('display_name')} ({_attendance_status_label(r.get('status'))})")
     copy_text = "\n".join(copy_lines)
+    award_state = preview.get("award_state") or {}
+    latest_request = preview.get("latest_request") or {}
+    event_type = str(preview.get("event_type") or "Dashboard Attendance")
     notice = ""
     if saved:
-        notice = "<div class='warn'>✅ Review wurde gesperrt/freigegeben. Es wurde kein EC gebucht.</div>"
+        notice = "<div class='warn'>✅ Aktion gespeichert/angefragt.</div>"
     if locked:
-        notice = "<div class='warn'>🔒 Review ist als freigegeben markiert. EC muss weiterhin über den Bot/Discord vergeben werden.</div>"
+        notice = "<div class='warn'>🔒 Review ist als freigegeben markiert.</div>"
+    if award_state.get("awarded"):
+        notice += f"<div class='warn'>⚠️ Dieses Event hat laut aktuellem Snapshot bereits EC-Buchungen: {_e(award_state.get('count'))} Buchungen / {_e(_fmt_ec(award_state.get('total')))} EC. Button bleibt gesperrt.</div>"
+    if latest_request:
+        notice += f"<div class='warn'>📌 Letzte Dashboard-EC-Anfrage: <strong>{_e(latest_request.get('status'))}</strong> · Request <code>{_e(latest_request.get('request_id'))}</code> · {_e(_dt(latest_request.get('requested_at')))}</div>"
     body = f"""
     <nav class="topnav"><a href="/attendance/{_e(event_id)}">← Review</a><a href="/attendance">Anwesenheit</a><a href="/ec">EC-Verlauf</a><a href="/event/{_e(event_id)}">Eventdetails</a></nav>
     <section class="hero">
       <div>
-        <div class="eyebrow">EC-Vorschau · keine echte Buchung</div>
+        <div class="eyebrow">EC-Vorschau + Bot-Buchung über sichere Queue</div>
         <h1>🪙 {_e(event.get('title') or event_id)}</h1>
-        <p class="muted">Review-Status: {_e(review_status)} · Event: {_e(_dt(event.get('when_iso')))} · Erkennung: {_e((preview.get('defaults') or {}).get('detected_from') or 'manuell')}</p>
+        <p class="muted">Review-Status: {_e(review_status)} · Event: {_e(_dt(event.get('when_iso')))} · Typ: {_e(event_type)} · Erkennung: {_e((preview.get('defaults') or {}).get('detected_from') or 'manuell')}</p>
       </div>
       <a class="btn" href="/export/attendance/{_e(event_id)}.csv?full_ec={_e(fe)}&partial_ec={_e(pe)}">CSV herunterladen</a>
     </section>
@@ -4235,12 +4458,13 @@ def _render_attendance_ec_preview(data: dict[str, Any], event_id: str, full_ec: 
     <section class="grid">
       {_card('Empfänger', recipients, 'bekommen EC laut Review')}
       {_card('Gesamt-EC', _fmt_ec(total), 'würde insgesamt vergeben')}
+      {_card('Eventtyp', event_type, 'für Doppelbuchungs-Schutz')}
       {_card('War da', (preview.get('counts') or {}).get('present', 0), f'+{_fmt_ec(fe)} EC')}
       {_card('Teilweise', (preview.get('counts') or {}).get('partial', 0), f'+{_fmt_ec(pe)} EC')}
     </section>
     <section class="panel">
       <h2>⚙️ Werte für Vorschau</h2>
-      <p class="muted">Hier wird nur gerechnet. Der Bot bucht dadurch noch keine EC und verändert keine produktiven Daten.</p>
+      <p class="muted">Diese Werte gelten für Vorschau und Buchungsanfrage. Echte EC werden erst gebucht, wenn der Bot die Postgres-Anfrage verarbeitet.</p>
       <form method="get" action="/attendance/{_e(event_id)}/ec-preview" style="display:flex;gap:12px;flex-wrap:wrap;align-items:end">
         <label>War da EC<br><input name="full_ec" value="{_e(fe)}" style="width:120px"></label>
         <label>Teilweise EC<br><input name="partial_ec" value="{_e(pe)}" style="width:120px"></label>
@@ -4254,10 +4478,17 @@ def _render_attendance_ec_preview(data: dict[str, Any], event_id: str, full_ec: 
     <section class="panel">
       <h2>📋 Copy-Text für DKP-Log</h2>
       <textarea readonly style="width:100%;min-height:180px;background:#101116;color:#f2ead7;border:1px solid var(--line);border-radius:12px;padding:12px">{_e(copy_text)}</textarea>
-      <form method="post" action="/admin/attendance/{_e(event_id)}/lock" style="margin-top:12px">
-        <input type="hidden" name="full_ec" value="{_e(fe)}"><input type="hidden" name="partial_ec" value="{_e(pe)}">
-        <button class="btn" type="submit">🔒 Review als freigegeben markieren</button>
-      </form>
+      <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:12px">
+        <form method="post" action="/admin/attendance/{_e(event_id)}/lock">
+          <input type="hidden" name="full_ec" value="{_e(fe)}"><input type="hidden" name="partial_ec" value="{_e(pe)}">
+          <button class="btn" type="submit">🔒 Review freigeben</button>
+        </form>
+        <form method="post" action="/admin/attendance/{_e(event_id)}/ec-award" onsubmit="return confirm('EC wirklich buchen? Der Bot verarbeitet diese Anfrage und schreibt danach in die echten EC-Daten.');">
+          <input type="hidden" name="full_ec" value="{_e(fe)}"><input type="hidden" name="partial_ec" value="{_e(pe)}"><input type="hidden" name="event_type" value="{_e(event_type)}">
+          <button class="btn" type="submit" {'disabled' if award_state.get('awarded') or str(latest_request.get('status') or '') in {'pending','processing','done'} or recipients <= 0 or fe <= 0 else ''}>✅ EC wirklich buchen</button>
+        </form>
+      </div>
+      <p class="muted">Doppelbuchungs-Schutz: Dashboard blockt bereits bekannte/pending Buchungen. Der Bot prüft vor dem Schreiben zusätzlich nochmal seine echten EC-Transaktionen.</p>
     </section>
     """
     return _html_shell(f"EC-Vorschau · {event.get('title') or event_id}", body)
@@ -4296,6 +4527,37 @@ async def admin_attendance_lock(event_id: str, request: Request, _: bool = Depen
     _attendance_review_save(guild_id, str(event_id), review_payload, _current_user(request) or {}, status="locked")
     return RedirectResponse(f"/attendance/{urllib.parse.quote(str(event_id))}/ec-preview?full_ec={urllib.parse.quote(str(full_ec))}&partial_ec={urllib.parse.quote(str(partial_ec))}&saved=1", status_code=303)
 
+
+
+@app.post("/admin/attendance/{event_id}/ec-award")
+async def admin_attendance_ec_award(event_id: str, request: Request, _: bool = Depends(_admin_auth)):
+    raw = (await request.body()).decode("utf-8", errors="replace")
+    form = urllib.parse.parse_qs(raw, keep_blank_values=True)
+    full_ec = _num((form.get("full_ec") or [0])[0], 0)
+    partial_ec = _num((form.get("partial_ec") or [0])[0], 0)
+    event_type = str((form.get("event_type") or [""])[0] or "Dashboard Attendance").strip() or "Dashboard Attendance"
+
+    payload = _snapshot_payload()
+    snap: dict[str, Any] = payload.get("snapshot") or {}
+    event = _event_by_id(snap, str(event_id))
+    if not event:
+        raise HTTPException(status_code=404, detail="Event nicht gefunden")
+    guild_id = _safe_guild_id(payload)
+    review = _attendance_review_load(guild_id, str(event_id))
+    review_status = str(review.get("status") or "").lower()
+    if review_status not in {"reviewed", "locked"}:
+        return HTMLResponse(_html_shell("EC-Buchung blockiert", f"<section class='panel'><h1>❌ EC-Buchung blockiert</h1><p>Speichere den Attendance Review zuerst. Aktueller Status: <strong>{_e(review_status or 'kein Review')}</strong></p><p><a class='btn' href='/attendance/{_e(event_id)}'>Zurück zum Review</a></p></section>"), status_code=400)
+
+    preview = _attendance_ec_preview_payload(payload, str(event_id), full_ec=full_ec, partial_ec=partial_ec)
+    if not preview.get("ok"):
+        raise HTTPException(status_code=400, detail=str(preview.get("error") or "Preview fehlgeschlagen"))
+    if (preview.get("award_state") or {}).get("awarded"):
+        return HTMLResponse(_html_shell("EC-Buchung blockiert", f"<section class='panel'><h1>❌ Doppelbuchung blockiert</h1><p>Für dieses Event gibt es laut Snapshot bereits EC-Buchungen.</p><p><a class='btn' href='/attendance/{_e(event_id)}/ec-preview'>Zurück</a></p></section>"), status_code=409)
+
+    result = _enqueue_ec_award_request(guild_id, str(event_id), event_type, preview, _current_user(request) or {})
+    if not result.get("ok"):
+        return HTMLResponse(_html_shell("EC-Buchung blockiert", f"<section class='panel'><h1>❌ EC-Buchung nicht angelegt</h1><p>{_e(result.get('error'))}</p><p><a class='btn' href='/attendance/{_e(event_id)}/ec-preview?full_ec={_e(full_ec)}&partial_ec={_e(partial_ec)}'>Zurück</a></p></section>"), status_code=409)
+    return RedirectResponse(f"/attendance/{urllib.parse.quote(str(event_id))}/ec-preview?full_ec={urllib.parse.quote(str(full_ec))}&partial_ec={urllib.parse.quote(str(partial_ec))}&saved=1", status_code=303)
 
 @app.get("/api/attendance/{event_id}/ec-preview")
 def api_attendance_ec_preview(event_id: str, full_ec: Optional[float] = None, partial_ec: Optional[float] = None, _: bool = Depends(_auth)):
