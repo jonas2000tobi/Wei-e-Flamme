@@ -367,6 +367,305 @@ def _snapshot_payload() -> dict[str, Any]:
     }
 
 
+# ---------------------------------------------------------------------------
+# Safe Admin Actions: Notizen / Prüfmarkierungen
+# ---------------------------------------------------------------------------
+
+def _is_dashboard_admin(request: Request) -> bool:
+    user = _current_user(request) or {}
+    return str(user.get("role") or "") == "admin"
+
+
+def _admin_auth(request: Request, credentials: Optional[HTTPBasicCredentials] = Depends(security)) -> bool:
+    _auth(request, credentials)
+    if _is_dashboard_admin(request):
+        return True
+    # Nur für lokalen Notfall, wenn Discord OAuth komplett deaktiviert ist.
+    if _auth_mode() in {"basic", "hybrid"} and not _discord_oauth_enabled():
+        return True
+    raise HTTPException(status_code=403, detail="Dashboard-Adminrolle erforderlich")
+
+
+def _safe_guild_id(data: Optional[dict[str, Any]] = None) -> int:
+    raw = _env("DASHBOARD_GUILD_ID")
+    if not raw and data:
+        raw = str(data.get("guild_id") or "")
+    try:
+        return int(str(raw).strip())
+    except Exception:
+        return 0
+
+
+def _ensure_admin_tables() -> None:
+    if not _database_url():
+        return
+    conn = _pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS dashboard_member_admin_state (
+                    guild_id BIGINT NOT NULL,
+                    member_user_id BIGINT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'ok',
+                    note TEXT NOT NULL DEFAULT '',
+                    updated_by_id TEXT,
+                    updated_by_name TEXT,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY (guild_id, member_user_id)
+                )
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS dashboard_admin_action_log (
+                    id BIGSERIAL PRIMARY KEY,
+                    guild_id BIGINT NOT NULL,
+                    action_type TEXT NOT NULL,
+                    target_type TEXT NOT NULL,
+                    target_id TEXT NOT NULL,
+                    actor_id TEXT,
+                    actor_name TEXT,
+                    payload_json TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+                """
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _member_admin_state(guild_id: int, user_id: int) -> dict[str, Any]:
+    if not _database_url() or not guild_id or not user_id:
+        return {}
+    _ensure_admin_tables()
+    conn = _pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT guild_id, member_user_id, status, note, updated_by_id, updated_by_name, updated_at
+                FROM dashboard_member_admin_state
+                WHERE guild_id = %s AND member_user_id = %s
+                """,
+                (guild_id, int(user_id)),
+            )
+            row = cur.fetchone()
+            return dict(row) if row else {}
+    finally:
+        conn.close()
+
+
+def _all_member_admin_states(guild_id: int) -> list[dict[str, Any]]:
+    if not _database_url() or not guild_id:
+        return []
+    _ensure_admin_tables()
+    conn = _pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT guild_id, member_user_id, status, note, updated_by_id, updated_by_name, updated_at
+                FROM dashboard_member_admin_state
+                WHERE guild_id = %s
+                ORDER BY updated_at DESC
+                """,
+                (guild_id,),
+            )
+            return [dict(r) for r in (cur.fetchall() or [])]
+    finally:
+        conn.close()
+
+
+def _admin_action_log(guild_id: int, limit: int = 100) -> list[dict[str, Any]]:
+    if not _database_url() or not guild_id:
+        return []
+    _ensure_admin_tables()
+    conn = _pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, guild_id, action_type, target_type, target_id, actor_id, actor_name, payload_json, created_at
+                FROM dashboard_admin_action_log
+                WHERE guild_id = %s
+                ORDER BY created_at DESC, id DESC
+                LIMIT %s
+                """,
+                (guild_id, int(limit)),
+            )
+            return [dict(r) for r in (cur.fetchall() or [])]
+    finally:
+        conn.close()
+
+
+def _save_member_admin_state(guild_id: int, user_id: int, status: str, note: str, actor: dict[str, Any]) -> None:
+    if not _database_url() or not guild_id or not user_id:
+        raise RuntimeError("DATABASE_URL/Guild/User fehlt")
+    status = str(status or "ok").strip().lower()
+    if status not in {"ok", "check", "watch", "critical"}:
+        status = "ok"
+    note = str(note or "").strip()[:4000]
+    actor_id = str(actor.get("user_id") or "")
+    actor_name = str(actor.get("username") or actor.get("user_id") or "")
+    _ensure_admin_tables()
+    conn = _pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO dashboard_member_admin_state
+                    (guild_id, member_user_id, status, note, updated_by_id, updated_by_name, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, NOW())
+                ON CONFLICT (guild_id, member_user_id) DO UPDATE SET
+                    status = EXCLUDED.status,
+                    note = EXCLUDED.note,
+                    updated_by_id = EXCLUDED.updated_by_id,
+                    updated_by_name = EXCLUDED.updated_by_name,
+                    updated_at = NOW()
+                """,
+                (guild_id, int(user_id), status, note, actor_id, actor_name),
+            )
+            cur.execute(
+                """
+                INSERT INTO dashboard_admin_action_log
+                    (guild_id, action_type, target_type, target_id, actor_id, actor_name, payload_json)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """,
+                (guild_id, "member_state_save", "member", str(user_id), actor_id, actor_name, json.dumps({"status": status, "note_length": len(note)}, ensure_ascii=False)),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _delete_member_admin_state(guild_id: int, user_id: int, actor: dict[str, Any]) -> None:
+    if not _database_url() or not guild_id or not user_id:
+        raise RuntimeError("DATABASE_URL/Guild/User fehlt")
+    actor_id = str(actor.get("user_id") or "")
+    actor_name = str(actor.get("username") or actor.get("user_id") or "")
+    _ensure_admin_tables()
+    conn = _pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                DELETE FROM dashboard_member_admin_state
+                WHERE guild_id = %s AND member_user_id = %s
+                """,
+                (guild_id, int(user_id)),
+            )
+            cur.execute(
+                """
+                INSERT INTO dashboard_admin_action_log
+                    (guild_id, action_type, target_type, target_id, actor_id, actor_name, payload_json)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """,
+                (guild_id, "member_state_delete", "member", str(user_id), actor_id, actor_name, "{}"),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _status_label(value: Any) -> str:
+    v = str(value or "ok").lower()
+    return {
+        "ok": "✅ OK",
+        "check": "🔎 Prüfen",
+        "watch": "👀 Beobachten",
+        "critical": "⛔ Kritisch",
+    }.get(v, "✅ OK")
+
+
+def _admin_member_panel(data: dict[str, Any], user_id: int, current_user: Optional[dict[str, Any]]) -> str:
+    if not current_user or str(current_user.get("role") or "") != "admin":
+        return ""
+    guild_id = _safe_guild_id(data)
+    state = _member_admin_state(guild_id, int(user_id)) if guild_id else {}
+    status = str(state.get("status") or "ok").lower()
+    note = str(state.get("note") or "")
+    def selected(v: str) -> str:
+        return " selected" if status == v else ""
+    last = "Noch keine interne Notiz."
+    if state:
+        last = f"Zuletzt geändert: {_dt(state.get('updated_at'))} · von {_e(state.get('updated_by_name') or state.get('updated_by_id') or 'unbekannt')}"
+    return f"""
+    <section class="panel" id="leitung">
+      <h2>🛡️ Leitungsnotiz</h2>
+      <p class="muted">Sichere Admin-Funktion: speichert nur interne Dashboard-Notizen/Prüfstatus. EC, Loot, Needs und Events werden nicht verändert.</p>
+      <form method="post" action="/admin/member/{int(user_id)}/save" style="display:grid; gap:10px; max-width:760px;">
+        <label>Status<br>
+          <select name="status" style="width:260px; padding:10px; border-radius:10px; background:#08090d; color:var(--text); border:1px solid var(--line);">
+            <option value="ok"{selected('ok')}>✅ OK</option>
+            <option value="check"{selected('check')}>🔎 Prüfen</option>
+            <option value="watch"{selected('watch')}>👀 Beobachten</option>
+            <option value="critical"{selected('critical')}>⛔ Kritisch</option>
+          </select>
+        </label>
+        <label>Interne Notiz<br>
+          <textarea name="note" rows="5" maxlength="4000" style="width:100%; padding:12px; border-radius:12px; background:#08090d; color:var(--text); border:1px solid var(--line); resize:vertical;">{_e(note)}</textarea>
+        </label>
+        <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
+          <button class="btn" type="submit" style="border:0; cursor:pointer;">Speichern</button>
+          <button class="btn" formaction="/admin/member/{int(user_id)}/clear" formmethod="post" type="submit" style="border:0; cursor:pointer; background:#303442; color:var(--text);">Notiz löschen</button>
+          <span class="muted">{last}</span>
+        </div>
+      </form>
+    </section>
+    """
+
+
+def _render_admin_actions_dashboard(data: dict[str, Any]) -> str:
+    if not data.get("ok"):
+        return _html_shell("Leitung · Ebo Dashboard", f"<section class='panel'><h1>🛡️ Leitung</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+    snap: dict[str, Any] = data.get("snapshot") or {}
+    guild_id = _safe_guild_id(data)
+    states = _all_member_admin_states(guild_id)
+    names = _profile_name_map(snap)
+    rows = []
+    for st in states:
+        uid = _user_id(st.get("member_user_id"))
+        rows.append([
+            _member_link(uid, names.get(uid, f"User {uid}")),
+            _status_label(st.get("status")),
+            _short(st.get("note"), 220) or "—",
+            st.get("updated_by_name") or st.get("updated_by_id") or "—",
+            _dt(st.get("updated_at")),
+        ])
+    logs = _admin_action_log(guild_id, limit=120)
+    log_rows = []
+    for lg in logs:
+        uid = _user_id(lg.get("target_id"))
+        log_rows.append([
+            _dt(lg.get("created_at")),
+            lg.get("action_type"),
+            _member_link(uid, names.get(uid, f"User {uid}")) if uid else lg.get("target_id"),
+            lg.get("actor_name") or lg.get("actor_id") or "—",
+        ])
+    body = f"""
+    <nav class="topnav"><a href="/">Kommando</a><a href="/members">Mitglieder</a><a href="/audit">Audit</a><a href="/settings">Einstellungen</a></nav>
+    <section class="hero">
+      <div>
+        <div class="eyebrow">Ebene 3 · Schritt 1</div>
+        <h1>🛡️ Leitungsbereich</h1>
+        <p>Sichere Admin-Aktionen: interne Notizen und Prüfmarkierungen. Keine EC-, Loot-, Event- oder Need-Änderungen.</p>
+      </div>
+      <a class="btn" href="/members">Mitglied suchen</a>
+    </section>
+    <section class="grid">
+      {_card('Interne Markierungen', len(rows), 'Mitglieder mit Notiz/Status')}
+      {_card('Admin-Aktionen', len(logs), 'letzte sichere Web-Aktionen')}
+      {_card('Guild-ID', guild_id or '—', 'Dashboard-Kontext')}
+      {_card('Schreibrechte', 'Notizen', 'noch kein EC/Loot/Need-Write')}
+    </section>
+    <section class="panel"><h2>👥 Markierte Mitglieder</h2>{_table(['Mitglied','Status','Notiz','Geändert von','Geändert am'], rows, placeholder='Markierungen durchsuchen…')}</section>
+    <section class="panel"><h2>🧾 Web-Admin-Aktionslog</h2>{_table(['Zeit','Aktion','Ziel','Akteur'], log_rows, placeholder='Adminlog durchsuchen…')}</section>
+    """
+    return _html_shell("Leitung · Ebo Dashboard", body)
+
+
 def _card(title: str, value: Any, sub: str = "") -> str:
     return f"""
     <div class="card">
@@ -777,7 +1076,7 @@ def _render_dashboard(data: dict[str, Any]) -> str:
     return _html_shell("Ebo Dashboard", body)
 
 
-def _render_member_detail(data: dict[str, Any], user_id: int) -> str:
+def _render_member_detail(data: dict[str, Any], user_id: int, current_user: Optional[dict[str, Any]] = None) -> str:
     if not data.get("ok"):
         return _html_shell("Ebo Dashboard", f"<section class='panel'><h1>📊 Ebo Dashboard</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
     snap: dict[str, Any] = data.get("snapshot") or {}
@@ -833,6 +1132,7 @@ def _render_member_detail(data: dict[str, Any], user_id: int) -> str:
       <a class="btn" href="/">Zurück</a>
     </section>
     <section class="grid">{cards}</section>
+    {_admin_member_panel(data, int(user_id), current_user)}
     <section class="panel" id="needs">
       <h2>🎁 Needliste</h2>
       <div class="split">
@@ -2253,7 +2553,7 @@ def _member_event_rows(snap: dict[str, Any], user_id: int) -> list[list[Any]]:
     return rows[:80]
 
 
-def _render_member_detail(data: dict[str, Any], user_id: int) -> str:
+def _render_member_detail(data: dict[str, Any], user_id: int, current_user: Optional[dict[str, Any]] = None) -> str:
     if not data.get("ok"):
         return _html_shell("Ebo Dashboard", f"<section class='panel'><h1>📊 Ebo Dashboard</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
     snap: dict[str, Any] = data.get("snapshot") or {}
@@ -2316,6 +2616,7 @@ def _render_member_detail(data: dict[str, Any], user_id: int) -> str:
       <a class="btn" href="/members">Zurück</a>
     </section>
     <section class="grid">{cards}</section>
+    {_admin_member_panel(data, int(user_id), current_user)}
     <section class="panel" id="needs">
       <h2>🎁 Needliste</h2>
       <div class="split">
@@ -2885,6 +3186,7 @@ def _render_leadership_dashboard(data: dict[str, Any]) -> str:
         [_raw('<a class="link" href="/loot">🏆 Loot</a>'), "Aktive Auktionen, Gewinner, Roll-/Bid-Historie"],
         [_raw('<a class="link" href="/fairness">⚖️ Fairness</a>'), "Need/EC/Loot-Hinweise"],
         [_raw('<a class="link" href="/audit">🧾 Audit</a>'), "Wer hat was gemacht"],
+        [_raw('<a class="link" href="/admin">🛡️ Leitung</a>'), "interne Notizen und Prüfmarkierungen"],
         [_raw('<a class="link" href="/overview">📊 Gesamtübersicht</a>'), "alte Tabellen-Startseite"],
     ], searchable=False)
 
@@ -2899,6 +3201,7 @@ def _render_leadership_dashboard(data: dict[str, Any]) -> str:
       <a href="/analytics">Analytics</a><a href="/voice">Voice</a>
       <a href="/ec">EC</a>
       <a href="/audit">Audit</a>
+      <a href="/admin">Leitung</a>
       <a href="/settings">Einstellungen</a>
       <a href="/system">System</a>
       <a href="/exports">Exports</a>
@@ -3233,15 +3536,54 @@ def event_detail(event_id: str, _: bool = Depends(_auth)):
 
 
 @app.get("/member/{user_id}", response_class=HTMLResponse)
-def member_detail(user_id: int, _: bool = Depends(_auth)):
+def member_detail(user_id: int, request: Request, _: bool = Depends(_auth)):
     try:
-        return HTMLResponse(_render_member_detail(_snapshot_payload(), int(user_id)))
+        return HTMLResponse(_render_member_detail(_snapshot_payload(), int(user_id), _current_user(request)))
     except Exception as exc:
         return HTMLResponse(
             _html_shell("Ebo Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
             status_code=500,
         )
 
+
+
+
+@app.get("/admin", response_class=HTMLResponse)
+def admin_actions_page(_: bool = Depends(_admin_auth)):
+    try:
+        return HTMLResponse(_render_admin_actions_dashboard(_snapshot_payload()))
+    except Exception as exc:
+        return HTMLResponse(
+            _html_shell("Ebo Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
+            status_code=500,
+        )
+
+
+@app.post("/admin/member/{user_id}/save")
+async def admin_member_save(user_id: int, request: Request, _: bool = Depends(_admin_auth)):
+    raw = (await request.body()).decode("utf-8", errors="replace")
+    form = urllib.parse.parse_qs(raw, keep_blank_values=True)
+    status = (form.get("status") or ["ok"])[0]
+    note = (form.get("note") or [""])[0]
+    payload = _snapshot_payload()
+    guild_id = _safe_guild_id(payload)
+    _save_member_admin_state(guild_id, int(user_id), status, note, _current_user(request) or {})
+    return RedirectResponse(f"/member/{int(user_id)}#leitung", status_code=303)
+
+
+@app.post("/admin/member/{user_id}/clear")
+async def admin_member_clear(user_id: int, request: Request, _: bool = Depends(_admin_auth)):
+    payload = _snapshot_payload()
+    guild_id = _safe_guild_id(payload)
+    _delete_member_admin_state(guild_id, int(user_id), _current_user(request) or {})
+    return RedirectResponse(f"/member/{int(user_id)}#leitung", status_code=303)
+
+
+@app.get("/api/admin/member-states")
+def api_admin_member_states(_: bool = Depends(_admin_auth)):
+    payload = _snapshot_payload()
+    guild_id = _safe_guild_id(payload)
+    return JSONResponse({"ok": True, "guild_id": guild_id, "states": _all_member_admin_states(guild_id), "actions": _admin_action_log(guild_id, 200)})
 
 
 @app.get("/settings", response_class=HTMLResponse)
