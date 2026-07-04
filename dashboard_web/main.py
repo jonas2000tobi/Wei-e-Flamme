@@ -2071,6 +2071,66 @@ def _render_auction_detail(data: dict[str, Any], auction_id: str, current_user: 
     return _html_shell(f"{auction.get('item_name') or 'Auktion'} · Ebo Dashboard", body)
 
 
+def _sidebar_html() -> str:
+    return f"""
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark"><img src="{_asset('logo_128.png')}" alt="Ebolus"></div>
+        <div><strong>Ebolus</strong><span>Gilden-Dashboard</span></div>
+      </div>
+
+      <nav class="side-nav">
+        <a href="/" data-nav="home">🏰 Kommando</a>
+        <a href="/overview" data-nav="overview">📊 Gesamtübersicht</a>
+
+        <details open>
+          <summary>Gilde</summary>
+          <a href="/members">👥 Mitglieder</a>
+          <a href="/planning">📅 Planung</a>
+          <a href="/attendance">✅ Anwesenheit</a>
+          <a href="/attendance-stats">📈 Stats</a>
+          <a href="/attendance-archive">📦 Archiv</a>
+        </details>
+
+        <details open>
+          <summary>Loot & Auktionen</summary>
+          <a href="/loot">🏆 Loot-Zentrale</a>
+          <a href="/loot-check">🔎 Truhencheck</a>
+          <a href="/loot-history">📜 Loot-Verlauf</a>
+          <a href="/needs">🎁 Needs</a>
+          <a href="/fairness">⚖️ Fairness</a>
+        </details>
+
+        <details open>
+          <summary>EC</summary>
+          <a href="/ec">🪙 EC-Verlauf</a>
+          <a href="/ec-queue">🌐 EC-Queue</a>
+        </details>
+
+        <details>
+          <summary>Auswertung</summary>
+          <a href="/analytics">📊 Analytics</a>
+          <a href="/voice">🎙️ Voice</a>
+          <a href="/exports">📤 Exports</a>
+        </details>
+
+        <details>
+          <summary>Leitung & System</summary>
+          <a href="/admin">🛡️ Admin</a>
+          <a href="/settings">⚙️ Einstellungen</a>
+          <a href="/audit">🧾 Audit</a>
+          <a href="/system">🧰 System</a>
+        </details>
+      </nav>
+
+      <div class="sidebar-footer">
+        <a href="/me">Mein Login</a>
+        <a href="/logout">Logout</a>
+      </div>
+    </aside>
+    """
+
+
 def _html_shell(title: str, body: str) -> str:
     auth_note = ""
     if _discord_oauth_enabled():
@@ -2090,13 +2150,29 @@ def _html_shell(title: str, body: str) -> str:
   <meta property="og:image" content="{_asset('opengraph.webp')}">
   <meta name="theme-color" content="#0f1014">
   <style>
-    :root {{ --bg:#0f1014; --panel:#181a22; --panel2:#20232d; --text:#f1eadb; --muted:#a8a193; --gold:#d6a84f; --line:#333746; --red:#d96868; --green:#81c784; }}
+    :root {{ --bg:#0f1014; --panel:#181a22; --panel2:#20232d; --text:#f1eadb; --muted:#a8a193; --gold:#d6a84f; --line:#333746; --red:#d96868; --green:#81c784; --side:#11121a; --side2:#171824; }}
     * {{ box-sizing:border-box; }} html {{ scroll-behavior:smooth; }}
-    body {{ margin:0; font-family:Inter, system-ui, Segoe UI, sans-serif; background:linear-gradient(180deg,rgba(15,16,20,.80),rgba(15,16,20,.96)), url("{_asset('dashboard_bg.webp')}") center top / cover fixed no-repeat; color:var(--text); }}
-    main {{ max-width:1240px; margin:0 auto; padding:22px 18px 60px; }}
-    .topnav {{ position:sticky; top:0; z-index:5; display:flex; gap:8px; flex-wrap:wrap; padding:10px; margin:-22px -18px 18px; background:rgba(10,11,15,.86); backdrop-filter:blur(12px); border-bottom:1px solid rgba(214,168,79,.24); box-shadow:0 10px 30px rgba(0,0,0,.35); }}
-    .topnav a {{ color:var(--text); text-decoration:none; padding:9px 12px; border:1px solid var(--line); border-radius:999px; background:linear-gradient(180deg,rgba(32,35,45,.95),rgba(13,14,20,.92)); font-size:13px; display:inline-flex; align-items:center; gap:8px; box-shadow:inset 0 1px 0 rgba(255,255,255,.04); }}
-    .topnav a::before {{ content:""; width:22px; height:22px; flex:0 0 22px; background:center / contain no-repeat; filter:drop-shadow(0 1px 3px rgba(0,0,0,.7)); display:none; }}
+    body {{ margin:0; font-family:Inter, system-ui, Segoe UI, sans-serif; background:linear-gradient(180deg,rgba(15,16,20,.78),rgba(15,16,20,.98)), url("{_asset('dashboard_bg.webp')}") center top / cover fixed no-repeat; color:var(--text); }}
+    .app-shell {{ display:grid; grid-template-columns:260px minmax(0,1fr); min-height:100vh; }}
+    .sidebar {{ position:sticky; top:0; height:100vh; overflow:auto; padding:18px 14px; background:linear-gradient(180deg,rgba(17,18,26,.97),rgba(11,12,18,.97)); border-right:1px solid rgba(214,168,79,.16); box-shadow:16px 0 45px rgba(0,0,0,.35); }}
+    .brand {{ display:flex; align-items:center; gap:12px; padding:8px 8px 18px; margin-bottom:8px; border-bottom:1px solid rgba(214,168,79,.14); }}
+    .brand-mark {{ width:46px; height:46px; border-radius:14px; background:radial-gradient(circle at 35% 30%,rgba(214,168,79,.28),rgba(32,35,45,.9)); border:1px solid rgba(214,168,79,.24); display:grid; place-items:center; }}
+    .brand-mark img {{ width:34px; height:34px; object-fit:contain; filter:drop-shadow(0 2px 8px rgba(0,0,0,.75)); }}
+    .brand strong {{ display:block; font-size:18px; }} .brand span {{ display:block; color:var(--muted); font-size:12px; }}
+    .side-nav {{ display:flex; flex-direction:column; gap:6px; }}
+    .side-nav a, .side-nav summary {{ color:var(--text); text-decoration:none; padding:10px 12px; border-radius:12px; display:flex; align-items:center; gap:9px; font-size:14px; cursor:pointer; }}
+    .side-nav a:hover, .side-nav summary:hover {{ background:rgba(214,168,79,.09); color:var(--gold); }}
+    .side-nav a.active {{ background:linear-gradient(90deg,rgba(214,168,79,.18),rgba(214,168,79,.06)); color:var(--gold); border:1px solid rgba(214,168,79,.24); }}
+    .side-nav details {{ border-top:1px solid rgba(214,168,79,.10); padding-top:8px; margin-top:8px; }}
+    .side-nav summary {{ color:var(--muted); text-transform:uppercase; letter-spacing:.08em; font-size:11px; font-weight:800; list-style:none; }}
+    .side-nav summary::-webkit-details-marker {{ display:none; }}
+    .side-nav details a {{ margin-left:8px; padding:9px 11px; font-size:13px; color:#ded7c8; }}
+    .sidebar-footer {{ margin-top:18px; padding-top:14px; border-top:1px solid rgba(214,168,79,.12); display:grid; gap:8px; }}
+    .sidebar-footer a {{ color:var(--muted); text-decoration:none; font-size:13px; padding:8px 10px; border-radius:10px; }} .sidebar-footer a:hover {{ color:var(--gold); background:rgba(214,168,79,.08); }}
+    main.content {{ max-width:1380px; width:100%; margin:0 auto; padding:22px 24px 70px; }}
+    .topnav {{ display:flex; gap:8px; flex-wrap:wrap; padding:0; margin:0 0 18px; background:transparent; border:0; box-shadow:none; }}
+    .topnav a {{ color:var(--text); text-decoration:none; padding:8px 11px; border:1px solid var(--line); border-radius:12px; background:linear-gradient(180deg,rgba(32,35,45,.82),rgba(13,14,20,.78)); font-size:12px; display:inline-flex; align-items:center; gap:7px; box-shadow:inset 0 1px 0 rgba(255,255,255,.04); }}
+    .topnav a::before {{ content:""; width:18px; height:18px; flex:0 0 18px; background:center / contain no-repeat; filter:drop-shadow(0 1px 3px rgba(0,0,0,.7)); display:none; }}
     .topnav a[href="/"]::before {{ display:block; background-image:url("{_asset('nav_kommando.png')}"); }}
     .topnav a[href="/overview"]::before {{ display:block; background-image:url("{_asset('nav_kommando.png')}"); }}
     .topnav a[href="/planning"]::before {{ display:block; background-image:url("{_asset('nav_planung.png')}"); }}
@@ -2133,6 +2209,15 @@ def _html_shell(title: str, body: str) -> str:
     .metric {{ background:var(--panel2); border:1px solid var(--line); border-radius:14px; padding:14px; }}
     .metric span {{ display:block; color:var(--muted); font-size:13px; }} .metric strong {{ display:block; color:var(--gold); font-size:28px; }} .metric small {{ color:var(--muted); }}
     .split {{ display:grid; grid-template-columns:1fr 1fr; gap:18px; }}
+    .home-layout {{ display:grid; grid-template-columns:minmax(0,2fr) minmax(300px,1fr); gap:18px; align-items:start; }}
+    .home-stack {{ display:grid; gap:14px; }}
+    .home-list {{ display:grid; gap:10px; margin-top:12px; }}
+    .home-item {{ display:grid; grid-template-columns:44px minmax(0,1fr) auto; gap:12px; align-items:center; padding:13px 14px; border:1px solid rgba(214,168,79,.14); border-radius:14px; background:rgba(32,35,45,.55); }}
+    .home-icon {{ width:44px; height:44px; border-radius:12px; display:grid; place-items:center; background:rgba(214,168,79,.12); border:1px solid rgba(214,168,79,.18); font-size:20px; }}
+    .home-title {{ font-weight:800; color:var(--text); }} .home-meta {{ color:var(--muted); font-size:13px; margin-top:3px; }}
+    .action-list {{ display:grid; gap:10px; margin-top:12px; }}
+    .action-list .btn {{ display:block; text-align:center; background:transparent; color:var(--text); border:1px solid rgba(241,234,219,.55); }}
+    .action-list .btn:hover {{ color:#111; background:var(--gold); border-color:var(--gold); }}
     .bar-row {{ display:grid; grid-template-columns:110px 1fr 44px; gap:10px; align-items:center; margin:8px 0; }} .bar-label,.bar-value {{ color:var(--muted); font-size:13px; }}
     .bar-track {{ height:10px; background:#0b0c10; border:1px solid var(--line); border-radius:999px; overflow:hidden; }} .bar-fill {{ height:100%; background:linear-gradient(90deg,var(--gold),#f1d28a); }}
     .table-search {{ width:100%; max-width:420px; margin:8px 0 12px; padding:10px 12px; border-radius:10px; border:1px solid var(--line); background:#08090d; color:var(--text); outline:none; }}
@@ -2151,12 +2236,13 @@ def _html_shell(title: str, body: str) -> str:
     .empty {{ color:var(--muted); padding:18px 16px 18px 58px; min-height:58px; display:flex; align-items:center; border:1px dashed rgba(214,168,79,.18); border-radius:14px; background:linear-gradient(90deg,rgba(10,11,15,.70),rgba(24,26,34,.54)); position:relative; }}
     .empty::before {{ content:""; position:absolute; left:16px; top:50%; width:30px; height:30px; transform:translateY(-50%); background:url("{_asset('status_ec_offen.png')}") center / contain no-repeat; opacity:.78; }}
     .warn {{ background:#3a250d; border:1px solid #8a5b18; padding:12px 14px; border-radius:12px; margin-bottom:14px; color:#ffe0a3; }}
-    .authbar {{ display:flex; gap:10px; align-items:center; justify-content:flex-end; background:rgba(24,26,34,.9); border:1px solid var(--line); border-radius:12px; padding:10px 12px; margin-bottom:14px; color:var(--muted); font-size:13px; }} .authbar a {{ color:var(--gold); text-decoration:none; font-weight:700; }}
+    .authbar {{ display:flex; gap:10px; align-items:center; justify-content:flex-end; background:rgba(24,26,34,.78); border:1px solid var(--line); border-radius:12px; padding:10px 12px; margin-bottom:14px; color:var(--muted); font-size:13px; }} .authbar a {{ color:var(--gold); text-decoration:none; font-weight:700; }}
+    @media(max-width:1100px) {{ .app-shell {{ grid-template-columns:1fr; }} .sidebar {{ position:relative; height:auto; border-right:0; border-bottom:1px solid rgba(214,168,79,.16); }} .side-nav {{ display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); }} .side-nav details {{ margin-top:0; }} .home-layout {{ grid-template-columns:1fr; }} }}
     @media(max-width:1000px) {{ .grid,.analytics-grid {{ grid-template-columns:repeat(2,minmax(0,1fr)); }} .split {{ grid-template-columns:1fr; }} .hero {{ flex-direction:column; align-items:flex-start; }} }}
-    @media(max-width:560px) {{ .grid,.analytics-grid {{ grid-template-columns:1fr; }} .bar-row {{ grid-template-columns:90px 1fr 38px; }} }}
+    @media(max-width:560px) {{ main.content {{ padding:16px 12px 50px; }} .grid,.analytics-grid,.side-nav {{ grid-template-columns:1fr; }} .bar-row {{ grid-template-columns:90px 1fr 38px; }} .home-item {{ grid-template-columns:38px minmax(0,1fr); }} .home-item .pill {{ grid-column:2; justify-self:start; }} }}
   </style>
 </head>
-<body><main>{auth_note}{body}</main><script>
+<body><div class="app-shell">{_sidebar_html()}<main class="content">{auth_note}{body}</main></div><script>
 function filterNextTable(input) {{
   const wrap = input.nextElementSibling;
   if (!wrap) return;
@@ -2168,6 +2254,18 @@ function filterNextTable(input) {{
     row.style.display = (!q || text.includes(q)) ? '' : 'none';
   }}
 }}
+(function markActiveNav() {{
+  const path = window.location.pathname || '/';
+  const links = document.querySelectorAll('.side-nav a');
+  let best = null;
+  for (const a of links) {{
+    const href = a.getAttribute('href') || '/';
+    if (href === path || (href !== '/' && path.startsWith(href + '/'))) {{
+      if (!best || href.length > (best.getAttribute('href') || '').length) best = a;
+    }}
+  }}
+  if (best) {{ best.classList.add('active'); const d = best.closest('details'); if (d) d.open = true; }}
+}})();
 </script></body>
 </html>"""
 
@@ -5920,65 +6018,140 @@ def _render_leadership_dashboard(data: dict[str, Any]) -> str:
         [_raw('<a class="link" href="/overview">📊 Gesamtübersicht</a>'), "alte Tabellen-Startseite"],
     ], searchable=False)
 
-    body = f"""
-    <nav class="topnav">
-      <a href="/">Kommando</a>
-      <a href="/planning">Planung</a>
-      <a href="/members">Mitglieder</a>
-      <a href="/needs">Needs</a>
-      <a href="/loot">Loot</a>
-      <a href="/fairness">Fairness</a>
-      <a href="/analytics">Analytics</a><a href="/voice">Voice</a>
-      <a href="/ec">EC</a>
-      <a href="/ec-queue">EC-Queue</a>
-      <a href="/attendance">Anwesenheit</a>
-      <a href="/attendance-stats">Anwesenheit-Stats</a>
-      <a href="/attendance-archive">Attendance-Archiv</a>
-      <a href="/audit">Audit</a>
-      <a href="/admin">Leitung</a>
-      <a href="/settings">Einstellungen</a>
-      <a href="/system">System</a>
-      <a href="/exports">Exports</a>
-    </nav>
+    # Kompakte Startseite im Guild-Manager-Stil: Hauptnavigation links, Startseite nur mit aktuellen To-dos.
+    def _home_item(icon: str, title: Any, meta: Any, href: str = "", badge: str = "") -> str:
+        title_html = f"<a class='link' href='{_e(href)}'>{_e(title)}</a>" if href else _e(title)
+        badge_html = f"<span class='pill'>{_e(badge)}</span>" if badge else ""
+        return f"<div class='home-item'><div class='home-icon'>{_e(icon)}</div><div><div class='home-title'>{title_html}</div><div class='home-meta'>{_e(meta)}</div></div>{badge_html}</div>"
 
+    home_events_html = "".join(
+        _home_item(
+            "📅",
+            ev.get("title") or ev.get("name") or ev.get("event_id") or "Event",
+            f"{_dt(ev.get('when_iso') or ev.get('start_at') or ev.get('created_at'))} · Teilnehmer: {ev.get('participant_count', ev.get('participants', '—'))} · EC: {_pending_ec_check_label(ev)}",
+            f"/attendance/{_e(str(ev.get('event_id') or ev.get('id') or ''))}" if ev.get("_attendance_review_only") else f"/event/{_e(str(ev.get('event_id') or ev.get('id') or ''))}",
+            "Review offen" if ev.get("_attendance_review_only") else "läuft",
+        )
+        for ev in running_events[:6]
+        if isinstance(ev, dict)
+    ) or '<div class="empty">Keine laufenden Events oder offenen Reviews.</div>'
+
+    home_auctions_html = "".join(
+        _home_item(
+            "🏆",
+            a.get("item_name") or a.get("title") or a.get("auction_id") or "Auktion",
+            f"{a.get('status') or '—'} · führend: {_auction_leader_text(a, names)} · Ende: {_dt(a.get('ends_at') or a.get('end_at') or a.get('expires_at'))}",
+            f"/auction/{_e(str(a.get('auction_id') or ''))}",
+            str(a.get("phase") or "Auktion"),
+        )
+        for a in active_auctions[:5]
+        if isinstance(a, dict)
+    ) or '<div class="empty">Keine aktiven Auktionen.</div>'
+
+    try:
+        member_payload = _member_center_payload(data)
+        member_rows_home = member_payload.get("rows") or []
+    except Exception:
+        member_rows_home = []
+    top_members = sorted(
+        [r for r in member_rows_home if isinstance(r, dict)],
+        key=lambda r: (int(r.get("attendance_present") or 0) + int(r.get("won_count") or 0), _num(r.get("voice_hours"), 0), _num(r.get("ec_balance"), 0)),
+        reverse=True,
+    )[:5]
+    top_members_html = "".join(
+        _home_item(
+            "👤",
+            r.get("display_name") or f"User {r.get('user_id')}",
+            f"Quote: {r.get('attendance_rate') or '—'} · Voice: {_num(r.get('voice_hours'), 0):.1f} h · EC: {_fmt_ec(r.get('ec_balance')) if r.get('ec_balance') is not None else '—'}",
+            f"/member/{_e(str(r.get('user_id') or ''))}",
+            f"{r.get('won_count', 0)} Loot",
+        )
+        for r in top_members
+    ) or '<div class="empty">Noch keine Top-Mitglieder-Daten.</div>'
+
+    activity_bits: list[str] = []
+    for t in tasks[:4]:
+        if isinstance(t, dict):
+            activity_bits.append(_home_item("✅", t.get("task") or "Aufgabe", f"{t.get('area') or 'Bereich'} · {t.get('detail') or ''}", str(t.get("link") or "/"), str(t.get("prio") or "")))
+    for q in queue_rows[:3]:
+        if isinstance(q, dict):
+            activity_bits.append(_home_item("🪙", q.get("event_id") or q.get("request_id") or "EC-Anfrage", f"Status: {_ec_award_status_label(q.get('status'))} · {_dt(q.get('requested_at'))}", "/ec-queue", "EC"))
+    home_activity_html = "".join(activity_bits[:6]) or '<div class="empty">Keine aktuellen Aufgaben oder Queue-Aktivitäten.</div>'
+
+    cards = "".join([
+        _card("Mitglieder", li.get("member_count", 0), role_line),
+        _card("Laufende/offene Events", len(running_events), "inkl. offener Reviews"),
+        _card("Aktive Auktionen", len(active_auctions), "Bieten möglich"),
+        _card("EC-Queue", queue_open, f"offen/verarbeitend · erledigt: {queue_counts.get('done', 0)}"),
+    ])
+
+    quick_action_html = """
+      <div class="action-list">
+        <a class="btn" href="/attendance">✅ Anwesenheit prüfen</a>
+        <a class="btn" href="/loot">🏆 Auktionen öffnen</a>
+        <a class="btn" href="/loot-check">🔎 Item prüfen</a>
+        <a class="btn" href="/members">👥 Mitglieder ansehen</a>
+        <a class="btn" href="/admin">🛡️ Admin-Zentrale</a>
+      </div>
+    """
+
+    body = f"""
     <section class="hero">
       <div>
-        <div class="eyebrow">Führungsstartseite · read-only</div>
-        <h1>🏰 {_e(guild.get('name') or data.get('guild_name') or 'Gilde')}</h1>
-        <p>Was heute wichtig ist: offene Aufgaben, laufende Events, aktive Auktionen und auffällige Mitglieder.</p>
+        <div class="eyebrow">Kommando · kompakt</div>
+        <h1>{_e(guild.get('name') or data.get('guild_name') or 'Gilde')}</h1>
+        <p>Startseite zeigt nur das, was jetzt gerade relevant ist. Alles andere ist links sauber gruppiert.</p>
         <p class="muted">{_e(role_line)} · Snapshot: {_e(_dt(data.get('published_at')))}</p>
       </div>
-      <a class="btn" href="/overview">Gesamtübersicht</a>
+      <div style="display:flex;gap:10px;flex-wrap:wrap;justify-content:flex-end">
+        <a class="btn" href="/attendance">Anwesenheit</a>
+        <a class="btn" href="/loot">Loot</a>
+        <a class="btn" href="/overview">Gesamtübersicht</a>
+      </div>
     </section>
 
     <section class="grid">{cards}</section>
 
-    <section class="panel">
-      <h2>✅ Offene Aufgaben</h2>
-      <p class="muted">Priorisierte Leitungs-Hinweise. Es wird nichts automatisch geändert.</p>
-      {_table(['Priorität','Bereich','Aufgabe','Details'], task_rows, placeholder='Aufgaben durchsuchen…')}
-    </section>
+    <section class="home-layout">
+      <div class="home-stack">
+        <section class="panel">
+          <h2>📅 Laufende Events / offene Reviews</h2>
+          <p class="muted">Bleibt sichtbar, solange Event läuft oder EC-/Review-Arbeit offen ist.</p>
+          <div class="home-list">{home_events_html}</div>
+        </section>
 
-    <section class="split">
-      <div class="panel">
-        <h2>📅 Laufende Events</h2>
-        {_table(['Event','Zeit','Teilnehmer','Vielleicht','Abgemeldet','Voice','EC-Check'], event_rows, placeholder='Laufende Events durchsuchen…')}
-      </div>
-      <div class="panel">
-        <h2>🎁 Aktive Auktionen</h2>
-        {_table(['Item','Status','Phase','Führend','Ende'], auction_rows, placeholder='Auktionen durchsuchen…')}
-      </div>
-    </section>
+        <section class="panel">
+          <h2>🏆 Aktive Auktionen</h2>
+          <p class="muted">Direkt öffnen, bieten und Status prüfen.</p>
+          <div class="home-list">{home_auctions_html}</div>
+        </section>
 
-    <section class="split">
-      <div class="panel">
-        <h2>⚠️ Mitglieder mit Hinweisen</h2>
-        {_table(['Spieler','Rolle','EC','Main','Loot','Hinweise'], member_rows, placeholder='Mitglieder durchsuchen…')}
+        <section class="panel">
+          <h2>✅ Offene Aufgaben</h2>
+          <p class="muted">Priorisierte Leitungs-Hinweise. Es wird nichts automatisch geändert.</p>
+          {_table(['Priorität','Bereich','Aufgabe','Details'], task_rows, placeholder='Aufgaben durchsuchen…')}
+        </section>
       </div>
-      <div class="panel">
-        <h2>🧭 Schnellzugriff</h2>
-        {quick_links}
-      </div>
+
+      <aside class="home-stack">
+        <section class="panel">
+          <h2>⚡ Schnellaktionen</h2>
+          <p class="muted">Die häufigsten Leitungswege ohne lange Menüleiste.</p>
+          {quick_action_html}
+        </section>
+
+        <section class="panel">
+          <h2>👑 Top-Mitglieder</h2>
+          <p class="muted">Aus Attendance, Voice, Loot und EC zusammengeführt.</p>
+          <div class="home-list">{top_members_html}</div>
+        </section>
+
+        <section class="panel">
+          <h2>🧾 Aktuelle Aktivität</h2>
+          <p class="muted">Aufgaben und EC-Queue in Kurzform.</p>
+          <div class="home-list">{home_activity_html}</div>
+        </section>
+      </aside>
     </section>
     """
     return _html_shell("Kommando · Ebo Dashboard", body)
