@@ -32,7 +32,7 @@ if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 ASSET_VER = "ebo-phase3-database-start"
-DASHBOARD_RELEASE_VERSION = "1.1.6 · Phase 3.6 EC-Read-Cutover"
+DASHBOARD_RELEASE_VERSION = "1.1.7 · Phase 3.7 Loot-Read-Cutover"
 
 
 def _database_url() -> str:
@@ -379,7 +379,7 @@ def _snapshot_payload() -> dict[str, Any]:
         "published_at": row.get("published_at"),
         "snapshot": snap,
     }
-    return _apply_phase3_ec_read_cutover(payload)
+    return _apply_phase3_loot_read_cutover(_apply_phase3_ec_read_cutover(payload))
 
 
 # ---------------------------------------------------------------------------
@@ -597,6 +597,366 @@ def _apply_phase3_ec_read_cutover(payload: dict[str, Any]) -> dict[str, Any]:
         "balances": len((pg_ec.get("balances") or {}).get("top") or []),
         "transactions": len((pg_ec.get("transactions") or {}).get("items") or []),
         "event_checks": len((pg_ec.get("event_checks") or {}).get("items") or []),
+    }
+    return payload
+
+
+# ---------------------------------------------------------------------------
+# Phase 3.7: Loot/Needs/Auktionen Read-Cutover
+# ---------------------------------------------------------------------------
+# Ziel: Das Dashboard liest Loot-/Need-/Auktionsdaten bevorzugt aus den
+# Phase-3-Postgres-Tabellen. JSON/Snapshot bleibt Fallback. Der Bot schreibt
+# weiterhin parallel JSON + Postgres; kein harter Write-Cutover.
+
+
+def _phase3_need_label(slot_name: Any, item_name: Any) -> str:
+    item = str(item_name or "").strip()
+    slot = str(slot_name or "").strip()
+    if not item:
+        return ""
+    if slot and not item.lower().startswith((slot + ":").lower()):
+        return f"{slot}: {item}"
+    return item
+
+
+def _phase3_member_name_map(guild_id: Any, snap: dict[str, Any]) -> dict[int, str]:
+    names = dict(_profile_name_map(snap))
+    if not _database_url():
+        return names
+    gid = str(guild_id or "").strip()
+    if not gid:
+        return names
+    try:
+        conn = _pg_connect()
+    except Exception:
+        return names
+    try:
+        with conn.cursor() as cur:
+            try:
+                cur.execute(
+                    """
+                    SELECT user_id, display_name, raw_json
+                    FROM phase3_members
+                    WHERE guild_id = %s
+                    """,
+                    (gid,),
+                )
+                for row in cur.fetchall() or []:
+                    raw = _phase3_json((row or {}).get("raw_json"), {}) if isinstance(row, dict) else {}
+                    uid = _user_id((row or {}).get("user_id"))
+                    name = str((row or {}).get("display_name") or raw.get("display_name") or raw.get("name") or raw.get("username") or "").strip()
+                    if uid and name:
+                        names[uid] = name
+            except Exception:
+                pass
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    return names
+
+
+def _phase3_loot_pg_payload(guild_id: Any, snap: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """Lädt Loot/Needs/Auktionen aus Postgres für den Dashboard-Read-Cutover.
+
+    Rückgabe ist absichtlich snapshot-kompatibel:
+    snap["loot"]["needs"]["items"]
+    snap["loot"]["auctions"]["items"]
+    snap["loot"]["history"]["items"]
+    """
+    if not _database_url():
+        return None
+    gid = str(guild_id or "").strip()
+    if not gid:
+        return None
+    names = _phase3_member_name_map(guild_id, snap)
+    try:
+        conn = _pg_connect()
+    except Exception:
+        return None
+    try:
+        with conn.cursor() as cur:
+            try:
+                cur.execute(
+                    """
+                    SELECT need_id, user_id, item_name, need_type, slot_name, status, raw_json, source, updated_at
+                    FROM phase3_loot_needs
+                    WHERE guild_id = %s
+                    ORDER BY user_id ASC, need_type ASC, slot_name ASC, item_name ASC
+                    """,
+                    (gid,),
+                )
+                need_rows = [dict(r) for r in (cur.fetchall() or [])]
+            except Exception:
+                need_rows = []
+
+            try:
+                cur.execute(
+                    """
+                    SELECT auction_id, item_name, status, winner_user_id, current_bid, raw_json, source, updated_at
+                    FROM phase3_loot_auctions
+                    WHERE guild_id = %s
+                    ORDER BY updated_at DESC, auction_id DESC
+                    """,
+                    (gid,),
+                )
+                auction_rows = [dict(r) for r in (cur.fetchall() or [])]
+            except Exception:
+                auction_rows = []
+
+            try:
+                cur.execute(
+                    """
+                    SELECT bid_id, auction_id, user_id, amount, raw_json, source, mirrored_at
+                    FROM phase3_loot_bids
+                    WHERE guild_id = %s
+                    ORDER BY mirrored_at DESC, bid_id DESC
+                    """,
+                    (gid,),
+                )
+                bid_rows = [dict(r) for r in (cur.fetchall() or [])]
+            except Exception:
+                bid_rows = []
+
+            try:
+                cur.execute(
+                    """
+                    SELECT entry_id, user_id, item_name, amount, raw_json, source, mirrored_at
+                    FROM phase3_loot_history
+                    WHERE guild_id = %s
+                    ORDER BY mirrored_at DESC, entry_id DESC
+                    LIMIT 1000
+                    """,
+                    (gid,),
+                )
+                history_rows = [dict(r) for r in (cur.fetchall() or [])]
+            except Exception:
+                history_rows = []
+
+            try:
+                cur.execute(
+                    """
+                    SELECT log_id, request_id, actor_id, target_user_id, action_type, old_item, new_item, raw_json, source, created_at
+                    FROM phase3_need_change_log
+                    WHERE guild_id = %s
+                    ORDER BY created_at DESC
+                    LIMIT 500
+                    """,
+                    (gid,),
+                )
+                need_log_rows = [dict(r) for r in (cur.fetchall() or [])]
+            except Exception:
+                need_log_rows = []
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    if not need_rows and not auction_rows and not bid_rows and not history_rows and not need_log_rows:
+        return None
+
+    # Needs spielerkompatibel gruppieren: eine Zeile pro Spieler, Main/Secondary als Listen.
+    players: dict[int, dict[str, Any]] = {}
+    need_entries: list[dict[str, Any]] = []
+    main_count = 0
+    secondary_count = 0
+    for row in need_rows:
+        raw = _phase3_json(row.get("raw_json"), {})
+        uid = _user_id(row.get("user_id") or raw.get("user_id"))
+        item = str(row.get("item_name") or raw.get("item_name") or raw.get("item") or raw.get("name") or "").strip()
+        if not uid or not item:
+            continue
+        slot = str(row.get("slot_name") or raw.get("slot_name") or raw.get("slot") or "").strip()
+        need_type_raw = str(row.get("need_type") or raw.get("need_type") or raw.get("type") or "Main").strip().lower()
+        kind = "secondary" if need_type_raw in {"secondary", "second", "off", "offspec", "secondary_need"} else "main"
+        if kind == "main":
+            main_count += 1
+        else:
+            secondary_count += 1
+        display = str(raw.get("display_name") or raw.get("name") or names.get(uid) or f"User {uid}")
+        p = players.setdefault(uid, {"user_id": uid, "display_name": display, "main": [], "secondary": []})
+        if display and (not p.get("display_name") or str(p.get("display_name")).startswith("User ")):
+            p["display_name"] = display
+        entry = {
+            "need_id": row.get("need_id") or raw.get("need_id"),
+            "item_name": item,
+            "slot": slot,
+            "slot_name": slot,
+            "label": _phase3_need_label(slot, item),
+            "status": row.get("status") or raw.get("status") or "",
+            "source": "postgres_phase3",
+        }
+        # _loot_text bevorzugt item_name. Damit die Loot-Zentrale weiterhin Slot+Item gruppiert,
+        # setzen wir item_name auf das sichtbare Label und bewahren das echte Item separat.
+        entry["raw_item_name"] = item
+        entry["item"] = item
+        entry["item_name"] = entry["label"] or item
+        p[kind].append(entry)
+        need_entries.append({**entry, "user_id": uid, "display_name": display, "need_type": "Main" if kind == "main" else "Secondary"})
+
+    need_items = sorted(players.values(), key=lambda p: str(p.get("display_name") or "").lower())
+
+    # Gebote nach Auktion gruppieren.
+    bids_by_auction: dict[str, list[dict[str, Any]]] = {}
+    for row in bid_rows:
+        raw = _phase3_json(row.get("raw_json"), {})
+        aid = str(row.get("auction_id") or raw.get("auction_id") or raw.get("id") or "").strip()
+        if not aid:
+            continue
+        uid = _user_id(row.get("user_id") or raw.get("user_id") or raw.get("bidder_user_id") or raw.get("actor_id"))
+        amount = int(_num(row.get("amount") if row.get("amount") is not None else raw.get("amount"), 0))
+        bid = {
+            **raw,
+            "bid_id": row.get("bid_id") or raw.get("bid_id"),
+            "auction_id": aid,
+            "user_id": uid,
+            "display_name": raw.get("display_name") or raw.get("user_name") or raw.get("bidder_name") or names.get(uid) or (f"User {uid}" if uid else "Unbekannt"),
+            "amount": amount,
+            "created_at": raw.get("created_at") or raw.get("timestamp") or raw.get("time") or str(row.get("mirrored_at") or ""),
+            "source": "postgres_phase3",
+        }
+        bids_by_auction.setdefault(aid, []).append(bid)
+    for arr in bids_by_auction.values():
+        arr.sort(key=lambda b: (int(_num(b.get("amount"), 0)), str(b.get("created_at") or "")), reverse=True)
+
+    auction_items: list[dict[str, Any]] = []
+    for row in auction_rows:
+        raw = _phase3_json(row.get("raw_json"), {})
+        aid = str(row.get("auction_id") or raw.get("auction_id") or raw.get("id") or "").strip()
+        if not aid:
+            continue
+        bids = list(bids_by_auction.get(aid) or [])
+        existing_bids = [b for b in (raw.get("bids") or []) if isinstance(b, dict)] if isinstance(raw, dict) else []
+        # Phase3-Gebote sind aktueller. Fehlende alte Gebote ergänzen, aber nicht doppeln.
+        seen_bid_keys = {(str(b.get("user_id") or b.get("bidder_user_id") or ""), str(b.get("amount") or ""), str(b.get("created_at") or b.get("timestamp") or "")) for b in bids}
+        for b in existing_bids:
+            key = (str(b.get("user_id") or b.get("bidder_user_id") or ""), str(b.get("amount") or ""), str(b.get("created_at") or b.get("timestamp") or ""))
+            if key not in seen_bid_keys:
+                bids.append(b)
+        bids.sort(key=lambda b: (int(_num(b.get("amount"), 0)), str(b.get("created_at") or b.get("timestamp") or "")), reverse=True)
+        top = bids[0] if bids else {}
+        winner_uid = _user_id(row.get("winner_user_id") or raw.get("winner_user_id") or raw.get("delivered_to_user_id") or raw.get("sold_to_user_id"))
+        item = str(row.get("item_name") or raw.get("item_name") or raw.get("item") or raw.get("name") or aid)
+        auction = {
+            **raw,
+            "auction_id": aid,
+            "item_name": item,
+            "status": row.get("status") or raw.get("status") or "",
+            "winner_user_id": winner_uid,
+            "winner_name": raw.get("winner_name") or raw.get("delivered_to_name") or names.get(winner_uid) or (f"User {winner_uid}" if winner_uid else ""),
+            "current_bid": int(_num(row.get("current_bid"), 0)),
+            "top_bid_amount": int(_num(raw.get("top_bid_amount") or raw.get("leader_bid") or raw.get("highest_bid") or (top.get("amount") if top else row.get("current_bid")), 0)),
+            "top_bid_user_id": _user_id(raw.get("top_bid_user_id") or raw.get("leader_user_id") or (top.get("user_id") if top else 0)),
+            "top_bid_user_name": raw.get("top_bid_user_name") or raw.get("leader_name") or (top.get("display_name") if top else ""),
+            "bid_count": len(bids),
+            "bids": bids,
+            "source": "postgres_phase3",
+        }
+        auction_items.append(auction)
+
+    history_items: list[dict[str, Any]] = []
+    for row in history_rows:
+        raw = _phase3_json(row.get("raw_json"), {})
+        uid = _user_id(row.get("user_id") or raw.get("user_id") or raw.get("winner_user_id") or raw.get("buyer_user_id"))
+        item = str(row.get("item_name") or raw.get("item_name") or raw.get("item") or raw.get("name") or "").strip()
+        history_items.append({
+            **raw,
+            "entry_id": row.get("entry_id") or raw.get("entry_id"),
+            "user_id": uid,
+            "display_name": raw.get("display_name") or raw.get("winner_name") or raw.get("buyer_name") or names.get(uid) or (f"User {uid}" if uid else ""),
+            "item_name": item,
+            "amount": int(_num(row.get("amount") if row.get("amount") is not None else raw.get("amount"), 0)),
+            "created_at": raw.get("created_at") or raw.get("closed_at") or raw.get("timestamp") or str(row.get("mirrored_at") or ""),
+            "source": "postgres_phase3",
+        })
+
+    need_log_items: list[dict[str, Any]] = []
+    for row in need_log_rows:
+        raw = _phase3_json(row.get("raw_json"), {})
+        actor = _user_id(row.get("actor_id") or raw.get("actor_id"))
+        target = _user_id(row.get("target_user_id") or raw.get("target_user_id") or raw.get("user_id"))
+        need_log_items.append({
+            **raw,
+            "log_id": row.get("log_id") or raw.get("log_id"),
+            "request_id": row.get("request_id") or raw.get("request_id"),
+            "actor_id": actor,
+            "actor_name": raw.get("actor_name") or names.get(actor) or (f"User {actor}" if actor else ""),
+            "target_user_id": target,
+            "target_name": raw.get("target_name") or raw.get("display_name") or names.get(target) or (f"User {target}" if target else ""),
+            "action_type": row.get("action_type") or raw.get("action_type") or raw.get("type") or "",
+            "old_item": row.get("old_item") or raw.get("old_item") or "",
+            "new_item": row.get("new_item") or raw.get("new_item") or raw.get("item_name") or "",
+            "created_at": str(row.get("created_at") or raw.get("created_at") or ""),
+            "source": "postgres_phase3",
+        })
+
+    auction_items.sort(key=lambda a: str(a.get("ends_at") or a.get("updated_at") or a.get("created_at") or ""), reverse=True)
+
+    return {
+        "source": "postgres_phase3_loot_read_cutover",
+        "read_cutover": True,
+        "needs": {
+            "items": need_items,
+            "entries": need_entries,
+            "entry_count": len(need_entries),
+            "player_count": len(need_items),
+            "main_count": main_count,
+            "secondary_count": secondary_count,
+            "source": "postgres_phase3",
+        },
+        "auctions": {
+            "items": auction_items,
+            "count": len(auction_items),
+            "source": "postgres_phase3",
+        },
+        "bids": {
+            "items": [b for arr in bids_by_auction.values() for b in arr],
+            "count": sum(len(arr) for arr in bids_by_auction.values()),
+            "source": "postgres_phase3",
+        },
+        "history": {
+            "items": history_items,
+            "count": len(history_items),
+            "source": "postgres_phase3",
+        },
+        "need_change_log": {
+            "items": need_log_items,
+            "count": len(need_log_items),
+            "source": "postgres_phase3",
+        },
+    }
+
+
+def _apply_phase3_loot_read_cutover(payload: dict[str, Any]) -> dict[str, Any]:
+    """Wendet Loot-Read-Cutover auf den Snapshot an, ohne den Snapshot selbst zu verlieren."""
+    if not payload.get("ok"):
+        return payload
+    snap = payload.get("snapshot") if isinstance(payload.get("snapshot"), dict) else {}
+    guild_id = payload.get("guild_id") or snap.get("guild_id") or _env("DASHBOARD_GUILD_ID")
+    pg_loot = _phase3_loot_pg_payload(guild_id, snap)
+    if not pg_loot:
+        payload["phase3_loot_read_cutover"] = {"active": False, "source": "snapshot_fallback", "reason": "Postgres-Loot nicht verfügbar oder leer"}
+        return payload
+    old_loot = snap.get("loot") if isinstance(snap.get("loot"), dict) else {}
+    snap["loot_snapshot_fallback"] = old_loot
+    merged = dict(old_loot)
+    # Nur die geprüften Phase-3-Bereiche ersetzen. Andere Loot-Teile aus dem Snapshot bleiben erhalten.
+    for key in ["needs", "auctions", "bids", "history", "need_change_log"]:
+        merged[key] = pg_loot.get(key) or merged.get(key) or {}
+    merged["source"] = "postgres_phase3_read_cutover"
+    merged["read_cutover"] = True
+    snap["loot"] = merged
+    payload["snapshot"] = snap
+    payload["phase3_loot_read_cutover"] = {
+        "active": True,
+        "source": "postgres_phase3",
+        "need_entries": int((pg_loot.get("needs") or {}).get("entry_count") or 0),
+        "need_players": int((pg_loot.get("needs") or {}).get("player_count") or 0),
+        "auctions": len((pg_loot.get("auctions") or {}).get("items") or []),
+        "bids": int((pg_loot.get("bids") or {}).get("count") or 0),
+        "history": int((pg_loot.get("history") or {}).get("count") or 0),
     }
     return payload
 
@@ -4311,9 +4671,12 @@ def _render_loot_center(data: dict[str, Any]) -> str:
     names = _profile_name_map(snap)
     center = _loot_center_payload_from_snapshot(snap)
 
+    loot_cut = data.get("phase3_loot_read_cutover") or {}
+    loot_source_title = "Postgres Phase 3" if loot_cut.get("active") else "Snapshot/Fallback"
+    loot_source_sub = "Read-Cutover aktiv" if loot_cut.get("active") else str(loot_cut.get("reason") or "Fallback aktiv")
     cards = "".join([
+        _card("Loot-Quelle", loot_source_title, loot_source_sub),
         _card("Aktive Auktionen", len(center["active"]), "offen/läuft"),
-        _card("Übergabe offen", len(center["handover"]), "Gewinner ohne Übergabe"),
         _card("Ohne Gebot", len(center["no_bid"]), "aktive Auktionen"),
         _card("Need-Items", len(center["needs"]), "aus Need-Einträge"),
     ])
@@ -5633,7 +5996,7 @@ def api_loot(_: bool = Depends(_auth)):
     if not payload.get("ok"):
         return JSONResponse(payload, status_code=404)
     snap = payload.get("snapshot") or {}
-    return JSONResponse({"ok": True, "loot": (snap.get("loot") or {}), "insights": (_insights(snap).get("loot") or {})})
+    return JSONResponse({"ok": True, "loot": (snap.get("loot") or {}), "insights": (_insights(snap).get("loot") or {}), "phase3_loot_read_cutover": payload.get("phase3_loot_read_cutover") or {}})
 
 
 @app.get("/export/members.csv")
