@@ -31,7 +31,7 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
-ASSET_VER = "ebo-sidebar-event-center-1"
+ASSET_VER = "ebo-event-center-step2"
 
 
 def _database_url() -> str:
@@ -6038,107 +6038,243 @@ def _event_role_counts(ev: dict[str, Any]) -> str:
 def _render_events_center(data: dict[str, Any], current_user: Optional[dict[str, Any]] = None, msg: str = "") -> str:
     if not data.get("ok"):
         return _html_shell("Events · Ebo Dashboard", f"<section class='panel'><h1>📅 Events</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+
     snap: dict[str, Any] = data.get("snapshot") or {}
     guild_id = _safe_guild_id(data)
     now = datetime.now(timezone.utc)
-    events = [dict(e) for e in ((snap.get("events") or {}).get("items") or []) if isinstance(e, dict)]
-    by_id = {str(e.get("event_id") or e.get("id") or ""): e for e in events if str(e.get("event_id") or e.get("id") or "")}
+
+    raw_events = [dict(e) for e in ((snap.get("events") or {}).get("items") or []) if isinstance(e, dict)]
+    by_id: dict[str, dict[str, Any]] = {}
+    for ev in raw_events:
+        eid = str(ev.get("event_id") or ev.get("id") or "").strip()
+        if eid:
+            by_id[eid] = ev
+
+    # Events mit offenem DKP-/EC-Check und gespeicherte Reviews werden bewusst ergänzt.
     for ev in _events_with_pending_ec_checks(snap):
-        eid = str(ev.get("event_id") or ev.get("id") or "")
+        eid = str(ev.get("event_id") or ev.get("id") or "").strip()
         if eid and eid not in by_id:
             by_id[eid] = dict(ev)
         elif eid:
             by_id[eid].update({k: v for k, v in ev.items() if str(k).startswith("_")})
     if guild_id:
-        for ev in _open_attendance_review_events_for_homepage(snap, guild_id, limit=40):
-            eid = str(ev.get("event_id") or ev.get("id") or "")
+        for ev in _open_attendance_review_events_for_homepage(snap, guild_id, limit=80):
+            eid = str(ev.get("event_id") or ev.get("id") or "").strip()
             if eid and eid not in by_id:
                 by_id[eid] = dict(ev)
+
     events = list(by_id.values())
-    def _sort_key(ev: dict[str, Any]):
-        dt = _dt_obj(ev.get("when_iso") or ev.get("start_at") or ev.get("created_at"))
-        return dt or datetime.max.replace(tzinfo=timezone.utc)
-    events.sort(key=_sort_key)
-    running = [e for e in events if _is_running_event(e) or e.get("_pending_ec_check") or e.get("_attendance_review_only")]
-    upcoming = []
-    for e in events:
-        dt = _dt_obj(e.get("when_iso") or e.get("start_at") or e.get("created_at"))
-        if dt and dt >= now and e not in running:
-            upcoming.append(e)
-    action_rows = _dashboard_event_action_requests(guild_id, limit=30) if guild_id else []
+
+    def _when(ev: dict[str, Any]) -> Optional[datetime]:
+        return _dt_obj(ev.get("when_iso") or ev.get("start_at") or ev.get("created_at"))
+
+    def _sort_key_future(ev: dict[str, Any]):
+        return _when(ev) or datetime.max.replace(tzinfo=timezone.utc)
+
+    def _sort_key_past(ev: dict[str, Any]):
+        dt = _when(ev) or datetime.min.replace(tzinfo=timezone.utc)
+        return -dt.timestamp()
+
+    running: list[dict[str, Any]] = []
+    upcoming: list[dict[str, Any]] = []
+    past: list[dict[str, Any]] = []
+    for ev in events:
+        dt = _when(ev)
+        if _is_running_event(ev) or ev.get("_pending_ec_check") or ev.get("_attendance_review_only"):
+            running.append(ev)
+        elif dt and dt >= now:
+            upcoming.append(ev)
+        else:
+            past.append(ev)
+
+    running.sort(key=_sort_key_future)
+    upcoming.sort(key=_sort_key_future)
+    past.sort(key=_sort_key_past)
+
+    action_rows = _dashboard_event_action_requests(guild_id, limit=50) if guild_id else []
     ac = _event_action_counts(action_rows)
-    cards = "".join([
-        _card("Laufend/offen", len(running), "inkl. Review/EC offen"),
-        _card("Kommend", len(upcoming), "geplante Events"),
-        _card("Event-Aktionen", ac.get("pending", 0) + ac.get("processing", 0), f"erledigt: {ac.get('done', 0)}"),
-        _card("Events gesamt", len(events), "Snapshot + offene Reviews"),
-    ])
-    event_rows = []
-    for ev in (running + [x for x in upcoming if x not in running])[:80]:
+
+    def _event_buttons(eid: str) -> str:
+        if not eid:
+            return "—"
+        return (
+            f"<div class='actions-inline'>"
+            f"<a class='link' href='/event/{_e(eid)}'>Details</a>"
+            f"<a class='link' href='/attendance/{_e(eid)}'>Review</a>"
+            f"<a class='link' href='/attendance/{_e(eid)}/report'>Bericht</a>"
+            f"<a class='link' href='/attendance/{_e(eid)}/ec-preview'>EC</a>"
+            f"</div>"
+        )
+
+    def _role_bar(ev: dict[str, Any]) -> str:
+        summary = _event_role_summary(ev)
+        parts = []
+        for label, icon in (("Tank", "🛡️"), ("Heiler", "✚"), ("DPS", "⚔️"), ("Reserve", "🪑")):
+            parts.append(f"<span class='pill'>{icon} {_e(label)}: {_e(summary.get(label, 0))}</span>")
+        maybe = int(_num(ev.get("maybe_count"), 0))
+        no = int(_num(ev.get("no_count"), 0))
+        if maybe:
+            parts.append(f"<span class='pill'>Vielleicht: {_e(maybe)}</span>")
+        if no:
+            parts.append(f"<span class='pill muted'>Abgemeldet: {_e(no)}</span>")
+        return " ".join(parts)
+
+    def _participant_preview(ev: dict[str, Any]) -> str:
+        parts = ev.get("participants") or {}
+        names: list[str] = []
+        yes = parts.get("yes") or []
+        if isinstance(yes, list):
+            for group in yes:
+                if not isinstance(group, dict):
+                    continue
+                for p in (group.get("participants") or [])[:3]:
+                    if isinstance(p, dict):
+                        names.append(str(p.get("display_name") or p.get("name") or p.get("user_id") or ""))
+                    elif p:
+                        names.append(str(p))
+                    if len(names) >= 6:
+                        break
+                if len(names) >= 6:
+                    break
+        if not names:
+            return "<span class='muted'>Noch keine Zusagen im Snapshot.</span>"
+        more = int(_num(ev.get("participant_count"), 0)) - len(names)
+        suffix = f" <span class='muted'>+{_e(more)} weitere</span>" if more > 0 else ""
+        return ", ".join(_e(n) for n in names if n) + suffix
+
+    def _event_card(ev: dict[str, Any], label: str) -> str:
         eid = str(ev.get("event_id") or ev.get("id") or "")
-        event_rows.append([
-            _raw(f"<a class='link' href='/event/{_e(eid)}'>{_e(ev.get('title') or ev.get('name') or eid)}</a>"),
-            _dt(ev.get("when_iso") or ev.get("start_at") or ev.get("created_at")),
-            _event_status_text(ev),
-            _event_role_counts(ev),
-            ev.get("participant_count", ev.get("participants", "—")),
-            _raw(f"<a class='link' href='/attendance/{_e(eid)}'>Review</a> · <a class='link' href='/attendance/{_e(eid)}/ec-preview'>EC</a>"),
-        ])
+        title = str(ev.get("title") or ev.get("name") or eid or "Event")
+        status = _event_status_text(ev)
+        status_class = "ok" if label == "kommend" else "warn" if label == "offen" else "muted"
+        queue_badge = _event_ec_queue_badge(guild_id, eid) if guild_id and eid else {"label": "—", "class": "muted"}
+        return f"""
+        <article class="event-card">
+          <div class="event-card-head">
+            <div>
+              <div class="eyebrow">{_e(label.upper())}</div>
+              <h3><a class="link" href="/event/{_e(eid)}">{_e(title)}</a></h3>
+              <p class="muted">{_dt(ev.get('when_iso') or ev.get('start_at') or ev.get('created_at'))}</p>
+            </div>
+            <div style="text-align:right"><span class="pill {status_class}">{_e(status)}</span><br><span class="pill {_e(queue_badge.get('class'))}">{_e(queue_badge.get('label'))}</span></div>
+          </div>
+          <div class="role-strip">{_role_bar(ev)}</div>
+          <p class="muted"><strong>Teilnehmer:</strong> {_participant_preview(ev)}</p>
+          {_raw(_event_buttons(eid)).get('__html__')}
+        </article>
+        """
+
+    def _section(title: str, items: list[dict[str, Any]], label: str, empty: str) -> str:
+        cards_html = "".join(_event_card(ev, label) for ev in items[:30])
+        if not cards_html:
+            cards_html = f"<div class='empty'>{_e(empty)}</div>"
+        return f"<section class='panel'><h2>{_e(title)}</h2><div class='event-card-grid'>{cards_html}</div></section>"
+
     action_table_rows = []
-    for r in action_rows[:30]:
+    for r in action_rows[:40]:
         result = ""
         try:
             result_obj = json.loads(str(r.get("result_json") or "{}"))
             result = result_obj.get("message") or result_obj.get("error") or ""
         except Exception:
-            result = str(r.get("result_json") or "")[:140]
-        action_table_rows.append([r.get("requested_at"), r.get("action_type"), r.get("event_id") or "neu", r.get("status"), r.get("actor_name"), result])
+            result = str(r.get("result_json") or "")[:160]
+        action_table_rows.append([
+            r.get("requested_at"),
+            r.get("action_type"),
+            r.get("event_id") or "neu",
+            r.get("status"),
+            r.get("actor_name"),
+            result,
+        ])
+
+    cards = "".join([
+        _card("Laufend/offen", len(running), "inkl. offener Review/EC"),
+        _card("Kommend", len(upcoming), "geplante Events"),
+        _card("Vergangen", len(past), "letzte Events im Snapshot"),
+        _card("Queue offen", ac.get("pending", 0) + ac.get("processing", 0), f"erledigt: {ac.get('done', 0)}"),
+    ])
+
+    event_table_rows = []
+    for ev in (running + upcoming + past)[:120]:
+        eid = str(ev.get("event_id") or ev.get("id") or "")
+        event_table_rows.append([
+            _raw(f"<a class='link' href='/event/{_e(eid)}'>{_e(ev.get('title') or ev.get('name') or eid)}</a>"),
+            _dt(ev.get("when_iso") or ev.get("start_at") or ev.get("created_at")),
+            _event_status_text(ev),
+            _raw(_role_bar(ev)),
+            ev.get("participant_count", ev.get("participants", "—")),
+            _raw(_event_buttons(eid)),
+        ])
+
     msg_panel = f"<section class='panel'><p>{_e(msg)}</p></section>" if msg else ""
     body = f"""
-    <nav class="topnav"><a href="/">← Kommando</a><a href="/attendance">Anwesenheit</a><a href="/ec">EC</a><a href="/overview">Gesamtübersicht</a><a href="/api/events-center">API</a></nav>
+    <style>
+      .event-card-grid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(280px,1fr)); gap:14px; }}
+      .event-card {{ border:1px solid rgba(255,255,255,.10); border-radius:18px; padding:16px; background:rgba(16,12,10,.55); box-shadow:0 12px 34px rgba(0,0,0,.22); }}
+      .event-card-head {{ display:flex; justify-content:space-between; gap:14px; align-items:flex-start; }}
+      .event-card h3 {{ margin:.15rem 0 .1rem; }}
+      .role-strip {{ display:flex; flex-wrap:wrap; gap:6px; margin:12px 0; }}
+      .actions-inline {{ display:flex; flex-wrap:wrap; gap:8px; margin-top:12px; }}
+      .actions-inline .link {{ border:1px solid rgba(255,255,255,.12); border-radius:999px; padding:7px 10px; background:rgba(255,255,255,.04); text-decoration:none; }}
+      .actions-inline .link:hover {{ background:rgba(234,179,8,.12); }}
+      .event-form-grid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:10px; }}
+      .event-form-grid label {{ display:block; }}
+      .event-form-grid input, .event-form-grid textarea, .event-form-grid select {{ width:100%; }}
+      @media(max-width:720px) {{ .event-card-head {{ flex-direction:column; }} .actions-inline .link {{ flex:1 1 auto; text-align:center; }} }}
+    </style>
+    <nav class="topnav"><a href="/">← Kommando</a><a href="/attendance">Anwesenheit</a><a href="/ec">EC</a><a href="/overview">Gesamtübersicht</a><a href="/api/events-center">API</a><a href="/export/events_center.csv">CSV</a></nav>
     <section class="hero">
-      <div><div class="eyebrow">Event-Zentrale</div><h1>📅 Events & Planung</h1><p class="muted">Kommende Events, laufende Events, Rollenverteilung, Teilnehmer, Review/EC und Dashboard-Anträge für Erstellen/Bearbeiten/Löschen.</p></div>
-      <div class="hero-actions"><a class="hero-action attendance" href="#create"><span>➕</span><strong>Event erstellen</strong><small>geht als Antrag an den Bot</small></a><a class="hero-action loot" href="#events"><span>📋</span><strong>Events prüfen</strong><small>Status & Rollen</small></a><a class="hero-action members" href="#actions"><span>🧾</span><strong>Queue</strong><small>Bot-Verarbeitung</small></a></div>
+      <div><div class="eyebrow">Event-Zentrale</div><h1>📅 Events & Planung</h1><p class="muted">Kommende Events, laufende Events, Eventstatus, Rollenverteilung, Teilnehmerübersicht und direkte Links zu Attendance, Review und EC.</p></div>
+      <div class="hero-actions"><a class="hero-action attendance" href="#create"><span>➕</span><strong>Event erstellen</strong><small>Bot-Queue</small></a><a class="hero-action loot" href="#overview"><span>📋</span><strong>Events prüfen</strong><small>Status & Rollen</small></a><a class="hero-action members" href="#actions"><span>🧾</span><strong>Queue</strong><small>Erstellen/Bearbeiten/Löschen</small></a></div>
     </section>
     {msg_panel}
     <section class="grid">{cards}</section>
-    <section class="panel" id="events"><h2>📋 Eventübersicht</h2><p class="muted">Direktlinks führen zu Eventdetail, Attendance-Review und EC-Vorschau.</p>{_table(['Event','Zeit','Status','Rollenverteilung','Teilnehmer','Aktionen'], event_rows, placeholder='Events durchsuchen…')}</section>
-    <section class="split">
-      <section class="panel" id="create"><h2>➕ Event erstellen</h2><p class="muted">Dashboard legt einen Antrag an. Der Bot postet das Event im angegebenen Zielkanal und verschickt optional DMs.</p>
-        <form method="post" action="/admin/events/action" style="display:grid; gap:10px;">
-          <input type="hidden" name="action_type" value="create">
-          <label>Titel<br><input name="title" required placeholder="z. B. Gildenbosse-Sonntag"></label>
+    <div id="overview"></div>
+    {_section('🔥 Laufende / offene Events', running, 'offen', 'Keine laufenden oder offenen Events.')}
+    {_section('📆 Kommende Events', upcoming, 'kommend', 'Keine kommenden Events im Snapshot.')}
+    {_section('🕰️ Vergangene / abgeschlossene Events', past[:20], 'vergangen', 'Keine alten Events im Snapshot.')}
+    <section class="panel"><h2>📋 Komplette Eventliste</h2><p class="muted">Suchbar. Enthält Snapshot-Events plus offene Review-/EC-Fallbacks.</p>{_table(['Event','Zeit','Status','Rollen','Teilnehmer','Links'], event_table_rows, placeholder='Event suchen…')}</section>
+    <section class="panel" id="create"><h2>➕ Event erstellen</h2><p class="muted">Das Dashboard schreibt nicht direkt in Discord. Es legt einen Antrag an, den der Bot verarbeitet.</p>
+      <form method="post" action="/admin/events/action" style="display:grid; gap:12px;">
+        <input type="hidden" name="action_type" value="create">
+        <div class="event-form-grid">
+          <label>Titel<br><input name="title" required placeholder="z. B. Gildenbosse Sonntag"></label>
           <label>Datum<br><input name="date" type="date" required></label>
           <label>Uhrzeit<br><input name="time" type="time" required></label>
           <label>Eventtyp<br><input name="event_type" placeholder="gildenbosse / raid / pvp / hm"></label>
           <label>Zielkanal-ID<br><input name="channel_id" required placeholder="Discord Channel ID"></label>
           <label>Zielrollen-ID optional<br><input name="target_role_id" placeholder="Discord Role ID"></label>
-          <label>Beschreibung<br><textarea name="description" rows="4" placeholder="Kurzbeschreibung"></textarea></label>
+        </div>
+        <label>Beschreibung<br><textarea name="description" rows="4" placeholder="Kurzbeschreibung"></textarea></label>
+        <div class="event-form-grid">
           <label>Bild-URL optional<br><input name="image_url" placeholder="https://..."></label>
-          <label style="display:flex; gap:8px; align-items:center;"><input type="checkbox" name="send_dms" value="1" checked> DMs an Zielgruppe senden</label>
-          <button class="btn" type="submit" onclick="return confirm('Event-Erstellung als Bot-Antrag senden?')">Event-Erstellung an Bot senden</button>
-        </form>
-      </section>
-      <section class="panel"><h2>✏️ Bearbeiten / Löschen</h2><p class="muted">Event-ID ist normalerweise die Discord-Message-ID des Eventposts.</p>
-        <form method="post" action="/admin/events/action" style="display:grid; gap:10px; margin-bottom:18px;">
+          <label style="display:flex; gap:8px; align-items:center; padding-top:22px;"><input type="checkbox" name="send_dms" value="1" checked> DMs an Zielgruppe senden</label>
+        </div>
+        <button class="btn" type="submit" onclick="return confirm('Event-Erstellung als Bot-Antrag senden?')">Event-Erstellung an Bot senden</button>
+      </form>
+    </section>
+    <section class="split">
+      <section class="panel"><h2>✏️ Event bearbeiten</h2><p class="muted">Nur ausgefüllte Felder werden geändert. Event-ID ist normalerweise die Discord-Message-ID des Eventposts.</p>
+        <form method="post" action="/admin/events/action" style="display:grid; gap:10px;">
           <input type="hidden" name="action_type" value="edit">
           <label>Event-ID<br><input name="event_id" required placeholder="Message-ID"></label>
           <label>Neuer Titel optional<br><input name="title"></label>
-          <label>Neues Datum optional<br><input name="date" type="date"></label>
-          <label>Neue Uhrzeit optional<br><input name="time" type="time"></label>
+          <div class="event-form-grid"><label>Neues Datum optional<br><input name="date" type="date"></label><label>Neue Uhrzeit optional<br><input name="time" type="time"></label></div>
           <label>Neue Beschreibung optional<br><textarea name="description" rows="3"></textarea></label>
           <label>Neue Bild-URL optional<br><input name="image_url"></label>
           <button class="btn" type="submit" onclick="return confirm('Änderung als Bot-Antrag senden?')">Bearbeitung an Bot senden</button>
         </form>
+      </section>
+      <section class="panel"><h2>🗑️ Event löschen</h2><p class="muted">Löscht nicht blind im Dashboard, sondern sendet einen sicheren Antrag an den Bot.</p>
         <form method="post" action="/admin/events/action" style="display:grid; gap:10px;">
           <input type="hidden" name="action_type" value="delete">
           <label>Event-ID<br><input name="event_id" required placeholder="Message-ID"></label>
           <label>Zur Sicherheit LÖSCHEN schreiben<br><input name="confirm" required placeholder="LÖSCHEN"></label>
-          <button class="btn danger" type="submit" onclick="return confirm('Event wirklich löschen? Serverpost und DMs werden durch den Bot gelöscht.')">Löschen an Bot senden</button>
+          <button class="btn danger" type="submit" onclick="return confirm('Event wirklich löschen? Der Bot entfernt den Eventpost.')">Löschen an Bot senden</button>
         </form>
       </section>
     </section>
-    <section class="panel" id="actions"><h2>🧾 Event-Aktionsqueue</h2><p class="muted">Hier siehst du, ob der Bot Dashboard-Anträge schon verarbeitet hat.</p>{_table(['Zeit','Aktion','Event','Status','Von','Ergebnis'], action_table_rows, placeholder='Queue durchsuchen…')}</section>
+    <section class="panel" id="actions"><h2>🧾 Event-Aktionsqueue</h2><p class="muted">Zeigt Erstellen/Bearbeiten/Löschen aus dem Dashboard und den Bot-Status.</p>{_table(['Zeit','Aktion','Event','Status','Von','Ergebnis'], action_table_rows, placeholder='Queue durchsuchen…')}</section>
     """
     return _html_shell("Events · Ebo Dashboard", body)
 
@@ -6158,7 +6294,53 @@ def api_events_center(_: bool = Depends(_auth)):
         return JSONResponse(payload, status_code=404)
     snap = payload.get("snapshot") or {}
     guild_id = _safe_guild_id(payload)
-    return JSONResponse({"ok": True, "events": (snap.get("events") or {}).get("items") or [], "actions": _dashboard_event_action_requests(guild_id, limit=80) if guild_id else []})
+    now = datetime.now(timezone.utc)
+    events = [dict(e) for e in ((snap.get("events") or {}).get("items") or []) if isinstance(e, dict)]
+    running: list[dict[str, Any]] = []
+    upcoming: list[dict[str, Any]] = []
+    past: list[dict[str, Any]] = []
+    for ev in events:
+        dt = _dt_obj(ev.get("when_iso") or ev.get("start_at") or ev.get("created_at"))
+        if _is_running_event(ev):
+            running.append(ev)
+        elif dt and dt >= now:
+            upcoming.append(ev)
+        else:
+            past.append(ev)
+    return JSONResponse({
+        "ok": True,
+        "counts": {"running": len(running), "upcoming": len(upcoming), "past": len(past), "total": len(events)},
+        "running": running,
+        "upcoming": upcoming,
+        "past": past,
+        "events": events,
+        "actions": _dashboard_event_action_requests(guild_id, limit=80) if guild_id else [],
+    })
+
+
+@app.get("/export/events_center.csv")
+def export_events_center_csv(_: bool = Depends(_auth)):
+    payload = _snapshot_payload()
+    if not payload.get("ok"):
+        return _csv_response("events_center.csv", ["error"], [[payload.get("error")]])
+    snap = payload.get("snapshot") or {}
+    rows: list[list[Any]] = []
+    for ev in ((snap.get("events") or {}).get("items") or []):
+        if not isinstance(ev, dict):
+            continue
+        eid = str(ev.get("event_id") or ev.get("id") or "")
+        rows.append([
+            eid,
+            ev.get("title") or ev.get("name") or "",
+            _dt(ev.get("when_iso") or ev.get("start_at") or ev.get("created_at")),
+            _event_status_text(ev),
+            _event_role_counts(ev),
+            ev.get("participant_count", ""),
+            ev.get("maybe_count", ""),
+            ev.get("no_count", ""),
+        ])
+    return _csv_response("events_center.csv", ["event_id", "title", "time", "status", "roles", "participants", "maybe", "no"], rows)
+
 
 
 @app.post("/admin/events/action")
