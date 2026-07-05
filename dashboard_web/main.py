@@ -24,14 +24,15 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response, RedirectResp
 from fastapi.staticfiles import StaticFiles
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
-app = FastAPI(title="Ebo Dashboard", version="0.9.0")
+app = FastAPI(title="Ebo Dashboard", version="1.0.0")
 security = HTTPBasic(auto_error=False)
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
-ASSET_VER = "ebo-member-portal-step3"
+ASSET_VER = "ebo-release-stability-step4"
+DASHBOARD_RELEASE_VERSION = "1.0.0 · Release/Stabilität Step 4"
 
 
 def _database_url() -> str:
@@ -2217,7 +2218,9 @@ def _sidebar_html() -> str:
 
       <div class="sidebar-footer">
         <a href="/me">Mein Login</a>
+        <a href="/release">Release</a>
         <a href="/logout">Logout</a>
+        <span class="version-pill">v{_e(DASHBOARD_RELEASE_VERSION)}</span>
       </div>
     </aside>
     """
@@ -2343,6 +2346,27 @@ def _html_shell(title: str, body: str) -> str:
     .empty::before {{ content:""; position:absolute; left:16px; top:50%; width:30px; height:30px; transform:translateY(-50%); background:url("{_asset('status_ec_offen.png')}") center / contain no-repeat; opacity:.78; }}
     .warn {{ background:#3a250d; border:1px solid #8a5b18; padding:12px 14px; border-radius:12px; margin-bottom:14px; color:#ffe0a3; }}
     .authbar {{ display:flex; gap:10px; align-items:center; justify-content:flex-end; background:rgba(24,26,34,.78); border:1px solid var(--line); border-radius:12px; padding:10px 12px; margin-bottom:14px; color:var(--muted); font-size:13px; }} .authbar a {{ color:var(--gold); text-decoration:none; font-weight:700; }}
+
+    .version-pill { color:var(--muted); font-size:11px; border:1px solid rgba(214,168,79,.16); background:rgba(214,168,79,.05); border-radius:999px; padding:6px 9px; text-align:center; }
+    .release-grid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:12px; margin:12px 0 18px; }
+    .release-card { background:rgba(32,35,45,.72); border:1px solid var(--line); border-radius:15px; padding:14px; min-width:0; }
+    .release-card b { color:var(--gold); display:block; font-size:20px; margin-bottom:4px; }
+    .release-card span { color:var(--muted); font-size:12px; }
+    .mobile-note { border:1px solid rgba(129,199,132,.25); background:rgba(129,199,132,.07); color:#d7ffd8; border-radius:14px; padding:12px 14px; margin:12px 0; }
+    .page-actions { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+    .page-actions .btn, .page-actions a { margin:0; }
+    img { max-width:100%; height:auto; }
+    form { max-width:100%; }
+    input, select, textarea, button { font:inherit; max-width:100%; }
+    input[type=text], input[type=number], input[type=datetime-local], input[type=date], input[type=url], input[type=search], select, textarea { width:100%; border:1px solid var(--line); background:#08090d; color:var(--text); border-radius:10px; padding:10px 12px; outline:none; }
+    input:focus, select:focus, textarea:focus { border-color:var(--gold); box-shadow:0 0 0 3px rgba(214,168,79,.12); }
+    .form-row, .form-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; align-items:end; }
+    .actions-inline { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+    .actions-inline form { display:inline-flex; gap:8px; flex-wrap:wrap; align-items:center; }
+    .responsive-table { width:100%; overflow-x:auto; -webkit-overflow-scrolling:touch; border-radius:12px; }
+    .responsive-table > table { min-width:680px; }
+    .skip-mobile { display:inline; }
+
     @media(max-width:1100px) {{ .app-shell {{ grid-template-columns:1fr; }} .sidebar {{ position:relative; height:auto; border-right:0; border-bottom:1px solid rgba(214,168,79,.16); }} .side-nav {{ display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); }} .side-nav details {{ margin-top:0; }} .home-layout {{ grid-template-columns:1fr; }} }}
     @media(max-width:1000px) {{ .grid,.analytics-grid {{ grid-template-columns:repeat(2,minmax(0,1fr)); }} .split {{ grid-template-columns:1fr; }} .hero {{ flex-direction:column; align-items:flex-start; }} .hero-actions {{ grid-template-columns:1fr; width:100%; }} }}
     @media(max-width:760px) {{
@@ -2380,6 +2404,18 @@ def _html_shell(title: str, body: str) -> str:
       th,td {{ padding:9px 7px; }}
       .btn {{ width:auto; max-width:100%; white-space:normal; text-align:center; }}
       .queue-badge,.pill {{ white-space:normal; }}
+
+      .topnav { display:flex; flex-wrap:nowrap; overflow-x:auto; -webkit-overflow-scrolling:touch; gap:8px; padding-bottom:6px; margin-bottom:12px; scrollbar-width:none; }
+      .topnav::-webkit-scrollbar { display:none; }
+      .topnav a { flex:0 0 auto; font-size:12px; padding:8px 10px; }
+      .release-grid { grid-template-columns:1fr 1fr; }
+      .form-row, .form-grid { grid-template-columns:1fr; }
+      .actions-inline, .actions-inline form, .page-actions { display:grid; grid-template-columns:1fr; width:100%; }
+      .actions-inline .btn, .actions-inline button, .actions-inline a, .page-actions .btn, .page-actions a { width:100%; text-align:center; }
+      input[type=text], input[type=number], input[type=datetime-local], input[type=date], input[type=url], input[type=search], select, textarea { min-height:42px; font-size:16px; }
+      .responsive-table { margin-inline:-2px; padding-bottom:4px; }
+      .skip-mobile { display:none; }
+
     }}
     @media(max-width:560px) {{ main.content {{ padding:12px 10px 42px; }} .grid,.analytics-grid,.side-nav {{ grid-template-columns:1fr; }} .bar-row {{ grid-template-columns:90px 1fr 38px; }} .home-item {{ grid-template-columns:38px minmax(0,1fr); }} .home-item .pill {{ grid-column:2; justify-self:start; }} .split {{ grid-template-columns:1fr; }} }}
   </style>
@@ -2411,6 +2447,15 @@ function filterNextTable(input) {{
 (function mobileNavCleanup() {{
   document.querySelectorAll('.side-nav a').forEach(a => a.addEventListener('click', () => document.body.classList.remove('nav-open')));
   document.addEventListener('keydown', ev => {{ if (ev.key === 'Escape') document.body.classList.remove('nav-open'); }});
+}})();
+(function responsiveTables() {{
+  document.querySelectorAll('table').forEach(tbl => {{
+    if (tbl.closest('.table-wrap') || tbl.closest('.responsive-table')) return;
+    const wrap = document.createElement('div');
+    wrap.className = 'responsive-table';
+    tbl.parentNode.insertBefore(wrap, tbl);
+    wrap.appendChild(tbl);
+  }});
 }})();
 </script></body>
 </html>"""
@@ -8106,6 +8151,108 @@ async def admin_settings_request_action(request: Request, request_id: str, queue
     res = _settings_request_admin_action(guild_id, request_id, queue_action, actor)
     msg = "Queue-Aktion ausgeführt." if res.get("ok") else f"Fehler: {res.get('error')}"
     return RedirectResponse("/admin-settings?msg=" + urllib.parse.quote(msg), status_code=303)
+
+
+def _release_status_payload(data: dict[str, Any]) -> dict[str, Any]:
+    snap = data.get("snapshot") or {} if isinstance(data, dict) else {}
+    events = ((snap.get("events") or {}).get("items") or []) if isinstance((snap.get("events") or {}), dict) else []
+    members_raw = (snap.get("members") or {})
+    members = (members_raw.get("items") or members_raw.get("profiles") or []) if isinstance(members_raw, dict) else []
+    if isinstance(members, dict):
+        member_count = len(members)
+    else:
+        member_count = len(members or [])
+    loot_raw = snap.get("loot") or {}
+    auctions = []
+    if isinstance(loot_raw, dict):
+        auctions = loot_raw.get("auctions") or loot_raw.get("items") or []
+        if isinstance(auctions, dict):
+            auctions = list(auctions.values())
+    ec_raw = snap.get("ec") or {}
+    balances = (ec_raw.get("balances") or {}) if isinstance(ec_raw, dict) else {}
+    warnings = []
+    if not data.get("ok"):
+        warnings.append(str(data.get("error") or "Kein Snapshot verfügbar"))
+    if not _database_url():
+        warnings.append("DATABASE_URL fehlt oder ist leer")
+    if not _discord_oauth_enabled():
+        warnings.append("Discord OAuth ist nicht aktiv, Fallback-Login wird genutzt")
+    return {
+        "ok": bool(data.get("ok")),
+        "version": DASHBOARD_RELEASE_VERSION,
+        "generated_at": data.get("generated_at"),
+        "published_at": data.get("published_at"),
+        "guild_id": data.get("guild_id"),
+        "guild_name": data.get("guild_name"),
+        "counts": {
+            "events": len(events or []),
+            "members": member_count,
+            "auctions": len(auctions or []),
+            "ec_accounts": len(balances or {}),
+        },
+        "checks": {
+            "snapshot": bool(data.get("ok")),
+            "database_url": bool(_database_url()),
+            "discord_oauth": bool(_discord_oauth_enabled()),
+            "basic_password": bool(_env("DASHBOARD_PASSWORD")),
+            "static_dir": bool(STATIC_DIR.exists()),
+        },
+        "warnings": warnings,
+    }
+
+
+def _render_release_dashboard(data: dict[str, Any]) -> str:
+    p = _release_status_payload(data)
+    counts = p.get("counts") or {}
+    checks = p.get("checks") or {}
+    warnings = p.get("warnings") or []
+    cards = "".join([
+        f"<div class='release-card'><b>{_e(counts.get('events', 0))}</b><span>Events im Snapshot</span></div>",
+        f"<div class='release-card'><b>{_e(counts.get('members', 0))}</b><span>Mitglieder/Profile</span></div>",
+        f"<div class='release-card'><b>{_e(counts.get('auctions', 0))}</b><span>Auktionen/Loot-Einträge</span></div>",
+        f"<div class='release-card'><b>{_e(counts.get('ec_accounts', 0))}</b><span>EC-Konten</span></div>",
+    ])
+    rows = []
+    labels = {
+        "snapshot": "Snapshot vorhanden",
+        "database_url": "Postgres/DATABASE_URL",
+        "discord_oauth": "Discord OAuth",
+        "basic_password": "Passwort-Fallback",
+        "static_dir": "Static-Ordner",
+    }
+    for key, label in labels.items():
+        ok = bool(checks.get(key))
+        rows.append([label, "✅ ok" if ok else "⚠️ prüfen"])
+    warn_html = "" if not warnings else "<section class='panel'><h2>Warnungen</h2><ul>" + "".join(f"<li>{_e(w)}</li>" for w in warnings) + "</ul></section>"
+    return _html_shell("Release & Stabilität · Ebo Dashboard", f"""
+    <nav class='topnav'><a href='/'>← Kommando</a><a href='/system'>System</a><a href='/admin'>Admin</a><a href='/api/release-status'>API</a></nav>
+    <section class='hero'><div><h1>Release & Stabilität</h1><p>Version {_e(p.get('version'))} · kompakte Systemübersicht für den Livebetrieb.</p></div><div class='page-actions'><a class='btn' href='/'>Startseite</a><a class='btn' href='/system'>System prüfen</a></div></section>
+    <section class='panel'><h2>Live-Status</h2><div class='release-grid'>{cards}</div><div class='mobile-note'>Mobile Optimierung ist aktiv: Sidebar klappt ein, Tabellen werden horizontal scrollbar, Aktionen werden auf Handybreite sauber gestapelt.</div></section>
+    <section class='panel'><h2>Prüfpunkte</h2>{_table(['Bereich','Status'], rows, searchable=False)}</section>
+    {warn_html}
+    <section class='panel'><h2>Finale Bereiche</h2><div class='grid'>
+      <a class='btn' href='/events'>Events</a><a class='btn' href='/portal'>Portal</a><a class='btn' href='/loot'>Loot</a><a class='btn' href='/admin-settings'>Admin-Einstellungen</a>
+    </div></section>
+    """)
+
+
+@app.get("/release", response_class=HTMLResponse)
+def release_page(_: bool = Depends(_auth)):
+    try:
+        return HTMLResponse(_render_release_dashboard(_snapshot_payload()))
+    except Exception as exc:
+        return HTMLResponse(_html_shell("Ebo Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"), status_code=500)
+
+
+@app.get("/api/release-status")
+def api_release_status(_: bool = Depends(_auth)):
+    return JSONResponse(_release_status_payload(_snapshot_payload()))
+
+
+@app.get("/healthz")
+def healthz():
+    return JSONResponse({"ok": True, "version": DASHBOARD_RELEASE_VERSION})
+
 
 @app.get("/audit", response_class=HTMLResponse)
 def audit_page(q: str = "", action: str = "", actor: str = "", _: bool = Depends(_auth)):
