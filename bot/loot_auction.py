@@ -82,6 +82,10 @@ guild_chest: dict = _load_json(GUILD_CHEST_FILE, {})
 
 def save_auctions() -> None:
     _save_json(AUCTION_FILE, auction_state)
+    try:
+        _phase3_mirror_all_auctions()
+    except Exception as e:
+        print(f"[phase3] Auktions-Spiegelung fehlgeschlagen: {e!r}")
 
 
 def save_cfg() -> None:
@@ -1749,6 +1753,189 @@ async def _close_auction(client: discord.Client, guild_id: int, auction_id: str,
     return True
 
 
+
+
+# ---------------------------------------------------------------------------
+# Phase 3.3 · Auktionen/Gebote/Loot-Historie parallel nach Postgres spiegeln
+# ---------------------------------------------------------------------------
+
+def _phase3_pg_ready() -> bool:
+    return bool(_dashboard_database_url())
+
+
+def _phase3_jsonb(value: Any):
+    from psycopg.types.json import Jsonb  # type: ignore
+    return Jsonb(value if value is not None else {})
+
+
+def _phase3_ensure_auction_tables() -> None:
+    if not _phase3_pg_ready():
+        return
+    conn = _dashboard_pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS phase3_loot_auctions (
+                    guild_id TEXT NOT NULL,
+                    auction_id TEXT NOT NULL,
+                    item_name TEXT,
+                    status TEXT,
+                    winner_user_id TEXT,
+                    current_bid INTEGER NOT NULL DEFAULT 0,
+                    raw_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    source TEXT NOT NULL DEFAULT 'bot',
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    PRIMARY KEY (guild_id, auction_id)
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS phase3_loot_bids (
+                    guild_id TEXT NOT NULL,
+                    bid_id TEXT NOT NULL,
+                    auction_id TEXT,
+                    user_id TEXT,
+                    amount INTEGER NOT NULL DEFAULT 0,
+                    raw_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    source TEXT NOT NULL DEFAULT 'bot',
+                    mirrored_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    PRIMARY KEY (guild_id, bid_id)
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS phase3_loot_history (
+                    guild_id TEXT NOT NULL,
+                    entry_id TEXT NOT NULL,
+                    user_id TEXT,
+                    item_name TEXT,
+                    amount INTEGER NOT NULL DEFAULT 0,
+                    raw_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    source TEXT NOT NULL DEFAULT 'bot',
+                    mirrored_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    PRIMARY KEY (guild_id, entry_id)
+                )
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_phase3_auctions_status ON phase3_loot_auctions (guild_id, status)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_phase3_bids_auction ON phase3_loot_bids (guild_id, auction_id)")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _phase3_auction_rows_for_guild(guild_id: int) -> tuple[list[dict], list[dict], list[dict]]:
+    auctions_out: list[dict] = []
+    bids_out: list[dict] = []
+    history_out: list[dict] = []
+    g = auction_state.get(str(guild_id)) or {}
+    auctions = g.get("auctions") if isinstance(g, dict) else {}
+    if not isinstance(auctions, dict):
+        return auctions_out, bids_out, history_out
+    for auction_id, auc in auctions.items():
+        if not isinstance(auc, dict):
+            continue
+        top = _highest_bid(auc)
+        winner = str(auc.get("winner_user_id") or auc.get("winner_id") or (top or {}).get("user_id") or "")
+        current_bid = int((top or {}).get("amount") or auc.get("current_bid") or auc.get("fixed_price") or 0)
+        item_name = str(auc.get("item_name") or auc.get("item") or auc.get("name") or auction_id)
+        status = str(auc.get("status") or "")
+        auctions_out.append({"auction_id": str(auction_id), "item_name": item_name, "status": status, "winner": winner, "current_bid": current_bid, "raw": auc})
+        for idx, bid in enumerate(auc.get("bids") if isinstance(auc.get("bids"), list) else []):
+            if not isinstance(bid, dict):
+                continue
+            bid_id = str(bid.get("id") or bid.get("bid_id") or f"{auction_id}:{bid.get('user_id','0')}:{bid.get('amount','0')}:{idx}")
+            bids_out.append({"bid_id": bid_id, "auction_id": str(auction_id), "user_id": str(bid.get("user_id") or bid.get("bidder_id") or ""), "amount": int(bid.get("amount") or bid.get("bid") or 0), "raw": bid})
+        if status in {"closed", "delivered", "finished", "done", "expired", "cancelled", "deleted"} or winner:
+            entry_id = str(auc.get("history_id") or f"auction:{auction_id}")
+            history_out.append({"entry_id": entry_id, "user_id": winner, "item_name": item_name, "amount": current_bid, "raw": auc})
+    return auctions_out, bids_out, history_out
+
+
+def _phase3_mirror_all_auctions() -> dict:
+    if not _phase3_pg_ready():
+        return {"ok": False, "error": "DATABASE_URL fehlt", "auctions": 0, "bids": 0, "history": 0}
+    _phase3_ensure_auction_tables()
+    counts = {"auctions": 0, "bids": 0, "history": 0}
+    conn = _dashboard_pg_connect()
+    try:
+        with conn.cursor() as cur:
+            for gid_s in list(auction_state.keys()):
+                try:
+                    gid = int(gid_s)
+                except Exception:
+                    continue
+                auction_rows, bid_rows, history_rows = _phase3_auction_rows_for_guild(gid)
+                cur.execute("DELETE FROM phase3_loot_auctions WHERE guild_id=%s AND source='bot'", (str(gid),))
+                cur.execute("DELETE FROM phase3_loot_bids WHERE guild_id=%s AND source='bot'", (str(gid),))
+                cur.execute("DELETE FROM phase3_loot_history WHERE guild_id=%s AND source='bot' AND entry_id LIKE 'auction:%%'", (str(gid),))
+                for row in auction_rows:
+                    cur.execute("""
+                        INSERT INTO phase3_loot_auctions (guild_id, auction_id, item_name, status, winner_user_id, current_bid, raw_json, source, updated_at)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,'bot',now())
+                        ON CONFLICT (guild_id, auction_id) DO UPDATE SET
+                          item_name=EXCLUDED.item_name,
+                          status=EXCLUDED.status,
+                          winner_user_id=EXCLUDED.winner_user_id,
+                          current_bid=EXCLUDED.current_bid,
+                          raw_json=EXCLUDED.raw_json,
+                          source='bot',
+                          updated_at=now()
+                    """, (str(gid), row["auction_id"], row["item_name"], row["status"], row["winner"], row["current_bid"], _phase3_jsonb(row["raw"])))
+                    counts["auctions"] += 1
+                for row in bid_rows:
+                    cur.execute("""
+                        INSERT INTO phase3_loot_bids (guild_id, bid_id, auction_id, user_id, amount, raw_json, source, mirrored_at)
+                        VALUES (%s,%s,%s,%s,%s,%s,'bot',now())
+                        ON CONFLICT (guild_id, bid_id) DO UPDATE SET
+                          auction_id=EXCLUDED.auction_id,
+                          user_id=EXCLUDED.user_id,
+                          amount=EXCLUDED.amount,
+                          raw_json=EXCLUDED.raw_json,
+                          source='bot',
+                          mirrored_at=now()
+                    """, (str(gid), row["bid_id"], row["auction_id"], row["user_id"], row["amount"], _phase3_jsonb(row["raw"])))
+                    counts["bids"] += 1
+                for row in history_rows:
+                    cur.execute("""
+                        INSERT INTO phase3_loot_history (guild_id, entry_id, user_id, item_name, amount, raw_json, source, mirrored_at)
+                        VALUES (%s,%s,%s,%s,%s,%s,'bot',now())
+                        ON CONFLICT (guild_id, entry_id) DO UPDATE SET
+                          user_id=EXCLUDED.user_id,
+                          item_name=EXCLUDED.item_name,
+                          amount=EXCLUDED.amount,
+                          raw_json=EXCLUDED.raw_json,
+                          source='bot',
+                          mirrored_at=now()
+                    """, (str(gid), row["entry_id"], row["user_id"], row["item_name"], row["amount"], _phase3_jsonb(row["raw"])))
+                    counts["history"] += 1
+        conn.commit()
+        counts["ok"] = True
+        return counts
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def _phase3_auction_status() -> dict:
+    if not _phase3_pg_ready():
+        return {"ok": False, "error": "DATABASE_URL fehlt"}
+    _phase3_ensure_auction_tables()
+    conn = _dashboard_pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) AS c FROM phase3_loot_auctions")
+            auctions = int((cur.fetchone() or {}).get("c") or 0)
+            cur.execute("SELECT COUNT(*) AS c FROM phase3_loot_bids")
+            bids = int((cur.fetchone() or {}).get("c") or 0)
+            cur.execute("SELECT COUNT(*) AS c FROM phase3_loot_history")
+            history = int((cur.fetchone() or {}).get("c") or 0)
+        local_auctions = 0
+        for gid_s in list(auction_state.keys()):
+            if str(gid_s).isdigit():
+                local_auctions += len(_phase3_auction_rows_for_guild(int(gid_s))[0])
+        return {"ok": True, "json_auctions": local_auctions, "postgres_auctions": auctions, "postgres_bids": bids, "postgres_history": history}
+    finally:
+        conn.close()
 
 # ---------------------------------------------------------------------------
 # Dashboard Loot-Aktionsqueue: verarbeitet Gebote/Käufe aus dashboard_web
@@ -3512,6 +3699,46 @@ async def setup_loot_auction(client: discord.Client, tree: app_commands.CommandT
             "EC-Buchungen und Kanal-Einstellungen wurden nicht verändert.",
             ephemeral=True,
         )
+
+    @group.command(name="phase3_status", description="Phase 3.3 Auktions-DB Status anzeigen")
+    async def auction_phase3_status(inter: discord.Interaction):
+        if inter.guild is None or not _is_leader_or_admin(inter):
+            await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
+            return
+        await inter.response.defer(ephemeral=True, thinking=True)
+        try:
+            status = _phase3_auction_status()
+            await inter.followup.send(
+                "🏷️ **Phase 3.3 Auktions-Status**\n"
+                f"JSON Auktionen: **{status.get('json_auctions', 0)}**\n"
+                f"Postgres Auktionen: **{status.get('postgres_auctions', 0)}**\n"
+                f"Postgres Gebote: **{status.get('postgres_bids', 0)}**\n"
+                f"Postgres Loot-Historie: **{status.get('postgres_history', 0)}**\n"
+                f"OK: `{status.get('ok')}`",
+                ephemeral=True,
+            )
+        except Exception as exc:
+            await inter.followup.send(f"❌ Fehler: {type(exc).__name__}: {exc}", ephemeral=True)
+
+    @group.command(name="phase3_mirror", description="Auktionen/Gebote sofort nach Postgres spiegeln")
+    async def auction_phase3_mirror(inter: discord.Interaction):
+        if inter.guild is None or not _is_leader_or_admin(inter):
+            await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
+            return
+        await inter.response.defer(ephemeral=True, thinking=True)
+        try:
+            result = _phase3_mirror_all_auctions()
+            status = _phase3_auction_status()
+            await inter.followup.send(
+                "✅ **Phase 3.3 Auktions-Spiegelung fertig**\n"
+                f"gespiegelte Auktionen: **{result.get('auctions', 0)}**\n"
+                f"gespiegelte Gebote: **{result.get('bids', 0)}**\n"
+                f"Historie: **{result.get('history', 0)}**\n"
+                f"DB jetzt: Auktionen **{status.get('postgres_auctions', 0)}**, Gebote **{status.get('postgres_bids', 0)}**",
+                ephemeral=True,
+            )
+        except Exception as exc:
+            await inter.followup.send(f"❌ Fehler: {type(exc).__name__}: {exc}", ephemeral=True)
 
     try:
         tree.add_command(group)
