@@ -32,7 +32,7 @@ if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 ASSET_VER = "ebo-phase3-database-start"
-DASHBOARD_RELEASE_VERSION = "1.1.5 · Phase 3.5 Cutover-Prüfung"
+DASHBOARD_RELEASE_VERSION = "1.1.6 · Phase 3.6 EC-Read-Cutover"
 
 
 def _database_url() -> str:
@@ -370,7 +370,7 @@ def _snapshot_payload() -> dict[str, Any]:
         snap = json.loads(row.get("snapshot_json") or "{}")
     except Exception as exc:
         return {"ok": False, "error": f"Snapshot JSON kaputt: {type(exc).__name__}: {exc}"}
-    return {
+    payload = {
         "ok": True,
         "id": row.get("id"),
         "guild_id": row.get("guild_id"),
@@ -379,6 +379,226 @@ def _snapshot_payload() -> dict[str, Any]:
         "published_at": row.get("published_at"),
         "snapshot": snap,
     }
+    return _apply_phase3_ec_read_cutover(payload)
+
+
+# ---------------------------------------------------------------------------
+# Phase 3.6: EC/DKP Read-Cutover
+# ---------------------------------------------------------------------------
+# Ziel: Das Dashboard liest EC-Konten, EC-Verlauf und EC-Eventchecks bevorzugt
+# aus den Phase-3-Postgres-Tabellen. JSON/Snapshot bleibt Fallback.
+# Der Bot schreibt weiterhin parallel JSON + Postgres; kein harter Write-Cutover.
+
+
+def _phase3_json(value: Any, default: Any = None) -> Any:
+    if default is None:
+        default = {}
+    if value is None:
+        return default
+    if isinstance(value, (dict, list)):
+        return value
+    try:
+        return json.loads(str(value or ""))
+    except Exception:
+        return default
+
+
+def _phase3_ec_pg_payload(guild_id: Any, snap: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """Lädt EC/DKP aus Postgres für den Dashboard-Read-Cutover.
+
+    Rückgabe ist absichtlich snapshot-kompatibel:
+    snap["ec"]["balances"]["top"]
+    snap["ec"]["transactions"]["items"]
+    snap["ec"]["event_checks"]["items"]
+    """
+    if not _database_url():
+        return None
+    gid = str(guild_id or "").strip()
+    if not gid:
+        return None
+    names = _profile_name_map(snap)
+    try:
+        conn = _pg_connect()
+    except Exception:
+        return None
+    try:
+        with conn.cursor() as cur:
+            try:
+                cur.execute(
+                    """
+                    SELECT user_id, balance, raw_json, source, updated_at
+                    FROM phase3_ec_balances
+                    WHERE guild_id = %s
+                    ORDER BY balance DESC, user_id ASC
+                    """,
+                    (gid,),
+                )
+                balance_rows = cur.fetchall() or []
+            except Exception:
+                return None
+
+            try:
+                cur.execute(
+                    """
+                    SELECT transaction_id, user_id, amount, reason, event_id, created_at_text, raw_json, source, mirrored_at
+                    FROM phase3_ec_transactions
+                    WHERE guild_id = %s
+                    ORDER BY COALESCE(NULLIF(created_at_text, ''), transaction_id) DESC, mirrored_at DESC
+                    LIMIT 1000
+                    """,
+                    (gid,),
+                )
+                tx_rows = cur.fetchall() or []
+            except Exception:
+                tx_rows = []
+
+            try:
+                cur.execute(
+                    """
+                    SELECT event_id, status, awarded, posted, raw_json, source, updated_at
+                    FROM phase3_ec_event_checks
+                    WHERE guild_id = %s
+                    ORDER BY updated_at DESC, event_id DESC
+                    LIMIT 500
+                    """,
+                    (gid,),
+                )
+                check_rows = cur.fetchall() or []
+            except Exception:
+                check_rows = []
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    if not balance_rows and not tx_rows and not check_rows:
+        return None
+
+    balances: list[dict[str, Any]] = []
+    for row in balance_rows:
+        raw = _phase3_json(row.get("raw_json"), {}) if isinstance(row, dict) else {}
+        uid = _user_id((row or {}).get("user_id"))
+        name = raw.get("display_name") or raw.get("name") or names.get(uid) or f"User {uid}"
+        balances.append({
+            **raw,
+            "user_id": uid,
+            "display_name": name,
+            "balance": _num((row or {}).get("balance"), 0),
+            "source": "postgres_phase3",
+        })
+
+    tx_items: list[dict[str, Any]] = []
+    total_earned = 0.0
+    total_spent = 0.0
+    by_user: dict[int, dict[str, Any]] = {}
+    for row in tx_rows:
+        raw = _phase3_json((row or {}).get("raw_json"), {}) if isinstance(row, dict) else {}
+        uid = _user_id((row or {}).get("user_id") or raw.get("user_id"))
+        amount = _num((row or {}).get("amount", raw.get("amount", 0)), 0)
+        if amount >= 0:
+            total_earned += amount
+        else:
+            total_spent += abs(amount)
+        bucket = by_user.setdefault(uid, {
+            "user_id": uid,
+            "display_name": raw.get("display_name") or names.get(uid) or f"User {uid}",
+            "earned": 0.0,
+            "spent": 0.0,
+            "net": 0.0,
+            "count": 0,
+        })
+        if amount >= 0:
+            bucket["earned"] += amount
+        else:
+            bucket["spent"] += abs(amount)
+        bucket["net"] += amount
+        bucket["count"] += 1
+        tx_items.append({
+            **raw,
+            "transaction_id": (row or {}).get("transaction_id") or raw.get("transaction_id"),
+            "user_id": uid,
+            "display_name": raw.get("display_name") or names.get(uid) or f"User {uid}",
+            "amount": amount,
+            "reason": (row or {}).get("reason") or raw.get("reason") or raw.get("note") or "",
+            "event_id": (row or {}).get("event_id") or raw.get("event_id") or raw.get("auction_id") or "",
+            "created_at": (row or {}).get("created_at_text") or raw.get("created_at") or raw.get("time") or raw.get("timestamp") or "",
+            "raw_type": raw.get("raw_type") or raw.get("type") or "Postgres",
+            "source": "postgres_phase3",
+        })
+
+    users = [b for b in by_user.values() if b.get("user_id")]
+    top_earned = sorted(users, key=lambda x: (_num(x.get("earned"), 0), _num(x.get("net"), 0)), reverse=True)
+    top_spent = sorted(users, key=lambda x: (_num(x.get("spent"), 0), _num(x.get("count"), 0)), reverse=True)
+    top_activity = sorted(users, key=lambda x: (_num(x.get("count"), 0), abs(_num(x.get("net"), 0))), reverse=True)
+
+    check_items: list[dict[str, Any]] = []
+    for row in check_rows:
+        raw = _phase3_json((row or {}).get("raw_json"), {}) if isinstance(row, dict) else {}
+        check_items.append({
+            **raw,
+            "event_id": (row or {}).get("event_id") or raw.get("event_id"),
+            "status": (row or {}).get("status") or raw.get("status") or "",
+            "awarded": bool((row or {}).get("awarded")),
+            "posted": bool((row or {}).get("posted")),
+            "source": "postgres_phase3",
+        })
+
+    return {
+        "source": "postgres_phase3_read_cutover",
+        "read_cutover": True,
+        "balances": {
+            "top": balances,
+            "items": balances,
+            "count": len(balances),
+            "loaded_count": len(balances),
+            "source": "postgres_phase3",
+        },
+        "transactions": {
+            "items": tx_items,
+            "recent": tx_items,
+            "count": len(tx_items),
+            "loaded_count": len(tx_items),
+            "total_earned": total_earned,
+            "total_spent": total_spent,
+            "net_loaded": total_earned - total_spent,
+            "top_earned": top_earned,
+            "top_spent": top_spent,
+            "top_activity": top_activity,
+            "source": "postgres_phase3",
+        },
+        "event_checks": {
+            "items": check_items,
+            "count": len(check_items),
+            "source": "postgres_phase3",
+        },
+    }
+
+
+def _apply_phase3_ec_read_cutover(payload: dict[str, Any]) -> dict[str, Any]:
+    """Wendet EC-Read-Cutover auf den Snapshot an, ohne den Snapshot selbst zu verlieren."""
+    if not payload.get("ok"):
+        return payload
+    snap = payload.get("snapshot") if isinstance(payload.get("snapshot"), dict) else {}
+    guild_id = payload.get("guild_id") or snap.get("guild_id") or _env("DASHBOARD_GUILD_ID")
+    pg_ec = _phase3_ec_pg_payload(guild_id, snap)
+    if not pg_ec:
+        payload["phase3_ec_read_cutover"] = {"active": False, "source": "snapshot_fallback", "reason": "Postgres-EC nicht verfügbar oder leer"}
+        return payload
+    old_ec = snap.get("ec") if isinstance(snap.get("ec"), dict) else {}
+    snap["ec_snapshot_fallback"] = old_ec
+    merged = dict(old_ec)
+    merged.update(pg_ec)
+    snap["ec"] = merged
+    payload["snapshot"] = snap
+    payload["phase3_ec_read_cutover"] = {
+        "active": True,
+        "source": "postgres_phase3",
+        "balances": len((pg_ec.get("balances") or {}).get("top") or []),
+        "transactions": len((pg_ec.get("transactions") or {}).get("items") or []),
+        "event_checks": len((pg_ec.get("event_checks") or {}).get("items") or []),
+    }
+    return payload
 
 
 # ---------------------------------------------------------------------------
@@ -2795,6 +3015,8 @@ def _render_ec_dashboard(data: dict[str, Any]) -> str:
     total_spent = _num(txs.get("total_spent"), 0)
     net_loaded = _num(txs.get("net_loaded"), total_earned - total_spent)
     guild_id = _safe_guild_id(data)
+    cut = data.get("phase3_ec_read_cutover") or {}
+    ec_source_label = "Postgres Phase 3" if cut.get("active") else "Snapshot/JSON Fallback"
     award_requests = _ec_award_requests_for_dashboard(guild_id, limit=80) if guild_id else []
     award_request_rows = _ec_award_request_table_rows(award_requests, snap)
     pending_count = sum(1 for r in award_requests if str(r.get("status") or "").lower() in {"pending", "processing"})
@@ -2808,6 +3030,7 @@ def _render_ec_dashboard(data: dict[str, Any]) -> str:
         _card("Netto", _fmt_ec(net_loaded), "Verdient minus ausgegeben"),
         _card("Buchungen", txs.get("count", len(recent)), f"geladen: {txs.get('loaded_count', len(recent))}"),
         _card("Dashboard-Queue", pending_count, f"erledigt: {done_count}"),
+        _card("EC-Quelle", ec_source_label, "Read-Cutover aktiv" if cut.get("active") else "Fallback aktiv"),
     ])
 
     recent_rows = []
@@ -2841,7 +3064,7 @@ def _render_ec_dashboard(data: dict[str, Any]) -> str:
       <div>
         <div class="eyebrow">Analytics</div>
         <h1>🪙 EC-Verlauf</h1>
-        <p class="muted">Read-only Auswertung. Es wird nichts verändert. Snapshot: {_e(_dt(data.get('published_at')))}</p>
+        <p class="muted">Read-only Auswertung. EC-Quelle: <b>{_e(ec_source_label)}</b>. JSON/Snapshot bleibt Fallback. Snapshot: {_e(_dt(data.get('published_at')))}</p>
       </div>
       <a class="btn" href="/">Zurück</a>
     </section>
@@ -7696,7 +7919,7 @@ def api_ec(_: bool = Depends(_auth)):
     if not payload.get("ok"):
         return JSONResponse(payload, status_code=404)
     snap = payload.get("snapshot") or {}
-    return JSONResponse({"ok": True, "ec": (snap.get("ec") or {})})
+    return JSONResponse({"ok": True, "ec": (snap.get("ec") or {}), "phase3_ec_read_cutover": payload.get("phase3_ec_read_cutover") or {}})
 
 
 @app.get("/api/quality")
