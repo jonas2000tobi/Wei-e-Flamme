@@ -102,14 +102,26 @@ def save_cfg() -> None:
 
 def save_balances() -> None:
     _save_json(DKP_BALANCES_FILE, dkp_balances)
+    try:
+        _phase3_mirror_ec_balances_to_pg()
+    except Exception as e:
+        print(f"[phase3-ec] Balance-Spiegelung übersprungen: {e!r}", flush=True)
 
 
 def save_transactions() -> None:
     _save_json(DKP_TX_FILE, dkp_transactions)
+    try:
+        _phase3_mirror_ec_transactions_to_pg()
+    except Exception as e:
+        print(f"[phase3-ec] Transaktions-Spiegelung übersprungen: {e!r}", flush=True)
 
 
 def save_event_checks() -> None:
     _save_json(DKP_CHECK_FILE, dkp_event_checks)
+    try:
+        _phase3_mirror_ec_event_checks_to_pg()
+    except Exception as e:
+        print(f"[phase3-ec] Eventcheck-Spiegelung übersprungen: {e!r}", flush=True)
 
 
 def _now_iso() -> str:
@@ -126,6 +138,14 @@ def _load_portal_cfg() -> dict:
 
 def _load_leader_cfg() -> dict:
     return _load_json(LEADER_CONTACT_CFG_FILE, {})
+
+
+def _save_portal_cfg(cfg: dict) -> None:
+    _save_json(MEMBER_PORTAL_CFG_FILE, cfg or {})
+
+
+def _save_leader_cfg(cfg: dict) -> None:
+    _save_json(LEADER_CONTACT_CFG_FILE, cfg or {})
 
 
 def _is_admin(inter: discord.Interaction) -> bool:
@@ -1469,6 +1489,264 @@ def _dashboard_queue_enabled() -> bool:
     return url.startswith("postgres://") or url.startswith("postgresql://")
 
 
+
+def _phase3_jsonb(value: Any):
+    from psycopg.types.json import Jsonb  # type: ignore
+    return Jsonb(value if value is not None else {})
+
+
+def _phase3_ec_enabled() -> bool:
+    return _dashboard_queue_enabled()
+
+
+def _ensure_phase3_ec_schema() -> None:
+    """Phase 3.2: EC/DKP-Tabellen vorbereiten. JSON bleibt Hauptquelle."""
+    if not _phase3_ec_enabled():
+        return
+    conn = _dash_pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS phase3_ec_balances (
+                    guild_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    balance INTEGER NOT NULL DEFAULT 0,
+                    raw_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    source TEXT NOT NULL DEFAULT 'bot_parallel',
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    PRIMARY KEY (guild_id, user_id)
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS phase3_ec_transactions (
+                    guild_id TEXT NOT NULL,
+                    transaction_id TEXT NOT NULL,
+                    user_id TEXT,
+                    amount INTEGER NOT NULL DEFAULT 0,
+                    reason TEXT,
+                    event_id TEXT,
+                    created_at_text TEXT,
+                    raw_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    source TEXT NOT NULL DEFAULT 'bot_parallel',
+                    mirrored_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    PRIMARY KEY (guild_id, transaction_id)
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS phase3_ec_event_checks (
+                    guild_id TEXT NOT NULL,
+                    event_id TEXT NOT NULL,
+                    status TEXT,
+                    awarded BOOLEAN NOT NULL DEFAULT FALSE,
+                    posted BOOLEAN NOT NULL DEFAULT FALSE,
+                    raw_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    source TEXT NOT NULL DEFAULT 'bot_parallel',
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    PRIMARY KEY (guild_id, event_id)
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS phase3_migration_runs (
+                    run_id TEXT PRIMARY KEY,
+                    guild_id TEXT,
+                    mode TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    counts_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    notes TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_phase3_ec_tx_user ON phase3_ec_transactions (guild_id, user_id)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_phase3_ec_tx_event ON phase3_ec_transactions (guild_id, event_id)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_phase3_ec_checks_status ON phase3_ec_event_checks (guild_id, awarded, posted)")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _phase3_write_migration_run(mode: str, status: str, counts: dict, notes: str = "", guild_id: str = "") -> None:
+    if not _phase3_ec_enabled():
+        return
+    _ensure_phase3_ec_schema()
+    conn = _dash_pg_connect()
+    try:
+        run_id = f"phase3ec_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')}"
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO phase3_migration_runs (run_id, guild_id, mode, status, counts_json, notes, created_at)
+                VALUES (%s,%s,%s,%s,%s,%s,now())
+            """, (run_id, str(guild_id or ""), str(mode), str(status), _phase3_jsonb(counts or {}), str(notes or "")))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _phase3_mirror_ec_balances_to_pg() -> dict:
+    if not _phase3_ec_enabled():
+        return {"ok": False, "error": "DATABASE_URL fehlt", "balances": 0}
+    _ensure_phase3_ec_schema()
+    count = 0
+    conn = _dash_pg_connect()
+    try:
+        with conn.cursor() as cur:
+            for gid, g in list((dkp_balances or {}).items()):
+                users = g.get("users") if isinstance(g, dict) else {}
+                if not isinstance(users, dict):
+                    continue
+                for uid, bal in list(users.items()):
+                    try:
+                        balance = int(bal or 0)
+                    except Exception:
+                        balance = 0
+                    raw = {"balance": balance, "guild_id": str(gid), "user_id": str(uid)}
+                    cur.execute("""
+                        INSERT INTO phase3_ec_balances (guild_id, user_id, balance, raw_json, source, updated_at)
+                        VALUES (%s,%s,%s,%s,'bot_parallel',now())
+                        ON CONFLICT (guild_id, user_id) DO UPDATE SET
+                          balance=EXCLUDED.balance,
+                          raw_json=EXCLUDED.raw_json,
+                          source='bot_parallel',
+                          updated_at=now()
+                    """, (str(gid), str(uid), balance, _phase3_jsonb(raw)))
+                    count += 1
+        conn.commit()
+        return {"ok": True, "balances": count}
+    finally:
+        conn.close()
+
+
+def _phase3_mirror_ec_transactions_to_pg() -> dict:
+    if not _phase3_ec_enabled():
+        return {"ok": False, "error": "DATABASE_URL fehlt", "transactions": 0}
+    _ensure_phase3_ec_schema()
+    count = 0
+    conn = _dash_pg_connect()
+    try:
+        with conn.cursor() as cur:
+            for gid, arr in list((dkp_transactions or {}).items()):
+                if not isinstance(arr, list):
+                    continue
+                for tx in arr:
+                    if not isinstance(tx, dict):
+                        continue
+                    tx_id = str(tx.get("id") or tx.get("transaction_id") or "").strip()
+                    if not tx_id:
+                        # Fallback nur für alte Alt-Daten ohne ID.
+                        tx_id = f"tx_{abs(hash(json.dumps(tx, sort_keys=True, ensure_ascii=False, default=str)))}"
+                    cur.execute("""
+                        INSERT INTO phase3_ec_transactions (guild_id, transaction_id, user_id, amount, reason, event_id, created_at_text, raw_json, source, mirrored_at)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,'bot_parallel',now())
+                        ON CONFLICT (guild_id, transaction_id) DO UPDATE SET
+                          user_id=EXCLUDED.user_id,
+                          amount=EXCLUDED.amount,
+                          reason=EXCLUDED.reason,
+                          event_id=EXCLUDED.event_id,
+                          created_at_text=EXCLUDED.created_at_text,
+                          raw_json=EXCLUDED.raw_json,
+                          source='bot_parallel',
+                          mirrored_at=now()
+                    """, (
+                        str(gid),
+                        tx_id,
+                        str(tx.get("user_id") or ""),
+                        int(tx.get("amount", 0) or 0),
+                        str(tx.get("reason") or tx.get("type") or ""),
+                        str(tx.get("event_id") or ""),
+                        str(tx.get("created_at") or tx.get("timestamp") or ""),
+                        _phase3_jsonb(tx),
+                    ))
+                    count += 1
+        conn.commit()
+        return {"ok": True, "transactions": count}
+    finally:
+        conn.close()
+
+
+def _phase3_mirror_ec_event_checks_to_pg() -> dict:
+    if not _phase3_ec_enabled():
+        return {"ok": False, "error": "DATABASE_URL fehlt", "checks": 0}
+    _ensure_phase3_ec_schema()
+    count = 0
+    conn = _dash_pg_connect()
+    try:
+        with conn.cursor() as cur:
+            for gid, g in list((dkp_event_checks or {}).items()):
+                events = g.get("events") if isinstance(g, dict) else {}
+                if not isinstance(events, dict):
+                    continue
+                for event_id, st in list(events.items()):
+                    if not isinstance(st, dict):
+                        continue
+                    awarded = bool(st.get("awarded", False))
+                    posted = bool(st.get("posted", False))
+                    status = "awarded" if awarded else ("posted" if posted else str(st.get("status") or "open"))
+                    cur.execute("""
+                        INSERT INTO phase3_ec_event_checks (guild_id, event_id, status, awarded, posted, raw_json, source, updated_at)
+                        VALUES (%s,%s,%s,%s,%s,%s,'bot_parallel',now())
+                        ON CONFLICT (guild_id, event_id) DO UPDATE SET
+                          status=EXCLUDED.status,
+                          awarded=EXCLUDED.awarded,
+                          posted=EXCLUDED.posted,
+                          raw_json=EXCLUDED.raw_json,
+                          source='bot_parallel',
+                          updated_at=now()
+                    """, (str(gid), str(event_id), status, awarded, posted, _phase3_jsonb(st)))
+                    count += 1
+        conn.commit()
+        return {"ok": True, "checks": count}
+    finally:
+        conn.close()
+
+
+def _phase3_mirror_all_ec_to_pg() -> dict:
+    if not _phase3_ec_enabled():
+        return {"ok": False, "error": "DATABASE_URL fehlt oder ist keine Postgres-URL."}
+    counts = {"balances": 0, "transactions": 0, "checks": 0}
+    try:
+        counts.update(_phase3_mirror_ec_balances_to_pg())
+        counts.update(_phase3_mirror_ec_transactions_to_pg())
+        counts.update(_phase3_mirror_ec_event_checks_to_pg())
+        counts.pop("ok", None)
+        _phase3_write_migration_run("ec_parallel_mirror", "done", counts, "Bot hat EC/DKP parallel nach Postgres gespiegelt.")
+        return {"ok": True, "counts": counts}
+    except Exception as e:
+        _phase3_write_migration_run("ec_parallel_mirror", "failed", counts, repr(e))
+        return {"ok": False, "error": repr(e), "counts": counts}
+
+
+def _phase3_ec_status(guild_id: int = 0) -> dict:
+    if not _phase3_ec_enabled():
+        return {"ok": False, "error": "DATABASE_URL fehlt oder ist keine Postgres-URL."}
+    _ensure_phase3_ec_schema()
+    conn = _dash_pg_connect()
+    try:
+        with conn.cursor() as cur:
+            where = "WHERE guild_id = %s" if int(guild_id or 0) else ""
+            args = (str(int(guild_id)),) if int(guild_id or 0) else ()
+            out = {}
+            for table in ("phase3_ec_balances", "phase3_ec_transactions", "phase3_ec_event_checks"):
+                cur.execute(f"SELECT COUNT(*) AS c FROM {table} {where}", args)
+                out[table] = int((cur.fetchone() or {}).get("c") or 0)
+        json_counts = {"balances": 0, "transactions": 0, "checks": 0}
+        for gid, g in list((dkp_balances or {}).items()):
+            if int(guild_id or 0) and str(gid) != str(int(guild_id)):
+                continue
+            users = g.get("users") if isinstance(g, dict) else {}
+            json_counts["balances"] += len(users) if isinstance(users, dict) else 0
+        for gid, arr in list((dkp_transactions or {}).items()):
+            if int(guild_id or 0) and str(gid) != str(int(guild_id)):
+                continue
+            json_counts["transactions"] += len(arr) if isinstance(arr, list) else 0
+        for gid, g in list((dkp_event_checks or {}).items()):
+            if int(guild_id or 0) and str(gid) != str(int(guild_id)):
+                continue
+            events = g.get("events") if isinstance(g, dict) else {}
+            json_counts["checks"] += len(events) if isinstance(events, dict) else 0
+        return {"ok": True, "postgres": out, "json": json_counts}
+    finally:
+        conn.close()
+
+
 def _ensure_dashboard_ec_award_table() -> None:
     if not _dashboard_queue_enabled():
         return
@@ -1555,6 +1833,60 @@ def _finish_dashboard_ec_award_request(request_id: str, status: str, result: dic
         conn.commit()
     finally:
         conn.close()
+
+
+def _dashboard_ec_award_queue_summary(guild_id: int, limit: int = 8) -> dict:
+    """Kleine Diagnose für Leader-Commands: zeigt, ob die Dashboard-Queue lebt."""
+    if not _dashboard_queue_enabled():
+        return {"ok": False, "error": "DATABASE_URL fehlt oder ist keine Postgres-URL."}
+    _ensure_dashboard_ec_award_table()
+    conn = _dash_pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT status, COUNT(*) AS count
+                FROM dashboard_ec_award_requests
+                WHERE guild_id = %s
+                GROUP BY status
+                ORDER BY status
+                """,
+                (int(guild_id),),
+            )
+            counts = {str(r.get("status") or "unknown"): int(r.get("count") or 0) for r in (cur.fetchall() or [])}
+            cur.execute(
+                """
+                SELECT request_id, guild_id, event_id, event_type, status, actor_name, requested_at, claimed_at, processed_at, result_json
+                FROM dashboard_ec_award_requests
+                WHERE guild_id = %s
+                ORDER BY requested_at DESC, id DESC
+                LIMIT %s
+                """,
+                (int(guild_id), int(limit)),
+            )
+            recent = []
+            for row in cur.fetchall() or []:
+                item = dict(row)
+                try:
+                    item["result"] = json.loads(item.get("result_json") or "{}")
+                except Exception:
+                    item["result"] = {}
+                recent.append(item)
+        return {"ok": True, "counts": counts, "recent": recent}
+    finally:
+        conn.close()
+
+
+def _dashboard_queue_status_text(status: str) -> str:
+    s = str(status or "").lower()
+    return {
+        "pending": "⏳ offen",
+        "processing": "🔄 verarbeitet",
+        "done": "✅ erledigt",
+        "failed": "❌ Fehler",
+        "rejected": "⛔ blockiert",
+        "cancelled": "⚪ abgebrochen",
+    }.get(s, s or "—")
 
 
 class _DashboardActor:
@@ -1713,6 +2045,336 @@ async def dashboard_ec_award_request_loop():
         return
     for row in rows:
         await _process_dashboard_ec_award_request(client, row)
+
+
+# ---------------------------------------------------------------------------
+# Dashboard → Bot Einstellungsqueue
+# ---------------------------------------------------------------------------
+# Das Dashboard darf dkp_cfg.json nicht direkt schreiben, weil es in einem
+# anderen Railway-Container läuft. Deshalb landen Regeländerungen zuerst in
+# Postgres und werden hier vom Bot übernommen.
+
+
+def _ensure_dashboard_settings_change_table() -> None:
+    if not _dashboard_queue_enabled():
+        return
+    conn = _dash_pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS dashboard_settings_change_requests (
+                    id BIGSERIAL PRIMARY KEY,
+                    request_id TEXT NOT NULL UNIQUE,
+                    guild_id BIGINT NOT NULL,
+                    scope TEXT NOT NULL DEFAULT 'dkp',
+                    action_type TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    payload_json TEXT NOT NULL DEFAULT '{}',
+                    actor_id TEXT,
+                    actor_name TEXT,
+                    requested_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    claimed_at TIMESTAMPTZ,
+                    processed_at TIMESTAMPTZ,
+                    result_json TEXT
+                )
+                """
+            )
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_dashboard_settings_change_requests_lookup
+                ON dashboard_settings_change_requests (guild_id, scope, status, requested_at DESC)
+                """
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _claim_dashboard_settings_change_requests(limit: int = 5) -> list[dict]:
+    if not _dashboard_queue_enabled():
+        return []
+    _ensure_dashboard_settings_change_table()
+    conn = _dash_pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE dashboard_settings_change_requests
+                SET status = 'processing', claimed_at = NOW()
+                WHERE id IN (
+                    SELECT id
+                    FROM dashboard_settings_change_requests
+                    WHERE status = 'pending'
+                    ORDER BY requested_at ASC, id ASC
+                    LIMIT %s
+                    FOR UPDATE SKIP LOCKED
+                )
+                RETURNING id, request_id, guild_id, scope, action_type, status, payload_json, actor_id, actor_name, requested_at
+                """,
+                (int(limit),),
+            )
+            rows = [dict(r) for r in (cur.fetchall() or [])]
+        conn.commit()
+        return rows
+    finally:
+        conn.close()
+
+
+def _finish_dashboard_settings_change_request(request_id: str, status: str, result: dict) -> None:
+    if not _dashboard_queue_enabled() or not request_id:
+        return
+    _ensure_dashboard_settings_change_table()
+    conn = _dash_pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE dashboard_settings_change_requests
+                SET status = %s, processed_at = NOW(), result_json = %s
+                WHERE request_id = %s
+                """,
+                (str(status), json.dumps(result, ensure_ascii=False, separators=(",", ":")), str(request_id)),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _dashboard_settings_change_summary(guild_id: int, limit: int = 8) -> dict:
+    if not _dashboard_queue_enabled():
+        return {"enabled": False, "counts": {}, "rows": []}
+    _ensure_dashboard_settings_change_table()
+    conn = _dash_pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT status, COUNT(*) AS count
+                FROM dashboard_settings_change_requests
+                WHERE guild_id = %s
+                GROUP BY status
+                """,
+                (int(guild_id),),
+            )
+            counts = {str(r["status"]): int(r["count"]) for r in (cur.fetchall() or [])}
+            cur.execute(
+                """
+                SELECT request_id, action_type, status, requested_at, processed_at, result_json
+                FROM dashboard_settings_change_requests
+                WHERE guild_id = %s
+                ORDER BY requested_at DESC, id DESC
+                LIMIT %s
+                """,
+                (int(guild_id), int(limit)),
+            )
+            rows = [dict(r) for r in (cur.fetchall() or [])]
+        return {"enabled": True, "counts": counts, "rows": rows}
+    finally:
+        conn.close()
+
+
+def _apply_dashboard_settings_change(row: dict) -> dict:
+    request_id = str(row.get("request_id") or "")
+    guild_id = int(row.get("guild_id") or 0)
+    action = str(row.get("action_type") or "").strip().lower()
+    try:
+        payload = json.loads(row.get("payload_json") or "{}")
+        if not isinstance(payload, dict):
+            payload = {}
+    except Exception:
+        payload = {}
+    if not guild_id:
+        return {"ok": False, "error": "Guild-ID fehlt."}
+    c = _gcfg(guild_id)
+    before = json.loads(json.dumps(c, ensure_ascii=False))
+
+    if action == "set_event_points":
+        event_type = str(payload.get("event_type") or "").strip()
+        if event_type not in EVENT_TYPE_CHOICES:
+            return {"ok": False, "error": f"Unbekannter Eventtyp: {event_type}"}
+        try:
+            points = int(float(str(payload.get("points") or "0").replace(",", ".")))
+        except Exception:
+            return {"ok": False, "error": "Ungültiger EC-Wert."}
+        if points < 0 or points > 500:
+            return {"ok": False, "error": "EC-Wert muss zwischen 0 und 500 liegen."}
+        pts = c.get("event_points") if isinstance(c.get("event_points"), dict) else {}
+        old = int(pts.get(event_type, DEFAULT_EVENT_POINTS.get(event_type, 0)) or 0)
+        pts[event_type] = points
+        c["event_points"] = pts
+        save_cfg()
+        return {"ok": True, "message": f"{event_type}: {old} → {points} EC", "changed": {"event_type": event_type, "old": old, "new": points}}
+
+    if action == "set_weekly_limit":
+        try:
+            limit = int(float(str(payload.get("weekly_event_limit") or "0").replace(",", ".")))
+        except Exception:
+            return {"ok": False, "error": "Ungültiges Wochenlimit."}
+        if limit < 0 or limit > 1000:
+            return {"ok": False, "error": "Wochenlimit muss zwischen 0 und 1000 liegen."}
+        old = int(c.get("weekly_event_limit", DEFAULT_WEEKLY_EVENT_LIMIT) or 0)
+        c["weekly_event_limit"] = limit
+        save_cfg()
+        return {"ok": True, "message": f"Wochenlimit: {old} → {limit} EC", "changed": {"old": old, "new": limit}}
+
+    if action == "set_decay":
+        try:
+            percent = float(str(payload.get("decay_percent") or "0").replace(",", "."))
+            protected = int(float(str(payload.get("decay_protected_balance") or "0").replace(",", ".")))
+        except Exception:
+            return {"ok": False, "error": "Ungültige Verfall-Regel."}
+        if percent < 0 or percent > 100:
+            return {"ok": False, "error": "Verfall muss zwischen 0 und 100 Prozent liegen."}
+        if protected < 0 or protected > 100000:
+            return {"ok": False, "error": "Schutzbetrag ist unplausibel."}
+        old_percent = float(c.get("decay_percent", DEFAULT_DECAY_PERCENT) or 0)
+        old_protected = int(c.get("decay_protected_balance", DEFAULT_DECAY_PROTECTED_BALANCE) or 0)
+        c["decay_percent"] = percent
+        c["decay_protected_balance"] = protected
+        save_cfg()
+        return {
+            "ok": True,
+            "message": f"Verfall: {old_percent:.1f}%/{old_protected} EC Schutz → {percent:.1f}%/{protected} EC Schutz",
+            "changed": {"decay_percent_old": old_percent, "decay_percent_new": percent, "protected_old": old_protected, "protected_new": protected},
+        }
+
+
+    if action == "set_roles":
+        def _parse_id(name: str) -> int:
+            raw = str(payload.get(name) or "0").strip()
+            if raw in {"", "—", "-"}:
+                raw = "0"
+            if not raw.isdigit():
+                raise ValueError(f"{name} ist keine gültige Discord-ID.")
+            value = int(raw or 0)
+            if value and (value < 10**16 or value > 10**22):
+                raise ValueError(f"{name} sieht nicht wie eine Discord-ID aus.")
+            return value
+        try:
+            leader_role_id = _parse_id("leader_role_id")
+            member_role_id = _parse_id("member_role_id")
+            log_channel_id = _parse_id("log_channel_id")
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
+
+        old_log = int(c.get("log_channel_id", 0) or 0)
+        if log_channel_id:
+            c["log_channel_id"] = int(log_channel_id)
+            dkp_cfg[str(guild_id)] = c
+            save_cfg()
+
+        leader_cfg = _load_leader_cfg()
+        old_leader = int(((leader_cfg.get(str(guild_id)) or {}).get("leader_role_id", 0)) or 0)
+        if leader_role_id:
+            lc = leader_cfg.get(str(guild_id)) or {}
+            lc["leader_role_id"] = int(leader_role_id)
+            leader_cfg[str(guild_id)] = lc
+            _save_leader_cfg(leader_cfg)
+
+        portal_cfg = _load_portal_cfg()
+        old_member = int(((portal_cfg.get(str(guild_id)) or {}).get("member_role_id", 0)) or 0)
+        if member_role_id:
+            pc = portal_cfg.get(str(guild_id)) or {}
+            pc["member_role_id"] = int(member_role_id)
+            portal_cfg[str(guild_id)] = pc
+            _save_portal_cfg(portal_cfg)
+
+        return {
+            "ok": True,
+            "message": "Rollen/Kanal übernommen. Danach /dashboard_status ausführen und neu einloggen, falls Dashboard-Zugriff betroffen ist.",
+            "changed": {
+                "log_channel_id_old": old_log,
+                "log_channel_id_new": log_channel_id or old_log,
+                "leader_role_id_old": old_leader,
+                "leader_role_id_new": leader_role_id or old_leader,
+                "member_role_id_old": old_member,
+                "member_role_id_new": member_role_id or old_member,
+            },
+        }
+
+    if action == "set_access_roles":
+        def _parse_list(name: str) -> list[int]:
+            raw = str(payload.get(name) or "")
+            out: list[int] = []
+            for part in raw.replace(";", ",").split(","):
+                p = part.strip()
+                if not p:
+                    continue
+                if not p.isdigit():
+                    raise ValueError(f"{name} enthält keine gültige Discord-ID: {p}")
+                value = int(p)
+                if value < 10**16 or value > 10**22:
+                    raise ValueError(f"{name} sieht nicht wie eine Discord-ID aus: {p}")
+                if value not in out:
+                    out.append(value)
+            return out
+        try:
+            admin_roles = _parse_list("dashboard_admin_role_ids")
+            allowed_roles = _parse_list("dashboard_allowed_role_ids")
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
+        old_admin = c.get("dashboard_admin_role_ids") or []
+        old_allowed = c.get("dashboard_allowed_role_ids") or []
+        c["dashboard_admin_role_ids"] = admin_roles
+        c["dashboard_allowed_role_ids"] = allowed_roles
+        dkp_cfg[str(guild_id)] = c
+        save_cfg()
+        return {
+            "ok": True,
+            "message": "Dashboard-Zugriffsrollen gespeichert. Aktiv wird es nach frischem Snapshot und erneutem Login, sofern dashboard_data diese Rollen exportiert.",
+            "changed": {"admin_old": old_admin, "admin_new": admin_roles, "allowed_old": old_allowed, "allowed_new": allowed_roles},
+        }
+
+    return {"ok": False, "error": f"Unbekannte Einstellungsaktion: {action}"}
+
+
+async def _process_dashboard_settings_change_request(client: discord.Client, row: dict) -> None:
+    request_id = str(row.get("request_id") or "")
+    guild_id = int(row.get("guild_id") or 0)
+    actor_id = int(row.get("actor_id") or 0) if str(row.get("actor_id") or "").isdigit() else 0
+    actor_name = str(row.get("actor_name") or "Dashboard")
+    try:
+        result = _apply_dashboard_settings_change(row)
+        if result.get("ok"):
+            result.update({"request_id": request_id, "actor_name": actor_name})
+            _finish_dashboard_settings_change_request(request_id, "done", result)
+            print(f"[dkp_system] Dashboard-Settings übernommen {request_id}: {result.get('message')}", flush=True)
+            if audit_log:
+                try:
+                    audit_log(
+                        guild_id=guild_id,
+                        actor_id=actor_id,
+                        action="dashboard_settings_change_apply",
+                        target_type="settings",
+                        target_id=str(row.get("action_type") or "dkp_cfg"),
+                        summary=str(result.get("message") or "Dashboard-Einstellung übernommen"),
+                        metadata={"request_id": request_id, "result": result},
+                    )
+                except Exception:
+                    pass
+        else:
+            _finish_dashboard_settings_change_request(request_id, "rejected", {"ok": False, "error": result.get("error") or "abgelehnt", "request_id": request_id})
+            print(f"[dkp_system] Dashboard-Settings abgelehnt {request_id}: {result.get('error')}", flush=True)
+    except Exception as e:
+        print(f"[dkp_system] Dashboard-Settings Fehler {request_id}: {e!r}", flush=True)
+        _finish_dashboard_settings_change_request(request_id, "failed", {"ok": False, "error": repr(e), "request_id": request_id})
+
+
+@tasks.loop(minutes=1)
+async def dashboard_settings_change_request_loop():
+    client = getattr(dashboard_settings_change_request_loop, "_client", None)
+    if client is None:
+        return
+    if not _dashboard_queue_enabled():
+        return
+    try:
+        rows = _claim_dashboard_settings_change_requests(limit=5)
+    except Exception as e:
+        print(f"[dkp_system] Dashboard-Settings Queue konnte nicht gelesen werden: {e!r}", flush=True)
+        return
+    for row in rows:
+        await _process_dashboard_settings_change_request(client, row)
 
 
 @tasks.loop(minutes=5)
@@ -2245,6 +2907,96 @@ async def setup_dkp_system(client: discord.Client, tree: app_commands.CommandTre
         await _log_to_channel(client, inter.guild.id, emb)
         await inter.followup.send(f"✅ EC-Verfall ausgeführt. Betroffene Konten: **{len(changed)}**", ephemeral=True)
 
+    @dkp.command(name="phase3_ec_status", description="Leader: Phase-3 EC/DKP Postgres-Status anzeigen")
+    async def phase3_ec_status_cmd(inter: discord.Interaction):
+        if inter.guild is None:
+            await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
+            return
+        if not _is_leader_or_admin(inter):
+            await inter.response.send_message("❌ Keine Berechtigung.", ephemeral=True)
+            return
+        await inter.response.defer(ephemeral=True)
+        info = _phase3_ec_status(inter.guild.id)
+        if not info.get("ok"):
+            await inter.followup.send(f"❌ Phase-3 EC Status nicht verfügbar: `{info.get('error')}`", ephemeral=True)
+            return
+        js = info.get("json") or {}
+        pg = info.get("postgres") or {}
+        lines = [
+            "🧱 **Phase 3.2 · EC/DKP Postgres**",
+            f"EC-Konten: JSON **{js.get('balances', 0)}** · DB **{pg.get('phase3_ec_balances', 0)}**",
+            f"EC-Verlauf: JSON **{js.get('transactions', 0)}** · DB **{pg.get('phase3_ec_transactions', 0)}**",
+            f"Eventchecks: JSON **{js.get('checks', 0)}** · DB **{pg.get('phase3_ec_event_checks', 0)}**",
+            "",
+            "JSON bleibt aktuell Hauptquelle. Postgres ist Parallel-/Prüfschicht.",
+        ]
+        await inter.followup.send("\n".join(lines), ephemeral=True)
+
+    @dkp.command(name="phase3_ec_mirror", description="Leader: EC/DKP jetzt manuell nach Postgres spiegeln")
+    async def phase3_ec_mirror_cmd(inter: discord.Interaction):
+        if inter.guild is None:
+            await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
+            return
+        if not _is_leader_or_admin(inter):
+            await inter.response.send_message("❌ Keine Berechtigung.", ephemeral=True)
+            return
+        await inter.response.defer(ephemeral=True, thinking=True)
+        res = _phase3_mirror_all_ec_to_pg()
+        if not res.get("ok"):
+            await inter.followup.send(f"❌ Spiegelung fehlgeschlagen: `{res.get('error')}`", ephemeral=True)
+            return
+        c = res.get("counts") or {}
+        await inter.followup.send(
+            "✅ Phase-3 EC/DKP gespiegelt.\n"
+            f"Konten: **{c.get('balances', 0)}** · Transaktionen: **{c.get('transactions', 0)}** · Eventchecks: **{c.get('checks', 0)}**",
+            ephemeral=True,
+        )
+
+    @dkp.command(name="dashboard_settings_status", description="Leader: Status der Dashboard-Einstellungsqueue")
+    async def dashboard_settings_status(inter: discord.Interaction):
+        if inter.guild is None:
+            await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
+            return
+        if not _is_leader_or_admin(inter):
+            await inter.response.send_message("❌ Keine Berechtigung.", ephemeral=True)
+            return
+        await inter.response.defer(ephemeral=True)
+        try:
+            info = _dashboard_settings_change_summary(inter.guild.id, limit=8)
+        except Exception as e:
+            await inter.followup.send(f"❌ Queue konnte nicht gelesen werden: `{e!r}`", ephemeral=True)
+            return
+        counts = info.get("counts") or {}
+        rows = info.get("rows") or []
+        lines = [f"pending: **{counts.get('pending', 0)}** · processing: **{counts.get('processing', 0)}** · done: **{counts.get('done', 0)}** · failed/rejected: **{counts.get('failed', 0) + counts.get('rejected', 0)}**"]
+        for r in rows[:8]:
+            result = ""
+            try:
+                result_obj = json.loads(r.get("result_json") or "{}")
+                result = result_obj.get("message") or result_obj.get("error") or ""
+            except Exception:
+                result = ""
+            lines.append(f"• `{r.get('status')}` · `{r.get('action_type')}` · {result or r.get('request_id')}")
+        await inter.followup.send("⚙️ **Dashboard-Settings-Queue**\n" + "\n".join(lines), ephemeral=True)
+
+    @dkp.command(name="dashboard_settings_run", description="Leader: Dashboard-Einstellungsqueue sofort verarbeiten")
+    async def dashboard_settings_run(inter: discord.Interaction):
+        if inter.guild is None:
+            await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
+            return
+        if not _is_leader_or_admin(inter):
+            await inter.response.send_message("❌ Keine Berechtigung.", ephemeral=True)
+            return
+        await inter.response.defer(ephemeral=True)
+        try:
+            rows = _claim_dashboard_settings_change_requests(limit=10)
+        except Exception as e:
+            await inter.followup.send(f"❌ Queue konnte nicht gelesen werden: `{e!r}`", ephemeral=True)
+            return
+        for row in rows:
+            await _process_dashboard_settings_change_request(client, row)
+        await inter.followup.send(f"✅ Settings-Queue verarbeitet. Anfragen: **{len(rows)}**", ephemeral=True)
+
     if not dkp_event_check_loop.is_running():
         dkp_event_check_loop._client = client  # type: ignore[attr-defined]
         dkp_event_check_loop.start()
@@ -2254,6 +3006,20 @@ async def setup_dkp_system(client: discord.Client, tree: app_commands.CommandTre
         dashboard_ec_award_request_loop._client = client  # type: ignore[attr-defined]
         dashboard_ec_award_request_loop.start()
         print("🌐 Dashboard-EC-Buchungsqueue gestartet.")
+
+    if not dashboard_settings_change_request_loop.is_running():
+        dashboard_settings_change_request_loop._client = client  # type: ignore[attr-defined]
+        dashboard_settings_change_request_loop.start()
+        print("⚙️ Dashboard-Settings-Queue gestartet.")
+
+    try:
+        res = _phase3_mirror_all_ec_to_pg()
+        if res.get("ok"):
+            print(f"🧱 Phase 3.2 EC/DKP Startspiegelung: {res.get('counts')}", flush=True)
+        else:
+            print(f"🧱 Phase 3.2 EC/DKP noch nicht aktiv: {res.get('error')}", flush=True)
+    except Exception as e:
+        print(f"[phase3-ec] Startspiegelung Fehler: {e!r}", flush=True)
 
     tree.add_command(dkp)
     print("💰 DKP-System geladen: /dkp Command-Gruppe aktiv.")
