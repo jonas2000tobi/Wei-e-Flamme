@@ -31,8 +31,8 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
-ASSET_VER = "ebo-release-stability-step4"
-DASHBOARD_RELEASE_VERSION = "1.0.0 · Release/Stabilität Step 4"
+ASSET_VER = "ebo-phase3-database-start"
+DASHBOARD_RELEASE_VERSION = "1.1.0 · Phase 3 Datenbank-Start"
 
 
 def _database_url() -> str:
@@ -10125,3 +10125,702 @@ def export_attendance_ec_preview_csv(event_id: str, full_ec: Optional[float] = N
             r.get("note"),
         ])
     return Response(output.getvalue(), media_type="text/csv; charset=utf-8", headers={"Content-Disposition": f"attachment; filename=attendance_ec_preview_{event_id}.csv"})
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 · Postgres-Datenbasis vorbereiten
+# ---------------------------------------------------------------------------
+# Ziel dieser Phase:
+# - JSON/Snapshot bleibt Hauptquelle.
+# - Postgres bekommt sichere Spiegel-Tabellen.
+# - Dashboard kann DB-Status und Vergleich anzeigen.
+# - Es wird nichts gelöscht und kein harter Cutover gemacht.
+
+PHASE3_TABLES = [
+    "phase3_members",
+    "phase3_ec_balances",
+    "phase3_ec_transactions",
+    "phase3_loot_needs",
+    "phase3_events",
+    "phase3_loot_auctions",
+    "phase3_loot_bids",
+    "phase3_loot_history",
+    "phase3_absences",
+    "phase3_settings",
+    "phase3_migration_runs",
+]
+
+
+def _phase3_jsonb(value: Any):
+    from psycopg.types.json import Jsonb  # type: ignore
+
+    return Jsonb(value if value is not None else {})
+
+
+def _phase3_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _phase3_list(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, dict):
+        # Manche Snapshot-Bereiche liegen als Dict user_id -> Objekt vor.
+        out = []
+        for k, v in value.items():
+            if isinstance(v, dict):
+                item = dict(v)
+                item.setdefault("id", str(k))
+                item.setdefault("user_id", str(k))
+                out.append(item)
+            else:
+                out.append({"id": str(k), "value": v})
+        return out
+    return []
+
+
+def _phase3_str(value: Any, default: str = "") -> str:
+    if value is None:
+        return default
+    return str(value).strip()
+
+
+def _phase3_first_id(item: Any, keys: list[str], fallback: str = "") -> str:
+    if not isinstance(item, dict):
+        return fallback
+    for k in keys:
+        v = item.get(k)
+        if v is not None and str(v).strip():
+            return str(v).strip()
+    return fallback
+
+
+def _phase3_hash_id(prefix: str, raw: Any) -> str:
+    blob = json.dumps(raw, ensure_ascii=False, sort_keys=True, default=str)
+    return prefix + "_" + hashlib.sha1(blob.encode("utf-8")).hexdigest()[:18]
+
+
+def _phase3_int(value: Any, default: int = 0) -> int:
+    try:
+        if value is None or value == "":
+            return default
+        return int(float(str(value).replace(",", ".")))
+    except Exception:
+        return default
+
+
+def _phase3_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None or value == "":
+            return default
+        return float(str(value).replace(",", "."))
+    except Exception:
+        return default
+
+
+def _phase3_dt_string(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return str(value).strip()
+
+
+def _phase3_ensure_schema() -> dict[str, Any]:
+    if not _database_url():
+        return {"ok": False, "error": "DATABASE_URL fehlt."}
+    conn = _pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS phase3_members (
+                    guild_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    discord_name TEXT,
+                    ingame_name TEXT,
+                    roles_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+                    raw_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    source TEXT NOT NULL DEFAULT 'snapshot',
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    PRIMARY KEY (guild_id, user_id)
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS phase3_ec_balances (
+                    guild_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    balance INTEGER NOT NULL DEFAULT 0,
+                    raw_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    source TEXT NOT NULL DEFAULT 'snapshot',
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    PRIMARY KEY (guild_id, user_id)
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS phase3_ec_transactions (
+                    guild_id TEXT NOT NULL,
+                    transaction_id TEXT NOT NULL,
+                    user_id TEXT,
+                    amount INTEGER NOT NULL DEFAULT 0,
+                    reason TEXT,
+                    event_id TEXT,
+                    created_at_text TEXT,
+                    raw_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    source TEXT NOT NULL DEFAULT 'snapshot',
+                    mirrored_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    PRIMARY KEY (guild_id, transaction_id)
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS phase3_loot_needs (
+                    guild_id TEXT NOT NULL,
+                    need_id TEXT NOT NULL,
+                    user_id TEXT,
+                    item_name TEXT,
+                    need_type TEXT,
+                    slot_name TEXT,
+                    status TEXT,
+                    raw_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    source TEXT NOT NULL DEFAULT 'snapshot',
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    PRIMARY KEY (guild_id, need_id)
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS phase3_events (
+                    guild_id TEXT NOT NULL,
+                    event_id TEXT NOT NULL,
+                    title TEXT,
+                    status TEXT,
+                    start_at_text TEXT,
+                    end_at_text TEXT,
+                    raw_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    source TEXT NOT NULL DEFAULT 'snapshot',
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    PRIMARY KEY (guild_id, event_id)
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS phase3_loot_auctions (
+                    guild_id TEXT NOT NULL,
+                    auction_id TEXT NOT NULL,
+                    item_name TEXT,
+                    status TEXT,
+                    winner_user_id TEXT,
+                    current_bid INTEGER NOT NULL DEFAULT 0,
+                    raw_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    source TEXT NOT NULL DEFAULT 'snapshot',
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    PRIMARY KEY (guild_id, auction_id)
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS phase3_loot_bids (
+                    guild_id TEXT NOT NULL,
+                    bid_id TEXT NOT NULL,
+                    auction_id TEXT,
+                    user_id TEXT,
+                    amount INTEGER NOT NULL DEFAULT 0,
+                    raw_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    source TEXT NOT NULL DEFAULT 'snapshot',
+                    mirrored_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    PRIMARY KEY (guild_id, bid_id)
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS phase3_loot_history (
+                    guild_id TEXT NOT NULL,
+                    entry_id TEXT NOT NULL,
+                    user_id TEXT,
+                    item_name TEXT,
+                    amount INTEGER NOT NULL DEFAULT 0,
+                    raw_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    source TEXT NOT NULL DEFAULT 'snapshot',
+                    mirrored_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    PRIMARY KEY (guild_id, entry_id)
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS phase3_absences (
+                    guild_id TEXT NOT NULL,
+                    absence_id TEXT NOT NULL,
+                    user_id TEXT,
+                    status TEXT,
+                    start_at_text TEXT,
+                    end_at_text TEXT,
+                    raw_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    source TEXT NOT NULL DEFAULT 'snapshot',
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    PRIMARY KEY (guild_id, absence_id)
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS phase3_settings (
+                    guild_id TEXT NOT NULL,
+                    setting_key TEXT NOT NULL,
+                    value_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    source TEXT NOT NULL DEFAULT 'snapshot',
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    PRIMARY KEY (guild_id, setting_key)
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS phase3_migration_runs (
+                    run_id TEXT PRIMARY KEY,
+                    guild_id TEXT,
+                    mode TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    counts_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    notes TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_phase3_members_guild ON phase3_members (guild_id)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_phase3_ec_tx_user ON phase3_ec_transactions (guild_id, user_id)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_phase3_needs_item ON phase3_loot_needs (guild_id, item_name)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_phase3_events_status ON phase3_events (guild_id, status)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_phase3_auctions_status ON phase3_loot_auctions (guild_id, status)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_phase3_runs_created ON phase3_migration_runs (created_at DESC)")
+        conn.commit()
+        return {"ok": True, "tables": PHASE3_TABLES}
+    except Exception as exc:
+        conn.rollback()
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    finally:
+        conn.close()
+
+
+def _phase3_status_payload() -> dict[str, Any]:
+    out: dict[str, Any] = {
+        "ok": False,
+        "database_url": bool(_database_url()),
+        "phase": "3.1",
+        "mode": "lesen + spiegeln, kein Cutover",
+        "tables": {},
+        "counts": {},
+        "latest_runs": [],
+        "warnings": [],
+    }
+    if not _database_url():
+        out["warnings"].append("DATABASE_URL fehlt. Postgres ist nicht erreichbar.")
+        return out
+    conn = _pg_connect()
+    try:
+        with conn.cursor() as cur:
+            for table in PHASE3_TABLES:
+                cur.execute("SELECT to_regclass(%s) AS reg", (table,))
+                exists = bool((cur.fetchone() or {}).get("reg"))
+                out["tables"][table] = exists
+                if exists:
+                    cur.execute(f"SELECT COUNT(*) AS c FROM {table}")
+                    out["counts"][table] = int((cur.fetchone() or {}).get("c") or 0)
+                else:
+                    out["counts"][table] = 0
+            if out["tables"].get("phase3_migration_runs"):
+                cur.execute("""
+                    SELECT run_id, guild_id, mode, status, counts_json, notes, created_at
+                    FROM phase3_migration_runs
+                    ORDER BY created_at DESC
+                    LIMIT 10
+                """)
+                out["latest_runs"] = [dict(r) for r in (cur.fetchall() or [])]
+        out["ok"] = all(out["tables"].values())
+        if not out["ok"]:
+            out["warnings"].append("Phase-3-Tabellen sind noch nicht vollständig angelegt.")
+        return out
+    except Exception as exc:
+        out["warnings"].append(f"DB-Status fehlgeschlagen: {type(exc).__name__}: {exc}")
+        return out
+    finally:
+        conn.close()
+
+
+def _phase3_extract_snapshot_counts(payload: dict[str, Any]) -> dict[str, int]:
+    snap = payload.get("snapshot") or {} if isinstance(payload, dict) else {}
+    events_raw = (snap.get("events") or {}) if isinstance(snap, dict) else {}
+    events = events_raw.get("items") if isinstance(events_raw, dict) else []
+    members_raw = (snap.get("members") or {}) if isinstance(snap, dict) else {}
+    members = []
+    if isinstance(members_raw, dict):
+        members = members_raw.get("items") or members_raw.get("profiles") or members_raw.get("members") or []
+    ec_raw = snap.get("ec") or {} if isinstance(snap, dict) else {}
+    balances = ec_raw.get("balances") or {} if isinstance(ec_raw, dict) else {}
+    transactions = ec_raw.get("transactions") or ec_raw.get("history") or [] if isinstance(ec_raw, dict) else []
+    loot_raw = snap.get("loot") or {} if isinstance(snap, dict) else {}
+    needs = []
+    auctions = []
+    history = []
+    if isinstance(loot_raw, dict):
+        needs = loot_raw.get("needs") or loot_raw.get("needlist") or loot_raw.get("needlists") or []
+        auctions = loot_raw.get("auctions") or loot_raw.get("items") or []
+        history = loot_raw.get("history") or loot_raw.get("loot_history") or loot_raw.get("transactions") or []
+    abs_raw = snap.get("absences") or snap.get("absence") or {} if isinstance(snap, dict) else {}
+    absences = abs_raw.get("items") if isinstance(abs_raw, dict) else []
+    return {
+        "members": len(_phase3_list(members)),
+        "ec_balances": len(balances) if isinstance(balances, dict) else len(_phase3_list(balances)),
+        "ec_transactions": len(_phase3_list(transactions)),
+        "needs": len(_phase3_list(needs)),
+        "events": len(_phase3_list(events)),
+        "auctions": len(_phase3_list(auctions)),
+        "loot_history": len(_phase3_list(history)),
+        "absences": len(_phase3_list(absences)),
+    }
+
+
+def _phase3_mirror_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
+    schema = _phase3_ensure_schema()
+    if not schema.get("ok"):
+        return schema
+    snap = payload.get("snapshot") or {} if isinstance(payload, dict) else {}
+    guild_id = _phase3_str(payload.get("guild_id") or (snap.get("guild_id") if isinstance(snap, dict) else "") or _env("GUILD_ID") or "default")
+    counts = {"members": 0, "ec_balances": 0, "ec_transactions": 0, "needs": 0, "events": 0, "auctions": 0, "bids": 0, "loot_history": 0, "absences": 0, "settings": 0}
+    conn = _pg_connect()
+    run_id = "phase3_" + hashlib.sha1(f"{guild_id}:{time.time()}".encode()).hexdigest()[:18]
+    try:
+        with conn.cursor() as cur:
+            # Members/Profile
+            members_raw = (snap.get("members") or {}) if isinstance(snap, dict) else {}
+            members = []
+            if isinstance(members_raw, dict):
+                members = members_raw.get("items") or members_raw.get("profiles") or members_raw.get("members") or members_raw
+            for item in _phase3_list(members):
+                if not isinstance(item, dict):
+                    continue
+                user_id = _phase3_first_id(item, ["user_id", "discord_id", "id", "member_id"])
+                if not user_id:
+                    continue
+                discord_name = _phase3_str(item.get("display_name") or item.get("discord_name") or item.get("name") or item.get("username"))
+                ingame_name = _phase3_str(item.get("ingame_name") or item.get("character") or item.get("char_name") or item.get("main_name"))
+                roles = item.get("roles") or item.get("role_names") or []
+                cur.execute("""
+                    INSERT INTO phase3_members (guild_id, user_id, discord_name, ingame_name, roles_json, raw_json, source, updated_at)
+                    VALUES (%s,%s,%s,%s,%s,%s,'snapshot',now())
+                    ON CONFLICT (guild_id, user_id) DO UPDATE SET
+                      discord_name=EXCLUDED.discord_name,
+                      ingame_name=EXCLUDED.ingame_name,
+                      roles_json=EXCLUDED.roles_json,
+                      raw_json=EXCLUDED.raw_json,
+                      source='snapshot',
+                      updated_at=now()
+                """, (guild_id, user_id, discord_name, ingame_name, _phase3_jsonb(roles if isinstance(roles, list) else [roles]), _phase3_jsonb(item)))
+                counts["members"] += 1
+
+            # EC balances and transactions
+            ec_raw = (snap.get("ec") or {}) if isinstance(snap, dict) else {}
+            balances = (ec_raw.get("balances") or {}) if isinstance(ec_raw, dict) else {}
+            if isinstance(balances, dict):
+                bal_items = balances.items()
+            else:
+                bal_items = [(None, x) for x in _phase3_list(balances)]
+            for uid, val in bal_items:
+                raw = val if isinstance(val, dict) else {"balance": val}
+                user_id = _phase3_str(uid) or _phase3_first_id(raw, ["user_id", "discord_id", "id", "member_id"])
+                if not user_id:
+                    continue
+                balance = _phase3_int(raw.get("balance") if isinstance(raw, dict) else val)
+                if isinstance(raw, dict):
+                    balance = _phase3_int(raw.get("balance", raw.get("dkp", raw.get("ec", balance))), balance)
+                cur.execute("""
+                    INSERT INTO phase3_ec_balances (guild_id, user_id, balance, raw_json, source, updated_at)
+                    VALUES (%s,%s,%s,%s,'snapshot',now())
+                    ON CONFLICT (guild_id, user_id) DO UPDATE SET
+                      balance=EXCLUDED.balance,
+                      raw_json=EXCLUDED.raw_json,
+                      source='snapshot',
+                      updated_at=now()
+                """, (guild_id, user_id, balance, _phase3_jsonb(raw)))
+                counts["ec_balances"] += 1
+            txs = []
+            if isinstance(ec_raw, dict):
+                txs = ec_raw.get("transactions") or ec_raw.get("history") or ec_raw.get("items") or []
+            for raw in _phase3_list(txs):
+                if not isinstance(raw, dict):
+                    continue
+                tx_id = _phase3_first_id(raw, ["transaction_id", "tx_id", "id"]) or _phase3_hash_id("tx", raw)
+                user_id = _phase3_first_id(raw, ["user_id", "discord_id", "member_id"])
+                amount = _phase3_int(raw.get("amount", raw.get("value", raw.get("delta", 0))))
+                reason = _phase3_str(raw.get("reason") or raw.get("note") or raw.get("type"))
+                event_id = _phase3_str(raw.get("event_id") or raw.get("source_event_id"))
+                created = _phase3_dt_string(raw.get("created_at") or raw.get("timestamp") or raw.get("time") or raw.get("date"))
+                cur.execute("""
+                    INSERT INTO phase3_ec_transactions (guild_id, transaction_id, user_id, amount, reason, event_id, created_at_text, raw_json, source, mirrored_at)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,'snapshot',now())
+                    ON CONFLICT (guild_id, transaction_id) DO UPDATE SET
+                      user_id=EXCLUDED.user_id,
+                      amount=EXCLUDED.amount,
+                      reason=EXCLUDED.reason,
+                      event_id=EXCLUDED.event_id,
+                      created_at_text=EXCLUDED.created_at_text,
+                      raw_json=EXCLUDED.raw_json,
+                      source='snapshot',
+                      mirrored_at=now()
+                """, (guild_id, tx_id, user_id, amount, reason, event_id, created, _phase3_jsonb(raw)))
+                counts["ec_transactions"] += 1
+
+            # Loot needs, auctions, bids, history
+            loot_raw = (snap.get("loot") or {}) if isinstance(snap, dict) else {}
+            needs = []
+            auctions = []
+            history = []
+            if isinstance(loot_raw, dict):
+                needs = loot_raw.get("needs") or loot_raw.get("needlist") or loot_raw.get("needlists") or []
+                auctions = loot_raw.get("auctions") or loot_raw.get("items") or []
+                history = loot_raw.get("history") or loot_raw.get("loot_history") or loot_raw.get("transactions") or []
+            for raw in _phase3_list(needs):
+                if not isinstance(raw, dict):
+                    continue
+                need_id = _phase3_first_id(raw, ["need_id", "id"]) or _phase3_hash_id("need", raw)
+                user_id = _phase3_first_id(raw, ["user_id", "discord_id", "member_id"])
+                item_name = _phase3_str(raw.get("item_name") or raw.get("item") or raw.get("name"))
+                need_type = _phase3_str(raw.get("need_type") or raw.get("type") or raw.get("kind"))
+                slot = _phase3_str(raw.get("slot") or raw.get("slot_name"))
+                status = _phase3_str(raw.get("status") or raw.get("state"))
+                cur.execute("""
+                    INSERT INTO phase3_loot_needs (guild_id, need_id, user_id, item_name, need_type, slot_name, status, raw_json, source, updated_at)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,'snapshot',now())
+                    ON CONFLICT (guild_id, need_id) DO UPDATE SET
+                      user_id=EXCLUDED.user_id,
+                      item_name=EXCLUDED.item_name,
+                      need_type=EXCLUDED.need_type,
+                      slot_name=EXCLUDED.slot_name,
+                      status=EXCLUDED.status,
+                      raw_json=EXCLUDED.raw_json,
+                      source='snapshot',
+                      updated_at=now()
+                """, (guild_id, need_id, user_id, item_name, need_type, slot, status, _phase3_jsonb(raw)))
+                counts["needs"] += 1
+            for raw in _phase3_list(auctions):
+                if not isinstance(raw, dict):
+                    continue
+                auction_id = _phase3_first_id(raw, ["auction_id", "id", "message_id"]) or _phase3_hash_id("auc", raw)
+                item_name = _phase3_str(raw.get("item_name") or raw.get("item") or raw.get("name") or raw.get("title"))
+                status = _phase3_str(raw.get("status") or raw.get("state"))
+                winner = _phase3_first_id(raw, ["winner_user_id", "winner_id", "winner", "user_id"])
+                current_bid = _phase3_int(raw.get("current_bid") or raw.get("highest_bid") or raw.get("price") or raw.get("amount"))
+                cur.execute("""
+                    INSERT INTO phase3_loot_auctions (guild_id, auction_id, item_name, status, winner_user_id, current_bid, raw_json, source, updated_at)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,'snapshot',now())
+                    ON CONFLICT (guild_id, auction_id) DO UPDATE SET
+                      item_name=EXCLUDED.item_name,
+                      status=EXCLUDED.status,
+                      winner_user_id=EXCLUDED.winner_user_id,
+                      current_bid=EXCLUDED.current_bid,
+                      raw_json=EXCLUDED.raw_json,
+                      source='snapshot',
+                      updated_at=now()
+                """, (guild_id, auction_id, item_name, status, winner, current_bid, _phase3_jsonb(raw)))
+                counts["auctions"] += 1
+                bids = raw.get("bids") or raw.get("bid_history") or []
+                for bid in _phase3_list(bids):
+                    if not isinstance(bid, dict):
+                        continue
+                    bid_raw = dict(bid)
+                    bid_raw.setdefault("auction_id", auction_id)
+                    bid_id = _phase3_first_id(bid_raw, ["bid_id", "id"]) or _phase3_hash_id("bid", bid_raw)
+                    bidder = _phase3_first_id(bid_raw, ["user_id", "discord_id", "bidder_id", "member_id"])
+                    amount = _phase3_int(bid_raw.get("amount") or bid_raw.get("bid") or bid_raw.get("value"))
+                    cur.execute("""
+                        INSERT INTO phase3_loot_bids (guild_id, bid_id, auction_id, user_id, amount, raw_json, source, mirrored_at)
+                        VALUES (%s,%s,%s,%s,%s,%s,'snapshot',now())
+                        ON CONFLICT (guild_id, bid_id) DO UPDATE SET
+                          auction_id=EXCLUDED.auction_id,
+                          user_id=EXCLUDED.user_id,
+                          amount=EXCLUDED.amount,
+                          raw_json=EXCLUDED.raw_json,
+                          source='snapshot',
+                          mirrored_at=now()
+                    """, (guild_id, bid_id, auction_id, bidder, amount, _phase3_jsonb(bid_raw)))
+                    counts["bids"] += 1
+            for raw in _phase3_list(history):
+                if not isinstance(raw, dict):
+                    continue
+                entry_id = _phase3_first_id(raw, ["entry_id", "history_id", "id"]) or _phase3_hash_id("loot", raw)
+                user_id = _phase3_first_id(raw, ["user_id", "discord_id", "winner_user_id", "member_id"])
+                item_name = _phase3_str(raw.get("item_name") or raw.get("item") or raw.get("name"))
+                amount = _phase3_int(raw.get("amount") or raw.get("price") or raw.get("bid") or raw.get("ec"))
+                cur.execute("""
+                    INSERT INTO phase3_loot_history (guild_id, entry_id, user_id, item_name, amount, raw_json, source, mirrored_at)
+                    VALUES (%s,%s,%s,%s,%s,%s,'snapshot',now())
+                    ON CONFLICT (guild_id, entry_id) DO UPDATE SET
+                      user_id=EXCLUDED.user_id,
+                      item_name=EXCLUDED.item_name,
+                      amount=EXCLUDED.amount,
+                      raw_json=EXCLUDED.raw_json,
+                      source='snapshot',
+                      mirrored_at=now()
+                """, (guild_id, entry_id, user_id, item_name, amount, _phase3_jsonb(raw)))
+                counts["loot_history"] += 1
+
+            # Events
+            events_raw = (snap.get("events") or {}) if isinstance(snap, dict) else {}
+            events = events_raw.get("items") if isinstance(events_raw, dict) else events_raw
+            for raw in _phase3_list(events):
+                if not isinstance(raw, dict):
+                    continue
+                event_id = _phase3_first_id(raw, ["event_id", "id", "message_id"]) or _phase3_hash_id("event", raw)
+                title = _phase3_str(raw.get("title") or raw.get("name"))
+                status = _phase3_str(raw.get("status") or raw.get("state"))
+                start_at = _phase3_dt_string(raw.get("start_at") or raw.get("start") or raw.get("start_time") or raw.get("date"))
+                end_at = _phase3_dt_string(raw.get("end_at") or raw.get("end") or raw.get("end_time"))
+                cur.execute("""
+                    INSERT INTO phase3_events (guild_id, event_id, title, status, start_at_text, end_at_text, raw_json, source, updated_at)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,'snapshot',now())
+                    ON CONFLICT (guild_id, event_id) DO UPDATE SET
+                      title=EXCLUDED.title,
+                      status=EXCLUDED.status,
+                      start_at_text=EXCLUDED.start_at_text,
+                      end_at_text=EXCLUDED.end_at_text,
+                      raw_json=EXCLUDED.raw_json,
+                      source='snapshot',
+                      updated_at=now()
+                """, (guild_id, event_id, title, status, start_at, end_at, _phase3_jsonb(raw)))
+                counts["events"] += 1
+
+            # Absences
+            abs_raw = (snap.get("absences") or snap.get("absence") or {}) if isinstance(snap, dict) else {}
+            absences = abs_raw.get("items") if isinstance(abs_raw, dict) else abs_raw
+            for raw in _phase3_list(absences):
+                if not isinstance(raw, dict):
+                    continue
+                absence_id = _phase3_first_id(raw, ["absence_id", "id"]) or _phase3_hash_id("absence", raw)
+                user_id = _phase3_first_id(raw, ["user_id", "discord_id", "member_id"])
+                status = _phase3_str(raw.get("status") or raw.get("state"))
+                start_at = _phase3_dt_string(raw.get("start_at") or raw.get("from") or raw.get("start"))
+                end_at = _phase3_dt_string(raw.get("end_at") or raw.get("to") or raw.get("end"))
+                cur.execute("""
+                    INSERT INTO phase3_absences (guild_id, absence_id, user_id, status, start_at_text, end_at_text, raw_json, source, updated_at)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,'snapshot',now())
+                    ON CONFLICT (guild_id, absence_id) DO UPDATE SET
+                      user_id=EXCLUDED.user_id,
+                      status=EXCLUDED.status,
+                      start_at_text=EXCLUDED.start_at_text,
+                      end_at_text=EXCLUDED.end_at_text,
+                      raw_json=EXCLUDED.raw_json,
+                      source='snapshot',
+                      updated_at=now()
+                """, (guild_id, absence_id, user_id, status, start_at, end_at, _phase3_jsonb(raw)))
+                counts["absences"] += 1
+
+            # Settings snapshot copy
+            settings_candidates = {}
+            for key in ["settings", "dkp_settings", "config", "cfg"]:
+                if isinstance(snap, dict) and isinstance(snap.get(key), dict):
+                    settings_candidates[key] = snap.get(key)
+            for key, value in settings_candidates.items():
+                cur.execute("""
+                    INSERT INTO phase3_settings (guild_id, setting_key, value_json, source, updated_at)
+                    VALUES (%s,%s,%s,'snapshot',now())
+                    ON CONFLICT (guild_id, setting_key) DO UPDATE SET
+                      value_json=EXCLUDED.value_json,
+                      source='snapshot',
+                      updated_at=now()
+                """, (guild_id, key, _phase3_jsonb(value)))
+                counts["settings"] += 1
+
+            cur.execute("""
+                INSERT INTO phase3_migration_runs (run_id, guild_id, mode, status, counts_json, notes, created_at)
+                VALUES (%s,%s,'snapshot_mirror','done',%s,%s,now())
+            """, (run_id, guild_id, _phase3_jsonb(counts), "Sichere Spiegelung aus Dashboard-Snapshot. JSON bleibt Hauptquelle."))
+        conn.commit()
+        return {"ok": True, "run_id": run_id, "guild_id": guild_id, "counts": counts}
+    except Exception as exc:
+        conn.rollback()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO phase3_migration_runs (run_id, guild_id, mode, status, counts_json, notes, created_at)
+                    VALUES (%s,%s,'snapshot_mirror','failed',%s,%s,now())
+                    ON CONFLICT (run_id) DO NOTHING
+                """, (run_id, guild_id, _phase3_jsonb(counts), f"{type(exc).__name__}: {exc}"))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}", "run_id": run_id, "counts": counts}
+    finally:
+        conn.close()
+
+
+def _render_phase3_database_page(payload: dict[str, Any]) -> str:
+    snap_counts = _phase3_extract_snapshot_counts(payload)
+    db_status = _phase3_status_payload()
+    table_rows = []
+    for table in PHASE3_TABLES:
+        table_rows.append([
+            table,
+            "✅ vorhanden" if db_status.get("tables", {}).get(table) else "⚠️ fehlt",
+            db_status.get("counts", {}).get(table, 0),
+        ])
+    compare_rows = [
+        ["Mitglieder/Profile", snap_counts.get("members", 0), db_status.get("counts", {}).get("phase3_members", 0)],
+        ["EC-Konten", snap_counts.get("ec_balances", 0), db_status.get("counts", {}).get("phase3_ec_balances", 0)],
+        ["EC-Verlauf", snap_counts.get("ec_transactions", 0), db_status.get("counts", {}).get("phase3_ec_transactions", 0)],
+        ["Needlisten", snap_counts.get("needs", 0), db_status.get("counts", {}).get("phase3_loot_needs", 0)],
+        ["Events", snap_counts.get("events", 0), db_status.get("counts", {}).get("phase3_events", 0)],
+        ["Auktionen", snap_counts.get("auctions", 0), db_status.get("counts", {}).get("phase3_loot_auctions", 0)],
+        ["Loot-Historie", snap_counts.get("loot_history", 0), db_status.get("counts", {}).get("phase3_loot_history", 0)],
+        ["Abwesenheiten", snap_counts.get("absences", 0), db_status.get("counts", {}).get("phase3_absences", 0)],
+    ]
+    run_rows = []
+    for r in db_status.get("latest_runs") or []:
+        counts = r.get("counts_json") or {}
+        if not isinstance(counts, dict):
+            counts = {}
+        run_rows.append([
+            r.get("created_at") or "",
+            r.get("mode") or "",
+            r.get("status") or "",
+            ", ".join(f"{k}:{v}" for k, v in counts.items())[:160],
+            r.get("notes") or "",
+        ])
+    warnings = db_status.get("warnings") or []
+    warn_html = "" if not warnings else "<section class='panel'><h2>Warnungen</h2><ul>" + "".join(f"<li>{_e(w)}</li>" for w in warnings) + "</ul></section>"
+    status_text = "✅ Datenbank bereit" if db_status.get("ok") else "⚠️ Datenbank vorbereiten"
+    return _html_shell("Phase 3 · Datenbank · Ebo Dashboard", f"""
+    <nav class='topnav'><a href='/'>← Kommando</a><a href='/release'>Release</a><a href='/admin'>Admin</a><a href='/api/database-status'>API</a></nav>
+    <section class='hero'><div><h1>Phase 3 · Daten sauberer machen</h1><p>{_e(status_text)} · JSON bleibt aktuell Hauptquelle. Postgres wird zuerst nur vorbereitet und gespiegelt.</p></div><div class='page-actions'><a class='btn' href='/database/init'>Tabellen vorbereiten</a><a class='btn' href='/database/mirror-snapshot'>Snapshot spiegeln</a></div></section>
+    <section class='panel'><h2>4-Schritte-Plan</h2><div class='grid'>
+      <div class='card'><b>1 · Grundlage</b><p>Tabellen erstellen, Snapshot sicher spiegeln, Vergleich anzeigen.</p></div>
+      <div class='card'><b>2 · EC/DKP</b><p>EC-Konten, Transaktionen, Event-Checks parallel schreiben und danach DB als Hauptquelle nutzen.</p></div>
+      <div class='card'><b>3 · Loot/Needs</b><p>Needlisten, Auktionen, Gebote und Loot-Historie nach Postgres ziehen.</p></div>
+      <div class='card'><b>4 · Events/Profile/Abwesenheit</b><p>Restliche Live-Daten migrieren. JSON bleibt Backup/Export.</p></div>
+    </div></section>
+    <section class='panel'><h2>Snapshot vs. Postgres</h2>{_table(['Bereich','Snapshot','Postgres Phase 3'], compare_rows, searchable=False)}</section>
+    <section class='panel'><h2>Phase-3-Tabellen</h2>{_table(['Tabelle','Status','Zeilen'], table_rows, searchable=False)}</section>
+    {warn_html}
+    <section class='panel'><h2>Letzte Spiegelungen</h2>{_table(['Zeit','Modus','Status','Zahlen','Notiz'], run_rows or [['—','—','—','Noch keine Spiegelung','']], searchable=False)}</section>
+    <section class='panel'><h2>Sicherheitsregeln</h2><ul><li>Diese Seite löscht keine Daten.</li><li>JSON/Snapshot bleibt Hauptquelle.</li><li>Spiegelung ist idempotent: erneutes Ausführen aktualisiert vorhandene DB-Zeilen.</li><li>Erst nach Prüfung stellen wir einzelne Bereiche hart auf Postgres um.</li></ul></section>
+    """)
+
+
+@app.get("/database", response_class=HTMLResponse)
+def database_page(_: bool = Depends(_auth)):
+    try:
+        return HTMLResponse(_render_phase3_database_page(_snapshot_payload()))
+    except Exception as exc:
+        return HTMLResponse(_html_shell("Datenbank Fehler", f"<section class='panel'><h1>❌ Datenbank-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"), status_code=500)
+
+
+@app.get("/api/database-status")
+def api_database_status(_: bool = Depends(_auth)):
+    payload = _snapshot_payload()
+    return JSONResponse({"ok": True, "snapshot_counts": _phase3_extract_snapshot_counts(payload), "database": _phase3_status_payload()})
+
+
+@app.get("/database/init")
+def database_init(_: bool = Depends(_auth)):
+    res = _phase3_ensure_schema()
+    msg = "Phase-3-Tabellen vorbereitet." if res.get("ok") else f"Fehler: {res.get('error')}"
+    return RedirectResponse("/database?msg=" + urllib.parse.quote(msg), status_code=303)
+
+
+@app.get("/database/mirror-snapshot")
+def database_mirror_snapshot(_: bool = Depends(_auth)):
+    res = _phase3_mirror_snapshot(_snapshot_payload())
+    if res.get("ok"):
+        msg = "Snapshot gespiegelt: " + ", ".join(f"{k}={v}" for k, v in (res.get("counts") or {}).items())
+    else:
+        msg = f"Fehler: {res.get('error')}"
+    return RedirectResponse("/database?msg=" + urllib.parse.quote(msg), status_code=303)
