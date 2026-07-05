@@ -31,7 +31,7 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
-ASSET_VER = "ebo-event-center-step2"
+ASSET_VER = "ebo-member-portal-step3"
 
 
 def _database_url() -> str:
@@ -545,6 +545,31 @@ def _ensure_admin_tables() -> None:
                 """
                 CREATE INDEX IF NOT EXISTS idx_dashboard_settings_change_requests_lookup
                 ON dashboard_settings_change_requests (guild_id, scope, status, requested_at DESC)
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS dashboard_need_change_requests (
+                    id BIGSERIAL PRIMARY KEY,
+                    request_id TEXT NOT NULL UNIQUE,
+                    guild_id BIGINT NOT NULL,
+                    target_user_id BIGINT NOT NULL,
+                    action_type TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    payload_json TEXT NOT NULL DEFAULT '{}',
+                    actor_id TEXT,
+                    actor_name TEXT,
+                    requested_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    claimed_at TIMESTAMPTZ,
+                    processed_at TIMESTAMPTZ,
+                    result_json TEXT
+                )
+                """
+            )
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_dashboard_need_change_requests_lookup
+                ON dashboard_need_change_requests (guild_id, target_user_id, status, requested_at DESC)
                 """
             )
         conn.commit()
@@ -2152,6 +2177,7 @@ def _sidebar_html() -> str:
         <details open>
           <summary>Gilde</summary>
           <a href="/members">👥 Mitglieder</a>
+        <a href="/portal">👤 Mein Portal</a>
           <a href="/events">📅 Events</a>
           <a href="/attendance">✅ Anwesenheit</a>
           <a href="/attendance-stats">📈 Stats</a>
@@ -5031,7 +5057,7 @@ def _render_member_detail(data: dict[str, Any], user_id: int, current_user: Opti
     ])
 
     body = f"""
-    <nav class="topnav"><a href="/members">← Mitglieder</a><a href="/member/{_e(user_id)}/loot">Loot-Verlauf</a><a href="/attendance-stats">Anwesenheit-Stats</a><a href="/analytics">Analytics</a><a href="/voice">Voice</a><a href="#needs">Needs</a><a href="#events">Events</a><a href="#ec">EC</a><a href="#voice">Voice</a></nav>
+    <nav class="topnav"><a href="/members">← Mitglieder</a><a href="/portal/member/{_e(user_id)}">Portal</a><a href="/member/{_e(user_id)}/loot">Loot-Verlauf</a><a href="/attendance-stats">Anwesenheit-Stats</a><a href="/analytics">Analytics</a><a href="/voice">Voice</a><a href="#needs">Needs</a><a href="#events">Events</a><a href="#ec">EC</a><a href="#voice">Voice</a></nav>
     <section class="hero">
       <div>
         <div class="eyebrow">Mitglied · Tiefenauswertung</div>
@@ -5545,6 +5571,266 @@ def export_loot_center_csv(_: bool = Depends(_auth)):
 def _parse_urlencoded_body(raw: bytes) -> dict[str, str]:
     parsed = urllib.parse.parse_qs((raw or b"").decode("utf-8", errors="replace"), keep_blank_values=True)
     return {str(k): str(v[-1] if v else "") for k, v in parsed.items()}
+
+
+# ---------------------------------------------------------------------------
+# Schritt 3: Spieler- & Mitgliederportal / Need-Änderungen
+# ---------------------------------------------------------------------------
+
+def _is_portal_admin(request: Request) -> bool:
+    if _is_dashboard_admin(request):
+        return True
+    if _auth_mode() in {"basic", "hybrid"} and not _discord_oauth_enabled():
+        return True
+    return False
+
+
+def _current_user_id(request: Request) -> int:
+    user = _current_user(request) or {}
+    return _user_id(user.get("user_id") or user.get("id"))
+
+
+def _portal_can_view(request: Request, user_id: int) -> bool:
+    uid = int(user_id or 0)
+    me = _current_user_id(request)
+    return bool(uid and (me == uid or _is_portal_admin(request)))
+
+
+def _portal_user_name(request: Request) -> str:
+    u = _current_user(request) or {}
+    return str(u.get("username") or u.get("global_name") or u.get("user_id") or "Dashboard")
+
+
+def _need_change_status_label(status: Any) -> dict[str, str]:
+    s = str(status or "pending").lower()
+    labels = {
+        "pending": "⏳ offen",
+        "processing": "⚙️ Verarbeitung",
+        "done": "✅ erledigt",
+        "failed": "❌ Fehler",
+        "rejected": "⛔ blockiert",
+        "cancelled": "🚫 abgebrochen",
+    }
+    cls = "pill"
+    if s in {"failed", "rejected"}:
+        cls += " bad"
+    elif s == "done":
+        cls += " ok"
+    return _raw(f'<span class="{cls}">{_e(labels.get(s, s))}</span>')
+
+
+def _need_change_requests(guild_id: int, *, user_id: int = 0, limit: int = 80) -> list[dict[str, Any]]:
+    if not _database_url() or not guild_id:
+        return []
+    _ensure_admin_tables()
+    conn = _pg_connect()
+    try:
+        with conn.cursor() as cur:
+            if user_id:
+                cur.execute(
+                    """
+                    SELECT id, request_id, guild_id, target_user_id, action_type, status, payload_json,
+                           actor_id, actor_name, requested_at, claimed_at, processed_at, result_json
+                    FROM dashboard_need_change_requests
+                    WHERE guild_id = %s AND target_user_id = %s
+                    ORDER BY requested_at DESC, id DESC
+                    LIMIT %s
+                    """,
+                    (int(guild_id), int(user_id), int(limit)),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT id, request_id, guild_id, target_user_id, action_type, status, payload_json,
+                           actor_id, actor_name, requested_at, claimed_at, processed_at, result_json
+                    FROM dashboard_need_change_requests
+                    WHERE guild_id = %s
+                    ORDER BY requested_at DESC, id DESC
+                    LIMIT %s
+                    """,
+                    (int(guild_id), int(limit)),
+                )
+            rows = []
+            for r in (cur.fetchall() or []):
+                d = dict(r)
+                try:
+                    d["payload"] = json.loads(d.get("payload_json") or "{}")
+                except Exception:
+                    d["payload"] = {}
+                try:
+                    d["result"] = json.loads(d.get("result_json") or "{}")
+                except Exception:
+                    d["result"] = {}
+                rows.append(d)
+            return rows
+    finally:
+        conn.close()
+
+
+def _create_need_change_request(guild_id: int, target_user_id: int, action_type: str, payload: dict[str, Any], actor: dict[str, Any]) -> str:
+    if not _database_url() or not guild_id:
+        raise RuntimeError("DATABASE_URL fehlt. Need-Änderungen laufen über Postgres-Queue.")
+    request_id = f"need_{int(time.time())}_{secrets.token_hex(5)}"
+    actor_id = str(actor.get("user_id") or "")
+    actor_name = str(actor.get("username") or actor.get("global_name") or actor_id or "Dashboard")
+    _ensure_admin_tables()
+    conn = _pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO dashboard_need_change_requests
+                    (request_id, guild_id, target_user_id, action_type, status, payload_json, actor_id, actor_name)
+                VALUES (%s, %s, %s, %s, 'pending', %s, %s, %s)
+                """,
+                (request_id, int(guild_id), int(target_user_id), str(action_type), json.dumps(payload, ensure_ascii=False), actor_id, actor_name),
+            )
+            cur.execute(
+                """
+                INSERT INTO dashboard_admin_action_log
+                    (guild_id, action_type, target_type, target_id, actor_id, actor_name, payload_json)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """,
+                (int(guild_id), "need_change_request", "member", str(target_user_id), actor_id, actor_name, json.dumps({"request_id": request_id, "action_type": action_type, "slot": payload.get("slot"), "tab": payload.get("tab")}, ensure_ascii=False)),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    return request_id
+
+
+def _portal_active_events(snap: dict[str, Any], user_id: int = 0) -> list[dict[str, Any]]:
+    events = []
+    now = datetime.now(timezone.utc)
+    for ev in ((snap.get("events") or {}).get("items") or []):
+        if not isinstance(ev, dict):
+            continue
+        dt = _dt_obj(ev.get("when_iso") or ev.get("start_at"))
+        if _is_running_event(ev) or (dt and dt >= now):
+            events.append(ev)
+    events.sort(key=lambda ev: _dt_obj(ev.get("when_iso") or ev.get("start_at")) or datetime.max.replace(tzinfo=timezone.utc))
+    return events[:40]
+
+
+def _portal_event_status_for_user(ev: dict[str, Any], user_id: int) -> str:
+    uid = int(user_id or 0)
+    parts = ev.get("participants") or {}
+    for group in parts.get("yes") or []:
+        if isinstance(group, dict) and any(isinstance(p, dict) and _user_id(p.get("user_id")) == uid for p in group.get("participants") or []):
+            return "✅ " + str(group.get("role") or "Zusage")
+    if any(isinstance(p, dict) and _user_id(p.get("user_id")) == uid for p in parts.get("maybe") or []):
+        return "🟡 Vielleicht"
+    if any(isinstance(p, dict) and _user_id(p.get("user_id")) == uid for p in parts.get("no") or []):
+        return "❌ Abgemeldet"
+    return "—"
+
+
+def _portal_active_auctions(snap: dict[str, Any]) -> list[dict[str, Any]]:
+    try:
+        return list((_loot_center_payload_from_snapshot(snap).get("active") or [])[:40])
+    except Exception:
+        return []
+
+
+def _slot_options_html() -> str:
+    return "".join(f'<option value="{_e(slot)}">{_e(slot)}</option>' for slot in ["Waffe 1","Waffe 2","Fähigkeitskern","Helm","Brust","Hose","Handschuhe","Schuhe","Brosche","Ohrringe","Kette","Armband","Ring 1","Ring 2","Gürtel","Umhang"])
+
+
+def _render_need_editor_panel(user_id: int, current_user: Optional[dict[str, Any]], requests: list[dict[str, Any]]) -> str:
+    req_rows = []
+    for r in requests[:30]:
+        p = r.get("payload") if isinstance(r.get("payload"), dict) else {}
+        res = r.get("result") if isinstance(r.get("result"), dict) else {}
+        detail = res.get("message") or res.get("error") or p.get("item_name") or p.get("item_text") or p.get("item_id") or "—"
+        req_rows.append([_dt(r.get("requested_at")), _need_change_status_label(r.get("status")), r.get("action_type"), p.get("tab"), p.get("slot"), _short(detail, 120)])
+    actor_hint = "Du bearbeitest deine eigene Needliste." if current_user else "Discord-Login nötig."
+    return f"""
+    <section class="panel" id="need-editor">
+      <h2>✍️ Needliste bearbeiten</h2>
+      <p class="muted">{_e(actor_hint)} Das Dashboard stellt nur einen Änderungsantrag. Der Bot schreibt danach die echte Needliste und der Vorgang bleibt geloggt.</p>
+      <div class="split">
+        <form method="post" action="/portal/member/{int(user_id)}/need-change" style="display:grid; gap:10px;">
+          <input type="hidden" name="action_type" value="set">
+          <label>Bereich<br><select name="tab" style="width:100%; padding:10px; border-radius:10px; background:#08090d; color:var(--text); border:1px solid var(--line);"><option value="Main">Main</option><option value="Secondary">Secondary</option></select></label>
+          <label>Slot<br><select name="slot" style="width:100%; padding:10px; border-radius:10px; background:#08090d; color:var(--text); border:1px solid var(--line);">{_slot_options_html()}</select></label>
+          <label>Itemname oder Item-ID<br><input name="item_text" maxlength="160" placeholder="z. B. Aridus Stab" style="width:100%; padding:10px; border-radius:10px; background:#08090d; color:var(--text); border:1px solid var(--line);"></label>
+          <button class="btn" type="submit" style="border:0; cursor:pointer;">Need setzen</button>
+        </form>
+        <form method="post" action="/portal/member/{int(user_id)}/need-change" style="display:grid; gap:10px; align-content:start;">
+          <input type="hidden" name="action_type" value="clear">
+          <label>Bereich<br><select name="tab" style="width:100%; padding:10px; border-radius:10px; background:#08090d; color:var(--text); border:1px solid var(--line);"><option value="Main">Main</option><option value="Secondary">Secondary</option></select></label>
+          <label>Slot löschen<br><select name="slot" style="width:100%; padding:10px; border-radius:10px; background:#08090d; color:var(--text); border:1px solid var(--line);">{_slot_options_html()}</select></label>
+          <button class="btn" type="submit" style="border:0; cursor:pointer; background:#303442; color:var(--text);">Need entfernen</button>
+          <p class="muted">Bereits als erhalten gesperrte Slots kann nur die Leitung ändern.</p>
+        </form>
+      </div>
+      <h3>Änderungslog</h3>
+      {_table(['Zeit','Status','Aktion','Bereich','Slot','Ergebnis'], req_rows, placeholder='Need-Änderungen durchsuchen…')}
+    </section>
+    """
+
+
+def _render_member_portal(data: dict[str, Any], user_id: int, request: Request, msg: str = "") -> str:
+    if not data.get("ok"):
+        return _html_shell("Portal · Ebo Dashboard", f"<section class='panel'><h1>👤 Portal</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+    if not _portal_can_view(request, int(user_id)):
+        raise HTTPException(status_code=403, detail="Du darfst nur dein eigenes Portal sehen. Leitung/Admins sehen alle Mitglieder.")
+    snap: dict[str, Any] = data.get("snapshot") or {}
+    guild_id = _safe_guild_id(data)
+    names = _profile_name_map(snap)
+    display = names.get(int(user_id), f"User {int(user_id)}")
+    balances = _balance_map(snap)
+    need_info = _needs_by_user(snap).get(int(user_id), {})
+    main_needs = need_info.get("main") if isinstance(need_info, dict) else []
+    sec_needs = need_info.get("secondary") if isinstance(need_info, dict) else []
+    response = _event_response_counts_for_user(snap, int(user_id))
+    loot_payload = _loot_member_payload_from_snapshot(snap, int(user_id), int(guild_id or 0))
+    active_events = _portal_active_events(snap, int(user_id))
+    active_auctions = _portal_active_auctions(snap)
+    need_requests = _need_change_requests(guild_id, user_id=int(user_id), limit=60) if guild_id else []
+
+    event_rows = []
+    for ev in active_events:
+        eid = str(ev.get("event_id") or ev.get("id") or "")
+        event_rows.append([_event_link(eid, ev.get("title") or eid), _dt(ev.get("when_iso") or ev.get("start_at")), _event_status_text(ev), _portal_event_status_for_user(ev, int(user_id)), _raw(f'<a class="link" href="/attendance/{_e(eid)}">Review</a>') if eid else "—"])
+
+    auction_rows = []
+    for a in active_auctions:
+        aid = str(a.get("auction_id") or "")
+        auction_rows.append([_auction_link(aid, a.get("item")), a.get("mode"), _fmt_ec(a.get("start_bid") or 0), a.get("leader") or "—", _dt(a.get("ends_at")), _raw(f'<a class="btn" href="/auction/{_e(aid)}">Bieten</a>') if aid else "—"])
+
+    tx_rows = [[_dt(tx.get("created_at")), _fmt_ec(tx.get("amount")), tx.get("raw_type"), _short(tx.get("reason"), 140)] for tx in _tx_for_user(snap, int(user_id), limit=30)]
+    loot_rows = []
+    for r in loot_payload.get("wins") or []:
+        aid = r.get("auction_id")
+        loot_rows.append([_auction_link(aid, r.get("item")) if aid else r.get("item"), r.get("mode"), _fmt_ec(r.get("winning_amount")), _dt(r.get("closed_at"))])
+
+    admin_links = ""
+    if _is_portal_admin(request):
+        admin_links = f'<a class="btn" href="/member/{int(user_id)}">Leitungsprüfung</a><a class="btn" href="/member/{int(user_id)}/loot">Loot prüfen</a><a class="btn" href="/attendance-stats">Attendance prüfen</a>'
+    msg_html = f'<div class="ok">{_e(msg)}</div>' if msg else ""
+    cards = "".join([
+        _card("EC", _fmt_ec(balances.get(int(user_id))) if balances.get(int(user_id)) is not None else "—", "aktueller Stand"),
+        _card("Needs", f"{len(main_needs)} / {len(sec_needs)}", "Main / Secondary"),
+        _card("Events", f"{response.get('yes',0)} Zusagen", f"{response.get('maybe',0)} vielleicht · {response.get('no',0)} nein"),
+        _card("Loot", loot_payload.get("won_count", 0), f"ausgegeben: {_fmt_ec(loot_payload.get('spent_ec', 0))} EC"),
+    ])
+    body = f"""
+    <nav class="topnav"><a href="/">Kommando</a><a href="/portal">Mein Portal</a><a href="/events">Events</a><a href="/loot">Loot</a><a href="/members">Mitglieder</a><a href="/ec">EC</a></nav>
+    <section class="hero">
+      <div><div class="eyebrow">Spieler- & Mitgliederportal</div><h1>👤 {_e(display)}</h1><p class="muted">Eigene Daten, laufende Events, laufende Auktionen, EC, Attendance, Loot und Needliste.</p></div>
+      <div class="hero-actions">{admin_links}<a class="btn" href="/logout">Logout</a></div>
+    </section>
+    {msg_html}
+    <section class="grid">{cards}</section>
+    <section class="panel"><h2>📅 Laufende & kommende Events</h2>{_table(['Event','Zeit','Status','Deine Anmeldung','Aktion'], event_rows, placeholder='Events durchsuchen…')}</section>
+    <section class="panel"><h2>⚔️ Laufende Auktionen</h2><p class="muted">Zum Bieten die Auktion öffnen. Bieten läuft weiterhin sicher über Bot-Queue.</p>{_table(['Item','Bereich','Start/Preis','Führend','Ende','Aktion'], auction_rows, placeholder='Auktionen durchsuchen…')}</section>
+    <section class="panel" id="needs"><h2>🎁 Deine Needliste</h2><div class="split"><div>{_need_list_html('Main-Needs', main_needs)}</div><div>{_need_list_html('Secondary-Needs', sec_needs)}</div></div></section>
+    {_render_need_editor_panel(int(user_id), _current_user(request), need_requests)}
+    <section class="panel"><h2>🪙 EC-Verlauf</h2>{_table(['Zeit','Betrag','Typ','Grund'], tx_rows, placeholder='EC durchsuchen…')}</section>
+    <section class="panel"><h2>🏆 Loot-Historie</h2>{_table(['Item','Bereich','EC','Zeit'], loot_rows, placeholder='Loot durchsuchen…')}</section>
+    """
+    return _html_shell(f"{display} Portal · Ebo Dashboard", body)
 
 
 def _settings_change_requests_for_dashboard(guild_id: int, limit: int = 100) -> list[dict[str, Any]]:
@@ -7480,6 +7766,88 @@ def event_detail(event_id: str, _: bool = Depends(_auth)):
             _html_shell("Ebo Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
             status_code=500,
         )
+
+
+
+@app.get("/portal", response_class=HTMLResponse)
+def portal_home(request: Request, _: bool = Depends(_auth), msg: str = ""):
+    user = _current_user(request)
+    uid = _current_user_id(request)
+    if uid:
+        return HTMLResponse(_render_member_portal(_snapshot_payload(), uid, request, msg))
+    if _is_portal_admin(request):
+        return RedirectResponse(url="/members", status_code=303)
+    body = """
+    <section class='panel'><h1>👤 Mein Portal</h1><p class='muted'>Für das persönliche Portal brauchst du Discord-Login, damit das Dashboard deine Discord-ID kennt.</p><p><a class='btn' href='/auth/discord/start'>Mit Discord einloggen</a></p></section>
+    """
+    return HTMLResponse(_html_shell("Mein Portal · Ebo Dashboard", body))
+
+
+@app.get("/portal/member/{user_id}", response_class=HTMLResponse)
+def member_portal_page(user_id: int, request: Request, _: bool = Depends(_auth), msg: str = ""):
+    return HTMLResponse(_render_member_portal(_snapshot_payload(), int(user_id), request, msg))
+
+
+@app.post("/portal/member/{user_id}/need-change")
+async def portal_need_change(user_id: int, request: Request, _: bool = Depends(_auth)):
+    if not _portal_can_view(request, int(user_id)):
+        raise HTTPException(status_code=403, detail="Keine Berechtigung für diese Needliste.")
+    data = _snapshot_payload()
+    guild_id = _safe_guild_id(data)
+    if not guild_id:
+        raise HTTPException(status_code=400, detail="Guild-ID fehlt.")
+    form = _parse_urlencoded_body(await request.body())
+    action_type = str(form.get("action_type") or "set").strip().lower()
+    if action_type not in {"set", "clear"}:
+        action_type = "set"
+    tab = str(form.get("tab") or "Main").strip()
+    slot = str(form.get("slot") or "").strip()
+    item_text = str(form.get("item_text") or "").strip()
+    if tab not in {"Main", "Secondary"}:
+        tab = "Main"
+    valid_slots = {"Waffe 1","Waffe 2","Fähigkeitskern","Helm","Brust","Hose","Handschuhe","Schuhe","Brosche","Ohrringe","Kette","Armband","Ring 1","Ring 2","Gürtel","Umhang"}
+    if slot not in valid_slots:
+        raise HTTPException(status_code=400, detail="Ungültiger Slot.")
+    if action_type == "set" and not item_text:
+        raise HTTPException(status_code=400, detail="Itemname fehlt.")
+    actor = _current_user(request) or {"user_id": "basic-admin", "username": "Basic Admin"}
+    payload = {
+        "target_user_id": int(user_id),
+        "tab": tab,
+        "slot": slot,
+        "item_text": item_text,
+        "source": "dashboard_portal",
+        "admin_override": bool(_is_portal_admin(request) and _current_user_id(request) != int(user_id)),
+    }
+    rid = _create_need_change_request(guild_id, int(user_id), action_type, payload, actor)
+    msg = urllib.parse.quote(f"Need-Änderung angelegt: {rid}")
+    return RedirectResponse(url=f"/portal/member/{int(user_id)}?msg={msg}#need-editor", status_code=303)
+
+
+@app.get("/api/portal/member/{user_id}")
+def api_member_portal(user_id: int, request: Request, _: bool = Depends(_auth)):
+    if not _portal_can_view(request, int(user_id)):
+        raise HTTPException(status_code=403, detail="Keine Berechtigung.")
+    data = _snapshot_payload()
+    snap = data.get("snapshot") or {}
+    guild_id = _safe_guild_id(data)
+    return {
+        "ok": bool(data.get("ok")),
+        "user_id": int(user_id),
+        "name": _profile_name_map(snap).get(int(user_id), f"User {int(user_id)}"),
+        "ec": _balance_map(snap).get(int(user_id)),
+        "needs": _needs_by_user(snap).get(int(user_id), {}),
+        "events": _member_event_rows(snap, int(user_id)),
+        "loot": _loot_member_payload_from_snapshot(snap, int(user_id), int(guild_id or 0)),
+        "need_change_requests": _need_change_requests(guild_id, user_id=int(user_id), limit=80) if guild_id else [],
+    }
+
+
+@app.get("/api/need-change-requests")
+def api_need_change_requests(_: bool = Depends(_admin_auth)):
+    data = _snapshot_payload()
+    guild_id = _safe_guild_id(data)
+    return {"ok": True, "items": _need_change_requests(guild_id, limit=150) if guild_id else []}
 
 
 @app.get("/member/{user_id}/loot", response_class=HTMLResponse)
