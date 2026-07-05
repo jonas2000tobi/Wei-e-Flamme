@@ -121,6 +121,10 @@ def save_items() -> None:
 
 def save_needs() -> None:
     _save_json(NEEDS_FILE, loot_needs)
+    try:
+        _phase3_mirror_all_needs()
+    except Exception as e:
+        print(f"[phase3] Need-Spiegelung fehlgeschlagen: {e!r}")
 
 
 def save_cfg() -> None:
@@ -1785,6 +1789,171 @@ def _event_matches_auto(obj: dict) -> bool:
     return any(str(k).lower() in title for k in keywords)
 
 
+
+# ---------------------------------------------------------------------------
+# Phase 3.3 · Needlisten parallel nach Postgres spiegeln
+# ---------------------------------------------------------------------------
+
+def _phase3_pg_ready() -> bool:
+    return bool(_dash_database_url())
+
+
+def _phase3_jsonb(value: Any):
+    from psycopg.types.json import Jsonb  # type: ignore
+    return Jsonb(value if value is not None else {})
+
+
+def _phase3_ensure_need_tables() -> None:
+    if not _phase3_pg_ready():
+        return
+    conn = _dash_pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS phase3_loot_needs (
+                    guild_id TEXT NOT NULL,
+                    need_id TEXT NOT NULL,
+                    user_id TEXT,
+                    item_name TEXT,
+                    need_type TEXT,
+                    slot_name TEXT,
+                    status TEXT,
+                    raw_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    source TEXT NOT NULL DEFAULT 'bot',
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    PRIMARY KEY (guild_id, need_id)
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS phase3_need_change_log (
+                    guild_id TEXT NOT NULL,
+                    log_id TEXT NOT NULL,
+                    request_id TEXT,
+                    actor_id TEXT,
+                    target_user_id TEXT,
+                    action_type TEXT,
+                    old_item TEXT,
+                    new_item TEXT,
+                    raw_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    source TEXT NOT NULL DEFAULT 'bot',
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    PRIMARY KEY (guild_id, log_id)
+                )
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_phase3_needs_item ON phase3_loot_needs (guild_id, item_name)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_phase3_need_log_target ON phase3_need_change_log (guild_id, target_user_id, created_at DESC)")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _phase3_need_rows_for_guild(guild_id: int) -> list[dict]:
+    rows: list[dict] = []
+    g = loot_needs.get(str(guild_id)) or {}
+    users = g.get("users") if isinstance(g, dict) else {}
+    if not isinstance(users, dict):
+        return rows
+    for user_id_s, udata in users.items():
+        if not isinstance(udata, dict):
+            continue
+        for tab in TABS:
+            slots = udata.get(tab) or {}
+            if not isinstance(slots, dict):
+                continue
+            for slot, raw_slot in slots.items():
+                sobj = _slot_obj(raw_slot)
+                item_id = str(sobj.get("item_id") or "")
+                if not item_id:
+                    continue
+                status = "received" if bool(sobj.get("received")) else "open"
+                raw = dict(sobj)
+                raw.update({"user_id": str(user_id_s), "tab": tab, "slot": str(slot), "item_id": item_id})
+                rows.append({
+                    "need_id": f"{user_id_s}:{tab}:{slot}",
+                    "user_id": str(user_id_s),
+                    "item_name": _item_name(int(guild_id), item_id, with_type=True),
+                    "need_type": tab,
+                    "slot_name": str(slot),
+                    "status": status,
+                    "raw": raw,
+                })
+    return rows
+
+
+def _phase3_mirror_all_needs() -> dict:
+    if not _phase3_pg_ready():
+        return {"ok": False, "error": "DATABASE_URL fehlt", "needs": 0}
+    _phase3_ensure_need_tables()
+    total = 0
+    conn = _dash_pg_connect()
+    try:
+        with conn.cursor() as cur:
+            for gid_s in list(loot_needs.keys()):
+                try:
+                    gid = int(gid_s)
+                except Exception:
+                    continue
+                rows = _phase3_need_rows_for_guild(gid)
+                cur.execute("DELETE FROM phase3_loot_needs WHERE guild_id=%s AND source='bot'", (str(gid),))
+                for row in rows:
+                    cur.execute("""
+                        INSERT INTO phase3_loot_needs (guild_id, need_id, user_id, item_name, need_type, slot_name, status, raw_json, source, updated_at)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,'bot',now())
+                        ON CONFLICT (guild_id, need_id) DO UPDATE SET
+                          user_id=EXCLUDED.user_id,
+                          item_name=EXCLUDED.item_name,
+                          need_type=EXCLUDED.need_type,
+                          slot_name=EXCLUDED.slot_name,
+                          status=EXCLUDED.status,
+                          raw_json=EXCLUDED.raw_json,
+                          source='bot',
+                          updated_at=now()
+                    """, (str(gid), row["need_id"], row["user_id"], row["item_name"], row["need_type"], row["slot_name"], row["status"], _phase3_jsonb(row["raw"])))
+                    total += 1
+        conn.commit()
+        return {"ok": True, "needs": total}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def _phase3_log_need_change(guild_id: int, request_id: str, actor_id: str, target_user_id: int, action_type: str, result: dict, payload: dict) -> None:
+    if not _phase3_pg_ready():
+        return
+    _phase3_ensure_need_tables()
+    raw = {"request_id": request_id, "actor_id": str(actor_id or ""), "target_user_id": str(target_user_id), "action_type": action_type, "result": result, "payload": payload}
+    log_id = request_id or ("needlog_" + str(int(datetime.now(timezone.utc).timestamp())))
+    conn = _dash_pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO phase3_need_change_log (guild_id, log_id, request_id, actor_id, target_user_id, action_type, old_item, new_item, raw_json, source, created_at)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,'bot',now())
+                ON CONFLICT (guild_id, log_id) DO UPDATE SET raw_json=EXCLUDED.raw_json
+            """, (str(guild_id), str(log_id), str(request_id), str(actor_id or ""), str(target_user_id), str(action_type), str(result.get("old_item") or ""), str(result.get("new_item") or ""), _phase3_jsonb(raw)))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _phase3_need_status() -> dict:
+    if not _phase3_pg_ready():
+        return {"ok": False, "error": "DATABASE_URL fehlt"}
+    _phase3_ensure_need_tables()
+    conn = _dash_pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) AS c FROM phase3_loot_needs")
+            needs = int((cur.fetchone() or {}).get("c") or 0)
+            cur.execute("SELECT COUNT(*) AS c FROM phase3_need_change_log")
+            logs = int((cur.fetchone() or {}).get("c") or 0)
+        local = sum(len(_phase3_need_rows_for_guild(int(g))) for g in loot_needs.keys() if str(g).isdigit())
+        return {"ok": True, "json_current_needs": local, "postgres_needs": needs, "need_change_log": logs}
+    finally:
+        conn.close()
+
 # ---------------------------------------------------------------------------
 # Dashboard Need-Änderungsqueue
 # ---------------------------------------------------------------------------
@@ -1996,7 +2165,9 @@ def _process_dashboard_need_request(row: dict) -> tuple[str, dict]:
     if action == "clear":
         _clear_slot_item(data, tab, slot)
         save_needs()
-        return "done", {"ok": True, "message": f"{tab} – {slot} entfernt.", "old_item": old_name, "new_item": "—"}
+        result = {"ok": True, "message": f"{tab} – {slot} entfernt.", "old_item": old_name, "new_item": "—"}
+        _phase3_log_need_change(guild_id, request_id, str(row.get("actor_id") or ""), target_user_id, action, result, payload)
+        return "done", result
     if action == "set":
         item_text = str(payload.get("item_id") or payload.get("item_text") or payload.get("item_name") or "").strip()
         item_id, err = _find_item_for_dashboard_need(guild_id, slot, item_text)
@@ -2005,7 +2176,9 @@ def _process_dashboard_need_request(row: dict) -> tuple[str, dict]:
         _set_slot_item(data, tab, slot, item_id)
         save_needs()
         new_name = _item_name(guild_id, item_id, with_type=True)
-        return "done", {"ok": True, "message": f"{tab} – {slot}: {new_name} gespeichert.", "old_item": old_name, "new_item": new_name, "item_id": item_id}
+        result = {"ok": True, "message": f"{tab} – {slot}: {new_name} gespeichert.", "old_item": old_name, "new_item": new_name, "item_id": item_id}
+        _phase3_log_need_change(guild_id, request_id, str(row.get("actor_id") or ""), target_user_id, action, result, payload)
+        return "done", result
     return "rejected", {"ok": False, "error": f"Unbekannte Aktion: {action}"}
 
 
@@ -2153,6 +2326,44 @@ async def setup_loot_needs(client: discord.Client, tree: app_commands.CommandTre
             f"Erledigt: **{result['done']}** · Blockiert: **{result['rejected']}** · Fehler: **{result['failed']}**",
             ephemeral=True,
         )
+
+    @tree.command(name="loot_phase3_needs_status", description="(Leader) Phase 3.3 Need-DB Status anzeigen")
+    async def loot_phase3_needs_status(inter: discord.Interaction):
+        if inter.guild is None or not _is_leader_or_admin(inter):
+            await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
+            return
+        await inter.response.defer(ephemeral=True, thinking=True)
+        try:
+            status = _phase3_need_status()
+            await inter.followup.send(
+                "🧾 **Phase 3.3 Need-Status**\n"
+                f"JSON aktuell: **{status.get('json_current_needs', 0)}**\n"
+                f"Postgres Needs: **{status.get('postgres_needs', 0)}**\n"
+                f"Need-Änderungslog: **{status.get('need_change_log', 0)}**\n"
+                f"OK: `{status.get('ok')}`",
+                ephemeral=True,
+            )
+        except Exception as exc:
+            await inter.followup.send(f"❌ Fehler: {type(exc).__name__}: {exc}", ephemeral=True)
+
+    @tree.command(name="loot_phase3_needs_mirror", description="(Leader) Needlisten sofort nach Postgres spiegeln")
+    async def loot_phase3_needs_mirror(inter: discord.Interaction):
+        if inter.guild is None or not _is_leader_or_admin(inter):
+            await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
+            return
+        await inter.response.defer(ephemeral=True, thinking=True)
+        try:
+            result = _phase3_mirror_all_needs()
+            status = _phase3_need_status()
+            await inter.followup.send(
+                "✅ **Phase 3.3 Need-Spiegelung fertig**\n"
+                f"gespiegelt: **{result.get('needs', 0)}**\n"
+                f"Postgres Needs: **{status.get('postgres_needs', 0)}**\n"
+                f"Need-Änderungslog: **{status.get('need_change_log', 0)}**",
+                ephemeral=True,
+            )
+        except Exception as exc:
+            await inter.followup.send(f"❌ Fehler: {type(exc).__name__}: {exc}", ephemeral=True)
 
     @tree.command(name="loot_set_leader_channel", description="(Leader) Kanal für automatische Loot-/Need-Übersichten setzen")
     async def loot_set_leader_channel(inter: discord.Interaction):
