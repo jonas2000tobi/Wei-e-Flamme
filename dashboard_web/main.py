@@ -32,7 +32,7 @@ if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 ASSET_VER = "ebo-phase3-database-start"
-DASHBOARD_RELEASE_VERSION = "1.1.7 · Phase 3.7 Loot-Read-Cutover"
+DASHBOARD_RELEASE_VERSION = "1.1.8 · Phase 3.8 Events Read-Cutover"
 
 
 def _database_url() -> str:
@@ -379,7 +379,7 @@ def _snapshot_payload() -> dict[str, Any]:
         "published_at": row.get("published_at"),
         "snapshot": snap,
     }
-    return _apply_phase3_loot_read_cutover(_apply_phase3_ec_read_cutover(payload))
+    return _apply_phase3_events_read_cutover(_apply_phase3_loot_read_cutover(_apply_phase3_ec_read_cutover(payload)))
 
 
 # ---------------------------------------------------------------------------
@@ -957,6 +957,286 @@ def _apply_phase3_loot_read_cutover(payload: dict[str, Any]) -> dict[str, Any]:
         "auctions": len((pg_loot.get("auctions") or {}).get("items") or []),
         "bids": int((pg_loot.get("bids") or {}).get("count") or 0),
         "history": int((pg_loot.get("history") or {}).get("count") or 0),
+    }
+    return payload
+
+
+
+# ---------------------------------------------------------------------------
+# Phase 3.8: Events/Profile/RSVP Read-Cutover
+# ---------------------------------------------------------------------------
+# Ziel: Dashboard liest Mitglieder/Profile, Events, RSVPs und Abwesenheiten
+# bevorzugt aus den Phase-3-Postgres-Tabellen. Snapshot bleibt Fallback.
+# Der Bot/Snapshot bleibt weiterhin kompatibel; kein Write-Cutover.
+
+
+def _phase3_events_pg_payload(guild_id: Any, snap: dict[str, Any]) -> Optional[dict[str, Any]]:
+    if not _database_url():
+        return None
+    gid = str(guild_id or "").strip()
+    if not gid:
+        return None
+    try:
+        conn = _pg_connect()
+    except Exception:
+        return None
+    try:
+        with conn.cursor() as cur:
+            try:
+                cur.execute(
+                    """
+                    SELECT user_id, discord_name, ingame_name, roles_json, raw_json, source, updated_at
+                    FROM phase3_members
+                    WHERE guild_id = %s
+                    ORDER BY COALESCE(NULLIF(ingame_name,''), NULLIF(discord_name,''), user_id) ASC
+                    """,
+                    (gid,),
+                )
+                member_rows = cur.fetchall() or []
+            except Exception:
+                member_rows = []
+
+            try:
+                cur.execute(
+                    """
+                    SELECT event_id, title, status, start_at_text, end_at_text, raw_json, source, updated_at
+                    FROM phase3_events
+                    WHERE guild_id = %s
+                    ORDER BY COALESCE(NULLIF(start_at_text,''), event_id) DESC
+                    LIMIT 1000
+                    """,
+                    (gid,),
+                )
+                event_rows = cur.fetchall() or []
+            except Exception:
+                event_rows = []
+
+            try:
+                cur.execute(
+                    """
+                    SELECT rsvp_id, event_id, user_id, response, role_name, display_name, raw_json, source, updated_at
+                    FROM phase3_event_rsvps
+                    WHERE guild_id = %s
+                    ORDER BY event_id ASC, updated_at DESC, display_name ASC
+                    LIMIT 5000
+                    """,
+                    (gid,),
+                )
+                rsvp_rows = cur.fetchall() or []
+            except Exception:
+                rsvp_rows = []
+
+            try:
+                cur.execute(
+                    """
+                    SELECT absence_id, user_id, status, start_at_text, end_at_text, raw_json, source, updated_at
+                    FROM phase3_absences
+                    WHERE guild_id = %s
+                    ORDER BY COALESCE(NULLIF(start_at_text,''), absence_id) DESC
+                    LIMIT 1000
+                    """,
+                    (gid,),
+                )
+                absence_rows = cur.fetchall() or []
+            except Exception:
+                absence_rows = []
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    if not member_rows and not event_rows and not rsvp_rows and not absence_rows:
+        return None
+
+    # Mitglieder/Profile aus DB vorbereiten.
+    fallback_names = _profile_name_map(snap)
+    member_items: list[dict[str, Any]] = []
+    names: dict[int, str] = dict(fallback_names)
+    member_ids: set[int] = set()
+    for row in member_rows:
+        raw = _phase3_json(row.get("raw_json"), {}) if isinstance(row, dict) else {}
+        uid = _user_id((row or {}).get("user_id") or raw.get("user_id"))
+        if not uid:
+            continue
+        roles = _phase3_json((row or {}).get("roles_json"), [])
+        display = raw.get("display_name") or raw.get("name") or (row or {}).get("ingame_name") or (row or {}).get("discord_name") or f"User {uid}"
+        item = {
+            **raw,
+            "user_id": uid,
+            "display_name": display,
+            "discord_name": (row or {}).get("discord_name") or raw.get("discord_name") or raw.get("username") or display,
+            "ingame_name": (row or {}).get("ingame_name") or raw.get("ingame_name") or raw.get("tl_name") or display,
+            "roles": roles if isinstance(roles, list) else [],
+            "is_dashboard_member": True,
+            "source": "postgres_phase3",
+        }
+        names[uid] = str(display)
+        member_ids.add(uid)
+        member_items.append(item)
+
+    # Event-Basis: Snapshot als Fallback behalten, Postgres überschreibt/ergänzt.
+    event_by_id: dict[str, dict[str, Any]] = {}
+    for ev in (((snap.get("events") or {}).get("items") or [])):
+        if not isinstance(ev, dict):
+            continue
+        eid = str(ev.get("event_id") or ev.get("id") or "").strip()
+        if eid:
+            event_by_id[eid] = dict(ev)
+
+    for row in event_rows:
+        raw = _phase3_json(row.get("raw_json"), {}) if isinstance(row, dict) else {}
+        eid = str((row or {}).get("event_id") or raw.get("event_id") or raw.get("id") or "").strip()
+        if not eid:
+            continue
+        base = dict(event_by_id.get(eid) or {})
+        base.update(raw if isinstance(raw, dict) else {})
+        base.update({
+            "event_id": eid,
+            "id": base.get("id") or eid,
+            "title": (row or {}).get("title") or raw.get("title") or raw.get("name") or base.get("title") or eid,
+            "status": (row or {}).get("status") or raw.get("status") or base.get("status") or "",
+            "when_iso": (row or {}).get("start_at_text") or raw.get("when_iso") or raw.get("start_at") or base.get("when_iso") or "",
+            "start_at": (row or {}).get("start_at_text") or raw.get("start_at") or base.get("start_at") or "",
+            "end_at": (row or {}).get("end_at_text") or raw.get("end_at") or base.get("end_at") or "",
+            "source": "postgres_phase3",
+        })
+        event_by_id[eid] = base
+
+    # RSVPs gruppieren und snapshot-kompatibel an Events hängen.
+    grouped: dict[str, dict[str, Any]] = {}
+    all_rsvp_items: list[dict[str, Any]] = []
+
+    def _rsvp_bucket(response: str, role: str) -> str:
+        txt = (response or "").strip().lower()
+        role_txt = (role or "").strip().lower()
+        if txt in {"no", "nein", "absent", "abgemeldet", "cancelled", "canceled", "declined", "deny"} or "abmeld" in txt:
+            return "no"
+        if txt in {"maybe", "vielleicht", "tentative", "unsure"} or "vielleicht" in txt:
+            return "maybe"
+        if role_txt in {"maybe", "vielleicht"}:
+            return "maybe"
+        if role_txt in {"no", "nein", "abgemeldet"}:
+            return "no"
+        return "yes"
+
+    for row in rsvp_rows:
+        raw = _phase3_json(row.get("raw_json"), {}) if isinstance(row, dict) else {}
+        eid = str((row or {}).get("event_id") or raw.get("event_id") or "").strip()
+        if not eid:
+            continue
+        uid = _user_id((row or {}).get("user_id") or raw.get("user_id"))
+        response = str((row or {}).get("response") or raw.get("response") or raw.get("status") or "").strip()
+        role = str((row or {}).get("role_name") or raw.get("role_name") or raw.get("role") or raw.get("class") or response or "Teilnehmer").strip()
+        display = str((row or {}).get("display_name") or raw.get("display_name") or names.get(uid) or (f"User {uid}" if uid else "Unbekannt")).strip()
+        bucket = _rsvp_bucket(response, role)
+        person = {
+            **(raw if isinstance(raw, dict) else {}),
+            "user_id": uid,
+            "display_name": display,
+            "name": display,
+            "response": response or bucket,
+            "role_name": role,
+            "is_dashboard_member": bool(uid and (uid in member_ids or uid in names)),
+            "source": "postgres_phase3",
+        }
+        all_rsvp_items.append({"event_id": eid, **person})
+        g = grouped.setdefault(eid, {"yes_groups": {}, "maybe": [], "no": [], "yes_count": 0, "maybe_count": 0, "no_count": 0})
+        if bucket == "yes":
+            role_label = role or "Teilnehmer"
+            g["yes_groups"].setdefault(role_label, []).append(person)
+            g["yes_count"] += 1
+        elif bucket == "maybe":
+            g["maybe"].append(person)
+            g["maybe_count"] += 1
+        else:
+            g["no"].append(person)
+            g["no_count"] += 1
+
+    for eid, g in grouped.items():
+        ev = dict(event_by_id.get(eid) or {"event_id": eid, "id": eid, "title": f"Event {eid}"})
+        yes_groups = []
+        yes_counts = {}
+        yes_dict = {}
+        for role, people in sorted((g.get("yes_groups") or {}).items(), key=lambda kv: str(kv[0]).lower()):
+            yes_groups.append({"role": role, "participants": people})
+            yes_counts[role] = len(people)
+            yes_dict[role] = people
+        ev["participants"] = {"yes": yes_groups, "maybe": g.get("maybe") or [], "no": g.get("no") or []}
+        ev["yes"] = yes_dict
+        ev["yes_counts"] = yes_counts
+        ev["participant_count"] = int(g.get("yes_count") or 0)
+        ev["maybe_count"] = int(g.get("maybe_count") or 0)
+        ev["no_count"] = int(g.get("no_count") or 0)
+        ev["rsvp_count"] = int(g.get("yes_count") or 0) + int(g.get("maybe_count") or 0) + int(g.get("no_count") or 0)
+        ev["source"] = "postgres_phase3"
+        event_by_id[eid] = ev
+
+    event_items = list(event_by_id.values())
+    event_items.sort(key=lambda ev: str(ev.get("when_iso") or ev.get("start_at") or ev.get("created_at") or ev.get("event_id") or ""), reverse=True)
+
+    absence_items: list[dict[str, Any]] = []
+    for row in absence_rows:
+        raw = _phase3_json(row.get("raw_json"), {}) if isinstance(row, dict) else {}
+        uid = _user_id((row or {}).get("user_id") or raw.get("user_id"))
+        absence_items.append({
+            **raw,
+            "absence_id": (row or {}).get("absence_id") or raw.get("absence_id") or raw.get("id"),
+            "user_id": uid,
+            "display_name": raw.get("display_name") or names.get(uid) or (f"User {uid}" if uid else ""),
+            "status": (row or {}).get("status") or raw.get("status") or "",
+            "start_at": (row or {}).get("start_at_text") or raw.get("start_at") or raw.get("from") or "",
+            "end_at": (row or {}).get("end_at_text") or raw.get("end_at") or raw.get("to") or "",
+            "source": "postgres_phase3",
+        })
+
+    return {
+        "source": "postgres_phase3_events_read_cutover",
+        "read_cutover": True,
+        "profiles": {"items": member_items, "count": len(member_items), "source": "postgres_phase3"},
+        "members": {"items": member_items, "count": len(member_items), "source": "postgres_phase3"},
+        "events": {"items": event_items, "count": len(event_items), "rsvp_count": len(all_rsvp_items), "source": "postgres_phase3"},
+        "event_rsvps": {"items": all_rsvp_items, "count": len(all_rsvp_items), "source": "postgres_phase3"},
+        "absences": {"items": absence_items, "count": len(absence_items), "source": "postgres_phase3"},
+    }
+
+
+def _apply_phase3_events_read_cutover(payload: dict[str, Any]) -> dict[str, Any]:
+    if not payload.get("ok"):
+        return payload
+    snap = payload.get("snapshot") if isinstance(payload.get("snapshot"), dict) else {}
+    guild_id = payload.get("guild_id") or snap.get("guild_id") or _env("DASHBOARD_GUILD_ID")
+    pg_live = _phase3_events_pg_payload(guild_id, snap)
+    if not pg_live:
+        payload["phase3_events_read_cutover"] = {"active": False, "source": "snapshot_fallback", "reason": "Postgres-Events/Profile nicht verfügbar oder leer"}
+        return payload
+
+    # Fallbacks behalten, damit Debug/Notfall weiterhin möglich bleibt.
+    snap["profiles_snapshot_fallback"] = snap.get("profiles") if isinstance(snap.get("profiles"), dict) else {}
+    snap["members_snapshot_fallback"] = snap.get("members") if isinstance(snap.get("members"), dict) else {}
+    snap["events_snapshot_fallback"] = snap.get("events") if isinstance(snap.get("events"), dict) else {}
+    snap["absences_snapshot_fallback"] = snap.get("absences") if isinstance(snap.get("absences"), dict) else {}
+
+    if (pg_live.get("profiles") or {}).get("items"):
+        snap["profiles"] = pg_live.get("profiles") or snap.get("profiles") or {}
+        snap["members"] = pg_live.get("members") or snap.get("members") or {}
+    if (pg_live.get("events") or {}).get("items"):
+        old_events = snap.get("events") if isinstance(snap.get("events"), dict) else {}
+        merged_events = dict(old_events)
+        merged_events.update(pg_live.get("events") or {})
+        snap["events"] = merged_events
+    if (pg_live.get("absences") or {}).get("items") is not None:
+        snap["absences"] = pg_live.get("absences") or snap.get("absences") or {}
+    snap["event_rsvps"] = pg_live.get("event_rsvps") or snap.get("event_rsvps") or {}
+
+    payload["snapshot"] = snap
+    payload["phase3_events_read_cutover"] = {
+        "active": True,
+        "source": "postgres_phase3",
+        "members": int((pg_live.get("profiles") or {}).get("count") or 0),
+        "events": int((pg_live.get("events") or {}).get("count") or 0),
+        "event_rsvps": int((pg_live.get("event_rsvps") or {}).get("count") or 0),
+        "absences": int((pg_live.get("absences") or {}).get("count") or 0),
     }
     return payload
 
@@ -7104,7 +7384,10 @@ def _render_events_center(data: dict[str, Any], current_user: Optional[dict[str,
             result,
         ])
 
+    event_cut = data.get("phase3_events_read_cutover") or {}
+    event_source_label = "Postgres Phase 3" if event_cut.get("active") else "Snapshot/Fallback"
     cards = "".join([
+        _card("Event-Quelle", event_source_label, "Read-Cutover aktiv" if event_cut.get("active") else "Fallback aktiv"),
         _card("Laufend/offen", len(running), "inkl. offener Review/EC"),
         _card("Kommend", len(upcoming), "geplante Events"),
         _card("Vergangen", len(past), "letzte Events im Snapshot"),
@@ -7232,6 +7515,7 @@ def api_events_center(_: bool = Depends(_auth)):
         "past": past,
         "events": events,
         "actions": _dashboard_event_action_requests(guild_id, limit=80) if guild_id else [],
+        "phase3_events_read_cutover": payload.get("phase3_events_read_cutover") or {},
     })
 
 
