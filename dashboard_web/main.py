@@ -522,6 +522,31 @@ def _ensure_admin_tables() -> None:
                 ON dashboard_event_action_requests (guild_id, event_id, status, requested_at DESC)
                 """
             )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS dashboard_settings_change_requests (
+                    id BIGSERIAL PRIMARY KEY,
+                    request_id TEXT NOT NULL UNIQUE,
+                    guild_id BIGINT NOT NULL,
+                    scope TEXT NOT NULL DEFAULT 'dkp',
+                    action_type TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    payload_json TEXT NOT NULL DEFAULT '{}',
+                    actor_id TEXT,
+                    actor_name TEXT,
+                    requested_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    claimed_at TIMESTAMPTZ,
+                    processed_at TIMESTAMPTZ,
+                    result_json TEXT
+                )
+                """
+            )
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_dashboard_settings_change_requests_lookup
+                ON dashboard_settings_change_requests (guild_id, scope, status, requested_at DESC)
+                """
+            )
         conn.commit()
     finally:
         conn.close()
@@ -864,8 +889,10 @@ def _admin_center_payload(data: dict[str, Any]) -> dict[str, Any]:
     source_bad = len(source_rows) - source_ok
     ec_requests = _ec_award_requests_for_dashboard(guild_id, limit=120) if guild_id else []
     loot_requests = _loot_action_requests_for_dashboard(guild_id, limit=120) if guild_id else []
+    settings_requests = _settings_change_requests_for_dashboard(guild_id, limit=80) if guild_id else []
     ec_counts = _queue_status_counts(ec_requests)
     loot_counts = _queue_status_counts(loot_requests)
+    settings_counts = _queue_status_counts(settings_requests)
     admin_states = _all_member_admin_states(guild_id) if guild_id else []
     admin_log = _admin_action_log(guild_id, limit=160) if guild_id else []
 
@@ -915,6 +942,8 @@ def _admin_center_payload(data: dict[str, Any]) -> dict[str, Any]:
         "loot_requests": loot_requests,
         "ec_counts": dict(ec_counts),
         "loot_counts": dict(loot_counts),
+        "settings_requests": settings_requests,
+        "settings_counts": dict(settings_counts),
         "admin_states": admin_states,
         "admin_log": admin_log,
         "next_steps": next_steps,
@@ -931,6 +960,7 @@ def _render_admin_center_dashboard(data: dict[str, Any]) -> str:
     guild_id = p.get("guild_id")
     ec_counts = Counter(p.get("ec_counts") or {})
     loot_counts = Counter(p.get("loot_counts") or {})
+    settings_counts = Counter(p.get("settings_counts") or {})
 
     overview_cards = "".join([
         _card("Guild-ID", guild_id or "—", "Dashboard-Kontext"),
@@ -939,8 +969,9 @@ def _render_admin_center_dashboard(data: dict[str, Any]) -> str:
         _card("Quellen OK", p.get("source_ok", 0), f"Fehler/fehlen: {p.get('source_bad', 0)}"),
         _card("Admin-Markierungen", len(p.get("admin_states") or []), "interne Leitungsnotizen"),
         _card("Admin-Log", len(p.get("admin_log") or []), "letzte Web-Aktionen"),
+        _card("Settings offen", settings_counts.get("pending", 0), f"erledigt: {settings_counts.get('done', 0)}"),
     ])
-    queue_cards = _queue_status_cards("EC", ec_counts) + _queue_status_cards("Loot", loot_counts)
+    queue_cards = _queue_status_cards("EC", ec_counts) + _queue_status_cards("Loot", loot_counts) + _queue_status_cards("Settings", settings_counts)
 
     auth_rows = [[r.get("setting"), r.get("value"), r.get("hint")] for r in p.get("auth_rows") or []]
     rule_rows = p.get("rule_rows") or []
@@ -961,6 +992,13 @@ def _render_admin_center_dashboard(data: dict[str, Any]) -> str:
         status = _ec_award_status_label(r.get("status")).replace("EC", "")
         loot_rows.append([_dt(r.get("requested_at")), status, _auction_link(r.get("auction_id"), item), r.get("action_type"), _fmt_ec(r.get("amount")), r.get("actor_name") or r.get("actor_id") or "—", _short(result.get("error") or result.get("message") or r.get("request_id"), 100)])
 
+    setting_req_rows = []
+    for r in p.get("settings_requests") or []:
+        payload = r.get("payload") if isinstance(r.get("payload"), dict) else {}
+        result = r.get("result") if isinstance(r.get("result"), dict) else {}
+        detail = result.get("message") or result.get("error") or payload.get("event_type") or payload.get("weekly_event_limit") or payload.get("decay_percent") or r.get("request_id")
+        setting_req_rows.append([_dt(r.get("requested_at")), _ec_award_status_label(r.get("status")).replace("EC", ""), r.get("action_type"), _short(detail, 140), r.get("actor_name") or r.get("actor_id") or "—"])
+
     state_rows = []
     for st in p.get("admin_states") or []:
         uid = _user_id(st.get("member_user_id"))
@@ -973,7 +1011,7 @@ def _render_admin_center_dashboard(data: dict[str, Any]) -> str:
 
     next_rows = [[x] for x in p.get("next_steps") or []]
     body = f"""
-    <nav class="topnav"><a href="/">Kommando</a><a href="/members">Mitglieder</a><a href="/loot">Loot</a><a href="/ec">EC</a><a href="/ec-queue">EC-Queue</a><a href="/settings">Setup</a><a href="/system">System</a><a href="/audit">Audit</a><a href="/api/admin-center">API</a></nav>
+    <nav class="topnav"><a href="/">Kommando</a><a href="/members">Mitglieder</a><a href="/loot">Loot</a><a href="/ec">EC</a><a href="/ec-queue">EC-Queue</a><a href="/admin-settings">EC-Regeln bearbeiten</a><a href="/settings">Setup</a><a href="/system">System</a><a href="/audit">Audit</a><a href="/api/admin-center">API</a></nav>
     <section class="hero">
       <div>
         <div class="eyebrow">Schritt 4 · Admin & Einstellungen</div>
@@ -987,7 +1025,9 @@ def _render_admin_center_dashboard(data: dict[str, Any]) -> str:
     <section class="panel"><h2>🚦 Nächste Prüfpunkte</h2>{_table(['Hinweis'], next_rows, placeholder='Hinweise durchsuchen…')}</section>
     <section class="panel"><h2>🔐 Login & Rollen</h2><p class="muted">Diese Werte kommen aus Railway-Variablen bzw. dem Snapshot. Änderungen weiter über Railway/Discord, nicht direkt über diese Seite.</p>{_table(['Setting','Wert','Hinweis'], auth_rows, placeholder='Login durchsuchen…')}</section>
     <section class="panel"><h2>🧾 Erkannte EC-/Loot-/Event-Regeln</h2><p class="muted">Gefilterte Snapshot-Settings. Wenn hier eine Regel fehlt, exportiert der Bot sie aktuell nicht ins Dashboard.</p>{_table(['Quelle','Key','Wert'], rule_rows, placeholder='Regeln durchsuchen…')}</section>
+    <section class="panel"><h2>⚙️ EC-Regeln bearbeiten</h2><p class="muted">EC-Werte, Wochenlimit und Verfall laufen sicher über eine Bot-Queue. Das Dashboard ändert keine Bot-JSON direkt.</p><a class="btn" href="/admin-settings">Zur Einstellungsseite</a></section>
     <section class="panel"><h2>🪙 EC-Queue zuletzt</h2>{_table(['Zeit','Status','Event','EC','Akteur','Resultat'], ec_rows, placeholder='EC-Queue durchsuchen…')}</section>
+    <section class="panel"><h2>⚙️ Settings-Queue zuletzt</h2>{_table(['Zeit','Status','Aktion','Details','Akteur'], setting_req_rows, placeholder='Settings-Queue durchsuchen…')}</section>
     <section class="panel"><h2>🎁 Loot-Dashboard-Aktionen zuletzt</h2>{_table(['Zeit','Status','Auktion/Item','Aktion','EC','Akteur','Resultat'], loot_rows, placeholder='Loot-Aktionen durchsuchen…')}</section>
     <section class="panel"><h2>👥 Markierte Mitglieder</h2>{_table(['Mitglied','Status','Notiz','Geändert von','Geändert am'], state_rows, placeholder='Mitglieder durchsuchen…')}</section>
     <section class="panel"><h2>🧩 Datenquellen</h2>{_table(['Key','Datei','vorhanden','Status','Bytes','Geändert'], source_rows, placeholder='Quellen durchsuchen…')}</section>
@@ -5507,6 +5547,234 @@ def _parse_urlencoded_body(raw: bytes) -> dict[str, str]:
     return {str(k): str(v[-1] if v else "") for k, v in parsed.items()}
 
 
+def _settings_change_requests_for_dashboard(guild_id: int, limit: int = 100) -> list[dict[str, Any]]:
+    """Letzte Dashboard-Einstellungsanträge.
+
+    Das Dashboard schreibt keine Bot-JSON. Es legt nur Änderungsanträge in Postgres ab.
+    Der Bot verarbeitet sie und schreibt dann dkp_cfg.json.
+    """
+    if not _database_url() or not guild_id:
+        return []
+    try:
+        _ensure_admin_tables()
+        conn = _pg_connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT id, request_id, guild_id, scope, action_type, status, payload_json,
+                           actor_id, actor_name, requested_at, claimed_at, processed_at, result_json
+                    FROM dashboard_settings_change_requests
+                    WHERE guild_id = %s
+                    ORDER BY requested_at DESC, id DESC
+                    LIMIT %s
+                    """,
+                    (int(guild_id), int(limit)),
+                )
+                rows: list[dict[str, Any]] = []
+                for row in cur.fetchall() or []:
+                    out = dict(row)
+                    try:
+                        out["payload"] = json.loads(out.get("payload_json") or "{}")
+                    except Exception:
+                        out["payload"] = {}
+                    try:
+                        out["result"] = json.loads(out.get("result_json") or "{}")
+                    except Exception:
+                        out["result"] = {}
+                    rows.append(out)
+                return rows
+        finally:
+            conn.close()
+    except Exception:
+        return []
+
+
+def _snapshot_setting_value(snap: dict[str, Any], suffix: str, default: Any = "") -> Any:
+    """Sucht einen Wert aus den vom Bot exportierten Settings-Zeilen.
+
+    Beispiel: suffix='weekly_event_limit' findet dkp_cfg.weekly_event_limit.
+    """
+    wanted = str(suffix or "").strip().lower()
+    for row in ((snap.get("settings") or {}).get("settings") or []):
+        if not isinstance(row, dict):
+            continue
+        src = str(row.get("source") or "").lower()
+        key = str(row.get("key") or "").lower()
+        if src == "dkp_cfg" and (key == wanted or key.endswith("." + wanted) or wanted in key):
+            return row.get("value")
+    return default
+
+
+def _current_dkp_settings_from_snapshot(snap: dict[str, Any]) -> dict[str, Any]:
+    event_types = ["Gildenboss", "HM Raid", "NM Raid", "Normal Raid", "Übungsrun HM Raid", "Übungsrun Trials", "Segensstein PvP"]
+    default_points = {
+        "Gildenboss": 20,
+        "HM Raid": 12,
+        "NM Raid": 12,
+        "Normal Raid": 12,
+        "Übungsrun HM Raid": 15,
+        "Übungsrun Trials": 15,
+        "Segensstein PvP": 5,
+    }
+    points: dict[str, Any] = {}
+    for et in event_types:
+        found = None
+        needle = "event_points." + et.lower()
+        for row in ((snap.get("settings") or {}).get("settings") or []):
+            if not isinstance(row, dict):
+                continue
+            key = str(row.get("key") or "").lower()
+            src = str(row.get("source") or "").lower()
+            if src == "dkp_cfg" and (key.endswith(needle) or needle in key):
+                found = row.get("value")
+                break
+        points[et] = found if found is not None else default_points.get(et, 0)
+    return {
+        "event_types": event_types,
+        "event_points": points,
+        "weekly_event_limit": _snapshot_setting_value(snap, "weekly_event_limit", 40),
+        "decay_percent": _snapshot_setting_value(snap, "decay_percent", 15),
+        "decay_protected_balance": _snapshot_setting_value(snap, "decay_protected_balance", 50),
+    }
+
+
+def _enqueue_settings_change_request(guild_id: int, action_type: str, payload: dict[str, Any], actor: dict[str, Any]) -> dict[str, Any]:
+    if not _database_url():
+        return {"ok": False, "error": "DATABASE_URL fehlt. Ohne Postgres kann das Dashboard keine Einstellungsänderung an den Bot übergeben."}
+    if not guild_id:
+        return {"ok": False, "error": "Guild-ID fehlt."}
+    action = str(action_type or "").strip().lower()
+    if action not in {"set_event_points", "set_weekly_limit", "set_decay"}:
+        return {"ok": False, "error": "Unbekannte Einstellungsaktion."}
+    clean_payload = dict(payload or {})
+    # Dashboard-Vorprüfung. Der Bot prüft später final nochmal.
+    try:
+        if action == "set_event_points":
+            et = str(clean_payload.get("event_type") or "").strip()
+            pts = int(float(str(clean_payload.get("points") or "0").replace(",", ".")))
+            if not et:
+                return {"ok": False, "error": "Eventtyp fehlt."}
+            if pts < 0 or pts > 500:
+                return {"ok": False, "error": "EC-Wert muss zwischen 0 und 500 liegen."}
+            clean_payload = {"event_type": et, "points": pts}
+        elif action == "set_weekly_limit":
+            limit = int(float(str(clean_payload.get("weekly_event_limit") or "0").replace(",", ".")))
+            if limit < 0 or limit > 1000:
+                return {"ok": False, "error": "Wochenlimit muss zwischen 0 und 1000 liegen."}
+            clean_payload = {"weekly_event_limit": limit}
+        elif action == "set_decay":
+            percent = float(str(clean_payload.get("decay_percent") or "0").replace(",", "."))
+            protected = int(float(str(clean_payload.get("decay_protected_balance") or "0").replace(",", ".")))
+            if percent < 0 or percent > 100:
+                return {"ok": False, "error": "Verfall muss zwischen 0 und 100 Prozent liegen."}
+            if protected < 0 or protected > 100000:
+                return {"ok": False, "error": "Schutzbetrag ist unplausibel."}
+            clean_payload = {"decay_percent": percent, "decay_protected_balance": protected}
+    except Exception:
+        return {"ok": False, "error": "Ungültige Zahl in der Änderung."}
+
+    actor_id = str(actor.get("user_id") or "").strip()
+    actor_name = str(actor.get("username") or actor_id or "Dashboard")
+    request_id = f"dash-settings-{int(time.time())}-{secrets.token_hex(6)}"
+    clean_payload.update({
+        "requested_by": {"id": actor_id, "name": actor_name},
+        "requested_at": datetime.now(timezone.utc).isoformat(),
+        "source": "dashboard_settings_change",
+    })
+    _ensure_admin_tables()
+    conn = _pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO dashboard_settings_change_requests
+                    (request_id, guild_id, scope, action_type, status, payload_json, actor_id, actor_name, requested_at)
+                VALUES (%s, %s, 'dkp', %s, 'pending', %s, %s, %s, NOW())
+                RETURNING id, request_id, status
+                """,
+                (request_id, int(guild_id), action, json.dumps(clean_payload, ensure_ascii=False, separators=(",", ":")), actor_id, actor_name),
+            )
+            row = dict(cur.fetchone() or {})
+            cur.execute(
+                """
+                INSERT INTO dashboard_admin_action_log
+                    (guild_id, action_type, target_type, target_id, actor_id, actor_name, payload_json)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """,
+                (int(guild_id), f"settings_change_{action}", "settings", "dkp_cfg", actor_id, actor_name, json.dumps(clean_payload, ensure_ascii=False)),
+            )
+        conn.commit()
+        return {"ok": True, "request": row, "request_id": request_id}
+    finally:
+        conn.close()
+
+
+def _render_admin_settings_editor(data: dict[str, Any], msg: str = "") -> str:
+    if not data.get("ok"):
+        return _html_shell("Admin-Einstellungen · Ebo Dashboard", f"<section class='panel'><h1>⚙️ Admin-Einstellungen</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+    snap: dict[str, Any] = data.get("snapshot") or {}
+    guild_id = _safe_guild_id(data)
+    cfg = _current_dkp_settings_from_snapshot(snap)
+    requests = _settings_change_requests_for_dashboard(guild_id, 80) if guild_id else []
+    counts = _queue_status_counts(requests)
+    cards = "".join([
+        _card("Offen", counts.get("pending", 0), "wartet auf Bot"),
+        _card("In Arbeit", counts.get("processing", 0), "Bot verarbeitet"),
+        _card("Erledigt", counts.get("done", 0), "übernommen"),
+        _card("Fehler", counts.get("failed", 0) + counts.get("rejected", 0), "failed/rejected"),
+    ])
+    point_rows = []
+    for et in cfg.get("event_types") or []:
+        val = (cfg.get("event_points") or {}).get(et, "")
+        form = f"""
+        <form method='post' action='/admin/settings-change' style='display:flex; gap:8px; align-items:center; flex-wrap:wrap;'>
+          <input type='hidden' name='action_type' value='set_event_points'>
+          <input type='hidden' name='event_type' value='{_e(et)}'>
+          <input name='points' value='{_e(val)}' inputmode='numeric' style='max-width:110px;'>
+          <button class='btn compact' type='submit'>ändern</button>
+        </form>
+        """
+        point_rows.append([et, val, _raw(form)])
+    req_rows = []
+    for r in requests:
+        payload = r.get("payload") if isinstance(r.get("payload"), dict) else {}
+        result = r.get("result") if isinstance(r.get("result"), dict) else {}
+        detail = result.get("message") or result.get("error") or payload.get("event_type") or payload.get("weekly_event_limit") or payload.get("decay_percent") or r.get("request_id")
+        req_rows.append([_dt(r.get("requested_at")), _ec_award_status_label(r.get("status")).replace("EC", ""), r.get("action_type"), _short(detail, 160), r.get("actor_name") or r.get("actor_id") or "—"])
+    msg_panel = f"<section class='panel'><p>{_e(msg)}</p></section>" if msg else ""
+    body = f"""
+    <nav class="topnav"><a href="/admin">← Admin</a><a href="/settings">Setup</a><a href="/ec">EC-Verlauf</a><a href="/api/admin-settings">API</a></nav>
+    <section class="hero">
+      <div><div class="eyebrow">Admin · Änderbar über Bot-Queue</div><h1>⚙️ EC-Regeln bearbeiten</h1><p class="muted">Das Dashboard legt nur Änderungsanträge an. Der Bot übernimmt sie in dkp_cfg.json und schreibt das Ergebnis zurück.</p></div>
+      <a class="btn" href="/admin">Admin-Zentrale</a>
+    </section>
+    {msg_panel}
+    <section class="grid">{cards}</section>
+    <section class="panel"><h2>🪙 EC-Werte pro Eventtyp</h2><p class="muted">Änderungen gelten erst, wenn der Bot den Antrag verarbeitet hat.</p>{_table(['Eventtyp','Aktuell','Ändern'], point_rows, placeholder='Eventtyp suchen…')}</section>
+    <section class="split">
+      <section class="panel"><h2>📅 Wochenlimit</h2><p class="muted">Aktuell: <strong>{_e(cfg.get('weekly_event_limit'))} EC</strong> aus Event-Buchungen pro Woche.</p>
+        <form method="post" action="/admin/settings-change" style="display:grid; gap:10px; max-width:520px;">
+          <input type="hidden" name="action_type" value="set_weekly_limit">
+          <label>Neues Wochenlimit<br><input name="weekly_event_limit" value="{_e(cfg.get('weekly_event_limit'))}" inputmode="numeric"></label>
+          <button class="btn" type="submit" onclick="return confirm('Wochenlimit als Bot-Antrag senden?')">Wochenlimit ändern</button>
+        </form>
+      </section>
+      <section class="panel"><h2>📉 Wöchentlicher Verfall</h2><p class="muted">Aktuell: <strong>{_e(cfg.get('decay_percent'))}%</strong> nur über <strong>{_e(cfg.get('decay_protected_balance'))} EC</strong>.</p>
+        <form method="post" action="/admin/settings-change" style="display:grid; gap:10px; max-width:520px;">
+          <input type="hidden" name="action_type" value="set_decay">
+          <label>Verfall in %<br><input name="decay_percent" value="{_e(cfg.get('decay_percent'))}" inputmode="decimal"></label>
+          <label>Schutzbetrag<br><input name="decay_protected_balance" value="{_e(cfg.get('decay_protected_balance'))}" inputmode="numeric"></label>
+          <button class="btn" type="submit" onclick="return confirm('Verfall-Regel als Bot-Antrag senden?')">Verfall ändern</button>
+        </form>
+      </section>
+    </section>
+    <section class="panel"><h2>🧾 Änderungsqueue</h2>{_table(['Zeit','Status','Aktion','Details','Akteur'], req_rows, placeholder='Änderungen durchsuchen…')}</section>
+    <section class="panel"><h2>🔒 Nicht direkt änderbar</h2><p class="muted">Dashboard-Rollen, OAuth, Secret und Railway-Variablen bleiben absichtlich außerhalb dieser Seite. Das sind Deploy-/Security-Einstellungen und werden nicht aus dem Dashboard heraus überschrieben.</p></section>
+    """
+    return _html_shell("Admin-Einstellungen · Ebo Dashboard", body)
+
+
 def _dashboard_event_action_requests(guild_id: int, limit: int = 80, event_id: str = "") -> list[dict[str, Any]]:
     if not _database_url() or not guild_id:
         return []
@@ -7083,6 +7351,51 @@ def settings_page(_: bool = Depends(_auth)):
             _html_shell("Ebo Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
             status_code=500,
         )
+
+
+@app.get("/admin-settings", response_class=HTMLResponse)
+def admin_settings_page(_: bool = Depends(_admin_auth), msg: str = ""):
+    try:
+        return HTMLResponse(_render_admin_settings_editor(_snapshot_payload(), msg=msg))
+    except Exception as exc:
+        return HTMLResponse(
+            _html_shell("Ebo Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
+            status_code=500,
+        )
+
+
+@app.get("/api/admin-settings")
+def api_admin_settings(_: bool = Depends(_admin_auth)):
+    payload = _snapshot_payload()
+    if not payload.get("ok"):
+        return JSONResponse(payload, status_code=404)
+    snap = payload.get("snapshot") or {}
+    guild_id = _safe_guild_id(payload)
+    return JSONResponse({
+        "ok": True,
+        "guild_id": guild_id,
+        "current": _current_dkp_settings_from_snapshot(snap),
+        "requests": _settings_change_requests_for_dashboard(guild_id, 120) if guild_id else [],
+    })
+
+
+@app.post("/admin/settings-change")
+async def admin_settings_change(request: Request, _: bool = Depends(_admin_auth)):
+    payload = _snapshot_payload()
+    guild_id = _safe_guild_id(payload)
+    actor = _current_user(request) or {"username": "Dashboard"}
+    form = _parse_urlencoded_body(await request.body())
+    action = str(form.get("action_type") or "").strip().lower()
+    clean_payload: dict[str, Any] = {}
+    if action == "set_event_points":
+        clean_payload = {"event_type": form.get("event_type"), "points": form.get("points")}
+    elif action == "set_weekly_limit":
+        clean_payload = {"weekly_event_limit": form.get("weekly_event_limit")}
+    elif action == "set_decay":
+        clean_payload = {"decay_percent": form.get("decay_percent"), "decay_protected_balance": form.get("decay_protected_balance")}
+    res = _enqueue_settings_change_request(guild_id, action, clean_payload, actor)
+    msg = "Einstellungsänderung wurde an den Bot gesendet." if res.get("ok") else f"Fehler: {res.get('error')}"
+    return RedirectResponse("/admin-settings?msg=" + urllib.parse.quote(msg), status_code=303)
 
 
 @app.get("/audit", response_class=HTMLResponse)
