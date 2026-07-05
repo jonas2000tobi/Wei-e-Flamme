@@ -3192,10 +3192,13 @@ async def setup_dkp_system(client: discord.Client, tree: app_commands.CommandTre
 
     @dkp.command(name="phase3_prune_inactive", description="Leader: Ausgetretene Mitglieder aus Phase-3-Postgres entfernen")
     async def phase3_prune_inactive_cmd(inter: discord.Interaction):
-        await inter.response.defer(ephemeral=True, thinking=True)
-        if not _is_leader(inter):
-            await inter.followup.send("❌ Keine Berechtigung.", ephemeral=True)
+        if inter.guild is None:
+            await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
             return
+        if not _is_leader_or_admin(inter):
+            await inter.response.send_message("❌ Keine Berechtigung.", ephemeral=True)
+            return
+        await inter.response.defer(ephemeral=True, thinking=True)
         try:
             res = _phase3_prune_inactive_members_from_pg(inter.guild.id)
             if not res.get("ok"):
