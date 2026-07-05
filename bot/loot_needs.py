@@ -1848,35 +1848,113 @@ def _phase3_ensure_need_tables() -> None:
 
 
 def _phase3_need_rows_for_guild(guild_id: int) -> list[dict]:
+    """Flattened echte Need-Einträge für Phase 3.3.
+
+    Unterstützt alte Bot-Struktur:
+      loot_needs[guild]["users"][user_id]["Main"/"Secondary"][slot]
+    und Snapshot-/Dashboard-Strukturen:
+      loot_needs[guild]["items"] mit Spieler- oder Item-Zeilen.
+    """
     rows: list[dict] = []
+    seen: set[str] = set()
     g = loot_needs.get(str(guild_id)) or {}
-    users = g.get("users") if isinstance(g, dict) else {}
-    if not isinstance(users, dict):
-        return rows
-    for user_id_s, udata in users.items():
-        if not isinstance(udata, dict):
-            continue
-        for tab in TABS:
-            slots = udata.get(tab) or {}
-            if not isinstance(slots, dict):
+
+    def label_from_value(value: Any) -> tuple[str, dict]:
+        if isinstance(value, dict):
+            sobj = _slot_obj(value) if ("item_id" in value or "received" in value or "locked" in value) else dict(value)
+            item_id = str(sobj.get("item_id") or "")
+            if item_id:
+                return _item_name(int(guild_id), item_id, with_type=True), sobj | {"item_id": item_id}
+            label = str(sobj.get("item_name") or sobj.get("item") or sobj.get("name") or sobj.get("label") or sobj.get("value") or sobj.get("text") or "").strip()
+            return label, sobj
+        if isinstance(value, str):
+            # Kann entweder item_id oder bereits lesbarer Itemname sein.
+            if value and value in (_gitems(guild_id).get("items") or {}):
+                return _item_name(int(guild_id), value, with_type=True), {"item_id": value}
+            return value.strip(), {"value": value}
+        return "", {"value": value}
+
+    def add_row(user_id_s: str, tab: str, slot: str, raw_slot: Any, display_name: str = "") -> None:
+        label, raw_obj = label_from_value(raw_slot)
+        if not label or label in {"—", "-"}:
+            return
+        status = "received" if bool(raw_obj.get("received")) else "open"
+        raw = dict(raw_obj) if isinstance(raw_obj, dict) else {"value": raw_obj}
+        raw.update({"user_id": str(user_id_s or ""), "display_name": str(display_name or ""), "tab": tab, "slot": str(slot), "phase3_source_shape": "bot_flattened"})
+        base = f"{user_id_s}|{display_name}|{tab}|{slot}|{label}"
+        need_id = f"need_{__import__('hashlib').sha1(base.encode('utf-8', 'ignore')).hexdigest()[:22]}"
+        if need_id in seen:
+            return
+        seen.add(need_id)
+        rows.append({
+            "need_id": need_id,
+            "user_id": str(user_id_s or ""),
+            "item_name": label,
+            "need_type": str(tab or "Main"),
+            "slot_name": str(slot or ""),
+            "status": status,
+            "raw": raw,
+        })
+
+    def iter_entries(value: Any):
+        if not value:
+            return []
+        if isinstance(value, list):
+            return list(enumerate(value, start=1))
+        if isinstance(value, dict):
+            return list(value.items())
+        return [("", value)]
+
+    if isinstance(g, dict):
+        users = g.get("users") if isinstance(g.get("users"), dict) else {}
+        for user_id_s, udata in users.items():
+            if not isinstance(udata, dict):
                 continue
-            for slot, raw_slot in slots.items():
-                sobj = _slot_obj(raw_slot)
-                item_id = str(sobj.get("item_id") or "")
-                if not item_id:
-                    continue
-                status = "received" if bool(sobj.get("received")) else "open"
-                raw = dict(sobj)
-                raw.update({"user_id": str(user_id_s), "tab": tab, "slot": str(slot), "item_id": item_id})
-                rows.append({
-                    "need_id": f"{user_id_s}:{tab}:{slot}",
-                    "user_id": str(user_id_s),
-                    "item_name": _item_name(int(guild_id), item_id, with_type=True),
-                    "need_type": tab,
-                    "slot_name": str(slot),
-                    "status": status,
-                    "raw": raw,
-                })
+            for tab in TABS:
+                slots = udata.get(tab) or {}
+                for slot, raw_slot in iter_entries(slots):
+                    add_row(str(user_id_s), tab, str(slot), raw_slot)
+
+        # Fallback für Snapshot-/Dashboard-ähnliche Strukturen.
+        raw_items = g.get("items") or g.get("rows") or g.get("need_items") or []
+        for row_idx, row in enumerate(iter_entries(raw_items), start=1):
+            _, row = row
+            if not isinstance(row, dict):
+                continue
+            uid = str(row.get("user_id") or row.get("discord_id") or row.get("member_id") or row.get("id") or "")
+            name = str(row.get("display_name") or row.get("name") or row.get("member_name") or "")
+            handled = False
+            for tab, keys in (
+                ("Main", ["main", "Main", "main_needs", "main_items", "main_need"]),
+                ("Secondary", ["secondary", "Secondary", "secondary_needs", "secondary_items", "second", "second_needs"]),
+            ):
+                entries = None
+                for key in keys:
+                    if row.get(key):
+                        entries = row.get(key)
+                        break
+                if entries:
+                    handled = True
+                    for slot, entry in iter_entries(entries):
+                        add_row(uid, tab, str(slot), entry, name)
+            if handled:
+                continue
+            item_label = row.get("item_name") or row.get("item") or row.get("name") or row.get("label")
+            if item_label and (row.get("main") is not None or row.get("secondary") is not None or row.get("second") is not None):
+                for tab, people in (("Main", row.get("main") or []), ("Secondary", row.get("secondary") or row.get("second") or [])):
+                    for _, person in iter_entries(people):
+                        if isinstance(person, dict):
+                            p_uid = str(person.get("user_id") or person.get("discord_id") or person.get("member_id") or person.get("id") or "")
+                            p_name = str(person.get("display_name") or person.get("name") or person.get("member_name") or "")
+                        else:
+                            p_uid = ""
+                            p_name = str(person)
+                        add_row(p_uid, tab, "", {"item_name": item_label}, p_name)
+
+    elif isinstance(g, list):
+        for row_idx, row in enumerate(g, start=1):
+            add_row("", "Main", str(row_idx), row)
+
     return rows
 
 
