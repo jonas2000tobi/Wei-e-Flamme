@@ -3561,11 +3561,11 @@ def _render_needs_dashboard(data: dict[str, Any]) -> str:
     ])
     body = f"""
     <nav class="topnav"><a href="/">← Übersicht</a><a href="/members">Mitglieder</a><a href="/loot">Loot</a><a href="/analytics">Analytics</a><a href="/voice">Voice</a><a href="/exports">Exports</a><a href="/api/needs">API</a></nav>
-    <section class="hero"><div><div class="eyebrow">Needlisten</div><h1>🎁 Need-Analytics</h1><p class="muted">Zeigt, welche Items wie oft gebraucht werden. Read-only.</p></div><a class="btn" href="/export/needs.csv">CSV herunterladen</a></section>
+    <section class="hero"><div><div class="eyebrow">Need-Einträge</div><h1>🎁 Need-Analytics</h1><p class="muted">Zeigt, welche Items wie oft gebraucht werden. Read-only.</p></div><a class="btn" href="/export/needs.csv">CSV herunterladen</a></section>
     <section class="grid">{cards}</section>
     <section class="split"><div class="panel"><h2>Top Main-Needs</h2>{_table(['Item','Anzahl'], top_main_rows, placeholder='Main-Needs durchsuchen…')}</div><div class="panel"><h2>Top Secondary-Needs</h2>{_table(['Item','Anzahl'], top_secondary_rows, placeholder='Secondary-Needs durchsuchen…')}</div></section>
     <section class="panel"><h2>🧹 Mitglieder ohne Needliste</h2>{_table(['Spieler','Rolle','GS'], without_rows, placeholder='Ohne Needliste durchsuchen…')}</section>
-    <section class="panel"><h2>Alle Needlisten</h2>{_table(['Spieler','Main','Secondary','Main-Needs','Secondary-Needs'], all_rows, placeholder='Needlisten durchsuchen…')}</section>
+    <section class="panel"><h2>Alle Need-Einträge</h2>{_table(['Spieler','Main','Secondary','Main-Needs','Secondary-Needs'], all_rows, placeholder='Need-Einträge durchsuchen…')}</section>
     """
     return _html_shell("Needs · Ebo Dashboard", body)
 
@@ -4092,7 +4092,7 @@ def _render_loot_center(data: dict[str, Any]) -> str:
         _card("Aktive Auktionen", len(center["active"]), "offen/läuft"),
         _card("Übergabe offen", len(center["handover"]), "Gewinner ohne Übergabe"),
         _card("Ohne Gebot", len(center["no_bid"]), "aktive Auktionen"),
-        _card("Need-Items", len(center["needs"]), "aus Needlisten"),
+        _card("Need-Items", len(center["needs"]), "aus Need-Einträge"),
     ])
 
     action_rows = []
@@ -10470,6 +10470,129 @@ def _phase3_status_payload() -> dict[str, Any]:
         conn.close()
 
 
+
+
+def _phase3_need_entry_rows_from_snapshot(snap: dict[str, Any]) -> list[dict[str, Any]]:
+    """Flattened Need-Einträge aus dem Dashboard-Snapshot.
+
+    Wichtig: snap['loot']['needs'] ist je nach Bot-Version nicht eine Liste von
+    Need-Slots, sondern oft ein Container mit Spieler-Zeilen oder bereits
+    gruppierten Item-Zeilen. Diese Funktion zählt echte Need-Einträge statt nur
+    Top-Level-Zeilen.
+    """
+    if not isinstance(snap, dict):
+        return []
+    loot_raw = snap.get("loot") or {}
+    if not isinstance(loot_raw, dict):
+        return []
+    needs_obj = loot_raw.get("needs") or loot_raw.get("needlist") or loot_raw.get("needlists") or []
+    if isinstance(needs_obj, dict):
+        raw_rows = needs_obj.get("items") or needs_obj.get("rows") or needs_obj.get("users") or needs_obj.get("profiles") or needs_obj
+    else:
+        raw_rows = needs_obj
+
+    names = _profile_name_map(snap)
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def add_need(*, user_id: Any, display_name: str, need_type: str, slot_name: str, item_value: Any, raw: Any) -> None:
+        label = _loot_text(item_value)
+        if not label:
+            return
+        if label in {"—", "-", "none", "None"}:
+            return
+        uid = str(_user_id(user_id) or user_id or "").strip()
+        need_type_s = str(need_type or "").strip() or "Main"
+        slot_s = str(slot_name or "").strip()
+        raw_json = raw if isinstance(raw, dict) else {"value": raw}
+        if not uid:
+            uid = str(raw_json.get("user_id") or raw_json.get("discord_id") or raw_json.get("member_id") or "").strip()
+        disp = str(display_name or raw_json.get("display_name") or raw_json.get("name") or (names.get(_user_id(uid), "") if uid else "") or "").strip()
+        base = f"{uid}|{disp}|{need_type_s}|{slot_s}|{label}"
+        need_id = "need_" + hashlib.sha1(base.encode("utf-8", "ignore")).hexdigest()[:22]
+        if need_id in seen:
+            return
+        seen.add(need_id)
+        out.append({
+            "need_id": need_id,
+            "user_id": uid,
+            "display_name": disp,
+            "item_name": label,
+            "need_type": need_type_s,
+            "slot_name": slot_s,
+            "status": str(raw_json.get("status") or raw_json.get("state") or ("received" if raw_json.get("received") else "open")),
+            "raw_json": raw_json | {"phase3_source_shape": "snapshot_flattened", "display_name": disp},
+        })
+
+    def iter_entries(value: Any):
+        if not value:
+            return []
+        if isinstance(value, list):
+            return list(enumerate(value, start=1))
+        if isinstance(value, dict):
+            return list(value.items())
+        return [("", value)]
+
+    for row_index, row in enumerate(_phase3_list(raw_rows), start=1):
+        if not isinstance(row, dict):
+            continue
+        uid = _phase3_first_id(row, ["user_id", "discord_id", "member_id", "id"])
+        display_name = str(row.get("display_name") or row.get("name") or row.get("member_name") or (names.get(_user_id(uid), "") if uid else "") or "")
+
+        # Form A: Spieler-Zeile: {user_id, main:[...], secondary:[...]}
+        handled_player_shape = False
+        for need_type, keys in (
+            ("Main", ["main", "Main", "main_needs", "main_items", "main_need"]),
+            ("Secondary", ["secondary", "Secondary", "secondary_needs", "secondary_items", "second", "second_needs"]),
+        ):
+            entries = None
+            for key in keys:
+                if row.get(key):
+                    entries = row.get(key)
+                    break
+            if entries:
+                handled_player_shape = True
+                for slot, entry in iter_entries(entries):
+                    label_val = entry
+                    slot_name = str(slot)
+                    if isinstance(entry, dict):
+                        label_val = entry.get("item_name") or entry.get("item") or entry.get("name") or entry.get("label") or entry.get("value") or entry.get("text") or entry
+                        slot_name = str(entry.get("slot") or entry.get("slot_name") or slot)
+                    add_need(user_id=uid, display_name=display_name, need_type=need_type, slot_name=slot_name, item_value=label_val, raw=entry)
+
+        if handled_player_shape:
+            continue
+
+        # Form B: Gruppierte Item-Zeile: {item, main:[people], secondary:[people]}
+        item_label = row.get("item_name") or row.get("item") or row.get("name") or row.get("label")
+        if item_label and (row.get("main") is not None or row.get("secondary") is not None or row.get("second") is not None):
+            for need_type, people_val in (("Main", row.get("main") or []), ("Secondary", row.get("secondary") or row.get("second") or [])):
+                for p_idx, p in iter_entries(people_val):
+                    if isinstance(p, dict):
+                        p_uid = _phase3_first_id(p, ["user_id", "discord_id", "member_id", "id"])
+                        p_name = str(p.get("display_name") or p.get("name") or p.get("member_name") or (names.get(_user_id(p_uid), "") if p_uid else ""))
+                        raw = dict(p)
+                    else:
+                        p_uid = ""
+                        p_name = str(p)
+                        raw = {"display_name": p_name}
+                    add_need(user_id=p_uid, display_name=p_name, need_type=need_type, slot_name=str(row.get("slot") or row.get("slot_name") or ""), item_value=item_label, raw=raw | {"item": item_label})
+            continue
+
+        # Form C: Einzelner Need-Datensatz.
+        direct_item = row.get("item_name") or row.get("item") or row.get("name") or row.get("label") or row.get("value")
+        if direct_item:
+            add_need(
+                user_id=uid,
+                display_name=display_name,
+                need_type=str(row.get("need_type") or row.get("type") or row.get("kind") or "Main"),
+                slot_name=str(row.get("slot") or row.get("slot_name") or row_index),
+                item_value=direct_item,
+                raw=row,
+            )
+
+    return out
+
 def _phase3_extract_snapshot_counts(payload: dict[str, Any]) -> dict[str, int]:
     snap = payload.get("snapshot") or {} if isinstance(payload, dict) else {}
     events_raw = (snap.get("events") or {}) if isinstance(snap, dict) else {}
@@ -10482,11 +10605,10 @@ def _phase3_extract_snapshot_counts(payload: dict[str, Any]) -> dict[str, int]:
     balances = ec_raw.get("balances") or {} if isinstance(ec_raw, dict) else {}
     transactions = ec_raw.get("transactions") or ec_raw.get("history") or [] if isinstance(ec_raw, dict) else []
     loot_raw = snap.get("loot") or {} if isinstance(snap, dict) else {}
-    needs = []
+    need_entries = _phase3_need_entry_rows_from_snapshot(snap)
     auctions = []
     history = []
     if isinstance(loot_raw, dict):
-        needs = loot_raw.get("needs") or loot_raw.get("needlist") or loot_raw.get("needlists") or []
         auctions = loot_raw.get("auctions") or loot_raw.get("items") or []
         history = loot_raw.get("history") or loot_raw.get("loot_history") or loot_raw.get("transactions") or []
     abs_raw = snap.get("absences") or snap.get("absence") or {} if isinstance(snap, dict) else {}
@@ -10495,7 +10617,7 @@ def _phase3_extract_snapshot_counts(payload: dict[str, Any]) -> dict[str, int]:
         "members": len(_phase3_list(members)),
         "ec_balances": len(balances) if isinstance(balances, dict) else len(_phase3_list(balances)),
         "ec_transactions": len(_phase3_list(transactions)),
-        "needs": len(_phase3_list(needs)),
+        "needs": len(need_entries),
         "events": len(_phase3_list(events)),
         "auctions": len(_phase3_list(auctions)),
         "loot_history": len(_phase3_list(history)),
@@ -10630,22 +10752,22 @@ def _phase3_mirror_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
 
             # Loot needs, auctions, bids, history
             loot_raw = (snap.get("loot") or {}) if isinstance(snap, dict) else {}
-            needs = []
+            need_entries = _phase3_need_entry_rows_from_snapshot(snap)
             auctions = []
             history = []
             if isinstance(loot_raw, dict):
-                needs = loot_raw.get("needs") or loot_raw.get("needlist") or loot_raw.get("needlists") or []
                 auctions = loot_raw.get("auctions") or loot_raw.get("items") or []
                 history = loot_raw.get("history") or loot_raw.get("loot_history") or loot_raw.get("transactions") or []
-            for raw in _phase3_list(needs):
+            cur.execute("DELETE FROM phase3_loot_needs WHERE guild_id=%s AND source='snapshot'", (guild_id,))
+            for raw in need_entries:
                 if not isinstance(raw, dict):
                     continue
-                need_id = _phase3_first_id(raw, ["need_id", "id"]) or _phase3_hash_id("need", raw)
-                user_id = _phase3_first_id(raw, ["user_id", "discord_id", "member_id"])
-                item_name = _phase3_str(raw.get("item_name") or raw.get("item") or raw.get("name"))
-                need_type = _phase3_str(raw.get("need_type") or raw.get("type") or raw.get("kind"))
-                slot = _phase3_str(raw.get("slot") or raw.get("slot_name"))
-                status = _phase3_str(raw.get("status") or raw.get("state"))
+                need_id = _phase3_str(raw.get("need_id")) or _phase3_hash_id("need", raw)
+                user_id = _phase3_str(raw.get("user_id"))
+                item_name = _phase3_str(raw.get("item_name"))
+                need_type = _phase3_str(raw.get("need_type"))
+                slot = _phase3_str(raw.get("slot_name"))
+                status = _phase3_str(raw.get("status") or "open")
                 cur.execute("""
                     INSERT INTO phase3_loot_needs (guild_id, need_id, user_id, item_name, need_type, slot_name, status, raw_json, source, updated_at)
                     VALUES (%s,%s,%s,%s,%s,%s,%s,%s,'snapshot',now())
@@ -10658,7 +10780,7 @@ def _phase3_mirror_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
                       raw_json=EXCLUDED.raw_json,
                       source='snapshot',
                       updated_at=now()
-                """, (guild_id, need_id, user_id, item_name, need_type, slot, status, _phase3_jsonb(raw)))
+                """, (guild_id, need_id, user_id, item_name, need_type, slot, status, _phase3_jsonb(raw.get("raw_json") or raw)))
                 counts["needs"] += 1
             for raw in _phase3_list(auctions):
                 if not isinstance(raw, dict):
@@ -10886,7 +11008,7 @@ def _render_phase3_loot_panel(payload: dict[str, Any]) -> str:
     info = _phase3_loot_status_payload(payload)
     pairs = info.get("pairs") or {}
     rows = [
-        ["Needlisten", pairs.get("needs", (0, 0))[0], pairs.get("needs", (0, 0))[1], "ℹ️ Postgres prüfen"],
+        ["Need-Einträge", pairs.get("needs", (0, 0))[0], pairs.get("needs", (0, 0))[1], "ℹ️ Postgres prüfen"],
         ["Auktionen", pairs.get("auctions", (0, 0))[0], pairs.get("auctions", (0, 0))[1], "ℹ️ Postgres prüfen"],
         ["Gebote", "—", pairs.get("bids", ("—", 0))[1], "DB-Prüftabelle"],
         ["Loot-Historie", pairs.get("history", (0, 0))[0], pairs.get("history", (0, 0))[1], "ℹ️ Postgres prüfen"],
@@ -10924,7 +11046,7 @@ def _render_phase3_database_page(payload: dict[str, Any]) -> str:
         ["EC-Konten", snap_counts.get("ec_balances", 0), db_status.get("counts", {}).get("phase3_ec_balances", 0)],
         ["EC-Verlauf", snap_counts.get("ec_transactions", 0), db_status.get("counts", {}).get("phase3_ec_transactions", 0)],
         ["EC-Eventchecks", "—", db_status.get("counts", {}).get("phase3_ec_event_checks", 0)],
-        ["Needlisten", snap_counts.get("needs", 0), db_status.get("counts", {}).get("phase3_loot_needs", 0)],
+        ["Need-Einträge", snap_counts.get("needs", 0), db_status.get("counts", {}).get("phase3_loot_needs", 0)],
         ["Events", snap_counts.get("events", 0), db_status.get("counts", {}).get("phase3_events", 0)],
         ["Auktionen", snap_counts.get("auctions", 0), db_status.get("counts", {}).get("phase3_loot_auctions", 0)],
         ["Loot-Historie", snap_counts.get("loot_history", 0), db_status.get("counts", {}).get("phase3_loot_history", 0)],
@@ -10952,7 +11074,7 @@ def _render_phase3_database_page(payload: dict[str, Any]) -> str:
     <section class='panel'><h2>4-Schritte-Plan</h2><div class='grid'>
       <div class='card'><b>1 · Grundlage</b><p>Tabellen erstellen, Snapshot sicher spiegeln, Vergleich anzeigen.</p></div>
       <div class='card'><b>2 · EC/DKP</b><p>EC-Konten, Transaktionen, Event-Checks parallel schreiben und danach DB als Hauptquelle nutzen.</p></div>
-      <div class='card'><b>3 · Loot/Needs</b><p>Needlisten, Auktionen, Gebote und Loot-Historie nach Postgres ziehen.</p></div>
+      <div class='card'><b>3 · Loot/Needs</b><p>Need-Einträge, Auktionen, Gebote und Loot-Historie nach Postgres ziehen.</p></div>
       <div class='card'><b>4 · Events/Profile/Abwesenheit</b><p>Restliche Live-Daten migrieren. JSON bleibt Backup/Export.</p></div>
     </div></section>
     {_render_phase3_ec_panel(payload)}
