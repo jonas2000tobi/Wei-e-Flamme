@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import re
 import asyncio
+import os
+import secrets
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, Any
@@ -1783,6 +1785,268 @@ def _event_matches_auto(obj: dict) -> bool:
     return any(str(k).lower() in title for k in keywords)
 
 
+# ---------------------------------------------------------------------------
+# Dashboard Need-Änderungsqueue
+# ---------------------------------------------------------------------------
+
+def _dash_database_url() -> str:
+    return str(os.getenv("DATABASE_URL") or "").strip()
+
+
+def _dash_normalized_database_url() -> str:
+    url = _dash_database_url()
+    if url.startswith("postgres://"):
+        return "postgresql://" + url[len("postgres://"):]
+    return url
+
+
+def _dash_pg_connect():
+    import psycopg  # type: ignore
+    from psycopg.rows import dict_row  # type: ignore
+    return psycopg.connect(_dash_normalized_database_url(), row_factory=dict_row, connect_timeout=10)
+
+
+def _dash_need_queue_available() -> bool:
+    return bool(_dash_database_url())
+
+
+def _ensure_dashboard_need_queue_table() -> None:
+    if not _dash_need_queue_available():
+        return
+    conn = _dash_pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS dashboard_need_change_requests (
+                    id BIGSERIAL PRIMARY KEY,
+                    request_id TEXT NOT NULL UNIQUE,
+                    guild_id BIGINT NOT NULL,
+                    target_user_id BIGINT NOT NULL,
+                    action_type TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    payload_json TEXT NOT NULL DEFAULT '{}',
+                    actor_id TEXT,
+                    actor_name TEXT,
+                    requested_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    claimed_at TIMESTAMPTZ,
+                    processed_at TIMESTAMPTZ,
+                    result_json TEXT
+                )
+                """
+            )
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_dashboard_need_change_requests_lookup
+                ON dashboard_need_change_requests (guild_id, target_user_id, status, requested_at DESC)
+                """
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _claim_dashboard_need_requests(limit: int = 5) -> list[dict]:
+    if not _dash_need_queue_available():
+        return []
+    _ensure_dashboard_need_queue_table()
+    conn = _dash_pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE dashboard_need_change_requests
+                SET status = 'processing', claimed_at = NOW()
+                WHERE id IN (
+                    SELECT id FROM dashboard_need_change_requests
+                    WHERE status = 'pending'
+                    ORDER BY requested_at ASC, id ASC
+                    LIMIT %s
+                    FOR UPDATE SKIP LOCKED
+                )
+                RETURNING id, request_id, guild_id, target_user_id, action_type, status, payload_json,
+                          actor_id, actor_name, requested_at, claimed_at
+                """,
+                (int(limit),),
+            )
+            rows = [dict(r) for r in (cur.fetchall() or [])]
+        conn.commit()
+        return rows
+    finally:
+        conn.close()
+
+
+def _finish_dashboard_need_request(request_id: str, status: str, result: dict) -> None:
+    if not _dash_need_queue_available():
+        return
+    conn = _dash_pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE dashboard_need_change_requests
+                SET status = %s, processed_at = NOW(), result_json = %s
+                WHERE request_id = %s AND status = 'processing'
+                """,
+                (str(status), json.dumps(result, ensure_ascii=False), str(request_id)),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _dashboard_need_queue_status(limit: int = 10) -> dict:
+    if not _dash_need_queue_available():
+        return {"ok": False, "error": "DATABASE_URL fehlt."}
+    _ensure_dashboard_need_queue_table()
+    conn = _dash_pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT status, COUNT(*) AS c FROM dashboard_need_change_requests GROUP BY status")
+            counts = {str(r["status"]): int(r["c"] or 0) for r in (cur.fetchall() or [])}
+            cur.execute(
+                """
+                SELECT request_id, guild_id, target_user_id, action_type, status, actor_name, requested_at, result_json
+                FROM dashboard_need_change_requests
+                ORDER BY requested_at DESC, id DESC
+                LIMIT %s
+                """,
+                (int(limit),),
+            )
+            rows = [dict(r) for r in (cur.fetchall() or [])]
+        return {"ok": True, "counts": counts, "items": rows}
+    finally:
+        conn.close()
+
+
+def _is_leader_or_admin_member(guild: discord.Guild, user_id: int) -> bool:
+    member = guild.get_member(int(user_id or 0))
+    if not member:
+        return False
+    perms = getattr(member, "guild_permissions", None)
+    if perms and (perms.administrator or perms.manage_guild):
+        return True
+    leader_cfg = _load_leader_cfg()
+    c = leader_cfg.get(str(guild.id)) or {}
+    role_id = int(c.get("leader_role_id", 0) or 0)
+    if role_id:
+        role = guild.get_role(role_id)
+        if role and role in member.roles:
+            return True
+    return False
+
+
+def _find_item_for_dashboard_need(guild_id: int, need_slot: str, text: str) -> tuple[str, str]:
+    raw = str(text or "").strip()
+    if not raw:
+        return "", "Item fehlt."
+    items = _all_items(guild_id)
+    if raw in items:
+        return raw, ""
+    target_slug = _slug(raw)
+    valid = _items_for_need_slot(guild_id, need_slot)
+    exact = []
+    contains = []
+    for item in valid:
+        iid = str(item.get("id") or "")
+        name = str(item.get("name") or iid)
+        if _slug(name) == target_slug or iid.lower() == raw.lower():
+            exact.append(iid)
+        elif target_slug and target_slug in _slug(name):
+            contains.append(iid)
+    matches = exact or contains
+    if len(matches) == 1:
+        return matches[0], ""
+    if not matches:
+        return "", f"Kein passendes Item im Katalog für Slot {need_slot}: {raw}"
+    names = ", ".join(_item_name(guild_id, mid, with_type=True) for mid in matches[:8])
+    return "", f"Mehrere passende Items gefunden: {names}. Bitte genauer eingeben."
+
+
+def _process_dashboard_need_request(row: dict) -> tuple[str, dict]:
+    request_id = str(row.get("request_id") or "")
+    guild_id = int(row.get("guild_id") or 0)
+    target_user_id = int(row.get("target_user_id") or 0)
+    action = str(row.get("action_type") or "set").strip().lower()
+    try:
+        payload = json.loads(row.get("payload_json") or "{}")
+        if not isinstance(payload, dict):
+            payload = {}
+    except Exception:
+        payload = {}
+    guild = _client_ref.get_guild(guild_id) if _client_ref else None
+    if not guild:
+        return "failed", {"ok": False, "error": f"Guild {guild_id} nicht gefunden."}
+    actor_id = int(str(row.get("actor_id") or payload.get("actor_id") or 0).replace("basic-admin", "0") or 0)
+    is_self = bool(actor_id and actor_id == target_user_id)
+    is_admin = bool(actor_id and _is_leader_or_admin_member(guild, actor_id))
+    basic_admin = str(row.get("actor_id") or "") == "basic-admin"
+    if not (is_self or is_admin or basic_admin):
+        return "rejected", {"ok": False, "error": "Nur eigene Needs oder Leitung/Admin dürfen diese Needliste ändern."}
+    tab = _normalize_tab(str(payload.get("tab") or "Main")) or "Main"
+    slot = _normalize_need_slot(str(payload.get("slot") or ""))
+    if tab not in TABS or slot not in NEED_SLOTS:
+        return "rejected", {"ok": False, "error": "Ungültiger Bereich oder Slot."}
+    data = _user_needs(guild_id, target_user_id)
+    old_slot = _slot_obj((data.get(tab) or {}).get(slot))
+    old_item_id = str(old_slot.get("item_id") or "")
+    old_name = _item_name(guild_id, old_item_id, with_type=True) if old_item_id else "—"
+    if bool(old_slot.get("received", False)) and not (is_admin or basic_admin):
+        return "rejected", {"ok": False, "error": "Dieser Slot ist als erhalten gesperrt. Nur die Leitung kann ihn ändern."}
+    if action == "clear":
+        _clear_slot_item(data, tab, slot)
+        save_needs()
+        return "done", {"ok": True, "message": f"{tab} – {slot} entfernt.", "old_item": old_name, "new_item": "—"}
+    if action == "set":
+        item_text = str(payload.get("item_id") or payload.get("item_text") or payload.get("item_name") or "").strip()
+        item_id, err = _find_item_for_dashboard_need(guild_id, slot, item_text)
+        if err:
+            return "rejected", {"ok": False, "error": err}
+        _set_slot_item(data, tab, slot, item_id)
+        save_needs()
+        new_name = _item_name(guild_id, item_id, with_type=True)
+        return "done", {"ok": True, "message": f"{tab} – {slot}: {new_name} gespeichert.", "old_item": old_name, "new_item": new_name, "item_id": item_id}
+    return "rejected", {"ok": False, "error": f"Unbekannte Aktion: {action}"}
+
+
+async def _run_dashboard_need_queue_once(limit: int = 5) -> dict:
+    rows = _claim_dashboard_need_requests(limit=limit)
+    done = failed = rejected = 0
+    errors = []
+    for row in rows:
+        request_id = str(row.get("request_id") or "")
+        try:
+            status, result = _process_dashboard_need_request(row)
+            _finish_dashboard_need_request(request_id, status, result)
+            if status == "done":
+                done += 1
+            elif status == "rejected":
+                rejected += 1
+            else:
+                failed += 1
+                if result.get("error"):
+                    errors.append(str(result.get("error")))
+        except Exception as exc:
+            failed += 1
+            err = f"{type(exc).__name__}: {exc}"
+            errors.append(err)
+            try:
+                _finish_dashboard_need_request(request_id, "failed", {"ok": False, "error": err})
+            except Exception:
+                pass
+    return {"claimed": len(rows), "done": done, "failed": failed, "rejected": rejected, "errors": errors[:5]}
+
+
+@tasks.loop(minutes=1)
+async def dashboard_need_change_queue_loop():
+    if _client_ref is None or not _dash_need_queue_available():
+        return
+    try:
+        await _run_dashboard_need_queue_once(limit=5)
+    except Exception as e:
+        print(f"[loot_needs] Dashboard-Need-Queue Fehler: {e!r}")
+
+
 @tasks.loop(minutes=1)
 async def auto_loot_need_eventstart():
     if _client_ref is None:
@@ -1847,6 +2111,48 @@ async def setup_loot_needs(client: discord.Client, tree: app_commands.CommandTre
     if not auto_loot_need_eventstart.is_running():
         auto_loot_need_eventstart.start()
         print("🎁 Loot-Need Auto-Task gestartet.")
+
+    if not dashboard_need_change_queue_loop.is_running():
+        dashboard_need_change_queue_loop.start()
+        print("🎁 Dashboard-Need-Queue gestartet.")
+
+    @tree.command(name="loot_dashboard_needs_status", description="(Leader) Dashboard-Need-Queue Status anzeigen")
+    async def loot_dashboard_needs_status(inter: discord.Interaction):
+        if inter.guild is None:
+            await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
+            return
+        if not _is_leader_or_admin(inter):
+            await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
+            return
+        data = _dashboard_need_queue_status(limit=8)
+        if not data.get("ok"):
+            await inter.response.send_message(f"❌ {data.get('error')}", ephemeral=True)
+            return
+        counts = data.get("counts") or {}
+        lines = ["**Dashboard-Need-Queue**", ""]
+        for key in ["pending", "processing", "done", "rejected", "failed", "cancelled"]:
+            lines.append(f"• {key}: **{counts.get(key, 0)}**")
+        lines.append("")
+        for r in data.get("items") or []:
+            lines.append(f"`{r.get('status')}` {r.get('action_type')} → <@{r.get('target_user_id')}> · {r.get('request_id')}")
+        await inter.response.send_message("\n".join(lines)[:1900], ephemeral=True)
+
+    @tree.command(name="loot_dashboard_needs_run", description="(Leader) Dashboard-Need-Queue sofort verarbeiten")
+    async def loot_dashboard_needs_run(inter: discord.Interaction):
+        if inter.guild is None:
+            await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
+            return
+        if not _is_leader_or_admin(inter):
+            await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
+            return
+        await inter.response.defer(ephemeral=True)
+        result = await _run_dashboard_need_queue_once(limit=20)
+        await inter.followup.send(
+            f"✅ Need-Queue verarbeitet\n"
+            f"Beansprucht: **{result['claimed']}**\n"
+            f"Erledigt: **{result['done']}** · Blockiert: **{result['rejected']}** · Fehler: **{result['failed']}**",
+            ephemeral=True,
+        )
 
     @tree.command(name="loot_set_leader_channel", description="(Leader) Kanal für automatische Loot-/Need-Übersichten setzen")
     async def loot_set_leader_channel(inter: discord.Interaction):
