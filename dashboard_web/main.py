@@ -5617,11 +5617,24 @@ def _current_dkp_settings_from_snapshot(snap: dict[str, Any]) -> dict[str, Any]:
         "Übungsrun Trials": 15,
         "Segensstein PvP": 5,
     }
+    rows = ((snap.get("settings") or {}).get("settings") or [])
+    def _find_any(names: list[str], default: Any = "") -> Any:
+        wanted = [str(n).lower() for n in names]
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            key = str(row.get("key") or "").lower()
+            src = str(row.get("source") or "").lower()
+            for n in wanted:
+                if key == n or key.endswith("." + n) or n in key or n in src:
+                    return row.get("value")
+        return default
+
     points: dict[str, Any] = {}
     for et in event_types:
         found = None
         needle = "event_points." + et.lower()
-        for row in ((snap.get("settings") or {}).get("settings") or []):
+        for row in rows:
             if not isinstance(row, dict):
                 continue
             key = str(row.get("key") or "").lower()
@@ -5630,14 +5643,27 @@ def _current_dkp_settings_from_snapshot(snap: dict[str, Any]) -> dict[str, Any]:
                 found = row.get("value")
                 break
         points[et] = found if found is not None else default_points.get(et, 0)
+
+    settings = snap.get("settings") or {}
+    guild = snap.get("guild") or {}
+    member_filter = settings.get("member_filter") or guild.get("member_filter") or {}
+    auth = snap.get("auth") or {}
+    member_role = auth.get("member_role") if isinstance(auth.get("member_role"), dict) else {}
+    admin_role = auth.get("admin_role") if isinstance(auth.get("admin_role"), dict) else {}
+
     return {
         "event_types": event_types,
         "event_points": points,
         "weekly_event_limit": _snapshot_setting_value(snap, "weekly_event_limit", 40),
         "decay_percent": _snapshot_setting_value(snap, "decay_percent", 15),
         "decay_protected_balance": _snapshot_setting_value(snap, "decay_protected_balance", 50),
+        "log_channel_id": _snapshot_setting_value(snap, "log_channel_id", _find_any(["log_channel_id"], "")),
+        "leader_role_id": _find_any(["leader_role_id", "admin_role_id"], (admin_role or {}).get("role_id") or ""),
+        "member_role_id": str((member_filter or {}).get("role_id") or (member_role or {}).get("role_id") or _find_any(["member_role_id"], "")),
+        "dashboard_admin_role_ids": ",".join(sorted(_admin_role_ids())) or _find_any(["dashboard_admin_role_ids"], ""),
+        "dashboard_allowed_role_ids": ",".join(sorted(_allowed_role_ids())) or _find_any(["dashboard_allowed_role_ids"], ""),
+        "auth_snapshot": auth,
     }
-
 
 def _enqueue_settings_change_request(guild_id: int, action_type: str, payload: dict[str, Any], actor: dict[str, Any]) -> dict[str, Any]:
     if not _database_url():
@@ -5645,9 +5671,29 @@ def _enqueue_settings_change_request(guild_id: int, action_type: str, payload: d
     if not guild_id:
         return {"ok": False, "error": "Guild-ID fehlt."}
     action = str(action_type or "").strip().lower()
-    if action not in {"set_event_points", "set_weekly_limit", "set_decay"}:
+    allowed_actions = {"set_event_points", "set_weekly_limit", "set_decay", "set_roles", "set_access_roles"}
+    if action not in allowed_actions:
         return {"ok": False, "error": "Unbekannte Einstellungsaktion."}
     clean_payload = dict(payload or {})
+
+    def _clean_id(value: Any, field: str, allow_empty: bool = True) -> str:
+        raw = str(value or "").strip().replace(" ", "")
+        if raw in {"", "0", "—", "-"}:
+            return "0" if allow_empty else ""
+        if not raw.isdigit() or len(raw) < 10 or len(raw) > 25:
+            raise ValueError(f"{field} muss eine Discord-ID sein.")
+        return raw
+
+    def _clean_id_list(value: Any, field: str) -> str:
+        parts = [p.strip() for p in str(value or "").replace(";", ",").split(",") if p.strip()]
+        out = []
+        for p in parts:
+            if not p.isdigit() or len(p) < 10 or len(p) > 25:
+                raise ValueError(f"{field} enthält eine ungültige Discord-ID: {p}")
+            if p not in out:
+                out.append(p)
+        return ",".join(out)
+
     # Dashboard-Vorprüfung. Der Bot prüft später final nochmal.
     try:
         if action == "set_event_points":
@@ -5671,8 +5717,21 @@ def _enqueue_settings_change_request(guild_id: int, action_type: str, payload: d
             if protected < 0 or protected > 100000:
                 return {"ok": False, "error": "Schutzbetrag ist unplausibel."}
             clean_payload = {"decay_percent": percent, "decay_protected_balance": protected}
+        elif action == "set_roles":
+            clean_payload = {
+                "leader_role_id": _clean_id(clean_payload.get("leader_role_id"), "Leitungsrolle"),
+                "member_role_id": _clean_id(clean_payload.get("member_role_id"), "Gildenrolle"),
+                "log_channel_id": _clean_id(clean_payload.get("log_channel_id"), "EC-/Loot-Logkanal"),
+            }
+        elif action == "set_access_roles":
+            clean_payload = {
+                "dashboard_admin_role_ids": _clean_id_list(clean_payload.get("dashboard_admin_role_ids"), "Dashboard-Adminrollen"),
+                "dashboard_allowed_role_ids": _clean_id_list(clean_payload.get("dashboard_allowed_role_ids"), "Dashboard-Zugriffsrollen"),
+            }
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
     except Exception:
-        return {"ok": False, "error": "Ungültige Zahl in der Änderung."}
+        return {"ok": False, "error": "Ungültige Zahl oder Discord-ID in der Änderung."}
 
     actor_id = str(actor.get("user_id") or "").strip()
     actor_name = str(actor.get("username") or actor_id or "Dashboard")
@@ -5690,7 +5749,7 @@ def _enqueue_settings_change_request(guild_id: int, action_type: str, payload: d
                 """
                 INSERT INTO dashboard_settings_change_requests
                     (request_id, guild_id, scope, action_type, status, payload_json, actor_id, actor_name, requested_at)
-                VALUES (%s, %s, 'dkp', %s, 'pending', %s, %s, %s, NOW())
+                VALUES (%s, %s, 'settings', %s, 'pending', %s, %s, %s, NOW())
                 RETURNING id, request_id, status
                 """,
                 (request_id, int(guild_id), action, json.dumps(clean_payload, ensure_ascii=False, separators=(",", ":")), actor_id, actor_name),
@@ -5699,16 +5758,70 @@ def _enqueue_settings_change_request(guild_id: int, action_type: str, payload: d
             cur.execute(
                 """
                 INSERT INTO dashboard_admin_action_log
-                    (guild_id, action_type, target_type, target_id, actor_id, actor_name, payload_json)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    (guild_id, actor_id, actor_name, action, target_type, target_id, before_json, after_json, created_at)
+                VALUES (%s, %s, %s, %s, 'settings', %s, '{}', %s, NOW())
                 """,
-                (int(guild_id), f"settings_change_{action}", "settings", "dkp_cfg", actor_id, actor_name, json.dumps(clean_payload, ensure_ascii=False)),
+                (int(guild_id), actor_id, actor_name, f"settings_change_{action}", request_id, json.dumps(clean_payload, ensure_ascii=False)),
             )
         conn.commit()
-        return {"ok": True, "request": row, "request_id": request_id}
+        row["ok"] = True
+        return row
     finally:
         conn.close()
 
+
+def _settings_request_admin_action(guild_id: int, request_id: str, action: str, actor: dict[str, Any]) -> dict[str, Any]:
+    if not _database_url():
+        return {"ok": False, "error": "DATABASE_URL fehlt."}
+    if not guild_id:
+        return {"ok": False, "error": "Guild-ID fehlt."}
+    request_id = str(request_id or "").strip()
+    action = str(action or "").strip().lower()
+    if not request_id:
+        return {"ok": False, "error": "Request-ID fehlt."}
+    if action not in {"cancel", "retry"}:
+        return {"ok": False, "error": "Unbekannte Queue-Aktion."}
+    actor_id = str(actor.get("user_id") or "").strip()
+    actor_name = str(actor.get("username") or actor_id or "Dashboard")
+    _ensure_admin_tables()
+    conn = _pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT status, action_type, payload_json FROM dashboard_settings_change_requests WHERE guild_id=%s AND request_id=%s", (int(guild_id), request_id))
+            old = dict(cur.fetchone() or {})
+            if not old:
+                return {"ok": False, "error": "Änderungsantrag nicht gefunden."}
+            status = str(old.get("status") or "").lower()
+            if action == "cancel":
+                if status not in {"pending"}:
+                    return {"ok": False, "error": f"Nur offene Anträge können abgebrochen werden. Aktuell: {status}"}
+                cur.execute("""
+                    UPDATE dashboard_settings_change_requests
+                    SET status='cancelled', processed_at=NOW(), result_json=%s
+                    WHERE guild_id=%s AND request_id=%s AND status='pending'
+                """, (json.dumps({"ok": True, "message": "Vom Dashboard abgebrochen", "actor": actor_name}, ensure_ascii=False), int(guild_id), request_id))
+                new_status = "cancelled"
+            else:
+                if status not in {"failed", "rejected", "cancelled"}:
+                    return {"ok": False, "error": f"Nur fehlgeschlagene/blockierte/abgebrochene Anträge können neu geöffnet werden. Aktuell: {status}"}
+                cur.execute("""
+                    UPDATE dashboard_settings_change_requests
+                    SET status='pending', claimed_at=NULL, processed_at=NULL, result_json=NULL
+                    WHERE guild_id=%s AND request_id=%s AND status IN ('failed','rejected','cancelled')
+                """, (int(guild_id), request_id))
+                new_status = "pending"
+            cur.execute(
+                """
+                INSERT INTO dashboard_admin_action_log
+                    (guild_id, actor_id, actor_name, action, target_type, target_id, before_json, after_json, created_at)
+                VALUES (%s, %s, %s, %s, 'settings_request', %s, %s, %s, NOW())
+                """,
+                (int(guild_id), actor_id, actor_name, f"settings_request_{action}", request_id, json.dumps(old, ensure_ascii=False), json.dumps({"status": new_status}, ensure_ascii=False)),
+            )
+        conn.commit()
+        return {"ok": True, "status": new_status}
+    finally:
+        conn.close()
 
 def _render_admin_settings_editor(data: dict[str, Any], msg: str = "") -> str:
     if not data.get("ok"):
@@ -5716,14 +5829,15 @@ def _render_admin_settings_editor(data: dict[str, Any], msg: str = "") -> str:
     snap: dict[str, Any] = data.get("snapshot") or {}
     guild_id = _safe_guild_id(data)
     cfg = _current_dkp_settings_from_snapshot(snap)
-    requests = _settings_change_requests_for_dashboard(guild_id, 80) if guild_id else []
+    requests = _settings_change_requests_for_dashboard(guild_id, 100) if guild_id else []
     counts = _queue_status_counts(requests)
     cards = "".join([
         _card("Offen", counts.get("pending", 0), "wartet auf Bot"),
         _card("In Arbeit", counts.get("processing", 0), "Bot verarbeitet"),
         _card("Erledigt", counts.get("done", 0), "übernommen"),
-        _card("Fehler", counts.get("failed", 0) + counts.get("rejected", 0), "failed/rejected"),
+        _card("Problem", counts.get("failed", 0) + counts.get("rejected", 0) + counts.get("cancelled", 0), "failed/rejected/cancelled"),
     ])
+
     point_rows = []
     for et in cfg.get("event_types") or []:
         val = (cfg.get("event_points") or {}).get(et, "")
@@ -5736,22 +5850,34 @@ def _render_admin_settings_editor(data: dict[str, Any], msg: str = "") -> str:
         </form>
         """
         point_rows.append([et, val, _raw(form)])
+
     req_rows = []
     for r in requests:
         payload = r.get("payload") if isinstance(r.get("payload"), dict) else {}
         result = r.get("result") if isinstance(r.get("result"), dict) else {}
-        detail = result.get("message") or result.get("error") or payload.get("event_type") or payload.get("weekly_event_limit") or payload.get("decay_percent") or r.get("request_id")
-        req_rows.append([_dt(r.get("requested_at")), _ec_award_status_label(r.get("status")).replace("EC", ""), r.get("action_type"), _short(detail, 160), r.get("actor_name") or r.get("actor_id") or "—"])
+        detail = result.get("message") or result.get("error") or payload.get("event_type") or payload.get("weekly_event_limit") or payload.get("decay_percent") or payload.get("leader_role_id") or payload.get("member_role_id") or r.get("request_id")
+        rid = _e(r.get("request_id") or "")
+        status = str(r.get("status") or "").lower()
+        actions = []
+        if status == "pending":
+            actions.append(f"<form method='post' action='/admin/settings-request/{rid}/cancel' style='display:inline'><button class='btn compact danger' type='submit' onclick=\"return confirm('Offenen Antrag abbrechen?')\">abbrechen</button></form>")
+        if status in {"failed", "rejected", "cancelled"}:
+            actions.append(f"<form method='post' action='/admin/settings-request/{rid}/retry' style='display:inline'><button class='btn compact' type='submit'>neu öffnen</button></form>")
+        req_rows.append([_dt(r.get("requested_at")), _ec_award_status_label(r.get("status")).replace("EC", ""), r.get("action_type"), _short(detail, 180), r.get("actor_name") or r.get("actor_id") or "—", _raw(" ".join(actions) or "—")])
+
     msg_panel = f"<section class='panel'><p>{_e(msg)}</p></section>" if msg else ""
+    role_hint = "Dashboard-Adminrollen brauchen zusätzlich einen frischen Snapshot und erneuten Login. Falls eure aktuelle Snapshot-Logik diese Rolle nicht exportiert, bleibt Railway-ENV weiterhin maßgeblich."
     body = f"""
     <nav class="topnav"><a href="/admin">← Admin</a><a href="/settings">Setup</a><a href="/ec">EC-Verlauf</a><a href="/api/admin-settings">API</a></nav>
     <section class="hero">
-      <div><div class="eyebrow">Admin · Änderbar über Bot-Queue</div><h1>⚙️ EC-Regeln bearbeiten</h1><p class="muted">Das Dashboard legt nur Änderungsanträge an. Der Bot übernimmt sie in dkp_cfg.json und schreibt das Ergebnis zurück.</p></div>
+      <div><div class="eyebrow">Admin · Änderbar über Bot-Queue</div><h1>⚙️ Admin-Einstellungen</h1><p class="muted">Das Dashboard legt nur Änderungsanträge an. Der Bot übernimmt sie und schreibt das Ergebnis zurück.</p></div>
       <a class="btn" href="/admin">Admin-Zentrale</a>
     </section>
     {msg_panel}
     <section class="grid">{cards}</section>
+
     <section class="panel"><h2>🪙 EC-Werte pro Eventtyp</h2><p class="muted">Änderungen gelten erst, wenn der Bot den Antrag verarbeitet hat.</p>{_table(['Eventtyp','Aktuell','Ändern'], point_rows, placeholder='Eventtyp suchen…')}</section>
+
     <section class="split">
       <section class="panel"><h2>📅 Wochenlimit</h2><p class="muted">Aktuell: <strong>{_e(cfg.get('weekly_event_limit'))} EC</strong> aus Event-Buchungen pro Woche.</p>
         <form method="post" action="/admin/settings-change" style="display:grid; gap:10px; max-width:520px;">
@@ -5769,11 +5895,30 @@ def _render_admin_settings_editor(data: dict[str, Any], msg: str = "") -> str:
         </form>
       </section>
     </section>
-    <section class="panel"><h2>🧾 Änderungsqueue</h2>{_table(['Zeit','Status','Aktion','Details','Akteur'], req_rows, placeholder='Änderungen durchsuchen…')}</section>
-    <section class="panel"><h2>🔒 Nicht direkt änderbar</h2><p class="muted">Dashboard-Rollen, OAuth, Secret und Railway-Variablen bleiben absichtlich außerhalb dieser Seite. Das sind Deploy-/Security-Einstellungen und werden nicht aus dem Dashboard heraus überschrieben.</p></section>
+
+    <section class="split">
+      <section class="panel"><h2>🛡️ Rollen & Kanäle</h2><p class="muted">Leitungsrolle, Gildenrolle und EC-/Loot-Logkanal zentral als Bot-Antrag setzen.</p>
+        <form method="post" action="/admin/settings-change" style="display:grid; gap:10px; max-width:620px;">
+          <input type="hidden" name="action_type" value="set_roles">
+          <label>Leitungsrolle / Adminrolle ID<br><input name="leader_role_id" value="{_e(cfg.get('leader_role_id'))}" placeholder="z. B. 123456789012345678"></label>
+          <label>Gildenrolle / Memberrolle ID<br><input name="member_role_id" value="{_e(cfg.get('member_role_id'))}" placeholder="z. B. 123456789012345678"></label>
+          <label>EC-/Loot-Logkanal ID<br><input name="log_channel_id" value="{_e(cfg.get('log_channel_id'))}" placeholder="z. B. 123456789012345678"></label>
+          <button class="btn" type="submit" onclick="return confirm('Rollen/Kanal als Bot-Antrag senden?')">Rollen & Kanal ändern</button>
+        </form>
+      </section>
+      <section class="panel"><h2>🔐 Dashboard-Zugriff</h2><p class="muted">{_e(role_hint)}</p>
+        <form method="post" action="/admin/settings-change" style="display:grid; gap:10px; max-width:620px;">
+          <input type="hidden" name="action_type" value="set_access_roles">
+          <label>Dashboard-Adminrollen IDs, kommagetrennt<br><input name="dashboard_admin_role_ids" value="{_e(cfg.get('dashboard_admin_role_ids'))}" placeholder="ID,ID,ID"></label>
+          <label>Dashboard-Zugriffsrollen IDs, kommagetrennt<br><input name="dashboard_allowed_role_ids" value="{_e(cfg.get('dashboard_allowed_role_ids'))}" placeholder="ID,ID,ID"></label>
+          <button class="btn" type="submit" onclick="return confirm('Dashboard-Zugriffsrollen als Bot-Antrag senden?')">Zugriffsrollen speichern</button>
+        </form>
+      </section>
+    </section>
+
+    <section class="panel"><h2>🧾 Änderungsqueue</h2><p class="muted">Offene Anträge können abgebrochen werden. Fehlgeschlagene/blockierte/abgebrochene Anträge können neu geöffnet werden.</p>{_table(['Zeit','Status','Aktion','Details','Akteur','Aktion'], req_rows, placeholder='Änderungen durchsuchen…')}</section>
     """
     return _html_shell("Admin-Einstellungen · Ebo Dashboard", body)
-
 
 def _dashboard_event_action_requests(guild_id: int, limit: int = 80, event_id: str = "") -> list[dict[str, Any]]:
     if not _database_url() or not guild_id:
@@ -7393,10 +7538,24 @@ async def admin_settings_change(request: Request, _: bool = Depends(_admin_auth)
         clean_payload = {"weekly_event_limit": form.get("weekly_event_limit")}
     elif action == "set_decay":
         clean_payload = {"decay_percent": form.get("decay_percent"), "decay_protected_balance": form.get("decay_protected_balance")}
+    elif action == "set_roles":
+        clean_payload = {"leader_role_id": form.get("leader_role_id"), "member_role_id": form.get("member_role_id"), "log_channel_id": form.get("log_channel_id")}
+    elif action == "set_access_roles":
+        clean_payload = {"dashboard_admin_role_ids": form.get("dashboard_admin_role_ids"), "dashboard_allowed_role_ids": form.get("dashboard_allowed_role_ids")}
     res = _enqueue_settings_change_request(guild_id, action, clean_payload, actor)
     msg = "Einstellungsänderung wurde an den Bot gesendet." if res.get("ok") else f"Fehler: {res.get('error')}"
     return RedirectResponse("/admin-settings?msg=" + urllib.parse.quote(msg), status_code=303)
 
+
+
+@app.post("/admin/settings-request/{request_id}/{queue_action}")
+async def admin_settings_request_action(request: Request, request_id: str, queue_action: str, _: bool = Depends(_admin_auth)):
+    payload = _snapshot_payload()
+    guild_id = _safe_guild_id(payload)
+    actor = _current_user(request) or {"username": "Dashboard"}
+    res = _settings_request_admin_action(guild_id, request_id, queue_action, actor)
+    msg = "Queue-Aktion ausgeführt." if res.get("ok") else f"Fehler: {res.get('error')}"
+    return RedirectResponse("/admin-settings?msg=" + urllib.parse.quote(msg), status_code=303)
 
 @app.get("/audit", response_class=HTMLResponse)
 def audit_page(q: str = "", action: str = "", actor: str = "", _: bool = Depends(_auth)):
