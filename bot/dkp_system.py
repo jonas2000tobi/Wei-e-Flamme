@@ -95,6 +95,35 @@ dkp_balances: dict = _load_json(DKP_BALANCES_FILE, {})
 dkp_transactions: dict = _load_json(DKP_TX_FILE, {})
 dkp_event_checks: dict = _load_json(DKP_CHECK_FILE, {})
 
+# Phase 3.2 Schutz: Postgres-EC darf nur aktive Gildenmitglieder spiegeln.
+# JSON bleibt weiterhin Backup/Fallback und kann historische/alte Accounts enthalten.
+PHASE3_ACTIVE_MEMBER_IDS_BY_GUILD: dict[str, set[str]] = {}
+
+
+def _phase3_active_member_ids(guild_id: int | str) -> set[str]:
+    return set(PHASE3_ACTIVE_MEMBER_IDS_BY_GUILD.get(str(int(guild_id)), set())) if str(guild_id).strip().isdigit() else set()
+
+
+def _phase3_refresh_active_member_cache(client: discord.Client) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    try:
+        for guild in getattr(client, "guilds", []) or []:
+            ids: set[str] = set()
+            for member in getattr(guild, "members", []) or []:
+                try:
+                    if getattr(member, "bot", False):
+                        continue
+                    # Nutzt vorhandene Memberrolle, falls gesetzt. Ohne Memberrolle zählen alle Nicht-Bots im Server.
+                    if _is_ebolus_member(client, int(guild.id), int(member.id)):
+                        ids.add(str(int(member.id)))
+                except Exception:
+                    continue
+            PHASE3_ACTIVE_MEMBER_IDS_BY_GUILD[str(int(guild.id))] = ids
+            counts[str(int(guild.id))] = len(ids)
+    except Exception as e:
+        print(f"[phase3-ec] Member-Cache konnte nicht aktualisiert werden: {e!r}", flush=True)
+    return counts
+
 
 def save_cfg() -> None:
     _save_json(DKP_CFG_FILE, dkp_cfg)
@@ -1586,6 +1615,8 @@ def _phase3_mirror_ec_balances_to_pg() -> dict:
         return {"ok": False, "error": "DATABASE_URL fehlt", "balances": 0}
     _ensure_phase3_ec_schema()
     count = 0
+    skipped = 0
+    pruned = 0
     conn = _dash_pg_connect()
     try:
         with conn.cursor() as cur:
@@ -1593,24 +1624,37 @@ def _phase3_mirror_ec_balances_to_pg() -> dict:
                 users = g.get("users") if isinstance(g, dict) else {}
                 if not isinstance(users, dict):
                     continue
+                active_ids = _phase3_active_member_ids(gid)
                 for uid, bal in list(users.items()):
+                    uid_s = str(uid)
+                    if active_ids and uid_s not in active_ids:
+                        skipped += 1
+                        continue
                     try:
                         balance = int(bal or 0)
                     except Exception:
                         balance = 0
-                    raw = {"balance": balance, "guild_id": str(gid), "user_id": str(uid)}
+                    raw = {"balance": balance, "guild_id": str(gid), "user_id": uid_s, "active_member_scope": bool(active_ids)}
                     cur.execute("""
                         INSERT INTO phase3_ec_balances (guild_id, user_id, balance, raw_json, source, updated_at)
-                        VALUES (%s,%s,%s,%s,'bot_parallel',now())
+                        VALUES (%s,%s,%s,%s,'bot_parallel_active_members',now())
                         ON CONFLICT (guild_id, user_id) DO UPDATE SET
                           balance=EXCLUDED.balance,
                           raw_json=EXCLUDED.raw_json,
-                          source='bot_parallel',
+                          source='bot_parallel_active_members',
                           updated_at=now()
-                    """, (str(gid), str(uid), balance, _phase3_jsonb(raw)))
+                    """, (str(gid), uid_s, balance, _phase3_jsonb(raw)))
                     count += 1
+                # Wichtig: alte/ausgetretene Accounts aus Phase-3-Postgres entfernen.
+                # JSON bleibt Backup/Fallback, aber DB-Phase3 soll nur aktuelle Gildenmitglieder zählen.
+                if active_ids:
+                    cur.execute(
+                        "DELETE FROM phase3_ec_balances WHERE guild_id = %s AND NOT (user_id = ANY(%s::text[]))",
+                        (str(gid), sorted(active_ids)),
+                    )
+                    pruned += int(getattr(cur, "rowcount", 0) or 0)
         conn.commit()
-        return {"ok": True, "balances": count}
+        return {"ok": True, "balances": count, "balances_skipped_inactive": skipped, "balances_pruned_inactive": pruned}
     finally:
         conn.close()
 
@@ -1620,14 +1664,24 @@ def _phase3_mirror_ec_transactions_to_pg() -> dict:
         return {"ok": False, "error": "DATABASE_URL fehlt", "transactions": 0}
     _ensure_phase3_ec_schema()
     count = 0
+    skipped = 0
+    pruned = 0
     conn = _dash_pg_connect()
     try:
         with conn.cursor() as cur:
             for gid, arr in list((dkp_transactions or {}).items()):
                 if not isinstance(arr, list):
                     continue
+                active_ids = _phase3_active_member_ids(gid)
                 for tx in arr:
                     if not isinstance(tx, dict):
+                        continue
+                    uid_s = str(tx.get("user_id") or "").strip()
+                    if active_ids and uid_s not in active_ids:
+                        skipped += 1
+                        continue
+                    if not uid_s:
+                        skipped += 1
                         continue
                     tx_id = str(tx.get("id") or tx.get("transaction_id") or "").strip()
                     if not tx_id:
@@ -1635,7 +1689,7 @@ def _phase3_mirror_ec_transactions_to_pg() -> dict:
                         tx_id = f"tx_{abs(hash(json.dumps(tx, sort_keys=True, ensure_ascii=False, default=str)))}"
                     cur.execute("""
                         INSERT INTO phase3_ec_transactions (guild_id, transaction_id, user_id, amount, reason, event_id, created_at_text, raw_json, source, mirrored_at)
-                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,'bot_parallel',now())
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,'bot_parallel_active_members',now())
                         ON CONFLICT (guild_id, transaction_id) DO UPDATE SET
                           user_id=EXCLUDED.user_id,
                           amount=EXCLUDED.amount,
@@ -1643,12 +1697,12 @@ def _phase3_mirror_ec_transactions_to_pg() -> dict:
                           event_id=EXCLUDED.event_id,
                           created_at_text=EXCLUDED.created_at_text,
                           raw_json=EXCLUDED.raw_json,
-                          source='bot_parallel',
+                          source='bot_parallel_active_members',
                           mirrored_at=now()
                     """, (
                         str(gid),
                         tx_id,
-                        str(tx.get("user_id") or ""),
+                        uid_s,
                         int(tx.get("amount", 0) or 0),
                         str(tx.get("reason") or tx.get("type") or ""),
                         str(tx.get("event_id") or ""),
@@ -1656,8 +1710,16 @@ def _phase3_mirror_ec_transactions_to_pg() -> dict:
                         _phase3_jsonb(tx),
                     ))
                     count += 1
+                # Auch alte Transaktionen aus Phase-3-Postgres entfernen, wenn der User nicht mehr aktuelles Gildenmitglied ist.
+                # JSON bleibt vollständiges Backup.
+                if active_ids:
+                    cur.execute(
+                        "DELETE FROM phase3_ec_transactions WHERE guild_id = %s AND (user_id IS NULL OR user_id = '' OR NOT (user_id = ANY(%s::text[])))",
+                        (str(gid), sorted(active_ids)),
+                    )
+                    pruned += int(getattr(cur, "rowcount", 0) or 0)
         conn.commit()
-        return {"ok": True, "transactions": count}
+        return {"ok": True, "transactions": count, "transactions_skipped_inactive": skipped, "transactions_pruned_inactive": pruned}
     finally:
         conn.close()
 
@@ -1701,7 +1763,7 @@ def _phase3_mirror_ec_event_checks_to_pg() -> dict:
 def _phase3_mirror_all_ec_to_pg() -> dict:
     if not _phase3_ec_enabled():
         return {"ok": False, "error": "DATABASE_URL fehlt oder ist keine Postgres-URL."}
-    counts = {"balances": 0, "transactions": 0, "checks": 0}
+    counts = {"balances": 0, "transactions": 0, "checks": 0, "active_members": sum(len(v) for v in PHASE3_ACTIVE_MEMBER_IDS_BY_GUILD.values())}
     try:
         counts.update(_phase3_mirror_ec_balances_to_pg())
         counts.update(_phase3_mirror_ec_transactions_to_pg())
@@ -1727,16 +1789,29 @@ def _phase3_ec_status(guild_id: int = 0) -> dict:
             for table in ("phase3_ec_balances", "phase3_ec_transactions", "phase3_ec_event_checks"):
                 cur.execute(f"SELECT COUNT(*) AS c FROM {table} {where}", args)
                 out[table] = int((cur.fetchone() or {}).get("c") or 0)
-        json_counts = {"balances": 0, "transactions": 0, "checks": 0}
+        json_counts = {"balances": 0, "transactions": 0, "checks": 0, "active_members": 0, "inactive_balances": 0, "inactive_transactions": 0}
         for gid, g in list((dkp_balances or {}).items()):
             if int(guild_id or 0) and str(gid) != str(int(guild_id)):
                 continue
+            active_ids = _phase3_active_member_ids(gid)
+            json_counts["active_members"] += len(active_ids)
             users = g.get("users") if isinstance(g, dict) else {}
-            json_counts["balances"] += len(users) if isinstance(users, dict) else 0
+            if isinstance(users, dict):
+                if active_ids:
+                    json_counts["balances"] += sum(1 for uid in users.keys() if str(uid) in active_ids)
+                    json_counts["inactive_balances"] += sum(1 for uid in users.keys() if str(uid) not in active_ids)
+                else:
+                    json_counts["balances"] += len(users)
         for gid, arr in list((dkp_transactions or {}).items()):
             if int(guild_id or 0) and str(gid) != str(int(guild_id)):
                 continue
-            json_counts["transactions"] += len(arr) if isinstance(arr, list) else 0
+            active_ids = _phase3_active_member_ids(gid)
+            if isinstance(arr, list):
+                if active_ids:
+                    json_counts["transactions"] += sum(1 for tx in arr if isinstance(tx, dict) and str(tx.get("user_id") or "") in active_ids)
+                    json_counts["inactive_transactions"] += sum(1 for tx in arr if isinstance(tx, dict) and str(tx.get("user_id") or "") not in active_ids)
+                else:
+                    json_counts["transactions"] += len(arr)
         for gid, g in list((dkp_event_checks or {}).items()):
             if int(guild_id or 0) and str(gid) != str(int(guild_id)):
                 continue
@@ -2916,6 +2991,7 @@ async def setup_dkp_system(client: discord.Client, tree: app_commands.CommandTre
             await inter.response.send_message("❌ Keine Berechtigung.", ephemeral=True)
             return
         await inter.response.defer(ephemeral=True)
+        _phase3_refresh_active_member_cache(inter.client)
         info = _phase3_ec_status(inter.guild.id)
         if not info.get("ok"):
             await inter.followup.send(f"❌ Phase-3 EC Status nicht verfügbar: `{info.get('error')}`", ephemeral=True)
@@ -2924,8 +3000,10 @@ async def setup_dkp_system(client: discord.Client, tree: app_commands.CommandTre
         pg = info.get("postgres") or {}
         lines = [
             "🧱 **Phase 3.2 · EC/DKP Postgres**",
-            f"EC-Konten: JSON **{js.get('balances', 0)}** · DB **{pg.get('phase3_ec_balances', 0)}**",
-            f"EC-Verlauf: JSON **{js.get('transactions', 0)}** · DB **{pg.get('phase3_ec_transactions', 0)}**",
+            f"Aktive Gildenmitglieder erkannt: **{js.get('active_members', 0)}**",
+            f"EC-Konten: aktuelle Mitglieder JSON **{js.get('balances', 0)}** · DB **{pg.get('phase3_ec_balances', 0)}**",
+            f"EC-Verlauf: aktuelle Mitglieder JSON **{js.get('transactions', 0)}** · DB **{pg.get('phase3_ec_transactions', 0)}**",
+            f"Ausgefiltert: Konten **{js.get('inactive_balances', 0)}** · Verlauf **{js.get('inactive_transactions', 0)}**",
             f"Eventchecks: JSON **{js.get('checks', 0)}** · DB **{pg.get('phase3_ec_event_checks', 0)}**",
             "",
             "JSON bleibt aktuell Hauptquelle. Postgres ist Parallel-/Prüfschicht.",
@@ -2941,6 +3019,7 @@ async def setup_dkp_system(client: discord.Client, tree: app_commands.CommandTre
             await inter.response.send_message("❌ Keine Berechtigung.", ephemeral=True)
             return
         await inter.response.defer(ephemeral=True, thinking=True)
+        _phase3_refresh_active_member_cache(inter.client)
         res = _phase3_mirror_all_ec_to_pg()
         if not res.get("ok"):
             await inter.followup.send(f"❌ Spiegelung fehlgeschlagen: `{res.get('error')}`", ephemeral=True)
@@ -3013,6 +3092,7 @@ async def setup_dkp_system(client: discord.Client, tree: app_commands.CommandTre
         print("⚙️ Dashboard-Settings-Queue gestartet.")
 
     try:
+        _phase3_refresh_active_member_cache(client)
         res = _phase3_mirror_all_ec_to_pg()
         if res.get("ok"):
             print(f"🧱 Phase 3.2 EC/DKP Startspiegelung: {res.get('counts')}", flush=True)
