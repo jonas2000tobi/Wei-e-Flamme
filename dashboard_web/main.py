@@ -32,7 +32,7 @@ if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 ASSET_VER = "ebo-phase3-database-start"
-DASHBOARD_RELEASE_VERSION = "1.1.4 · Phase 3.4 Events/Profile"
+DASHBOARD_RELEASE_VERSION = "1.1.5 · Phase 3.5 Cutover-Prüfung"
 
 
 def _database_url() -> str:
@@ -11315,7 +11315,7 @@ def _render_phase3_database_page(payload: dict[str, Any]) -> str:
     warn_html = "" if not warnings else "<section class='panel'><h2>Warnungen</h2><ul>" + "".join(f"<li>{_e(w)}</li>" for w in warnings) + "</ul></section>"
     status_text = "✅ Datenbank bereit" if db_status.get("ok") else "⚠️ Datenbank vorbereiten"
     return _html_shell("Phase 3 · Datenbank · Ebo Dashboard", f"""
-    <nav class='topnav'><a href='/'>← Kommando</a><a href='/release'>Release</a><a href='/admin'>Admin</a><a href='/api/database-status'>API</a><a href='/api/database-ec-status'>EC API</a><a href='/api/database-live-status'>Live API</a></nav>
+    <nav class='topnav'><a href='/'>← Kommando</a><a href='/release'>Release</a><a href='/admin'>Admin</a><a href='/database-audit'>Cutover-Prüfung</a><a href='/api/database-status'>API</a><a href='/api/database-ec-status'>EC API</a><a href='/api/database-live-status'>Live API</a></nav>
     <section class='hero'><div><h1>Phase 3 · Daten sauberer machen</h1><p>{_e(status_text)} · JSON bleibt aktuell Hauptquelle. Postgres wird zuerst nur vorbereitet und gespiegelt. Der Dashboard-Snapshot ist nur ein Ausschnitt.</p></div><div class='page-actions'><a class='btn' href='/database/init'>Tabellen vorbereiten</a><a class='btn' href='/database/mirror-snapshot'>Snapshot spiegeln</a></div></section>
     <section class='panel'><h2>4-Schritte-Plan</h2><div class='grid'>
       <div class='card'><b>1 · Grundlage</b><p>Tabellen erstellen, Snapshot sicher spiegeln, Vergleich anzeigen.</p></div>
@@ -11381,3 +11381,243 @@ def database_mirror_snapshot(_: bool = Depends(_auth)):
     else:
         msg = f"Fehler: {res.get('error')}"
     return RedirectResponse("/database?msg=" + urllib.parse.quote(msg), status_code=303)
+
+
+# ---------------------------------------------------------------------------
+# Phase 3.5 - Cutover-/Datenprüfung
+# ---------------------------------------------------------------------------
+
+def _phase3_fetch_rows(cur, sql: str, params: tuple[Any, ...] = (), limit: int = 50) -> list[dict[str, Any]]:
+    cur.execute(sql, params)
+    rows = cur.fetchall() or []
+    return [dict(r) for r in rows[:limit]]
+
+
+def _phase3_count_query(cur, sql: str, params: tuple[Any, ...] = ()) -> int:
+    cur.execute(sql, params)
+    return int((cur.fetchone() or {}).get("c") or 0)
+
+
+def _phase3_audit_payload() -> dict[str, Any]:
+    out: dict[str, Any] = {
+        "ok": False,
+        "ready": False,
+        "warnings": [],
+        "blockers": [],
+        "counts": {},
+        "orphans": {},
+        "samples": {},
+        "notes": [],
+    }
+    if not _database_url():
+        out["blockers"].append("DATABASE_URL fehlt.")
+        return out
+    conn = _pg_connect()
+    try:
+        with conn.cursor() as cur:
+            # Schema sicherstellen, damit die Prüfung nicht an fehlenden Tabellen scheitert.
+            schema = _phase3_ensure_schema()
+            if not schema.get("ok"):
+                out["blockers"].append(f"Tabellen konnten nicht vorbereitet werden: {schema.get('error')}")
+
+            for table in [
+                "phase3_members", "phase3_ec_balances", "phase3_ec_transactions", "phase3_ec_event_checks",
+                "phase3_loot_needs", "phase3_loot_auctions", "phase3_loot_bids", "phase3_loot_history",
+                "phase3_event_rsvps", "phase3_absences", "phase3_need_change_log",
+            ]:
+                cur.execute("SELECT to_regclass(%s) AS reg", (table,))
+                exists = bool((cur.fetchone() or {}).get("reg"))
+                out["counts"][table + "_exists"] = 1 if exists else 0
+                if exists:
+                    cur.execute(f"SELECT COUNT(*) AS c FROM {table}")
+                    out["counts"][table] = int((cur.fetchone() or {}).get("c") or 0)
+                else:
+                    out["counts"][table] = 0
+                    out["blockers"].append(f"Tabelle fehlt: {table}")
+
+            # Kernprüfungen: Datensätze, deren user_id nicht in phase3_members existiert.
+            checks = {
+                "ec_balances_without_member": """
+                    SELECT b.user_id, b.balance, b.source, b.updated_at::text AS updated_at
+                    FROM phase3_ec_balances b
+                    LEFT JOIN phase3_members m ON m.guild_id=b.guild_id AND m.user_id=b.user_id
+                    WHERE COALESCE(b.user_id,'') <> '' AND m.user_id IS NULL
+                    ORDER BY b.balance DESC, b.user_id
+                """,
+                "ec_transactions_without_member": """
+                    SELECT t.user_id, COUNT(*) AS entries, COALESCE(SUM(t.amount),0) AS total_amount, MAX(t.mirrored_at)::text AS last_seen
+                    FROM phase3_ec_transactions t
+                    LEFT JOIN phase3_members m ON m.guild_id=t.guild_id AND m.user_id=t.user_id
+                    WHERE COALESCE(t.user_id,'') <> '' AND m.user_id IS NULL
+                    GROUP BY t.user_id
+                    ORDER BY entries DESC, total_amount DESC
+                """,
+                "needs_without_member": """
+                    SELECT n.user_id, COUNT(*) AS entries, STRING_AGG(DISTINCT COALESCE(n.item_name,'?'), ', ' ORDER BY COALESCE(n.item_name,'?')) AS items
+                    FROM phase3_loot_needs n
+                    LEFT JOIN phase3_members m ON m.guild_id=n.guild_id AND m.user_id=n.user_id
+                    WHERE COALESCE(n.user_id,'') <> '' AND m.user_id IS NULL
+                    GROUP BY n.user_id
+                    ORDER BY entries DESC, n.user_id
+                """,
+                "bids_without_member": """
+                    SELECT b.user_id, COUNT(*) AS entries, COALESCE(SUM(b.amount),0) AS total_bid
+                    FROM phase3_loot_bids b
+                    LEFT JOIN phase3_members m ON m.guild_id=b.guild_id AND m.user_id=b.user_id
+                    WHERE COALESCE(b.user_id,'') <> '' AND m.user_id IS NULL
+                    GROUP BY b.user_id
+                    ORDER BY entries DESC, total_bid DESC
+                """,
+                "loot_history_without_member": """
+                    SELECT h.user_id, COUNT(*) AS entries, COALESCE(SUM(h.amount),0) AS total_amount
+                    FROM phase3_loot_history h
+                    LEFT JOIN phase3_members m ON m.guild_id=h.guild_id AND m.user_id=h.user_id
+                    WHERE COALESCE(h.user_id,'') <> '' AND m.user_id IS NULL
+                    GROUP BY h.user_id
+                    ORDER BY entries DESC, total_amount DESC
+                """,
+                "event_rsvps_without_member": """
+                    SELECT r.user_id, COUNT(*) AS entries, STRING_AGG(DISTINCT COALESCE(r.response,'?'), ', ' ORDER BY COALESCE(r.response,'?')) AS responses
+                    FROM phase3_event_rsvps r
+                    LEFT JOIN phase3_members m ON m.guild_id=r.guild_id AND m.user_id=r.user_id
+                    WHERE COALESCE(r.user_id,'') <> '' AND m.user_id IS NULL
+                    GROUP BY r.user_id
+                    ORDER BY entries DESC, r.user_id
+                """,
+            }
+            for key, sql in checks.items():
+                rows = _phase3_fetch_rows(cur, sql)
+                out["orphans"][key] = len(rows)
+                out["samples"][key] = rows[:20]
+
+            # Leere/komische IDs separat anzeigen.
+            empty_checks = {
+                "ec_balances_empty_user": "SELECT COUNT(*) AS c FROM phase3_ec_balances WHERE COALESCE(user_id,'')=''",
+                "ec_transactions_empty_user": "SELECT COUNT(*) AS c FROM phase3_ec_transactions WHERE COALESCE(user_id,'')=''",
+                "needs_empty_user": "SELECT COUNT(*) AS c FROM phase3_loot_needs WHERE COALESCE(user_id,'')=''",
+                "rsvps_empty_user": "SELECT COUNT(*) AS c FROM phase3_event_rsvps WHERE COALESCE(user_id,'')=''",
+                "bids_empty_user": "SELECT COUNT(*) AS c FROM phase3_loot_bids WHERE COALESCE(user_id,'')=''",
+            }
+            for key, sql in empty_checks.items():
+                out["counts"][key] = _phase3_count_query(cur, sql)
+
+            # Events ohne Teilnehmer sind nicht zwingend Fehler, aber für Cutover prüfenswert.
+            event_no_rsvp = _phase3_fetch_rows(cur, """
+                SELECT e.event_id, e.title, e.status, e.start_at_text
+                FROM phase3_events e
+                LEFT JOIN phase3_event_rsvps r ON r.guild_id=e.guild_id AND r.event_id=e.event_id
+                GROUP BY e.guild_id, e.event_id, e.title, e.status, e.start_at_text
+                HAVING COUNT(r.rsvp_id)=0
+                ORDER BY e.start_at_text DESC NULLS LAST, e.title
+            """)
+            out["orphans"]["events_without_rsvps"] = len(event_no_rsvp)
+            out["samples"]["events_without_rsvps"] = event_no_rsvp[:20]
+
+            member_count = int(out["counts"].get("phase3_members") or 0)
+            ec_count = int(out["counts"].get("phase3_ec_balances") or 0)
+            if member_count <= 0:
+                out["blockers"].append("Keine Mitglieder in phase3_members. Profile/Mitglieder müssen vor Cutover gespiegelt sein.")
+            if ec_count > member_count and member_count > 0:
+                out["blockers"].append(f"EC-Konten ({ec_count}) sind mehr als Mitglieder/Profile ({member_count}).")
+            if out["orphans"].get("ec_balances_without_member"):
+                out["blockers"].append(f"{out['orphans']['ec_balances_without_member']} EC-Konten ohne aktuelles Mitglied.")
+            if out["orphans"].get("event_rsvps_without_member"):
+                out["warnings"].append(f"{out['orphans']['event_rsvps_without_member']} RSVP-Spieler ohne aktuelles Mitglied.")
+            if out["orphans"].get("needs_without_member"):
+                out["warnings"].append(f"{out['orphans']['needs_without_member']} Need-Spieler ohne aktuelles Mitglied.")
+            if out["counts"].get("phase3_loot_needs", 0) <= 0:
+                out["warnings"].append("Keine Need-Einträge in phase3_loot_needs.")
+            if out["counts"].get("phase3_event_rsvps", 0) <= 0 and out["counts"].get("phase3_events", 0) > 0:
+                out["warnings"].append("Events vorhanden, aber keine RSVPs gespiegelt.")
+
+            out["notes"].append("Diese Prüfung löscht nichts. Sie zeigt nur, ob ein harter Cutover schon sinnvoll wäre.")
+            out["notes"].append("JSON bleibt Hauptquelle, bis die Blocker weg sind.")
+            out["ready"] = not out["blockers"]
+            out["ok"] = True
+            return out
+    except Exception as exc:
+        out["blockers"].append(f"{type(exc).__name__}: {exc}")
+        return out
+    finally:
+        conn.close()
+
+
+def _phase3_audit_table(title: str, rows: list[dict[str, Any]], columns: list[tuple[str, str]]) -> str:
+    if not rows:
+        return f"<section class='panel'><h2>{_e(title)}</h2><p class='muted'>Keine Treffer.</p></section>"
+    table_rows = []
+    for row in rows:
+        table_rows.append([row.get(key, "") for key, _label in columns])
+    return f"<section class='panel'><h2>{_e(title)}</h2>{_table([label for _key, label in columns], table_rows, searchable=True)}</section>"
+
+
+def _render_phase3_audit_page() -> str:
+    audit = _phase3_audit_payload()
+    counts = audit.get("counts") or {}
+    orphans = audit.get("orphans") or {}
+    samples = audit.get("samples") or {}
+    status_label = "✅ Cutover grundsätzlich möglich" if audit.get("ready") else "⚠️ Noch nicht Cutover-bereit"
+    status_hint = "Keine harten Blocker gefunden." if audit.get("ready") else "Erst die Blocker prüfen. JSON bleibt Hauptquelle."
+    cards = [
+        ["Mitglieder", counts.get("phase3_members", 0), "phase3_members"],
+        ["EC-Konten", counts.get("phase3_ec_balances", 0), "phase3_ec_balances"],
+        ["EC ohne Mitglied", orphans.get("ec_balances_without_member", 0), "muss 0 sein"],
+        ["RSVPs ohne Mitglied", orphans.get("event_rsvps_without_member", 0), "prüfen"],
+        ["Need-Spieler ohne Mitglied", orphans.get("needs_without_member", 0), "prüfen"],
+        ["Events ohne RSVPs", orphans.get("events_without_rsvps", 0), "kann okay sein"],
+    ]
+    card_html = "".join(f"<div class='card'><small>{_e(str(label))}</small><div class='metric'>{_e(str(value))}</div><p>{_e(str(hint))}</p></div>" for label, value, hint in cards)
+    blockers = audit.get("blockers") or []
+    warnings = audit.get("warnings") or []
+    block_html = "" if not blockers else "<section class='panel'><h2>Blocker</h2><ul>" + "".join(f"<li>{_e(b)}</li>" for b in blockers) + "</ul></section>"
+    warn_html = "" if not warnings else "<section class='panel'><h2>Warnungen</h2><ul>" + "".join(f"<li>{_e(w)}</li>" for w in warnings) + "</ul></section>"
+    count_rows = [
+        ["Mitglieder/Profile", counts.get("phase3_members", 0)],
+        ["EC-Konten", counts.get("phase3_ec_balances", 0)],
+        ["EC-Transaktionen", counts.get("phase3_ec_transactions", 0)],
+        ["EC-Eventchecks", counts.get("phase3_ec_event_checks", 0)],
+        ["Need-Einträge", counts.get("phase3_loot_needs", 0)],
+        ["Auktionen", counts.get("phase3_loot_auctions", 0)],
+        ["Gebote", counts.get("phase3_loot_bids", 0)],
+        ["Loot-Historie", counts.get("phase3_loot_history", 0)],
+        ["Events", counts.get("phase3_events", 0)],
+        ["Event-RSVPs", counts.get("phase3_event_rsvps", 0)],
+        ["Abwesenheiten", counts.get("phase3_absences", 0)],
+    ]
+    empty_rows = [
+        ["EC-Konten ohne User-ID", counts.get("ec_balances_empty_user", 0)],
+        ["EC-Transaktionen ohne User-ID", counts.get("ec_transactions_empty_user", 0)],
+        ["Needs ohne User-ID", counts.get("needs_empty_user", 0)],
+        ["RSVPs ohne User-ID", counts.get("rsvps_empty_user", 0)],
+        ["Gebote ohne User-ID", counts.get("bids_empty_user", 0)],
+    ]
+    return _html_shell("Phase 3.5 · Cutover-Prüfung · Ebo Dashboard", f"""
+    <nav class='topnav'><a href='/database'>← Datenbank</a><a href='/'>Kommando</a><a href='/release'>Release</a><a href='/api/database-audit'>API</a></nav>
+    <section class='hero'><div><h1>Phase 3.5 · Cutover-Prüfung</h1><p>{_e(status_label)} · { _e(status_hint) }</p></div><div class='page-actions'><a class='btn' href='/database'>Datenbank</a><a class='btn' href='/api/database-audit'>API öffnen</a></div></section>
+    <section class='panel'><h2>Bereitschaft</h2><div class='grid'>{card_html}</div></section>
+    {block_html}
+    {warn_html}
+    <section class='panel'><h2>Phase-3-Zahlen</h2>{_table(['Bereich','Postgres'], count_rows, searchable=False)}</section>
+    <section class='panel'><h2>Leere User-IDs</h2>{_table(['Bereich','Anzahl'], empty_rows, searchable=False)}</section>
+    {_phase3_audit_table('EC-Konten ohne aktuelles Mitglied', samples.get('ec_balances_without_member') or [], [('user_id','User-ID'), ('balance','EC'), ('source','Quelle'), ('updated_at','Aktualisiert')])}
+    {_phase3_audit_table('EC-Transaktionen ohne aktuelles Mitglied', samples.get('ec_transactions_without_member') or [], [('user_id','User-ID'), ('entries','Buchungen'), ('total_amount','Summe'), ('last_seen','Zuletzt')])}
+    {_phase3_audit_table('Need-Einträge ohne aktuelles Mitglied', samples.get('needs_without_member') or [], [('user_id','User-ID'), ('entries','Einträge'), ('items','Items')])}
+    {_phase3_audit_table('Gebote ohne aktuelles Mitglied', samples.get('bids_without_member') or [], [('user_id','User-ID'), ('entries','Gebote'), ('total_bid','Summe')])}
+    {_phase3_audit_table('Loot-Historie ohne aktuelles Mitglied', samples.get('loot_history_without_member') or [], [('user_id','User-ID'), ('entries','Einträge'), ('total_amount','Summe')])}
+    {_phase3_audit_table('Event-RSVPs ohne aktuelles Mitglied', samples.get('event_rsvps_without_member') or [], [('user_id','User-ID'), ('entries','Antworten'), ('responses','Status')])}
+    {_phase3_audit_table('Events ohne RSVPs', samples.get('events_without_rsvps') or [], [('event_id','Event-ID'), ('title','Titel'), ('status','Status'), ('start_at_text','Start')])}
+    <section class='panel'><h2>Sicherheitsregeln</h2><ul><li>Diese Seite löscht nichts.</li><li>Diese Seite stellt nichts auf Postgres um.</li><li>Cutover erst, wenn die Blocker geklärt sind.</li><li>JSON bleibt bis dahin Hauptquelle und Backup.</li></ul></section>
+    """)
+
+
+@app.get("/database-audit", response_class=HTMLResponse)
+def database_audit_page(_: bool = Depends(_auth)):
+    try:
+        return HTMLResponse(_render_phase3_audit_page())
+    except Exception as exc:
+        return HTMLResponse(_html_shell("Cutover-Prüfung Fehler", f"<section class='panel'><h1>❌ Cutover-Prüfung Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"), status_code=500)
+
+
+@app.get("/api/database-audit")
+def api_database_audit(_: bool = Depends(_auth)):
+    return JSONResponse(_phase3_audit_payload())
