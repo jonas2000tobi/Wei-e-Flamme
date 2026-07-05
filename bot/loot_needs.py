@@ -1802,6 +1802,24 @@ def _phase3_jsonb(value: Any):
     from psycopg.types.json import Jsonb  # type: ignore
     return Jsonb(value if value is not None else {})
 
+def _phase3_need_active_member_ids(guild_id: int | str) -> set[str]:
+    try:
+        gid = str(int(guild_id))
+    except Exception:
+        return set()
+    if not _phase3_pg_ready():
+        return set()
+    try:
+        conn = _dash_pg_connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT user_id FROM phase3_members WHERE guild_id=%s", (gid,))
+                return {str(r.get("user_id") or "").strip() for r in (cur.fetchall() or []) if str(r.get("user_id") or "").strip()}
+        finally:
+            conn.close()
+    except Exception:
+        return set()
+
 
 def _phase3_ensure_need_tables() -> None:
     if not _phase3_pg_ready():
@@ -1972,6 +1990,9 @@ def _phase3_mirror_all_needs() -> dict:
                 except Exception:
                     continue
                 rows = _phase3_need_rows_for_guild(gid)
+                active_ids = _phase3_need_active_member_ids(gid)
+                if active_ids:
+                    rows = [r for r in rows if str(r.get("user_id") or "").strip() in active_ids]
                 cur.execute("DELETE FROM phase3_loot_needs WHERE guild_id=%s AND source='bot'", (str(gid),))
                 for row in rows:
                     cur.execute("""
