@@ -2322,6 +2322,24 @@ def _phase3_event_jsonb(value: Any):
     from psycopg.types.json import Jsonb  # type: ignore
     return Jsonb(value if value is not None else {})
 
+def _phase3_event_active_member_ids(guild_id: int | str) -> set[str]:
+    try:
+        gid = str(int(guild_id))
+    except Exception:
+        return set()
+    if not _dashboard_event_queue_available():
+        return set()
+    try:
+        conn = _dashboard_pg_connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT user_id FROM phase3_members WHERE guild_id=%s", (gid,))
+                return {str(r.get("user_id") or "").strip() for r in (cur.fetchall() or []) if str(r.get("user_id") or "").strip()}
+        finally:
+            conn.close()
+    except Exception:
+        return set()
+
 
 def _phase3_event_rsvp_rows_from_store(obj: dict, event_id: str) -> list[dict[str, Any]]:
     _init_event_shape(obj)
@@ -2411,8 +2429,13 @@ def _phase3_mirror_events_from_store(guild_id: int | None = None) -> dict[str, A
                     continue
                 gid_s = str(gid)
                 ev_id = str(event_id)
+                active_ids = _phase3_event_active_member_ids(gid_s)
+                skipped_inactive = 0
                 for row in _phase3_event_rsvp_rows_from_store(obj, ev_id):
                     uid = str(row.get("user_id") or "").strip()
+                    if active_ids and (not uid or uid not in active_ids):
+                        skipped_inactive += 1
+                        continue
                     display = str(row.get("display_name") or "").strip()
                     response = str(row.get("response") or "").strip()
                     role_name = str(row.get("role_name") or "").strip()
@@ -2431,7 +2454,7 @@ def _phase3_mirror_events_from_store(guild_id: int | None = None) -> dict[str, A
             cur.execute("""
                 INSERT INTO phase3_migration_runs (run_id, guild_id, mode, status, counts_json, notes, created_at)
                 VALUES (%s,%s,'event_rsvp_parallel_mirror','done',%s,%s,now())
-            """, (run_id, str(guild_id or ""), _phase3_event_jsonb({"events": events_count, "event_rsvps": rsvp_count}), "Bot hat Events/RSVPs direkt aus event_rsvp.json nach Postgres gespiegelt."))
+            """, (run_id, str(guild_id or ""), _phase3_event_jsonb({"events": events_count, "event_rsvps": rsvp_count, "inactive_rsvps_skipped": locals().get("skipped_inactive", 0)}), "Bot hat Events/RSVPs direkt aus event_rsvp.json nach Postgres gespiegelt; ehemalige Mitglieder wurden aus Phase-3-RSVPs ausgelassen."))
         conn.commit()
         return {"ok": True, "events": events_count, "event_rsvps": rsvp_count}
     finally:
