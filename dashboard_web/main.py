@@ -32,7 +32,7 @@ if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 ASSET_VER = "ebo-phase3-database-start"
-DASHBOARD_RELEASE_VERSION = "1.1.3 · Phase 3.3 Loot/Needs"
+DASHBOARD_RELEASE_VERSION = "1.1.4 · Phase 3.4 Events/Profile"
 
 
 def _database_url() -> str:
@@ -10143,6 +10143,7 @@ PHASE3_TABLES = [
     "phase3_ec_event_checks",
     "phase3_loot_needs",
     "phase3_events",
+    "phase3_event_rsvps",
     "phase3_loot_auctions",
     "phase3_loot_bids",
     "phase3_loot_history",
@@ -10318,6 +10319,21 @@ def _phase3_ensure_schema() -> dict[str, Any]:
                 )
             """)
             cur.execute("""
+                CREATE TABLE IF NOT EXISTS phase3_event_rsvps (
+                    guild_id TEXT NOT NULL,
+                    rsvp_id TEXT NOT NULL,
+                    event_id TEXT,
+                    user_id TEXT,
+                    response TEXT,
+                    role_name TEXT,
+                    display_name TEXT,
+                    raw_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    source TEXT NOT NULL DEFAULT 'snapshot',
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    PRIMARY KEY (guild_id, rsvp_id)
+                )
+            """)
+            cur.execute("""
                 CREATE TABLE IF NOT EXISTS phase3_loot_auctions (
                     guild_id TEXT NOT NULL,
                     auction_id TEXT NOT NULL,
@@ -10409,6 +10425,8 @@ def _phase3_ensure_schema() -> dict[str, Any]:
                 )
             """)
             cur.execute("CREATE INDEX IF NOT EXISTS idx_phase3_members_guild ON phase3_members (guild_id)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_phase3_event_rsvps_event ON phase3_event_rsvps (guild_id, event_id)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_phase3_event_rsvps_user ON phase3_event_rsvps (guild_id, user_id)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_phase3_ec_tx_user ON phase3_ec_transactions (guild_id, user_id)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_phase3_ec_checks_status ON phase3_ec_event_checks (guild_id, awarded, posted)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_phase3_needs_item ON phase3_loot_needs (guild_id, item_name)")
@@ -10593,14 +10611,171 @@ def _phase3_need_entry_rows_from_snapshot(snap: dict[str, Any]) -> list[dict[str
 
     return out
 
+
+def _phase3_member_rows_from_snapshot(snap: dict[str, Any]) -> list[dict[str, Any]]:
+    """Liefert echte Mitglieder/Profile aus allen aktuell bekannten Snapshot-Bereichen.
+
+    Wichtig: Der alte Top-Level-Bereich snapshot.members ist bei uns oft leer. Die
+    brauchbaren Mitglieder liegen meist unter snapshot.insights.members oder
+    snapshot.profiles.items. Darum sammeln und deduplizieren wir hier gezielt.
+    """
+    if not isinstance(snap, dict):
+        return []
+    candidates: list[Any] = []
+    members_raw = snap.get("members") or {}
+    if isinstance(members_raw, dict):
+        candidates.extend(_phase3_list(members_raw.get("items") or members_raw.get("profiles") or members_raw.get("members") or []))
+    else:
+        candidates.extend(_phase3_list(members_raw))
+    profiles_raw = snap.get("profiles") or {}
+    if isinstance(profiles_raw, dict):
+        candidates.extend(_phase3_list(profiles_raw.get("items") or profiles_raw.get("profiles") or profiles_raw.get("members") or []))
+    insights_raw = snap.get("insights") or {}
+    if isinstance(insights_raw, dict):
+        candidates.extend(_phase3_list(insights_raw.get("members") or []))
+        quality = insights_raw.get("needs") if isinstance(insights_raw.get("needs"), dict) else {}
+        candidates.extend(_phase3_list(quality.get("users_without_needs") or []))
+        risk_members = insights_raw.get("risk_members") or []
+        candidates.extend(_phase3_list(risk_members))
+    out: dict[str, dict[str, Any]] = {}
+    for row in candidates:
+        if not isinstance(row, dict):
+            continue
+        uid = _phase3_first_id(row, ["user_id", "discord_id", "id", "member_id"])
+        if not uid:
+            continue
+        current = out.get(uid, {})
+        merged = dict(current)
+        merged.update(row)
+        merged["user_id"] = uid
+        out[uid] = merged
+    return list(out.values())
+
+
+def _phase3_event_rows_from_snapshot(snap: dict[str, Any]) -> list[dict[str, Any]]:
+    if not isinstance(snap, dict):
+        return []
+    events_raw = snap.get("events") or {}
+    if isinstance(events_raw, dict):
+        return [x for x in _phase3_list(events_raw.get("items") or events_raw.get("events") or []) if isinstance(x, dict)]
+    return [x for x in _phase3_list(events_raw) if isinstance(x, dict)]
+
+
+def _phase3_event_rsvp_rows_from_snapshot(snap: dict[str, Any]) -> list[dict[str, Any]]:
+    """Extrahiert RSVP-/Teilnehmerzeilen aus den Event-Snapshots.
+
+    Unterstützt die vom Bot exportierte Struktur:
+    event.participants = {tank:[...], heal:[...], dps:[...], reserve:[...], maybe:[...], no:[...]}
+    sowie ältere Varianten mit yes/accepted/maybe/no.
+    """
+    out: list[dict[str, Any]] = []
+    for ev in _phase3_event_rows_from_snapshot(snap):
+        event_id = _phase3_first_id(ev, ["event_id", "id", "message_id"]) or _phase3_hash_id("event", ev)
+        title = _phase3_str(ev.get("title") or ev.get("name"))
+        participants = ev.get("participants") or ev.get("rsvps") or {}
+        # Falls yes_counts existiert, enthält participants meist die eigentlichen Listen.
+        if isinstance(participants, dict):
+            for response_key, values in participants.items():
+                for person in _phase3_list(values):
+                    if isinstance(person, dict):
+                        uid = _phase3_first_id(person, ["user_id", "discord_id", "id", "member_id"])
+                        display = _phase3_str(person.get("display_name") or person.get("name") or person.get("username"))
+                        role_name = _phase3_str(person.get("role") or person.get("role_name") or response_key)
+                        response = _phase3_str(person.get("response") or person.get("status") or response_key)
+                        raw = dict(person)
+                    else:
+                        uid = _phase3_str(person)
+                        display = ""
+                        role_name = _phase3_str(response_key)
+                        response = _phase3_str(response_key)
+                        raw = {"value": person}
+                    if not uid and not display:
+                        continue
+                    raw.setdefault("event_id", event_id)
+                    raw.setdefault("event_title", title)
+                    raw.setdefault("response", response)
+                    raw.setdefault("role_name", role_name)
+                    out.append({
+                        "event_id": event_id,
+                        "user_id": uid,
+                        "display_name": display,
+                        "response": response,
+                        "role_name": role_name,
+                        "raw_json": raw,
+                    })
+        # Fallback: manche Event-JSONs halten direkt yes/maybe/no.
+        for response_key in ["yes", "accepted", "maybe", "no", "declined", "reserve", "tentative"]:
+            values = ev.get(response_key)
+            if not values:
+                continue
+            if isinstance(values, dict):
+                iterable = []
+                for role_name, sub in values.items():
+                    for person in _phase3_list(sub):
+                        iterable.append((role_name, person))
+            else:
+                iterable = [(response_key, person) for person in _phase3_list(values)]
+            for role_name, person in iterable:
+                if isinstance(person, dict):
+                    uid = _phase3_first_id(person, ["user_id", "discord_id", "id", "member_id"])
+                    display = _phase3_str(person.get("display_name") or person.get("name") or person.get("username"))
+                    raw = dict(person)
+                else:
+                    uid = _phase3_str(person)
+                    display = ""
+                    raw = {"value": person}
+                if not uid and not display:
+                    continue
+                raw.setdefault("event_id", event_id)
+                raw.setdefault("event_title", title)
+                raw.setdefault("response", response_key)
+                raw.setdefault("role_name", role_name)
+                out.append({
+                    "event_id": event_id,
+                    "user_id": uid,
+                    "display_name": display,
+                    "response": _phase3_str(response_key),
+                    "role_name": _phase3_str(role_name),
+                    "raw_json": raw,
+                })
+    # Deduplizieren, falls participants und yes/no dieselben Leute liefern.
+    seen: set[tuple[str, str, str, str]] = set()
+    deduped: list[dict[str, Any]] = []
+    for row in out:
+        key = (row.get("event_id") or "", row.get("user_id") or row.get("display_name") or "", row.get("response") or "", row.get("role_name") or "")
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(row)
+    return deduped
+
+
+def _phase3_absence_rows_from_snapshot(snap: dict[str, Any]) -> list[dict[str, Any]]:
+    if not isinstance(snap, dict):
+        return []
+    candidates: list[Any] = []
+    for key in ["absences", "absence", "absence_reports", "away"]:
+        raw = snap.get(key)
+        if isinstance(raw, dict):
+            candidates.extend(_phase3_list(raw.get("items") or raw.get("absences") or raw.get("reports") or raw))
+        else:
+            candidates.extend(_phase3_list(raw))
+    profiles = snap.get("profiles") or {}
+    if isinstance(profiles, dict):
+        candidates.extend(_phase3_list(profiles.get("absences") or []))
+    out: dict[str, dict[str, Any]] = {}
+    for row in candidates:
+        if not isinstance(row, dict):
+            continue
+        aid = _phase3_first_id(row, ["absence_id", "id", "request_id"]) or _phase3_hash_id("absence", row)
+        out[aid] = row
+    return list(out.values())
+
 def _phase3_extract_snapshot_counts(payload: dict[str, Any]) -> dict[str, int]:
     snap = payload.get("snapshot") or {} if isinstance(payload, dict) else {}
-    events_raw = (snap.get("events") or {}) if isinstance(snap, dict) else {}
-    events = events_raw.get("items") if isinstance(events_raw, dict) else []
-    members_raw = (snap.get("members") or {}) if isinstance(snap, dict) else {}
-    members = []
-    if isinstance(members_raw, dict):
-        members = members_raw.get("items") or members_raw.get("profiles") or members_raw.get("members") or []
+    events = _phase3_event_rows_from_snapshot(snap)
+    members = _phase3_member_rows_from_snapshot(snap)
+    event_rsvps = _phase3_event_rsvp_rows_from_snapshot(snap)
     ec_raw = snap.get("ec") or {} if isinstance(snap, dict) else {}
     balances = ec_raw.get("balances") or {} if isinstance(ec_raw, dict) else {}
     transactions = ec_raw.get("transactions") or ec_raw.get("history") or [] if isinstance(ec_raw, dict) else []
@@ -10611,14 +10786,14 @@ def _phase3_extract_snapshot_counts(payload: dict[str, Any]) -> dict[str, int]:
     if isinstance(loot_raw, dict):
         auctions = loot_raw.get("auctions") or loot_raw.get("items") or []
         history = loot_raw.get("history") or loot_raw.get("loot_history") or loot_raw.get("transactions") or []
-    abs_raw = snap.get("absences") or snap.get("absence") or {} if isinstance(snap, dict) else {}
-    absences = abs_raw.get("items") if isinstance(abs_raw, dict) else []
+    absences = _phase3_absence_rows_from_snapshot(snap)
     return {
         "members": len(_phase3_list(members)),
         "ec_balances": len(balances) if isinstance(balances, dict) else len(_phase3_list(balances)),
         "ec_transactions": len(_phase3_list(transactions)),
         "needs": len(need_entries),
         "events": len(_phase3_list(events)),
+        "event_rsvps": len(event_rsvps),
         "auctions": len(_phase3_list(auctions)),
         "loot_history": len(_phase3_list(history)),
         "absences": len(_phase3_list(absences)),
@@ -10631,16 +10806,13 @@ def _phase3_mirror_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
         return schema
     snap = payload.get("snapshot") or {} if isinstance(payload, dict) else {}
     guild_id = _phase3_str(payload.get("guild_id") or (snap.get("guild_id") if isinstance(snap, dict) else "") or _env("GUILD_ID") or "default")
-    counts = {"members": 0, "ec_balances": 0, "ec_transactions": 0, "ec_event_checks": 0, "needs": 0, "events": 0, "auctions": 0, "bids": 0, "loot_history": 0, "absences": 0, "settings": 0}
+    counts = {"members": 0, "ec_balances": 0, "ec_transactions": 0, "ec_event_checks": 0, "needs": 0, "events": 0, "event_rsvps": 0, "auctions": 0, "bids": 0, "loot_history": 0, "absences": 0, "settings": 0}
     conn = _pg_connect()
     run_id = "phase3_" + hashlib.sha1(f"{guild_id}:{time.time()}".encode()).hexdigest()[:18]
     try:
         with conn.cursor() as cur:
             # Members/Profile
-            members_raw = (snap.get("members") or {}) if isinstance(snap, dict) else {}
-            members = []
-            if isinstance(members_raw, dict):
-                members = members_raw.get("items") or members_raw.get("profiles") or members_raw.get("members") or members_raw
+            members = _phase3_member_rows_from_snapshot(snap)
             for item in _phase3_list(members):
                 if not isinstance(item, dict):
                     continue
@@ -10845,8 +11017,7 @@ def _phase3_mirror_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
                 counts["loot_history"] += 1
 
             # Events
-            events_raw = (snap.get("events") or {}) if isinstance(snap, dict) else {}
-            events = events_raw.get("items") if isinstance(events_raw, dict) else events_raw
+            events = _phase3_event_rows_from_snapshot(snap)
             for raw in _phase3_list(events):
                 if not isinstance(raw, dict):
                     continue
@@ -10869,9 +11040,33 @@ def _phase3_mirror_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
                 """, (guild_id, event_id, title, status, start_at, end_at, _phase3_jsonb(raw)))
                 counts["events"] += 1
 
+            # Event RSVPs / Teilnehmer
+            for raw in _phase3_event_rsvp_rows_from_snapshot(snap):
+                if not isinstance(raw, dict):
+                    continue
+                event_id = _phase3_str(raw.get("event_id"))
+                user_id = _phase3_str(raw.get("user_id"))
+                response = _phase3_str(raw.get("response"))
+                role_name = _phase3_str(raw.get("role_name"))
+                display_name = _phase3_str(raw.get("display_name"))
+                rsvp_id = _phase3_hash_id("rsvp", {"event_id": event_id, "user_id": user_id or display_name, "response": response, "role": role_name})
+                cur.execute("""
+                    INSERT INTO phase3_event_rsvps (guild_id, rsvp_id, event_id, user_id, response, role_name, display_name, raw_json, source, updated_at)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,'snapshot',now())
+                    ON CONFLICT (guild_id, rsvp_id) DO UPDATE SET
+                      event_id=EXCLUDED.event_id,
+                      user_id=EXCLUDED.user_id,
+                      response=EXCLUDED.response,
+                      role_name=EXCLUDED.role_name,
+                      display_name=EXCLUDED.display_name,
+                      raw_json=EXCLUDED.raw_json,
+                      source='snapshot',
+                      updated_at=now()
+                """, (guild_id, rsvp_id, event_id, user_id, response, role_name, display_name, _phase3_jsonb(raw.get("raw_json") or raw)))
+                counts["event_rsvps"] += 1
+
             # Absences
-            abs_raw = (snap.get("absences") or snap.get("absence") or {}) if isinstance(snap, dict) else {}
-            absences = abs_raw.get("items") if isinstance(abs_raw, dict) else abs_raw
+            absences = _phase3_absence_rows_from_snapshot(snap)
             for raw in _phase3_list(absences):
                 if not isinstance(raw, dict):
                     continue
@@ -11031,6 +11226,56 @@ def _render_phase3_loot_panel(payload: dict[str, Any]) -> str:
     </section>
     """
 
+
+def _phase3_live_status_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Phase 3.4: Events, Profile/Mitglieder und Abwesenheiten prüfen."""
+    snap_counts = _phase3_extract_snapshot_counts(payload)
+    db_status = _phase3_status_payload()
+    counts = db_status.get("counts") or {}
+    pairs = {
+        "members": (snap_counts.get("members", 0), int(counts.get("phase3_members", 0) or 0)),
+        "events": (snap_counts.get("events", 0), int(counts.get("phase3_events", 0) or 0)),
+        "event_rsvps": (snap_counts.get("event_rsvps", 0), int(counts.get("phase3_event_rsvps", 0) or 0)),
+        "absences": (snap_counts.get("absences", 0), int(counts.get("phase3_absences", 0) or 0)),
+    }
+    warnings: list[str] = []
+    if not db_status.get("tables", {}).get("phase3_members"):
+        warnings.append("Tabelle phase3_members fehlt noch. Bitte Tabellen vorbereiten ausführen.")
+    if not db_status.get("tables", {}).get("phase3_event_rsvps"):
+        warnings.append("Tabelle phase3_event_rsvps fehlt noch. Bitte Tabellen vorbereiten ausführen.")
+    if not _database_url():
+        warnings.append("DATABASE_URL fehlt. Postgres kann nicht genutzt werden.")
+    warnings.append("Hinweis: Phase 3.4 spiegelt Profile/Mitglieder, Events, Teilnehmer/RSVPs und Abwesenheiten. JSON/Snapshot bleibt weiterhin Hauptquelle.")
+    ready = bool(_database_url()) and db_status.get("tables", {}).get("phase3_members") and db_status.get("tables", {}).get("phase3_events") and db_status.get("tables", {}).get("phase3_event_rsvps") and db_status.get("tables", {}).get("phase3_absences")
+    return {"ok": bool(ready), "pairs": pairs, "database": db_status, "warnings": warnings}
+
+
+def _render_phase3_live_panel(payload: dict[str, Any]) -> str:
+    info = _phase3_live_status_payload(payload)
+    pairs = info.get("pairs") or {}
+    rows = [
+        ["Mitglieder/Profile", pairs.get("members", (0, 0))[0], pairs.get("members", (0, 0))[1], "ℹ️ Postgres prüfen"],
+        ["Events", pairs.get("events", (0, 0))[0], pairs.get("events", (0, 0))[1], "ℹ️ Postgres prüfen"],
+        ["Event-Teilnehmer/RSVPs", pairs.get("event_rsvps", (0, 0))[0], pairs.get("event_rsvps", (0, 0))[1], "DB-Prüftabelle"],
+        ["Abwesenheiten", pairs.get("absences", (0, 0))[0], pairs.get("absences", (0, 0))[1], "ℹ️ Postgres prüfen"],
+    ]
+    warnings = info.get("warnings") or []
+    warn_html = "" if not warnings else "<div class='notice'><b>Hinweise</b><ul>" + "".join(f"<li>{_e(w)}</li>" for w in warnings) + "</ul></div>"
+    return f"""
+    <section class='panel'>
+      <h2>Phase 3.4 · Events / Profile / Abwesenheiten</h2>
+      <p>Restliche Live-Daten werden nach Postgres gespiegelt. Noch kein Cutover: Bot/Dashboard bleiben JSON- und Snapshot-kompatibel.</p>
+      <div class='grid'>
+        <div class='card'><b>Profile</b><p>Mitglieder/Profile werden aus Snapshot-Profilen und Insights zusammengeführt.</p></div>
+        <div class='card'><b>Events</b><p>Event-Stammdaten landen in phase3_events.</p></div>
+        <div class='card'><b>Teilnehmer</b><p>RSVPs/Rollenverteilung werden in phase3_event_rsvps prüfbar.</p></div>
+        <div class='card'><b>Abwesenheiten</b><p>Abwesenheiten werden vorbereitet und gespiegelt, sobald Einträge vorhanden sind.</p></div>
+      </div>
+      {_table(['Bereich','Dashboard-Snapshot','Postgres/Bot-Spiegelung','Status'], rows, searchable=False)}
+      {warn_html}
+    </section>
+    """
+
 def _render_phase3_database_page(payload: dict[str, Any]) -> str:
     snap_counts = _phase3_extract_snapshot_counts(payload)
     db_status = _phase3_status_payload()
@@ -11048,6 +11293,7 @@ def _render_phase3_database_page(payload: dict[str, Any]) -> str:
         ["EC-Eventchecks", "—", db_status.get("counts", {}).get("phase3_ec_event_checks", 0)],
         ["Need-Einträge", snap_counts.get("needs", 0), db_status.get("counts", {}).get("phase3_loot_needs", 0)],
         ["Events", snap_counts.get("events", 0), db_status.get("counts", {}).get("phase3_events", 0)],
+        ["Event-Teilnehmer/RSVPs", snap_counts.get("event_rsvps", 0), db_status.get("counts", {}).get("phase3_event_rsvps", 0)],
         ["Auktionen", snap_counts.get("auctions", 0), db_status.get("counts", {}).get("phase3_loot_auctions", 0)],
         ["Loot-Historie", snap_counts.get("loot_history", 0), db_status.get("counts", {}).get("phase3_loot_history", 0)],
         ["Need-Änderungslog", "—", db_status.get("counts", {}).get("phase3_need_change_log", 0)],
@@ -11069,7 +11315,7 @@ def _render_phase3_database_page(payload: dict[str, Any]) -> str:
     warn_html = "" if not warnings else "<section class='panel'><h2>Warnungen</h2><ul>" + "".join(f"<li>{_e(w)}</li>" for w in warnings) + "</ul></section>"
     status_text = "✅ Datenbank bereit" if db_status.get("ok") else "⚠️ Datenbank vorbereiten"
     return _html_shell("Phase 3 · Datenbank · Ebo Dashboard", f"""
-    <nav class='topnav'><a href='/'>← Kommando</a><a href='/release'>Release</a><a href='/admin'>Admin</a><a href='/api/database-status'>API</a><a href='/api/database-ec-status'>EC API</a></nav>
+    <nav class='topnav'><a href='/'>← Kommando</a><a href='/release'>Release</a><a href='/admin'>Admin</a><a href='/api/database-status'>API</a><a href='/api/database-ec-status'>EC API</a><a href='/api/database-live-status'>Live API</a></nav>
     <section class='hero'><div><h1>Phase 3 · Daten sauberer machen</h1><p>{_e(status_text)} · JSON bleibt aktuell Hauptquelle. Postgres wird zuerst nur vorbereitet und gespiegelt. Der Dashboard-Snapshot ist nur ein Ausschnitt.</p></div><div class='page-actions'><a class='btn' href='/database/init'>Tabellen vorbereiten</a><a class='btn' href='/database/mirror-snapshot'>Snapshot spiegeln</a></div></section>
     <section class='panel'><h2>4-Schritte-Plan</h2><div class='grid'>
       <div class='card'><b>1 · Grundlage</b><p>Tabellen erstellen, Snapshot sicher spiegeln, Vergleich anzeigen.</p></div>
@@ -11079,6 +11325,7 @@ def _render_phase3_database_page(payload: dict[str, Any]) -> str:
     </div></section>
     {_render_phase3_ec_panel(payload)}
     {_render_phase3_loot_panel(payload)}
+    {_render_phase3_live_panel(payload)}
     <section class='panel'><h2>Dashboard-Snapshot vs. Postgres</h2><p>Der Snapshot ist nur der exportierte Dashboard-Ausschnitt. Postgres zeigt die Phase-3-Spiegelung aus Bot/Dashboard.</p>{_table(['Bereich','Dashboard-Snapshot','Postgres Phase 3'], compare_rows, searchable=False)}</section>
     <section class='panel'><h2>Phase-3-Tabellen</h2>{_table(['Tabelle','Status','Zeilen'], table_rows, searchable=False)}</section>
     {warn_html}
@@ -11111,6 +11358,12 @@ def api_database_ec_status(_: bool = Depends(_auth)):
 def api_database_loot_status(_: bool = Depends(_auth)):
     payload = _snapshot_payload()
     return JSONResponse(_phase3_loot_status_payload(payload))
+
+
+@app.get("/api/database-live-status")
+def api_database_live_status(_: bool = Depends(_auth)):
+    payload = _snapshot_payload()
+    return JSONResponse(_phase3_live_status_payload(payload))
 
 
 @app.get("/database/init")
