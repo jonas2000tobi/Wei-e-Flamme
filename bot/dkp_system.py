@@ -100,7 +100,32 @@ dkp_event_checks: dict = _load_json(DKP_CHECK_FILE, {})
 PHASE3_ACTIVE_MEMBER_IDS_BY_GUILD: dict[str, set[str]] = {}
 
 
+def _phase3_db_member_ids(guild_id: int | str) -> set[str]:
+    """Phase 3: aktuelle Mitglieder aus Postgres nehmen, wenn phase3_members gefüllt ist."""
+    try:
+        gid = str(int(guild_id))
+    except Exception:
+        return set()
+    try:
+        if not _phase3_ec_enabled():
+            return set()
+        conn = _dash_pg_connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT user_id FROM phase3_members WHERE guild_id = %s", (gid,))
+                return {str(r.get("user_id") or "").strip() for r in (cur.fetchall() or []) if str(r.get("user_id") or "").strip()}
+        finally:
+            conn.close()
+    except Exception:
+        return set()
+
+
 def _phase3_active_member_ids(guild_id: int | str) -> set[str]:
+    # DB-Scope gewinnt, sobald Phase 3.4 Mitglieder erfolgreich gespiegelt hat.
+    # Dadurch zählen EC-Konten nicht mehr alle Nicht-Bots auf dem Discord-Server.
+    db_ids = _phase3_db_member_ids(guild_id)
+    if db_ids:
+        return db_ids
     return set(PHASE3_ACTIVE_MEMBER_IDS_BY_GUILD.get(str(int(guild_id)), set())) if str(guild_id).strip().isdigit() else set()
 
 
@@ -1763,7 +1788,20 @@ def _phase3_mirror_ec_event_checks_to_pg() -> dict:
 def _phase3_mirror_all_ec_to_pg() -> dict:
     if not _phase3_ec_enabled():
         return {"ok": False, "error": "DATABASE_URL fehlt oder ist keine Postgres-URL."}
-    counts = {"balances": 0, "transactions": 0, "checks": 0, "active_members": sum(len(v) for v in PHASE3_ACTIVE_MEMBER_IDS_BY_GUILD.values())}
+    guild_keys = set()
+    try:
+        guild_keys |= {str(k) for k in (dkp_balances or {}).keys()}
+    except Exception:
+        pass
+    try:
+        guild_keys |= {str(k) for k in (dkp_transactions or {}).keys()}
+    except Exception:
+        pass
+    try:
+        guild_keys |= {str(k) for k in (dkp_event_checks or {}).keys()}
+    except Exception:
+        pass
+    counts = {"balances": 0, "transactions": 0, "checks": 0, "active_members": sum(len(_phase3_active_member_ids(gid)) for gid in guild_keys)}
     try:
         counts.update(_phase3_mirror_ec_balances_to_pg())
         counts.update(_phase3_mirror_ec_transactions_to_pg())
