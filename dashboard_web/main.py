@@ -31,7 +31,7 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
-ASSET_VER = "ebo-theme-root-1"
+ASSET_VER = "ebo-sidebar-event-center-1"
 
 
 def _database_url() -> str:
@@ -495,6 +495,31 @@ def _ensure_admin_tables() -> None:
                 """
                 CREATE INDEX IF NOT EXISTS idx_dashboard_loot_action_requests_lookup
                 ON dashboard_loot_action_requests (guild_id, auction_id, status, requested_at DESC)
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS dashboard_event_action_requests (
+                    id BIGSERIAL PRIMARY KEY,
+                    request_id TEXT NOT NULL UNIQUE,
+                    guild_id BIGINT NOT NULL,
+                    event_id TEXT NOT NULL DEFAULT '',
+                    action_type TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    payload_json TEXT NOT NULL DEFAULT '{}',
+                    actor_id TEXT,
+                    actor_name TEXT,
+                    requested_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    claimed_at TIMESTAMPTZ,
+                    processed_at TIMESTAMPTZ,
+                    result_json TEXT
+                )
+                """
+            )
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_dashboard_event_action_requests_lookup
+                ON dashboard_event_action_requests (guild_id, event_id, status, requested_at DESC)
                 """
             )
         conn.commit()
@@ -2075,7 +2100,7 @@ def _sidebar_html() -> str:
     return f"""
     <aside class="sidebar">
       <div class="brand">
-        <div class="brand-mark"><img src="{_asset('logo_128.png')}" alt="Ebolus"></div>
+        <div class="brand-mark"><img src="{_asset('ebolus_logo.png')}" alt="Ebolus"></div>
         <div><strong>Ebolus</strong><span>Gilden-Dashboard</span></div>
       </div>
       <button class="mobile-nav-toggle" type="button" onclick="document.body.classList.toggle('nav-open')">☰ Menü</button>
@@ -2087,7 +2112,7 @@ def _sidebar_html() -> str:
         <details open>
           <summary>Gilde</summary>
           <a href="/members">👥 Mitglieder</a>
-          <a href="/planning">📅 Planung</a>
+          <a href="/events">📅 Events</a>
           <a href="/attendance">✅ Anwesenheit</a>
           <a href="/attendance-stats">📈 Stats</a>
           <a href="/attendance-archive">📦 Archiv</a>
@@ -2159,8 +2184,8 @@ def _html_shell(title: str, body: str) -> str:
     .sidebar::-webkit-scrollbar {{ width:0; height:0; display:none; }}
     .mobile-nav-toggle {{ display:none; border:1px solid rgba(214,168,79,.24); border-radius:12px; background:linear-gradient(180deg,rgba(32,35,45,.92),rgba(13,14,20,.86)); color:var(--text); font-weight:800; padding:10px 12px; cursor:pointer; }}
     .brand {{ display:flex; align-items:center; gap:12px; padding:8px 8px 18px; margin-bottom:8px; border-bottom:1px solid rgba(214,168,79,.14); }}
-    .brand-mark {{ width:46px; height:46px; border-radius:14px; background:radial-gradient(circle at 35% 30%,rgba(214,168,79,.28),rgba(32,35,45,.9)); border:1px solid rgba(214,168,79,.24); display:grid; place-items:center; }}
-    .brand-mark img {{ width:34px; height:34px; object-fit:contain; filter:drop-shadow(0 2px 8px rgba(0,0,0,.75)); }}
+    .brand-mark {{ width:54px; height:54px; border-radius:16px; background:radial-gradient(circle at 35% 30%,rgba(214,168,79,.18),rgba(32,35,45,.9)); border:1px solid rgba(214,168,79,.24); display:grid; place-items:center; overflow:hidden; }}
+    .brand-mark img {{ width:52px; height:52px; object-fit:contain; filter:drop-shadow(0 2px 8px rgba(0,0,0,.75)); }}
     .brand strong {{ display:block; font-size:18px; }} .brand span {{ display:block; color:var(--muted); font-size:12px; }}
     .side-nav {{ display:flex; flex-direction:column; gap:6px; scrollbar-width:none; -ms-overflow-style:none; }}
     .side-nav::-webkit-scrollbar, .sidebar-footer::-webkit-scrollbar {{ width:0; height:0; display:none; }}
@@ -2199,7 +2224,18 @@ def _html_shell(title: str, body: str) -> str:
     .hero {{ position:relative; overflow:hidden; display:flex; justify-content:space-between; gap:18px; align-items:center; padding:30px; border:1px solid rgba(214,168,79,.32); background:linear-gradient(90deg,rgba(10,11,15,.90),rgba(24,26,34,.78)), url("{_asset('hero_banner.webp')}") center / cover no-repeat; border-radius:20px; margin-bottom:18px; box-shadow:0 18px 44px rgba(0,0,0,.42); }}
     .hero::after {{ content:""; position:absolute; inset:0; pointer-events:none; background:radial-gradient(circle at 76% 50%,rgba(214,168,79,.16),transparent 34%), linear-gradient(180deg,transparent,rgba(0,0,0,.24)); }}
     .hero > * {{ position:relative; z-index:1; }}
-    .hero h1::before {{ content:""; display:inline-block; width:38px; height:38px; margin-right:10px; vertical-align:-8px; background:url("{_asset('logo_128.png')}") center / contain no-repeat; filter:drop-shadow(0 2px 7px rgba(0,0,0,.8)); }}
+    .hero h1::before {{ content:""; display:inline-block; width:38px; height:38px; margin-right:10px; vertical-align:-8px; background:url("{_asset('ebolus_logo.png')}") center / contain no-repeat; filter:drop-shadow(0 2px 7px rgba(0,0,0,.8)); }}
+    .hero-actions {{ display:grid; grid-template-columns:repeat(3,minmax(142px,1fr)); gap:12px; min-width:min(520px,100%); }}
+    .hero-action {{ position:relative; overflow:hidden; color:var(--text); text-decoration:none; border:1px solid rgba(214,168,79,.22); border-radius:18px; padding:14px 15px; background:linear-gradient(135deg,rgba(32,35,45,.86),rgba(12,13,19,.78)); box-shadow:inset 0 1px 0 rgba(255,255,255,.05), 0 14px 26px rgba(0,0,0,.22); display:grid; gap:3px; min-height:82px; }}
+    .hero-action::before {{ content:""; position:absolute; inset:-60% -30%; background:radial-gradient(circle at 25% 18%,rgba(214,168,79,.20),transparent 32%); opacity:.9; pointer-events:none; }}
+    .hero-action:hover {{ transform:translateY(-2px); border-color:rgba(214,168,79,.55); box-shadow:inset 0 1px 0 rgba(255,255,255,.08), 0 18px 36px rgba(0,0,0,.34); }}
+    .hero-action span,.hero-action strong,.hero-action small {{ position:relative; z-index:1; }}
+    .hero-action span {{ font-size:22px; line-height:1; }}
+    .hero-action strong {{ font-size:15px; letter-spacing:.01em; }}
+    .hero-action small {{ color:var(--muted); font-size:11px; }}
+    .hero-action.attendance {{ border-color:rgba(129,199,132,.28); }}
+    .hero-action.loot {{ border-color:rgba(214,168,79,.34); }}
+    .hero-action.members {{ border-color:rgba(150,130,230,.30); }}
     .eyebrow {{ color:var(--gold); text-transform:uppercase; letter-spacing:.12em; font-size:12px; font-weight:700; }}
     h1,h2,h3 {{ margin:0 0 8px; }} p {{ color:var(--muted); }}
     .muted {{ color:var(--muted); }}
@@ -2242,7 +2278,7 @@ def _html_shell(title: str, body: str) -> str:
     .warn {{ background:#3a250d; border:1px solid #8a5b18; padding:12px 14px; border-radius:12px; margin-bottom:14px; color:#ffe0a3; }}
     .authbar {{ display:flex; gap:10px; align-items:center; justify-content:flex-end; background:rgba(24,26,34,.78); border:1px solid var(--line); border-radius:12px; padding:10px 12px; margin-bottom:14px; color:var(--muted); font-size:13px; }} .authbar a {{ color:var(--gold); text-decoration:none; font-weight:700; }}
     @media(max-width:1100px) {{ .app-shell {{ grid-template-columns:1fr; }} .sidebar {{ position:relative; height:auto; border-right:0; border-bottom:1px solid rgba(214,168,79,.16); }} .side-nav {{ display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); }} .side-nav details {{ margin-top:0; }} .home-layout {{ grid-template-columns:1fr; }} }}
-    @media(max-width:1000px) {{ .grid,.analytics-grid {{ grid-template-columns:repeat(2,minmax(0,1fr)); }} .split {{ grid-template-columns:1fr; }} .hero {{ flex-direction:column; align-items:flex-start; }} }}
+    @media(max-width:1000px) {{ .grid,.analytics-grid {{ grid-template-columns:repeat(2,minmax(0,1fr)); }} .split {{ grid-template-columns:1fr; }} .hero {{ flex-direction:column; align-items:flex-start; }} .hero-actions {{ grid-template-columns:1fr; width:100%; }} }}
     @media(max-width:760px) {{
       body {{ background-attachment:scroll; }}
       .app-shell {{ display:block; min-height:100vh; }}
@@ -2261,7 +2297,7 @@ def _html_shell(title: str, body: str) -> str:
       .hero {{ padding:18px; border-radius:16px; margin-bottom:12px; }}
       .hero h1 {{ font-size:28px; line-height:1.1; }}
       .hero h1::before {{ width:30px; height:30px; margin-right:8px; vertical-align:-6px; }}
-      .hero .btn, .hero a.btn {{ width:100%; text-align:center; margin-top:4px; }}
+      .hero .btn, .hero a.btn {{ width:100%; text-align:center; margin-top:4px; }} .hero-actions {{ grid-template-columns:1fr; }} .hero-action {{ min-height:72px; }}
       .grid,.analytics-grid {{ grid-template-columns:1fr; gap:10px; }}
       .card {{ padding:14px; }} .card-value {{ font-size:25px; }}
       .home-layout {{ grid-template-columns:1fr; gap:12px; }}
@@ -5464,6 +5500,280 @@ def export_loot_center_csv(_: bool = Depends(_auth)):
     return _csv_response("loot_center.csv", ["auction_id","item","bereich","status","gebote","fuehrend","gewinner","ende","main_needs","secondary_needs","naechster_schritt"], rows)
 
 
+
+
+def _parse_urlencoded_body(raw: bytes) -> dict[str, str]:
+    parsed = urllib.parse.parse_qs((raw or b"").decode("utf-8", errors="replace"), keep_blank_values=True)
+    return {str(k): str(v[-1] if v else "") for k, v in parsed.items()}
+
+
+def _dashboard_event_action_requests(guild_id: int, limit: int = 80, event_id: str = "") -> list[dict[str, Any]]:
+    if not _database_url() or not guild_id:
+        return []
+    try:
+        _ensure_admin_tables()
+        conn = _pg_connect()
+        try:
+            with conn.cursor() as cur:
+                if event_id:
+                    cur.execute(
+                        """
+                        SELECT id, request_id, guild_id, event_id, action_type, status, payload_json, actor_id, actor_name, requested_at, claimed_at, processed_at, result_json
+                        FROM dashboard_event_action_requests
+                        WHERE guild_id = %s AND event_id = %s
+                        ORDER BY requested_at DESC
+                        LIMIT %s
+                        """,
+                        (int(guild_id), str(event_id), int(limit)),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        SELECT id, request_id, guild_id, event_id, action_type, status, payload_json, actor_id, actor_name, requested_at, claimed_at, processed_at, result_json
+                        FROM dashboard_event_action_requests
+                        WHERE guild_id = %s
+                        ORDER BY requested_at DESC
+                        LIMIT %s
+                        """,
+                        (int(guild_id), int(limit)),
+                    )
+                return [dict(r) for r in (cur.fetchall() or [])]
+        finally:
+            conn.close()
+    except Exception:
+        return []
+
+
+def _event_action_counts(rows: list[dict[str, Any]]) -> dict[str, int]:
+    c: dict[str, int] = {}
+    for r in rows or []:
+        s = str((r or {}).get("status") or "unknown").lower()
+        c[s] = c.get(s, 0) + 1
+    return c
+
+
+def _enqueue_event_action_request(guild_id: int, action_type: str, payload: dict[str, Any], actor: dict[str, Any]) -> dict[str, Any]:
+    if not _database_url():
+        return {"ok": False, "error": "DATABASE_URL fehlt. Ohne Postgres kann das Dashboard keine Event-Aktion an den Bot übergeben."}
+    if not guild_id:
+        return {"ok": False, "error": "Guild-ID fehlt."}
+    action = str(action_type or "").strip().lower()
+    if action not in {"create", "edit", "delete"}:
+        return {"ok": False, "error": "Unbekannte Event-Aktion."}
+    actor_id = str(actor.get("user_id") or "").strip()
+    actor_name = str(actor.get("username") or actor_id or "Dashboard")
+    event_id = str(payload.get("event_id") or "").strip()
+    if action in {"edit", "delete"} and not event_id:
+        return {"ok": False, "error": "Event-ID fehlt."}
+    if action == "create" and not str(payload.get("title") or "").strip():
+        return {"ok": False, "error": "Titel fehlt."}
+    if action == "create" and not str(payload.get("channel_id") or "").strip():
+        return {"ok": False, "error": "Zielkanal-ID fehlt."}
+    request_id = f"dash-event-{int(time.time())}-{secrets.token_hex(6)}"
+    payload = dict(payload)
+    payload.update({
+        "action_type": action,
+        "requested_by": {"id": actor_id, "name": actor_name},
+        "requested_at": datetime.now(timezone.utc).isoformat(),
+        "source": "dashboard_event_action",
+    })
+    _ensure_admin_tables()
+    conn = _pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO dashboard_event_action_requests
+                    (request_id, guild_id, event_id, action_type, status, payload_json, actor_id, actor_name, requested_at)
+                VALUES (%s, %s, %s, %s, 'pending', %s, %s, %s, NOW())
+                RETURNING id, request_id, status
+                """,
+                (request_id, int(guild_id), event_id, action, json.dumps(payload, ensure_ascii=False, separators=(",", ":")), actor_id, actor_name),
+            )
+            row = dict(cur.fetchone() or {})
+            cur.execute(
+                """
+                INSERT INTO dashboard_admin_action_log
+                    (guild_id, action_type, target_type, target_id, actor_id, actor_name, payload_json)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """,
+                (int(guild_id), f"event_action_{action}_create", "event", event_id or "new", actor_id, actor_name, json.dumps(payload, ensure_ascii=False)),
+            )
+        conn.commit()
+        return {"ok": True, "request": row, "request_id": request_id}
+    finally:
+        conn.close()
+
+
+def _event_status_text(ev: dict[str, Any]) -> str:
+    if ev.get("_attendance_review_only"):
+        return "Review offen"
+    if ev.get("_pending_ec_check"):
+        return "EC offen"
+    if _is_running_event(ev):
+        return "läuft/offen"
+    return str(ev.get("status") or ev.get("state") or "geplant")
+
+
+def _event_role_counts(ev: dict[str, Any]) -> str:
+    yes = ev.get("yes") if isinstance(ev.get("yes"), dict) else {}
+    if yes:
+        return " · ".join(f"{k}: {len(v) if isinstance(v, list) else 0}" for k, v in yes.items()) or "—"
+    return f"Teilnehmer: {ev.get('participant_count', ev.get('participants', '—'))}"
+
+
+def _render_events_center(data: dict[str, Any], current_user: Optional[dict[str, Any]] = None, msg: str = "") -> str:
+    if not data.get("ok"):
+        return _html_shell("Events · Ebo Dashboard", f"<section class='panel'><h1>📅 Events</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+    snap: dict[str, Any] = data.get("snapshot") or {}
+    guild_id = _safe_guild_id(data)
+    now = datetime.now(timezone.utc)
+    events = [dict(e) for e in ((snap.get("events") or {}).get("items") or []) if isinstance(e, dict)]
+    by_id = {str(e.get("event_id") or e.get("id") or ""): e for e in events if str(e.get("event_id") or e.get("id") or "")}
+    for ev in _events_with_pending_ec_checks(snap):
+        eid = str(ev.get("event_id") or ev.get("id") or "")
+        if eid and eid not in by_id:
+            by_id[eid] = dict(ev)
+        elif eid:
+            by_id[eid].update({k: v for k, v in ev.items() if str(k).startswith("_")})
+    if guild_id:
+        for ev in _open_attendance_review_events_for_homepage(snap, guild_id, limit=40):
+            eid = str(ev.get("event_id") or ev.get("id") or "")
+            if eid and eid not in by_id:
+                by_id[eid] = dict(ev)
+    events = list(by_id.values())
+    def _sort_key(ev: dict[str, Any]):
+        dt = _dt_obj(ev.get("when_iso") or ev.get("start_at") or ev.get("created_at"))
+        return dt or datetime.max.replace(tzinfo=timezone.utc)
+    events.sort(key=_sort_key)
+    running = [e for e in events if _is_running_event(e) or e.get("_pending_ec_check") or e.get("_attendance_review_only")]
+    upcoming = []
+    for e in events:
+        dt = _dt_obj(e.get("when_iso") or e.get("start_at") or e.get("created_at"))
+        if dt and dt >= now and e not in running:
+            upcoming.append(e)
+    action_rows = _dashboard_event_action_requests(guild_id, limit=30) if guild_id else []
+    ac = _event_action_counts(action_rows)
+    cards = "".join([
+        _card("Laufend/offen", len(running), "inkl. Review/EC offen"),
+        _card("Kommend", len(upcoming), "geplante Events"),
+        _card("Event-Aktionen", ac.get("pending", 0) + ac.get("processing", 0), f"erledigt: {ac.get('done', 0)}"),
+        _card("Events gesamt", len(events), "Snapshot + offene Reviews"),
+    ])
+    event_rows = []
+    for ev in (running + [x for x in upcoming if x not in running])[:80]:
+        eid = str(ev.get("event_id") or ev.get("id") or "")
+        event_rows.append([
+            _raw(f"<a class='link' href='/event/{_e(eid)}'>{_e(ev.get('title') or ev.get('name') or eid)}</a>"),
+            _dt(ev.get("when_iso") or ev.get("start_at") or ev.get("created_at")),
+            _event_status_text(ev),
+            _event_role_counts(ev),
+            ev.get("participant_count", ev.get("participants", "—")),
+            _raw(f"<a class='link' href='/attendance/{_e(eid)}'>Review</a> · <a class='link' href='/attendance/{_e(eid)}/ec-preview'>EC</a>"),
+        ])
+    action_table_rows = []
+    for r in action_rows[:30]:
+        result = ""
+        try:
+            result_obj = json.loads(str(r.get("result_json") or "{}"))
+            result = result_obj.get("message") or result_obj.get("error") or ""
+        except Exception:
+            result = str(r.get("result_json") or "")[:140]
+        action_table_rows.append([r.get("requested_at"), r.get("action_type"), r.get("event_id") or "neu", r.get("status"), r.get("actor_name"), result])
+    msg_panel = f"<section class='panel'><p>{_e(msg)}</p></section>" if msg else ""
+    body = f"""
+    <nav class="topnav"><a href="/">← Kommando</a><a href="/attendance">Anwesenheit</a><a href="/ec">EC</a><a href="/overview">Gesamtübersicht</a><a href="/api/events-center">API</a></nav>
+    <section class="hero">
+      <div><div class="eyebrow">Event-Zentrale</div><h1>📅 Events & Planung</h1><p class="muted">Kommende Events, laufende Events, Rollenverteilung, Teilnehmer, Review/EC und Dashboard-Anträge für Erstellen/Bearbeiten/Löschen.</p></div>
+      <div class="hero-actions"><a class="hero-action attendance" href="#create"><span>➕</span><strong>Event erstellen</strong><small>geht als Antrag an den Bot</small></a><a class="hero-action loot" href="#events"><span>📋</span><strong>Events prüfen</strong><small>Status & Rollen</small></a><a class="hero-action members" href="#actions"><span>🧾</span><strong>Queue</strong><small>Bot-Verarbeitung</small></a></div>
+    </section>
+    {msg_panel}
+    <section class="grid">{cards}</section>
+    <section class="panel" id="events"><h2>📋 Eventübersicht</h2><p class="muted">Direktlinks führen zu Eventdetail, Attendance-Review und EC-Vorschau.</p>{_table(['Event','Zeit','Status','Rollenverteilung','Teilnehmer','Aktionen'], event_rows, placeholder='Events durchsuchen…')}</section>
+    <section class="split">
+      <section class="panel" id="create"><h2>➕ Event erstellen</h2><p class="muted">Dashboard legt einen Antrag an. Der Bot postet das Event im angegebenen Zielkanal und verschickt optional DMs.</p>
+        <form method="post" action="/admin/events/action" style="display:grid; gap:10px;">
+          <input type="hidden" name="action_type" value="create">
+          <label>Titel<br><input name="title" required placeholder="z. B. Gildenbosse-Sonntag"></label>
+          <label>Datum<br><input name="date" type="date" required></label>
+          <label>Uhrzeit<br><input name="time" type="time" required></label>
+          <label>Eventtyp<br><input name="event_type" placeholder="gildenbosse / raid / pvp / hm"></label>
+          <label>Zielkanal-ID<br><input name="channel_id" required placeholder="Discord Channel ID"></label>
+          <label>Zielrollen-ID optional<br><input name="target_role_id" placeholder="Discord Role ID"></label>
+          <label>Beschreibung<br><textarea name="description" rows="4" placeholder="Kurzbeschreibung"></textarea></label>
+          <label>Bild-URL optional<br><input name="image_url" placeholder="https://..."></label>
+          <label style="display:flex; gap:8px; align-items:center;"><input type="checkbox" name="send_dms" value="1" checked> DMs an Zielgruppe senden</label>
+          <button class="btn" type="submit" onclick="return confirm('Event-Erstellung als Bot-Antrag senden?')">Event-Erstellung an Bot senden</button>
+        </form>
+      </section>
+      <section class="panel"><h2>✏️ Bearbeiten / Löschen</h2><p class="muted">Event-ID ist normalerweise die Discord-Message-ID des Eventposts.</p>
+        <form method="post" action="/admin/events/action" style="display:grid; gap:10px; margin-bottom:18px;">
+          <input type="hidden" name="action_type" value="edit">
+          <label>Event-ID<br><input name="event_id" required placeholder="Message-ID"></label>
+          <label>Neuer Titel optional<br><input name="title"></label>
+          <label>Neues Datum optional<br><input name="date" type="date"></label>
+          <label>Neue Uhrzeit optional<br><input name="time" type="time"></label>
+          <label>Neue Beschreibung optional<br><textarea name="description" rows="3"></textarea></label>
+          <label>Neue Bild-URL optional<br><input name="image_url"></label>
+          <button class="btn" type="submit" onclick="return confirm('Änderung als Bot-Antrag senden?')">Bearbeitung an Bot senden</button>
+        </form>
+        <form method="post" action="/admin/events/action" style="display:grid; gap:10px;">
+          <input type="hidden" name="action_type" value="delete">
+          <label>Event-ID<br><input name="event_id" required placeholder="Message-ID"></label>
+          <label>Zur Sicherheit LÖSCHEN schreiben<br><input name="confirm" required placeholder="LÖSCHEN"></label>
+          <button class="btn danger" type="submit" onclick="return confirm('Event wirklich löschen? Serverpost und DMs werden durch den Bot gelöscht.')">Löschen an Bot senden</button>
+        </form>
+      </section>
+    </section>
+    <section class="panel" id="actions"><h2>🧾 Event-Aktionsqueue</h2><p class="muted">Hier siehst du, ob der Bot Dashboard-Anträge schon verarbeitet hat.</p>{_table(['Zeit','Aktion','Event','Status','Von','Ergebnis'], action_table_rows, placeholder='Queue durchsuchen…')}</section>
+    """
+    return _html_shell("Events · Ebo Dashboard", body)
+
+
+@app.get("/events", response_class=HTMLResponse)
+def events_page(request: Request, _: bool = Depends(_auth), msg: str = ""):
+    try:
+        return HTMLResponse(_render_events_center(_snapshot_payload(), _current_user(request), msg))
+    except Exception as exc:
+        return HTMLResponse(_html_shell("Ebo Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"), status_code=500)
+
+
+@app.get("/api/events-center")
+def api_events_center(_: bool = Depends(_auth)):
+    payload = _snapshot_payload()
+    if not payload.get("ok"):
+        return JSONResponse(payload, status_code=404)
+    snap = payload.get("snapshot") or {}
+    guild_id = _safe_guild_id(payload)
+    return JSONResponse({"ok": True, "events": (snap.get("events") or {}).get("items") or [], "actions": _dashboard_event_action_requests(guild_id, limit=80) if guild_id else []})
+
+
+@app.post("/admin/events/action")
+async def admin_events_action(request: Request, _: bool = Depends(_admin_auth)):
+    payload = _snapshot_payload()
+    guild_id = _safe_guild_id(payload)
+    actor = _current_user(request) or {"username": "Dashboard"}
+    form = _parse_urlencoded_body(await request.body())
+    action = str(form.get("action_type") or "").strip().lower()
+    if action == "delete" and str(form.get("confirm") or "").strip().upper() != "LÖSCHEN":
+        return RedirectResponse("/events?msg=" + urllib.parse.quote("Löschen abgebrochen: Sicherheitswort fehlt."), status_code=303)
+    clean_payload = {
+        "event_id": str(form.get("event_id") or "").strip(),
+        "title": str(form.get("title") or "").strip(),
+        "date": str(form.get("date") or "").strip(),
+        "time": str(form.get("time") or "").strip(),
+        "event_type": str(form.get("event_type") or "").strip(),
+        "channel_id": str(form.get("channel_id") or "").strip(),
+        "target_role_id": str(form.get("target_role_id") or "").strip(),
+        "description": str(form.get("description") or "").strip(),
+        "image_url": str(form.get("image_url") or "").strip(),
+        "send_dms": str(form.get("send_dms") or "") == "1",
+    }
+    res = _enqueue_event_action_request(guild_id, action, clean_payload, actor)
+    msg = "Event-Aktion wurde an den Bot gesendet." if res.get("ok") else f"Fehler: {res.get('error')}"
+    return RedirectResponse("/events?msg=" + urllib.parse.quote(msg), status_code=303)
+
+
 @app.get("/planning", response_class=HTMLResponse)
 def planning_page(_: bool = Depends(_auth)):
     try:
@@ -6066,13 +6376,13 @@ def _render_leadership_dashboard(data: dict[str, Any]) -> str:
     def _home_item(icon: str, title: Any, meta: Any, href: str = "", badge: str = "") -> str:
         title_html = f"<a class='link' href='{_e(href)}'>{_e(title)}</a>" if href else _e(title)
         badge_html = f"<span class='pill'>{_e(badge)}</span>" if badge else ""
-        return f"<div class='home-item'><div class='home-icon'>{_e(icon)}</div><div><div class='home-title'>{title_html}</div><div class='home-meta'>{_e(meta)}</div></div>{badge_html}</div>"
+        return f"<div class='home-item'><div class='home-icon'>{_e(icon)}</div><div><div class='home-title'>{title_html}</div><div class='home-meta'>{_cell(meta)}</div></div>{badge_html}</div>"
 
     home_events_html = "".join(
         _home_item(
             "📅",
             ev.get("title") or ev.get("name") or ev.get("event_id") or "Event",
-            f"{_dt(ev.get('when_iso') or ev.get('start_at') or ev.get('created_at'))} · Teilnehmer: {ev.get('participant_count', ev.get('participants', '—'))} · EC: {_pending_ec_check_label(ev)}",
+            f"{_dt(ev.get('when_iso') or ev.get('start_at') or ev.get('created_at'))} · Teilnehmer: {ev.get('participant_count', ev.get('participants', '—'))} · {'EC offen' if ev.get('_pending_ec_check') else ('Review offen' if ev.get('_attendance_review_only') else 'EC: —')}",
             f"/attendance/{_e(str(ev.get('event_id') or ev.get('id') or ''))}" if ev.get("_attendance_review_only") else f"/event/{_e(str(ev.get('event_id') or ev.get('id') or ''))}",
             "Review offen" if ev.get("_attendance_review_only") else "läuft",
         )
@@ -6147,10 +6457,10 @@ def _render_leadership_dashboard(data: dict[str, Any]) -> str:
         <p>Startseite zeigt nur das, was jetzt gerade relevant ist. Alles andere ist links sauber gruppiert.</p>
         <p class="muted">{_e(role_line)} · Snapshot: {_e(_dt(data.get('published_at')))}</p>
       </div>
-      <div style="display:flex;gap:10px;flex-wrap:wrap;justify-content:flex-end">
-        <a class="btn" href="/attendance">Anwesenheit</a>
-        <a class="btn" href="/loot">Loot</a>
-        <a class="btn" href="/overview">Gesamtübersicht</a>
+      <div class="hero-actions">
+        <a class="hero-action attendance" href="/attendance"><span>✅</span><strong>Anwesenheit</strong><small>Reviews, Voice & EC</small></a>
+        <a class="hero-action loot" href="/loot"><span>🏆</span><strong>Loot</strong><small>Auktionen & Gebote</small></a>
+        <a class="hero-action members" href="/members"><span>👥</span><strong>Mitglieder</strong><small>Roster & Aktivität</small></a>
       </div>
     </section>
 
