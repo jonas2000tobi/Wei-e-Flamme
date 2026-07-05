@@ -32,7 +32,7 @@ if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 ASSET_VER = "ebo-phase3-database-start"
-DASHBOARD_RELEASE_VERSION = "1.1.0 · Phase 3 Datenbank-Start"
+DASHBOARD_RELEASE_VERSION = "1.1.3 · Phase 3.3 Loot/Needs"
 
 
 def _database_url() -> str:
@@ -10146,6 +10146,7 @@ PHASE3_TABLES = [
     "phase3_loot_auctions",
     "phase3_loot_bids",
     "phase3_loot_history",
+    "phase3_need_change_log",
     "phase3_absences",
     "phase3_settings",
     "phase3_migration_runs",
@@ -10357,6 +10358,22 @@ def _phase3_ensure_schema() -> dict[str, Any]:
                 )
             """)
             cur.execute("""
+                CREATE TABLE IF NOT EXISTS phase3_need_change_log (
+                    guild_id TEXT NOT NULL,
+                    log_id TEXT NOT NULL,
+                    request_id TEXT,
+                    actor_id TEXT,
+                    target_user_id TEXT,
+                    action_type TEXT,
+                    old_item TEXT,
+                    new_item TEXT,
+                    raw_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    source TEXT NOT NULL DEFAULT 'bot',
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    PRIMARY KEY (guild_id, log_id)
+                )
+            """)
+            cur.execute("""
                 CREATE TABLE IF NOT EXISTS phase3_absences (
                     guild_id TEXT NOT NULL,
                     absence_id TEXT NOT NULL,
@@ -10397,6 +10414,7 @@ def _phase3_ensure_schema() -> dict[str, Any]:
             cur.execute("CREATE INDEX IF NOT EXISTS idx_phase3_needs_item ON phase3_loot_needs (guild_id, item_name)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_phase3_events_status ON phase3_events (guild_id, status)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_phase3_auctions_status ON phase3_loot_auctions (guild_id, status)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_phase3_need_log_target ON phase3_need_change_log (guild_id, target_user_id, created_at DESC)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_phase3_runs_created ON phase3_migration_runs (created_at DESC)")
         conn.commit()
         return {"ok": True, "tables": PHASE3_TABLES}
@@ -10795,7 +10813,7 @@ def _phase3_mirror_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _phase3_ec_status_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    """Phase 3.2: EC/DKP Vergleich. JSON/Snapshot bleibt Hauptquelle, Postgres ist Parallel-/Prüfschicht."""
+    """Phase 3.2: EC/DKP Vergleich. Dashboard-Snapshot ist nur Auszug; Postgres ist Bot-Spiegelung."""
     snap_counts = _phase3_extract_snapshot_counts(payload)
     db_status = _phase3_status_payload()
     counts = db_status.get("counts") or {}
@@ -10803,16 +10821,13 @@ def _phase3_ec_status_payload(payload: dict[str, Any]) -> dict[str, Any]:
     ec_pairs = {
         "ec_balances": (snap_counts.get("ec_balances", 0), int(counts.get("phase3_ec_balances", 0) or 0)),
         "ec_transactions": (snap_counts.get("ec_transactions", 0), int(counts.get("phase3_ec_transactions", 0) or 0)),
-        "ec_event_checks": (int(counts.get("phase3_ec_event_checks", 0) or 0), int(counts.get("phase3_ec_event_checks", 0) or 0)),
+        "ec_event_checks": ("—", int(counts.get("phase3_ec_event_checks", 0) or 0)),
     }
     if not db_status.get("tables", {}).get("phase3_ec_event_checks"):
         warnings.append("Tabelle phase3_ec_event_checks fehlt noch. Bitte Tabellen vorbereiten ausführen.")
-    if ec_pairs["ec_balances"][0] != ec_pairs["ec_balances"][1]:
-        warnings.append("EC-Konten unterscheiden sich zwischen Snapshot und Postgres.")
-    if ec_pairs["ec_transactions"][0] != ec_pairs["ec_transactions"][1]:
-        warnings.append("EC-Verlauf unterscheidet sich zwischen Snapshot und Postgres.")
     if not _database_url():
         warnings.append("DATABASE_URL fehlt. Postgres kann nicht genutzt werden.")
+    warnings.append("Hinweis: Dashboard-Snapshot ist kein vollständiges JSON. Für EC zählt die Bot-Spiegelung in Postgres, nicht der kleine Snapshot-Auszug.")
     ready = bool(_database_url()) and db_status.get("tables", {}).get("phase3_ec_balances") and db_status.get("tables", {}).get("phase3_ec_transactions")
     return {"ok": bool(ready), "pairs": ec_pairs, "database": db_status, "warnings": warnings}
 
@@ -10821,23 +10836,75 @@ def _render_phase3_ec_panel(payload: dict[str, Any]) -> str:
     info = _phase3_ec_status_payload(payload)
     pairs = info.get("pairs") or {}
     rows = [
-        ["EC-Konten", pairs.get("ec_balances", (0, 0))[0], pairs.get("ec_balances", (0, 0))[1], "✅ passt" if pairs.get("ec_balances", (0, 1))[0] == pairs.get("ec_balances", (1, 0))[1] else "⚠️ prüfen"],
-        ["EC-Verlauf", pairs.get("ec_transactions", (0, 0))[0], pairs.get("ec_transactions", (0, 0))[1], "✅ passt" if pairs.get("ec_transactions", (0, 1))[0] == pairs.get("ec_transactions", (1, 0))[1] else "⚠️ prüfen"],
-        ["EC-Eventchecks", "—", pairs.get("ec_event_checks", (0, 0))[1], "DB-Prüftabelle"],
+        ["EC-Konten", pairs.get("ec_balances", (0, 0))[0], pairs.get("ec_balances", (0, 0))[1], "ℹ️ Postgres prüfen"],
+        ["EC-Verlauf", pairs.get("ec_transactions", (0, 0))[0], pairs.get("ec_transactions", (0, 0))[1], "ℹ️ Postgres prüfen"],
+        ["EC-Eventchecks", "—", pairs.get("ec_event_checks", ("—", 0))[1], "DB-Prüftabelle"],
     ]
     warnings = info.get("warnings") or []
-    warn_html = "" if not warnings else "<div class='notice warn'><b>Hinweise</b><ul>" + "".join(f"<li>{_e(w)}</li>" for w in warnings) + "</ul></div>"
+    warn_html = "" if not warnings else "<div class='notice'><b>Hinweise</b><ul>" + "".join(f"<li>{_e(w)}</li>" for w in warnings) + "</ul></div>"
     return f"""
     <section class='panel'>
       <h2>Phase 3.2 · EC/DKP</h2>
-      <p>Dieser Schritt stellt EC noch nicht hart um. Bot schreibt EC parallel nach Postgres, JSON bleibt Backup/Fallback.</p>
+      <p>EC ist noch nicht hart umgestellt. JSON bleibt Backup/Fallback; Postgres ist die Bot-Spiegelung für die Prüfung.</p>
       <div class='grid'>
-        <div class='card'><b>Lesen</b><p>Dashboard kann EC-Daten aus Postgres prüfen.</p></div>
-        <div class='card'><b>Parallel schreiben</b><p>Bot schreibt neue EC-Buchungen in JSON und Postgres.</p></div>
-        <div class='card'><b>Vergleich</b><p>Snapshot und DB-Zahlen müssen passen.</p></div>
+        <div class='card'><b>Dashboard-Snapshot</b><p>Kann unvollständig sein und zeigt nur exportierte Ausschnitte.</p></div>
+        <div class='card'><b>Postgres</b><p>Enthält die vom Bot gespiegelten EC-Konten und EC-Verläufe.</p></div>
         <div class='card'><b>Noch kein Cutover</b><p>Postgres wird erst nach Prüfung Hauptquelle.</p></div>
+        <div class='card'><b>JSON bleibt sicher</b><p>Alte JSON-Daten werden nicht gelöscht.</p></div>
       </div>
-      {_table(['Bereich','Snapshot/JSON','Postgres','Status'], rows, searchable=False)}
+      {_table(['Bereich','Dashboard-Snapshot','Postgres/Bot-Spiegelung','Status'], rows, searchable=False)}
+      {warn_html}
+    </section>
+    """
+
+
+def _phase3_loot_status_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Phase 3.3: Loot/Needs/Auktionen/Gebote als Postgres-Spiegelung prüfen."""
+    snap_counts = _phase3_extract_snapshot_counts(payload)
+    db_status = _phase3_status_payload()
+    counts = db_status.get("counts") or {}
+    pairs = {
+        "needs": (snap_counts.get("needs", 0), int(counts.get("phase3_loot_needs", 0) or 0)),
+        "auctions": (snap_counts.get("auctions", 0), int(counts.get("phase3_loot_auctions", 0) or 0)),
+        "bids": ("—", int(counts.get("phase3_loot_bids", 0) or 0)),
+        "history": (snap_counts.get("loot_history", 0), int(counts.get("phase3_loot_history", 0) or 0)),
+        "need_log": ("—", int(counts.get("phase3_need_change_log", 0) or 0)),
+    }
+    warnings: list[str] = []
+    if not db_status.get("tables", {}).get("phase3_loot_needs"):
+        warnings.append("Tabelle phase3_loot_needs fehlt noch. Bitte Tabellen vorbereiten ausführen.")
+    if not db_status.get("tables", {}).get("phase3_loot_auctions"):
+        warnings.append("Tabelle phase3_loot_auctions fehlt noch. Bitte Tabellen vorbereiten ausführen.")
+    if not _database_url():
+        warnings.append("DATABASE_URL fehlt. Postgres kann nicht genutzt werden.")
+    warnings.append("Hinweis: Auch hier ist der Dashboard-Snapshot nur ein Ausschnitt. Für Phase 3.3 zählt die Bot-Spiegelung in Postgres.")
+    ready = bool(_database_url()) and db_status.get("tables", {}).get("phase3_loot_needs") and db_status.get("tables", {}).get("phase3_loot_auctions")
+    return {"ok": bool(ready), "pairs": pairs, "database": db_status, "warnings": warnings}
+
+
+def _render_phase3_loot_panel(payload: dict[str, Any]) -> str:
+    info = _phase3_loot_status_payload(payload)
+    pairs = info.get("pairs") or {}
+    rows = [
+        ["Needlisten", pairs.get("needs", (0, 0))[0], pairs.get("needs", (0, 0))[1], "ℹ️ Postgres prüfen"],
+        ["Auktionen", pairs.get("auctions", (0, 0))[0], pairs.get("auctions", (0, 0))[1], "ℹ️ Postgres prüfen"],
+        ["Gebote", "—", pairs.get("bids", ("—", 0))[1], "DB-Prüftabelle"],
+        ["Loot-Historie", pairs.get("history", (0, 0))[0], pairs.get("history", (0, 0))[1], "ℹ️ Postgres prüfen"],
+        ["Need-Änderungslog", "—", pairs.get("need_log", ("—", 0))[1], "DB-Prüftabelle"],
+    ]
+    warnings = info.get("warnings") or []
+    warn_html = "" if not warnings else "<div class='notice'><b>Hinweise</b><ul>" + "".join(f"<li>{_e(w)}</li>" for w in warnings) + "</ul></div>"
+    return f"""
+    <section class='panel'>
+      <h2>Phase 3.3 · Loot / Needs / Auktionen</h2>
+      <p>Loot-Daten werden jetzt parallel nach Postgres gespiegelt. Dashboard/Bot bleiben weiterhin JSON-kompatibel; kein harter Cutover.</p>
+      <div class='grid'>
+        <div class='card'><b>Needs</b><p>Aktuelle Need-Slots werden in phase3_loot_needs gespiegelt.</p></div>
+        <div class='card'><b>Auktionen</b><p>Auktionen und Status landen in phase3_loot_auctions.</p></div>
+        <div class='card'><b>Gebote</b><p>Gebotslisten landen einzeln in phase3_loot_bids.</p></div>
+        <div class='card'><b>Historie</b><p>Gewinner/Sale/Müll und Need-Änderungen werden prüfbar.</p></div>
+      </div>
+      {_table(['Bereich','Dashboard-Snapshot','Postgres/Bot-Spiegelung','Status'], rows, searchable=False)}
       {warn_html}
     </section>
     """
@@ -10861,6 +10928,7 @@ def _render_phase3_database_page(payload: dict[str, Any]) -> str:
         ["Events", snap_counts.get("events", 0), db_status.get("counts", {}).get("phase3_events", 0)],
         ["Auktionen", snap_counts.get("auctions", 0), db_status.get("counts", {}).get("phase3_loot_auctions", 0)],
         ["Loot-Historie", snap_counts.get("loot_history", 0), db_status.get("counts", {}).get("phase3_loot_history", 0)],
+        ["Need-Änderungslog", "—", db_status.get("counts", {}).get("phase3_need_change_log", 0)],
         ["Abwesenheiten", snap_counts.get("absences", 0), db_status.get("counts", {}).get("phase3_absences", 0)],
     ]
     run_rows = []
@@ -10880,7 +10948,7 @@ def _render_phase3_database_page(payload: dict[str, Any]) -> str:
     status_text = "✅ Datenbank bereit" if db_status.get("ok") else "⚠️ Datenbank vorbereiten"
     return _html_shell("Phase 3 · Datenbank · Ebo Dashboard", f"""
     <nav class='topnav'><a href='/'>← Kommando</a><a href='/release'>Release</a><a href='/admin'>Admin</a><a href='/api/database-status'>API</a><a href='/api/database-ec-status'>EC API</a></nav>
-    <section class='hero'><div><h1>Phase 3 · Daten sauberer machen</h1><p>{_e(status_text)} · JSON bleibt aktuell Hauptquelle. Postgres wird zuerst nur vorbereitet und gespiegelt.</p></div><div class='page-actions'><a class='btn' href='/database/init'>Tabellen vorbereiten</a><a class='btn' href='/database/mirror-snapshot'>Snapshot spiegeln</a></div></section>
+    <section class='hero'><div><h1>Phase 3 · Daten sauberer machen</h1><p>{_e(status_text)} · JSON bleibt aktuell Hauptquelle. Postgres wird zuerst nur vorbereitet und gespiegelt. Der Dashboard-Snapshot ist nur ein Ausschnitt.</p></div><div class='page-actions'><a class='btn' href='/database/init'>Tabellen vorbereiten</a><a class='btn' href='/database/mirror-snapshot'>Snapshot spiegeln</a></div></section>
     <section class='panel'><h2>4-Schritte-Plan</h2><div class='grid'>
       <div class='card'><b>1 · Grundlage</b><p>Tabellen erstellen, Snapshot sicher spiegeln, Vergleich anzeigen.</p></div>
       <div class='card'><b>2 · EC/DKP</b><p>EC-Konten, Transaktionen, Event-Checks parallel schreiben und danach DB als Hauptquelle nutzen.</p></div>
@@ -10888,7 +10956,8 @@ def _render_phase3_database_page(payload: dict[str, Any]) -> str:
       <div class='card'><b>4 · Events/Profile/Abwesenheit</b><p>Restliche Live-Daten migrieren. JSON bleibt Backup/Export.</p></div>
     </div></section>
     {_render_phase3_ec_panel(payload)}
-    <section class='panel'><h2>Snapshot vs. Postgres</h2>{_table(['Bereich','Snapshot','Postgres Phase 3'], compare_rows, searchable=False)}</section>
+    {_render_phase3_loot_panel(payload)}
+    <section class='panel'><h2>Dashboard-Snapshot vs. Postgres</h2><p>Der Snapshot ist nur der exportierte Dashboard-Ausschnitt. Postgres zeigt die Phase-3-Spiegelung aus Bot/Dashboard.</p>{_table(['Bereich','Dashboard-Snapshot','Postgres Phase 3'], compare_rows, searchable=False)}</section>
     <section class='panel'><h2>Phase-3-Tabellen</h2>{_table(['Tabelle','Status','Zeilen'], table_rows, searchable=False)}</section>
     {warn_html}
     <section class='panel'><h2>Letzte Spiegelungen</h2>{_table(['Zeit','Modus','Status','Zahlen','Notiz'], run_rows or [['—','—','—','Noch keine Spiegelung','']], searchable=False)}</section>
@@ -10914,6 +10983,12 @@ def api_database_status(_: bool = Depends(_auth)):
 def api_database_ec_status(_: bool = Depends(_auth)):
     payload = _snapshot_payload()
     return JSONResponse(_phase3_ec_status_payload(payload))
+
+
+@app.get("/api/database-loot-status")
+def api_database_loot_status(_: bool = Depends(_auth)):
+    payload = _snapshot_payload()
+    return JSONResponse(_phase3_loot_status_payload(payload))
 
 
 @app.get("/database/init")
