@@ -1635,6 +1635,127 @@ def _phase3_write_migration_run(mode: str, status: str, counts: dict, notes: str
         conn.close()
 
 
+def _phase3_table_column_exists(cur, table: str, column: str) -> bool:
+    try:
+        cur.execute(
+            """
+            SELECT 1
+            FROM information_schema.columns
+            WHERE table_schema = current_schema() AND table_name = %s AND column_name = %s
+            LIMIT 1
+            """,
+            (table, column),
+        )
+        return bool(cur.fetchone())
+    except Exception:
+        return False
+
+
+def _phase3_prune_member_from_pg(guild_id: int | str, user_id: int | str, reason: str = "member_left") -> dict:
+    """Entfernt einen ausgetretenen User aus aktiven Phase-3-Postgres-Spiegelungen.
+
+    Wichtig: Das löscht keine historischen JSON-Backups. Es bereinigt nur die Phase-3-
+    Live-/Prüftabellen, damit Cutover/Audit nicht durch ehemalige Mitglieder blockiert wird.
+    """
+    if not _phase3_ec_enabled():
+        return {"ok": False, "error": "DATABASE_URL fehlt", "deleted": {}}
+    gid = str(guild_id or "").strip()
+    uid = str(user_id or "").strip()
+    if not gid or not uid:
+        return {"ok": False, "error": "guild_id/user_id fehlt", "deleted": {}}
+    deleted: dict[str, int] = {}
+    touched: dict[str, int] = {}
+    conn = _dash_pg_connect()
+    try:
+        with conn.cursor() as cur:
+            # Tabellen mit normaler user_id-Spalte komplett entfernen.
+            for table in (
+                "phase3_members",
+                "phase3_ec_balances",
+                "phase3_ec_transactions",
+                "phase3_loot_needs",
+                "phase3_loot_bids",
+                "phase3_loot_history",
+                "phase3_event_rsvps",
+            ):
+                if not (_phase3_table_column_exists(cur, table, "guild_id") and _phase3_table_column_exists(cur, table, "user_id")):
+                    continue
+                cur.execute(f"DELETE FROM {table} WHERE guild_id = %s AND user_id = %s", (gid, uid))
+                deleted[table] = int(getattr(cur, "rowcount", 0) or 0)
+
+            # Need-Änderungslog enthält Ziel- und Actor-Spalten.
+            if _phase3_table_column_exists(cur, "phase3_need_change_log", "guild_id"):
+                parts = []
+                params: list[str] = [gid]
+                if _phase3_table_column_exists(cur, "phase3_need_change_log", "target_user_id"):
+                    parts.append("target_user_id = %s")
+                    params.append(uid)
+                if _phase3_table_column_exists(cur, "phase3_need_change_log", "actor_id"):
+                    parts.append("actor_id = %s")
+                    params.append(uid)
+                if parts:
+                    cur.execute("DELETE FROM phase3_need_change_log WHERE guild_id = %s AND (" + " OR ".join(parts) + ")", tuple(params))
+                    deleted["phase3_need_change_log"] = int(getattr(cur, "rowcount", 0) or 0)
+
+            # Auktionen behalten wir als Auktionsobjekte, aber ein ehemaliger Gewinner darf keine aktive User-Verknüpfung bleiben.
+            if _phase3_table_column_exists(cur, "phase3_loot_auctions", "guild_id") and _phase3_table_column_exists(cur, "phase3_loot_auctions", "winner_user_id"):
+                cur.execute("UPDATE phase3_loot_auctions SET winner_user_id = NULL WHERE guild_id = %s AND winner_user_id = %s", (gid, uid))
+                touched["phase3_loot_auctions.winner_user_id"] = int(getattr(cur, "rowcount", 0) or 0)
+
+            run_id = f"phase3_prune_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')}"
+            cur.execute(
+                """
+                INSERT INTO phase3_migration_runs (run_id, guild_id, mode, status, counts_json, notes, created_at)
+                VALUES (%s,%s,'phase3_member_prune','done',%s,%s,now())
+                """,
+                (run_id, gid, _phase3_jsonb({"user_id": uid, "deleted": deleted, "touched": touched}), f"Ausgetretenes Mitglied aus Phase-3-Spiegelung entfernt: {reason}"),
+            )
+        conn.commit()
+        return {"ok": True, "user_id": uid, "deleted": deleted, "touched": touched}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def _phase3_prune_inactive_members_from_pg(guild_id: int | str) -> dict:
+    """Entfernt aus Phase-3-Prüftabellen alle User, die nicht in phase3_members stehen."""
+    if not _phase3_ec_enabled():
+        return {"ok": False, "error": "DATABASE_URL fehlt", "users_pruned": 0}
+    gid = str(guild_id or "").strip()
+    if not gid:
+        return {"ok": False, "error": "guild_id fehlt", "users_pruned": 0}
+    active = _phase3_db_member_ids(gid)
+    if not active:
+        return {"ok": False, "error": "phase3_members ist leer; erst /database Snapshot spiegeln", "users_pruned": 0}
+    candidates: set[str] = set()
+    conn = _dash_pg_connect()
+    try:
+        with conn.cursor() as cur:
+            for table, col in (
+                ("phase3_ec_balances", "user_id"),
+                ("phase3_ec_transactions", "user_id"),
+                ("phase3_loot_needs", "user_id"),
+                ("phase3_loot_bids", "user_id"),
+                ("phase3_loot_history", "user_id"),
+                ("phase3_event_rsvps", "user_id"),
+            ):
+                if not (_phase3_table_column_exists(cur, table, "guild_id") and _phase3_table_column_exists(cur, table, col)):
+                    continue
+                cur.execute(f"SELECT DISTINCT {col} AS uid FROM {table} WHERE guild_id = %s AND COALESCE({col}, '') <> ''", (gid,))
+                for row in cur.fetchall() or []:
+                    uid = str(row.get("uid") or "").strip()
+                    if uid and uid not in active:
+                        candidates.add(uid)
+        results = []
+        for uid in sorted(candidates):
+            results.append(_phase3_prune_member_from_pg(gid, uid, "inactive_member_audit_cleanup"))
+        return {"ok": True, "users_pruned": len(results), "user_ids": sorted(candidates), "results": results}
+    finally:
+        conn.close()
+
+
 def _phase3_mirror_ec_balances_to_pg() -> dict:
     if not _phase3_ec_enabled():
         return {"ok": False, "error": "DATABASE_URL fehlt", "balances": 0}
@@ -3069,6 +3190,25 @@ async def setup_dkp_system(client: discord.Client, tree: app_commands.CommandTre
             ephemeral=True,
         )
 
+    @dkp.command(name="phase3_prune_inactive", description="Leader: Ausgetretene Mitglieder aus Phase-3-Postgres entfernen")
+    async def phase3_prune_inactive_cmd(inter: discord.Interaction):
+        await inter.response.defer(ephemeral=True, thinking=True)
+        if not _is_leader(inter):
+            await inter.followup.send("❌ Keine Berechtigung.", ephemeral=True)
+            return
+        try:
+            res = _phase3_prune_inactive_members_from_pg(inter.guild.id)
+            if not res.get("ok"):
+                await inter.followup.send(f"❌ Phase-3-Bereinigung fehlgeschlagen: {res.get('error')}", ephemeral=True)
+                return
+            ids = res.get("user_ids") or []
+            extra = ""
+            if ids:
+                extra = "\nEntfernt: " + ", ".join(str(x) for x in ids[:10]) + (" …" if len(ids) > 10 else "")
+            await inter.followup.send(f"✅ Phase-3-Bereinigung fertig. Entfernte ehemalige Mitglieder: **{res.get('users_pruned', 0)}**.{extra}", ephemeral=True)
+        except Exception as e:
+            await inter.followup.send(f"❌ Phase-3-Bereinigung Fehler: {type(e).__name__}: {e}", ephemeral=True)
+
     @dkp.command(name="dashboard_settings_status", description="Leader: Status der Dashboard-Einstellungsqueue")
     async def dashboard_settings_status(inter: discord.Interaction):
         if inter.guild is None:
@@ -3113,6 +3253,23 @@ async def setup_dkp_system(client: discord.Client, tree: app_commands.CommandTre
         for row in rows:
             await _process_dashboard_settings_change_request(client, row)
         await inter.followup.send(f"✅ Settings-Queue verarbeitet. Anfragen: **{len(rows)}**", ephemeral=True)
+
+    try:
+        if not getattr(client, "_ebolus_phase3_member_remove_cleanup_added", False):
+            async def _ebolus_phase3_member_remove_cleanup(member: discord.Member):
+                try:
+                    if getattr(member, "bot", False):
+                        return
+                    res = _phase3_prune_member_from_pg(member.guild.id, member.id, "discord_member_remove")
+                    print(f"🧹 Phase 3 Member-Leave Cleanup: guild={member.guild.id} user={member.id} result={res}", flush=True)
+                except Exception as e:
+                    print(f"[phase3-cleanup] Member-Leave Cleanup Fehler: {e!r}", flush=True)
+
+            client.add_listener(_ebolus_phase3_member_remove_cleanup, "on_member_remove")
+            setattr(client, "_ebolus_phase3_member_remove_cleanup_added", True)
+            print("🧹 Phase 3 Member-Leave Cleanup Listener gestartet.")
+    except Exception as e:
+        print(f"[phase3-cleanup] Listener Startfehler: {e!r}", flush=True)
 
     if not dkp_event_check_loop.is_running():
         dkp_event_check_loop._client = client  # type: ignore[attr-defined]
