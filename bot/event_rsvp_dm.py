@@ -2261,6 +2261,206 @@ def _dashboard_event_ensure_tables() -> None:
         conn.close()
 
 
+# ---------------------------------------------------------------------------
+# Phase 3.4b · Event-/RSVP-Spiegelung direkt aus Bot-Store
+# ---------------------------------------------------------------------------
+
+def _phase3_event_ensure_tables() -> None:
+    if not _dashboard_event_queue_available():
+        return
+    conn = _dashboard_pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS phase3_events (
+                    guild_id TEXT NOT NULL,
+                    event_id TEXT NOT NULL,
+                    title TEXT,
+                    status TEXT,
+                    start_at_text TEXT,
+                    end_at_text TEXT,
+                    raw_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    source TEXT NOT NULL DEFAULT 'bot_event_store',
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    PRIMARY KEY (guild_id, event_id)
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS phase3_event_rsvps (
+                    guild_id TEXT NOT NULL,
+                    rsvp_id TEXT NOT NULL,
+                    event_id TEXT,
+                    user_id TEXT,
+                    response TEXT,
+                    role_name TEXT,
+                    display_name TEXT,
+                    raw_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    source TEXT NOT NULL DEFAULT 'bot_event_store',
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    PRIMARY KEY (guild_id, rsvp_id)
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS phase3_migration_runs (
+                    run_id TEXT PRIMARY KEY,
+                    guild_id TEXT,
+                    mode TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    counts_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    notes TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_phase3_event_rsvps_event ON phase3_event_rsvps (guild_id, event_id)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_phase3_event_rsvps_user ON phase3_event_rsvps (guild_id, user_id)")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _phase3_event_jsonb(value: Any):
+    from psycopg.types.json import Jsonb  # type: ignore
+    return Jsonb(value if value is not None else {})
+
+
+def _phase3_event_rsvp_rows_from_store(obj: dict, event_id: str) -> list[dict[str, Any]]:
+    _init_event_shape(obj)
+    rows: list[dict[str, Any]] = []
+    title = str(obj.get("title") or "Event")
+
+    for role_name in ("TANK", "HEAL", "DPS", "BANK"):
+        for entry in obj.get("yes", {}).get(role_name, []) or []:
+            uid = _entry_user_id(entry)
+            name = _entry_name(entry)
+            if not uid and not name:
+                continue
+            raw = dict(entry) if isinstance(entry, dict) else {"value": entry}
+            raw.update({"event_id": event_id, "event_title": title, "response": "yes", "role_name": role_name})
+            rows.append({"event_id": event_id, "user_id": str(uid) if uid else "", "display_name": name, "response": "yes", "role_name": role_name, "raw_json": raw})
+
+    maybe_map = obj.get("maybe") if isinstance(obj.get("maybe"), dict) else {}
+    for uid_key, entry in (maybe_map or {}).items():
+        uid = _entry_user_id(entry) or _entry_user_id(uid_key)
+        name = _entry_name(entry) if isinstance(entry, dict) else ""
+        raw = dict(entry) if isinstance(entry, dict) else {"value": entry}
+        raw.update({"event_id": event_id, "event_title": title, "response": "maybe", "role_name": str(raw.get("role") or raw.get("label") or "MAYBE")})
+        rows.append({"event_id": event_id, "user_id": str(uid) if uid else str(uid_key), "display_name": name, "response": "maybe", "role_name": str(raw.get("role_name") or raw.get("role") or "MAYBE"), "raw_json": raw})
+
+    for entry in obj.get("no", []) or []:
+        uid = _entry_user_id(entry)
+        name = _entry_name(entry)
+        if not uid and not name:
+            continue
+        raw = dict(entry) if isinstance(entry, dict) else {"value": entry}
+        raw.update({"event_id": event_id, "event_title": title, "response": "no", "role_name": "NO"})
+        rows.append({"event_id": event_id, "user_id": str(uid) if uid else "", "display_name": name, "response": "no", "role_name": "NO", "raw_json": raw})
+
+    # Pro Event und User nur die aktuelle Antwort spiegeln. Dadurch zählen Abmeldungen/Vielleicht mit,
+    # aber ein Spieler wird nicht doppelt gezählt, falls alte Formen parallel im Objekt liegen.
+    dedup: dict[tuple[str, str], dict[str, Any]] = {}
+    for row in rows:
+        key = (str(row.get("event_id") or ""), str(row.get("user_id") or row.get("display_name") or ""))
+        dedup[key] = row
+    return list(dedup.values())
+
+
+def _phase3_mirror_events_from_store(guild_id: int | None = None) -> dict[str, Any]:
+    if not _dashboard_event_queue_available():
+        return {"ok": False, "error": "DATABASE_URL fehlt", "events": 0, "rsvps": 0}
+    _phase3_event_ensure_tables()
+    events_count = 0
+    rsvp_count = 0
+    guild_ids: set[str] = set()
+    conn = _dashboard_pg_connect()
+    try:
+        with conn.cursor() as cur:
+            for event_id, obj in list(store.items()):
+                if not isinstance(obj, dict):
+                    continue
+                _init_event_shape(obj)
+                gid = int(obj.get("guild_id", 0) or 0)
+                if not gid:
+                    continue
+                if guild_id and int(guild_id) != int(gid):
+                    continue
+                gid_s = str(gid)
+                guild_ids.add(gid_s)
+                ev_id = str(event_id)
+                title = str(obj.get("title") or "Event")
+                status = str(obj.get("status") or obj.get("state") or ("deleted" if obj.get("deleted") else "active"))
+                start_at = str(obj.get("when_iso") or obj.get("start_at") or obj.get("date") or "")
+                end_at = str(obj.get("end_at") or "")
+                cur.execute("""
+                    INSERT INTO phase3_events (guild_id, event_id, title, status, start_at_text, end_at_text, raw_json, source, updated_at)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,'bot_event_store',now())
+                    ON CONFLICT (guild_id, event_id) DO UPDATE SET
+                      title=EXCLUDED.title, status=EXCLUDED.status, start_at_text=EXCLUDED.start_at_text,
+                      end_at_text=EXCLUDED.end_at_text, raw_json=EXCLUDED.raw_json, source='bot_event_store', updated_at=now()
+                """, (gid_s, ev_id, title, status, start_at, end_at, _phase3_event_jsonb(obj)))
+                events_count += 1
+
+            # Alte RSVP-Spiegelung pro betroffener Gilde entfernen, dann vollständig aus dem Bot-Store neu schreiben.
+            for gid_s in guild_ids:
+                cur.execute("DELETE FROM phase3_event_rsvps WHERE guild_id = %s", (gid_s,))
+
+            for event_id, obj in list(store.items()):
+                if not isinstance(obj, dict):
+                    continue
+                gid = int(obj.get("guild_id", 0) or 0)
+                if not gid or (guild_id and int(guild_id) != int(gid)):
+                    continue
+                gid_s = str(gid)
+                ev_id = str(event_id)
+                for row in _phase3_event_rsvp_rows_from_store(obj, ev_id):
+                    uid = str(row.get("user_id") or "").strip()
+                    display = str(row.get("display_name") or "").strip()
+                    response = str(row.get("response") or "").strip()
+                    role_name = str(row.get("role_name") or "").strip()
+                    rsvp_id = f"{ev_id}:{uid or display}:{response}:{role_name}"
+                    cur.execute("""
+                        INSERT INTO phase3_event_rsvps (guild_id, rsvp_id, event_id, user_id, response, role_name, display_name, raw_json, source, updated_at)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,'bot_event_store',now())
+                        ON CONFLICT (guild_id, rsvp_id) DO UPDATE SET
+                          event_id=EXCLUDED.event_id, user_id=EXCLUDED.user_id, response=EXCLUDED.response,
+                          role_name=EXCLUDED.role_name, display_name=EXCLUDED.display_name, raw_json=EXCLUDED.raw_json,
+                          source='bot_event_store', updated_at=now()
+                    """, (gid_s, rsvp_id, ev_id, uid, response, role_name, display, _phase3_event_jsonb(row.get("raw_json") or row)))
+                    rsvp_count += 1
+
+            run_id = f"event_rsvp_{int(time.time())}_{secrets.token_hex(4)}"
+            cur.execute("""
+                INSERT INTO phase3_migration_runs (run_id, guild_id, mode, status, counts_json, notes, created_at)
+                VALUES (%s,%s,'event_rsvp_parallel_mirror','done',%s,%s,now())
+            """, (run_id, str(guild_id or ""), _phase3_event_jsonb({"events": events_count, "event_rsvps": rsvp_count}), "Bot hat Events/RSVPs direkt aus event_rsvp.json nach Postgres gespiegelt."))
+        conn.commit()
+        return {"ok": True, "events": events_count, "event_rsvps": rsvp_count}
+    finally:
+        conn.close()
+
+
+def _phase3_event_status(guild_id: int | None = None) -> dict[str, Any]:
+    if not _dashboard_event_queue_available():
+        return {"ok": False, "error": "DATABASE_URL fehlt"}
+    _phase3_event_ensure_tables()
+    gid_s = str(guild_id or "")
+    conn = _dashboard_pg_connect()
+    try:
+        with conn.cursor() as cur:
+            if gid_s:
+                cur.execute("SELECT COUNT(*) AS c FROM phase3_events WHERE guild_id = %s", (gid_s,))
+                events_db = int((cur.fetchone() or {}).get("c") or 0)
+                cur.execute("SELECT COUNT(*) AS c FROM phase3_event_rsvps WHERE guild_id = %s", (gid_s,))
+                rsvps_db = int((cur.fetchone() or {}).get("c") or 0)
+            else:
+                cur.execute("SELECT COUNT(*) AS c FROM phase3_events")
+                events_db = int((cur.fetchone() or {}).get("c") or 0)
+                cur.execute("SELECT COUNT(*) AS c FROM phase3_event_rsvps")
+                rsvps_db = int((cur.fetchone() or {}).get("c") or 0)
+        return {"ok": True, "events_db": events_db, "event_rsvps_db": rsvps_db}
+    finally:
+        conn.close()
+
+
 def _dashboard_event_claim_batch(limit: int = 5) -> list[dict[str, Any]]:
     if not _dashboard_event_queue_available():
         return []
@@ -2600,6 +2800,36 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
             print("🔊 Event-Voice-State-Listener gestartet.")
     except Exception as e:
         print(f"[event_rsvp_dm] Voice-State-Listener Startfehler: {e!r}")
+
+    @tree.command(name="events_phase3_mirror", description="Leader: Events/RSVPs direkt aus dem Bot-Store nach Postgres spiegeln")
+    async def events_phase3_mirror_cmd(inter: discord.Interaction):
+        await inter.response.defer(ephemeral=True, thinking=True)
+        if not _is_admin(inter):
+            await inter.followup.send("❌ Nur Admin/Manage Server.", ephemeral=True)
+            return
+        try:
+            res = _phase3_mirror_events_from_store(int(inter.guild_id or 0))
+            if not res.get("ok"):
+                await inter.followup.send(f"❌ Phase 3 Event-Spiegelung fehlgeschlagen: {res.get('error')}", ephemeral=True)
+                return
+            await inter.followup.send(f"✅ Events/RSVPs gespiegelt: Events **{res.get('events', 0)}**, RSVPs **{res.get('event_rsvps', 0)}**.", ephemeral=True)
+        except Exception as e:
+            await inter.followup.send(f"❌ Phase 3 Event-Spiegelung Fehler: {type(e).__name__}: {e}", ephemeral=True)
+
+    @tree.command(name="events_phase3_status", description="Leader: Phase-3 Events/RSVP Postgres-Status anzeigen")
+    async def events_phase3_status_cmd(inter: discord.Interaction):
+        await inter.response.defer(ephemeral=True, thinking=True)
+        if not _is_admin(inter):
+            await inter.followup.send("❌ Nur Admin/Manage Server.", ephemeral=True)
+            return
+        try:
+            res = _phase3_event_status(int(inter.guild_id or 0))
+            if not res.get("ok"):
+                await inter.followup.send(f"❌ Phase 3 Event-Status Fehler: {res.get('error')}", ephemeral=True)
+                return
+            await inter.followup.send(f"📅 Phase 3 Events: **{res.get('events_db', 0)}** · RSVPs: **{res.get('event_rsvps_db', 0)}**", ephemeral=True)
+        except Exception as e:
+            await inter.followup.send(f"❌ Phase 3 Event-Status Fehler: {type(e).__name__}: {e}", ephemeral=True)
 
     @tree.command(name="raid_set_roles_dm", description="(Admin) Primärrollen (Tank/Heal/DPS) für Maybe-Label setzen")
     @app_commands.describe(tank_role="Rolle: Tank", heal_role="Rolle: Heal", dps_role="Rolle: DPS")
