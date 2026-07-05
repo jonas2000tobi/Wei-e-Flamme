@@ -3,6 +3,9 @@ from __future__ import annotations
 import json
 import asyncio
 import re
+import os
+import secrets
+import time
 from pathlib import Path
 from typing import Dict, Optional, Iterable, List, Any
 from datetime import datetime, timedelta
@@ -2188,6 +2191,367 @@ def _register_persistent_views_for_event(client: discord.Client, msg_id: str, ob
     return registered_server, registered_dm
 
 
+
+
+# ---------------------------------------------------------------------------
+# Dashboard Event-Aktionsqueue
+# ---------------------------------------------------------------------------
+
+def _dashboard_database_url() -> str:
+    return str(os.getenv("DATABASE_URL") or "").strip()
+
+
+def _dashboard_normalized_database_url() -> str:
+    url = _dashboard_database_url()
+    if url.startswith("postgres://"):
+        return "postgresql://" + url[len("postgres://"):]
+    return url
+
+
+def _dashboard_pg_connect():
+    import psycopg  # type: ignore
+    from psycopg.rows import dict_row  # type: ignore
+    return psycopg.connect(_dashboard_normalized_database_url(), row_factory=dict_row, connect_timeout=10)
+
+
+def _dashboard_event_queue_available() -> bool:
+    u = _dashboard_database_url().lower()
+    return u.startswith("postgres://") or u.startswith("postgresql://")
+
+
+def _dashboard_event_result(ok: bool, message: str, **extra: Any) -> str:
+    payload = {"ok": bool(ok), "message": str(message or "")}
+    payload.update(extra)
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
+def _dashboard_event_ensure_tables() -> None:
+    if not _dashboard_event_queue_available():
+        return
+    conn = _dashboard_pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS dashboard_event_action_requests (
+                    id BIGSERIAL PRIMARY KEY,
+                    request_id TEXT NOT NULL UNIQUE,
+                    guild_id BIGINT NOT NULL,
+                    event_id TEXT NOT NULL DEFAULT '',
+                    action_type TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    payload_json TEXT NOT NULL DEFAULT '{}',
+                    actor_id TEXT,
+                    actor_name TEXT,
+                    requested_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    claimed_at TIMESTAMPTZ,
+                    processed_at TIMESTAMPTZ,
+                    result_json TEXT
+                )
+                """
+            )
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_dashboard_event_action_requests_lookup
+                ON dashboard_event_action_requests (guild_id, event_id, status, requested_at DESC)
+                """
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _dashboard_event_claim_batch(limit: int = 5) -> list[dict[str, Any]]:
+    if not _dashboard_event_queue_available():
+        return []
+    _dashboard_event_ensure_tables()
+    conn = _dashboard_pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                WITH picked AS (
+                    SELECT id
+                    FROM dashboard_event_action_requests
+                    WHERE status = 'pending'
+                    ORDER BY requested_at ASC
+                    LIMIT %s
+                    FOR UPDATE SKIP LOCKED
+                )
+                UPDATE dashboard_event_action_requests r
+                SET status = 'processing', claimed_at = NOW()
+                FROM picked
+                WHERE r.id = picked.id
+                RETURNING r.id, r.request_id, r.guild_id, r.event_id, r.action_type, r.payload_json, r.actor_id, r.actor_name
+                """,
+                (int(limit),),
+            )
+            rows = [dict(x) for x in (cur.fetchall() or [])]
+        conn.commit()
+        return rows
+    finally:
+        conn.close()
+
+
+def _dashboard_event_finish_request(row_id: int, status: str, result_json: str) -> None:
+    if not _dashboard_event_queue_available():
+        return
+    conn = _dashboard_pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE dashboard_event_action_requests
+                SET status = %s, processed_at = NOW(), result_json = %s
+                WHERE id = %s
+                """,
+                (str(status), str(result_json or "{}"), int(row_id)),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _dashboard_event_parse_when(payload: dict[str, Any], fallback_iso: str = "") -> datetime:
+    when_iso = str(payload.get("when_iso") or "").strip()
+    if when_iso:
+        dt = datetime.fromisoformat(when_iso.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=TZ)
+        return dt.astimezone(TZ)
+    date_s = str(payload.get("date") or "").strip()
+    time_s = str(payload.get("time") or "").strip()
+    if date_s and time_s:
+        yyyy, mm, dd = [int(x) for x in date_s.split("-")]
+        hh, mi = [int(x) for x in time_s.split(":")]
+        return datetime(yyyy, mm, dd, hh, mi, tzinfo=TZ)
+    if fallback_iso:
+        dt = datetime.fromisoformat(str(fallback_iso).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=TZ)
+        return dt.astimezone(TZ)
+    raise ValueError("Datum/Zeit fehlt oder ist ungültig")
+
+
+def _dashboard_event_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(str(value or "").strip())
+    except Exception:
+        return default
+
+
+async def _dashboard_event_create(client: discord.Client, guild_id: int, payload: dict[str, Any]) -> dict[str, Any]:
+    guild = client.get_guild(int(guild_id))
+    if guild is None:
+        raise RuntimeError("Bot sieht den Server nicht")
+    channel_id = _dashboard_event_int(payload.get("channel_id"))
+    ch = guild.get_channel(channel_id)
+    if not isinstance(ch, (discord.TextChannel, discord.Thread)):
+        raise RuntimeError("Zielkanal wurde nicht gefunden oder ist kein Textkanal")
+    title = str(payload.get("title") or "").strip()
+    if not title:
+        raise RuntimeError("Titel fehlt")
+    when = _dashboard_event_parse_when(payload)
+    target_role_id = _dashboard_event_int(payload.get("target_role_id"))
+    obj = {
+        "guild_id": int(guild.id),
+        "channel_id": int(ch.id),
+        "title": title,
+        "description": str(payload.get("description") or "").strip(),
+        "event_type": str(payload.get("event_type") or "").strip(),
+        "when_iso": when.isoformat(),
+        "image_url": str(payload.get("image_url") or "").strip() or None,
+        "yes": {"TANK": [], "HEAL": [], "DPS": [], "BANK": []},
+        "maybe": {},
+        "no": [],
+        "target_role_id": int(target_role_id or 0),
+        "reminders": [],
+        "reminder_sent": {},
+        "dm_messages": {},
+        "created_from": "dashboard",
+    }
+    emb = build_embed(guild, obj)
+    msg = await ch.send(embed=emb)
+    msg_id = int(msg.id)
+    obj["message_id"] = msg_id
+    store[str(msg_id)] = obj
+    save_store()
+    try:
+        await msg.edit(view=ServerRaidView(msg_id))
+    except Exception:
+        pass
+    sent = 0
+    skipped_opt_out = 0
+    if bool(payload.get("send_dms", True)):
+        for member in _eligible_members(guild, obj):
+            if not is_dm_enabled(guild.id, member.id):
+                skipped_opt_out += 1
+                continue
+            try:
+                dm_text = _format_dm_text(
+                    title=title,
+                    when=when,
+                    channel_name_or_ref=f"Übersicht im Server: #{getattr(ch, 'name', 'event')}",
+                    description=obj.get("description"),
+                    intro_line="Wähle unten deine Teilnahme:",
+                )
+                dm_msg = await member.send(dm_text, view=RaidView(msg_id))
+                obj["dm_messages"][str(member.id)] = int(dm_msg.id)
+                sent += 1
+                await asyncio.sleep(0.05)
+            except Exception:
+                pass
+        save_store()
+    _schedule_portal_refresh_for_event(client, guild, obj)
+    await _log(client, guild.id, f"Dashboard-Event erstellt: {title} ({msg_id})")
+    return {"event_id": str(msg_id), "jump_url": getattr(msg, "jump_url", ""), "dm_sent": sent, "dm_skipped_opt_out": skipped_opt_out}
+
+
+async def _dashboard_event_edit(client: discord.Client, guild_id: int, payload: dict[str, Any]) -> dict[str, Any]:
+    event_id = str(payload.get("event_id") or "").strip()
+    if not event_id or event_id not in store:
+        raise RuntimeError("Event nicht gefunden")
+    obj = store[event_id]
+    _init_event_shape(obj)
+    if int(obj.get("guild_id", 0) or 0) != int(guild_id):
+        raise RuntimeError("Event gehört nicht zu diesem Server")
+    changed: list[str] = []
+    title = str(payload.get("title") or "").strip()
+    if title:
+        obj["title"] = title
+        changed.append("Titel")
+    # Beschreibung darf bewusst auf leer gesetzt werden, wenn Feld mitgesendet wurde.
+    if "description" in payload and str(payload.get("description") or "").strip():
+        obj["description"] = str(payload.get("description") or "").strip()
+        changed.append("Beschreibung")
+    if str(payload.get("image_url") or "").strip():
+        obj["image_url"] = str(payload.get("image_url") or "").strip()
+        changed.append("Bild")
+    if str(payload.get("date") or "").strip() or str(payload.get("time") or "").strip() or str(payload.get("when_iso") or "").strip():
+        obj["when_iso"] = _dashboard_event_parse_when(payload, str(obj.get("when_iso") or "")).isoformat()
+        changed.append("Zeit")
+    if str(payload.get("target_role_id") or "").strip():
+        obj["target_role_id"] = _dashboard_event_int(payload.get("target_role_id"))
+        changed.append("Zielrolle")
+    store[event_id] = obj
+    save_store()
+    await _push_overview(client, event_id, obj)
+    guild = client.get_guild(int(guild_id))
+    if guild is not None:
+        _schedule_portal_refresh_for_event(client, guild, obj)
+    await _log(client, int(guild_id), f"Dashboard-Event bearbeitet: {obj.get('title')} ({event_id})")
+    return {"event_id": event_id, "changed": changed or ["keine sichtbaren Felder"]}
+
+
+async def _dashboard_event_delete(client: discord.Client, guild_id: int, payload: dict[str, Any]) -> dict[str, Any]:
+    event_id = str(payload.get("event_id") or "").strip()
+    if not event_id or event_id not in store:
+        raise RuntimeError("Event nicht gefunden")
+    obj = store[event_id]
+    _init_event_shape(obj)
+    if int(obj.get("guild_id", 0) or 0) != int(guild_id):
+        raise RuntimeError("Event gehört nicht zu diesem Server")
+    deleted_posts = 0
+    failed_posts: list[str] = []
+    deleted_dms = 0
+    if _is_alliance_event(obj) and obj.get("mirrors"):
+        for mirror in list(obj.get("mirrors") or []):
+            try:
+                guild = client.get_guild(int(mirror.get("guild_id", 0) or 0))
+                if not guild:
+                    failed_posts.append(f"{mirror.get('label', 'Unbekannt')} — Server nicht gefunden")
+                    continue
+                ch = guild.get_channel(int(mirror.get("channel_id", 0) or 0))
+                if not isinstance(ch, (discord.TextChannel, discord.Thread)):
+                    failed_posts.append(f"{mirror.get('label', guild.name)} — Channel nicht gefunden")
+                    continue
+                try:
+                    msg_obj = await ch.fetch_message(int(mirror.get("message_id", 0) or 0))
+                    await msg_obj.delete()
+                    deleted_posts += 1
+                except Exception:
+                    failed_posts.append(f"{mirror.get('label', guild.name)} — Post nicht gefunden oder keine Rechte")
+                await asyncio.sleep(0.05)
+            except Exception as e:
+                failed_posts.append(f"{mirror.get('label', 'Unbekannt')} — {e}")
+    else:
+        guild = client.get_guild(int(guild_id))
+        if guild is not None:
+            ch = guild.get_channel(int(obj.get("channel_id", 0) or 0))
+            if isinstance(ch, (discord.TextChannel, discord.Thread)):
+                try:
+                    msg_obj = await ch.fetch_message(int(event_id))
+                    await msg_obj.delete()
+                    deleted_posts += 1
+                except Exception:
+                    failed_posts.append("Serverpost nicht gefunden oder keine Rechte")
+    for uid_str in list((obj.get("dm_messages") or {}).keys()):
+        try:
+            uid = int(uid_str)
+            ok = await _delete_dm_message_for_user(client, obj, uid)
+            if ok:
+                deleted_dms += 1
+            await asyncio.sleep(0.05)
+        except Exception:
+            pass
+    try:
+        await _cleanup_event_voice_for_obj(client, obj)
+    except Exception:
+        pass
+    store.pop(event_id, None)
+    save_store()
+    await _log(client, int(guild_id), f"Dashboard-Event gelöscht: {obj.get('title')} ({event_id})")
+    return {"event_id": event_id, "deleted_posts": deleted_posts, "deleted_dms": deleted_dms, "failed_posts": failed_posts[:10]}
+
+
+async def _dashboard_event_process_request(client: discord.Client, row: dict[str, Any]) -> tuple[bool, str, dict[str, Any]]:
+    payload = {}
+    try:
+        payload = json.loads(str(row.get("payload_json") or "{}"))
+        if not isinstance(payload, dict):
+            payload = {}
+    except Exception:
+        payload = {}
+    action = str(row.get("action_type") or payload.get("action_type") or "").strip().lower()
+    guild_id = int(row.get("guild_id") or payload.get("guild_id") or 0)
+    if action == "create":
+        result = await _dashboard_event_create(client, guild_id, payload)
+        return True, f"Event erstellt: {result.get('event_id')}", result
+    if action == "edit":
+        result = await _dashboard_event_edit(client, guild_id, payload)
+        return True, f"Event bearbeitet: {result.get('event_id')}", result
+    if action == "delete":
+        result = await _dashboard_event_delete(client, guild_id, payload)
+        return True, f"Event gelöscht: {result.get('event_id')}", result
+    raise RuntimeError("Unbekannte Event-Aktion")
+
+
+@tasks.loop(seconds=20)
+async def dashboard_event_action_loop():
+    client = getattr(dashboard_event_action_loop, "_client", None)
+    if client is None or not _dashboard_event_queue_available():
+        return
+    try:
+        rows = _dashboard_event_claim_batch(limit=4)
+    except Exception as e:
+        print(f"[dashboard_event_action_loop] Claim Fehler: {e!r}")
+        return
+    for row in rows:
+        try:
+            ok, message, details = await _dashboard_event_process_request(client, row)
+            _dashboard_event_finish_request(
+                int(row.get("id")),
+                "done" if ok else "failed",
+                _dashboard_event_result(ok, message, **({"details": details} if isinstance(details, dict) else {})),
+            )
+        except Exception as e:
+            print(f"[dashboard_event_action_loop] Verarbeitung Fehler request={row.get('request_id')}: {e!r}")
+            try:
+                _dashboard_event_finish_request(int(row.get("id")), "failed", _dashboard_event_result(False, str(e)))
+            except Exception:
+                pass
+
+
 async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
     restored_server_views = 0
     restored_dm_views = 0
@@ -2213,6 +2577,14 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
             print("⏰ Event-Reminder-Task gestartet.")
     except Exception as e:
         print(f"[event_rsvp_dm] Reminder-Task Startfehler: {e!r}")
+
+    try:
+        dashboard_event_action_loop._client = client  # type: ignore[attr-defined]
+        if not dashboard_event_action_loop.is_running():
+            dashboard_event_action_loop.start()
+            print("📅 Dashboard-Event-Aktionsqueue gestartet.")
+    except Exception as e:
+        print(f"[event_rsvp_dm] Dashboard-Event-Queue Startfehler: {e!r}")
 
     try:
         if not getattr(client, "_ebolus_event_voice_listener_added", False):
