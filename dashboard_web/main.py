@@ -2589,17 +2589,54 @@ def _render_member_detail(data: dict[str, Any], user_id: int, current_user: Opti
 
 
 def _event_by_id(snap: dict[str, Any], event_id: str) -> Optional[dict[str, Any]]:
-    """Event suchen – inklusive offener DKP-/EC-Anwesenheitschecks.
+    """Event suchen – inklusive direkter Eventliste, RSVP-Fallback und offener EC-Checks.
 
-    Wichtig für Ebolus: Ein Event darf im Dashboard nicht verschwinden, solange
-    im DKP-Log noch ein EC-Anwesenheitscheck offen ist. Deshalb durchsuchen wir
-    nicht nur snapshot["events"], sondern auch event_checks und erzeugen bei
-    Bedarf einen kleinen Platzhalter-Eintrag.
+    Alte Versionen haben nur _events_with_pending_ec_checks() durchsucht. Dadurch
+    konnten abgeschlossene/alte Events in der Anwesenheit leer erscheinen, obwohl
+    die RSVP-Daten in Postgres noch vorhanden waren.
     """
-    target = str(event_id or "")
-    for ev in _events_with_pending_ec_checks(snap):
-        if isinstance(ev, dict) and str(ev.get("event_id") or "") == target:
+    target = str(event_id or "").strip()
+    if not target:
+        return None
+
+    # 1) Direkte Eventliste aus Snapshot/Postgres-Read-Cutover.
+    events_obj = snap.get("events") if isinstance(snap.get("events"), dict) else {}
+    for ev in events_obj.get("items") or []:
+        if not isinstance(ev, dict):
+            continue
+        if str(ev.get("event_id") or ev.get("id") or "").strip() == target:
             return ev
+
+    # 2) Eventliste plus EC-/Review-Fallbacks.
+    for ev in _events_with_pending_ec_checks(snap):
+        if isinstance(ev, dict) and str(ev.get("event_id") or ev.get("id") or "").strip() == target:
+            return ev
+
+    # 3) Minimal-Event direkt aus RSVP-Zeilen bauen. Reicht für Attendance.
+    rsvp_items = ((snap.get("event_rsvps") or {}).get("items") or []) if isinstance(snap.get("event_rsvps"), dict) else []
+    hits = [r for r in rsvp_items if isinstance(r, dict) and str(r.get("event_id") or "").strip() == target]
+    if hits:
+        title = str(hits[0].get("event_title") or hits[0].get("title") or f"Event {target}")
+        ev = {"event_id": target, "id": target, "title": title, "source": "event_rsvps_fallback", "participants": {"yes": [], "maybe": [], "no": []}}
+        yes_groups: dict[str, list[dict[str, Any]]] = {}
+        for r in hits:
+            uid = _user_id(r.get("user_id") or r.get("id"))
+            person = {**r, "user_id": uid, "id": uid, "display_name": r.get("display_name") or r.get("name") or (f"User {uid}" if uid else "Unbekannt")}
+            response = str(r.get("response") or r.get("status") or "").strip().lower()
+            role = str(r.get("role_name") or r.get("role") or "Zusage").strip()
+            role_l = role.lower()
+            if response in {"no", "nein", "absent", "abgemeldet", "declined", "deny"} or role_l in {"no", "nein", "abgemeldet"} or "abmeld" in response:
+                ev["participants"]["no"].append(person)
+            elif response in {"maybe", "vielleicht", "tentative", "unsure"} or role_l in {"maybe", "vielleicht"}:
+                ev["participants"]["maybe"].append(person)
+            else:
+                yes_groups.setdefault(role or "Zusage", []).append(person)
+        ev["participants"]["yes"] = [{"role": role, "participants": people} for role, people in sorted(yes_groups.items())]
+        ev["participant_count"] = sum(len(g.get("participants") or []) for g in ev["participants"]["yes"])
+        ev["maybe_count"] = len(ev["participants"].get("maybe") or [])
+        ev["no_count"] = len(ev["participants"].get("no") or [])
+        ev["rsvp_count"] = len(hits)
+        return ev
     return None
 
 
@@ -7365,41 +7402,81 @@ def _weapon_type_options_html() -> str:
 
 
 def _render_need_editor_panel(user_id: int, current_user: Optional[dict[str, Any]], requests: list[dict[str, Any]], snap: Optional[dict[str, Any]] = None) -> str:
+    snap = snap or {}
     req_rows = []
     for r in requests[:30]:
         p = r.get("payload") if isinstance(r.get("payload"), dict) else {}
         res = r.get("result") if isinstance(r.get("result"), dict) else {}
         detail = res.get("message") or res.get("error") or p.get("item_name") or p.get("item_text") or p.get("item_id") or "—"
         req_rows.append([_dt(r.get("requested_at")), _need_change_status_label(r.get("status")), r.get("action_type"), p.get("tab"), p.get("slot"), _short(detail, 120)])
+
+    need_info = _needs_by_user(snap).get(int(user_id), {})
+    main_map = _need_slot_map((need_info or {}).get("main") or (need_info or {}).get("main_needs") or []) if isinstance(need_info, dict) else {}
+    sec_map = _need_slot_map((need_info or {}).get("secondary") or (need_info or {}).get("secondary_needs") or (need_info or {}).get("second") or []) if isinstance(need_info, dict) else {}
+
+    def row_html(tab: str, slot: str, entry: Any, idx: int) -> str:
+        locked = bool(entry and _need_is_received(entry))
+        current = _need_item_display(entry) if entry else ""
+        input_id = f"need-inline-{int(user_id)}-{tab.lower()}-{idx}"
+        slot_id = f"need-slot-fixed-{int(user_id)}-{tab.lower()}-{idx}"
+        weapon_html = ""
+        if slot.startswith("Waffe"):
+            weapon_html = f'<select name="weapon_type" class="mini-input"><option value="">Waffenart</option>{_weapon_type_options_html()}</select>'
+        hidden_slot = f'<select id="{_e(slot_id)}" class="need-slot-select" name="slot" style="display:none"><option selected value="{_e(slot)}">{_e(slot)}</option></select>'
+        if locked:
+            return f"""
+            <div class="need-inline-row locked">
+              <div class="need-inline-slot">🔒 {_e(slot)}</div>
+              <div class="need-inline-current">{_e(current or '—')}</div>
+              <div class="muted">erhalten · gesperrt</div>
+            </div>"""
+        picker = _loot_item_picker_html(snap, input_id=input_id, name="item_text", required=False, placeholder=(current or "Item auswählen oder tippen"), slot_select_id=slot_id)
+        return f"""
+        <form class="need-inline-row" method="post" action="/portal/member/{int(user_id)}/need-change">
+          <input type="hidden" name="action_type" value="set">
+          <input type="hidden" name="tab" value="{_e(tab)}">
+          {hidden_slot}
+          <div class="need-inline-slot">{_e(slot)}</div>
+          <div class="need-inline-picker">{picker}</div>
+          {weapon_html}
+          <button class="btn mini-btn" type="submit">Speichern</button>
+          <button class="btn mini-btn ghost" type="submit" name="action_type" value="clear" onclick="return confirm('Need für {_e(slot)} entfernen?')">Leeren</button>
+        </form>"""
+
+    def board_html(tab: str, slot_map: dict[str, Any]) -> str:
+        blocks = []
+        idx = 0
+        for title, slots in _NEED_SLOT_GROUPS:
+            rows = []
+            for slot in slots:
+                idx += 1
+                rows.append(row_html(tab, slot, slot_map.get(slot), idx))
+            blocks.append(f'<div class="need-slot-group"><h3>{_e(title)}</h3>{"".join(rows)}</div>')
+        return f'<div class="need-board edit-board"><h3>{_e(tab)}</h3><p class="muted">Direkt ins Feld klicken, Item wählen oder tippen. Waffen-Slots haben zusätzlich Waffenart.</p>{"".join(blocks)}</div>'
+
     actor_hint = "Du bearbeitest deine eigene Needliste." if current_user else "Discord-Login nötig."
-    slot_select_id = f"need-slot-{int(user_id)}"
-    picker = _loot_item_picker_html(snap or {}, input_id=f"need-item-{int(user_id)}", name="item_text", required=False, placeholder="Item aus Liste wählen oder tippen", slot_select_id=slot_select_id)
     return f"""
     <section class="panel" id="need-editor">
       <h2>✍️ Needliste bearbeiten</h2>
-      <p class="muted">{_e(actor_hint)} Das Dashboard stellt nur einen Änderungsantrag. Der Bot schreibt danach die echte Needliste und der Vorgang bleibt geloggt.</p>
+      <p class="muted">{_e(actor_hint)} Jede Zeile speichert nur diesen Slot. Der Bot verarbeitet den Antrag und schreibt die echte Needliste.</p>
+      <style>
+        .need-inline-row{{display:grid;grid-template-columns:160px minmax(220px,1fr) 150px auto auto;gap:10px;align-items:end;padding:10px 0;border-bottom:1px solid rgba(255,255,255,.08)}}
+        .need-inline-slot{{font-weight:800;color:var(--gold)}}
+        .need-inline-current{{font-weight:800}}
+        .need-inline-picker input,.need-inline-picker select,.mini-input{{width:100%;padding:9px;border-radius:10px;background:#08090d;color:var(--text);border:1px solid var(--line)}}
+        .mini-btn{{padding:9px 11px;border:0;cursor:pointer;white-space:nowrap}}
+        .ghost{{background:#303442;color:var(--text)}}
+        .edit-board .need-slot-group{{margin-top:12px}}
+        @media(max-width:760px){{.need-inline-row{{grid-template-columns:1fr;align-items:stretch}}.need-inline-row .btn{{width:100%}}}}
+      </style>
       <div class="split">
-        <form method="post" action="/portal/member/{int(user_id)}/need-change" style="display:grid; gap:10px;">
-          <input type="hidden" name="action_type" value="set">
-          <label>Bereich<br><select name="tab" style="width:100%; padding:10px; border-radius:10px; background:#08090d; color:var(--text); border:1px solid var(--line);"><option value="Main">Main</option><option value="Secondary">Secondary</option></select></label>
-          <label>Slot<br><select id="{_e(slot_select_id)}" class="need-slot-select" name="slot" style="width:100%; padding:10px; border-radius:10px; background:#08090d; color:var(--text); border:1px solid var(--line);">{_slot_options_html()}</select></label>
-          <label>Waffenart nur bei Waffe<br><select name="weapon_type" style="width:100%; padding:10px; border-radius:10px; background:#08090d; color:var(--text); border:1px solid var(--line);"><option value="">nicht relevant</option>{_weapon_type_options_html()}</select></label>
-          <label>Itemname oder Item-ID<br>{picker}</label>
-          <button class="btn" type="submit" style="border:0; cursor:pointer;">Need setzen</button>
-        </form>
-        <form method="post" action="/portal/member/{int(user_id)}/need-change" style="display:grid; gap:10px; align-content:start;">
-          <input type="hidden" name="action_type" value="clear">
-          <label>Bereich<br><select name="tab" style="width:100%; padding:10px; border-radius:10px; background:#08090d; color:var(--text); border:1px solid var(--line);"><option value="Main">Main</option><option value="Secondary">Secondary</option></select></label>
-          <label>Slot löschen<br><select name="slot" style="width:100%; padding:10px; border-radius:10px; background:#08090d; color:var(--text); border:1px solid var(--line);">{_slot_options_html()}</select></label>
-          <button class="btn" type="submit" style="border:0; cursor:pointer; background:#303442; color:var(--text);">Need entfernen</button>
-          <p class="muted">Bereits als erhalten gesperrte Slots kann nur die Leitung ändern.</p>
-        </form>
+        {board_html('Main', main_map)}
+        {board_html('Secondary', sec_map)}
       </div>
       <h3>Änderungslog</h3>
       {_table(['Zeit','Status','Aktion','Bereich','Slot','Ergebnis'], req_rows, placeholder='Need-Änderungen durchsuchen…')}
     </section>
     """
-
 
 def _render_member_portal(data: dict[str, Any], user_id: int, request: Request, msg: str = "") -> str:
     if not data.get("ok"):
@@ -7508,10 +7585,9 @@ def _render_member_home(data: dict[str, Any], request: Request) -> str:
     cards = "".join([_card("Meine EC", _fmt_ec(my_ec_balance) if my_ec_balance is not None else "—", "aktueller Stand"), _card("Uhrzeit", now_text, "lokale Dashboard-Zeit"), _card("Events", len(running_events), "max. 2 auf Startseite"), _card("Auktionen", len(active_auctions), "max. 4 auf Startseite")])
     body = f"""
     <nav class="topnav"><a href="/member">Start</a><a href="#events">Events</a><a href="#auctions">Auktionen</a><a href="/portal">Eigenes Profil</a><a href="/portal#needs">Meine Needs</a><a href="/portal#need-editor">Need ändern</a></nav>
-    <section class="hero member-home-hero"><div style="display:flex;gap:16px;align-items:center;flex-wrap:wrap;"><div class="member-start-logo"><img src="{_asset('ebolus_logo.png')}" alt="Ebolus"></div><div><div class="eyebrow">Mitgliederbereich</div><h1>Willkommen, {_e(display)}</h1><p class="muted">Kurzüberblick für Mitglieder. Details findest du über die Buttons.</p></div></div><div class="hero-actions"><a class="hero-action" href="/portal"><span>👤</span><strong>Eigenes Profil</strong><small>Daten & Übersicht</small></a><a class="hero-action" href="/portal#needs"><span>🎁</span><strong>Meine Needs</strong><small>ansehen/bearbeiten</small></a><a class="hero-action" href="#auctions"><span>🏆</span><strong>Auktionen</strong><small>bieten/kaufen</small></a></div></section>
+    <section class="hero member-home-hero"><div style="display:flex;gap:16px;align-items:center;flex-wrap:wrap;"><div class="member-start-logo"><img src="{_asset('ebolus_logo.png')}" alt="Ebolus"></div><div><div class="eyebrow">Mitgliederbereich</div><h1>Willkommen, {_e(display)}</h1><p class="muted">Kurzüberblick. Weitere Bereiche erreichst du links über die Leiste.</p></div></div></section>
     <section class="grid">{cards}</section>
-    <section class="split"><div class="panel" id="events"><h2>📅 Nächste 2 Events</h2>{_member_home_event_rows(running_events, int(uid or 0))}<p><a class="btn" href="/events">Mehr Events</a></p></div><div class="panel" id="auctions"><h2>🏆 Max. 4 laufende Auktionen</h2>{_member_home_auction_rows(active_auctions, snap)}<p><a class="btn" href="/loot">Mehr Auktionen</a></p></div></section>
-    <section class="panel"><h2>🔎 Mehr anzeigen</h2><div class="hero-actions"><a class="hero-action members" href="/members"><span>👥</span><strong>Mitglieder</strong><small>Gildenübersicht</small></a><a class="hero-action" href="/portal#my-ec"><span>🪙</span><strong>Mein EC-Verlauf</strong><small>Buchungen ansehen</small></a><a class="hero-action loot" href="/portal#need-editor"><span>✍️</span><strong>Need ändern</strong><small>Slot & Item setzen</small></a></div></section>
+    <section class="split"><div class="panel" id="events"><h2>📅 Nächste 2 Events</h2>{_member_home_event_rows(running_events, int(uid or 0))}</div><div class="panel" id="auctions"><h2>🏆 Max. 4 laufende Auktionen</h2>{_member_home_auction_rows(active_auctions, snap)}</div></section>
     """
     return _html_shell("Mitgliederbereich · Ebo Dashboard", body, nav_mode="member")
 
@@ -8221,7 +8297,8 @@ def _render_events_center(data: dict[str, Any], current_user: Optional[dict[str,
         </div>
         <label>Beschreibung<br><textarea name="description" rows="4" placeholder="Kurzbeschreibung"></textarea></label>
         <div class="event-form-grid">
-          <label>Bild-URL optional<br><input name="image_url" placeholder="https://..."></label>
+          <label>Bildtyp<br><select name="image_type" style="width:100%; padding:10px; border-radius:10px; background:#08090d; color:var(--text); border:1px solid var(--line);"><option value="none">Kein Bild</option><option value="custom">Eigene URL</option><option value="normal">Normal Raid</option><option value="hard">Hard Raid</option><option value="nightmare">Nightmare</option><option value="trials">Trials</option><option value="pvp">PvP</option><option value="boss">Gildenbosse</option></select></label>
+          <label>Bild-URL bei Eigene URL<br><input name="image_url" placeholder="https://..."></label>
           <label style="display:flex; gap:8px; align-items:center; padding-top:22px;"><input type="checkbox" name="send_dms" value="1" checked> DMs an Zielgruppe senden</label>
         </div>
         <button class="btn" type="submit" onclick="return confirm('Event-Erstellung als Bot-Antrag senden?')">Event-Erstellung an Bot senden</button>
@@ -8336,6 +8413,7 @@ async def admin_events_action(request: Request, _: bool = Depends(_admin_auth)):
         "channel_id": str(form.get("channel_id") or "").strip(),
         "target_role_id": str(form.get("target_role_id") or "").strip(),
         "description": str(form.get("description") or "").strip(),
+        "image_type": str(form.get("image_type") or "").strip(),
         "image_url": str(form.get("image_url") or "").strip(),
         "send_dms": str(form.get("send_dms") or "") == "1",
     }
@@ -10194,6 +10272,22 @@ def _attendance_candidate_map(snap: dict[str, Any], event: dict[str, Any]) -> di
     eid = str(event.get("event_id") or event.get("id") or "").strip()
 
     parts = event.get("participants") or {}
+    # Phase-3 und ältere Snapshots liefern Teilnehmer teils direkt als yes/maybe/no
+    # statt unter participants. Für Attendance normalisieren wir beide Formen.
+    if not parts and (event.get("yes") or event.get("maybe") or event.get("no")):
+        yes_groups: list[dict[str, Any]] = []
+        raw_yes = event.get("yes")
+        if isinstance(raw_yes, dict):
+            for role, people in raw_yes.items():
+                yes_groups.append({"role": role, "participants": people if isinstance(people, list) else []})
+        elif isinstance(raw_yes, list):
+            for group in raw_yes:
+                if isinstance(group, dict) and ("participants" in group or "role" in group):
+                    yes_groups.append(group)
+                elif isinstance(group, dict):
+                    yes_groups.append({"role": group.get("role_name") or group.get("role") or "Zusage", "participants": [group]})
+        parts = {"yes": yes_groups, "maybe": event.get("maybe") or [], "no": event.get("no") or []}
+
     for group in parts.get("yes") or []:
         if not isinstance(group, dict):
             continue
@@ -10228,6 +10322,45 @@ def _attendance_candidate_map(snap: dict[str, Any], event: dict[str, Any]) -> di
             add(uid, name, "Vielleicht", "partial", "RSVP")
         else:
             add(uid, name, role or "Zusage", "present", "RSVP")
+
+    # Falls Snapshot/Review trotzdem keine Spieler liefert, direkt aus Phase-3-RSVPs lesen.
+    # Das rettet alte Reviews, wenn die aktuelle Eventliste nur noch den Review-Fallback kennt.
+    if eid and not candidates and _database_url():
+        gid = _user_id((snap.get("guild") or {}).get("id") or snap.get("guild_id") or event.get("guild_id") or event.get("source_guild_id"))
+        if gid:
+            try:
+                conn = _pg_connect()
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """
+                            SELECT event_id, user_id, response, role_name, display_name, raw_json, updated_at
+                            FROM phase3_event_rsvps
+                            WHERE guild_id = %s AND event_id = %s
+                            ORDER BY display_name ASC
+                            LIMIT 500
+                            """,
+                            (int(gid), str(eid)),
+                        )
+                        for row in cur.fetchall() or []:
+                            raw = _phase3_json(row.get("raw_json"), {}) if isinstance(row, dict) else {}
+                            uid = _user_id((row or {}).get("user_id") or raw.get("user_id"))
+                            if not uid:
+                                continue
+                            response = str((row or {}).get("response") or raw.get("response") or raw.get("status") or "").strip().lower()
+                            role = str((row or {}).get("role_name") or raw.get("role_name") or raw.get("role") or "").strip()
+                            name = str((row or {}).get("display_name") or raw.get("display_name") or raw.get("name") or names.get(uid) or "").strip()
+                            role_l = role.lower()
+                            if response in {"no", "nein", "absent", "abgemeldet", "declined", "deny"} or "abmeld" in response or role_l in {"no", "nein", "abgemeldet"}:
+                                add(uid, name, "Abgemeldet", "absent", "Postgres-RSVP")
+                            elif response in {"maybe", "vielleicht", "tentative", "unsure"} or role_l in {"maybe", "vielleicht"}:
+                                add(uid, name, "Vielleicht" if not role else role, "partial", "Postgres-RSVP")
+                            else:
+                                add(uid, name, role or "Zusage", "present", "Postgres-RSVP")
+                finally:
+                    conn.close()
+            except Exception:
+                pass
 
     for r in voice.get("voice_by_user") or []:
         if not isinstance(r, dict):
