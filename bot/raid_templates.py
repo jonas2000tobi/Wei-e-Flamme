@@ -6,6 +6,11 @@ from pathlib import Path
 from typing import Optional, List
 from datetime import datetime, timedelta, date
 
+try:
+    from bot.json_store import load_json_file, save_json_atomic, warn_json_store  # type: ignore
+except Exception:
+    from json_store import load_json_file, save_json_atomic, warn_json_store  # type: ignore
+
 import discord
 
 try:
@@ -55,25 +60,19 @@ _client_ref: Optional[discord.Client] = None
 
 
 def _load() -> dict:
-    try:
-        return json.loads(TEMPLATE_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+    return load_json_file(TEMPLATE_FILE, {}, context=__name__)
 
 
 def _save(obj: dict) -> None:
-    TEMPLATE_FILE.write_text(json.dumps(obj, indent=2, ensure_ascii=False), encoding="utf-8")
+    save_json_atomic(TEMPLATE_FILE, obj, context=__name__)
 
 
 def _load_auto_state() -> dict:
-    try:
-        return json.loads(AUTO_STATE_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+    return load_json_file(AUTO_STATE_FILE, {}, context=__name__)
 
 
 def _save_auto_state(obj: dict) -> None:
-    AUTO_STATE_FILE.write_text(json.dumps(obj, indent=2, ensure_ascii=False), encoding="utf-8")
+    save_json_atomic(AUTO_STATE_FILE, obj, context=__name__)
 
 
 templates: dict = _load()
