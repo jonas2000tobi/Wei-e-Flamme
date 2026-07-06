@@ -2672,7 +2672,7 @@ def _render_event_detail(data: dict[str, Any], event_id: str) -> str:
     <section class="panel" id="signups"><h2>✅ Zusagen nach Rolle</h2>{_role_signup_html(event)}</section>
     <section class="panel" id="maybe"><h2>🟡 Vielleicht</h2>{_table(['Spieler','Gildenrolle'], maybe_rows, placeholder='Vielleicht durchsuchen…')}</section>
     <section class="panel" id="no"><h2>❌ Abgemeldet</h2>{_table(['Spieler','Gildenrolle'], no_rows, placeholder='Abmeldungen durchsuchen…')}</section>
-    {_raw(_event_ec_queue_panel(_safe_guild_id(data), str(event_id)))}
+    {_event_ec_queue_panel(_safe_guild_id(data), str(event_id))}
     """
     return _html_shell(f"{event.get('title') or 'Event'} · Ebo Dashboard", body)
 
@@ -10675,7 +10675,7 @@ def _render_attendance_event(data: dict[str, Any], event_id: str, saved: bool = 
       <div style="display:flex;gap:8px;flex-wrap:wrap"><form method="post" action="/admin/attendance/{_e(event_id)}/voice-suggest"><button class="btn" type="submit">🎙️ Voice-Vorschlag neu laden</button></form><a class="btn" href="#review-save">✅ 1. Überprüfen</a><a class="btn" href="/attendance/{_e(event_id)}/report">📋 Abschlussbericht</a></div>
     </section>
     {saved_note}
-    {_raw(_attendance_review_control_panel(guild_id, str(event_id), review))}
+    {_attendance_review_control_panel(guild_id, str(event_id), review)}
     <section class="grid">{cards}</section>
     <section class="panel">
       <h2>⚙️ Schnellaktionen</h2>
@@ -10713,7 +10713,7 @@ def _render_attendance_event(data: dict[str, Any], event_id: str, saved: bool = 
         </div>
       </form>
     </section>
-    {_raw(_event_ec_queue_panel(guild_id, str(event_id)))}
+    {_event_ec_queue_panel(guild_id, str(event_id))}
     """
     return _html_shell(f"Anwesenheit · {event.get('title') or event_id}", body)
 
@@ -11496,7 +11496,7 @@ def _render_attendance_ec_preview(data: dict[str, Any], event_id: str, full_ec: 
       </div>
     </section>
     {notice}
-    {_raw(_event_ec_queue_panel(guild_id, str(event_id)))}
+    {_event_ec_queue_panel(guild_id, str(event_id))}
     <section class="grid">
       {_card('Empfänger', recipients, 'bekommen EC laut Review')}
       {_card('Gesamt-EC', _fmt_ec(total), 'würde insgesamt vergeben')}
@@ -11670,7 +11670,7 @@ def _render_attendance_report(data: dict[str, Any], event_id: str, full_ec: Opti
       {_card('Teilweise', counts.get('partial', 0), f'+{_fmt_ec(pe)} EC')}
       {_card('Queue', latest_status, 'letzte Anfrage')}
     </section>
-    {_raw(_event_ec_queue_panel(guild_id, str(event_id)))}
+    {_event_ec_queue_panel(guild_id, str(event_id))}
     <section class="panel">
       <h2>⚠️ Prüfpunkte</h2>
       <p class="muted">Diese Liste ist bewusst streng. Sie hilft, Fehlbuchungen vor dem finalen EC-Button zu vermeiden.</p>
