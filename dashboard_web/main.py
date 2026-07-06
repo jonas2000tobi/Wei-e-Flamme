@@ -3289,7 +3289,36 @@ def _sidebar_html() -> str:
     """
 
 
-def _html_shell(title: str, body: str) -> str:
+
+
+def _member_sidebar_html() -> str:
+    return f"""
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark"><img src="{_asset('ebolus_logo.png')}" alt="Ebolus"></div>
+        <div><strong>Ebolus</strong><span>Mitgliederbereich</span></div>
+      </div>
+      <button class="mobile-nav-toggle" type="button" onclick="document.body.classList.toggle('nav-open')">☰ Menü</button>
+
+      <nav class="side-nav">
+        <a href="/member" data-nav="member-home">🏠 Start</a>
+        <a href="/member#members" data-nav="member-members">👥 Mitglieder</a>
+        <a href="/member#events" data-nav="member-events">📅 Laufende Events</a>
+        <a href="/member#auctions" data-nav="member-auctions">🏆 Laufende Auktionen</a>
+        <a href="/portal" data-nav="member-profile">👤 Eigenes Profil</a>
+        <a href="/portal#needs" data-nav="member-needs">🎁 Meine Needs</a>
+      </nav>
+
+      <div class="sidebar-footer">
+        <a href="/me">Mein Login</a>
+        <a href="/logout">Logout</a>
+        <span class="version-pill">v{_e(DASHBOARD_RELEASE_VERSION)}</span>
+      </div>
+    </aside>
+    """
+
+
+def _html_shell(title: str, body: str, *, nav_mode: str = "admin") -> str:
     auth_note = ""
     if _discord_oauth_enabled():
         auth_note = '<div class="authbar">🔐 Discord-Login aktiv · <a href="/me">Mein Login</a> · <a href="/logout">Logout</a></div>'
@@ -3483,7 +3512,7 @@ def _html_shell(title: str, body: str) -> str:
     @media(max-width:560px) {{ main.content {{ padding:12px 10px 42px; }} .grid,.analytics-grid,.side-nav {{ grid-template-columns:1fr; }} .bar-row {{ grid-template-columns:90px 1fr 38px; }} .home-item {{ grid-template-columns:38px minmax(0,1fr); }} .home-item .pill {{ grid-column:2; justify-self:start; }} .split {{ grid-template-columns:1fr; }} }}
   </style>
 </head>
-<body><div class="app-shell">{_sidebar_html()}<main class="content">{auth_note}{body}</main></div><script>
+<body><div class="app-shell">{_member_sidebar_html() if nav_mode == "member" else _sidebar_html()}<main class="content">{auth_note}{body}</main></div><script>
 function filterNextTable(input) {{
   const wrap = input.nextElementSibling;
   if (!wrap) return;
@@ -4103,7 +4132,7 @@ def _render_activity_analytics(data: dict[str, Any]) -> str:
         if not isinstance(r, dict):
             continue
         top_rows.append([
-            _member_link(r.get("user_id"), r.get("display_name")),
+            r.get("display_name") or f"User {r.get('user_id')}",
             f"{float(r.get('participation_rate') or 0):.0f} %",
             r.get("yes"),
             r.get("maybe"),
@@ -7042,8 +7071,9 @@ def _render_member_portal(data: dict[str, Any], user_id: int, request: Request, 
         _card("Events", f"{response.get('yes',0)} Zusagen", f"{response.get('maybe',0)} vielleicht · {response.get('no',0)} nein"),
         _card("Loot", loot_payload.get("won_count", 0), f"ausgegeben: {_fmt_ec(loot_payload.get('spent_ec', 0))} EC"),
     ])
+    portal_nav = '<nav class="topnav"><a href="/">Kommando</a><a href="/portal">Mein Portal</a><a href="/events">Events</a><a href="/loot">Loot</a><a href="/members">Mitglieder</a><a href="/ec">EC</a></nav>' if _is_portal_admin(request) else '<nav class="topnav"><a href="/member">Start</a><a href="/member#members">Mitglieder</a><a href="/member#events">Events</a><a href="/member#auctions">Auktionen</a><a href="/portal">Eigenes Profil</a><a href="#needs">Meine Needs</a></nav>'
     body = f"""
-    <nav class="topnav"><a href="/">Kommando</a><a href="/portal">Mein Portal</a><a href="/events">Events</a><a href="/loot">Loot</a><a href="/members">Mitglieder</a><a href="/ec">EC</a></nav>
+    {portal_nav}
     <section class="hero">
       <div><div class="eyebrow">Spieler- & Mitgliederportal</div><h1>👤 {_e(display)}</h1><p class="muted">Eigene Daten, laufende Events, laufende Auktionen, EC, Attendance, Loot und Needliste.</p></div>
       <div class="hero-actions">{admin_links}<a class="btn" href="/logout">Logout</a></div>
@@ -7057,10 +7087,93 @@ def _render_member_portal(data: dict[str, Any], user_id: int, request: Request, 
     <section class="panel"><h2>🪙 EC-Verlauf</h2>{_table(['Zeit','Betrag','Typ','Grund'], tx_rows, placeholder='EC durchsuchen…')}</section>
     <section class="panel"><h2>🏆 Loot-Historie</h2>{_table(['Item','Bereich','EC','Zeit'], loot_rows, placeholder='Loot durchsuchen…')}</section>
     """
-    return _html_shell(f"{display} Portal · Ebo Dashboard", body)
+    shell_mode = "admin" if _is_portal_admin(request) else "member"
+    return _html_shell(f"{display} Portal · Ebo Dashboard", body, nav_mode=shell_mode)
 
 
-def _settings_change_requests_for_dashboard(guild_id: int, limit: int = 100) -> list[dict[str, Any]]:
+
+def _render_member_home(data: dict[str, Any], request: Request) -> str:
+    if not data.get("ok"):
+        return _html_shell("Mitgliederbereich · Ebo Dashboard", f"<section class='panel'><h1>🏠 Mitgliederbereich</h1><p class='muted'>{_e(data.get('error'))}</p></section>", nav_mode="member")
+    user = _current_user(request) or {}
+    uid = _current_user_id(request)
+    snap: dict[str, Any] = data.get("snapshot") or {}
+    names = _profile_name_map(snap)
+
+    display = names.get(int(uid), str(user.get("username") or "Mitglied")) if uid else str(user.get("username") or "Mitglied")
+
+    # Öffentliche, reduzierte Mitgliederliste: keine Adminnotizen, keine EC-Queue, keine internen Prüfmarkierungen.
+    members_payload = _member_center_payload(data)
+    member_rows: list[list[Any]] = []
+    for r in (members_payload.get("rows") or [])[:120]:
+        if not isinstance(r, dict):
+            continue
+        member_rows.append([
+            _member_link(r.get("user_id"), r.get("display_name")),
+            r.get("ingame_name") or "—",
+            r.get("main_role") or r.get("role") or "—",
+            r.get("gearscore") or "—",
+        ])
+
+    running_events = []
+    for ev in _events_items(snap):
+        if isinstance(ev, dict) and _is_running_event(ev):
+            running_events.append(ev)
+    running_events.sort(key=lambda ev: _dt_obj(ev.get("when_iso") or ev.get("start_at") or ev.get("created_at")) or datetime.max.replace(tzinfo=timezone.utc))
+
+    event_rows: list[list[Any]] = []
+    for ev in running_events[:30]:
+        eid = str(ev.get("event_id") or ev.get("id") or "")
+        event_rows.append([
+            _event_link(eid, ev.get("title") or ev.get("name") or eid),
+            _dt(ev.get("when_iso") or ev.get("start_at") or ev.get("created_at")),
+            _event_status_text(ev),
+            _portal_event_status_for_user(ev, int(uid or 0)) if uid else "—",
+        ])
+
+    auctions = (((snap.get("loot") or {}).get("auctions") or {}).get("items") or [])
+    active_auctions = [a for a in auctions if isinstance(a, dict) and _loot_is_active(a)]
+    active_auctions.sort(key=lambda a: _dt_obj(a.get("ends_at") or a.get("end_at") or a.get("expires_at")) or datetime.max.replace(tzinfo=timezone.utc))
+    auction_rows: list[list[Any]] = []
+    for a in active_auctions[:30]:
+        aid = str(a.get("auction_id") or "")
+        auction_rows.append([
+            _auction_link(aid, a.get("item_name") or a.get("item") or aid),
+            _phase_label(a),
+            _loot_effective_status_label(a),
+            _auction_leader_text(a, names),
+            _dt(a.get("ends_at") or a.get("end_at") or a.get("expires_at")),
+            _raw(f'<a class="btn" href="/auction/{_e(aid)}">Öffnen</a>') if aid else "—",
+        ])
+
+    cards = "".join([
+        _card("Mitglieder", len(member_rows), "Gildenübersicht"),
+        _card("Laufende Events", len(running_events), "bis 1h nach Start"),
+        _card("Laufende Auktionen", len(active_auctions), "Bieten/Kaufen möglich"),
+        _card("Profil", display, "eigene Daten & Needs"),
+    ])
+
+    body = f"""
+    <nav class="topnav"><a href="/member">Start</a><a href="#members">Mitglieder</a><a href="#events">Events</a><a href="#auctions">Auktionen</a><a href="/portal">Eigenes Profil</a><a href="/portal#needs">Meine Needs</a></nav>
+    <section class="hero">
+      <div>
+        <div class="eyebrow">Mitgliederbereich</div>
+        <h1>🏠 Willkommen, {_e(display)}</h1>
+        <p class="muted">Reduzierte Ansicht für normale Mitglieder: Mitglieder, laufende Events, laufende Auktionen, eigenes Profil und eigene Needliste.</p>
+      </div>
+      <div class="hero-actions">
+        <a class="hero-action" href="/portal"><span>👤</span><strong>Eigenes Profil</strong><small>Daten & Übersicht</small></a>
+        <a class="hero-action" href="/portal#needs"><span>🎁</span><strong>Meine Needs</strong><small>ansehen/bearbeiten</small></a>
+        <a class="hero-action" href="#auctions"><span>🏆</span><strong>Auktionen</strong><small>bieten/kaufen</small></a>
+      </div>
+    </section>
+    <section class="grid">{cards}</section>
+    <section class="panel" id="events"><h2>📅 Laufende Events</h2><p class="muted">Nach deiner Regel sichtbar ab Erstellung bis 1 Stunde nach Eventbeginn.</p>{_table(['Event','Zeit','Status','Deine Anmeldung'], event_rows, placeholder='Events durchsuchen…')}</section>
+    <section class="panel" id="auctions"><h2>🏆 Laufende Auktionen</h2><p class="muted">Zum Bieten oder Kaufen die Auktion öffnen. Aktionen laufen weiter über die Bot-Queue.</p>{_table(['Item','Bereich','Status','Führend','Ende','Aktion'], auction_rows, placeholder='Auktionen durchsuchen…')}</section>
+    <section class="panel" id="members"><h2>👥 Mitglieder</h2>{_table(['Discord','Ingame','Rolle','Gearscore'], member_rows, placeholder='Mitglieder durchsuchen…')}</section>
+    """
+    return _html_shell("Mitgliederbereich · Ebo Dashboard", body, nav_mode="member")
+
     """Letzte Dashboard-Einstellungsanträge.
 
     Das Dashboard schreibt keine Bot-JSON. Es legt nur Änderungsanträge in Postgres ab.
@@ -8806,7 +8919,12 @@ def discord_callback(request: Request, code: str = "", state: str = "", error: s
             "iat": int(time.time()),
             "exp": int(time.time()) + 7 * 24 * 3600,
         }
-        resp = RedirectResponse(str(state_data.get("next") or "/"), status_code=303)
+        target = str(state_data.get("next") or "/")
+        # Normale Mitglieder landen nach dem Login automatisch im reduzierten Mitgliederbereich.
+        # Admins behalten den vollen Dashboard-Einstieg.
+        if not is_admin and target in {"", "/", "/overview", "/admin", "/settings", "/system", "/audit", "/ec", "/ec-queue", "/attendance", "/analytics", "/voice", "/exports"}:
+            target = "/member"
+        resp = RedirectResponse(target, status_code=303)
         resp.delete_cookie(STATE_COOKIE)
         resp.set_cookie(SESSION_COOKIE, _make_token(session), max_age=7 * 24 * 3600, httponly=True, secure=_cookie_secure(), samesite="lax")
         return resp
@@ -9029,6 +9147,16 @@ def event_detail(event_id: str, _: bool = Depends(_auth)):
             status_code=500,
         )
 
+
+
+@app.get("/member", response_class=HTMLResponse)
+def member_home(request: Request, _: bool = Depends(_auth)):
+    try:
+        user = _current_user(request) or {}
+        # Admins können die Mitgliederansicht bewusst öffnen, bleiben sonst im vollen Dashboard.
+        return HTMLResponse(_render_member_home(_snapshot_payload(), request))
+    except Exception as exc:
+        return HTMLResponse(_html_shell("Mitgliederbereich Fehler", f"<section class='panel'><h1>❌ Mitgliederbereich-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>", nav_mode="member"), status_code=500)
 
 
 @app.get("/portal", response_class=HTMLResponse)
@@ -9527,7 +9655,10 @@ def overview(_: bool = Depends(_auth)):
 
 
 @app.get("/", response_class=HTMLResponse)
-def index(_: bool = Depends(_auth)):
+def index(request: Request, _: bool = Depends(_auth)):
+    user = _current_user(request) or {}
+    if str(user.get("role") or "") == "member":
+        return RedirectResponse("/member", status_code=303)
     try:
         return HTMLResponse(_render_leadership_dashboard(_snapshot_payload()))
     except Exception as exc:
