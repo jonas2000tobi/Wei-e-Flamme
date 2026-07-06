@@ -2197,6 +2197,77 @@ def _need_list_html(title: str, items: Any) -> str:
     more = f"<p class='muted'>+ {len(arr) - 80} weitere</p>" if len(arr) > 80 else ""
     return f"<h3>{_e(title)} <span class='pill'>{len(arr)}</span></h3><ul class='need-list'>{lis}</ul>{more}"
 
+_NEED_SLOT_GROUPS = [
+    ("⚔️ Waffen", ["Waffe 1", "Waffe 2"]),
+    ("✨ Fähigkeitskern", ["Fähigkeitskern"]),
+    ("🛡️ Rüstung", ["Helm", "Brust", "Hose", "Handschuhe", "Schuhe"]),
+    ("💍 Schmuck", ["Brosche", "Ohrringe", "Kette", "Armband", "Ring 1", "Ring 2"]),
+    ("🧥 Sonstiges", ["Gürtel", "Umhang"]),
+]
+_NEED_SLOTS = [slot for _title, slots in _NEED_SLOT_GROUPS for slot in slots]
+_WEAPON_TYPES = ["Schwert & Schild", "Großschwert", "Dolche", "Langbogen", "Armbrust", "Stab", "Zauberstab", "Kugel"]
+
+def _need_slot_from_entry(entry: Any) -> str:
+    if not isinstance(entry, dict):
+        return ""
+    raw_slot = str(entry.get("slot_name") or entry.get("slot") or "").strip()
+    raw_text = str(entry.get("raw_item_name") or entry.get("item") or entry.get("item_name") or entry.get("label") or "")
+    text = f"{raw_slot} {raw_text}".lower()
+    for slot in _NEED_SLOTS:
+        sl = slot.lower()
+        if raw_slot.lower() == sl or raw_slot.lower().startswith(sl) or sl in text:
+            return slot
+    numeric_map = {"1": "Waffe 1", "2": "Waffe 2", "3": "Helm", "4": "Brust", "5": "Hose", "6": "Handschuhe", "7": "Schuhe", "8": "Brosche", "9": "Ohrringe", "10": "Kette", "11": "Armband", "12": "Ring 1", "13": "Ring 2", "14": "Gürtel", "15": "Umhang"}
+    return numeric_map.get(raw_slot, "")
+
+def _need_item_display(entry: Any) -> str:
+    if not isinstance(entry, dict):
+        return _loot_text(entry) or "—"
+    for key in ("raw_item_name", "item", "item_name", "label"):
+        raw = str(entry.get(key) or "").strip()
+        if raw:
+            text = re.sub(r"^\s*\d+\s*:\s*", "", raw).strip()
+            for slot in _NEED_SLOTS:
+                text = re.sub(rf"^\s*{re.escape(slot)}\s*:\s*", "", text, flags=re.I).strip()
+            text = re.sub(r"^\s*[A-Za-zÄÖÜäöüß ]+\s+\d+\s*:\s*", "", text).strip()
+            if text:
+                return text
+    return _loot_text(entry) or "—"
+
+def _need_is_received(entry: Any) -> bool:
+    if not isinstance(entry, dict):
+        return False
+    status = str(entry.get("status") or entry.get("state") or "").lower()
+    raw = json.dumps(entry, ensure_ascii=False).lower()
+    return status in {"received", "erhalten", "done", "locked", "complete", "completed"} or "✅" in raw or "erhalten" in raw
+
+def _need_slot_map(items: Any) -> dict[str, dict[str, Any]]:
+    out: dict[str, dict[str, Any]] = {}
+    for entry in items if isinstance(items, list) else []:
+        slot = _need_slot_from_entry(entry)
+        if not slot:
+            continue
+        old = out.get(slot)
+        if old is None or (_need_is_received(entry) and not _need_is_received(old)):
+            out[slot] = entry
+    return out
+
+def _render_need_slot_board(display_name: str, area: str, items: Any) -> str:
+    slot_map = _need_slot_map(items)
+    blocks: list[str] = []
+    for title, slots in _NEED_SLOT_GROUPS:
+        rows = []
+        for slot in slots:
+            entry = slot_map.get(slot)
+            if entry:
+                item = _need_item_display(entry)
+                value = f"🔒 {item}" if _need_is_received(entry) else item
+            else:
+                value = "—"
+            rows.append(f'<div class="need-slot-row"><span>{_e(slot)}:</span><strong>{_e(value)}</strong></div>')
+        blocks.append(f'<div class="need-slot-group"><h3>{_e(title)}</h3>{"".join(rows)}</div>')
+    return f'<div class="need-board"><h3>{_e(display_name)}</h3><p class="muted"><b>Bereich:</b> {_e(area)}</p><p class="mobile-note">🔒 Erhaltene Items bleiben dauerhaft sichtbar, der Slot ist gesperrt und zählt nicht mehr als offener Need.</p>{"".join(blocks)}</div>'
+
 
 def _safe_percent(part: float, total: float) -> str:
     if not total:
@@ -3600,6 +3671,21 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "admin") -> str:
     .queue-badge.wait {{ color:#ffe0a3; border-color:rgba(214,168,79,.46); background:rgba(214,168,79,.12); }}
     .queue-badge.bad {{ color:#ffb3b3; border-color:rgba(217,104,104,.42); background:rgba(217,104,104,.10); }}
     .need-list {{ margin:8px 0 16px; padding-left:22px; color:var(--text); }} .need-list li {{ margin:5px 0; }}
+    .need-board {{ display:grid; gap:12px; }}
+    .need-board > h3 {{ font-size:24px; }}
+    .need-slot-group {{ border:1px solid rgba(214,168,79,.14); border-radius:14px; padding:13px 14px; background:rgba(10,11,15,.28); }}
+    .need-slot-group h3 {{ color:var(--gold); margin-bottom:9px; }}
+    .need-slot-row {{ display:grid; grid-template-columns:150px minmax(0,1fr); gap:10px; padding:7px 0; border-bottom:1px solid rgba(255,255,255,.07); }}
+    .need-slot-row:last-child {{ border-bottom:0; }}
+    .need-slot-row span {{ color:var(--muted); }}
+    .need-slot-row strong {{ color:var(--text); overflow-wrap:anywhere; }}
+    .member-start-logo {{ width:86px; height:86px; border-radius:22px; padding:8px; border:1px solid rgba(214,168,79,.32); background:rgba(214,168,79,.08); box-shadow:0 14px 30px rgba(0,0,0,.35); }}
+    .member-start-logo img {{ width:100%; height:100%; object-fit:contain; }}
+    .member-home-hero {{ align-items:center; }}
+    .member-summary-list {{ display:grid; gap:10px; margin-top:10px; }}
+    .member-summary-item {{ display:grid; grid-template-columns:minmax(0,1fr) auto; gap:12px; align-items:center; padding:12px 13px; border:1px solid rgba(214,168,79,.14); border-radius:14px; background:rgba(32,35,45,.55); }}
+    .member-summary-title {{ font-weight:800; color:var(--gold); overflow-wrap:anywhere; }}
+    .member-summary-meta {{ color:var(--muted); font-size:13px; margin-top:3px; }}
     code {{ background:#05060a; border:1px solid var(--line); padding:2px 5px; border-radius:6px; }}
     .empty {{ color:var(--muted); padding:18px 16px 18px 58px; min-height:58px; display:flex; align-items:center; border:1px dashed rgba(214,168,79,.18); border-radius:14px; background:linear-gradient(90deg,rgba(10,11,15,.70),rgba(24,26,34,.54)); position:relative; }}
     .empty::before {{ content:""; position:absolute; left:16px; top:50%; width:30px; height:30px; transform:translateY(-50%); background:url("{_asset('status_ec_offen.png')}") center / contain no-repeat; opacity:.78; }}
@@ -3658,6 +3744,10 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "admin") -> str:
       .home-title {{ overflow-wrap:anywhere; }}
       .home-meta {{ overflow-wrap:anywhere; font-size:12px; }}
       .home-item .pill {{ grid-column:2; justify-self:start; }}
+      .member-summary-item {{ grid-template-columns:1fr; }}
+      .member-start-logo {{ width:70px; height:70px; border-radius:18px; }}
+      .need-slot-row {{ grid-template-columns:1fr; gap:3px; }}
+      .need-slot-row span {{ font-size:12px; text-transform:uppercase; letter-spacing:.04em; color:var(--gold); }}
       .action-list .btn {{ padding:11px 12px; }}
       .table-search {{ max-width:100%; }}
       .table-wrap {{ width:100%; overflow-x:auto; -webkit-overflow-scrolling:touch; }}
@@ -3721,6 +3811,26 @@ function filterNextTable(input) {{
   document.querySelectorAll('.side-nav a').forEach(a => a.addEventListener('click', () => document.body.classList.remove('nav-open')));
   document.addEventListener('keydown', ev => {{ if (ev.key === 'Escape') document.body.classList.remove('nav-open'); }});
 }})();
+function refreshItemPickerFilters() {{
+  for (const picker of document.querySelectorAll('select.item-picker-select[data-slot-source]')) {{
+    const source = document.getElementById(picker.dataset.slotSource);
+    const slot = (source && source.value ? source.value : '').toLowerCase();
+    let visible = 0;
+    for (const opt of picker.options) {{
+      if (!opt.value) {{ opt.hidden = false; continue; }}
+      const optSlot = (opt.dataset.slot || '').toLowerCase();
+      const ok = !slot || !optSlot || optSlot === slot || (slot.startsWith('waffe') && optSlot.startsWith('waffe'));
+      opt.hidden = !ok;
+      if (ok) visible++;
+    }}
+    const first = picker.options[0];
+    if (first) first.textContent = visible ? `Item aus Liste anklicken ... (${{visible}})` : 'Keine bekannten Items für diesen Slot – Freitext nutzen';
+  }}
+}}
+document.addEventListener('change', function(ev) {{
+  if (ev.target && ev.target.matches('select.need-slot-select')) refreshItemPickerFilters();
+}});
+document.addEventListener('DOMContentLoaded', refreshItemPickerFilters);
 (function responsiveTables() {{
   document.querySelectorAll('table').forEach(tbl => {{
     if (tbl.closest('.table-wrap') || tbl.closest('.responsive-table')) return;
@@ -5011,6 +5121,12 @@ def _loot_bid_count(auction: dict[str, Any]) -> int:
     return 0
 
 
+def _auction_activity_count(auction: dict[str, Any]) -> int:
+    if auction.get("junk_drop"):
+        return _auction_roll_count(auction)
+    return _loot_bid_count(auction)
+
+
 def _loot_leader_text(auction: dict[str, Any], names: dict[int, str]) -> str:
     uid = _user_id(auction.get("top_bid_user_id") or auction.get("leader_user_id"))
     amount = auction.get("top_bid_amount")
@@ -5098,6 +5214,8 @@ def _loot_mode_bucket(auction: dict[str, Any]) -> str:
 def _loot_next_step(auction: dict[str, Any], need_info: Optional[dict[str, Any]] = None) -> str:
     s = _loot_status(auction.get("status"))
     bids = _loot_bid_count(auction)
+    activity_count = _auction_activity_count(auction)
+    is_junk = bool(auction.get("junk_drop"))
     winner = bool(auction.get("winner_user_id") or auction.get("winner_name"))
     delivered = bool(auction.get("delivered_at"))
     phase = _loot_status(auction.get("phase"))
@@ -5114,6 +5232,8 @@ def _loot_next_step(auction: dict[str, Any], need_info: Optional[dict[str, Any]]
     if s in _LOOT_DONE_STATUSES:
         return "Ergebnis prüfen"
     if _loot_is_ended(auction):
+        if is_junk and activity_count > 0:
+            return "Würfelphase beendet → Gewinner prüfen"
         if bids > 0:
             return "abgelaufen → Bot sollte Gewinner/Übergabe erstellen"
         if "sale" in mode:
@@ -5121,6 +5241,8 @@ def _loot_next_step(auction: dict[str, Any], need_info: Optional[dict[str, Any]]
         if "freie" in mode or phase == "free":
             return "abgelaufen → Bot sollte Sale starten"
         return "abgelaufen → Bot sollte freie Auktion starten"
+    if is_junk:
+        return "Würfelphase läuft" if activity_count > 0 else "wartet auf erste Würfe"
     if bids > 0:
         return "läuft: Gebote beobachten"
     if "sale" in mode:
@@ -5155,6 +5277,7 @@ def _loot_center_payload_from_snapshot(snap: dict[str, Any]) -> dict[str, Any]:
         key = _loot_key(item)
         need_info = need_index.get(key, {"main": [], "secondary": []})
         bids = _loot_bid_count(a)
+        activity_count = _auction_activity_count(a)
         mode = _loot_mode_bucket(a)
         entry = {
             "auction_id": str(a.get("auction_id") or a.get("id") or ""),
@@ -5166,6 +5289,8 @@ def _loot_center_payload_from_snapshot(snap: dict[str, Any]) -> dict[str, Any]:
             "window": _loot_phase_window_text(a),
             "mode": mode,
             "bid_count": bids,
+            "activity_count": activity_count,
+            "is_junk": bool(a.get("junk_drop")),
             "leader": _loot_leader_text(a, names),
             "winner_user_id": _user_id(a.get("winner_user_id") or a.get("delivered_to_user_id")),
             "winner_name": str(a.get("winner_name") or ""),
@@ -5183,7 +5308,7 @@ def _loot_center_payload_from_snapshot(snap: dict[str, Any]) -> dict[str, Any]:
         if _loot_is_active(a):
             active.append(entry)
             next_actions.append(entry)
-            if bids <= 0:
+            if activity_count <= 0 and not a.get("junk_drop"):
                 no_bid.append(entry)
             if mode.lower() in {"sale", "freie auktion", "müll/sale"}:
                 sale_free.append(entry)
@@ -5413,48 +5538,70 @@ def _render_loot_check(data: dict[str, Any], item_query: str = "") -> str:
     return _html_shell("Truhencheck · Ebo Dashboard", body)
 
 
-def _loot_catalog_item_names(snap: dict[str, Any], limit: int = 650) -> list[str]:
-    """Klick-/Auswahlliste aus allem, was dem Dashboard online bekannt ist."""
-    names: set[str] = set()
+def _loot_catalog_items(snap: dict[str, Any], limit: int = 800) -> list[dict[str, str]]:
+    found: dict[str, dict[str, str]] = {}
 
-    def add(value: Any) -> None:
+    def add(value: Any, slot_hint: Any = "") -> None:
         text = _loot_text(value)
-        if text and len(text) >= 3 and not text.lower().startswith("user "):
-            names.add(text)
+        if not text or len(text) < 3 or text.lower().startswith("user "):
+            return
+        key = _loot_key(text)
+        if not key:
+            return
+        slot = str(slot_hint or "").strip()
+        if not slot and isinstance(value, dict):
+            slot = _need_slot_from_entry(value)
+        old = found.get(key)
+        if not old:
+            found[key] = {"name": text, "slot": slot}
+        elif slot and not old.get("slot"):
+            old["slot"] = slot
 
     loot = (snap.get("loot") or {}) if isinstance(snap, dict) else {}
     for n in (((loot.get("needs") or {}).get("entries") or [])):
         if isinstance(n, dict):
-            add(n.get("raw_item_name") or n.get("item") or n.get("item_name") or n)
+            add(n.get("raw_item_name") or n.get("item") or n.get("item_name") or n, n.get("slot_name") or n.get("slot"))
     for player in (((loot.get("needs") or {}).get("items") or [])):
         if not isinstance(player, dict):
             continue
         for key in ("main", "secondary"):
             for entry in player.get(key) or []:
-                add(entry)
+                add(entry, _need_slot_from_entry(entry))
     for section in ("auctions", "history", "need_change_log"):
         obj = loot.get(section) or {}
         for row in obj.get("items") or []:
             if isinstance(row, dict):
-                add(row.get("raw_item_name") or row.get("item_name") or row.get("item") or row.get("new_item") or row.get("old_item") or row)
-    return sorted(names, key=lambda x: x.lower())[:limit]
+                add(row.get("raw_item_name") or row.get("item_name") or row.get("item") or row.get("new_item") or row.get("old_item") or row, row.get("slot") or row.get("slot_name"))
+    items = sorted(found.values(), key=lambda x: x.get("name", "").lower())
+    return items[:limit]
 
 
-def _loot_item_picker_html(snap: dict[str, Any], *, input_id: str, name: str = "item", required: bool = True, placeholder: str = "Item auswählen oder tippen") -> str:
-    items = _loot_catalog_item_names(snap)
+def _loot_catalog_item_names(snap: dict[str, Any], limit: int = 650) -> list[str]:
+    return [x.get("name", "") for x in _loot_catalog_items(snap, limit=limit) if x.get("name")]
+
+
+def _loot_item_picker_html(snap: dict[str, Any], *, input_id: str, name: str = "item", required: bool = True, placeholder: str = "Item auswählen oder tippen", slot_select_id: str = "") -> str:
+    items = _loot_catalog_items(snap)
     datalist_id = f"{input_id}-list"
     required_attr = " required" if required else ""
-    options = "".join(f'<option value="{_e(item)}"></option>' for item in items)
-    select_options = "".join(f'<option value="{_e(item)}">{_e(item)}</option>' for item in items[:350])
+    options = "".join(f'<option value="{_e(item.get("name"))}"></option>' for item in items)
+    select_options = "".join(f'<option value="{_e(item.get("name"))}" data-slot="{_e(item.get("slot"))}">{_e(item.get("name"))}{(" · " + _e(item.get("slot"))) if item.get("slot") else ""}</option>' for item in items[:500])
+    filter_attr = f' data-slot-source="{_e(slot_select_id)}"' if slot_select_id else ""
     select = ""
     if items:
-        select = f'''<select class="item-picker-select" onchange="var el=document.getElementById('{_e(input_id)}'); if(el && this.value) el.value=this.value; this.selectedIndex=0;">
-            <option value="">Item aus Liste anklicken ...</option>{select_options}
-          </select>'''
-    return f'''{select}
-      <input id="{_e(input_id)}" list="{_e(datalist_id)}" name="{_e(name)}"{required_attr} placeholder="{_e(placeholder)}" autocomplete="off">
-      <datalist id="{_e(datalist_id)}">{options}</datalist>
-      <small class="muted">{len(items)} bekannte Items aus Online-Datenbank/Needs/Auktionen.</small>'''
+        select = (
+            f'<select class="item-picker-select"{filter_attr} '
+            f'onchange="var el=document.getElementById(\'{_e(input_id)}\'); '
+            f'if(el && this.value) el.value=this.value; this.selectedIndex=0;">'
+            f'<option value="">Item aus Liste anklicken ...</option>{select_options}</select>'
+        )
+    return (
+        f'{select}<input id="{_e(input_id)}" list="{_e(datalist_id)}" name="{_e(name)}"{required_attr} '
+        f'placeholder="{_e(placeholder)}" autocomplete="off">'
+        f'<datalist id="{_e(datalist_id)}">{options}</datalist>'
+        f'<small class="muted">{len(items)} bekannte Items aus Online-Datenbank/Needs/Auktionen. '
+        f'Bei Slot-Auswahl wird die Klickliste gefiltert.</small>'
+    )
 
 def _render_loot_center(data: dict[str, Any], request: Optional[Request] = None, msg: str = "") -> str:
     if not data.get("ok"):
@@ -7210,7 +7357,11 @@ def _portal_active_auctions(snap: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _slot_options_html() -> str:
-    return "".join(f'<option value="{_e(slot)}">{_e(slot)}</option>' for slot in ["Waffe 1","Waffe 2","Fähigkeitskern","Helm","Brust","Hose","Handschuhe","Schuhe","Brosche","Ohrringe","Kette","Armband","Ring 1","Ring 2","Gürtel","Umhang"])
+    return "".join(f'<option value="{_e(slot)}">{_e(slot)}</option>' for slot in _NEED_SLOTS)
+
+
+def _weapon_type_options_html() -> str:
+    return "".join(f'<option value="{_e(w)}">{_e(w)}</option>' for w in _WEAPON_TYPES)
 
 
 def _render_need_editor_panel(user_id: int, current_user: Optional[dict[str, Any]], requests: list[dict[str, Any]], snap: Optional[dict[str, Any]] = None) -> str:
@@ -7221,7 +7372,8 @@ def _render_need_editor_panel(user_id: int, current_user: Optional[dict[str, Any
         detail = res.get("message") or res.get("error") or p.get("item_name") or p.get("item_text") or p.get("item_id") or "—"
         req_rows.append([_dt(r.get("requested_at")), _need_change_status_label(r.get("status")), r.get("action_type"), p.get("tab"), p.get("slot"), _short(detail, 120)])
     actor_hint = "Du bearbeitest deine eigene Needliste." if current_user else "Discord-Login nötig."
-    picker = _loot_item_picker_html(snap or {}, input_id=f"need-item-{int(user_id)}", name="item_text", required=False, placeholder="Item aus Liste wählen oder tippen")
+    slot_select_id = f"need-slot-{int(user_id)}"
+    picker = _loot_item_picker_html(snap or {}, input_id=f"need-item-{int(user_id)}", name="item_text", required=False, placeholder="Item aus Liste wählen oder tippen", slot_select_id=slot_select_id)
     return f"""
     <section class="panel" id="need-editor">
       <h2>✍️ Needliste bearbeiten</h2>
@@ -7230,7 +7382,8 @@ def _render_need_editor_panel(user_id: int, current_user: Optional[dict[str, Any
         <form method="post" action="/portal/member/{int(user_id)}/need-change" style="display:grid; gap:10px;">
           <input type="hidden" name="action_type" value="set">
           <label>Bereich<br><select name="tab" style="width:100%; padding:10px; border-radius:10px; background:#08090d; color:var(--text); border:1px solid var(--line);"><option value="Main">Main</option><option value="Secondary">Secondary</option></select></label>
-          <label>Slot<br><select name="slot" style="width:100%; padding:10px; border-radius:10px; background:#08090d; color:var(--text); border:1px solid var(--line);">{_slot_options_html()}</select></label>
+          <label>Slot<br><select id="{_e(slot_select_id)}" class="need-slot-select" name="slot" style="width:100%; padding:10px; border-radius:10px; background:#08090d; color:var(--text); border:1px solid var(--line);">{_slot_options_html()}</select></label>
+          <label>Waffenart nur bei Waffe<br><select name="weapon_type" style="width:100%; padding:10px; border-radius:10px; background:#08090d; color:var(--text); border:1px solid var(--line);"><option value="">nicht relevant</option>{_weapon_type_options_html()}</select></label>
           <label>Itemname oder Item-ID<br>{picker}</label>
           <button class="btn" type="submit" style="border:0; cursor:pointer;">Need setzen</button>
         </form>
@@ -7304,7 +7457,7 @@ def _render_member_portal(data: dict[str, Any], user_id: int, request: Request, 
     <section class="grid">{cards}</section>
     <section class="panel"><h2>📅 Laufende & kommende Events</h2>{_table(['Event','Zeit','Status','Deine Anmeldung','Aktion'], event_rows, placeholder='Events durchsuchen…')}</section>
     <section class="panel"><h2>⚔️ Laufende Auktionen</h2><p class="muted">Zum Bieten die Auktion öffnen. Bieten läuft weiterhin sicher über Bot-Queue.</p>{_table(['Item','Bereich','Start/Preis','Führend','Ende','Aktion'], auction_rows, placeholder='Auktionen durchsuchen…')}</section>
-    <section class="panel" id="needs"><h2>🎁 Deine Needliste</h2><div class="split"><div>{_need_list_html('Main-Needs', main_needs)}</div><div>{_need_list_html('Secondary-Needs', sec_needs)}</div></div></section>
+    <section class="panel" id="needs"><h2>🎁 Deine Needliste</h2><div class="split"><div>{_render_need_slot_board(display, 'Main', main_needs)}</div><div>{_render_need_slot_board(display, 'Secondary', sec_needs)}</div></div></section>
     {_render_need_editor_panel(int(user_id), _current_user(request), need_requests, snap)}
     <section class="panel"><h2>🪙 EC-Verlauf</h2>{_table(['Zeit','Betrag','Typ','Grund'], tx_rows, placeholder='EC durchsuchen…')}</section>
     <section class="panel"><h2>🏆 Loot-Historie</h2>{_table(['Item','Bereich','EC','Zeit'], loot_rows, placeholder='Loot durchsuchen…')}</section>
@@ -7314,6 +7467,29 @@ def _render_member_portal(data: dict[str, Any], user_id: int, request: Request, 
 
 
 
+def _member_home_event_rows(events: list[dict[str, Any]], user_id: int) -> str:
+    if not events:
+        return '<div class="empty">Keine laufenden Events.</div>'
+    items = []
+    for ev in events[:2]:
+        eid = str(ev.get("event_id") or ev.get("id") or "")
+        title = ev.get("title") or ev.get("name") or eid or "Event"
+        meta = f"{_dt(ev.get('when_iso') or ev.get('start_at') or ev.get('created_at'))} · {_event_status_text(ev)} · Deine Anmeldung: {_portal_event_status_for_user(ev, user_id)}"
+        items.append(f'<div class="member-summary-item"><div><div class="member-summary-title">{_cell(_event_link(eid, title))}</div><div class="member-summary-meta">{_e(meta)}</div></div><a class="btn" href="/event/{_e(eid)}">Öffnen</a></div>')
+    return '<div class="member-summary-list">' + ''.join(items) + '</div>'
+
+def _member_home_auction_rows(auctions: list[dict[str, Any]], snap: dict[str, Any]) -> str:
+    if not auctions:
+        return '<div class="empty">Keine laufenden Auktionen.</div>'
+    items = []
+    for a in auctions[:4]:
+        aid = str(a.get("auction_id") or "")
+        title = _loot_text(a.get("item_name") or a.get("item") or aid)
+        count_title, count_value, _ = _auction_count_label(a)
+        meta = f"{_phase_label(a)} · {count_value} {count_title} · {_auction_leader_or_roll_text(a, snap)} · {_auction_timer_text(a)}"
+        items.append(f'<div class="member-summary-item"><div><div class="member-summary-title">{_cell(_auction_link(aid, title))}</div><div class="member-summary-meta">{_e(meta)}</div></div><a class="btn" href="/auction/{_e(aid)}">Öffnen</a></div>')
+    return '<div class="member-summary-list">' + ''.join(items) + '</div>'
+
 def _render_member_home(data: dict[str, Any], request: Request) -> str:
     if not data.get("ok"):
         return _html_shell("Mitgliederbereich · Ebo Dashboard", f"<section class='panel'><h1>🏠 Mitgliederbereich</h1><p class='muted'>{_e(data.get('error'))}</p></section>", nav_mode="member")
@@ -7321,87 +7497,24 @@ def _render_member_home(data: dict[str, Any], request: Request) -> str:
     uid = _current_user_id(request)
     snap: dict[str, Any] = data.get("snapshot") or {}
     names = _profile_name_map(snap)
-
     display = names.get(int(uid), str(user.get("username") or "Mitglied")) if uid else str(user.get("username") or "Mitglied")
-
-    # Öffentliche, reduzierte Mitgliederliste: keine Adminnotizen, keine EC-Queue, keine internen Prüfmarkierungen.
-    members_payload = _member_center_payload(data)
-    member_rows: list[list[Any]] = []
-    for r in (members_payload.get("rows") or [])[:120]:
-        if not isinstance(r, dict):
-            continue
-        member_rows.append([
-            _member_link(r.get("user_id"), r.get("display_name")),
-            r.get("ingame_name") or "—",
-            r.get("main_role") or r.get("role") or "—",
-            r.get("gearscore") or "—",
-        ])
-
-    running_events = []
-    for ev in _events_items(snap):
-        if isinstance(ev, dict) and _is_running_event(ev):
-            running_events.append(ev)
+    running_events = [ev for ev in _events_items(snap) if isinstance(ev, dict) and _is_running_event(ev)]
     running_events.sort(key=lambda ev: _dt_obj(ev.get("when_iso") or ev.get("start_at") or ev.get("created_at")) or datetime.max.replace(tzinfo=timezone.utc))
-
-    event_rows: list[list[Any]] = []
-    for ev in running_events[:30]:
-        eid = str(ev.get("event_id") or ev.get("id") or "")
-        event_rows.append([
-            _event_link(eid, ev.get("title") or ev.get("name") or eid),
-            _dt(ev.get("when_iso") or ev.get("start_at") or ev.get("created_at")),
-            _event_status_text(ev),
-            _portal_event_status_for_user(ev, int(uid or 0)) if uid else "—",
-        ])
-
     auctions = (((snap.get("loot") or {}).get("auctions") or {}).get("items") or [])
     active_auctions = [a for a in auctions if isinstance(a, dict) and _loot_is_active(a)]
-    active_auctions.sort(key=lambda a: _dt_obj(a.get("ends_at") or a.get("end_at") or a.get("expires_at")) or datetime.max.replace(tzinfo=timezone.utc))
-    auction_rows: list[list[Any]] = []
-    for a in active_auctions[:30]:
-        aid = str(a.get("auction_id") or "")
-        count_title, count_value, _count_sub = _auction_count_label(a)
-        auction_rows.append([
-            _auction_link(aid, _loot_text(a.get("item_name") or a.get("item") or aid)),
-            _phase_label(a),
-            _loot_effective_status_label(a),
-            f"{count_value} {count_title}",
-            _auction_leader_or_roll_text(a, snap),
-            _auction_timer_text(a),
-            _raw(f'<a class="btn" href="/auction/{_e(aid)}">Öffnen</a>') if aid else "—",
-        ])
-
-    my_ec_rows = [[_dt(tx.get("created_at")), _fmt_ec(tx.get("amount")), tx.get("raw_type") or tx.get("type") or "—", _short(tx.get("reason"), 160)] for tx in (_tx_for_user(snap, int(uid or 0), limit=12) if uid else [])]
+    active_auctions.sort(key=lambda a: _auction_timer_dt(a) or datetime.max.replace(tzinfo=timezone.utc))
     my_ec_balance = _balance_map(snap).get(int(uid or 0)) if uid else None
-
-    cards = "".join([
-        _card("Mitglieder", len(member_rows), "Gildenübersicht"),
-        _card("Laufende Events", len(running_events), "bis 1h nach Start"),
-        _card("Laufende Auktionen", len(active_auctions), "Bieten/Kaufen möglich"),
-        _card("Meine EC", _fmt_ec(my_ec_balance) if my_ec_balance is not None else "—", "aktueller Stand"),
-        _card("Profil", display, "eigene Daten & Needs"),
-    ])
-
+    now_text = datetime.now().strftime("%d.%m.%Y %H:%M")
+    cards = "".join([_card("Meine EC", _fmt_ec(my_ec_balance) if my_ec_balance is not None else "—", "aktueller Stand"), _card("Uhrzeit", now_text, "lokale Dashboard-Zeit"), _card("Events", len(running_events), "max. 2 auf Startseite"), _card("Auktionen", len(active_auctions), "max. 4 auf Startseite")])
     body = f"""
-    <nav class="topnav"><a href="/member">Start</a><a href="#members">Mitglieder</a><a href="#events">Events</a><a href="#auctions">Auktionen</a><a href="#my-ec">Mein EC</a><a href="/portal">Eigenes Profil</a><a href="/portal#needs">Meine Needs</a></nav>
-    <section class="hero">
-      <div>
-        <div class="eyebrow">Mitgliederbereich</div>
-        <h1>🏠 Willkommen, {_e(display)}</h1>
-        <p class="muted">Reduzierte Ansicht für normale Mitglieder: Mitglieder, laufende Events, laufende Auktionen, eigenes Profil und eigene Needliste.</p>
-      </div>
-      <div class="hero-actions">
-        <a class="hero-action" href="/portal"><span>👤</span><strong>Eigenes Profil</strong><small>Daten & Übersicht</small></a>
-        <a class="hero-action" href="/portal#needs"><span>🎁</span><strong>Meine Needs</strong><small>ansehen/bearbeiten</small></a>
-        <a class="hero-action" href="#auctions"><span>🏆</span><strong>Auktionen</strong><small>bieten/kaufen</small></a>
-      </div>
-    </section>
+    <nav class="topnav"><a href="/member">Start</a><a href="#events">Events</a><a href="#auctions">Auktionen</a><a href="/portal">Eigenes Profil</a><a href="/portal#needs">Meine Needs</a><a href="/portal#need-editor">Need ändern</a></nav>
+    <section class="hero member-home-hero"><div style="display:flex;gap:16px;align-items:center;flex-wrap:wrap;"><div class="member-start-logo"><img src="{_asset('ebolus_logo.png')}" alt="Ebolus"></div><div><div class="eyebrow">Mitgliederbereich</div><h1>Willkommen, {_e(display)}</h1><p class="muted">Kurzüberblick für Mitglieder. Details findest du über die Buttons.</p></div></div><div class="hero-actions"><a class="hero-action" href="/portal"><span>👤</span><strong>Eigenes Profil</strong><small>Daten & Übersicht</small></a><a class="hero-action" href="/portal#needs"><span>🎁</span><strong>Meine Needs</strong><small>ansehen/bearbeiten</small></a><a class="hero-action" href="#auctions"><span>🏆</span><strong>Auktionen</strong><small>bieten/kaufen</small></a></div></section>
     <section class="grid">{cards}</section>
-    <section class="panel" id="events"><h2>📅 Laufende Events</h2><p class="muted">Nach deiner Regel sichtbar ab Erstellung bis 1 Stunde nach Eventbeginn.</p>{_table(['Event','Zeit','Status','Deine Anmeldung'], event_rows, placeholder='Events durchsuchen…')}</section>
-    <section class="panel" id="auctions"><h2>🏆 Laufende Auktionen</h2><p class="muted">Zum Bieten oder Kaufen die Auktion öffnen. Aktionen laufen weiter über die Bot-Queue.</p>{_table(['Item','Bereich','Status','Gebote/Würfe','Führung/Wurf','Timer','Aktion'], auction_rows, placeholder='Auktionen durchsuchen…')}</section>
-    <section class="panel" id="my-ec"><h2>🪙 Mein EC-Verlauf</h2>{_table(['Zeit','Betrag','Typ','Grund'], my_ec_rows, placeholder='EC-Verlauf durchsuchen…')}</section>
-    <section class="panel" id="members"><h2>👥 Mitglieder</h2>{_table(['Discord','Ingame','Rolle','Gearscore'], member_rows, placeholder='Mitglieder durchsuchen…')}</section>
+    <section class="split"><div class="panel" id="events"><h2>📅 Nächste 2 Events</h2>{_member_home_event_rows(running_events, int(uid or 0))}<p><a class="btn" href="/events">Mehr Events</a></p></div><div class="panel" id="auctions"><h2>🏆 Max. 4 laufende Auktionen</h2>{_member_home_auction_rows(active_auctions, snap)}<p><a class="btn" href="/loot">Mehr Auktionen</a></p></div></section>
+    <section class="panel"><h2>🔎 Mehr anzeigen</h2><div class="hero-actions"><a class="hero-action members" href="/members"><span>👥</span><strong>Mitglieder</strong><small>Gildenübersicht</small></a><a class="hero-action" href="/portal#my-ec"><span>🪙</span><strong>Mein EC-Verlauf</strong><small>Buchungen ansehen</small></a><a class="hero-action loot" href="/portal#need-editor"><span>✍️</span><strong>Need ändern</strong><small>Slot & Item setzen</small></a></div></section>
     """
     return _html_shell("Mitgliederbereich · Ebo Dashboard", body, nav_mode="member")
+
 
     """Letzte Dashboard-Einstellungsanträge.
 
@@ -9422,6 +9535,7 @@ async def portal_need_change(user_id: int, request: Request, _: bool = Depends(_
     tab = str(form.get("tab") or "Main").strip()
     slot = str(form.get("slot") or "").strip()
     item_text = str(form.get("item_text") or "").strip()
+    weapon_type = str(form.get("weapon_type") or "").strip()
     if tab not in {"Main", "Secondary"}:
         tab = "Main"
     valid_slots = {"Waffe 1","Waffe 2","Fähigkeitskern","Helm","Brust","Hose","Handschuhe","Schuhe","Brosche","Ohrringe","Kette","Armband","Ring 1","Ring 2","Gürtel","Umhang"}
@@ -9435,6 +9549,7 @@ async def portal_need_change(user_id: int, request: Request, _: bool = Depends(_
         "tab": tab,
         "slot": slot,
         "item_text": item_text,
+        "weapon_type": weapon_type if slot.startswith("Waffe") else "",
         "source": "dashboard_portal",
         "admin_override": bool(_is_portal_admin(request) and _current_user_id(request) != int(user_id)),
     }
