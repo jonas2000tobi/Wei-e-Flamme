@@ -11,6 +11,11 @@ from typing import Dict, Optional, Iterable, List, Any
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
+try:
+    from bot.json_store import load_json_file, save_json_atomic, warn_json_store  # type: ignore
+except Exception:
+    from json_store import load_json_file, save_json_atomic, warn_json_store  # type: ignore
+
 import discord
 from discord import app_commands
 from discord.ext import tasks
@@ -77,14 +82,11 @@ ATTENDANCE_FILE = DATA_DIR / "event_attendance.json"
 
 
 def _load(p: Path, default):
-    try:
-        return json.loads(p.read_text(encoding="utf-8"))
-    except Exception:
-        return default
+    return load_json_file(p, default, context=__name__)
 
 
 def _save(p: Path, obj):
-    p.write_text(json.dumps(obj, indent=2, ensure_ascii=False), encoding="utf-8")
+    save_json_atomic(p, obj, context=__name__)
 
 
 store: Dict[str, dict] = _load(RSVP_FILE, {})
