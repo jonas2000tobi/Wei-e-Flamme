@@ -3,6 +3,11 @@ import json
 from pathlib import Path
 from typing import Dict
 
+try:
+    from bot.json_store import load_json_file, save_json_atomic, warn_json_store  # type: ignore
+except Exception:
+    from json_store import load_json_file, save_json_atomic, warn_json_store  # type: ignore
+
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -11,14 +16,11 @@ PREF_FILE = DATA_DIR / "event_dm_prefs.json"
 
 
 def _load() -> Dict[str, Dict[str, bool]]:
-    try:
-        return json.loads(PREF_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+    return load_json_file(PREF_FILE, {}, context=__name__)
 
 
 def _save(data: Dict[str, Dict[str, bool]]) -> None:
-    PREF_FILE.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    save_json_atomic(PREF_FILE, data, context=__name__)
 
 
 prefs: Dict[str, Dict[str, bool]] = _load()
