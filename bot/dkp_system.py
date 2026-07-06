@@ -3189,7 +3189,7 @@ async def setup_dkp_system(client: discord.Client, tree: app_commands.CommandTre
             f"Ausgefiltert: Konten **{js.get('inactive_balances', 0)}** · Verlauf **{js.get('inactive_transactions', 0)}**",
             f"Eventchecks: JSON **{js.get('checks', 0)}** · DB **{pg.get('phase3_ec_event_checks', 0)}**",
             "",
-            "JSON bleibt aktuell Hauptquelle. Postgres ist Parallel-/Prüfschicht.",
+            "Dashboard liest EC/DKP Postgres-first. JSON bleibt Bot-Sicherheitskopie/Backup.",
         ]
         await inter.followup.send("\n".join(lines), ephemeral=True)
 
