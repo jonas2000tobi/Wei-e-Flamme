@@ -2631,12 +2631,117 @@ def _junk_user_has_roll(auction: dict[str, Any], user_id: Any) -> bool:
     return False
 
 
-def _junk_roll_rows(auction: dict[str, Any]) -> list[list[Any]]:
+def _snapshot_display_name(snap: dict[str, Any], user_id: Any, fallback: Any = "") -> str:
+    uid = _user_id(user_id)
+    text = str(fallback or "").strip()
+    # Wenn nur eine nackte ID oder "User 123" aus der DB kommt, lieber den Discord-/Profilnamen aus dem Snapshot nehmen.
+    weak_fallback = (not text) or text.isdigit() or (uid and text.lower() == f"user {uid}".lower()) or text.lower().startswith("user ")
+    if uid:
+        name = _profile_name_map(snap).get(uid)
+        if name and weak_fallback:
+            return name
+        if name and not text:
+            return name
+    if text:
+        return text
+    return f"User {uid}" if uid else "—"
+
+
+def _member_link_from_snapshot(snap: dict[str, Any], user_id: Any, fallback: Any = "") -> dict[str, str]:
+    uid = _user_id(user_id)
+    return _member_link(uid, _snapshot_display_name(snap, uid, fallback))
+
+
+def _junk_roll_rows(auction: dict[str, Any], snap: Optional[dict[str, Any]] = None) -> list[list[Any]]:
     rows: list[list[Any]] = []
+    snap = snap or {}
     for r in _junk_roll_entries_dashboard(auction):
-        rows.append([_member_link(r.get("user_id"), r.get("display_name") or r.get("name")), r.get("roll"), _dt(r.get("created_at"))])
+        uid = _user_id(r.get("user_id"))
+        rows.append([_member_link_from_snapshot(snap, uid, r.get("display_name") or r.get("name")), r.get("roll"), _dt(r.get("created_at"))])
     return rows
 
+
+def _auction_roll_count(auction: dict[str, Any]) -> int:
+    return len(_junk_roll_entries_dashboard(auction))
+
+
+def _auction_count_label(auction: dict[str, Any]) -> tuple[str, int, str]:
+    if auction.get("junk_drop"):
+        rolls = _auction_roll_count(auction)
+        return "Würfe", rolls, "Müll-Würfe"
+    return "Gebote", _loot_bid_count(auction), "Gebote"
+
+
+def _best_junk_roll_text(auction: dict[str, Any], snap: Optional[dict[str, Any]] = None) -> str:
+    snap = snap or {}
+    entries = _junk_roll_entries_dashboard(auction)
+    if not entries:
+        return "—"
+    best = entries[0]
+    uid = _user_id(best.get("user_id"))
+    name = _snapshot_display_name(snap, uid, best.get("display_name") or best.get("name"))
+    roll = best.get("roll")
+    return f"{name} · {roll}"
+
+
+def _auction_timer_dt(auction: dict[str, Any]) -> Optional[datetime]:
+    # Normale Auktionen/Sales nutzen ends_at. Müll-Drops haben teils kein ends_at,
+    # aber eine Würfelphase über junk_roll_until. Genau diese Zeit ist für den Nutzer relevant.
+    for key in ("ends_at", "expires_at", "end_at"):
+        dt = _dt_obj(auction.get(key))
+        if dt:
+            return dt
+    if auction.get("junk_drop"):
+        return _dt_obj(auction.get("junk_roll_until"))
+    return None
+
+
+def _auction_timer_text(auction: dict[str, Any]) -> str:
+    dt = _auction_timer_dt(auction)
+    if not dt:
+        return "—"
+    seconds = int((dt - datetime.now(timezone.utc)).total_seconds())
+    if seconds <= 0:
+        return "abgelaufen"
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, secs = divmod(rem, 60)
+    parts: list[str] = []
+    if days:
+        parts.append(f"{days} Tage")
+    if hours or days:
+        parts.append(f"{hours} Std")
+    parts.append(f"{minutes} Min")
+    parts.append(f"{secs} Sek")
+    return " ".join(parts)
+
+
+def _auction_timer_subtext(auction: dict[str, Any]) -> str:
+    dt = _auction_timer_dt(auction)
+    if not dt:
+        return f"Start: {_dt(auction.get('created_at'))}"
+    if auction.get("junk_drop") and not _dt_obj(auction.get("ends_at")):
+        return f"Würfelphase bis: {_dt(dt.isoformat())}"
+    return f"Ende: {_dt(dt.isoformat())}"
+
+
+def _auction_leader_or_roll_text(auction: dict[str, Any], snap: Optional[dict[str, Any]] = None) -> str:
+    snap = snap or {}
+    if auction.get("junk_drop"):
+        return _best_junk_roll_text(auction, snap)
+    uid = _user_id(auction.get("top_bid_user_id"))
+    amount = auction.get("top_bid_amount")
+    if uid and amount is not None:
+        return f"{_snapshot_display_name(snap, uid, auction.get('top_bid_user_name'))} · {_fmt_ec(amount)} EC"
+    return "—"
+
+
+def _auction_eligible_card_value(auction: dict[str, Any]) -> tuple[str, str]:
+    mode = str(auction.get("eligibility_mode") or "").strip().lower()
+    phase = str(auction.get("phase") or "").strip().lower()
+    if mode in {"all", "free", "sale"} or phase in {"free", "sale"} or auction.get("junk_drop"):
+        return "Alle", "alle Gildenmitglieder"
+    return str(auction.get("eligible_count", 0)), auction.get("eligibility_mode") or "—"
 
 
 # ---------------------------------------------------------------------------
@@ -3138,29 +3243,31 @@ def _render_auction_detail(data: dict[str, Any], auction_id: str, current_user: 
             "<section class='panel'><h1>❌ Auktion nicht gefunden</h1><p class='muted'>Diese Auktion ist nicht im aktuellen Dashboard-Snapshot.</p><p><a class='btn' href='/#loot'>Zurück</a></p></section>",
         )
 
-    leader = "—"
-    if auction.get("top_bid_amount") is not None:
-        uid = _user_id(auction.get("top_bid_user_id"))
-        leader = f"{auction.get('top_bid_user_name') or f'User {uid}'} · {_fmt_ec(auction.get('top_bid_amount'))} EC"
+    count_title, count_value, count_sub = _auction_count_label(auction)
+    leader = _auction_leader_or_roll_text(auction, snap)
+    leader_label = "Bester Wurf" if auction.get("junk_drop") else "Führend"
     winner = "—"
     if auction.get("winner_user_id"):
-        winner = f"{auction.get('winner_name') or ('User ' + str(auction.get('winner_user_id')))}"
+        winner = _snapshot_display_name(snap, auction.get("winner_user_id"), auction.get("winner_name"))
+    elif auction.get("winner_name"):
+        winner = str(auction.get("winner_name"))
+    eligible_value, eligible_sub = _auction_eligible_card_value(auction)
 
     cards = "".join([
         _card("Status", _loot_effective_status_key(auction), _phase_label(auction)),
-        _card("Gebote", auction.get("bid_count", 0), f"Führend: {leader}"),
+        _card(count_title, count_value, f"{leader_label}: {leader}"),
         _card("Gewinner", winner, _dt(auction.get("delivered_at")) if auction.get("delivered_at") else "noch offen"),
-        _card("Ende", _dt(auction.get("ends_at")), f"Start: {_dt(auction.get('created_at'))}"),
+        _card("Timer", _auction_timer_text(auction), _auction_timer_subtext(auction)),
         _card("Regel", _loot_phase_window_text(auction), "Soll-Laufzeit"),
         _card("Startgebot", _fmt_ec(auction.get("start_bid")), "EC"),
         _card("Mindestschritt", _fmt_ec(auction.get("min_increment")), "EC"),
         _card("Festpreis", _fmt_ec(auction.get("fixed_price")), "Sale"),
-        _card("Berechtigt", auction.get("eligible_count", 0), auction.get("eligibility_mode") or "alle"),
+        _card("Berechtigt", eligible_value, eligible_sub),
     ])
 
     bid_rows = _bid_rows(auction)
     eligible_rows = _eligible_rows(auction)
-    roll_rows = _junk_roll_rows(auction)
+    roll_rows = _junk_roll_rows(auction, snap)
     channel_info = [
         ["Auktions-/Log-Nachricht", auction.get("channel_id") or "—", auction.get("message_id") or "—"],
         ["Auktionshaus-Nachricht", "—", auction.get("market_message_id") or auction.get("active_message_id") or "—"],
@@ -4679,11 +4786,9 @@ def _render_loot_dashboard(data: dict[str, Any]) -> str:
     for a in auctions:
         if not isinstance(a, dict):
             continue
-        leader = "—"
-        uid = _user_id(a.get("top_bid_user_id"))
-        if uid and a.get("top_bid_amount") is not None:
-            leader = f"{names.get(uid, a.get('top_bid_user_name') or f'User {uid}')} · {_fmt_ec(a.get('top_bid_amount'))} EC"
-        row = [_auction_link(a.get("auction_id"), a.get("item_name")), _phase_label(a), _loot_effective_status_label(a), a.get("bid_count"), leader, _member_link(a.get("winner_user_id"), a.get("winner_name")) if a.get("winner_user_id") else "—", _dt(a.get("ends_at"))]
+        leader = _auction_leader_or_roll_text(a, snap)
+        _, count_value, _ = _auction_count_label(a)
+        row = [_auction_link(a.get("auction_id"), a.get("item_name")), _phase_label(a), _loot_effective_status_label(a), count_value, leader, _member_link(a.get("winner_user_id"), _snapshot_display_name(snap, a.get("winner_user_id"), a.get("winner_name"))) if a.get("winner_user_id") else "—", _auction_timer_text(a)]
         if _loot_is_active(a):
             active_rows.append(row)
         else:
@@ -4712,8 +4817,8 @@ def _render_loot_dashboard(data: dict[str, Any]) -> str:
     <section class="hero"><div><div class="eyebrow">Loot & Auktionen</div><h1>🎁 Loot-Dashboard</h1><p class="muted">Aktive Auktionen, Gewinnerverteilung und Auktionshistorie. Read-only.</p></div><a class="btn" href="/export/auctions.csv">CSV herunterladen</a></section>
     <section class="grid">{cards}</section>
     <section class="split"><div class="panel"><h2>🏆 Loot-Gewinner</h2>{_table(['Spieler','Items'], winner_rows, placeholder='Gewinner durchsuchen…')}</div><div class="panel"><h2>📈 Aktuell führend</h2>{_table(['Spieler','Führungen'], leader_rows, placeholder='Führungen durchsuchen…')}</div></section>
-    <section class="panel"><h2>🟢 Aktive Auktionen</h2>{_table(['Item','Bereich','Status','Gebote','Führend','Gewinner','Ende'], active_rows, placeholder='Aktive Auktionen durchsuchen…')}</section>
-    <section class="panel"><h2>📜 Auktionshistorie</h2>{_table(['Item','Bereich','Status','Gebote','Führend','Gewinner','Ende'], closed_rows[:250], placeholder='Auktionshistorie durchsuchen…')}</section>
+    <section class="panel"><h2>🟢 Aktive Auktionen</h2>{_table(['Item','Bereich','Status','Gebote/Würfe','Führung/Wurf','Gewinner','Timer'], active_rows, placeholder='Aktive Auktionen durchsuchen…')}</section>
+    <section class="panel"><h2>📜 Auktionshistorie</h2>{_table(['Item','Bereich','Status','Gebote/Würfe','Führung/Wurf','Gewinner','Timer'], closed_rows[:250], placeholder='Auktionshistorie durchsuchen…')}</section>
     """
     return _html_shell("Loot · Ebo Dashboard", body)
 
