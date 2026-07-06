@@ -5,6 +5,11 @@ from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Optional, List
 
+try:
+    from bot.json_store import load_json_file, save_json_atomic, warn_json_store  # type: ignore
+except Exception:
+    from json_store import load_json_file, save_json_atomic, warn_json_store  # type: ignore
+
 import discord
 
 try:
@@ -37,14 +42,11 @@ MEMBER_PROFILE_FILE = DATA_DIR / "member_profiles.json"
 
 
 def _load_json(path: Path, default):
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return default
+    return load_json_file(path, default, context=__name__)
 
 
 def _save_json(path: Path, obj) -> None:
-    path.write_text(json.dumps(obj, indent=2, ensure_ascii=False), encoding="utf-8")
+    save_json_atomic(path, obj, context=__name__)
 
 
 cfg: dict = _load_json(CFG_FILE, {})
