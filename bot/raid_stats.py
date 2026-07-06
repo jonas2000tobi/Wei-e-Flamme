@@ -4,6 +4,11 @@ from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Any
 from datetime import datetime
 
+try:
+    from bot.json_store import load_json_file, save_json_atomic, warn_json_store  # type: ignore
+except Exception:
+    from json_store import load_json_file, save_json_atomic, warn_json_store  # type: ignore
+
 import discord
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -19,32 +24,28 @@ def _default() -> dict:
     }
 
 def _load() -> dict:
-    try:
-        data = json.loads(FILE.read_text(encoding="utf-8"))
+    data = load_json_file(FILE, _default(), context=__name__)
 
-        if not isinstance(data, dict):
-            return _default()
-
-        users = data.setdefault("users", {})
-        for _gid, guild_users in users.items():
-            if not isinstance(guild_users, dict):
-                continue
-
-            for _uid, bucket in guild_users.items():
-                if isinstance(bucket, dict):
-                    bucket.setdefault("yes", 0)
-                    bucket.setdefault("bank", 0)
-                    bucket.setdefault("maybe", 0)
-                    bucket.setdefault("no", 0)
-
-        data.setdefault("events", {})
-        return data
-
-    except Exception:
+    if not isinstance(data, dict):
         return _default()
 
+    users = data.setdefault("users", {})
+    for _gid, guild_users in users.items():
+        if not isinstance(guild_users, dict):
+            continue
+
+        for _uid, bucket in guild_users.items():
+            if isinstance(bucket, dict):
+                bucket.setdefault("yes", 0)
+                bucket.setdefault("bank", 0)
+                bucket.setdefault("maybe", 0)
+                bucket.setdefault("no", 0)
+
+    data.setdefault("events", {})
+    return data
+
 def _save(data: dict) -> None:
-    FILE.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    save_json_atomic(FILE, data, context=__name__)
 
 stats = _load()
 
