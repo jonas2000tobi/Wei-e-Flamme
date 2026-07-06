@@ -2043,6 +2043,18 @@ def _profile_name_map(snap: dict[str, Any]) -> dict[int, str]:
     return names
 
 
+def _events_items(snap: dict[str, Any]) -> list[dict[str, Any]]:
+    events = (snap.get("events") or {}) if isinstance(snap, dict) else {}
+    if isinstance(events, dict):
+        raw = events.get("items") or events.get("events") or []
+        if isinstance(raw, dict):
+            raw = list(raw.values())
+        return [ev for ev in raw if isinstance(ev, dict)]
+    if isinstance(events, list):
+        return [ev for ev in events if isinstance(ev, dict)]
+    return []
+
+
 def _fmt_ec(value: Any) -> str:
     n = _num(value)
     if abs(n - round(n)) < 0.0001:
