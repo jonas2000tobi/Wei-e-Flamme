@@ -2568,12 +2568,56 @@ def _eligible_rows(auction: dict[str, Any]) -> list[list[Any]]:
     return rows
 
 
+def _junk_roll_entries_dashboard(auction: dict[str, Any]) -> list[dict[str, Any]]:
+    """Dashboard-kompatible Müll-Würfe.
+
+    Der Bot speichert neue Müll-Würfe als Dict nach User-ID:
+    {"123": {"user_id": 123, "roll": 77, ...}}.
+    Ältere/andere Dashboard-Ansichten erwarteten eine Liste. Diese Normalisierung
+    verhindert, dass echte Würfe zwar gespeichert sind, aber im Dashboard leer wirken.
+    """
+    raw = auction.get("junk_rolls")
+    entries: list[dict[str, Any]] = []
+
+    if isinstance(raw, dict):
+        for uid_key, value in raw.items():
+            if isinstance(value, dict):
+                entry = dict(value)
+            else:
+                entry = {"roll": value}
+            if not entry.get("user_id"):
+                entry["user_id"] = uid_key
+            entries.append(entry)
+    elif isinstance(raw, list):
+        for value in raw:
+            if isinstance(value, dict):
+                entries.append(dict(value))
+
+    def _sort_key(entry: dict[str, Any]) -> tuple[int, str]:
+        try:
+            roll = int(_num(entry.get("roll"), 0))
+        except Exception:
+            roll = 0
+        return (roll, str(entry.get("created_at") or ""))
+
+    entries.sort(key=_sort_key, reverse=True)
+    return entries
+
+
+def _junk_user_has_roll(auction: dict[str, Any], user_id: Any) -> bool:
+    uid = str(_user_id(user_id) or "").strip()
+    if not uid:
+        return False
+    for entry in _junk_roll_entries_dashboard(auction):
+        if str(_user_id(entry.get("user_id")) or "") == uid:
+            return True
+    return False
+
+
 def _junk_roll_rows(auction: dict[str, Any]) -> list[list[Any]]:
     rows: list[list[Any]] = []
-    for r in auction.get("junk_rolls") or []:
-        if not isinstance(r, dict):
-            continue
-        rows.append([_member_link(r.get("user_id"), r.get("display_name")), r.get("roll")])
+    for r in _junk_roll_entries_dashboard(auction):
+        rows.append([_member_link(r.get("user_id"), r.get("display_name") or r.get("name")), r.get("roll"), _dt(r.get("created_at"))])
     return rows
 
 
@@ -2728,6 +2772,8 @@ def _loot_sale_precheck(guild_id: int, auction: dict[str, Any], actor: Optional[
     balances = _balance_map(snap)
     if uid and price > 0 and uid in balances and balances.get(uid, 0) < price:
         errors.append(f"Du hast aktuell nur {_fmt_ec(balances.get(uid, 0))} EC, benötigt werden {price} EC.")
+    if uid and bool(auction.get("junk_drop")) and price <= 0 and _junk_user_has_roll(auction, uid):
+        errors.append("Du hast für dieses Müll-Item bereits gewürfelt.")
     if uid:
         active_req = _loot_action_active_for_actor(int(guild_id), str(auction_id), str(uid))
         if active_req:
@@ -2885,7 +2931,8 @@ def _loot_dashboard_action_panel(guild_id: int, auction: dict[str, Any], current
         price = int(_num(auction.get("fixed_price") if auction.get("fixed_price") is not None else auction.get("start_bid"), 0))
         is_junk = bool(auction.get("junk_drop")) and price <= 0
         action = "junk_roll" if is_junk else "sale_buy"
-        label = "🎲 Müll würfeln" if is_junk else ("Gratis nehmen" if price <= 0 else f"Sofort kaufen für {price} EC")
+        already_rolled = bool(is_junk and _junk_user_has_roll(auction, user_id))
+        label = ("✅ Bereits gewürfelt" if already_rolled else "🎲 Müll würfeln") if is_junk else ("Gratis nehmen" if price <= 0 else f"Sofort kaufen für {price} EC")
         sale_errors = _loot_sale_precheck(int(guild_id), auction, current_user, snap)
         if sale_errors:
             warn_html += "".join(f"<p class='muted'>⛔ {_e(w)}</p>" for w in sale_errors if w not in warnings)
@@ -3108,7 +3155,7 @@ def _render_auction_detail(data: dict[str, Any], auction_id: str, current_user: 
         <section class="panel" id="rolls">
           <h2>🎲 Müll-Würfe</h2>
           <p class="muted">Würfelphase bis: {_e(_dt(auction.get('junk_roll_until')))} · Gewinnerwurf: {_e(auction.get('junk_roll_winner_roll') or '—')}</p>
-          {_table(['Spieler','Wurf'], roll_rows, placeholder='Würfe durchsuchen…')}
+          {_table(['Spieler','Wurf','Zeit'], roll_rows, placeholder='Würfe durchsuchen…')}
         </section>
         """
 
