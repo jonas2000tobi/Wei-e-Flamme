@@ -138,8 +138,149 @@ def save_cfg() -> None:
     _save_json(CFG_FILE, cfg)
 
 
+def _phase3_profile_database_url() -> str:
+    return str(os.getenv("DATABASE_URL") or os.getenv("DASHBOARD_DATABASE_URL") or "").strip()
+
+
+def _phase3_profile_normalized_database_url() -> str:
+    url = _phase3_profile_database_url()
+    if url.startswith("postgres://"):
+        return "postgresql://" + url[len("postgres://"):]
+    return url
+
+
+def _phase3_profile_pg_connect():
+    import psycopg  # type: ignore
+    from psycopg.rows import dict_row  # type: ignore
+    return psycopg.connect(_phase3_profile_normalized_database_url(), row_factory=dict_row, connect_timeout=10)
+
+
+def _phase3_profile_jsonb(value: Any):
+    from psycopg.types.json import Jsonb  # type: ignore
+    return Jsonb(value if value is not None else {})
+
+
+def _phase3_profile_ensure_tables() -> None:
+    if not _phase3_profile_database_url():
+        return
+    conn = _phase3_profile_pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS phase3_members (
+                    guild_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    discord_name TEXT,
+                    ingame_name TEXT,
+                    roles_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+                    raw_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    source TEXT NOT NULL DEFAULT 'snapshot',
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    PRIMARY KEY (guild_id, user_id)
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS phase3_absences (
+                    guild_id TEXT NOT NULL,
+                    absence_id TEXT NOT NULL,
+                    user_id TEXT,
+                    status TEXT,
+                    start_at_text TEXT,
+                    end_at_text TEXT,
+                    raw_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    source TEXT NOT NULL DEFAULT 'snapshot',
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    PRIMARY KEY (guild_id, absence_id)
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS phase3_migration_runs (
+                    run_id TEXT PRIMARY KEY,
+                    guild_id TEXT,
+                    mode TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    counts_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                    notes TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_phase3_members_guild ON phase3_members (guild_id)")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _phase3_mirror_profiles_to_pg(guild_id: Optional[int] = None) -> dict[str, Any]:
+    if not _phase3_profile_database_url():
+        return {"ok": False, "error": "DATABASE_URL fehlt"}
+    _phase3_profile_ensure_tables()
+    target_gid = str(guild_id or "").strip()
+    counts = {"members": 0, "absences": 0}
+    conn = _phase3_profile_pg_connect()
+    try:
+        with conn.cursor() as cur:
+            for gid_s, guild_data in list(profiles.items()):
+                if target_gid and str(gid_s) != target_gid:
+                    continue
+                if not isinstance(guild_data, dict):
+                    continue
+                users = guild_data.get("users") if isinstance(guild_data.get("users"), dict) else {}
+                for uid_s, profile in users.items():
+                    if not str(uid_s).strip() or not isinstance(profile, dict):
+                        continue
+                    raw = dict(profile)
+                    raw["user_id"] = str(uid_s)
+                    cur.execute("""
+                        INSERT INTO phase3_members (guild_id, user_id, discord_name, ingame_name, roles_json, raw_json, source, updated_at)
+                        VALUES (%s,%s,%s,%s,%s,%s,'member_portal',now())
+                        ON CONFLICT (guild_id, user_id) DO UPDATE SET
+                          discord_name=COALESCE(NULLIF(EXCLUDED.discord_name,''), phase3_members.discord_name),
+                          ingame_name=COALESCE(NULLIF(EXCLUDED.ingame_name,''), phase3_members.ingame_name),
+                          raw_json=EXCLUDED.raw_json,
+                          source='member_portal',
+                          updated_at=now()
+                    """, (
+                        str(gid_s), str(uid_s), str(profile.get("discord_name") or profile.get("display_name") or ""),
+                        str(profile.get("ingame_name") or ""), _phase3_profile_jsonb(profile.get("roles") or []), _phase3_profile_jsonb(raw),
+                    ))
+                    counts["members"] += 1
+                absences = guild_data.get("absences") if isinstance(guild_data.get("absences"), dict) else {}
+                cur.execute("DELETE FROM phase3_absences WHERE guild_id=%s AND source='member_portal'", (str(gid_s),))
+                for uid_s, absence in absences.items():
+                    if not str(uid_s).strip():
+                        continue
+                    raw = absence if isinstance(absence, dict) else {"value": absence}
+                    absence_id = f"absence:{uid_s}"
+                    cur.execute("""
+                        INSERT INTO phase3_absences (guild_id, absence_id, user_id, status, start_at_text, end_at_text, raw_json, source, updated_at)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,'member_portal',now())
+                        ON CONFLICT (guild_id, absence_id) DO UPDATE SET
+                          user_id=EXCLUDED.user_id, status=EXCLUDED.status, start_at_text=EXCLUDED.start_at_text, end_at_text=EXCLUDED.end_at_text,
+                          raw_json=EXCLUDED.raw_json, source='member_portal', updated_at=now()
+                    """, (str(gid_s), absence_id, str(uid_s), str(raw.get("status") or "active"), str(raw.get("from") or raw.get("start") or ""), str(raw.get("to") or raw.get("end") or ""), _phase3_profile_jsonb(raw)))
+                    counts["absences"] += 1
+            run_id = f"member_portal_{int(time.time() * 1000)}"
+            cur.execute("""
+                INSERT INTO phase3_migration_runs (run_id, guild_id, mode, status, counts_json, notes, created_at)
+                VALUES (%s,%s,'member_portal_parallel_mirror','done',%s,%s,now())
+            """, (run_id, target_gid, _phase3_profile_jsonb(counts), "Member-Portal Profile/Abwesenheiten nach Postgres gespiegelt."))
+        conn.commit()
+        return {"ok": True, "counts": counts}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def save_profiles() -> None:
     _save_json(PROFILE_FILE, profiles)
+    try:
+        _phase3_mirror_profiles_to_pg()
+    except NameError:
+        pass
+    except Exception as e:
+        print(f"[phase3-members] Profil-Spiegelung übersprungen: {e!r}", flush=True)
 
 
 def save_sent() -> None:
