@@ -70,6 +70,7 @@ def _member_is_active(guild: discord.Guild, user_id: int) -> bool:
 
 DASHBOARD_MEMBER_ROLE_SETTING = "dashboard_member_role_id"
 DASHBOARD_ADMIN_ROLE_SETTING = "dashboard_admin_role_ids"
+DASHBOARD_ALLOWED_ROLE_SETTING = "dashboard_allowed_role_ids"
 
 
 def _dashboard_member_role_config_value(guild_id: int) -> Any:
@@ -131,24 +132,16 @@ def _dashboard_member_ids(guild: discord.Guild) -> set[int]:
     return set()
 
 
-def _dashboard_admin_role_config_values(guild_id: int) -> list[int]:
-    """Admin-/Leitungsrollen fürs Dashboard aus Postgres/Runtime-DB lesen."""
-    raw = None
-    try:
-        raw = runtime_db.get_guild_setting(int(guild_id), DASHBOARD_ADMIN_ROLE_SETTING, None)
-    except Exception:
-        raw = None
-
+def _parse_role_id_values(raw: Any) -> list[int]:
     values: list[int] = []
     if isinstance(raw, list):
         seq = raw
     elif isinstance(raw, str):
-        # unterstützt JSON-Listen und einfache CSV-Strings
         try:
             loaded = json.loads(raw)
-            seq = loaded if isinstance(loaded, list) else [raw]
+            seq = loaded if isinstance(loaded, list) else [x.strip() for x in raw.replace(";", ",").split(",") if x.strip()]
         except Exception:
-            seq = [x.strip() for x in raw.split(",") if x.strip()]
+            seq = [x.strip() for x in raw.replace(";", ",").split(",") if x.strip()]
     elif raw not in (None, ""):
         seq = [raw]
     else:
@@ -161,27 +154,50 @@ def _dashboard_admin_role_config_values(guild_id: int) -> list[int]:
                 values.append(rid)
         except Exception:
             continue
-
-    # optionaler Railway-Fallback beim Bot-Service
-    env_ids = os.getenv("DASHBOARD_ADMIN_ROLE_IDS", "").strip()
-    if env_ids:
-        for part in env_ids.replace(";", ",").split(","):
-            try:
-                rid = int(part.strip())
-                if rid and rid not in values:
-                    values.append(rid)
-            except Exception:
-                continue
     return values
 
 
-def _dashboard_admin_roles(guild: discord.Guild) -> list[discord.Role]:
+def _dashboard_role_config_values(guild_id: int, setting_name: str, env_name: str) -> list[int]:
+    """Rollen-IDs fürs Dashboard aus Runtime-DB plus optionalem Railway-Fallback."""
+    raw = None
+    try:
+        raw = runtime_db.get_guild_setting(int(guild_id), setting_name, None)
+    except Exception as exc:
+        print(f"⚠️ Dashboard-Rollen-Setting konnte nicht gelesen werden ({setting_name}): {exc!r}", flush=True)
+        raw = None
+
+    values = _parse_role_id_values(raw)
+
+    env_ids = os.getenv(env_name, "").strip()
+    for rid in _parse_role_id_values(env_ids):
+        if rid not in values:
+            values.append(rid)
+    return values
+
+
+def _dashboard_admin_role_config_values(guild_id: int) -> list[int]:
+    return _dashboard_role_config_values(guild_id, DASHBOARD_ADMIN_ROLE_SETTING, "DASHBOARD_ADMIN_ROLE_IDS")
+
+
+def _dashboard_allowed_role_config_values(guild_id: int) -> list[int]:
+    return _dashboard_role_config_values(guild_id, DASHBOARD_ALLOWED_ROLE_SETTING, "DASHBOARD_ALLOWED_ROLE_IDS")
+
+
+def _roles_from_ids(guild: discord.Guild, role_ids: list[int]) -> list[discord.Role]:
     out: list[discord.Role] = []
-    for rid in _dashboard_admin_role_config_values(guild.id):
+    for rid in role_ids:
         role = guild.get_role(int(rid))
         if role is not None and role not in out:
             out.append(role)
     return out
+
+
+def _dashboard_admin_roles(guild: discord.Guild) -> list[discord.Role]:
+    return _roles_from_ids(guild, _dashboard_admin_role_config_values(guild.id))
+
+
+def _dashboard_allowed_roles(guild: discord.Guild) -> list[discord.Role]:
+    return _roles_from_ids(guild, _dashboard_allowed_role_config_values(guild.id))
 
 
 def _dashboard_auth_info(guild: discord.Guild) -> dict[str, Any]:
@@ -193,7 +209,22 @@ def _dashboard_auth_info(guild: discord.Guild) -> dict[str, Any]:
     403-Probleme bei guilds.members.read.
     """
     member_role = _dashboard_member_role(guild)
-    allowed_ids = sorted(str(x) for x in _dashboard_member_ids(guild))
+    member_ids = set(_dashboard_member_ids(guild))
+
+    allowed_roles = _dashboard_allowed_roles(guild)
+    allowed_role_rows: list[dict[str, Any]] = []
+    role_allowed_ids: set[int] = set()
+    for role in allowed_roles:
+        members = [m for m in getattr(role, "members", []) if getattr(m, "id", None)]
+        role_allowed_ids.update(int(m.id) for m in members)
+        allowed_role_rows.append({
+            "role_id": str(role.id),
+            "role_name": str(role.name),
+            "member_count": len(members),
+        })
+
+    allowed_ids = sorted(str(x) for x in (member_ids | role_allowed_ids))
+
     admin_roles = _dashboard_admin_roles(guild)
     admin_ids: set[int] = set()
     admin_role_rows: list[dict[str, Any]] = []
@@ -210,15 +241,19 @@ def _dashboard_auth_info(guild: discord.Guild) -> dict[str, Any]:
         "member_role": {
             "role_id": str(member_role.id) if member_role else "",
             "role_name": str(member_role.name) if member_role else "",
-            "member_count": len(allowed_ids),
+            "member_count": len(member_ids),
             "configured": member_role is not None,
         },
+        "allowed_roles": allowed_role_rows,
         "admin_roles": admin_role_rows,
         "allowed_member_ids": allowed_ids,
         "admin_member_ids": sorted(str(x) for x in admin_ids),
         "counts": {
             "allowed_members": len(allowed_ids),
+            "member_role_members": len(member_ids),
+            "allowed_role_members": len(role_allowed_ids),
             "admin_members": len(admin_ids),
+            "allowed_roles": len(allowed_role_rows),
             "admin_roles": len(admin_role_rows),
         },
     }
