@@ -2287,17 +2287,14 @@ def _render_need_slot_board(
         input_id = f"need-field-{int(user_id or 0)}-{area.lower()}-{idx}"
         slot_id = f"need-slot-{int(user_id or 0)}-{area.lower()}-{idx}"
         hidden_slot = f'<select id="{_e(slot_id)}" class="need-slot-select" name="slot" style="display:none"><option selected value="{_e(slot)}">{_e(slot)}</option></select>'
-        picker = _loot_item_picker_html(
+        picker = _need_slot_picker_html(
             snap,
             input_id=input_id,
+            slot=slot,
             name="item_text",
             required=False,
             placeholder=(current or "Item auswählen oder tippen"),
-            slot_select_id=slot_id,
         )
-        weapon_html = ""
-        if slot.startswith("Waffe"):
-            weapon_html = f'<select name="weapon_type" class="mini-input"><option value="">Waffenart wählen</option>{_weapon_type_options_html()}</select>'
         return f"""
         <form class="need-slot-row need-slot-edit-row" method="post" action="/portal/member/{int(user_id)}/need-change">
           <input type="hidden" name="action_type" value="set">
@@ -2305,7 +2302,6 @@ def _render_need_slot_board(
           {hidden_slot}
           <span>{_e(slot)}:</span>
           <div class="need-field-box">{picker}</div>
-          {weapon_html}
           <button class="btn mini-btn" type="submit">Speichern</button>
           <button class="btn mini-btn ghost" type="submit" name="action_type" value="clear" onclick="return confirm('Need für {_e(slot)} entfernen?')">Leeren</button>
         </form>"""
@@ -3631,9 +3627,10 @@ def _member_sidebar_html() -> str:
 
       <nav class="side-nav">
         <a href="/member" data-nav="member-home">🏠 Start</a>
-        <a href="/member#members" data-nav="member-members">👥 Mitglieder</a>
-        <a href="/member#events" data-nav="member-events">📅 Laufende Events</a>
-        <a href="/member#auctions" data-nav="member-auctions">🏆 Laufende Auktionen</a>
+        <a href="/member/members" data-nav="member-members">👥 Mitglieder</a>
+        <a href="/member/events" data-nav="member-events">📅 Events</a>
+        <a href="/member/auctions" data-nav="member-auctions">🏆 Auktionen</a>
+        <a href="/member/ec" data-nav="member-ec">🪙 Meine EC</a>
         <a href="/portal" data-nav="member-profile">👤 Eigenes Profil</a>
         <a href="/portal#needs" data-nav="member-needs">🎁 Meine Needs</a>
       </nav>
@@ -3802,6 +3799,9 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "admin") -> str:
     .responsive-table {{ width:100%; overflow-x:auto; -webkit-overflow-scrolling:touch; border-radius:12px; }}
     .responsive-table > table {{ min-width:680px; }}
     .item-picker-select {{ width:100%; margin:0 0 8px; border:1px solid var(--line); background:#08090d; color:var(--text); border-radius:10px; padding:10px 12px; }}
+    .need-two-step-picker {{ display:grid; grid-template-columns:minmax(160px,.55fr) minmax(220px,1fr); gap:8px; align-items:start; }}
+    .need-two-step-picker input, .need-two-step-picker small {{ grid-column:1 / -1; }}
+    .weapon-type-picker {{ width:100%; margin:0 0 8px; border:1px solid var(--line); background:#08090d; color:var(--text); border-radius:10px; padding:10px 12px; }}
     td {{ overflow-wrap:anywhere; }}
     .skip-mobile {{ display:inline; }}
 
@@ -3839,6 +3839,7 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "admin") -> str:
       .member-start-logo {{ width:70px; height:70px; border-radius:18px; }}
       .need-slot-row {{ grid-template-columns:1fr; gap:3px; }}
       .need-slot-row span {{ font-size:12px; text-transform:uppercase; letter-spacing:.04em; color:var(--gold); }}
+      .need-two-step-picker {{ grid-template-columns:1fr; }}
       .action-list .btn {{ padding:11px 12px; }}
       .table-search {{ max-width:100%; }}
       .table-wrap {{ width:100%; overflow-x:auto; -webkit-overflow-scrolling:touch; }}
@@ -3902,6 +3903,25 @@ function filterNextTable(input) {{
   document.querySelectorAll('.side-nav a').forEach(a => a.addEventListener('click', () => document.body.classList.remove('nav-open')));
   document.addEventListener('keydown', ev => {{ if (ev.key === 'Escape') document.body.classList.remove('nav-open'); }});
 }})();
+function refreshNeedWeaponPicker(source) {{
+  const wrap = source.closest('.need-two-step-picker');
+  if (!wrap) return;
+  const wanted = (source.value || '').toLowerCase();
+  const picker = wrap.querySelector('select.weapon-item-picker');
+  if (!picker) return;
+  let visible = 0;
+  for (const opt of picker.options) {{
+    if (!opt.value) {{ opt.hidden = false; continue; }}
+    const weapon = (opt.dataset.weapon || '').toLowerCase();
+    const ok = !wanted || !weapon || weapon === wanted;
+    opt.hidden = !ok;
+    if (ok) visible++;
+  }}
+  const first = picker.options[0];
+  if (first) first.textContent = wanted ? (visible ? `2. Item auswählen ... (${{visible}})` : 'Keine bekannten Items für diese Waffenart – Freitext nutzen') : '2. Item rechts auswählen ...';
+  picker.selectedIndex = 0;
+}}
+
 function refreshItemPickerFilters() {{
   for (const picker of document.querySelectorAll('select.item-picker-select[data-slot-source]')) {{
     const source = document.getElementById(picker.dataset.slotSource);
@@ -3920,8 +3940,12 @@ function refreshItemPickerFilters() {{
 }}
 document.addEventListener('change', function(ev) {{
   if (ev.target && ev.target.matches('select.need-slot-select')) refreshItemPickerFilters();
+  if (ev.target && ev.target.matches('select.weapon-type-picker')) refreshNeedWeaponPicker(ev.target);
 }});
-document.addEventListener('DOMContentLoaded', refreshItemPickerFilters);
+document.addEventListener('DOMContentLoaded', function() {{
+  refreshItemPickerFilters();
+  document.querySelectorAll('select.weapon-type-picker').forEach(refreshNeedWeaponPicker);
+}});
 (function responsiveTables() {{
   document.querySelectorAll('table').forEach(tbl => {{
     if (tbl.closest('.table-wrap') || tbl.closest('.responsive-table')) return;
@@ -5692,6 +5716,134 @@ def _loot_item_picker_html(snap: dict[str, Any], *, input_id: str, name: str = "
         f'<datalist id="{_e(datalist_id)}">{options}</datalist>'
         f'<small class="muted">{len(items)} bekannte Items aus Online-Datenbank/Needs/Auktionen. '
         f'Bei Slot-Auswahl wird die Klickliste gefiltert.</small>'
+    )
+
+
+
+def _need_slot_kind(slot: str) -> str:
+    s = str(slot or "").strip().lower()
+    if s.startswith("waffe"):
+        return "weapon"
+    if "fähigkeits" in s or "kern" in s:
+        return "core"
+    if s in {"helm", "brust", "hose", "handschuhe", "schuhe"}:
+        return "armor"
+    if s in {"brosche", "ohrringe", "kette", "armband", "ring 1", "ring 2", "ring"}:
+        return "jewelry"
+    if s in {"gürtel", "guertel", "umhang"}:
+        return "other"
+    return ""
+
+
+def _weapon_type_from_text(text: Any) -> str:
+    raw = str(text or "")
+    low = raw.lower()
+    # Erst Klammerangaben wie "(Schwert & Schild)" bevorzugen.
+    m = re.search(r"\(([^)]{2,40})\)", raw)
+    candidates = [m.group(1)] if m else []
+    candidates.append(raw)
+    for cand in candidates:
+        c = cand.lower()
+        for w in _WEAPON_TYPES:
+            wl = w.lower()
+            if wl in c:
+                return w
+        if "schwert" in c and "schild" in c:
+            return "Schwert & Schild"
+        if "großschwert" in c or "grossschwert" in c:
+            return "Großschwert"
+        if "dolch" in c or "dolche" in c:
+            return "Dolche"
+        if "langbogen" in c or "bogen" in c:
+            return "Langbogen"
+        if "armbrust" in c:
+            return "Armbrust"
+        if "zauberstab" in c:
+            return "Zauberstab"
+        if "stab" in c:
+            return "Stab"
+        if "kugel" in c:
+            return "Kugel"
+    return ""
+
+
+def _need_item_slot_matches(item_slot: str, target_slot: str, item_name: str = "") -> bool:
+    item_slot_l = str(item_slot or "").strip().lower()
+    target_l = str(target_slot or "").strip().lower()
+    name_l = str(item_name or "").lower()
+    if not target_l:
+        return True
+    if item_slot_l == target_l:
+        return True
+    if target_l.startswith("waffe"):
+        return item_slot_l.startswith("waffe") or bool(_weapon_type_from_text(item_name))
+    if target_l.startswith("ring"):
+        return item_slot_l.startswith("ring") or "ring" in name_l
+    if target_l in item_slot_l or item_slot_l in target_l:
+        return True
+    # Wenn kein Slot bekannt ist, einfache Namenshinweise zulassen.
+    if not item_slot_l:
+        hints = {
+            "helm": ["helm", "hut", "kappe", "haube"],
+            "brust": ["rüstung", "robe", "panzer", "brust", "gewand"],
+            "hose": ["hose", "beinschutz", "bein"],
+            "handschuhe": ["handschuh", "stulpen"],
+            "schuhe": ["schuh", "stiefel"],
+            "brosche": ["brosche"],
+            "ohrringe": ["ohrring", "ohrringe"],
+            "kette": ["kette", "halskette"],
+            "armband": ["armband", "armreif"],
+            "gürtel": ["gürtel", "guertel"],
+            "umhang": ["umhang", "mantel"],
+            "fähigkeitskern": ["fähigkeitskern", "faehigkeitskern", "kern"],
+        }
+        return any(h in name_l for h in hints.get(target_l, []))
+    return False
+
+
+def _need_slot_picker_html(snap: dict[str, Any], *, input_id: str, slot: str, name: str = "item_text", required: bool = False, placeholder: str = "Item auswählen oder tippen") -> str:
+    """Kompakter Slot-Picker.
+
+    Waffen: zuerst Waffenart wählen, danach werden rechts nur passende Waffen angezeigt.
+    Andere Slots: direkt passende Items für den Slot anzeigen.
+    """
+    items = _loot_catalog_items(snap)
+    slot_kind = _need_slot_kind(slot)
+    required_attr = " required" if required else ""
+    datalist_id = f"{input_id}-list"
+    # Kandidaten stark auf den Slot begrenzen; wenn keine Treffer, fallback auf alle bekannten Items.
+    filtered = [it for it in items if _need_item_slot_matches(it.get("slot", ""), slot, it.get("name", ""))]
+    if not filtered:
+        filtered = items
+    options = "".join(f'<option value="{_e(it.get("name"))}"></option>' for it in filtered[:650])
+    if slot_kind == "weapon":
+        # Waffenarten sind der erste Klick. Die Itemliste rechts wird per JS gefiltert.
+        weapon_opts = ''.join(f'<option value="{_e(w)}">{_e(w)}</option>' for w in _WEAPON_TYPES)
+        select_options = []
+        for it in filtered[:650]:
+            name_val = it.get("name") or ""
+            wt = _weapon_type_from_text(name_val)
+            if not wt and it.get("slot") and str(it.get("slot")).lower().startswith("waffe"):
+                wt = ""
+            select_options.append(f'<option value="{_e(name_val)}" data-weapon="{_e(wt)}">{_e(name_val)}{(" · " + _e(wt)) if wt else ""}</option>')
+        return (
+            f'<div class="need-two-step-picker" data-need-picker="weapon">'
+            f'<select class="weapon-type-picker" name="weapon_type" onchange="refreshNeedWeaponPicker(this)">'
+            f'<option value="">1. Waffenart wählen</option>{weapon_opts}</select>'
+            f'<select class="item-picker-select weapon-item-picker" onchange="var el=document.getElementById(\'{_e(input_id)}\'); if(el && this.value) el.value=this.value; this.selectedIndex=0;">'
+            f'<option value="">2. Item rechts auswählen ...</option>{"".join(select_options)}</select>'
+            f'<input id="{_e(input_id)}" list="{_e(datalist_id)}" name="{_e(name)}"{required_attr} placeholder="{_e(placeholder)}" autocomplete="off">'
+            f'<datalist id="{_e(datalist_id)}">{options}</datalist>'
+            f'<small class="muted">Erst Waffenart, dann passendes Item. Freitext bleibt möglich.</small>'
+            f'</div>'
+        )
+    select_options = ''.join(f'<option value="{_e(it.get("name"))}">{_e(it.get("name"))}</option>' for it in filtered[:650])
+    return (
+        f'<select class="item-picker-select" onchange="var el=document.getElementById(\'{_e(input_id)}\'); if(el && this.value) el.value=this.value; this.selectedIndex=0;">'
+        f'<option value="">Passendes Item für {_e(slot)} auswählen ... ({len(filtered)})</option>{select_options}</select>'
+        f'<input id="{_e(input_id)}" list="{_e(datalist_id)}" name="{_e(name)}"{required_attr} placeholder="{_e(placeholder)}" autocomplete="off">'
+        f'<datalist id="{_e(datalist_id)}">{options}</datalist>'
+        f'<small class="muted">{len(filtered)} bekannte Treffer für diesen Slot. Freitext bleibt möglich.</small>'
     )
 
 def _render_loot_center(data: dict[str, Any], request: Optional[Request] = None, msg: str = "") -> str:
@@ -7484,7 +7636,7 @@ def _render_need_editor_panel(user_id: int, current_user: Optional[dict[str, Any
               <div class="need-inline-current">{_e(current or '—')}</div>
               <div class="muted">erhalten · gesperrt</div>
             </div>"""
-        picker = _loot_item_picker_html(snap, input_id=input_id, name="item_text", required=False, placeholder=(current or "Item auswählen oder tippen"), slot_select_id=slot_id)
+        picker = _need_slot_picker_html(snap, input_id=input_id, slot=slot, name="item_text", required=False, placeholder=(current or "Item auswählen oder tippen"))
         return f"""
         <form class="need-inline-row" method="post" action="/portal/member/{int(user_id)}/need-change">
           <input type="hidden" name="action_type" value="set">
@@ -7492,7 +7644,6 @@ def _render_need_editor_panel(user_id: int, current_user: Optional[dict[str, Any
           {hidden_slot}
           <div class="need-inline-slot">{_e(slot)}</div>
           <div class="need-inline-picker">{picker}</div>
-          {weapon_html}
           <button class="btn mini-btn" type="submit">Speichern</button>
           <button class="btn mini-btn ghost" type="submit" name="action_type" value="clear" onclick="return confirm('Need für {_e(slot)} entfernen?')">Leeren</button>
         </form>"""
@@ -7514,7 +7665,7 @@ def _render_need_editor_panel(user_id: int, current_user: Optional[dict[str, Any
       <h2>✍️ Needliste bearbeiten</h2>
       <p class="muted">{_e(actor_hint)} Jede Zeile speichert nur diesen Slot. Der Bot verarbeitet den Antrag und schreibt die echte Needliste.</p>
       <style>
-        .need-inline-row{{display:grid;grid-template-columns:160px minmax(220px,1fr) 150px auto auto;gap:10px;align-items:end;padding:10px 0;border-bottom:1px solid rgba(255,255,255,.08)}}
+        .need-inline-row{{display:grid;grid-template-columns:160px minmax(260px,1fr) auto auto;gap:10px;align-items:end;padding:10px 0;border-bottom:1px solid rgba(255,255,255,.08)}}
         .need-inline-slot{{font-weight:800;color:var(--gold)}}
         .need-inline-current{{font-weight:800}}
         .need-inline-picker input,.need-inline-picker select,.mini-input{{width:100%;padding:9px;border-radius:10px;background:#08090d;color:var(--text);border:1px solid var(--line)}}
@@ -7578,12 +7729,12 @@ def _render_member_portal(data: dict[str, Any], user_id: int, request: Request, 
         _card("Events", f"{response.get('yes',0)} Zusagen", f"{response.get('maybe',0)} vielleicht · {response.get('no',0)} nein"),
         _card("Loot", loot_payload.get("won_count", 0), f"ausgegeben: {_fmt_ec(loot_payload.get('spent_ec', 0))} EC"),
     ])
-    portal_nav = '<nav class="topnav"><a href="/">Kommando</a><a href="/portal">Mein Portal</a><a href="/events">Events</a><a href="/loot">Loot</a><a href="/members">Mitglieder</a><a href="/ec">EC</a></nav>' if _is_portal_admin(request) else '<nav class="topnav"><a href="/member">Start</a><a href="/member#members">Mitglieder</a><a href="/member#events">Events</a><a href="/member#auctions">Auktionen</a><a href="/portal">Eigenes Profil</a><a href="#needs">Meine Needs</a></nav>'
+    portal_nav = '<nav class="topnav"><a href="/">Kommando</a><a href="/portal">Mein Portal</a><a href="/events">Events</a><a href="/loot">Loot</a><a href="/members">Mitglieder</a><a href="/ec">EC</a></nav>' if _is_portal_admin(request) else '<nav class="topnav"><a href="/member">Start</a><a href="/member/members">Mitglieder</a><a href="/member/events">Events</a><a href="/member/auctions">Auktionen</a><a href="/member/ec">Meine EC</a><a href="/portal">Eigenes Profil</a><a href="#needs">Meine Needs</a></nav>'
     body = f"""
     <style>
       .soft-details summary{{cursor:pointer;list-style:none;padding:10px 0;color:var(--gold)}}
       .soft-details summary::-webkit-details-marker{{display:none}}
-      .need-slot-edit-row{{display:grid;grid-template-columns:140px minmax(240px,1fr) 150px auto auto;gap:10px;align-items:end}}
+      .need-slot-edit-row{{display:grid;grid-template-columns:140px minmax(260px,1fr) auto auto;gap:10px;align-items:end}}
       .need-slot-edit-row .need-field-box input,.need-slot-edit-row .need-field-box select,.need-slot-edit-row .mini-input{{width:100%;padding:9px;border-radius:10px;background:#08090d;color:var(--text);border:1px solid var(--line)}}
       .need-slot-edit-row .mini-btn{{padding:9px 11px;white-space:nowrap}}
       .need-slot-row.locked em{{color:var(--muted);font-style:normal}}
@@ -7656,7 +7807,7 @@ def _render_member_home(data: dict[str, Any], request: Request) -> str:
     now_text = datetime.now().strftime("%d.%m.%Y %H:%M")
     cards = "".join([_card("Meine EC", _fmt_ec(my_ec_balance) if my_ec_balance is not None else "—", "aktueller Stand"), _card("Uhrzeit", now_text, "lokale Dashboard-Zeit"), _card("Events", len(running_events), "max. 2 auf Startseite"), _card("Auktionen", len(active_auctions), "max. 4 auf Startseite")])
     body = f"""
-    <nav class="topnav"><a href="/member">Start</a><a href="#events">Events</a><a href="#auctions">Auktionen</a><a href="/portal">Eigenes Profil</a><a href="/portal#needs">Meine Needs</a><a href="/portal#need-editor">Need ändern</a></nav>
+    <nav class="topnav"><a href="/member">Start</a><a href="/member/events">Events</a><a href="/member/auctions">Auktionen</a><a href="/member/members">Mitglieder</a><a href="/member/ec">Meine EC</a><a href="/portal">Eigenes Profil</a><a href="/portal#needs">Meine Needs</a></nav>
     <section class="hero member-home-hero"><div style="display:flex;gap:16px;align-items:center;flex-wrap:wrap;"><div class="member-start-logo"><img src="{_asset('ebolus_logo.png')}" alt="Ebolus"></div><div><div class="eyebrow">Mitgliederbereich</div><h1>Willkommen, {_e(display)}</h1><p class="muted">Kurzüberblick. Weitere Bereiche erreichst du links über die Leiste.</p></div></div></section>
     <section class="grid">{cards}</section>
     <section class="split"><div class="panel" id="events"><h2>📅 Nächste 2 Events</h2>{_member_home_event_rows(running_events, int(uid or 0))}</div><div class="panel" id="auctions"><h2>🏆 Max. 4 laufende Auktionen</h2>{_member_home_auction_rows(active_auctions, snap)}</div></section>
@@ -7704,6 +7855,109 @@ def _render_member_home(data: dict[str, Any], request: Request) -> str:
             conn.close()
     except Exception:
         return []
+
+
+def _member_event_role_summary_text(ev: dict[str, Any]) -> str:
+    try:
+        s = _event_role_summary(ev)
+        return f"Tank {s.get('Tank',0)} · Heal {s.get('Heiler',0)} · DPS {s.get('DPS',0)} · Reserve {s.get('Reserve',0)}"
+    except Exception:
+        return "—"
+
+
+def _render_member_events_page(data: dict[str, Any], request: Request) -> str:
+    if not data.get("ok"):
+        return _html_shell("Events · Mitgliederbereich", f"<section class='panel'><h1>📅 Events</h1><p class='muted'>{_e(data.get('error'))}</p></section>", nav_mode="member")
+    uid = _current_user_id(request)
+    snap: dict[str, Any] = data.get("snapshot") or {}
+    events = _portal_active_events(snap, int(uid or 0))
+    rows = []
+    for ev in events:
+        eid = str(ev.get("event_id") or ev.get("id") or "")
+        rows.append([
+            _event_link(eid, ev.get("title") or ev.get("name") or eid),
+            _dt(ev.get("when_iso") or ev.get("start_at") or ev.get("created_at")),
+            _event_status_text(ev),
+            _member_event_role_summary_text(ev),
+            _portal_event_status_for_user(ev, int(uid or 0)),
+            _raw(f'<a class="btn" href="/event/{_e(eid)}">Details</a>') if eid else "—",
+        ])
+    history_rows = _member_event_rows(snap, int(uid or 0)) if uid else []
+    body = f"""
+    <nav class="topnav"><a href="/member">Start</a><a href="/member/events">Events</a><a href="/member/auctions">Auktionen</a><a href="/portal">Eigenes Profil</a></nav>
+    <section class="hero"><div><div class="eyebrow">Mitgliederbereich</div><h1>📅 Events</h1><p class="muted">Eigene Eventseite mit mehr Infos als die Startseite.</p></div></section>
+    <section class="panel"><h2>📆 Laufende & kommende Events</h2>{_table(['Event','Zeit','Status','Rollen','Deine Anmeldung','Aktion'], rows, placeholder='Events durchsuchen…')}</section>
+    <section class="panel"><h2>🧾 Deine Event-Historie</h2>{_table(['Event','Zeit','Deine Anmeldung'], history_rows, placeholder='Historie durchsuchen…')}</section>
+    """
+    return _html_shell("Events · Mitgliederbereich", body, nav_mode="member")
+
+
+def _render_member_auctions_page(data: dict[str, Any], request: Request) -> str:
+    if not data.get("ok"):
+        return _html_shell("Auktionen · Mitgliederbereich", f"<section class='panel'><h1>🏆 Auktionen</h1><p class='muted'>{_e(data.get('error'))}</p></section>", nav_mode="member")
+    snap: dict[str, Any] = data.get("snapshot") or {}
+    auctions = _portal_active_auctions(snap)
+    rows = []
+    for a in auctions:
+        aid = str(a.get("auction_id") or "")
+        count_title, count_value, _ = _auction_count_label(a)
+        rows.append([
+            _auction_link(aid, a.get("item_name") or a.get("item") or aid),
+            _phase_label(a),
+            _loot_effective_status_label(a),
+            f"{count_value} {count_title}",
+            _auction_leader_or_roll_text(a, snap),
+            _auction_timer_text(a),
+            _raw(f'<a class="btn" href="/auction/{_e(aid)}">Öffnen</a>') if aid else "—",
+        ])
+    body = f"""
+    <nav class="topnav"><a href="/member">Start</a><a href="/member/events">Events</a><a href="/member/auctions">Auktionen</a><a href="/portal">Eigenes Profil</a></nav>
+    <section class="hero"><div><div class="eyebrow">Mitgliederbereich</div><h1>🏆 Laufende Auktionen</h1><p class="muted">Alle aktuell offenen Auktionen, Würfelitems und Sales mit Timer.</p></div></section>
+    <section class="panel">{_table(['Item','Bereich','Status','Gebote/Würfe','Führung/Wurf','Timer','Aktion'], rows, placeholder='Auktionen durchsuchen…')}</section>
+    """
+    return _html_shell("Auktionen · Mitgliederbereich", body, nav_mode="member")
+
+
+def _render_member_members_page(data: dict[str, Any], request: Request) -> str:
+    if not data.get("ok"):
+        return _html_shell("Mitglieder · Mitgliederbereich", f"<section class='panel'><h1>👥 Mitglieder</h1><p class='muted'>{_e(data.get('error'))}</p></section>", nav_mode="member")
+    snap: dict[str, Any] = data.get("snapshot") or {}
+    profiles = ((snap.get("profiles") or {}).get("items") or [])
+    rows = []
+    for p in profiles:
+        if not isinstance(p, dict):
+            continue
+        uid = _user_id(p.get("user_id") or p.get("id"))
+        rows.append([
+            _member_link(uid, p.get("display_name") or p.get("discord_name") or p.get("ingame_name") or f"User {uid}"),
+            p.get("ingame_name") or "—",
+            p.get("main_role") or "—",
+            p.get("gearscore") or "—",
+            "ja" if p.get("has_needs") else "nein",
+        ])
+    body = f"""
+    <nav class="topnav"><a href="/member">Start</a><a href="/member/members">Mitglieder</a><a href="/member/events">Events</a><a href="/member/auctions">Auktionen</a></nav>
+    <section class="hero"><div><div class="eyebrow">Mitgliederbereich</div><h1>👥 Mitglieder</h1><p class="muted">Reduzierte Mitgliederliste ohne Leitungs-Prüfliste.</p></div></section>
+    <section class="panel">{_table(['Name','Ingame','Rolle','GS','Needliste'], rows, placeholder='Mitglieder durchsuchen…')}</section>
+    """
+    return _html_shell("Mitglieder · Mitgliederbereich", body, nav_mode="member")
+
+
+def _render_member_ec_page(data: dict[str, Any], request: Request) -> str:
+    if not data.get("ok"):
+        return _html_shell("Meine EC · Mitgliederbereich", f"<section class='panel'><h1>🪙 Meine EC</h1><p class='muted'>{_e(data.get('error'))}</p></section>", nav_mode="member")
+    uid = _current_user_id(request)
+    snap: dict[str, Any] = data.get("snapshot") or {}
+    balance = _balance_map(snap).get(int(uid or 0)) if uid else None
+    rows = [[_dt(tx.get("created_at")), _fmt_ec(tx.get("amount")), tx.get("raw_type") or tx.get("type") or "—", _short(tx.get("reason"), 180)] for tx in _tx_for_user(snap, int(uid or 0), limit=120)] if uid else []
+    body = f"""
+    <nav class="topnav"><a href="/member">Start</a><a href="/member/ec">Meine EC</a><a href="/portal">Eigenes Profil</a></nav>
+    <section class="hero"><div><div class="eyebrow">Mitgliederbereich</div><h1>🪙 Meine EC</h1><p class="muted">Eigener Kontostand und persönlicher EC-Verlauf.</p></div></section>
+    <section class="grid">{_card('EC-Kontostand', _fmt_ec(balance) if balance is not None else '—', 'aktueller Stand')}</section>
+    <section class="panel"><h2>EC-Verlauf</h2>{_table(['Zeit','Betrag','Typ','Grund'], rows, placeholder='EC-Verlauf durchsuchen…')}</section>
+    """
+    return _html_shell("Meine EC · Mitgliederbereich", body, nav_mode="member")
+
 
 
 def _snapshot_setting_value(snap: dict[str, Any], suffix: str, default: Any = "") -> Any:
@@ -9697,6 +9951,40 @@ def member_home(request: Request, _: bool = Depends(_auth)):
         return HTMLResponse(_render_member_home(_snapshot_payload(), request))
     except Exception as exc:
         return HTMLResponse(_html_shell("Mitgliederbereich Fehler", f"<section class='panel'><h1>❌ Mitgliederbereich-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>", nav_mode="member"), status_code=500)
+
+
+
+
+@app.get("/member/events", response_class=HTMLResponse)
+def member_events_page(request: Request, _: bool = Depends(_auth)):
+    try:
+        return HTMLResponse(_render_member_events_page(_snapshot_payload(), request))
+    except Exception as exc:
+        return HTMLResponse(_html_shell("Events Fehler", f"<section class='panel'><h1>❌ Events-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>", nav_mode="member"), status_code=500)
+
+
+@app.get("/member/auctions", response_class=HTMLResponse)
+def member_auctions_page(request: Request, _: bool = Depends(_auth)):
+    try:
+        return HTMLResponse(_render_member_auctions_page(_snapshot_payload(), request))
+    except Exception as exc:
+        return HTMLResponse(_html_shell("Auktionen Fehler", f"<section class='panel'><h1>❌ Auktionen-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>", nav_mode="member"), status_code=500)
+
+
+@app.get("/member/members", response_class=HTMLResponse)
+def member_members_page(request: Request, _: bool = Depends(_auth)):
+    try:
+        return HTMLResponse(_render_member_members_page(_snapshot_payload(), request))
+    except Exception as exc:
+        return HTMLResponse(_html_shell("Mitglieder Fehler", f"<section class='panel'><h1>❌ Mitglieder-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>", nav_mode="member"), status_code=500)
+
+
+@app.get("/member/ec", response_class=HTMLResponse)
+def member_ec_page(request: Request, _: bool = Depends(_auth)):
+    try:
+        return HTMLResponse(_render_member_ec_page(_snapshot_payload(), request))
+    except Exception as exc:
+        return HTMLResponse(_html_shell("EC Fehler", f"<section class='panel'><h1>❌ EC-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>", nav_mode="member"), status_code=500)
 
 
 @app.get("/portal", response_class=HTMLResponse)
