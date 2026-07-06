@@ -151,6 +151,32 @@ def _is_leader_or_admin(inter: discord.Interaction) -> bool:
     return bool(role and role in inter.user.roles)
 
 
+def _is_leader_or_admin_member(guild: discord.Guild, member: Optional[discord.Member]) -> bool:
+    if member is None or getattr(member, "bot", False):
+        return False
+    perms = getattr(member, "guild_permissions", None)
+    if perms and (getattr(perms, "administrator", False) or getattr(perms, "manage_guild", False)):
+        return True
+    cfg = _load_leader_cfg().get(str(int(guild.id))) or {}
+    role_id = int(cfg.get("leader_role_id", 0) or 0)
+    role = guild.get_role(role_id) if role_id else None
+    return bool(role and role in getattr(member, "roles", []))
+
+
+class _DashboardDropContext:
+    """Minimaler Interaction-Ersatz für Dashboard-Queue-Drops.
+
+    Die vorhandenen Discord-Funktionen erwarten nur client/guild/user/channel.
+    Damit nutzen Dashboard-Drops exakt denselben Pfad wie das Admin-Menü, ohne
+    echte Discord-Interactions zu fälschen.
+    """
+    def __init__(self, client: discord.Client, guild: discord.Guild, user: discord.Member):
+        self.client = client
+        self.guild = guild
+        self.user = user
+        self.channel = None
+
+
 def _gcfg(guild_id: int) -> dict:
     gid = str(int(guild_id))
     c = auction_cfg.get(gid) or {}
@@ -359,6 +385,35 @@ def _need_mode_label(mode: str) -> str:
     if mode == "secondary_need":
         return "Second-Need"
     return "Freie Auktion"
+
+
+def _auction_rule_defaults(mode: str) -> tuple[str, int, int, int]:
+    """Regel-Defaults für neu gestartete Loot-Auktionen.
+
+    Main/Second-Need-Auktionen laufen 48h. Freie Auktionen laufen 24h.
+    Sale/Sofortkauf hat eigene Startlogik.
+    """
+    m = str(mode or "all")
+    if m == "main_need":
+        return "need", NEED_AUCTION_HOURS, MAIN_NEED_START_BID, DEFAULT_MIN_INCREMENT
+    if m == "secondary_need":
+        return "need", NEED_AUCTION_HOURS, SECOND_NEED_START_BID, DEFAULT_MIN_INCREMENT
+    return "free", FREE_AUCTION_HOURS, FREE_START_BID, FREE_MIN_INCREMENT
+
+
+def _auction_is_expired_waiting(auction: dict) -> bool:
+    """Aktiv gespeichert, aber Endzeit ist vorbei und der Close-Loop muss noch verarbeiten."""
+    if str((auction or {}).get("status", "")) != "active":
+        return False
+    end_dt = _parse_dt(str((auction or {}).get("ends_at", "") or ""))
+    return bool(end_dt and _now() >= end_dt)
+
+
+def _auction_is_currently_open(auction: dict) -> bool:
+    """Aktiv und noch nicht über Endzeit. Müll-Sales ohne Endzeit bleiben offen."""
+    if str((auction or {}).get("status", "")) != "active":
+        return False
+    return not _auction_is_expired_waiting(auction)
 
 
 def _eligible_user_ids(guild: discord.Guild, item_id: str, mode: str) -> tuple[str, list[int]]:
@@ -664,7 +719,8 @@ async def _refresh_auction_message(client: discord.Client, guild_id: int, auctio
     try:
         msg = await ch.fetch_message(msg_id)
         phase = _auction_phase(auction)
-        view = (SaleBuyView(int(guild_id), str(auction.get("id", ""))) if phase == "sale" else AuctionBidView(int(guild_id), str(auction.get("id", "")))) if auction.get("status") == "active" else None
+        is_open = _auction_is_currently_open(auction)
+        view = (SaleBuyView(int(guild_id), str(auction.get("id", ""))) if phase == "sale" else AuctionBidView(int(guild_id), str(auction.get("id", "")))) if is_open else None
         embed = _sale_embed(guild, auction) if phase == "sale" else _auction_embed(guild, auction)
         await msg.edit(embed=embed, view=view)
     except Exception as e:
@@ -757,7 +813,7 @@ async def _delete_active_auction_message(client: discord.Client, auction: dict) 
 
 async def _post_or_refresh_active_auction_message(client: discord.Client, guild_id: int, auction: dict) -> None:
     """Postet/aktualisiert eine kurze öffentliche Übersicht im Auktionshaus."""
-    if str(auction.get("status", "")) != "active":
+    if not _auction_is_currently_open(auction):
         await _delete_active_auction_message(client, auction)
         return
     # Müll-Items haben im Auktionshaus ihre eigene Würfelkarte mit Button.
@@ -808,7 +864,7 @@ async def _sync_active_auction_messages(client: discord.Client, guild_id: int | 
         auctions = (_gauctions(gid).get("auctions") or {})
         for auc in list(auctions.values()):
             try:
-                if str(auc.get("status", "")) == "active":
+                if _auction_is_currently_open(auc) and not _is_junk_interest_sale(auc):
                     await _post_or_refresh_active_auction_message(client, gid, auc)
                 else:
                     await _delete_active_auction_message(client, auc)
@@ -1822,6 +1878,19 @@ def _phase3_ensure_auction_tables() -> None:
         conn.close()
 
 
+def _phase3_is_real_auction_record(auction_id: Any, auc: Any) -> bool:
+    aid = str(auction_id or "").strip().lower()
+    if aid in {"", "items", "count", "by_status", "status", "source", "read_cutover"}:
+        return False
+    if not isinstance(auc, dict):
+        return False
+    # Alte/kaputte Spiegelungen können Sammelobjekte in die Auktionsliste schreiben.
+    # Eine echte Auktion hat mindestens Item/Status/Phase/Kind oder eine echte Auktions-ID.
+    if str(auc.get("id") or auc.get("auction_id") or auction_id or "").strip().lower() in {"items", "count", "by_status"}:
+        return False
+    return bool(auc.get("item_name") or auc.get("item_id") or auc.get("status") or auc.get("kind") or auc.get("phase") or str(auction_id or "").startswith("A"))
+
+
 def _phase3_auction_rows_for_guild(guild_id: int) -> tuple[list[dict], list[dict], list[dict]]:
     auctions_out: list[dict] = []
     bids_out: list[dict] = []
@@ -1831,7 +1900,7 @@ def _phase3_auction_rows_for_guild(guild_id: int) -> tuple[list[dict], list[dict
     if not isinstance(auctions, dict):
         return auctions_out, bids_out, history_out
     for auction_id, auc in auctions.items():
-        if not isinstance(auc, dict):
+        if not _phase3_is_real_auction_record(auction_id, auc):
             continue
         top = _highest_bid(auc)
         winner = str(auc.get("winner_user_id") or auc.get("winner_id") or (top or {}).get("user_id") or "")
@@ -2229,6 +2298,51 @@ async def _dashboard_apply_sale_or_junk(client: discord.Client, guild: discord.G
     return {"ok": True, "status": "done", "message": f"Sale-Kauf erledigt ({price} EC).", "auction_id": auction_id, "price": int(price), "embed_title": getattr(emb, "title", "")}
 
 
+
+async def _dashboard_apply_drop_create(client: discord.Client, guild: discord.Guild, row: dict, member: discord.Member, action_type: str) -> dict:
+    payload = _dashboard_row_payload(row)
+    item_query = _safe_text(str(payload.get("item_query") or payload.get("item_name") or payload.get("item") or "").strip())[:160]
+    if not item_query:
+        return {"ok": False, "status": "rejected", "error": "Itemname fehlt."}
+    if not _is_leader_or_admin_member(guild, member):
+        return {"ok": False, "status": "rejected", "error": "Nur Gildenleitung/Admins dürfen Drops aus dem Dashboard erstellen."}
+
+    ctx = _DashboardDropContext(client, guild, member)
+    if action_type == "junk_drop":
+        result = await start_junk_sale_drop(ctx, int(guild.id), item_query, actor_id=int(member.id))  # type: ignore[arg-type]
+        ok = bool(result.get("ok", True)) if isinstance(result, dict) else True
+        if not ok:
+            return {"ok": False, "status": "failed", "error": str(result.get("error") or "Müll-Drop konnte nicht erstellt werden.")}
+        return {
+            "ok": True,
+            "status": "done",
+            "message": "Müll-Drop erstellt.",
+            "auction_id": result.get("auction_id") if isinstance(result, dict) else "",
+            "item_name": item_query,
+            "kind": "junk_drop",
+        }
+
+    item_id, display, matches = _find_item(int(guild.id), item_query)
+    if not item_id:
+        suggestions = ", ".join(str(m[1]) for m in (matches or [])[:8])
+        suffix = f" Vorschläge: {suggestions}" if suggestions else ""
+        return {"ok": False, "status": "rejected", "error": f"Item nicht eindeutig im Loot-Katalog gefunden.{suffix}"}
+    result = await start_loot_drop_auction(ctx, guild, str(item_id), actor_id=int(member.id))  # type: ignore[arg-type]
+    return {
+        "ok": True,
+        "status": "done",
+        "message": "Loot-Drop erstellt.",
+        "auction_id": result.get("auction_id") if isinstance(result, dict) else "",
+        "item_id": str(item_id),
+        "item_name": result.get("item_name") if isinstance(result, dict) else display,
+        "phase": result.get("phase") if isinstance(result, dict) else "",
+        "eligibility_mode": result.get("eligibility_mode") if isinstance(result, dict) else "",
+        "eligible_count": len(result.get("eligible_user_ids") or []) if isinstance(result, dict) else 0,
+        "notified": result.get("notified") if isinstance(result, dict) else 0,
+        "kind": "loot_drop",
+    }
+
+
 async def _process_dashboard_loot_action(client: discord.Client, row: dict) -> dict:
     guild_id = int(row.get("guild_id") or 0)
     auction_id = str(row.get("auction_id") or "")
@@ -2248,6 +2362,10 @@ async def _process_dashboard_loot_action(client: discord.Client, row: dict) -> d
     actor_name = getattr(member, "display_name", None) or actor_name
     if not _is_ebolus_member(guild, actor_id):
         return {"ok": False, "status": "rejected", "error": "Nur Ebolus-Mitglieder dürfen Loot-Aktionen nutzen."}
+
+    if action_type in {"loot_drop", "junk_drop"}:
+        return await _dashboard_apply_drop_create(client, guild, row, member, action_type)
+
     until = _loot_lock_until_for_member(member)
     if until:
         return {"ok": False, "status": "rejected", "error": f"Lootsperre aktiv bis {until.strftime('%d.%m.%Y %H:%M')}."}
@@ -2339,7 +2457,7 @@ def _new_auction_id() -> str:
 
 def _active_auctions(guild_id: int) -> list[dict]:
     auctions = (_gauctions(guild_id).get("auctions") or {}).values()
-    out = [a for a in auctions if str(a.get("status", "")) == "active"]
+    out = [a for a in auctions if isinstance(a, dict) and _auction_is_currently_open(a)]
     out.sort(key=lambda a: str(a.get("ends_at", "")))
     return out
 
@@ -3478,16 +3596,16 @@ async def setup_loot_auction(client: discord.Client, tree: app_commands.CommandT
     async def auction_start(
         inter: discord.Interaction,
         item: str,
-        start_bid: int = DEFAULT_START_BID,
-        min_increment: int = DEFAULT_MIN_INCREMENT,
-        duration_hours: int = DEFAULT_DURATION_HOURS,
+        start_bid: int = 0,
+        min_increment: int = 0,
+        duration_hours: int = 0,
         eligibility: str = "auto",
     ):
         if inter.guild is None or not _is_leader_or_admin(inter):
             await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
             return
-        if start_bid < 0 or min_increment < 1 or duration_hours < 1 or duration_hours > 240:
-            await inter.response.send_message("❌ Ungültige Werte. Dauer: 1–240 Stunden, Mindestschritt mindestens 1.", ephemeral=True)
+        if start_bid < 0 or min_increment < 0 or duration_hours < 0 or duration_hours > 240:
+            await inter.response.send_message("❌ Ungültige Werte. 0 = Regelwert. Dauer: 0 oder 1–240 Stunden.", ephemeral=True)
             return
         guild = inter.guild
         item_id, item_name, matches = _find_item(guild.id, item)
@@ -3502,19 +3620,28 @@ async def setup_loot_auction(client: discord.Client, tree: app_commands.CommandT
         if eligibility in {"main_need", "secondary_need"} and not eligible_ids:
             await inter.response.send_message("❌ Für dieses Item gibt es aktuell keinen passenden offenen Need. Nutze eligibility = Alle Ebolus-Mitglieder.", ephemeral=True)
             return
+        phase, rule_hours, rule_start_bid, rule_min_increment = _auction_rule_defaults(mode)
+        final_hours = int(duration_hours or rule_hours)
+        final_start_bid = int(start_bid or rule_start_bid)
+        final_min_increment = int(min_increment or rule_min_increment)
+        if final_hours < 1 or final_hours > 240 or final_start_bid < 1 or final_min_increment < 1:
+            await inter.response.send_message("❌ Ungültige Regel-/Eingabewerte. Auktionen brauchen Dauer 1–240h, Startgebot ≥1, Mindestschritt ≥1.", ephemeral=True)
+            return
         aid = _new_auction_id()
-        ends = _now() + timedelta(hours=int(duration_hours))
+        ends = _now() + timedelta(hours=final_hours)
         auc = {
             "id": aid,
             "guild_id": int(guild.id),
             "kind": "auction",
+            "phase": phase,
             "item_id": item_id,
             "item_name": item_name,
             "created_at": _now_iso(),
             "created_by": int(inter.user.id),
+            "source": "slash_command",
             "ends_at": ends.isoformat(),
-            "start_bid": int(start_bid),
-            "min_increment": int(min_increment),
+            "start_bid": final_start_bid,
+            "min_increment": final_min_increment,
             "eligibility_mode": mode,
             "eligible_user_ids": eligible_ids,
             "bids": [],
@@ -3534,9 +3661,12 @@ async def setup_loot_auction(client: discord.Client, tree: app_commands.CommandT
         auc["channel_id"] = int(getattr(ch, "id", 0) or 0)
         save_auctions()
         await _post_or_refresh_active_auction_message(client, guild.id, auc)
-        if _auction_phase(auc) == "free":
-            await _post_or_refresh_market_message(client, guild.id, auc)
-        await inter.response.send_message(f"✅ Auktion gestartet: `{aid}` in {ch.mention}", ephemeral=True)
+        await _post_or_refresh_market_message(client, guild.id, auc)
+        await inter.response.send_message(
+            f"✅ Auktion gestartet: `{aid}` in {ch.mention} · {_need_mode_label(mode)} · "
+            f"{final_hours}h · Start {final_start_bid} EC",
+            ephemeral=True,
+        )
 
 
 
