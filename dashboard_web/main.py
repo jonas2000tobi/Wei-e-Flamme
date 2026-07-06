@@ -861,7 +861,7 @@ def _phase3_loot_pg_payload(guild_id: Any, snap: dict[str, Any]) -> Optional[dic
     for row in auction_rows:
         raw = _phase3_json(row.get("raw_json"), {})
         aid = str(row.get("auction_id") or raw.get("auction_id") or raw.get("id") or "").strip()
-        if not aid:
+        if not aid or aid.lower() in {"items", "count", "by_status", "status", "source", "read_cutover"}:
             continue
         bids = list(bids_by_auction.get(aid) or [])
         existing_bids = [b for b in (raw.get("bids") or []) if isinstance(b, dict)] if isinstance(raw, dict) else []
@@ -2600,6 +2600,8 @@ def _loot_action_type_label(value: Any) -> str:
         "bid": "Gebot",
         "sale_buy": "Sofortkauf",
         "junk_roll": "Müll-Wurf",
+        "loot_drop": "Loot gedroppt",
+        "junk_drop": "Müll gedroppt",
     }.get(v, v or "—")
 
 
@@ -2983,6 +2985,84 @@ def _enqueue_loot_action_request(guild_id: int, auction: dict[str, Any], action_
     finally:
         conn.close()
 
+
+
+def _enqueue_loot_drop_request(guild_id: int, drop_type: str, item_query: str, actor: dict[str, Any]) -> dict[str, Any]:
+    """Dashboard -> Bot Queue: normale Drops/Müll-Drops anlegen.
+
+    Das Dashboard erstellt die Auktion nicht selbst. Es legt nur eine Anfrage in
+    Postgres ab. Der Bot verarbeitet sie mit der bestehenden Discord-Logik
+    (Need-Prüfung, Auktion erstellen, DMs, Discord-Nachrichten, Spiegelung).
+    """
+    if not _database_url():
+        return {"ok": False, "error": "DATABASE_URL fehlt. Ohne Postgres kann das Dashboard keine Bot-Aktion anstoßen."}
+    gid = int(guild_id or 0)
+    if not gid:
+        return {"ok": False, "error": "Guild fehlt."}
+    item = str(item_query or "").strip()
+    if not item:
+        return {"ok": False, "error": "Itemname fehlt."}
+    if len(item) > 160:
+        item = item[:160]
+    actor_id = str(actor.get("user_id") or actor.get("id") or "").strip()
+    actor_name = str(actor.get("username") or actor.get("global_name") or actor_id or "Dashboard")
+    if not actor_id:
+        return {"ok": False, "error": "Discord-Login erforderlich. Das Dashboard muss wissen, welcher Admin den Drop meldet."}
+    dtype = str(drop_type or "").strip().lower()
+    if dtype in {"loot", "loot_drop", "normal", "item"}:
+        action = "loot_drop"
+        label = "Loot gedroppt"
+    elif dtype in {"junk", "junk_drop", "muell", "müll", "trash"}:
+        action = "junk_drop"
+        label = "Müll gedroppt"
+    else:
+        return {"ok": False, "error": "Unbekannter Drop-Typ."}
+
+    request_id = f"dash-drop-{int(time.time())}-{secrets.token_hex(6)}"
+    virtual_auction_id = f"new:{action}:{request_id}"
+    payload = {
+        "action_type": action,
+        "drop_type": dtype,
+        "item_query": item,
+        "item_name": item,
+        "requested_by": {"id": actor_id, "name": actor_name},
+        "requested_at": datetime.now(timezone.utc).isoformat(),
+        "source": "dashboard_loot_drop",
+    }
+    _ensure_admin_tables()
+    conn = _pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO dashboard_loot_action_requests
+                (request_id, guild_id, auction_id, action_type, amount, status, payload_json, actor_id, actor_name)
+                VALUES (%s, %s, %s, %s, %s, 'pending', %s, %s, %s)
+                RETURNING id, requested_at
+                """,
+                (
+                    request_id,
+                    gid,
+                    virtual_auction_id,
+                    action,
+                    0,
+                    json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                    actor_id,
+                    actor_name,
+                ),
+            )
+            row = cur.fetchone() or {}
+        conn.commit()
+        return {"ok": True, "request_id": request_id, "queue_id": row.get("id"), "requested_at": str(row.get("requested_at") or ""), "message": f"{label} wurde an den Bot gesendet."}
+    except Exception as exc:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    finally:
+        conn.close()
+
 def _render_auction_detail(data: dict[str, Any], auction_id: str, current_user: Optional[dict[str, Any]] = None, msg: str = "") -> str:
     if not data.get("ok"):
         return _html_shell("Ebo Dashboard", f"<section class='panel'><h1>📊 Ebo Dashboard</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
@@ -3003,10 +3083,11 @@ def _render_auction_detail(data: dict[str, Any], auction_id: str, current_user: 
         winner = f"{auction.get('winner_name') or ('User ' + str(auction.get('winner_user_id')))}"
 
     cards = "".join([
-        _card("Status", auction.get("status") or "—", _phase_label(auction)),
+        _card("Status", _loot_effective_status_key(auction), _phase_label(auction)),
         _card("Gebote", auction.get("bid_count", 0), f"Führend: {leader}"),
         _card("Gewinner", winner, _dt(auction.get("delivered_at")) if auction.get("delivered_at") else "noch offen"),
         _card("Ende", _dt(auction.get("ends_at")), f"Start: {_dt(auction.get('created_at'))}"),
+        _card("Regel", _loot_phase_window_text(auction), "Soll-Laufzeit"),
         _card("Startgebot", _fmt_ec(auction.get("start_bid")), "EC"),
         _card("Mindestschritt", _fmt_ec(auction.get("min_increment")), "EC"),
         _card("Festpreis", _fmt_ec(auction.get("fixed_price")), "Sale"),
@@ -3035,6 +3116,14 @@ def _render_auction_detail(data: dict[str, Any], auction_id: str, current_user: 
     action_panel = _loot_dashboard_action_panel(int(guild_id), auction, current_user, snap) if guild_id else ""
     queue_panel = _loot_action_queue_panel(int(guild_id), auction_id) if guild_id else ""
     msg_panel = f"<section class='panel'><p>{_e(msg)}</p></section>" if msg else ""
+    state_panel = ""
+    if _loot_effective_status_key(auction) == "expired_waiting":
+        state_panel = """
+        <section class='panel'>
+          <h2>⚠️ Abgelaufen, wartet auf Bot</h2>
+          <p class='muted'>Diese Auktion hat laut Enddatum die Laufzeit überschritten, steht in Postgres/Snapshot aber noch auf aktiv. Der Bot sollte sie im nächsten Auktions-Loop schließen oder in die nächste Phase schieben.</p>
+        </section>
+        """
 
     body = f"""
     <nav class="topnav"><a href="/">← Übersicht</a><a href="/loot">Loot</a><a href="#bid">Bieten/Kaufen</a><a href="#loot-actions">Queue</a><a href="#bids">Gebote</a><a href="#eligible">Berechtigte</a><a href="#tech">Technik</a><a href="/api/snapshot">JSON</a></nav>
@@ -3047,6 +3136,7 @@ def _render_auction_detail(data: dict[str, Any], auction_id: str, current_user: 
       <a class="btn" href="/#loot">Zurück</a>
     </section>
     {msg_panel}
+    {state_panel}
     <section class="grid">{cards}</section>
     {action_panel}
     {queue_panel}
@@ -4487,8 +4577,8 @@ def _render_loot_dashboard(data: dict[str, Any]) -> str:
         uid = _user_id(a.get("top_bid_user_id"))
         if uid and a.get("top_bid_amount") is not None:
             leader = f"{names.get(uid, a.get('top_bid_user_name') or f'User {uid}')} · {_fmt_ec(a.get('top_bid_amount'))} EC"
-        row = [_auction_link(a.get("auction_id"), a.get("item_name")), _phase_label(a), a.get("status"), a.get("bid_count"), leader, _member_link(a.get("winner_user_id"), a.get("winner_name")) if a.get("winner_user_id") else "—", _dt(a.get("ends_at"))]
-        if str(a.get("status") or "").lower() in {"open", "active", "running", "bidding", "roll", "sale", "free", "main", "secondary"}:
+        row = [_auction_link(a.get("auction_id"), a.get("item_name")), _phase_label(a), _loot_effective_status_label(a), a.get("bid_count"), leader, _member_link(a.get("winner_user_id"), a.get("winner_name")) if a.get("winner_user_id") else "—", _dt(a.get("ends_at"))]
+        if _loot_is_active(a):
             active_rows.append(row)
         else:
             closed_rows.append(row)
@@ -4586,6 +4676,47 @@ def _loot_is_active(auction: dict[str, Any]) -> bool:
 def _loot_is_done(auction: dict[str, Any]) -> bool:
     s = _loot_status(auction.get("status"))
     return s in _LOOT_DONE_STATUSES or bool(auction.get("delivered_at"))
+
+
+def _loot_effective_status_key(auction: dict[str, Any]) -> str:
+    """Dashboard-Sicht auf den echten Zustand, auch wenn der Bot noch nicht geschlossen hat."""
+    s = _loot_status(auction.get("status"))
+    if s in _LOOT_CANCELLED_STATUSES:
+        return "cancelled"
+    if _loot_is_done(auction):
+        return "done"
+    if s in _LOOT_ACTIVE_STATUSES:
+        if _loot_is_ended(auction):
+            return "expired_waiting"
+        return "active"
+    if _loot_is_ended(auction):
+        return "expired"
+    return s or "unknown"
+
+
+def _loot_effective_status_label(auction: dict[str, Any]) -> dict[str, str]:
+    key = _loot_effective_status_key(auction)
+    labels = {
+        "active": "offen",
+        "expired_waiting": "abgelaufen · wartet auf Bot",
+        "expired": "abgelaufen",
+        "done": "erledigt",
+        "cancelled": "abgebrochen",
+        "unknown": "unklar",
+    }
+    return _raw(f"<span class='pill'>{_e(labels.get(key, key))}</span>")
+
+
+def _loot_phase_window_text(auction: dict[str, Any]) -> str:
+    phase = _loot_status(auction.get("phase"))
+    mode = _loot_status(auction.get("eligibility_mode"))
+    if phase == "sale" or auction.get("fixed_price") is not None:
+        return "Sale: 10 Tage"
+    if phase == "free" or mode == "all":
+        return "Frei: 24h"
+    if mode in {"main_need", "secondary_need"} or phase == "need":
+        return "Need: 48h"
+    return "—"
 
 
 def _loot_bid_count(auction: dict[str, Any]) -> int:
@@ -4699,6 +4830,14 @@ def _loot_next_step(auction: dict[str, Any], need_info: Optional[dict[str, Any]]
         return "abgebrochen"
     if s in _LOOT_DONE_STATUSES:
         return "Ergebnis prüfen"
+    if _loot_is_ended(auction):
+        if bids > 0:
+            return "abgelaufen → Bot sollte Gewinner/Übergabe erstellen"
+        if "sale" in mode:
+            return "abgelaufen → Sale ohne Käufer schließen"
+        if "freie" in mode or phase == "free":
+            return "abgelaufen → Bot sollte Sale starten"
+        return "abgelaufen → Bot sollte freie Auktion starten"
     if bids > 0:
         return "läuft: Gebote beobachten"
     if "sale" in mode:
@@ -4738,7 +4877,10 @@ def _loot_center_payload_from_snapshot(snap: dict[str, Any]) -> dict[str, Any]:
             "auction_id": str(a.get("auction_id") or a.get("id") or ""),
             "item": item or str(a.get("auction_id") or "—"),
             "status": str(a.get("status") or "—"),
+            "effective_status": _loot_effective_status_key(a),
+            "status_label": _loot_effective_status_label(a),
             "phase": str(a.get("phase") or "—"),
+            "window": _loot_phase_window_text(a),
             "mode": mode,
             "bid_count": bids,
             "leader": _loot_leader_text(a, names),
@@ -4764,6 +4906,8 @@ def _loot_center_payload_from_snapshot(snap: dict[str, Any]) -> dict[str, Any]:
                 sale_free.append(entry)
         else:
             history.append(entry)
+            if entry.get("effective_status") == "expired_waiting":
+                next_actions.append(entry)
         if (a.get("winner_user_id") or a.get("winner_name")) and not a.get("delivered_at"):
             handover.append(entry)
             if entry not in next_actions:
@@ -4875,8 +5019,10 @@ def _loot_check_payload_from_snapshot(snap: dict[str, Any], item_query: str = ""
             "item": item or str(a.get("auction_id") or "—"),
             "score": score,
             "status": str(a.get("status") or "—"),
+            "status_label": _loot_effective_status_label(a),
             "phase": str(a.get("phase") or "—"),
             "mode": _loot_mode_bucket(a),
+            "window": _loot_phase_window_text(a),
             "active": _loot_is_active(a),
             "bid_count": _loot_bid_count(a),
             "leader": _loot_leader_text(a, names),
@@ -4956,7 +5102,7 @@ def _render_loot_check(data: dict[str, Any], item_query: str = "") -> str:
             _auction_link(aid, a.get("item")) if aid else a.get("item"),
             a.get("score") if q else "—",
             a.get("mode"),
-            _loot_status_label(a.get("status")),
+            a.get("status_label") or _loot_status_label(a.get("status")),
             a.get("bid_count"),
             a.get("leader"),
             a.get("winner") if isinstance(a.get("winner"), dict) else a.get("winner"),
@@ -4983,7 +5129,7 @@ def _render_loot_check(data: dict[str, Any], item_query: str = "") -> str:
     """
     return _html_shell("Truhencheck · Ebo Dashboard", body)
 
-def _render_loot_center(data: dict[str, Any]) -> str:
+def _render_loot_center(data: dict[str, Any], request: Optional[Request] = None, msg: str = "") -> str:
     if not data.get("ok"):
         return _html_shell("Loot · Ebo Dashboard", f"<section class='panel'><h1>🎁 Loot</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
     snap: dict[str, Any] = data.get("snapshot") or {}
@@ -5006,7 +5152,7 @@ def _render_loot_center(data: dict[str, Any]) -> str:
         action_rows.append([
             _auction_link(aid, a.get("item")) if aid else a.get("item"),
             a.get("mode"),
-            _loot_status_label(a.get("status")),
+            a.get("status_label") or _loot_status_label(a.get("status")),
             a.get("bid_count"),
             a.get("leader"),
             _loot_winner_cell(a.get("raw") or {}, names),
@@ -5020,10 +5166,11 @@ def _render_loot_center(data: dict[str, Any]) -> str:
         active_rows.append([
             _auction_link(aid, a.get("item")) if aid else a.get("item"),
             a.get("mode"),
-            _loot_status_label(a.get("status")),
+            a.get("status_label") or _loot_status_label(a.get("status")),
             a.get("bid_count"),
             a.get("leader"),
             f"{a.get('main_need_count', 0)} / {a.get('secondary_need_count', 0)}",
+            a.get("window") or "—",
             _dt(a.get("ends_at")),
         ])
 
@@ -5073,13 +5220,46 @@ def _render_loot_center(data: dict[str, Any]) -> str:
             _dt(a.get("ends_at")),
         ])
 
+    drop_msg = f"<p class='muted'>{_e(msg)}</p>" if msg else ""
+    if request is not None and _is_portal_admin(request):
+        drop_panel = f"""
+        <section class="panel"><h2>📦 Drop aus Dashboard melden</h2>
+          {drop_msg}
+          <p class="muted">Das Dashboard schreibt nicht direkt in Lootdaten. Es legt eine Bot-Anfrage in Postgres an. Der Bot erstellt danach mit der bestehenden Discord-Logik die Auktion, DMs und Auktionshaus-Nachrichten.</p>
+          <div class="split">
+            <form method="post" action="/admin/loot/drop" style="display:grid;gap:10px;">
+              <h3>📦 Loot gedroppt</h3>
+              <input type="hidden" name="drop_type" value="loot_drop">
+              <label>Item aus Loot-Katalog<br><input name="item" required placeholder="z. B. Aridus Stab" style="width:100%;padding:12px;border-radius:12px;border:1px solid rgba(255,255,255,.16);background:rgba(0,0,0,.22);color:inherit"></label>
+              <button class="btn" type="submit" onclick="return confirm('Loot-Drop an den Bot senden?');">Loot-Drop erstellen</button>
+              <p class="muted">Bot prüft Main-Need → Second-Need → freie Auktion.</p>
+            </form>
+            <form method="post" action="/admin/loot/drop" style="display:grid;gap:10px;">
+              <h3>🧹 Müll gedroppt</h3>
+              <input type="hidden" name="drop_type" value="junk_drop">
+              <label>Freier Itemname<br><input name="item" required placeholder="z. B. Restitem aus Truhe" style="width:100%;padding:12px;border-radius:12px;border:1px solid rgba(255,255,255,.16);background:rgba(0,0,0,.22);color:inherit"></label>
+              <button class="btn" type="submit" onclick="return confirm('Müll-Drop an den Bot senden?');">Müll-Drop erstellen</button>
+              <p class="muted">Bot erstellt ein kostenloses Müll-/Würfelitem.</p>
+            </form>
+          </div>
+        </section>
+        """
+    else:
+        drop_panel = f"""
+        <section class="panel"><h2>📦 Drop aus Dashboard melden</h2>
+          {drop_msg}
+          <p class="muted">Nur Dashboard-Admins können Loot-/Müll-Drops aus dem Dashboard an den Bot senden.</p>
+        </section>
+        """
+
     body = f"""
     <nav class="topnav"><a href="/">← Übersicht</a><a href="/loot">Loot</a><a href="/loot-history">Loot-Verlauf</a><a href="/loot-check">Truhencheck</a><a href="/needs">Needs</a><a href="/members">Mitglieder</a><a href="/fairness">Fairness</a><a href="/exports">Exports</a><a href="/api/loot-center">API</a></nav>
     <section class="hero"><div><div class="eyebrow">Loot-Zentrale</div><h1>🎁 Loot / Auktionen</h1><p class="muted">Kontrollzentrum für aktive Auktionen, offene Übergaben, Gebote und Need-Spieler. Read-only, keine Bot-Daten werden verändert.</p></div><div style="display:flex;gap:10px;flex-wrap:wrap"><a class="btn" href="/loot-history">Loot-Verlauf</a><a class="btn" href="/export/loot_center.csv">CSV herunterladen</a></div></section>
     <section class="grid">{cards}</section>
     <section class="panel"><h2>🔎 Schneller Truhencheck</h2><form method="get" action="/loot-check" style="display:flex;gap:10px;flex-wrap:wrap;align-items:center"><input name="item" placeholder="Itemname eingeben, z. B. Aridus Stab" style="min-width:280px;flex:1;padding:12px;border-radius:12px;border:1px solid rgba(255,255,255,.16);background:rgba(0,0,0,.22);color:inherit"><button class="btn" type="submit">Need prüfen</button></form><p class="muted">Prüft Main-/Second-Needs und ob dazu schon eine Auktion läuft.</p></section>
+    {drop_panel}
     <section class="panel"><h2>🔥 Nächste Loot-Aktionen</h2><p class="muted">Das ist die Arbeitsliste: Übergaben, offene Auktionen, Sale/Freie-Auktion-Kandidaten und aktive Auktionen ohne Gebote.</p>{_table(['Item','Bereich','Status','Gebote','Führend','Gewinner','Ende','Nächster Schritt'], action_rows, placeholder='Aktionen durchsuchen…')}</section>
-    <section class="panel"><h2>🟢 Aktive Auktionen</h2>{_table(['Item','Bereich','Status','Gebote','Führend','Main/Second Need','Ende'], active_rows, placeholder='Aktive Auktionen durchsuchen…')}</section>
+    <section class="panel"><h2>🟢 Aktive Auktionen</h2>{_table(['Item','Bereich','Status','Gebote','Führend','Main/Second Need','Regel','Ende'], active_rows, placeholder='Aktive Auktionen durchsuchen…')}</section>
     <section class="split"><div class="panel"><h2>🏁 Übergabe offen</h2>{_table(['Item','Gewinner','Führend','Ende','Nächster Schritt'], handover_rows, placeholder='Übergaben durchsuchen…')}</div><div class="panel"><h2>🟡 Ohne Gebot / Sale prüfen</h2>{_table(['Item','Bereich','Main/Second Need','Ende','Hinweis'], no_bid_rows, placeholder='Ohne Gebot durchsuchen…')}</div></section>
     <section class="panel"><h2>🎯 Need-Spieler pro Item</h2><p class="muted">Damit sieht man direkt, ob ein Drop Main-/Second-Need-Spieler hat und ob schon eine Auktion dazu läuft.</p>{_table(['Item','Main','Main-Spieler','Second','Second-Spieler','aktive Auktionen'], need_rows, placeholder='Need-Item suchen…')}</section>
     <section class="panel"><h2>📜 Auktionshistorie</h2>{_table(['Item','Bereich','Status','Gebote','Führend','Gewinner','Ende'], history_rows, placeholder='Historie durchsuchen…')}</section>
@@ -6225,12 +6405,32 @@ def needs_page(_: bool = Depends(_auth)):
 
 
 @app.get("/loot", response_class=HTMLResponse)
-def loot_page(_: bool = Depends(_auth)):
+def loot_page(request: Request, msg: str = "", _: bool = Depends(_auth)):
     try:
-        return HTMLResponse(_render_loot_center(_snapshot_payload()))
+        return HTMLResponse(_render_loot_center(_snapshot_payload(), request, msg=msg))
     except Exception as exc:
         return HTMLResponse(_html_shell("Ebo Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"), status_code=500)
 
+
+
+@app.post("/admin/loot/drop")
+async def admin_loot_drop_dashboard(request: Request, _: bool = Depends(_admin_auth)):
+    try:
+        raw = await request.body()
+        form = _parse_urlencoded_body(raw)
+        drop_type = str(form.get("drop_type") or "loot_drop").strip().lower()
+        item = str(form.get("item") or "").strip()
+        payload = _snapshot_payload()
+        guild_id = _safe_guild_id(payload)
+        actor = _current_user(request) or {}
+        result = _enqueue_loot_drop_request(int(guild_id), drop_type, item, actor)
+        if result.get("ok"):
+            msg = "✅ " + str(result.get("message") or "Drop wurde an den Bot gesendet.")
+        else:
+            msg = "❌ " + str(result.get("error") or "Drop konnte nicht gesendet werden.")
+    except Exception as exc:
+        msg = f"❌ Fehler: {type(exc).__name__}: {exc}"
+    return RedirectResponse(f"/loot?msg={urllib.parse.quote(msg)}", status_code=303)
 
 
 
