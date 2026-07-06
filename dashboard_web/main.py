@@ -10191,6 +10191,8 @@ def _attendance_candidate_map(snap: dict[str, Any], event: dict[str, Any]) -> di
         if default_status != "open" and entry.get("suggested_status") in {"open", "absent"}:
             entry["suggested_status"] = default_status
 
+    eid = str(event.get("event_id") or event.get("id") or "").strip()
+
     parts = event.get("participants") or {}
     for group in parts.get("yes") or []:
         if not isinstance(group, dict):
@@ -10198,11 +10200,34 @@ def _attendance_candidate_map(snap: dict[str, Any], event: dict[str, Any]) -> di
         role = str(group.get("role") or "Zusage")
         for p in group.get("participants") or []:
             if isinstance(p, dict):
-                add(_user_id(p.get("user_id")), str(p.get("display_name") or ""), role, "present", "Zusage")
+                add(_user_id(p.get("user_id") or p.get("id")), str(p.get("display_name") or p.get("name") or ""), role, "present", "Zusage")
     for key, label, status in (("maybe", "Vielleicht", "partial"), ("no", "Abgemeldet", "absent")):
         for p in parts.get(key) or []:
             if isinstance(p, dict):
-                add(_user_id(p.get("user_id")), str(p.get("display_name") or ""), label, status, label)
+                add(_user_id(p.get("user_id") or p.get("id")), str(p.get("display_name") or p.get("name") or ""), label, status, label)
+
+    # Fallback für alte/abgeschlossene Events: Manche Events fallen aus der normalen
+    # Eventliste, die Phase-3-RSVPs liegen aber weiterhin in snap["event_rsvps"].
+    # Ohne diesen Fallback kann ein gespeicherter leerer Review 0 Spieler anzeigen.
+    rsvp_items = ((snap.get("event_rsvps") or {}).get("items") or []) if isinstance(snap.get("event_rsvps"), dict) else []
+    for r in rsvp_items:
+        if not isinstance(r, dict):
+            continue
+        if eid and str(r.get("event_id") or "").strip() != eid:
+            continue
+        uid = _user_id(r.get("user_id") or r.get("id"))
+        if not uid:
+            continue
+        response = str(r.get("response") or r.get("status") or "").strip().lower()
+        role = str(r.get("role_name") or r.get("role") or r.get("class") or "").strip()
+        name = str(r.get("display_name") or r.get("name") or names.get(uid) or "").strip()
+        role_l = role.lower()
+        if response in {"no", "nein", "absent", "abgemeldet", "declined", "deny"} or "abmeld" in response or role_l in {"no", "nein", "abgemeldet"}:
+            add(uid, name, "Abgemeldet", "absent", "RSVP")
+        elif response in {"maybe", "vielleicht", "tentative", "unsure"} or "vielleicht" in response or role_l in {"maybe", "vielleicht"}:
+            add(uid, name, "Vielleicht", "partial", "RSVP")
+        else:
+            add(uid, name, role or "Zusage", "present", "RSVP")
 
     for r in voice.get("voice_by_user") or []:
         if not isinstance(r, dict):
@@ -10617,9 +10642,11 @@ def _render_attendance_event(data: dict[str, Any], event_id: str, saved: bool = 
         return _html_shell("Event nicht gefunden", "<section class='panel'><h1>❌ Event nicht gefunden</h1><p>Dieses Event ist nicht im aktuellen Snapshot und es gibt keinen gespeicherten Review-Fallback.</p><p><a class='btn' href='/attendance'>Zurück</a></p></section>")
     review = _attendance_review_load(guild_id, event_id)
     payload = review.get("payload") or {}
-    if not payload.get("items"):
+    raw_items = payload.get("items") if isinstance(payload, dict) else None
+    valid_items = [x for x in (raw_items or []) if isinstance(x, dict) and _user_id(x.get("user_id"))] if isinstance(raw_items, list) else []
+    if not valid_items:
         payload = _attendance_review_payload_from_event(snap, event, mode="voice")
-    items = payload.get("items") or []
+    items = [x for x in ((payload.get("items") if isinstance(payload, dict) else []) or []) if isinstance(x, dict)]
     present = sum(1 for i in items if str(i.get("status")) == "present")
     partial = sum(1 for i in items if str(i.get("status")) == "partial")
     absent = sum(1 for i in items if str(i.get("status")) == "absent")
