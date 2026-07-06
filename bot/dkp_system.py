@@ -8,6 +8,11 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional, Any
 from zoneinfo import ZoneInfo
 
+try:
+    from bot.json_store import load_json_file, save_json_atomic, warn_json_store  # type: ignore
+except Exception:
+    from json_store import load_json_file, save_json_atomic, warn_json_store  # type: ignore
+
 import discord
 from discord import app_commands
 from discord.ext import tasks
@@ -26,6 +31,18 @@ except Exception:
         from runtime_db import aggregate_voice_seconds  # type: ignore
     except Exception:
         aggregate_voice_seconds = None  # type: ignore
+
+try:
+    from bot import runtime_db as _runtime_db  # type: ignore
+except Exception:
+    try:
+        import runtime_db as _runtime_db  # type: ignore
+    except Exception:
+        _runtime_db = None  # type: ignore
+
+DASHBOARD_MEMBER_ROLE_SETTING = "dashboard_member_role_id"
+DASHBOARD_ADMIN_ROLE_SETTING = "dashboard_admin_role_ids"
+DASHBOARD_ALLOWED_ROLE_SETTING = "dashboard_allowed_role_ids"
 
 try:
     from bot.audit_system import audit_log  # type: ignore
@@ -79,15 +96,11 @@ WEEKLY_RESET_HOUR = 10
 
 
 def _load_json(path: Path, default):
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        return data if isinstance(data, type(default)) else default
-    except Exception:
-        return default
+    return load_json_file(path, default, context=__name__)
 
 
 def _save_json(path: Path, obj) -> None:
-    path.write_text(json.dumps(obj, indent=2, ensure_ascii=False), encoding="utf-8")
+    save_json_atomic(path, obj, context=__name__)
 
 
 dkp_cfg: dict = _load_json(DKP_CFG_FILE, {})
@@ -2513,6 +2526,11 @@ def _apply_dashboard_settings_change(row: dict) -> dict:
             pc["member_role_id"] = int(member_role_id)
             portal_cfg[str(guild_id)] = pc
             _save_portal_cfg(portal_cfg)
+            if _runtime_db is not None:
+                try:
+                    _runtime_db.set_guild_setting(int(guild_id), DASHBOARD_MEMBER_ROLE_SETTING, int(member_role_id))
+                except Exception as exc:
+                    print(f"[dkp_system] Dashboard-Memberrolle konnte nicht in Runtime-DB gespeichert werden: {exc!r}", flush=True)
 
         return {
             "ok": True,
@@ -2554,9 +2572,15 @@ def _apply_dashboard_settings_change(row: dict) -> dict:
         c["dashboard_allowed_role_ids"] = allowed_roles
         dkp_cfg[str(guild_id)] = c
         save_cfg()
+        if _runtime_db is not None:
+            try:
+                _runtime_db.set_guild_setting(int(guild_id), DASHBOARD_ADMIN_ROLE_SETTING, admin_roles)
+                _runtime_db.set_guild_setting(int(guild_id), DASHBOARD_ALLOWED_ROLE_SETTING, allowed_roles)
+            except Exception as exc:
+                print(f"[dkp_system] Dashboard-Zugriffsrollen konnten nicht in Runtime-DB gespeichert werden: {exc!r}", flush=True)
         return {
             "ok": True,
-            "message": "Dashboard-Zugriffsrollen gespeichert. Aktiv wird es nach frischem Snapshot und erneutem Login, sofern dashboard_data diese Rollen exportiert.",
+            "message": "Dashboard-Zugriffsrollen gespeichert. Aktiv wird es nach frischem Snapshot und erneutem Login.",
             "changed": {"admin_old": old_admin, "admin_new": admin_roles, "allowed_old": old_allowed, "allowed_new": allowed_roles},
         }
 
