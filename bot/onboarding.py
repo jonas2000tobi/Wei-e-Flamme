@@ -3,6 +3,11 @@ import json
 from pathlib import Path
 from typing import Optional, List
 
+try:
+    from bot.json_store import load_json_file, save_json_atomic, warn_json_store  # type: ignore
+except Exception:
+    from json_store import load_json_file, save_json_atomic, warn_json_store  # type: ignore
+
 import discord
 from discord import app_commands
 from discord.ui import View, button
@@ -27,13 +32,10 @@ CFG_FILE = DATA_DIR / "onboarding_cfg.json"
 # }
 
 def _load_cfg() -> dict:
-    try:
-        return json.loads(CFG_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+    return load_json_file(CFG_FILE, {}, context=__name__)
 
 def _save_cfg(obj: dict) -> None:
-    CFG_FILE.write_text(json.dumps(obj, indent=2, ensure_ascii=False), encoding="utf-8")
+    save_json_atomic(CFG_FILE, obj, context=__name__)
 
 cfg: dict = _load_cfg()
 
