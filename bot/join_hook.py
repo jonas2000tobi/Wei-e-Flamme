@@ -7,6 +7,11 @@ import json
 from pathlib import Path
 from typing import Callable, Awaitable, Set
 
+try:
+    from bot.json_store import load_json_file, save_json_atomic, warn_json_store  # type: ignore
+except Exception:
+    from json_store import load_json_file, save_json_atomic, warn_json_store  # type: ignore
+
 import discord
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -16,13 +21,10 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 STATE_FILE = DATA_DIR / "onboarding_sent.json"   # {"<guild_id>": ["user_id", ...]}
 
 def _load_state() -> dict:
-    try:
-        return json.loads(STATE_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+    return load_json_file(STATE_FILE, {}, context=__name__)
 
 def _save_state(obj: dict) -> None:
-    STATE_FILE.write_text(json.dumps(obj, indent=2, ensure_ascii=False), encoding="utf-8")
+    save_json_atomic(STATE_FILE, obj, context=__name__)
 
 _sent_cache = _load_state()  # guild_id -> list[str user_id]
 
