@@ -4577,6 +4577,9 @@ def _loot_status_label(status: Any) -> dict[str, str]:
 def _loot_is_active(auction: dict[str, Any]) -> bool:
     s = _loot_status(auction.get("status"))
     phase = _loot_status(auction.get("phase"))
+    end_dt = _dt_obj(auction.get("ends_at") or auction.get("end_at") or auction.get("expires_at"))
+    if end_dt and datetime.now(timezone.utc) >= end_dt:
+        return False
     return s in _LOOT_ACTIVE_STATUSES or (not s and phase in {"need", "free", "sale", "roll"})
 
 
@@ -7692,6 +7695,9 @@ def _is_active_auction(auction: dict[str, Any]) -> bool:
         return False
 
     active_statuses = {"active", "open", "running", "bidding", "pending", "roll"}
+    end_dt = _dt_obj(auction.get("ends_at") or auction.get("end_at") or auction.get("expires_at"))
+    if end_dt and datetime.now(timezone.utc) >= end_dt:
+        return False
     if status in active_statuses:
         return True
 
@@ -9914,7 +9920,7 @@ def _render_attendance_event(data: dict[str, Any], event_id: str, saved: bool = 
         <p class="muted">Event-ID: {_e(event_id)} · Zeit: {_e(_dt(event.get('when_iso')))} · Voice: {_e(event.get('voice_channel_id') or event.get('voice_last_channel_id') or 'kein Voice')}</p>
         {updated}
       </div>
-      <div style="display:flex;gap:8px;flex-wrap:wrap"><form method="post" action="/admin/attendance/{_e(event_id)}/voice-suggest"><button class="btn" type="submit">🎙️ Voice-Vorschlag neu laden</button></form><a class="btn" href="/attendance/{_e(event_id)}/ec-preview">🪙 EC-Vorschau</a><a class="btn" href="/attendance/{_e(event_id)}/report">📋 Abschlussbericht</a></div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap"><form method="post" action="/admin/attendance/{_e(event_id)}/voice-suggest"><button class="btn" type="submit">🎙️ Voice-Vorschlag neu laden</button></form><a class="btn" href="#review-save">✅ 1. Überprüfen</a><a class="btn" href="/attendance/{_e(event_id)}/report">📋 Abschlussbericht</a></div>
     </section>
     {saved_note}
     {_raw(_attendance_review_control_panel(guild_id, str(event_id), review))}
@@ -9946,9 +9952,13 @@ def _render_attendance_event(data: dict[str, Any], event_id: str, saved: bool = 
     <section class="panel">
       <h2>👥 Review-Liste</h2>
       <p class="muted">Diese Speicherung ist ein Dashboard-Review für die Leitung. Sie verändert noch keine EC-Konten und nicht die Discord-Anwesenheitskarte.</p>
-      <form method="post" action="/admin/attendance/{_e(event_id)}/save">
+      <form id="review-save" method="post" action="/admin/attendance/{_e(event_id)}/save">
         <div class='table-wrap'><table><thead><tr><th>Spieler</th><th>Anmeldung</th><th>Voice</th><th>Quelle</th><th>Status</th><th>Notiz</th></tr></thead><tbody>{''.join(rows_html)}</tbody></table></div>
-        <p style="margin-top:14px"><button class="btn" type="submit">Review speichern</button></p>
+        <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:14px;align-items:center">
+          <button class="btn" type="submit" name="next" value="preview">✅ 1. Überprüfen</button>
+          <button class="btn" type="submit" name="next" value="save">Review nur speichern</button>
+          <span class="muted">Überprüfen speichert den Review und öffnet direkt die EC-Vorschau. Danach ist nur noch „EC wirklich buchen“ nötig.</span>
+        </div>
       </form>
     </section>
     {_raw(_event_ec_queue_panel(guild_id, str(event_id)))}
@@ -10199,6 +10209,9 @@ async def admin_attendance_save(event_id: str, request: Request, _: bool = Depen
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
     _attendance_review_save(guild_id, str(event_id), review_payload, _current_user(request) or {}, status="reviewed")
+    next_action = str((form.get("next") or [""])[0] or "").strip().lower()
+    if next_action == "preview":
+        return RedirectResponse(f"/attendance/{urllib.parse.quote(str(event_id))}/ec-preview?saved=1", status_code=303)
     return RedirectResponse(f"/attendance/{urllib.parse.quote(str(event_id))}?saved=1", status_code=303)
 
 
@@ -10702,6 +10715,9 @@ def _render_attendance_ec_preview(data: dict[str, Any], event_id: str, full_ec: 
     award_state = preview.get("award_state") or {}
     latest_request = preview.get("latest_request") or {}
     event_type = str(preview.get("event_type") or "Dashboard Attendance")
+    latest_status = str(latest_request.get("status") or "").lower()
+    book_blocked = bool(award_state.get("awarded")) or latest_status in {"pending", "processing", "done"} or recipients <= 0 or fe <= 0
+    book_disabled_attr = "disabled" if book_blocked else ""
     notice = ""
     if saved:
         notice = "<div class='warn'>✅ Aktion gespeichert/angefragt.</div>"
@@ -10719,7 +10735,13 @@ def _render_attendance_ec_preview(data: dict[str, Any], event_id: str, full_ec: 
         <h1>🪙 {_e(event.get('title') or event_id)}</h1>
         <p class="muted">Review-Status: {_e(review_status)} · Event: {_e(_dt(event.get('when_iso')))} · Typ: {_e(event_type)} · Erkennung: {_e((preview.get('defaults') or {}).get('detected_from') or 'manuell')}</p>
       </div>
-      <a class="btn" href="/export/attendance/{_e(event_id)}.csv?full_ec={_e(fe)}&partial_ec={_e(pe)}">CSV herunterladen</a>
+      <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
+        <form method="post" action="/admin/attendance/{_e(event_id)}/ec-award" onsubmit="return confirm('EC wirklich buchen? Der Bot verarbeitet diese Anfrage und schreibt danach in die echten EC-Daten.');">
+          <input type="hidden" name="full_ec" value="{_e(fe)}"><input type="hidden" name="partial_ec" value="{_e(pe)}"><input type="hidden" name="event_type" value="{_e(event_type)}">
+          <button class="btn" type="submit" {book_disabled_attr}>✅ 2. EC wirklich buchen</button>
+        </form>
+        <a class="btn" href="/export/attendance/{_e(event_id)}.csv?full_ec={_e(fe)}&partial_ec={_e(pe)}">CSV herunterladen</a>
+      </div>
     </section>
     {notice}
     {_raw(_event_ec_queue_panel(guild_id, str(event_id)))}
@@ -10753,7 +10775,7 @@ def _render_attendance_ec_preview(data: dict[str, Any], event_id: str, full_ec: 
         </form>
         <form method="post" action="/admin/attendance/{_e(event_id)}/ec-award" onsubmit="return confirm('EC wirklich buchen? Der Bot verarbeitet diese Anfrage und schreibt danach in die echten EC-Daten.');">
           <input type="hidden" name="full_ec" value="{_e(fe)}"><input type="hidden" name="partial_ec" value="{_e(pe)}"><input type="hidden" name="event_type" value="{_e(event_type)}">
-          <button class="btn" type="submit" {'disabled' if award_state.get('awarded') or str(latest_request.get('status') or '') in {'pending','processing','done'} or recipients <= 0 or fe <= 0 else ''}>✅ EC wirklich buchen</button>
+          <button class="btn" type="submit" {book_disabled_attr}>✅ 2. EC wirklich buchen</button>
         </form>
       </div>
       <p class="muted">Doppelbuchungs-Schutz: Dashboard blockt bereits bekannte/pending Buchungen. Der Bot prüft vor dem Schreiben zusätzlich nochmal seine echten EC-Transaktionen.</p>
