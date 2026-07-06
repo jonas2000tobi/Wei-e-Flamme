@@ -10,6 +10,11 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional, Any
 from zoneinfo import ZoneInfo
 
+try:
+    from bot.json_store import load_json_file, save_json_atomic, warn_json_store  # type: ignore
+except Exception:
+    from json_store import load_json_file, save_json_atomic, warn_json_store  # type: ignore
+
 import discord
 from discord import app_commands
 from discord.ext import tasks
@@ -64,15 +69,11 @@ _client_ref: Optional[discord.Client] = None
 
 
 def _load_json(path: Path, default):
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        return data if isinstance(data, type(default)) else default
-    except Exception:
-        return default
+    return load_json_file(path, default, context=__name__)
 
 
 def _save_json(path: Path, obj) -> None:
-    path.write_text(json.dumps(obj, indent=2, ensure_ascii=False), encoding="utf-8")
+    save_json_atomic(path, obj, context=__name__)
 
 
 auction_state: dict = _load_json(AUCTION_FILE, {})
