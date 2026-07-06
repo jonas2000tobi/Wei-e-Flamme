@@ -15,7 +15,7 @@ import urllib.parse
 import urllib.request
 import urllib.error
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any, Optional
 from pathlib import Path
 
@@ -154,6 +154,37 @@ def _configured_member_role_name_from_snapshot() -> str:
     return ""
 
 
+def _auth_role_ids_from_snapshot(kind: str) -> set[str]:
+    """Rollen-IDs aus dem Bot-Snapshot lesen. kind: admin, allowed, member."""
+    out: set[str] = set()
+    try:
+        payload = _snapshot_payload()
+        snap = payload.get("snapshot") or {}
+        auth = snap.get("auth") or {}
+        if not isinstance(auth, dict):
+            return out
+        if kind == "member":
+            member_role = auth.get("member_role") if isinstance(auth.get("member_role"), dict) else {}
+            rid = str(member_role.get("role_id") or "").strip()
+            if rid:
+                out.add(rid)
+        if kind in {"allowed", "all"}:
+            for row in auth.get("allowed_roles") or []:
+                if isinstance(row, dict):
+                    rid = str(row.get("role_id") or "").strip()
+                    if rid:
+                        out.add(rid)
+        if kind in {"admin", "all"}:
+            for row in auth.get("admin_roles") or []:
+                if isinstance(row, dict):
+                    rid = str(row.get("role_id") or "").strip()
+                    if rid:
+                        out.add(rid)
+    except Exception:
+        return out
+    return out
+
+
 def _allowed_role_ids() -> set[str]:
     explicit = _csv_ids(_env("DASHBOARD_ALLOWED_ROLE_IDS"))
     admin = _csv_ids(_env("DASHBOARD_ADMIN_ROLE_IDS"))
@@ -163,13 +194,18 @@ def _allowed_role_ids() -> set[str]:
     out.update(explicit)
     out.update(admin)
     out.update(member)
+    out.update(_auth_role_ids_from_snapshot("allowed"))
+    out.update(_auth_role_ids_from_snapshot("admin"))
+    out.update(_auth_role_ids_from_snapshot("member"))
     if configured:
         out.add(str(configured))
     return out
 
 
 def _admin_role_ids() -> set[str]:
-    return _csv_ids(_env("DASHBOARD_ADMIN_ROLE_IDS"))
+    out = _csv_ids(_env("DASHBOARD_ADMIN_ROLE_IDS"))
+    out.update(_auth_role_ids_from_snapshot("admin"))
+    return out
 
 
 def _snapshot_auth_lists() -> dict[str, Any]:
@@ -6846,7 +6882,10 @@ def _current_dkp_settings_from_snapshot(snap: dict[str, Any]) -> dict[str, Any]:
     member_filter = settings.get("member_filter") or guild.get("member_filter") or {}
     auth = snap.get("auth") or {}
     member_role = auth.get("member_role") if isinstance(auth.get("member_role"), dict) else {}
-    admin_role = auth.get("admin_role") if isinstance(auth.get("admin_role"), dict) else {}
+    admin_roles = auth.get("admin_roles") if isinstance(auth.get("admin_roles"), list) else []
+    allowed_roles = auth.get("allowed_roles") if isinstance(auth.get("allowed_roles"), list) else []
+    auth_admin_ids = [str(r.get("role_id") or "").strip() for r in admin_roles if isinstance(r, dict) and str(r.get("role_id") or "").strip()]
+    auth_allowed_ids = [str(r.get("role_id") or "").strip() for r in allowed_roles if isinstance(r, dict) and str(r.get("role_id") or "").strip()]
 
     return {
         "event_types": event_types,
@@ -6855,10 +6894,10 @@ def _current_dkp_settings_from_snapshot(snap: dict[str, Any]) -> dict[str, Any]:
         "decay_percent": _snapshot_setting_value(snap, "decay_percent", 15),
         "decay_protected_balance": _snapshot_setting_value(snap, "decay_protected_balance", 50),
         "log_channel_id": _snapshot_setting_value(snap, "log_channel_id", _find_any(["log_channel_id"], "")),
-        "leader_role_id": _find_any(["leader_role_id", "admin_role_id"], (admin_role or {}).get("role_id") or ""),
+        "leader_role_id": _find_any(["leader_role_id", "admin_role_id"], ""),
         "member_role_id": str((member_filter or {}).get("role_id") or (member_role or {}).get("role_id") or _find_any(["member_role_id"], "")),
-        "dashboard_admin_role_ids": ",".join(sorted(_admin_role_ids())) or _find_any(["dashboard_admin_role_ids"], ""),
-        "dashboard_allowed_role_ids": ",".join(sorted(_allowed_role_ids())) or _find_any(["dashboard_allowed_role_ids"], ""),
+        "dashboard_admin_role_ids": ",".join(auth_admin_ids or sorted(_admin_role_ids())) or _find_any(["dashboard_admin_role_ids"], ""),
+        "dashboard_allowed_role_ids": ",".join(auth_allowed_ids or sorted(_allowed_role_ids())) or _find_any(["dashboard_allowed_role_ids"], ""),
         "auth_snapshot": auth,
     }
 
@@ -7665,7 +7704,13 @@ def _is_active_auction(auction: dict[str, Any]) -> bool:
 
 
 def _is_running_event(event: dict[str, Any]) -> bool:
-    """Dashboard-Definition: erstellt und nicht beendet/gelöscht/abgebrochen."""
+    """Laufend = erstellt, nicht manuell geschlossen und noch nicht 1h nach Start.
+
+    Jonas-Definition:
+    - Sobald ein Event erstellt ist, zählt es als laufend/aktiv.
+    - Automatisch abgeschlossen ist es 60 Minuten nach Eventbeginn.
+    - Manuell gelöschte/abgebrochene/geschlossene Events bleiben draußen.
+    """
     if not isinstance(event, dict):
         return False
 
@@ -7695,7 +7740,22 @@ def _is_running_event(event: dict[str, Any]) -> bool:
     if event.get("ended_at") or event.get("deleted_at") or event.get("cancelled_at") or event.get("canceled_at"):
         return False
 
-    return True
+    start = _dt_obj(
+        event.get("when_iso")
+        or event.get("start_at")
+        or event.get("start_time")
+        or event.get("starts_at")
+        or event.get("datetime")
+        or event.get("date")
+    )
+
+    # Ohne lesbare Startzeit lieber anzeigen statt verstecken. Sonst verschwinden
+    # manuell erstellte Alt-Events nur wegen alter Datenstruktur.
+    if not start:
+        return True
+
+    now = datetime.now(timezone.utc)
+    return now < (start + timedelta(hours=1))
 
 
 def _event_check_items(snap: dict[str, Any]) -> list[dict[str, Any]]:
@@ -8087,7 +8147,7 @@ def _render_leadership_dashboard(data: dict[str, Any]) -> str:
     cards = "".join([
         _card("Offene Aufgaben", len(tasks), f"hoch: {urgent_count}"),
         _card("Rollenmitglieder", li.get("member_count", 0), role_line),
-        _card("Laufende Events", len(running_events), "inkl. offener Reviews"),
+        _card("Laufende Events", len(running_events), "bis 1h nach Start"),
         _card("Aktive Auktionen", len(active_auctions), "Auktionshaus/DKP-Log"),
         _card("ohne Needliste", quality.get("missing_needs", 0), "nachpflegen lassen"),
         _card("EC gesamt", _fmt_ec(analytics.get("total_ec")), f"Ø {_fmt_ec(analytics.get('avg_ec'))}"),
@@ -8230,7 +8290,7 @@ def _render_leadership_dashboard(data: dict[str, Any]) -> str:
 
     cards = "".join([
         _card("Mitglieder", li.get("member_count", 0), role_line),
-        _card("Laufende/offene Events", len(running_events), "inkl. offener Reviews"),
+        _card("Laufende Events", len(running_events), "bis 1h nach Start"),
         _card("Aktive Auktionen", len(active_auctions), "Bieten möglich"),
         _card("EC-Queue", queue_open, f"offen/verarbeitend · erledigt: {queue_counts.get('done', 0)}"),
     ])
@@ -8265,8 +8325,8 @@ def _render_leadership_dashboard(data: dict[str, Any]) -> str:
     <section class="home-layout">
       <div class="home-stack">
         <section class="panel">
-          <h2>📅 Laufende Events / offene Reviews</h2>
-          <p class="muted">Bleibt sichtbar, solange Event läuft oder EC-/Review-Arbeit offen ist.</p>
+          <h2>📅 Laufende Events</h2>
+          <p class="muted">Sichtbar ab Erstellung bis 1 Stunde nach Eventbeginn. Offene Reviews bleiben zusätzlich sichtbar.</p>
           <div class="home-list">{home_events_html}</div>
         </section>
 
@@ -8491,7 +8551,11 @@ def me(request: Request, _: bool = Depends(_auth)):
 
 @app.get("/healthz")
 def healthz():
-    return {"ok": True, "database_url": bool(_database_url())}
+    return {
+        "ok": True,
+        "database_url": bool(_database_url()),
+        "version": DASHBOARD_RELEASE_VERSION,
+    }
 
 
 @app.get("/api/snapshot")
@@ -9118,10 +9182,6 @@ def release_page(_: bool = Depends(_auth)):
 def api_release_status(_: bool = Depends(_auth)):
     return JSONResponse(_release_status_payload(_snapshot_payload()))
 
-
-@app.get("/healthz")
-def healthz():
-    return JSONResponse({"ok": True, "version": DASHBOARD_RELEASE_VERSION})
 
 
 @app.get("/audit", response_class=HTMLResponse)
