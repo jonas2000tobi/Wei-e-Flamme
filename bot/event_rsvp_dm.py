@@ -96,6 +96,13 @@ attendance_store: Dict[str, dict] = _load(ATTENDANCE_FILE, {})
 
 def save_store():
     _save(RSVP_FILE, store)
+    try:
+        _phase3_mirror_events_from_store()
+    except NameError:
+        # Während des Modulimports ist die Spiegel-Funktion noch nicht definiert.
+        pass
+    except Exception as e:
+        print(f"[phase3-events] Event-Spiegelung übersprungen: {e!r}", flush=True)
 
 
 def save_cfg():
