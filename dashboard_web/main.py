@@ -2252,21 +2252,75 @@ def _need_slot_map(items: Any) -> dict[str, dict[str, Any]]:
             out[slot] = entry
     return out
 
-def _render_need_slot_board(display_name: str, area: str, items: Any) -> str:
+def _render_need_slot_board(
+    display_name: str,
+    area: str,
+    items: Any,
+    *,
+    editable: bool = False,
+    user_id: int = 0,
+    snap: Optional[dict[str, Any]] = None,
+) -> str:
+    """Slot-Board für Member-Needs.
+
+    Normalmodus: nur lesen, so schlank wie im Discord-Bot.
+    Bearbeiten: dieselben Slot-Zeilen werden klickbar/editierbar; keine zweite Liste darunter.
+    """
+    snap = snap or {}
     slot_map = _need_slot_map(items)
     blocks: list[str] = []
+
+    def row_read(slot: str, entry: Any) -> str:
+        if entry:
+            item = _need_item_display(entry)
+            value = f"🔒 {item}" if _need_is_received(entry) else item
+        else:
+            value = "—"
+        cls = " locked" if entry and _need_is_received(entry) else ""
+        return f'<div class="need-slot-row{cls}"><span>{_e(slot)}:</span><strong>{_e(value)}</strong></div>'
+
+    def row_edit(slot: str, entry: Any, idx: int) -> str:
+        locked = bool(entry and _need_is_received(entry))
+        current = _need_item_display(entry) if entry else ""
+        if locked:
+            return f'<div class="need-slot-row locked"><span>🔒 {_e(slot)}:</span><strong>{_e(current or "—")}</strong><em>erhalten · gesperrt</em></div>'
+        input_id = f"need-field-{int(user_id or 0)}-{area.lower()}-{idx}"
+        slot_id = f"need-slot-{int(user_id or 0)}-{area.lower()}-{idx}"
+        hidden_slot = f'<select id="{_e(slot_id)}" class="need-slot-select" name="slot" style="display:none"><option selected value="{_e(slot)}">{_e(slot)}</option></select>'
+        picker = _loot_item_picker_html(
+            snap,
+            input_id=input_id,
+            name="item_text",
+            required=False,
+            placeholder=(current or "Item auswählen oder tippen"),
+            slot_select_id=slot_id,
+        )
+        weapon_html = ""
+        if slot.startswith("Waffe"):
+            weapon_html = f'<select name="weapon_type" class="mini-input"><option value="">Waffenart wählen</option>{_weapon_type_options_html()}</select>'
+        return f"""
+        <form class="need-slot-row need-slot-edit-row" method="post" action="/portal/member/{int(user_id)}/need-change">
+          <input type="hidden" name="action_type" value="set">
+          <input type="hidden" name="tab" value="{_e(area)}">
+          {hidden_slot}
+          <span>{_e(slot)}:</span>
+          <div class="need-field-box">{picker}</div>
+          {weapon_html}
+          <button class="btn mini-btn" type="submit">Speichern</button>
+          <button class="btn mini-btn ghost" type="submit" name="action_type" value="clear" onclick="return confirm('Need für {_e(slot)} entfernen?')">Leeren</button>
+        </form>"""
+
+    idx = 0
     for title, slots in _NEED_SLOT_GROUPS:
         rows = []
         for slot in slots:
+            idx += 1
             entry = slot_map.get(slot)
-            if entry:
-                item = _need_item_display(entry)
-                value = f"🔒 {item}" if _need_is_received(entry) else item
-            else:
-                value = "—"
-            rows.append(f'<div class="need-slot-row"><span>{_e(slot)}:</span><strong>{_e(value)}</strong></div>')
+            rows.append(row_edit(slot, entry, idx) if editable else row_read(slot, entry))
         blocks.append(f'<div class="need-slot-group"><h3>{_e(title)}</h3>{"".join(rows)}</div>')
-    return f'<div class="need-board"><h3>{_e(display_name)}</h3><p class="muted"><b>Bereich:</b> {_e(area)}</p><p class="mobile-note">🔒 Erhaltene Items bleiben dauerhaft sichtbar, der Slot ist gesperrt und zählt nicht mehr als offener Need.</p>{"".join(blocks)}</div>'
+
+    edit_note = "<p class='muted'>Bearbeitungsmodus: direkt ins Feld klicken, passendes Item wählen oder tippen. Waffen-Slots haben zusätzlich Waffenart.</p>" if editable else ""
+    return f'<div class="need-board{(" edit-board" if editable else "")}"><h3>{_e(display_name)}</h3><p class="muted"><b>Bereich:</b> {_e(area)}</p><p class="mobile-note">🔒 Erhaltene Items bleiben dauerhaft sichtbar, der Slot ist gesperrt und zählt nicht mehr als offener Need.</p>{edit_note}{"".join(blocks)}</div>'
 
 
 def _safe_percent(part: float, total: float) -> str:
@@ -4951,7 +5005,7 @@ def _render_members_dashboard(data: dict[str, Any]) -> str:
     <section class="hero"><div><div class="eyebrow">Mitgliederzentrale</div><h1>👥 Mitglieder</h1><p class="muted">Kombiniert Profil, EC, Needliste, Attendance-Reviews, Loot-Verlauf und Leitungsmarkierungen. Read-only – hier wird nichts am Bot verändert.</p></div><a class="btn" href="/export/member_center.csv">CSV herunterladen</a></section>
     <section class="grid">{cards}</section>
     <section class="split"><div class="panel"><h2>Rollenverteilung</h2>{_bars(role_rows, max_items=8)}</div><div class="panel"><h2>Top EC</h2>{_table(['Spieler','EC','Rolle','Anwesenheit','Hinweis'], ec_rows, placeholder='Top EC durchsuchen…')}</div></section>
-    <section class="panel"><h2>⚠️ Prüfliste</h2><p class="muted">Auffällige Mitglieder aus Profil-/EC-/Need-Daten, Attendance-Historie, Loot-Verlauf und internen Leitungsnotizen.</p>{_table(['Spieler','Leitung','Attendance','EC','Hinweis','Letzte Aktivität'], problem_rows, placeholder='Prüfliste durchsuchen…')}</section>
+    <section class="panel"><details class="soft-details"><summary><strong>⚠️ Prüfliste optional anzeigen</strong> <span class="muted">({len(problem_rows)} Einträge)</span></summary><p class="muted">Auffällige Mitglieder aus Profil-/EC-/Need-Daten, Attendance-Historie, Loot-Verlauf und internen Leitungsnotizen.</p>{_table(['Spieler','Leitung','Attendance','EC','Hinweis','Letzte Aktivität'], problem_rows, placeholder='Prüfliste durchsuchen…')}</details></section>
     <section class="panel"><h2>👥 Alle Mitglieder</h2>{_table(['Name','Ingame','Rolle','GS','EC','Needs M/S','Anwesenheit','Review-Zähler','Voice','Loot/EC','Leitung','Hinweise','Loot'], member_rows, placeholder='Mitglieder durchsuchen…')}</section>
     """
     return _html_shell("Mitgliederzentrale · Ebo Dashboard", body)
@@ -7496,6 +7550,7 @@ def _render_member_portal(data: dict[str, Any], user_id: int, request: Request, 
     active_events = _portal_active_events(snap, int(user_id))
     active_auctions = _portal_active_auctions(snap)
     need_requests = _need_change_requests(guild_id, user_id=int(user_id), limit=60) if guild_id else []
+    edit_needs = str(request.query_params.get("edit_needs") or "").strip() == "1"
 
     event_rows = []
     for ev in active_events:
@@ -7525,6 +7580,15 @@ def _render_member_portal(data: dict[str, Any], user_id: int, request: Request, 
     ])
     portal_nav = '<nav class="topnav"><a href="/">Kommando</a><a href="/portal">Mein Portal</a><a href="/events">Events</a><a href="/loot">Loot</a><a href="/members">Mitglieder</a><a href="/ec">EC</a></nav>' if _is_portal_admin(request) else '<nav class="topnav"><a href="/member">Start</a><a href="/member#members">Mitglieder</a><a href="/member#events">Events</a><a href="/member#auctions">Auktionen</a><a href="/portal">Eigenes Profil</a><a href="#needs">Meine Needs</a></nav>'
     body = f"""
+    <style>
+      .soft-details summary{{cursor:pointer;list-style:none;padding:10px 0;color:var(--gold)}}
+      .soft-details summary::-webkit-details-marker{{display:none}}
+      .need-slot-edit-row{{display:grid;grid-template-columns:140px minmax(240px,1fr) 150px auto auto;gap:10px;align-items:end}}
+      .need-slot-edit-row .need-field-box input,.need-slot-edit-row .need-field-box select,.need-slot-edit-row .mini-input{{width:100%;padding:9px;border-radius:10px;background:#08090d;color:var(--text);border:1px solid var(--line)}}
+      .need-slot-edit-row .mini-btn{{padding:9px 11px;white-space:nowrap}}
+      .need-slot-row.locked em{{color:var(--muted);font-style:normal}}
+      @media(max-width:760px){{.need-slot-edit-row{{grid-template-columns:1fr;align-items:stretch}}.need-slot-edit-row .btn{{width:100%}}}}
+    </style>
     {portal_nav}
     <section class="hero">
       <div><div class="eyebrow">Spieler- & Mitgliederportal</div><h1>👤 {_e(display)}</h1><p class="muted">Eigene Daten, laufende Events, laufende Auktionen, EC, Attendance, Loot und Needliste.</p></div>
@@ -7534,8 +7598,16 @@ def _render_member_portal(data: dict[str, Any], user_id: int, request: Request, 
     <section class="grid">{cards}</section>
     <section class="panel"><h2>📅 Laufende & kommende Events</h2>{_table(['Event','Zeit','Status','Deine Anmeldung','Aktion'], event_rows, placeholder='Events durchsuchen…')}</section>
     <section class="panel"><h2>⚔️ Laufende Auktionen</h2><p class="muted">Zum Bieten die Auktion öffnen. Bieten läuft weiterhin sicher über Bot-Queue.</p>{_table(['Item','Bereich','Start/Preis','Führend','Ende','Aktion'], auction_rows, placeholder='Auktionen durchsuchen…')}</section>
-    <section class="panel" id="needs"><h2>🎁 Deine Needliste</h2><div class="split"><div>{_render_need_slot_board(display, 'Main', main_needs)}</div><div>{_render_need_slot_board(display, 'Secondary', sec_needs)}</div></div></section>
-    {_render_need_editor_panel(int(user_id), _current_user(request), need_requests, snap)}
+    <section class="panel" id="needs">
+      <div style="display:flex;justify-content:space-between;gap:10px;align-items:center;flex-wrap:wrap">
+        <h2>🎁 Deine Needliste</h2>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          {('<a class="btn" href="/portal#needs">Bearbeiten beenden</a>' if edit_needs else '<a class="btn" href="/portal?edit_needs=1#needs">✍️ Needliste bearbeiten</a>')}
+        </div>
+      </div>
+      <div class="split"><div>{_render_need_slot_board(display, 'Main', main_needs, editable=edit_needs, user_id=int(user_id), snap=snap)}</div><div>{_render_need_slot_board(display, 'Secondary', sec_needs, editable=edit_needs, user_id=int(user_id), snap=snap)}</div></div>
+      <details class="soft-details" style="margin-top:14px"><summary>Änderungslog anzeigen</summary>{_table(['Zeit','Status','Aktion','Bereich','Slot','Ergebnis'], [[_dt(r.get('requested_at')), _need_change_status_label(r.get('status')), r.get('action_type'), (r.get('payload') or {}).get('tab'), (r.get('payload') or {}).get('slot'), _short(((r.get('result') or {}).get('message') or (r.get('result') or {}).get('error') or (r.get('payload') or {}).get('item_text') or (r.get('payload') or {}).get('item_name') or '—'), 120)] for r in need_requests[:30]], placeholder='Need-Änderungen durchsuchen…')}</details>
+    </section>
     <section class="panel"><h2>🪙 EC-Verlauf</h2>{_table(['Zeit','Betrag','Typ','Grund'], tx_rows, placeholder='EC durchsuchen…')}</section>
     <section class="panel"><h2>🏆 Loot-Historie</h2>{_table(['Item','Bereich','EC','Zeit'], loot_rows, placeholder='Loot durchsuchen…')}</section>
     """
@@ -7552,7 +7624,7 @@ def _member_home_event_rows(events: list[dict[str, Any]], user_id: int) -> str:
         eid = str(ev.get("event_id") or ev.get("id") or "")
         title = ev.get("title") or ev.get("name") or eid or "Event"
         meta = f"{_dt(ev.get('when_iso') or ev.get('start_at') or ev.get('created_at'))} · {_event_status_text(ev)} · Deine Anmeldung: {_portal_event_status_for_user(ev, user_id)}"
-        items.append(f'<div class="member-summary-item"><div><div class="member-summary-title">{_cell(_event_link(eid, title))}</div><div class="member-summary-meta">{_e(meta)}</div></div><a class="btn" href="/event/{_e(eid)}">Öffnen</a></div>')
+        items.append(f'<div class="member-summary-item"><div><div class="member-summary-title">{_cell(_event_link(eid, title))}</div><div class="member-summary-meta">{_e(meta)}</div></div></div>')
     return '<div class="member-summary-list">' + ''.join(items) + '</div>'
 
 def _member_home_auction_rows(auctions: list[dict[str, Any]], snap: dict[str, Any]) -> str:
@@ -7564,7 +7636,7 @@ def _member_home_auction_rows(auctions: list[dict[str, Any]], snap: dict[str, An
         title = _loot_text(a.get("item_name") or a.get("item") or aid)
         count_title, count_value, _ = _auction_count_label(a)
         meta = f"{_phase_label(a)} · {count_value} {count_title} · {_auction_leader_or_roll_text(a, snap)} · {_auction_timer_text(a)}"
-        items.append(f'<div class="member-summary-item"><div><div class="member-summary-title">{_cell(_auction_link(aid, title))}</div><div class="member-summary-meta">{_e(meta)}</div></div><a class="btn" href="/auction/{_e(aid)}">Öffnen</a></div>')
+        items.append(f'<div class="member-summary-item"><div><div class="member-summary-title">{_cell(_auction_link(aid, title))}</div><div class="member-summary-meta">{_e(meta)}</div></div></div>')
     return '<div class="member-summary-list">' + ''.join(items) + '</div>'
 
 def _render_member_home(data: dict[str, Any], request: Request) -> str:
@@ -8082,6 +8154,52 @@ def _event_role_counts(ev: dict[str, Any]) -> str:
     return f"Teilnehmer: {ev.get('participant_count', ev.get('participants', '—'))}"
 
 
+
+def _dashboard_select_options_from_settings(snap: dict[str, Any], kind: str) -> list[tuple[str, str]]:
+    settings = snap.get("settings") if isinstance(snap.get("settings"), dict) else {}
+    rows = settings.get(kind) if isinstance(settings.get(kind), list) else []
+    out: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    id_key = "channel_id" if kind == "channels" else "role_id"
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        value = str(row.get(id_key) or row.get("id") or row.get("value") or "").strip()
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        name = str(row.get("name") or row.get("label") or row.get("key") or value).strip()
+        out.append((value, name))
+    return out
+
+
+def _dashboard_channel_select_html(snap: dict[str, Any], *, required: bool = True) -> str:
+    opts = _dashboard_select_options_from_settings(snap, "channels")
+    req = " required" if required else ""
+    if not opts:
+        return f'<input name="channel_id"{req} placeholder="Kanal-ID, falls keine Kanäle im Snapshot sind">'
+    html = '<select name="channel_id"' + req + '><option value="">Kanal auswählen</option>'
+    for value, name in opts:
+        html += f'<option value="{_e(value)}">#{_e(name)} · {_e(value)}</option>'
+    html += '</select>'
+    return html
+
+
+def _dashboard_role_select_html(snap: dict[str, Any]) -> str:
+    opts = _dashboard_select_options_from_settings(snap, "roles")
+    if not opts:
+        return '<input name="target_role_id" placeholder="optional: Rollen-ID, falls keine Rollen im Snapshot sind">'
+    html = '<select name="target_role_id"><option value="">Keine Zielrolle / alle erlaubten Mitglieder</option>'
+    for value, name in opts:
+        html += f'<option value="{_e(value)}">@{_e(name)} · {_e(value)}</option>'
+    html += '</select>'
+    return html
+
+
+def _dashboard_event_type_select_html() -> str:
+    values = ["Nicht DKP-relevant", "Gildenboss", "Normal Raid", "HM Raid", "NM Raid", "Übungsrun HM Raid", "Übungsrun Trials", "Segensstein PvP"]
+    return '<select name="dkp_event_type">' + ''.join(f'<option value="{_e(v)}">{_e(v)}</option>' for v in values) + '</select>'
+
 def _render_events_center(data: dict[str, Any], current_user: Optional[dict[str, Any]] = None, msg: str = "") -> str:
     if not data.get("ok"):
         return _html_shell("Events · Ebo Dashboard", f"<section class='panel'><h1>📅 Events</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
@@ -8291,9 +8409,10 @@ def _render_events_center(data: dict[str, Any], current_user: Optional[dict[str,
           <label>Titel<br><input name="title" required placeholder="z. B. Gildenbosse Sonntag"></label>
           <label>Datum<br><input name="date" type="date" required></label>
           <label>Uhrzeit<br><input name="time" type="time" required></label>
-          <label>Eventtyp<br><input name="event_type" placeholder="gildenbosse / raid / pvp / hm"></label>
-          <label>Zielkanal-ID<br><input name="channel_id" required placeholder="Discord Channel ID"></label>
-          <label>Zielrollen-ID optional<br><input name="target_role_id" placeholder="Discord Role ID"></label>
+          <label>Eventtyp / EC-Regel<br>{_dashboard_event_type_select_html()}</label>
+          <label>Sichtbarer Eventbereich<br><select name="event_type"><option value="">Standard</option><option value="Normal Raid">Normal Raid</option><option value="Hard Raid">Hard Raid</option><option value="Nightmare">Nightmare</option><option value="Trials">Trials</option><option value="PvP">PvP</option><option value="Gildenbosse">Gildenbosse</option></select></label>
+          <label>Zielkanal<br>{_dashboard_channel_select_html(snap, required=True)}</label>
+          <label>Zielrolle optional<br>{_dashboard_role_select_html(snap)}</label>
         </div>
         <label>Beschreibung<br><textarea name="description" rows="4" placeholder="Kurzbeschreibung"></textarea></label>
         <div class="event-form-grid">
@@ -8410,6 +8529,7 @@ async def admin_events_action(request: Request, _: bool = Depends(_admin_auth)):
         "date": str(form.get("date") or "").strip(),
         "time": str(form.get("time") or "").strip(),
         "event_type": str(form.get("event_type") or "").strip(),
+        "dkp_event_type": str(form.get("dkp_event_type") or "").strip(),
         "channel_id": str(form.get("channel_id") or "").strip(),
         "target_role_id": str(form.get("target_role_id") or "").strip(),
         "description": str(form.get("description") or "").strip(),
@@ -9633,7 +9753,7 @@ async def portal_need_change(user_id: int, request: Request, _: bool = Depends(_
     }
     rid = _create_need_change_request(guild_id, int(user_id), action_type, payload, actor)
     msg = urllib.parse.quote(f"Need-Änderung angelegt: {rid}")
-    return RedirectResponse(url=f"/portal/member/{int(user_id)}?msg={msg}#need-editor", status_code=303)
+    return RedirectResponse(url=f"/portal/member/{int(user_id)}?edit_needs=1&msg={msg}#needs", status_code=303)
 
 
 @app.get("/api/portal/member/{user_id}")
@@ -10823,18 +10943,43 @@ def _render_attendance_event(data: dict[str, Any], event_id: str, saved: bool = 
     updated = ""
     if review:
         updated = f"<p class='muted'>Letzte Speicherung: {_e(_dt(review.get('updated_at')))} durch {_e(review.get('updated_by_name') or '—')} · Status: {_e(review.get('status') or 'draft')}</p>"
+    award_state = _event_award_state(snap, str(event_id))
+    award_rows = _event_award_transaction_rows(snap, str(event_id)) if award_state.get("awarded") else []
+    if award_state.get("awarded"):
+        awarded_sum = _fmt_ec(award_state.get("total") or sum(_num(x.get("amount"), 0) for x in award_rows))
+        award_preview_rows = []
+        for tx in award_rows[:24]:
+            uid = _user_id(tx.get("user_id"))
+            award_preview_rows.append([_member_link(uid, tx.get("display_name")), _fmt_ec(tx.get("amount")), _e((tx.get("meta") or {}).get("signup") or "—") if isinstance(tx.get("meta"), dict) else "—"])
+        award_table = _table(["Spieler", "EC", "Anmeldung"], award_preview_rows) if award_preview_rows else "<p class='muted'>EC-Eventcheck ist als vergeben markiert. Einzelne Transaktionen sind im geladenen Snapshot nicht vollständig enthalten.</p>"
+        award_notice = f"""
+        <section class="panel good">
+          <h2>✅ EC bereits vergeben</h2>
+          <p class="muted">Dieses Event ist laut Bot/Postgres abgeschlossen und soll nicht mehr in der normalen Anwesenheitsliste/Homepage auftauchen.</p>
+          <div class="grid">{_card('EC-Buchungen', len(award_rows) or award_state.get('count') or '—', 'Transaktionen')}{_card('Summe', awarded_sum, 'vergebene EC')}{_card('Quelle', award_state.get('source') or 'Eventcheck', 'Abschluss erkannt')}</div>
+          {award_table}
+          <p class="muted">Falls die alte Review-Liste darunter abweicht: maßgeblich ist die finale EC-Vergabe aus dem Discord/Bot. Die Review-Liste ist nur der gespeicherte Dashboard-Review.</p>
+        </section>
+        """
+        hero_label = "Anwesenheits-Review · EC bereits vergeben"
+        hero_actions = f'<a class="btn" href="/attendance-archive">📚 Archiv öffnen</a><a class="btn" href="/ec">EC-Verlauf</a><a class="btn" href="/attendance/{_e(event_id)}/report">📋 Abschlussbericht</a>'
+    else:
+        award_notice = ""
+        hero_label = "Anwesenheits-Review · keine EC-Buchung"
+        hero_actions = f'<form method="post" action="/admin/attendance/{_e(event_id)}/voice-suggest"><button class="btn" type="submit">🎙️ Voice-Vorschlag neu laden</button></form><a class="btn" href="#review-save">✅ 1. Überprüfen</a><a class="btn" href="/attendance/{_e(event_id)}/report">📋 Abschlussbericht</a>'
     body = f"""
     <nav class="topnav"><a href="/attendance">← Anwesenheit</a><a href="/attendance-stats">Stats</a><a href="/attendance-archive">Archiv</a><a href="/event/{_e(event_id)}">Eventdetails</a><a href="/attendance/{_e(event_id)}/ec-preview">EC-Vorschau</a><a href="/attendance/{_e(event_id)}/report">Abschlussbericht</a><a href="#event-ec-queue">EC-Queue</a><a href="/voice">Voice</a><a href="/ec">EC</a></nav>
     <section class="hero">
       <div>
-        <div class="eyebrow">Anwesenheits-Review · keine EC-Buchung</div>
+        <div class="eyebrow">{hero_label}</div>
         <h1>📝 {_e(event.get('title') or event_id)}</h1>
         <p class="muted">Event-ID: {_e(event_id)} · Zeit: {_e(_dt(event.get('when_iso')))} · Voice: {_e(event.get('voice_channel_id') or event.get('voice_last_channel_id') or 'kein Voice')}</p>
         {updated}
       </div>
-      <div style="display:flex;gap:8px;flex-wrap:wrap"><form method="post" action="/admin/attendance/{_e(event_id)}/voice-suggest"><button class="btn" type="submit">🎙️ Voice-Vorschlag neu laden</button></form><a class="btn" href="#review-save">✅ 1. Überprüfen</a><a class="btn" href="/attendance/{_e(event_id)}/report">📋 Abschlussbericht</a></div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap">{hero_actions}</div>
     </section>
     {saved_note}
+    {award_notice}
     {_attendance_review_control_panel(guild_id, str(event_id), review)}
     <section class="grid">{cards}</section>
     <section class="panel">
@@ -11251,19 +11396,70 @@ def _snapshot_event_points(snap: dict[str, Any]) -> dict[str, float]:
 
 
 def _event_award_state(snap: dict[str, Any], event_id: str) -> dict[str, Any]:
+    """Erkennt zuverlässig, ob für ein Event bereits EC/DKP vergeben wurde.
+
+    Wichtig: Discord-/Bot-seitige EC-Vergaben können im Snapshot als
+    phase3_ec_event_checks.awarded/status=awarded auftauchen, auch wenn die
+    Dashboard-Queue nie benutzt wurde. Deshalb reicht es nicht, nur die
+    Dashboard-Queue oder nur die Transaktionsliste zu prüfen.
+    """
+    eid = str(event_id or "").strip()
     txs = _ec_transactions(snap)
     recent = txs.get("items") or txs.get("recent") or []
-    hits = []
+    hits: list[dict[str, Any]] = []
     for tx in recent:
         if not isinstance(tx, dict):
             continue
-        if str(tx.get("event_id") or "") != str(event_id):
+        if str(tx.get("event_id") or "").strip() != eid:
             continue
-        if str(tx.get("raw_type") or "") != "event_award":
+        raw_type = str(tx.get("raw_type") or tx.get("type") or "").strip().lower()
+        if raw_type and raw_type != "event_award":
             continue
         hits.append(tx)
+
+    checks = []
+    for chk in _event_check_items(snap):
+        if not isinstance(chk, dict):
+            continue
+        if str(chk.get("event_id") or chk.get("check_id") or "").strip() != eid:
+            continue
+        checks.append(chk)
+
+    awarded_check = None
+    for chk in checks:
+        status = str(chk.get("status") or chk.get("state") or "").strip().lower()
+        if bool(chk.get("awarded") or chk.get("ec_awarded")) or status in {"awarded", "done", "finished", "closed", "completed"}:
+            awarded_check = chk
+            break
+
     total = sum(_num(tx.get("amount"), 0) for tx in hits)
-    return {"awarded": bool(hits), "count": len(hits), "total": total, "latest": hits[0] if hits else {}}
+    return {
+        "awarded": bool(hits) or bool(awarded_check),
+        "count": len(hits),
+        "total": total,
+        "latest": hits[0] if hits else {},
+        "check": awarded_check or (checks[0] if checks else {}),
+        "source": "transactions" if hits else ("event_check" if awarded_check else ""),
+    }
+
+
+def _event_award_transaction_rows(snap: dict[str, Any], event_id: str) -> list[dict[str, Any]]:
+    """Finale EC-Buchungen eines Events für die Anzeige im Attendance-Archiv."""
+    eid = str(event_id or "").strip()
+    txs = _ec_transactions(snap)
+    recent = txs.get("items") or txs.get("recent") or []
+    rows: list[dict[str, Any]] = []
+    for tx in recent:
+        if not isinstance(tx, dict):
+            continue
+        if str(tx.get("event_id") or "").strip() != eid:
+            continue
+        raw_type = str(tx.get("raw_type") or tx.get("type") or "").strip().lower()
+        if raw_type and raw_type != "event_award":
+            continue
+        rows.append(tx)
+    rows.sort(key=lambda x: str(x.get("created_at") or x.get("id") or ""))
+    return rows
 
 
 def _latest_ec_award_request(guild_id: int, event_id: str) -> dict[str, Any]:
