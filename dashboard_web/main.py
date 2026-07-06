@@ -662,14 +662,55 @@ def _apply_phase3_ec_read_cutover(payload: dict[str, Any]) -> dict[str, Any]:
 # weiterhin parallel JSON + Postgres; kein harter Write-Cutover.
 
 
-def _phase3_need_label(slot_name: Any, item_name: Any) -> str:
-    item = str(item_name or "").strip()
-    slot = str(slot_name or "").strip()
-    if not item:
+def _clean_item_display_name(value: Any) -> str:
+    """Kurzer Itemname für Dashboard-Anzeigen.
+
+    Bot-/Postgres-Rohwerte enthalten bei Needs oft Slot- und Dict-Metadaten, z. B.
+    "1: Waffe 1: Daigons Sturmklinge (Schwert & Schild)" oder sogar die
+    String-Repräsentation eines Dicts. Für die Oberfläche soll nur der Itemname
+    sichtbar sein.
+    """
+    if value is None:
         return ""
-    if slot and not item.lower().startswith((slot + ":").lower()):
-        return f"{slot}: {item}"
-    return item
+    if isinstance(value, dict):
+        for key in ("item_name", "raw_item_name", "item", "name", "label", "title", "short_name", "value", "text"):
+            text = _clean_item_display_name(value.get(key))
+            if text:
+                return text
+        return ""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+
+    m = re.search(r"['\"](?:item_name|raw_item_name|item|name|label)['\"]\s*:\s*['\"]([^'\"]+)['\"]", text)
+    if m:
+        text = m.group(1).strip()
+
+    text = html.unescape(text)
+    text = re.sub(r"\s*✅\s*Erhalten\s*", "", text, flags=re.I).strip()
+    text = re.sub(r"\s+", " ", text).strip(" -–—:\t\n\r")
+
+    slot_words = (
+        "waffe", "weapon", "umhang", "cape", "brosche", "kette", "halskette", "gürtel", "guertel",
+        "ring", "armreif", "armband", "band", "hose", "handschuhe", "schuhe", "stiefel", "helm",
+        "hut", "rüstung", "ruestung", "brust", "mantel", "anhänger", "anhaenger", "slot"
+    )
+    slot_re = r"(?:" + "|".join(slot_words) + r")"
+    changed = True
+    while changed:
+        before = text
+        text = re.sub(r"^\s*\d+\s*:\s*", "", text).strip()
+        text = re.sub(rf"^\s*{slot_re}(?:\s*\d+)?\s*:\s*", "", text, flags=re.I).strip()
+        text = re.sub(r"^\s*[A-Za-zÄÖÜäöüß ]+\s+\d+\s*:\s*", "", text).strip()
+        changed = (text != before)
+
+    text = re.sub(r"\s*\((?:Schwert & Schild|Schwert und Schild|Langbogen|Dolche|Kugel|Zauberstab|Stab|Armbrust|Großschwert|Grossschwert|Schild|Bogen|Dagger|Sword|Shield|Staff|Wand|Bow|Crossbow)[^)]*?\)\s*$", "", text, flags=re.I).strip()
+    text = re.sub(r"\s*\((?:[^()]*)\)\s*$", "", text).strip()
+    return text.strip(" -–—:")
+
+
+def _phase3_need_label(slot_name: Any, item_name: Any) -> str:
+    return _clean_item_display_name(item_name)
 
 
 def _phase3_member_name_map(guild_id: Any, snap: dict[str, Any]) -> dict[int, str]:
@@ -818,7 +859,7 @@ def _phase3_loot_pg_payload(guild_id: Any, snap: dict[str, Any]) -> Optional[dic
     for row in need_rows:
         raw = _phase3_json(row.get("raw_json"), {})
         uid = _user_id(row.get("user_id") or raw.get("user_id"))
-        item = str(row.get("item_name") or raw.get("item_name") or raw.get("item") or raw.get("name") or "").strip()
+        item = _clean_item_display_name(row.get("item_name") or raw.get("item_name") or raw.get("item") or raw.get("name") or "")
         if not uid or not item:
             continue
         slot = str(row.get("slot_name") or raw.get("slot_name") or raw.get("slot") or "").strip()
@@ -891,7 +932,7 @@ def _phase3_loot_pg_payload(guild_id: Any, snap: dict[str, Any]) -> Optional[dic
         bids.sort(key=lambda b: (int(_num(b.get("amount"), 0)), str(b.get("created_at") or b.get("timestamp") or "")), reverse=True)
         top = bids[0] if bids else {}
         winner_uid = _user_id(row.get("winner_user_id") or raw.get("winner_user_id") or raw.get("delivered_to_user_id") or raw.get("sold_to_user_id"))
-        item = str(row.get("item_name") or raw.get("item_name") or raw.get("item") or raw.get("name") or aid)
+        item = _clean_item_display_name(row.get("item_name") or raw.get("item_name") or raw.get("item") or raw.get("name") or aid)
         auction = {
             **raw,
             "auction_id": aid,
@@ -913,7 +954,7 @@ def _phase3_loot_pg_payload(guild_id: Any, snap: dict[str, Any]) -> Optional[dic
     for row in history_rows:
         raw = _phase3_json(row.get("raw_json"), {})
         uid = _user_id(row.get("user_id") or raw.get("user_id") or raw.get("winner_user_id") or raw.get("buyer_user_id"))
-        item = str(row.get("item_name") or raw.get("item_name") or raw.get("item") or raw.get("name") or "").strip()
+        item = _clean_item_display_name(row.get("item_name") or raw.get("item_name") or raw.get("item") or raw.get("name") or "")
         history_items.append({
             **raw,
             "entry_id": row.get("entry_id") or raw.get("entry_id"),
@@ -2023,7 +2064,14 @@ def _table(headers: list[str], rows: list[list[Any]], *, searchable: bool = True
     if not rows:
         return '<div class="empty">Keine Daten vorhanden.</div>'
     head = "".join(f"<th>{_e(h)}</th>" for h in headers)
-    body = "".join("<tr>" + "".join(f"<td>{_cell(c)}</td>" for c in row) + "</tr>" for row in rows)
+    body_rows: list[str] = []
+    for row in rows:
+        cells: list[str] = []
+        for idx, cell in enumerate(row):
+            label = headers[idx] if idx < len(headers) else ""
+            cells.append(f'<td data-label="{_e(label)}">{_cell(cell)}</td>')
+        body_rows.append("<tr>" + "".join(cells) + "</tr>")
+    body = "".join(body_rows)
     search = f'<input class="table-search" type="search" placeholder="{_e(placeholder)}" oninput="filterNextTable(this)">' if searchable else ""
     return f"{search}<div class='table-wrap'><table class='searchable-table'><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div>"
 
@@ -2145,7 +2193,7 @@ def _need_list_html(title: str, items: Any) -> str:
     arr = items if isinstance(items, list) else []
     if not arr:
         return f"<h3>{_e(title)}</h3><div class='empty'>Keine Einträge.</div>"
-    lis = "".join(f"<li>{_e(x)}</li>" for x in arr[:80])
+    lis = "".join(f"<li>{_e(_loot_text(x))}</li>" for x in arr[:80])
     more = f"<p class='muted'>+ {len(arr) - 80} weitere</p>" if len(arr) > 80 else ""
     return f"<h3>{_e(title)} <span class='pill'>{len(arr)}</span></h3><ul class='need-list'>{lis}</ul>{more}"
 
@@ -3325,7 +3373,7 @@ def _render_auction_detail(data: dict[str, Any], auction_id: str, current_user: 
     <section class="hero">
       <div>
         <div class="eyebrow">Auktion</div>
-        <h1>🎁 {_e(auction.get('item_name') or auction_id)}</h1>
+        <h1>🎁 {_e(_loot_text(auction.get('item_name') or auction_id))}</h1>
         <p class="muted">Auktions-ID: {_e(auction_id)} · {_e(_phase_label(auction))} · Snapshot: {_e(_dt(data.get('published_at')))}</p>
       </div>
       <a class="btn" href="/#loot">Zurück</a>
@@ -3341,7 +3389,7 @@ def _render_auction_detail(data: dict[str, Any], auction_id: str, current_user: 
     <section class="panel" id="eligible"><h2>✅ Berechtigte Spieler</h2><p class="muted">Bei freien Auktionen/Sale kann die Liste leer sein, weil dann alle berechtigt sind.</p>{_table(['Spieler'], eligible_rows, placeholder='Berechtigte durchsuchen…')}</section>
     <section class="panel" id="tech"><h2>🧾 Technische Infos</h2>{_table(['Bereich','Kanal-ID','Nachricht-ID'], channel_info, searchable=False)}</section>
     """
-    return _html_shell(f"{auction.get('item_name') or 'Auktion'} · Ebo Dashboard", body)
+    return _html_shell(f"{_loot_text(auction.get('item_name') or 'Auktion')} · Ebo Dashboard", body)
 
 
 def _sidebar_html() -> str:
@@ -3576,6 +3624,8 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "admin") -> str:
     .actions-inline form {{ display:inline-flex; gap:8px; flex-wrap:wrap; align-items:center; }}
     .responsive-table {{ width:100%; overflow-x:auto; -webkit-overflow-scrolling:touch; border-radius:12px; }}
     .responsive-table > table {{ min-width:680px; }}
+    .item-picker-select {{ width:100%; margin:0 0 8px; border:1px solid var(--line); background:#08090d; color:var(--text); border-radius:10px; padding:10px 12px; }}
+    td {{ overflow-wrap:anywhere; }}
     .skip-mobile {{ display:inline; }}
 
     @media(max-width:1100px) {{ .app-shell {{ grid-template-columns:1fr; }} .sidebar {{ position:relative; height:auto; border-right:0; border-bottom:1px solid rgba(214,168,79,.16); }} .side-nav {{ display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); }} .side-nav details {{ margin-top:0; }} .home-layout {{ grid-template-columns:1fr; }} }}
@@ -3611,7 +3661,7 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "admin") -> str:
       .action-list .btn {{ padding:11px 12px; }}
       .table-search {{ max-width:100%; }}
       .table-wrap {{ width:100%; overflow-x:auto; -webkit-overflow-scrolling:touch; }}
-      table {{ font-size:13px; min-width:640px; }}
+      table {{ font-size:13px; min-width:520px; }}
       th,td {{ padding:9px 7px; }}
       .btn {{ width:auto; max-width:100%; white-space:normal; text-align:center; }}
       .queue-badge,.pill {{ white-space:normal; }}
@@ -3628,7 +3678,19 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "admin") -> str:
       .skip-mobile {{ display:none; }}
 
     }}
-    @media(max-width:560px) {{ main.content {{ padding:12px 10px 42px; }} .grid,.analytics-grid,.side-nav {{ grid-template-columns:1fr; }} .bar-row {{ grid-template-columns:90px 1fr 38px; }} .home-item {{ grid-template-columns:38px minmax(0,1fr); }} .home-item .pill {{ grid-column:2; justify-self:start; }} .split {{ grid-template-columns:1fr; }} }}
+    @media(max-width:560px) {{
+      main.content {{ padding:12px 10px 42px; }} .grid,.analytics-grid,.side-nav {{ grid-template-columns:1fr; }} .bar-row {{ grid-template-columns:90px 1fr 38px; }} .home-item {{ grid-template-columns:38px minmax(0,1fr); }} .home-item .pill {{ grid-column:2; justify-self:start; }} .split {{ grid-template-columns:1fr; }}
+      .table-wrap {{ overflow:visible; }}
+      table.searchable-table {{ min-width:0; display:block; width:100%; }}
+      table.searchable-table thead {{ display:none; }}
+      table.searchable-table tbody {{ display:grid; gap:10px; }}
+      table.searchable-table tr {{ display:block; border:1px solid rgba(214,168,79,.16); border-radius:14px; padding:8px 10px; background:rgba(16,18,25,.72); }}
+      table.searchable-table td {{ display:grid; grid-template-columns:112px minmax(0,1fr); gap:10px; border-bottom:1px solid rgba(255,255,255,.08); padding:8px 0; overflow-wrap:anywhere; }}
+      table.searchable-table td:last-child {{ border-bottom:0; }}
+      table.searchable-table td::before {{ content:attr(data-label); color:var(--gold); font-size:11px; font-weight:800; text-transform:uppercase; letter-spacing:.04em; }}
+      .card-value {{ font-size:22px; overflow-wrap:anywhere; }}
+      .panel h2 {{ font-size:22px; }}
+    }}
   </style>
 </head>
 <body><div class="app-shell">{_member_sidebar_html() if nav_mode == "member" else _sidebar_html()}<main class="content">{auth_note}{body}</main></div><script>
@@ -4845,24 +4907,22 @@ def _loot_text(value: Any) -> str:
     """Robuste Text-Extraktion für Item-/Need-/Auktionswerte aus älteren und neueren Snapshots."""
     if value is None:
         return ""
-    if isinstance(value, str):
-        return value.strip()
-    if isinstance(value, (int, float)):
-        return str(value)
+    if isinstance(value, (str, int, float)):
+        return _clean_item_display_name(value)
     if isinstance(value, dict):
         for key in (
-            "item_name", "item", "name", "label", "title", "display_name", "short_name",
+            "item_name", "raw_item_name", "item", "name", "label", "title", "display_name", "short_name",
             "ingame_name", "value", "text", "query", "loot_name",
         ):
             v = value.get(key)
-            if isinstance(v, (str, int, float)) and str(v).strip():
-                return str(v).strip()
-        # Manche Need-Einträge liegen als {slot: item} vor.
+            text = _clean_item_display_name(v)
+            if text:
+                return text
         for v in value.values():
-            if isinstance(v, (str, int, float)) and str(v).strip():
-                return str(v).strip()
-    return str(value).strip()
-
+            text = _clean_item_display_name(v)
+            if text:
+                return text
+    return _clean_item_display_name(str(value))
 
 def _loot_key(value: Any) -> str:
     label = _loot_text(value).lower()
@@ -5329,7 +5389,7 @@ def _render_loot_check(data: dict[str, Any], item_query: str = "") -> str:
             a.get("bid_count"),
             a.get("leader"),
             a.get("winner") if isinstance(a.get("winner"), dict) else a.get("winner"),
-            _dt(a.get("ends_at")),
+            (_auction_timer_text(a.get("raw") or {}) if isinstance(a.get("raw"), dict) else _dt(a.get("ends_at"))),
             a.get("next_step"),
         ])
 
@@ -5351,6 +5411,50 @@ def _render_loot_check(data: dict[str, Any], item_query: str = "") -> str:
     <section class="panel"><h2>🏷️ Passende Auktionen</h2>{_table(['Item','Match','Bereich','Status','Gebote','Führend','Gewinner','Ende','Nächster Schritt'], auction_rows, placeholder='Auktionen durchsuchen…')}</section>
     """
     return _html_shell("Truhencheck · Ebo Dashboard", body)
+
+
+def _loot_catalog_item_names(snap: dict[str, Any], limit: int = 650) -> list[str]:
+    """Klick-/Auswahlliste aus allem, was dem Dashboard online bekannt ist."""
+    names: set[str] = set()
+
+    def add(value: Any) -> None:
+        text = _loot_text(value)
+        if text and len(text) >= 3 and not text.lower().startswith("user "):
+            names.add(text)
+
+    loot = (snap.get("loot") or {}) if isinstance(snap, dict) else {}
+    for n in (((loot.get("needs") or {}).get("entries") or [])):
+        if isinstance(n, dict):
+            add(n.get("raw_item_name") or n.get("item") or n.get("item_name") or n)
+    for player in (((loot.get("needs") or {}).get("items") or [])):
+        if not isinstance(player, dict):
+            continue
+        for key in ("main", "secondary"):
+            for entry in player.get(key) or []:
+                add(entry)
+    for section in ("auctions", "history", "need_change_log"):
+        obj = loot.get(section) or {}
+        for row in obj.get("items") or []:
+            if isinstance(row, dict):
+                add(row.get("raw_item_name") or row.get("item_name") or row.get("item") or row.get("new_item") or row.get("old_item") or row)
+    return sorted(names, key=lambda x: x.lower())[:limit]
+
+
+def _loot_item_picker_html(snap: dict[str, Any], *, input_id: str, name: str = "item", required: bool = True, placeholder: str = "Item auswählen oder tippen") -> str:
+    items = _loot_catalog_item_names(snap)
+    datalist_id = f"{input_id}-list"
+    required_attr = " required" if required else ""
+    options = "".join(f'<option value="{_e(item)}"></option>' for item in items)
+    select_options = "".join(f'<option value="{_e(item)}">{_e(item)}</option>' for item in items[:350])
+    select = ""
+    if items:
+        select = f'''<select class="item-picker-select" onchange="var el=document.getElementById('{_e(input_id)}'); if(el && this.value) el.value=this.value; this.selectedIndex=0;">
+            <option value="">Item aus Liste anklicken ...</option>{select_options}
+          </select>'''
+    return f'''{select}
+      <input id="{_e(input_id)}" list="{_e(datalist_id)}" name="{_e(name)}"{required_attr} placeholder="{_e(placeholder)}" autocomplete="off">
+      <datalist id="{_e(datalist_id)}">{options}</datalist>
+      <small class="muted">{len(items)} bekannte Items aus Online-Datenbank/Needs/Auktionen.</small>'''
 
 def _render_loot_center(data: dict[str, Any], request: Optional[Request] = None, msg: str = "") -> str:
     if not data.get("ok"):
@@ -5376,10 +5480,10 @@ def _render_loot_center(data: dict[str, Any], request: Optional[Request] = None,
             _auction_link(aid, a.get("item")) if aid else a.get("item"),
             a.get("mode"),
             a.get("status_label") or _loot_status_label(a.get("status")),
-            a.get("bid_count"),
-            a.get("leader"),
+            (_auction_count_label(a.get("raw") or {})[1] if isinstance(a.get("raw"), dict) else a.get("bid_count")),
+            (_auction_leader_or_roll_text(a.get("raw") or {}, snap) if isinstance(a.get("raw"), dict) else a.get("leader")),
             _loot_winner_cell(a.get("raw") or {}, names),
-            _dt(a.get("ends_at")),
+            (_auction_timer_text(a.get("raw") or {}) if isinstance(a.get("raw"), dict) else _dt(a.get("ends_at"))),
             a.get("next_step"),
         ])
 
@@ -5390,11 +5494,11 @@ def _render_loot_center(data: dict[str, Any], request: Optional[Request] = None,
             _auction_link(aid, a.get("item")) if aid else a.get("item"),
             a.get("mode"),
             a.get("status_label") or _loot_status_label(a.get("status")),
-            a.get("bid_count"),
-            a.get("leader"),
+            (_auction_count_label(a.get("raw") or {})[1] if isinstance(a.get("raw"), dict) else a.get("bid_count")),
+            (_auction_leader_or_roll_text(a.get("raw") or {}, snap) if isinstance(a.get("raw"), dict) else a.get("leader")),
             f"{a.get('main_need_count', 0)} / {a.get('secondary_need_count', 0)}",
             a.get("window") or "—",
-            _dt(a.get("ends_at")),
+            (_auction_timer_text(a.get("raw") or {}) if isinstance(a.get("raw"), dict) else _dt(a.get("ends_at"))),
         ])
 
     handover_rows = []
@@ -5404,7 +5508,7 @@ def _render_loot_center(data: dict[str, Any], request: Optional[Request] = None,
             _auction_link(aid, a.get("item")) if aid else a.get("item"),
             _loot_winner_cell(a.get("raw") or {}, names),
             a.get("leader"),
-            _dt(a.get("ends_at")),
+            (_auction_timer_text(a.get("raw") or {}) if isinstance(a.get("raw"), dict) else _dt(a.get("ends_at"))),
             a.get("next_step"),
         ])
 
@@ -5415,14 +5519,14 @@ def _render_loot_center(data: dict[str, Any], request: Optional[Request] = None,
             _auction_link(aid, a.get("item")) if aid else a.get("item"),
             a.get("mode"),
             f"{a.get('main_need_count', 0)} / {a.get('secondary_need_count', 0)}",
-            _dt(a.get("ends_at")),
+            (_auction_timer_text(a.get("raw") or {}) if isinstance(a.get("raw"), dict) else _dt(a.get("ends_at"))),
             a.get("next_step"),
         ])
 
     need_rows = []
     for n in center["needs"][:150]:
         need_rows.append([
-            n.get("item"),
+            _loot_text(n.get("item")),
             n.get("main_count"),
             _loot_people_html(n.get("main") or []),
             n.get("secondary_count"),
@@ -5437,10 +5541,10 @@ def _render_loot_center(data: dict[str, Any], request: Optional[Request] = None,
             _auction_link(aid, a.get("item")) if aid else a.get("item"),
             a.get("mode"),
             _loot_status_label(a.get("status")),
-            a.get("bid_count"),
-            a.get("leader"),
+            (_auction_count_label(a.get("raw") or {})[1] if isinstance(a.get("raw"), dict) else a.get("bid_count")),
+            (_auction_leader_or_roll_text(a.get("raw") or {}, snap) if isinstance(a.get("raw"), dict) else a.get("leader")),
             _loot_winner_cell(a.get("raw") or {}, names),
-            _dt(a.get("ends_at")),
+            (_auction_timer_text(a.get("raw") or {}) if isinstance(a.get("raw"), dict) else _dt(a.get("ends_at"))),
         ])
 
     drop_msg = f"<p class='muted'>{_e(msg)}</p>" if msg else ""
@@ -5453,7 +5557,7 @@ def _render_loot_center(data: dict[str, Any], request: Optional[Request] = None,
             <form method="post" action="/admin/loot/drop" style="display:grid;gap:10px;">
               <h3>📦 Loot gedroppt</h3>
               <input type="hidden" name="drop_type" value="loot_drop">
-              <label>Item aus Loot-Katalog<br><input name="item" required placeholder="z. B. Aridus Stab" style="width:100%;padding:12px;border-radius:12px;border:1px solid rgba(255,255,255,.16);background:rgba(0,0,0,.22);color:inherit"></label>
+              <label>Item aus Loot-Katalog<br>{_loot_item_picker_html(snap, input_id="loot-drop-item", placeholder="z. B. Aridus Stab")}</label>
               <button class="btn" type="submit" onclick="return confirm('Loot-Drop an den Bot senden?');">Loot-Drop erstellen</button>
               <p class="muted">Bot prüft Main-Need → Second-Need → freie Auktion.</p>
             </form>
@@ -5481,11 +5585,11 @@ def _render_loot_center(data: dict[str, Any], request: Optional[Request] = None,
     <section class="grid">{cards}</section>
     <section class="panel"><h2>🔎 Schneller Truhencheck</h2><form method="get" action="/loot-check" style="display:flex;gap:10px;flex-wrap:wrap;align-items:center"><input name="item" placeholder="Itemname eingeben, z. B. Aridus Stab" style="min-width:280px;flex:1;padding:12px;border-radius:12px;border:1px solid rgba(255,255,255,.16);background:rgba(0,0,0,.22);color:inherit"><button class="btn" type="submit">Need prüfen</button></form><p class="muted">Prüft Main-/Second-Needs und ob dazu schon eine Auktion läuft.</p></section>
     {drop_panel}
-    <section class="panel"><h2>🔥 Nächste Loot-Aktionen</h2><p class="muted">Das ist die Arbeitsliste: Übergaben, offene Auktionen, Sale/Freie-Auktion-Kandidaten und aktive Auktionen ohne Gebote.</p>{_table(['Item','Bereich','Status','Gebote','Führend','Gewinner','Ende','Nächster Schritt'], action_rows, placeholder='Aktionen durchsuchen…')}</section>
-    <section class="panel"><h2>🟢 Aktive Auktionen</h2>{_table(['Item','Bereich','Status','Gebote','Führend','Main/Second Need','Regel','Ende'], active_rows, placeholder='Aktive Auktionen durchsuchen…')}</section>
-    <section class="split"><div class="panel"><h2>🏁 Übergabe offen</h2>{_table(['Item','Gewinner','Führend','Ende','Nächster Schritt'], handover_rows, placeholder='Übergaben durchsuchen…')}</div><div class="panel"><h2>🟡 Ohne Gebot / Sale prüfen</h2>{_table(['Item','Bereich','Main/Second Need','Ende','Hinweis'], no_bid_rows, placeholder='Ohne Gebot durchsuchen…')}</div></section>
+    <section class="panel"><h2>🔥 Nächste Loot-Aktionen</h2><p class="muted">Das ist die Arbeitsliste: Übergaben, offene Auktionen, Sale/Freie-Auktion-Kandidaten und aktive Auktionen ohne Gebote.</p>{_table(['Item','Bereich','Status','Gebote/Würfe','Führung/Wurf','Gewinner','Timer','Nächster Schritt'], action_rows, placeholder='Aktionen durchsuchen…')}</section>
+    <section class="panel"><h2>🟢 Aktive Auktionen</h2>{_table(['Item','Bereich','Status','Gebote/Würfe','Führung/Wurf','Main/Second Need','Regel','Timer'], active_rows, placeholder='Aktive Auktionen durchsuchen…')}</section>
+    <section class="split"><div class="panel"><h2>🏁 Übergabe offen</h2>{_table(['Item','Gewinner','Führend','Ende','Nächster Schritt'], handover_rows, placeholder='Übergaben durchsuchen…')}</div><div class="panel"><h2>🟡 Ohne Gebot / Sale prüfen</h2>{_table(['Item','Bereich','Main/Second Need','Timer','Hinweis'], no_bid_rows, placeholder='Ohne Gebot durchsuchen…')}</div></section>
     <section class="panel"><h2>🎯 Need-Spieler pro Item</h2><p class="muted">Damit sieht man direkt, ob ein Drop Main-/Second-Need-Spieler hat und ob schon eine Auktion dazu läuft.</p>{_table(['Item','Main','Main-Spieler','Second','Second-Spieler','aktive Auktionen'], need_rows, placeholder='Need-Item suchen…')}</section>
-    <section class="panel"><h2>📜 Auktionshistorie</h2>{_table(['Item','Bereich','Status','Gebote','Führend','Gewinner','Ende'], history_rows, placeholder='Historie durchsuchen…')}</section>
+    <section class="panel"><h2>📜 Auktionshistorie</h2>{_table(['Item','Bereich','Status','Gebote/Würfe','Führung/Wurf','Gewinner','Timer'], history_rows, placeholder='Historie durchsuchen…')}</section>
     """
     return _html_shell("Loot · Ebo Dashboard", body)
 
@@ -7109,7 +7213,7 @@ def _slot_options_html() -> str:
     return "".join(f'<option value="{_e(slot)}">{_e(slot)}</option>' for slot in ["Waffe 1","Waffe 2","Fähigkeitskern","Helm","Brust","Hose","Handschuhe","Schuhe","Brosche","Ohrringe","Kette","Armband","Ring 1","Ring 2","Gürtel","Umhang"])
 
 
-def _render_need_editor_panel(user_id: int, current_user: Optional[dict[str, Any]], requests: list[dict[str, Any]]) -> str:
+def _render_need_editor_panel(user_id: int, current_user: Optional[dict[str, Any]], requests: list[dict[str, Any]], snap: Optional[dict[str, Any]] = None) -> str:
     req_rows = []
     for r in requests[:30]:
         p = r.get("payload") if isinstance(r.get("payload"), dict) else {}
@@ -7117,6 +7221,7 @@ def _render_need_editor_panel(user_id: int, current_user: Optional[dict[str, Any
         detail = res.get("message") or res.get("error") or p.get("item_name") or p.get("item_text") or p.get("item_id") or "—"
         req_rows.append([_dt(r.get("requested_at")), _need_change_status_label(r.get("status")), r.get("action_type"), p.get("tab"), p.get("slot"), _short(detail, 120)])
     actor_hint = "Du bearbeitest deine eigene Needliste." if current_user else "Discord-Login nötig."
+    picker = _loot_item_picker_html(snap or {}, input_id=f"need-item-{int(user_id)}", name="item_text", required=False, placeholder="Item aus Liste wählen oder tippen")
     return f"""
     <section class="panel" id="need-editor">
       <h2>✍️ Needliste bearbeiten</h2>
@@ -7126,7 +7231,7 @@ def _render_need_editor_panel(user_id: int, current_user: Optional[dict[str, Any
           <input type="hidden" name="action_type" value="set">
           <label>Bereich<br><select name="tab" style="width:100%; padding:10px; border-radius:10px; background:#08090d; color:var(--text); border:1px solid var(--line);"><option value="Main">Main</option><option value="Secondary">Secondary</option></select></label>
           <label>Slot<br><select name="slot" style="width:100%; padding:10px; border-radius:10px; background:#08090d; color:var(--text); border:1px solid var(--line);">{_slot_options_html()}</select></label>
-          <label>Itemname oder Item-ID<br><input name="item_text" maxlength="160" placeholder="z. B. Aridus Stab" style="width:100%; padding:10px; border-radius:10px; background:#08090d; color:var(--text); border:1px solid var(--line);"></label>
+          <label>Itemname oder Item-ID<br>{picker}</label>
           <button class="btn" type="submit" style="border:0; cursor:pointer;">Need setzen</button>
         </form>
         <form method="post" action="/portal/member/{int(user_id)}/need-change" style="display:grid; gap:10px; align-content:start;">
@@ -7200,7 +7305,7 @@ def _render_member_portal(data: dict[str, Any], user_id: int, request: Request, 
     <section class="panel"><h2>📅 Laufende & kommende Events</h2>{_table(['Event','Zeit','Status','Deine Anmeldung','Aktion'], event_rows, placeholder='Events durchsuchen…')}</section>
     <section class="panel"><h2>⚔️ Laufende Auktionen</h2><p class="muted">Zum Bieten die Auktion öffnen. Bieten läuft weiterhin sicher über Bot-Queue.</p>{_table(['Item','Bereich','Start/Preis','Führend','Ende','Aktion'], auction_rows, placeholder='Auktionen durchsuchen…')}</section>
     <section class="panel" id="needs"><h2>🎁 Deine Needliste</h2><div class="split"><div>{_need_list_html('Main-Needs', main_needs)}</div><div>{_need_list_html('Secondary-Needs', sec_needs)}</div></div></section>
-    {_render_need_editor_panel(int(user_id), _current_user(request), need_requests)}
+    {_render_need_editor_panel(int(user_id), _current_user(request), need_requests, snap)}
     <section class="panel"><h2>🪙 EC-Verlauf</h2>{_table(['Zeit','Betrag','Typ','Grund'], tx_rows, placeholder='EC durchsuchen…')}</section>
     <section class="panel"><h2>🏆 Loot-Historie</h2>{_table(['Item','Bereich','EC','Zeit'], loot_rows, placeholder='Loot durchsuchen…')}</section>
     """
@@ -7254,24 +7359,30 @@ def _render_member_home(data: dict[str, Any], request: Request) -> str:
     auction_rows: list[list[Any]] = []
     for a in active_auctions[:30]:
         aid = str(a.get("auction_id") or "")
+        count_title, count_value, _count_sub = _auction_count_label(a)
         auction_rows.append([
-            _auction_link(aid, a.get("item_name") or a.get("item") or aid),
+            _auction_link(aid, _loot_text(a.get("item_name") or a.get("item") or aid)),
             _phase_label(a),
             _loot_effective_status_label(a),
-            _auction_leader_text(a, names),
-            _dt(a.get("ends_at") or a.get("end_at") or a.get("expires_at")),
+            f"{count_value} {count_title}",
+            _auction_leader_or_roll_text(a, snap),
+            _auction_timer_text(a),
             _raw(f'<a class="btn" href="/auction/{_e(aid)}">Öffnen</a>') if aid else "—",
         ])
+
+    my_ec_rows = [[_dt(tx.get("created_at")), _fmt_ec(tx.get("amount")), tx.get("raw_type") or tx.get("type") or "—", _short(tx.get("reason"), 160)] for tx in (_tx_for_user(snap, int(uid or 0), limit=12) if uid else [])]
+    my_ec_balance = _balance_map(snap).get(int(uid or 0)) if uid else None
 
     cards = "".join([
         _card("Mitglieder", len(member_rows), "Gildenübersicht"),
         _card("Laufende Events", len(running_events), "bis 1h nach Start"),
         _card("Laufende Auktionen", len(active_auctions), "Bieten/Kaufen möglich"),
+        _card("Meine EC", _fmt_ec(my_ec_balance) if my_ec_balance is not None else "—", "aktueller Stand"),
         _card("Profil", display, "eigene Daten & Needs"),
     ])
 
     body = f"""
-    <nav class="topnav"><a href="/member">Start</a><a href="#members">Mitglieder</a><a href="#events">Events</a><a href="#auctions">Auktionen</a><a href="/portal">Eigenes Profil</a><a href="/portal#needs">Meine Needs</a></nav>
+    <nav class="topnav"><a href="/member">Start</a><a href="#members">Mitglieder</a><a href="#events">Events</a><a href="#auctions">Auktionen</a><a href="#my-ec">Mein EC</a><a href="/portal">Eigenes Profil</a><a href="/portal#needs">Meine Needs</a></nav>
     <section class="hero">
       <div>
         <div class="eyebrow">Mitgliederbereich</div>
@@ -7286,7 +7397,8 @@ def _render_member_home(data: dict[str, Any], request: Request) -> str:
     </section>
     <section class="grid">{cards}</section>
     <section class="panel" id="events"><h2>📅 Laufende Events</h2><p class="muted">Nach deiner Regel sichtbar ab Erstellung bis 1 Stunde nach Eventbeginn.</p>{_table(['Event','Zeit','Status','Deine Anmeldung'], event_rows, placeholder='Events durchsuchen…')}</section>
-    <section class="panel" id="auctions"><h2>🏆 Laufende Auktionen</h2><p class="muted">Zum Bieten oder Kaufen die Auktion öffnen. Aktionen laufen weiter über die Bot-Queue.</p>{_table(['Item','Bereich','Status','Führend','Ende','Aktion'], auction_rows, placeholder='Auktionen durchsuchen…')}</section>
+    <section class="panel" id="auctions"><h2>🏆 Laufende Auktionen</h2><p class="muted">Zum Bieten oder Kaufen die Auktion öffnen. Aktionen laufen weiter über die Bot-Queue.</p>{_table(['Item','Bereich','Status','Gebote/Würfe','Führung/Wurf','Timer','Aktion'], auction_rows, placeholder='Auktionen durchsuchen…')}</section>
+    <section class="panel" id="my-ec"><h2>🪙 Mein EC-Verlauf</h2>{_table(['Zeit','Betrag','Typ','Grund'], my_ec_rows, placeholder='EC-Verlauf durchsuchen…')}</section>
     <section class="panel" id="members"><h2>👥 Mitglieder</h2>{_table(['Discord','Ingame','Rolle','Gearscore'], member_rows, placeholder='Mitglieder durchsuchen…')}</section>
     """
     return _html_shell("Mitgliederbereich · Ebo Dashboard", body, nav_mode="member")
