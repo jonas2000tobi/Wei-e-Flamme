@@ -32,7 +32,7 @@ if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 ASSET_VER = "ebo-phase3-database-start"
-DASHBOARD_RELEASE_VERSION = "1.1.8 · Phase 3.8 Events Read-Cutover"
+DASHBOARD_RELEASE_VERSION = "1.1.9 · Phase 3.9 Online-DB Finalisierung"
 
 
 def _database_url() -> str:
@@ -437,6 +437,23 @@ def _phase3_json(value: Any, default: Any = None) -> Any:
         return json.loads(str(value or ""))
     except Exception:
         return default
+
+
+def _json_safe(value: Any) -> Any:
+    """Macht DB-/Snapshot-Daten sicher für JSONResponse.
+
+    psycopg liefert bei TIMESTAMPTZ echte datetime-Objekte. JSONResponse kann
+    die nicht selbst serialisieren. Diese Funktion hält Status-APIs stabil.
+    """
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, tuple):
+        return [_json_safe(v) for v in value]
+    return value
 
 
 def _phase3_ec_pg_payload(guild_id: Any, snap: dict[str, Any]) -> Optional[dict[str, Any]]:
@@ -3162,6 +3179,18 @@ def _render_auction_detail(data: dict[str, Any], auction_id: str, current_user: 
     guild_id = _safe_guild_id(data)
     action_panel = _loot_dashboard_action_panel(int(guild_id), auction, current_user, snap) if guild_id else ""
     queue_panel = _loot_action_queue_panel(int(guild_id), auction_id) if guild_id else ""
+    recent_actions = _loot_action_requests_for_auction(int(guild_id), auction_id, limit=10) if guild_id else []
+    queue_counts = Counter(str(r.get("status") or "").lower() for r in recent_actions)
+    auto_refresh = bool(_loot_is_active(auction) or queue_counts.get("pending") or queue_counts.get("processing"))
+    refresh_panel = ""
+    if auto_refresh:
+        refresh_panel = """
+        <section class='panel'>
+          <h2>🔄 Live-Aktualisierung</h2>
+          <p class='muted'>Diese Seite lädt sich alle 15 Sekunden neu, solange die Auktion aktiv ist oder Dashboard-Aktionen offen sind.</p>
+          <script>setTimeout(function(){ if(!document.hidden){ window.location.reload(); } }, 15000);</script>
+        </section>
+        """
     msg_panel = f"<section class='panel'><p>{_e(msg)}</p></section>" if msg else ""
     state_panel = ""
     if _loot_effective_status_key(auction) == "expired_waiting":
@@ -3184,6 +3213,7 @@ def _render_auction_detail(data: dict[str, Any], auction_id: str, current_user: 
     </section>
     {msg_panel}
     {state_panel}
+    {refresh_panel}
     <section class="grid">{cards}</section>
     {action_panel}
     {queue_panel}
@@ -11330,10 +11360,10 @@ def export_attendance_ec_preview_csv(event_id: str, full_ec: Optional[float] = N
 # Phase 3 · Postgres-Datenbasis vorbereiten
 # ---------------------------------------------------------------------------
 # Ziel dieser Phase:
-# - JSON/Snapshot bleibt Hauptquelle.
-# - Postgres bekommt sichere Spiegel-Tabellen.
-# - Dashboard kann DB-Status und Vergleich anzeigen.
-# - Es wird nichts gelöscht und kein harter Cutover gemacht.
+# - Dashboard liest Phase-3-Tabellen Postgres-first.
+# - Bot speichert weiterhin JSON und spiegelt direkt nach Postgres.
+# - JSON bleibt Backup/Fallback und lokale Bot-Sicherheitskopie.
+# - Es wird nichts gelöscht.
 
 PHASE3_TABLES = [
     "phase3_members",
@@ -11646,8 +11676,8 @@ def _phase3_status_payload() -> dict[str, Any]:
     out: dict[str, Any] = {
         "ok": False,
         "database_url": bool(_database_url()),
-        "phase": "3.1",
-        "mode": "lesen + spiegeln, kein Cutover",
+        "phase": "3.9",
+        "mode": "Dashboard Postgres-first · Bot JSON+Postgres-Spiegelung",
         "tables": {},
         "counts": {},
         "latest_runs": [],
@@ -12361,11 +12391,11 @@ def _render_phase3_ec_panel(payload: dict[str, Any]) -> str:
     return f"""
     <section class='panel'>
       <h2>Phase 3.2 · EC/DKP</h2>
-      <p>EC ist noch nicht hart umgestellt. JSON bleibt Backup/Fallback; Postgres ist die Bot-Spiegelung für die Prüfung.</p>
+      <p>EC läuft im Dashboard Postgres-first. Der Bot spiegelt EC-Konten, Transaktionen und Eventchecks nach jedem Speichern in Postgres.</p>
       <div class='grid'>
         <div class='card'><b>Dashboard-Snapshot</b><p>Kann unvollständig sein und zeigt nur exportierte Ausschnitte.</p></div>
         <div class='card'><b>Postgres</b><p>Enthält die vom Bot gespiegelten EC-Konten und EC-Verläufe.</p></div>
-        <div class='card'><b>Noch kein Cutover</b><p>Postgres wird erst nach Prüfung Hauptquelle.</p></div>
+        <div class='card'><b>Read-Cutover aktiv</b><p>Dashboard nutzt Postgres, wenn die Phase-3-Tabellen gefüllt sind.</p></div>
         <div class='card'><b>JSON bleibt sicher</b><p>Alte JSON-Daten werden nicht gelöscht.</p></div>
       </div>
       {_table(['Bereich','Dashboard-Snapshot','Postgres/Bot-Spiegelung','Status'], rows, searchable=False)}
@@ -12413,7 +12443,7 @@ def _render_phase3_loot_panel(payload: dict[str, Any]) -> str:
     return f"""
     <section class='panel'>
       <h2>Phase 3.3 · Loot / Needs / Auktionen</h2>
-      <p>Loot-Daten werden jetzt parallel nach Postgres gespiegelt. Dashboard/Bot bleiben weiterhin JSON-kompatibel; kein harter Cutover.</p>
+      <p>Loot/Needs/Auktionen laufen im Dashboard Postgres-first. Bot speichert JSON und spiegelt Needs, Auktionen, Gebote und Historie nach Postgres.</p>
       <div class='grid'>
         <div class='card'><b>Needs</b><p>Aktuelle Need-Slots werden in phase3_loot_needs gespiegelt.</p></div>
         <div class='card'><b>Auktionen</b><p>Auktionen und Status landen in phase3_loot_auctions.</p></div>
@@ -12444,7 +12474,7 @@ def _phase3_live_status_payload(payload: dict[str, Any]) -> dict[str, Any]:
         warnings.append("Tabelle phase3_event_rsvps fehlt noch. Bitte Tabellen vorbereiten ausführen.")
     if not _database_url():
         warnings.append("DATABASE_URL fehlt. Postgres kann nicht genutzt werden.")
-    warnings.append("Hinweis: Phase 3.4 spiegelt Profile/Mitglieder, Events, Teilnehmer/RSVPs und Abwesenheiten. JSON/Snapshot bleibt weiterhin Hauptquelle.")
+    warnings.append("Hinweis: Dashboard liest Events/Profile Postgres-first. JSON bleibt lokale Bot-Sicherheitskopie und Fallback.")
     ready = bool(_database_url()) and db_status.get("tables", {}).get("phase3_members") and db_status.get("tables", {}).get("phase3_events") and db_status.get("tables", {}).get("phase3_event_rsvps") and db_status.get("tables", {}).get("phase3_absences")
     return {"ok": bool(ready), "pairs": pairs, "database": db_status, "warnings": warnings}
 
@@ -12463,7 +12493,7 @@ def _render_phase3_live_panel(payload: dict[str, Any]) -> str:
     return f"""
     <section class='panel'>
       <h2>Phase 3.4 · Events / Profile / Abwesenheiten</h2>
-      <p>Restliche Live-Daten werden nach Postgres gespiegelt. Noch kein Cutover: Bot/Dashboard bleiben JSON- und Snapshot-kompatibel.</p>
+      <p>Events/Profile/Abwesenheiten werden nach Postgres gespiegelt. Das Dashboard liest diese Bereiche bevorzugt aus Postgres.</p>
       <div class='grid'>
         <div class='card'><b>Profile</b><p>Mitglieder/Profile werden aus Snapshot-Profilen und Insights zusammengeführt.</p></div>
         <div class='card'><b>Events</b><p>Event-Stammdaten landen in phase3_events.</p></div>
@@ -12475,7 +12505,47 @@ def _render_phase3_live_panel(payload: dict[str, Any]) -> str:
     </section>
     """
 
+def _phase3_cutover_summary(payload: dict[str, Any]) -> dict[str, Any]:
+    ec = payload.get("phase3_ec_read_cutover") or {}
+    loot = payload.get("phase3_loot_read_cutover") or {}
+    events = payload.get("phase3_events_read_cutover") or {}
+    active = {
+        "ec": bool(ec.get("active")),
+        "loot": bool(loot.get("active")),
+        "events": bool(events.get("active")),
+    }
+    return {
+        "ok": all(active.values()),
+        "database_url": bool(_database_url()),
+        "read_mode": "postgres_first",
+        "bot_write_mode": "json_plus_postgres_mirror",
+        "json_role": "backup_fallback_and_bot_local_store",
+        "active": active,
+        "sources": {
+            "ec": ec.get("source") or "snapshot_fallback",
+            "loot": loot.get("source") or "snapshot_fallback",
+            "events": events.get("source") or "snapshot_fallback",
+        },
+        "counts": {
+            "ec_balances": ec.get("balances"),
+            "loot_needs": loot.get("need_entries"),
+            "loot_auctions": loot.get("auctions"),
+            "members": events.get("members"),
+            "events": events.get("events"),
+            "event_rsvps": events.get("event_rsvps"),
+        },
+        "warnings": [
+            msg for ok, msg in [
+                (active["ec"], "EC/DKP liest noch Snapshot-Fallback."),
+                (active["loot"], "Loot/Needs/Auktionen liest noch Snapshot-Fallback."),
+                (active["events"], "Events/Profile liest noch Snapshot-Fallback."),
+            ] if not ok
+        ],
+    }
+
+
 def _render_phase3_database_page(payload: dict[str, Any]) -> str:
+    cutover = _phase3_cutover_summary(payload)
     snap_counts = _phase3_extract_snapshot_counts(payload)
     db_status = _phase3_status_payload()
     table_rows = []
@@ -12512,15 +12582,23 @@ def _render_phase3_database_page(payload: dict[str, Any]) -> str:
         ])
     warnings = db_status.get("warnings") or []
     warn_html = "" if not warnings else "<section class='panel'><h2>Warnungen</h2><ul>" + "".join(f"<li>{_e(w)}</li>" for w in warnings) + "</ul></section>"
-    status_text = "✅ Datenbank bereit" if db_status.get("ok") else "⚠️ Datenbank vorbereiten"
+    status_text = "✅ Online-Datenbank aktiv" if cutover.get("ok") else ("✅ Datenbank bereit" if db_status.get("ok") else "⚠️ Datenbank vorbereiten")
+    cut_rows = [
+        ["EC/DKP", "✅ Postgres" if (cutover.get("active") or {}).get("ec") else "⚠️ Fallback", (cutover.get("sources") or {}).get("ec", "—"), (cutover.get("counts") or {}).get("ec_balances") or 0],
+        ["Loot/Needs/Auktionen", "✅ Postgres" if (cutover.get("active") or {}).get("loot") else "⚠️ Fallback", (cutover.get("sources") or {}).get("loot", "—"), (cutover.get("counts") or {}).get("loot_needs") or 0],
+        ["Events/Profile", "✅ Postgres" if (cutover.get("active") or {}).get("events") else "⚠️ Fallback", (cutover.get("sources") or {}).get("events", "—"), (cutover.get("counts") or {}).get("members") or 0],
+    ]
+    cut_warn = cutover.get("warnings") or []
+    cut_warn_html = "" if not cut_warn else "<div class='notice'><b>Cutover-Hinweise</b><ul>" + "".join(f"<li>{_e(w)}</li>" for w in cut_warn) + "</ul></div>"
     return _html_shell("Phase 3 · Datenbank · Ebo Dashboard", f"""
-    <nav class='topnav'><a href='/'>← Kommando</a><a href='/release'>Release</a><a href='/admin'>Admin</a><a href='/database-audit'>Cutover-Prüfung</a><a href='/api/database-status'>API</a><a href='/api/database-ec-status'>EC API</a><a href='/api/database-live-status'>Live API</a></nav>
-    <section class='hero'><div><h1>Phase 3 · Daten sauberer machen</h1><p>{_e(status_text)} · JSON bleibt aktuell Hauptquelle. Postgres wird zuerst nur vorbereitet und gespiegelt. Der Dashboard-Snapshot ist nur ein Ausschnitt.</p></div><div class='page-actions'><a class='btn' href='/database/init'>Tabellen vorbereiten</a><a class='btn' href='/database/mirror-snapshot'>Snapshot spiegeln</a></div></section>
-    <section class='panel'><h2>4-Schritte-Plan</h2><div class='grid'>
-      <div class='card'><b>1 · Grundlage</b><p>Tabellen erstellen, Snapshot sicher spiegeln, Vergleich anzeigen.</p></div>
-      <div class='card'><b>2 · EC/DKP</b><p>EC-Konten, Transaktionen, Event-Checks parallel schreiben und danach DB als Hauptquelle nutzen.</p></div>
-      <div class='card'><b>3 · Loot/Needs</b><p>Need-Einträge, Auktionen, Gebote und Loot-Historie nach Postgres ziehen.</p></div>
-      <div class='card'><b>4 · Events/Profile/Abwesenheit</b><p>Restliche Live-Daten migrieren. JSON bleibt Backup/Export.</p></div>
+    <nav class='topnav'><a href='/'>← Kommando</a><a href='/release'>Release</a><a href='/admin'>Admin</a><a href='/database-audit'>Cutover-Prüfung</a><a href='/api/database-cutover-status'>Cutover API</a><a href='/api/database-status'>Status API</a><a href='/api/database-live-status'>Live API</a></nav>
+    <section class='hero'><div><h1>Phase 3.9 · Online-Datenbank</h1><p>{_e(status_text)} · Dashboard liest Postgres-first. Bot schreibt sicher weiter lokal JSON und spiegelt direkt nach Postgres, damit JSON als Backup/Fallback erhalten bleibt.</p></div><div class='page-actions'><a class='btn' href='/database/init'>Tabellen vorbereiten</a><a class='btn' href='/database/mirror-snapshot'>Snapshot nachspiegeln</a></div></section>
+    <section class='panel'><h2>Cutover-Stand</h2><p>Das ist der relevante Zustand: Nicht ob JSON-Dateien noch existieren, sondern ob das Dashboard die Live-Bereiche aus Postgres liest.</p>{_table(['Bereich','Status','Quelle','Zeilen/Einträge'], cut_rows, searchable=False)}{cut_warn_html}</section>
+    <section class='panel'><h2>Jetzt gültige Architektur</h2><div class='grid'>
+      <div class='card'><b>Dashboard</b><p>Liest EC, Loot, Events und Profile bevorzugt aus Postgres.</p></div>
+      <div class='card'><b>Bot</b><p>Schreibt weiterhin JSON und spiegelt beim Speichern nach Postgres.</p></div>
+      <div class='card'><b>Dashboard-Aktionen</b><p>EC, Gebote, Käufe, Würfe und Drops laufen über Postgres-Queues zum Bot.</p></div>
+      <div class='card'><b>JSON</b><p>Bleibt Backup/Fallback und lokale Bot-Sicherheitskopie. Nicht löschen.</p></div>
     </div></section>
     {_render_phase3_ec_panel(payload)}
     {_render_phase3_loot_panel(payload)}
@@ -12529,7 +12607,7 @@ def _render_phase3_database_page(payload: dict[str, Any]) -> str:
     <section class='panel'><h2>Phase-3-Tabellen</h2>{_table(['Tabelle','Status','Zeilen'], table_rows, searchable=False)}</section>
     {warn_html}
     <section class='panel'><h2>Letzte Spiegelungen</h2>{_table(['Zeit','Modus','Status','Zahlen','Notiz'], run_rows or [['—','—','—','Noch keine Spiegelung','']], searchable=False)}</section>
-    <section class='panel'><h2>Sicherheitsregeln</h2><ul><li>Diese Seite löscht keine Daten.</li><li>JSON/Snapshot bleibt Hauptquelle.</li><li>Spiegelung ist idempotent: erneutes Ausführen aktualisiert vorhandene DB-Zeilen.</li><li>Erst nach Prüfung stellen wir einzelne Bereiche hart auf Postgres um.</li></ul></section>
+    <section class='panel'><h2>Sicherheitsregeln</h2><ul><li>Diese Seite löscht keine Daten.</li><li>Dashboard ist Postgres-first, sobald die Phase-3-Tabellen Daten liefern.</li><li>JSON bleibt bewusst erhalten und darf nicht überschrieben oder gelöscht werden.</li><li>Spiegelung ist idempotent: erneutes Ausführen aktualisiert vorhandene DB-Zeilen.</li></ul></section>
     """)
 
 
@@ -12544,25 +12622,31 @@ def database_page(_: bool = Depends(_auth)):
 @app.get("/api/database-status")
 def api_database_status(_: bool = Depends(_auth)):
     payload = _snapshot_payload()
-    return JSONResponse({"ok": True, "snapshot_counts": _phase3_extract_snapshot_counts(payload), "database": _phase3_status_payload()})
+    return JSONResponse(_json_safe({"ok": True, "snapshot_counts": _phase3_extract_snapshot_counts(payload), "cutover": _phase3_cutover_summary(payload), "database": _phase3_status_payload()}))
+
+
+@app.get("/api/database-cutover-status")
+def api_database_cutover_status(_: bool = Depends(_auth)):
+    payload = _snapshot_payload()
+    return JSONResponse(_json_safe(_phase3_cutover_summary(payload)))
 
 
 @app.get("/api/database-ec-status")
 def api_database_ec_status(_: bool = Depends(_auth)):
     payload = _snapshot_payload()
-    return JSONResponse(_phase3_ec_status_payload(payload))
+    return JSONResponse(_json_safe(_phase3_ec_status_payload(payload)))
 
 
 @app.get("/api/database-loot-status")
 def api_database_loot_status(_: bool = Depends(_auth)):
     payload = _snapshot_payload()
-    return JSONResponse(_phase3_loot_status_payload(payload))
+    return JSONResponse(_json_safe(_phase3_loot_status_payload(payload)))
 
 
 @app.get("/api/database-live-status")
 def api_database_live_status(_: bool = Depends(_auth)):
     payload = _snapshot_payload()
-    return JSONResponse(_phase3_live_status_payload(payload))
+    return JSONResponse(_json_safe(_phase3_live_status_payload(payload)))
 
 
 @app.get("/database/init")
