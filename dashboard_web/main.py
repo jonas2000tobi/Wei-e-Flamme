@@ -2502,7 +2502,8 @@ def _render_dashboard(data: dict[str, Any]) -> str:
 
     body = f"""
     <nav class="topnav">
-      <a href="#overview">Übersicht</a>
+      <a href="/status">← Statusansicht</a>
+      <a href="#overview">Admin-Übersicht</a>
       <a href="/members">Mitglieder</a>
       <a href="/needs">Needs</a>
       <a href="/loot">Loot</a>
@@ -3560,8 +3561,8 @@ def _sidebar_html() -> str:
       <button class="mobile-nav-toggle" type="button" onclick="document.body.classList.toggle('nav-open')">☰ Menü</button>
 
       <nav class="side-nav">
-        <a href="/" data-nav="home">🏰 Kommando</a>
-        <a href="/overview" data-nav="overview">📊 Gesamtübersicht</a>
+        <a href="/" data-nav="home">📡 Status</a>
+        <a href="/overview" data-nav="overview">🏰 Kommando</a>
 
         <details open>
           <summary>Gilde</summary>
@@ -3626,7 +3627,7 @@ def _member_sidebar_html() -> str:
       <button class="mobile-nav-toggle" type="button" onclick="document.body.classList.toggle('nav-open')">☰ Menü</button>
 
       <nav class="side-nav">
-        <a href="/member" data-nav="member-home">🏠 Start</a>
+        <a href="/member" data-nav="member-home">📡 Status</a>
         <a href="/member/members" data-nav="member-members">👥 Mitglieder</a>
         <a href="/member/events" data-nav="member-events">📅 Events</a>
         <a href="/member/auctions" data-nav="member-auctions">🏆 Auktionen</a>
@@ -3774,6 +3775,11 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "admin") -> str:
     .member-summary-item {{ display:grid; grid-template-columns:minmax(0,1fr) auto; gap:12px; align-items:center; padding:12px 13px; border:1px solid rgba(214,168,79,.14); border-radius:14px; background:rgba(32,35,45,.55); }}
     .member-summary-title {{ font-weight:800; color:var(--gold); overflow-wrap:anywhere; }}
     .member-summary-meta {{ color:var(--muted); font-size:13px; margin-top:3px; }}
+    .status-hero-logo {{ width:92px; height:92px; border-radius:24px; padding:8px; border:1px solid rgba(214,168,79,.32); background:rgba(214,168,79,.08); box-shadow:0 14px 30px rgba(0,0,0,.35); flex:0 0 auto; }}
+    .status-hero-logo img {{ width:100%; height:100%; object-fit:contain; }}
+    .status-map-frame {{ width:100%; height:min(52vh,600px); min-height:330px; border:0; border-radius:14px; background:#05060a; box-shadow:0 16px 34px rgba(0,0,0,.38); }}
+    .status-grid-compact {{ grid-template-columns:repeat(4,minmax(0,1fr)); }}
+    .status-source-note {{ display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-top:10px; }}
     code {{ background:#05060a; border:1px solid var(--line); padding:2px 5px; border-radius:6px; }}
     .empty {{ color:var(--muted); padding:18px 16px 18px 58px; min-height:58px; display:flex; align-items:center; border:1px dashed rgba(214,168,79,.18); border-radius:14px; background:linear-gradient(90deg,rgba(10,11,15,.70),rgba(24,26,34,.54)); position:relative; }}
     .empty::before {{ content:""; position:absolute; left:16px; top:50%; width:30px; height:30px; transform:translateY(-50%); background:url("{_asset('status_ec_offen.png')}") center / contain no-repeat; opacity:.78; }}
@@ -3837,6 +3843,8 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "admin") -> str:
       .home-item .pill {{ grid-column:2; justify-self:start; }}
       .member-summary-item {{ grid-template-columns:1fr; }}
       .member-start-logo {{ width:70px; height:70px; border-radius:18px; }}
+      .status-hero-logo {{ width:72px; height:72px; border-radius:18px; }}
+      .status-map-frame {{ height:420px; min-height:320px; }}
       .need-slot-row {{ grid-template-columns:1fr; gap:3px; }}
       .need-slot-row span {{ font-size:12px; text-transform:uppercase; letter-spacing:.04em; color:var(--gold); }}
       .need-two-step-picker {{ grid-template-columns:1fr; }}
@@ -9293,6 +9301,161 @@ def _prio_pill(priority: Any) -> dict[str, str]:
     return _raw(f"<span class='pill'>{_e(label)}</span>")
 
 
+
+def _first_present_dict(*values: Any) -> dict[str, Any]:
+    for value in values:
+        if isinstance(value, dict) and value:
+            return value
+    return {}
+
+
+def _status_value(data: dict[str, Any], *keys: str, default: str = "—") -> str:
+    for key in keys:
+        value = data.get(key)
+        if value is None or value == "":
+            continue
+        if isinstance(value, bool):
+            return "Online" if value else "Offline"
+        return str(value)
+    return default
+
+
+def _status_countdown_to(value: Any) -> str:
+    dt = _dt_obj(value)
+    if not dt:
+        return "—"
+    seconds = int((dt - datetime.now(timezone.utc)).total_seconds())
+    if seconds <= 0:
+        return "jetzt / überfällig"
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, secs = divmod(rem, 60)
+    parts: list[str] = []
+    if days:
+        parts.append(f"{days} Tage")
+    if hours or days:
+        parts.append(f"{hours} Std")
+    parts.append(f"{minutes} Min")
+    parts.append(f"{secs} Sek")
+    return " ".join(parts)
+
+
+def _game_status_from_snapshot(snap: dict[str, Any]) -> dict[str, Any]:
+    """Liest vorbereitete Spielstatusdaten, falls ein Worker sie später liefert."""
+    raw = _first_present_dict(
+        snap.get("game_status"),
+        snap.get("game"),
+        snap.get("tl_status"),
+        snap.get("world_status"),
+        (snap.get("external") or {}).get("game_status") if isinstance(snap.get("external"), dict) else {},
+    )
+    region = _status_value(raw, "region", "game_region", "region_name", default="Europe")
+    server = _status_value(raw, "server_name", "server", "world", "shard", default="Fearless")
+    server_state = _status_value(raw, "server_status", "status", "online", "server_online", default="noch nicht verbunden")
+    population = _status_value(raw, "population", "server_population", "load", default="—")
+
+    phase = _status_value(raw, "daynight_state", "day_night", "time_state", "phase", default="noch nicht verbunden")
+    next_phase_at = raw.get("next_daynight_change_at") or raw.get("next_phase_at") or raw.get("next_change_at")
+    phase_sub = f"Wechsel in {_status_countdown_to(next_phase_at)}" if next_phase_at else "Questlog/Status-Cache noch nicht eingerichtet"
+
+    weather = _status_value(raw, "weather_state", "weather", "rain_state", default="noch nicht verbunden")
+    next_rain_at = raw.get("next_rain_at") or raw.get("rain_at") or raw.get("next_weather_at")
+    weather_sub = f"Nächster Regen in {_status_countdown_to(next_rain_at)}" if next_rain_at else "Regenplan noch nicht eingerichtet"
+
+    updated = _dt(raw.get("updated_at") or raw.get("source_updated_at") or raw.get("last_updated")) if raw else "—"
+    source = _status_value(raw, "source", "provider", default="lokaler Platzhalter")
+    map_url = _status_value(raw, "map_url", default="https://interactivemap.app/throne-and-liberty/maps/solisium?embed=light")
+    return {
+        "raw": raw,
+        "region": region,
+        "server": server,
+        "server_state": server_state,
+        "population": population,
+        "phase": phase,
+        "phase_sub": phase_sub,
+        "weather": weather,
+        "weather_sub": weather_sub,
+        "updated": updated,
+        "source": source,
+        "map_url": map_url,
+    }
+
+
+def _render_status_dashboard(data: dict[str, Any], request: Optional[Request] = None, *, nav_mode: str = "admin") -> str:
+    if not data.get("ok"):
+        return _html_shell(
+            "Status · Ebo Dashboard",
+            f"<section class='panel'><h1>📡 Status</h1><p class='muted'>{_e(data.get('error'))}</p></section>",
+            nav_mode=nav_mode,
+        )
+    snap: dict[str, Any] = data.get("snapshot") or {}
+    guild = snap.get("guild") or {}
+    li = _leadership_insights(snap)
+    member_filter = guild.get("member_filter") if isinstance(guild.get("member_filter"), dict) else {}
+    member_count = int(_num(member_filter.get("eligible_count"), li.get("member_count", 0)))
+    guild_name = str(guild.get("name") or "Ebolus")
+
+    running_events = list(li.get("running_events") or [])
+    guild_id = _safe_guild_id(data)
+    if guild_id:
+        seen_event_ids = {str(ev.get("event_id") or ev.get("id") or "") for ev in running_events if isinstance(ev, dict)}
+        for ev in _open_attendance_review_events_for_homepage(snap, guild_id, limit=8):
+            eid = str(ev.get("event_id") or ev.get("id") or "")
+            if eid and eid not in seen_event_ids:
+                running_events.append(ev)
+                seen_event_ids.add(eid)
+
+    auctions = (((snap.get("loot") or {}).get("auctions") or {}).get("items") or [])
+    active_auctions = [a for a in auctions if isinstance(a, dict) and _loot_is_active(a)]
+    active_auctions.sort(key=lambda a: _auction_timer_dt(a) or datetime.max.replace(tzinfo=timezone.utc))
+
+    game = _game_status_from_snapshot(snap)
+    top_cards = "".join([
+        _card("Mitglieder", member_count, "Gildenrolle / Dashboard-Mitglieder"),
+        _card("Laufende Events", len(running_events), "erstellt bis 1h nach Start"),
+        _card("Aktive Auktionen", len(active_auctions), "Auktionshaus / Müll / Sale"),
+        _card("Server", game.get("server"), game.get("region")),
+    ])
+    game_cards = "".join([
+        _card("Spielzeit", game.get("phase"), game.get("phase_sub")),
+        _card("Wetter", game.get("weather"), game.get("weather_sub")),
+        _card("Serverstatus", game.get("server_state"), f"Population: {game.get('population')}"),
+        _card("Quelle", game.get("source"), f"Aktualisiert: {game.get('updated')}"),
+    ])
+    map_url = str(game.get("map_url") or "https://interactivemap.app/throne-and-liberty/maps/solisium?embed=light")
+    direct_map_url = map_url.replace("?embed=light", "")
+    if nav_mode == "member":
+        nav_html = '<nav class="topnav"><a href="/member">Status</a><a href="/portal">Mein Portal</a><a href="/member/auctions">Loot</a><a href="/member/events">Events</a><a href="/member/members">Mitglieder</a><a href="/member/ec">Meine EC</a></nav>'
+    else:
+        nav_html = '<nav class="topnav"><a href="/status">Status</a><a href="/portal">Mein Portal</a><a href="/loot">Loot</a><a href="/events">Events</a><a href="/members">Mitglieder</a><a href="/overview">Adminbereich</a></nav>'
+    admin_action = ""
+    if nav_mode == "admin":
+        admin_action = '<div style="margin-left:auto;display:flex;gap:10px;align-items:center;flex-wrap:wrap;"><a class="btn" href="/overview">⚙️ Adminbereich öffnen</a></div>'
+    body = f"""
+    {nav_html}
+    <section class="hero">
+      <div style="display:flex;gap:16px;align-items:center;flex-wrap:wrap;">
+        <div class="status-hero-logo"><img src="{_asset('ebolus_logo.png')}" alt="Ebolus"></div>
+        <div>
+          <div class="eyebrow">Dashboard Status</div>
+          <h1>{_e(guild_name)}</h1>
+          <p class="muted">Kurzübersicht für alle. Details liegen sauber getrennt in Portal, Loot, Events und Mitglieder.</p>
+        </div>
+        {admin_action}
+      </div>
+    </section>
+    <section class="grid status-grid-compact">{top_cards}</section>
+    <section class="grid status-grid-compact">{game_cards}</section>
+    <section class="panel" id="map">
+      <h2>🗺️ Solisium Karte</h2>
+      <p class="muted">Interaktive Karte als eingebetteter Ausschnitt. Falls der Anbieter Einbettung blockiert, den Link direkt öffnen.</p>
+      <iframe class="status-map-frame" src="{_e(map_url)}" width="100%" height="600" style="border:none;border-radius:8px;" allowfullscreen loading="lazy"></iframe>
+      <div class="status-source-note"><a class="btn" href="{_e(direct_map_url)}" target="_blank" rel="noopener">Karte groß öffnen</a><span class="muted">Quelle: interactivemap.app</span></div>
+    </section>
+    """
+    return _html_shell("Status · Ebo Dashboard", body, nav_mode=nav_mode)
+
+
 def _render_leadership_dashboard(data: dict[str, Any]) -> str:
     if not data.get("ok"):
         return _html_shell(
@@ -9946,9 +10109,7 @@ def event_detail(event_id: str, _: bool = Depends(_auth)):
 @app.get("/member", response_class=HTMLResponse)
 def member_home(request: Request, _: bool = Depends(_auth)):
     try:
-        user = _current_user(request) or {}
-        # Admins können die Mitgliederansicht bewusst öffnen, bleiben sonst im vollen Dashboard.
-        return HTMLResponse(_render_member_home(_snapshot_payload(), request))
+        return HTMLResponse(_render_status_dashboard(_snapshot_payload(), request, nav_mode="member"))
     except Exception as exc:
         return HTMLResponse(_html_shell("Mitgliederbereich Fehler", f"<section class='panel'><h1>❌ Mitgliederbereich-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>", nav_mode="member"), status_code=500)
 
@@ -10487,15 +10648,21 @@ def overview(_: bool = Depends(_auth)):
 @app.get("/", response_class=HTMLResponse)
 def index(request: Request, _: bool = Depends(_auth)):
     user = _current_user(request) or {}
-    if str(user.get("role") or "") == "member":
-        return RedirectResponse("/member", status_code=303)
+    nav_mode = "member" if str(user.get("role") or "") == "member" else "admin"
     try:
-        return HTMLResponse(_render_leadership_dashboard(_snapshot_payload()))
+        return HTMLResponse(_render_status_dashboard(_snapshot_payload(), request, nav_mode=nav_mode))
     except Exception as exc:
         return HTMLResponse(
             _html_shell("Ebo Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
             status_code=500,
         )
+
+
+@app.get("/status", response_class=HTMLResponse)
+def status_page(request: Request, _: bool = Depends(_auth)):
+    user = _current_user(request) or {}
+    nav_mode = "member" if str(user.get("role") or "") == "member" else "admin"
+    return HTMLResponse(_render_status_dashboard(_snapshot_payload(), request, nav_mode=nav_mode))
 
 
 # ---------------------------------------------------------------------------
