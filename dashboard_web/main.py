@@ -31,7 +31,7 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
-ASSET_VER = "ebo-status-bg-polish-20260707"
+ASSET_VER = "ebo-status-arch-swap"
 DASHBOARD_RELEASE_VERSION = "1.2.0 · Status Playwright Worker"
 
 
@@ -3666,7 +3666,7 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "admin") -> str:
   <style>
     :root {{ --bg:#0f1014; --panel:#181a22; --panel2:#20232d; --text:#f1eadb; --muted:#a8a193; --gold:#d6a84f; --line:#333746; --red:#d96868; --green:#81c784; --side:#11121a; --side2:#171824; }}
     * {{ box-sizing:border-box; }} html {{ scroll-behavior:smooth; }}
-    body {{ margin:0; font-family:Inter, system-ui, Segoe UI, sans-serif; background:linear-gradient(180deg,rgba(15,16,20,.78),rgba(15,16,20,.98)), url("{_asset('dashboard_bg.webp')}") center top / cover fixed no-repeat; color:var(--text); overflow-x:hidden; }}
+    body {{ margin:0; font-family:Inter, system-ui, Segoe UI, sans-serif; background:linear-gradient(180deg,rgba(15,16,20,.82),rgba(15,16,20,.98)), url("{_asset('hero_banner.webp')}") center top / cover fixed no-repeat; color:var(--text); overflow-x:hidden; }}
     .app-shell {{ display:grid; grid-template-columns:260px minmax(0,1fr); min-height:100vh; }}
     .sidebar {{ position:sticky; top:0; height:100vh; overflow:auto; scrollbar-width:none; -ms-overflow-style:none; padding:18px 14px; background:linear-gradient(180deg,rgba(17,18,26,.97),rgba(11,12,18,.97)); border-right:1px solid rgba(214,168,79,.16); box-shadow:16px 0 45px rgba(0,0,0,.35); }}
     .sidebar::-webkit-scrollbar {{ width:0; height:0; display:none; }}
@@ -9975,52 +9975,35 @@ def _render_status_dashboard(data: dict[str, Any], request: Optional[Request] = 
     stats_href_auctions = "/member/auctions" if nav_mode == "member" else "/loot"
     hero_stats = f"""
       <div class="status-hero-stats">
-        <a class="status-hero-stat" data-kind="members" href="{stats_href_members}"><span>Mitglieder</span><strong>{member_count}</strong><small>Gildenrolle</small></a>
-        <a class="status-hero-stat" data-kind="events" href="{stats_href_events}"><span>Events</span><strong>{len(running_events)}</strong><small>laufend</small></a>
-        <a class="status-hero-stat" data-kind="auctions" href="{stats_href_auctions}"><span>Auktionen</span><strong>{len(active_auctions)}</strong><small>aktiv</small></a>
-        <div class="status-hero-stat compact" data-kind="server"><span>Server</span><strong>{_e(game.get('server') or 'Fearless')}</strong><small id="status-server-value">{_e(_mini_status_value('server', game.get('server_state')))}</small><small id="status-server-sub">{_e(game.get('region') or 'Europe')}</small></div>
-        <div class="status-hero-stat compact" data-kind="phase"><span>Spielzeit</span><strong id="status-phase-value">{_e(_mini_status_value('phase', game.get('phase')))}</strong><small id="status-phase-sub">{_e(game.get('phase_sub') or '—')}</small></div>
-        <div class="status-hero-stat compact" data-kind="weather"><span>Wetter</span><strong id="status-weather-value">{_e(_mini_status_value('weather', game.get('weather')))}</strong><small id="status-weather-sub">{_e(game.get('weather_sub') or '—')}</small></div>
+        <a class="status-hero-stat" href="{stats_href_members}"><span>Mitglieder</span><strong>{member_count}</strong><small>Gildenrolle</small></a>
+        <a class="status-hero-stat" href="{stats_href_events}"><span>Events</span><strong>{len(running_events)}</strong><small>laufend</small></a>
+        <a class="status-hero-stat" href="{stats_href_auctions}"><span>Auktionen</span><strong>{len(active_auctions)}</strong><small>aktiv</small></a>
+        <div class="status-hero-stat compact"><span>Server</span><strong>{_e(game.get('server') or 'Fearless')}</strong><small id="status-server-value">{_e(_mini_status_value('server', game.get('server_state')))}</small><small id="status-server-sub">{_e(game.get('region') or 'Europe')}</small></div>
+        <div class="status-hero-stat compact"><span>Spielzeit</span><strong id="status-phase-value">{_e(_mini_status_value('phase', game.get('phase')))}</strong><small id="status-phase-sub">{_e(game.get('phase_sub') or '—')}</small></div>
+        <div class="status-hero-stat compact"><span>Wetter</span><strong id="status-weather-value">{_e(_mini_status_value('weather', game.get('weather')))}</strong><small id="status-weather-sub">{_e(game.get('weather_sub') or '—')}</small></div>
       </div>
       <style>
-        .status-topnav-shell{{border:1px solid rgba(218,166,74,.44);border-radius:20px;padding:10px;margin:0 0 18px;background:linear-gradient(180deg,rgba(218,166,74,.12),rgba(8,10,16,.54));box-shadow:0 18px 44px rgba(0,0,0,.30), inset 0 0 0 1px rgba(255,221,151,.07);}}
+        .status-topnav-shell{{border:1px solid rgba(218,166,74,.34);border-radius:20px;padding:10px;margin:0 0 18px;background:linear-gradient(180deg,rgba(218,166,74,.09),rgba(11,14,22,.38));box-shadow:0 16px 40px rgba(0,0,0,.22), inset 0 0 0 1px rgba(255,221,151,.04);}}
         .status-topnav{{margin:0;}}
-        .status-topnav a{{border-color:rgba(218,166,74,.44);background:linear-gradient(180deg,rgba(26,28,36,.88),rgba(8,9,14,.82));box-shadow:inset 0 1px 0 rgba(255,233,179,.08),0 8px 20px rgba(0,0,0,.24);}}
-        .status-topnav a:hover{{border-color:rgba(255,212,128,.72);background:linear-gradient(180deg,rgba(78,34,28,.72),rgba(16,12,14,.86));}}
-        .status-main-hero{{position:relative;padding:34px 32px 28px;min-height:430px;border-radius:22px;border:1px solid rgba(218,166,74,.50);background:
-          linear-gradient(90deg,rgba(4,5,9,.94) 0%,rgba(6,7,12,.70) 22%,rgba(8,8,13,.50) 50%,rgba(6,7,12,.70) 78%,rgba(4,5,9,.94) 100%),
-          radial-gradient(circle at 50% 34%,rgba(218,166,74,.24),rgba(118,38,22,.10) 34%,transparent 62%),
-          linear-gradient(180deg,rgba(0,0,0,.25),rgba(0,0,0,.72)),
-          url("{_asset('ebolusback.png')}") center 54% / cover no-repeat !important;
-          box-shadow:0 28px 80px rgba(0,0,0,.58), inset 0 0 0 1px rgba(255,221,151,.10), inset 0 0 80px rgba(0,0,0,.44);}}
-        .status-main-hero::before{{content:"";position:absolute;inset:9px;border-radius:17px;border:1px solid rgba(218,166,74,.18);pointer-events:none;box-shadow:inset 0 0 38px rgba(218,166,74,.08);}}
-        .status-main-hero::after{{content:"";position:absolute;inset:0;border-radius:22px;pointer-events:none;background:linear-gradient(180deg,rgba(255,226,163,.08),transparent 18%,transparent 72%,rgba(0,0,0,.28)),radial-gradient(circle at 50% 18%,rgba(255,202,105,.14),transparent 28%);}}
-        .status-hero-inner{{position:relative;z-index:1;width:100%;display:flex;flex-direction:column;align-items:center;gap:18px;}}
+        .status-topnav a{{border-color:rgba(218,166,74,.34);}}
+        .status-main-hero{{padding:26px 28px;background:linear-gradient(180deg,rgba(6,8,12,.46),rgba(7,9,14,.78)), url("{_asset('status_arch_bg.png')}") center center / cover no-repeat;border:1px solid rgba(218,166,74,.34);box-shadow:0 18px 48px rgba(0,0,0,.42), inset 0 0 0 1px rgba(255,220,150,.04);}}
+        .status-hero-inner{{width:100%;display:flex;flex-direction:column;align-items:center;gap:18px;}}
         .status-hero-head{{display:flex;flex-direction:column;align-items:center;text-align:center;gap:12px;width:100%;}}
-        .status-hero-logo{{width:158px;height:158px;border-radius:34px;padding:13px;margin:0 auto;background:radial-gradient(circle at 35% 25%,rgba(255,219,141,.22),rgba(85,31,22,.22) 45%,rgba(8,10,16,.72));border:1px solid rgba(218,166,74,.55);box-shadow:0 24px 56px rgba(0,0,0,.54),0 0 42px rgba(218,166,74,.18),inset 0 0 0 1px rgba(255,231,175,.10);}}
-        .status-hero-logo img{{width:100%;height:100%;object-fit:contain;filter:drop-shadow(0 8px 18px rgba(0,0,0,.80)) drop-shadow(0 0 12px rgba(220,145,55,.28));}}
-        .status-hero-title h1{{font-size:clamp(42px,6vw,72px);line-height:1;margin:.03em 0 .08em;text-shadow:0 4px 18px rgba(0,0,0,.85);}}
-        .status-welcome{{font-size:clamp(18px,2.6vw,26px);color:#f0e2c6;margin:.15em 0 0;text-shadow:0 2px 12px rgba(0,0,0,.72);}}
+        .status-hero-logo{{width:154px;height:154px;border-radius:32px;padding:12px;margin:0 auto;background:radial-gradient(circle at 35% 25%,rgba(218,166,74,.24),rgba(11,14,22,.66));border:1px solid rgba(218,166,74,.42);box-shadow:0 22px 50px rgba(0,0,0,.42),0 0 0 1px rgba(255,221,151,.06) inset;}}
+        .status-hero-logo img{{width:100%;height:100%;object-fit:contain;filter:drop-shadow(0 6px 16px rgba(0,0,0,.72));}}
+        .status-hero-title h1{{font-size:clamp(38px,6vw,68px);line-height:1;margin:.05em 0 .08em;}}
+        .status-welcome{{font-size:clamp(18px,2.6vw,26px);color:#efe3c8;margin:.15em 0 0;}}
         .status-welcome strong{{color:var(--gold);}}
-        .status-admin-action{{display:flex;justify-content:center;width:100%;}}
-        .status-admin-action .btn,.status-main-hero .btn{{align-self:center;background:linear-gradient(180deg,#b11f1f,#5e0709);border:1px solid rgba(255,204,113,.55);color:#ffe3a7;box-shadow:0 14px 30px rgba(0,0,0,.36),inset 0 1px 0 rgba(255,255,255,.16);}}
         .status-hero-stats{{display:grid;grid-template-columns:repeat(6,minmax(120px,1fr));gap:12px;margin-top:2px;width:100%;}}
-        .status-hero-stat{{position:relative;display:flex;flex-direction:column;gap:4px;padding:15px 15px 15px 56px;border:1px solid rgba(218,166,74,.38);border-radius:17px;background:linear-gradient(145deg,rgba(14,16,22,.78),rgba(4,5,9,.62));text-decoration:none;color:inherit;min-width:0;box-shadow:inset 0 1px 0 rgba(255,232,177,.06),0 14px 30px rgba(0,0,0,.28);}}
-        .status-hero-stat::before{{content:"";position:absolute;left:13px;top:50%;transform:translateY(-50%);width:34px;height:34px;border-radius:999px;border:1px solid rgba(218,166,74,.40);display:grid;place-items:center;background:radial-gradient(circle at 35% 28%,rgba(255,213,126,.22),rgba(8,10,16,.82));box-shadow:0 8px 18px rgba(0,0,0,.34),inset 0 0 0 1px rgba(255,231,176,.06);color:#e6b65d;font-size:18px;}}
-        .status-hero-stat[data-kind="members"]::before{{content:"👥";}}
-        .status-hero-stat[data-kind="events"]::before{{content:"📅";}}
-        .status-hero-stat[data-kind="auctions"]::before{{content:"⚖️";}}
-        .status-hero-stat[data-kind="server"]::before{{content:"🛡️";}}
-        .status-hero-stat[data-kind="phase"]::before{{content:"☀️";}}
-        .status-hero-stat[data-kind="weather"]::before{{content:"☀️";}}
-        .status-hero-stat:hover{{border-color:rgba(255,212,128,.70);background:linear-gradient(145deg,rgba(38,25,17,.78),rgba(8,9,14,.70));transform:translateY(-1px);}}
-        .status-hero-stat span{{font-size:.80rem;color:#d3c3a3;font-weight:800;letter-spacing:.01em;}}
-        .status-hero-stat strong{{font-size:1.45rem;color:var(--gold);line-height:1.05;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;text-shadow:0 2px 10px rgba(0,0,0,.55);}}
-        .status-hero-stat small{{color:#bdb09b;line-height:1.25;}}
-        .status-hero-stat.compact strong{{font-size:1.10rem;}}
-        .panel:has(#mapFrame), .map-panel{{border-color:rgba(218,166,74,.36);box-shadow:0 18px 45px rgba(0,0,0,.35),inset 0 0 0 1px rgba(255,221,151,.05);}}
+        .status-hero-stat{{display:flex;flex-direction:column;gap:4px;padding:14px 16px;border:1px solid rgba(218,166,74,.26);border-radius:16px;background:rgba(11,14,22,.58);text-decoration:none;color:inherit;min-width:0;}}
+        .status-hero-stat:hover{{border-color:rgba(218,166,74,.48);background:rgba(218,166,74,.08);}}
+        .status-hero-stat span{{font-size:.82rem;color:var(--muted);font-weight:700;}}
+        .status-hero-stat strong{{font-size:1.45rem;color:var(--gold);line-height:1.05;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}}
+        .status-hero-stat small{{color:var(--muted);line-height:1.25;}}
+        .status-hero-stat.compact strong{{font-size:1.12rem;}}
+        .status-main-hero .btn{{align-self:center;}}
         @media(max-width:1100px){{.status-hero-stats{{grid-template-columns:repeat(3,minmax(130px,1fr));}}}}
-        @media(max-width:640px){{.status-topnav-shell{{padding:8px;border-radius:18px;}}.status-main-hero{{padding:24px 20px 22px;min-height:auto;background-position:center 48% !important;}}.status-hero-logo{{width:132px;height:132px;border-radius:28px;}}.status-hero-stats{{grid-template-columns:1fr 1fr;gap:12px;}}.status-hero-stat{{padding:12px 12px 12px 50px;min-height:74px;}}.status-hero-stat::before{{left:11px;width:31px;height:31px;font-size:16px;}}.status-hero-stat strong{{font-size:1.18rem;}}}}
+        @media(max-width:640px){{.status-topnav-shell{{padding:8px;border-radius:18px;}}.status-main-hero{{padding:22px 20px;}}.status-hero-logo{{width:132px;height:132px;border-radius:28px;}}.status-hero-stats{{grid-template-columns:1fr 1fr;}}.status-hero-stat{{padding:12px}}.status-hero-stat strong{{font-size:1.18rem;}}}}
       </style>
     """
     map_url = str(game.get("map_url") or "https://tldb.info/map/world")
@@ -10039,7 +10022,7 @@ def _render_status_dashboard(data: dict[str, Any], request: Optional[Request] = 
     nav_html = f'<div class="status-topnav-shell"><nav class="topnav status-topnav">{nav_links}</nav></div>'
     admin_action = ""
     if nav_mode == "admin":
-        admin_action = '<div class="status-admin-action"><a class="btn" href="/overview">⚙️ Adminbereich öffnen</a></div>'
+        admin_action = '<div style="margin-left:auto;display:flex;gap:10px;align-items:center;flex-wrap:wrap;"><a class="btn" href="/overview">⚙️ Adminbereich öffnen</a></div>'
     body = f"""
     {nav_html}
     <section class="hero status-main-hero">
