@@ -9926,6 +9926,10 @@ def _render_status_dashboard(data: dict[str, Any], request: Optional[Request] = 
     member_filter = guild.get("member_filter") if isinstance(guild.get("member_filter"), dict) else {}
     member_count = int(_num(member_filter.get("eligible_count"), li.get("member_count", 0)))
     guild_name = str(guild.get("name") or "Ebolus")
+    current_user = _current_user(request) if request is not None else None
+    current_uid = _user_id((current_user or {}).get("user_id"))
+    status_names = _profile_name_map(snap)
+    welcome_name = status_names.get(current_uid) or (current_user or {}).get("username") or "Gildenmitglied"
 
     running_events = list(li.get("running_events") or [])
     guild_id = _safe_guild_id(data)
@@ -9979,15 +9983,27 @@ def _render_status_dashboard(data: dict[str, Any], request: Optional[Request] = 
         <div class="status-hero-stat compact"><span>Wetter</span><strong id="status-weather-value">{_e(_mini_status_value('weather', game.get('weather')))}</strong><small id="status-weather-sub">{_e(game.get('weather_sub') or '—')}</small></div>
       </div>
       <style>
-        .status-hero-stats{{display:grid;grid-template-columns:repeat(6,minmax(120px,1fr));gap:12px;margin-top:18px;width:100%;}}
-        .status-hero-stat{{display:flex;flex-direction:column;gap:4px;padding:14px 16px;border:1px solid rgba(218,166,74,.24);border-radius:16px;background:rgba(11,14,22,.58);text-decoration:none;color:inherit;min-width:0;}}
-        .status-hero-stat:hover{{border-color:rgba(218,166,74,.45);background:rgba(218,166,74,.08);}}
+        .status-topnav-shell{{border:1px solid rgba(218,166,74,.34);border-radius:20px;padding:10px;margin:0 0 18px;background:linear-gradient(180deg,rgba(218,166,74,.09),rgba(11,14,22,.38));box-shadow:0 16px 40px rgba(0,0,0,.22), inset 0 0 0 1px rgba(255,221,151,.04);}}
+        .status-topnav{{margin:0;}}
+        .status-topnav a{{border-color:rgba(218,166,74,.34);}}
+        .status-main-hero{{padding:26px 28px;}}
+        .status-hero-inner{{width:100%;display:flex;flex-direction:column;align-items:center;gap:18px;}}
+        .status-hero-head{{display:flex;flex-direction:column;align-items:center;text-align:center;gap:12px;width:100%;}}
+        .status-hero-logo{{width:154px;height:154px;border-radius:32px;padding:12px;margin:0 auto;background:radial-gradient(circle at 35% 25%,rgba(218,166,74,.24),rgba(11,14,22,.66));border:1px solid rgba(218,166,74,.42);box-shadow:0 22px 50px rgba(0,0,0,.42),0 0 0 1px rgba(255,221,151,.06) inset;}}
+        .status-hero-logo img{{width:100%;height:100%;object-fit:contain;filter:drop-shadow(0 6px 16px rgba(0,0,0,.72));}}
+        .status-hero-title h1{{font-size:clamp(38px,6vw,68px);line-height:1;margin:.05em 0 .08em;}}
+        .status-welcome{{font-size:clamp(18px,2.6vw,26px);color:#efe3c8;margin:.15em 0 0;}}
+        .status-welcome strong{{color:var(--gold);}}
+        .status-hero-stats{{display:grid;grid-template-columns:repeat(6,minmax(120px,1fr));gap:12px;margin-top:2px;width:100%;}}
+        .status-hero-stat{{display:flex;flex-direction:column;gap:4px;padding:14px 16px;border:1px solid rgba(218,166,74,.26);border-radius:16px;background:rgba(11,14,22,.58);text-decoration:none;color:inherit;min-width:0;}}
+        .status-hero-stat:hover{{border-color:rgba(218,166,74,.48);background:rgba(218,166,74,.08);}}
         .status-hero-stat span{{font-size:.82rem;color:var(--muted);font-weight:700;}}
         .status-hero-stat strong{{font-size:1.45rem;color:var(--gold);line-height:1.05;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}}
         .status-hero-stat small{{color:var(--muted);line-height:1.25;}}
         .status-hero-stat.compact strong{{font-size:1.12rem;}}
+        .status-main-hero .btn{{align-self:center;}}
         @media(max-width:1100px){{.status-hero-stats{{grid-template-columns:repeat(3,minmax(130px,1fr));}}}}
-        @media(max-width:640px){{.status-hero-stats{{grid-template-columns:1fr 1fr;}}.status-hero-stat{{padding:12px}}.status-hero-stat strong{{font-size:1.18rem;}}}}
+        @media(max-width:640px){{.status-topnav-shell{{padding:8px;border-radius:18px;}}.status-main-hero{{padding:22px 20px;}}.status-hero-logo{{width:132px;height:132px;border-radius:28px;}}.status-hero-stats{{grid-template-columns:1fr 1fr;}}.status-hero-stat{{padding:12px}}.status-hero-stat strong{{font-size:1.18rem;}}}}
       </style>
     """
     map_url = str(game.get("map_url") or "https://tldb.info/map/world")
@@ -10000,21 +10016,24 @@ def _render_status_dashboard(data: dict[str, Any], request: Optional[Request] = 
     questlog_map_url = "https://questlog.gg/throne-and-liberty/de/map"
     tldb_map_url = "https://tldb.info/map/world"
     if nav_mode == "member":
-        nav_html = '<nav class="topnav"><a href="/member">Status</a><a href="/portal">Mein Portal</a><a href="/member/auctions">Loot</a><a href="/member/events">Events</a><a href="/member/members">Mitglieder</a><a href="/member/ec">Meine EC</a></nav>'
+        nav_links = '<a href="/member">Status</a><a href="/portal">Mein Portal</a><a href="/member/auctions">Loot</a><a href="/member/events">Events</a><a href="/member/members">Mitglieder</a><a href="/member/ec">Meine EC</a>'
     else:
-        nav_html = '<nav class="topnav"><a href="/status">Status</a><a href="/portal">Mein Portal</a><a href="/loot">Loot</a><a href="/events">Events</a><a href="/members">Mitglieder</a><a href="/overview">Adminbereich</a></nav>'
+        nav_links = '<a href="/status">Status</a><a href="/portal">Mein Portal</a><a href="/loot">Loot</a><a href="/events">Events</a><a href="/members">Mitglieder</a><a href="/overview">Adminbereich</a>'
+    nav_html = f'<div class="status-topnav-shell"><nav class="topnav status-topnav">{nav_links}</nav></div>'
     admin_action = ""
     if nav_mode == "admin":
         admin_action = '<div style="margin-left:auto;display:flex;gap:10px;align-items:center;flex-wrap:wrap;"><a class="btn" href="/overview">⚙️ Adminbereich öffnen</a></div>'
     body = f"""
     {nav_html}
     <section class="hero status-main-hero">
-      <div style="display:flex;gap:16px;align-items:center;flex-wrap:wrap;width:100%;">
-        <div class="status-hero-logo"><img src="{_asset('ebolus_logo.png')}" alt="Ebolus"></div>
-        <div style="min-width:220px;flex:1;">
-          <div class="eyebrow">Dashboard Status</div>
-          <h1>{_e(guild_name)}</h1>
-          <p class="muted">Kurzübersicht. Details liegen in Portal, Loot, Events und Mitglieder.</p>
+      <div class="status-hero-inner">
+        <div class="status-hero-head">
+          <div class="status-hero-logo"><img src="{_asset('ebolus_logo.png')}" alt="Ebolus"></div>
+          <div class="status-hero-title">
+            <div class="eyebrow">Dashboard Status</div>
+            <h1>{_e(guild_name)}</h1>
+            <p class="status-welcome">Willkommen, <strong>{_e(welcome_name)}</strong></p>
+          </div>
         </div>
         {admin_action}
         {hero_stats}
