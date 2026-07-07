@@ -31,7 +31,7 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
-ASSET_VER = "ebo-gothic-whale-dashboard-v1"
+ASSET_VER = "ebo-gothic-whale-dashboard-mobile-v1"
 DASHBOARD_RELEASE_VERSION = "1.2.0 · Status Playwright Worker"
 
 
@@ -3933,6 +3933,150 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "admin") -> str:
       .card-value {{ font-size:22px; overflow-wrap:anywhere; }}
       .panel h2 {{ font-size:22px; }}
     }}
+
+
+    /* Mobile UX Patch v1 – bessere Handy/Tablet-Bedienung */
+    @media(max-width:900px) {{
+      :root {{ --mobile-pad:12px; }}
+      body {{ background-attachment:scroll; background-position:center top; }}
+      body.nav-open {{ overflow:hidden; }}
+      .app-shell {{ display:block; min-height:100dvh; }}
+      main.content {{ width:100%; max-width:none; padding:12px var(--mobile-pad) 44px; }}
+      .authbar,.warn {{ margin:0 0 10px; padding:8px 10px; border-radius:12px; font-size:12px; line-height:1.35; }}
+      .sidebar {{
+        position:sticky; top:0; z-index:100;
+        height:auto; min-height:0; max-height:none; overflow:visible;
+        padding:8px 12px; border-right:0; border-left:0;
+        border-bottom:1px solid rgba(214,168,79,.22);
+        background:linear-gradient(180deg,rgba(18,12,10,.96),rgba(8,9,13,.94));
+        box-shadow:0 14px 34px rgba(0,0,0,.48);
+        backdrop-filter:blur(14px);
+      }}
+      .sidebar::before,.sidebar::after {{ display:none !important; }}
+      .brand {{
+        min-height:48px; margin:0; padding:0 112px 0 0; gap:10px;
+        flex-direction:row; justify-content:flex-start; text-align:left; border-bottom:0;
+      }}
+      .brand-mark {{ width:44px; height:44px; border-radius:13px; padding:4px; flex:0 0 44px; }}
+      .brand-mark img {{ width:100%; height:100%; object-fit:contain; }}
+      .brand strong {{ font-size:16px; letter-spacing:.08em; line-height:1.05; }}
+      .brand span {{ font-size:10px; letter-spacing:.06em; line-height:1.15; }}
+      .mobile-nav-toggle {{
+        display:inline-flex; align-items:center; justify-content:center; gap:6px;
+        position:absolute; right:12px; top:10px; min-height:40px;
+        padding:9px 12px; border-radius:12px; z-index:3;
+      }}
+      .side-nav,.sidebar-footer {{ display:none; }}
+      body.nav-open .sidebar {{
+        position:fixed; inset:0; height:100dvh; overflow:auto;
+        padding:10px 12px 18px;
+      }}
+      body.nav-open .brand {{ padding-right:112px; margin-bottom:10px; }}
+      body.nav-open .side-nav {{
+        display:grid; grid-template-columns:1fr; gap:7px;
+        max-height:none; overflow:visible; margin-top:10px; padding:12px 0 0;
+        border-top:1px solid rgba(214,168,79,.18);
+      }}
+      body.nav-open .side-nav details {{ margin-top:6px; padding-top:8px; border-top:1px solid rgba(214,168,79,.14); }}
+      body.nav-open .side-nav details a {{ margin-left:0; }}
+      body.nav-open .sidebar-footer {{
+        display:grid; grid-template-columns:1fr 1fr; gap:8px;
+        margin-top:12px; padding-top:12px; border-top:1px solid rgba(214,168,79,.16);
+      }}
+      .side-nav a,.side-nav summary {{ min-height:44px; padding:11px 12px; font-size:13px; border-radius:12px; }}
+      .nav-ico {{ width:22px; height:22px; flex-basis:22px; }}
+      .version-pill {{ grid-column:1/-1; text-align:center; }}
+
+      .topnav {{
+        display:flex; flex-wrap:nowrap; overflow-x:auto; -webkit-overflow-scrolling:touch;
+        gap:8px; margin:0 -12px 12px; padding:0 12px 8px;
+        scrollbar-width:none; scroll-snap-type:x proximity;
+      }}
+      .topnav::-webkit-scrollbar {{ display:none; }}
+      .topnav a {{ flex:0 0 auto; min-height:38px; padding:8px 11px; font-size:12px; border-radius:12px; scroll-snap-align:start; }}
+      .topnav a::before {{ width:16px; height:16px; flex-basis:16px; }}
+
+      .hero {{
+        min-height:0; flex-direction:column; align-items:stretch; gap:14px;
+        padding:20px 16px; margin-bottom:12px; border-radius:16px;
+        background-position:center center;
+      }}
+      .hero h1 {{ font-size:clamp(28px,9vw,42px); line-height:1.04; overflow-wrap:anywhere; }}
+      .hero p {{ max-width:none; margin:.35rem 0 0; font-size:14px; line-height:1.45; }}
+      .eyebrow {{ font-size:11px; letter-spacing:.11em; }}
+      .hero-actions {{ width:100%; max-width:none; grid-template-columns:1fr; gap:9px; }}
+      .hero-action {{ min-height:68px; padding:12px; border-radius:14px; }}
+      .hero .btn,.hero a.btn,.page-actions .btn,.page-actions a {{ width:100%; justify-content:center; text-align:center; }}
+
+      .grid,.analytics-grid,.mini-grid {{ grid-template-columns:1fr; gap:10px; margin:12px 0; }}
+      .card {{ padding:14px; border-radius:14px; }}
+      .card-value {{ font-size:24px; overflow-wrap:anywhere; }}
+      .panel {{ padding:14px; margin:12px 0; border-radius:14px; }}
+      .panel h2 {{ font-size:20px; line-height:1.15; overflow-wrap:anywhere; }}
+      .panel h3 {{ font-size:17px; line-height:1.2; }}
+      .split,.home-layout,.member-summary-item {{ grid-template-columns:1fr !important; gap:12px; }}
+      .home-item {{ grid-template-columns:38px minmax(0,1fr); gap:10px; padding:12px; border-radius:14px; }}
+      .home-icon {{ width:38px; height:38px; }}
+      .home-title,.home-meta {{ overflow-wrap:anywhere; }}
+      .home-item .pill {{ grid-column:2; justify-self:start; }}
+
+      .btn,button.btn,a.btn {{ min-height:40px; padding:10px 12px; max-width:100%; white-space:normal; text-align:center; }}
+      .actions-inline,.page-actions,.form-row,.form-grid {{ display:grid !important; grid-template-columns:1fr !important; gap:9px; width:100%; }}
+      .actions-inline form,.actions-inline .btn,.actions-inline button,.actions-inline a,.page-actions .btn,.page-actions a {{ width:100%; }}
+      input[type=text],input[type=number],input[type=datetime-local],input[type=date],input[type=url],input[type=search],select,textarea {{
+        width:100%; min-height:44px; font-size:16px;
+      }}
+      textarea {{ min-height:96px; }}
+      label {{ overflow-wrap:anywhere; }}
+
+      .table-search {{ max-width:100%; width:100%; margin:8px 0 10px; }}
+      .table-wrap,.responsive-table {{ width:100%; overflow-x:auto; -webkit-overflow-scrolling:touch; padding-bottom:4px; }}
+      table {{ font-size:13px; min-width:560px; }}
+      th,td {{ padding:9px 8px; vertical-align:top; }}
+      .queue-badge,.pill {{ white-space:normal; overflow-wrap:anywhere; }}
+      .skip-mobile {{ display:none !important; }}
+
+      .status-main-hero {{ padding:20px 16px !important; border-radius:16px; }}
+      .status-hero-logo {{ width:92px !important; height:92px !important; border-radius:22px !important; padding:8px !important; }}
+      .status-hero-title h1 {{ font-size:clamp(32px,11vw,46px) !important; }}
+      .status-hero-stats {{ grid-template-columns:1fr 1fr !important; gap:8px !important; }}
+      .status-hero-stat {{ padding:11px 10px !important; border-radius:13px !important; }}
+      .status-hero-stat strong {{ font-size:1.05rem !important; }}
+      .status-hero-stat small {{ font-size:11px; }}
+      .status-topnav-shell {{ padding:8px !important; border-radius:16px !important; }}
+      .status-map-frame,.status-map-wrap {{ min-height:320px; }}
+      .status-map-frame iframe,.status-map-wrap iframe {{ width:100%; min-height:320px; }}
+    }}
+
+    @media(max-width:560px) {{
+      :root {{ --mobile-pad:10px; }}
+      main.content {{ padding:10px var(--mobile-pad) 38px; }}
+      .brand strong {{ font-size:15px; }}
+      .hero {{ padding:18px 14px; }}
+      .hero h1 {{ font-size:clamp(26px,10vw,36px); }}
+      .panel {{ padding:12px; }}
+      .card {{ padding:12px; }}
+      .release-grid {{ grid-template-columns:1fr !important; }}
+      table.searchable-table {{ min-width:0; display:block; width:100%; }}
+      table.searchable-table thead {{ display:none; }}
+      table.searchable-table tbody {{ display:grid; gap:10px; }}
+      table.searchable-table tr {{ display:block; border:1px solid rgba(214,168,79,.18); border-radius:14px; padding:8px 10px; background:rgba(16,18,25,.76); }}
+      table.searchable-table td {{ display:grid; grid-template-columns:104px minmax(0,1fr); gap:9px; border-bottom:1px solid rgba(255,255,255,.08); padding:8px 0; overflow-wrap:anywhere; }}
+      table.searchable-table td:last-child {{ border-bottom:0; }}
+      table.searchable-table td::before {{ content:attr(data-label); color:var(--gold); font-size:10px; font-weight:800; text-transform:uppercase; letter-spacing:.04em; }}
+      .status-hero-stats {{ grid-template-columns:1fr !important; }}
+      .status-hero-stat {{ min-width:0; }}
+      .status-map-frame,.status-map-wrap {{ min-height:280px; }}
+      .status-map-frame iframe,.status-map-wrap iframe {{ min-height:280px; }}
+    }}
+
+    @media(max-width:380px) {{
+      .brand span {{ display:none; }}
+      .mobile-nav-toggle {{ padding:8px 10px; }}
+      .topnav a {{ font-size:11px; padding:8px 9px; }}
+      table.searchable-table td {{ grid-template-columns:1fr; gap:3px; }}
+    }}
+
   </style>
 </head>
 <body><div class="app-shell">{_member_sidebar_html() if nav_mode == "member" else _sidebar_html()}<main class="content">{auth_note}{body}</main></div><script>
@@ -3962,6 +4106,17 @@ function filterNextTable(input) {{
 (function mobileNavCleanup() {{
   document.querySelectorAll('.side-nav a').forEach(a => a.addEventListener('click', () => document.body.classList.remove('nav-open')));
   document.addEventListener('keydown', ev => {{ if (ev.key === 'Escape') document.body.classList.remove('nav-open'); }});
+}})();
+(function mobileNavUX() {{
+  const mq = window.matchMedia('(max-width: 900px)');
+  function closeNav() {{ document.body.classList.remove('nav-open'); }}
+  document.addEventListener('click', ev => {{
+    if (!mq.matches || !document.body.classList.contains('nav-open')) return;
+    const sidebar = document.querySelector('.sidebar');
+    const toggle = document.querySelector('.mobile-nav-toggle');
+    if (sidebar && !sidebar.contains(ev.target) && toggle && !toggle.contains(ev.target)) closeNav();
+  }});
+  window.addEventListener('resize', () => {{ if (!mq.matches) closeNav(); }});
 }})();
 function refreshNeedWeaponPicker(source) {{
   const wrap = source.closest('.need-two-step-picker');
