@@ -31,7 +31,7 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
-ASSET_VER = "ebo-phase3-database-start"
+ASSET_VER = "ebo-status-layout-gold-v2"
 DASHBOARD_RELEASE_VERSION = "1.2.0 · Status Playwright Worker"
 
 
@@ -338,6 +338,21 @@ def _e(value: Any) -> str:
 
 def _asset(name: str) -> str:
     return f"/static/{name}?v={ASSET_VER}"
+
+
+def _asset_first(*names: str) -> str:
+    """Robuste Asset-Auswahl.
+
+    Unterstützt sowohl die alte flache Struktur unter /static/assets/*.png
+    als auch die neuere Ordnung /static/assets/icons|logos|backgrounds/*.png.
+    """
+    for name in names:
+        try:
+            if name and (STATIC_DIR / name).exists():
+                return _asset(name)
+        except Exception:
+            pass
+    return _asset(names[-1] if names else "")
 
 
 def _dt(value: Any) -> str:
@@ -9926,10 +9941,6 @@ def _render_status_dashboard(data: dict[str, Any], request: Optional[Request] = 
     member_filter = guild.get("member_filter") if isinstance(guild.get("member_filter"), dict) else {}
     member_count = int(_num(member_filter.get("eligible_count"), li.get("member_count", 0)))
     guild_name = str(guild.get("name") or "Ebolus")
-    current_user = _current_user(request) if request is not None else None
-    current_uid = _user_id((current_user or {}).get("user_id"))
-    status_names = _profile_name_map(snap)
-    welcome_name = status_names.get(current_uid) or (current_user or {}).get("username") or "Gildenmitglied"
 
     running_events = list(li.get("running_events") or [])
     guild_id = _safe_guild_id(data)
@@ -9944,6 +9955,29 @@ def _render_status_dashboard(data: dict[str, Any], request: Optional[Request] = 
     auctions = (((snap.get("loot") or {}).get("auctions") or {}).get("items") or [])
     active_auctions = [a for a in auctions if isinstance(a, dict) and _loot_is_active(a)]
     active_auctions.sort(key=lambda a: _auction_timer_dt(a) or datetime.max.replace(tzinfo=timezone.utc))
+
+    current_user = _current_user(request) if request is not None else None
+    current_uid = _user_id((current_user or {}).get("user_id"))
+    user_names = _profile_name_map(snap)
+    welcome_name = user_names.get(current_uid) or (current_user or {}).get("global_name") or (current_user or {}).get("username") or "Mitglied"
+
+    logo_main = _asset_first("assets/logos/ebolus_logo_crop.png", "assets/ebolus_logo_crop.png", "ebolus_logo_crop.png", "ebolus_logo.png")
+    logo_small = _asset_first("assets/logos/ebolus_small_crest_crop.png", "assets/ebolus_small_crest_crop.png", "ebolus_logo_crop.png", "ebolus_logo.png")
+    hero_bg = _asset_first("assets/ebolusback.png", "ebolusback.png", "assets/backgrounds/header_hall_crop.png", "assets/header_hall_crop.png", "dashboard_bg.webp")
+    map_preview = _asset_first("assets/backgrounds/solisium_map_panel_crop.png", "assets/solisium_map_panel_crop.png", "map_preview.png", "dashboard_bg.webp")
+    icon_members = _asset_first("assets/icons/mitglieder.png", "assets/mitglieder.png")
+    icon_events = _asset_first("assets/icons/events.png", "assets/events.png")
+    icon_auctions = _asset_first("assets/icons/auktionen.png", "assets/auktionen.png")
+    icon_server = _asset_first("assets/icons/server.png", "assets/server.png")
+    icon_time = _asset_first("assets/icons/spielzeit_tag.png", "assets/spielzeit_tag.png")
+    icon_weather = _asset_first("assets/icons/wetter_trocken.png", "assets/wetter_trocken.png")
+    icon_nav_status = _asset_first("assets/icons/nav_status.png", "assets/nav_status.png")
+    icon_nav_portal = _asset_first("assets/icons/nav_portal.png", "assets/nav_portal.png")
+    icon_nav_loot = _asset_first("assets/icons/nav_loot.png", "assets/nav_loot.png")
+    icon_nav_events = _asset_first("assets/icons/nav_events.png", "assets/nav_events.png")
+    icon_nav_members = _asset_first("assets/icons/nav_mitglieder.png", "assets/nav_mitglieder.png")
+    icon_admin = _asset_first("assets/icons/admin_gear.png", "assets/admin_gear.png")
+    icon_map = _asset_first("assets/icons/map_book.png", "assets/map_book.png")
 
     game = _game_status_from_snapshot(snap)
     def _mini_status_value(kind: str, value: Any) -> str:
@@ -9970,77 +10004,33 @@ def _render_status_dashboard(data: dict[str, Any], request: Optional[Request] = 
             return "⚪ " + str(value or "—")
         return str(value or "—")
 
-    def _mini_status_icon(kind: str, value: Any) -> str:
-        v = str(value or "").lower()
-        if kind == "phase":
-            if "nacht" in v or "night" in v:
-                return "🌙"
-            if "tag" in v or "day" in v:
-                return "☀️"
-            return "🕒"
-        if kind == "weather":
-            if "regen" in v or "rain" in v:
-                return "🌧️"
-            if "trocken" in v or "dry" in v:
-                return "☀️"
-            return "🌦️"
-        if kind == "server":
-            if "online" in v or "good" in v:
-                return "🛡️"
-            if "wartung" in v or "maintenance" in v:
-                return "🛠️"
-            if "offline" in v:
-                return "🔴"
-            return "🛡️"
-        return ""
+    stats_href_members = "/member/members" if nav_mode == "member" else "/members"
+    stats_href_events = "/member/events" if nav_mode == "member" else "/events"
+    stats_href_auctions = "/member/auctions" if nav_mode == "member" else "/loot"
+    def _status_card(icon: str, title: str, value: str, sub: str, *, href: str = "", extra_class: str = "", value_id: str = "", sub_id: str = "") -> str:
+        tag = "a" if href else "div"
+        href_attr = f' href="{_e(href)}"' if href else ""
+        value_attr = f' id="{_e(value_id)}"' if value_id else ""
+        sub_attr = f' id="{_e(sub_id)}"' if sub_id else ""
+        return f"""
+        <{tag} class="ebo-stat-card {extra_class}"{href_attr}>
+          <span class="ebo-stat-icon"><img src="{icon}" alt=""></span>
+          <span class="ebo-stat-copy"><span class="ebo-stat-title">{_e(title)}</span><strong{value_attr}>{_e(value)}</strong><small{sub_attr}>{_e(sub)}</small></span>
+        </{tag}>
+        """
 
     stats_href_members = "/member/members" if nav_mode == "member" else "/members"
     stats_href_events = "/member/events" if nav_mode == "member" else "/events"
     stats_href_auctions = "/member/auctions" if nav_mode == "member" else "/loot"
     hero_stats = f"""
-      <div class="status-hero-stats">
-        <a class="status-hero-stat" href="{stats_href_members}"><span class="status-stat-icon">👥</span><span>Mitglieder</span><strong>{member_count}</strong><small>Gildenrolle</small></a>
-        <a class="status-hero-stat" href="{stats_href_events}"><span class="status-stat-icon">📅</span><span>Events</span><strong>{len(running_events)}</strong><small>laufend</small></a>
-        <a class="status-hero-stat" href="{stats_href_auctions}"><span class="status-stat-icon">🔨</span><span>Auktionen</span><strong>{len(active_auctions)}</strong><small>aktiv</small></a>
-        <div class="status-hero-stat compact"><span class="status-stat-icon" id="status-server-icon">{_e(_mini_status_icon('server', game.get('server_state')))}</span><span>Server</span><strong>{_e(game.get('server') or 'Fearless')}</strong><small id="status-server-value">{_e(game.get('server_state') or '—')}</small><small id="status-server-sub">{_e(game.get('region') or 'Europe')}</small></div>
-        <div class="status-hero-stat compact"><span class="status-stat-icon" id="status-phase-icon">{_e(_mini_status_icon('phase', game.get('phase')))}</span><span>Spielzeit</span><strong id="status-phase-value">{_e(game.get('phase') or '—')}</strong><small id="status-phase-sub">{_e(game.get('phase_sub') or '—')}</small></div>
-        <div class="status-hero-stat compact"><span class="status-stat-icon" id="status-weather-icon">{_e(_mini_status_icon('weather', game.get('weather')))}</span><span>Wetter</span><strong id="status-weather-value">{_e(game.get('weather') or '—')}</strong><small id="status-weather-sub">{_e(game.get('weather_sub') or '—')}</small></div>
+      <div class="ebo-status-grid">
+        {_status_card(icon_members, "Mitglieder", str(member_count), "Gildenrolle", href=stats_href_members)}
+        {_status_card(icon_events, "Events", str(len(running_events)), "laufend", href=stats_href_events)}
+        {_status_card(icon_auctions, "Auktionen", str(len(active_auctions)), "aktiv", href=stats_href_auctions)}
+        {_status_card(icon_server, "Server", str(game.get('server') or 'Fearless'), _mini_status_value('server', game.get('server_state')) + " · Fearless · Europe", extra_class="ebo-server-card", value_id="status-server-name", sub_id="status-server-sub")}
+        {_status_card(icon_time, "Spielzeit", _mini_status_value('phase', game.get('phase')), str(game.get('phase_sub') or '—'), value_id="status-phase-value", sub_id="status-phase-sub")}
+        {_status_card(icon_weather, "Wetter", _mini_status_value('weather', game.get('weather')), str(game.get('weather_sub') or '—'), value_id="status-weather-value", sub_id="status-weather-sub")}
       </div>
-      <style>
-        .status-topnav-shell{{position:relative;border:1px solid rgba(218,166,74,.42);border-radius:22px;padding:10px;margin:0 0 18px;background:linear-gradient(180deg,rgba(218,166,74,.13),rgba(11,14,22,.48));box-shadow:0 18px 46px rgba(0,0,0,.28),0 0 0 1px rgba(255,221,151,.06) inset,0 0 28px rgba(218,166,74,.08);overflow:hidden;}}
-        .status-topnav-shell:before{{content:"";position:absolute;inset:0;border-radius:inherit;pointer-events:none;background:linear-gradient(90deg,transparent,rgba(255,222,156,.16),transparent);opacity:.58;}}
-        .status-topnav{{margin:0;position:relative;z-index:1;}}
-        .status-topnav a{{border-color:rgba(218,166,74,.42);background:linear-gradient(180deg,rgba(255,236,181,.07),rgba(7,9,15,.52));box-shadow:0 8px 18px rgba(0,0,0,.22),inset 0 0 0 1px rgba(255,255,255,.03);transition:transform .16s ease,border-color .16s ease,background .16s ease;}}
-        .status-topnav a:hover{{transform:translateY(-1px);border-color:rgba(255,215,128,.68);background:linear-gradient(180deg,rgba(142,23,23,.42),rgba(62,11,13,.56));}}
-        .status-main-hero{{position:relative;overflow:hidden;padding:30px 30px 28px;border-color:rgba(218,166,74,.48);box-shadow:0 24px 70px rgba(0,0,0,.42),0 0 0 1px rgba(255,219,145,.08) inset,0 0 42px rgba(218,166,74,.08);}}
-        .status-main-hero:before{{content:"";position:absolute;inset:0;pointer-events:none;background:radial-gradient(circle at 50% 8%,rgba(255,221,151,.20),transparent 24%),radial-gradient(circle at 50% 52%,rgba(142,23,23,.18),transparent 38%),linear-gradient(180deg,rgba(0,0,0,.06),rgba(0,0,0,.34));}}
-        .status-main-hero:after{{content:"✦";position:absolute;top:-13px;left:50%;transform:translateX(-50%);color:rgba(218,166,74,.92);font-size:28px;text-shadow:0 0 18px rgba(218,166,74,.55);}}
-        .status-hero-inner{{position:relative;z-index:1;width:100%;display:flex;flex-direction:column;align-items:center;gap:18px;}}
-        .status-hero-head{{display:flex;flex-direction:column;align-items:center;text-align:center;gap:12px;width:100%;}}
-        .status-hero-logo{{width:168px;height:168px;border-radius:36px;padding:13px;margin:0 auto;background:radial-gradient(circle at 35% 25%,rgba(255,221,151,.28),rgba(142,23,23,.18) 44%,rgba(8,10,17,.74));border:1px solid rgba(218,166,74,.55);box-shadow:0 26px 62px rgba(0,0,0,.52),0 0 0 1px rgba(255,221,151,.08) inset,0 0 36px rgba(218,166,74,.18);}}
-        .status-hero-logo img{{width:100%;height:100%;object-fit:contain;filter:drop-shadow(0 8px 18px rgba(0,0,0,.78)) drop-shadow(0 0 15px rgba(218,166,74,.20));}}
-        .status-hero-title .eyebrow{{letter-spacing:.22em;text-shadow:0 0 16px rgba(218,166,74,.22);}}
-        .status-hero-title h1{{font-size:clamp(42px,6.4vw,72px);line-height:1;margin:.05em 0 .08em;text-shadow:0 3px 18px rgba(0,0,0,.55),0 0 22px rgba(218,166,74,.13);}}
-        .status-welcome{{font-size:clamp(19px,2.8vw,28px);color:#efe3c8;margin:.15em 0 0;text-shadow:0 2px 12px rgba(0,0,0,.55);}}
-        .status-welcome strong{{color:var(--gold);}}
-        .status-hero-stats{{display:grid;grid-template-columns:repeat(6,minmax(120px,1fr));gap:12px;margin-top:2px;width:100%;}}
-        .status-hero-stat{{position:relative;display:grid;grid-template-columns:auto 1fr;grid-template-rows:auto auto auto;column-gap:13px;row-gap:3px;align-items:center;padding:15px 16px;border:1px solid rgba(218,166,74,.36);border-radius:18px;background:linear-gradient(180deg,rgba(21,24,34,.70),rgba(7,9,15,.55));text-decoration:none;color:inherit;min-width:0;box-shadow:0 14px 32px rgba(0,0,0,.30),inset 0 0 0 1px rgba(255,255,255,.025);overflow:hidden;}}
-        .status-hero-stat:before{{content:"";position:absolute;inset:0;background:radial-gradient(circle at 18% 20%,rgba(218,166,74,.16),transparent 34%);opacity:.75;pointer-events:none;}}
-        .status-hero-stat:hover{{transform:translateY(-1px);border-color:rgba(255,215,128,.62);background:linear-gradient(180deg,rgba(42,24,20,.74),rgba(11,14,22,.62));}}
-        .status-stat-icon{{grid-row:1 / span 3;display:grid;place-items:center;width:52px;height:52px;border-radius:50%;border:1px solid rgba(218,166,74,.42);background:radial-gradient(circle at 35% 28%,rgba(255,220,142,.25),rgba(9,10,15,.55) 62%);box-shadow:0 12px 24px rgba(0,0,0,.32),inset 0 0 0 1px rgba(255,255,255,.04);font-size:25px;line-height:1;filter:drop-shadow(0 3px 8px rgba(0,0,0,.55));}}
-        .status-hero-stat span,.status-hero-stat strong,.status-hero-stat small{{position:relative;z-index:1;}}
-        .status-hero-stat > span:not(.status-stat-icon){{font-size:.82rem;color:rgba(238,225,198,.78);font-weight:800;}}
-        .status-hero-stat strong{{font-size:1.52rem;color:var(--gold);line-height:1.05;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;text-shadow:0 2px 12px rgba(0,0,0,.55);}}
-        .status-hero-stat small{{color:rgba(238,225,198,.72);line-height:1.25;}}
-        .status-hero-stat.compact strong{{font-size:1.16rem;}}
-        .status-admin-action{{width:100%;display:flex;justify-content:center;margin:0 0 2px;}}
-        .status-main-hero .btn{{align-self:center;background:linear-gradient(180deg,#a62323,#650e12);border-color:rgba(255,201,92,.58);box-shadow:0 12px 26px rgba(0,0,0,.32),inset 0 0 0 1px rgba(255,221,151,.10);}}
-        #map.panel{{border-color:rgba(218,166,74,.40);box-shadow:0 18px 56px rgba(0,0,0,.34),0 0 0 1px rgba(255,221,151,.05) inset;}}
-        #map h2{{font-size:clamp(24px,4.4vw,36px);}}
-        .status-map-toolbar .btn{{border-radius:16px;}}
-        @media(max-width:1100px){{.status-hero-stats{{grid-template-columns:repeat(3,minmax(130px,1fr));}}}}
-        @media(max-width:640px){{.status-topnav-shell{{padding:8px;border-radius:18px;}}.status-topnav{{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:9px;}}.status-topnav a{{padding:11px 8px;justify-content:center;font-size:12px;}}.status-main-hero{{padding:24px 20px;}}.status-hero-logo{{width:148px;height:148px;border-radius:31px;}}.status-hero-stats{{grid-template-columns:1fr 1fr;gap:11px;}}.status-hero-stat{{padding:13px 13px;border-radius:17px;column-gap:10px;}}.status-stat-icon{{width:46px;height:46px;font-size:22px;}}.status-hero-stat strong{{font-size:1.24rem;}}.status-hero-stat.compact strong{{font-size:1.08rem;}}}}
-      </style>
     """
     map_url = str(game.get("map_url") or "https://tldb.info/map/world")
     if "interactivemap.app" in map_url:
@@ -10052,29 +10042,70 @@ def _render_status_dashboard(data: dict[str, Any], request: Optional[Request] = 
     questlog_map_url = "https://questlog.gg/throne-and-liberty/de/map"
     tldb_map_url = "https://tldb.info/map/world"
     if nav_mode == "member":
-        nav_links = '<a href="/portal">Mein Portal</a><a href="/member/auctions">Loot</a><a href="/member/events">Events</a><a href="/member/members">Mitglieder</a>'
+        nav_html = f'''
+        <nav class="ebo-status-nav">
+          <a class="active" href="/member"><img src="{icon_nav_status}" alt="">Status</a>
+          <a href="/portal"><img src="{icon_nav_portal}" alt="">Mein Portal</a>
+          <a href="/member/auctions"><img src="{icon_nav_loot}" alt="">Loot</a>
+          <a href="/member/events"><img src="{icon_nav_events}" alt="">Events</a>
+          <a href="/member/members"><img src="{icon_nav_members}" alt="">Mitglieder</a>
+        </nav>'''
     else:
-        nav_links = '<a href="/portal">Mein Portal</a><a href="/loot">Loot</a><a href="/events">Events</a><a href="/members">Mitglieder</a>'
-    nav_html = f'<div class="status-topnav-shell"><nav class="topnav status-topnav">{nav_links}</nav></div>'
+        nav_html = f'''
+        <nav class="ebo-status-nav">
+          <a class="active" href="/status"><img src="{icon_nav_status}" alt="">Status</a>
+          <a href="/portal"><img src="{icon_nav_portal}" alt="">Mein Portal</a>
+          <a href="/loot"><img src="{icon_nav_loot}" alt="">Loot</a>
+          <a href="/events"><img src="{icon_nav_events}" alt="">Events</a>
+          <a href="/members"><img src="{icon_nav_members}" alt="">Mitglieder</a>
+        </nav>'''
     admin_action = ""
     if nav_mode == "admin":
-        admin_action = '<div class="status-admin-action"><a class="btn" href="/overview">🛡️ Adminbereich öffnen</a></div>'
+        admin_action = f'<a class="ebo-admin-button" href="/overview"><img src="{icon_admin}" alt="">Adminbereich öffnen <span>›</span></a>'
     body = f"""
     {nav_html}
-    <section class="hero status-main-hero">
-      <div class="status-hero-inner">
-        <div class="status-hero-head">
-          <div class="status-hero-logo"><img src="{_asset('ebolus_logo.png')}" alt="Ebolus"></div>
-          <div class="status-hero-title">
-            <div class="eyebrow">Dashboard Status</div>
-            <h1>{_e(guild_name)}</h1>
-            <p class="status-welcome">Willkommen, <strong>{_e(welcome_name)}</strong></p>
-          </div>
-        </div>
-        {admin_action}
-        {hero_stats}
-      </div>
+    <section class="ebo-status-hero" style="--ebo-hero-bg:url('{hero_bg}')">
+      <div class="ebo-hero-ornament" aria-hidden="true"></div>
+      <div class="ebo-hero-logo"><img src="{logo_main}" alt="Ebolus"></div>
+      <div class="ebo-hero-eyebrow">Dashboard Status</div>
+      <h1>Willkommen, <span>{_e(welcome_name)}</span></h1>
+      {admin_action}
+      {hero_stats}
     </section>
+    <style>
+      .ebo-status-nav{{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:12px;margin:0 0 18px;padding:14px 16px;border:1px solid rgba(218,166,74,.38);border-radius:22px;background:linear-gradient(180deg,rgba(16,17,24,.84),rgba(8,9,13,.88));box-shadow:0 10px 26px rgba(0,0,0,.32), inset 0 0 0 1px rgba(255,224,151,.06);}}
+      .ebo-status-nav a{{display:flex;align-items:center;justify-content:center;gap:8px;min-height:48px;padding:10px 12px;text-decoration:none;color:#f5ead7;border:1px solid rgba(218,166,74,.35);border-radius:15px;background:linear-gradient(180deg,rgba(31,30,29,.78),rgba(8,9,13,.78));box-shadow:inset 0 1px 0 rgba(255,255,255,.06),0 8px 20px rgba(0,0,0,.25);font-family:Georgia,'Times New Roman',serif;font-size:17px;white-space:nowrap;}}
+      .ebo-status-nav a img{{width:22px;height:22px;object-fit:contain;filter:drop-shadow(0 2px 4px rgba(0,0,0,.6));}}
+      .ebo-status-nav a.active{{background:linear-gradient(180deg,rgba(132,14,18,.94),rgba(78,5,8,.94));border-color:rgba(255,198,91,.78);box-shadow:0 0 18px rgba(198,33,23,.28),inset 0 0 0 1px rgba(255,232,158,.12);}}
+      .ebo-status-hero{{position:relative;overflow:hidden;margin:0 0 18px;padding:34px 36px 36px;border:1px solid rgba(218,166,74,.55);border-radius:24px;background:linear-gradient(180deg,rgba(5,6,8,.45),rgba(5,6,8,.78)),var(--ebo-hero-bg) center top/cover no-repeat;box-shadow:0 22px 55px rgba(0,0,0,.46),inset 0 0 0 1px rgba(255,226,147,.08),inset 0 0 55px rgba(216,160,61,.09);text-align:center;}}
+      .ebo-status-hero::before{{content:"";position:absolute;inset:0;background:radial-gradient(circle at 50% 14%,rgba(224,176,82,.20),transparent 24%),linear-gradient(90deg,rgba(0,0,0,.58),transparent 18%,transparent 82%,rgba(0,0,0,.58));pointer-events:none;}}
+      .ebo-status-hero>*{{position:relative;z-index:1;}}
+      .ebo-hero-ornament{{position:absolute;top:-1px;left:50%;width:38px;height:22px;transform:translateX(-50%);background:linear-gradient(135deg,transparent 35%,rgba(218,166,74,.95) 36%,rgba(218,166,74,.95) 64%,transparent 65%);filter:drop-shadow(0 0 8px rgba(218,166,74,.55));}}
+      .ebo-hero-logo{{width:178px;height:178px;margin:0 auto 18px;border-radius:28px;display:grid;place-items:center;}}
+      .ebo-hero-logo img{{max-width:100%;max-height:100%;object-fit:contain;filter:drop-shadow(0 14px 26px rgba(0,0,0,.65)) drop-shadow(0 0 16px rgba(226,164,55,.22));}}
+      .ebo-hero-eyebrow{{text-transform:uppercase;letter-spacing:.22em;color:var(--gold);font-weight:900;font-size:13px;margin-bottom:6px;text-shadow:0 2px 8px rgba(0,0,0,.7);}}
+      .ebo-status-hero h1{{margin:0 0 20px;font-family:Georgia,'Times New Roman',serif;font-size:clamp(34px,5vw,58px);line-height:1.05;color:#fff7ea;text-shadow:0 5px 22px rgba(0,0,0,.78);}}
+      .ebo-status-hero h1 span{{color:var(--gold);}}
+      .ebo-admin-button{{display:inline-flex;align-items:center;justify-content:center;gap:14px;min-width:min(430px,100%);padding:14px 24px;margin:0 auto 28px;text-decoration:none;color:#fce7b4;border:1px solid rgba(255,196,86,.75);border-radius:16px;background:linear-gradient(180deg,#9e181a,#57070b);box-shadow:0 14px 28px rgba(0,0,0,.42),inset 0 1px 0 rgba(255,255,255,.14),0 0 18px rgba(154,24,16,.22);font-family:Georgia,'Times New Roman',serif;font-size:22px;}}
+      .ebo-admin-button img{{width:28px;height:28px;object-fit:contain;}} .ebo-admin-button span{{margin-left:auto;font-size:34px;line-height:.7;}}
+      .ebo-status-grid{{display:grid;grid-template-columns:1fr 1fr;gap:18px;max-width:1030px;margin:0 auto;width:100%;}}
+      .ebo-stat-card{{display:grid;grid-template-columns:96px minmax(0,1fr);align-items:center;gap:18px;min-height:132px;text-decoration:none;color:inherit;padding:20px 22px;border:1px solid rgba(231,177,82,.60);border-radius:20px;background:linear-gradient(180deg,rgba(25,24,22,.76),rgba(7,8,10,.76));box-shadow:0 12px 30px rgba(0,0,0,.36),inset 0 0 0 1px rgba(255,255,255,.04),inset 0 0 28px rgba(222,165,67,.055);text-align:left;}}
+      .ebo-stat-card:hover{{border-color:rgba(255,207,114,.88);transform:translateY(-1px);}}
+      .ebo-stat-icon{{width:78px;height:78px;border-radius:999px;display:grid;place-items:center;border:1px solid rgba(218,166,74,.48);background:radial-gradient(circle,rgba(228,176,81,.18),rgba(0,0,0,.82));box-shadow:inset 0 0 12px rgba(0,0,0,.65),0 8px 18px rgba(0,0,0,.32);}}
+      .ebo-stat-icon img{{width:54px;height:54px;object-fit:contain;filter:drop-shadow(0 3px 5px rgba(0,0,0,.55));}}
+      .ebo-stat-title{{display:block;color:#eadac0;font-family:Georgia,'Times New Roman',serif;font-size:22px;line-height:1.1;margin-bottom:3px;}}
+      .ebo-stat-copy strong{{display:block;color:var(--gold);font-family:Georgia,'Times New Roman',serif;font-size:38px;line-height:1.02;text-shadow:0 2px 10px rgba(0,0,0,.5);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}}
+      .ebo-stat-copy small{{display:block;color:#cfc0aa;font-family:Georgia,'Times New Roman',serif;font-size:18px;line-height:1.25;}}
+      .ebo-server-card .ebo-stat-copy strong{{font-size:32px;}}
+      .ebo-map-panel{{border:1px solid rgba(218,166,74,.43);border-radius:22px;background:linear-gradient(180deg,rgba(10,12,18,.87),rgba(5,6,10,.94));box-shadow:0 18px 36px rgba(0,0,0,.40),inset 0 0 0 1px rgba(255,226,147,.06);overflow:hidden;}}
+      .ebo-map-head{{display:flex;align-items:center;gap:14px;padding:22px 24px 8px;}}
+      .ebo-map-head img{{width:48px;height:48px;object-fit:contain;}} .ebo-map-head h2{{font-family:Georgia,'Times New Roman',serif;font-size:36px;margin:0;}} .ebo-map-head a{{margin-left:auto;color:var(--gold);font-size:42px;text-decoration:none;}}
+      .ebo-map-toolbar{{padding:0 24px 14px;}}
+      .ebo-map-wrap{{margin:0 24px 24px;border:1px solid rgba(218,166,74,.25);border-radius:18px;overflow:hidden;background:url('{map_preview}') center/cover no-repeat;}}
+      .ebo-map-wrap .status-map-frame{{border-radius:0;}}
+      @media(max-width:900px){{.ebo-status-nav{{gap:8px;padding:12px;}}.ebo-status-nav a{{font-size:14px;padding:9px 8px;}}.ebo-status-nav a img{{width:19px;height:19px;}}.ebo-status-hero{{padding:28px 24px 30px;}}.ebo-hero-logo{{width:150px;height:150px;}}.ebo-status-grid{{gap:14px;}}.ebo-stat-card{{grid-template-columns:76px minmax(0,1fr);min-height:116px;padding:16px;gap:14px;}}.ebo-stat-icon{{width:66px;height:66px;}}.ebo-stat-icon img{{width:46px;height:46px;}}.ebo-stat-title{{font-size:19px;}}.ebo-stat-copy strong{{font-size:32px;}}.ebo-stat-copy small{{font-size:16px;}}}}
+      @media(max-width:620px){{.ebo-status-nav{{grid-template-columns:repeat(5,minmax(0,1fr));gap:7px;padding:10px;overflow:visible;}}.ebo-status-nav a{{min-height:48px;flex-direction:column;gap:3px;font-size:11px;padding:7px 4px;border-radius:12px;}}.ebo-status-nav a img{{width:20px;height:20px;}}.ebo-status-hero{{border-radius:20px;padding:26px 18px 28px;}}.ebo-hero-logo{{width:138px;height:138px;margin-bottom:12px;}}.ebo-hero-eyebrow{{font-size:11px;letter-spacing:.18em;}}.ebo-status-hero h1{{font-size:32px;margin-bottom:14px;}}.ebo-admin-button{{font-size:18px;padding:12px 16px;margin-bottom:22px;}}.ebo-admin-button img{{width:24px;height:24px;}}.ebo-status-grid{{grid-template-columns:1fr 1fr;gap:12px;}}.ebo-stat-card{{grid-template-columns:48px minmax(0,1fr);min-height:112px;padding:13px 12px;gap:10px;border-radius:17px;}}.ebo-stat-icon{{width:46px;height:46px;}}.ebo-stat-icon img{{width:34px;height:34px;}}.ebo-stat-title{{font-size:16px;}}.ebo-stat-copy strong{{font-size:26px;}}.ebo-server-card .ebo-stat-copy strong{{font-size:22px;}}.ebo-stat-copy small{{font-size:13px;}}.ebo-map-head{{padding:18px 18px 8px;}}.ebo-map-head img{{width:38px;height:38px;}}.ebo-map-head h2{{font-size:28px;}}.ebo-map-toolbar{{padding:0 18px 12px;}}.ebo-map-wrap{{margin:0 18px 18px;}}}}
+    </style>
     <script>
     (function() {{
       function text(id, value) {{
@@ -10140,15 +10171,12 @@ def _render_status_dashboard(data: dict[str, Any], request: Optional[Request] = 
         const phase = payload.phase || '—';
         const weather = payload.weather || '—';
         const server = payload.server_state || '—';
-        text('status-phase-icon', iconFor('phase', phase));
-        text('status-phase-value', phase);
+        text('status-phase-value', iconFor('phase', phase) + ' ' + phase);
         text('status-phase-sub', payload.phase_sub || '—');
-        text('status-weather-icon', iconFor('weather', weather));
-        text('status-weather-value', weather);
+        text('status-weather-value', iconFor('weather', weather) + ' ' + weather);
         text('status-weather-sub', payload.weather_sub || '—');
-        text('status-server-icon', iconFor('server', server) === '🟢' ? '🛡️' : iconFor('server', server));
-        text('status-server-value', server);
-        text('status-server-sub', 'Fearless · Europe');
+        text('status-server-name', payload.server || 'Fearless');
+        text('status-server-sub', iconFor('server', server) + ' ' + server + ' · Fearless · Europe');
         const nextPhase = payload.next_phase || (String(phase).toLowerCase().includes('tag') ? 'Nacht' : 'Tag');
         setCountdown('phase', nextPhase, payload.phase_countdown_seconds);
         const wLabel = String(weather).toLowerCase().includes('regen') ? 'Ende' : 'Regen';
@@ -10170,15 +10198,15 @@ def _render_status_dashboard(data: dict[str, Any], request: Optional[Request] = 
       setInterval(loadGameStatus, 300000);
     }})();
     </script>
-    <section class="panel" id="map">
-      <h2>🗺️ Solisium Karte</h2>
-      <div class="status-map-toolbar" style="display:flex;gap:10px;flex-wrap:wrap;margin:12px 0;">
+    <section class="ebo-map-panel" id="map">
+      <div class="ebo-map-head"><img src="{icon_map}" alt=""><h2>Solisium Karte</h2><a href="#map" aria-label="Karte">›</a></div>
+      <div class="status-map-toolbar ebo-map-toolbar" style="display:flex;gap:10px;flex-wrap:wrap;margin:12px 0;">
         <button class="btn" type="button" data-map-src="{_e(tldb_map_url)}" data-map-label="TLDB">TLDB Karte</button>
         <button class="btn ghost" type="button" data-map-src="{_e(imapp_map_url)}" data-map-label="IMapp">IMapp Karte</button>
         <button class="btn ghost" type="button" data-map-src="{_e(questlog_map_url)}" data-map-label="Questlog">Questlog Karte</button>
         <a class="btn ghost" id="statusMapDirect" href="{_e(direct_map_url)}" target="_blank" rel="noopener">Karte groß öffnen</a>
       </div>
-      <div class="status-map-wrap" style="position:relative;contain:content;content-visibility:auto;">
+      <div class="status-map-wrap ebo-map-wrap" style="position:relative;contain:content;content-visibility:auto;">
         <div id="statusMapLoader" class="muted" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;z-index:1;background:rgba(0,0,0,.35);border-radius:12px;min-height:420px;">Karte wird geladen …</div>
         <iframe id="statusMapFrame" class="status-map-frame" title="Solisium Karte" src="about:blank" data-src="{_e(map_url)}" width="100%" height="560" style="border:none;border-radius:8px;background:#05060a;" allowfullscreen loading="eager" referrerpolicy="no-referrer-when-downgrade"></iframe>
       </div>
