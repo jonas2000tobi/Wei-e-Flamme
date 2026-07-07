@@ -3732,9 +3732,9 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "admin") -> str:
     .card,.panel {{ background:linear-gradient(180deg,rgba(24,26,34,.94),rgba(16,18,25,.94)), url("{_asset('panel_texture.webp')}") center / cover; border:1px solid rgba(214,168,79,.16); border-radius:16px; box-shadow:0 10px 30px rgba(0,0,0,.32), inset 0 1px 0 rgba(255,255,255,.03); }}
     .card {{ padding:16px; }} .card-title {{ color:var(--muted); font-size:13px; }} .card-value {{ font-size:28px; font-weight:800; color:var(--gold); }} .card-sub {{ color:var(--muted); font-size:12px; }}
     .panel {{ padding:18px; margin:14px 0; scroll-margin-top:70px; }}
-    .subpanel {{ background:rgba(32,35,45,.72); border:1px solid var(--line); border-radius:14px; padding:14px; margin:12px 0; }}
+    .subpanel {{ background:rgba(32,35,45,.72); border:1px solid rgba(214,168,79,.20); border-radius:0; padding:14px; margin:12px 0; box-shadow:inset 0 0 0 1px rgba(255,226,160,.025); }}
     .analytics-grid {{ display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:12px; margin:12px 0 18px; }}
-    .metric {{ background:var(--panel2); border:1px solid var(--line); border-radius:14px; padding:14px; }}
+    .metric {{ background:var(--panel2); border:1px solid rgba(214,168,79,.20); border-radius:0; padding:14px; box-shadow:inset 0 0 0 1px rgba(255,226,160,.02); }}
     .metric span {{ display:block; color:var(--muted); font-size:13px; }} .metric strong {{ display:block; color:var(--gold); font-size:28px; }} .metric small {{ color:var(--muted); }}
     .split {{ display:grid; grid-template-columns:1fr 1fr; gap:18px; }}
     .home-layout {{ display:grid; grid-template-columns:minmax(0,2fr) minmax(300px,1fr); gap:18px; align-items:start; }}
@@ -3815,7 +3815,7 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "admin") -> str:
     body::before {{ content:""; position:fixed; inset:0; pointer-events:none; z-index:-1; background:radial-gradient(circle at 50% 0%,rgba(214,168,79,.12),transparent 34%), linear-gradient(90deg,rgba(0,0,0,.58),rgba(0,0,0,.12) 22%,rgba(0,0,0,.12) 78%,rgba(0,0,0,.62)); }}
     .app-shell {{ grid-template-columns:286px minmax(0,1fr); }}
     .sidebar {{ position:sticky; background:linear-gradient(180deg,rgba(33,15,10,.90),rgba(12,8,8,.96)); border-right:0; box-shadow:22px 0 58px rgba(0,0,0,.52), inset -1px 0 0 rgba(255,216,140,.05); padding:28px 18px 24px; isolation:isolate; }}
-    .sidebar::before {{ content:""; position:absolute; inset:8px 8px 8px 8px; pointer-events:none; z-index:0; background:var(--frame-sidebar) left top / 96% 100% no-repeat; opacity:.98; filter:drop-shadow(0 16px 28px rgba(0,0,0,.44)); }}
+    .sidebar::before {{ content:""; position:absolute; inset:8px 8px 8px 8px; pointer-events:none; z-index:0; background:var(--frame-sidebar) left top / 96% 100% no-repeat; opacity:.82; filter:drop-shadow(0 16px 28px rgba(0,0,0,.44)); }}
     .sidebar > * {{ position:relative; z-index:1; }}
     .brand {{ justify-content:center; flex-direction:column; text-align:center; gap:9px; padding:12px 18px 22px; margin:2px 0 14px; border-bottom:0; }}
     .brand-mark {{ width:108px; height:108px; border-radius:24px; padding:9px; background:radial-gradient(circle at 50% 28%,rgba(214,168,79,.22),rgba(13,8,8,.78)); border:1px solid rgba(214,168,79,.42); box-shadow:0 18px 38px rgba(0,0,0,.42), inset 0 0 0 1px rgba(255,222,150,.06); }}
@@ -3835,9 +3835,9 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "admin") -> str:
     .sidebar-footer {{ border-top:1px solid rgba(214,168,79,.18); margin:18px 12px 0 14px; padding-top:14px; }}
     main.content {{ max-width:1460px; padding:26px 30px 74px; }}
     .topnav a {{ border-color:rgba(214,168,79,.24); background:linear-gradient(180deg,rgba(32,22,14,.72),rgba(9,9,12,.76)); box-shadow:0 8px 18px rgba(0,0,0,.22), inset 0 1px 0 rgba(255,235,180,.05); }}
-    .hero {{ min-height:245px; border-radius:0; outline:none; border:0; padding:42px 42px 38px; overflow:hidden; isolation:isolate; }}
-    .hero::before {{ content:""; position:absolute; inset:0; pointer-events:none; z-index:0; background:var(--frame-header) center / 100% 100% no-repeat, linear-gradient(180deg,rgba(255,255,255,.03),transparent 24%,rgba(0,0,0,.38)), radial-gradient(circle at 72% 45%,rgba(61,137,255,.22),transparent 31%); }}
-    .hero::after {{ background:linear-gradient(180deg,rgba(0,0,0,.10),transparent 36%,rgba(0,0,0,.45)); z-index:0; }}
+    .hero {{ min-height:245px; border-radius:0; border:24px solid transparent; border-image:var(--frame-header) 96 122 86 122 stretch; outline:none; padding:30px 34px 28px; overflow:hidden; isolation:isolate; background-clip:padding-box; }}
+    .hero::before {{ content:""; position:absolute; inset:0; pointer-events:none; z-index:0; background:linear-gradient(180deg,rgba(255,255,255,.03),transparent 22%,rgba(0,0,0,.42)), radial-gradient(circle at 72% 45%,rgba(61,137,255,.22),transparent 31%); }}
+    .hero::after {{ content:""; position:absolute; inset:14px 18px; pointer-events:none; z-index:0; border:1px solid rgba(214,168,79,.14); box-shadow:inset 0 0 0 1px rgba(255,230,170,.025); background:linear-gradient(90deg,transparent,rgba(214,168,79,.24),transparent) top center/78% 1px no-repeat, linear-gradient(90deg,transparent,rgba(214,168,79,.20),transparent) bottom center/78% 1px no-repeat; }}
     .hero h1 {{ font-family:Georgia,'Times New Roman',serif; font-size:clamp(40px,5vw,70px); line-height:.98; letter-spacing:.05em; text-transform:uppercase; color:#f0c56b; text-shadow:0 3px 15px rgba(0,0,0,.76); }}
     .hero h1::before {{ display:none; }}
     .eyebrow {{ font-family:Georgia,'Times New Roman',serif; color:#d9aa58; text-transform:uppercase; letter-spacing:.16em; font-weight:800; }}
@@ -3846,16 +3846,16 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "admin") -> str:
     .hero-action {{ border-radius:0; background:linear-gradient(180deg,rgba(20,15,10,.72),rgba(7,8,12,.82)); border-color:rgba(214,168,79,.32); box-shadow:inset 0 0 0 1px rgba(255,223,160,.04); }}
     .hero-action:hover {{ border-color:rgba(214,168,79,.62); background:linear-gradient(180deg,rgba(48,34,18,.78),rgba(9,9,12,.86)); }}
     .hero-action-icon {{ width:34px; height:34px; object-fit:contain; filter:drop-shadow(0 3px 8px rgba(0,0,0,.70)); }}
-    .panel,.card,.metric,.release-card {{ background:linear-gradient(180deg,rgba(18,16,14,.90),rgba(8,9,12,.84)); border:0; box-shadow:0 18px 46px rgba(0,0,0,.34), inset 0 0 0 1px rgba(255,226,160,.035); backdrop-filter:blur(6px); }}
-    .panel {{ border-radius:0; position:relative; overflow:hidden; isolation:isolate; padding:22px; }}
-    .panel::before,.card::before {{ content:""; position:absolute; inset:0; background:var(--frame-panel) center / 100% 100% no-repeat; opacity:.98; pointer-events:none; z-index:0; }}
+    .panel,.card,.metric,.release-card {{ background:linear-gradient(180deg,rgba(18,16,14,.90),rgba(8,9,12,.84)); border:12px solid transparent; border-image:var(--frame-panel) 66 66 66 66 stretch; box-shadow:0 18px 46px rgba(0,0,0,.34), inset 0 0 0 1px rgba(255,226,160,.035); backdrop-filter:blur(6px); background-clip:padding-box; }}
+    .panel {{ border-radius:0; position:relative; overflow:hidden; isolation:isolate; padding:18px; }}
+    .panel::before,.card::before,.panel::after,.card::after {{ display:none; }}
     .panel > *, .card > * {{ position:relative; z-index:1; }}
     .panel h2,.panel h3,.card-label {{ font-family:Georgia,'Times New Roman',serif; color:var(--gold); text-transform:uppercase; letter-spacing:.07em; }}
-    .card {{ border-radius:0; position:relative; overflow:hidden; isolation:isolate; padding:20px 18px; }}
+    .card {{ border-radius:0; position:relative; overflow:hidden; isolation:isolate; padding:16px; }}
     .card-value {{ font-family:Georgia,'Times New Roman',serif; color:#f0c56b; }}
     .home-layout {{ grid-template-columns:minmax(0,1.55fr) minmax(330px,.78fr); gap:18px; }}
     .home-list {{ display:grid; gap:10px; }}
-    .home-item {{ background:linear-gradient(90deg,rgba(214,168,79,.075),rgba(8,9,12,.40)); border:1px solid rgba(214,168,79,.16); border-radius:0; overflow:hidden; }}
+    .home-item {{ background:linear-gradient(90deg,rgba(214,168,79,.075),rgba(8,9,12,.40)); border:1px solid rgba(214,168,79,.20); border-radius:0; overflow:hidden; box-shadow:inset 0 0 0 1px rgba(255,226,160,.025); }}
     .home-icon {{ background:radial-gradient(circle at 40% 30%,rgba(214,168,79,.22),rgba(8,9,12,.72)); border-radius:0; border-color:rgba(214,168,79,.26); color:transparent; }}
     .home-icon img {{ width:28px; height:28px; object-fit:contain; filter:drop-shadow(0 2px 5px rgba(0,0,0,.7)); }}
     .btn {{ border-radius:0; background:linear-gradient(180deg,#d9ad5a,#8f6424); color:#130d08; border:1px solid rgba(255,230,170,.34); box-shadow:0 10px 22px rgba(0,0,0,.26), inset 0 1px 0 rgba(255,255,255,.25); }}
@@ -3884,14 +3884,14 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "admin") -> str:
       .side-nav details a {{ margin-left:0; padding:10px 12px; }}
       main.content {{ padding:12px 10px 46px; }}
       .authbar {{ justify-content:flex-start; flex-wrap:wrap; font-size:12px; }}
-      .hero {{ padding:24px 22px 22px; border-radius:0; margin-bottom:12px; }}
+      .hero {{ padding:22px 18px 20px; border-radius:0; margin-bottom:12px; border-width:18px; }}
       .hero h1 {{ font-size:28px; line-height:1.1; }}
       .hero h1::before {{ width:30px; height:30px; margin-right:8px; vertical-align:-6px; }}
       .hero .btn, .hero a.btn {{ width:100%; text-align:center; margin-top:4px; }} .hero-actions {{ grid-template-columns:1fr; }} .hero-action {{ min-height:72px; }}
       .grid,.analytics-grid {{ grid-template-columns:1fr; gap:10px; }}
-      .card {{ padding:14px; }} .card-value {{ font-size:25px; }}
+      .card {{ padding:12px; border-width:10px; }} .card-value {{ font-size:25px; }}
       .home-layout {{ grid-template-columns:1fr; gap:12px; }}
-      .panel {{ padding:18px 16px; border-radius:0; margin:12px 0; }}
+      .panel {{ padding:16px 12px; border-radius:0; margin:12px 0; border-width:10px; }}
       .home-item {{ grid-template-columns:38px minmax(0,1fr); gap:10px; padding:12px; }}
       .home-icon {{ width:38px; height:38px; font-size:18px; }}
       .home-title {{ overflow-wrap:anywhere; }}
