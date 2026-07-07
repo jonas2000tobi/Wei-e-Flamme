@@ -31,7 +31,7 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
-ASSET_VER = "ebo-status-arch-swap"
+ASSET_VER = "ebo-gothic-whale-dashboard-v1"
 DASHBOARD_RELEASE_VERSION = "1.2.0 · Status Playwright Worker"
 
 
@@ -3561,47 +3561,47 @@ def _sidebar_html() -> str:
       <button class="mobile-nav-toggle" type="button" onclick="document.body.classList.toggle('nav-open')">☰ Menü</button>
 
       <nav class="side-nav">
-        <a href="/" data-nav="home">📡 Status</a>
-        <a href="/overview" data-nav="overview">🏰 Kommando</a>
+        <a href="/" data-nav="home"><img class="nav-ico" src="{_asset('nav_status.png')}" alt="">Status</a>
+        <a href="/overview" data-nav="overview"><img class="nav-ico" src="{_asset('nav_kommando.png')}" alt="">Kommando</a>
 
         <details open>
           <summary>Gilde</summary>
-          <a href="/members">👥 Mitglieder</a>
-        <a href="/portal">👤 Mein Portal</a>
-          <a href="/events">📅 Events</a>
-          <a href="/attendance">✅ Anwesenheit</a>
-          <a href="/attendance-stats">📈 Stats</a>
-          <a href="/attendance-archive">📦 Archiv</a>
+          <a href="/members"><img class="nav-ico" src="{_asset('nav_mitglieder.png')}" alt="">Mitglieder</a>
+        <a href="/portal"><img class="nav-ico" src="{_asset('nav_portal.png')}" alt="">Mein Portal</a>
+          <a href="/events"><img class="nav-ico" src="{_asset('nav_events.png')}" alt="">Events</a>
+          <a href="/attendance"><img class="nav-ico" src="{_asset('nav_anwesenheit.png')}" alt="">Anwesenheit</a>
+          <a href="/attendance-stats"><img class="nav-ico" src="{_asset('nav_analytics.png')}" alt="">Stats</a>
+          <a href="/attendance-archive"><img class="nav-ico" src="{_asset('nav_exports.png')}" alt="">Archiv</a>
         </details>
 
         <details open>
           <summary>Loot & Auktionen</summary>
-          <a href="/loot">🏆 Loot-Zentrale</a>
-          <a href="/loot-check">🔎 Truhencheck</a>
-          <a href="/loot-history">📜 Loot-Verlauf</a>
-          <a href="/needs">🎁 Needs</a>
-          <a href="/fairness">⚖️ Fairness</a>
+          <a href="/loot"><img class="nav-ico" src="{_asset('nav_loot.png')}" alt="">Loot-Zentrale</a>
+          <a href="/loot-check"><img class="nav-ico" src="{_asset('nav_loot.png')}" alt="">Truhencheck</a>
+          <a href="/loot-history"><img class="nav-ico" src="{_asset('nav_exports.png')}" alt="">Loot-Verlauf</a>
+          <a href="/needs"><img class="nav-ico" src="{_asset('nav_needs.png')}" alt="">Needs</a>
+          <a href="/fairness"><img class="nav-ico" src="{_asset('nav_fairness.png')}" alt="">Fairness</a>
         </details>
 
         <details open>
           <summary>EC</summary>
-          <a href="/ec">🪙 EC-Verlauf</a>
-          <a href="/ec-queue">🌐 EC-Queue</a>
+          <a href="/ec"><img class="nav-ico" src="{_asset('nav_ec.png')}" alt="">EC-Verlauf</a>
+          <a href="/ec-queue"><img class="nav-ico" src="{_asset('nav_ec.png')}" alt="">EC-Queue</a>
         </details>
 
         <details>
           <summary>Auswertung</summary>
-          <a href="/analytics">📊 Analytics</a>
-          <a href="/voice">🎙️ Voice</a>
-          <a href="/exports">📤 Exports</a>
+          <a href="/analytics"><img class="nav-ico" src="{_asset('nav_analytics.png')}" alt="">Analytics</a>
+          <a href="/voice"><img class="nav-ico" src="{_asset('nav_voice.png')}" alt="">Voice</a>
+          <a href="/exports"><img class="nav-ico" src="{_asset('nav_exports.png')}" alt="">Exports</a>
         </details>
 
         <details>
           <summary>Leitung & System</summary>
-          <a href="/admin">🛡️ Admin</a>
-          <a href="/settings">⚙️ Einstellungen</a>
-          <a href="/audit">🧾 Audit</a>
-          <a href="/system">🧰 System</a>
+          <a href="/admin"><img class="nav-ico" src="{_asset('nav_leitung.png')}" alt="">Admin</a>
+          <a href="/settings"><img class="nav-ico" src="{_asset('nav_einstellungen.png')}" alt="">Einstellungen</a>
+          <a href="/audit"><img class="nav-ico" src="{_asset('nav_audit.png')}" alt="">Audit</a>
+          <a href="/system"><img class="nav-ico" src="{_asset('nav_system.png')}" alt="">System</a>
         </details>
       </nav>
 
@@ -3627,13 +3627,13 @@ def _member_sidebar_html() -> str:
       <button class="mobile-nav-toggle" type="button" onclick="document.body.classList.toggle('nav-open')">☰ Menü</button>
 
       <nav class="side-nav">
-        <a href="/member" data-nav="member-home">📡 Status</a>
-        <a href="/member/members" data-nav="member-members">👥 Mitglieder</a>
-        <a href="/member/events" data-nav="member-events">📅 Events</a>
-        <a href="/member/auctions" data-nav="member-auctions">🏆 Auktionen</a>
-        <a href="/member/ec" data-nav="member-ec">🪙 Meine EC</a>
-        <a href="/portal" data-nav="member-profile">👤 Eigenes Profil</a>
-        <a href="/portal#needs" data-nav="member-needs">🎁 Meine Needs</a>
+        <a href="/member" data-nav="member-home"><img class="nav-ico" src="{_asset('nav_status.png')}" alt="">Status</a>
+        <a href="/member/members" data-nav="member-members"><img class="nav-ico" src="{_asset('nav_mitglieder.png')}" alt="">Mitglieder</a>
+        <a href="/member/events" data-nav="member-events"><img class="nav-ico" src="{_asset('nav_events.png')}" alt="">Events</a>
+        <a href="/member/auctions" data-nav="member-auctions"><img class="nav-ico" src="{_asset('nav_loot.png')}" alt="">Auktionen</a>
+        <a href="/member/ec" data-nav="member-ec"><img class="nav-ico" src="{_asset('nav_ec.png')}" alt="">Meine EC</a>
+        <a href="/portal" data-nav="member-profile"><img class="nav-ico" src="{_asset('nav_portal.png')}" alt="">Eigenes Profil</a>
+        <a href="/portal#needs" data-nav="member-needs"><img class="nav-ico" src="{_asset('nav_needs.png')}" alt="">Meine Needs</a>
       </nav>
 
       <div class="sidebar-footer">
@@ -3666,7 +3666,7 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "admin") -> str:
   <style>
     :root {{ --bg:#0f1014; --panel:#181a22; --panel2:#20232d; --text:#f1eadb; --muted:#a8a193; --gold:#d6a84f; --line:#333746; --red:#d96868; --green:#81c784; --side:#11121a; --side2:#171824; }}
     * {{ box-sizing:border-box; }} html {{ scroll-behavior:smooth; }}
-    body {{ margin:0; font-family:Inter, system-ui, Segoe UI, sans-serif; background:linear-gradient(180deg,rgba(15,16,20,.82),rgba(15,16,20,.98)), url("{_asset('hero_banner.webp')}") center top / cover fixed no-repeat; color:var(--text); overflow-x:hidden; }}
+    body {{ margin:0; font-family:Inter, system-ui, Segoe UI, sans-serif; background:linear-gradient(180deg,rgba(5,6,9,.56),rgba(5,6,9,.88)), url("{_asset('dashboard_bg.webp')}") center center / cover fixed no-repeat; color:var(--text); overflow-x:hidden; }}
     .app-shell {{ display:grid; grid-template-columns:260px minmax(0,1fr); min-height:100vh; }}
     .sidebar {{ position:sticky; top:0; height:100vh; overflow:auto; scrollbar-width:none; -ms-overflow-style:none; padding:18px 14px; background:linear-gradient(180deg,rgba(17,18,26,.97),rgba(11,12,18,.97)); border-right:1px solid rgba(214,168,79,.16); box-shadow:16px 0 45px rgba(0,0,0,.35); }}
     .sidebar::-webkit-scrollbar {{ width:0; height:0; display:none; }}
@@ -3709,7 +3709,7 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "admin") -> str:
     .topnav a[href="/system"]::before {{ display:block; background-image:url("{_asset('nav_system.png')}"); }}
     .topnav a[href="/exports"]::before {{ display:block; background-image:url("{_asset('nav_exports.png')}"); }}
     .topnav a:hover {{ border-color:var(--gold); color:var(--gold); transform:translateY(-1px); }}
-    .hero {{ position:relative; overflow:hidden; display:flex; justify-content:space-between; gap:18px; align-items:center; padding:30px; border:1px solid rgba(214,168,79,.32); background:linear-gradient(90deg,rgba(10,11,15,.90),rgba(24,26,34,.78)), url("{_asset('hero_banner.webp')}") center / cover no-repeat; border-radius:20px; margin-bottom:18px; box-shadow:0 18px 44px rgba(0,0,0,.42); }}
+    .hero {{ position:relative; overflow:hidden; display:flex; justify-content:space-between; gap:18px; align-items:center; padding:34px; border:1px solid rgba(214,168,79,.38); background:linear-gradient(90deg,rgba(6,8,14,.88) 0%,rgba(9,12,20,.66) 48%,rgba(9,12,20,.26) 100%), url("{_asset('hero_banner.webp')}") center center / cover no-repeat; border-radius:22px; margin-bottom:18px; box-shadow:0 24px 60px rgba(0,0,0,.50), inset 0 0 0 1px rgba(255,222,150,.06); }}
     .hero::after {{ content:""; position:absolute; inset:0; pointer-events:none; background:radial-gradient(circle at 76% 50%,rgba(214,168,79,.16),transparent 34%), linear-gradient(180deg,transparent,rgba(0,0,0,.24)); }}
     .hero > * {{ position:relative; z-index:1; }}
     .hero h1::before {{ content:""; display:inline-block; width:38px; height:38px; margin-right:10px; vertical-align:-8px; background:url("{_asset('ebolus_logo.png')}") center / contain no-repeat; filter:drop-shadow(0 2px 7px rgba(0,0,0,.8)); }}
@@ -3810,6 +3810,58 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "admin") -> str:
     .weapon-type-picker {{ width:100%; margin:0 0 8px; border:1px solid var(--line); background:#08090d; color:var(--text); border-radius:10px; padding:10px 12px; }}
     td {{ overflow-wrap:anywhere; }}
     .skip-mobile {{ display:inline; }}
+
+    /* Ebolus Gothic/Whale Visual Pass v1 */
+    body::before {{ content:""; position:fixed; inset:0; pointer-events:none; z-index:-1; background:radial-gradient(circle at 50% 0%,rgba(214,168,79,.12),transparent 34%), linear-gradient(90deg,rgba(0,0,0,.58),rgba(0,0,0,.12) 22%,rgba(0,0,0,.12) 78%,rgba(0,0,0,.62)); }}
+    .app-shell {{ grid-template-columns:286px minmax(0,1fr); }}
+    .sidebar {{ background:linear-gradient(180deg,rgba(33,15,10,.84),rgba(12,8,8,.92)); border-right:1px solid rgba(214,168,79,.32); box-shadow:22px 0 58px rgba(0,0,0,.52), inset -1px 0 0 rgba(255,216,140,.05); }}
+    .brand {{ justify-content:center; flex-direction:column; text-align:center; gap:9px; padding:10px 10px 22px; margin-bottom:14px; }}
+    .brand-mark {{ width:108px; height:108px; border-radius:24px; padding:9px; background:radial-gradient(circle at 50% 28%,rgba(214,168,79,.22),rgba(13,8,8,.78)); border:1px solid rgba(214,168,79,.42); box-shadow:0 18px 38px rgba(0,0,0,.42), inset 0 0 0 1px rgba(255,222,150,.06); }}
+    .brand-mark img {{ width:100%; height:100%; object-fit:contain; }}
+    .brand strong {{ font-family:Georgia,'Times New Roman',serif; text-transform:uppercase; letter-spacing:.12em; color:var(--gold); font-size:20px; }}
+    .brand span {{ letter-spacing:.08em; text-transform:uppercase; }}
+    .side-nav {{ gap:5px; }}
+    .side-nav a, .side-nav summary {{ border-radius:0; min-height:43px; padding:10px 13px; border:1px solid transparent; background:linear-gradient(90deg,rgba(255,255,255,.015),rgba(0,0,0,.00)); font-family:Georgia,'Times New Roman',serif; text-transform:uppercase; letter-spacing:.065em; }}
+    .side-nav a {{ position:relative; font-size:12px; }}
+    .side-nav a::after {{ content:""; position:absolute; left:13px; right:13px; bottom:-3px; height:1px; background:linear-gradient(90deg,transparent,rgba(214,168,79,.20),transparent); }}
+    .side-nav a:hover {{ background:linear-gradient(90deg,rgba(214,168,79,.16),rgba(214,168,79,.045)); border-color:rgba(214,168,79,.18); }}
+    .side-nav a.active {{ background:linear-gradient(90deg,rgba(214,168,79,.24),rgba(214,168,79,.07)); border-color:rgba(214,168,79,.36); box-shadow:inset 3px 0 0 rgba(236,194,104,.86), 0 8px 20px rgba(0,0,0,.24); }}
+    .nav-ico {{ width:22px; height:22px; object-fit:contain; flex:0 0 22px; filter:drop-shadow(0 2px 5px rgba(0,0,0,.75)); opacity:.92; }}
+    .side-nav a.active .nav-ico, .side-nav a:hover .nav-ico {{ opacity:1; }}
+    .side-nav details {{ border-top:1px solid rgba(214,168,79,.16); margin-top:10px; padding-top:10px; }}
+    .side-nav summary {{ color:#b9a783; font-size:10px; min-height:28px; padding:6px 12px; }}
+    .sidebar-footer {{ border-top:1px solid rgba(214,168,79,.18); }}
+    main.content {{ max-width:1460px; padding:26px 30px 74px; }}
+    .topnav a {{ border-color:rgba(214,168,79,.24); background:linear-gradient(180deg,rgba(32,22,14,.72),rgba(9,9,12,.76)); box-shadow:0 8px 18px rgba(0,0,0,.22), inset 0 1px 0 rgba(255,235,180,.05); }}
+    .hero {{ min-height:245px; border-radius:0; outline:1px solid rgba(255,226,160,.055); outline-offset:-6px; }}
+    .hero::before {{ content:""; position:absolute; inset:0; pointer-events:none; background:linear-gradient(180deg,rgba(255,255,255,.03),transparent 24%,rgba(0,0,0,.38)), radial-gradient(circle at 72% 45%,rgba(61,137,255,.22),transparent 31%); }}
+    .hero::after {{ background:linear-gradient(180deg,transparent 58%,rgba(0,0,0,.45)); }}
+    .hero h1 {{ font-family:Georgia,'Times New Roman',serif; font-size:clamp(40px,5vw,70px); line-height:.98; letter-spacing:.05em; text-transform:uppercase; color:#f0c56b; text-shadow:0 3px 15px rgba(0,0,0,.76); }}
+    .hero h1::before {{ display:none; }}
+    .eyebrow {{ font-family:Georgia,'Times New Roman',serif; color:#d9aa58; text-transform:uppercase; letter-spacing:.16em; font-weight:800; }}
+    .hero p {{ max-width:720px; }}
+    .hero-actions {{ max-width:560px; }}
+    .hero-action {{ border-radius:0; background:linear-gradient(180deg,rgba(20,15,10,.72),rgba(7,8,12,.82)); border-color:rgba(214,168,79,.32); box-shadow:inset 0 0 0 1px rgba(255,223,160,.04); }}
+    .hero-action:hover {{ border-color:rgba(214,168,79,.62); background:linear-gradient(180deg,rgba(48,34,18,.78),rgba(9,9,12,.86)); }}
+    .hero-action-icon {{ width:34px; height:34px; object-fit:contain; filter:drop-shadow(0 3px 8px rgba(0,0,0,.70)); }}
+    .panel,.card,.metric,.release-card {{ background:linear-gradient(180deg,rgba(18,16,14,.86),rgba(8,9,12,.82)); border:1px solid rgba(214,168,79,.22); box-shadow:0 18px 46px rgba(0,0,0,.34), inset 0 0 0 1px rgba(255,226,160,.035); backdrop-filter:blur(6px); }}
+    .panel {{ border-radius:0; position:relative; }}
+    .panel::before,.card::before {{ content:""; position:absolute; left:12px; right:12px; top:0; height:1px; background:linear-gradient(90deg,transparent,rgba(214,168,79,.45),transparent); opacity:.72; pointer-events:none; }}
+    .panel h2,.panel h3,.card-label {{ font-family:Georgia,'Times New Roman',serif; color:var(--gold); text-transform:uppercase; letter-spacing:.07em; }}
+    .card {{ border-radius:0; position:relative; }}
+    .card-value {{ font-family:Georgia,'Times New Roman',serif; color:#f0c56b; }}
+    .home-layout {{ grid-template-columns:minmax(0,1.55fr) minmax(330px,.78fr); gap:18px; }}
+    .home-list {{ display:grid; gap:10px; }}
+    .home-item {{ background:linear-gradient(90deg,rgba(214,168,79,.075),rgba(8,9,12,.40)); border:1px solid rgba(214,168,79,.16); border-radius:0; }}
+    .home-icon {{ background:radial-gradient(circle at 40% 30%,rgba(214,168,79,.22),rgba(8,9,12,.72)); border-radius:0; border-color:rgba(214,168,79,.26); color:transparent; }}
+    .home-icon img {{ width:28px; height:28px; object-fit:contain; filter:drop-shadow(0 2px 5px rgba(0,0,0,.7)); }}
+    .btn {{ border-radius:0; background:linear-gradient(180deg,#d9ad5a,#8f6424); color:#130d08; border:1px solid rgba(255,230,170,.34); box-shadow:0 10px 22px rgba(0,0,0,.26), inset 0 1px 0 rgba(255,255,255,.25); }}
+    .btn:hover {{ filter:brightness(1.06); transform:translateY(-1px); }}
+    .btn.ghost,.ghost {{ background:linear-gradient(180deg,rgba(20,15,10,.58),rgba(7,8,12,.82)); color:#eadabb; border:1px solid rgba(214,168,79,.28); }}
+    .btn.danger,.danger {{ background:linear-gradient(180deg,#8e3832,#4c1715); color:#ffe1dc; border:1px solid rgba(255,155,140,.35); }}
+    input[type=text], input[type=number], input[type=datetime-local], input[type=date], input[type=url], input[type=search], select, textarea {{ background:rgba(5,6,9,.72); border-color:rgba(214,168,79,.20); }}
+    th {{ color:#e2b660; }}
+    th,td {{ border-bottom-color:rgba(214,168,79,.15); }}
 
     @media(max-width:1100px) {{ .app-shell {{ grid-template-columns:1fr; }} .sidebar {{ position:relative; height:auto; border-right:0; border-bottom:1px solid rgba(214,168,79,.16); }} .side-nav {{ display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); }} .side-nav details {{ margin-top:0; }} .home-layout {{ grid-template-columns:1fr; }} }}
     @media(max-width:1000px) {{ .grid,.analytics-grid {{ grid-template-columns:repeat(2,minmax(0,1fr)); }} .split {{ grid-template-columns:1fr; }} .hero {{ flex-direction:column; align-items:flex-start; }} .hero-actions {{ grid-template-columns:1fr; width:100%; }} }}
@@ -9986,7 +10038,7 @@ def _render_status_dashboard(data: dict[str, Any], request: Optional[Request] = 
         .status-topnav-shell{{border:1px solid rgba(218,166,74,.34);border-radius:20px;padding:10px;margin:0 0 18px;background:linear-gradient(180deg,rgba(218,166,74,.09),rgba(11,14,22,.38));box-shadow:0 16px 40px rgba(0,0,0,.22), inset 0 0 0 1px rgba(255,221,151,.04);}}
         .status-topnav{{margin:0;}}
         .status-topnav a{{border-color:rgba(218,166,74,.34);}}
-        .status-main-hero{{padding:26px 28px;background:linear-gradient(180deg,rgba(6,8,12,.46),rgba(7,9,14,.78)), url("{_asset('status_arch_bg.png')}") center center / cover no-repeat;border:1px solid rgba(218,166,74,.34);box-shadow:0 18px 48px rgba(0,0,0,.42), inset 0 0 0 1px rgba(255,220,150,.04);}}
+        .status-main-hero{{padding:30px 32px;background:linear-gradient(90deg,rgba(6,8,12,.88) 0%,rgba(7,9,14,.62) 52%,rgba(7,9,14,.18) 100%), url("{_asset('hero_banner.webp')}") center center / cover no-repeat;border:1px solid rgba(218,166,74,.38);box-shadow:0 22px 56px rgba(0,0,0,.48), inset 0 0 0 1px rgba(255,220,150,.05);}}
         .status-hero-inner{{width:100%;display:flex;flex-direction:column;align-items:center;gap:18px;}}
         .status-hero-head{{display:flex;flex-direction:column;align-items:center;text-align:center;gap:12px;width:100%;}}
         .status-hero-logo{{width:154px;height:154px;border-radius:32px;padding:12px;margin:0 auto;background:radial-gradient(circle at 35% 25%,rgba(218,166,74,.24),rgba(11,14,22,.66));border:1px solid rgba(218,166,74,.42);box-shadow:0 22px 50px rgba(0,0,0,.42),0 0 0 1px rgba(255,221,151,.06) inset;}}
@@ -10312,10 +10364,21 @@ def _render_leadership_dashboard(data: dict[str, Any]) -> str:
     ], searchable=False)
 
     # Kompakte Startseite im Guild-Manager-Stil: Hauptnavigation links, Startseite nur mit aktuellen To-dos.
+    def _home_icon_src(icon: str) -> str:
+        return {
+            "📅": "status_event_laeuft.png",
+            "🏆": "status_active_auction.png",
+            "👤": "nav_mitglieder.png",
+            "✅": "status_ok.png",
+            "🪙": "nav_ec.png",
+        }.get(str(icon or ""), "")
+
     def _home_item(icon: str, title: Any, meta: Any, href: str = "", badge: str = "") -> str:
         title_html = f"<a class='link' href='{_e(href)}'>{_e(title)}</a>" if href else _e(title)
         badge_html = f"<span class='pill'>{_e(badge)}</span>" if badge else ""
-        return f"<div class='home-item'><div class='home-icon'>{_e(icon)}</div><div><div class='home-title'>{title_html}</div><div class='home-meta'>{_cell(meta)}</div></div>{badge_html}</div>"
+        icon_src = _home_icon_src(icon)
+        icon_html = f"<img src='{_asset(icon_src)}' alt=''>" if icon_src else _e(icon)
+        return f"<div class='home-item'><div class='home-icon'>{icon_html}</div><div><div class='home-title'>{title_html}</div><div class='home-meta'>{_cell(meta)}</div></div>{badge_html}</div>"
 
     home_events_html = "".join(
         _home_item(
@@ -10397,9 +10460,9 @@ def _render_leadership_dashboard(data: dict[str, Any]) -> str:
         <p class="muted">{_e(role_line)} · Snapshot: {_e(_dt(data.get('published_at')))}</p>
       </div>
       <div class="hero-actions">
-        <a class="hero-action attendance" href="/attendance"><span>✅</span><strong>Anwesenheit</strong><small>Reviews, Voice & EC</small></a>
-        <a class="hero-action loot" href="/loot"><span>🏆</span><strong>Loot</strong><small>Auktionen & Gebote</small></a>
-        <a class="hero-action members" href="/members"><span>👥</span><strong>Mitglieder</strong><small>Roster & Aktivität</small></a>
+        <a class="hero-action attendance" href="/attendance"><img class="hero-action-icon" src="{_asset('nav_anwesenheit.png')}" alt=""><strong>Anwesenheit</strong><small>Reviews, Voice & EC</small></a>
+        <a class="hero-action loot" href="/loot"><img class="hero-action-icon" src="{_asset('nav_loot.png')}" alt=""><strong>Loot</strong><small>Auktionen & Gebote</small></a>
+        <a class="hero-action members" href="/members"><img class="hero-action-icon" src="{_asset('nav_mitglieder.png')}" alt=""><strong>Mitglieder</strong><small>Roster & Aktivität</small></a>
       </div>
     </section>
 
