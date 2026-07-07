@@ -9364,7 +9364,7 @@ def _game_status_from_snapshot(snap: dict[str, Any]) -> dict[str, Any]:
 
     updated = _dt(raw.get("updated_at") or raw.get("source_updated_at") or raw.get("last_updated")) if raw else "—"
     source = _status_value(raw, "source", "provider", default="lokaler Platzhalter")
-    map_url = _status_value(raw, "map_url", default="https://interactivemap.app/throne-and-liberty/maps/solisium?embed=light")
+    map_url = _status_value(raw, "map_url", default="https://tldb.info/map/world")
     return {
         "raw": raw,
         "region": region,
@@ -9422,8 +9422,15 @@ def _render_status_dashboard(data: dict[str, Any], request: Optional[Request] = 
         _card("Serverstatus", game.get("server_state"), f"Population: {game.get('population')}"),
         _card("Quelle", game.get("source"), f"Aktualisiert: {game.get('updated')}"),
     ])
-    map_url = str(game.get("map_url") or "https://interactivemap.app/throne-and-liberty/maps/solisium?embed=light")
-    direct_map_url = map_url.replace("?embed=light", "")
+    map_url = str(game.get("map_url") or "https://tldb.info/map/world")
+    if "interactivemap.app" in map_url:
+        direct_map_url = map_url.replace("?embed=light", "")
+    else:
+        direct_map_url = map_url
+    imapp_map_url = "https://interactivemap.app/throne-and-liberty/maps/solisium?embed=light"
+    imapp_direct_url = "https://interactivemap.app/throne-and-liberty/maps/solisium"
+    questlog_map_url = "https://questlog.gg/throne-and-liberty/de/map"
+    tldb_map_url = "https://tldb.info/map/world"
     if nav_mode == "member":
         nav_html = '<nav class="topnav"><a href="/member">Status</a><a href="/portal">Mein Portal</a><a href="/member/auctions">Loot</a><a href="/member/events">Events</a><a href="/member/members">Mitglieder</a><a href="/member/ec">Meine EC</a></nav>'
     else:
@@ -9448,9 +9455,55 @@ def _render_status_dashboard(data: dict[str, Any], request: Optional[Request] = 
     <section class="grid status-grid-compact">{game_cards}</section>
     <section class="panel" id="map">
       <h2>🗺️ Solisium Karte</h2>
-      <p class="muted">Interaktive Karte als eingebetteter Ausschnitt. Falls der Anbieter Einbettung blockiert, den Link direkt öffnen.</p>
-      <iframe class="status-map-frame" src="{_e(map_url)}" width="100%" height="600" style="border:none;border-radius:8px;" allowfullscreen loading="lazy"></iframe>
-      <div class="status-source-note"><a class="btn" href="{_e(direct_map_url)}" target="_blank" rel="noopener">Karte groß öffnen</a><span class="muted">Quelle: interactivemap.app</span></div>
+      <p class="muted">Die Karte wird automatisch nachgeladen, aber erst nachdem das Dashboard selbst fertig gerendert ist. Standard ist TLDB, weil der IMapp-Embed auf Handy zu schwer war.</p>
+      <div class="status-map-toolbar" style="display:flex;gap:10px;flex-wrap:wrap;margin:12px 0;">
+        <button class="btn" type="button" data-map-src="{_e(tldb_map_url)}" data-map-label="TLDB">TLDB Karte</button>
+        <button class="btn ghost" type="button" data-map-src="{_e(imapp_map_url)}" data-map-label="IMapp">IMapp Karte</button>
+        <button class="btn ghost" type="button" data-map-src="{_e(questlog_map_url)}" data-map-label="Questlog">Questlog Karte</button>
+        <a class="btn ghost" id="statusMapDirect" href="{_e(direct_map_url)}" target="_blank" rel="noopener">Karte groß öffnen</a>
+      </div>
+      <div class="status-map-wrap" style="position:relative;contain:content;content-visibility:auto;">
+        <div id="statusMapLoader" class="muted" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;z-index:1;background:rgba(0,0,0,.35);border-radius:12px;min-height:420px;">Karte wird geladen …</div>
+        <iframe id="statusMapFrame" class="status-map-frame" title="Solisium Karte" src="about:blank" data-src="{_e(map_url)}" width="100%" height="560" style="border:none;border-radius:8px;background:#05060a;" allowfullscreen loading="eager" referrerpolicy="no-referrer-when-downgrade"></iframe>
+      </div>
+      <div class="status-source-note"><span class="muted">Quelle: <span id="statusMapSource">TLDB</span>. Falls ein Anbieter blockiert, oben anderen Kartenanbieter wählen.</span></div>
+      <script>
+      (function() {{
+        const frame = document.getElementById('statusMapFrame');
+        const loader = document.getElementById('statusMapLoader');
+        const direct = document.getElementById('statusMapDirect');
+        const source = document.getElementById('statusMapSource');
+        if (!frame) return;
+        function directUrl(src) {{
+          return String(src || '').replace('?embed=light', '');
+        }}
+        function setMap(src, label) {{
+          if (!src) return;
+          if (loader) loader.style.display = 'flex';
+          frame.src = src;
+          if (direct) direct.href = directUrl(src);
+          if (source) source.textContent = label || 'Karte';
+        }}
+        frame.addEventListener('load', function() {{
+          if (loader) loader.style.display = 'none';
+        }});
+        document.querySelectorAll('[data-map-src]').forEach(function(btn) {{
+          btn.addEventListener('click', function() {{
+            document.querySelectorAll('[data-map-src]').forEach(function(b) {{ b.classList.add('ghost'); }});
+            btn.classList.remove('ghost');
+            setMap(btn.getAttribute('data-map-src'), btn.getAttribute('data-map-label'));
+          }});
+        }});
+        const initial = frame.getAttribute('data-src') || '{_e(tldb_map_url)}';
+        const initialLabel = initial.indexOf('interactivemap.app') >= 0 ? 'IMapp' : (initial.indexOf('questlog.gg') >= 0 ? 'Questlog' : 'TLDB');
+        const load = function() {{ setMap(initial, initialLabel); }};
+        if ('requestIdleCallback' in window) {{
+          window.requestIdleCallback(load, {{timeout: 1600}});
+        }} else {{
+          window.addEventListener('load', function() {{ setTimeout(load, 500); }});
+        }}
+      }})();
+      </script>
     </section>
     """
     return _html_shell("Status · Ebo Dashboard", body, nav_mode=nav_mode)
