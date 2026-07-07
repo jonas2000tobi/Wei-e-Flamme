@@ -9356,9 +9356,12 @@ def _fetch_text_url(url: str, *, timeout: float = 6.0) -> str:
     req = urllib.request.Request(
         url,
         headers={
-            "User-Agent": "EboDashboard/1.0 (+https://chat.openai.com; status-cache)",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "de-DE,de;q=0.9,en;q=0.8",
+            # Einige Questlog/Status-Seiten liefern mit Bot-User-Agent nur unvollständige/alte Inhalte.
+            # Ein normaler Browser-UA vermeidet falsche Maintenance-/Platzhalter-Treffer.
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36 EboDashboard/1.0",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,application/json;q=0.8,*/*;q=0.7",
+            "Accept-Language": "en-US,en;q=0.9,de-DE;q=0.8,de;q=0.7",
+            "Cache-Control": "no-cache",
         },
     )
     with urllib.request.urlopen(req, timeout=timeout) as res:  # nosec - public status pages only
@@ -9379,6 +9382,31 @@ def _html_to_text(raw: str) -> str:
     text = re.sub(r"<style\b[^>]*>.*?</style>", " ", text, flags=re.I | re.S)
     text = re.sub(r"<[^>]+>", " ", text)
     text = html.unescape(text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def _html_to_searchable_text(raw: str) -> str:
+    """Macht JS-lastige Seiten suchbar, ohne Scriptdaten wegzuwerfen.
+
+    Questlog/Next-Seiten legen verwertbare Daten oft in JSON/Script-Blöcken ab.
+    _html_to_text entfernt Scripts bewusst; für Status-/Schedule-Parsing brauchen wir
+    aber genau diese eingebetteten Strings.
+    """
+    text = raw or ""
+    text = re.sub(r"<style\b[^>]*>.*?</style>", " ", text, flags=re.I | re.S)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = html.unescape(text)
+
+    def _u(m: re.Match[str]) -> str:
+        try:
+            return chr(int(m.group(1), 16))
+        except Exception:
+            return " "
+
+    text = re.sub(r"\\u([0-9a-fA-F]{4})", _u, text)
+    text = text.replace("\\n", " ").replace("\\t", " ").replace('\\"', '"').replace("\\/", "/")
+    text = re.sub(r"([a-z])([A-Z])", r"\1 \2", text)
     text = re.sub(r"\s+", " ", text)
     return text.strip()
 
@@ -9434,41 +9462,69 @@ def _parse_rain_text(text: str) -> dict[str, str]:
 
 
 def _normalize_server_state(raw: str) -> str:
-    text = (raw or "").lower()
-    if any(x in text for x in ["maintenance", "wartung", "wird gewartet"]):
-        return "Wartung"
-    if any(x in text for x in ["full", "voll"]):
-        return "Voll"
+    text = (raw or "").lower().strip()
+    if text in {"good", "healthy"}:
+        return "Online"
+    if any(x in text for x in ["online", "up", "good", "healthy"]):
+        return "Online"
     if any(x in text for x in ["busy", "ausgelastet"]):
         return "Ausgelastet"
-    if any(x in text for x in ["online", "up"]):
-        return "Online"
+    if any(x in text for x in ["full", "voll"]):
+        return "Voll"
+    if any(x in text for x in ["maintenance", "in maintenance", "wartung", "wird gewartet"]):
+        return "Wartung"
     if any(x in text for x in ["offline", "down"]):
         return "Offline"
     return raw.strip()[:40] if raw else "nicht ermittelbar"
 
 
-def _parse_server_status_text(text: str, server: str) -> dict[str, str]:
-    server_l = (server or "Fearless").lower()
-    text_plain = text or ""
-    idx = text_plain.lower().find(server_l)
-    if idx < 0:
-        return {"server_state": "nicht gefunden", "population": "—"}
-    window = text_plain[max(0, idx - 250): idx + 600]
-    state = "nicht ermittelbar"
-    for token in ["Maintenance", "Wird gewartet", "Online", "Ausgelastet", "Busy", "Full", "Voll", "Offline"]:
-        if re.search(re.escape(token), window, re.I):
-            state = _normalize_server_state(token)
-            break
-    population = "—"
-    m = re.search(r"\b(Europe|Europa)\b\D{0,80}([0-9][0-9\.,\s]{2,12}|N/A)\b", window, re.I)
+def _parse_server_status_text(text: str, server: str, *, source: str = "") -> dict[str, str]:
+    """Parst nur Status, der direkt zum gewünschten Server gehört.
+
+    Keine Legenden, keine globalen Maintenance-Hinweise, keine alten Historien.
+    Wenn Fearless nicht eindeutig gelesen wird, kommt "nicht ermittelbar" statt falscher Wartung.
+    """
+    server_name = server or "Fearless"
+    text_plain = re.sub(r"\s+", " ", text or "").strip()
+    if not text_plain:
+        return {"server_state": "nicht ermittelbar", "population": "—"}
+
+    status_words = r"Online|Good|Busy|Full|Offline|Maintenance|In Maintenance|Wartung"
+
+    # JSON/Next-Daten: {"name":"Fearless", ... "status":"Good"}
+    json_patterns = [
+        rf'"(?:name|server|serverName)"\s*:\s*"{re.escape(server_name)}".{{0,500}}?"(?:status|state|serverStatus)"\s*:\s*"({status_words})"',
+        rf'"(?:status|state|serverStatus)"\s*:\s*"({status_words})".{{0,500}}?"(?:name|server|serverName)"\s*:\s*"{re.escape(server_name)}"',
+    ]
+    for pat in json_patterns:
+        m = re.search(pat, text_plain, re.I)
+        if m:
+            return {"server_state": _normalize_server_state(m.group(1)), "population": "—"}
+
+    # Throney: "Fearless (Europe) is currently Online"
+    m = re.search(rf"{re.escape(server_name)}\s*\([^)]*Europe[^)]*\)\s+is\s+currently\s+({status_words})", text_plain, re.I)
     if m:
-        population = m.group(2).strip()
-    else:
-        nums = re.findall(r"\b[0-9]{1,3}(?:[\.,\s][0-9]{3})+\b|\b[0-9]{4,6}\b", window)
-        if nums:
-            population = nums[0].strip()
-    return {"server_state": state, "population": population}
+        return {"server_state": _normalize_server_state(m.group(1)), "population": "—"}
+
+    # Throney-Seite: Headbereich vor Historie enthält "Status Online".
+    if f"{server_name} Server Status".lower() in text_plain.lower() or source.lower() == "throney":
+        head = text_plain.split("Recent status changes", 1)[0]
+        head = head.split("Maintenance History", 1)[0]
+        m = re.search(rf"\bStatus\s+({status_words})\b", head, re.I)
+        if m:
+            return {"server_state": _normalize_server_state(m.group(1)), "population": "—"}
+
+    # Questlog gerendert: Tabelle/Zeile "Fearless Good".
+    # Nur ein kleines Fenster direkt nach dem Servernamen nutzen, damit Legenden unten nicht fälschlich greifen.
+    m = re.search(rf"\b{re.escape(server_name)}\b(.{{0,160}})", text_plain, re.I)
+    if m:
+        near = m.group(1)
+        m2 = re.search(rf"\b({status_words})\b", near, re.I)
+        if m2:
+            return {"server_state": _normalize_server_state(m2.group(1)), "population": "—"}
+        return {"server_state": "nicht ermittelbar", "population": "—"}
+
+    return {"server_state": "nicht gefunden", "population": "—"}
 
 
 def _live_game_status_payload(*, force: bool = False) -> dict[str, Any]:
@@ -9484,38 +9540,61 @@ def _live_game_status_payload(*, force: bool = False) -> dict[str, Any]:
         "region": region,
         "server": server,
         "phase": "nicht ermittelbar",
-        "phase_sub": "wird geladen",
+        "phase_sub": "Questlog-Zeitplan per einfachem Abruf nicht lesbar",
         "weather": "nicht ermittelbar",
-        "weather_sub": "wird geladen",
+        "weather_sub": "Questlog-Regenplan per einfachem Abruf nicht lesbar",
         "server_state": "nicht ermittelbar",
         "population": "—",
-        "source": "live: Questlog / Official / TLDB",
+        "source": "live: Throney / Official / Questlog",
         "updated_at": datetime.now(timezone.utc).isoformat(),
         "errors": [],
     }
 
-    try:
-        day_html = _fetch_text_url("https://questlog.gg/throne-and-liberty/en/day-and-night-schedule", timeout=6.0)
-        day_text = _html_to_text(day_html)
-        payload.update(_parse_daynight_text(day_text))
-        rain = _parse_rain_text(day_text)
-        if rain.get("weather") and rain.get("weather") != "nicht ermittelbar":
-            payload.update(rain)
-        else:
-            rain_html = _fetch_text_url("https://questlog.gg/throne-and-liberty/en/rain-schedule", timeout=6.0)
-            payload.update(_parse_rain_text(_html_to_text(rain_html)))
-    except Exception as exc:
-        payload.setdefault("errors", []).append(f"questlog_schedule: {type(exc).__name__}: {exc}")
+    schedule_urls = [
+        "https://questlog.gg/throne-and-liberty/en/day-and-night-schedule",
+        "https://questlog.gg/throne-and-liberty/en-nc/day-and-night-schedule",
+    ]
+    rain_urls = [
+        "https://questlog.gg/throne-and-liberty/en/rain-schedule",
+        "https://questlog.gg/throne-and-liberty/en-nc/rain-schedule",
+    ]
+    for url in schedule_urls:
+        try:
+            day_html = _fetch_text_url(url, timeout=7.0)
+            day_text = (_html_to_text(day_html) + " " + _html_to_searchable_text(day_html)).strip()
+            parsed_day = _parse_daynight_text(day_text)
+            if parsed_day.get("phase") != "nicht ermittelbar":
+                payload.update(parsed_day)
+            rain = _parse_rain_text(day_text)
+            if rain.get("weather") and rain.get("weather") != "nicht ermittelbar":
+                payload.update(rain)
+            if payload.get("phase") != "nicht ermittelbar" and payload.get("weather") != "nicht ermittelbar":
+                break
+        except Exception as exc:
+            payload.setdefault("errors", []).append(f"questlog_schedule:{url}: {type(exc).__name__}: {exc}")
+    if payload.get("weather") == "nicht ermittelbar":
+        for url in rain_urls:
+            try:
+                rain_html = _fetch_text_url(url, timeout=7.0)
+                rain_text = (_html_to_text(rain_html) + " " + _html_to_searchable_text(rain_html)).strip()
+                rain = _parse_rain_text(rain_text)
+                if rain.get("weather") != "nicht ermittelbar":
+                    payload.update(rain)
+                    break
+            except Exception as exc:
+                payload.setdefault("errors", []).append(f"questlog_rain:{url}: {type(exc).__name__}: {exc}")
 
+    server_slug = re.sub(r"[^a-z0-9]+", "-", server.lower()).strip("-") or "fearless"
     server_sources = [
-        ("official", "https://www.playthroneandliberty.com/de-de/support/server-status"),
-        ("tldb", "https://tldb.info/server-status"),
+        ("throney", f"https://throney.gg/servers/{server_slug}/status"),
         ("questlog", "https://questlog.gg/throne-and-liberty/en/server-status"),
+        ("official", "https://www.playthroneandliberty.com/de-de/support/server-status"),
     ]
     for name, url in server_sources:
         try:
-            raw = _fetch_text_url(url, timeout=6.0)
-            parsed = _parse_server_status_text(_html_to_text(raw), server)
+            raw = _fetch_text_url(url, timeout=7.0)
+            server_text = (_html_to_text(raw) + " " + _html_to_searchable_text(raw)).strip()
+            parsed = _parse_server_status_text(server_text, server, source=name)
             if parsed.get("server_state") not in {"nicht gefunden", "nicht ermittelbar", ""}:
                 payload.update(parsed)
                 payload["server_source"] = name
