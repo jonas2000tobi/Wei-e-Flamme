@@ -337,7 +337,43 @@ def _e(value: Any) -> str:
 
 
 def _asset(name: str) -> str:
-    return f"/static/{name}?v={ASSET_VER}"
+    """Return an asset URL.
+
+    Supports both package layouts:
+    - preferred nested layout: static/assets/icons/foo.png
+    - flat GitHub upload layout: static/assets/foo.png
+
+    That prevents broken images when the files were uploaded into
+    dashboard_web/static/assets directly instead of the subfolders.
+    """
+    raw = str(name or "").strip().lstrip("/")
+    if not raw:
+        return f"/static/missing-asset.png?v={ASSET_VER}"
+
+    candidates = [raw]
+
+    # Fallback from assets/icons/foo.png, assets/logos/foo.png, ...
+    # to assets/foo.png when GitHub upload flattened the folder.
+    parts = raw.split("/")
+    if len(parts) >= 3 and parts[0] == "assets":
+        candidates.append("assets/" + parts[-1])
+
+    # Fallback for older non-nested names such as panel_texture.webp.
+    if len(parts) == 1:
+        candidates.append("assets/" + raw)
+
+    seen = set()
+    for cand in candidates:
+        if cand in seen:
+            continue
+        seen.add(cand)
+        try:
+            if (STATIC_DIR / cand).exists():
+                return f"/static/{cand}?v={ASSET_VER}"
+        except Exception:
+            pass
+
+    return f"/static/{raw}?v={ASSET_VER}"
 
 
 def _dt(value: Any) -> str:
