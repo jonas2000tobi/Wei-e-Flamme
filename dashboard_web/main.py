@@ -3814,15 +3814,16 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "admin") -> str:
     /* Ebolus Gothic/Whale Visual Pass v1 */
     body::before {{ content:""; position:fixed; inset:0; pointer-events:none; z-index:-1; background:radial-gradient(circle at 50% 0%,rgba(214,168,79,.12),transparent 34%), linear-gradient(90deg,rgba(0,0,0,.58),rgba(0,0,0,.12) 22%,rgba(0,0,0,.12) 78%,rgba(0,0,0,.62)); }}
     .app-shell {{ grid-template-columns:286px minmax(0,1fr); }}
-    .sidebar {{ position:sticky; background:linear-gradient(180deg,rgba(33,15,10,.90),rgba(12,8,8,.96)); border-right:0; box-shadow:22px 0 58px rgba(0,0,0,.52), inset -1px 0 0 rgba(255,216,140,.05); padding:30px 22px 26px; isolation:isolate; }}
-    .sidebar::before {{ content:""; position:absolute; inset:8px 10px 8px 10px; pointer-events:none; z-index:0; background:var(--frame-sidebar-clean) center top / 100% 100% no-repeat; opacity:.96; filter:drop-shadow(0 16px 28px rgba(0,0,0,.44)); }}
+    .sidebar {{ position:sticky; background:linear-gradient(180deg,rgba(36,16,10,.92),rgba(13,8,8,.96)); border-right:1px solid rgba(214,168,79,.30); border-left:1px solid rgba(214,168,79,.34); box-shadow:22px 0 58px rgba(0,0,0,.52), inset -1px 0 0 rgba(255,216,140,.05), inset 1px 0 0 rgba(255,216,140,.05); padding:26px 18px 24px; isolation:isolate; }}
+    .sidebar::before {{ content:""; position:absolute; inset:14px 14px 18px; pointer-events:none; z-index:0; border:1px solid rgba(214,168,79,.28); box-shadow:inset 0 0 0 1px rgba(255,226,160,.035), inset 0 0 38px rgba(0,0,0,.28); background:linear-gradient(180deg,rgba(214,168,79,.12),transparent 9%,transparent 91%,rgba(214,168,79,.12)), linear-gradient(90deg,rgba(214,168,79,.18),transparent 18%,transparent 82%,rgba(214,168,79,.18)); }}
+    .sidebar::after {{ content:""; position:absolute; left:30px; right:30px; bottom:9px; height:26px; pointer-events:none; z-index:0; border-bottom:1px solid rgba(214,168,79,.46); transform:skewX(-28deg); box-shadow:0 10px 20px rgba(0,0,0,.35); }}
     .sidebar > * {{ position:relative; z-index:1; }}
-    .brand {{ justify-content:center; flex-direction:column; text-align:center; gap:9px; padding:12px 24px 22px; margin:2px 0 14px; border-bottom:0; }}
+    .brand {{ justify-content:center; flex-direction:column; text-align:center; gap:9px; padding:12px 18px 20px; margin:2px 4px 14px; border-bottom:1px solid rgba(214,168,79,.16); }}
     .brand-mark {{ width:108px; height:108px; border-radius:24px; padding:9px; background:radial-gradient(circle at 50% 28%,rgba(214,168,79,.22),rgba(13,8,8,.78)); border:1px solid rgba(214,168,79,.42); box-shadow:0 18px 38px rgba(0,0,0,.42), inset 0 0 0 1px rgba(255,222,150,.06); }}
     .brand-mark img {{ width:100%; height:100%; object-fit:contain; }}
     .brand strong {{ font-family:Georgia,'Times New Roman',serif; text-transform:uppercase; letter-spacing:.12em; color:var(--gold); font-size:20px; }}
     .brand span {{ letter-spacing:.08em; text-transform:uppercase; }}
-    .side-nav {{ gap:5px; padding:0 16px; }}
+    .side-nav {{ gap:5px; padding:0 6px; }}
     .side-nav a, .side-nav summary {{ border-radius:0; min-height:43px; padding:10px 13px; border:1px solid transparent; background:linear-gradient(90deg,rgba(255,255,255,.015),rgba(0,0,0,.00)); font-family:Georgia,'Times New Roman',serif; text-transform:uppercase; letter-spacing:.065em; }}
     .side-nav a {{ position:relative; font-size:12px; }}
     .side-nav a::after {{ content:""; position:absolute; left:13px; right:13px; bottom:-3px; height:1px; background:linear-gradient(90deg,transparent,rgba(214,168,79,.20),transparent); }}
@@ -3832,12 +3833,12 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "admin") -> str:
     .side-nav a.active .nav-ico, .side-nav a:hover .nav-ico {{ opacity:1; }}
     .side-nav details {{ border-top:1px solid rgba(214,168,79,.16); margin-top:10px; padding-top:10px; }}
     .side-nav summary {{ color:#b9a783; font-size:10px; min-height:28px; padding:6px 12px; }}
-    .sidebar-footer {{ border-top:1px solid rgba(214,168,79,.18); margin:18px 16px 0; padding-top:14px; }}
+    .sidebar-footer {{ border-top:1px solid rgba(214,168,79,.18); margin:18px 6px 0; padding-top:14px; }}
     main.content {{ max-width:1460px; padding:26px 30px 74px; }}
     .topnav a {{ border-color:rgba(214,168,79,.24); background:linear-gradient(180deg,rgba(32,22,14,.72),rgba(9,9,12,.76)); box-shadow:0 8px 18px rgba(0,0,0,.22), inset 0 1px 0 rgba(255,235,180,.05); }}
-    .hero {{ min-height:245px; border-radius:0; border:1px solid rgba(214,168,79,.42); outline:1px solid rgba(255,226,160,.07); outline-offset:-8px; padding:38px 46px 36px; overflow:hidden; isolation:isolate; background-clip:padding-box; box-shadow:0 24px 60px rgba(0,0,0,.52), inset 0 0 0 1px rgba(255,222,150,.045); }}
-    .hero::before {{ content:""; position:absolute; inset:0; pointer-events:none; z-index:0; background:var(--hero-pillar-left) left 12px center / 92px 82% no-repeat, var(--hero-pillar-right) right 12px center / 92px 82% no-repeat, linear-gradient(180deg,rgba(255,255,255,.03),transparent 22%,rgba(0,0,0,.42)), radial-gradient(circle at 72% 45%,rgba(61,137,255,.22),transparent 31%); }}
-    .hero::after {{ content:""; position:absolute; inset:12px 14px; pointer-events:none; z-index:0; border:1px solid rgba(214,168,79,.18); box-shadow:inset 0 0 0 1px rgba(255,230,170,.03), inset 0 0 46px rgba(0,0,0,.22); background:linear-gradient(90deg,transparent,rgba(214,168,79,.34),transparent) top center/82% 1px no-repeat, linear-gradient(90deg,transparent,rgba(214,168,79,.26),transparent) bottom center/82% 1px no-repeat, linear-gradient(180deg,rgba(214,168,79,.16),transparent 16%,transparent 84%,rgba(214,168,79,.10)); }}
+    .hero {{ min-height:245px; border-radius:0; border:1px solid rgba(214,168,79,.46); outline:1px solid rgba(255,226,160,.075); outline-offset:-8px; padding:38px 44px 36px; overflow:hidden; isolation:isolate; background-clip:padding-box; box-shadow:0 24px 60px rgba(0,0,0,.52), inset 0 0 0 1px rgba(255,222,150,.045); }}
+    .hero::before {{ content:""; position:absolute; inset:0; pointer-events:none; z-index:0; background:linear-gradient(180deg,rgba(255,255,255,.03),transparent 22%,rgba(0,0,0,.42)), radial-gradient(circle at 72% 45%,rgba(61,137,255,.22),transparent 31%), linear-gradient(90deg,rgba(214,168,79,.16),transparent 10%,transparent 90%,rgba(214,168,79,.14)); }}
+    .hero::after {{ content:""; position:absolute; inset:12px 14px; pointer-events:none; z-index:0; border:1px solid rgba(214,168,79,.20); box-shadow:inset 0 0 0 1px rgba(255,230,170,.03), inset 0 0 46px rgba(0,0,0,.22); background:linear-gradient(90deg,transparent,rgba(214,168,79,.34),transparent) top center/82% 1px no-repeat, linear-gradient(90deg,transparent,rgba(214,168,79,.26),transparent) bottom center/82% 1px no-repeat, linear-gradient(180deg,rgba(214,168,79,.12),transparent 16%,transparent 84%,rgba(214,168,79,.08)); }}
     .hero h1 {{ font-family:Georgia,'Times New Roman',serif; font-size:clamp(40px,5vw,70px); line-height:.98; letter-spacing:.05em; text-transform:uppercase; color:#f0c56b; text-shadow:0 3px 15px rgba(0,0,0,.76); }}
     .hero h1::before {{ display:none; }}
     .eyebrow {{ font-family:Georgia,'Times New Roman',serif; color:#d9aa58; text-transform:uppercase; letter-spacing:.16em; font-weight:800; }}
