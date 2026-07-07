@@ -9536,6 +9536,56 @@ def _clean_countdown(value: str) -> str:
     return value[:80] if value else "—"
 
 
+def _countdown_seconds_from_text(value: str) -> Optional[int]:
+    """Parst Questlog/GamesLantern-Countdowns für Live-Countdown im Dashboard."""
+    raw = html.unescape(str(value or "")).strip()
+    if not raw or raw == "—":
+        return None
+    raw = re.sub(r"\s+", " ", raw)
+    m = re.search(r"(\d{1,2}):(\d{2}):(\d{2})", raw)
+    if m:
+        return int(m.group(1)) * 3600 + int(m.group(2)) * 60 + int(m.group(3))
+    total = 0
+    matched = False
+    patterns = [
+        (86400, r"(\d+)\s*(?:tage?|days?|d)\b"),
+        (3600, r"(\d+)\s*(?:std|stunden?|hours?|hrs?|h)\b"),
+        (60, r"(\d+)\s*(?:minuten?|mins?|min|m)\b"),
+        (1, r"(\d+)\s*(?:sekunden?|secs?|sec|sek|s)\b"),
+    ]
+    low = raw.lower()
+    for mult, pat in patterns:
+        mm = re.search(pat, low, re.I)
+        if mm:
+            total += int(mm.group(1)) * mult
+            matched = True
+    if matched:
+        return max(0, total)
+    return None
+
+
+def _format_countdown_seconds(seconds: Optional[int]) -> str:
+    if seconds is None:
+        return "—"
+    try:
+        seconds = int(seconds)
+    except Exception:
+        return "—"
+    if seconds <= 0:
+        return "jetzt"
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, secs = divmod(rem, 60)
+    parts: list[str] = []
+    if days:
+        parts.append(f"{days} Tage")
+    if hours or days:
+        parts.append(f"{hours} Std")
+    parts.append(f"{minutes} Min")
+    parts.append(f"{secs} Sek")
+    return " ".join(parts)
+
+
 def _parse_daynight_text(text: str) -> dict[str, str]:
     patterns = [
         r"\b(Night|Day)\s+in\s+([0-9]{1,2}:[0-9]{2}:[0-9]{2})",
@@ -9550,8 +9600,10 @@ def _parse_daynight_text(text: str) -> dict[str, str]:
         nxt = m.group(1).lower()
         cd = _clean_countdown(m.group(2))
         if nxt in {"night", "nacht"}:
-            return {"phase": "Tag", "phase_sub": f"Nacht in {cd}", "next_phase": "Nacht", "countdown": cd}
-        return {"phase": "Nacht", "phase_sub": f"Tag in {cd}", "next_phase": "Tag", "countdown": cd}
+            secs = _countdown_seconds_from_text(cd)
+            return {"phase": "Tag", "phase_sub": f"Nacht in {_format_countdown_seconds(secs)}", "next_phase": "Nacht", "countdown": _format_countdown_seconds(secs), "phase_countdown_seconds": secs}
+        secs = _countdown_seconds_from_text(cd)
+        return {"phase": "Nacht", "phase_sub": f"Tag in {_format_countdown_seconds(secs)}", "next_phase": "Tag", "countdown": _format_countdown_seconds(secs), "phase_countdown_seconds": secs}
     return {"phase": "nicht ermittelbar", "phase_sub": "Questlog-Zeitplan konnte nicht gelesen werden"}
 
 
@@ -9571,7 +9623,8 @@ def _parse_rain_text(text: str) -> dict[str, str]:
         m = re.search(pat, text or "", re.I)
         if m:
             cd = _clean_countdown(m.group(1))
-            return {"weather": "Trocken", "weather_sub": f"Regen in {cd}", "next_rain": cd}
+            secs = _countdown_seconds_from_text(cd)
+            return {"weather": "Trocken", "weather_sub": f"Regen in {_format_countdown_seconds(secs)}", "next_rain": _format_countdown_seconds(secs), "weather_countdown_seconds": secs}
     return {"weather": "nicht ermittelbar", "weather_sub": "Regenplan konnte nicht gelesen werden"}
 
 
@@ -9671,12 +9724,16 @@ def _parse_daynight_rendered(text: str, region: str = "Europe") -> dict[str, str
                 # Wenn "Next Day" gefunden wurde, ist aktuell Nacht; wenn "Current Day" gefunden wurde, aktuell Tag.
                 is_next = candidate[max(0, m.start()-12):m.start()].lower().strip().endswith("next")
                 if is_next:
-                    return {"phase": "Nacht", "phase_sub": f"Tag in {cd}", "next_phase": "Tag", "countdown": cd}
-                return {"phase": "Tag", "phase_sub": f"Wechsel in {cd}", "next_phase": "Nacht", "countdown": cd}
+                    secs = _countdown_seconds_from_text(cd)
+                    return {"phase": "Nacht", "phase_sub": f"Tag in {_format_countdown_seconds(secs)}", "next_phase": "Tag", "countdown": _format_countdown_seconds(secs), "phase_countdown_seconds": secs}
+                secs = _countdown_seconds_from_text(cd)
+                return {"phase": "Tag", "phase_sub": f"Nacht in {_format_countdown_seconds(secs)}", "next_phase": "Nacht", "countdown": _format_countdown_seconds(secs), "phase_countdown_seconds": secs}
             is_next = candidate[max(0, m.start()-12):m.start()].lower().strip().endswith("next")
             if is_next:
-                return {"phase": "Tag", "phase_sub": f"Nacht in {cd}", "next_phase": "Nacht", "countdown": cd}
-            return {"phase": "Nacht", "phase_sub": f"Wechsel in {cd}", "next_phase": "Tag", "countdown": cd}
+                secs = _countdown_seconds_from_text(cd)
+                return {"phase": "Tag", "phase_sub": f"Nacht in {_format_countdown_seconds(secs)}", "next_phase": "Nacht", "countdown": _format_countdown_seconds(secs), "phase_countdown_seconds": secs}
+            secs = _countdown_seconds_from_text(cd)
+            return {"phase": "Nacht", "phase_sub": f"Tag in {_format_countdown_seconds(secs)}", "next_phase": "Tag", "countdown": _format_countdown_seconds(secs), "phase_countdown_seconds": secs}
     return {"phase": "nicht ermittelbar", "phase_sub": "Questlog/GamesLantern gerendert, aber Zeit nicht erkannt"}
 
 
@@ -9698,7 +9755,8 @@ def _parse_rain_rendered(text: str, region: str = "Europe") -> dict[str, str]:
                 continue
             if m.lastindex:
                 cd = _clean_countdown(m.group(1))
-                return {"weather": "Trocken", "weather_sub": f"Regen in {cd}", "next_rain": cd}
+                secs = _countdown_seconds_from_text(cd)
+                return {"weather": "Trocken", "weather_sub": f"Regen in {_format_countdown_seconds(secs)}", "next_rain": _format_countdown_seconds(secs), "weather_countdown_seconds": secs}
             return {"weather": "Regen", "weather_sub": "läuft gerade"}
     return {"weather": "nicht ermittelbar", "weather_sub": "Questlog/GamesLantern gerendert, aber Regen nicht erkannt"}
 
@@ -9942,17 +10000,80 @@ def _render_status_dashboard(data: dict[str, Any], request: Optional[Request] = 
         const el = document.getElementById(id);
         if (el && value !== undefined && value !== null && String(value) !== '') el.textContent = value;
       }}
+      const statusCountdowns = {{phase: null, weather: null}};
+      function iconFor(kind, value) {{
+        const v = String(value || '').toLowerCase();
+        if (kind === 'phase') {{
+          if (v.includes('nacht')) return '🌙';
+          if (v.includes('tag')) return '☀️';
+          return '🕒';
+        }}
+        if (kind === 'weather') {{
+          if (v.includes('regen') || v.includes('rain')) return '🌧️';
+          if (v.includes('trocken') || v.includes('dry')) return '☀️';
+          return '🌦️';
+        }}
+        if (kind === 'server') {{
+          if (v.includes('online') || v.includes('good')) return '🟢';
+          if (v.includes('wartung') || v.includes('maintenance')) return '🛠️';
+          if (v.includes('offline')) return '🔴';
+          return '⚪';
+        }}
+        return '';
+      }}
+      function formatSeconds(seconds) {{
+        seconds = Math.max(0, Math.floor(Number(seconds) || 0));
+        if (seconds <= 0) return 'jetzt';
+        const d = Math.floor(seconds / 86400); seconds %= 86400;
+        const h = Math.floor(seconds / 3600); seconds %= 3600;
+        const m = Math.floor(seconds / 60);
+        const s = seconds % 60;
+        const out = [];
+        if (d) out.push(d + ' Tage');
+        if (h || d) out.push(h + ' Std');
+        out.push(m + ' Min');
+        out.push(s + ' Sek');
+        return out.join(' ');
+      }}
+      function setCountdown(kind, label, seconds) {{
+        const subId = kind === 'phase' ? 'status-phase-sub' : 'status-weather-sub';
+        const n = Number(seconds);
+        if (!Number.isFinite(n) || n < 0) {{
+          statusCountdowns[kind] = null;
+          return;
+        }}
+        statusCountdowns[kind] = {{label: label || 'Wechsel', seconds: Math.floor(n), subId: subId, started: Date.now()}};
+      }}
+      function tickCountdowns() {{
+        Object.keys(statusCountdowns).forEach(function(kind) {{
+          const c = statusCountdowns[kind];
+          if (!c) return;
+          const elapsed = Math.floor((Date.now() - c.started) / 1000);
+          const left = Math.max(0, c.seconds - elapsed);
+          const el = document.getElementById(c.subId);
+          if (el) el.textContent = c.label + ' in ' + formatSeconds(left);
+        }});
+      }}
       function updateStatusCards(payload) {{
         if (!payload || !payload.ok) return;
-        text('status-phase-value', payload.phase || '—');
+        const phase = payload.phase || '—';
+        const weather = payload.weather || '—';
+        const server = payload.server_state || '—';
+        text('status-phase-value', iconFor('phase', phase) + ' ' + phase);
         text('status-phase-sub', payload.phase_sub || '—');
-        text('status-weather-value', payload.weather || '—');
+        text('status-weather-value', iconFor('weather', weather) + ' ' + weather);
         text('status-weather-sub', payload.weather_sub || '—');
-        text('status-server-value', payload.server_state || '—');
+        text('status-server-value', iconFor('server', server) + ' ' + server);
         text('status-server-sub', 'Fearless · Europe · Population: ' + (payload.population || '—'));
         text('status-source-value', payload.source || 'live');
         text('status-source-sub', 'Aktualisiert: ' + (payload.updated_at ? new Date(payload.updated_at).toLocaleString('de-DE') : '—'));
+        const nextPhase = payload.next_phase || (String(phase).toLowerCase().includes('tag') ? 'Nacht' : 'Tag');
+        setCountdown('phase', nextPhase, payload.phase_countdown_seconds);
+        const wLabel = String(weather).toLowerCase().includes('regen') ? 'Ende' : 'Regen';
+        setCountdown('weather', wLabel, payload.weather_countdown_seconds);
+        tickCountdowns();
       }}
+      setInterval(tickCountdowns, 1000);
       function loadGameStatus() {{
         fetch('/api/game-status-live', {{headers: {{'Accept': 'application/json'}}}})
           .then(function(r) {{ return r.ok ? r.json() : null; }})
