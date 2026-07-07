@@ -9340,6 +9340,195 @@ def _status_countdown_to(value: Any) -> str:
     return " ".join(parts)
 
 
+
+_GAME_STATUS_CACHE: dict[str, Any] = {"expires_at": 0.0, "payload": None}
+
+
+def _tl_region() -> str:
+    return _env("TL_REGION", "Europe") or "Europe"
+
+
+def _tl_server_name() -> str:
+    return _env("TL_SERVER_NAME", "Fearless") or "Fearless"
+
+
+def _fetch_text_url(url: str, *, timeout: float = 6.0) -> str:
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "EboDashboard/1.0 (+https://chat.openai.com; status-cache)",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "de-DE,de;q=0.9,en;q=0.8",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as res:  # nosec - public status pages only
+        raw = res.read(2_500_000)
+        ctype = str(res.headers.get("content-type") or "")
+    charset = "utf-8"
+    try:
+        m = re.search(r"charset=([\w\-]+)", ctype, re.I)
+        if m:
+            charset = m.group(1)
+    except Exception:
+        pass
+    return raw.decode(charset, errors="replace")
+
+
+def _html_to_text(raw: str) -> str:
+    text = re.sub(r"<script\b[^>]*>.*?</script>", " ", raw or "", flags=re.I | re.S)
+    text = re.sub(r"<style\b[^>]*>.*?</style>", " ", text, flags=re.I | re.S)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = html.unescape(text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def _clean_countdown(value: str) -> str:
+    value = html.unescape(str(value or "")).strip()
+    value = re.sub(r"\s+", " ", value)
+    value = value.strip(" -–—|·")
+    m = re.match(r"^(\d{1,2}):(\d{2}):(\d{2})$", value)
+    if m:
+        h, mi, sec = m.groups()
+        return f"{int(h)} Std {int(mi)} Min {int(sec)} Sek"
+    return value[:80] if value else "—"
+
+
+def _parse_daynight_text(text: str) -> dict[str, str]:
+    patterns = [
+        r"\b(Night|Day)\s+in\s+([0-9]{1,2}:[0-9]{2}:[0-9]{2})",
+        r"\b(Night|Day)\s+in\s+([0-9]+\s*h\s*[0-9]*\s*m?|[0-9]+\s*m)",
+        r"\b(Nacht|Tag)\s+in\s+([0-9]{1,2}:[0-9]{2}:[0-9]{2})",
+        r"\b(Nacht|Tag)\s+in\s+([0-9]+\s*(?:Std|h)\s*[0-9]*\s*(?:Min|m)?|[0-9]+\s*(?:Min|m))",
+    ]
+    for pat in patterns:
+        m = re.search(pat, text or "", re.I)
+        if not m:
+            continue
+        nxt = m.group(1).lower()
+        cd = _clean_countdown(m.group(2))
+        if nxt in {"night", "nacht"}:
+            return {"phase": "Tag", "phase_sub": f"Nacht in {cd}", "next_phase": "Nacht", "countdown": cd}
+        return {"phase": "Nacht", "phase_sub": f"Tag in {cd}", "next_phase": "Tag", "countdown": cd}
+    return {"phase": "nicht ermittelbar", "phase_sub": "Questlog-Zeitplan konnte nicht gelesen werden"}
+
+
+def _parse_rain_text(text: str) -> dict[str, str]:
+    lower = (text or "").lower()
+    if "raining now" in lower or "currently raining" in lower or "regnet gerade" in lower:
+        return {"weather": "Regen", "weather_sub": "läuft gerade"}
+    patterns = [
+        r"\bRaining\s+in\s+([0-9]{1,2}:[0-9]{2}:[0-9]{2})",
+        r"\bRaining\s+in\s+([0-9]+\s*h\s*[0-9]*\s*m?|[0-9]+\s*m)",
+        r"\bRain\s+in\s+([0-9]{1,2}:[0-9]{2}:[0-9]{2})",
+        r"\bRain\s+in\s+([0-9]+\s*h\s*[0-9]*\s*m?|[0-9]+\s*m)",
+        r"\bRegen\s+in\s+([0-9]{1,2}:[0-9]{2}:[0-9]{2})",
+        r"\bRegen\s+in\s+([0-9]+\s*(?:Std|h)\s*[0-9]*\s*(?:Min|m)?|[0-9]+\s*(?:Min|m))",
+    ]
+    for pat in patterns:
+        m = re.search(pat, text or "", re.I)
+        if m:
+            cd = _clean_countdown(m.group(1))
+            return {"weather": "Trocken", "weather_sub": f"Regen in {cd}", "next_rain": cd}
+    return {"weather": "nicht ermittelbar", "weather_sub": "Regenplan konnte nicht gelesen werden"}
+
+
+def _normalize_server_state(raw: str) -> str:
+    text = (raw or "").lower()
+    if any(x in text for x in ["maintenance", "wartung", "wird gewartet"]):
+        return "Wartung"
+    if any(x in text for x in ["full", "voll"]):
+        return "Voll"
+    if any(x in text for x in ["busy", "ausgelastet"]):
+        return "Ausgelastet"
+    if any(x in text for x in ["online", "up"]):
+        return "Online"
+    if any(x in text for x in ["offline", "down"]):
+        return "Offline"
+    return raw.strip()[:40] if raw else "nicht ermittelbar"
+
+
+def _parse_server_status_text(text: str, server: str) -> dict[str, str]:
+    server_l = (server or "Fearless").lower()
+    text_plain = text or ""
+    idx = text_plain.lower().find(server_l)
+    if idx < 0:
+        return {"server_state": "nicht gefunden", "population": "—"}
+    window = text_plain[max(0, idx - 250): idx + 600]
+    state = "nicht ermittelbar"
+    for token in ["Maintenance", "Wird gewartet", "Online", "Ausgelastet", "Busy", "Full", "Voll", "Offline"]:
+        if re.search(re.escape(token), window, re.I):
+            state = _normalize_server_state(token)
+            break
+    population = "—"
+    m = re.search(r"\b(Europe|Europa)\b\D{0,80}([0-9][0-9\.,\s]{2,12}|N/A)\b", window, re.I)
+    if m:
+        population = m.group(2).strip()
+    else:
+        nums = re.findall(r"\b[0-9]{1,3}(?:[\.,\s][0-9]{3})+\b|\b[0-9]{4,6}\b", window)
+        if nums:
+            population = nums[0].strip()
+    return {"server_state": state, "population": population}
+
+
+def _live_game_status_payload(*, force: bool = False) -> dict[str, Any]:
+    now = time.time()
+    cached = _GAME_STATUS_CACHE.get("payload")
+    if cached and not force and float(_GAME_STATUS_CACHE.get("expires_at") or 0) > now:
+        return dict(cached)
+
+    region = _tl_region()
+    server = _tl_server_name()
+    payload: dict[str, Any] = {
+        "ok": True,
+        "region": region,
+        "server": server,
+        "phase": "nicht ermittelbar",
+        "phase_sub": "wird geladen",
+        "weather": "nicht ermittelbar",
+        "weather_sub": "wird geladen",
+        "server_state": "nicht ermittelbar",
+        "population": "—",
+        "source": "live: Questlog / Official / TLDB",
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "errors": [],
+    }
+
+    try:
+        day_html = _fetch_text_url("https://questlog.gg/throne-and-liberty/en/day-and-night-schedule", timeout=6.0)
+        day_text = _html_to_text(day_html)
+        payload.update(_parse_daynight_text(day_text))
+        rain = _parse_rain_text(day_text)
+        if rain.get("weather") and rain.get("weather") != "nicht ermittelbar":
+            payload.update(rain)
+        else:
+            rain_html = _fetch_text_url("https://questlog.gg/throne-and-liberty/en/rain-schedule", timeout=6.0)
+            payload.update(_parse_rain_text(_html_to_text(rain_html)))
+    except Exception as exc:
+        payload.setdefault("errors", []).append(f"questlog_schedule: {type(exc).__name__}: {exc}")
+
+    server_sources = [
+        ("official", "https://www.playthroneandliberty.com/de-de/support/server-status"),
+        ("tldb", "https://tldb.info/server-status"),
+        ("questlog", "https://questlog.gg/throne-and-liberty/en/server-status"),
+    ]
+    for name, url in server_sources:
+        try:
+            raw = _fetch_text_url(url, timeout=6.0)
+            parsed = _parse_server_status_text(_html_to_text(raw), server)
+            if parsed.get("server_state") not in {"nicht gefunden", "nicht ermittelbar", ""}:
+                payload.update(parsed)
+                payload["server_source"] = name
+                break
+        except Exception as exc:
+            payload.setdefault("errors", []).append(f"{name}_server: {type(exc).__name__}: {exc}")
+
+    if payload.get("phase") == "nicht ermittelbar" and payload.get("weather") == "nicht ermittelbar" and payload.get("server_state") == "nicht ermittelbar":
+        payload["ok"] = False
+    _GAME_STATUS_CACHE["payload"] = dict(payload)
+    _GAME_STATUS_CACHE["expires_at"] = now + 300.0
+    return payload
+
 def _game_status_from_snapshot(snap: dict[str, Any]) -> dict[str, Any]:
     """Liest vorbereitete Spielstatusdaten, falls ein Worker sie später liefert."""
     raw = _first_present_dict(
@@ -9416,11 +9605,20 @@ def _render_status_dashboard(data: dict[str, Any], request: Optional[Request] = 
         _card("Aktive Auktionen", len(active_auctions), "Auktionshaus / Müll / Sale"),
         _card("Server", game.get("server"), game.get("region")),
     ])
+    def _status_live_card(key: str, title: str, value: Any, sub: str = "") -> str:
+        return f"""
+        <div class="card status-live-card" data-status-key="{_e(key)}">
+          <div class="card-title">{_e(title)}</div>
+          <div class="card-value" id="status-{_e(key)}-value">{_e(value)}</div>
+          <div class="card-sub" id="status-{_e(key)}-sub">{_e(sub)}</div>
+        </div>
+        """
+
     game_cards = "".join([
-        _card("Spielzeit", game.get("phase"), game.get("phase_sub")),
-        _card("Wetter", game.get("weather"), game.get("weather_sub")),
-        _card("Serverstatus", game.get("server_state"), f"Population: {game.get('population')}"),
-        _card("Quelle", game.get("source"), f"Aktualisiert: {game.get('updated')}"),
+        _status_live_card("phase", "Spielzeit", game.get("phase"), game.get("phase_sub")),
+        _status_live_card("weather", "Wetter", game.get("weather"), game.get("weather_sub")),
+        _status_live_card("server", "Serverstatus", game.get("server_state"), f"Population: {game.get('population')}"),
+        _status_live_card("source", "Quelle", game.get("source"), f"Aktualisiert: {game.get('updated')}"),
     ])
     map_url = str(game.get("map_url") or "https://tldb.info/map/world")
     if "interactivemap.app" in map_url:
@@ -9453,9 +9651,39 @@ def _render_status_dashboard(data: dict[str, Any], request: Optional[Request] = 
     </section>
     <section class="grid status-grid-compact">{top_cards}</section>
     <section class="grid status-grid-compact">{game_cards}</section>
+    <script>
+    (function() {{
+      function text(id, value) {{
+        const el = document.getElementById(id);
+        if (el && value !== undefined && value !== null && String(value) !== '') el.textContent = value;
+      }}
+      function updateStatusCards(payload) {{
+        if (!payload || !payload.ok) return;
+        text('status-phase-value', payload.phase || '—');
+        text('status-phase-sub', payload.phase_sub || '—');
+        text('status-weather-value', payload.weather || '—');
+        text('status-weather-sub', payload.weather_sub || '—');
+        text('status-server-value', payload.server_state || '—');
+        text('status-server-sub', 'Fearless · Europe · Population: ' + (payload.population || '—'));
+        text('status-source-value', payload.source || 'live');
+        text('status-source-sub', 'Aktualisiert: ' + (payload.updated_at ? new Date(payload.updated_at).toLocaleString('de-DE') : '—'));
+      }}
+      function loadGameStatus() {{
+        fetch('/api/game-status-live', {{headers: {{'Accept': 'application/json'}}}})
+          .then(function(r) {{ return r.ok ? r.json() : null; }})
+          .then(updateStatusCards)
+          .catch(function() {{}});
+      }}
+      if ('requestIdleCallback' in window) {{
+        window.requestIdleCallback(loadGameStatus, {{timeout: 1800}});
+      }} else {{
+        window.addEventListener('load', function() {{ setTimeout(loadGameStatus, 700); }});
+      }}
+      setInterval(loadGameStatus, 300000);
+    }})();
+    </script>
     <section class="panel" id="map">
       <h2>🗺️ Solisium Karte</h2>
-      <p class="muted">Die Karte wird automatisch nachgeladen, aber erst nachdem das Dashboard selbst fertig gerendert ist. Standard ist TLDB, weil der IMapp-Embed auf Handy zu schwer war.</p>
       <div class="status-map-toolbar" style="display:flex;gap:10px;flex-wrap:wrap;margin:12px 0;">
         <button class="btn" type="button" data-map-src="{_e(tldb_map_url)}" data-map-label="TLDB">TLDB Karte</button>
         <button class="btn ghost" type="button" data-map-src="{_e(imapp_map_url)}" data-map-label="IMapp">IMapp Karte</button>
@@ -10716,6 +10944,14 @@ def status_page(request: Request, _: bool = Depends(_auth)):
     user = _current_user(request) or {}
     nav_mode = "member" if str(user.get("role") or "") == "member" else "admin"
     return HTMLResponse(_render_status_dashboard(_snapshot_payload(), request, nav_mode=nav_mode))
+
+
+@app.get("/api/game-status-live")
+def api_game_status_live(_: bool = Depends(_auth)):
+    # Holt Fearless/Europe live, cached aber 5 Minuten im Dashboard-Prozess.
+    # Die Statusseite lädt diesen Endpoint erst nach dem eigentlichen Seitenrendern,
+    # damit externe Quellen die UI nicht blockieren.
+    return JSONResponse(_json_safe(_live_game_status_payload()))
 
 
 # ---------------------------------------------------------------------------
