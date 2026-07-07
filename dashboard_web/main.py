@@ -32,7 +32,7 @@ if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 ASSET_VER = "ebo-phase3-database-start"
-DASHBOARD_RELEASE_VERSION = "1.1.9 · Phase 3.9 Online-DB Finalisierung"
+DASHBOARD_RELEASE_VERSION = "1.2.0 · Status Playwright Worker"
 
 
 def _database_url() -> str:
@@ -9377,6 +9377,120 @@ def _fetch_text_url(url: str, *, timeout: float = 6.0) -> str:
     return raw.decode(charset, errors="replace")
 
 
+def _playwright_enabled() -> bool:
+    return (_env("TL_STATUS_PLAYWRIGHT", "1") or "1").lower() not in {"0", "false", "no", "off"}
+
+
+def _render_text_with_playwright(url: str, *, wait_ms: int = 4500, timeout_ms: int = 30000) -> dict[str, str]:
+    """Rendert JS-lastige Statusseiten mit echtem Chromium.
+
+    Questlog/GamesLantern liefern die Regen-/Tag-Nacht-Daten nicht zuverlässig im
+    normalen HTML. Dieser Helfer lädt die Seite wie ein Browser und gibt sichtbaren
+    Text plus HTML zurück. Wenn Playwright/Chromium auf Railway nicht verfügbar ist,
+    wird der Fehler sauber an /api/game-status-live gemeldet.
+    """
+    if not _playwright_enabled():
+        return {"ok": "0", "error": "Playwright ist per TL_STATUS_PLAYWRIGHT=0 deaktiviert", "text": "", "html": ""}
+    try:
+        from playwright.sync_api import sync_playwright  # type: ignore
+    except Exception as exc:
+        return {"ok": "0", "error": f"playwright_import:{type(exc).__name__}: {exc}", "text": "", "html": ""}
+
+    try:
+        with sync_playwright() as pw:
+            launch_kwargs: dict[str, Any] = {
+                "headless": True,
+                "args": [
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                    "--disable-extensions",
+                    "--disable-background-networking",
+                ],
+            }
+            exe = _env("PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH", "")
+            if exe:
+                launch_kwargs["executable_path"] = exe
+            browser = pw.chromium.launch(**launch_kwargs)
+            page = browser.new_page(
+                viewport={"width": 1365, "height": 900},
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/126.0 Safari/537.36 EboDashboard/1.0"
+                ),
+                locale="en-US",
+                timezone_id="Europe/Berlin",
+            )
+            page.set_default_timeout(timeout_ms)
+            try:
+                page.goto(url, wait_until="networkidle", timeout=timeout_ms)
+            except Exception:
+                # Einige Seiten halten dauerhafte Requests offen. DOMContentLoaded reicht
+                # plus Wartezeit für Client-Rendering.
+                page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+            try:
+                page.wait_for_timeout(max(500, min(int(wait_ms), 12000)))
+            except Exception:
+                pass
+            try:
+                text = page.locator("body").inner_text(timeout=8000)
+            except Exception:
+                text = page.evaluate("() => document.body ? document.body.innerText : ''")
+            try:
+                page_html = page.content()
+            except Exception:
+                page_html = ""
+            browser.close()
+            return {"ok": "1", "error": "", "text": text or "", "html": page_html or ""}
+    except Exception as exc:
+        return {"ok": "0", "error": f"playwright_run:{type(exc).__name__}: {exc}", "text": "", "html": ""}
+
+
+def _normalize_status_text(text: str) -> str:
+    text = html.unescape(str(text or ""))
+    text = text.replace("\\u0026", "&")
+    text = re.sub(r"\\u([0-9a-fA-F]{4})", lambda m: chr(int(m.group(1), 16)), text)
+    text = text.replace("\\n", " ").replace("\\t", " ").replace('\\"', '"').replace("\\/", "/")
+    text = text.replace("\n", " ").replace("\t", " ")
+    text = re.sub(r"([a-z])([A-Z])", r"\1 \2", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def _text_window(text: str, marker: str, *, before: int = 500, after: int = 1200) -> str:
+    if not text or not marker:
+        return text or ""
+    idx = text.lower().find(marker.lower())
+    if idx < 0:
+        return text[: after + before]
+    return text[max(0, idx - before): idx + len(marker) + after]
+
+
+def _readable_status_context(raw: str) -> str:
+    text = _normalize_status_text(raw)
+    for stop in [
+        "Server Status Legend", "Status Legend", "Population Legend",
+        "Recent status changes", "Recent Status Changes", "Maintenance History",
+        "Let us notify you", "Get notified",
+    ]:
+        pos = text.lower().find(stop.lower())
+        if pos > 0:
+            text = text[:pos]
+    return text.strip()
+
+
+def _merge_rendered_text(rendered: dict[str, str]) -> str:
+    return _normalize_status_text((rendered.get("text") or "") + " " + _html_to_searchable_text(rendered.get("html") or ""))
+
+
+def _playwright_render_for_status(url: str, *, wait_ms: int = 4500) -> tuple[str, str]:
+    rendered = _render_text_with_playwright(url, wait_ms=wait_ms)
+    if rendered.get("ok") == "1":
+        return _merge_rendered_text(rendered), ""
+    return "", str(rendered.get("error") or "playwright_failed")
+
+
 def _html_to_text(raw: str) -> str:
     text = re.sub(r"<script\b[^>]*>.*?</script>", " ", raw or "", flags=re.I | re.S)
     text = re.sub(r"<style\b[^>]*>.*?</style>", " ", text, flags=re.I | re.S)
@@ -9489,7 +9603,7 @@ def _parse_server_status_text(text: str, server: str, *, source: str = "") -> di
     if not text_plain:
         return {"server_state": "nicht ermittelbar", "population": "—"}
 
-    status_words = r"Online|Good|Busy|Full|Offline|Maintenance|In Maintenance|Wartung"
+    status_words = r"Online|Good|Busy|Full|Offline|Healthy|Up|Ausgelastet|Voll"
 
     # JSON/Next-Daten: {"name":"Fearless", ... "status":"Good"}
     json_patterns = [
@@ -9506,13 +9620,19 @@ def _parse_server_status_text(text: str, server: str, *, source: str = "") -> di
     if m:
         return {"server_state": _normalize_server_state(m.group(1)), "population": "—"}
 
-    # Throney-Seite: Headbereich vor Historie enthält "Status Online".
+    # Throney-Seite: Headbereich vor Historie enthält meist direkt "Status Online" oder "Current Status Online".
     if f"{server_name} Server Status".lower() in text_plain.lower() or source.lower() == "throney":
-        head = text_plain.split("Recent status changes", 1)[0]
-        head = head.split("Maintenance History", 1)[0]
-        m = re.search(rf"\bStatus\s+({status_words})\b", head, re.I)
-        if m:
-            return {"server_state": _normalize_server_state(m.group(1)), "population": "—"}
+        head = _readable_status_context(text_plain)
+        patterns = [
+            rf"\bCurrent\s+Status\s+({status_words})\b",
+            rf"\bServer\s+Status\s+({status_words})\b",
+            rf"\bStatus\s+({status_words})\b",
+            rf"\b{re.escape(server_name)}\b(.{{0,220}}?)\b({status_words})\b",
+        ]
+        for pat in patterns:
+            m = re.search(pat, head, re.I)
+            if m:
+                return {"server_state": _normalize_server_state(m.group(m.lastindex or 1)), "population": "—"}
 
     # Questlog gerendert: Tabelle/Zeile "Fearless Good".
     # Nur ein kleines Fenster direkt nach dem Servernamen nutzen, damit Legenden unten nicht fälschlich greifen.
@@ -9527,6 +9647,62 @@ def _parse_server_status_text(text: str, server: str, *, source: str = "") -> di
     return {"server_state": "nicht gefunden", "population": "—"}
 
 
+
+def _parse_daynight_rendered(text: str, region: str = "Europe") -> dict[str, str]:
+    clean = _normalize_status_text(text)
+    region_text = _text_window(clean, region, before=600, after=1800) if region else clean
+    for candidate in [region_text, clean]:
+        parsed = _parse_daynight_text(candidate)
+        if parsed.get("phase") != "nicht ermittelbar":
+            return parsed
+        # Häufige Varianten aus gerenderten Widgets.
+        patterns = [
+            r"Current(?:ly)?\s*(?:cycle|state|time)?\s*[:\-]?\s*(Day|Night|Tag|Nacht)\b.*?(?:ends|changes|switches|in)\s*(?:in)?\s*([0-9]{1,2}:[0-9]{2}:[0-9]{2}|[0-9]+\s*h\s*[0-9]*\s*m?|[0-9]+\s*m)",
+            r"\b(Day|Night|Tag|Nacht)\b\s*(?:ends|changes|switches|in)\s*(?:in)?\s*([0-9]{1,2}:[0-9]{2}:[0-9]{2}|[0-9]+\s*h\s*[0-9]*\s*m?|[0-9]+\s*m)",
+            r"Next\s*(Day|Night|Tag|Nacht)\s*(?:in)?\s*([0-9]{1,2}:[0-9]{2}:[0-9]{2}|[0-9]+\s*h\s*[0-9]*\s*m?|[0-9]+\s*m)",
+        ]
+        for pat in patterns:
+            m = re.search(pat, candidate, re.I)
+            if not m:
+                continue
+            value = m.group(1).lower()
+            cd = _clean_countdown(m.group(2))
+            if value in {"day", "tag"}:
+                # Wenn "Next Day" gefunden wurde, ist aktuell Nacht; wenn "Current Day" gefunden wurde, aktuell Tag.
+                is_next = candidate[max(0, m.start()-12):m.start()].lower().strip().endswith("next")
+                if is_next:
+                    return {"phase": "Nacht", "phase_sub": f"Tag in {cd}", "next_phase": "Tag", "countdown": cd}
+                return {"phase": "Tag", "phase_sub": f"Wechsel in {cd}", "next_phase": "Nacht", "countdown": cd}
+            is_next = candidate[max(0, m.start()-12):m.start()].lower().strip().endswith("next")
+            if is_next:
+                return {"phase": "Tag", "phase_sub": f"Nacht in {cd}", "next_phase": "Nacht", "countdown": cd}
+            return {"phase": "Nacht", "phase_sub": f"Wechsel in {cd}", "next_phase": "Tag", "countdown": cd}
+    return {"phase": "nicht ermittelbar", "phase_sub": "Questlog/GamesLantern gerendert, aber Zeit nicht erkannt"}
+
+
+def _parse_rain_rendered(text: str, region: str = "Europe") -> dict[str, str]:
+    clean = _normalize_status_text(text)
+    region_text = _text_window(clean, region, before=600, after=2200) if region else clean
+    for candidate in [region_text, clean]:
+        parsed = _parse_rain_text(candidate)
+        if parsed.get("weather") != "nicht ermittelbar":
+            return parsed
+        patterns = [
+            r"(?:Next\s*)?Rain(?:ing)?\s*(?:starts|in|at)?\s*[:\-]?\s*([0-9]{1,2}:[0-9]{2}:[0-9]{2}|[0-9]+\s*h\s*[0-9]*\s*m?|[0-9]+\s*m)",
+            r"(?:Next\s*)?Regen\s*(?:startet|in|um)?\s*[:\-]?\s*([0-9]{1,2}:[0-9]{2}:[0-9]{2}|[0-9]+\s*(?:Std|h)\s*[0-9]*\s*(?:Min|m)?|[0-9]+\s*(?:Min|m))",
+            r"Raining\s*Now|Currently\s*Raining|Rain\s*Now",
+        ]
+        for pat in patterns:
+            m = re.search(pat, candidate, re.I)
+            if not m:
+                continue
+            if m.lastindex:
+                cd = _clean_countdown(m.group(1))
+                return {"weather": "Trocken", "weather_sub": f"Regen in {cd}", "next_rain": cd}
+            return {"weather": "Regen", "weather_sub": "läuft gerade"}
+    return {"weather": "nicht ermittelbar", "weather_sub": "Questlog/GamesLantern gerendert, aber Regen nicht erkannt"}
+
+
 def _live_game_status_payload(*, force: bool = False) -> dict[str, Any]:
     now = time.time()
     cached = _GAME_STATUS_CACHE.get("payload")
@@ -9539,71 +9715,101 @@ def _live_game_status_payload(*, force: bool = False) -> dict[str, Any]:
         "ok": True,
         "region": region,
         "server": server,
-        "phase": "nicht ermittelbar",
-        "phase_sub": "Questlog-Zeitplan per einfachem Abruf nicht lesbar",
-        "weather": "nicht ermittelbar",
-        "weather_sub": "Questlog-Regenplan per einfachem Abruf nicht lesbar",
+        "phase": "Live-Worker läuft",
+        "phase_sub": "Questlog/GamesLantern wird per Browser gelesen …",
+        "weather": "Live-Worker läuft",
+        "weather_sub": "Questlog/GamesLantern wird per Browser gelesen …",
         "server_state": "nicht ermittelbar",
         "population": "—",
-        "source": "live: Throney / Official / Questlog",
+        "source": "Playwright: Questlog/GamesLantern + Throney",
         "updated_at": datetime.now(timezone.utc).isoformat(),
         "errors": [],
+        "playwright": "enabled" if _playwright_enabled() else "disabled",
     }
 
-    schedule_urls = [
-        "https://questlog.gg/throne-and-liberty/en/day-and-night-schedule",
-        "https://questlog.gg/throne-and-liberty/en-nc/day-and-night-schedule",
-    ]
-    rain_urls = [
-        "https://questlog.gg/throne-and-liberty/en/rain-schedule",
-        "https://questlog.gg/throne-and-liberty/en-nc/rain-schedule",
-    ]
-    for url in schedule_urls:
-        try:
-            day_html = _fetch_text_url(url, timeout=7.0)
-            day_text = (_html_to_text(day_html) + " " + _html_to_searchable_text(day_html)).strip()
-            parsed_day = _parse_daynight_text(day_text)
-            if parsed_day.get("phase") != "nicht ermittelbar":
-                payload.update(parsed_day)
-            rain = _parse_rain_text(day_text)
-            if rain.get("weather") and rain.get("weather") != "nicht ermittelbar":
-                payload.update(rain)
-            if payload.get("phase") != "nicht ermittelbar" and payload.get("weather") != "nicht ermittelbar":
-                break
-        except Exception as exc:
-            payload.setdefault("errors", []).append(f"questlog_schedule:{url}: {type(exc).__name__}: {exc}")
-    if payload.get("weather") == "nicht ermittelbar":
-        for url in rain_urls:
+    # 1) Serverstatus: erst Throney per Browser, dann einfache Fallbacks.
+    server_slug = re.sub(r"[^a-z0-9]+", "-", server.lower()).strip("-") or "fearless"
+    throney_url = f"https://throney.gg/servers/{server_slug}/status"
+    server_text, err = _playwright_render_for_status(throney_url, wait_ms=2500)
+    if err:
+        payload.setdefault("errors", []).append(f"playwright_throney:{err}")
+    else:
+        parsed = _parse_server_status_text(server_text, server, source="throney")
+        if parsed.get("server_state") not in {"nicht gefunden", "nicht ermittelbar", "", "Wartung"}:
+            payload.update(parsed)
+            payload["server_source"] = "throney_playwright"
+
+    if payload.get("server_state") in {"nicht ermittelbar", "nicht gefunden", "Wartung", ""}:
+        server_sources = [
+            ("throney", throney_url),
+            ("questlog", "https://questlog.gg/throne-and-liberty/en/server-status"),
+            ("official", "https://www.playthroneandliberty.com/de-de/support/server-status"),
+        ]
+        for name, url in server_sources:
             try:
-                rain_html = _fetch_text_url(url, timeout=7.0)
-                rain_text = (_html_to_text(rain_html) + " " + _html_to_searchable_text(rain_html)).strip()
-                rain = _parse_rain_text(rain_text)
-                if rain.get("weather") != "nicht ermittelbar":
-                    payload.update(rain)
+                raw = _fetch_text_url(url, timeout=7.0)
+                server_text2 = _readable_status_context((_html_to_text(raw) + " " + _html_to_searchable_text(raw)).strip())
+                parsed = _parse_server_status_text(server_text2, server, source=name)
+                state = parsed.get("server_state")
+                if state not in {"nicht gefunden", "nicht ermittelbar", "", "Wartung"}:
+                    payload.update(parsed)
+                    payload["server_source"] = name
                     break
             except Exception as exc:
-                payload.setdefault("errors", []).append(f"questlog_rain:{url}: {type(exc).__name__}: {exc}")
+                payload.setdefault("errors", []).append(f"{name}_server: {type(exc).__name__}: {exc}")
 
-    server_slug = re.sub(r"[^a-z0-9]+", "-", server.lower()).strip("-") or "fearless"
-    server_sources = [
-        ("throney", f"https://throney.gg/servers/{server_slug}/status"),
-        ("questlog", "https://questlog.gg/throne-and-liberty/en/server-status"),
-        ("official", "https://www.playthroneandliberty.com/de-de/support/server-status"),
+    # Keine falsche Wartung mehr anzeigen. Wartung nur, wenn sie wirklich direkt am Server erkannt wurde.
+    if payload.get("server_state") == "Wartung":
+        payload["server_state"] = "nicht ermittelbar"
+        payload.setdefault("errors", []).append("server_state_guard: Wartung verworfen, weil nicht eindeutig direkt am Server bestätigt")
+
+    # 2) Tag/Nacht und Regen: zuerst Questlog per Browser, dann GamesLantern per Browser.
+    schedule_sources = [
+        ("questlog_daynight", "https://questlog.gg/throne-and-liberty/en/day-and-night-schedule"),
+        ("questlog_daynight_nc", "https://questlog.gg/throne-and-liberty/en-nc/day-and-night-schedule"),
+        ("gameslantern_daynight", "https://throneandliberty.gameslantern.com/day-and-night-schedule"),
     ]
-    for name, url in server_sources:
-        try:
-            raw = _fetch_text_url(url, timeout=7.0)
-            server_text = (_html_to_text(raw) + " " + _html_to_searchable_text(raw)).strip()
-            parsed = _parse_server_status_text(server_text, server, source=name)
-            if parsed.get("server_state") not in {"nicht gefunden", "nicht ermittelbar", ""}:
-                payload.update(parsed)
-                payload["server_source"] = name
-                break
-        except Exception as exc:
-            payload.setdefault("errors", []).append(f"{name}_server: {type(exc).__name__}: {exc}")
+    rain_sources = [
+        ("questlog_rain", "https://questlog.gg/throne-and-liberty/en/rain-schedule"),
+        ("questlog_rain_nc", "https://questlog.gg/throne-and-liberty/en-nc/rain-schedule"),
+        ("gameslantern_rain", "https://throneandliberty.gameslantern.com/rain-schedule"),
+    ]
 
-    if payload.get("phase") == "nicht ermittelbar" and payload.get("weather") == "nicht ermittelbar" and payload.get("server_state") == "nicht ermittelbar":
-        payload["ok"] = False
+    for name, url in schedule_sources:
+        text, err = _playwright_render_for_status(url, wait_ms=5000)
+        if err:
+            payload.setdefault("errors", []).append(f"{name}:{err}")
+            continue
+        parsed_day = _parse_daynight_rendered(text, region)
+        if parsed_day.get("phase") != "nicht ermittelbar":
+            payload.update(parsed_day)
+            payload["time_source"] = name
+            break
+        payload.setdefault("errors", []).append(f"{name}: rendered_but_not_parsed")
+
+    for name, url in rain_sources:
+        text, err = _playwright_render_for_status(url, wait_ms=5000)
+        if err:
+            payload.setdefault("errors", []).append(f"{name}:{err}")
+            continue
+        parsed_rain = _parse_rain_rendered(text, region)
+        if parsed_rain.get("weather") != "nicht ermittelbar":
+            payload.update(parsed_rain)
+            payload["weather_source"] = name
+            break
+        payload.setdefault("errors", []).append(f"{name}: rendered_but_not_parsed")
+
+    # 3) Lesbare Fallback-Texte, wenn Browser/Parser nicht klappt.
+    if str(payload.get("phase") or "").lower().startswith("live-worker"):
+        payload["phase"] = "nicht ermittelbar"
+        payload["phase_sub"] = "Browser-Worker konnte Tag/Nacht noch nicht auslesen"
+    if str(payload.get("weather") or "").lower().startswith("live-worker"):
+        payload["weather"] = "nicht ermittelbar"
+        payload["weather_sub"] = "Browser-Worker konnte Regenplan noch nicht auslesen"
+
+    if payload.get("server_state") in {"nicht ermittelbar", "nicht gefunden", "", None}:
+        payload["ok"] = False if payload.get("phase") == "nicht ermittelbar" and payload.get("weather") == "nicht ermittelbar" else True
+
     _GAME_STATUS_CACHE["payload"] = dict(payload)
     _GAME_STATUS_CACHE["expires_at"] = now + 300.0
     return payload
@@ -11026,11 +11232,10 @@ def status_page(request: Request, _: bool = Depends(_auth)):
 
 
 @app.get("/api/game-status-live")
-def api_game_status_live(_: bool = Depends(_auth)):
+def api_game_status_live(force: bool = False, _: bool = Depends(_auth)):
     # Holt Fearless/Europe live, cached aber 5 Minuten im Dashboard-Prozess.
-    # Die Statusseite lädt diesen Endpoint erst nach dem eigentlichen Seitenrendern,
-    # damit externe Quellen die UI nicht blockieren.
-    return JSONResponse(_json_safe(_live_game_status_payload()))
+    # Mit ?force=1 kann der Cache für Tests umgangen werden.
+    return JSONResponse(_json_safe(_live_game_status_payload(force=force)))
 
 
 # ---------------------------------------------------------------------------
