@@ -9942,27 +9942,54 @@ def _render_status_dashboard(data: dict[str, Any], request: Optional[Request] = 
     active_auctions.sort(key=lambda a: _auction_timer_dt(a) or datetime.max.replace(tzinfo=timezone.utc))
 
     game = _game_status_from_snapshot(snap)
-    top_cards = "".join([
-        _card("Mitglieder", member_count, "Gildenrolle / Dashboard-Mitglieder"),
-        _card("Laufende Events", len(running_events), "erstellt bis 1h nach Start"),
-        _card("Aktive Auktionen", len(active_auctions), "Auktionshaus / Müll / Sale"),
-        _card("Server", game.get("server"), game.get("region")),
-    ])
-    def _status_live_card(key: str, title: str, value: Any, sub: str = "") -> str:
-        return f"""
-        <div class="card status-live-card" data-status-key="{_e(key)}">
-          <div class="card-title">{_e(title)}</div>
-          <div class="card-value" id="status-{_e(key)}-value">{_e(value)}</div>
-          <div class="card-sub" id="status-{_e(key)}-sub">{_e(sub)}</div>
-        </div>
-        """
+    def _mini_status_value(kind: str, value: Any) -> str:
+        v = str(value or "").lower()
+        if kind == "phase":
+            if "nacht" in v or "night" in v:
+                return "🌙 " + str(value or "—")
+            if "tag" in v or "day" in v:
+                return "☀️ " + str(value or "—")
+            return "🕒 " + str(value or "—")
+        if kind == "weather":
+            if "regen" in v or "rain" in v:
+                return "🌧️ " + str(value or "—")
+            if "trocken" in v or "dry" in v:
+                return "☀️ " + str(value or "—")
+            return "🌦️ " + str(value or "—")
+        if kind == "server":
+            if "online" in v or "good" in v:
+                return "🟢 " + str(value or "—")
+            if "wartung" in v or "maintenance" in v:
+                return "🛠️ " + str(value or "—")
+            if "offline" in v:
+                return "🔴 " + str(value or "—")
+            return "⚪ " + str(value or "—")
+        return str(value or "—")
 
-    game_cards = "".join([
-        _status_live_card("phase", "Spielzeit", game.get("phase"), game.get("phase_sub")),
-        _status_live_card("weather", "Wetter", game.get("weather"), game.get("weather_sub")),
-        _status_live_card("server", "Serverstatus", game.get("server_state"), f"Population: {game.get('population')}"),
-        _status_live_card("source", "Quelle", game.get("source"), f"Aktualisiert: {game.get('updated')}"),
-    ])
+    stats_href_members = "/member/members" if nav_mode == "member" else "/members"
+    stats_href_events = "/member/events" if nav_mode == "member" else "/events"
+    stats_href_auctions = "/member/auctions" if nav_mode == "member" else "/loot"
+    hero_stats = f"""
+      <div class="status-hero-stats">
+        <a class="status-hero-stat" href="{stats_href_members}"><span>Mitglieder</span><strong>{member_count}</strong><small>Gildenrolle</small></a>
+        <a class="status-hero-stat" href="{stats_href_events}"><span>Events</span><strong>{len(running_events)}</strong><small>laufend</small></a>
+        <a class="status-hero-stat" href="{stats_href_auctions}"><span>Auktionen</span><strong>{len(active_auctions)}</strong><small>aktiv</small></a>
+        <div class="status-hero-stat compact"><span>Server</span><strong>{_e(game.get('server') or 'Fearless')}</strong><small id="status-server-value">{_e(_mini_status_value('server', game.get('server_state')))}</small><small id="status-server-sub">{_e(game.get('region') or 'Europe')}</small></div>
+        <div class="status-hero-stat compact"><span>Spielzeit</span><strong id="status-phase-value">{_e(_mini_status_value('phase', game.get('phase')))}</strong><small id="status-phase-sub">{_e(game.get('phase_sub') or '—')}</small></div>
+        <div class="status-hero-stat compact"><span>Wetter</span><strong id="status-weather-value">{_e(_mini_status_value('weather', game.get('weather')))}</strong><small id="status-weather-sub">{_e(game.get('weather_sub') or '—')}</small></div>
+      </div>
+      <style>
+        .status-hero-stats{{display:grid;grid-template-columns:repeat(6,minmax(120px,1fr));gap:12px;margin-top:18px;width:100%;}}
+        .status-hero-stat{{display:flex;flex-direction:column;gap:4px;padding:14px 16px;border:1px solid rgba(218,166,74,.24);border-radius:16px;background:rgba(11,14,22,.58);text-decoration:none;color:inherit;min-width:0;}}
+        .status-hero-stat:hover{{border-color:rgba(218,166,74,.45);background:rgba(218,166,74,.08);}}
+        .status-hero-stat span{{font-size:.82rem;color:var(--muted);font-weight:700;}}
+        .status-hero-stat strong{{font-size:1.45rem;color:var(--gold);line-height:1.05;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}}
+        .status-hero-stat small{{color:var(--muted);line-height:1.25;}}
+        .status-hero-stat.compact strong{{font-size:1.12rem;}}
+        @media(max-width:1100px){{.status-hero-stats{{grid-template-columns:repeat(3,minmax(130px,1fr));}}}}
+        @media(max-width:640px){{.status-hero-stats{{grid-template-columns:1fr 1fr;}}.status-hero-stat{{padding:12px}}.status-hero-stat strong{{font-size:1.18rem;}}}}
+      </style>
+    """
     map_url = str(game.get("map_url") or "https://tldb.info/map/world")
     if "interactivemap.app" in map_url:
         direct_map_url = map_url.replace("?embed=light", "")
@@ -9981,19 +10008,18 @@ def _render_status_dashboard(data: dict[str, Any], request: Optional[Request] = 
         admin_action = '<div style="margin-left:auto;display:flex;gap:10px;align-items:center;flex-wrap:wrap;"><a class="btn" href="/overview">⚙️ Adminbereich öffnen</a></div>'
     body = f"""
     {nav_html}
-    <section class="hero">
-      <div style="display:flex;gap:16px;align-items:center;flex-wrap:wrap;">
+    <section class="hero status-main-hero">
+      <div style="display:flex;gap:16px;align-items:center;flex-wrap:wrap;width:100%;">
         <div class="status-hero-logo"><img src="{_asset('ebolus_logo.png')}" alt="Ebolus"></div>
-        <div>
+        <div style="min-width:220px;flex:1;">
           <div class="eyebrow">Dashboard Status</div>
           <h1>{_e(guild_name)}</h1>
-          <p class="muted">Kurzübersicht für alle. Details liegen sauber getrennt in Portal, Loot, Events und Mitglieder.</p>
+          <p class="muted">Kurzübersicht. Details liegen in Portal, Loot, Events und Mitglieder.</p>
         </div>
         {admin_action}
+        {hero_stats}
       </div>
     </section>
-    <section class="grid status-grid-compact">{top_cards}</section>
-    <section class="grid status-grid-compact">{game_cards}</section>
     <script>
     (function() {{
       function text(id, value) {{
@@ -10064,9 +10090,7 @@ def _render_status_dashboard(data: dict[str, Any], request: Optional[Request] = 
         text('status-weather-value', iconFor('weather', weather) + ' ' + weather);
         text('status-weather-sub', payload.weather_sub || '—');
         text('status-server-value', iconFor('server', server) + ' ' + server);
-        text('status-server-sub', 'Fearless · Europe · Population: ' + (payload.population || '—'));
-        text('status-source-value', payload.source || 'live');
-        text('status-source-sub', 'Aktualisiert: ' + (payload.updated_at ? new Date(payload.updated_at).toLocaleString('de-DE') : '—'));
+        text('status-server-sub', 'Fearless · Europe');
         const nextPhase = payload.next_phase || (String(phase).toLowerCase().includes('tag') ? 'Nacht' : 'Tag');
         setCountdown('phase', nextPhase, payload.phase_countdown_seconds);
         const wLabel = String(weather).toLowerCase().includes('regen') ? 'Ende' : 'Regen';
@@ -10100,7 +10124,7 @@ def _render_status_dashboard(data: dict[str, Any], request: Optional[Request] = 
         <div id="statusMapLoader" class="muted" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;z-index:1;background:rgba(0,0,0,.35);border-radius:12px;min-height:420px;">Karte wird geladen …</div>
         <iframe id="statusMapFrame" class="status-map-frame" title="Solisium Karte" src="about:blank" data-src="{_e(map_url)}" width="100%" height="560" style="border:none;border-radius:8px;background:#05060a;" allowfullscreen loading="eager" referrerpolicy="no-referrer-when-downgrade"></iframe>
       </div>
-      <div class="status-source-note"><span class="muted">Quelle: <span id="statusMapSource">TLDB</span>. Falls ein Anbieter blockiert, oben anderen Kartenanbieter wählen.</span></div>
+
       <script>
       (function() {{
         const frame = document.getElementById('statusMapFrame');
