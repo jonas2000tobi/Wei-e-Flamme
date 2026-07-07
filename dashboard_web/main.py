@@ -31,7 +31,7 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
-ASSET_VER = "ebo-phase3-database-start"
+ASSET_VER = "ebo-ebolisback-working-base"
 DASHBOARD_RELEASE_VERSION = "1.2.0 · Status Playwright Worker"
 
 
@@ -3709,7 +3709,7 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "admin") -> str:
     .topnav a[href="/system"]::before {{ display:block; background-image:url("{_asset('nav_system.png')}"); }}
     .topnav a[href="/exports"]::before {{ display:block; background-image:url("{_asset('nav_exports.png')}"); }}
     .topnav a:hover {{ border-color:var(--gold); color:var(--gold); transform:translateY(-1px); }}
-    .hero {{ position:relative; overflow:hidden; display:flex; justify-content:space-between; gap:18px; align-items:center; padding:30px; border:1px solid rgba(214,168,79,.32); background:linear-gradient(90deg,rgba(10,11,15,.90),rgba(24,26,34,.78)), url("{_asset('hero_banner.webp')}") center / cover no-repeat; border-radius:20px; margin-bottom:18px; box-shadow:0 18px 44px rgba(0,0,0,.42); }}
+    .hero {{ position:relative; overflow:hidden; display:flex; justify-content:space-between; gap:18px; align-items:center; padding:30px; border:1px solid rgba(214,168,79,.32); background:linear-gradient(90deg,rgba(10,11,15,.90),rgba(24,26,34,.78)), url("{_asset('ebolusback.png')}") center / cover no-repeat; border-radius:20px; margin-bottom:18px; box-shadow:0 18px 44px rgba(0,0,0,.42); }}
     .hero::after {{ content:""; position:absolute; inset:0; pointer-events:none; background:radial-gradient(circle at 76% 50%,rgba(214,168,79,.16),transparent 34%), linear-gradient(180deg,transparent,rgba(0,0,0,.24)); }}
     .hero > * {{ position:relative; z-index:1; }}
     .hero h1::before {{ content:""; display:inline-block; width:38px; height:38px; margin-right:10px; vertical-align:-8px; background:url("{_asset('ebolus_logo.png')}") center / contain no-repeat; filter:drop-shadow(0 2px 7px rgba(0,0,0,.8)); }}
