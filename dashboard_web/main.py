@@ -31,7 +31,7 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
-ASSET_VER = "ebo-gothic-whale-dashboard-mobile-v1"
+ASSET_VER = "ebo-gothic-whale-dashboard-mobile-v3"
 DASHBOARD_RELEASE_VERSION = "1.2.0 · Status Playwright Worker"
 
 
@@ -4075,6 +4075,300 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "admin") -> str:
       .mobile-nav-toggle {{ padding:8px 10px; }}
       .topnav a {{ font-size:11px; padding:8px 9px; }}
       table.searchable-table td {{ grid-template-columns:1fr; gap:3px; }}
+    }}
+
+
+    /* Mobile UX Patch v2 – Bottom Navigation + cleaner hero */
+    @media(max-width:900px) {{
+      :root {{ --mobile-bottom-nav-h:58px; --mobile-auth-h:48px; --mobile-menu-h:48px; }}
+
+      .sidebar {{
+        position:static !important;
+        height:0 !important;
+        min-height:0 !important;
+        max-height:0 !important;
+        overflow:visible !important;
+        padding:0 !important;
+        margin:0 !important;
+        border:0 !important;
+        background:transparent !important;
+        box-shadow:none !important;
+        backdrop-filter:none !important;
+      }}
+      .sidebar::before,.sidebar::after {{ display:none !important; }}
+      .brand {{ display:none !important; }}
+
+      .mobile-nav-toggle {{
+        display:inline-flex !important;
+        position:fixed !important;
+        right:12px !important;
+        bottom:calc(env(safe-area-inset-bottom, 0px) + var(--mobile-bottom-nav-h) + var(--mobile-auth-h) + 10px) !important;
+        top:auto !important;
+        z-index:220 !important;
+        min-height:42px !important;
+        padding:9px 12px !important;
+        border-radius:14px !important;
+        box-shadow:0 12px 30px rgba(0,0,0,.45), inset 0 1px 0 rgba(255,255,255,.06) !important;
+      }}
+
+      body.nav-open .sidebar {{
+        position:fixed !important;
+        inset:0 !important;
+        z-index:300 !important;
+        height:100dvh !important;
+        max-height:none !important;
+        overflow:auto !important;
+        padding:12px !important;
+        background:linear-gradient(180deg,rgba(18,12,10,.98),rgba(8,9,13,.98)) !important;
+        box-shadow:none !important;
+      }}
+      body.nav-open .brand {{
+        display:flex !important;
+        min-height:46px !important;
+        margin:0 0 10px !important;
+        padding:0 112px 0 0 !important;
+        flex-direction:row !important;
+        justify-content:flex-start !important;
+        text-align:left !important;
+      }}
+      body.nav-open .brand-mark {{ width:42px !important; height:42px !important; flex:0 0 42px !important; }}
+      body.nav-open .brand strong {{ font-size:15px !important; }}
+      body.nav-open .brand span {{ font-size:10px !important; }}
+      body.nav-open .mobile-nav-toggle {{
+        position:fixed !important;
+        top:12px !important;
+        right:12px !important;
+        bottom:auto !important;
+        z-index:320 !important;
+      }}
+      body.nav-open .side-nav {{
+        display:grid !important;
+        grid-template-columns:1fr !important;
+        gap:7px !important;
+        margin-top:10px !important;
+        padding-top:12px !important;
+        border-top:1px solid rgba(214,168,79,.18) !important;
+      }}
+      body.nav-open .sidebar-footer {{
+        display:grid !important;
+        grid-template-columns:1fr 1fr !important;
+        margin-top:12px !important;
+      }}
+
+      .authbar {{
+        position:fixed !important;
+        left:10px !important;
+        right:10px !important;
+        bottom:calc(env(safe-area-inset-bottom, 0px) + var(--mobile-bottom-nav-h) + 6px) !important;
+        z-index:210 !important;
+        min-height:42px !important;
+        margin:0 !important;
+        display:flex !important;
+        align-items:center !important;
+        gap:8px !important;
+        overflow-x:auto !important;
+        white-space:nowrap !important;
+        scrollbar-width:none !important;
+        border-radius:14px !important;
+        background:linear-gradient(180deg,rgba(17,18,26,.96),rgba(8,9,13,.96)) !important;
+        box-shadow:0 10px 28px rgba(0,0,0,.42), inset 0 1px 0 rgba(255,255,255,.04) !important;
+      }}
+      .authbar::-webkit-scrollbar {{ display:none !important; }}
+
+      .topnav {{
+        position:fixed !important;
+        left:0 !important;
+        right:0 !important;
+        bottom:env(safe-area-inset-bottom, 0px) !important;
+        z-index:205 !important;
+        margin:0 !important;
+        padding:8px 10px calc(8px + env(safe-area-inset-bottom, 0px)) !important;
+        display:flex !important;
+        flex-wrap:nowrap !important;
+        gap:8px !important;
+        overflow-x:auto !important;
+        -webkit-overflow-scrolling:touch !important;
+        scrollbar-width:none !important;
+        background:linear-gradient(180deg,rgba(9,10,15,.88),rgba(7,7,10,.98)) !important;
+        border-top:1px solid rgba(214,168,79,.24) !important;
+        box-shadow:0 -14px 36px rgba(0,0,0,.50) !important;
+      }}
+      .topnav::-webkit-scrollbar {{ display:none !important; }}
+      .topnav a {{
+        flex:0 0 auto !important;
+        min-height:42px !important;
+        padding:9px 13px !important;
+        border-radius:14px !important;
+        font-size:13px !important;
+        background:linear-gradient(180deg,rgba(32,22,14,.86),rgba(9,9,12,.92)) !important;
+      }}
+
+      main.content {{
+        padding-top:12px !important;
+        padding-bottom:calc(var(--mobile-bottom-nav-h) + var(--mobile-auth-h) + 86px + env(safe-area-inset-bottom, 0px)) !important;
+      }}
+
+      .status-main-hero,
+      .hero {{
+        background-position:68% center !important;
+      }}
+      .status-main-hero {{
+        min-height:calc(100dvh - 230px) !important;
+        display:flex !important;
+        flex-direction:column !important;
+        justify-content:flex-start !important;
+        padding:28px 16px 18px !important;
+      }}
+      .status-hero-logo {{
+        width:86px !important;
+        height:86px !important;
+        margin-bottom:8px !important;
+      }}
+      .status-hero-title h1 {{
+        font-size:clamp(36px,13vw,58px) !important;
+      }}
+      .status-hero-title p {{
+        font-size:20px !important;
+      }}
+      .status-hero-stats {{
+        margin-top:24px !important;
+        grid-template-columns:1fr 1fr !important;
+        gap:10px !important;
+      }}
+    }}
+
+    @media(max-width:560px) {{
+      .mobile-nav-toggle {{
+        right:10px !important;
+        bottom:calc(env(safe-area-inset-bottom, 0px) + var(--mobile-bottom-nav-h) + var(--mobile-auth-h) + 8px) !important;
+      }}
+      .status-main-hero,
+      .hero {{
+        background-position:72% center !important;
+      }}
+      .status-hero-stats {{
+        grid-template-columns:1fr 1fr !important;
+      }}
+      .status-hero-stat {{
+        min-height:112px !important;
+      }}
+    }}
+
+    @media(max-width:390px) {{
+      .status-hero-stats {{
+        grid-template-columns:1fr !important;
+      }}
+      .authbar {{
+        font-size:11px !important;
+      }}
+      .topnav a {{
+        font-size:12px !important;
+        padding:8px 11px !important;
+      }}
+    }}
+
+
+    /* Mobile UX Patch v3 – whale centered, login at very bottom, 2-column stat cards */
+    @media(max-width:900px) {{
+      :root {{ --mobile-bottom-nav-h:58px; --mobile-auth-h:48px; }}
+
+      /* Nur mobil: Wal/Hero sauber mittig im Header, nichts außerhalb */
+      .status-main-hero,
+      .hero {{
+        overflow:hidden !important;
+        background-position:center center !important;
+        background-size:cover !important;
+        background-repeat:no-repeat !important;
+      }}
+
+      /* Kacheln im Header mobil wieder 2 nebeneinander statt breit untereinander */
+      .status-hero-stats {{
+        display:grid !important;
+        grid-template-columns:repeat(2,minmax(0,1fr)) !important;
+        gap:10px !important;
+      }}
+      .status-hero-stat {{
+        min-width:0 !important;
+        width:auto !important;
+      }}
+
+      /* Discord-Login-Leiste wirklich ganz nach unten */
+      .authbar {{
+        position:fixed !important;
+        left:10px !important;
+        right:10px !important;
+        bottom:calc(env(safe-area-inset-bottom, 0px) + 6px) !important;
+        z-index:230 !important;
+        min-height:42px !important;
+        margin:0 !important;
+        display:flex !important;
+        align-items:center !important;
+        gap:8px !important;
+        overflow-x:auto !important;
+        white-space:nowrap !important;
+        scrollbar-width:none !important;
+        border-radius:14px !important;
+        background:linear-gradient(180deg,rgba(17,18,26,.96),rgba(8,9,13,.96)) !important;
+        box-shadow:0 10px 28px rgba(0,0,0,.42), inset 0 1px 0 rgba(255,255,255,.04) !important;
+      }}
+      .authbar::-webkit-scrollbar {{ display:none !important; }}
+
+      /* Hauptbutton-Leiste bleibt unten, aber über der Login-Leiste */
+      .topnav {{
+        position:fixed !important;
+        left:0 !important;
+        right:0 !important;
+        bottom:calc(env(safe-area-inset-bottom, 0px) + var(--mobile-auth-h) + 8px) !important;
+        z-index:220 !important;
+        margin:0 !important;
+        padding:8px 10px !important;
+        display:flex !important;
+        flex-wrap:nowrap !important;
+        gap:8px !important;
+        overflow-x:auto !important;
+        -webkit-overflow-scrolling:touch !important;
+        scrollbar-width:none !important;
+        background:linear-gradient(180deg,rgba(9,10,15,.88),rgba(7,7,10,.98)) !important;
+        border-top:1px solid rgba(214,168,79,.24) !important;
+        box-shadow:0 -14px 36px rgba(0,0,0,.50) !important;
+      }}
+      .topnav::-webkit-scrollbar {{ display:none !important; }}
+      .topnav a {{
+        flex:0 0 auto !important;
+        min-height:42px !important;
+        padding:9px 13px !important;
+        border-radius:14px !important;
+        font-size:13px !important;
+      }}
+
+      /* Menü-Button nicht über Login/Nav legen */
+      .mobile-nav-toggle {{
+        bottom:calc(env(safe-area-inset-bottom, 0px) + var(--mobile-auth-h) + var(--mobile-bottom-nav-h) + 18px) !important;
+      }}
+
+      main.content {{
+        padding-bottom:calc(var(--mobile-bottom-nav-h) + var(--mobile-auth-h) + 94px + env(safe-area-inset-bottom, 0px)) !important;
+      }}
+    }}
+
+    @media(max-width:560px) {{
+      .status-main-hero,
+      .hero {{
+        background-position:center center !important;
+      }}
+      .status-hero-stats {{
+        grid-template-columns:repeat(2,minmax(0,1fr)) !important;
+        gap:9px !important;
+      }}
+      .status-hero-stat {{
+        min-height:112px !important;
+      }}
+    }}
+
+    @media(max-width:360px) {{
+      .status-hero-stats {{
+        grid-template-columns:1fr !important;
+      }}
     }}
 
   </style>
