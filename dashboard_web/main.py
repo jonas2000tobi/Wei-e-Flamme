@@ -9983,37 +9983,27 @@ def _render_status_dashboard(data: dict[str, Any], request: Optional[Request] = 
         <div class="status-hero-stat compact"><span>Wetter</span><strong id="status-weather-value">{_e(_mini_status_value('weather', game.get('weather')))}</strong><small id="status-weather-sub">{_e(game.get('weather_sub') or '—')}</small></div>
       </div>
       <style>
-        .status-topnav-shell{{position:relative;border:1px solid rgba(218,166,74,.42);border-radius:22px;padding:10px;margin:0 0 18px;background:linear-gradient(180deg,rgba(218,166,74,.13),rgba(11,14,22,.48));box-shadow:0 18px 46px rgba(0,0,0,.28),0 0 0 1px rgba(255,221,151,.06) inset,0 0 28px rgba(218,166,74,.08);overflow:hidden;}}
-        .status-topnav-shell:before{{content:"";position:absolute;inset:0;border-radius:inherit;pointer-events:none;background:linear-gradient(90deg,transparent,rgba(255,222,156,.16),transparent);opacity:.58;}}
-        .status-topnav{{margin:0;position:relative;z-index:1;}}
-        .status-topnav a{{border-color:rgba(218,166,74,.42);background:linear-gradient(180deg,rgba(255,236,181,.07),rgba(7,9,15,.52));box-shadow:0 8px 18px rgba(0,0,0,.22),inset 0 0 0 1px rgba(255,255,255,.03);transition:transform .16s ease,border-color .16s ease,background .16s ease;}}
-        .status-topnav a:hover{{transform:translateY(-1px);border-color:rgba(255,215,128,.68);background:linear-gradient(180deg,rgba(142,23,23,.42),rgba(62,11,13,.56));}}
-        .status-main-hero{{position:relative;overflow:hidden;padding:30px 30px 28px;border-color:rgba(218,166,74,.48);box-shadow:0 24px 70px rgba(0,0,0,.42),0 0 0 1px rgba(255,219,145,.08) inset,0 0 42px rgba(218,166,74,.08);}}
-        .status-main-hero:before{{content:"";position:absolute;inset:0;pointer-events:none;background:radial-gradient(circle at 50% 8%,rgba(255,221,151,.20),transparent 24%),radial-gradient(circle at 50% 52%,rgba(142,23,23,.18),transparent 38%),linear-gradient(180deg,rgba(0,0,0,.06),rgba(0,0,0,.34));}}
-        .status-main-hero:after{{content:"✦";position:absolute;top:-13px;left:50%;transform:translateX(-50%);color:rgba(218,166,74,.92);font-size:28px;text-shadow:0 0 18px rgba(218,166,74,.55);}}
-        .status-hero-inner{{position:relative;z-index:1;width:100%;display:flex;flex-direction:column;align-items:center;gap:18px;}}
+        .status-topnav-shell{{border:1px solid rgba(218,166,74,.34);border-radius:20px;padding:10px;margin:0 0 18px;background:linear-gradient(180deg,rgba(218,166,74,.09),rgba(11,14,22,.38));box-shadow:0 16px 40px rgba(0,0,0,.22), inset 0 0 0 1px rgba(255,221,151,.04);}}
+        .status-topnav{{margin:0;}}
+        .status-topnav a{{border-color:rgba(218,166,74,.34);}}
+        .status-main-hero{{padding:26px 28px;}}
+        .status-hero-inner{{width:100%;display:flex;flex-direction:column;align-items:center;gap:18px;}}
         .status-hero-head{{display:flex;flex-direction:column;align-items:center;text-align:center;gap:12px;width:100%;}}
-        .status-hero-logo{{width:168px;height:168px;border-radius:36px;padding:13px;margin:0 auto;background:radial-gradient(circle at 35% 25%,rgba(255,221,151,.28),rgba(142,23,23,.18) 44%,rgba(8,10,17,.74));border:1px solid rgba(218,166,74,.55);box-shadow:0 26px 62px rgba(0,0,0,.52),0 0 0 1px rgba(255,221,151,.08) inset,0 0 36px rgba(218,166,74,.18);}}
-        .status-hero-logo img{{width:100%;height:100%;object-fit:contain;filter:drop-shadow(0 8px 18px rgba(0,0,0,.78)) drop-shadow(0 0 15px rgba(218,166,74,.20));}}
-        .status-hero-title .eyebrow{{letter-spacing:.22em;text-shadow:0 0 16px rgba(218,166,74,.22);}}
-        .status-hero-title h1{{font-size:clamp(42px,6.4vw,72px);line-height:1;margin:.05em 0 .08em;text-shadow:0 3px 18px rgba(0,0,0,.55),0 0 22px rgba(218,166,74,.13);}}
-        .status-welcome{{font-size:clamp(19px,2.8vw,28px);color:#efe3c8;margin:.15em 0 0;text-shadow:0 2px 12px rgba(0,0,0,.55);}}
+        .status-hero-logo{{width:154px;height:154px;border-radius:32px;padding:12px;margin:0 auto;background:radial-gradient(circle at 35% 25%,rgba(218,166,74,.24),rgba(11,14,22,.66));border:1px solid rgba(218,166,74,.42);box-shadow:0 22px 50px rgba(0,0,0,.42),0 0 0 1px rgba(255,221,151,.06) inset;}}
+        .status-hero-logo img{{width:100%;height:100%;object-fit:contain;filter:drop-shadow(0 6px 16px rgba(0,0,0,.72));}}
+        .status-hero-title h1{{font-size:clamp(38px,6vw,68px);line-height:1;margin:.05em 0 .08em;}}
+        .status-welcome{{font-size:clamp(18px,2.6vw,26px);color:#efe3c8;margin:.15em 0 0;}}
         .status-welcome strong{{color:var(--gold);}}
         .status-hero-stats{{display:grid;grid-template-columns:repeat(6,minmax(120px,1fr));gap:12px;margin-top:2px;width:100%;}}
-        .status-hero-stat{{position:relative;display:flex;flex-direction:column;gap:4px;padding:15px 16px;border:1px solid rgba(218,166,74,.36);border-radius:18px;background:linear-gradient(180deg,rgba(21,24,34,.70),rgba(7,9,15,.55));text-decoration:none;color:inherit;min-width:0;box-shadow:0 14px 32px rgba(0,0,0,.30),inset 0 0 0 1px rgba(255,255,255,.025);overflow:hidden;}}
-        .status-hero-stat:before{{content:"";position:absolute;inset:0;background:radial-gradient(circle at 18% 20%,rgba(218,166,74,.16),transparent 34%);opacity:.75;pointer-events:none;}}
-        .status-hero-stat:hover{{transform:translateY(-1px);border-color:rgba(255,215,128,.62);background:linear-gradient(180deg,rgba(42,24,20,.74),rgba(11,14,22,.62));}}
-        .status-hero-stat span,.status-hero-stat strong,.status-hero-stat small{{position:relative;z-index:1;}}
-        .status-hero-stat span{{font-size:.82rem;color:rgba(238,225,198,.78);font-weight:800;}}
-        .status-hero-stat strong{{font-size:1.52rem;color:var(--gold);line-height:1.05;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;text-shadow:0 2px 12px rgba(0,0,0,.55);}}
-        .status-hero-stat small{{color:rgba(238,225,198,.72);line-height:1.25;}}
-        .status-hero-stat.compact strong{{font-size:1.16rem;}}
-        .status-main-hero .btn{{align-self:center;background:linear-gradient(180deg,#a62323,#650e12);border-color:rgba(255,201,92,.58);box-shadow:0 12px 26px rgba(0,0,0,.32),inset 0 0 0 1px rgba(255,221,151,.10);}}
-        #map.panel{{border-color:rgba(218,166,74,.40);box-shadow:0 18px 56px rgba(0,0,0,.34),0 0 0 1px rgba(255,221,151,.05) inset;}}
-        #map h2{{font-size:clamp(24px,4.4vw,36px);}}
-        .status-map-toolbar .btn{{border-radius:16px;}}
+        .status-hero-stat{{display:flex;flex-direction:column;gap:4px;padding:14px 16px;border:1px solid rgba(218,166,74,.26);border-radius:16px;background:rgba(11,14,22,.58);text-decoration:none;color:inherit;min-width:0;}}
+        .status-hero-stat:hover{{border-color:rgba(218,166,74,.48);background:rgba(218,166,74,.08);}}
+        .status-hero-stat span{{font-size:.82rem;color:var(--muted);font-weight:700;}}
+        .status-hero-stat strong{{font-size:1.45rem;color:var(--gold);line-height:1.05;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}}
+        .status-hero-stat small{{color:var(--muted);line-height:1.25;}}
+        .status-hero-stat.compact strong{{font-size:1.12rem;}}
+        .status-main-hero .btn{{align-self:center;}}
         @media(max-width:1100px){{.status-hero-stats{{grid-template-columns:repeat(3,minmax(130px,1fr));}}}}
-        @media(max-width:640px){{.status-topnav-shell{{padding:8px;border-radius:18px;}}.status-topnav{{gap:9px;}}.status-topnav a{{padding:11px 15px;}}.status-main-hero{{padding:24px 20px;}}.status-hero-logo{{width:148px;height:148px;border-radius:31px;}}.status-hero-stats{{grid-template-columns:1fr 1fr;gap:11px;}}.status-hero-stat{{padding:13px 14px;border-radius:17px;}}.status-hero-stat strong{{font-size:1.24rem;}}.status-hero-stat.compact strong{{font-size:1.08rem;}}}}
+        @media(max-width:640px){{.status-topnav-shell{{padding:8px;border-radius:18px;}}.status-main-hero{{padding:22px 20px;}}.status-hero-logo{{width:132px;height:132px;border-radius:28px;}}.status-hero-stats{{grid-template-columns:1fr 1fr;}}.status-hero-stat{{padding:12px}}.status-hero-stat strong{{font-size:1.18rem;}}}}
       </style>
     """
     map_url = str(game.get("map_url") or "https://tldb.info/map/world")
