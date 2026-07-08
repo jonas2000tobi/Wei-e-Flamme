@@ -1185,15 +1185,46 @@ def extract_questlog_detail_model(text: str, *, name: str, rarity: str | None, s
         if m.group(2):
             detail["item_level_range"] = clean_text(m.group(2))
 
-    # Rüstungs-Hauptwert / Defense
-    defense_block = find_label_value_block(lines, ["Verteidigung", "Defense", "Rüstung", "Ruestung", "Armor"], max_lookahead=8)
-    if defense_block:
-        entries = defense_block.get("entries") or _number_entries_from_values(defense_block.get("raw_values") or [])
+    # Rüstungs-Hauptwerte / Defense
+    # Questlog zeigt bei Rüstung meist zwei getrennte Hauptwerte, z. B.
+    # Nahkampfverteidigung 530 ▲152 und Fernkampfverteidigung 581 ▲167.
+    # Der alte Parser hat daraus nur ein generisches "DEF" gemacht.
+    armor_defense_labels = [
+        ("Nahkampfverteidigung", ["Nahkampfverteidigung", "Melee Defense"]),
+        ("Fernkampfverteidigung", ["Fernkampfverteidigung", "Ranged Defense"]),
+        ("Magieverteidigung", ["Magieverteidigung", "Magic Defense"]),
+    ]
+    parsed_specific_defense = False
+    for out_label, labels in armor_defense_labels:
+        block = find_label_value_block(lines, labels, max_lookahead=5)
+        if not block:
+            mm = re.search(rf"{re.escape(out_label)}\s*:?[\s\n]+([+\-]?\d+(?:[.,]\d+)?)(?:\s*▲\s*([+\-]?\d+(?:[.,]\d+)?))?", raw, flags=re.I)
+            if mm:
+                val = clean_text(mm.group(1))
+                delta = clean_text(mm.group(2) or "")
+                detail.setdefault("defenses", {})[out_label] = {"value": val, "delta": delta}
+                detail["primary"].append({"label": out_label, "value": val, "delta": delta})
+                parsed_specific_defense = True
+            continue
+        entries = block.get("entries") or _number_entries_from_values(block.get("raw_values") or [])
         base_nums = [str(e.get("value")) for e in entries if not e.get("is_delta")]
         deltas = [str(e.get("value")) for e in entries if e.get("is_delta")]
         if base_nums:
-            detail["defense"] = {"value": base_nums[0], "delta": deltas[0] if deltas else "", "raw": defense_block.get("raw_values")}
-            detail["primary"].append({"label": "Verteidigung", "value": base_nums[0], "delta": deltas[0] if deltas else "", "raw": defense_block.get("raw_values")})
+            detail.setdefault("defenses", {})[out_label] = {"value": base_nums[0], "delta": deltas[0] if deltas else "", "raw": block.get("raw_values")}
+            detail["primary"].append({"label": out_label, "value": base_nums[0], "delta": deltas[0] if deltas else "", "raw": block.get("raw_values")})
+            parsed_specific_defense = True
+
+    # Fallback für alte/andere Layouts: generische Verteidigung nur nutzen,
+    # wenn keine spezifische Rüstungsverteidigung erkannt wurde.
+    if not parsed_specific_defense:
+        defense_block = find_label_value_block(lines, ["Verteidigung", "Defense", "Rüstung", "Ruestung", "Armor"], max_lookahead=8)
+        if defense_block:
+            entries = defense_block.get("entries") or _number_entries_from_values(defense_block.get("raw_values") or [])
+            base_nums = [str(e.get("value")) for e in entries if not e.get("is_delta")]
+            deltas = [str(e.get("value")) for e in entries if e.get("is_delta")]
+            if base_nums:
+                detail["defense"] = {"value": base_nums[0], "delta": deltas[0] if deltas else "", "raw": defense_block.get("raw_values")}
+                detail["primary"].append({"label": "Verteidigung", "value": base_nums[0], "delta": deltas[0] if deltas else "", "raw": defense_block.get("raw_values")})
 
     # Hauptwerte
     dmg = find_label_value_block(lines, ["Max. Schaden", "Max Damage", "Schaden", "Damage"], max_lookahead=10)
@@ -1273,24 +1304,59 @@ def extract_questlog_detail_model(text: str, *, name: str, rarity: str | None, s
                 entry["delta"] = vals[1]
             detail["bonus_stats"].append(entry)
 
-    # Eigenschaften / Traits: Abschnitt nach Eigenschaften: bis Ende/Kommentare.
+    # Eigenschaften / Traits: Abschnitt nach Eigenschaften: strikt nur bis zum nächsten Questlog-Bereich.
+    # Bei Rüstung stand danach z. B. Set-Effekt, Verkaufspreis, Ads usw. und wurde fälschlich als Trait gelesen.
     trait_start = -1
     for i, line in enumerate(lines):
         if line.lower().strip(" :") in {"eigenschaften", "traits"}:
             trait_start = i + 1
             break
+
+    def _is_trait_stop_line(value: str) -> bool:
+        low = clean_text(value).lower().strip(" :[]{}")
+        if not low:
+            return False
+        exact_stops = {
+            "kommentare", "comments", "used in litographs", "in litographen verwendet",
+            "dropped from npcs", "von npcs erbeutet", "dropped from resources", "von ressourcen erbeutet",
+            "map", "karte", "auction house", "auktionshaus", "stats", "enchanting",
+            "remove ads", "learn more", "share", "teilen",
+        }
+        if low in exact_stops:
+            return True
+        prefixes = (
+            "dieser gegenstand hat", "this item has", "verkaufspreis", "sales price",
+            "ausrüstungseffekt", "ausruestungseffekt", "equipment set effect", "set effect",
+            "set:", "ausrüstungsset", "ausruestungsset", "enjoying questlog", "sponsored",
+        )
+        return any(low.startswith(p) for p in prefixes)
+
+    def _valid_trait_label(value: str) -> bool:
+        low = clean_text(value).lower().strip(" :")
+        if not low or _is_trait_stop_line(low):
+            return False
+        if len(low) > 45:
+            return False
+        bad_bits = ["ads", "questlog", "werbung", "sponsored", "set", "ausrüstungseffekt", "ausruestungseffekt"]
+        if any(b in low for b in bad_bits):
+            return False
+        # Traits sind kurze Werte-Namen, keine ganzen Sätze.
+        if re.search(r"[.!?]", low):
+            return False
+        return True
+
     if trait_start >= 0:
         i = trait_start
         while i < len(lines):
             label = clean_text(lines[i]).rstrip(":")
             low = label.lower()
-            if low in {"kommentare", "comments", "used in litographs", "dropped from npcs", "dropped from resources"}:
+            if _is_trait_stop_line(label):
                 break
             if not label or re.search(r"^(\||▲|~)$", label):
                 i += 1
                 continue
             # Trait-Name hat meistens keine Zahl, Werte danach schon.
-            if not re.search(r"\d", label):
+            if not re.search(r"\d", label) and _valid_trait_label(label):
                 vals: list[str] = []
                 j = i + 1
                 while j < len(lines) and j < i + 10:
@@ -1299,16 +1365,20 @@ def extract_questlog_detail_model(text: str, *, name: str, rarity: str | None, s
                     if not v:
                         j += 1
                         continue
-                    if vl in {"kommentare", "comments"}:
+                    if _is_trait_stop_line(v):
+                        j = len(lines)
                         break
-                    if not re.search(r"\d", v) and not v in {"|"}:
+                    # Neues Label ohne Zahl beendet den aktuellen Wertblock.
+                    if not re.search(r"\d", v) and v != "|":
                         break
                     if v != "|":
                         num = parse_number_token(v)
                         if num:
                             vals.append(num)
                     j += 1
-                if len(vals) >= 2:
+                # Normale Trait-Reihen bei Questlog haben meistens 4 Werte, manche 2/6.
+                # Einzelne Fake-Paare aus Settext/Ads werden dadurch nicht mehr übernommen.
+                if len(vals) >= 2 and len(vals) <= 8:
                     detail["traits"].append({"name": label, "values": vals[:8]})
                     i = j
                     continue
