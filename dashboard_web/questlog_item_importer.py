@@ -1324,10 +1324,16 @@ def extract_questlog_detail_model(text: str, *, name: str, rarity: str | None, s
         }
         if low in exact_stops:
             return True
-        prefixes = (
-            "dieser gegenstand hat", "this item has", "verkaufspreis", "sales price",
+        # Settexte/Ads/Questlog-Bereiche können mitten im Text stehen, nicht nur am Anfang.
+        stop_contains = (
             "ausrüstungseffekt", "ausruestungseffekt", "equipment set effect", "set effect",
-            "set:", "ausrüstungsset", "ausruestungsset", "enjoying questlog", "sponsored",
+            "verkaufspreis", "sales price", "remove ads", "sponsored", "enjoying questlog",
+            "kommentare", "comments", "erbeutet", "litograph", "lithograph", "verwendet",
+        )
+        if any(p in low for p in stop_contains):
+            return True
+        prefixes = (
+            "dieser gegenstand hat", "this item has", "set:", "ausrüstungsset", "ausruestungsset",
         )
         return any(low.startswith(p) for p in prefixes)
 
@@ -1339,6 +1345,19 @@ def extract_questlog_detail_model(text: str, *, name: str, rarity: str | None, s
             return False
         bad_bits = ["ads", "questlog", "werbung", "sponsored", "set", "ausrüstungseffekt", "ausruestungseffekt"]
         if any(b in low for b in bad_bits):
+            return False
+        # Nur echte Questlog-Eigenschaftsnamen zulassen. Dadurch werden Set-/Lore-Zeilen nicht als Trait gespeichert.
+        allowed_traits = {
+            "max. gesundheit", "max. leben", "max. mana", "manaregeneration", "mana-kosteneffizienz",
+            "trefferchance", "krit. trefferchance", "kritische trefferchance",
+            "chance auf starken angriff", "chance auf fesseln", "schwächungschance", "schwaechungschance",
+            "nahkampfausweichen", "fernkampfausweichen", "magieausweichen",
+            "nahkampfausdauer", "fernkampfausdauer", "magieausdauer",
+            "buff-dauer", "debuff-dauer", "angriffstempo",
+            "wildkin-bonusschaden", "untote-zusatzschaden", "humanoide-zusatzschaden", "konstrukt-zusatzschaden",
+            "mana-regeneration", "manakosteneffizienz",
+        }
+        if low not in allowed_traits and "-zusatzschaden" not in low and "bonusschaden" not in low:
             return False
         # Traits sind kurze Werte-Namen, keine ganzen Sätze.
         if re.search(r"[.!?]", low):
@@ -1383,6 +1402,112 @@ def extract_questlog_detail_model(text: str, *, name: str, rarity: str | None, s
                     i = j
                     continue
             i += 1
+
+
+    # Rüstungs-Zusatzwerte nach Questlog-Regel begrenzen.
+    # Muster aus Questlog-Rüstungsseiten:
+    # - Item Level 21: 2 Zusatzwerte nach den DEF-Werten
+    # - Item Level 31/45/50: 4 Zusatzwerte
+    # - Item Level 80: 5 Zusatzwerte
+    # Dadurch werden Settexte, Verkaufspreise, Ads oder Trait-Werte nicht mehr als Zusatzwerte gelesen.
+    def _armor_expected_bonus_count(level_value: Any) -> int | None:
+        try:
+            lvl = int(str(level_value or "0"))
+        except Exception:
+            return None
+        if lvl >= 80:
+            return 5
+        if lvl in {31, 45, 50}:
+            return 4
+        if lvl <= 21 and lvl > 0:
+            return 2
+        return 4 if lvl else None
+
+    def _parse_armor_bonus_stats_by_level() -> list[dict[str, Any]]:
+        armor_types = {"helm", "brust", "hose", "handschuhe", "schuhe", "umhang"}
+        if str(sub_category or "").strip().lower() not in armor_types:
+            return []
+        expected = _armor_expected_bonus_count(detail.get("item_level"))
+        if not expected:
+            return []
+
+        # Nur die echten Zusatzwert-Namen zulassen. Keine Eigenschaften, keine Settexte.
+        allowed_labels = [
+            "Stärke", "Geschicklichkeit", "Weisheit", "Wahrnehmung",
+            "Standhaftigkeit", "Ausdauer", "Schadensverminderung",
+            "Trefferchance", "Krit. Trefferchance", "Kritische Trefferchance",
+            "Max. Gesundheit", "Max. Leben", "Max. Mana", "Manaregeneration",
+            "Mana-Kosteneffizienz", "Abklingtempo", "Abklingzeit",
+            "Nahkampfausweichen", "Fernkampfausweichen", "Magieausweichen",
+            "Nahkampfausdauer", "Fernkampfausdauer", "Magieausdauer",
+            "Buff-Dauer", "Debuff-Dauer",
+            "Wildkin-Bonusschaden", "Untote-Zusatzschaden", "Humanoide-Zusatzschaden", "Konstrukt-Zusatzschaden",
+        ]
+        allowed_map = {x.lower().strip(" :"): x for x in allowed_labels}
+        primary_lows = {
+            "nahkampfverteidigung", "fernkampfverteidigung", "magieverteidigung",
+            "verteidigung", "def", "wert", "max. schaden", "reichweite", "angriffstempo",
+            "angriffsgeschwindigkeit", "passiv", "passive", "eigenschaften", "traits",
+        }
+
+        # Zusatzwerte stehen auf Questlog vor Eigenschaften. Alles danach ignorieren.
+        end = len(lines)
+        for idx, line in enumerate(lines):
+            if clean_text(line).lower().strip(" :") in {"eigenschaften", "traits"}:
+                end = idx
+                break
+
+        # Start ungefähr nach Item-Level/DEF. Wir scannen trotzdem ab oben, aber akzeptieren nur allowed labels.
+        out: list[dict[str, Any]] = []
+        seen_labels: set[str] = set()
+        i = 0
+        while i < end and len(out) < expected:
+            raw_label = clean_text(lines[i]).rstrip(":")
+            low = raw_label.lower().strip(" :")
+            canonical = allowed_map.get(low)
+            if not canonical or low in primary_lows:
+                i += 1
+                continue
+
+            vals: list[str] = []
+            j = i + 1
+            while j < end and j < i + 5:
+                v = clean_text(lines[j]).strip()
+                vl = v.lower().strip(" :")
+                if not v:
+                    j += 1
+                    continue
+                # Neues Label oder Abschnitt beendet den aktuellen Wert.
+                if vl in allowed_map or vl in primary_lows:
+                    break
+                if vl.startswith(("ausrüstungseffekt", "ausruestungseffekt", "verkaufspreis", "remove ads", "kommentare")):
+                    break
+                num = parse_number_token(v)
+                if num:
+                    vals.append(v)
+                # Ein Basiswert + optional ▲ reicht für einen Zusatzwert.
+                if len(vals) >= 2:
+                    break
+                j += 1
+
+            entries = _number_entries_from_values(vals)
+            base_nums = [str(e.get("value")) for e in entries if not e.get("is_delta")]
+            deltas = [str(e.get("value")) for e in entries if e.get("is_delta")]
+            if base_nums and canonical.lower() not in seen_labels:
+                entry: dict[str, Any] = {"label": canonical, "value": base_nums[0]}
+                if deltas:
+                    entry["delta"] = deltas[0]
+                out.append(entry)
+                seen_labels.add(canonical.lower())
+                i = max(j, i + 1)
+                continue
+            i += 1
+
+        return out[:expected]
+
+    armor_level_bonus_stats = _parse_armor_bonus_stats_by_level()
+    if armor_level_bonus_stats:
+        detail["bonus_stats"] = armor_level_bonus_stats
 
     # Dedupe Bonusstats/Traits.
     seen = set(); b=[]
@@ -2087,7 +2212,7 @@ def parse_detail_page(page, url: str, main_category_hint: str, locale: str, sour
             "main_category_hint": main_category_hint,
             "json_candidate_count": len(json_candidates),
             "source_list_url": source_list_url,
-            "parser": "playwright-detail-page-v13-de-exact-links-pagination",
+            "parser": "playwright-detail-page-v14-armor-level-rules",
         },
     }
 
