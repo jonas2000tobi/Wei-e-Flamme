@@ -1590,6 +1590,43 @@ def extract_questlog_detail_model(text: str, *, name: str, rarity: str | None, s
                 i += 1
                 continue
 
+            # Questlog rendert manche Eigenschaften als eine einzige Zeile:
+            # "Max. Mana: 150 | 300 | 450 | 600". Der alte Parser erwartete
+            # Label und Werte getrennt in Folgezeilen und hat diese Zeile dadurch
+            # komplett verloren. Genau deshalb fehlte bei Level-21-Rüstung oft
+            # die 6. Eigenschaft.
+            inline_label = ""
+            inline_values_text = ""
+            m_inline = re.match(r"^(.+?)\s*:\s*(.+)$", label)
+            if m_inline:
+                inline_label = clean_text(m_inline.group(1)).rstrip(":")
+                inline_values_text = clean_text(m_inline.group(2))
+            else:
+                # Fallback für Layouts ohne Doppelpunkt: "Max. Mana 150 | 300 | 450 | 600"
+                known_inline_trait_labels = [
+                    "Max. Gesundheit", "Max. Leben", "Max. Mana", "Manaregeneration",
+                    "Mana-Kosteneffizienz", "Trefferchance", "Krit. Trefferchance",
+                    "Kritische Trefferchance", "Chance auf starken Angriff", "Chance auf Fesseln",
+                    "Schwächungschance", "Schwaechungschance", "Nahkampfausweichen",
+                    "Fernkampfausweichen", "Magieausweichen", "Nahkampfausdauer",
+                    "Fernkampfausdauer", "Magieausdauer", "Buff-Dauer", "Debuff-Dauer",
+                    "Angriffstempo", "Wildkin-Bonusschaden", "Untote-Zusatzschaden",
+                    "Humanoide-Zusatzschaden", "Konstrukt-Zusatzschaden",
+                ]
+                for candidate in sorted(known_inline_trait_labels, key=len, reverse=True):
+                    if low.startswith(candidate.lower() + " "):
+                        inline_label = candidate
+                        inline_values_text = label[len(candidate):].strip()
+                        break
+
+            if inline_label and _valid_trait_label(inline_label):
+                inline_vals = [clean_text(x) for x in re.findall(r"[+\-]?\d+(?:[.,]\d+)?\s*%?", inline_values_text)]
+                if len(inline_vals) >= 2 and inline_label.lower().strip(" :") not in seen_names:
+                    out.append({"name": inline_label, "values": inline_vals[:8]})
+                    seen_names.add(inline_label.lower().strip(" :"))
+                    i += 1
+                    continue
+
             if _valid_trait_label(label) and low not in seen_names:
                 vals: list[str] = []
                 j = i + 1
@@ -1624,10 +1661,91 @@ def extract_questlog_detail_model(text: str, *, name: str, rarity: str | None, s
 
         return out[:trait_limit]
 
-    armor_traits = _reparse_armor_traits_by_expected_count()
+    def _parse_armor_traits_from_section_text() -> list[dict[str, Any]]:
+        """Eigenschaften aus dem reinen Abschnittstext lesen.
+
+        Grund: Questlog rendert Rüstungs-Eigenschaften je nach Item anders:
+        - Label und Werte getrennt
+        - Label: Werte in einer Zeile
+        - Inline/Text ohne saubere Zeilenumbrüche
+
+        Die zuverlässigste Regel ist: nur den Abschnitt NACH "Eigenschaften" und
+        VOR Seteffekt/Preis/Kommentare betrachten, dann bekannte Trait-Namen in
+        ihrer Reihenfolge suchen und bis zum nächsten Trait auswerten.
+        """
+        armor_types = {"helm", "brust", "hose", "handschuhe", "schuhe", "umhang"}
+        if str(sub_category or "").strip().lower() not in armor_types:
+            return []
+
+        trait_labels = [
+            "Max. Gesundheit", "Max. Leben", "Max. Mana", "Manaregeneration",
+            "Mana-Regeneration", "Mana-Kosteneffizienz", "Manakosteneffizienz",
+            "Trefferchance", "Krit. Trefferchance", "Kritische Trefferchance",
+            "Chance auf starken Angriff", "Chance auf Fesseln", "Schwächungschance", "Schwaechungschance",
+            "Nahkampfausweichen", "Fernkampfausweichen", "Magieausweichen",
+            "Nahkampfausdauer", "Fernkampfausdauer", "Magieausdauer",
+            "Buff-Dauer", "Debuff-Dauer", "Angriffstempo",
+            "Wildkin-Bonusschaden", "Untote-Zusatzschaden", "Humanoide-Zusatzschaden", "Konstrukt-Zusatzschaden",
+        ]
+
+        # Abschnitt nach Eigenschaften/Traits isolieren.
+        m_start = re.search(r"(?:^|\n)\s*(Eigenschaften|Traits)\s*:?\s*(?:\n|$)", raw, flags=re.I)
+        if not m_start:
+            # Fallback: auch kompakte Darstellung akzeptieren.
+            m_start = re.search(r"\b(Eigenschaften|Traits)\b\s*:?", raw, flags=re.I)
+        if not m_start:
+            return []
+        section = raw[m_start.end():]
+
+        stop_match = re.search(
+            r"(?:\n\s*)?(Dieser Gegenstand hat|This item has|Ausrüstungseffekte|Ausruestungseffekte|Equipment Set Effect|Ausrüstungsset|Ausruestungsset|Verkaufspreis|Sales Price|Kommentare|Comments|Von NPCs erbeutet|Dropped from|In Lithographen|Litograph|Remove Ads)",
+            section,
+            flags=re.I,
+        )
+        if stop_match:
+            section = section[:stop_match.start()]
+
+        # Sauberer Arbeitsstring: Zeilenumbrüche behalten, aber Spaces normalisieren.
+        sec = normalize_raw_text(section)
+        sec = re.sub(r"[\t\r]+", "\n", sec)
+
+        label_patterns: list[tuple[str, re.Pattern[str]]] = []
+        for label in trait_labels:
+            # Leerraum in Labels flexibel matchen, Punkt/Bindestrich normal lassen.
+            pat_text = re.escape(label).replace(r"\ ", r"\s+")
+            label_patterns.append((label, re.compile(rf"(?<![\wÄÖÜäöüß]){pat_text}\s*:??", flags=re.I)))
+
+        matches: list[tuple[int, int, str]] = []
+        for label, pat in label_patterns:
+            for m in pat.finditer(sec):
+                matches.append((m.start(), m.end(), label))
+        if not matches:
+            return []
+        matches.sort(key=lambda x: x[0])
+
+        out: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for idx, (start_pos, end_pos, label) in enumerate(matches):
+            key = label.lower().strip(" :")
+            if key in seen:
+                continue
+            next_pos = matches[idx + 1][0] if idx + 1 < len(matches) else len(sec)
+            chunk = sec[end_pos:next_pos]
+            # Nur Werte aus diesem Trait-Block. Pipes sind egal, Zahlen reichen.
+            vals = [clean_text(x) for x in re.findall(r"[+\-]?\d+(?:[.,]\d+)?\s*%?", chunk)]
+            # Upgrade-Deltas/Preis/Count gehören hier nicht hin; der Abschnitt ist schon isoliert.
+            if len(vals) >= 2:
+                out.append({"name": label, "values": vals[:4]})
+                seen.add(key)
+            if len(out) >= trait_limit:
+                break
+        return out[:trait_limit]
+
+    armor_traits_by_section = _parse_armor_traits_from_section_text()
+    armor_traits = armor_traits_by_section or _reparse_armor_traits_by_expected_count()
     if armor_traits:
-        # Die robuste Armor-Regel gewinnt gegen die generische Trait-Erkennung.
-        detail["traits"] = armor_traits
+        # Die Armor-Regel gewinnt gegen die generische Trait-Erkennung.
+        detail["traits"] = armor_traits[:trait_limit]
     else:
         detail["traits"] = tr[:trait_limit]
     detail["trait_count_rule"] = trait_limit
@@ -2321,7 +2439,7 @@ def parse_detail_page(page, url: str, main_category_hint: str, locale: str, sour
             "main_category_hint": main_category_hint,
             "json_candidate_count": len(json_candidates),
             "source_list_url": source_list_url,
-            "parser": "playwright-detail-page-v14-armor-level-rules",
+            "parser": "playwright-detail-page-v15-armor-trait-section",
         },
     }
 
