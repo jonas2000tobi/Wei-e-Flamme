@@ -8,7 +8,8 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
+import hashlib
 
 from item_catalog_db import connect, ensure_item_catalog_schema, upsert_item
 
@@ -90,6 +91,401 @@ STAT_KEYWORDS = [
     "cooldown", "attack speed", "skill damage", "boss damage",
     "melee", "ranged", "magic", "evasion", "endurance", "defense",
 ]
+
+
+# Begriffe, die Questlog als Navigation/Kategorie nutzt und nicht als Item importiert werden dürfen.
+ITEM_NAME_BLACKLIST = {
+    "items", "item", "weapons", "weapon", "armor", "armour", "equipment", "accessories",
+    "materials", "material", "currencies", "currency", "consumables", "food", "misc",
+    "sword", "sword and shield", "greatsword", "dagger", "daggers", "bow", "longbow",
+    "crossbow", "wand", "staff", "spear", "orb", "gauntlet", "gauntlets",
+    "head", "chest", "cloak", "hands", "feet", "legs", "necklace", "bracelet", "brooch",
+    "ring", "belt", "earring", "all", "filter", "search", "database", "questlog",
+}
+
+JSON_NAME_KEYS = [
+    "name", "title", "itemName", "item_name", "displayName", "display_name",
+    "localizedName", "localized_name", "label", "fullName", "full_name",
+]
+JSON_ID_KEYS = [
+    "id", "itemId", "item_id", "itemID", "code", "hash", "key", "slug", "itemCode", "item_code", "uuid",
+]
+JSON_URL_KEYS = ["url", "href", "link", "path", "pathname", "detailUrl", "detail_url"]
+JSON_IMAGE_KEYS = [
+    "icon", "iconUrl", "icon_url", "image", "imageUrl", "image_url", "thumbnail", "thumbnailUrl",
+    "smallIcon", "small_icon", "largeIcon", "large_icon", "asset", "assetUrl", "asset_url",
+]
+
+
+def to_abs_url(value: Any) -> str:
+    src = str(value or "").strip()
+    if not src:
+        return ""
+    if src.startswith("//"):
+        return "https:" + src
+    if src.startswith("/"):
+        return urljoin(BASE, src)
+    if src.startswith("http://") or src.startswith("https://"):
+        return src
+    return src
+
+
+def stable_hash(value: str) -> str:
+    return hashlib.sha1(value.encode("utf-8", errors="ignore")).hexdigest()[:16]
+
+
+def value_to_text(value: Any, locale: str = DEFAULT_LOCALE) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return clean_text(value)
+    if isinstance(value, (int, float)):
+        return clean_text(str(value))
+    if isinstance(value, dict):
+        for key in (locale, "en", "de", "value", "text", "name", "title", "label"):
+            if key in value:
+                txt = value_to_text(value.get(key), locale)
+                if txt:
+                    return txt
+    return ""
+
+
+def pick_text(d: dict[str, Any], keys: list[str], locale: str = DEFAULT_LOCALE) -> str:
+    for key in keys:
+        if key in d:
+            txt = value_to_text(d.get(key), locale)
+            if txt:
+                return txt
+    # Fallback: case-insensitive keys
+    lower_map = {str(k).lower(): k for k in d.keys()}
+    for key in keys:
+        real = lower_map.get(key.lower())
+        if real is not None:
+            txt = value_to_text(d.get(real), locale)
+            if txt:
+                return txt
+    return ""
+
+
+def compact_json_text(obj: Any, limit: int = 12000) -> str:
+    try:
+        raw = json.dumps(obj, ensure_ascii=False, default=str)
+    except Exception:
+        raw = str(obj)
+    return raw[:limit]
+
+
+def find_first_url_value(obj: Any, keys: list[str]) -> str:
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            kl = str(k).lower()
+            if any(needle.lower() == kl for needle in keys) or any(needle.lower() in kl for needle in keys):
+                if isinstance(v, str) and v.strip():
+                    return to_abs_url(v)
+            found = find_first_url_value(v, keys)
+            if found:
+                return found
+    elif isinstance(obj, list):
+        for v in obj:
+            found = find_first_url_value(v, keys)
+            if found:
+                return found
+    return ""
+
+
+def extract_candidate_name(d: dict[str, Any], locale: str = DEFAULT_LOCALE) -> str:
+    name = pick_text(d, JSON_NAME_KEYS, locale)
+    if name:
+        return name
+    # Manchmal heißen Lokalisierungsfelder direkt en/de ohne Name-Key.
+    for key in (locale, "en", "de"):
+        if key in d:
+            txt = value_to_text(d.get(key), locale)
+            if 3 <= len(txt) <= 120:
+                return txt
+    return ""
+
+
+def is_probably_item_object(d: dict[str, Any], source_url: str, main_category: str, locale: str = DEFAULT_LOCALE) -> bool:
+    name = extract_candidate_name(d, locale)
+    if not name or not (3 <= len(name) <= 140):
+        return False
+    low_name = name.strip().lower()
+    if low_name in ITEM_NAME_BLACKLIST:
+        return False
+    if low_name.startswith(("http://", "https://")):
+        return False
+    # Navigation/Filter-Objekte haben oft nur name + href/path. Items haben fast immer id/icon/rarity/stats/level/etc.
+    keys = {str(k).lower() for k in d.keys()}
+    serialized = compact_json_text(d, limit=8000).lower()
+    item_hints = {
+        "item", "itemid", "item_id", "rarity", "grade", "quality", "icon", "image", "thumbnail",
+        "damage", "attack", "defense", "stats", "stat", "trait", "traits", "effect", "effects",
+        "ability", "abilities", "description", "level", "equip", "slot", "category", "type",
+        "weapon", "armor", "material", "currency",
+    }
+    has_hint_key = any(any(h in k for h in item_hints) for k in keys)
+    has_hint_text = any(h in serialized for h in ["rarity", "itemlevel", "item level", "damage", "icon", "trait", "weapon", "armor", "material"])
+    has_id = any(k.lower() in keys for k in [x.lower() for x in JSON_ID_KEYS])
+    has_img = bool(find_first_url_value(d, JSON_IMAGE_KEYS))
+    # Auf Unterkategorie-Seiten reichen id+name oder icon+name, weil die Kategorie über die Seite kommt.
+    if is_subcategory_list_url(source_url) and (has_id or has_img or has_hint_key or has_hint_text):
+        return True
+    return bool(has_hint_key or has_hint_text or has_id or has_img)
+
+
+def source_url_from_candidate(d: dict[str, Any], current_url: str, source_id: str) -> str:
+    raw_url = pick_text(d, JSON_URL_KEYS, DEFAULT_LOCALE)
+    if raw_url:
+        abs_url = to_abs_url(raw_url)
+        if is_items_url(abs_url):
+            return abs_url.rstrip("/")
+        if raw_url.startswith("/"):
+            return to_abs_url(raw_url).rstrip("/")
+    return f"{current_url.rstrip('/')}#json-{source_id}"
+
+
+def extract_source_id(d: dict[str, Any], fallback_seed: str, locale: str = DEFAULT_LOCALE) -> str:
+    sid = pick_text(d, JSON_ID_KEYS, locale)
+    if sid:
+        return slugify(sid)[:120]
+    return stable_hash(fallback_seed)
+
+
+def extract_structured_stats_from_json(obj: Any, locale: str = DEFAULT_LOCALE) -> dict[str, Any]:
+    stats: dict[str, Any] = {}
+    def add(key: Any, val: Any) -> None:
+        k = value_to_text(key, locale)
+        v = value_to_text(val, locale)
+        if not k or not v:
+            return
+        if len(k) > 80 or len(v) > 120:
+            return
+        low = k.lower()
+        if any(word in low for word in STAT_KEYWORDS) or re.search(r"[+\-]?\d", v):
+            stats[k] = v
+
+    for d in walk_json(obj):
+        if not isinstance(d, dict):
+            continue
+        keys = {str(k).lower() for k in d.keys()}
+        # Typische Formen: {name: Strength, value: 3}, {statName: ..., statValue: ...}
+        name = pick_text(d, ["stat", "statName", "stat_name", "name", "label", "type"], locale)
+        value = pick_text(d, ["value", "amount", "statValue", "stat_value", "bonus", "max", "min"], locale)
+        if name and value:
+            add(name, value)
+        # Direkte Felder: {strength: 3, dexterity: 2}
+        for k, v in d.items():
+            kl = str(k).lower()
+            if any(word in kl for word in STAT_KEYWORDS):
+                if isinstance(v, (str, int, float)):
+                    add(k, v)
+    return stats
+
+
+def extract_structured_abilities_from_json(obj: Any, locale: str = DEFAULT_LOCALE) -> list[dict[str, str]]:
+    out: list[dict[str, str]] = []
+    interesting = ["ability", "abilities", "effect", "effects", "passive", "skill", "description", "desc", "tooltip"]
+    for d in walk_json(obj):
+        if not isinstance(d, dict):
+            continue
+        keys = {str(k).lower() for k in d.keys()}
+        if not any(any(word in k for word in interesting) for k in keys):
+            continue
+        label = pick_text(d, ["name", "title", "label", "abilityName", "effectName"], locale)
+        text = pick_text(d, ["description", "desc", "text", "tooltip", "effect", "effects", "content"], locale)
+        if text and 15 <= len(text) <= 2000:
+            out.append({"label": label[:120] if label else "Effect", "text": text[:1500]})
+    # Dedupe
+    seen: set[str] = set()
+    result: list[dict[str, str]] = []
+    for a in out:
+        key = (a.get("label", "") + "|" + a.get("text", "")).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(a)
+    return result[:8]
+
+
+def json_candidate_to_record(d: dict[str, Any], current_url: str, main_category_hint: str, locale: str) -> dict[str, Any] | None:
+    if not is_probably_item_object(d, current_url, main_category_hint, locale):
+        return None
+    name = extract_candidate_name(d, locale)
+    serialized = compact_json_text(d, limit=25000)
+    source_id = extract_source_id(d, name + current_url + serialized[:500], locale)
+    source_url = source_url_from_candidate(d, current_url, source_id)
+    main_category = main_category_hint or classify_main_category(source_url or current_url, serialized)
+    sub_category, confidence = detect_sub_category(main_category, serialized, source_url or current_url)
+    if confidence == "low" and main_category in {"weapon", "armor"}:
+        confidence = "medium"
+    stats = extract_structured_stats_from_json(d, locale)
+    # Text-Fallback ergänzen.
+    for k, v in extract_stats_from_lines(serialized).items():
+        stats.setdefault(k, v)
+    abilities = extract_structured_abilities_from_json(d, locale)
+    if not abilities:
+        abilities = extract_abilities(serialized)
+    damage_min, damage_max = extract_damage(serialized)
+    image_url = find_first_url_value(d, JSON_IMAGE_KEYS)
+    icon_url = image_url
+    return {
+        "source": "questlog",
+        "source_url": source_url,
+        "source_item_id": source_id,
+        "locale": locale,
+        "name": name,
+        "slug": slugify(name),
+        "main_category": main_category,
+        "sub_category": sub_category,
+        "rarity": detect_rarity(serialized),
+        "item_level": extract_level(serialized, "Item Level", "itemLevel", "Gegenstandsstufe", "Level"),
+        "required_level": extract_level(serialized, "Required Level", "requiredLevel", "Benötigte Stufe"),
+        "damage_min": damage_min,
+        "damage_max": damage_max,
+        "defense": extract_defense(serialized),
+        "stats": stats,
+        "abilities": abilities,
+        "traits": [],
+        "image_url": image_url or None,
+        "icon_url": icon_url or None,
+        "classification_confidence": confidence,
+        "raw_text": serialized[:30000],
+        "raw_data": {
+            "scraped_at": now_iso(),
+            "url": current_url,
+            "source": "json_payload_or_next_data",
+            "parser": "questlog-json-v3",
+            "raw": d,
+        },
+    }
+
+
+def extract_records_from_json_payloads(payloads: list[Any], current_url: str, main_category: str, locale: str) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for payload in payloads:
+        for d in walk_json(payload):
+            if not isinstance(d, dict):
+                continue
+            rec = json_candidate_to_record(d, current_url, main_category, locale)
+            if not rec:
+                continue
+            key = str(rec.get("source_url") or rec.get("name"))
+            if key in seen:
+                continue
+            seen.add(key)
+            records.append(rec)
+    return records
+
+
+def extract_dom_card_records(page, current_url: str, main_category: str, locale: str) -> list[dict[str, Any]]:
+    """Fallback, wenn Questlog Itemkarten ohne <a>-Detail-Links rendert.
+
+    Wir sammeln Elternbereiche von Bildern und nehmen daraus sichtbaren Text. Das ist
+    bewusst defensiv gefiltert, damit nicht Navigation/Logos als Items landen.
+    """
+    try:
+        cards = page.locator("img").evaluate_all(
+            """
+            imgs => imgs.map((img, idx) => {
+              let node = img;
+              let best = img.parentElement;
+              for (let i = 0; i < 5 && node && node.parentElement; i++) {
+                node = node.parentElement;
+                const txt = (node.innerText || '').trim();
+                if (txt.length >= 3 && txt.length <= 2000) best = node;
+              }
+              return {
+                idx,
+                src: img.currentSrc || img.src || img.getAttribute('data-src') || '',
+                alt: img.alt || '',
+                text: best ? (best.innerText || '').trim() : '',
+                href: best ? ((best.closest('a') || {}).href || '') : ''
+              };
+            })
+            """
+        )
+    except Exception:
+        return []
+
+    records: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for c in cards or []:
+        text = normalize_raw_text(str(c.get("text") or ""))
+        src = to_abs_url(c.get("src") or "")
+        if not text or not src:
+            continue
+        lines = [clean_text(x) for x in re.split(r"[\n\r]+", text) if clean_text(x)]
+        # Ersten plausiblen Namen nehmen.
+        name = ""
+        for line in lines[:6]:
+            low = line.lower()
+            if 3 <= len(line) <= 120 and low not in ITEM_NAME_BLACKLIST and not re.fullmatch(r"[+\-]?\d+(?:[.,]\d+)?%?", line):
+                name = line
+                break
+        if not name:
+            continue
+        # Ohne itemartige Hinweise nicht importieren; sonst würden Logos/Kategorien reinlaufen.
+        if not is_subcategory_list_url(current_url) and not any(k in text.lower() for k in ["damage", "level", "rarity", "trait", "attack", "defense"]):
+            continue
+        source_id = stable_hash(current_url + name + src)
+        source_url = str(c.get("href") or "").strip()
+        if source_url and is_items_url(source_url):
+            source_url = source_url.rstrip("/")
+        else:
+            source_url = f"{current_url.rstrip('/')}#dom-{source_id}"
+        if source_url in seen:
+            continue
+        seen.add(source_url)
+        sub_category, confidence = detect_sub_category(main_category, text, current_url)
+        if confidence == "low" and main_category in {"weapon", "armor"}:
+            confidence = "medium"
+        damage_min, damage_max = extract_damage(text)
+        records.append({
+            "source": "questlog",
+            "source_url": source_url,
+            "source_item_id": source_id,
+            "locale": locale,
+            "name": name,
+            "slug": slugify(name),
+            "main_category": main_category,
+            "sub_category": sub_category,
+            "rarity": detect_rarity(text),
+            "item_level": extract_level(text, "Item Level", "Level"),
+            "required_level": extract_level(text, "Required Level"),
+            "damage_min": damage_min,
+            "damage_max": damage_max,
+            "defense": extract_defense(text),
+            "stats": extract_stats_from_lines(text),
+            "abilities": extract_abilities(text),
+            "traits": [],
+            "image_url": src,
+            "icon_url": src,
+            "classification_confidence": confidence,
+            "raw_text": text[:30000],
+            "raw_data": {"scraped_at": now_iso(), "url": current_url, "source": "dom_card", "parser": "questlog-dom-v3"},
+        })
+    return records
+
+
+def attach_json_capture(page, bucket: list[Any]) -> None:
+    def on_response(response):
+        try:
+            url = response.url or ""
+            if "questlog" not in url and "/_next/" not in url and "/api/" not in url:
+                return
+            ct = (response.headers or {}).get("content-type", "").lower()
+            if "json" not in ct and "/_next/data/" not in url and "/api/" not in url:
+                return
+            data = response.json()
+            bucket.append(data)
+        except Exception:
+            return
+    try:
+        page.on("response", on_response)
+    except Exception:
+        pass
 
 
 @dataclass
@@ -658,6 +1054,8 @@ def crawl_category(context, conn, seed: CategorySeed, limit_left: int | None = N
     """
     list_page = context.new_page()
     detail_page = context.new_page()
+    network_payloads: list[Any] = []
+    attach_json_capture(list_page, network_payloads)
     imported = 0
 
     list_queue: list[str] = [seed.url.rstrip("/")]
@@ -671,8 +1069,44 @@ def crawl_category(context, conn, seed: CategorySeed, limit_left: int | None = N
         visited_lists.add(current_url)
 
         print(f"📄 {seed.main_category}: {current_url}", flush=True)
+        network_payloads.clear()
         if not goto_page(list_page, current_url):
             continue
+
+        # 1) Questlog rendert die Itemkarten teils ohne echte Detail-Links.
+        # Deshalb zuerst JSON-/Next.js-/API-Daten und DOM-Karten direkt als Items auslesen.
+        payloads = list(network_payloads)
+        payloads.extend(collect_json_candidates(list_page))
+        page_records = extract_records_from_json_payloads(payloads, current_url, seed.main_category, DEFAULT_LOCALE)
+        dom_records = extract_dom_card_records(list_page, current_url, seed.main_category, DEFAULT_LOCALE)
+        existing_record_keys = {str(r.get("source_url") or r.get("name")) for r in page_records}
+        for rec in dom_records:
+            key = str(rec.get("source_url") or rec.get("name"))
+            if key not in existing_record_keys:
+                existing_record_keys.add(key)
+                page_records.append(rec)
+
+        page_imported = 0
+        for item in page_records:
+            rec_key = str(item.get("source_url") or item.get("source_item_id") or item.get("name"))
+            if rec_key in seen_detail:
+                continue
+            seen_detail.add(rec_key)
+            try:
+                if dry_run:
+                    print(f"DRY ✅ {item['main_category']} / {item.get('sub_category') or '-'} / {item['name']}", flush=True)
+                else:
+                    upsert_item(conn, item)
+                    conn.commit()
+                    print(f"✅ {item['main_category']} / {item.get('sub_category') or '-'} / {item['name']}", flush=True)
+                imported += 1
+                page_imported += 1
+            except Exception as exc:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                print(f"❌ Fehler bei JSON/DOM-Item {item.get('name')}: {type(exc).__name__}: {exc}", flush=True)
 
         links = collect_links(list_page)
         # Fallback: Links aus HTML/Next.js-Daten ergänzen.
@@ -696,7 +1130,7 @@ def crawl_category(context, conn, seed: CategorySeed, limit_left: int | None = N
             if next_url not in visited_lists and next_url not in list_queue:
                 list_queue.append(next_url)
 
-        print(f"   ↳ Listen gefunden: {len(sub_lists)} · Detailseiten gefunden: {len(detail_links)}", flush=True)
+        print(f"   ↳ JSON/DOM-Items: {page_imported} · Listen gefunden: {len(sub_lists)} · Detailseiten gefunden: {len(detail_links)}", flush=True)
 
         if not detail_links:
             continue
