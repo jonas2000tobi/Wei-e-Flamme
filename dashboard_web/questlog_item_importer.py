@@ -786,22 +786,22 @@ def extract_defense(text: str) -> float | None:
 
 def extract_stats_from_lines(text: str) -> dict[str, Any]:
     stats: dict[str, Any] = {}
-    raw_lines = [clean_text(x) for x in re.split(r"[\n\r]+| {2,}", text) if clean_text(x)]
+    # Erst echte Key/Value-Paare. Keine nackten Labels mehr speichern.
+    stats.update(extract_stat_value_pairs_from_text(text))
+    raw_lines = [clean_text(x) for x in re.split(r"[\n\r]+| {2,}", normalize_raw_text(text)) if clean_text(x)]
     for line in raw_lines:
         low = line.lower()
         if not any(k in low for k in STAT_KEYWORDS):
             continue
-        # Typische Questlog-Zeilen: "Strength +3", "Critical Hit Chance 120"
-        m = re.match(r"^([A-Za-zÄÖÜäöüß ./%'\-]+?)\s*([+\-]?\d+(?:[.,]\d+)?%?)$", line)
+        # Zeilen ohne Wert nicht aufnehmen. Das war der Grund für "Reichweite:" ohne Zahl.
+        if not re.search(r"\d", line):
+            continue
+        m = re.match(r"^([A-Za-zÄÖÜäöüß ./%'\-]+?)\s*:?\s*([+\-]?\d+(?:[.,]\d+)?%?(?:\s*[~\-–|/]\s*[+\-]?\d+(?:[.,]\d+)?%?)*)$", line)
         if m:
             key = clean_text(m.group(1))
             val = clean_text(m.group(2))
-            if key and val:
-                stats[key] = val
-                continue
-        # Fallback: komplette Zeile behalten, aber nicht ausufern lassen.
-        if 4 <= len(line) <= 90:
-            stats.setdefault(line, True)
+            if key and val and len(key) <= 80:
+                stats.setdefault(key, val)
     return stats
 
 
@@ -826,6 +826,114 @@ def extract_abilities(text: str) -> list[dict[str, str]]:
         result.append(item)
     return result[:8]
 
+
+
+
+def extract_stat_value_pairs_from_text(text: str) -> dict[str, Any]:
+    """Liest sichtbare Questlog-Statzeilen mit echten Werten.
+
+    Beispiele von Detailseiten:
+      Max. Schaden 61 ~ 195
+      Reichweite: 19,2m
+      Angriffsgeschwindigkeit: 0,64s
+      Geschicklichkeit: 11
+      Trefferchance: 180
+    """
+    stats: dict[str, Any] = {}
+    text = normalize_raw_text(text)
+    lines = [clean_text(x) for x in re.split(r"[\n\r]+", text) if clean_text(x)]
+    known_labels = [
+        "Max. Schaden", "Max Damage", "Schaden", "Damage", "Reichweite", "Range",
+        "Angriffsgeschwindigkeit", "Attack Speed", "Stärke", "Strength", "Geschicklichkeit", "Dexterity",
+        "Weisheit", "Wisdom", "Wahrnehmung", "Perception", "Trefferchance", "Hit Chance",
+        "Krit. Trefferchance", "Critical Hit Chance", "Schwere Angriffschance", "Heavy Attack Chance",
+        "Max. Leben", "Max Health", "Max. Mana", "Max Mana", "Manaregeneration", "Mana Regen",
+        "Lebensregeneration", "Health Regen", "Abklingzeit", "Cooldown Speed", "Untote-Zusatzschaden",
+        "Wildkin-Bonusschaden", "Wildkin Bonus Damage", "Humanoide-Zusatzschaden", "Konstrukt-Zusatzschaden",
+        "Mana-Kosteneffizienz", "Mana Cost Efficiency",
+    ]
+    label_pattern = "|".join(sorted((re.escape(x) for x in known_labels), key=len, reverse=True))
+
+    for line in lines:
+        # Deutsch/Englisch mit Doppelpunkt
+        m = re.match(rf"^({label_pattern})\s*:?\s*([+\-]?\d+(?:[.,]\d+)?(?:\s*[~\-–]\s*[+\-]?\d+(?:[.,]\d+)?)?\s*(?:%|m|s)?)$", line, flags=re.I)
+        if m:
+            stats[clean_text(m.group(1))] = clean_text(m.group(2))
+            continue
+        # Allgemeiner Fallback: Label : Wert
+        m = re.match(r"^([A-Za-zÄÖÜäöüß ./%'\-]+?)\s*:\s*([+\-]?\d+(?:[.,]\d+)?(?:\s*[|~\-–]\s*[+\-]?\d+(?:[.,]\d+)?)*\s*(?:%|m|s)?)$", line)
+        if m:
+            key = clean_text(m.group(1))
+            val = clean_text(m.group(2))
+            if any(k in key.lower() for k in STAT_KEYWORDS) or re.search(r"\d", val):
+                stats[key] = val
+            continue
+        # Form ohne Doppelpunkt: "Geschicklichkeit 11"
+        m = re.match(rf"^({label_pattern})\s+([+\-]?\d+(?:[.,]\d+)?(?:\s*[~\-–]\s*[+\-]?\d+(?:[.,]\d+)?)?\s*(?:%|m|s)?)$", line, flags=re.I)
+        if m:
+            stats[clean_text(m.group(1))] = clean_text(m.group(2))
+    return stats
+
+
+def extract_stat_pairs_from_dom(page) -> dict[str, Any]:
+    """Liest Tabellen/Listen der Detailseite direkt aus dem DOM.
+
+    Questlog zeigt rechts häufig eine Stat-Tabelle: Header-Zeile + Werte-Zeile.
+    Diese Funktion macht daraus {Header: Wert}.
+    """
+    stats: dict[str, Any] = {}
+    try:
+        tables = page.locator("table").evaluate_all(
+            """
+            tables => tables.map(t => Array.from(t.querySelectorAll('tr')).map(tr =>
+              Array.from(tr.querySelectorAll('th,td')).map(c => (c.innerText || '').trim()).filter(Boolean)
+            ).filter(r => r.length))
+            """
+        )
+        for table in tables or []:
+            if not table or len(table) < 2:
+                continue
+            header = table[0]
+            # Wertzeile meistens zweite Zeile; bei mehreren Zeilen jede verarbeiten.
+            for row in table[1:]:
+                if len(row) == len(header):
+                    for k, v in zip(header, row):
+                        k = clean_text(k)
+                        v = clean_text(v)
+                        if k and v and k.lower() not in {"level", "stufe"}:
+                            stats[k] = v
+                elif len(row) >= 2:
+                    stats[clean_text(row[0])] = clean_text(row[1])
+    except Exception:
+        pass
+    try:
+        text = page.locator("body").inner_text(timeout=3000)
+        for k, v in extract_stat_value_pairs_from_text(text).items():
+            stats.setdefault(k, v)
+    except Exception:
+        pass
+    return stats
+
+
+def extract_traits_from_text(text: str) -> list[dict[str, Any]]:
+    traits: list[dict[str, Any]] = []
+    lines = [clean_text(x) for x in re.split(r"[\n\r]+", normalize_raw_text(text)) if clean_text(x)]
+    for line in lines:
+        # Beispiele: Mana Regen: 15 | 30 | 45 | 60
+        m = re.match(r"^([A-Za-zÄÖÜäöüß ./%'\-]+?)\s*:\s*((?:\d+(?:[.,]\d+)?%?\s*(?:\||/|,)?\s*){2,})$", line)
+        if not m:
+            continue
+        name = clean_text(m.group(1))
+        values = [clean_text(x) for x in re.split(r"\s*[|/,]\s*", m.group(2)) if clean_text(x)]
+        if name and len(values) >= 2:
+            traits.append({"name": name, "values": values})
+    # Dedupe
+    seen=set(); out=[]
+    for t in traits:
+        key=(t.get('name','')+str(t.get('values',''))).lower()
+        if key in seen: continue
+        seen.add(key); out.append(t)
+    return out[:12]
 
 def normalize_raw_text(text: str) -> str:
     text = str(text or "")
@@ -900,70 +1008,109 @@ def page_title(page) -> str:
 
 
 def collect_image_urls(page) -> tuple[str | None, str | None]:
-    """Findet Item-Bild/Icon möglichst robust.
+    """Findet das echte Itembild/Icon auf Questlog-Detailseiten.
 
-    Questlog kann Bilder als normale <img>, lazy-loaded data-src/currentSrc,
-    Meta-Preview (og:image) oder CSS background-image ausliefern. Wir speichern
-    nur die URL in Postgres; heruntergeladen wird das Bild im MVP nicht.
+    Wichtig: Ads/Map/Logo rausfiltern und Bilder bevorzugen, deren URL zum Item-ID passt.
     """
+    detail_id = ""
+    try:
+        detail_id = item_detail_id(page.url).lower()
+    except Exception:
+        detail_id = ""
     candidates: list[dict[str, Any]] = []
 
-    def add_candidate(src: str, *, w: int = 0, h: int = 0, source: str = "") -> None:
-        src = str(src or "").strip()
+    def add_candidate(src: Any, *, w: int = 0, h: int = 0, source: str = "", alt: str = "", context: str = "") -> None:
+        src = to_abs_url(str(src or "").strip())
         if not src or src.startswith("data:") or src.endswith(".svg"):
             return
         low = src.lower()
-        if any(x in low for x in ["doubleclick", "googleads", "googlesyndication", "adservice", "learning", "onechuman", "sponsored"]):
+        bad = [
+            "doubleclick", "googleads", "googlesyndication", "adservice", "learning", "onechuman",
+            "sponsored", "advertisement", "avatar", "profile", "logo", "favicon", "map", "worldmap",
+            "youtube", "twitch", "discord",
+        ]
+        if any(x in low for x in bad):
             return
-        if not any(x in low for x in ["icon", "item", "cdn", "assets", "questlog", "amazonaws", "cloudfront", "webp", "png", "jpg", "jpeg"]):
-            return
-        candidates.append({"src": src, "w": int(w or 0), "h": int(h or 0), "source": source})
+        score = 0
+        if detail_id and detail_id in low:
+            score += 120
+        if any(x in low for x in ["/item", "items", "equipment", "weapon", "armor", "icon"]):
+            score += 40
+        if any(x in low for x in ["webp", "png", "jpg", "jpeg"]):
+            score += 10
+        if source == "css":
+            score += 25
+        if source == "img":
+            score += 15
+        if w and h:
+            area = w * h
+            if 24 <= w <= 512 and 24 <= h <= 512:
+                score += 30
+            if area > 300000:
+                score -= 60
+        text = f"{alt} {context}".lower()
+        if any(x in text for x in ["item", "weapon", "waffe", "longbow", "langbogen", "staff", "stab"]):
+            score += 10
+        candidates.append({"src": src, "w": int(w or 0), "h": int(h or 0), "source": source, "score": score})
 
     try:
         imgs = page.locator("img").evaluate_all(
             """
-            els => els.map(img => ({
-                src: img.currentSrc || img.src || img.getAttribute('data-src') || img.getAttribute('data-nimg') || '',
-                srcset: img.srcset || img.getAttribute('data-srcset') || '',
-                alt: img.alt || '',
-                w: img.naturalWidth || img.width || 0,
-                h: img.naturalHeight || img.height || 0
-            }))
+            els => els.map(img => {
+                let box = img.getBoundingClientRect();
+                let parent = img.parentElement;
+                let ctx = '';
+                for (let i = 0; i < 4 && parent; i++, parent = parent.parentElement) {
+                    ctx += ' ' + ((parent.innerText || '').trim());
+                }
+                return {
+                    src: img.currentSrc || img.src || img.getAttribute('data-src') || '',
+                    srcset: img.srcset || img.getAttribute('data-srcset') || '',
+                    alt: img.alt || '',
+                    w: Math.round(img.naturalWidth || box.width || img.width || 0),
+                    h: Math.round(img.naturalHeight || box.height || img.height || 0),
+                    context: ctx.slice(0, 600)
+                };
+            })
             """
         )
         for img in imgs or []:
-            add_candidate(str(img.get("src") or ""), w=int(img.get("w") or 0), h=int(img.get("h") or 0), source="img")
+            add_candidate(img.get("src"), w=int(img.get("w") or 0), h=int(img.get("h") or 0), source="img", alt=str(img.get("alt") or ""), context=str(img.get("context") or ""))
             srcset = str(img.get("srcset") or "")
-            if srcset:
-                # Letzten srcset-Eintrag nehmen, meistens größte Variante.
-                last = srcset.split(",")[-1].strip().split(" ")[0]
-                add_candidate(last, w=int(img.get("w") or 0), h=int(img.get("h") or 0), source="srcset")
-    except Exception:
-        pass
-
-    try:
-        metas = page.locator("meta[property='og:image'], meta[name='twitter:image']").evaluate_all(
-            "els => els.map(e => e.getAttribute('content') || '').filter(Boolean)"
-        )
-        for src in metas or []:
-            add_candidate(str(src), source="meta")
+            for part in srcset.split(","):
+                first = part.strip().split(" ")[0]
+                if first:
+                    add_candidate(first, w=int(img.get("w") or 0), h=int(img.get("h") or 0), source="srcset", alt=str(img.get("alt") or ""), context=str(img.get("context") or ""))
     except Exception:
         pass
 
     try:
         backgrounds = page.locator("*").evaluate_all(
             """
-            els => els.slice(0, 2000).map(e => getComputedStyle(e).backgroundImage || '')
-              .filter(v => v && v !== 'none')
+            els => els.slice(0, 2500).map(e => {
+              const st = getComputedStyle(e);
+              const box = e.getBoundingClientRect();
+              const txt = (e.innerText || '').trim().slice(0, 600);
+              return {bg: st.backgroundImage || '', w: Math.round(box.width || 0), h: Math.round(box.height || 0), text: txt};
+            }).filter(x => x.bg && x.bg !== 'none')
             """
         )
         for bg in backgrounds or []:
-            for m in re.finditer(r"url\\([\"']?([^\"')]+)[\"']?\\)", str(bg)):
-                add_candidate(m.group(1), source="css")
+            for m in re.finditer(r"url\([\"']?([^\"')]+)[\"']?\)", str(bg.get("bg") or "")):
+                add_candidate(m.group(1), w=int(bg.get("w") or 0), h=int(bg.get("h") or 0), source="css", context=str(bg.get("text") or ""))
     except Exception:
         pass
 
-    # Dedupe
+    # Meta nur als allerletzter Fallback; oft ist das kein Icon, sondern Preview/Ad.
+    try:
+        metas = page.locator("meta[property='og:image'], meta[name='twitter:image']").evaluate_all(
+            "els => els.map(e => e.getAttribute('content') || '').filter(Boolean)"
+        )
+        for src in metas or []:
+            add_candidate(src, source="meta")
+    except Exception:
+        pass
+
     seen: set[str] = set()
     valid: list[dict[str, Any]] = []
     for c in candidates:
@@ -972,16 +1119,13 @@ def collect_image_urls(page) -> tuple[str | None, str | None]:
             continue
         seen.add(src)
         valid.append(c)
-
     if not valid:
         return None, None
 
-    # Größtes Bild als image_url; quadratisches/kleines Bild als icon_url.
-    valid.sort(key=lambda x: int(x.get("w") or 0) * int(x.get("h") or 0), reverse=True)
-    image_url = valid[0].get("src")
-    square = sorted(valid, key=lambda x: (abs(int(x.get("w") or 0) - int(x.get("h") or 0)), -int(x.get("w") or 0) * int(x.get("h") or 0)))
-    icon_url = square[0].get("src") if square else image_url
-    return image_url, icon_url
+    valid.sort(key=lambda x: (int(x.get("score") or 0), int(x.get("w") or 0) * int(x.get("h") or 0)), reverse=True)
+    best = valid[0].get("src")
+    # Für Dashboard lieber dasselbe echte Itembild als Icon nutzen statt Questlog-Typ-Symbol.
+    return best, best
 
 def collect_links(page) -> list[str]:
     try:
@@ -1173,6 +1317,11 @@ def parse_detail_page(page, url: str, main_category_hint: str, locale: str, sour
     item_level = extract_level(raw_text, "Item Level", "Gegenstandsstufe", "Level")
     required_level = extract_level(raw_text, "Required Level", "Benötigte Stufe")
     image_url, icon_url = collect_image_urls(page)
+    dom_stats = extract_stat_pairs_from_dom(page)
+    text_stats = extract_stats_from_lines(raw_text)
+    stats = dict(text_stats)
+    for k, v in dom_stats.items():
+        stats[k] = v
     source_item_id = item_detail_id(url)
     return {
         "source": "questlog",
@@ -1189,9 +1338,9 @@ def parse_detail_page(page, url: str, main_category_hint: str, locale: str, sour
         "damage_min": damage_min,
         "damage_max": damage_max,
         "defense": extract_defense(raw_text),
-        "stats": extract_stats_from_lines(raw_text),
+        "stats": stats,
         "abilities": extract_abilities(raw_text),
-        "traits": [],
+        "traits": extract_traits_from_text(raw_text),
         "image_url": image_url,
         "icon_url": icon_url,
         "classification_confidence": confidence,
