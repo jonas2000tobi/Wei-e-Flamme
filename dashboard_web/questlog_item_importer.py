@@ -221,6 +221,22 @@ def is_skill_core_like(url: str, text: str, name: str = "") -> bool:
     return any(n in hay for n in needles)
 
 
+SKIP_REASON_BY_URL: dict[str, str] = {}
+
+
+def skip_item(url: str, reason: str) -> None:
+    SKIP_REASON_BY_URL[str(url)] = str(reason)
+    return None
+
+
+def has_grade_filter(url: str) -> bool:
+    try:
+        q = dict(parse_qsl(urlparse(str(url or "")).query, keep_blank_values=True))
+        return bool(q.get("grade"))
+    except Exception:
+        return "grade=" in str(url or "")
+
+
 def stable_hash(value: str) -> str:
     return hashlib.sha1(value.encode("utf-8", errors="ignore")).hexdigest()[:16]
 
@@ -1540,7 +1556,7 @@ def collect_next_data_urls(page) -> list[str]:
 
 def parse_detail_page(page, url: str, main_category_hint: str, locale: str, source_list_url: str = "") -> dict[str, Any] | None:
     if not goto_page(page, url):
-        return None
+        return skip_item(url, "Seite nicht erreichbar/Timeout")
     try:
         body_text = page.locator("body").inner_text(timeout=6000)
     except Exception:
@@ -1549,7 +1565,7 @@ def parse_detail_page(page, url: str, main_category_hint: str, locale: str, sour
     json_candidates = collect_json_candidates(page)
     name = page_title(page) or best_name_from_json(json_candidates)
     if not name or name.lower() in {"items", "weapons", "questlog"}:
-        return None
+        return skip_item(url, "kein echter Itemname erkannt")
     main_category = main_category_hint or classify_main_category(source_list_url or url, raw_text)
     # Unterkategorie kommt bei Questlog am sichersten aus der Listen-URL, z. B. /weapons/bow.
     sub_category, confidence = detect_sub_category(main_category, raw_text, source_list_url or url)
@@ -1557,10 +1573,15 @@ def parse_detail_page(page, url: str, main_category_hint: str, locale: str, sour
         # Kategorie aus Listen-URL ist sicher, Untertyp aber nicht.
         confidence = "medium"
     rarity = detect_rarity(raw_text)
+    # Wenn der Link aus einer gefilterten Questlog-Liste kommt (?grade=41), ist Rare+
+    # bereits über die Liste abgesichert. Falls Questlog die Seltenheit erst spät/kaputt
+    # rendert, importieren wir trotzdem statt echte Waffen zu verlieren.
+    if not rarity and has_grade_filter(source_list_url):
+        rarity = "Rare"
     if not rarity_allowed(rarity):
-        return None
-    if main_category == "weapon" and is_skill_core_like(url, raw_text, name):
-        return None
+        return skip_item(url, f"Seltenheit unter Filter oder nicht erkannt: {rarity or '-'}")
+    # Fähigkeitskerne werden hier nicht mehr pauschal gefiltert. Bei den Waffen-
+    # Detailseiten von Questlog kommen sie laut aktueller Struktur nicht mehr vor.
 
     damage_min, damage_max = extract_damage(raw_text)
     item_level = extract_level(raw_text, "Item Level", "Gegenstandsstufe", "Level")
@@ -1627,7 +1648,7 @@ def parse_detail_page(page, url: str, main_category_hint: str, locale: str, sour
             "main_category_hint": main_category_hint,
             "json_candidate_count": len(json_candidates),
             "source_list_url": source_list_url,
-            "parser": "playwright-detail-page-v7-rare-detail",
+            "parser": "playwright-detail-page-v8-rare-detail-no-skillcore-skip",
         },
     }
 
@@ -1757,7 +1778,8 @@ def crawl_category(context, conn, seed: CategorySeed, limit_left: int | None = N
             try:
                 item = parse_detail_page(detail_page, href, seed.main_category, DEFAULT_LOCALE, source_list_url=current_url)
                 if not item:
-                    print(f"⚠️ Übersprungen: {href}", flush=True)
+                    reason = SKIP_REASON_BY_URL.get(href, "kein verwertbares Detailmodell")
+                    print(f"⚠️ Übersprungen: {href} ({reason})", flush=True)
                     continue
                 if dry_run:
                     print(f"DRY ✅ {item['main_category']} / {item.get('sub_category') or '-'} / {item['name']}", flush=True)
