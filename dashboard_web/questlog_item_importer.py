@@ -1267,100 +1267,205 @@ def page_title(page) -> str:
 
 
 def collect_image_urls(page) -> tuple[str | None, str | None]:
-    """Findet das echte Itembild/Icon auf Questlog-Detailseiten.
+    """Findet bevorzugt das echte Item-/Waffenbild auf Questlog-Detailseiten.
 
-    Wichtig: Ads/Map/Logo rausfiltern und Bilder bevorzugen, deren URL zum Item-ID passt.
+    Questlog hat auf der Detailseite mehrere kleine Bilder: Itembild oben rechts,
+    Passiv-/Fähigkeitsicon, Typ-Icon, Ads, Map usw. Diese Funktion bevorzugt deshalb
+    Kandidaten aus dem oberen Itemkarten-Bereich und bestraft lokale Passive-/Skill-Kontexte.
     """
     detail_id = ""
     try:
         detail_id = item_detail_id(page.url).lower()
     except Exception:
         detail_id = ""
+    try:
+        item_name = page_title(page).lower()
+    except Exception:
+        item_name = ""
+    name_tokens = [t for t in re.split(r"[^a-zA-ZäöüÄÖÜß0-9]+", item_name) if len(t) >= 4][:8]
     candidates: list[dict[str, Any]] = []
 
-    def add_candidate(src: Any, *, w: int = 0, h: int = 0, source: str = "", alt: str = "", context: str = "") -> None:
+    def add_candidate(
+        src: Any,
+        *,
+        w: int = 0,
+        h: int = 0,
+        x: int = 0,
+        y: int = 0,
+        source: str = "",
+        alt: str = "",
+        local_context: str = "",
+        broad_context: str = "",
+    ) -> None:
         src = to_abs_url(str(src or "").strip())
         if not src or src.startswith("data:") or src.endswith(".svg"):
             return
         low = src.lower()
-        bad = [
+        hard_bad = [
             "doubleclick", "googleads", "googlesyndication", "adservice", "learning", "onechuman",
             "sponsored", "advertisement", "avatar", "profile", "logo", "favicon", "map", "worldmap",
-            "youtube", "twitch", "discord",
+            "youtube", "twitch", "discord", "premium", "removeads",
         ]
-        if any(x in low for x in bad):
+        if any(x in low for x in hard_bad):
             return
+
+        local = f"{alt} {local_context}".lower()
+        broad = f"{alt} {local_context} {broad_context}".lower()
         score = 0
+
+        # Bestes Signal: Asset/URL enthält die konkrete Item-ID.
         if detail_id and detail_id in low:
-            score += 120
-        if any(x in low for x in ["/item", "items", "equipment", "weapon", "armor", "icon"]):
-            score += 40
-        if any(x in low for x in ["webp", "png", "jpg", "jpeg"]):
+            score += 220
+
+        # Pfad-Hinweise. Skill-/Ability-Assets dürfen nicht gegen Itembilder gewinnen.
+        if any(x in low for x in ["/item", "items", "equipment", "weapon", "armor"]):
+            score += 70
+        if "icon" in low:
             score += 10
+        if any(x in low for x in ["skill", "ability", "passive", "buff", "spell", "trait"]):
+            score -= 130
+        if any(x in low for x in ["webp", "png", "jpg", "jpeg"]):
+            score += 8
+
+        # Quelle/Grafikgröße.
         if source == "css":
-            score += 25
-        if source == "img":
-            score += 15
+            score += 45
+        elif source == "img":
+            score += 20
+        elif source == "srcset":
+            score += 16
+        elif source == "meta":
+            score -= 30
         if w and h:
             area = w * h
-            if 24 <= w <= 512 and 24 <= h <= 512:
-                score += 30
+            if 40 <= w <= 260 and 40 <= h <= 260:
+                score += 35
+            if area < 1800:
+                score -= 25
             if area > 300000:
-                score -= 60
-        text = f"{alt} {context}".lower()
-        if any(x in text for x in ["item", "weapon", "waffe", "longbow", "langbogen", "staff", "stab"]):
-            score += 10
-        candidates.append({"src": src, "w": int(w or 0), "h": int(h or 0), "source": source, "score": score})
+                score -= 80
+            # Passiv-Icons sind meist kleine quadratische Bilder im unteren Bereich.
+            if abs(w - h) <= 8 and 32 <= w <= 90 and y and y > 430:
+                score -= 35
+
+        # Position: Das Waffenbild sitzt oben in der Itemkarte; Passivicons deutlich darunter.
+        if y:
+            if 160 <= y <= 390:
+                score += 45
+            elif y > 430:
+                score -= 25
+        if x:
+            # Ads links/rechts liegen oft weit außerhalb vom Content.
+            if x < 250 or x > 1450:
+                score -= 40
+
+        # Lokaler Kontext ist entscheidend. Broad-Kontext kann die komplette Itemkarte enthalten
+        # und darf deshalb nicht zu hart bestrafen.
+        passive_words = ["passiv", "passive", "fähigkeit", "faehigkeit", "skill", "effekt", "effect"]
+        trait_words = ["eigenschaften", "traits", "verkaufspreis", "kommentare", "erbeutet"]
+        item_header_words = ["item level", "gegenstandsstufe", "max. schaden", "max damage", "reichweite", "angriffstempo"]
+        if any(wd in local for wd in passive_words):
+            score -= 160
+        elif any(wd in broad for wd in passive_words):
+            score -= 8
+        if any(wd in local for wd in trait_words):
+            score -= 80
+        if any(wd in local for wd in item_header_words):
+            score += 50
+        elif any(wd in broad for wd in item_header_words):
+            score += 22
+        if item_name and item_name in broad:
+            score += 25
+        token_hits = sum(1 for t in name_tokens if t in broad)
+        score += min(token_hits * 8, 32)
+
+        candidates.append({
+            "src": src,
+            "w": int(w or 0),
+            "h": int(h or 0),
+            "x": int(x or 0),
+            "y": int(y or 0),
+            "source": source,
+            "score": score,
+        })
 
     try:
         imgs = page.locator("img").evaluate_all(
             """
             els => els.map(img => {
                 let box = img.getBoundingClientRect();
-                let parent = img.parentElement;
-                let ctx = '';
-                for (let i = 0; i < 4 && parent; i++, parent = parent.parentElement) {
-                    ctx += ' ' + ((parent.innerText || '').trim());
-                }
+                let p1 = img.parentElement;
+                let p2 = p1 ? p1.parentElement : null;
+                let p3 = p2 ? p2.parentElement : null;
                 return {
                     src: img.currentSrc || img.src || img.getAttribute('data-src') || '',
                     srcset: img.srcset || img.getAttribute('data-srcset') || '',
                     alt: img.alt || '',
                     w: Math.round(img.naturalWidth || box.width || img.width || 0),
                     h: Math.round(img.naturalHeight || box.height || img.height || 0),
-                    context: ctx.slice(0, 600)
+                    x: Math.round(box.left || 0),
+                    y: Math.round(box.top || 0),
+                    local: ((p1 && p1.innerText) || '') + ' ' + ((p2 && p2.innerText) || ''),
+                    broad: ((p3 && p3.innerText) || '')
                 };
             })
             """
         )
         for img in imgs or []:
-            add_candidate(img.get("src"), w=int(img.get("w") or 0), h=int(img.get("h") or 0), source="img", alt=str(img.get("alt") or ""), context=str(img.get("context") or ""))
+            add_candidate(
+                img.get("src"),
+                w=int(img.get("w") or 0), h=int(img.get("h") or 0),
+                x=int(img.get("x") or 0), y=int(img.get("y") or 0),
+                source="img", alt=str(img.get("alt") or ""),
+                local_context=str(img.get("local") or ""), broad_context=str(img.get("broad") or ""),
+            )
             srcset = str(img.get("srcset") or "")
             for part in srcset.split(","):
                 first = part.strip().split(" ")[0]
                 if first:
-                    add_candidate(first, w=int(img.get("w") or 0), h=int(img.get("h") or 0), source="srcset", alt=str(img.get("alt") or ""), context=str(img.get("context") or ""))
+                    add_candidate(
+                        first,
+                        w=int(img.get("w") or 0), h=int(img.get("h") or 0),
+                        x=int(img.get("x") or 0), y=int(img.get("y") or 0),
+                        source="srcset", alt=str(img.get("alt") or ""),
+                        local_context=str(img.get("local") or ""), broad_context=str(img.get("broad") or ""),
+                    )
     except Exception:
         pass
 
     try:
         backgrounds = page.locator("*").evaluate_all(
             """
-            els => els.slice(0, 2500).map(e => {
+            els => els.slice(0, 3500).map(e => {
               const st = getComputedStyle(e);
               const box = e.getBoundingClientRect();
-              const txt = (e.innerText || '').trim().slice(0, 600);
-              return {bg: st.backgroundImage || '', w: Math.round(box.width || 0), h: Math.round(box.height || 0), text: txt};
+              const p1 = e.parentElement;
+              const p2 = p1 ? p1.parentElement : null;
+              return {
+                bg: st.backgroundImage || '',
+                w: Math.round(box.width || 0),
+                h: Math.round(box.height || 0),
+                x: Math.round(box.left || 0),
+                y: Math.round(box.top || 0),
+                local: (e.innerText || '').trim().slice(0, 600),
+                broad: (((p1 && p1.innerText) || '') + ' ' + ((p2 && p2.innerText) || '')).trim().slice(0, 1000)
+              };
             }).filter(x => x.bg && x.bg !== 'none')
             """
         )
         for bg in backgrounds or []:
             for m in re.finditer(r"url\([\"']?([^\"')]+)[\"']?\)", str(bg.get("bg") or "")):
-                add_candidate(m.group(1), w=int(bg.get("w") or 0), h=int(bg.get("h") or 0), source="css", context=str(bg.get("text") or ""))
+                add_candidate(
+                    m.group(1),
+                    w=int(bg.get("w") or 0), h=int(bg.get("h") or 0),
+                    x=int(bg.get("x") or 0), y=int(bg.get("y") or 0),
+                    source="css",
+                    local_context=str(bg.get("local") or ""), broad_context=str(bg.get("broad") or ""),
+                )
     except Exception:
         pass
 
-    # Meta nur als allerletzter Fallback; oft ist das kein Icon, sondern Preview/Ad.
+    # Meta nur als letzter Fallback; oft ist das Preview/Share-Bild, nicht das Itembild.
     try:
         metas = page.locator("meta[property='og:image'], meta[name='twitter:image']").evaluate_all(
             "els => els.map(e => e.getAttribute('content') || '').filter(Boolean)"
@@ -1383,7 +1488,6 @@ def collect_image_urls(page) -> tuple[str | None, str | None]:
 
     valid.sort(key=lambda x: (int(x.get("score") or 0), int(x.get("w") or 0) * int(x.get("h") or 0)), reverse=True)
     best = valid[0].get("src")
-    # Für Dashboard lieber dasselbe echte Itembild als Icon nutzen statt Questlog-Typ-Symbol.
     return best, best
 
 def collect_links(page) -> list[str]:
