@@ -1662,83 +1662,113 @@ def extract_questlog_detail_model(text: str, *, name: str, rarity: str | None, s
         return out[:trait_limit]
 
     def _parse_armor_traits_from_section_text() -> list[dict[str, Any]]:
-        """Eigenschaften aus dem reinen Abschnittstext lesen.
+        """Armor-Eigenschaften aus dem echten Itemkasten lesen.
 
-        Grund: Questlog rendert Rüstungs-Eigenschaften je nach Item anders:
-        - Label und Werte getrennt
-        - Label: Werte in einer Zeile
-        - Inline/Text ohne saubere Zeilenumbrüche
-
-        Die zuverlässigste Regel ist: nur den Abschnitt NACH "Eigenschaften" und
-        VOR Seteffekt/Preis/Kommentare betrachten, dann bekannte Trait-Namen in
-        ihrer Reihenfolge suchen und bis zum nächsten Trait auswerten.
+        Diese Version arbeitet nicht mehr über frei schwebende Regex-Matches im
+        kompletten Body. Sie isoliert den Eigenschaften-Abschnitt und scannt ihn
+        zeilenweise gegen eine feste Liste echter Questlog-Traitnamen.
+        Erwartete Menge: Level 21/31 = 6, Level 45/50/80 = 8.
         """
         armor_types = {"helm", "brust", "hose", "handschuhe", "schuhe", "umhang"}
         if str(sub_category or "").strip().lower() not in armor_types:
             return []
 
         trait_labels = [
-            "Max. Gesundheit", "Max. Leben", "Max. Mana", "Manaregeneration",
-            "Mana-Regeneration", "Mana-Kosteneffizienz", "Manakosteneffizienz",
-            "Trefferchance", "Krit. Trefferchance", "Kritische Trefferchance",
-            "Chance auf starken Angriff", "Chance auf Fesseln", "Schwächungschance", "Schwaechungschance",
-            "Nahkampfausweichen", "Fernkampfausweichen", "Magieausweichen",
-            "Nahkampfausdauer", "Fernkampfausdauer", "Magieausdauer",
-            "Buff-Dauer", "Debuff-Dauer", "Angriffstempo",
-            "Wildkin-Bonusschaden", "Untote-Zusatzschaden", "Humanoide-Zusatzschaden", "Konstrukt-Zusatzschaden",
+            "Max. Gesundheit", "Max. Leben", "Max. Mana", "Manaregeneration", "Mana-Regeneration",
+            "Mana-Kosteneffizienz", "Manakosteneffizienz", "Trefferchance", "Krit. Trefferchance",
+            "Kritische Trefferchance", "Chance auf starken Angriff", "Chance auf Fesseln",
+            "Schwächungschance", "Schwaechungschance", "Nahkampfausweichen", "Fernkampfausweichen",
+            "Magieausweichen", "Nahkampfausdauer", "Fernkampfausdauer", "Magieausdauer",
+            "Buff-Dauer", "Debuff-Dauer", "Angriffstempo", "Wildkin-Bonusschaden",
+            "Untote-Zusatzschaden", "Humanoide-Zusatzschaden", "Konstrukt-Zusatzschaden",
         ]
+        label_lows = [(x.lower().strip(" :"), x) for x in sorted(trait_labels, key=len, reverse=True)]
 
-        # Abschnitt nach Eigenschaften/Traits isolieren.
-        m_start = re.search(r"(?:^|\n)\s*(Eigenschaften|Traits)\s*:?\s*(?:\n|$)", raw, flags=re.I)
-        if not m_start:
-            # Fallback: auch kompakte Darstellung akzeptieren.
-            m_start = re.search(r"\b(Eigenschaften|Traits)\b\s*:?", raw, flags=re.I)
-        if not m_start:
-            return []
-        section = raw[m_start.end():]
+        def _is_known_trait_start(line: str) -> tuple[str, str] | None:
+            txt = clean_text(line).strip()
+            low = txt.lower().strip(" :")
+            for low_label, canonical in label_lows:
+                if low == low_label:
+                    return canonical, ""
+                # Inline: "Max. Mana: 150 | 300 | 450 | 600"
+                if low.startswith(low_label + ":"):
+                    return canonical, txt[len(canonical):].lstrip(" :")
+                # Inline ohne Doppelpunkt: "Max. Mana 150 | 300 | 450 | 600"
+                if low.startswith(low_label + " "):
+                    return canonical, txt[len(canonical):].strip()
+            return None
 
-        stop_match = re.search(
-            r"(?:\n\s*)?(Dieser Gegenstand hat|This item has|Ausrüstungseffekte|Ausruestungseffekte|Equipment Set Effect|Ausrüstungsset|Ausruestungsset|Verkaufspreis|Sales Price|Kommentare|Comments|Von NPCs erbeutet|Dropped from|In Lithographen|Litograph|Remove Ads)",
-            section,
-            flags=re.I,
+        # Abschnitt zwischen Eigenschaften und dem nächsten echten Questlog-Bereich.
+        src_lines = [clean_text(x) for x in re.split(r"[\n\r]+", normalize_raw_text(raw)) if clean_text(x)]
+        start_idx = -1
+        for idx, line in enumerate(src_lines):
+            if clean_text(line).lower().strip(" :") in {"eigenschaften", "traits"}:
+                start_idx = idx + 1
+                break
+        if start_idx < 0:
+            # Fallback: wenn "Eigenschaften:" und erstes Trait in einer Zeile stehen.
+            joined = "\n".join(src_lines)
+            m = re.search(r"\bEigenschaften\b\s*:?(.*)$", joined, flags=re.I | re.S)
+            if not m:
+                return []
+            src_lines = [clean_text(x) for x in re.split(r"[\n\r]+", m.group(1)) if clean_text(x)]
+            start_idx = 0
+
+        stop_words = (
+            "dieser gegenstand hat", "this item has", "ausrüstungseffekte", "ausruestungseffekte",
+            "ausrüstungsset", "ausruestungsset", "equipment set", "verkaufspreis", "sales price",
+            "kommentare", "comments", "von npcs erbeutet", "dropped from", "in lithographen",
+            "litograph", "remove ads", "auction house", "auktionshaus", "preisverlauf", "bestandsverlauf",
         )
-        if stop_match:
-            section = section[:stop_match.start()]
-
-        # Sauberer Arbeitsstring: Zeilenumbrüche behalten, aber Spaces normalisieren.
-        sec = normalize_raw_text(section)
-        sec = re.sub(r"[\t\r]+", "\n", sec)
-
-        label_patterns: list[tuple[str, re.Pattern[str]]] = []
-        for label in trait_labels:
-            # Leerraum in Labels flexibel matchen, Punkt/Bindestrich normal lassen.
-            pat_text = re.escape(label).replace(r"\ ", r"\s+")
-            label_patterns.append((label, re.compile(rf"(?<![\wÄÖÜäöüß]){pat_text}\s*:??", flags=re.I)))
-
-        matches: list[tuple[int, int, str]] = []
-        for label, pat in label_patterns:
-            for m in pat.finditer(sec):
-                matches.append((m.start(), m.end(), label))
-        if not matches:
-            return []
-        matches.sort(key=lambda x: x[0])
 
         out: list[dict[str, Any]] = []
         seen: set[str] = set()
-        for idx, (start_pos, end_pos, label) in enumerate(matches):
+        i = start_idx
+        while i < len(src_lines) and len(out) < trait_limit:
+            line = clean_text(src_lines[i])
+            low = line.lower().strip(" :")
+            if any(w in low for w in stop_words):
+                break
+
+            found = _is_known_trait_start(line)
+            if not found:
+                i += 1
+                continue
+
+            label, inline_values = found
             key = label.lower().strip(" :")
             if key in seen:
+                i += 1
                 continue
-            next_pos = matches[idx + 1][0] if idx + 1 < len(matches) else len(sec)
-            chunk = sec[end_pos:next_pos]
-            # Nur Werte aus diesem Trait-Block. Pipes sind egal, Zahlen reichen.
-            vals = [clean_text(x) for x in re.findall(r"[+\-]?\d+(?:[.,]\d+)?\s*%?", chunk)]
-            # Upgrade-Deltas/Preis/Count gehören hier nicht hin; der Abschnitt ist schon isoliert.
+
+            vals: list[str] = []
+            if inline_values:
+                vals.extend([clean_text(x) for x in re.findall(r"[+\-]?\d+(?:[.,]\d+)?\s*%?", inline_values)])
+
+            j = i + 1
+            while j < len(src_lines) and len(vals) < 4:
+                nxt = clean_text(src_lines[j]).strip("|")
+                nl = nxt.lower().strip(" :")
+                if not nxt:
+                    j += 1
+                    continue
+                if any(w in nl for w in stop_words):
+                    break
+                # nächster Trait beginnt -> aktueller Block fertig
+                if _is_known_trait_start(nxt):
+                    break
+                nums = [clean_text(x) for x in re.findall(r"[+\-]?\d+(?:[.,]\d+)?\s*%?", nxt)]
+                if nums:
+                    vals.extend(nums)
+                j += 1
+
             if len(vals) >= 2:
                 out.append({"name": label, "values": vals[:4]})
                 seen.add(key)
-            if len(out) >= trait_limit:
-                break
+                i = max(j, i + 1)
+                continue
+            i += 1
+
         return out[:trait_limit]
 
     armor_traits_by_section = _parse_armor_traits_from_section_text()
@@ -1749,6 +1779,7 @@ def extract_questlog_detail_model(text: str, *, name: str, rarity: str | None, s
     else:
         detail["traits"] = tr[:trait_limit]
     detail["trait_count_rule"] = trait_limit
+    detail["trait_count_observed"] = len(detail.get("traits") or [])
     return detail
 
 
@@ -2332,6 +2363,62 @@ def collect_next_data_urls(page) -> list[str]:
     return urls
 
 
+
+
+def get_questlog_item_card_text(page, item_name: str = "") -> str:
+    """Extrahiert bevorzugt nur den linken Questlog-Itemkasten.
+
+    Der Body-Text enthält bei Questlog auch Auction-House, Footer, Ads, Tabs und
+    andere globale Blöcke. Für Rüstungstraits ist das tödlich. Diese Funktion
+    sucht den kleinsten sichtbaren DOM-Block, der Item Level + Eigenschaften bzw.
+    die typischen Itemwerte enthält. Daraus werden Traits/Stats wesentlich stabiler
+    gelesen als aus document.body.innerText.
+    """
+    try:
+        return str(page.evaluate(
+            """
+            (itemName) => {
+              const wanted = (itemName || '').toLowerCase().trim();
+              const norm = (s) => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+              const rawText = (el) => (el.innerText || '').replace(/\r/g, '\n').trim();
+              const els = Array.from(document.querySelectorAll('div, section, article, main, aside'));
+              const candidates = [];
+              for (const el of els) {
+                const rect = el.getBoundingClientRect();
+                if (!rect || rect.width < 180 || rect.height < 180) continue;
+                const style = window.getComputedStyle(el);
+                if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity || '1') === 0) continue;
+                const text = rawText(el);
+                if (!text || text.length < 120 || text.length > 9000) continue;
+                const low = norm(text);
+                let score = 0;
+                if (wanted && low.includes(wanted)) score += 80;
+                if (low.includes('item level')) score += 45;
+                if (low.includes('gegenstandsstufe')) score += 45;
+                if (low.includes('eigenschaften')) score += 70;
+                if (low.includes('traits')) score += 60;
+                if (low.includes('nahkampfverteidigung') || low.includes('fernkampfverteidigung')) score += 45;
+                if (low.includes('max. schaden') || low.includes('reichweite') || low.includes('angriffstempo')) score += 35;
+                if (low.includes('passiv') || low.includes('passive')) score += 12;
+                if (low.includes('auction house') || low.includes('auktionshaus') || low.includes('preisverlauf') || low.includes('bestandsverlauf')) score -= 120;
+                if (low.includes('kommentare') || low.includes('comments')) score -= 35;
+                if (low.includes('remove ads') || low.includes('advertisement') || low.includes('sponsored')) score -= 50;
+                // der Itemkasten ist typischerweise links/oben und relativ schmal
+                if (rect.width < 620) score += 20;
+                if (rect.x < 900) score += 8;
+                const area = rect.width * rect.height;
+                candidates.push({score, area, len: text.length, text});
+              }
+              candidates.sort((a,b) => (b.score - a.score) || (a.area - b.area) || (a.len - b.len));
+              const best = candidates.find(c => c.score >= 80);
+              return best ? best.text : '';
+            }
+            """,
+            item_name or "",
+        ) or "")
+    except Exception:
+        return ""
+
 def parse_detail_page(page, url: str, main_category_hint: str, locale: str, source_list_url: str = "") -> dict[str, Any] | None:
     url = force_de_locale_url(url)
     if not is_de_questlog_url(url):
@@ -2342,9 +2429,10 @@ def parse_detail_page(page, url: str, main_category_hint: str, locale: str, sour
         body_text = page.locator("body").inner_text(timeout=6000)
     except Exception:
         body_text = page.evaluate("() => document.body ? document.body.innerText : ''")
-    raw_text = normalize_raw_text(body_text)
     json_candidates = collect_json_candidates(page)
     name = page_title(page) or best_name_from_json(json_candidates)
+    card_text = get_questlog_item_card_text(page, name)
+    raw_text = normalize_raw_text(card_text or body_text)
     if not name or name.lower() in {"items", "weapons", "questlog"}:
         return skip_item(url, "kein echter Itemname erkannt")
     main_category = main_category_hint or classify_main_category(source_list_url or url, raw_text)
