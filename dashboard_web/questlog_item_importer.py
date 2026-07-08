@@ -1087,6 +1087,227 @@ def extract_traits_from_text(text: str) -> list[dict[str, Any]]:
         seen.add(key); out.append(t)
     return out[:12]
 
+
+def _armor_expected_trait_count_from_level(level_value: Any) -> int:
+    """Questlog-Rüstung: mögliche Eigenschaften nach Item-Level.
+
+    Jonas-Regel:
+    - Level 21 und 31: 6 Eigenschaften
+    - Level 45, 50 und 80+: 8 Eigenschaften
+    """
+    try:
+        lvl = int(str(level_value or "0"))
+    except Exception:
+        lvl = 0
+    return 8 if lvl >= 45 else 6
+
+
+ARMOR_TRAIT_LABELS_DE = [
+    "Max. Gesundheit", "Max. Leben", "Max. Mana",
+    "Gesundheitsregeneration", "Manaregeneration", "Mana-Regeneration",
+    "Mana-Kosteneffizienz", "Manakosteneffizienz",
+    "Trefferchance", "Krit. Trefferchance", "Kritische Trefferchance",
+    "Chance auf starken Angriff", "Chance auf Fesseln", "Schwächungschance", "Schwaechungschance",
+    "Nahkampfausweichen", "Fernkampfausweichen", "Magieausweichen",
+    "Nahkampfausdauer", "Fernkampfausdauer", "Magieausdauer",
+    "Buff-Dauer", "Debuff-Dauer", "Angriffstempo",
+    "Untote-Zusatzschaden", "Humanoide-Zusatzschaden", "Konstrukt-Zusatzschaden", "Wildkin-Bonusschaden",
+    "Manakosteneffizienz", "Manakosteneffizienz",
+]
+
+
+def _canon_armor_trait_label(label: str) -> str:
+    low = clean_text(label).lower().strip(" :")
+    aliases = {
+        "max. leben": "Max. Gesundheit",
+        "kritische trefferchance": "Krit. Trefferchance",
+        "mana-regeneration": "Manaregeneration",
+        "manakosteneffizienz": "Mana-Kosteneffizienz",
+        "schwaechungschance": "Schwächungschance",
+    }
+    if low in aliases:
+        return aliases[low]
+    for cand in ARMOR_TRAIT_LABELS_DE:
+        if low == cand.lower().strip(" :"):
+            return cand
+    return clean_text(label).rstrip(":")
+
+
+def _parse_armor_traits_from_text_sequence(tokens: list[str], expected: int) -> list[dict[str, Any]]:
+    """Liest Questlog-Eigenschaften aus einer echten Text-Reihenfolge.
+
+    Der Punkt, der vorher kaputt war: wir dürfen nicht versuchen, aus dem kompletten
+    Body einzelne Regex-Funde zu raten. Questlog rendert den linken Itemkasten aber
+    immer in der gleichen Reihenfolge:
+
+        Eigenschaften:
+        Label
+        150 | 300 | 450 | 600
+        Label
+        40 | 80 | 120 | 160
+
+    Manchmal stehen Label und Werte in einer Zeile. Diese Funktion kann beides.
+    """
+    if expected <= 0:
+        return []
+
+    # Labels lang -> kurz, damit "Krit. Trefferchance" vor "Trefferchance" gewinnt.
+    labels = sorted(set(ARMOR_TRAIT_LABELS_DE), key=len, reverse=True)
+    label_lows = [(x.lower().strip(" :"), x) for x in labels]
+
+    def find_label(text: str) -> tuple[str, str] | None:
+        t = clean_text(text).strip()
+        low = t.lower().strip(" :")
+        if not t:
+            return None
+        for low_label, label in label_lows:
+            if low == low_label:
+                return _canon_armor_trait_label(label), ""
+            if low.startswith(low_label + ":"):
+                return _canon_armor_trait_label(label), t[len(label):].lstrip(" :")
+            if low.startswith(low_label + " "):
+                rest = t[len(label):].strip()
+                # Nur als Inline werten, wenn danach wirklich Zahlen kommen.
+                if re.search(r"\d", rest):
+                    return _canon_armor_trait_label(label), rest
+        return None
+
+    def nums(text: str) -> list[str]:
+        # Traits haben Werte wie 150, 300 oder -1,5 %, 3 %, 12 %.
+        return [clean_text(x) for x in re.findall(r"[+\-]?\d+(?:[.,]\d+)?\s*%?", str(text or ""))]
+
+    def is_stop(text: str) -> bool:
+        low = clean_text(text).lower().strip(" :")
+        return any(x in low for x in (
+            "dieser gegenstand hat", "this item has", "ausrüstungseffekt", "ausruestungseffekt",
+            "ausrüstungsset", "ausruestungsset", "set des", "verkaufspreis", "sales price",
+            "kommentare", "comments", "von npcs erbeutet", "dropped from", "in lithographen",
+            "lithograph", "remove ads", "auction house", "auktionshaus", "preisverlauf", "bestandsverlauf",
+            "karte", "map", "stats", "enchanting", "teilen", "share",
+        ))
+
+    clean_tokens = [clean_text(t).strip() for t in tokens if clean_text(t).strip()]
+
+    # Start exakt nach Eigenschaften suchen. Wenn nicht da, erster bekannter Trait.
+    start = -1
+    for i, t in enumerate(clean_tokens):
+        if clean_text(t).lower().strip(" :") in {"eigenschaften", "traits"}:
+            start = i + 1
+            break
+    if start < 0:
+        for i, t in enumerate(clean_tokens):
+            if find_label(t):
+                start = i
+                break
+    if start < 0:
+        return []
+
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    i = start
+    while i < len(clean_tokens) and len(out) < expected:
+        t = clean_tokens[i]
+        if is_stop(t):
+            break
+        found = find_label(t)
+        if not found:
+            i += 1
+            continue
+
+        label, inline = found
+        key = label.lower().strip(" :")
+        if key in seen:
+            i += 1
+            continue
+
+        values: list[str] = []
+        if inline:
+            values.extend(nums(inline))
+
+        j = i + 1
+        while j < len(clean_tokens) and len(values) < 4:
+            nxt = clean_tokens[j]
+            if is_stop(nxt):
+                break
+            if find_label(nxt):
+                break
+            # Separators/empty dots ignorieren, Zahlen einsammeln.
+            values.extend(nums(nxt))
+            j += 1
+
+        # Jede Questlog-Eigenschaft hat faktisch 4 Stufen. Wenn ein Layout nur 2 liefert,
+        # nehmen wir sie trotzdem, aber nur aus dem echten Eigenschaften-Block.
+        if len(values) >= 2:
+            out.append({"name": label, "values": values[:4]})
+            seen.add(key)
+            i = max(j, i + 1)
+            continue
+        i += 1
+
+    return out[:expected]
+
+
+def extract_armor_traits_from_dom_textnodes(page, *, sub_category: str | None, item_level: Any, item_name: str) -> list[dict[str, Any]]:
+    """Extrahiert Armor-Eigenschaften direkt aus sichtbaren Textnodes des linken Itemkastens.
+
+    Das ist absichtlich derselbe robuste Ansatz wie bei Waffen: erst der echte
+    Questlog-Detailkasten, dann exakt der Eigenschaften-Abschnitt. Keine globale
+    Body-Regex mehr.
+    """
+    armor_types = {"helm", "brust", "hose", "handschuhe", "schuhe", "umhang"}
+    if str(sub_category or "").strip().lower() not in armor_types:
+        return []
+    expected = _armor_expected_trait_count_from_level(item_level)
+
+    try:
+        tokens = page.evaluate(
+            """
+            (itemName) => {
+              const clean = (s) => (s || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
+              const visible = (el) => {
+                if (!el) return false;
+                const st = window.getComputedStyle(el);
+                if (!st || st.display === 'none' || st.visibility === 'hidden' || Number(st.opacity || 1) === 0) return false;
+                const r = el.getBoundingClientRect();
+                return r.width > 0 && r.height > 0;
+              };
+              const all = Array.from(document.querySelectorAll('body *'));
+              const namePart = clean(itemName).split(/\s+/).slice(0, 2).join(' ');
+              let candidates = all.map(el => ({el, text: clean(el.innerText || '')}))
+                .filter(x => x.text && x.text.includes('Eigenschaften') && x.text.length < 7000)
+                .filter(x => !/Preisverlauf|Bestandsverlauf|Durchschnittspreis|Auf Lager/.test(x.text));
+              if (namePart) candidates = candidates.filter(x => x.text.includes(namePart) || candidates.length < 3);
+              candidates.sort((a, b) => a.text.length - b.text.length);
+              const root = (candidates[0] && candidates[0].el) || document.body;
+
+              const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+                acceptNode(node) {
+                  const txt = clean(node.nodeValue || '');
+                  if (!txt) return NodeFilter.FILTER_REJECT;
+                  const p = node.parentElement;
+                  if (!visible(p)) return NodeFilter.FILTER_REJECT;
+                  return NodeFilter.FILTER_ACCEPT;
+                }
+              });
+              const out = [];
+              let n;
+              while ((n = walker.nextNode())) {
+                const txt = clean(n.nodeValue || '');
+                if (txt) out.push(txt);
+              }
+              return out;
+            }
+            """,
+            item_name or "",
+        )
+    except Exception:
+        tokens = []
+
+    if not isinstance(tokens, list):
+        return []
+    traits = _parse_armor_traits_from_text_sequence([str(x) for x in tokens], expected)
+    return traits[:expected]
+
 def _line_values_after_label(lines: list[str], label_idx: int, max_lookahead: int = 8) -> list[str]:
     vals: list[str] = []
     stop_words = {
@@ -2469,6 +2690,19 @@ def parse_detail_page(page, url: str, main_category_hint: str, locale: str, sour
         sub_category=sub_category,
         image_url=image_url or icon_url,
     )
+
+    # Armor-Eigenschaften final aus echten DOM-Textnodes des linken Questlog-Itemkastens.
+    # Das überschreibt die alten Body/Text-Fallbacks, wenn die erwartete Menge gefunden wird.
+    armor_dom_traits = extract_armor_traits_from_dom_textnodes(
+        page,
+        sub_category=sub_category,
+        item_level=detail_model.get("item_level") or item_level,
+        item_name=name,
+    )
+    if armor_dom_traits:
+        detail_model["traits"] = armor_dom_traits
+        detail_model["trait_count_observed"] = len(armor_dom_traits)
+        detail_model["trait_count_source"] = "dom_textnodes_left_item_card"
     # Detailmodell zusätzlich in flache Felder spiegeln, damit Dashboard/API ohne
     # Sonderlogik brauchbare Werte bekommt.
     if detail_model.get("max_damage") and (damage_min is None or damage_max is None):
@@ -2527,7 +2761,7 @@ def parse_detail_page(page, url: str, main_category_hint: str, locale: str, sour
             "main_category_hint": main_category_hint,
             "json_candidate_count": len(json_candidates),
             "source_list_url": source_list_url,
-            "parser": "playwright-detail-page-v15-armor-trait-section",
+            "parser": "playwright-detail-page-v16-armor-dom-textnode-traits",
         },
     }
 
