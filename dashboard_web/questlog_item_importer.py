@@ -1021,18 +1021,50 @@ def parse_number_token(value: str) -> str:
     return clean_text(m.group(0)) if m else ""
 
 
+def _looks_like_delta_token(value: str) -> bool:
+    text = str(value or "").strip().lower()
+    return "▲" in text or "△" in text or "arrow" in text or text.startswith("+")
+
+
+def _number_entries_from_values(values: list[str]) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    for raw in values:
+        num = parse_number_token(raw)
+        if not num:
+            continue
+        entries.append({"value": num, "raw": raw, "is_delta": _looks_like_delta_token(raw)})
+    return entries
+
+
 def find_label_value_block(lines: list[str], labels: list[str], max_lookahead: int = 8) -> dict[str, Any] | None:
     label_lows = [x.lower().rstrip(":") for x in labels]
     for i, line in enumerate(lines):
         low = clean_text(line).lower().rstrip(":")
         if low not in label_lows:
             continue
-        vals = _line_values_after_label(lines, i, max_lookahead=max_lookahead)
-        nums = [parse_number_token(v) for v in vals]
-        nums = [n for n in nums if n]
+        vals: list[str] = []
+        stop_words = {
+            "passiv", "passive", "eigenschaften", "traits", "kommentare", "comments",
+            "karte", "map", "auktionshaus", "auction house", "stats", "enchanting",
+        }
+        for j in range(i + 1, min(len(lines), i + 1 + max_lookahead)):
+            x = clean_text(lines[j]).strip(" :")
+            if not x:
+                continue
+            low_x = x.lower().rstrip(":")
+            if low_x in stop_words:
+                break
+            # Gleiches oder anderes Label beendet den aktuellen Wertblock.
+            if low_x in label_lows:
+                break
+            if re.match(r"^[A-Za-zÄÖÜäöüß ./%'\-]+:$", x) and not re.search(r"\d", x):
+                break
+            vals.append(x)
+        entries = _number_entries_from_values(vals)
+        nums = [e["value"] for e in entries]
         if not nums:
             continue
-        return {"label": clean_text(line).rstrip(":"), "values": nums, "raw_values": vals}
+        return {"label": clean_text(line).rstrip(":"), "values": nums, "entries": entries, "raw_values": vals}
     return None
 
 
@@ -1065,14 +1097,17 @@ def extract_questlog_detail_model(text: str, *, name: str, rarity: str | None, s
     # Hauptwerte
     dmg = find_label_value_block(lines, ["Max. Schaden", "Max Damage", "Schaden", "Damage"], max_lookahead=10)
     if dmg:
-        nums = dmg.get("values") or []
-        # Questlog zeigt oft: 70, ▲ 22, ~, 277, ▲ 88. Wir nehmen Basiswerte und Erhöhungen getrennt.
-        base_nums = [x for x in nums if not str(x).startswith("+")]
+        entries = dmg.get("entries") or _number_entries_from_values(dmg.get("raw_values") or [])
+        # Questlog zeigt oft:
+        # Max. Schaden / 70 / ▲ 22 / ~ / 277 / ▲ 88
+        # Wichtig: ▲-Werte sind Upgrade-Deltas und dürfen nicht als Max-Schaden gelesen werden.
+        base_nums = [str(e.get("value")) for e in entries if not e.get("is_delta")]
+        deltas = [str(e.get("value")) for e in entries if e.get("is_delta")]
         if len(base_nums) >= 2:
-            detail["max_damage"] = {"min": base_nums[0], "max": base_nums[1], "raw": dmg.get("raw_values")}
-            detail["primary"].append({"label": "Max. Schaden", "value": f"{base_nums[0]} ~ {base_nums[1]}", "raw": dmg.get("raw_values")})
-        elif nums:
-            detail["primary"].append({"label": "Max. Schaden", "value": " ~ ".join(nums), "raw": dmg.get("raw_values")})
+            detail["max_damage"] = {"min": base_nums[0], "max": base_nums[1], "deltas": deltas[:2], "raw": dmg.get("raw_values")}
+            detail["primary"].append({"label": "Max. Schaden", "value": f"{base_nums[0]} ~ {base_nums[1]}", "deltas": deltas[:2], "raw": dmg.get("raw_values")})
+        elif base_nums:
+            detail["primary"].append({"label": "Max. Schaden", "value": " ~ ".join(base_nums), "deltas": deltas[:2], "raw": dmg.get("raw_values")})
 
     for labels, out_label in [
         (["Reichweite", "Range"], "Reichweite"),
@@ -1323,7 +1358,7 @@ def collect_image_urls(page) -> tuple[str | None, str | None]:
         if "icon" in low:
             score += 10
         if any(x in low for x in ["skill", "ability", "passive", "buff", "spell", "trait"]):
-            score -= 130
+            score -= 260
         if any(x in low for x in ["webp", "png", "jpg", "jpeg"]):
             score += 8
 
@@ -1350,7 +1385,9 @@ def collect_image_urls(page) -> tuple[str | None, str | None]:
                 score -= 80
             # Passiv-Icons sind meist kleine quadratische Bilder im unteren Bereich.
             if abs(w - h) <= 8 and 32 <= w <= 90 and y and y > 430:
-                score -= 35
+                score -= 120
+            if abs(w - h) <= 12 and 48 <= w <= 150 and detail_id and detail_id not in low and any(x in low for x in ["skill", "icon", "ability", "passive"]):
+                score -= 220
 
         # Position: Das Waffenbild sitzt oben in der Itemkarte; Passivicons deutlich darunter.
         if y:
@@ -1431,11 +1468,12 @@ def collect_image_urls(page) -> tuple[str | None, str | None]:
                     if (!c) return;
                     const cy = b.top + (b.height / 2);
                     const cx = b.left + (b.width / 2);
-                    // Nur oberer Kopfbereich des Itemkastens: Waffenbild sitzt dort, Passive-Icon nicht.
-                    if (cy > c.top + 155) return;
+                    // Nur oberer Kopfbereich des Itemkastens: Waffenbild sitzt dort, Passive-/Fähigkeitsicon nicht.
+                    if (cy > c.top + 135) return;
                     // Rechtes Drittel bevorzugen, dort liegt das Questlog-Waffenbild.
-                    if (cx < c.left + c.width * 0.45) return;
-                    if (b.width < 30 || b.height < 30 || b.width > 240 || b.height > 240) return;
+                    if (cx < c.left + c.width * 0.50) return;
+                    if (b.width > 260 || b.height > 260) return;
+                    if ((b.width > 0 && b.width < 18) || (b.height > 0 && b.height < 18)) return;
                     out.push({
                         src,
                         alt,
@@ -1465,6 +1503,17 @@ def collect_image_urls(page) -> tuple[str | None, str | None]:
                         if (bg && bg !== 'none') {
                             const matches = [...bg.matchAll(/url\(["']?([^"')]+)["']?\)/g)];
                             for (const m of matches) pushUrl(m[1], n, 'css', '');
+                        }
+                        // Questlog rendert das Waffenbild teils über ::before/::after statt als normales img.
+                        for (const pseudo of ['::before', '::after']) {
+                            try {
+                                const pst = getComputedStyle(n, pseudo);
+                                const pbg = pst && pst.backgroundImage || '';
+                                if (pbg && pbg !== 'none') {
+                                    const matches = [...pbg.matchAll(/url\(["']?([^"')]+)["']?\)/g)];
+                                    for (const m of matches) pushUrl(m[1], n, 'css', '');
+                                }
+                            } catch (_) {}
                         }
                     }
                 }
@@ -1535,8 +1584,14 @@ def collect_image_urls(page) -> tuple[str | None, str | None]:
               const box = e.getBoundingClientRect();
               const p1 = e.parentElement;
               const p2 = p1 ? p1.parentElement : null;
+              let bg = st.backgroundImage || '';
+              try {
+                const b1 = getComputedStyle(e, '::before').backgroundImage || '';
+                const b2 = getComputedStyle(e, '::after').backgroundImage || '';
+                bg = [bg, b1, b2].filter(x => x && x !== 'none').join(', ');
+              } catch (_) {}
               return {
-                bg: st.backgroundImage || '',
+                bg: bg || '',
                 w: Math.round(box.width || 0),
                 h: Math.round(box.height || 0),
                 x: Math.round(box.left || 0),
@@ -1846,7 +1901,7 @@ def parse_detail_page(page, url: str, main_category_hint: str, locale: str, sour
             "main_category_hint": main_category_hint,
             "json_candidate_count": len(json_candidates),
             "source_list_url": source_list_url,
-            "parser": "playwright-detail-page-v8-rare-detail-no-skillcore-skip",
+            "parser": "playwright-detail-page-v9-image-damage-fix",
         },
     }
 
