@@ -31,7 +31,7 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
-ASSET_VER = "ebo-gothic-whale-dashboard-mobile-v4"
+ASSET_VER = "ebo-gothic-whale-dashboard-mobile-v5"
 DASHBOARD_RELEASE_VERSION = "1.2.0 · Status Playwright Worker"
 
 
@@ -4491,6 +4491,69 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "admin") -> str:
       .mobile-nav-toggle {{
         right:12px !important;
         top:calc(var(--mobile-topnav-h) + 144px) !important;
+      }}
+    }}
+
+
+    /* Mobile UX Patch v5 – Status/Admin aus Topnav, Menü höher, Adminbutton schöner */
+    @media(max-width:900px) {{
+      /* Menü weiter nach oben in den Header */
+      .mobile-nav-toggle {{
+        top:calc(var(--mobile-topnav-h) + 108px) !important;
+        right:18px !important;
+      }}
+
+      /* Admin-Button im Header schöner und zentraler */
+      .status-main-hero .btn[href="/overview"] {{
+        display:inline-flex !important;
+        align-items:center !important;
+        justify-content:center !important;
+        align-self:center !important;
+        margin:18px auto 4px !important;
+        min-width:min(310px,92%) !important;
+        min-height:52px !important;
+        padding:13px 18px !important;
+        border-radius:0 !important;
+        font-size:18px !important;
+        font-weight:900 !important;
+        letter-spacing:.01em !important;
+        color:#160d05 !important;
+        background:
+          linear-gradient(90deg,rgba(255,255,255,.16),transparent 22%,transparent 78%,rgba(255,255,255,.10)),
+          linear-gradient(180deg,#f0c972,#b77a28 55%,#8a551b) !important;
+        border:1px solid rgba(255,232,170,.72) !important;
+        box-shadow:
+          0 14px 28px rgba(0,0,0,.38),
+          inset 0 1px 0 rgba(255,255,255,.36),
+          inset 0 -1px 0 rgba(70,35,8,.55) !important;
+        text-shadow:0 1px 0 rgba(255,234,180,.35) !important;
+      }}
+
+      .status-main-hero .btn[href="/overview"]:hover {{
+        filter:brightness(1.06) !important;
+      }}
+
+      /* Topnav bleibt oben, aber ohne Status/Admin durch geänderte Links */
+      .status-topnav {{
+        justify-content:flex-start !important;
+      }}
+    }}
+
+    @media(max-width:560px) {{
+      .mobile-nav-toggle {{
+        top:calc(var(--mobile-topnav-h) + 100px) !important;
+        right:16px !important;
+      }}
+      .status-main-hero .btn[href="/overview"] {{
+        min-width:min(300px,92%) !important;
+        font-size:17px !important;
+      }}
+    }}
+
+    @media(max-width:390px) {{
+      .mobile-nav-toggle {{
+        top:calc(var(--mobile-topnav-h) + 94px) !important;
+        right:12px !important;
       }}
     }}
 
@@ -10642,7 +10705,7 @@ def _render_status_dashboard(data: dict[str, Any], request: Optional[Request] = 
     if nav_mode == "member":
         nav_links = '<a href="/member">Status</a><a href="/portal">Mein Portal</a><a href="/member/auctions">Loot</a><a href="/member/events">Events</a><a href="/member/members">Mitglieder</a><a href="/member/ec">Meine EC</a>'
     else:
-        nav_links = '<a href="/status">Status</a><a href="/portal">Mein Portal</a><a href="/loot">Loot</a><a href="/events">Events</a><a href="/members">Mitglieder</a><a href="/overview">Adminbereich</a>'
+        nav_links = '<a href="/portal">Mein Portal</a><a href="/loot">Loot</a><a href="/events">Events</a><a href="/members">Mitglieder</a>'
     nav_html = f'<div class="status-topnav-shell"><nav class="topnav status-topnav">{nav_links}</nav></div>'
     admin_action = ""
     if nav_mode == "admin":
