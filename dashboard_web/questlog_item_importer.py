@@ -1626,6 +1626,62 @@ def collect_image_urls(page) -> tuple[str | None, str | None]:
     best = valid[0].get("src")
     return best, best
 
+
+
+def hydrate_listing_page(page) -> None:
+    """Laedt lazy/infinite Questlog-Listen komplett nach.
+
+    Questlog zeigt auf Kategorie-Seiten initial oft nur ca. 40 Detail-Links.
+    Weitere Items erscheinen erst nach Scrollen/Virtualisierung. Ohne diesen Schritt
+    importieren Helm/Brust/etc. nur die ersten 40 Items.
+    """
+    try:
+        last_count = -1
+        stable_rounds = 0
+        max_rounds = int(os.getenv("QUESTLOG_SCROLL_ROUNDS", "40") or "40")
+        step_px = int(os.getenv("QUESTLOG_SCROLL_STEP", "900") or "900")
+        wait_ms = int(os.getenv("QUESTLOG_SCROLL_WAIT_MS", "450") or "450")
+    except Exception:
+        max_rounds = 40
+        step_px = 900
+        wait_ms = 450
+
+    for _ in range(max_rounds):
+        try:
+            current_count = len(collect_detail_links(page))
+        except Exception:
+            current_count = -1
+
+        if current_count == last_count:
+            stable_rounds += 1
+        else:
+            stable_rounds = 0
+            last_count = current_count
+
+        # Zwei stabile Runden nach unten reichen meist. Nicht sofort abbrechen,
+        # weil Questlog manchmal nach dem ersten Scroll noch nachrendert.
+        if stable_rounds >= 3:
+            break
+
+        try:
+            page.mouse.wheel(0, step_px)
+        except Exception:
+            try:
+                page.evaluate("y => window.scrollBy(0, y)", step_px)
+            except Exception:
+                pass
+        try:
+            page.wait_for_timeout(wait_ms)
+        except Exception:
+            pass
+
+    # Nochmal ganz nach unten und kurz warten, falls der letzte Block erst dann kommt.
+    try:
+        page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
+        page.wait_for_timeout(800)
+    except Exception:
+        pass
+
 def collect_links(page) -> list[str]:
     try:
         links = page.locator("a[href]").evaluate_all("els => els.map(a => a.href).filter(Boolean)")
@@ -2027,6 +2083,10 @@ def crawl_category(context, conn, seed: CategorySeed, limit_left: int | None = N
         network_payloads.clear()
         if not goto_page(list_page, current_url):
             continue
+
+        # Questlog rendert Kategorie-Listen lazy/virtuell. Ohne Scrollen sieht der
+        # DOM oft nur die ersten ca. 40 Items, obwohl es mehr gibt.
+        hydrate_listing_page(list_page)
 
         # Keine JSON/DOM-Listenobjekte mehr direkt importieren.
         # Die hatten Guides, Bosse, Streamtitel und Übersetzungen als Waffen gespeichert.
