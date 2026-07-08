@@ -1,13 +1,47 @@
-# Status Live Truthy Hotfix
+# Questlog Item-Importer für Ebo Dashboard
 
-Geändert: `dashboard_web/main.py`
+Ziel: Questlog.gg wird per Playwright gelesen, Items werden lokal in Postgres unter `item_catalog` gespeichert. Bot und Dashboard lesen danach nur aus Postgres.
 
-## Fix
-- Serverstatus wird nicht mehr aus Legenden/alten Maintenance-Historien geraten.
-- Fearless/Europe wird zuerst über Throney geprüft, das den offiziellen T&L-Status alle 15 Minuten spiegelt.
-- Questlog/Official bleiben Fallbacks, aber nur bei explizitem Treffer direkt am Servernamen.
-- TLDB wurde als Statusquelle entfernt, weil die Seite aktuell globale/alte Maintenance-Texte liefern kann und dadurch falsch-positive Wartung erzeugt.
-- Wetter und Spielzeit werden nicht mehr geraten. Wenn Questlog per einfachem HTTP nicht lesbar ist, bleibt es ehrlich "nicht ermittelbar".
+## Railway-Service
 
-## Hintergrund
-Questlog Rain/Day-Night laden die echten Inhalte clientseitig per JavaScript. Ohne gefundenen internen JSON-Endpunkt oder Browser-Renderer/Playwright kann das Dashboard diese Werte nicht zuverlässig live auslesen.
+Empfohlen: eigener Railway-Service mit Root `dashboard_web`, weil dort Playwright/Chromium bereits eingerichtet ist.
+
+Start Command:
+
+```bash
+python questlog_item_importer.py --only weapon,armor,material,currency,misc
+```
+
+Für den ersten Test nur Waffen:
+
+```bash
+python questlog_item_importer.py --category-url https://questlog.gg/throne-and-liberty/en/db/items/weapons --only weapon
+```
+
+## ENV
+
+```text
+DATABASE_URL=${{Postgres.DATABASE_URL}}
+QUESTLOG_LOCALE=en
+QUESTLOG_IMPORT_DELAY=1.2
+QUESTLOG_MAX_PAGES=250
+QUESTLOG_MAX_ITEMS=0
+QUESTLOG_HEADLESS=1
+```
+
+`QUESTLOG_MAX_ITEMS=0` bedeutet unbegrenzt.
+
+## Sicherheit
+
+Der Importer überschreibt keine produktiven JSON-Dateien. Er schreibt nur in die neue Postgres-Tabelle `item_catalog`.
+
+## Dashboard
+
+Nach dem Import:
+
+```text
+/items
+/api/items
+/api/items?category=weapon
+/api/items?category=weapon&sub_category=Langbogen
+```
