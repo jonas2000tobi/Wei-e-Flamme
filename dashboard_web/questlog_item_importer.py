@@ -37,6 +37,9 @@ REQUEST_DELAY = float(os.getenv("QUESTLOG_IMPORT_DELAY", "1.2"))
 MAX_PAGES = int(os.getenv("QUESTLOG_MAX_PAGES", "250"))
 MAX_ITEMS = int(os.getenv("QUESTLOG_MAX_ITEMS", "0") or "0")
 HEADLESS = os.getenv("QUESTLOG_HEADLESS", "1").lower() not in {"0", "false", "no", "off"}
+NAV_TIMEOUT_MS = int(os.getenv("QUESTLOG_TIMEOUT_MS", "120000") or "120000")
+PAGE_SETTLE_MS = int(os.getenv("QUESTLOG_PAGE_SETTLE_MS", "6000") or "6000")
+
 
 BROWSER_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -479,20 +482,42 @@ def find_next_url(page) -> str | None:
     return f"{current}{joiner}page=2"
 
 
-def goto_page(page, url: str, timeout_ms: int = 45000) -> bool:
+def goto_page(page, url: str, timeout_ms: int | None = None) -> bool:
+    """Robustes Laden für Questlog/Railway.
+
+    Auf Railway bleibt Questlog teils lange vor DOMContentLoaded hängen. Für Scraping
+    reicht oft schon der erste Response-Commit plus ein kurzer Warteblock, weil
+    Playwright danach trotzdem DOM/JS ausführen kann. Deshalb nicht hart auf
+    networkidle warten.
+    """
+    timeout_ms = int(timeout_ms or NAV_TIMEOUT_MS)
     try:
-        page.goto(url, wait_until="networkidle", timeout=timeout_ms)
-    except Exception:
-        try:
-            page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
-        except Exception as exc:
-            print(f"❌ Seite nicht erreichbar: {url} ({type(exc).__name__}: {exc})")
-            return False
-    try:
-        page.wait_for_timeout(900)
+        page.set_default_navigation_timeout(timeout_ms)
     except Exception:
         pass
-    return True
+
+    last_exc: Exception | None = None
+    for wait_until in ("commit", "domcontentloaded", "load"):
+        try:
+            page.goto(url, wait_until=wait_until, timeout=timeout_ms)
+            try:
+                page.wait_for_load_state("domcontentloaded", timeout=min(15000, timeout_ms))
+            except Exception:
+                pass
+            try:
+                page.wait_for_timeout(PAGE_SETTLE_MS)
+            except Exception:
+                pass
+            return True
+        except Exception as exc:
+            last_exc = exc
+            try:
+                page.wait_for_timeout(1000)
+            except Exception:
+                pass
+
+    print(f"❌ Seite nicht erreichbar: {url} ({type(last_exc).__name__}: {last_exc})", flush=True)
+    return False
 
 
 def discover_category_seeds(page, locale: str, include_fallback: bool = True) -> list[CategorySeed]:
@@ -502,7 +527,7 @@ def discover_category_seeds(page, locale: str, include_fallback: bool = True) ->
     ]
     seeds: dict[str, CategorySeed] = {}
     for root in roots:
-        if not goto_page(page, root, timeout_ms=35000):
+        if not goto_page(page, root, timeout_ms=NAV_TIMEOUT_MS):
             continue
         for href in collect_links(page):
             if is_category_list_url(href):
@@ -569,7 +594,7 @@ def parse_detail_page(page, url: str, main_category_hint: str, locale: str) -> d
             "url": url,
             "main_category_hint": main_category_hint,
             "json_candidate_count": len(json_candidates),
-            "parser": "playwright-visible-text-v1",
+            "parser": "playwright-visible-text-v2-timeout-fix",
         },
     }
 
@@ -635,7 +660,7 @@ def run_import(args: argparse.Namespace) -> int:
     with sync_playwright() as pw:
         launch_kwargs: dict[str, Any] = {
             "headless": HEADLESS,
-            "args": ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--disable-extensions"],
+            "args": ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--disable-extensions", "--disable-background-networking"],
         }
         exe = os.getenv("PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH", "").strip()
         if exe:
@@ -646,7 +671,20 @@ def run_import(args: argparse.Namespace) -> int:
             user_agent=BROWSER_UA,
             locale="en-US" if DEFAULT_LOCALE.startswith("en") else "de-DE",
             timezone_id="Europe/Berlin",
+            extra_http_headers={
+                "Accept-Language": "en-US,en;q=0.9,de;q=0.8",
+            },
         )
+        try:
+            # Fonts/Video/Tracking kosten auf Railway viel Zeit, für den Import sind sie egal.
+            context.route(
+                "**/*",
+                lambda route, request: route.abort()
+                if request.resource_type in {"font", "media"}
+                else route.continue_(),
+            )
+        except Exception:
+            pass
         page = context.new_page()
         if args.category_url:
             seeds = [CategorySeed(args.category_url.rstrip("/"), classify_main_category(args.category_url))]
