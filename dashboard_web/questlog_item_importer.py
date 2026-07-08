@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+# Patch: stabile Bildlogik aus der funktionierenden Version + Schaden-Fix (▲-Werte nicht als Schaden).
+
 import argparse
 import json
 import os
@@ -16,7 +18,28 @@ from item_catalog_db import connect, ensure_item_catalog_schema, upsert_item
 BASE = "https://questlog.gg"
 GAME = "throne-and-liberty"
 DEFAULT_LOCALE = os.getenv("QUESTLOG_LOCALE", "de").strip() or "de"
-DEFAULT_START_URL = f"{BASE}/{GAME}/{DEFAULT_LOCALE}/db/items/weapons?grade=41"
+WEAPON_CATEGORY_SLUGS = [
+    "sword",
+    "sword2h",
+    "dagger",
+    "bow",
+    "crossbow",
+    "wand",
+    "staff",
+    "spear",
+    "orb",
+    "gauntlet",
+]
+
+DEFAULT_START_URL = f"{BASE}/{GAME}/{DEFAULT_LOCALE}/db/items/weapons/sword?grade=41"
+DEFAULT_WEAPON_CATEGORY_URLS = [
+    f"{BASE}/{GAME}/{DEFAULT_LOCALE}/db/items/weapons/{slug}?grade=41"
+    for slug in WEAPON_CATEGORY_SLUGS
+]
+DEFAULT_ARMOR_CATEGORY_URLS = [
+    f"{BASE}/{GAME}/{DEFAULT_LOCALE}/db/items/armor?grade=41",
+    f"{BASE}/{GAME}/{DEFAULT_LOCALE}/db/items/accessories?grade=41",
+]
 
 # Diese bekannten Listen werden nur als Fallback genutzt. Der Importer versucht zuerst,
 # Kategorien von /db/items automatisch zu entdecken.
@@ -96,6 +119,8 @@ STAT_KEYWORDS = [
     "max damage", "range", "wildkin", "mana", "hit chance",
     "abkling", "angriffsgeschwindigkeit", "schaden", "reichweite", "trefferchance", "krit",
     "melee", "ranged", "magic", "evasion", "endurance", "defense",
+    "verteidigung", "ausweichen", "magieausweichen", "fernkampfausweichen", "nahkampfausweichen",
+    "ausdauer", "robustheit", "schadensreduzierung", "heilung", "buff", "debuff",
 ]
 
 
@@ -192,12 +217,13 @@ def url_with_query_param(url: str, key: str, value: str) -> str:
 
 
 def force_weapon_grade_filter(url: str) -> str:
-    """Für Waffenlisten immer Questlog-Filter ab Rare setzen.
+    """Für Item-Listen ab Rare filtern.
 
     Detailseiten brauchen keinen grade-Query. Listen und Unterlisten dagegen schon,
     sonst importiert Questlog auch Common/Uncommon und teils unnötige Seitendaten.
+    Historischer Funktionsname bleibt aus Kompatibilität erhalten.
     """
-    if is_items_url(url) and classify_main_category(url) == "weapon":
+    if is_items_url(url) and classify_main_category(url) in {"weapon", "armor"}:
         return url_with_query_param(url, "grade", "41")
     return url
 
@@ -1036,49 +1062,6 @@ def _number_entries_from_values(values: list[str]) -> list[dict[str, Any]]:
     return entries
 
 
-def _damage_pair_from_raw_values(raw_values: list[str]) -> tuple[str | None, str | None, list[str]]:
-    """Liest Questlog-Max-Schaden robust.
-
-    Questlog zeigt z. B.:
-      41 / ▲ 12 / ~ / 162 / ▲ 50
-    In Playwrights innerText fehlen die Pfeile manchmal, dann kommt nur:
-      41 / 12 / ~ / 162 / 50
-    Trotzdem sind 41 und 162 die Basiswerte; 12 und 50 sind Upgrade-Deltas.
-    """
-    vals = [clean_text(v).strip() for v in (raw_values or []) if clean_text(v).strip()]
-    if not vals:
-        return None, None, []
-
-    # Separator-basierter Fall: links vom ~ erster Zahlenwert, rechts vom ~ erster Zahlenwert.
-    sep_idx = -1
-    for i, v in enumerate(vals):
-        if v in {"~", "-", "–"} or v.strip() in {"~", "-", "–"}:
-            sep_idx = i
-            break
-    if sep_idx >= 0:
-        left = [_number_entries_from_values([v])[0] for v in vals[:sep_idx] if _number_entries_from_values([v])]
-        right = [_number_entries_from_values([v])[0] for v in vals[sep_idx + 1:] if _number_entries_from_values([v])]
-        if left and right:
-            min_v = str(left[0].get("value"))
-            max_v = str(right[0].get("value"))
-            deltas = [str(e.get("value")) for e in (left[1:] + right[1:]) if e.get("value")]
-            return min_v, max_v, deltas[:2]
-
-    entries = _number_entries_from_values(vals)
-    if len(entries) >= 4:
-        # Typisch: base_min, delta_min, base_max, delta_max
-        return str(entries[0].get("value")), str(entries[2].get("value")), [str(entries[1].get("value")), str(entries[3].get("value"))]
-    base_nums = [str(e.get("value")) for e in entries if not e.get("is_delta")]
-    deltas = [str(e.get("value")) for e in entries if e.get("is_delta")]
-    if len(base_nums) >= 2:
-        return base_nums[0], base_nums[1], deltas[:2]
-    if len(entries) >= 2:
-        return str(entries[0].get("value")), str(entries[1].get("value")), deltas[:2]
-    if entries:
-        return str(entries[0].get("value")), None, deltas[:2]
-    return None, None, []
-
-
 def find_label_value_block(lines: list[str], labels: list[str], max_lookahead: int = 8) -> dict[str, Any] | None:
     label_lows = [x.lower().rstrip(":") for x in labels]
     for i, line in enumerate(lines):
@@ -1137,15 +1120,30 @@ def extract_questlog_detail_model(text: str, *, name: str, rarity: str | None, s
         if m.group(2):
             detail["item_level_range"] = clean_text(m.group(2))
 
+    # Rüstungs-Hauptwert / Defense
+    defense_block = find_label_value_block(lines, ["Verteidigung", "Defense", "Rüstung", "Ruestung", "Armor"], max_lookahead=8)
+    if defense_block:
+        entries = defense_block.get("entries") or _number_entries_from_values(defense_block.get("raw_values") or [])
+        base_nums = [str(e.get("value")) for e in entries if not e.get("is_delta")]
+        deltas = [str(e.get("value")) for e in entries if e.get("is_delta")]
+        if base_nums:
+            detail["defense"] = {"value": base_nums[0], "delta": deltas[0] if deltas else "", "raw": defense_block.get("raw_values")}
+            detail["primary"].append({"label": "Verteidigung", "value": base_nums[0], "delta": deltas[0] if deltas else "", "raw": defense_block.get("raw_values")})
+
     # Hauptwerte
     dmg = find_label_value_block(lines, ["Max. Schaden", "Max Damage", "Schaden", "Damage"], max_lookahead=10)
     if dmg:
-        dmg_min_v, dmg_max_v, deltas = _damage_pair_from_raw_values(dmg.get("raw_values") or [])
-        if dmg_min_v and dmg_max_v:
-            detail["max_damage"] = {"min": dmg_min_v, "max": dmg_max_v, "deltas": deltas[:2], "raw": dmg.get("raw_values")}
-            detail["primary"].append({"label": "Max. Schaden", "value": f"{dmg_min_v} ~ {dmg_max_v}", "deltas": deltas[:2], "raw": dmg.get("raw_values")})
-        elif dmg_min_v:
-            detail["primary"].append({"label": "Max. Schaden", "value": dmg_min_v, "deltas": deltas[:2], "raw": dmg.get("raw_values")})
+        entries = dmg.get("entries") or _number_entries_from_values(dmg.get("raw_values") or [])
+        # Questlog zeigt oft:
+        # Max. Schaden / 70 / ▲ 22 / ~ / 277 / ▲ 88
+        # Wichtig: ▲-Werte sind Upgrade-Deltas und dürfen nicht als Max-Schaden gelesen werden.
+        base_nums = [str(e.get("value")) for e in entries if not e.get("is_delta")]
+        deltas = [str(e.get("value")) for e in entries if e.get("is_delta")]
+        if len(base_nums) >= 2:
+            detail["max_damage"] = {"min": base_nums[0], "max": base_nums[1], "deltas": deltas[:2], "raw": dmg.get("raw_values")}
+            detail["primary"].append({"label": "Max. Schaden", "value": f"{base_nums[0]} ~ {base_nums[1]}", "deltas": deltas[:2], "raw": dmg.get("raw_values")})
+        elif base_nums:
+            detail["primary"].append({"label": "Max. Schaden", "value": " ~ ".join(base_nums), "deltas": deltas[:2], "raw": dmg.get("raw_values")})
 
     for labels, out_label in [
         (["Reichweite", "Range"], "Reichweite"),
@@ -1356,12 +1354,6 @@ def collect_image_urls(page) -> tuple[str | None, str | None]:
     except Exception:
         item_name = ""
     name_tokens = [t for t in re.split(r"[^a-zA-ZäöüÄÖÜß0-9]+", item_name) if len(t) >= 4][:8]
-    detail_compact = re.sub(r"[^a-z0-9]+", "", detail_id)
-    detail_parts = [x for x in re.split(r"[_\-]+", detail_id) if len(x) >= 3]
-    weapon_id_hints = [
-        x for x in detail_parts
-        if x in {"bow", "crossbow", "dagger", "sword", "sword2h", "staff", "wand", "spear", "orb", "gauntlet"}
-    ]
     candidates: list[dict[str, Any]] = []
 
     def add_candidate(
@@ -1392,18 +1384,30 @@ def collect_image_urls(page) -> tuple[str | None, str | None]:
         broad = f"{alt} {local_context} {broad_context}".lower()
         score = 0
 
-        # Bestes Signal: Asset/URL enthält die konkrete Item-ID.
-        compact_low = re.sub(r"[^a-z0-9]+", "", low)
-        id_hit = bool(detail_id and detail_id in low) or bool(detail_compact and detail_compact in compact_low)
-        if id_hit:
+        # Questlog-Assetmuster:
+        # - echte Itembilder liegen fast immer unter .../Icon/Item_128/Equip/...
+        # - Passiv-/Fähigkeitsbilder liegen oft unter .../Icon/Item_128/Misc/Perk_...
+        #   und enthalten manchmal sogar die Item-ID. Deshalb muss Perk stärker verlieren
+        #   als die ID gewinnen kann.
+        is_equip_asset = "/icon/item_128/equip/" in low or "/equip/" in low
+        is_weapon_asset = "/equip/weapon/" in low
+        is_armor_asset = "/equip/armor/" in low or "/equip/accessory/" in low or "/equip/equipment/" in low
+        is_perk_asset = "/misc/perk" in low or "perk_" in low
+
+        if is_weapon_asset:
+            score += 820
+        elif is_armor_asset:
+            score += 760
+        elif is_equip_asset:
             score += 520
-        # Viele Questlog-Waffenbilder enthalten wenigstens den Waffentyp aus der Item-ID
-        # (bow/crossbow/dagger/...). Passive-Icons tun das meistens nicht.
-        if any(h in low for h in weapon_id_hints):
-            score += 95
-        # Boss-/Archboss-Waffen haben nicht immer die volle ID im Bildpfad, aber oft Boss/Archboss-Teile.
-        id_part_hits = sum(1 for part in detail_parts if len(part) >= 4 and part in low)
-        score += min(id_part_hits * 22, 110)
+
+        if is_perk_asset:
+            score -= 900
+
+        # Bestes Signal nur noch, wenn es kein Perk-/Fähigkeitsasset ist.
+        # Sonst gewinnt z.B. Perk_dagger_... fälschlich gegen IT_P_Dagger_....
+        if detail_id and detail_id in low and not is_perk_asset:
+            score += 220
 
         # Pfad-Hinweise. Skill-/Ability-Assets dürfen nicht gegen Itembilder gewinnen.
         if any(x in low for x in ["/item", "items", "equipment", "weapon", "armor"]):
@@ -1411,22 +1415,12 @@ def collect_image_urls(page) -> tuple[str | None, str | None]:
         if "icon" in low:
             score += 10
         if any(x in low for x in ["skill", "ability", "passive", "buff", "spell", "trait"]):
-            score -= 260
+            score -= 130
         if any(x in low for x in ["webp", "png", "jpg", "jpeg"]):
             score += 8
-        # Rarity-Rahmen, Kartenhintergründe und UI-Flächen sind keine Itembilder.
-        if any(x in low for x in ["background", "bg_", "/bg", "pattern", "frame", "border", "grade", "rarity", "slot"]):
-            score -= 260
-        # Wenn es ein Skill-/Icon-Asset ohne Item-ID/Waffentyp ist, hart abwerten.
-        if any(x in low for x in ["skill", "ability", "passive", "buff", "spell"]) and not id_hit:
-            score -= 420
 
         # Quelle/Grafikgröße.
-        if source == "header":
-            # Gezielt aus dem oberen Questlog-Itemkasten. Das ist fast immer das Waffenbild,
-            # nicht das Passive-/Skill-Icon.
-            score += 320
-        elif source == "css":
+        if source == "css":
             score += 45
         elif source == "img":
             score += 20
@@ -1444,9 +1438,7 @@ def collect_image_urls(page) -> tuple[str | None, str | None]:
                 score -= 80
             # Passiv-Icons sind meist kleine quadratische Bilder im unteren Bereich.
             if abs(w - h) <= 8 and 32 <= w <= 90 and y and y > 430:
-                score -= 120
-            if abs(w - h) <= 12 and 48 <= w <= 150 and detail_id and detail_id not in low and any(x in low for x in ["skill", "icon", "ability", "passive"]):
-                score -= 220
+                score -= 35
 
         # Position: Das Waffenbild sitzt oben in der Itemkarte; Passivicons deutlich darunter.
         if y:
@@ -1488,178 +1480,6 @@ def collect_image_urls(page) -> tuple[str | None, str | None]:
             "source": source,
             "score": score,
         })
-
-    # 1) Harte Priorität: Bild aus dem oberen Questlog-Itemkasten.
-    # Dort sitzt das echte Waffen-/Itembild rechts oben. Passive-/Fähigkeitsicons liegen tiefer
-    # im selben Kasten und werden hier bewusst nicht eingesammelt.
-    try:
-        header_assets = page.locator("*").evaluate_all(
-            """
-            els => {
-                const norm = s => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
-                const title = norm((document.querySelector('h1') && document.querySelector('h1').innerText) || document.title || '');
-                const looksLikeItemBox = e => {
-                    const r = e.getBoundingClientRect();
-                    if (!r || r.width < 240 || r.width > 720 || r.height < 180 || r.height > 900) return false;
-                    if (r.left < 250 || r.left > 900 || r.top < 120 || r.top > 420) return false;
-                    const txt = norm(e.innerText || '');
-                    if (!txt.includes('item level') && !txt.includes('gegenstandsstufe')) return false;
-                    if (!txt.includes('max. schaden') && !txt.includes('max damage') && !txt.includes('reichweite')) return false;
-                    // Wenn ein Titel vorhanden ist, reicht ein grober Treffer auf die ersten Wörter.
-                    if (title) {
-                        const shortTitle = title.split(/[|\-–—]/)[0].slice(0, 22);
-                        if (shortTitle.length >= 8 && !txt.includes(shortTitle)) {
-                            // Manche Namen sind im Kasten abgeschnitten, daher nicht hart ausschließen.
-                        }
-                    }
-                    return true;
-                };
-
-                const boxes = els.filter(looksLikeItemBox)
-                    .sort((a, b) => (a.getBoundingClientRect().width * a.getBoundingClientRect().height) - (b.getBoundingClientRect().width * b.getBoundingClientRect().height))
-                    .slice(0, 3);
-
-                const out = [];
-                const pushUrl = (src, node, kind, alt='') => {
-                    if (!src) return;
-                    const b = node.getBoundingClientRect();
-                    const c = boxes[0] ? boxes[0].getBoundingClientRect() : null;
-                    if (!c) return;
-                    const cy = b.top + (b.height / 2);
-                    const cx = b.left + (b.width / 2);
-                    // Nur oberer Kopfbereich des Itemkastens: Waffenbild sitzt dort, Passive-/Fähigkeitsicon nicht.
-                    if (cy > c.top + 135) return;
-                    // Rechtes Drittel bevorzugen, dort liegt das Questlog-Waffenbild.
-                    if (cx < c.left + c.width * 0.50) return;
-                    if (b.width > 260 || b.height > 260) return;
-                    if ((b.width > 0 && b.width < 18) || (b.height > 0 && b.height < 18)) return;
-                    out.push({
-                        src,
-                        alt,
-                        w: Math.round(b.width || 0),
-                        h: Math.round(b.height || 0),
-                        x: Math.round(b.left || 0),
-                        y: Math.round(b.top || 0),
-                        local: (node.innerText || alt || '').slice(0, 300),
-                        broad: (boxes[0].innerText || '').slice(0, 1200),
-                        kind
-                    });
-                };
-
-                for (const box of boxes) {
-                    const nodes = [box, ...Array.from(box.querySelectorAll('*'))];
-                    for (const n of nodes) {
-                        if (n.tagName && n.tagName.toLowerCase() === 'img') {
-                            pushUrl(n.currentSrc || n.src || n.getAttribute('data-src') || '', n, 'img', n.alt || '');
-                            const ss = n.srcset || n.getAttribute('data-srcset') || '';
-                            for (const part of ss.split(',')) {
-                                const first = part.trim().split(' ')[0];
-                                if (first) pushUrl(first, n, 'srcset', n.alt || '');
-                            }
-                        }
-                        const st = getComputedStyle(n);
-                        const bg = st && st.backgroundImage || '';
-                        if (bg && bg !== 'none') {
-                            const matches = [...bg.matchAll(/url\(["']?([^"')]+)["']?\)/g)];
-                            for (const m of matches) pushUrl(m[1], n, 'css', '');
-                        }
-                        // Questlog rendert das Waffenbild teils über ::before/::after statt als normales img.
-                        for (const pseudo of ['::before', '::after']) {
-                            try {
-                                const pst = getComputedStyle(n, pseudo);
-                                const pbg = pst && pst.backgroundImage || '';
-                                if (pbg && pbg !== 'none') {
-                                    const matches = [...pbg.matchAll(/url\(["']?([^"')]+)["']?\)/g)];
-                                    for (const m of matches) pushUrl(m[1], n, 'css', '');
-                                }
-                            } catch (_) {}
-                        }
-                    }
-                }
-                return out;
-            }
-            """
-        )
-        for img in header_assets or []:
-            add_candidate(
-                img.get("src"),
-                w=int(img.get("w") or 0), h=int(img.get("h") or 0),
-                x=int(img.get("x") or 0), y=int(img.get("y") or 0),
-                source="header", alt=str(img.get("alt") or ""),
-                local_context=str(img.get("local") or ""), broad_context=str(img.get("broad") or ""),
-            )
-    except Exception:
-        pass
-
-    # 1b) Fallback für Questlog-Headerbilder, die als große/layered CSS-Backgrounds
-    # auf dem Itemkasten liegen. Bei Boss-/Archboss-Waffen ist genau das oft der Fall.
-    try:
-        forced_header_assets = page.locator("*").evaluate_all(
-            """
-            els => {
-                const norm = s => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
-                const looksLikeItemBox = e => {
-                    const r = e.getBoundingClientRect();
-                    if (!r || r.width < 240 || r.width > 760 || r.height < 150 || r.height > 950) return false;
-                    if (r.left < 250 || r.left > 950 || r.top < 120 || r.top > 430) return false;
-                    const txt = norm(e.innerText || '');
-                    if (!txt.includes('item level') && !txt.includes('gegenstandsstufe')) return false;
-                    if (!txt.includes('max. schaden') && !txt.includes('max damage') && !txt.includes('reichweite')) return false;
-                    return true;
-                };
-                const boxes = els.filter(looksLikeItemBox)
-                    .sort((a, b) => (a.getBoundingClientRect().width * a.getBoundingClientRect().height) - (b.getBoundingClientRect().width * b.getBoundingClientRect().height))
-                    .slice(0, 2);
-                const out = [];
-                const addBgUrls = (node, box) => {
-                    const b = node.getBoundingClientRect();
-                    const c = box.getBoundingClientRect();
-                    const nodeTop = b.top || c.top;
-                    // Nur Kopfbereich des Itemkastens. Passive Icons sitzen darunter.
-                    if (nodeTop > c.top + 170) return;
-                    let all = '';
-                    try { all += ' ' + (getComputedStyle(node).backgroundImage || ''); } catch (_) {}
-                    for (const pseudo of ['::before', '::after']) {
-                        try { all += ' ' + (getComputedStyle(node, pseudo).backgroundImage || ''); } catch (_) {}
-                    }
-                    const matches = [...all.matchAll(/url\(["']?([^"')]+)["']?\)/g)];
-                    for (const m of matches) {
-                        const src = m[1] || '';
-                        if (!src) continue;
-                        out.push({
-                            src,
-                            alt: '',
-                            // Synthetische Itembild-Position im rechten Kopfbereich.
-                            w: Math.round(Math.min(Math.max(b.width || 96, 64), 180)),
-                            h: Math.round(Math.min(Math.max(b.height || 96, 64), 180)),
-                            x: Math.round(c.left + c.width * 0.70),
-                            y: Math.round(c.top + 35),
-                            local: (node.innerText || '').slice(0, 300),
-                            broad: (box.innerText || '').slice(0, 1200),
-                            kind: 'css_header_forced'
-                        });
-                    }
-                };
-                for (const box of boxes) {
-                    addBgUrls(box, box);
-                    for (const n of Array.from(box.querySelectorAll('*')).slice(0, 250)) {
-                        addBgUrls(n, box);
-                    }
-                }
-                return out;
-            }
-            """
-        )
-        for img in forced_header_assets or []:
-            add_candidate(
-                img.get("src"),
-                w=int(img.get("w") or 0), h=int(img.get("h") or 0),
-                x=int(img.get("x") or 0), y=int(img.get("y") or 0),
-                source="header", alt=str(img.get("alt") or ""),
-                local_context=str(img.get("local") or ""), broad_context=str(img.get("broad") or ""),
-            )
-    except Exception:
-        pass
 
     try:
         imgs = page.locator("img").evaluate_all(
@@ -1713,14 +1533,8 @@ def collect_image_urls(page) -> tuple[str | None, str | None]:
               const box = e.getBoundingClientRect();
               const p1 = e.parentElement;
               const p2 = p1 ? p1.parentElement : null;
-              let bg = st.backgroundImage || '';
-              try {
-                const b1 = getComputedStyle(e, '::before').backgroundImage || '';
-                const b2 = getComputedStyle(e, '::after').backgroundImage || '';
-                bg = [bg, b1, b2].filter(x => x && x !== 'none').join(', ');
-              } catch (_) {}
               return {
-                bg: bg || '',
+                bg: st.backgroundImage || '',
                 w: Math.round(box.width || 0),
                 h: Math.round(box.height || 0),
                 x: Math.round(box.left || 0),
@@ -1915,6 +1729,44 @@ def same_main_category(url: str, main_category: str) -> bool:
     return classify_main_category(url) == main_category
 
 
+def is_locale_detail_url(url: str, locale: str = DEFAULT_LOCALE) -> bool:
+    parts = path_parts(url)
+    try:
+        idx = parts.index(GAME)
+        return len(parts) > idx + 3 and parts[idx + 1] == locale and parts[idx + 2] == "db" and parts[idx + 3] == "item"
+    except ValueError:
+        return False
+
+
+def detail_matches_source_list(detail_url: str, list_url: str, main_category: str) -> bool:
+    """Verhindert Cross-Imports zwischen Unterkategorien.
+
+    Beispiel: /weapons/sword darf keine sword2h-Detailseiten speichern.
+    Questlog verlinkt in React/HTML teils mehr als die sichtbare Liste. Für Waffen
+    sind die Item-IDs aber stabil nach Typ geprefixt: bow_..., sword2h_..., usw.
+    """
+    if not is_locale_detail_url(detail_url, DEFAULT_LOCALE):
+        return False
+    slug = subcategory_slug(list_url)
+    if main_category == "weapon" and slug in WEAPON_SLUG_TO_SUBCATEGORY:
+        item_id = item_detail_id(detail_url).lower()
+        return item_id.startswith(f"{slug.lower()}_")
+    return True
+
+
+def expand_seed_url(raw_url: str) -> list[str]:
+    """Hauptlisten auf feste Unterlisten expandieren.
+
+    Dadurch crawlen wir bei Waffen nicht mehr /weapons als Mischseite, sondern exakt
+    die zehn deutschen Waffenarten. Das verhindert Fremdsprachen-Duplikate und
+    Schwert/Schild vs. Großschwert-Mischungen.
+    """
+    url = force_weapon_grade_filter(raw_url.rstrip("/"))
+    if classify_main_category(url) == "weapon" and is_category_list_url(url):
+        return [force_weapon_grade_filter(u.rstrip("/")) for u in DEFAULT_WEAPON_CATEGORY_URLS]
+    return [url]
+
+
 def collect_next_data_urls(page) -> list[str]:
     """Fallback für Next.js-Datenlinks, falls Items nicht als normale <a> auftauchen.
 
@@ -1984,14 +1836,22 @@ def parse_detail_page(page, url: str, main_category_hint: str, locale: str, sour
     )
     # Detailmodell zusätzlich in flache Felder spiegeln, damit Dashboard/API ohne
     # Sonderlogik brauchbare Werte bekommt.
-    if detail_model.get("max_damage"):
-        # Detailmodell ist verlässlicher als Regex über kompletten body.innerText,
-        # weil Questlog Upgrade-Deltas direkt neben den Basiswerten rendert.
+    if detail_model.get("max_damage") and (damage_min is None or damage_max is None):
         try:
             damage_min = float(str(detail_model["max_damage"].get("min", "")).replace(",", "."))
             damage_max = float(str(detail_model["max_damage"].get("max", "")).replace(",", "."))
         except Exception:
             pass
+    detail_defense = detail_model.get("defense") if isinstance(detail_model, dict) else None
+    if isinstance(detail_defense, dict) and detail_defense.get("value"):
+        # Für Rüstungsitems den Verteidigungswert zusätzlich in die feste Spalte spiegeln.
+        try:
+            defense_value = float(str(detail_defense.get("value", "")).replace(",", "."))
+        except Exception:
+            defense_value = None
+    else:
+        defense_value = None
+
     for row in detail_model.get("primary") or []:
         if isinstance(row, dict) and row.get("label") and row.get("value"):
             stats.setdefault(str(row.get("label")), str(row.get("value")))
@@ -2017,7 +1877,7 @@ def parse_detail_page(page, url: str, main_category_hint: str, locale: str, sour
         "required_level": required_level,
         "damage_min": damage_min,
         "damage_max": damage_max,
-        "defense": extract_defense(raw_text),
+        "defense": defense_value if defense_value is not None else extract_defense(raw_text),
         "stats": stats,
         "abilities": ([{"label": (detail_model.get("passive") or {}).get("name") or "Passiv", "text": (detail_model.get("passive") or {}).get("text") or ""}] if detail_model.get("passive") else extract_abilities(raw_text)),
         "traits": detail_model.get("traits") or extract_traits_from_text(raw_text),
@@ -2032,7 +1892,7 @@ def parse_detail_page(page, url: str, main_category_hint: str, locale: str, sour
             "main_category_hint": main_category_hint,
             "json_candidate_count": len(json_candidates),
             "source_list_url": source_list_url,
-            "parser": "playwright-detail-page-v9-image-damage-fix",
+            "parser": "playwright-detail-page-v11-fixed-weapon-subcategories",
         },
     }
 
@@ -2135,8 +1995,23 @@ def crawl_category(context, conn, seed: CategorySeed, limit_left: int | None = N
         # auch Armor/Material-Navigation mit.
         links = [u for u in links if same_main_category(u, seed.main_category)]
 
-        sub_lists = sorted({force_weapon_grade_filter(u) for u in links if is_subcategory_list_url(u) and force_weapon_grade_filter(u) not in visited_lists})
-        detail_links = sorted({u for u in collect_detail_links(list_page) if u not in seen_detail})
+        # Wenn der Seed bereits eine konkrete Unterkategorie ist, bleiben wir hart
+        # auf dieser einen Waffenart. Sonst würden Links aus Questlog-Nav/JSON wieder
+        # andere Kategorien mit reinziehen.
+        if is_subcategory_list_url(seed.url):
+            sub_lists = []
+        else:
+            sub_lists = sorted({
+                force_weapon_grade_filter(u)
+                for u in links
+                if is_subcategory_list_url(u) and force_weapon_grade_filter(u) not in visited_lists
+            })
+
+        detail_links = sorted({
+            u
+            for u in collect_detail_links(list_page)
+            if u not in seen_detail and detail_matches_source_list(u, current_url, seed.main_category)
+        })
 
         for sub in sub_lists:
             if sub not in list_queue:
@@ -2221,8 +2096,26 @@ def run_import(args: argparse.Namespace) -> int:
         except Exception:
             pass
         page = context.new_page()
-        if args.category_url:
-            seeds = [CategorySeed(force_weapon_grade_filter(args.category_url.rstrip("/")), classify_main_category(args.category_url))]
+        preset = str(getattr(args, "preset", "") or "").strip().lower()
+        if preset in {"weapon", "weapons", "waffen", "waffe"}:
+            seeds = [CategorySeed(force_weapon_grade_filter(u.rstrip("/")), "weapon") for u in DEFAULT_WEAPON_CATEGORY_URLS]
+        elif preset in {"armor", "armors", "rüstung", "ruestung", "rüstungen", "ruestungen", "gear", "equipment"}:
+            # Rüstung in Questlog besteht aus Armor + Accessories. Beides landet bei uns
+            # unter main_category='armor', aber mit Subkategorien Helm/Brust/Ring/Kette usw.
+            seeds = [CategorySeed(force_weapon_grade_filter(u.rstrip("/")), "armor") for u in DEFAULT_ARMOR_CATEGORY_URLS]
+        elif args.category_url:
+            raw_urls = [x.strip() for x in re.split(r"[,;\n]+", str(args.category_url or "")) if x.strip()]
+            expanded_urls: list[str] = []
+            for raw in raw_urls:
+                expanded_urls.extend(expand_seed_url(raw))
+            # Reihenfolge erhalten, Duplikate entfernen.
+            seen_seed_urls: set[str] = set()
+            clean_urls: list[str] = []
+            for u in expanded_urls:
+                if u not in seen_seed_urls:
+                    seen_seed_urls.add(u)
+                    clean_urls.append(u)
+            seeds = [CategorySeed(force_weapon_grade_filter(u.rstrip("/")), classify_main_category(u)) for u in clean_urls]
         else:
             seeds = discover_category_seeds(page, DEFAULT_LOCALE, include_fallback=True)
         page.close()
@@ -2269,7 +2162,8 @@ def run_import(args: argparse.Namespace) -> int:
 
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Questlog.gg Item-Importer für Ebo Dashboard/Postgres")
-    p.add_argument("--category-url", default="", help="Nur eine konkrete Questlog-Kategorie crawlen, z. B. /db/items/weapons")
+    p.add_argument("--category-url", default="", help="Eine oder mehrere Questlog-Kategorien crawlen, getrennt mit Komma/Semikolon, z. B. /db/items/armor,/db/items/accessories")
+    p.add_argument("--preset", default="", help="Vordefinierter Import: weapon oder armor. armor = Rüstung + Schmuck ab Rare")
     p.add_argument("--only", default="", help="Nur Hauptkategorien, z. B. weapon,armor,material,currency,misc")
     p.add_argument("--discover-only", action="store_true", help="Nur Kategorie-Links anzeigen, nichts importieren")
     p.add_argument("--dry-run", action="store_true", help="Nichts in Postgres schreiben")
