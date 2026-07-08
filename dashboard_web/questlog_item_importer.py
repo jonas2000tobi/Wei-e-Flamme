@@ -1328,7 +1328,11 @@ def collect_image_urls(page) -> tuple[str | None, str | None]:
             score += 8
 
         # Quelle/Grafikgröße.
-        if source == "css":
+        if source == "header":
+            # Gezielt aus dem oberen Questlog-Itemkasten. Das ist fast immer das Waffenbild,
+            # nicht das Passive-/Skill-Icon.
+            score += 320
+        elif source == "css":
             score += 45
         elif source == "img":
             score += 20
@@ -1388,6 +1392,96 @@ def collect_image_urls(page) -> tuple[str | None, str | None]:
             "source": source,
             "score": score,
         })
+
+    # 1) Harte Priorität: Bild aus dem oberen Questlog-Itemkasten.
+    # Dort sitzt das echte Waffen-/Itembild rechts oben. Passive-/Fähigkeitsicons liegen tiefer
+    # im selben Kasten und werden hier bewusst nicht eingesammelt.
+    try:
+        header_assets = page.locator("*").evaluate_all(
+            """
+            els => {
+                const norm = s => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+                const title = norm((document.querySelector('h1') && document.querySelector('h1').innerText) || document.title || '');
+                const looksLikeItemBox = e => {
+                    const r = e.getBoundingClientRect();
+                    if (!r || r.width < 240 || r.width > 720 || r.height < 180 || r.height > 900) return false;
+                    if (r.left < 250 || r.left > 900 || r.top < 120 || r.top > 420) return false;
+                    const txt = norm(e.innerText || '');
+                    if (!txt.includes('item level') && !txt.includes('gegenstandsstufe')) return false;
+                    if (!txt.includes('max. schaden') && !txt.includes('max damage') && !txt.includes('reichweite')) return false;
+                    // Wenn ein Titel vorhanden ist, reicht ein grober Treffer auf die ersten Wörter.
+                    if (title) {
+                        const shortTitle = title.split(/[|\-–—]/)[0].slice(0, 22);
+                        if (shortTitle.length >= 8 && !txt.includes(shortTitle)) {
+                            // Manche Namen sind im Kasten abgeschnitten, daher nicht hart ausschließen.
+                        }
+                    }
+                    return true;
+                };
+
+                const boxes = els.filter(looksLikeItemBox)
+                    .sort((a, b) => (a.getBoundingClientRect().width * a.getBoundingClientRect().height) - (b.getBoundingClientRect().width * b.getBoundingClientRect().height))
+                    .slice(0, 3);
+
+                const out = [];
+                const pushUrl = (src, node, kind, alt='') => {
+                    if (!src) return;
+                    const b = node.getBoundingClientRect();
+                    const c = boxes[0] ? boxes[0].getBoundingClientRect() : null;
+                    if (!c) return;
+                    const cy = b.top + (b.height / 2);
+                    const cx = b.left + (b.width / 2);
+                    // Nur oberer Kopfbereich des Itemkastens: Waffenbild sitzt dort, Passive-Icon nicht.
+                    if (cy > c.top + 155) return;
+                    // Rechtes Drittel bevorzugen, dort liegt das Questlog-Waffenbild.
+                    if (cx < c.left + c.width * 0.45) return;
+                    if (b.width < 30 || b.height < 30 || b.width > 240 || b.height > 240) return;
+                    out.push({
+                        src,
+                        alt,
+                        w: Math.round(b.width || 0),
+                        h: Math.round(b.height || 0),
+                        x: Math.round(b.left || 0),
+                        y: Math.round(b.top || 0),
+                        local: (node.innerText || alt || '').slice(0, 300),
+                        broad: (boxes[0].innerText || '').slice(0, 1200),
+                        kind
+                    });
+                };
+
+                for (const box of boxes) {
+                    const nodes = [box, ...Array.from(box.querySelectorAll('*'))];
+                    for (const n of nodes) {
+                        if (n.tagName && n.tagName.toLowerCase() === 'img') {
+                            pushUrl(n.currentSrc || n.src || n.getAttribute('data-src') || '', n, 'img', n.alt || '');
+                            const ss = n.srcset || n.getAttribute('data-srcset') || '';
+                            for (const part of ss.split(',')) {
+                                const first = part.trim().split(' ')[0];
+                                if (first) pushUrl(first, n, 'srcset', n.alt || '');
+                            }
+                        }
+                        const st = getComputedStyle(n);
+                        const bg = st && st.backgroundImage || '';
+                        if (bg && bg !== 'none') {
+                            const matches = [...bg.matchAll(/url\(["']?([^"')]+)["']?\)/g)];
+                            for (const m of matches) pushUrl(m[1], n, 'css', '');
+                        }
+                    }
+                }
+                return out;
+            }
+            """
+        )
+        for img in header_assets or []:
+            add_candidate(
+                img.get("src"),
+                w=int(img.get("w") or 0), h=int(img.get("h") or 0),
+                x=int(img.get("x") or 0), y=int(img.get("y") or 0),
+                source="header", alt=str(img.get("alt") or ""),
+                local_context=str(img.get("local") or ""), broad_context=str(img.get("broad") or ""),
+            )
+    except Exception:
+        pass
 
     try:
         imgs = page.locator("img").evaluate_all(
