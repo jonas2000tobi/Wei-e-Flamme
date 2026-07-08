@@ -1247,6 +1247,98 @@ def _parse_armor_traits_from_text_sequence(tokens: list[str], expected: int) -> 
     return out[:expected]
 
 
+
+
+def _parse_armor_traits_by_label_windows(raw_text: str, expected: int) -> list[dict[str, Any]]:
+    """Letzter robuster Fallback für Questlog-Rüstungs-Eigenschaften.
+
+    Arbeitet wie der Waffenparser: erst den echten Abschnitt ab "Eigenschaften" isolieren,
+    dann bekannte Trait-Labels nach ihrer tatsächlichen Reihenfolge im Abschnitt finden.
+    Pro Label werden die Zahlen bis zum nächsten bekannten Label gelesen. Dadurch ist es egal,
+    ob Questlog die Zeile als "Label: 1 | 2 | 3 | 4" oder als mehrere DOM-Textnodes rendert.
+    """
+    if expected <= 0:
+        return []
+    raw = normalize_raw_text(raw_text)
+    low = raw.lower()
+    start = low.find("eigenschaften")
+    if start < 0:
+        start = low.find("traits")
+    if start < 0:
+        return []
+
+    segment = raw[start:]
+    seg_low = segment.lower()
+    stop_markers = [
+        "dieser gegenstand hat", "this item has", "ausrüstungseffekte", "ausruestungseffekte",
+        "ausrüstungseffekt", "ausruestungseffekt", "ausrüstungsset", "ausruestungsset",
+        "verkaufspreis", "sales price", "kommentare", "comments", "von npcs erbeutet",
+        "dropped from", "in lithographen", "lithograph", "auktion", "auction house",
+        "preisverlauf", "bestandsverlauf", "remove ads",
+    ]
+    cut = len(segment)
+    for marker in stop_markers:
+        idx = seg_low.find(marker)
+        if idx > 0:
+            cut = min(cut, idx)
+    segment = segment[:cut]
+
+    # Varianten/Schreibweisen. Kanonische Namen bleiben deutsch fürs Dashboard.
+    labels = [
+        "Max. Gesundheit", "Max. Leben", "Max. Mana",
+        "Gesundheitsregeneration", "Manaregeneration", "Mana-Regeneration",
+        "Mana-Kosteneffizienz", "Manakosteneffizienz", "Manakosten-Effizienz",
+        "Trefferchance", "Krit. Trefferchance", "Kritische Trefferchance",
+        "Chance auf starken Angriff", "Chance auf Fesseln", "Schwächungschance", "Schwaechungschance",
+        "Nahkampfausweichen", "Fernkampfausweichen", "Magieausweichen",
+        "Nahkampfausdauer", "Fernkampfausdauer", "Magieausdauer",
+        "Buff-Dauer", "Debuff-Dauer", "Angriffstempo",
+        "Untote-Zusatzschaden", "Humanoide-Zusatzschaden", "Konstrukt-Zusatzschaden",
+        "Wildkin-Bonusschaden", "Wildkin Bonus Damage",
+    ]
+    # längere Labels zuerst verhindert, dass "Trefferchance" in "Krit. Trefferchance" matcht.
+    labels_sorted = sorted(set(labels), key=len, reverse=True)
+
+    matches: list[tuple[int, int, str]] = []
+    for label in labels_sorted:
+        pattern = re.compile(r"(?<![A-Za-zÄÖÜäöüß])" + re.escape(label) + r"\s*:?")
+        for m in pattern.finditer(segment):
+            canon = _canon_armor_trait_label(label)
+            matches.append((m.start(), m.end(), canon))
+
+    if not matches:
+        return []
+
+    # Doppelte/überlappende Matches entfernen. Wenn zwei an gleicher Position starten,
+    # gewinnt das längere Label, weil labels_sorted nach Länge sortiert ist.
+    matches.sort(key=lambda x: (x[0], -(x[1] - x[0])))
+    cleaned: list[tuple[int, int, str]] = []
+    occupied_until = -1
+    for m in matches:
+        if m[0] < occupied_until:
+            continue
+        cleaned.append(m)
+        occupied_until = m[1]
+    matches = cleaned
+
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for idx, (start_pos, end_pos, label) in enumerate(matches):
+        key = label.lower().strip(" :")
+        if key in seen:
+            continue
+        next_pos = matches[idx + 1][0] if idx + 1 < len(matches) else len(segment)
+        value_text = segment[end_pos:next_pos]
+        nums = [clean_text(x) for x in re.findall(r"[+\-]?\d+(?:[.,]\d+)?\s*%?", value_text)]
+        # Jede Eigenschaft hat 4 Stufen. Falls Questlog Prozentwerte mit Komma rendert, bleibt das als Text erhalten.
+        if len(nums) >= 4:
+            out.append({"name": label, "values": nums[:4]})
+            seen.add(key)
+        if len(out) >= expected:
+            break
+    return out[:expected]
+
+
 def extract_armor_traits_from_dom_textnodes(page, *, sub_category: str | None, item_level: Any, item_name: str) -> list[dict[str, Any]]:
     """Extrahiert Armor-Eigenschaften direkt aus sichtbaren Textnodes des linken Itemkastens.
 
@@ -1993,12 +2085,28 @@ def extract_questlog_detail_model(text: str, *, name: str, rarity: str | None, s
         return out[:trait_limit]
 
     armor_traits_by_section = _parse_armor_traits_from_section_text()
-    armor_traits = armor_traits_by_section or _reparse_armor_traits_by_expected_count()
-    if armor_traits:
-        # Die Armor-Regel gewinnt gegen die generische Trait-Erkennung.
-        detail["traits"] = armor_traits[:trait_limit]
+    armor_traits_by_window = _parse_armor_traits_by_label_windows(raw, trait_limit)
+    armor_traits_by_old = _reparse_armor_traits_by_expected_count()
+
+    # Reihenfolge: exakter Abschnittsparser mit Label-Fenstern gewinnt.
+    # Nur auf schwächere Parser zurückfallen, wenn sie mindestens die erwartete Menge liefern.
+    if len(armor_traits_by_window) >= trait_limit:
+        detail["traits"] = armor_traits_by_window[:trait_limit]
+        detail["trait_count_source"] = "armor_label_window_section"
+    elif len(armor_traits_by_section) >= trait_limit:
+        detail["traits"] = armor_traits_by_section[:trait_limit]
+        detail["trait_count_source"] = "armor_section_text"
+    elif len(armor_traits_by_old) >= trait_limit:
+        detail["traits"] = armor_traits_by_old[:trait_limit]
+        detail["trait_count_source"] = "armor_old_reparse"
     else:
-        detail["traits"] = tr[:trait_limit]
+        # Wenn nicht genug gefunden wurde, trotzdem die beste Fundmenge nehmen,
+        # aber nicht durch einen schlechteren Parser überschreiben.
+        candidates = [armor_traits_by_window, armor_traits_by_section, armor_traits_by_old, tr]
+        best = max(candidates, key=lambda arr: len(arr or []))
+        detail["traits"] = (best or [])[:trait_limit]
+        detail["trait_count_source"] = "armor_best_effort"
+
     detail["trait_count_rule"] = trait_limit
     detail["trait_count_observed"] = len(detail.get("traits") or [])
     return detail
@@ -2699,9 +2807,10 @@ def parse_detail_page(page, url: str, main_category_hint: str, locale: str, sour
         item_level=detail_model.get("item_level") or item_level,
         item_name=name,
     )
-    if armor_dom_traits:
-        detail_model["traits"] = armor_dom_traits
-        detail_model["trait_count_observed"] = len(armor_dom_traits)
+    expected_traits = detail_model.get("trait_count_rule") or _armor_expected_trait_count_from_level(detail_model.get("item_level") or item_level)
+    if armor_dom_traits and len(armor_dom_traits) >= int(expected_traits or 0):
+        detail_model["traits"] = armor_dom_traits[:int(expected_traits)]
+        detail_model["trait_count_observed"] = len(detail_model["traits"])
         detail_model["trait_count_source"] = "dom_textnodes_left_item_card"
     # Detailmodell zusätzlich in flache Felder spiegeln, damit Dashboard/API ohne
     # Sonderlogik brauchbare Werte bekommt.
