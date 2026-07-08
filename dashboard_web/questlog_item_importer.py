@@ -17,7 +17,7 @@ from item_catalog_db import connect, ensure_item_catalog_schema, upsert_item
 
 BASE = "https://questlog.gg"
 GAME = "throne-and-liberty"
-DEFAULT_LOCALE = os.getenv("QUESTLOG_LOCALE", "de").strip() or "de"
+DEFAULT_LOCALE = "de"  # hart festgelegt: Questlog-Import fuer Ebolus immer Deutsch
 WEAPON_CATEGORY_SLUGS = [
     "sword",
     "sword2h",
@@ -33,12 +33,24 @@ WEAPON_CATEGORY_SLUGS = [
 
 DEFAULT_START_URL = f"{BASE}/{GAME}/{DEFAULT_LOCALE}/db/items/weapons/sword?grade=41"
 DEFAULT_WEAPON_CATEGORY_URLS = [
-    f"{BASE}/{GAME}/{DEFAULT_LOCALE}/db/items/weapons/{slug}?grade=41"
-    for slug in WEAPON_CATEGORY_SLUGS
+    "https://questlog.gg/throne-and-liberty/de/db/items/weapons/sword?grade=41",
+    "https://questlog.gg/throne-and-liberty/de/db/items/weapons/sword2h?grade=41",
+    "https://questlog.gg/throne-and-liberty/de/db/items/weapons/dagger?grade=41",
+    "https://questlog.gg/throne-and-liberty/de/db/items/weapons/bow?grade=41",
+    "https://questlog.gg/throne-and-liberty/de/db/items/weapons/crossbow?grade=41",
+    "https://questlog.gg/throne-and-liberty/de/db/items/weapons/wand?grade=41",
+    "https://questlog.gg/throne-and-liberty/de/db/items/weapons/staff?grade=41",
+    "https://questlog.gg/throne-and-liberty/de/db/items/weapons/spear?grade=41",
+    "https://questlog.gg/throne-and-liberty/de/db/items/weapons/orb?grade=41",
+    "https://questlog.gg/throne-and-liberty/de/db/items/weapons/gauntlet?grade=41",
 ]
 DEFAULT_ARMOR_CATEGORY_URLS = [
-    f"{BASE}/{GAME}/{DEFAULT_LOCALE}/db/items/armor?grade=41",
-    f"{BASE}/{GAME}/{DEFAULT_LOCALE}/db/items/accessories?grade=41",
+    "https://questlog.gg/throne-and-liberty/de/db/items/armor/head?grade=41",
+    "https://questlog.gg/throne-and-liberty/de/db/items/armor/chest?grade=41",
+    "https://questlog.gg/throne-and-liberty/de/db/items/armor/cloak?grade=41",
+    "https://questlog.gg/throne-and-liberty/de/db/items/armor/hands?grade=41",
+    "https://questlog.gg/throne-and-liberty/de/db/items/armor/feet?grade=41",
+    "https://questlog.gg/throne-and-liberty/de/db/items/armor/legs?grade=41",
 ]
 
 # Diese bekannten Listen werden nur als Fallback genutzt. Der Importer versucht zuerst,
@@ -205,6 +217,37 @@ def to_abs_url(value: Any) -> str:
     return src
 
 
+
+
+def force_de_locale_url(url: str) -> str:
+    """Questlog-URL hart auf /de/ normalisieren.
+
+    Wichtig: Questlog/Next.js kann in eingebetteten Links andere Locales wie /ja/
+    liefern. Fuer den Ebolus-Katalog wollen wir ausschließlich deutsche Daten.
+    """
+    raw = str(url or "").strip()
+    if not raw:
+        return raw
+    try:
+        parsed = urlparse(raw)
+        parts = [p for p in parsed.path.split("/") if p]
+        if len(parts) >= 2 and parts[0] == GAME:
+            parts[1] = "de"
+            new_path = "/" + "/".join(parts)
+            return urlunparse((parsed.scheme or "https", parsed.netloc or "questlog.gg", new_path, parsed.params, parsed.query, parsed.fragment))
+    except Exception:
+        pass
+    return raw
+
+
+def is_de_questlog_url(url: str) -> bool:
+    parts = path_parts(url)
+    try:
+        idx = parts.index(GAME)
+        return len(parts) > idx + 1 and parts[idx + 1] == "de"
+    except ValueError:
+        return False
+
 def url_with_query_param(url: str, key: str, value: str) -> str:
     try:
         parsed = urlparse(url)
@@ -217,6 +260,7 @@ def url_with_query_param(url: str, key: str, value: str) -> str:
 
 
 def force_weapon_grade_filter(url: str) -> str:
+    url = force_de_locale_url(url)
     """Für Item-Listen ab Rare filtern.
 
     Detailseiten brauchen keinen grade-Query. Listen und Unterlisten dagegen schon,
@@ -1590,8 +1634,8 @@ def collect_links(page) -> list[str]:
     out: list[str] = []
     seen: set[str] = set()
     for href in links or []:
-        href = str(href).split("#", 1)[0].rstrip("/")
-        if not is_items_url(href):
+        href = force_de_locale_url(str(href).split("#", 1)[0].rstrip("/"))
+        if not is_items_url(href) or not is_de_questlog_url(href):
             continue
         if href in seen:
             continue
@@ -1609,8 +1653,8 @@ def collect_detail_links(page) -> list[str]:
     seen: set[str] = set()
 
     def add(raw: Any) -> None:
-        href = to_abs_url(str(raw or "")).split("#", 1)[0].split("?", 1)[0].rstrip("/")
-        if not href or not is_item_detail_url(href):
+        href = force_de_locale_url(to_abs_url(str(raw or "")).split("#", 1)[0].split("?", 1)[0].rstrip("/"))
+        if not href or not is_item_detail_url(href) or not is_de_questlog_url(href):
             return
         low = href.lower()
         if any(hint in low for hint in NON_ITEM_URL_HINTS):
@@ -1632,7 +1676,7 @@ def collect_detail_links(page) -> list[str]:
         html_text = page.content()
     except Exception:
         html_text = ""
-    for m in re.finditer(r"/(?:throne-and-liberty)/(?:en|de)/db/item/[A-Za-z0-9_.%\-]+", html_text):
+    for m in re.finditer(r"/(?:throne-and-liberty)/(?:[a-z]{2})/db/item/[A-Za-z0-9_.%\-]+", html_text):
         add(BASE + m.group(0))
 
     return urls
@@ -1755,15 +1799,16 @@ def detail_matches_source_list(detail_url: str, list_url: str, main_category: st
 
 
 def expand_seed_url(raw_url: str) -> list[str]:
-    """Hauptlisten auf feste Unterlisten expandieren.
+    """Hauptlisten auf feste deutsche Unterlisten expandieren.
 
-    Dadurch crawlen wir bei Waffen nicht mehr /weapons als Mischseite, sondern exakt
-    die zehn deutschen Waffenarten. Das verhindert Fremdsprachen-Duplikate und
-    Schwert/Schild vs. Großschwert-Mischungen.
+    Fuer Waffen gelten ausschließlich die 10 deutschen Links aus DEFAULT_WEAPON_CATEGORY_URLS.
+    Fremdsprachen-URLs wie /ja/ werden niemals gecrawlt.
     """
-    url = force_weapon_grade_filter(raw_url.rstrip("/"))
+    url = force_weapon_grade_filter(force_de_locale_url(raw_url.rstrip("/")))
     if classify_main_category(url) == "weapon" and is_category_list_url(url):
         return [force_weapon_grade_filter(u.rstrip("/")) for u in DEFAULT_WEAPON_CATEGORY_URLS]
+    if classify_main_category(url) == "armor" and is_category_list_url(url):
+        return [force_weapon_grade_filter(u.rstrip("/")) for u in DEFAULT_ARMOR_CATEGORY_URLS]
     return [url]
 
 
@@ -1779,8 +1824,8 @@ def collect_next_data_urls(page) -> list[str]:
         html_text = ""
     urls: list[str] = []
     seen: set[str] = set()
-    for m in re.finditer(r"/(?:throne-and-liberty)/(?:en|de)/db/items/[A-Za-z0-9_./%\-]+", html_text):
-        href = BASE + m.group(0)
+    for m in re.finditer(r"/(?:throne-and-liberty)/(?:[a-z]{2})/db/items/[A-Za-z0-9_./%\-]+", html_text):
+        href = force_de_locale_url(BASE + m.group(0))
         href = href.split("?", 1)[0].split("#", 1)[0].rstrip("/")
         if href not in seen and is_items_url(href):
             seen.add(href)
@@ -1789,6 +1834,9 @@ def collect_next_data_urls(page) -> list[str]:
 
 
 def parse_detail_page(page, url: str, main_category_hint: str, locale: str, source_list_url: str = "") -> dict[str, Any] | None:
+    url = force_de_locale_url(url)
+    if not is_de_questlog_url(url):
+        return skip_item(url, "nicht-deutsche Questlog-URL blockiert")
     if not goto_page(page, url):
         return skip_item(url, "Seite nicht erreichbar/Timeout")
     try:
@@ -1892,7 +1940,7 @@ def parse_detail_page(page, url: str, main_category_hint: str, locale: str, sour
             "main_category_hint": main_category_hint,
             "json_candidate_count": len(json_candidates),
             "source_list_url": source_list_url,
-            "parser": "playwright-detail-page-v11-fixed-weapon-subcategories",
+            "parser": "playwright-detail-page-v12-fixed-de-weapon-armor-links",
         },
     }
 
@@ -2082,7 +2130,7 @@ def run_import(args: argparse.Namespace) -> int:
             locale="en-US" if DEFAULT_LOCALE.startswith("en") else "de-DE",
             timezone_id="Europe/Berlin",
             extra_http_headers={
-                "Accept-Language": "de-DE,de;q=0.9,en;q=0.7" if DEFAULT_LOCALE.startswith("de") else "en-US,en;q=0.9,de;q=0.8",
+                "Accept-Language": "de-DE,de;q=0.9,en;q=0.7",
             },
         )
         try:
@@ -2100,8 +2148,8 @@ def run_import(args: argparse.Namespace) -> int:
         if preset in {"weapon", "weapons", "waffen", "waffe"}:
             seeds = [CategorySeed(force_weapon_grade_filter(u.rstrip("/")), "weapon") for u in DEFAULT_WEAPON_CATEGORY_URLS]
         elif preset in {"armor", "armors", "rüstung", "ruestung", "rüstungen", "ruestungen", "gear", "equipment"}:
-            # Rüstung in Questlog besteht aus Armor + Accessories. Beides landet bei uns
-            # unter main_category='armor', aber mit Subkategorien Helm/Brust/Ring/Kette usw.
+            # Rüstung nutzt ausschließlich die festen deutschen Rare+-Unterseiten.
+            # Keine Sammelseiten crawlen, damit keine fremden Sprachen/Unterkategorien reinlaufen.
             seeds = [CategorySeed(force_weapon_grade_filter(u.rstrip("/")), "armor") for u in DEFAULT_ARMOR_CATEGORY_URLS]
         elif args.category_url:
             raw_urls = [x.strip() for x in re.split(r"[,;\n]+", str(args.category_url or "")) if x.strip()]
