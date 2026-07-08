@@ -25,11 +25,19 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
 try:
-    from item_catalog_db import catalog_stats, ensure_item_catalog_schema, query_items
+    from item_catalog_db import (
+        catalog_stats,
+        ensure_item_catalog_schema,
+        item_source_url_by_id,
+        query_items,
+        set_item_image_override,
+    )
 except Exception:  # Dashboard soll auch ohne Item-Modul starten
     catalog_stats = None  # type: ignore
     ensure_item_catalog_schema = None  # type: ignore
+    item_source_url_by_id = None  # type: ignore
     query_items = None  # type: ignore
+    set_item_image_override = None  # type: ignore
 
 app = FastAPI(title="Ebo Dashboard", version="1.0.0")
 security = HTTPBasic(auto_error=False)
@@ -8007,7 +8015,7 @@ def _item_ability_preview(item: dict[str, Any], max_len: int = 220) -> str:
 
 
 def _item_image_cell(item: dict[str, Any]) -> dict[str, str]:
-    src = str(item.get("image_url") or item.get("icon_url") or "").strip()
+    src = str(item.get("manual_image_url") or item.get("image_url") or item.get("icon_url") or "").strip()
     if not src:
         return _raw("—")
     return _raw(f'<img src="{_e(src)}" alt="" loading="lazy" style="width:56px;height:56px;object-fit:contain;border-radius:12px;background:rgba(0,0,0,.32);border:1px solid rgba(212,164,74,.35);padding:4px">')
@@ -8144,9 +8152,47 @@ def _passive_html(item: dict[str, Any], detail: dict[str, Any]) -> str:
     return '<p class="muted">Keine Fähigkeit/Effekt erkannt.</p>'
 
 
-def _item_card_html(item: dict[str, Any]) -> str:
+
+def _item_admin_image_form(item: dict[str, Any], request: Optional[Request]) -> str:
+    if not request:
+        return ""
+    try:
+        is_admin = _is_dashboard_admin(request)
+    except Exception:
+        is_admin = False
+    # Im reinen Basic-Auth-Fallback darf der eingeloggte Dashboard-Nutzer ebenfalls korrigieren.
+    try:
+        if not is_admin and _auth_mode() in {"basic", "hybrid"} and not _discord_oauth_enabled():
+            is_admin = True
+    except Exception:
+        pass
+    if not is_admin:
+        return ""
+    item_id = item.get("id")
+    if not item_id:
+        return ""
+    current = str(item.get("manual_image_url") or item.get("image_url") or item.get("icon_url") or "").strip()
+    next_url = str(request.url)
+    manual_badge = '<span class="manual-badge">manuell</span>' if item.get("manual_image_url") else ""
+    return f"""
+      <details class="admin-img-box">
+        <summary>Bild ändern {manual_badge}</summary>
+        <form method="post" action="/api/items/{_e(item_id)}/image" class="admin-img-form">
+          <input type="hidden" name="next" value="{_e(next_url)}">
+          <input name="image_url" value="{_e(current)}" placeholder="Bild-URL einfügen">
+          <button class="btn small" type="submit">Speichern</button>
+        </form>
+        <form method="post" action="/api/items/{_e(item_id)}/image" class="admin-img-form">
+          <input type="hidden" name="next" value="{_e(next_url)}">
+          <input type="hidden" name="image_url" value="">
+          <button class="btn small danger" type="submit">Manuelles Bild löschen</button>
+        </form>
+      </details>
+    """
+
+def _item_card_html(item: dict[str, Any], request: Optional[Request] = None) -> str:
     detail = _item_detail_model(item)
-    src = str((detail.get("image_url") if isinstance(detail, dict) else "") or item.get("image_url") or item.get("icon_url") or "").strip()
+    src = str(item.get("manual_image_url") or item.get("image_url") or (detail.get("image_url") if isinstance(detail, dict) else "") or item.get("icon_url") or "").strip()
     image = f'<img src="{_e(src)}" alt="" loading="lazy">' if src else '<div class="item-no-img">?</div>'
     rarity = str((detail.get("rarity") if isinstance(detail, dict) else "") or item.get("rarity") or "—")
     sub = str((detail.get("type") if isinstance(detail, dict) else "") or item.get("sub_category") or "—")
@@ -8158,7 +8204,10 @@ def _item_card_html(item: dict[str, Any]) -> str:
     traits_html = _trait_table_html(item, detail)
     return f"""
       <article class="item-card ql-card">
-        <div class="item-art ql-art">{image}</div>
+        <div>
+          <div class="item-art ql-art">{image}</div>
+          {_item_admin_image_form(item, request)}
+        </div>
         <div class="item-main">
           <div class="item-head">
             <div>
@@ -8231,7 +8280,7 @@ def _render_item_catalog(request: Optional[Request] = None) -> str:
             item.get("classification_confidence") or "—",
             _item_source_link(item),
         ])
-    item_cards = "".join(_item_card_html(item) for item in items) or '<p class="muted">Keine Items für diese Filterung gefunden.</p>'
+    item_cards = "".join(_item_card_html(item, request) for item in items) or '<p class="muted">Keine Items für diese Filterung gefunden.</p>'
     item_card_css = """
     <style>
       .item-card-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(520px,1fr));gap:16px;margin-top:12px}
@@ -8264,6 +8313,14 @@ def _render_item_catalog(request: Optional[Request] = None) -> str:
       .ql-stat span{display:block;color:#b7a88c;font-size:12px;margin-bottom:4px}.ql-stat strong{display:block;color:#fff;font-size:17px;line-height:1.15}.ql-stat em{display:inline-block;color:#75d47a;font-style:normal;font-size:12px;margin-top:3px}
       .passive-box{border:1px solid rgba(120,88,180,.26);background:rgba(120,88,180,.10);border-radius:14px;padding:12px}.passive-box h4{margin:0 0 6px;color:#e6ccff}.passive-box p{margin:0;line-height:1.5}
       .trait-table{display:grid;gap:7px}.trait-row{display:grid;grid-template-columns:minmax(160px,240px) 1fr;gap:10px;align-items:center;border:1px solid rgba(255,255,255,.07);background:rgba(0,0,0,.2);border-radius:12px;padding:8px 10px}.trait-row>span{color:#d9c08a;font-weight:700}.trait-values{display:flex;flex-wrap:wrap;gap:7px;align-items:center}.trait-values b{color:#fff}.trait-values i{opacity:.35;font-style:normal}
+
+      .admin-img-box{margin-top:8px;border:1px solid rgba(212,164,74,.22);border-radius:12px;background:rgba(0,0,0,.22);padding:8px;font-size:12px}
+      .admin-img-box summary{cursor:pointer;color:#f1cf82;font-weight:800}
+      .admin-img-form{display:grid;grid-template-columns:1fr auto;gap:6px;margin-top:8px}
+      .admin-img-form input{min-width:0;padding:8px;border-radius:9px;border:1px solid rgba(255,255,255,.14);background:rgba(0,0,0,.32);color:inherit}
+      .btn.small{padding:7px 10px;font-size:12px}
+      .btn.danger{border-color:rgba(255,110,110,.32);color:#ffb0b0;background:rgba(160,30,30,.14)}
+      .manual-badge{display:inline-block;margin-left:6px;color:#75d47a;font-size:11px}
       @media(max-width:760px){.item-card-grid{grid-template-columns:1fr}.item-card{grid-template-columns:84px minmax(0,1fr);padding:12px}.item-art{width:84px;height:84px}.item-meta{grid-template-columns:repeat(2,minmax(0,1fr))}.item-head{display:block}.item-badges{justify-content:flex-start;margin-top:8px}.ql-card{grid-template-columns:1fr}.ql-art{width:120px;height:120px}.trait-row{grid-template-columns:1fr}}
     </style>
     """
@@ -8307,6 +8364,26 @@ def items_page(request: Request):
         return HTMLResponse(_render_item_catalog(request))
     except Exception as exc:
         return HTMLResponse(_html_shell("Item-Datenbank Fehler", f"<section class='panel'><h1>❌ Item-Datenbank Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"), status_code=500)
+
+
+@app.post("/api/items/{item_id}/image")
+async def api_item_image_override(item_id: int, request: Request, _: bool = Depends(_admin_auth)):
+    if not set_item_image_override or not item_source_url_by_id:
+        raise HTTPException(status_code=500, detail="Item-Katalog-Modul nicht vollständig geladen")
+    raw_body = (await request.body()).decode("utf-8", errors="ignore")
+    form = urllib.parse.parse_qs(raw_body, keep_blank_values=True)
+    image_url = str((form.get("image_url") or [""])[0] or "").strip()
+    next_url = str((form.get("next") or ["/items"])[0] or "/items").strip()
+    if next_url and not next_url.startswith("/") and _base_url(request) not in next_url:
+        next_url = "/items"
+    source_url = item_source_url_by_id(int(item_id))  # type: ignore[misc]
+    if not source_url:
+        raise HTTPException(status_code=404, detail="Item nicht gefunden")
+    actor = _current_user(request) or {}
+    actor_id = str(actor.get("user_id") or actor.get("id") or "")
+    actor_name = str(actor.get("username") or actor.get("name") or actor_id or "Dashboard Admin")
+    set_item_image_override(source_url, image_url, actor_id=actor_id, actor_name=actor_name)  # type: ignore[misc]
+    return RedirectResponse(next_url or "/items", status_code=303)
 
 
 @app.get("/api/items")

@@ -115,6 +115,17 @@ def ensure_item_catalog_schema(conn=None) -> None:
             "ALTER TABLE item_catalog ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now()",
         ]:
             conn.execute(ddl)
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS item_catalog_image_overrides (
+                source_url TEXT PRIMARY KEY,
+                image_url TEXT NOT NULL DEFAULT '',
+                updated_by_id TEXT,
+                updated_by_name TEXT,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+            """
+        )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_item_catalog_category ON item_catalog (main_category, sub_category)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_item_catalog_rarity ON item_catalog (rarity)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_item_catalog_active ON item_catalog (is_active)")
@@ -265,48 +276,86 @@ def query_items(
     where: list[str] = []
     params: dict[str, Any] = {"limit": max(1, min(int(limit or 200), 500)), "offset": max(0, int(offset or 0))}
     if active_only:
-        where.append("is_active = TRUE")
+        where.append("ic.is_active = TRUE")
     if q:
-        where.append("name ILIKE %(q)s")
+        where.append("ic.name ILIKE %(q)s")
         params["q"] = f"%{q.strip()}%"
     if category:
-        where.append("main_category = %(category)s")
+        where.append("ic.main_category = %(category)s")
         params["category"] = category.strip()
     if sub_category:
-        where.append("sub_category = %(sub_category)s")
+        where.append("ic.sub_category = %(sub_category)s")
         params["sub_category"] = sub_category.strip()
     if rarity:
-        where.append("rarity = %(rarity)s")
+        where.append("ic.rarity = %(rarity)s")
         params["rarity"] = rarity.strip()
     if confidence:
-        where.append("classification_confidence = %(confidence)s")
+        where.append("ic.classification_confidence = %(confidence)s")
         params["confidence"] = confidence.strip()
     sql_where = "WHERE " + " AND ".join(where) if where else ""
     sql = f"""
         SELECT
-            id, source, source_url, source_item_id, locale, name, slug,
-            main_category, sub_category, rarity, item_level, required_level,
-            damage_min, damage_max, defense, stats, abilities, traits,
-            image_url, icon_url, classification_confidence, raw_data,
-            is_active, first_seen_at, last_seen_at, updated_at
-        FROM item_catalog
+            ic.id, ic.source, ic.source_url, ic.source_item_id, ic.locale, ic.name, ic.slug,
+            ic.main_category, ic.sub_category, ic.rarity, ic.item_level, ic.required_level,
+            ic.damage_min, ic.damage_max, ic.defense, ic.stats, ic.abilities, ic.traits,
+            ic.image_url, ic.icon_url, ov.image_url AS manual_image_url,
+            ic.classification_confidence, ic.raw_data,
+            ic.is_active, ic.first_seen_at, ic.last_seen_at, ic.updated_at
+        FROM item_catalog ic
+        LEFT JOIN item_catalog_image_overrides ov ON ov.source_url = ic.source_url
         {sql_where}
         ORDER BY
-            CASE main_category
+            CASE ic.main_category
                 WHEN 'weapon' THEN 1
                 WHEN 'armor' THEN 2
                 WHEN 'material' THEN 3
                 WHEN 'currency' THEN 4
                 ELSE 9
             END,
-            COALESCE(sub_category, ''),
-            name
+            COALESCE(ic.sub_category, ''),
+            ic.name
         LIMIT %(limit)s OFFSET %(offset)s
     """
     with connect() as conn:
         rows = conn.execute(sql, params).fetchall()
     return [dict(r) for r in rows]
 
+
+
+def set_item_image_override(source_url: str, image_url: str, *, actor_id: str = "", actor_name: str = "") -> None:
+    """Speichert eine manuelle Bildkorrektur anhand der Questlog-URL.
+
+    Der Override überlebt normale Re-Imports, solange die source_url gleich bleibt.
+    """
+    ensure_item_catalog_schema()
+    source_url = str(source_url or "").strip()
+    image_url = str(image_url or "").strip()
+    if not source_url:
+        raise ValueError("source_url fehlt")
+    with connect() as conn:
+        if image_url:
+            conn.execute(
+                """
+                INSERT INTO item_catalog_image_overrides (source_url, image_url, updated_by_id, updated_by_name, updated_at)
+                VALUES (%s, %s, %s, %s, now())
+                ON CONFLICT (source_url) DO UPDATE SET
+                    image_url = EXCLUDED.image_url,
+                    updated_by_id = EXCLUDED.updated_by_id,
+                    updated_by_name = EXCLUDED.updated_by_name,
+                    updated_at = now()
+                """,
+                (source_url, image_url, actor_id, actor_name),
+            )
+        else:
+            conn.execute("DELETE FROM item_catalog_image_overrides WHERE source_url = %s", (source_url,))
+        conn.commit()
+
+
+def item_source_url_by_id(item_id: int) -> str:
+    ensure_item_catalog_schema()
+    with connect() as conn:
+        row = conn.execute("SELECT source_url FROM item_catalog WHERE id = %s", (int(item_id),)).fetchone()
+    return str((row or {}).get("source_url") or "").strip()
 
 def catalog_stats() -> dict[str, Any]:
     ensure_item_catalog_schema()
