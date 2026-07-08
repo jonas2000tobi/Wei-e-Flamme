@@ -31,7 +31,7 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
-ASSET_VER = "ebo-gothic-whale-dashboard-mobile-v5"
+ASSET_VER = "ebo-gothic-whale-dashboard-mobile-v6"
 DASHBOARD_RELEASE_VERSION = "1.2.0 · Status Playwright Worker"
 
 
@@ -4554,6 +4554,86 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "admin") -> str:
       .mobile-nav-toggle {{
         top:calc(var(--mobile-topnav-h) + 94px) !important;
         right:12px !important;
+      }}
+    }}
+
+
+    /* Mobile UX Patch v6 – kompakter Topnav, Menü höher, Adminbutton kleiner */
+    @media(max-width:900px) {{
+      :root {{ --mobile-topnav-h:46px; }}
+
+      /* Obere Buttonleiste deutlich flacher, damit Header hochrückt */
+      .status-topnav-shell {{
+        padding:4px 6px !important;
+        margin:0 0 8px !important;
+        border-radius:13px !important;
+      }}
+      .topnav {{
+        min-height:0 !important;
+        padding:4px 6px !important;
+        gap:6px !important;
+        border-radius:13px !important;
+      }}
+      .topnav a {{
+        min-height:34px !important;
+        padding:6px 11px !important;
+        font-size:12px !important;
+        border-radius:12px !important;
+        line-height:1.05 !important;
+      }}
+      .topnav a::before {{
+        width:14px !important;
+        height:14px !important;
+        flex-basis:14px !important;
+      }}
+
+      /* Menü höher und weiter an den rechten Header-Rand */
+      .mobile-nav-toggle {{
+        top:calc(var(--mobile-topnav-h) + 72px) !important;
+        right:14px !important;
+        min-height:38px !important;
+        padding:8px 11px !important;
+        border-radius:13px !important;
+      }}
+
+      /* Admin-Button kleiner und zentraler */
+      .status-main-hero .btn[href="/overview"] {{
+        align-self:center !important;
+        margin:12px auto 2px !important;
+        min-width:min(260px,84%) !important;
+        min-height:44px !important;
+        padding:10px 14px !important;
+        font-size:15px !important;
+        border-radius:0 !important;
+      }}
+
+      .status-main-hero {{
+        margin-top:0 !important;
+      }}
+    }}
+
+    @media(max-width:560px) {{
+      .status-topnav-shell {{
+        padding:4px 5px !important;
+        margin-bottom:8px !important;
+      }}
+      .topnav {{
+        padding:4px 5px !important;
+        gap:6px !important;
+      }}
+      .topnav a {{
+        min-height:34px !important;
+        padding:6px 10px !important;
+        font-size:12px !important;
+      }}
+      .mobile-nav-toggle {{
+        top:calc(var(--mobile-topnav-h) + 68px) !important;
+        right:12px !important;
+      }}
+      .status-main-hero .btn[href="/overview"] {{
+        min-width:min(250px,82%) !important;
+        min-height:42px !important;
+        font-size:14px !important;
       }}
     }}
 
@@ -10703,9 +10783,9 @@ def _render_status_dashboard(data: dict[str, Any], request: Optional[Request] = 
     questlog_map_url = "https://questlog.gg/throne-and-liberty/de/map"
     tldb_map_url = "https://tldb.info/map/world"
     if nav_mode == "member":
-        nav_links = '<a href="/member">Status</a><a href="/portal">Mein Portal</a><a href="/member/auctions">Loot</a><a href="/member/events">Events</a><a href="/member/members">Mitglieder</a><a href="/member/ec">Meine EC</a>'
+        nav_links = '<a href="/portal">Mein Portal</a><a href="/member/auctions">Loot</a><a href="/member/events">Events</a><a href="/member/members">Mitglieder</a><a href="/member/ec">Meine EC</a>'
     else:
-        nav_links = '<a href="/portal">Mein Portal</a><a href="/loot">Loot</a><a href="/events">Events</a><a href="/members">Mitglieder</a>'
+        nav_links = '<a href="/portal">Mein Portal</a><a href="/loot">Loot</a><a href="/events">Events</a><a href="/members">Mitglieder</a><a href="/ec">Meine EC</a>'
     nav_html = f'<div class="status-topnav-shell"><nav class="topnav status-topnav">{nav_links}</nav></div>'
     admin_action = ""
     if nav_mode == "admin":
