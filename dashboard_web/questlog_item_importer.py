@@ -1521,7 +1521,26 @@ def extract_questlog_detail_model(text: str, *, name: str, rarity: str | None, s
         key = (x.get("name"), tuple(x.get("values") or []))
         if key in seen: continue
         seen.add(key); tr.append(x)
-    detail["traits"] = tr
+
+    # Questlog-Rüstungen haben je nach Item-Level unterschiedlich viele mögliche
+    # Eigenschafts-Reihen. Nicht mit Zusatzwerten verwechseln:
+    # Zusatzwerte hängen ebenfalls vom Level ab, aber Traits/Eigenschaften haben
+    # eine eigene Begrenzung. Dadurch schneiden wir Ads/Lore/Settext sauber ab.
+    def _armor_expected_trait_count(level_value: Any) -> int:
+        try:
+            lvl = int(str(level_value or "0"))
+        except Exception:
+            lvl = 0
+        if lvl in {45, 50} or lvl >= 80:
+            return 8
+        if lvl in {21, 31}:
+            return 6
+        # Fallback für seltene Zwischenstufen: lieber konservativ, aber nicht 5.
+        return 8 if lvl >= 45 else 6
+
+    trait_limit = _armor_expected_trait_count(detail.get("item_level"))
+    detail["traits"] = tr[:trait_limit]
+    detail["trait_count_rule"] = trait_limit
     return detail
 
 
