@@ -1,29 +1,47 @@
-# Ebo Dashboard Web-Service
+# Questlog Item-Importer für Ebo Dashboard
 
-Separater Railway-Service für das read-only Web-Dashboard.
+Ziel: Questlog.gg wird per Playwright gelesen, Items werden lokal in Postgres unter `item_catalog` gespeichert. Bot und Dashboard lesen danach nur aus Postgres.
 
-## Railway Variablen
+## Railway-Service
 
-Im Web-Service setzen:
+Empfohlen: eigener Railway-Service mit Root `dashboard_web`, weil dort Playwright/Chromium bereits eingerichtet ist.
 
-```txt
+Start Command:
+
+```bash
+python questlog_item_importer.py --only weapon,armor,material,currency,misc
+```
+
+Für den ersten Test nur Waffen:
+
+```bash
+python questlog_item_importer.py --category-url https://questlog.gg/throne-and-liberty/en/db/items/weapons --only weapon
+```
+
+## ENV
+
+```text
 DATABASE_URL=${{Postgres.DATABASE_URL}}
-DASHBOARD_USERNAME=admin
-DASHBOARD_PASSWORD=<sicheres-passwort>
+QUESTLOG_LOCALE=en
+QUESTLOG_IMPORT_DELAY=1.2
+QUESTLOG_MAX_PAGES=250
+QUESTLOG_MAX_ITEMS=0
+QUESTLOG_HEADLESS=1
 ```
 
-Optional:
+`QUESTLOG_MAX_ITEMS=0` bedeutet unbegrenzt.
 
-```txt
-DASHBOARD_GUILD_ID=1457385148730576987
+## Sicherheit
+
+Der Importer überschreibt keine produktiven JSON-Dateien. Er schreibt nur in die neue Postgres-Tabelle `item_catalog`.
+
+## Dashboard
+
+Nach dem Import:
+
+```text
+/items
+/api/items
+/api/items?category=weapon
+/api/items?category=weapon&sub_category=Langbogen
 ```
-
-## Start
-
-Railway nutzt den Procfile:
-
-```txt
-web: uvicorn main:app --host 0.0.0.0 --port $PORT
-```
-
-Der Bot veröffentlicht alle 5 Minuten einen Snapshot in Postgres. Sofort aktualisieren kannst du im Discord mit `/dashboard_status`.
