@@ -1539,7 +1539,97 @@ def extract_questlog_detail_model(text: str, *, name: str, rarity: str | None, s
         return 8 if lvl >= 45 else 6
 
     trait_limit = _armor_expected_trait_count(detail.get("item_level"))
-    detail["traits"] = tr[:trait_limit]
+
+    def _reparse_armor_traits_by_expected_count() -> list[dict[str, Any]]:
+        """Armor traits robust erfassen.
+
+        Questlog streut auf manchen Detailseiten Buttons/Ads/Settexte zwischen die
+        Eigenschaftszeilen. Deshalb darf "Remove Ads" nicht als harter Stop
+        zählen, solange die erwartete Anzahl noch nicht erreicht ist.
+        Die Anzahl kommt aus der Item-Level-Regel:
+        Level 21/31 = 6, Level 45/50/80 = 8.
+        """
+        armor_types = {"helm", "brust", "hose", "handschuhe", "schuhe", "umhang"}
+        if str(sub_category or "").strip().lower() not in armor_types:
+            return []
+
+        start = -1
+        for idx, line in enumerate(lines):
+            if clean_text(line).lower().strip(" :") in {"eigenschaften", "traits"}:
+                start = idx + 1
+                break
+        if start < 0:
+            return []
+
+        out: list[dict[str, Any]] = []
+        seen_names: set[str] = set()
+        i = start
+        hard_stop_contains = (
+            "kommentare", "comments", "dropped from", "erbeutet",
+            "used in litograph", "litographen", "verwendet",
+        )
+
+        while i < len(lines) and len(out) < trait_limit:
+            label = clean_text(lines[i]).rstrip(":")
+            low = label.lower().strip(" :")
+
+            if not label:
+                i += 1
+                continue
+
+            # Harte Seitenbereiche beenden erst, wenn wir die erwartete Menge schon haben.
+            # Vorher überspringen wir Noise und suchen weiter.
+            if any(x in low for x in hard_stop_contains):
+                if len(out) >= trait_limit:
+                    break
+                i += 1
+                continue
+
+            # Ads/Buttons/Settexte nicht als Trait nehmen, aber auch nicht zu früh abbrechen.
+            if _is_trait_stop_line(label):
+                i += 1
+                continue
+
+            if _valid_trait_label(label) and low not in seen_names:
+                vals: list[str] = []
+                j = i + 1
+                while j < len(lines) and j < i + 14:
+                    v = clean_text(lines[j]).strip("|")
+                    vl = v.lower().strip(" :")
+                    if not v:
+                        j += 1
+                        continue
+                    if any(x in vl for x in hard_stop_contains):
+                        break
+                    if _is_trait_stop_line(v):
+                        j += 1
+                        continue
+                    # Neues Trait-Label beendet diesen Werteblock.
+                    if _valid_trait_label(v) and not re.search(r"\d", v):
+                        break
+                    num = parse_number_token(v)
+                    if num:
+                        vals.append(num)
+                    if len(vals) >= 4:
+                        break
+                    j += 1
+
+                if len(vals) >= 2:
+                    out.append({"name": label, "values": vals[:8]})
+                    seen_names.add(low)
+                    i = max(j, i + 1)
+                    continue
+
+            i += 1
+
+        return out[:trait_limit]
+
+    armor_traits = _reparse_armor_traits_by_expected_count()
+    if armor_traits:
+        # Die robuste Armor-Regel gewinnt gegen die generische Trait-Erkennung.
+        detail["traits"] = armor_traits
+    else:
+        detail["traits"] = tr[:trait_limit]
     detail["trait_count_rule"] = trait_limit
     return detail
 
