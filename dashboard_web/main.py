@@ -31,7 +31,7 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
-ASSET_VER = "ebo-gothic-whale-dashboard-mobile-v6"
+ASSET_VER = "ebo-gothic-whale-dashboard-mobile-v7"
 DASHBOARD_RELEASE_VERSION = "1.2.0 · Status Playwright Worker"
 
 
@@ -4634,6 +4634,75 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "admin") -> str:
         min-width:min(250px,82%) !important;
         min-height:42px !important;
         font-size:14px !important;
+      }}
+    }}
+
+
+    /* Mobile UX Patch v7 – obere Buttonleiste flacher + nur ein Rahmen */
+    @media(max-width:900px) {{
+      :root {{ --mobile-topnav-h:38px; }}
+
+      .status-topnav-shell {{
+        padding:0 !important;
+        margin:0 0 8px !important;
+        border:0 !important;
+        border-radius:0 !important;
+        background:transparent !important;
+        box-shadow:none !important;
+      }}
+
+      .topnav {{
+        min-height:38px !important;
+        height:38px !important;
+        padding:4px 6px !important;
+        gap:5px !important;
+        border:1px solid rgba(214,168,79,.28) !important;
+        border-radius:12px !important;
+        background:linear-gradient(180deg,rgba(12,13,18,.84),rgba(7,7,10,.94)) !important;
+        box-shadow:0 8px 18px rgba(0,0,0,.30), inset 0 1px 0 rgba(255,255,255,.035) !important;
+        align-items:center !important;
+      }}
+
+      .topnav a {{
+        min-height:28px !important;
+        height:28px !important;
+        padding:4px 10px !important;
+        font-size:12px !important;
+        line-height:1 !important;
+        border-radius:10px !important;
+        border:1px solid rgba(214,168,79,.22) !important;
+        display:inline-flex !important;
+        align-items:center !important;
+      }}
+
+      .topnav a::before {{
+        width:13px !important;
+        height:13px !important;
+        flex-basis:13px !important;
+      }}
+
+      .mobile-nav-toggle {{
+        top:calc(var(--mobile-topnav-h) + 66px) !important;
+      }}
+    }}
+
+    @media(max-width:560px) {{
+      .topnav {{
+        min-height:36px !important;
+        height:36px !important;
+        padding:3px 5px !important;
+        gap:5px !important;
+      }}
+
+      .topnav a {{
+        min-height:28px !important;
+        height:28px !important;
+        padding:4px 9px !important;
+        font-size:12px !important;
+      }}
+
+      .mobile-nav-toggle {{
+        top:calc(var(--mobile-topnav-h) + 62px) !important;
       }}
     }}
 
