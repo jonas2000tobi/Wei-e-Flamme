@@ -259,6 +259,27 @@ def url_with_query_param(url: str, key: str, value: str) -> str:
         return f"{url}{sep}{key}={value}"
 
 
+def query_int_param(url: str, key: str, default: int = 1) -> int:
+    try:
+        q = dict(parse_qsl(urlparse(str(url or "")).query, keep_blank_values=True))
+        raw = str(q.get(key) or "").strip()
+        return int(raw) if raw else int(default)
+    except Exception:
+        return int(default)
+
+
+def next_page_url(url: str) -> str:
+    """Questlog-Kategorie-Seiten paginieren.
+
+    Questlog zeigt auf vielen Listen nur 40 Items pro Seite. Scrollen allein reicht
+    nicht; weitere Items liegen hinter ?page=2, ?page=3, ... .
+    Wir generieren die naechste Seite nur, wenn auf der aktuellen Seite neue
+    Detailseiten gefunden wurden. So stoppen wir automatisch, falls Questlog eine
+    nicht vorhandene Seite auf Seite 1 zurueckfallen laesst.
+    """
+    return url_with_query_param(url, "page", str(query_int_param(url, "page", 1) + 1))
+
+
 def force_weapon_grade_filter(url: str) -> str:
     url = force_de_locale_url(url)
     """Für Item-Listen ab Rare filtern.
@@ -1996,7 +2017,7 @@ def parse_detail_page(page, url: str, main_category_hint: str, locale: str, sour
             "main_category_hint": main_category_hint,
             "json_candidate_count": len(json_candidates),
             "source_list_url": source_list_url,
-            "parser": "playwright-detail-page-v12-fixed-de-weapon-armor-links",
+            "parser": "playwright-detail-page-v13-de-exact-links-pagination",
         },
     }
 
@@ -2115,15 +2136,26 @@ def crawl_category(context, conn, seed: CategorySeed, limit_left: int | None = N
                 if is_subcategory_list_url(u) and force_weapon_grade_filter(u) not in visited_lists
             })
 
-        detail_links = sorted({
+        all_detail_links = sorted({
             u
             for u in collect_detail_links(list_page)
-            if u not in seen_detail and detail_matches_source_list(u, current_url, seed.main_category)
+            if detail_matches_source_list(u, current_url, seed.main_category)
         })
+        detail_links = [u for u in all_detail_links if u not in seen_detail]
 
         for sub in sub_lists:
             if sub not in list_queue:
                 list_queue.append(sub)
+
+        # Questlog paginiert viele Itemlisten mit 40 Items pro Seite. Bei festen
+        # Unterkategorien wie /armor/head?grade=41 oder /weapons/bow?grade=41
+        # duerfen wir nicht nur scrollen, sondern muessen ?page=2, ?page=3 usw.
+        # versuchen. Sobald eine generierte Seite keine neuen Detailseiten mehr
+        # liefert, wird nicht weiter paginiert.
+        if is_subcategory_list_url(current_url) and detail_links:
+            generated_next = next_page_url(force_weapon_grade_filter(current_url))
+            if generated_next not in visited_lists and generated_next not in list_queue:
+                list_queue.append(generated_next)
 
         next_url = find_next_url(list_page)
         if next_url and same_main_category(next_url, seed.main_category) and is_list_url(next_url):
@@ -2131,7 +2163,7 @@ def crawl_category(context, conn, seed: CategorySeed, limit_left: int | None = N
             if next_url not in visited_lists and next_url not in list_queue:
                 list_queue.append(next_url)
 
-        print(f"   ↳ Detailseiten gefunden: {len(detail_links)} · Listen gefunden: {len(sub_lists)} · importiert: {page_imported}", flush=True)
+        print(f"   ↳ Detailseiten gefunden: {len(all_detail_links)} · neu: {len(detail_links)} · Listen gefunden: {len(sub_lists)} · importiert: {page_imported}", flush=True)
 
         if not detail_links:
             continue
