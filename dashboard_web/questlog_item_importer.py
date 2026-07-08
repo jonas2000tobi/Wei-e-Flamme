@@ -103,6 +103,50 @@ ITEM_NAME_BLACKLIST = {
     "ring", "belt", "earring", "all", "filter", "search", "database", "questlog",
 }
 
+# Questlog-Unterkategorie-Slugs. Damit wird z. B. /weapons/bow sicher als
+# Langbogen erkannt, auch wenn der Itemname selbst nicht "Longbow" enthält.
+WEAPON_SLUG_TO_SUBCATEGORY = {
+    "sword": "Schwert & Schild",
+    "sword2h": "Großschwert",
+    "dagger": "Dolche",
+    "bow": "Langbogen",
+    "crossbow": "Armbrust",
+    "wand": "Zauberstab",
+    "staff": "Stab",
+    "spear": "Speer",
+    "orb": "Kugel",
+    "gauntlet": "Fäustlinge",
+}
+
+ARMOR_SLUG_TO_SUBCATEGORY = {
+    "head": "Helm",
+    "chest": "Brust",
+    "legs": "Hose",
+    "hands": "Handschuhe",
+    "feet": "Schuhe",
+    "cloak": "Umhang",
+    "necklace": "Kette",
+    "bracelet": "Armband",
+    "brooch": "Brosche",
+    "ring": "Ring",
+    "belt": "Gürtel",
+    "earring": "Ohrringe",
+}
+
+BAD_NON_ITEM_NAME_PATTERNS = [
+    r"\bguide\b", r"\bhow\s+to\b", r"\bunlock(?:ing)?\b", r"\bintroduction\b", r"\bintro\b",
+    r"\bbreakdown\b", r"\bcontracts?\b", r"\bpuzzle\b", r"\bboss\b", r"\bevent\b",
+    r"\bfirst\s+look\b", r"\bwhat\s+to\s+do\b", r"\bfishing\b", r"\bamitoi\b",
+    r"\bhousing\b", r"\bplayer\s+homes\b", r"\bmystic\s+keys\b", r"\bdistribution\b",
+    r"\bstat\s+points\b", r"\btraits\s+guide\b", r"\bskill\s+showcase\b", r"\bweapon\s+combos\b",
+]
+
+NON_ITEM_URL_HINTS = [
+    "/db/guides", "/guides", "/db/skills", "/skills", "/db/npcs", "/npcs",
+    "/db/quests", "/quests", "/db/events", "/events", "/db/guardians", "/guardians",
+    "/news", "/article", "/articles", "/builds",
+]
+
 JSON_NAME_KEYS = [
     "name", "title", "itemName", "item_name", "displayName", "display_name",
     "localizedName", "localized_name", "label", "fullName", "full_name",
@@ -211,26 +255,43 @@ def is_probably_item_object(d: dict[str, Any], source_url: str, main_category: s
     if not name or not (3 <= len(name) <= 140):
         return False
     low_name = name.strip().lower()
-    if low_name in ITEM_NAME_BLACKLIST:
+    if is_bad_non_item_name(name):
         return False
     if low_name.startswith(("http://", "https://")):
         return False
-    # Navigation/Filter-Objekte haben oft nur name + href/path. Items haben fast immer id/icon/rarity/stats/level/etc.
+    if candidate_has_non_item_url(d):
+        return False
+
+    # Auf Hauptlisten wie /weapons importieren wir gar keine JSON-Objekte. Dort liegen
+    # bei Questlog viele Guides/News/Navigationen im App-JSON. Importiert wird erst auf
+    # Unterlisten wie /weapons/bow.
+    if main_category in {"weapon", "armor"} and not (is_subcategory_list_url(source_url) or is_detail_url(source_url)):
+        return False
+
     keys = {str(k).lower() for k in d.keys()}
     serialized = compact_json_text(d, limit=8000).lower()
-    item_hints = {
-        "item", "itemid", "item_id", "rarity", "grade", "quality", "icon", "image", "thumbnail",
-        "damage", "attack", "defense", "stats", "stat", "trait", "traits", "effect", "effects",
-        "ability", "abilities", "description", "level", "equip", "slot", "category", "type",
+
+    item_specific_key_hints = {
+        "itemid", "item_id", "itemcode", "item_code", "itemlevel", "item_level",
+        "rarity", "grade", "quality", "icon", "iconurl", "icon_url", "image", "imageurl",
+        "image_url", "thumbnail", "damage", "attack", "defense", "stats", "stat",
+        "trait", "traits", "effect", "effects", "ability", "abilities", "equip", "slot",
         "weapon", "armor", "material", "currency",
     }
-    has_hint_key = any(any(h in k for h in item_hints) for k in keys)
-    has_hint_text = any(h in serialized for h in ["rarity", "itemlevel", "item level", "damage", "icon", "trait", "weapon", "armor", "material"])
+    has_hint_key = any(any(h in k for h in item_specific_key_hints) for k in keys)
+    has_hint_text = any(h in serialized for h in [
+        "rarity", "itemlevel", "item level", "damage", "weapon damage", "icon", "trait", "equipment",
+        "critical hit", "strength", "dexterity", "wisdom", "perception",
+    ])
     has_id = any(k.lower() in keys for k in [x.lower() for x in JSON_ID_KEYS])
     has_img = bool(find_first_url_value(d, JSON_IMAGE_KEYS))
-    # Auf Unterkategorie-Seiten reichen id+name oder icon+name, weil die Kategorie über die Seite kommt.
-    if is_subcategory_list_url(source_url) and (has_id or has_img or has_hint_key or has_hint_text):
-        return True
+
+    # Guides/Bosse/Skills haben oft id+name+thumbnail. Deshalb reicht id+image nicht.
+    # Für Waffen/Rüstung verlangen wir auf Listen mindestens irgendeinen Item-Hinweis
+    # wie Rarity/Stats/Damage/Itemlevel/Slot/Equipment.
+    if main_category in {"weapon", "armor"}:
+        return bool(has_hint_key or has_hint_text) and not (has_id and has_img and not (has_hint_key or has_hint_text))
+
     return bool(has_hint_key or has_hint_text or has_id or has_img)
 
 
@@ -312,13 +373,17 @@ def json_candidate_to_record(d: dict[str, Any], current_url: str, main_category_
     if not is_probably_item_object(d, current_url, main_category_hint, locale):
         return None
     name = extract_candidate_name(d, locale)
+    if is_bad_non_item_name(name) or candidate_has_non_item_url(d):
+        return None
     serialized = compact_json_text(d, limit=25000)
     source_id = extract_source_id(d, name + current_url + serialized[:500], locale)
     source_url = source_url_from_candidate(d, current_url, source_id)
     main_category = main_category_hint or classify_main_category(source_url or current_url, serialized)
     sub_category, confidence = detect_sub_category(main_category, serialized, source_url or current_url)
     if confidence == "low" and main_category in {"weapon", "armor"}:
-        confidence = "medium"
+        # Ohne sicheren Untertyp nehmen wir solche Kandidaten nicht mehr.
+        # Das verhindert Guides/Bosse/Skills im Waffenimport.
+        return None
     stats = extract_structured_stats_from_json(d, locale)
     # Text-Fallback ergänzen.
     for k, v in extract_stats_from_lines(serialized).items():
@@ -424,10 +489,14 @@ def extract_dom_card_records(page, current_url: str, main_category: str, locale:
             if 3 <= len(line) <= 120 and low not in ITEM_NAME_BLACKLIST and not re.fullmatch(r"[+\-]?\d+(?:[.,]\d+)?%?", line):
                 name = line
                 break
-        if not name:
+        if not name or is_bad_non_item_name(name):
+            continue
+        # DOM-Karten nur auf echten Unterlisten importieren. Auf /weapons selbst stehen
+        # auch Guides/Navigation/Empfehlungen.
+        if main_category in {"weapon", "armor"} and not is_subcategory_list_url(current_url):
             continue
         # Ohne itemartige Hinweise nicht importieren; sonst würden Logos/Kategorien reinlaufen.
-        if not is_subcategory_list_url(current_url) and not any(k in text.lower() for k in ["damage", "level", "rarity", "trait", "attack", "defense"]):
+        if not any(k in text.lower() for k in ["damage", "level", "rarity", "trait", "attack", "defense", "common", "uncommon", "rare", "epic", "legendary"]):
             continue
         source_id = stable_hash(current_url + name + src)
         source_url = str(c.get("href") or "").strip()
@@ -440,7 +509,7 @@ def extract_dom_card_records(page, current_url: str, main_category: str, locale:
         seen.add(source_url)
         sub_category, confidence = detect_sub_category(main_category, text, current_url)
         if confidence == "low" and main_category in {"weapon", "armor"}:
-            confidence = "medium"
+            continue
         damage_min, damage_max = extract_damage(text)
         records.append({
             "source": "questlog",
@@ -546,6 +615,42 @@ def item_tail(url: str) -> list[str]:
     return parts[idx + 1:]
 
 
+def subcategory_slug(url: str) -> str:
+    tail = item_tail(url)
+    if len(tail) >= 2:
+        return tail[1].lower()
+    return ""
+
+
+def subcategory_from_url(main_category: str, url: str) -> str | None:
+    slug = subcategory_slug(url)
+    if main_category == "weapon":
+        return WEAPON_SLUG_TO_SUBCATEGORY.get(slug)
+    if main_category == "armor":
+        return ARMOR_SLUG_TO_SUBCATEGORY.get(slug)
+    return None
+
+
+def is_bad_non_item_name(name: str) -> bool:
+    low = clean_text(name).lower()
+    if not low or low in ITEM_NAME_BLACKLIST:
+        return True
+    return any(re.search(pattern, low, flags=re.I) for pattern in BAD_NON_ITEM_NAME_PATTERNS)
+
+
+def candidate_has_non_item_url(d: dict[str, Any]) -> bool:
+    for key in JSON_URL_KEYS:
+        raw = pick_text(d, [key], DEFAULT_LOCALE)
+        if not raw:
+            continue
+        abs_url = to_abs_url(raw).lower()
+        if any(hint in abs_url for hint in NON_ITEM_URL_HINTS):
+            return True
+        if "/db/" in abs_url and "/db/items" not in abs_url:
+            return True
+    return False
+
+
 def is_category_list_url(url: str) -> bool:
     """Oberste Questlog-Itemliste, z. B. /db/items/weapons."""
     if not is_items_url(url):
@@ -609,6 +714,9 @@ def detect_alias(text: str, aliases: list[tuple[str, list[str]]]) -> str | None:
 
 
 def detect_sub_category(main_category: str, text: str, url: str = "") -> tuple[str | None, str]:
+    from_url = subcategory_from_url(main_category, url)
+    if from_url:
+        return from_url, "high"
     hay = f"{url} {text}"
     if main_category == "weapon":
         label = detect_alias(hay, WEAPON_ALIASES)
@@ -1040,6 +1148,56 @@ def parse_detail_page(page, url: str, main_category_hint: str, locale: str) -> d
     }
 
 
+def record_identity_key(item: dict[str, Any]) -> str:
+    name = slugify(str(item.get("name") or ""))
+    sub = str(item.get("sub_category") or "").strip().lower()
+    cat = str(item.get("main_category") or "").strip().lower()
+    return f"{cat}|{sub}|{name}"
+
+
+def record_quality(item: dict[str, Any]) -> int:
+    score = 0
+    if item.get("rarity"):
+        score += 10
+    if item.get("image_url") or item.get("icon_url"):
+        score += 8
+    if item.get("damage_min") is not None or item.get("damage_max") is not None:
+        score += 8
+    if item.get("stats"):
+        score += 6
+    if item.get("abilities"):
+        score += 6
+    if item.get("source_url") and "#" not in str(item.get("source_url")):
+        score += 5
+    score += min(len(str(item.get("raw_text") or "")) // 500, 5)
+    return score
+
+
+def dedupe_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    best: dict[str, dict[str, Any]] = {}
+    for rec in records:
+        key = record_identity_key(rec)
+        if not key or key.endswith('|'):
+            continue
+        if key not in best or record_quality(rec) > record_quality(best[key]):
+            best[key] = rec
+    return list(best.values())
+
+
+def reset_imported_category(conn, categories: set[str]) -> int:
+    if not categories:
+        return 0
+    placeholders = ",".join(["%s"] * len(categories))
+    sql = f"DELETE FROM item_catalog WHERE source = 'questlog' AND main_category IN ({placeholders})"
+    cur = conn.execute(sql, tuple(sorted(categories)))
+    try:
+        deleted = int(cur.rowcount or 0)
+    except Exception:
+        deleted = 0
+    conn.commit()
+    return deleted
+
+
 def crawl_category(context, conn, seed: CategorySeed, limit_left: int | None = None, dry_run: bool = False) -> int:
     """Crawlt eine Questlog-Hauptkategorie.
 
@@ -1074,21 +1232,25 @@ def crawl_category(context, conn, seed: CategorySeed, limit_left: int | None = N
             continue
 
         # 1) Questlog rendert die Itemkarten teils ohne echte Detail-Links.
-        # Deshalb zuerst JSON-/Next.js-/API-Daten und DOM-Karten direkt als Items auslesen.
-        payloads = list(network_payloads)
-        payloads.extend(collect_json_candidates(list_page))
-        page_records = extract_records_from_json_payloads(payloads, current_url, seed.main_category, DEFAULT_LOCALE)
-        dom_records = extract_dom_card_records(list_page, current_url, seed.main_category, DEFAULT_LOCALE)
-        existing_record_keys = {str(r.get("source_url") or r.get("name")) for r in page_records}
-        for rec in dom_records:
-            key = str(rec.get("source_url") or rec.get("name"))
-            if key not in existing_record_keys:
-                existing_record_keys.add(key)
-                page_records.append(rec)
+        # Wichtig: Auf der Hauptseite /weapons liegen im JSON auch Guides/News.
+        # Deshalb importieren wir JSON/DOM-Records nur auf Unterseiten wie /weapons/bow.
+        page_records: list[dict[str, Any]] = []
+        if is_subcategory_list_url(current_url):
+            payloads = list(network_payloads)
+            payloads.extend(collect_json_candidates(list_page))
+            page_records = extract_records_from_json_payloads(payloads, current_url, seed.main_category, DEFAULT_LOCALE)
+            dom_records = extract_dom_card_records(list_page, current_url, seed.main_category, DEFAULT_LOCALE)
+            existing_record_keys = {record_identity_key(r) for r in page_records}
+            for rec in dom_records:
+                key = record_identity_key(rec)
+                if key not in existing_record_keys:
+                    existing_record_keys.add(key)
+                    page_records.append(rec)
+            page_records = dedupe_records(page_records)
 
         page_imported = 0
         for item in page_records:
-            rec_key = str(item.get("source_url") or item.get("source_item_id") or item.get("name"))
+            rec_key = record_identity_key(item)
             if rec_key in seen_detail:
                 continue
             seen_detail.add(rec_key)
@@ -1225,6 +1387,11 @@ def run_import(args: argparse.Namespace) -> int:
             else:
                 conn = connect()
                 ensure_item_catalog_schema(conn)
+                reset_requested = bool(args.reset_category) or os.getenv("QUESTLOG_RESET_CATEGORY", "0").lower() in {"1", "true", "yes", "ja"}
+                if reset_requested:
+                    cats = {s.main_category for s in seeds}
+                    deleted = reset_imported_category(conn, cats)
+                    print(f"🧹 Alte Questlog-Items gelöscht: {deleted} ({', '.join(sorted(cats))})", flush=True)
             for seed in seeds:
                 remaining = None
                 if MAX_ITEMS > 0:
@@ -1248,6 +1415,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--only", default="", help="Nur Hauptkategorien, z. B. weapon,armor,material,currency,misc")
     p.add_argument("--discover-only", action="store_true", help="Nur Kategorie-Links anzeigen, nichts importieren")
     p.add_argument("--dry-run", action="store_true", help="Nichts in Postgres schreiben")
+    p.add_argument("--reset-category", action="store_true", help="Vor dem Import questlog-Items der gewählten Hauptkategorie löschen")
     return p
 
 
