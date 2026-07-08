@@ -1036,6 +1036,49 @@ def _number_entries_from_values(values: list[str]) -> list[dict[str, Any]]:
     return entries
 
 
+def _damage_pair_from_raw_values(raw_values: list[str]) -> tuple[str | None, str | None, list[str]]:
+    """Liest Questlog-Max-Schaden robust.
+
+    Questlog zeigt z. B.:
+      41 / ▲ 12 / ~ / 162 / ▲ 50
+    In Playwrights innerText fehlen die Pfeile manchmal, dann kommt nur:
+      41 / 12 / ~ / 162 / 50
+    Trotzdem sind 41 und 162 die Basiswerte; 12 und 50 sind Upgrade-Deltas.
+    """
+    vals = [clean_text(v).strip() for v in (raw_values or []) if clean_text(v).strip()]
+    if not vals:
+        return None, None, []
+
+    # Separator-basierter Fall: links vom ~ erster Zahlenwert, rechts vom ~ erster Zahlenwert.
+    sep_idx = -1
+    for i, v in enumerate(vals):
+        if v in {"~", "-", "–"} or v.strip() in {"~", "-", "–"}:
+            sep_idx = i
+            break
+    if sep_idx >= 0:
+        left = [_number_entries_from_values([v])[0] for v in vals[:sep_idx] if _number_entries_from_values([v])]
+        right = [_number_entries_from_values([v])[0] for v in vals[sep_idx + 1:] if _number_entries_from_values([v])]
+        if left and right:
+            min_v = str(left[0].get("value"))
+            max_v = str(right[0].get("value"))
+            deltas = [str(e.get("value")) for e in (left[1:] + right[1:]) if e.get("value")]
+            return min_v, max_v, deltas[:2]
+
+    entries = _number_entries_from_values(vals)
+    if len(entries) >= 4:
+        # Typisch: base_min, delta_min, base_max, delta_max
+        return str(entries[0].get("value")), str(entries[2].get("value")), [str(entries[1].get("value")), str(entries[3].get("value"))]
+    base_nums = [str(e.get("value")) for e in entries if not e.get("is_delta")]
+    deltas = [str(e.get("value")) for e in entries if e.get("is_delta")]
+    if len(base_nums) >= 2:
+        return base_nums[0], base_nums[1], deltas[:2]
+    if len(entries) >= 2:
+        return str(entries[0].get("value")), str(entries[1].get("value")), deltas[:2]
+    if entries:
+        return str(entries[0].get("value")), None, deltas[:2]
+    return None, None, []
+
+
 def find_label_value_block(lines: list[str], labels: list[str], max_lookahead: int = 8) -> dict[str, Any] | None:
     label_lows = [x.lower().rstrip(":") for x in labels]
     for i, line in enumerate(lines):
@@ -1097,17 +1140,12 @@ def extract_questlog_detail_model(text: str, *, name: str, rarity: str | None, s
     # Hauptwerte
     dmg = find_label_value_block(lines, ["Max. Schaden", "Max Damage", "Schaden", "Damage"], max_lookahead=10)
     if dmg:
-        entries = dmg.get("entries") or _number_entries_from_values(dmg.get("raw_values") or [])
-        # Questlog zeigt oft:
-        # Max. Schaden / 70 / ▲ 22 / ~ / 277 / ▲ 88
-        # Wichtig: ▲-Werte sind Upgrade-Deltas und dürfen nicht als Max-Schaden gelesen werden.
-        base_nums = [str(e.get("value")) for e in entries if not e.get("is_delta")]
-        deltas = [str(e.get("value")) for e in entries if e.get("is_delta")]
-        if len(base_nums) >= 2:
-            detail["max_damage"] = {"min": base_nums[0], "max": base_nums[1], "deltas": deltas[:2], "raw": dmg.get("raw_values")}
-            detail["primary"].append({"label": "Max. Schaden", "value": f"{base_nums[0]} ~ {base_nums[1]}", "deltas": deltas[:2], "raw": dmg.get("raw_values")})
-        elif base_nums:
-            detail["primary"].append({"label": "Max. Schaden", "value": " ~ ".join(base_nums), "deltas": deltas[:2], "raw": dmg.get("raw_values")})
+        dmg_min_v, dmg_max_v, deltas = _damage_pair_from_raw_values(dmg.get("raw_values") or [])
+        if dmg_min_v and dmg_max_v:
+            detail["max_damage"] = {"min": dmg_min_v, "max": dmg_max_v, "deltas": deltas[:2], "raw": dmg.get("raw_values")}
+            detail["primary"].append({"label": "Max. Schaden", "value": f"{dmg_min_v} ~ {dmg_max_v}", "deltas": deltas[:2], "raw": dmg.get("raw_values")})
+        elif dmg_min_v:
+            detail["primary"].append({"label": "Max. Schaden", "value": dmg_min_v, "deltas": deltas[:2], "raw": dmg.get("raw_values")})
 
     for labels, out_label in [
         (["Reichweite", "Range"], "Reichweite"),
@@ -1318,6 +1356,12 @@ def collect_image_urls(page) -> tuple[str | None, str | None]:
     except Exception:
         item_name = ""
     name_tokens = [t for t in re.split(r"[^a-zA-ZäöüÄÖÜß0-9]+", item_name) if len(t) >= 4][:8]
+    detail_compact = re.sub(r"[^a-z0-9]+", "", detail_id)
+    detail_parts = [x for x in re.split(r"[_\-]+", detail_id) if len(x) >= 3]
+    weapon_id_hints = [
+        x for x in detail_parts
+        if x in {"bow", "crossbow", "dagger", "sword", "sword2h", "staff", "wand", "spear", "orb", "gauntlet"}
+    ]
     candidates: list[dict[str, Any]] = []
 
     def add_candidate(
@@ -1349,8 +1393,17 @@ def collect_image_urls(page) -> tuple[str | None, str | None]:
         score = 0
 
         # Bestes Signal: Asset/URL enthält die konkrete Item-ID.
-        if detail_id and detail_id in low:
-            score += 220
+        compact_low = re.sub(r"[^a-z0-9]+", "", low)
+        id_hit = bool(detail_id and detail_id in low) or bool(detail_compact and detail_compact in compact_low)
+        if id_hit:
+            score += 520
+        # Viele Questlog-Waffenbilder enthalten wenigstens den Waffentyp aus der Item-ID
+        # (bow/crossbow/dagger/...). Passive-Icons tun das meistens nicht.
+        if any(h in low for h in weapon_id_hints):
+            score += 95
+        # Boss-/Archboss-Waffen haben nicht immer die volle ID im Bildpfad, aber oft Boss/Archboss-Teile.
+        id_part_hits = sum(1 for part in detail_parts if len(part) >= 4 and part in low)
+        score += min(id_part_hits * 22, 110)
 
         # Pfad-Hinweise. Skill-/Ability-Assets dürfen nicht gegen Itembilder gewinnen.
         if any(x in low for x in ["/item", "items", "equipment", "weapon", "armor"]):
@@ -1361,6 +1414,12 @@ def collect_image_urls(page) -> tuple[str | None, str | None]:
             score -= 260
         if any(x in low for x in ["webp", "png", "jpg", "jpeg"]):
             score += 8
+        # Rarity-Rahmen, Kartenhintergründe und UI-Flächen sind keine Itembilder.
+        if any(x in low for x in ["background", "bg_", "/bg", "pattern", "frame", "border", "grade", "rarity", "slot"]):
+            score -= 260
+        # Wenn es ein Skill-/Icon-Asset ohne Item-ID/Waffentyp ist, hart abwerten.
+        if any(x in low for x in ["skill", "ability", "passive", "buff", "spell"]) and not id_hit:
+            score -= 420
 
         # Quelle/Grafikgröße.
         if source == "header":
@@ -1522,6 +1581,76 @@ def collect_image_urls(page) -> tuple[str | None, str | None]:
             """
         )
         for img in header_assets or []:
+            add_candidate(
+                img.get("src"),
+                w=int(img.get("w") or 0), h=int(img.get("h") or 0),
+                x=int(img.get("x") or 0), y=int(img.get("y") or 0),
+                source="header", alt=str(img.get("alt") or ""),
+                local_context=str(img.get("local") or ""), broad_context=str(img.get("broad") or ""),
+            )
+    except Exception:
+        pass
+
+    # 1b) Fallback für Questlog-Headerbilder, die als große/layered CSS-Backgrounds
+    # auf dem Itemkasten liegen. Bei Boss-/Archboss-Waffen ist genau das oft der Fall.
+    try:
+        forced_header_assets = page.locator("*").evaluate_all(
+            """
+            els => {
+                const norm = s => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+                const looksLikeItemBox = e => {
+                    const r = e.getBoundingClientRect();
+                    if (!r || r.width < 240 || r.width > 760 || r.height < 150 || r.height > 950) return false;
+                    if (r.left < 250 || r.left > 950 || r.top < 120 || r.top > 430) return false;
+                    const txt = norm(e.innerText || '');
+                    if (!txt.includes('item level') && !txt.includes('gegenstandsstufe')) return false;
+                    if (!txt.includes('max. schaden') && !txt.includes('max damage') && !txt.includes('reichweite')) return false;
+                    return true;
+                };
+                const boxes = els.filter(looksLikeItemBox)
+                    .sort((a, b) => (a.getBoundingClientRect().width * a.getBoundingClientRect().height) - (b.getBoundingClientRect().width * b.getBoundingClientRect().height))
+                    .slice(0, 2);
+                const out = [];
+                const addBgUrls = (node, box) => {
+                    const b = node.getBoundingClientRect();
+                    const c = box.getBoundingClientRect();
+                    const nodeTop = b.top || c.top;
+                    // Nur Kopfbereich des Itemkastens. Passive Icons sitzen darunter.
+                    if (nodeTop > c.top + 170) return;
+                    let all = '';
+                    try { all += ' ' + (getComputedStyle(node).backgroundImage || ''); } catch (_) {}
+                    for (const pseudo of ['::before', '::after']) {
+                        try { all += ' ' + (getComputedStyle(node, pseudo).backgroundImage || ''); } catch (_) {}
+                    }
+                    const matches = [...all.matchAll(/url\(["']?([^"')]+)["']?\)/g)];
+                    for (const m of matches) {
+                        const src = m[1] || '';
+                        if (!src) continue;
+                        out.push({
+                            src,
+                            alt: '',
+                            // Synthetische Itembild-Position im rechten Kopfbereich.
+                            w: Math.round(Math.min(Math.max(b.width || 96, 64), 180)),
+                            h: Math.round(Math.min(Math.max(b.height || 96, 64), 180)),
+                            x: Math.round(c.left + c.width * 0.70),
+                            y: Math.round(c.top + 35),
+                            local: (node.innerText || '').slice(0, 300),
+                            broad: (box.innerText || '').slice(0, 1200),
+                            kind: 'css_header_forced'
+                        });
+                    }
+                };
+                for (const box of boxes) {
+                    addBgUrls(box, box);
+                    for (const n of Array.from(box.querySelectorAll('*')).slice(0, 250)) {
+                        addBgUrls(n, box);
+                    }
+                }
+                return out;
+            }
+            """
+        )
+        for img in forced_header_assets or []:
             add_candidate(
                 img.get("src"),
                 w=int(img.get("w") or 0), h=int(img.get("h") or 0),
@@ -1855,7 +1984,9 @@ def parse_detail_page(page, url: str, main_category_hint: str, locale: str, sour
     )
     # Detailmodell zusätzlich in flache Felder spiegeln, damit Dashboard/API ohne
     # Sonderlogik brauchbare Werte bekommt.
-    if detail_model.get("max_damage") and (damage_min is None or damage_max is None):
+    if detail_model.get("max_damage"):
+        # Detailmodell ist verlässlicher als Regex über kompletten body.innerText,
+        # weil Questlog Upgrade-Deltas direkt neben den Basiswerten rendert.
         try:
             damage_min = float(str(detail_model["max_damage"].get("min", "")).replace(",", "."))
             damage_max = float(str(detail_model["max_damage"].get("max", "")).replace(",", "."))
