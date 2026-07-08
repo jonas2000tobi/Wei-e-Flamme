@@ -24,6 +24,13 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response, RedirectResp
 from fastapi.staticfiles import StaticFiles
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
+try:
+    from item_catalog_db import catalog_stats, ensure_item_catalog_schema, query_items
+except Exception:  # Dashboard soll auch ohne Item-Modul starten
+    catalog_stats = None  # type: ignore
+    ensure_item_catalog_schema = None  # type: ignore
+    query_items = None  # type: ignore
+
 app = FastAPI(title="Ebo Dashboard", version="1.0.0")
 security = HTTPBasic(auto_error=False)
 
@@ -32,7 +39,7 @@ if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 ASSET_VER = "ebo-gothic-whale-dashboard-portal-v1"
-DASHBOARD_RELEASE_VERSION = "1.2.0 · Status Playwright Worker"
+DASHBOARD_RELEASE_VERSION = "1.2.1 · Status Playwright Worker + Questlog Items"
 
 
 def _database_url() -> str:
@@ -7929,6 +7936,205 @@ def _render_audit_dashboard(data: dict[str, Any], *, action: str = "", actor: st
     <section class="panel" id="logs"><h2>Letzte Audit-Einträge</h2>{_table(['Zeit','Aktion','Actor','Zusammenfassung'], log_rows, placeholder='Audit durchsuchen…')}</section>
     """
     return _html_shell("Audit · Ebo Dashboard", body)
+
+
+def _item_catalog_available() -> bool:
+    return bool(catalog_stats and ensure_item_catalog_schema and query_items)
+
+
+def _jsonable(value: Any) -> Any:
+    try:
+        from decimal import Decimal
+    except Exception:  # pragma: no cover
+        Decimal = ()  # type: ignore
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if Decimal and isinstance(value, Decimal):  # type: ignore[arg-type]
+        return float(value)
+    if isinstance(value, dict):
+        return {str(k): _jsonable(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_jsonable(v) for v in value]
+    return value
+
+
+def _item_catalog_payload(q: str = "", category: str = "", sub_category: str = "", rarity: str = "", confidence: str = "", limit: int = 200, offset: int = 0) -> dict[str, Any]:
+    if not _item_catalog_available():
+        return {"ok": False, "error": "Item-Katalog-Modul nicht geladen."}
+    try:
+        ensure_item_catalog_schema()  # type: ignore[misc]
+        items = query_items(  # type: ignore[misc]
+            q=q,
+            category=category,
+            sub_category=sub_category,
+            rarity=rarity,
+            confidence=confidence,
+            limit=limit,
+            offset=offset,
+        )
+        stats = catalog_stats()  # type: ignore[misc]
+        return {"ok": True, "items": _jsonable(items), "stats": _jsonable(stats)}
+    except Exception as exc:
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+
+def _item_stat_preview(item: dict[str, Any], max_len: int = 180) -> str:
+    stats = item.get("stats") or {}
+    if not isinstance(stats, dict) or not stats:
+        return "—"
+    parts: list[str] = []
+    for k, v in list(stats.items())[:6]:
+        if v is True:
+            parts.append(str(k))
+        else:
+            parts.append(f"{k}: {v}")
+    txt = ", ".join(parts)
+    return txt[:max_len] + ("…" if len(txt) > max_len else "")
+
+
+def _item_ability_preview(item: dict[str, Any], max_len: int = 220) -> str:
+    abilities = item.get("abilities") or []
+    if not isinstance(abilities, list) or not abilities:
+        return "—"
+    texts: list[str] = []
+    for ab in abilities[:2]:
+        if isinstance(ab, dict):
+            texts.append(str(ab.get("text") or ab.get("label") or ""))
+        else:
+            texts.append(str(ab))
+    txt = " | ".join([clean for clean in (_loot_text(x) for x in texts) if clean])
+    return txt[:max_len] + ("…" if len(txt) > max_len else "") if txt else "—"
+
+
+def _item_image_cell(item: dict[str, Any]) -> dict[str, str]:
+    src = str(item.get("icon_url") or item.get("image_url") or "").strip()
+    if not src:
+        return _raw("—")
+    return _raw(f'<img src="{_e(src)}" alt="" style="width:42px;height:42px;object-fit:contain;border-radius:10px;background:rgba(0,0,0,.28);border:1px solid rgba(255,255,255,.10);padding:3px">')
+
+
+def _item_source_link(item: dict[str, Any]) -> dict[str, str]:
+    url = str(item.get("source_url") or "").strip()
+    if not url:
+        return _raw("—")
+    return _raw(f'<a class="link" href="{_e(url)}" target="_blank" rel="noopener">Questlog</a>')
+
+
+def _render_item_catalog(request: Optional[Request] = None) -> str:
+    q = str((request.query_params.get("q") if request else "") or "").strip()
+    category = str((request.query_params.get("category") if request else "") or "").strip()
+    sub_category = str((request.query_params.get("sub_category") if request else "") or "").strip()
+    rarity = str((request.query_params.get("rarity") if request else "") or "").strip()
+    confidence = str((request.query_params.get("confidence") if request else "") or "").strip()
+    payload = _item_catalog_payload(q=q, category=category, sub_category=sub_category, rarity=rarity, confidence=confidence, limit=250)
+    if not payload.get("ok"):
+        body = f"""
+        <nav class="topnav"><a href="/">← Übersicht</a><a href="/loot">Loot</a><a href="/loot-check">Truhencheck</a><a href="/api/items">API</a></nav>
+        <section class="hero"><div><div class="eyebrow">Questlog Item-Katalog</div><h1>📚 Item-Datenbank</h1><p class="muted">Noch keine Item-Daten verfügbar oder Postgres/Schema fehlt.</p></div></section>
+        <section class="panel"><h2>Fehler</h2><p class="muted">{_e(payload.get('error'))}</p><p>Importer starten:</p><pre>python questlog_item_importer.py --category-url https://questlog.gg/throne-and-liberty/en/db/items/weapons --only weapon</pre></section>
+        """
+        return _html_shell("Item-Datenbank · Ebo Dashboard", body)
+
+    items: list[dict[str, Any]] = payload.get("items") or []
+    stats: dict[str, Any] = payload.get("stats") or {}
+    total = int(stats.get("total") or 0)
+    low_conf = int(stats.get("low_confidence") or 0)
+    last_update = _dt(stats.get("last_update")) if stats.get("last_update") else "—"
+    cards = "".join([
+        _card("Items", total, "aktive Einträge in Postgres"),
+        _card("Treffer", len(items), "aktuelle Filterung"),
+        _card("Prüfen", low_conf, "niedrige Erkennungssicherheit"),
+        _card("Letztes Update", last_update, "Questlog Importer"),
+    ])
+    cat_rows = []
+    for row in stats.get("by_category") or []:
+        cat = str(row.get("main_category") or "misc")
+        sub = str(row.get("sub_category") or "—")
+        cat_rows.append([
+            _raw(f'<a class="link" href="/items?category={urllib.parse.quote(cat)}">{_e(cat)}</a>'),
+            _raw(f'<a class="link" href="/items?category={urllib.parse.quote(cat)}&sub_category={urllib.parse.quote(sub if sub != "—" else "")}">{_e(sub)}</a>'),
+            row.get("count"),
+        ])
+    rows = []
+    for item in items:
+        dmg = "—"
+        if item.get("damage_min") is not None or item.get("damage_max") is not None:
+            dmg = f"{item.get('damage_min') or '—'} - {item.get('damage_max') or '—'}"
+        elif item.get("defense") is not None:
+            dmg = f"DEF {item.get('defense')}"
+        rows.append([
+            _item_image_cell(item),
+            item.get("name"),
+            item.get("main_category"),
+            item.get("sub_category") or "—",
+            item.get("rarity") or "—",
+            dmg,
+            _item_stat_preview(item),
+            _item_ability_preview(item),
+            item.get("classification_confidence") or "—",
+            _item_source_link(item),
+        ])
+    def selected(value: str, current: str) -> str:
+        return ' selected' if value == current else ''
+    body = f"""
+    <nav class="topnav"><a href="/">← Übersicht</a><a href="/loot">Loot</a><a href="/loot-check">Truhencheck</a><a href="/needs">Needs</a><a href="/api/items">API</a></nav>
+    <section class="hero">
+      <div>
+        <div class="eyebrow">Questlog → Postgres</div>
+        <h1>📚 Item-Datenbank</h1>
+        <p class="muted">Lokaler Katalog aus Questlog. Bot und Dashboard sollen später nur noch diese Tabelle nutzen, nicht Questlog live.</p>
+      </div>
+      <a class="btn" href="/api/items?category={_e(urllib.parse.quote(category))}&q={_e(urllib.parse.quote(q))}">JSON öffnen</a>
+    </section>
+    <section class="grid">{cards}</section>
+    <section class="panel">
+      <h2>Filter</h2>
+      <form method="get" action="/items" style="display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:10px;align-items:end">
+        <label><span class="muted">Suche</span><input name="q" value="{_e(q)}" placeholder="Aridus, Tevent, Bow..." style="width:100%;padding:12px;border-radius:12px;border:1px solid rgba(255,255,255,.16);background:rgba(0,0,0,.22);color:inherit"></label>
+        <label><span class="muted">Kategorie</span><select name="category" style="width:100%;padding:12px;border-radius:12px;border:1px solid rgba(255,255,255,.16);background:rgba(0,0,0,.22);color:inherit"><option value="">alle</option><option value="weapon"{selected('weapon', category)}>weapon</option><option value="armor"{selected('armor', category)}>armor</option><option value="material"{selected('material', category)}>material</option><option value="currency"{selected('currency', category)}>currency</option><option value="misc"{selected('misc', category)}>misc</option></select></label>
+        <label><span class="muted">Unterkategorie</span><input name="sub_category" value="{_e(sub_category)}" placeholder="Langbogen, Helm..." style="width:100%;padding:12px;border-radius:12px;border:1px solid rgba(255,255,255,.16);background:rgba(0,0,0,.22);color:inherit"></label>
+        <label><span class="muted">Seltenheit</span><input name="rarity" value="{_e(rarity)}" placeholder="Epic..." style="width:100%;padding:12px;border-radius:12px;border:1px solid rgba(255,255,255,.16);background:rgba(0,0,0,.22);color:inherit"></label>
+        <label><span class="muted">Sicherheit</span><select name="confidence" style="width:100%;padding:12px;border-radius:12px;border:1px solid rgba(255,255,255,.16);background:rgba(0,0,0,.22);color:inherit"><option value="">alle</option><option value="high"{selected('high', confidence)}>high</option><option value="medium"{selected('medium', confidence)}>medium</option><option value="low"{selected('low', confidence)}>low</option></select></label>
+        <button class="btn" type="submit">Anzeigen</button>
+      </form>
+      <p class="muted">Importer-Befehl für Waffen: <code>python questlog_item_importer.py --category-url https://questlog.gg/throne-and-liberty/en/db/items/weapons --only weapon</code></p>
+    </section>
+    <section class="panel"><h2>Kategorien</h2>{_table(['Kategorie','Unterkategorie','Items'], cat_rows, placeholder='Kategorien durchsuchen…')}</section>
+    <section class="panel"><h2>Items</h2>{_table(['Bild','Name','Kategorie','Typ','Seltenheit','Wert','Stats','Fähigkeit/Effekt','Erkennung','Quelle'], rows, placeholder='Items durchsuchen…')}</section>
+    """
+    return _html_shell("Item-Datenbank · Ebo Dashboard", body)
+
+
+
+@app.get("/items", response_class=HTMLResponse)
+def items_page(request: Request):
+    try:
+        return HTMLResponse(_render_item_catalog(request))
+    except Exception as exc:
+        return HTMLResponse(_html_shell("Item-Datenbank Fehler", f"<section class='panel'><h1>❌ Item-Datenbank Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"), status_code=500)
+
+
+@app.get("/api/items")
+def api_items(
+    q: str = "",
+    category: str = "",
+    sub_category: str = "",
+    rarity: str = "",
+    confidence: str = "",
+    limit: int = 200,
+    offset: int = 0,
+):
+    payload = _item_catalog_payload(q=q, category=category, sub_category=sub_category, rarity=rarity, confidence=confidence, limit=limit, offset=offset)
+    return JSONResponse(payload)
+
+
+@app.get("/api/items/stats")
+def api_items_stats():
+    payload = _item_catalog_payload(limit=1)
+    if not payload.get("ok"):
+        return JSONResponse(payload)
+    return JSONResponse({"ok": True, "stats": payload.get("stats")})
+
 
 
 @app.get("/voice", response_class=HTMLResponse)
