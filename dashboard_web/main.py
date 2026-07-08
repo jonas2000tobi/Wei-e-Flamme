@@ -8055,39 +8055,127 @@ def _item_traits_html(item: dict[str, Any], max_items: int = 5) -> str:
     return "".join(out)
 
 
+def _item_detail_model(item: dict[str, Any]) -> dict[str, Any]:
+    raw = item.get("raw_data") or {}
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except Exception:
+            raw = {}
+    if isinstance(raw, dict) and isinstance(raw.get("detail"), dict):
+        return raw.get("detail") or {}
+    return {}
+
+
+def _stat_box(label: str, value: Any, delta: Any = "") -> str:
+    if value in (None, ""):
+        return ""
+    delta_html = f'<em>▲ {_e(delta)}</em>' if delta not in (None, "") else ""
+    return f'<div class="ql-stat"><span>{_e(label)}</span><strong>{_e(value)}</strong>{delta_html}</div>'
+
+
+def _questlog_stats_html(item: dict[str, Any], detail: dict[str, Any]) -> str:
+    out: list[str] = []
+    primary = detail.get("primary") if isinstance(detail, dict) else []
+    if isinstance(primary, list):
+        for row in primary:
+            if isinstance(row, dict):
+                out.append(_stat_box(str(row.get("label") or ""), row.get("value") or ""))
+    if not out:
+        dmg = _item_damage_label(item)
+        if dmg != "—":
+            out.append(_stat_box("Max. Schaden" if item.get("main_category") == "weapon" else "Wert", dmg))
+        stats = item.get("stats") or {}
+        if isinstance(stats, dict):
+            for key in ["Reichweite", "Angriffstempo", "Angriffsgeschwindigkeit", "Range", "Attack Speed"]:
+                if key in stats:
+                    out.append(_stat_box(key, stats.get(key)))
+    return "".join(out) if out else '<span class="muted">—</span>'
+
+
+def _bonus_stats_html(item: dict[str, Any], detail: dict[str, Any]) -> str:
+    rows = detail.get("bonus_stats") if isinstance(detail, dict) else []
+    out: list[str] = []
+    if isinstance(rows, list) and rows:
+        for row in rows[:10]:
+            if not isinstance(row, dict):
+                continue
+            out.append(_stat_box(str(row.get("label") or ""), row.get("value") or "", row.get("delta") or ""))
+    if not out:
+        stats = item.get("stats") or {}
+        skip = {"Max. Schaden", "Schaden", "Max Damage", "Damage", "Reichweite", "Range", "Angriffstempo", "Angriffsgeschwindigkeit", "Attack Speed"}
+        if isinstance(stats, dict):
+            for k, v in list(stats.items())[:12]:
+                if k in skip or v in (None, "", True):
+                    continue
+                out.append(_stat_box(str(k), v))
+    return "".join(out) if out else '<span class="muted">—</span>'
+
+
+def _trait_table_html(item: dict[str, Any], detail: dict[str, Any]) -> str:
+    traits = detail.get("traits") if isinstance(detail, dict) else None
+    if not traits:
+        traits = item.get("traits") or []
+    if not isinstance(traits, list) or not traits:
+        return ""
+    rows: list[str] = []
+    for tr in traits[:12]:
+        if not isinstance(tr, dict):
+            continue
+        name = str(tr.get("name") or "").strip()
+        vals = tr.get("values") or []
+        if not name:
+            continue
+        if isinstance(vals, list):
+            val_html = '<span class="trait-values">' + '<i>|</i>'.join(f'<b>{_e(v)}</b>' for v in vals[:8]) + '</span>'
+        else:
+            val_html = f'<span class="trait-values"><b>{_e(vals)}</b></span>'
+        rows.append(f'<div class="trait-row"><span>{_e(name)}</span>{val_html}</div>')
+    return '<div class="trait-table">' + "".join(rows) + '</div>' if rows else ""
+
+
+def _passive_html(item: dict[str, Any], detail: dict[str, Any]) -> str:
+    passive = detail.get("passive") if isinstance(detail, dict) else None
+    if isinstance(passive, dict) and (passive.get("name") or passive.get("text")):
+        return f'<div class="passive-box"><small>Passiv</small><h4>{_e(passive.get("name") or "Passiv")}</h4><p>{_e(passive.get("text") or "")}</p></div>'
+    ability = _item_ability_preview(item, max_len=520)
+    if ability and ability != "—":
+        return f'<div class="passive-box"><small>Fähigkeit / Effekt</small><p>{_e(ability)}</p></div>'
+    return '<p class="muted">Keine Fähigkeit/Effekt erkannt.</p>'
+
+
 def _item_card_html(item: dict[str, Any]) -> str:
-    src = str(item.get("image_url") or item.get("icon_url") or "").strip()
+    detail = _item_detail_model(item)
+    src = str((detail.get("image_url") if isinstance(detail, dict) else "") or item.get("image_url") or item.get("icon_url") or "").strip()
     image = f'<img src="{_e(src)}" alt="" loading="lazy">' if src else '<div class="item-no-img">?</div>'
-    rarity = str(item.get("rarity") or "—")
-    sub = str(item.get("sub_category") or "—")
-    lvl = item.get("item_level")
-    lvl_badge = f'<span>Lv. {_e(lvl)}</span>' if lvl not in (None, "") else ""
-    ability = _item_ability_preview(item, max_len=420)
-    ability_html = f'<p class="item-ability">{_e(ability)}</p>' if ability and ability != "—" else '<p class="item-ability muted">Keine Fähigkeit/Effekt erkannt.</p>'
-    traits = _item_traits_html(item)
+    rarity = str((detail.get("rarity") if isinstance(detail, dict) else "") or item.get("rarity") or "—")
+    sub = str((detail.get("type") if isinstance(detail, dict) else "") or item.get("sub_category") or "—")
+    lvl = (detail.get("item_level") if isinstance(detail, dict) else None) or item.get("item_level")
+    lvl_range = str((detail.get("item_level_range") if isinstance(detail, dict) else "") or "").strip()
+    lvl_label = f'Item Level {lvl}' + (f' ({_e(lvl_range)})' if lvl_range else '') if lvl not in (None, "") else ""
     source = str(item.get("source_url") or "").strip()
     source_link = f'<a class="link" href="{_e(source)}" target="_blank" rel="noopener">Questlog</a>' if source else "—"
+    traits_html = _trait_table_html(item, detail)
     return f"""
-      <article class="item-card">
-        <div class="item-art">{image}</div>
+      <article class="item-card ql-card">
+        <div class="item-art ql-art">{image}</div>
         <div class="item-main">
           <div class="item-head">
-            <h3>{_e(item.get("name") or "—")}</h3>
-            <div class="item-badges"><span>{_e(sub)}</span><span>{_e(rarity)}</span>{lvl_badge}</div>
+            <div>
+              <h3>{_e(item.get("name") or "—")}</h3>
+              <div class="ql-subline"><span>{_e(rarity)}</span><i>|</i><span>{_e(sub)}</span></div>
+              {f'<div class="ql-level">{_e(lvl_label)}</div>' if lvl_label else ''}
+            </div>
+            <div class="item-badges"><span>{_e(item.get("main_category") or "—")}</span><span>{source_link}</span></div>
           </div>
-          <div class="item-meta">
-            <div><small>Wert</small><strong>{_e(_item_damage_label(item))}</strong></div>
-            <div><small>Kategorie</small><strong>{_e(item.get("main_category") or "—")}</strong></div>
-            <div><small>Erkennung</small><strong>{_e(item.get("classification_confidence") or "—")}</strong></div>
-            <div><small>Quelle</small><strong>{source_link}</strong></div>
-          </div>
-          <div class="item-block"><small>Stats</small><div class="item-chips">{_item_stats_html(item)}</div></div>
-          {f'<div class="item-block"><small>Traits</small><div class="item-chips">{traits}</div></div>' if traits else ''}
-          <div class="item-block"><small>Fähigkeit / Effekt</small>{ability_html}</div>
+
+          <div class="ql-section"><small>Hauptwerte</small><div class="ql-stat-grid">{_questlog_stats_html(item, detail)}</div></div>
+          <div class="ql-section"><small>Passiv / Effekt</small>{_passive_html(item, detail)}</div>
+          <div class="ql-section"><small>Zusatzwerte</small><div class="ql-stat-grid">{_bonus_stats_html(item, detail)}</div></div>
+          {f'<div class="ql-section"><small>Eigenschaften</small>{traits_html}</div>' if traits_html else ''}
         </div>
       </article>
     """
-
 
 def _render_item_catalog(request: Optional[Request] = None) -> str:
     q = str((request.query_params.get("q") if request else "") or "").strip()
@@ -8100,7 +8188,7 @@ def _render_item_catalog(request: Optional[Request] = None) -> str:
         body = f"""
         <nav class="topnav"><a href="/">← Übersicht</a><a href="/loot">Loot</a><a href="/loot-check">Truhencheck</a><a href="/api/items">API</a></nav>
         <section class="hero"><div><div class="eyebrow">Questlog Item-Katalog</div><h1>📚 Item-Datenbank</h1><p class="muted">Noch keine Item-Daten verfügbar oder Postgres/Schema fehlt.</p></div></section>
-        <section class="panel"><h2>Fehler</h2><p class="muted">{_e(payload.get('error'))}</p><p>Importer starten:</p><pre>python questlog_item_importer.py --category-url https://questlog.gg/throne-and-liberty/de/db/items/weapons --only weapon</pre></section>
+        <section class="panel"><h2>Fehler</h2><p class="muted">{_e(payload.get('error'))}</p><p>Importer starten:</p><pre>python questlog_item_importer.py --category-url https://questlog.gg/throne-and-liberty/de/db/items/weapons?grade=41 --only weapon</pre></section>
         """
         return _html_shell("Item-Datenbank · Ebo Dashboard", body)
 
@@ -8164,7 +8252,19 @@ def _render_item_catalog(request: Optional[Request] = None) -> str:
       .item-chip b{color:#fff;margin-right:4px}
       .item-chip.trait{background:rgba(120,88,180,.12)}
       .item-ability{margin:4px 0 0;line-height:1.45;color:#eee}
-      @media(max-width:760px){.item-card-grid{grid-template-columns:1fr}.item-card{grid-template-columns:84px minmax(0,1fr);padding:12px}.item-art{width:84px;height:84px}.item-meta{grid-template-columns:repeat(2,minmax(0,1fr))}.item-head{display:block}.item-badges{justify-content:flex-start;margin-top:8px}}
+      .ql-card{grid-template-columns:148px minmax(0,1fr);padding:20px;border-radius:20px;background:linear-gradient(135deg,rgba(24,16,10,.94),rgba(2,2,2,.72));}
+      .ql-art{width:148px;height:148px;border-radius:20px;background:linear-gradient(135deg,rgba(88,45,120,.24),rgba(0,0,0,.42));}
+      .ql-art img{padding:10px;max-width:100%;max-height:100%;object-fit:contain;}
+      .ql-subline{display:flex;gap:8px;align-items:center;color:#d9c08a;font-weight:700;margin-top:6px}
+      .ql-subline i{opacity:.45;font-style:normal}.ql-level{margin-top:8px;color:#b7a88c;font-weight:700}
+      .ql-section{margin-top:14px;padding-top:12px;border-top:1px solid rgba(212,164,74,.18)}
+      .ql-section>small{display:block;color:#d4a44a;text-transform:uppercase;letter-spacing:.05em;font-size:11px;margin-bottom:8px;font-weight:800}
+      .ql-stat-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px}
+      .ql-stat{border:1px solid rgba(255,255,255,.08);background:rgba(0,0,0,.26);border-radius:14px;padding:10px;min-height:58px}
+      .ql-stat span{display:block;color:#b7a88c;font-size:12px;margin-bottom:4px}.ql-stat strong{display:block;color:#fff;font-size:17px;line-height:1.15}.ql-stat em{display:inline-block;color:#75d47a;font-style:normal;font-size:12px;margin-top:3px}
+      .passive-box{border:1px solid rgba(120,88,180,.26);background:rgba(120,88,180,.10);border-radius:14px;padding:12px}.passive-box h4{margin:0 0 6px;color:#e6ccff}.passive-box p{margin:0;line-height:1.5}
+      .trait-table{display:grid;gap:7px}.trait-row{display:grid;grid-template-columns:minmax(160px,240px) 1fr;gap:10px;align-items:center;border:1px solid rgba(255,255,255,.07);background:rgba(0,0,0,.2);border-radius:12px;padding:8px 10px}.trait-row>span{color:#d9c08a;font-weight:700}.trait-values{display:flex;flex-wrap:wrap;gap:7px;align-items:center}.trait-values b{color:#fff}.trait-values i{opacity:.35;font-style:normal}
+      @media(max-width:760px){.item-card-grid{grid-template-columns:1fr}.item-card{grid-template-columns:84px minmax(0,1fr);padding:12px}.item-art{width:84px;height:84px}.item-meta{grid-template-columns:repeat(2,minmax(0,1fr))}.item-head{display:block}.item-badges{justify-content:flex-start;margin-top:8px}.ql-card{grid-template-columns:1fr}.ql-art{width:120px;height:120px}.trait-row{grid-template-columns:1fr}}
     </style>
     """
 
@@ -8191,7 +8291,7 @@ def _render_item_catalog(request: Optional[Request] = None) -> str:
         <label><span class="muted">Sicherheit</span><select name="confidence" style="width:100%;padding:12px;border-radius:12px;border:1px solid rgba(255,255,255,.16);background:rgba(0,0,0,.22);color:inherit"><option value="">alle</option><option value="high"{selected('high', confidence)}>high</option><option value="medium"{selected('medium', confidence)}>medium</option><option value="low"{selected('low', confidence)}>low</option></select></label>
         <button class="btn" type="submit">Anzeigen</button>
       </form>
-      <p class="muted">Importer-Befehl für Waffen: <code>python questlog_item_importer.py --category-url https://questlog.gg/throne-and-liberty/de/db/items/weapons --only weapon</code></p>
+      <p class="muted">Importer-Befehl für Waffen: <code>python questlog_item_importer.py --category-url https://questlog.gg/throne-and-liberty/de/db/items/weapons?grade=41 --only weapon</code></p>
     </section>
     {item_card_css}
     <section class="panel"><h2>Kategorien</h2>{_table(['Kategorie','Unterkategorie','Items'], cat_rows, placeholder='Kategorien durchsuchen…')}</section>

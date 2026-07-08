@@ -287,7 +287,7 @@ def query_items(
             id, source, source_url, source_item_id, locale, name, slug,
             main_category, sub_category, rarity, item_level, required_level,
             damage_min, damage_max, defense, stats, abilities, traits,
-            image_url, icon_url, classification_confidence,
+            image_url, icon_url, classification_confidence, raw_data,
             is_active, first_seen_at, last_seen_at, updated_at
         FROM item_catalog
         {sql_where}

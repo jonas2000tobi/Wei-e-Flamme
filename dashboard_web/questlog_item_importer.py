@@ -8,7 +8,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
-from urllib.parse import urlparse, urljoin
+from urllib.parse import urlparse, urljoin, urlencode, parse_qsl, urlunparse
 import hashlib
 
 from item_catalog_db import connect, ensure_item_catalog_schema, upsert_item
@@ -16,7 +16,7 @@ from item_catalog_db import connect, ensure_item_catalog_schema, upsert_item
 BASE = "https://questlog.gg"
 GAME = "throne-and-liberty"
 DEFAULT_LOCALE = os.getenv("QUESTLOG_LOCALE", "de").strip() or "de"
-DEFAULT_START_URL = f"{BASE}/{GAME}/{DEFAULT_LOCALE}/db/items/weapons"
+DEFAULT_START_URL = f"{BASE}/{GAME}/{DEFAULT_LOCALE}/db/items/weapons?grade=41"
 
 # Diese bekannten Listen werden nur als Fallback genutzt. Der Importer versucht zuerst,
 # Kategorien von /db/items automatisch zu entdecken.
@@ -40,6 +40,10 @@ MAX_ITEMS = int(os.getenv("QUESTLOG_MAX_ITEMS", "0") or "0")
 HEADLESS = os.getenv("QUESTLOG_HEADLESS", "1").lower() not in {"0", "false", "no", "off"}
 NAV_TIMEOUT_MS = int(os.getenv("QUESTLOG_TIMEOUT_MS", "120000") or "120000")
 PAGE_SETTLE_MS = int(os.getenv("QUESTLOG_PAGE_SETTLE_MS", "6000") or "6000")
+
+# Standard: nur Rare und höher. Questlog nutzt in der URL grade=41 für diesen Filter.
+DEFAULT_MIN_RARITY = os.getenv("QUESTLOG_MIN_RARITY", "Rare").strip() or "Rare"
+RARITY_RANK = {"Common": 10, "Uncommon": 20, "Rare": 30, "Epic": 40, "Legendary": 50}
 
 
 BROWSER_UA = (
@@ -174,6 +178,47 @@ def to_abs_url(value: Any) -> str:
     if src.startswith("http://") or src.startswith("https://"):
         return src
     return src
+
+
+def url_with_query_param(url: str, key: str, value: str) -> str:
+    try:
+        parsed = urlparse(url)
+        q = dict(parse_qsl(parsed.query, keep_blank_values=True))
+        q[key] = value
+        return urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, urlencode(q), parsed.fragment))
+    except Exception:
+        sep = "&" if "?" in url else "?"
+        return f"{url}{sep}{key}={value}"
+
+
+def force_weapon_grade_filter(url: str) -> str:
+    """Für Waffenlisten immer Questlog-Filter ab Rare setzen.
+
+    Detailseiten brauchen keinen grade-Query. Listen und Unterlisten dagegen schon,
+    sonst importiert Questlog auch Common/Uncommon und teils unnötige Seitendaten.
+    """
+    if is_items_url(url) and classify_main_category(url) == "weapon":
+        return url_with_query_param(url, "grade", "41")
+    return url
+
+
+def rarity_allowed(rarity: str | None, min_rarity: str = DEFAULT_MIN_RARITY) -> bool:
+    if not min_rarity:
+        return True
+    if not rarity:
+        # Bei fehlender Seltenheit lieber nicht blind importieren.
+        return False
+    return RARITY_RANK.get(str(rarity), 0) >= RARITY_RANK.get(str(min_rarity), 0)
+
+
+def is_skill_core_like(url: str, text: str, name: str = "") -> bool:
+    hay = f"{url} {name} {text}".lower()
+    needles = [
+        "talistone", "skillcore", "skill-core", "skill core",
+        "fähigkeitskern", "faehigkeitskern", "fähigkeitkern", "faehigkeitkern",
+        "fähigkeits-kerne", "faehigkeits-kerne", "fähigkeitskern",
+    ]
+    return any(n in hay for n in needles)
 
 
 def stable_hash(value: str) -> str:
@@ -935,6 +980,204 @@ def extract_traits_from_text(text: str) -> list[dict[str, Any]]:
         seen.add(key); out.append(t)
     return out[:12]
 
+def _line_values_after_label(lines: list[str], label_idx: int, max_lookahead: int = 8) -> list[str]:
+    vals: list[str] = []
+    stop_words = {
+        "passiv", "passive", "eigenschaften", "traits", "kommentare", "comments",
+        "karte", "map", "auktionshaus", "auction house", "stats", "enchanting",
+    }
+    for j in range(label_idx + 1, min(len(lines), label_idx + 1 + max_lookahead)):
+        x = clean_text(lines[j]).strip(" :")
+        if not x:
+            continue
+        low = x.lower()
+        if low in stop_words:
+            break
+        # Ein neues Label beendet den aktuellen Wertblock.
+        if re.match(r"^[A-Za-zÄÖÜäöüß ./%'\-]+:$", x) and not re.search(r"\d", x):
+            break
+        vals.append(x)
+    return vals
+
+
+def parse_number_token(value: str) -> str:
+    m = re.search(r"[+\-]?\d+(?:[.,]\d+)?\s*(?:%|m|s|Sek\.)?", str(value or ""), flags=re.I)
+    return clean_text(m.group(0)) if m else ""
+
+
+def find_label_value_block(lines: list[str], labels: list[str], max_lookahead: int = 8) -> dict[str, Any] | None:
+    label_lows = [x.lower().rstrip(":") for x in labels]
+    for i, line in enumerate(lines):
+        low = clean_text(line).lower().rstrip(":")
+        if low not in label_lows:
+            continue
+        vals = _line_values_after_label(lines, i, max_lookahead=max_lookahead)
+        nums = [parse_number_token(v) for v in vals]
+        nums = [n for n in nums if n]
+        if not nums:
+            continue
+        return {"label": clean_text(line).rstrip(":"), "values": nums, "raw_values": vals}
+    return None
+
+
+def extract_questlog_detail_model(text: str, *, name: str, rarity: str | None, sub_category: str | None, image_url: str | None) -> dict[str, Any]:
+    """Baut eine Questlog-nahe Detailstruktur aus der sichtbaren Itemseite.
+
+    Ziel ist nicht nur eine flache Stats-Liste, sondern Daten wie auf Questlog:
+    Item-Level, Max. Schaden mit Range, Reichweite, Angriffstempo, Passiv,
+    Zusatzstats und Eigenschaften/Traits.
+    """
+    raw = normalize_raw_text(text)
+    lines = [clean_text(x) for x in re.split(r"[\n\r]+", raw) if clean_text(x)]
+    detail: dict[str, Any] = {
+        "name": name,
+        "rarity": rarity,
+        "type": sub_category,
+        "image_url": image_url,
+        "primary": [],
+        "bonus_stats": [],
+        "traits": [],
+    }
+
+    # Item Level 50 (21-50) / Item Level 21 (Fixed Level) / Gegenstandsstufe ...
+    m = re.search(r"(?:Item\s*Level|Gegenstandsstufe)\s*(\d+)(?:\s*\(([^)]*)\))?", raw, flags=re.I)
+    if m:
+        detail["item_level"] = int(m.group(1))
+        if m.group(2):
+            detail["item_level_range"] = clean_text(m.group(2))
+
+    # Hauptwerte
+    dmg = find_label_value_block(lines, ["Max. Schaden", "Max Damage", "Schaden", "Damage"], max_lookahead=10)
+    if dmg:
+        nums = dmg.get("values") or []
+        # Questlog zeigt oft: 70, ▲ 22, ~, 277, ▲ 88. Wir nehmen Basiswerte und Erhöhungen getrennt.
+        base_nums = [x for x in nums if not str(x).startswith("+")]
+        if len(base_nums) >= 2:
+            detail["max_damage"] = {"min": base_nums[0], "max": base_nums[1], "raw": dmg.get("raw_values")}
+            detail["primary"].append({"label": "Max. Schaden", "value": f"{base_nums[0]} ~ {base_nums[1]}", "raw": dmg.get("raw_values")})
+        elif nums:
+            detail["primary"].append({"label": "Max. Schaden", "value": " ~ ".join(nums), "raw": dmg.get("raw_values")})
+
+    for labels, out_label in [
+        (["Reichweite", "Range"], "Reichweite"),
+        (["Angriffstempo", "Angriffsgeschwindigkeit", "Attack Speed"], "Angriffstempo"),
+    ]:
+        block = find_label_value_block(lines, labels, max_lookahead=4)
+        if block:
+            val = (block.get("values") or [""])[0]
+            if val:
+                detail["primary"].append({"label": out_label, "value": val, "raw": block.get("raw_values")})
+                detail[out_label.lower().replace(".", "").replace(" ", "_")] = val
+
+    # Passive/Fähigkeit: Marker -> Name -> Beschreibung bis zum nächsten bekannten Abschnitt.
+    passive_markers = {"passiv", "passive"}
+    stat_label_lows = {
+        "stärke", "geschicklichkeit", "weisheit", "wahrnehmung", "trefferchance", "krit. trefferchance",
+        "kritische trefferchance", "abklingtempo", "abklingzeit", "spezies-schadensbonus", "wildkin-bonusschaden",
+        "untote-zusatzschaden", "humanoide-zusatzschaden", "konstrukt-zusatzschaden", "eigenschaften", "traits",
+        "max. gesundheit", "max. leben", "max. mana", "manaregeneration", "trefferchance", "chance auf",
+    }
+    for i, line in enumerate(lines):
+        low = line.lower().strip(" :")
+        if low not in passive_markers:
+            continue
+        p_name = ""
+        desc_parts: list[str] = []
+        for j in range(i + 1, min(len(lines), i + 12)):
+            x = clean_text(lines[j])
+            if not x:
+                continue
+            xl = x.lower().strip(" :")
+            if xl in stat_label_lows or xl in {"eigenschaften", "traits"}:
+                break
+            if not p_name and not re.fullmatch(r"[+\-]?\d+(?:[.,]\d+)?%?", x):
+                p_name = x
+                continue
+            desc_parts.append(x)
+        if p_name or desc_parts:
+            detail["passive"] = {"name": p_name, "text": " ".join(desc_parts).strip()}
+            break
+
+    # Bonus-Stats: Label-Zeile, danach Wert und optional ▲-Delta.
+    bonus_labels = [
+        "Stärke", "Geschicklichkeit", "Weisheit", "Wahrnehmung", "Trefferchance", "Krit. Trefferchance",
+        "Kritische Trefferchance", "Abklingtempo", "Abklingzeit", "Spezies-Schadensbonus",
+        "Wildkin-Bonusschaden", "Untote-Zusatzschaden", "Humanoide-Zusatzschaden", "Konstrukt-Zusatzschaden",
+        "Max. Gesundheit", "Max. Leben", "Max. Mana", "Manaregeneration", "Mana-Kosteneffizienz",
+    ]
+    for label in bonus_labels:
+        block = find_label_value_block(lines, [label], max_lookahead=4)
+        if not block:
+            # Falls Label und Wert auf einer Zeile stehen.
+            mm = re.search(rf"{re.escape(label)}\s*:?\s*([+\-]?\d+(?:[.,]\d+)?\s*(?:%|m|s)?)", raw, flags=re.I)
+            if mm:
+                val = clean_text(mm.group(1))
+                detail["bonus_stats"].append({"label": label, "value": val})
+            continue
+        vals = block.get("values") or []
+        if vals:
+            entry = {"label": label, "value": vals[0]}
+            if len(vals) >= 2:
+                entry["delta"] = vals[1]
+            detail["bonus_stats"].append(entry)
+
+    # Eigenschaften / Traits: Abschnitt nach Eigenschaften: bis Ende/Kommentare.
+    trait_start = -1
+    for i, line in enumerate(lines):
+        if line.lower().strip(" :") in {"eigenschaften", "traits"}:
+            trait_start = i + 1
+            break
+    if trait_start >= 0:
+        i = trait_start
+        while i < len(lines):
+            label = clean_text(lines[i]).rstrip(":")
+            low = label.lower()
+            if low in {"kommentare", "comments", "used in litographs", "dropped from npcs", "dropped from resources"}:
+                break
+            if not label or re.search(r"^(\||▲|~)$", label):
+                i += 1
+                continue
+            # Trait-Name hat meistens keine Zahl, Werte danach schon.
+            if not re.search(r"\d", label):
+                vals: list[str] = []
+                j = i + 1
+                while j < len(lines) and j < i + 10:
+                    v = clean_text(lines[j]).strip("|")
+                    vl = v.lower().rstrip(":")
+                    if not v:
+                        j += 1
+                        continue
+                    if vl in {"kommentare", "comments"}:
+                        break
+                    if not re.search(r"\d", v) and not v in {"|"}:
+                        break
+                    if v != "|":
+                        num = parse_number_token(v)
+                        if num:
+                            vals.append(num)
+                    j += 1
+                if len(vals) >= 2:
+                    detail["traits"].append({"name": label, "values": vals[:8]})
+                    i = j
+                    continue
+            i += 1
+
+    # Dedupe Bonusstats/Traits.
+    seen = set(); b=[]
+    for x in detail.get("bonus_stats") or []:
+        key = (x.get("label"), x.get("value"), x.get("delta"))
+        if key in seen: continue
+        seen.add(key); b.append(x)
+    detail["bonus_stats"] = b
+    seen = set(); tr=[]
+    for x in detail.get("traits") or []:
+        key = (x.get("name"), tuple(x.get("values") or []))
+        if key in seen: continue
+        seen.add(key); tr.append(x)
+    detail["traits"] = tr
+    return detail
+
+
 def normalize_raw_text(text: str) -> str:
     text = str(text or "")
     text = text.replace("\u00a0", " ")
@@ -1263,7 +1506,7 @@ def discover_category_seeds(page, locale: str, include_fallback: bool = True) ->
                 seeds[href] = CategorySeed(href, main)
     if include_fallback:
         for path in FALLBACK_CATEGORY_PATHS:
-            url = f"{BASE}/{GAME}/{locale}/db/items/{path}"
+            url = force_weapon_grade_filter(f"{BASE}/{GAME}/{locale}/db/items/{path}")
             seeds.setdefault(url, CategorySeed(url, classify_main_category(url)))
     # Waffen zuerst, dann Rüstung, Material, Currency, Rest.
     order = {"weapon": 1, "armor": 2, "material": 3, "currency": 4, "misc": 9}
@@ -1313,6 +1556,12 @@ def parse_detail_page(page, url: str, main_category_hint: str, locale: str, sour
     if confidence == "low" and main_category in {"weapon", "armor"}:
         # Kategorie aus Listen-URL ist sicher, Untertyp aber nicht.
         confidence = "medium"
+    rarity = detect_rarity(raw_text)
+    if not rarity_allowed(rarity):
+        return None
+    if main_category == "weapon" and is_skill_core_like(url, raw_text, name):
+        return None
+
     damage_min, damage_max = extract_damage(raw_text)
     item_level = extract_level(raw_text, "Item Level", "Gegenstandsstufe", "Level")
     required_level = extract_level(raw_text, "Required Level", "Benötigte Stufe")
@@ -1322,6 +1571,32 @@ def parse_detail_page(page, url: str, main_category_hint: str, locale: str, sour
     stats = dict(text_stats)
     for k, v in dom_stats.items():
         stats[k] = v
+
+    detail_model = extract_questlog_detail_model(
+        raw_text,
+        name=name,
+        rarity=rarity,
+        sub_category=sub_category,
+        image_url=image_url or icon_url,
+    )
+    # Detailmodell zusätzlich in flache Felder spiegeln, damit Dashboard/API ohne
+    # Sonderlogik brauchbare Werte bekommt.
+    if detail_model.get("max_damage") and (damage_min is None or damage_max is None):
+        try:
+            damage_min = float(str(detail_model["max_damage"].get("min", "")).replace(",", "."))
+            damage_max = float(str(detail_model["max_damage"].get("max", "")).replace(",", "."))
+        except Exception:
+            pass
+    for row in detail_model.get("primary") or []:
+        if isinstance(row, dict) and row.get("label") and row.get("value"):
+            stats.setdefault(str(row.get("label")), str(row.get("value")))
+    for row in detail_model.get("bonus_stats") or []:
+        if isinstance(row, dict) and row.get("label") and row.get("value"):
+            val = str(row.get("value"))
+            if row.get("delta"):
+                val += f" ▲ {row.get('delta')}"
+            stats.setdefault(str(row.get("label")), val)
+
     source_item_id = item_detail_id(url)
     return {
         "source": "questlog",
@@ -1332,15 +1607,15 @@ def parse_detail_page(page, url: str, main_category_hint: str, locale: str, sour
         "slug": slugify(name),
         "main_category": main_category,
         "sub_category": sub_category,
-        "rarity": detect_rarity(raw_text),
+        "rarity": rarity,
         "item_level": item_level,
         "required_level": required_level,
         "damage_min": damage_min,
         "damage_max": damage_max,
         "defense": extract_defense(raw_text),
         "stats": stats,
-        "abilities": extract_abilities(raw_text),
-        "traits": extract_traits_from_text(raw_text),
+        "abilities": ([{"label": (detail_model.get("passive") or {}).get("name") or "Passiv", "text": (detail_model.get("passive") or {}).get("text") or ""}] if detail_model.get("passive") else extract_abilities(raw_text)),
+        "traits": detail_model.get("traits") or extract_traits_from_text(raw_text),
         "image_url": image_url,
         "icon_url": icon_url,
         "classification_confidence": confidence,
@@ -1348,10 +1623,11 @@ def parse_detail_page(page, url: str, main_category_hint: str, locale: str, sour
         "raw_data": {
             "scraped_at": now_iso(),
             "url": url,
+            "detail": detail_model,
             "main_category_hint": main_category_hint,
             "json_candidate_count": len(json_candidates),
             "source_list_url": source_list_url,
-            "parser": "playwright-detail-page-v5",
+            "parser": "playwright-detail-page-v7-rare-detail",
         },
     }
 
@@ -1454,7 +1730,7 @@ def crawl_category(context, conn, seed: CategorySeed, limit_left: int | None = N
         # auch Armor/Material-Navigation mit.
         links = [u for u in links if same_main_category(u, seed.main_category)]
 
-        sub_lists = sorted({u for u in links if is_subcategory_list_url(u) and u not in visited_lists})
+        sub_lists = sorted({force_weapon_grade_filter(u) for u in links if is_subcategory_list_url(u) and force_weapon_grade_filter(u) not in visited_lists})
         detail_links = sorted({u for u in collect_detail_links(list_page) if u not in seen_detail})
 
         for sub in sub_lists:
@@ -1463,6 +1739,7 @@ def crawl_category(context, conn, seed: CategorySeed, limit_left: int | None = N
 
         next_url = find_next_url(list_page)
         if next_url and same_main_category(next_url, seed.main_category) and is_list_url(next_url):
+            next_url = force_weapon_grade_filter(next_url)
             if next_url not in visited_lists and next_url not in list_queue:
                 list_queue.append(next_url)
 
@@ -1539,7 +1816,7 @@ def run_import(args: argparse.Namespace) -> int:
             pass
         page = context.new_page()
         if args.category_url:
-            seeds = [CategorySeed(args.category_url.rstrip("/"), classify_main_category(args.category_url))]
+            seeds = [CategorySeed(force_weapon_grade_filter(args.category_url.rstrip("/")), classify_main_category(args.category_url))]
         else:
             seeds = discover_category_seeds(page, DEFAULT_LOCALE, include_fallback=True)
         page.close()
