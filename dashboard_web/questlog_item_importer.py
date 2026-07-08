@@ -142,23 +142,43 @@ def is_items_url(url: str) -> bool:
     return f"/{GAME}/" in url and "/db/items" in url
 
 
-def is_category_list_url(url: str) -> bool:
-    if not is_items_url(url):
-        return False
+def item_tail(url: str) -> list[str]:
     parts = path_parts(url)
     idx = item_path_index(url)
-    return idx >= 0 and len(parts) == idx + 2
+    if idx < 0:
+        return []
+    return parts[idx + 1:]
+
+
+def is_category_list_url(url: str) -> bool:
+    """Oberste Questlog-Itemliste, z. B. /db/items/weapons."""
+    if not is_items_url(url):
+        return False
+    return len(item_tail(url)) == 1
+
+
+def is_subcategory_list_url(url: str) -> bool:
+    """Questlog-Unterliste, z. B. /db/items/weapons/sword.
+
+    Der alte Importer hat solche URLs fälschlich als Item-Detailseiten behandelt.
+    Questlog nutzt diese Ebene aber als Filter-/Unterkategorie-Seite.
+    Echte Detailseiten liegen darunter, z. B. /db/items/weapons/sword/<item>.
+    """
+    if not is_items_url(url):
+        return False
+    return len(item_tail(url)) == 2
+
+
+def is_list_url(url: str) -> bool:
+    return is_category_list_url(url) or is_subcategory_list_url(url)
 
 
 def is_detail_url(url: str) -> bool:
     if not is_items_url(url):
         return False
-    parts = path_parts(url)
-    idx = item_path_index(url)
-    if idx < 0:
-        return False
-    # /db/items/weapons/some-item ist Detail. /db/items/weapons?page=2 ist Liste.
-    return len(parts) >= idx + 3
+    # /db/items/weapons/sword ist nur eine Unterliste.
+    # Echte Items haben mindestens drei Segmente nach /items/.
+    return len(item_tail(url)) >= 3
 
 
 def category_segment(url: str) -> str:
@@ -456,6 +476,11 @@ def collect_links(page) -> list[str]:
 
 
 def find_next_url(page) -> str | None:
+    """Findet echte Pagination-Links.
+
+    Wichtig: Nicht mehr blind ?page=2 erfinden. Auf Questlog führte das auf
+    Railway zu leeren/unnötigen Seiten und verwirrenden 0-Item-Imports.
+    """
     try:
         entries = page.locator("a[href]").evaluate_all(
             """
@@ -470,16 +495,11 @@ def find_next_url(page) -> str | None:
     except Exception:
         entries = []
     for e in entries or []:
-        href = str(e.get("href") or "")
+        href = str(e.get("href") or "").split("#", 1)[0].rstrip("/")
         label = " ".join([str(e.get("text") or ""), str(e.get("aria") or ""), str(e.get("rel") or "")])
-        if href and is_items_url(href) and any(x in label for x in ["next", "weiter"]):
-            return href.rstrip("/")
-    current = page.url
-    m = re.search(r"([?&]page=)(\d+)", current)
-    if m:
-        return re.sub(r"([?&]page=)\d+", lambda mm: f"{mm.group(1)}{int(m.group(2)) + 1}", current)
-    joiner = "&" if "?" in current else "?"
-    return f"{current}{joiner}page=2"
+        if href and is_items_url(href) and any(x in label for x in ["next", "weiter", "nächste", "naechste"]):
+            return href
+    return None
 
 
 def goto_page(page, url: str, timeout_ms: int | None = None) -> bool:
@@ -542,6 +562,31 @@ def discover_category_seeds(page, locale: str, include_fallback: bool = True) ->
     return sorted(seeds.values(), key=lambda s: (order.get(s.main_category, 9), s.url))
 
 
+def same_main_category(url: str, main_category: str) -> bool:
+    return classify_main_category(url) == main_category
+
+
+def collect_next_data_urls(page) -> list[str]:
+    """Fallback für Next.js-Datenlinks, falls Items nicht als normale <a> auftauchen.
+
+    Questlog ist eine JS-App. Manchmal stehen Slugs/Links nur in eingebetteten JSON-Daten.
+    Diese Funktion sammelt alle passenden /db/items/... Pfade aus HTML und Scripts.
+    """
+    try:
+        html_text = page.content()
+    except Exception:
+        html_text = ""
+    urls: list[str] = []
+    seen: set[str] = set()
+    for m in re.finditer(r"/(?:throne-and-liberty)/(?:en|de)/db/items/[A-Za-z0-9_./%\-]+", html_text):
+        href = BASE + m.group(0)
+        href = href.split("?", 1)[0].split("#", 1)[0].rstrip("/")
+        if href not in seen and is_items_url(href):
+            seen.add(href)
+            urls.append(href)
+    return urls
+
+
 def parse_detail_page(page, url: str, main_category_hint: str, locale: str) -> dict[str, Any] | None:
     if not goto_page(page, url):
         return None
@@ -600,23 +645,63 @@ def parse_detail_page(page, url: str, main_category_hint: str, locale: str) -> d
 
 
 def crawl_category(context, conn, seed: CategorySeed, limit_left: int | None = None, dry_run: bool = False) -> int:
+    """Crawlt eine Questlog-Hauptkategorie.
+
+    Questlog-Struktur bei Items:
+      /db/items/weapons              = Hauptliste
+      /db/items/weapons/sword        = Unterliste / Waffentyp
+      /db/items/weapons/sword/<slug> = echte Item-Detailseite
+
+    Der alte Stand hat /weapons/sword als Detailseite genommen und deshalb alles
+    übersprungen. Diese Version geht erst in die Unterlisten und sammelt dort die
+    echten Detailseiten.
+    """
     list_page = context.new_page()
     detail_page = context.new_page()
     imported = 0
+
+    list_queue: list[str] = [seed.url.rstrip("/")]
+    visited_lists: set[str] = set()
     seen_detail: set[str] = set()
-    current_url = seed.url
-    for page_no in range(1, MAX_PAGES + 1):
-        print(f"📄 {seed.main_category}: {current_url}")
+
+    while list_queue and len(visited_lists) < MAX_PAGES:
+        current_url = list_queue.pop(0).rstrip("/")
+        if current_url in visited_lists:
+            continue
+        visited_lists.add(current_url)
+
+        print(f"📄 {seed.main_category}: {current_url}", flush=True)
         if not goto_page(list_page, current_url):
-            break
-        detail_links = [u for u in collect_links(list_page) if is_detail_url(u)]
-        # Falls Questlog die erste Seite unter /weapons ohne ?page rendert und Page 2 durch Fallback erfunden wurde,
-        # stoppen wir, sobald keine Detail-Links mehr kommen.
-        new_links = [u for u in detail_links if u not in seen_detail]
-        if not new_links:
-            print("ℹ️ Keine neuen Detailseiten mehr gefunden.")
-            break
-        for href in new_links:
+            continue
+
+        links = collect_links(list_page)
+        # Fallback: Links aus HTML/Next.js-Daten ergänzen.
+        for href in collect_next_data_urls(list_page):
+            if href not in links:
+                links.append(href)
+
+        # Nur innerhalb der gewünschten Hauptkategorie bleiben. Sonst nimmt die Waffen-Seite
+        # auch Armor/Material-Navigation mit.
+        links = [u for u in links if same_main_category(u, seed.main_category)]
+
+        sub_lists = sorted({u for u in links if is_subcategory_list_url(u) and u not in visited_lists})
+        detail_links = sorted({u for u in links if is_detail_url(u) and u not in seen_detail})
+
+        for sub in sub_lists:
+            if sub not in list_queue:
+                list_queue.append(sub)
+
+        next_url = find_next_url(list_page)
+        if next_url and same_main_category(next_url, seed.main_category) and is_list_url(next_url):
+            if next_url not in visited_lists and next_url not in list_queue:
+                list_queue.append(next_url)
+
+        print(f"   ↳ Listen gefunden: {len(sub_lists)} · Detailseiten gefunden: {len(detail_links)}", flush=True)
+
+        if not detail_links:
+            continue
+
+        for href in detail_links:
             if limit_left is not None and imported >= limit_left:
                 list_page.close()
                 detail_page.close()
@@ -625,27 +710,23 @@ def crawl_category(context, conn, seed: CategorySeed, limit_left: int | None = N
             try:
                 item = parse_detail_page(detail_page, href, seed.main_category, DEFAULT_LOCALE)
                 if not item:
-                    print(f"⚠️ Übersprungen: {href}")
+                    print(f"⚠️ Übersprungen: {href}", flush=True)
                     continue
                 if dry_run:
-                    print(f"DRY ✅ {item['main_category']} / {item.get('sub_category') or '-'} / {item['name']}")
+                    print(f"DRY ✅ {item['main_category']} / {item.get('sub_category') or '-'} / {item['name']}", flush=True)
                 else:
                     upsert_item(conn, item)
                     conn.commit()
-                    print(f"✅ {item['main_category']} / {item.get('sub_category') or '-'} / {item['name']}")
+                    print(f"✅ {item['main_category']} / {item.get('sub_category') or '-'} / {item['name']}", flush=True)
                 imported += 1
             except Exception as exc:
                 try:
                     conn.rollback()
                 except Exception:
                     pass
-                print(f"❌ Fehler bei {href}: {type(exc).__name__}: {exc}")
+                print(f"❌ Fehler bei {href}: {type(exc).__name__}: {exc}", flush=True)
             time.sleep(REQUEST_DELAY)
-        next_url = find_next_url(list_page)
-        if not next_url or next_url == current_url:
-            break
-        current_url = next_url
-        time.sleep(REQUEST_DELAY)
+
     list_page.close()
     detail_page.close()
     return imported
