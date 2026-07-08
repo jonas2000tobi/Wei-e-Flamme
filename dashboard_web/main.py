@@ -31,7 +31,7 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
-ASSET_VER = "ebo-gothic-whale-dashboard-mobile-v7"
+ASSET_VER = "ebo-gothic-whale-dashboard-portal-v1"
 DASHBOARD_RELEASE_VERSION = "1.2.0 · Status Playwright Worker"
 
 
@@ -8529,82 +8529,153 @@ def _render_need_editor_panel(user_id: int, current_user: Optional[dict[str, Any
 
 def _render_member_portal(data: dict[str, Any], user_id: int, request: Request, msg: str = "") -> str:
     if not data.get("ok"):
-        return _html_shell("Portal · Ebo Dashboard", f"<section class='panel'><h1>👤 Portal</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+        return _html_shell("Portal · Ebo Dashboard", f"<section class='panel'><h1>👤 Portal</h1><p class='muted'>{_e(data.get('error'))}</p></section>", nav_mode="member")
     if not _portal_can_view(request, int(user_id)):
         raise HTTPException(status_code=403, detail="Du darfst nur dein eigenes Portal sehen. Leitung/Admins sehen alle Mitglieder.")
+
     snap: dict[str, Any] = data.get("snapshot") or {}
     guild_id = _safe_guild_id(data)
     names = _profile_name_map(snap)
-    display = names.get(int(user_id), f"User {int(user_id)}")
-    balances = _balance_map(snap)
-    need_info = _needs_by_user(snap).get(int(user_id), {})
+    uid = int(user_id)
+
+    profiles = ((snap.get("profiles") or {}).get("items") or [])
+    profile: dict[str, Any] = {}
+    for p in profiles:
+        if not isinstance(p, dict):
+            continue
+        if _user_id(p.get("user_id") or p.get("member_id") or p.get("discord_id")) == uid:
+            profile = p
+            break
+
+    display = (
+        profile.get("display_name")
+        or profile.get("ingame_name")
+        or profile.get("discord_name")
+        or names.get(uid)
+        or f"User {uid}"
+    )
+    profile_name = profile.get("ingame_name") or profile.get("display_name") or display
+    gearscore = profile.get("gearscore") or profile.get("gear_score") or profile.get("gs") or "—"
+    main_role = profile.get("main_role") or profile.get("role_name") or profile.get("class_role") or profile.get("role") or "—"
+    guild_rank = (
+        profile.get("guild_rank")
+        or profile.get("rank_name")
+        or profile.get("rank")
+        or profile.get("guild_role")
+        or profile.get("member_rank")
+        or "—"
+    )
+    joined_raw = (
+        profile.get("guild_joined_at")
+        or profile.get("joined_guild_at")
+        or profile.get("member_since")
+        or profile.get("joined_since")
+        or profile.get("joined_at")
+        or profile.get("created_at")
+        or ""
+    )
+    joined_text = _dt(joined_raw) if joined_raw else "—"
+
+    need_info = _needs_by_user(snap).get(uid, {})
     main_needs = need_info.get("main") if isinstance(need_info, dict) else []
     sec_needs = need_info.get("secondary") if isinstance(need_info, dict) else []
-    response = _event_response_counts_for_user(snap, int(user_id))
-    loot_payload = _loot_member_payload_from_snapshot(snap, int(user_id), int(guild_id or 0))
-    active_events = _portal_active_events(snap, int(user_id))
-    active_auctions = _portal_active_auctions(snap)
-    need_requests = _need_change_requests(guild_id, user_id=int(user_id), limit=60) if guild_id else []
-    edit_needs = str(request.query_params.get("edit_needs") or "").strip() == "1"
 
-    event_rows = []
-    for ev in active_events:
-        eid = str(ev.get("event_id") or ev.get("id") or "")
-        event_rows.append([_event_link(eid, ev.get("title") or eid), _dt(ev.get("when_iso") or ev.get("start_at")), _event_status_text(ev), _portal_event_status_for_user(ev, int(user_id)), _raw(f'<a class="link" href="/attendance/{_e(eid)}">Review</a>') if eid else "—"])
+    active_events = _portal_active_events(snap, uid)
+    user_auctions = [a for a in _auctions_for_user(snap, uid, limit=100) if isinstance(a, dict)]
+    active_user_auctions = [a for a in user_auctions if _loot_is_active(a)]
+    if not active_user_auctions:
+        # Fallback: Wenn Snapshot keine userbezogene Auktionszuordnung liefert, wenigstens alle aktiven anzeigen/zählen.
+        active_user_auctions = [a for a in _portal_active_auctions(snap) if isinstance(a, dict)]
 
-    auction_rows = []
-    for a in active_auctions:
-        aid = str(a.get("auction_id") or "")
-        auction_rows.append([_auction_link(aid, a.get("item")), a.get("mode"), _fmt_ec(a.get("start_bid") or 0), a.get("leader") or "—", _dt(a.get("ends_at")), _raw(f'<a class="btn" href="/auction/{_e(aid)}">Bieten</a>') if aid else "—"])
-
-    tx_rows = [[_dt(tx.get("created_at")), _fmt_ec(tx.get("amount")), tx.get("raw_type"), _short(tx.get("reason"), 140)] for tx in _tx_for_user(snap, int(user_id), limit=30)]
-    loot_rows = []
-    for r in loot_payload.get("wins") or []:
-        aid = r.get("auction_id")
-        loot_rows.append([_auction_link(aid, r.get("item")) if aid else r.get("item"), r.get("mode"), _fmt_ec(r.get("winning_amount")), _dt(r.get("closed_at"))])
-
+    msg_html = f'<div class="ok">{_e(msg)}</div>' if msg else ""
     admin_links = ""
     if _is_portal_admin(request):
-        admin_links = f'<a class="btn" href="/member/{int(user_id)}">Leitungsprüfung</a><a class="btn" href="/member/{int(user_id)}/loot">Loot prüfen</a><a class="btn" href="/attendance-stats">Attendance prüfen</a>'
-    msg_html = f'<div class="ok">{_e(msg)}</div>' if msg else ""
-    cards = "".join([
-        _card("EC", _fmt_ec(balances.get(int(user_id))) if balances.get(int(user_id)) is not None else "—", "aktueller Stand"),
-        _card("Needs", f"{len(main_needs)} / {len(sec_needs)}", "Main / Secondary"),
-        _card("Events", f"{response.get('yes',0)} Zusagen", f"{response.get('maybe',0)} vielleicht · {response.get('no',0)} nein"),
-        _card("Loot", loot_payload.get("won_count", 0), f"ausgegeben: {_fmt_ec(loot_payload.get('spent_ec', 0))} EC"),
+        admin_links = f'<a class="btn ghost" href="/member/{uid}">Leitungsprüfung</a><a class="btn ghost" href="/member/{uid}/loot">Loot prüfen</a>'
+
+    profile_rows = "".join([
+        f'<div class="portal-profile-row"><span>Name</span><strong>{_e(profile_name)}</strong></div>',
+        f'<div class="portal-profile-row"><span>Gearscore</span><strong>{_e(gearscore)}</strong></div>',
+        f'<div class="portal-profile-row"><span>Rolle</span><strong>{_e(main_role)}</strong></div>',
+        f'<div class="portal-profile-row"><span>Gildenrang</span><strong>{_e(guild_rank)}</strong></div>',
+        f'<div class="portal-profile-row"><span>In Gilde seit</span><strong>{_e(joined_text)}</strong></div>',
     ])
-    portal_nav = '<nav class="topnav"><a href="/">Kommando</a><a href="/portal">Mein Portal</a><a href="/events">Events</a><a href="/loot">Loot</a><a href="/members">Mitglieder</a><a href="/ec">EC</a></nav>' if _is_portal_admin(request) else '<nav class="topnav"><a href="/member">Start</a><a href="/member/members">Mitglieder</a><a href="/member/events">Events</a><a href="/member/auctions">Auktionen</a><a href="/member/ec">Meine EC</a><a href="/portal">Eigenes Profil</a><a href="#needs">Meine Needs</a></nav>'
+
+    event_preview = "Keine aktive Anmeldung."
+    if active_events:
+        event_preview = _short(active_events[0].get("title") or active_events[0].get("name") or "Nächstes Event", 56)
+    auction_preview = "Keine laufende Auktion."
+    if active_user_auctions:
+        auction_preview = _short(_loot_text(active_user_auctions[0].get("item_name") or active_user_auctions[0].get("item") or active_user_auctions[0].get("auction_id")), 56)
+
+    portal_nav = '<nav class="topnav"><a href="/">Kommando</a><a href="/portal">Mein Portal</a><a href="/events">Events</a><a href="/loot">Loot</a><a href="/members">Mitglieder</a><a href="/ec">EC</a></nav>' if _is_portal_admin(request) else '<nav class="topnav"><a href="/member">Start</a><a href="/member/events">Events</a><a href="/member/auctions">Auktionen</a><a href="/member/ec">Meine EC</a><a href="/portal">Mein Portal</a></nav>'
+
     body = f"""
     <style>
-      .soft-details summary{{cursor:pointer;list-style:none;padding:10px 0;color:var(--gold)}}
-      .soft-details summary::-webkit-details-marker{{display:none}}
-      .need-slot-edit-row{{display:grid;grid-template-columns:140px minmax(260px,1fr) auto auto;gap:10px;align-items:end}}
-      .need-slot-edit-row .need-field-box input,.need-slot-edit-row .need-field-box select,.need-slot-edit-row .mini-input{{width:100%;padding:9px;border-radius:10px;background:#08090d;color:var(--text);border:1px solid var(--line)}}
-      .need-slot-edit-row .mini-btn{{padding:9px 11px;white-space:nowrap}}
-      .need-slot-row.locked em{{color:var(--muted);font-style:normal}}
-      @media(max-width:760px){{.need-slot-edit-row{{grid-template-columns:1fr;align-items:stretch}}.need-slot-edit-row .btn{{width:100%}}}}
+      .portal-page-hero{{min-height:180px;}}
+      .portal-profile-card{{display:grid;gap:10px;}}
+      .portal-profile-row{{display:grid;grid-template-columns:150px minmax(0,1fr);gap:12px;align-items:center;padding:11px 0;border-bottom:1px solid rgba(214,168,79,.13)}}
+      .portal-profile-row:last-child{{border-bottom:0}}
+      .portal-profile-row span{{color:var(--muted);font-size:13px;text-transform:uppercase;letter-spacing:.06em;font-weight:800}}
+      .portal-profile-row strong{{color:var(--text);font-size:16px;overflow-wrap:anywhere}}
+      .portal-mini-grid{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin:14px 0}}
+      .portal-kpi{{padding:18px}}
+      .portal-kpi .card-value{{font-size:34px}}
+      .portal-kpi p{{margin:6px 0 0}}
+      .portal-need-card{{margin-top:14px}}
+      .portal-need-head{{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:12px}}
+      .portal-need-card details{{margin-top:14px}}
+      .portal-need-card summary{{cursor:pointer;list-style:none;display:inline-flex;align-items:center;justify-content:center;gap:8px}}
+      .portal-need-card summary::-webkit-details-marker{{display:none}}
+      .portal-need-card .need-board > h3:first-child{{display:none}}
+      .portal-need-card .need-board > p.muted:first-of-type{{display:none}}
+      .portal-need-card .mobile-note{{display:none}}
+      @media(max-width:760px){{
+        .portal-profile-row{{grid-template-columns:1fr;gap:4px;padding:10px 0}}
+        .portal-mini-grid{{grid-template-columns:1fr 1fr;gap:10px}}
+        .portal-kpi{{padding:14px}}
+        .portal-kpi .card-value{{font-size:28px}}
+      }}
+      @media(max-width:380px){{
+        .portal-mini-grid{{grid-template-columns:1fr}}
+      }}
     </style>
     {portal_nav}
-    <section class="hero">
-      <div><div class="eyebrow">Spieler- & Mitgliederportal</div><h1>👤 {_e(display)}</h1><p class="muted">Eigene Daten, laufende Events, laufende Auktionen, EC, Attendance, Loot und Needliste.</p></div>
-      <div class="hero-actions">{admin_links}<a class="btn" href="/logout">Logout</a></div>
+    <section class="hero portal-page-hero">
+      <div>
+        <div class="eyebrow">Mein Portal</div>
+        <h1>👤 {_e(display)}</h1>
+        <p class="muted">Profil, Event-Anmeldungen, Auktionen und eigene Needliste.</p>
+      </div>
+      <div class="hero-actions">{admin_links}</div>
     </section>
     {msg_html}
-    <section class="grid">{cards}</section>
-    <section class="panel"><h2>📅 Laufende & kommende Events</h2>{_table(['Event','Zeit','Status','Deine Anmeldung','Aktion'], event_rows, placeholder='Events durchsuchen…')}</section>
-    <section class="panel"><h2>⚔️ Laufende Auktionen</h2><p class="muted">Zum Bieten die Auktion öffnen. Bieten läuft weiterhin sicher über Bot-Queue.</p>{_table(['Item','Bereich','Start/Preis','Führend','Ende','Aktion'], auction_rows, placeholder='Auktionen durchsuchen…')}</section>
-    <section class="panel" id="needs">
-      <div style="display:flex;justify-content:space-between;gap:10px;align-items:center;flex-wrap:wrap">
-        <h2>🎁 Deine Needliste</h2>
-        <div style="display:flex;gap:8px;flex-wrap:wrap">
-          {('<a class="btn" href="/portal#needs">Bearbeiten beenden</a>' if edit_needs else '<a class="btn" href="/portal?edit_needs=1#needs">✍️ Needliste bearbeiten</a>')}
-        </div>
-      </div>
-      <div class="split"><div>{_render_need_slot_board(display, 'Main', main_needs, editable=edit_needs, user_id=int(user_id), snap=snap)}</div><div>{_render_need_slot_board(display, 'Secondary', sec_needs, editable=edit_needs, user_id=int(user_id), snap=snap)}</div></div>
-      <details class="soft-details" style="margin-top:14px"><summary>Änderungslog anzeigen</summary>{_table(['Zeit','Status','Aktion','Bereich','Slot','Ergebnis'], [[_dt(r.get('requested_at')), _need_change_status_label(r.get('status')), r.get('action_type'), (r.get('payload') or {}).get('tab'), (r.get('payload') or {}).get('slot'), _short(((r.get('result') or {}).get('message') or (r.get('result') or {}).get('error') or (r.get('payload') or {}).get('item_text') or (r.get('payload') or {}).get('item_name') or '—'), 120)] for r in need_requests[:30]], placeholder='Need-Änderungen durchsuchen…')}</details>
+    <section class="panel portal-profile-card">
+      <h2>Profil</h2>
+      {profile_rows}
     </section>
-    <section class="panel"><h2>🪙 EC-Verlauf</h2>{_table(['Zeit','Betrag','Typ','Grund'], tx_rows, placeholder='EC durchsuchen…')}</section>
-    <section class="panel"><h2>🏆 Loot-Historie</h2>{_table(['Item','Bereich','EC','Zeit'], loot_rows, placeholder='Loot durchsuchen…')}</section>
+    <section class="portal-mini-grid">
+      <div class="card portal-kpi">
+        <div class="card-title">An Events angemeldet</div>
+        <div class="card-value">{len(active_events)}</div>
+        <p class="card-sub">{_e(event_preview)}</p>
+      </div>
+      <div class="card portal-kpi">
+        <div class="card-title">Deine Auktionen</div>
+        <div class="card-value">{len(active_user_auctions)}</div>
+        <p class="card-sub">{_e(auction_preview)}</p>
+      </div>
+    </section>
+    <section class="panel portal-need-card" id="needs">
+      <div class="portal-need-head">
+        <h2>Eigene Needliste</h2>
+        <a class="btn ghost" href="/portal?edit_needs=1#needs">Bearbeiten</a>
+      </div>
+      {_render_need_slot_board(str(display), 'Main', main_needs, editable=False, user_id=uid, snap=snap)}
+      <details>
+        <summary class="btn">Second anzeigen</summary>
+        {_render_need_slot_board(str(display), 'Secondary', sec_needs, editable=False, user_id=uid, snap=snap)}
+      </details>
+    </section>
     """
     shell_mode = "admin" if _is_portal_admin(request) else "member"
     return _html_shell(f"{display} Portal · Ebo Dashboard", body, nav_mode=shell_mode)
