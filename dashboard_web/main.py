@@ -31,7 +31,7 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
-ASSET_VER = "ebo-gothic-whale-dashboard-mobile-v3"
+ASSET_VER = "ebo-gothic-whale-dashboard-mobile-v4"
 DASHBOARD_RELEASE_VERSION = "1.2.0 · Status Playwright Worker"
 
 
@@ -4368,6 +4368,129 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "admin") -> str:
     @media(max-width:360px) {{
       .status-hero-stats {{
         grid-template-columns:1fr !important;
+      }}
+    }}
+
+
+    /* Mobile UX Patch v4 – topnav oben, Menü im Hero, Login am echten Seitenende */
+    @media(max-width:900px) {{
+      :root {{ --mobile-topnav-h:58px; }}
+
+      main.content {{
+        display:flex !important;
+        flex-direction:column !important;
+        padding-top:8px !important;
+        padding-bottom:34px !important;
+      }}
+
+      .topnav {{
+        position:sticky !important;
+        top:0 !important;
+        left:auto !important;
+        right:auto !important;
+        bottom:auto !important;
+        z-index:190 !important;
+        order:-20 !important;
+        margin:0 0 12px !important;
+        padding:8px 10px !important;
+        display:flex !important;
+        flex-wrap:nowrap !important;
+        gap:8px !important;
+        overflow-x:auto !important;
+        -webkit-overflow-scrolling:touch !important;
+        scrollbar-width:none !important;
+        background:linear-gradient(180deg,rgba(9,10,15,.92),rgba(7,7,10,.96)) !important;
+        border:1px solid rgba(214,168,79,.24) !important;
+        border-radius:16px !important;
+        box-shadow:0 10px 24px rgba(0,0,0,.36), inset 0 1px 0 rgba(255,255,255,.04) !important;
+      }}
+      .topnav::-webkit-scrollbar {{ display:none !important; }}
+      .topnav a {{
+        flex:0 0 auto !important;
+        min-height:42px !important;
+        padding:9px 13px !important;
+        border-radius:14px !important;
+        font-size:13px !important;
+        background:linear-gradient(180deg,rgba(32,22,14,.86),rgba(9,9,12,.92)) !important;
+      }}
+
+      .authbar {{
+        position:static !important;
+        left:auto !important;
+        right:auto !important;
+        bottom:auto !important;
+        z-index:auto !important;
+        order:999 !important;
+        min-height:42px !important;
+        margin:18px 0 0 !important;
+        display:flex !important;
+        align-items:center !important;
+        gap:8px !important;
+        overflow-x:auto !important;
+        white-space:nowrap !important;
+        scrollbar-width:none !important;
+        border-radius:14px !important;
+        background:linear-gradient(180deg,rgba(17,18,26,.96),rgba(8,9,13,.96)) !important;
+        box-shadow:0 10px 28px rgba(0,0,0,.32), inset 0 1px 0 rgba(255,255,255,.04) !important;
+      }}
+      .authbar::-webkit-scrollbar {{ display:none !important; }}
+
+      .mobile-nav-toggle {{
+        display:inline-flex !important;
+        position:fixed !important;
+        right:18px !important;
+        top:calc(var(--mobile-topnav-h) + 158px) !important;
+        bottom:auto !important;
+        z-index:210 !important;
+        min-height:42px !important;
+        padding:9px 12px !important;
+        border-radius:14px !important;
+        box-shadow:0 12px 30px rgba(0,0,0,.45), inset 0 1px 0 rgba(255,255,255,.06) !important;
+      }}
+
+      body.nav-open .mobile-nav-toggle {{
+        top:12px !important;
+        right:12px !important;
+        bottom:auto !important;
+        z-index:320 !important;
+      }}
+
+      .status-main-hero,
+      .hero {{
+        overflow:hidden !important;
+        background-position:center center !important;
+        background-size:cover !important;
+        background-repeat:no-repeat !important;
+      }}
+
+      .status-hero-stats {{
+        display:grid !important;
+        grid-template-columns:repeat(2,minmax(0,1fr)) !important;
+        gap:10px !important;
+      }}
+      .status-hero-stat {{
+        min-width:0 !important;
+        width:auto !important;
+      }}
+    }}
+
+    @media(max-width:560px) {{
+      .mobile-nav-toggle {{
+        right:16px !important;
+        top:calc(var(--mobile-topnav-h) + 150px) !important;
+      }}
+      .status-hero-stats {{
+        grid-template-columns:repeat(2,minmax(0,1fr)) !important;
+      }}
+    }}
+
+    @media(max-width:360px) {{
+      .status-hero-stats {{
+        grid-template-columns:1fr !important;
+      }}
+      .mobile-nav-toggle {{
+        right:12px !important;
+        top:calc(var(--mobile-topnav-h) + 144px) !important;
       }}
     }}
 
