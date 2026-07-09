@@ -3696,6 +3696,15 @@ def run_debug(args: argparse.Namespace) -> int:
 def run_import(args: argparse.Namespace) -> int:
     if getattr(args, "debug_url", ""):
         return run_debug(args)
+
+    # Kombi-Modus: vorhandene Armor-Items korrigieren, ohne Reset und ohne Bilder/Namen/Kategorien anzufassen.
+    # Reihenfolge: erst DEF/Zusatzwerte, dann Eigenschaften. So sind beide Datenbereiche aktuell.
+    if getattr(args, "armor_stats_only", False) and getattr(args, "traits_only", False):
+        print("🔧 Kombi-Update: Armor DEF/Zusatzwerte + Eigenschaften. Kein Reset, keine Bild-/Item-Änderung.")
+        rc1 = run_armor_stats_only(args)
+        rc2 = run_traits_only(args)
+        return rc1 or rc2
+
     if getattr(args, "armor_stats_only", False):
         return run_armor_stats_only(args)
     if getattr(args, "traits_only", False):
@@ -3798,6 +3807,256 @@ def run_import(args: argparse.Namespace) -> int:
     return total
 
 
+
+# ---------------------------------------------------------------------------
+# Finaler Armor-Detail-Updater-Fix
+# ---------------------------------------------------------------------------
+# Der vorherige Armor-Parser war zu abhängig von festen Trait-Namen und hat bei
+# Rüstung/Handschuhen oft nur 5-7 Eigenschaften gefunden. Questlog rendert den
+# Eigenschaften-Block aber sehr regelmäßig: Label: + vier Werte. Deshalb lesen
+# diese Overrides generisch aus dem Abschnitt ab "Eigenschaften" und nicht mehr
+# über eine unvollständige Whitelist.
+
+_old_extract_bonus_stats_from_parsed = _extract_bonus_stats_from_parsed
+
+
+def _ql_num_tokens_keep(text: Any) -> list[str]:
+    raw = str(text or "")
+    return [clean_text(x) for x in re.findall(r"[+\-]?\d+(?:[.,]\d+)?\s*%?", raw)]
+
+
+def _armor_noise_line(text: Any) -> bool:
+    low = clean_text(text).lower().strip(" :")
+    if not low:
+        return True
+    noise_parts = (
+        "remove ads", "werbung", "anzeige", "questlog", "datenbank", "upgrade",
+        "anmelden", "zurück", "zurueck", "teilen", "share", "hot", "new",
+        "charakter-builds", "skill-builds", "auktionshaus", "kampfprotokolle",
+        "preisverlauf", "bestandsverlauf", "durchschnittspreis", "auf lager",
+        "kommentare", "comments", "karte", "map", "enchanting", "stats",
+        "verkaufspreis", "sales price", "von npcs erbeutet", "dropped from",
+        "in lithographen", "lithograph", "litograph", "ausrüstungseffekt",
+        "ausruestungseffekt", "ausrüstungseffekte", "ausruestungseffekte",
+        "ausrüstungsset", "ausruestungsset", "dieser gegenstand hat",
+        "this item has", "regen in", "nacht in", "discord", "strg",
+    )
+    return any(x in low for x in noise_parts)
+
+
+def _armor_generic_label(text: Any) -> str:
+    t = clean_text(text).strip()
+    if not t:
+        return ""
+    # Inline-Label abtrennen: "Max. Mana: 150 | 300 ..."
+    if ":" in t:
+        left = clean_text(t.split(":", 1)[0]).rstrip(":")
+    else:
+        left = t.rstrip(":")
+    low = left.lower().strip(" :")
+    if not left or _armor_noise_line(left):
+        return ""
+    if re.search(r"\d", left):
+        return ""
+    if left in {"|", "~", "▲", "Episch", "Selten", "Rare", "Epic", "Level", "Item Level", "Eigenschaften", "Traits"}:
+        return ""
+    if len(left) > 80:
+        return ""
+    return left
+
+
+def _armor_is_likely_next_label(token: Any) -> bool:
+    t = clean_text(token).strip()
+    if not t or _armor_noise_line(t):
+        return False
+    if _ql_num_tokens_keep(t):
+        return False
+    return bool(_armor_generic_label(t))
+
+
+def _parse_armor_traits_from_text_sequence(tokens: list[str], expected: int) -> list[dict[str, Any]]:  # type: ignore[override]
+    """Generischer Questlog-Traitparser für Armor.
+
+    Quelle ist eine echte Text-Reihenfolge aus Itemkasten oder Body. Er startet
+    exakt nach "Eigenschaften" und nimmt dann jedes Label mit vier Wertstufen.
+    Damit funktionieren auch Trait-Namen, die nicht in einer alten Whitelist
+    standen, z. B. seltene Resistenz-/Chance-Zeilen.
+    """
+    if expected <= 0:
+        return []
+    clean_tokens = [clean_text(t).strip() for t in tokens if clean_text(t).strip()]
+    start = -1
+    for i, t in enumerate(clean_tokens):
+        if clean_text(t).lower().strip(" :") in {"eigenschaften", "traits"}:
+            start = i + 1
+            break
+    if start < 0:
+        return []
+
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    i = start
+    max_i = min(len(clean_tokens), start + 260)
+    while i < max_i and len(out) < expected:
+        tok = clean_tokens[i]
+        if _armor_noise_line(tok):
+            i += 1
+            continue
+
+        label = ""
+        inline_values = ""
+        if ":" in tok:
+            left, right = tok.split(":", 1)
+            label = _armor_generic_label(left)
+            inline_values = right
+        else:
+            label = _armor_generic_label(tok)
+
+        if not label:
+            i += 1
+            continue
+        key = label.lower().strip(" :")
+        if key in seen:
+            i += 1
+            continue
+
+        vals: list[str] = []
+        if inline_values:
+            vals.extend(_ql_num_tokens_keep(inline_values))
+
+        j = i + 1
+        while j < max_i and len(vals) < 4:
+            nxt = clean_tokens[j]
+            if _armor_noise_line(nxt):
+                j += 1
+                continue
+            # Nächstes Label beginnt. Wenn wir noch nicht 4 Werte haben, ist das
+            # aktuelle Label offenbar kein echter Trait.
+            if _armor_is_likely_next_label(nxt):
+                break
+            if clean_text(nxt).strip() != "|":
+                vals.extend(_ql_num_tokens_keep(nxt))
+            j += 1
+
+        if len(vals) >= 4:
+            out.append({"name": label, "values": vals[:4]})
+            seen.add(key)
+            i = max(j, i + 1)
+            continue
+        i += 1
+
+    return out[:expected]
+
+
+def _parse_armor_traits_by_label_windows(raw_text: str, expected: int) -> list[dict[str, Any]]:  # type: ignore[override]
+    raw = normalize_raw_text(raw_text)
+    lines = [clean_text(x) for x in re.split(r"[\n\r]+", raw) if clean_text(x)]
+    return _parse_armor_traits_from_text_sequence(lines, expected)
+
+
+def _parse_armor_bonus_stats_generic(raw_text: str, expected: int) -> list[dict[str, Any]]:
+    if expected <= 0:
+        return []
+    lines = [clean_text(x) for x in re.split(r"[\n\r]+", normalize_raw_text(raw_text)) if clean_text(x)]
+    if not lines:
+        return []
+
+    # Ende ist der Eigenschaften-Block. Bonuswerte liegen davor.
+    end = len(lines)
+    for idx, line in enumerate(lines):
+        if clean_text(line).lower().strip(" :") in {"eigenschaften", "traits"}:
+            end = idx
+            break
+
+    # Start nach den beiden Verteidigungswerten suchen. Wenn das nicht klappt,
+    # nach Item Level starten.
+    defense_labels = {"nahkampfverteidigung", "fernkampfverteidigung", "magieverteidigung", "verteidigung", "def"}
+    start = 0
+    defense_hits = 0
+    for idx, line in enumerate(lines[:end]):
+        low = clean_text(line).lower().strip(" :")
+        if low in defense_labels:
+            defense_hits += 1
+            # Label + Wert + evtl. ▲-Wert überspringen.
+            start = max(start, idx + 3)
+    if defense_hits < 1:
+        for idx, line in enumerate(lines[:end]):
+            if "item level" in clean_text(line).lower() or clean_text(line).lower().strip(" :") == "level":
+                start = idx + 1
+                break
+
+    primary_labels = defense_labels | {"item level", "level", "episch", "selten", "rare", "epic"}
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    i = start
+    while i < end and len(out) < expected:
+        tok = lines[i]
+        if _armor_noise_line(tok):
+            i += 1
+            continue
+        label = ""
+        inline = ""
+        if ":" in tok:
+            left, right = tok.split(":", 1)
+            label = _armor_generic_label(left)
+            inline = right
+        else:
+            label = _armor_generic_label(tok)
+        if not label or label.lower().strip(" :") in primary_labels:
+            i += 1
+            continue
+        key = label.lower().strip(" :")
+        if key in seen:
+            i += 1
+            continue
+        vals: list[str] = []
+        if inline:
+            vals.extend(_ql_num_tokens_keep(inline))
+        j = i + 1
+        while j < end and len(vals) < 2:
+            nxt = lines[j]
+            if _armor_noise_line(nxt):
+                j += 1
+                continue
+            if _armor_is_likely_next_label(nxt):
+                break
+            if clean_text(nxt).strip() not in {"|", "~"}:
+                vals.extend(_ql_num_tokens_keep(nxt))
+            j += 1
+        if vals:
+            entry: dict[str, Any] = {"label": label, "value": vals[0]}
+            # Questlog zeigt Verbesserung als ▲-Zeile. In den Tokens ist das meist der zweite Wert.
+            if len(vals) >= 2:
+                entry["delta"] = vals[1]
+            out.append(entry)
+            seen.add(key)
+            i = max(j, i + 1)
+            continue
+        i += 1
+    return out[:expected]
+
+
+def _extract_bonus_stats_from_parsed(parsed: dict[str, Any], row: dict[str, Any]) -> tuple[list[dict[str, Any]], int]:  # type: ignore[override]
+    detail = ((parsed.get("raw_data") or {}).get("detail") or {}) if isinstance(parsed.get("raw_data"), dict) else {}
+    level = parsed.get("item_level") or detail.get("item_level") or row.get("item_level")
+    expected = armor_expected_bonus_count_from_level(level)
+
+    raw_text = str(parsed.get("raw_text") or "")
+    generic = _parse_armor_bonus_stats_generic(raw_text, expected)
+    if expected > 0 and len(generic) >= expected:
+        return generic[:expected], expected
+
+    # Fallback auf den bisherigen Detailparser, falls generisch bei Sonderseiten
+    # nichts findet. Aber wenn generisch mehr findet, nehmen wir generisch.
+    try:
+        old_bonus, _ = _old_extract_bonus_stats_from_parsed(parsed, row)
+    except Exception:
+        old_bonus = []
+    if len(generic) >= len(old_bonus or []):
+        return generic[:expected] if expected else generic, expected
+    return (old_bonus or [])[:expected] if expected else (old_bonus or []), expected
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Questlog.gg Item-Importer für Ebo Dashboard/Postgres")
     p.add_argument("--category-url", default="", help="Eine oder mehrere Questlog-Kategorien crawlen, getrennt mit Komma/Semikolon, z. B. /db/items/armor,/db/items/accessories")
@@ -3808,7 +4067,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--reset-category", action="store_true", help="Vor dem Import questlog-Items der gewählten Hauptkategorie löschen")
     p.add_argument("--debug-url", default="", help="Eine oder mehrere Questlog-Detailseiten debuggen. Schreibt nichts in Postgres.")
     p.add_argument("--traits-only", action="store_true", help="Nur vorhandene Armor-Eigenschaften neu lesen und aktualisieren. Kein Reset, keine Bild-/Item-Änderung.")
-    p.add_argument("--armor-stats-only", action="store_true", help="Nur vorhandene Armor-DEF/Zusatzwerte neu lesen und aktualisieren. Kein Reset, keine Bild-/Item-Änderung.")
+    p.add_argument("--armor-stats-only", action="store_true", help="Nur vorhandene Armor-DEF/Zusatzwerte neu lesen und aktualisieren. Kein Reset, keine Bild-/Item-Änderung. Kann mit --traits-only kombiniert werden.")
     return p
 
 
