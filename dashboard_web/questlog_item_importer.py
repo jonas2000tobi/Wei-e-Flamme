@@ -4147,6 +4147,44 @@ def _extract_bonus_stats_from_parsed(parsed: dict[str, Any], row: dict[str, Any]
     return (old_bonus or [])[:expected] if expected else (old_bonus or []), expected
 
 
+
+# Patch: scalable Questlog armor pieces like "Item Level 50 (21-50)" often expose
+# only 3 Zusatzwerte on the rendered German detail page. They are not missing;
+# the fixed rule "Level 50 = 4" only fits fixed/newer armor blocks.
+def _armor_is_scaling_21_50_item(raw_text: str) -> bool:
+    raw = normalize_raw_text(raw_text or "")
+    return bool(re.search(r"Item\s*Level\s*50\s*\(\s*21\s*[-–]\s*50\s*\)", raw, re.I)) or bool(re.search(r"\(\s*21\s*[-–]\s*50\s*\)", raw))
+
+
+def _armor_expected_bonus_count_from_context(level_value: Any, raw_text: str, found_count: int = 0) -> int:
+    base = armor_expected_bonus_count_from_level(level_value)
+    if base == 4 and found_count == 3 and _armor_is_scaling_21_50_item(raw_text):
+        return 3
+    return base
+
+
+def _extract_bonus_stats_from_parsed(parsed: dict[str, Any], row: dict[str, Any]) -> tuple[list[dict[str, Any]], int]:  # type: ignore[override]
+    detail = ((parsed.get("raw_data") or {}).get("detail") or {}) if isinstance(parsed.get("raw_data"), dict) else {}
+    level = parsed.get("item_level") or detail.get("item_level") or row.get("item_level")
+    raw_text = str(parsed.get("raw_text") or "")
+
+    initial_expected = armor_expected_bonus_count_from_level(level)
+    generic = _parse_armor_bonus_stats_generic(raw_text, initial_expected)
+    expected = _armor_expected_bonus_count_from_context(level, raw_text, len(generic))
+
+    if expected > 0 and len(generic) >= expected:
+        return generic[:expected], expected
+
+    try:
+        old_bonus, _ = _old_extract_bonus_stats_from_parsed(parsed, row)
+    except Exception:
+        old_bonus = []
+
+    best = generic if len(generic) >= len(old_bonus or []) else (old_bonus or [])
+    if expected > 0:
+        return best[:expected], expected
+    return best, expected
+
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Questlog.gg Item-Importer für Ebo Dashboard/Postgres")
     p.add_argument("--category-url", default="", help="Eine oder mehrere Questlog-Kategorien crawlen, getrennt mit Komma/Semikolon, z. B. /db/items/armor,/db/items/accessories")
