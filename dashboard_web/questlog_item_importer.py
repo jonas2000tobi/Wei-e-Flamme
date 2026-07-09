@@ -4062,8 +4062,13 @@ def _parse_armor_bonus_stats_generic(raw_text: str, expected: int) -> list[dict[
         low = clean_text(line).lower().strip(" :")
         if low in defense_labels:
             defense_hits += 1
-            # Label + Wert + evtl. ▲-Wert überspringen.
-            start = max(start, idx + 3)
+            # Nach dem letzten DEF-Label starten wir direkt hinter dessen Basiswert.
+            # Questlog rendert Fixed-Level-Items ohne ▲-Delta:
+            #   Fernkampfverteidigung / 246 / Weisheit / 7 ...
+            # Der alte idx+3 sprang dabei über den ersten echten Zusatzwert.
+            # Bei Items mit ▲-Delta landet idx+2 auf der Delta-Zeile; die wird
+            # unten als reine Zahl/kein Label sauber übersprungen.
+            start = max(start, idx + 2)
     if defense_hits < 1:
         for idx, line in enumerate(lines[:end]):
             if "item level" in clean_text(line).lower() or clean_text(line).lower().strip(" :") == "level":
