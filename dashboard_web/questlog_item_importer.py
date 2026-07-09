@@ -3059,10 +3059,9 @@ def crawl_category(context, conn, seed: CategorySeed, limit_left: int | None = N
 def debug_dump_item_card(context, url: str) -> None:
     """Debuggt exakt, was Playwright auf einer Questlog-Detailseite sieht.
 
-    Wichtig: Dieser Modus schreibt nichts in die Datenbank. Er gibt den linken
-    Itemkasten, die besten DOM-Kandidaten, Bild-URLs und das vom Parser erzeugte
-    Detailmodell aus. Damit kann der Armor-Trait-Parser danach gezielt gefixt
-    werden, statt weiter zu raten.
+    Dieser Modus schreibt nichts in die Datenbank. Er dumpft sehr roh: Body-Text,
+    DOM-Kandidaten, Links und Bilder. Damit bauen wir den Armor-Trait-Parser auf
+    echte Questlog-Ausgabe statt weiter zu raten.
     """
     url = force_de_locale_url(str(url or "").strip())
     if not url:
@@ -3079,46 +3078,60 @@ def debug_dump_item_card(context, url: str) -> None:
             return
 
         try:
-            body_text = page.locator("body").inner_text(timeout=6000)
+            page.wait_for_timeout(2500)
+            page.evaluate("() => window.scrollTo(0, 0)")
+            page.wait_for_timeout(500)
+        except Exception:
+            pass
+
+        try:
+            body_text = page.locator("body").inner_text(timeout=10000)
         except Exception:
             body_text = page.evaluate("() => document.body ? document.body.innerText : ''")
 
         json_candidates = collect_json_candidates(page)
         name = page_title(page) or best_name_from_json(json_candidates)
-        print(f"NAME: {name}", flush=True)
+        print(f"NAME_GUESSED: {name}", flush=True)
         print(f"JSON_CANDIDATES: {len(json_candidates)}", flush=True)
+
+        body_lines = [clean_text(x) for x in str(body_text or "").splitlines() if clean_text(x)]
+        print("\n--- BODY TEXT LINES ---", flush=True)
+        print(f"BODY_LINE_COUNT: {len(body_lines)}", flush=True)
+        for idx, line in enumerate(body_lines[:420]):
+            print(f"{idx:03d}: {line}", flush=True)
+        if len(body_lines) > 420:
+            print(f"... ({len(body_lines) - 420} weitere Body-Zeilen)", flush=True)
 
         try:
             candidates = page.evaluate(
-                """
+                r"""
                 (itemName) => {
-                  const wanted = (itemName || '').toLowerCase().trim();
-                  const norm = (s) => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
-                  const rawText = (el) => (el.innerText || '').replace(/\r/g, '\n').trim();
+                  const wanted = String(itemName || '').toLowerCase().trim();
+                  const norm = (s) => String(s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+                  const rawText = (el) => String(el.innerText || '').replace(/\r/g, '\n').trim();
                   const els = Array.from(document.querySelectorAll('div, section, article, main, aside'));
                   const out = [];
                   for (const el of els) {
                     const rect = el.getBoundingClientRect();
-                    if (!rect || rect.width < 120 || rect.height < 80) continue;
+                    if (!rect || rect.width < 120 || rect.height < 60) continue;
                     const style = window.getComputedStyle(el);
                     if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity || '1') === 0) continue;
                     const text = rawText(el);
-                    if (!text || text.length < 40 || text.length > 12000) continue;
+                    if (!text || text.length < 25 || text.length > 20000) continue;
                     const low = norm(text);
                     let score = 0;
-                    if (wanted && low.includes(wanted)) score += 90;
-                    if (low.includes('item level')) score += 50;
-                    if (low.includes('gegenstandsstufe')) score += 50;
-                    if (low.includes('eigenschaften')) score += 80;
-                    if (low.includes('traits')) score += 70;
-                    if (low.includes('nahkampfverteidigung') || low.includes('fernkampfverteidigung')) score += 55;
-                    if (low.includes('max. schaden') || low.includes('reichweite') || low.includes('angriffstempo')) score += 40;
+                    if (wanted && wanted !== 'episch' && wanted !== 'selten' && wanted !== 'legendär' && low.includes(wanted)) score += 90;
+                    if (low.includes('item level')) score += 70;
+                    if (low.includes('gegenstandsstufe')) score += 70;
+                    if (low.includes('eigenschaften')) score += 100;
+                    if (low.includes('nahkampfverteidigung') || low.includes('fernkampfverteidigung')) score += 80;
+                    if (low.includes('max. schaden') || low.includes('reichweite') || low.includes('angriffstempo')) score += 65;
                     if (low.includes('passiv') || low.includes('passive')) score += 15;
-                    if (low.includes('auction house') || low.includes('auktionshaus') || low.includes('preisverlauf') || low.includes('bestandsverlauf')) score -= 160;
-                    if (low.includes('kommentare') || low.includes('comments')) score -= 35;
-                    if (low.includes('remove ads') || low.includes('advertisement') || low.includes('sponsored')) score -= 60;
-                    if (rect.width < 650) score += 25;
-                    if (rect.x < 900) score += 10;
+                    if (low.includes('auction house') || low.includes('auktionshaus') || low.includes('preisverlauf') || low.includes('bestandsverlauf')) score -= 220;
+                    if (low.includes('kommentare') || low.includes('comments')) score -= 60;
+                    if (low.includes('remove ads') || low.includes('advertisement') || low.includes('sponsored')) score -= 80;
+                    if (rect.x < 900) score += 20;
+                    if (rect.width < 850) score += 10;
                     const area = Math.round(rect.width * rect.height);
                     out.push({
                       score,
@@ -3129,12 +3142,12 @@ def debug_dump_item_card(context, url: str) -> None:
                       area,
                       len: text.length,
                       tag: el.tagName,
-                      cls: String(el.className || '').slice(0, 140),
+                      cls: String(el.className || '').slice(0, 180),
                       text
                     });
                   }
                   out.sort((a,b) => (b.score - a.score) || (a.area - b.area) || (a.len - b.len));
-                  return out.slice(0, 10);
+                  return out.slice(0, 12);
                 }
                 """,
                 name or "",
@@ -3146,20 +3159,62 @@ def debug_dump_item_card(context, url: str) -> None:
         print("\n--- TOP DOM-KANDIDATEN ---", flush=True)
         for i, c in enumerate(candidates, 1):
             print(f"\n### CANDIDATE {i} score={c.get('score')} rect={c.get('x')},{c.get('y')} {c.get('w')}x{c.get('h')} len={c.get('len')} tag={c.get('tag')}", flush=True)
+            cls = str(c.get('cls') or '')
+            if cls:
+                print(f"CLASS: {cls}", flush=True)
             lines = [clean_text(x) for x in str(c.get('text') or '').splitlines() if clean_text(x)]
-            for idx, line in enumerate(lines[:120]):
+            for idx, line in enumerate(lines[:220]):
                 print(f"{idx:03d}: {line}", flush=True)
-            if len(lines) > 120:
-                print(f"... ({len(lines) - 120} weitere Zeilen)", flush=True)
+            if len(lines) > 220:
+                print(f"... ({len(lines) - 220} weitere Zeilen)", flush=True)
 
         card_text = get_questlog_item_card_text(page, name)
         print("\n--- GET_QUESTLOG_ITEM_CARD_TEXT ---", flush=True)
         card_lines = [clean_text(x) for x in str(card_text or '').splitlines() if clean_text(x)]
         print(f"CARD_LINE_COUNT: {len(card_lines)}", flush=True)
-        for idx, line in enumerate(card_lines[:180]):
+        for idx, line in enumerate(card_lines[:220]):
             print(f"{idx:03d}: {line}", flush=True)
-        if len(card_lines) > 180:
-            print(f"... ({len(card_lines) - 180} weitere Zeilen)", flush=True)
+        if len(card_lines) > 220:
+            print(f"... ({len(card_lines) - 220} weitere Zeilen)", flush=True)
+
+        try:
+            print("\n--- LINKS DE ITEM ---", flush=True)
+            links = page.evaluate(
+                r"""
+                () => Array.from(document.querySelectorAll('a[href]'))
+                  .map(a => ({href: a.href, text: String(a.innerText || '').replace(/\s+/g, ' ').trim()}))
+                  .filter(x => x.href.includes('/throne-and-liberty/de/db/item'))
+                  .slice(0, 80)
+                """
+            ) or []
+            for idx, row in enumerate(links):
+                print(f"{idx:03d}: {row.get('text') or '-'} -> {row.get('href')}", flush=True)
+        except Exception as exc:
+            print(f"LINK_DEBUG_ERROR: {type(exc).__name__}: {exc}", flush=True)
+
+        try:
+            print("\n--- ALL IMAGES MATCHING QUESTLOG ITEM_128 ---", flush=True)
+            imgs = page.evaluate(
+                r"""
+                () => {
+                  const out = [];
+                  for (const img of Array.from(document.querySelectorAll('img'))) {
+                    const rect = img.getBoundingClientRect();
+                    const srcs = [img.currentSrc, img.src, img.getAttribute('src'), img.getAttribute('data-src')].filter(Boolean);
+                    for (const src of srcs) {
+                      if (String(src).includes('Item_128') || String(src).includes('/Icon/')) {
+                        out.push({src, alt: img.alt || '', x: Math.round(rect.x), y: Math.round(rect.y), w: Math.round(rect.width), h: Math.round(rect.height)});
+                      }
+                    }
+                  }
+                  return out.slice(0, 120);
+                }
+                """
+            ) or []
+            for idx, img in enumerate(imgs):
+                print(f"{idx:03d}: {img.get('w')}x{img.get('h')} at {img.get('x')},{img.get('y')} alt={img.get('alt') or '-'} src={img.get('src')}", flush=True)
+        except Exception as exc:
+            print(f"IMAGE_LIST_DEBUG_ERROR: {type(exc).__name__}: {exc}", flush=True)
 
         try:
             image_url, icon_url = collect_image_urls(page)
