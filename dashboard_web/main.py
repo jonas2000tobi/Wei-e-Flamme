@@ -8358,6 +8358,603 @@ def _render_item_catalog(request: Optional[Request] = None) -> str:
 
 
 
+
+# ---------------------------------------------------------------------------
+# Needlisten-Baukasten / Build-Planner
+# ---------------------------------------------------------------------------
+
+_NEED_BUILDER_SLOT_GROUPS = [
+    ("⚔️ Waffen", ["Waffe 1", "Waffe 2"]),
+    ("🛡️ Rüstung", ["Helm", "Brust", "Handschuhe", "Hose", "Schuhe", "Umhang"]),
+    ("💍 Zubehör", ["Kette", "Armband", "Brosche", "Ohrringe", "Ring 1", "Ring 2", "Gürtel"]),
+]
+_NEED_BUILDER_SLOTS = [slot for _title, slots in _NEED_BUILDER_SLOT_GROUPS for slot in slots]
+
+
+def _need_builder_slot_filter(slot: str) -> dict[str, Any]:
+    """Mappt Dashboard-Slots auf Questlog item_catalog Kategorien."""
+    slot = str(slot or "").strip()
+    if slot in {"Waffe 1", "Waffe 2"}:
+        return {"category": "weapon", "subs": []}
+    armor = {
+        "Helm": "Helm",
+        "Brust": "Brust",
+        "Handschuhe": "Handschuhe",
+        "Hose": "Hose",
+        "Schuhe": "Schuhe",
+        "Umhang": "Umhang",
+    }
+    if slot in armor:
+        return {"category": "armor", "subs": [armor[slot]]}
+    accessory = {
+        "Kette": "Kette",
+        "Armband": "Armband",
+        "Brosche": "Brosche",
+        "Ohrringe": "Ohrringe",
+        "Ring 1": "Ring",
+        "Ring 2": "Ring",
+        "Gürtel": "Gürtel",
+    }
+    if slot in accessory:
+        return {"category": "accessory", "subs": [accessory[slot]]}
+    return {"category": "", "subs": []}
+
+
+def _ensure_need_builder_tables() -> None:
+    if not _database_url():
+        return
+    conn = _pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS dashboard_need_builds (
+                    id BIGSERIAL PRIMARY KEY,
+                    build_id TEXT NOT NULL UNIQUE,
+                    guild_id BIGINT NOT NULL,
+                    user_id BIGINT NOT NULL,
+                    name TEXT NOT NULL DEFAULT 'Build',
+                    is_main BOOLEAN NOT NULL DEFAULT FALSE,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+                """
+            )
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_dashboard_need_builds_lookup
+                ON dashboard_need_builds (guild_id, user_id, updated_at DESC)
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS dashboard_need_build_slots (
+                    id BIGSERIAL PRIMARY KEY,
+                    build_id TEXT NOT NULL,
+                    slot_name TEXT NOT NULL,
+                    item_catalog_id BIGINT,
+                    item_name TEXT NOT NULL DEFAULT '',
+                    item_source_url TEXT NOT NULL DEFAULT '',
+                    item_image_url TEXT NOT NULL DEFAULT '',
+                    main_category TEXT NOT NULL DEFAULT '',
+                    sub_category TEXT NOT NULL DEFAULT '',
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    UNIQUE(build_id, slot_name)
+                )
+                """
+            )
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_dashboard_need_build_slots_build
+                ON dashboard_need_build_slots (build_id, slot_name)
+                """
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _need_builder_new_id(user_id: int) -> str:
+    return f"nb_{int(user_id or 0)}_{int(time.time())}_{secrets.token_hex(4)}"
+
+
+def _need_builder_members(snap: dict[str, Any]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for m in _insight_members(snap):
+        uid = _user_id(m.get("user_id"))
+        if not uid or uid in seen:
+            continue
+        seen.add(uid)
+        out.append({
+            "user_id": uid,
+            "display_name": str(m.get("display_name") or m.get("ingame_name") or f"User {uid}"),
+            "role": str(m.get("main_role") or ""),
+        })
+    out.sort(key=lambda x: str(x.get("display_name") or "").lower())
+    return out
+
+
+def _need_builder_target_user(request: Request, snap: dict[str, Any]) -> tuple[int, str, list[dict[str, Any]]]:
+    members = _need_builder_members(snap)
+    query_uid = _user_id(request.query_params.get("user_id"))
+    me = _current_user_id(request)
+    can_pick = bool(_is_portal_admin(request) or (_auth_mode() in {"basic", "hybrid"} and not _discord_oauth_enabled()))
+    uid = query_uid if (query_uid and can_pick) else me
+    if not uid and can_pick and members:
+        uid = int(members[0].get("user_id") or 0)
+    names = {int(x.get("user_id") or 0): str(x.get("display_name") or "") for x in members}
+    return int(uid or 0), names.get(int(uid or 0), f"User {uid}" if uid else "Unbekannt"), members
+
+
+def _need_builder_create_default(guild_id: int, user_id: int) -> str:
+    build_id = _need_builder_new_id(user_id)
+    conn = _pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO dashboard_need_builds (build_id, guild_id, user_id, name, is_main)
+                VALUES (%s, %s, %s, %s, TRUE)
+                """,
+                (build_id, int(guild_id), int(user_id), "Main Build"),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    return build_id
+
+
+def _need_builder_load(guild_id: int, user_id: int) -> dict[str, Any]:
+    if not _database_url() or not guild_id or not user_id:
+        return {"builds": [], "slots": {}}
+    _ensure_need_builder_tables()
+    conn = _pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT build_id, guild_id, user_id, name, is_main, created_at, updated_at
+                FROM dashboard_need_builds
+                WHERE guild_id = %s AND user_id = %s
+                ORDER BY is_main DESC, updated_at DESC, id ASC
+                """,
+                (int(guild_id), int(user_id)),
+            )
+            builds = [dict(r) for r in (cur.fetchall() or [])]
+        if not builds:
+            _need_builder_create_default(guild_id, user_id)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT build_id, guild_id, user_id, name, is_main, created_at, updated_at
+                    FROM dashboard_need_builds
+                    WHERE guild_id = %s AND user_id = %s
+                    ORDER BY is_main DESC, updated_at DESC, id ASC
+                    """,
+                    (int(guild_id), int(user_id)),
+                )
+                builds = [dict(r) for r in (cur.fetchall() or [])]
+        build_ids = [str(b.get("build_id") or "") for b in builds if b.get("build_id")]
+        slots_by_build: dict[str, dict[str, dict[str, Any]]] = {bid: {} for bid in build_ids}
+        if build_ids:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT build_id, slot_name, item_catalog_id, item_name, item_source_url,
+                           item_image_url, main_category, sub_category, updated_at
+                    FROM dashboard_need_build_slots
+                    WHERE build_id = ANY(%s)
+                    """,
+                    (build_ids,),
+                )
+                for r in (cur.fetchall() or []):
+                    d = dict(r)
+                    slots_by_build.setdefault(str(d.get("build_id") or ""), {})[str(d.get("slot_name") or "")] = d
+        return {"builds": builds, "slots": slots_by_build}
+    finally:
+        conn.close()
+
+
+def _need_builder_items() -> list[dict[str, Any]]:
+    if not _item_catalog_available():
+        return []
+    try:
+        ensure_item_catalog_schema()  # type: ignore[misc]
+        all_items: list[dict[str, Any]] = []
+        for category in ["weapon", "armor", "accessory"]:
+            try:
+                rows = query_items(category=category, limit=500, offset=0)  # type: ignore[misc]
+            except TypeError:
+                rows = query_items(category=category, limit=500)  # type: ignore[misc]
+            all_items.extend([dict(x) for x in (rows or [])])
+        out: list[dict[str, Any]] = []
+        for item in all_items:
+            iid = item.get("id")
+            if iid is None:
+                continue
+            out.append({
+                "id": int(iid),
+                "name": str(item.get("name") or ""),
+                "category": str(item.get("main_category") or ""),
+                "sub": str(item.get("sub_category") or ""),
+                "rarity": str(item.get("rarity") or ""),
+                "level": item.get("item_level") or "",
+                "image": str(item.get("manual_image_url") or item.get("image_url") or item.get("icon_url") or ""),
+                "source_url": str(item.get("source_url") or ""),
+            })
+        return out
+    except Exception:
+        return []
+
+
+def _need_builder_item_by_id(item_id: int) -> dict[str, Any]:
+    item_id = int(item_id or 0)
+    if not item_id or not _database_url():
+        return {}
+    conn = _pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT ic.id, ic.name, ic.source_url, ic.main_category, ic.sub_category, ic.rarity,
+                       ic.item_level, COALESCE(ov.image_url, ic.image_url, ic.icon_url, '') AS image_url
+                FROM item_catalog ic
+                LEFT JOIN item_catalog_image_overrides ov ON ov.source_url = ic.source_url
+                WHERE ic.id = %s AND ic.is_active = TRUE
+                LIMIT 1
+                """,
+                (int(item_id),),
+            )
+            row = cur.fetchone()
+            return dict(row) if row else {}
+    finally:
+        conn.close()
+
+
+def _need_builder_save_build(guild_id: int, user_id: int, build_id: str, build_name: str, slot_item_ids: dict[str, int]) -> str:
+    if not _database_url() or not guild_id or not user_id:
+        raise RuntimeError("DATABASE_URL fehlt.")
+    _ensure_need_builder_tables()
+    build_id = str(build_id or "").strip()
+    build_name = str(build_name or "Build").strip()[:80] or "Build"
+    if not build_id:
+        build_id = _need_builder_new_id(user_id)
+    conn = _pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO dashboard_need_builds (build_id, guild_id, user_id, name, is_main)
+                VALUES (%s, %s, %s, %s, FALSE)
+                ON CONFLICT (build_id) DO UPDATE SET name = EXCLUDED.name, updated_at = NOW()
+                """,
+                (build_id, int(guild_id), int(user_id), build_name),
+            )
+            cur.execute("DELETE FROM dashboard_need_build_slots WHERE build_id = %s", (build_id,))
+            for slot in _NEED_BUILDER_SLOTS:
+                item_id = int(slot_item_ids.get(slot) or 0)
+                if not item_id:
+                    continue
+                item = _need_builder_item_by_id(item_id)
+                if not item:
+                    continue
+                cur.execute(
+                    """
+                    INSERT INTO dashboard_need_build_slots
+                        (build_id, slot_name, item_catalog_id, item_name, item_source_url,
+                         item_image_url, main_category, sub_category, updated_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                    ON CONFLICT (build_id, slot_name) DO UPDATE SET
+                        item_catalog_id = EXCLUDED.item_catalog_id,
+                        item_name = EXCLUDED.item_name,
+                        item_source_url = EXCLUDED.item_source_url,
+                        item_image_url = EXCLUDED.item_image_url,
+                        main_category = EXCLUDED.main_category,
+                        sub_category = EXCLUDED.sub_category,
+                        updated_at = NOW()
+                    """,
+                    (
+                        build_id,
+                        slot,
+                        int(item.get("id") or item_id),
+                        str(item.get("name") or ""),
+                        str(item.get("source_url") or ""),
+                        str(item.get("image_url") or ""),
+                        str(item.get("main_category") or ""),
+                        str(item.get("sub_category") or ""),
+                    ),
+                )
+        conn.commit()
+    finally:
+        conn.close()
+    return build_id
+
+
+def _need_builder_set_main(guild_id: int, user_id: int, build_id: str) -> None:
+    if not _database_url() or not guild_id or not user_id or not build_id:
+        raise RuntimeError("Build kann nicht als Main gesetzt werden.")
+    _ensure_need_builder_tables()
+    conn = _pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE dashboard_need_builds SET is_main = FALSE WHERE guild_id = %s AND user_id = %s",
+                (int(guild_id), int(user_id)),
+            )
+            cur.execute(
+                "UPDATE dashboard_need_builds SET is_main = TRUE, updated_at = NOW() WHERE guild_id = %s AND user_id = %s AND build_id = %s",
+                (int(guild_id), int(user_id), str(build_id)),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _need_builder_duplicate(guild_id: int, user_id: int, build_id: str) -> str:
+    state = _need_builder_load(guild_id, user_id)
+    builds = state.get("builds") or []
+    src = next((b for b in builds if str(b.get("build_id") or "") == str(build_id)), None)
+    if not src:
+        raise RuntimeError("Build nicht gefunden.")
+    new_id = _need_builder_new_id(user_id)
+    name = (str(src.get("name") or "Build") + " Kopie")[:80]
+    slots = state.get("slots", {}).get(str(build_id), {})
+    conn = _pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO dashboard_need_builds (build_id, guild_id, user_id, name, is_main) VALUES (%s,%s,%s,%s,FALSE)",
+                (new_id, int(guild_id), int(user_id), name),
+            )
+            for slot, row in slots.items():
+                cur.execute(
+                    """
+                    INSERT INTO dashboard_need_build_slots
+                        (build_id, slot_name, item_catalog_id, item_name, item_source_url, item_image_url, main_category, sub_category)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                    """,
+                    (new_id, slot, row.get("item_catalog_id"), row.get("item_name") or "", row.get("item_source_url") or "", row.get("item_image_url") or "", row.get("main_category") or "", row.get("sub_category") or ""),
+                )
+        conn.commit()
+    finally:
+        conn.close()
+    return new_id
+
+
+def _need_builder_delete(guild_id: int, user_id: int, build_id: str) -> None:
+    if not _database_url() or not build_id:
+        return
+    state = _need_builder_load(guild_id, user_id)
+    builds = state.get("builds") or []
+    if len(builds) <= 1:
+        raise RuntimeError("Der letzte Build kann nicht gelöscht werden.")
+    conn = _pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM dashboard_need_build_slots WHERE build_id = %s", (str(build_id),))
+            cur.execute("DELETE FROM dashboard_need_builds WHERE guild_id = %s AND user_id = %s AND build_id = %s", (int(guild_id), int(user_id), str(build_id)))
+            cur.execute(
+                """
+                UPDATE dashboard_need_builds SET is_main = TRUE, updated_at = NOW()
+                WHERE id = (
+                    SELECT id FROM dashboard_need_builds
+                    WHERE guild_id = %s AND user_id = %s
+                    ORDER BY updated_at DESC, id ASC LIMIT 1
+                ) AND NOT EXISTS (
+                    SELECT 1 FROM dashboard_need_builds WHERE guild_id = %s AND user_id = %s AND is_main = TRUE
+                )
+                """,
+                (int(guild_id), int(user_id), int(guild_id), int(user_id)),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _need_builder_queue_main(guild_id: int, user_id: int, build_id: str, actor: dict[str, Any]) -> int:
+    state = _need_builder_load(guild_id, user_id)
+    slots = state.get("slots", {}).get(str(build_id), {})
+    if not slots:
+        return 0
+    count = 0
+    for slot in _NEED_BUILDER_SLOTS:
+        row = slots.get(slot) or {}
+        item_name = str(row.get("item_name") or "").strip()
+        if not item_name:
+            continue
+        payload = {
+            "target_user_id": int(user_id),
+            "tab": "Main",
+            "slot": slot,
+            "item_text": item_name,
+            "item_name": item_name,
+            "item_catalog_id": row.get("item_catalog_id"),
+            "item_source_url": row.get("item_source_url") or "",
+            "item_image_url": row.get("item_image_url") or "",
+            "main_category": row.get("main_category") or "",
+            "sub_category": row.get("sub_category") or "",
+            "source": "dashboard_need_build",
+            "admin_override": bool(actor and str(actor.get("role") or "") == "admin"),
+        }
+        _create_need_change_request(guild_id, int(user_id), "set", payload, actor)
+        count += 1
+    _need_builder_set_main(guild_id, user_id, build_id)
+    return count
+
+
+def _render_need_builder_dashboard(data: dict[str, Any], request: Request, msg: str = "") -> str:
+    if not data.get("ok"):
+        return _html_shell("Needs · Ebo Dashboard", f"<section class='panel'><h1>🎁 Needliste</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+    snap: dict[str, Any] = data.get("snapshot") or {}
+    guild_id = _safe_guild_id(data)
+    user_id, display_name, members = _need_builder_target_user(request, snap)
+    if not guild_id or not user_id:
+        return _html_shell("Needs · Ebo Dashboard", "<section class='panel'><h1>🎁 Needliste</h1><p class='muted'>Keine Guild-ID oder kein Zielmitglied gefunden. Melde dich per Discord an oder öffne die Seite als Dashboard-Admin.</p></section>")
+    state = _need_builder_load(guild_id, user_id)
+    builds = state.get("builds") or []
+    slots_by_build = state.get("slots") or {}
+    active_build_id = str(request.query_params.get("build") or "").strip()
+    if not active_build_id and builds:
+        active_build_id = str(builds[0].get("build_id") or "")
+    active = next((b for b in builds if str(b.get("build_id") or "") == active_build_id), (builds[0] if builds else {}))
+    active_build_id = str(active.get("build_id") or active_build_id)
+    active_slots = slots_by_build.get(active_build_id, {}) if isinstance(slots_by_build, dict) else {}
+    item_catalog = _need_builder_items()
+    items_json = json.dumps(item_catalog, ensure_ascii=False)
+    slot_filters_json = json.dumps({slot: _need_builder_slot_filter(slot) for slot in _NEED_BUILDER_SLOTS}, ensure_ascii=False)
+
+    member_select = ""
+    if _is_portal_admin(request) or (_auth_mode() in {"basic", "hybrid"} and not _discord_oauth_enabled()):
+        opts = "".join(f'<option value="{int(m.get("user_id") or 0)}"{" selected" if int(m.get("user_id") or 0)==int(user_id) else ""}>{_e(m.get("display_name") or m.get("user_id"))}</option>' for m in members)
+        member_select = f"""
+        <form method="get" action="/needs" class="need-builder-memberpick">
+          <label><span>Zielmitglied</span><select name="user_id" onchange="this.form.submit()">{opts}</select></label>
+        </form>
+        """
+
+    build_cards = []
+    for b in builds:
+        bid = str(b.get("build_id") or "")
+        active_cls = " active" if bid == active_build_id else ""
+        main_badge = '<span class="nb-main-badge">★ Main Need</span>' if b.get("is_main") else ""
+        img = "⚔️" if bid == active_build_id else "🛡️"
+        build_cards.append(f"""
+        <a class="nb-build{active_cls}" href="/needs?user_id={int(user_id)}&build={_e(urllib.parse.quote(bid))}">
+          <span class="nb-build-icon">{img}</span><span><strong>{_e(b.get('name') or 'Build')}</strong>{main_badge}</span><em>⋮</em>
+        </a>
+        """)
+    build_list = "".join(build_cards) or "<div class='empty'>Noch kein Build.</div>"
+
+    def slot_html(slot: str) -> str:
+        row = active_slots.get(slot) or {}
+        iid = str(row.get("item_catalog_id") or "")
+        name = str(row.get("item_name") or "")
+        img = str(row.get("item_image_url") or "")
+        image_html = f'<img src="{_e(img)}" alt="" loading="lazy">' if img else '<span>＋</span>'
+        return f"""
+        <div class="nb-slot" data-slot="{_e(slot)}">
+          <label>{_e(slot)}</label>
+          <button type="button" class="nb-picker" onclick="nbOpenPicker(this)">
+            <span class="nb-thumb">{image_html}</span>
+            <span class="nb-picked" data-empty="Item auswählen">{_e(name or 'Item auswählen')}</span>
+            <b>⌄</b>
+          </button>
+          <input type="hidden" name="slot_{_e(slot)}" value="{_e(iid)}">
+        </div>
+        """
+
+    group_html = []
+    for title, slots in _NEED_BUILDER_SLOT_GROUPS:
+        group_html.append(f'<section class="nb-section"><h3>{_e(title)}</h3><div class="nb-slot-grid">' + "".join(slot_html(s) for s in slots) + '</div></section>')
+
+    analytics_hint = ""
+    try:
+        needs = (((snap.get("loot") or {}).get("needs") or {}).get("items") or [])
+        analytics_hint = f"<span>Snapshot-Need-Spieler: <b>{len(needs)}</b></span>"
+    except Exception:
+        analytics_hint = ""
+
+    css = """
+    <style>
+      .need-builder-shell{display:grid;grid-template-columns:260px minmax(0,1fr);gap:16px;align-items:start}
+      .need-builder-side,.need-builder-main{border:1px solid rgba(212,164,74,.22);background:linear-gradient(135deg,rgba(24,16,10,.86),rgba(0,0,0,.62));border-radius:18px;padding:16px;box-shadow:0 18px 60px rgba(0,0,0,.22)}
+      .need-builder-side h2,.nb-section h3{margin:0 0 12px;color:#e8c579;font-family:Georgia,serif;letter-spacing:.03em}.nb-builds{display:grid;gap:10px}.nb-build{display:grid;grid-template-columns:42px 1fr auto;gap:10px;align-items:center;padding:10px;border:1px solid rgba(255,255,255,.08);border-radius:14px;text-decoration:none;color:inherit;background:rgba(0,0,0,.18)}.nb-build.active{border-color:rgba(212,164,74,.75);background:linear-gradient(90deg,rgba(121,75,18,.32),rgba(0,0,0,.2))}.nb-build-icon{display:grid;place-items:center;width:40px;height:40px;border-radius:12px;background:rgba(120,88,180,.14);border:1px solid rgba(182,137,255,.3)}.nb-main-badge{display:block;color:#ffd05d;font-size:12px;margin-top:2px}.nb-build em{color:#b7a88c;font-style:normal}.nb-side-actions{display:grid;gap:8px;margin-top:14px}.nb-side-actions .btn{width:100%;justify-content:center}.nb-toolbar{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:16px}.nb-toolbar input{min-width:220px;padding:11px 12px;border-radius:12px;border:1px solid rgba(255,255,255,.16);background:rgba(0,0,0,.25);color:inherit}.nb-toolbar .btn{min-height:42px}.nb-section{margin-top:18px;padding-top:14px;border-top:1px solid rgba(212,164,74,.16)}.nb-slot-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.nb-slot label{display:block;color:#d9c08a;font-weight:800;font-size:12px;margin:0 0 6px}.nb-picker{width:100%;display:grid;grid-template-columns:44px 1fr auto;gap:10px;align-items:center;text-align:left;border:1px solid rgba(255,255,255,.10);background:rgba(0,0,0,.28);color:inherit;border-radius:14px;padding:9px;min-height:62px;cursor:pointer}.nb-picker:hover,.nb-picker.nb-open{border-color:rgba(212,164,74,.72);box-shadow:0 0 0 2px rgba(212,164,74,.08)}.nb-thumb{display:grid;place-items:center;width:42px;height:42px;border-radius:10px;background:linear-gradient(135deg,rgba(82,45,122,.38),rgba(0,0,0,.2));border:1px solid rgba(182,137,255,.35);overflow:hidden}.nb-thumb img{width:100%;height:100%;object-fit:contain;padding:3px}.nb-picked{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:#d9b4ff;font-weight:700}.nb-picker b{color:#d4a44a}.nb-status{display:flex;gap:14px;flex-wrap:wrap;align-items:center;border:1px solid rgba(117,212,122,.22);background:rgba(27,91,35,.10);border-radius:14px;padding:12px;margin-bottom:16px}.nb-status b{color:#75d47a}.need-builder-memberpick{margin-bottom:14px}.need-builder-memberpick span{display:block;color:#b7a88c;font-size:12px}.need-builder-memberpick select{width:100%;padding:10px;border-radius:12px;border:1px solid rgba(255,255,255,.14);background:rgba(0,0,0,.32);color:inherit}.nb-help{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:18px}.nb-help .soft{border:1px solid rgba(212,164,74,.16);border-radius:14px;padding:12px;background:rgba(0,0,0,.18)}.nb-picker-pop{position:fixed;z-index:9999;width:min(430px,calc(100vw - 24px));max-height:520px;border:1px solid rgba(212,164,74,.65);background:#120e09;border-radius:16px;box-shadow:0 24px 90px rgba(0,0,0,.72);padding:10px}.nb-picker-pop input{width:100%;box-sizing:border-box;padding:12px;border-radius:12px;border:1px solid rgba(212,164,74,.35);background:rgba(0,0,0,.42);color:inherit;margin-bottom:8px}.nb-picker-list{max-height:400px;overflow:auto;display:grid;gap:6px}.nb-item-option{display:grid;grid-template-columns:38px 1fr auto;gap:9px;align-items:center;border:1px solid rgba(255,255,255,.07);background:rgba(255,255,255,.03);border-radius:12px;padding:7px;cursor:pointer}.nb-item-option:hover{border-color:rgba(212,164,74,.45);background:rgba(212,164,74,.08)}.nb-item-option img{width:36px;height:36px;object-fit:contain;border-radius:8px;background:rgba(0,0,0,.3);border:1px solid rgba(182,137,255,.26)}.nb-item-option strong{display:block;color:#e1c0ff;font-size:13px}.nb-item-option small{color:#b7a88c}.nb-item-option em{font-style:normal;color:#d4a44a}.nb-empty{padding:14px;color:#b7a88c}.nb-mobile-note{display:none;color:#b7a88c}.hero .nb-top-actions{display:flex;gap:8px;flex-wrap:wrap}.btn.gold{background:linear-gradient(180deg,#c89b43,#7a531f);color:#1b1208;border-color:#d4a44a;font-weight:900}
+      @media(max-width:980px){.need-builder-shell{grid-template-columns:1fr}.nb-slot-grid{grid-template-columns:1fr 1fr}.nb-help{grid-template-columns:1fr}.nb-mobile-note{display:block}}
+      @media(max-width:620px){.nb-slot-grid{grid-template-columns:1fr}.nb-toolbar{display:grid}.nb-toolbar input{min-width:0;width:100%}}
+    </style>
+    """
+
+    body = f"""
+    <nav class="topnav"><a href="/">← Übersicht</a><a href="/items">Item-Datenbank</a><a href="/loot">Loot</a><a href="/members">Mitglieder</a><a href="/api/needs">API</a></nav>
+    <section class="hero">
+      <div><div class="eyebrow">Needliste · Build-Baukasten</div><h1>🎁 Needliste</h1><p class="muted">Mehrere Builds pro Spieler. Nur der aktive <b>Main-Need-Build</b> wird an den Bot übertragen.</p></div>
+      <div class="nb-top-actions"><a class="btn" href="/items">Item-Datenbank</a></div>
+    </section>
+    {css}
+    {('<section class="panel"><p class="ok">' + _e(msg) + '</p></section>') if msg else ''}
+    <div class="need-builder-shell">
+      <aside class="need-builder-side">
+        {member_select}
+        <h2>Meine Builds</h2>
+        <div class="nb-builds">{build_list}</div>
+        <form class="nb-side-actions" method="post" action="/needs/builds/new">
+          <input type="hidden" name="user_id" value="{int(user_id)}"><button class="btn" type="submit">＋ Neuen Build erstellen</button>
+        </form>
+        <form class="nb-side-actions" method="post" action="/needs/builds/main">
+          <input type="hidden" name="user_id" value="{int(user_id)}"><input type="hidden" name="build_id" value="{_e(active_build_id)}">
+          <button class="btn gold" type="submit">★ Als Main Need setzen<br><small>und an Bot übertragen</small></button>
+        </form>
+        <p class="muted">Dieser Build wird aktuell an den Bot übertragen und für Loot-Needs verwendet.</p>
+      </aside>
+      <main class="need-builder-main">
+        <div class="nb-status"><span>🔄 Bot-Sync: <b>Queue aktiv</b></span><span>Main-Need-Items: <b>{len([s for s in active_slots.values() if s.get('item_name')])}</b></span>{analytics_hint}</div>
+        <form method="post" action="/needs/builds/save" id="needBuilderForm">
+          <input type="hidden" name="user_id" value="{int(user_id)}"><input type="hidden" name="build_id" value="{_e(active_build_id)}">
+          <div class="nb-toolbar">
+            <input name="build_name" value="{_e(active.get('name') or 'Build')}" placeholder="Buildname">
+            <button class="btn" type="submit">💾 Speichern</button>
+            <button class="btn" type="submit" formaction="/needs/builds/duplicate">⧉ Build duplizieren</button>
+            <button class="btn danger" type="submit" formaction="/needs/builds/delete" onclick="return confirm('Build wirklich löschen?')">🗑 Löschen</button>
+            <button class="btn gold" type="submit" formaction="/needs/builds/save-main">⬆ An Bot übertragen</button>
+          </div>
+          {''.join(group_html)}
+        </form>
+        <div class="nb-help"><div class="soft"><b>Hinweis</b><p class="muted">Klicke in einen Slot und wähle ein Item aus dem importierten Questlog-Katalog. Gespeichert wird erstmal im Dashboard.</p></div><div class="soft"><b>Bot-Übergabe</b><p class="muted">Beim Übertragen erzeugt das Dashboard Queue-Aufträge. Der Bot verarbeitet diese und schreibt die echte Main-Needliste.</p></div></div>
+      </main>
+    </div>
+    <script>
+      window.NB_ITEMS = {items_json};
+      window.NB_FILTERS = {slot_filters_json};
+      let nbCurrentSlot = null;
+      let nbPop = null;
+      function nbMatchesSlot(item, slot) {{
+        const f = window.NB_FILTERS[slot] || {{category:'',subs:[]}};
+        if (f.category && item.category !== f.category) return false;
+        if (f.subs && f.subs.length && !f.subs.includes(item.sub)) return false;
+        return true;
+      }}
+      function nbClosePicker() {{ if (nbPop) {{ nbPop.remove(); nbPop = null; }} document.querySelectorAll('.nb-picker.nb-open').forEach(x=>x.classList.remove('nb-open')); }}
+      function nbOpenPicker(btn) {{
+        nbClosePicker();
+        btn.classList.add('nb-open');
+        nbCurrentSlot = btn.closest('.nb-slot');
+        const slot = nbCurrentSlot.dataset.slot;
+        const rect = btn.getBoundingClientRect();
+        nbPop = document.createElement('div');
+        nbPop.className = 'nb-picker-pop';
+        nbPop.style.left = Math.min(rect.left, window.innerWidth - 450) + 'px';
+        nbPop.style.top = Math.min(rect.bottom + 8, window.innerHeight - 540) + 'px';
+        nbPop.innerHTML = `<input type="search" placeholder="Nach Items suchen..." oninput="nbRenderOptions(this.value)"><div class="nb-picker-list"></div>`;
+        document.body.appendChild(nbPop);
+        nbRenderOptions('');
+        nbPop.querySelector('input').focus();
+      }}
+      function nbRenderOptions(q) {{
+        if (!nbPop || !nbCurrentSlot) return;
+        const slot = nbCurrentSlot.dataset.slot;
+        const needle = (q || '').toLowerCase().trim();
+        const list = nbPop.querySelector('.nb-picker-list');
+        const items = window.NB_ITEMS.filter(i => nbMatchesSlot(i, slot) && (!needle || (i.name||'').toLowerCase().includes(needle))).slice(0, 80);
+        if (!items.length) {{ list.innerHTML = '<div class="nb-empty">Keine Items gefunden.</div>'; return; }}
+        list.innerHTML = items.map(i => `<div class="nb-item-option" onclick="nbChooseItem(${{i.id}})"><img src="${{(i.image||'').replaceAll('"','&quot;')}}" onerror="this.style.visibility='hidden'" alt=""><span><strong>${{nbEsc(i.name)}}</strong><small>${{nbEsc(i.sub || i.category)}} · Lv. ${{nbEsc(i.level || '—')}}</small></span><em>＋</em></div>`).join('');
+      }}
+      function nbEsc(s) {{ return String(s ?? '').replace(/[&<>"']/g, c => ({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c])); }}
+      function nbChooseItem(id) {{
+        const item = window.NB_ITEMS.find(i => Number(i.id) === Number(id));
+        if (!item || !nbCurrentSlot) return;
+        nbCurrentSlot.querySelector('input[type="hidden"]').value = item.id;
+        nbCurrentSlot.querySelector('.nb-picked').textContent = item.name;
+        const thumb = nbCurrentSlot.querySelector('.nb-thumb');
+        thumb.innerHTML = item.image ? `<img src="${{nbEsc(item.image)}}" alt="">` : '<span>＋</span>';
+        nbClosePicker();
+      }}
+      document.addEventListener('click', e => {{ if (nbPop && !nbPop.contains(e.target) && !e.target.closest('.nb-picker')) nbClosePicker(); }});
+      document.addEventListener('keydown', e => {{ if (e.key === 'Escape') nbClosePicker(); }});
+    </script>
+    """
+    return _html_shell("Needliste · Ebo Dashboard", body)
+
 @app.get("/items", response_class=HTMLResponse)
 def items_page(request: Request):
     try:
@@ -8436,11 +9033,85 @@ def members_page(_: bool = Depends(_auth)):
 
 
 @app.get("/needs", response_class=HTMLResponse)
-def needs_page(_: bool = Depends(_auth)):
+def needs_page(request: Request, msg: str = "", _: bool = Depends(_auth)):
     try:
-        return HTMLResponse(_render_needs_dashboard(_snapshot_payload()))
+        return HTMLResponse(_render_need_builder_dashboard(_snapshot_payload(), request, msg=msg))
     except Exception as exc:
         return HTMLResponse(_html_shell("Ebo Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"), status_code=500)
+
+
+@app.post("/needs/builds/new")
+async def need_build_new(request: Request, _: bool = Depends(_auth)):
+    data = _snapshot_payload(); guild_id = _safe_guild_id(data)
+    form = _parse_urlencoded_body(await request.body())
+    user_id = _user_id(form.get("user_id")) or _current_user_id(request)
+    if not _portal_can_view(request, int(user_id)) and not _is_portal_admin(request):
+        raise HTTPException(status_code=403, detail="Keine Berechtigung für diese Needliste.")
+    bid = _need_builder_create_default(int(guild_id), int(user_id))
+    return RedirectResponse(url=f"/needs?user_id={int(user_id)}&build={urllib.parse.quote(bid)}&msg={urllib.parse.quote('Build erstellt')}", status_code=303)
+
+
+@app.post("/needs/builds/save")
+async def need_build_save(request: Request, _: bool = Depends(_auth)):
+    data = _snapshot_payload(); guild_id = _safe_guild_id(data)
+    form = _parse_urlencoded_body(await request.body())
+    user_id = _user_id(form.get("user_id")) or _current_user_id(request)
+    if not _portal_can_view(request, int(user_id)) and not _is_portal_admin(request):
+        raise HTTPException(status_code=403, detail="Keine Berechtigung für diese Needliste.")
+    slot_ids = {slot: _user_id(form.get(f"slot_{slot}")) for slot in _NEED_BUILDER_SLOTS}
+    bid = _need_builder_save_build(int(guild_id), int(user_id), str(form.get("build_id") or ""), str(form.get("build_name") or "Build"), slot_ids)
+    return RedirectResponse(url=f"/needs?user_id={int(user_id)}&build={urllib.parse.quote(bid)}&msg={urllib.parse.quote('Build gespeichert')}", status_code=303)
+
+
+@app.post("/needs/builds/save-main")
+async def need_build_save_main(request: Request, _: bool = Depends(_auth)):
+    data = _snapshot_payload(); guild_id = _safe_guild_id(data)
+    form = _parse_urlencoded_body(await request.body())
+    user_id = _user_id(form.get("user_id")) or _current_user_id(request)
+    if not _portal_can_view(request, int(user_id)) and not _is_portal_admin(request):
+        raise HTTPException(status_code=403, detail="Keine Berechtigung für diese Needliste.")
+    slot_ids = {slot: _user_id(form.get(f"slot_{slot}")) for slot in _NEED_BUILDER_SLOTS}
+    bid = _need_builder_save_build(int(guild_id), int(user_id), str(form.get("build_id") or ""), str(form.get("build_name") or "Build"), slot_ids)
+    actor = _current_user(request) or {"user_id": "basic-admin", "username": "Basic Admin"}
+    queued = _need_builder_queue_main(int(guild_id), int(user_id), bid, actor)
+    return RedirectResponse(url=f"/needs?user_id={int(user_id)}&build={urllib.parse.quote(bid)}&msg={urllib.parse.quote(f'Build gespeichert und {queued} Bot-Aufträge angelegt')}", status_code=303)
+
+
+@app.post("/needs/builds/main")
+async def need_build_main(request: Request, _: bool = Depends(_auth)):
+    data = _snapshot_payload(); guild_id = _safe_guild_id(data)
+    form = _parse_urlencoded_body(await request.body())
+    user_id = _user_id(form.get("user_id")) or _current_user_id(request)
+    bid = str(form.get("build_id") or "").strip()
+    if not _portal_can_view(request, int(user_id)) and not _is_portal_admin(request):
+        raise HTTPException(status_code=403, detail="Keine Berechtigung für diese Needliste.")
+    actor = _current_user(request) or {"user_id": "basic-admin", "username": "Basic Admin"}
+    queued = _need_builder_queue_main(int(guild_id), int(user_id), bid, actor)
+    return RedirectResponse(url=f"/needs?user_id={int(user_id)}&build={urllib.parse.quote(bid)}&msg={urllib.parse.quote(f'Main Need gesetzt: {queued} Bot-Aufträge')}", status_code=303)
+
+
+@app.post("/needs/builds/duplicate")
+async def need_build_duplicate(request: Request, _: bool = Depends(_auth)):
+    data = _snapshot_payload(); guild_id = _safe_guild_id(data)
+    form = _parse_urlencoded_body(await request.body())
+    user_id = _user_id(form.get("user_id")) or _current_user_id(request)
+    bid = str(form.get("build_id") or "").strip()
+    if not _portal_can_view(request, int(user_id)) and not _is_portal_admin(request):
+        raise HTTPException(status_code=403, detail="Keine Berechtigung für diese Needliste.")
+    new_id = _need_builder_duplicate(int(guild_id), int(user_id), bid)
+    return RedirectResponse(url=f"/needs?user_id={int(user_id)}&build={urllib.parse.quote(new_id)}&msg={urllib.parse.quote('Build dupliziert')}", status_code=303)
+
+
+@app.post("/needs/builds/delete")
+async def need_build_delete(request: Request, _: bool = Depends(_auth)):
+    data = _snapshot_payload(); guild_id = _safe_guild_id(data)
+    form = _parse_urlencoded_body(await request.body())
+    user_id = _user_id(form.get("user_id")) or _current_user_id(request)
+    bid = str(form.get("build_id") or "").strip()
+    if not _portal_can_view(request, int(user_id)) and not _is_portal_admin(request):
+        raise HTTPException(status_code=403, detail="Keine Berechtigung für diese Needliste.")
+    _need_builder_delete(int(guild_id), int(user_id), bid)
+    return RedirectResponse(url=f"/needs?user_id={int(user_id)}&msg={urllib.parse.quote('Build gelöscht')}", status_code=303)
 
 
 @app.get("/loot", response_class=HTMLResponse)
