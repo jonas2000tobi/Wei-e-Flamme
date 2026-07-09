@@ -4279,97 +4279,114 @@ def _accessory_is_likely_label(text: Any) -> bool:
     return bool(_accessory_label(text)) and not _accessory_number_tokens(text)
 
 
+def _accessory_primary_labels() -> set[str]:
+    return {
+        "magieverteidigung", "nahkampfverteidigung", "fernkampfverteidigung",
+        "verteidigung", "def", "magic defense", "melee defense", "ranged defense",
+    }
+
+
 def _parse_accessory_bonus_stats(raw_text: str) -> list[dict[str, Any]]:
+    """Parse Zubehör-Zusatzwerte strikt nach Questlog-Aufbau.
+
+    Regel laut Questlog-Karte:
+    Primärwert (z. B. Magieverteidigung) -> Zusatzwerte -> Eigenschaften:
+
+    Alles zwischen dem Primärwert-Block und "Eigenschaften:" sind Zusatzwerte.
+    Keine Whitelist, damit Werte wie Nahkampftrefferchance, Fernkampftrefferchance,
+    Angriffstempo usw. nicht verloren gehen.
+    """
     lines = [clean_text(x) for x in re.split(r"[\n\r]+", normalize_raw_text(raw_text)) if clean_text(x)]
     if not lines:
         return []
 
-    # Zusatzwerte liegen VOR Eigenschaften. Alles danach sind Traits.
+    primary_labels = _accessory_primary_labels()
+
+    # Ende der Zusatzwerte: ab Eigenschaften beginnen Traits.
     end = len(lines)
     for idx, line in enumerate(lines):
         if clean_text(line).lower().strip(" :") in {"eigenschaften", "traits"}:
             end = idx
             break
 
-    # Start nach dem letzten Primärwert. Accessoires haben meist Magieverteidigung,
-    # können aber auch andere Defense-Labels bekommen.
-    primary_labels = {"magieverteidigung", "nahkampfverteidigung", "fernkampfverteidigung", "verteidigung", "def"}
+    # Start: nach dem letzten Primärwert-Block. Bei Zubehör ist das meistens
+    # Magieverteidigung + Basiswert + optional ▲ Delta.
     start = 0
     for idx, line in enumerate(lines[:end]):
         low = clean_text(line).lower().strip(" :")
-        if low in primary_labels:
-            # Label + Basiswert, optional danach ▲-Delta. Reine Zahlen/▲ werden unten ignoriert.
-            start = max(start, idx + 2)
-
-    # Nur echte Zusatzwerte, die im Bereich vor Eigenschaften stehen. Damit landen
-    # Max. Mana/Manaregeneration/Fähigkeitsschaden-Bonus aus den Eigenschaften nicht
-    # mehr unter Zusatzwerte/Passiv.
-    allowed = {
-        "stärke": "Stärke",
-        "staerke": "Stärke",
-        "geschicklichkeit": "Geschicklichkeit",
-        "weisheit": "Weisheit",
-        "wahrnehmung": "Wahrnehmung",
-        "trefferchance": "Trefferchance",
-        "krit. trefferchance": "Krit. Trefferchance",
-        "kritische trefferchance": "Krit. Trefferchance",
-        "angriffstempo": "Angriffstempo",
-        "angriffsgeschwindigkeit": "Angriffstempo",
-        "abklingtempo": "Abklingtempo",
-        "abklingzeit": "Abklingzeit",
-        "max. gesundheit": "Max. Gesundheit",
-        "max. leben": "Max. Gesundheit",
-        "max. mana": "Max. Mana",
-        "manaregeneration": "Manaregeneration",
-        "mana-regeneration": "Manaregeneration",
-        "mana-kosteneffizienz": "Mana-Kosteneffizienz",
-        "manakosteneffizienz": "Mana-Kosteneffizienz",
-        "buff-dauer": "Buff-Dauer",
-        "debuff-dauer": "Debuff-Dauer",
-        "schwächungschance": "Schwächungschance",
-        "schwaechungschance": "Schwächungschance",
-    }
+        if low in primary_labels or any(low.startswith(pl + " ") for pl in primary_labels):
+            j = idx + 1
+            # Zahlen, Pfeile und Trenner gehören noch zum Primärwert.
+            while j < end:
+                nxt = clean_text(lines[j]).strip()
+                nl = nxt.lower().strip(" :")
+                if not nxt or nxt == "|" or nxt.startswith("▲") or _accessory_number_tokens(nxt):
+                    j += 1
+                    continue
+                break
+            start = max(start, j)
 
     out: list[dict[str, Any]] = []
     seen: set[str] = set()
     i = start
     while i < end:
-        raw_label = clean_text(lines[i]).strip().rstrip(":")
-        low = raw_label.lower().strip(" :")
-        canonical = allowed.get(low)
-        if not canonical:
+        tok = clean_text(lines[i]).strip()
+        if not tok or tok == "|" or _accessory_is_stop_line(tok):
             i += 1
             continue
-        key = canonical.lower()
-        if key in seen:
+
+        label = ""
+        inline = ""
+        if ":" in tok:
+            left, right = tok.split(":", 1)
+            label = _accessory_label(left)
+            inline = right
+        else:
+            label = _accessory_label(tok)
+
+        if not label:
+            i += 1
+            continue
+
+        low_label = clean_text(label).lower().strip(" :")
+        if low_label in primary_labels or low_label in {"item level", "level"}:
+            i += 1
+            continue
+        if low_label in seen:
             i += 1
             continue
 
         vals: list[str] = []
+        if inline:
+            vals.extend(_accessory_number_tokens(inline))
+
         j = i + 1
-        while j < end and j < i + 6 and len(vals) < 2:
+        # Zusatzwerte haben einen Basiswert und optional ein grünes ▲-Delta.
+        # Wir lesen höchstens bis zum nächsten Label oder Eigenschaften.
+        while j < end and len(vals) < 2:
             nxt = clean_text(lines[j]).strip()
             nl = nxt.lower().strip(" :")
             if not nxt or nxt == "|":
                 j += 1
                 continue
-            if nl in allowed or nl in primary_labels or _accessory_is_stop_line(nxt):
+            if nl in {"eigenschaften", "traits"} or nl in primary_labels or _accessory_is_stop_line(nxt):
+                break
+            if _accessory_is_likely_label(nxt) or (":" in nxt and not _accessory_number_tokens(nxt.split(":", 1)[0])):
                 break
             vals.extend(_accessory_number_tokens(nxt))
             j += 1
 
         if vals:
-            entry: dict[str, Any] = {"label": canonical, "value": vals[0]}
+            entry: dict[str, Any] = {"label": label, "value": vals[0]}
             if len(vals) >= 2:
                 entry["delta"] = vals[1]
             out.append(entry)
-            seen.add(key)
+            seen.add(low_label)
             i = max(j, i + 1)
             continue
         i += 1
 
     return out
-
 
 def _parse_accessory_traits(raw_text: str) -> list[dict[str, Any]]:
     lines = [clean_text(x) for x in re.split(r"[\n\r]+", normalize_raw_text(raw_text)) if clean_text(x)]
