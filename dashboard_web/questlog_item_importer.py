@@ -2836,6 +2836,12 @@ def parse_detail_page(page, url: str, main_category_hint: str, locale: str, sour
         image_url=image_url or icon_url,
     )
 
+    # Zubehör/Schmuck hat ein anderes Questlog-Layout als Armor:
+    # - Zusatzwerte stehen nur vor "Eigenschaften"
+    # - Eigenschaften dürfen nicht als Bonusstats oder Passive/Effekt landen
+    if main_category == "accessory":
+        detail_model = _sanitize_accessory_detail_model(detail_model, raw_text)
+
     # Armor-Eigenschaften final aus echten DOM-Textnodes des linken Questlog-Itemkastens.
     # Das überschreibt die alten Body/Text-Fallbacks, wenn die erwartete Menge gefunden wird.
     armor_dom_traits = extract_armor_traits_from_dom_textnodes(
@@ -2894,7 +2900,7 @@ def parse_detail_page(page, url: str, main_category_hint: str, locale: str, sour
         "damage_max": damage_max,
         "defense": defense_value if defense_value is not None else extract_defense(raw_text),
         "stats": stats,
-        "abilities": ([{"label": (detail_model.get("passive") or {}).get("name") or "Passiv", "text": (detail_model.get("passive") or {}).get("text") or ""}] if detail_model.get("passive") else extract_abilities(raw_text)),
+        "abilities": ([] if main_category == "accessory" else ([{"label": (detail_model.get("passive") or {}).get("name") or "Passiv", "text": (detail_model.get("passive") or {}).get("text") or ""}] if detail_model.get("passive") else extract_abilities(raw_text))),
         "traits": detail_model.get("traits") or extract_traits_from_text(raw_text),
         "image_url": image_url,
         "icon_url": icon_url,
@@ -4224,6 +4230,231 @@ def _extract_bonus_stats_from_parsed(parsed: dict[str, Any], row: dict[str, Any]
     if expected > 0:
         return best[:expected], expected
     return best, expected
+
+
+# Patch: Zubehör/Schmuck-Detailparser getrennt von Armor.
+# Questlog zeigt bei Accessories Zusatzwerte und Eigenschaften sehr ähnlich,
+# aber die Eigenschaften stehen NACH dem Marker "Eigenschaften". Der alte
+# generische Parser hat dadurch Trait-Zeilen wie Max. Mana oder
+# Fähigkeitsschaden-Bonus teilweise als Zusatzwert/Passiv übernommen.
+def _accessory_is_stop_line(value: Any) -> bool:
+    low = clean_text(str(value or "")).lower().strip(" :[]{}")
+    if not low:
+        return False
+    if low in {
+        "auction house", "auktionshaus", "stats", "enchanting", "kommentare", "comments",
+        "remove ads", "teilen", "share", "preisverlauf", "bestandsverlauf",
+    }:
+        return True
+    return any(x in low for x in (
+        "verkaufspreis", "sales price", "dieser gegenstand hat", "this item has",
+        "resonanzeigenschaften", "ausrüstungseffekte", "ausruestungseffekte",
+        "von npcs erbeutet", "dropped from", "in rezepten", "in kisten", "remove ads",
+        "sponsored", "questlog.gg",
+    ))
+
+
+def _accessory_label(text: Any) -> str:
+    t = clean_text(str(text or "")).strip().rstrip(":")
+    if not t or _accessory_is_stop_line(t):
+        return ""
+    if t in {"|", "~", "▲", "Episch", "Selten", "Rare", "Epic", "Level", "Item Level", "Eigenschaften", "Traits"}:
+        return ""
+    if re.search(r"\d", t):
+        return ""
+    if len(t) > 80:
+        return ""
+    return t
+
+
+def _accessory_number_tokens(text: Any) -> list[str]:
+    s = clean_text(str(text or ""))
+    if not s or s == "|":
+        return []
+    # ▲ bleibt im Delta-Feld nicht erhalten, aber die Zahl wird sauber extrahiert.
+    return [clean_text(x) for x in re.findall(r"[+\-]?\d+(?:[.,]\d+)?\s*%?", s)]
+
+
+def _accessory_is_likely_label(text: Any) -> bool:
+    return bool(_accessory_label(text)) and not _accessory_number_tokens(text)
+
+
+def _parse_accessory_bonus_stats(raw_text: str) -> list[dict[str, Any]]:
+    lines = [clean_text(x) for x in re.split(r"[\n\r]+", normalize_raw_text(raw_text)) if clean_text(x)]
+    if not lines:
+        return []
+
+    # Zusatzwerte liegen VOR Eigenschaften. Alles danach sind Traits.
+    end = len(lines)
+    for idx, line in enumerate(lines):
+        if clean_text(line).lower().strip(" :") in {"eigenschaften", "traits"}:
+            end = idx
+            break
+
+    # Start nach dem letzten Primärwert. Accessoires haben meist Magieverteidigung,
+    # können aber auch andere Defense-Labels bekommen.
+    primary_labels = {"magieverteidigung", "nahkampfverteidigung", "fernkampfverteidigung", "verteidigung", "def"}
+    start = 0
+    for idx, line in enumerate(lines[:end]):
+        low = clean_text(line).lower().strip(" :")
+        if low in primary_labels:
+            # Label + Basiswert, optional danach ▲-Delta. Reine Zahlen/▲ werden unten ignoriert.
+            start = max(start, idx + 2)
+
+    # Nur echte Zusatzwerte, die im Bereich vor Eigenschaften stehen. Damit landen
+    # Max. Mana/Manaregeneration/Fähigkeitsschaden-Bonus aus den Eigenschaften nicht
+    # mehr unter Zusatzwerte/Passiv.
+    allowed = {
+        "stärke": "Stärke",
+        "staerke": "Stärke",
+        "geschicklichkeit": "Geschicklichkeit",
+        "weisheit": "Weisheit",
+        "wahrnehmung": "Wahrnehmung",
+        "trefferchance": "Trefferchance",
+        "krit. trefferchance": "Krit. Trefferchance",
+        "kritische trefferchance": "Krit. Trefferchance",
+        "angriffstempo": "Angriffstempo",
+        "angriffsgeschwindigkeit": "Angriffstempo",
+        "abklingtempo": "Abklingtempo",
+        "abklingzeit": "Abklingzeit",
+        "max. gesundheit": "Max. Gesundheit",
+        "max. leben": "Max. Gesundheit",
+        "max. mana": "Max. Mana",
+        "manaregeneration": "Manaregeneration",
+        "mana-regeneration": "Manaregeneration",
+        "mana-kosteneffizienz": "Mana-Kosteneffizienz",
+        "manakosteneffizienz": "Mana-Kosteneffizienz",
+        "buff-dauer": "Buff-Dauer",
+        "debuff-dauer": "Debuff-Dauer",
+        "schwächungschance": "Schwächungschance",
+        "schwaechungschance": "Schwächungschance",
+    }
+
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    i = start
+    while i < end:
+        raw_label = clean_text(lines[i]).strip().rstrip(":")
+        low = raw_label.lower().strip(" :")
+        canonical = allowed.get(low)
+        if not canonical:
+            i += 1
+            continue
+        key = canonical.lower()
+        if key in seen:
+            i += 1
+            continue
+
+        vals: list[str] = []
+        j = i + 1
+        while j < end and j < i + 6 and len(vals) < 2:
+            nxt = clean_text(lines[j]).strip()
+            nl = nxt.lower().strip(" :")
+            if not nxt or nxt == "|":
+                j += 1
+                continue
+            if nl in allowed or nl in primary_labels or _accessory_is_stop_line(nxt):
+                break
+            vals.extend(_accessory_number_tokens(nxt))
+            j += 1
+
+        if vals:
+            entry: dict[str, Any] = {"label": canonical, "value": vals[0]}
+            if len(vals) >= 2:
+                entry["delta"] = vals[1]
+            out.append(entry)
+            seen.add(key)
+            i = max(j, i + 1)
+            continue
+        i += 1
+
+    return out
+
+
+def _parse_accessory_traits(raw_text: str) -> list[dict[str, Any]]:
+    lines = [clean_text(x) for x in re.split(r"[\n\r]+", normalize_raw_text(raw_text)) if clean_text(x)]
+    start = -1
+    for idx, line in enumerate(lines):
+        if clean_text(line).lower().strip(" :") in {"eigenschaften", "traits"}:
+            start = idx + 1
+            break
+    if start < 0:
+        return []
+
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    i = start
+    while i < len(lines) and len(out) < 12:
+        tok = clean_text(lines[i]).strip()
+        if not tok or tok == "|":
+            i += 1
+            continue
+        if _accessory_is_stop_line(tok):
+            break
+
+        label = ""
+        inline = ""
+        if ":" in tok:
+            left, right = tok.split(":", 1)
+            label = _accessory_label(left)
+            inline = right
+        else:
+            label = _accessory_label(tok)
+        if not label:
+            i += 1
+            continue
+        key = label.lower().strip(" :")
+        if key in seen:
+            i += 1
+            continue
+
+        vals: list[str] = []
+        if inline:
+            vals.extend(_accessory_number_tokens(inline))
+        j = i + 1
+        while j < len(lines) and len(vals) < 4:
+            nxt = clean_text(lines[j]).strip()
+            if not nxt or nxt == "|":
+                j += 1
+                continue
+            if _accessory_is_stop_line(nxt):
+                break
+            if _accessory_is_likely_label(nxt):
+                break
+            vals.extend(_accessory_number_tokens(nxt))
+            j += 1
+
+        # Questlog-Traits haben vier Stufen. Weniger nicht übernehmen.
+        if len(vals) >= 4:
+            out.append({"name": label, "values": vals[:4]})
+            seen.add(key)
+            i = max(j, i + 1)
+            continue
+        i += 1
+
+    return out
+
+
+def _sanitize_accessory_detail_model(detail: dict[str, Any], raw_text: str) -> dict[str, Any]:
+    if not isinstance(detail, dict):
+        detail = {}
+    cleaned = dict(detail)
+
+    bonus = _parse_accessory_bonus_stats(raw_text)
+    if bonus:
+        cleaned["bonus_stats"] = bonus
+
+    traits = _parse_accessory_traits(raw_text)
+    if traits:
+        cleaned["traits"] = traits
+        cleaned["trait_count_observed"] = len(traits)
+        cleaned["trait_count_source"] = "accessory_section_parser"
+
+    # Zubehör hat in Questlog keine Waffen-Passive. Alte Fallbacks haben hier
+    # Trait-Zeilen wie Fähigkeitsschaden-Bonus als Passive/Effekt missverstanden.
+    cleaned.pop("passive", None)
+    cleaned["accessory_parser"] = "section_bonus_traits_v1"
+    return cleaned
 
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Questlog.gg Item-Importer für Ebo Dashboard/Postgres")
