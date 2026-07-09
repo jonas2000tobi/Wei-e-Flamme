@@ -3054,7 +3054,196 @@ def crawl_category(context, conn, seed: CategorySeed, limit_left: int | None = N
     return imported
 
 
+
+
+def debug_dump_item_card(context, url: str) -> None:
+    """Debuggt exakt, was Playwright auf einer Questlog-Detailseite sieht.
+
+    Wichtig: Dieser Modus schreibt nichts in die Datenbank. Er gibt den linken
+    Itemkasten, die besten DOM-Kandidaten, Bild-URLs und das vom Parser erzeugte
+    Detailmodell aus. Damit kann der Armor-Trait-Parser danach gezielt gefixt
+    werden, statt weiter zu raten.
+    """
+    url = force_de_locale_url(str(url or "").strip())
+    if not url:
+        print("❌ DEBUG: leere URL", flush=True)
+        return
+
+    page = context.new_page()
+    try:
+        print("\n================ QUESTLOG DEBUG START ================", flush=True)
+        print(f"URL: {url}", flush=True)
+        ok = goto_page(page, url, timeout_ms=NAV_TIMEOUT_MS)
+        print(f"PAGE_OK: {ok}", flush=True)
+        if not ok:
+            return
+
+        try:
+            body_text = page.locator("body").inner_text(timeout=6000)
+        except Exception:
+            body_text = page.evaluate("() => document.body ? document.body.innerText : ''")
+
+        json_candidates = collect_json_candidates(page)
+        name = page_title(page) or best_name_from_json(json_candidates)
+        print(f"NAME: {name}", flush=True)
+        print(f"JSON_CANDIDATES: {len(json_candidates)}", flush=True)
+
+        try:
+            candidates = page.evaluate(
+                """
+                (itemName) => {
+                  const wanted = (itemName || '').toLowerCase().trim();
+                  const norm = (s) => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+                  const rawText = (el) => (el.innerText || '').replace(/\r/g, '\n').trim();
+                  const els = Array.from(document.querySelectorAll('div, section, article, main, aside'));
+                  const out = [];
+                  for (const el of els) {
+                    const rect = el.getBoundingClientRect();
+                    if (!rect || rect.width < 120 || rect.height < 80) continue;
+                    const style = window.getComputedStyle(el);
+                    if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity || '1') === 0) continue;
+                    const text = rawText(el);
+                    if (!text || text.length < 40 || text.length > 12000) continue;
+                    const low = norm(text);
+                    let score = 0;
+                    if (wanted && low.includes(wanted)) score += 90;
+                    if (low.includes('item level')) score += 50;
+                    if (low.includes('gegenstandsstufe')) score += 50;
+                    if (low.includes('eigenschaften')) score += 80;
+                    if (low.includes('traits')) score += 70;
+                    if (low.includes('nahkampfverteidigung') || low.includes('fernkampfverteidigung')) score += 55;
+                    if (low.includes('max. schaden') || low.includes('reichweite') || low.includes('angriffstempo')) score += 40;
+                    if (low.includes('passiv') || low.includes('passive')) score += 15;
+                    if (low.includes('auction house') || low.includes('auktionshaus') || low.includes('preisverlauf') || low.includes('bestandsverlauf')) score -= 160;
+                    if (low.includes('kommentare') || low.includes('comments')) score -= 35;
+                    if (low.includes('remove ads') || low.includes('advertisement') || low.includes('sponsored')) score -= 60;
+                    if (rect.width < 650) score += 25;
+                    if (rect.x < 900) score += 10;
+                    const area = Math.round(rect.width * rect.height);
+                    out.push({
+                      score,
+                      x: Math.round(rect.x),
+                      y: Math.round(rect.y),
+                      w: Math.round(rect.width),
+                      h: Math.round(rect.height),
+                      area,
+                      len: text.length,
+                      tag: el.tagName,
+                      cls: String(el.className || '').slice(0, 140),
+                      text
+                    });
+                  }
+                  out.sort((a,b) => (b.score - a.score) || (a.area - b.area) || (a.len - b.len));
+                  return out.slice(0, 10);
+                }
+                """,
+                name or "",
+            ) or []
+        except Exception as exc:
+            print(f"DEBUG_CANDIDATES_ERROR: {type(exc).__name__}: {exc}", flush=True)
+            candidates = []
+
+        print("\n--- TOP DOM-KANDIDATEN ---", flush=True)
+        for i, c in enumerate(candidates, 1):
+            print(f"\n### CANDIDATE {i} score={c.get('score')} rect={c.get('x')},{c.get('y')} {c.get('w')}x{c.get('h')} len={c.get('len')} tag={c.get('tag')}", flush=True)
+            lines = [clean_text(x) for x in str(c.get('text') or '').splitlines() if clean_text(x)]
+            for idx, line in enumerate(lines[:120]):
+                print(f"{idx:03d}: {line}", flush=True)
+            if len(lines) > 120:
+                print(f"... ({len(lines) - 120} weitere Zeilen)", flush=True)
+
+        card_text = get_questlog_item_card_text(page, name)
+        print("\n--- GET_QUESTLOG_ITEM_CARD_TEXT ---", flush=True)
+        card_lines = [clean_text(x) for x in str(card_text or '').splitlines() if clean_text(x)]
+        print(f"CARD_LINE_COUNT: {len(card_lines)}", flush=True)
+        for idx, line in enumerate(card_lines[:180]):
+            print(f"{idx:03d}: {line}", flush=True)
+        if len(card_lines) > 180:
+            print(f"... ({len(card_lines) - 180} weitere Zeilen)", flush=True)
+
+        try:
+            image_url, icon_url = collect_image_urls(page)
+            print("\n--- IMAGE PICK ---", flush=True)
+            print(f"image_url: {image_url}", flush=True)
+            print(f"icon_url:  {icon_url}", flush=True)
+        except Exception as exc:
+            print(f"IMAGE_DEBUG_ERROR: {type(exc).__name__}: {exc}", flush=True)
+
+        try:
+            item = parse_detail_page(page, url, classify_main_category(url), DEFAULT_LOCALE, source_list_url=url)
+        except Exception as exc:
+            item = None
+            print(f"PARSE_ERROR: {type(exc).__name__}: {exc}", flush=True)
+
+        print("\n--- PARSER RESULT ---", flush=True)
+        if not item:
+            print("PARSED_ITEM: None", flush=True)
+        else:
+            detail = ((item.get('raw_data') or {}).get('detail') or {}) if isinstance(item, dict) else {}
+            print(json.dumps({
+                "name": item.get("name"),
+                "main_category": item.get("main_category"),
+                "sub_category": item.get("sub_category"),
+                "rarity": item.get("rarity"),
+                "item_level": item.get("item_level"),
+                "primary": detail.get("primary"),
+                "bonus_stats": detail.get("bonus_stats"),
+                "trait_count_rule": detail.get("trait_count_rule"),
+                "trait_count_observed": detail.get("trait_count_observed"),
+                "trait_count_source": detail.get("trait_count_source"),
+                "traits": detail.get("traits"),
+            }, ensure_ascii=False, indent=2), flush=True)
+        print("================ QUESTLOG DEBUG END ================\n", flush=True)
+    finally:
+        try:
+            page.close()
+        except Exception:
+            pass
+
+
+def run_debug(args: argparse.Namespace) -> int:
+    from playwright.sync_api import sync_playwright
+
+    urls = [x.strip() for x in re.split(r"[,;\n]+", str(getattr(args, "debug_url", "") or "")) if x.strip()]
+    if not urls:
+        print("❌ Keine --debug-url angegeben.", flush=True)
+        return 2
+
+    with sync_playwright() as pw:
+        launch_kwargs: dict[str, Any] = {
+            "headless": HEADLESS,
+            "args": ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--disable-extensions", "--disable-background-networking"],
+        }
+        exe = os.getenv("PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH", "").strip()
+        if exe:
+            launch_kwargs["executable_path"] = exe
+        browser = pw.chromium.launch(**launch_kwargs)
+        context = browser.new_context(
+            viewport={"width": 1440, "height": 1200},
+            user_agent=BROWSER_UA,
+            locale="de-DE",
+            timezone_id="Europe/Berlin",
+            extra_http_headers={"Accept-Language": "de-DE,de;q=0.9,en;q=0.7"},
+        )
+        try:
+            context.route(
+                "**/*",
+                lambda route, request: route.abort()
+                if request.resource_type in {"font", "media"}
+                else route.continue_(),
+            )
+        except Exception:
+            pass
+        try:
+            for url in urls:
+                debug_dump_item_card(context, url)
+        finally:
+            browser.close()
+    return 0
+
 def run_import(args: argparse.Namespace) -> int:
+    if getattr(args, "debug_url", ""):
+        return run_debug(args)
     if not os.getenv("DATABASE_URL") and not args.dry_run:
         raise RuntimeError("DATABASE_URL fehlt. Setze die Postgres-Variable im Importer-Service.")
     from playwright.sync_api import sync_playwright
@@ -3161,6 +3350,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--discover-only", action="store_true", help="Nur Kategorie-Links anzeigen, nichts importieren")
     p.add_argument("--dry-run", action="store_true", help="Nichts in Postgres schreiben")
     p.add_argument("--reset-category", action="store_true", help="Vor dem Import questlog-Items der gewählten Hauptkategorie löschen")
+    p.add_argument("--debug-url", default="", help="Eine oder mehrere Questlog-Detailseiten debuggen. Schreibt nichts in Postgres.")
     return p
 
 
