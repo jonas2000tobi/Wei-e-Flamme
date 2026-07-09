@@ -2925,6 +2925,176 @@ def reset_imported_category(conn, categories: set[str]) -> int:
     return deleted
 
 
+
+def armor_source_url_for_subcategory(sub_category: Any) -> str:
+    mapping = {
+        "helm": "head",
+        "brust": "chest",
+        "umhang": "cloak",
+        "handschuhe": "hands",
+        "schuhe": "feet",
+        "hose": "legs",
+    }
+    key = clean_text(sub_category).lower()
+    slug = mapping.get(key, "")
+    if not slug:
+        return "https://questlog.gg/throne-and-liberty/de/db/items/armor/head?grade=41"
+    return f"https://questlog.gg/throne-and-liberty/de/db/items/armor/{slug}?grade=41"
+
+
+def update_armor_traits_only(conn, row: dict[str, Any], parsed: dict[str, Any]) -> bool:
+    """Aktualisiert bewusst nur Eigenschaften/Traits von bestehenden Armor-Items.
+
+    Kein Delete, kein Reinsert, keine Bild-/Name-/Kategorie-Änderung. Wenn der Parser
+    nicht genug Eigenschaften findet, bleibt der alte Datensatz unangetastet.
+    """
+    source_url = str(row.get("source_url") or "").strip()
+    if not source_url:
+        return False
+
+    raw_data = row.get("raw_data") or {}
+    if isinstance(raw_data, str):
+        try:
+            raw_data = json.loads(raw_data or "{}")
+        except Exception:
+            raw_data = {}
+    if not isinstance(raw_data, dict):
+        raw_data = {}
+
+    detail = ((parsed.get("raw_data") or {}).get("detail") or {}) if isinstance(parsed.get("raw_data"), dict) else {}
+    traits = parsed.get("traits") or detail.get("traits") or []
+    if not isinstance(traits, list):
+        traits = []
+    expected = int(detail.get("trait_count_rule") or _armor_expected_trait_count_from_level(parsed.get("item_level") or row.get("item_level")))
+
+    if expected > 0 and len(traits) < expected:
+        print(f"⚠️ Traits nicht überschrieben: {row.get('name') or source_url} ({len(traits)}/{expected})", flush=True)
+        return False
+
+    old_detail = raw_data.get("detail") if isinstance(raw_data.get("detail"), dict) else {}
+    merged_detail = dict(old_detail)
+    for key in ("traits", "trait_count_rule", "trait_count_observed", "trait_count_source"):
+        if key in detail:
+            merged_detail[key] = detail.get(key)
+    merged_detail["trait_count_observed"] = len(traits)
+    merged_detail.setdefault("trait_count_rule", expected)
+    merged_detail["trait_count_source"] = detail.get("trait_count_source") or "traits_only_parser"
+
+    raw_data["detail"] = merged_detail
+    raw_data["traits_only_updated_at"] = now_iso()
+
+    conn.execute(
+        """
+        UPDATE item_catalog
+        SET traits = %(traits)s::jsonb,
+            raw_data = %(raw_data)s::jsonb,
+            updated_at = now()
+        WHERE source_url = %(source_url)s
+        """,
+        {
+            "traits": json.dumps(traits, ensure_ascii=False),
+            "raw_data": json.dumps(raw_data, ensure_ascii=False),
+            "source_url": source_url,
+        },
+    )
+    return True
+
+
+def run_traits_only(args: argparse.Namespace) -> int:
+    """Korrigiert nur Rüstungseigenschaften vorhandener Items.
+
+    Wichtig für Jonas: kein Reset, kein Löschen, kein Überschreiben der Bilder.
+    """
+    if not os.getenv("DATABASE_URL"):
+        raise RuntimeError("DATABASE_URL fehlt. Setze die Postgres-Variable im Importer-Service.")
+    from playwright.sync_api import sync_playwright
+
+    conn = connect()
+    ensure_item_catalog_schema(conn)
+    rows = []
+    try:
+        cur = conn.execute(
+            """
+            SELECT source_url, name, sub_category, item_level, raw_data
+            FROM item_catalog
+            WHERE source = 'questlog'
+              AND main_category = 'armor'
+              AND is_active = TRUE
+            ORDER BY sub_category ASC, name ASC
+            """
+        )
+        rows = [dict(r) for r in (cur.fetchall() or [])]
+    except Exception:
+        conn.close()
+        raise
+
+    print(f"🔧 Traits-only Armor Update: {len(rows)} vorhandene Armor-Items", flush=True)
+    if not rows:
+        conn.close()
+        return 0
+
+    updated = 0
+    skipped = 0
+    with sync_playwright() as pw:
+        launch_kwargs: dict[str, Any] = {
+            "headless": HEADLESS,
+            "args": ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--disable-extensions", "--disable-background-networking"],
+        }
+        exe = os.getenv("PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH", "").strip()
+        if exe:
+            launch_kwargs["executable_path"] = exe
+        browser = pw.chromium.launch(**launch_kwargs)
+        context = browser.new_context(
+            viewport={"width": 1440, "height": 1200},
+            user_agent=BROWSER_UA,
+            locale="de-DE",
+            timezone_id="Europe/Berlin",
+            extra_http_headers={"Accept-Language": "de-DE,de;q=0.9,en;q=0.7"},
+        )
+        try:
+            context.route(
+                "**/*",
+                lambda route, request: route.abort()
+                if request.resource_type in {"font", "media"}
+                else route.continue_(),
+            )
+        except Exception:
+            pass
+        page = context.new_page()
+        try:
+            for row in rows:
+                url = force_de_locale_url(str(row.get("source_url") or ""))
+                if not url:
+                    skipped += 1
+                    continue
+                source_list_url = armor_source_url_for_subcategory(row.get("sub_category"))
+                parsed = parse_detail_page(page, url, "armor", "de", source_list_url=source_list_url)
+                if not parsed:
+                    skipped += 1
+                    print(f"⚠️ Traits skip: {row.get('name') or url} ({SKIP_REASON_BY_URL.get(url, 'parse failed')})", flush=True)
+                    continue
+                if update_armor_traits_only(conn, row, parsed):
+                    conn.commit()
+                    detail = (parsed.get("raw_data") or {}).get("detail") or {}
+                    obs = int(detail.get("trait_count_observed") or len(parsed.get("traits") or []))
+                    rule = int(detail.get("trait_count_rule") or _armor_expected_trait_count_from_level(parsed.get("item_level") or row.get("item_level")))
+                    print(f"✅ Traits aktualisiert: {row.get('name')} ({obs}/{rule})", flush=True)
+                    updated += 1
+                else:
+                    conn.rollback()
+                    skipped += 1
+                time.sleep(REQUEST_DELAY)
+        finally:
+            try:
+                page.close()
+            except Exception:
+                pass
+            browser.close()
+            conn.close()
+
+    print(f"✅ Traits-only fertig. Aktualisiert: {updated}, übersprungen: {skipped}", flush=True)
+    return updated
+
 def crawl_category(context, conn, seed: CategorySeed, limit_left: int | None = None, dry_run: bool = False) -> int:
     """Crawlt eine Questlog-Hauptkategorie.
 
@@ -3299,6 +3469,8 @@ def run_debug(args: argparse.Namespace) -> int:
 def run_import(args: argparse.Namespace) -> int:
     if getattr(args, "debug_url", ""):
         return run_debug(args)
+    if getattr(args, "traits_only", False):
+        return run_traits_only(args)
     if not os.getenv("DATABASE_URL") and not args.dry_run:
         raise RuntimeError("DATABASE_URL fehlt. Setze die Postgres-Variable im Importer-Service.")
     from playwright.sync_api import sync_playwright
@@ -3406,6 +3578,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--dry-run", action="store_true", help="Nichts in Postgres schreiben")
     p.add_argument("--reset-category", action="store_true", help="Vor dem Import questlog-Items der gewählten Hauptkategorie löschen")
     p.add_argument("--debug-url", default="", help="Eine oder mehrere Questlog-Detailseiten debuggen. Schreibt nichts in Postgres.")
+    p.add_argument("--traits-only", action="store_true", help="Nur vorhandene Armor-Eigenschaften neu lesen und aktualisieren. Kein Reset, keine Bild-/Item-Änderung.")
     return p
 
 
