@@ -2205,6 +2205,52 @@ def _is_leader_or_admin_member(guild: discord.Guild, user_id: int) -> bool:
     return False
 
 
+
+def _dashboard_catalog_item_id(payload: dict, item_text: str) -> str:
+    raw_id = str(payload.get("item_catalog_id") or "").strip()
+    if raw_id:
+        return f"ql-{raw_id}"
+    src = str(payload.get("item_source_url") or "").strip()
+    if src:
+        return "ql-" + _slug(src)[-80:]
+    return "ql-" + _slug(item_text)[:80]
+
+
+def _ensure_dashboard_catalog_item(guild_id: int, need_slot: str, item_text: str, payload: dict) -> str:
+    """Legt für Dashboard-Need-Builds ein minimales Bot-Katalogitem an.
+
+    Der Questlog-Itemkatalog lebt im Dashboard/Postgres. Das bestehende Loot-Need-System
+    erwartet aber weiterhin IDs im Bot-Katalog. Für per Dashboard ausgewählte Items
+    erzeugen wir deshalb einen stabilen ql-* Eintrag, damit Anzeige, Needliste und
+    Loot-Matching weiter mit dem vorhandenen System funktionieren.
+    """
+    name = str(payload.get("item_name") or item_text or "").strip()
+    if not name:
+        return ""
+    item_id = _dashboard_catalog_item_id(payload, name)
+    items = _all_items(guild_id)
+    slot = _catalog_slot_for_need_slot(need_slot)
+    sub = str(payload.get("sub_category") or "").strip()
+    category = str(payload.get("main_category") or "").strip()
+    weapon_type = ""
+    if slot == "Waffe":
+        weapon_type = _normalize_weapon_type(sub) or sub
+    current = items.get(item_id) if isinstance(items.get(item_id), dict) else {}
+    merged = dict(current or {})
+    merged.update({
+        "name": name,
+        "slot": slot,
+        "weapon_type": weapon_type,
+        "source": "questlog_dashboard",
+        "source_url": str(payload.get("item_source_url") or ""),
+        "image_url": str(payload.get("item_image_url") or ""),
+        "main_category": category,
+        "sub_category": sub,
+    })
+    items[item_id] = merged
+    save_items()
+    return item_id
+
 def _find_item_for_dashboard_need(guild_id: int, need_slot: str, text: str) -> tuple[str, str]:
     raw = str(text or "").strip()
     if not raw:
@@ -2271,6 +2317,9 @@ def _process_dashboard_need_request(row: dict) -> tuple[str, dict]:
     if action == "set":
         item_text = str(payload.get("item_id") or payload.get("item_text") or payload.get("item_name") or "").strip()
         item_id, err = _find_item_for_dashboard_need(guild_id, slot, item_text)
+        if err and str(payload.get("source") or "") == "dashboard_need_build":
+            item_id = _ensure_dashboard_catalog_item(guild_id, slot, item_text, payload)
+            err = "" if item_id else err
         if err:
             return "rejected", {"ok": False, "error": err}
         _set_slot_item(data, tab, slot, item_id)
