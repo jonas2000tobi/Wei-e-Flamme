@@ -2942,6 +2942,233 @@ def armor_source_url_for_subcategory(sub_category: Any) -> str:
     return f"https://questlog.gg/throne-and-liberty/de/db/items/armor/{slug}?grade=41"
 
 
+def armor_expected_bonus_count_from_level(level_value: Any) -> int:
+    """Questlog-Rüstungs-Zusatzwerte direkt unter den DEF-Werten.
+
+    Nicht mit Eigenschaften/Traits verwechseln:
+    Level 21 = 2 Zusatzwerte
+    Level 31 = 4 Zusatzwerte
+    Level 45 = 4 Zusatzwerte
+    Level 50 = 4 Zusatzwerte
+    Level 80 = 5 Zusatzwerte
+    """
+    try:
+        lvl = int(str(level_value or "0"))
+    except Exception:
+        lvl = 0
+    if lvl >= 80:
+        return 5
+    if lvl in {31, 45, 50}:
+        return 4
+    if lvl in {21} or (0 < lvl <= 21):
+        return 2
+    return 4 if lvl else 0
+
+
+def armor_expected_trait_count_from_level_public(level_value: Any) -> int:
+    """Questlog-Rüstungs-Eigenschaften/Traits, getrennt von Zusatzwerten."""
+    try:
+        lvl = int(str(level_value or "0"))
+    except Exception:
+        lvl = 0
+    if lvl >= 45:
+        return 8
+    if lvl in {21, 31} or (0 < lvl < 45):
+        return 6
+    return 0
+
+
+def _extract_bonus_stats_from_parsed(parsed: dict[str, Any], row: dict[str, Any]) -> tuple[list[dict[str, Any]], int]:
+    detail = ((parsed.get("raw_data") or {}).get("detail") or {}) if isinstance(parsed.get("raw_data"), dict) else {}
+    level = parsed.get("item_level") or detail.get("item_level") or row.get("item_level")
+    expected = armor_expected_bonus_count_from_level(level)
+    bonus = detail.get("bonus_stats") or []
+    if not isinstance(bonus, list):
+        bonus = []
+    clean_bonus: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in bonus:
+        if not isinstance(item, dict):
+            continue
+        label = clean_text(item.get("label") or item.get("name") or "").rstrip(":")
+        value = clean_text(item.get("value") or "")
+        delta = clean_text(item.get("delta") or "")
+        if not label or not value:
+            continue
+        key = label.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out: dict[str, Any] = {"label": label, "value": value}
+        if delta:
+            out["delta"] = delta
+        clean_bonus.append(out)
+        if expected and len(clean_bonus) >= expected:
+            break
+    return clean_bonus, expected
+
+
+def update_armor_stats_only(conn, row: dict[str, Any], parsed: dict[str, Any]) -> bool:
+    """Aktualisiert bewusst nur DEF/Item-Level/Zusatzwerte von bestehenden Armor-Items.
+
+    Kein Delete, kein Reinsert, keine Bild-/Name-/Kategorie-Änderung.
+    Wenn nicht genug Zusatzwerte gefunden werden, bleibt der alte Datensatz unangetastet.
+    """
+    source_url = str(row.get("source_url") or "").strip()
+    if not source_url:
+        return False
+
+    raw_data = row.get("raw_data") or {}
+    if isinstance(raw_data, str):
+        try:
+            raw_data = json.loads(raw_data or "{}")
+        except Exception:
+            raw_data = {}
+    if not isinstance(raw_data, dict):
+        raw_data = {}
+
+    parsed_raw = parsed.get("raw_data") if isinstance(parsed.get("raw_data"), dict) else {}
+    detail = (parsed_raw.get("detail") or {}) if isinstance(parsed_raw, dict) else {}
+    bonus_stats, expected = _extract_bonus_stats_from_parsed(parsed, row)
+
+    if expected > 0 and len(bonus_stats) < expected:
+        print(f"⚠️ Zusatzwerte nicht überschrieben: {row.get('name') or source_url} ({len(bonus_stats)}/{expected})", flush=True)
+        return False
+
+    old_detail = raw_data.get("detail") if isinstance(raw_data.get("detail"), dict) else {}
+    merged_detail = dict(old_detail)
+    for key in ("primary", "defenses", "defense", "item_level", "item_level_range"):
+        if key in detail:
+            merged_detail[key] = detail.get(key)
+    merged_detail["bonus_stats"] = bonus_stats[:expected] if expected else bonus_stats
+    merged_detail["bonus_count_rule"] = expected
+    merged_detail["bonus_count_observed"] = len(merged_detail.get("bonus_stats") or [])
+    merged_detail["bonus_count_source"] = "armor_stats_only_parser"
+
+    raw_data["detail"] = merged_detail
+    raw_data["armor_stats_only_updated_at"] = now_iso()
+
+    stats_payload: dict[str, Any] = {}
+    for block in (merged_detail.get("primary") or []):
+        if isinstance(block, dict) and block.get("label") and block.get("value"):
+            val = str(block.get("value"))
+            if block.get("delta"):
+                val += f" ▲ {block.get('delta')}"
+            stats_payload[str(block.get("label"))] = val
+    for block in (merged_detail.get("bonus_stats") or []):
+        if isinstance(block, dict) and block.get("label") and block.get("value"):
+            val = str(block.get("value"))
+            if block.get("delta"):
+                val += f" ▲ {block.get('delta')}"
+            stats_payload[str(block.get("label"))] = val
+
+    conn.execute(
+        """
+        UPDATE item_catalog
+        SET stats = %(stats)s::jsonb,
+            raw_data = %(raw_data)s::jsonb,
+            item_level = COALESCE(%(item_level)s, item_level),
+            defense = COALESCE(%(defense)s, defense),
+            updated_at = now()
+        WHERE source_url = %(source_url)s
+        """,
+        {
+            "stats": json.dumps(stats_payload, ensure_ascii=False),
+            "raw_data": json.dumps(raw_data, ensure_ascii=False),
+            "item_level": parsed.get("item_level") or detail.get("item_level"),
+            "defense": parsed.get("defense"),
+            "source_url": source_url,
+        },
+    )
+    return True
+
+
+def run_armor_stats_only(args: argparse.Namespace) -> int:
+    """Korrigiert nur Rüstungs-Hauptwerte und Zusatzwerte vorhandener Items."""
+    if not os.getenv("DATABASE_URL"):
+        raise RuntimeError("DATABASE_URL fehlt. Setze die Postgres-Variable im Importer-Service.")
+    from playwright.sync_api import sync_playwright
+
+    conn = connect()
+    ensure_item_catalog_schema(conn)
+    cur = conn.execute(
+        """
+        SELECT source_url, name, sub_category, item_level, raw_data
+        FROM item_catalog
+        WHERE source = 'questlog'
+          AND main_category = 'armor'
+          AND is_active = TRUE
+        ORDER BY sub_category ASC, name ASC
+        """
+    )
+    rows = [dict(r) for r in (cur.fetchall() or [])]
+
+    print(f"🔧 Armor-Stats-only Update: {len(rows)} vorhandene Armor-Items", flush=True)
+    if not rows:
+        conn.close()
+        return 0
+
+    updated = 0
+    skipped = 0
+    with sync_playwright() as pw:
+        launch_kwargs: dict[str, Any] = {
+            "headless": HEADLESS,
+            "args": ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--disable-extensions", "--disable-background-networking"],
+        }
+        exe = os.getenv("PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH", "").strip()
+        if exe:
+            launch_kwargs["executable_path"] = exe
+        browser = pw.chromium.launch(**launch_kwargs)
+        context = browser.new_context(
+            viewport={"width": 1440, "height": 1200},
+            user_agent=BROWSER_UA,
+            locale="de-DE",
+            timezone_id="Europe/Berlin",
+            extra_http_headers={"Accept-Language": "de-DE,de;q=0.9,en;q=0.7"},
+        )
+        try:
+            context.route(
+                "**/*",
+                lambda route, request: route.abort()
+                if request.resource_type in {"font", "media"}
+                else route.continue_(),
+            )
+        except Exception:
+            pass
+        page = context.new_page()
+        try:
+            for row in rows:
+                url = force_de_locale_url(str(row.get("source_url") or ""))
+                if not url:
+                    skipped += 1
+                    continue
+                source_list_url = armor_source_url_for_subcategory(row.get("sub_category"))
+                parsed = parse_detail_page(page, url, "armor", "de", source_list_url=source_list_url)
+                if not parsed:
+                    skipped += 1
+                    print(f"⚠️ Stats skip: {row.get('name') or url} ({SKIP_REASON_BY_URL.get(url, 'parse failed')})", flush=True)
+                    continue
+                bonus_stats, expected = _extract_bonus_stats_from_parsed(parsed, row)
+                if update_armor_stats_only(conn, row, parsed):
+                    conn.commit()
+                    print(f"✅ Zusatzwerte aktualisiert: {row.get('name')} ({len(bonus_stats)}/{expected})", flush=True)
+                    updated += 1
+                else:
+                    conn.rollback()
+                    skipped += 1
+                time.sleep(REQUEST_DELAY)
+        finally:
+            try:
+                page.close()
+            except Exception:
+                pass
+            browser.close()
+            conn.close()
+
+    print(f"✅ Armor-Stats-only fertig. Aktualisiert: {updated}, übersprungen: {skipped}", flush=True)
+    return updated
+
+
 def update_armor_traits_only(conn, row: dict[str, Any], parsed: dict[str, Any]) -> bool:
     """Aktualisiert bewusst nur Eigenschaften/Traits von bestehenden Armor-Items.
 
@@ -3469,6 +3696,8 @@ def run_debug(args: argparse.Namespace) -> int:
 def run_import(args: argparse.Namespace) -> int:
     if getattr(args, "debug_url", ""):
         return run_debug(args)
+    if getattr(args, "armor_stats_only", False):
+        return run_armor_stats_only(args)
     if getattr(args, "traits_only", False):
         return run_traits_only(args)
     if not os.getenv("DATABASE_URL") and not args.dry_run:
@@ -3579,6 +3808,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--reset-category", action="store_true", help="Vor dem Import questlog-Items der gewählten Hauptkategorie löschen")
     p.add_argument("--debug-url", default="", help="Eine oder mehrere Questlog-Detailseiten debuggen. Schreibt nichts in Postgres.")
     p.add_argument("--traits-only", action="store_true", help="Nur vorhandene Armor-Eigenschaften neu lesen und aktualisieren. Kein Reset, keine Bild-/Item-Änderung.")
+    p.add_argument("--armor-stats-only", action="store_true", help="Nur vorhandene Armor-DEF/Zusatzwerte neu lesen und aktualisieren. Kein Reset, keine Bild-/Item-Änderung.")
     return p
 
 
