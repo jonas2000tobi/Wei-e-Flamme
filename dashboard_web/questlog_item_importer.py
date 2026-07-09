@@ -3083,6 +3083,79 @@ def update_armor_stats_only(conn, row: dict[str, Any], parsed: dict[str, Any]) -
     return True
 
 
+
+
+def _armor_row_raw_data(row: dict[str, Any]) -> dict[str, Any]:
+    raw = row.get("raw_data") or {}
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw or "{}")
+        except Exception:
+            raw = {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def _armor_row_detail(row: dict[str, Any]) -> dict[str, Any]:
+    raw = _armor_row_raw_data(row)
+    detail = raw.get("detail") if isinstance(raw.get("detail"), dict) else {}
+    return detail if isinstance(detail, dict) else {}
+
+
+def _armor_row_item_level(row: dict[str, Any]) -> int:
+    detail = _armor_row_detail(row)
+    for value in (row.get("item_level"), detail.get("item_level"), detail.get("level")):
+        try:
+            if value not in (None, ""):
+                return int(str(value).strip())
+        except Exception:
+            pass
+    return 0
+
+
+def _armor_row_needs_stats_update(row: dict[str, Any]) -> bool:
+    level = _armor_row_item_level(row)
+    expected = armor_expected_bonus_count_from_level(level)
+    if expected <= 0:
+        return False
+    detail = _armor_row_detail(row)
+    bonus = detail.get("bonus_stats") or []
+    if not isinstance(bonus, list):
+        bonus = []
+    try:
+        observed = int(detail.get("bonus_count_observed") or len(bonus))
+    except Exception:
+        observed = len(bonus)
+    try:
+        rule = int(detail.get("bonus_count_rule") or expected)
+    except Exception:
+        rule = expected
+    return observed < rule or len(bonus) < expected
+
+
+def _armor_row_needs_traits_update(row: dict[str, Any]) -> bool:
+    level = _armor_row_item_level(row)
+    expected = armor_expected_trait_count_from_level_public(level)
+    if expected <= 0:
+        return False
+    detail = _armor_row_detail(row)
+    traits = detail.get("traits") or row.get("traits") or []
+    if isinstance(traits, str):
+        try:
+            traits = json.loads(traits or "[]")
+        except Exception:
+            traits = []
+    if not isinstance(traits, list):
+        traits = []
+    try:
+        observed = int(detail.get("trait_count_observed") or len(traits))
+    except Exception:
+        observed = len(traits)
+    try:
+        rule = int(detail.get("trait_count_rule") or expected)
+    except Exception:
+        rule = expected
+    return observed < rule or len(traits) < expected
+
 def run_armor_stats_only(args: argparse.Namespace) -> int:
     """Korrigiert nur Rüstungs-Hauptwerte und Zusatzwerte vorhandener Items."""
     if not os.getenv("DATABASE_URL"):
@@ -3103,9 +3176,15 @@ def run_armor_stats_only(args: argparse.Namespace) -> int:
     )
     rows = [dict(r) for r in (cur.fetchall() or [])]
 
-    print(f"🔧 Armor-Stats-only Update: {len(rows)} vorhandene Armor-Items", flush=True)
+    total_rows = len(rows)
+    if getattr(args, "failed_only", False):
+        rows = [r for r in rows if _armor_row_needs_stats_update(r)]
+        print(f"🔧 Armor-Stats-only Update: nur fehlerhafte Items {len(rows)}/{total_rows}", flush=True)
+    else:
+        print(f"🔧 Armor-Stats-only Update: {len(rows)} vorhandene Armor-Items", flush=True)
     if not rows:
         conn.close()
+        print("✅ Keine fehlerhaften Armor-Zusatzwerte gefunden.", flush=True)
         return 0
 
     updated = 0
@@ -3242,7 +3321,7 @@ def run_traits_only(args: argparse.Namespace) -> int:
     try:
         cur = conn.execute(
             """
-            SELECT source_url, name, sub_category, item_level, raw_data
+            SELECT source_url, name, sub_category, item_level, raw_data, traits
             FROM item_catalog
             WHERE source = 'questlog'
               AND main_category = 'armor'
@@ -3255,9 +3334,15 @@ def run_traits_only(args: argparse.Namespace) -> int:
         conn.close()
         raise
 
-    print(f"🔧 Traits-only Armor Update: {len(rows)} vorhandene Armor-Items", flush=True)
+    total_rows = len(rows)
+    if getattr(args, "failed_only", False):
+        rows = [r for r in rows if _armor_row_needs_traits_update(r)]
+        print(f"🔧 Traits-only Armor Update: nur fehlerhafte Items {len(rows)}/{total_rows}", flush=True)
+    else:
+        print(f"🔧 Traits-only Armor Update: {len(rows)} vorhandene Armor-Items", flush=True)
     if not rows:
         conn.close()
+        print("✅ Keine fehlerhaften Armor-Traits gefunden.", flush=True)
         return 0
 
     updated = 0
@@ -4068,6 +4153,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--debug-url", default="", help="Eine oder mehrere Questlog-Detailseiten debuggen. Schreibt nichts in Postgres.")
     p.add_argument("--traits-only", action="store_true", help="Nur vorhandene Armor-Eigenschaften neu lesen und aktualisieren. Kein Reset, keine Bild-/Item-Änderung.")
     p.add_argument("--armor-stats-only", action="store_true", help="Nur vorhandene Armor-DEF/Zusatzwerte neu lesen und aktualisieren. Kein Reset, keine Bild-/Item-Änderung. Kann mit --traits-only kombiniert werden.")
+    p.add_argument("--failed-only", action="store_true", help="Nur Armor-Items erneut prüfen, deren bisherige Zusatzwerte/Traits laut gespeicherten Counts unvollständig sind.")
     return p
 
 
