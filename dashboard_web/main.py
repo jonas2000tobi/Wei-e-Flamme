@@ -46,7 +46,7 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
-ASSET_VER = "sidebar-earth-v2-20260710"
+ASSET_VER = "sidebar-warm-v4-20260710"
 DASHBOARD_RELEASE_VERSION = "1.2.1 · Status Playwright Worker + Questlog Items"
 
 
@@ -3603,7 +3603,7 @@ def _sidebar_html() -> str:
       <button class="mobile-nav-toggle" type="button" onclick="document.body.classList.toggle('nav-open')">☰ Menü</button>
 
       <nav class="side-nav">
-        <a class="admin-back" href="/"><span>←</span> Zur normalen Ansicht</a>
+        <a class="admin-back" href="/"><span>⌂</span> Zur Startseite</a>
         <details open>
           <summary>Admin</summary>
           <a href="/admin"><img class="nav-ico" src="{_asset('nav_admin_portal.png')}" alt="">Admin-Portal</a>
@@ -3642,6 +3642,7 @@ def _member_sidebar_html() -> str:
       <button class="mobile-nav-toggle" type="button" onclick="document.body.classList.toggle('nav-open')">☰ Menü</button>
 
       <nav class="side-nav">
+        <a class="home-sidebar-button" href="/"><span class="nav-home-glyph" aria-hidden="true">⌂</span>Zur Startseite</a>
         <a class="admin-portal-button" href="/admin"><img class="nav-ico" src="{_asset('nav_admin_portal.png')}" alt="">Admin-Portal</a>
 
         <details open>
@@ -3717,8 +3718,11 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "member") -> str:
     .side-nav summary {{ color:var(--muted); text-transform:uppercase; letter-spacing:.08em; font-size:11px; font-weight:800; list-style:none; }}
     .side-nav summary::-webkit-details-marker {{ display:none; }}
     .side-nav details a {{ margin-left:8px; padding:9px 11px; font-size:13px; color:#ded7c8; }}
+    .side-nav .home-sidebar-button {{ margin:0 0 6px 0; border:1px solid rgba(214,168,79,.42); background:linear-gradient(90deg,rgba(214,168,79,.20),rgba(55,30,14,.26)); color:var(--gold); font-weight:800; }}
+    .side-nav .home-sidebar-button:hover {{ background:linear-gradient(90deg,rgba(214,168,79,.29),rgba(71,38,16,.34)); border-color:rgba(232,190,101,.62); }}
+    .nav-home-glyph {{ width:24px; flex:0 0 24px; display:grid; place-items:center; font-size:19px; line-height:1; color:#e2b75c; filter:drop-shadow(0 2px 4px rgba(0,0,0,.72)); }}
     .side-nav .admin-portal-button {{ margin:0 0 6px 0; border:1px solid rgba(214,168,79,.34); background:linear-gradient(90deg,rgba(214,168,79,.18),rgba(77,52,18,.18)); color:var(--gold); font-weight:800; }}
-    .side-nav .admin-back {{ margin:0 0 6px 0; border:1px solid rgba(129,199,132,.25); background:rgba(129,199,132,.08); color:#bfe8c1; font-weight:800; }}
+    .side-nav .admin-back {{ margin:0 0 6px 0; border:1px solid rgba(214,168,79,.34); background:linear-gradient(90deg,rgba(214,168,79,.18),rgba(77,52,18,.18)); color:var(--gold); font-weight:800; }}
 
     .sidebar-footer {{ margin-top:18px; padding-top:14px; border-top:1px solid rgba(214,168,79,.12); display:grid; gap:8px; }}
     .sidebar-footer a {{ color:var(--muted); text-decoration:none; font-size:13px; padding:8px 10px; border-radius:10px; }} .sidebar-footer a:hover {{ color:var(--gold); background:rgba(214,168,79,.08); }}
@@ -3850,7 +3854,7 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "member") -> str:
     /* Ebolus Gothic/Whale Visual Pass v1 */
     body::before {{ content:""; position:fixed; inset:0; pointer-events:none; z-index:-1; background:radial-gradient(circle at 50% 0%,rgba(214,168,79,.12),transparent 34%), linear-gradient(90deg,rgba(0,0,0,.58),rgba(0,0,0,.12) 22%,rgba(0,0,0,.12) 78%,rgba(0,0,0,.62)); }}
     .app-shell {{ grid-template-columns:286px minmax(0,1fr); }}
-    .sidebar {{ background:#081522 url("{_asset('sidebar_panel_earth.webp')}") center center / 100% 100% no-repeat; border-right:1px solid rgba(214,168,79,.48); box-shadow:22px 0 58px rgba(0,0,0,.58), inset -1px 0 0 rgba(255,216,140,.08); }}
+    .sidebar {{ background-color:#100b08; background-image:linear-gradient(180deg,rgba(26,13,8,.34),rgba(9,7,6,.47)),url("{_asset('sidebar_panel_warm.webp')}"); background-position:center center,center center; background-size:100% 100%,100% 100%; background-repeat:no-repeat,no-repeat; border-right:1px solid rgba(214,168,79,.48); box-shadow:22px 0 58px rgba(0,0,0,.58), inset -1px 0 0 rgba(255,216,140,.08); }}
     .brand {{ justify-content:center; flex-direction:column; text-align:center; gap:9px; padding:10px 10px 22px; margin-bottom:14px; }}
     .brand-mark {{ width:108px; height:108px; border-radius:24px; padding:9px; background:radial-gradient(circle at 50% 28%,rgba(214,168,79,.22),rgba(13,8,8,.78)); border:1px solid rgba(214,168,79,.42); box-shadow:0 18px 38px rgba(0,0,0,.42), inset 0 0 0 1px rgba(255,222,150,.06); }}
     .brand-mark img {{ width:100%; height:100%; object-fit:contain; }}
