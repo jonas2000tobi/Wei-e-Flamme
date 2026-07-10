@@ -28,6 +28,7 @@ try:
     from item_catalog_db import (
         catalog_stats,
         ensure_item_catalog_schema,
+        get_item_by_id,
         item_source_url_by_id,
         query_items,
         set_item_image_override,
@@ -35,6 +36,7 @@ try:
 except Exception:  # Dashboard soll auch ohne Item-Modul starten
     catalog_stats = None  # type: ignore
     ensure_item_catalog_schema = None  # type: ignore
+    get_item_by_id = None  # type: ignore
     item_source_url_by_id = None  # type: ignore
     query_items = None  # type: ignore
     set_item_image_override = None  # type: ignore
@@ -46,8 +48,10 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
-ASSET_VER = "sidebar-warm-v4-20260710"
-DASHBOARD_RELEASE_VERSION = "1.2.1 · Status Playwright Worker + Questlog Items"
+ASSET_VER = "member-avatar-itemdb-v1-20260711"
+DASHBOARD_RELEASE_VERSION = "1.2.2 · Mitgliederfilter + Discord-Avatar + Item-Verknüpfung"
+
+_ITEM_MATCH_CACHE: dict[str, Optional[dict[str, Any]]] = {}
 
 
 def _database_url() -> str:
@@ -2095,10 +2099,13 @@ def _event_link(event_id: Any, label: Any) -> dict[str, str]:
 
 def _auction_link(auction_id: Any, label: Any) -> dict[str, str]:
     aid = str(auction_id or "").strip()
-    text = _e(label or aid or "Auktion")
-    if not aid:
-        return _raw(text)
-    return _raw(f'<a class="link" href="/auction/{_e(aid)}">{text}</a>')
+    item_name = label or aid or "Auktion"
+    primary_href = f"/auction/{aid}" if aid else ""
+    try:
+        return _raw(_catalog_item_reference_html(item_name, primary_href=primary_href))
+    except Exception:
+        text = _e(item_name)
+        return _raw(f'<a class="link" href="{_e(primary_href)}">{text}</a>' if primary_href else text)
 
 
 def _table(headers: list[str], rows: list[list[Any]], *, searchable: bool = True, placeholder: str = "Tabelle durchsuchen…") -> str:
@@ -2162,27 +2169,42 @@ def _profile_name_map(snap: dict[str, Any]) -> dict[int, str]:
 
 
 def _member_directory_items(snap: dict[str, Any]) -> list[dict[str, Any]]:
-    """Vollständige Mitgliederliste aus Profilen + Discord-Rollen-Snapshot."""
-    profiles = ((snap.get("profiles") or {}).get("items") or [])
-    insights = ((snap.get("insights") or {}).get("members") or [])
-    by_uid: dict[int, dict[str, Any]] = {}
+    """Aktuelle Mitgliederliste aus dem gesetzten Discord-Gildenrollen-Snapshot.
 
+    Alte Profile bleiben in den produktiven JSON-Dateien erhalten, werden hier aber
+    nicht mehr als aktive Mitglieder angezeigt, sobald ein aktueller Rollen-Snapshot
+    vorhanden ist.
+    """
+    profiles = [x for x in (((snap.get("profiles") or {}).get("items") or [])) if isinstance(x, dict)]
+    insights = [x for x in (((snap.get("insights") or {}).get("members") or [])) if isinstance(x, dict)]
+
+    current_ids: set[int] = {
+        _user_id(row.get("user_id") or row.get("id"))
+        for row in insights
+        if _user_id(row.get("user_id") or row.get("id"))
+    }
+
+    auth = snap.get("auth") or {}
+    member_role = auth.get("member_role") if isinstance(auth, dict) else {}
+    if isinstance(member_role, dict):
+        for raw_uid in member_role.get("member_ids") or []:
+            uid = _user_id(raw_uid)
+            if uid:
+                current_ids.add(uid)
+
+    by_uid: dict[int, dict[str, Any]] = {}
     for member in insights:
-        if not isinstance(member, dict):
-            continue
         uid = _user_id(member.get("user_id") or member.get("id"))
         if uid:
             by_uid[uid] = dict(member)
 
+    # Nur Profile der aktuell gesetzten Gildenrolle ergänzen. Falls noch kein neuer
+    # Rollen-Snapshot existiert, bleibt der alte Fallback erhalten.
     for profile in profiles:
-        if not isinstance(profile, dict):
-            continue
         uid = _user_id(profile.get("user_id") or profile.get("id"))
-        if not uid:
+        if not uid or (current_ids and uid not in current_ids):
             continue
         merged = dict(by_uid.get(uid) or {})
-        # Profilfelder ergänzen die Discord-Daten, leere Profilwerte überschreiben
-        # aber keinen bereits vorhandenen Servernamen/Avatar.
         for key, value in profile.items():
             if value not in (None, "", [], {}):
                 merged[key] = value
@@ -2191,6 +2213,8 @@ def _member_directory_items(snap: dict[str, Any]) -> list[dict[str, Any]]:
 
     rows: list[dict[str, Any]] = []
     for uid, member in by_uid.items():
+        if current_ids and uid not in current_ids:
+            continue
         profile_name = str(member.get("ingame_name") or "").strip()
         server_name = str(
             member.get("server_name")
@@ -2421,13 +2445,15 @@ def _render_need_slot_board(
     blocks: list[str] = []
 
     def row_read(slot: str, entry: Any) -> str:
+        locked = bool(entry and _need_is_received(entry))
         if entry:
             item = _need_item_display(entry)
-            value = f"🔒 {item}" if _need_is_received(entry) else item
+            item_html = _catalog_item_reference_html(item)
+            value_html = f'<span class="need-lock" aria-label="erhalten">🔒</span>{item_html}' if locked else item_html
         else:
-            value = "—"
-        cls = " locked" if entry and _need_is_received(entry) else ""
-        return f'<div class="need-slot-row{cls}"><span>{_e(slot)}:</span><strong>{_e(value)}</strong></div>'
+            value_html = "—"
+        cls = " locked" if locked else ""
+        return f'<div class="need-slot-row{cls}"><span>{_e(slot)}:</span><div class="need-item-linked">{value_html}</div></div>'
 
     def row_edit(slot: str, entry: Any, idx: int) -> str:
         locked = bool(entry and _need_is_received(entry))
@@ -3685,8 +3711,10 @@ def _render_auction_detail(data: dict[str, Any], auction_id: str, current_user: 
         </section>
         """
 
+    item_panel = _catalog_item_detail_panel(auction.get("item_name") or auction.get("item") or auction_id)
+
     body = f"""
-    <nav class="topnav"><a href="/">← Übersicht</a><a href="/loot">Loot</a><a href="#bid">Bieten/Kaufen</a><a href="#loot-actions">Queue</a><a href="#bids">Gebote</a><a href="#eligible">Berechtigte</a><a href="#tech">Technik</a><a href="/api/snapshot">JSON</a></nav>
+    <nav class="topnav"><a href="/">← Übersicht</a><a href="/loot">Loot</a><a href="#item-database">Item</a><a href="#bid">Bieten/Kaufen</a><a href="#loot-actions">Queue</a><a href="#bids">Gebote</a><a href="#eligible">Berechtigte</a><a href="#tech">Technik</a><a href="/api/snapshot">JSON</a></nav>
     <section class="hero">
       <div>
         <div class="eyebrow">Auktion</div>
@@ -3699,6 +3727,7 @@ def _render_auction_detail(data: dict[str, Any], auction_id: str, current_user: 
     {state_panel}
     {refresh_panel}
     <section class="grid">{cards}</section>
+    {item_panel}
     {action_panel}
     {queue_panel}
     <section class="panel" id="bids"><h2>💰 Gebotshistorie</h2>{_table(['Spieler','Gebot','Zeit'], bid_rows, placeholder='Gebote durchsuchen…')}</section>
@@ -3963,6 +3992,18 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "member") -> str:
     .actions-inline form {{ display:inline-flex; gap:8px; flex-wrap:wrap; align-items:center; }}
     .responsive-table {{ width:100%; overflow-x:auto; -webkit-overflow-scrolling:touch; border-radius:12px; }}
     .responsive-table > table {{ min-width:680px; }}
+    .catalog-item-ref {{ display:grid; grid-template-columns:42px minmax(120px,1fr) auto; gap:9px; align-items:center; min-width:220px; max-width:520px; }}
+    .catalog-item-thumb {{ width:42px; height:42px; display:grid; place-items:center; border:1px solid rgba(214,168,79,.28); border-radius:10px; background:rgba(0,0,0,.34); overflow:hidden; }}
+    .catalog-item-thumb img,.catalog-item-placeholder {{ width:100%; height:100%; object-fit:contain; display:grid; place-items:center; color:var(--gold); font-weight:900; }}
+    .catalog-item-copy {{ min-width:0; display:grid; gap:2px; }}
+    .catalog-item-name {{ overflow-wrap:anywhere; font-weight:800; }}
+    .catalog-item-copy small {{ color:var(--muted); font-size:10px; line-height:1.25; overflow-wrap:anywhere; }}
+    .catalog-db-link {{ color:#f0c56b; border:1px solid rgba(214,168,79,.34); background:rgba(214,168,79,.08); border-radius:8px; padding:5px 7px; font-size:10px; font-weight:900; text-decoration:none; }}
+    .catalog-db-link:hover {{ background:rgba(214,168,79,.18); }}
+    .need-item-linked {{ min-width:0; display:flex; gap:7px; align-items:center; }}
+    .need-item-linked .catalog-item-ref {{ min-width:0; width:100%; }}
+    .need-lock {{ flex:0 0 auto; }}
+    .catalog-linked-panel .item-card {{ margin-top:12px; }}
     .item-picker-select {{ width:100%; margin:0 0 8px; border:1px solid var(--line); background:#08090d; color:var(--text); border-radius:10px; padding:10px 12px; }}
     .need-two-step-picker {{ display:grid; grid-template-columns:minmax(160px,.55fr) minmax(220px,1fr); gap:8px; align-items:start; }}
     .need-two-step-picker input, .need-two-step-picker small {{ grid-column:1 / -1; }}
@@ -8094,6 +8135,103 @@ def _item_catalog_available() -> bool:
     return bool(catalog_stats and ensure_item_catalog_schema and query_items)
 
 
+def _normalize_item_lookup_name(value: Any) -> str:
+    text = _loot_text(value)
+    text = re.sub(r"^[🔒✅🎁🧹\s]+", "", text).strip()
+    text = re.sub(r"\s+\((?:Schwert\s*&\s*Schild|Großschwert|Grossschwert|Dolche?|Langbogen|Armbrust|Zauberstab|Stab|Kugel|Speer)\)\s*$", "", text, flags=re.I)
+    text = re.sub(r"\s+", " ", text).strip().casefold()
+    return text
+
+
+def _catalog_item_match(item_name: Any) -> Optional[dict[str, Any]]:
+    """Bestmöglicher Item-Katalogtreffer für einen Loot-/Need-Namen."""
+    key = _normalize_item_lookup_name(item_name)
+    if not key or len(key) < 3 or not _item_catalog_available():
+        return None
+    if key in _ITEM_MATCH_CACHE:
+        cached = _ITEM_MATCH_CACHE[key]
+        return dict(cached) if isinstance(cached, dict) else None
+    try:
+        ensure_item_catalog_schema()  # type: ignore[misc]
+        candidates = query_items(q=str(_loot_text(item_name)).strip(), limit=18, offset=0)  # type: ignore[misc]
+        if not candidates and key != str(_loot_text(item_name)).strip().casefold():
+            candidates = query_items(q=key, limit=18, offset=0)  # type: ignore[misc]
+    except Exception:
+        _ITEM_MATCH_CACHE[key] = None
+        return None
+
+    key_tokens = {x for x in re.findall(r"[a-z0-9äöüß]+", key) if len(x) > 2}
+    best: Optional[dict[str, Any]] = None
+    best_score = -1.0
+    for candidate in candidates or []:
+        if not isinstance(candidate, dict):
+            continue
+        cname = _normalize_item_lookup_name(candidate.get("name"))
+        if not cname:
+            continue
+        if cname == key:
+            score = 1000.0
+        elif cname in key or key in cname:
+            score = 700.0 - abs(len(cname) - len(key))
+        else:
+            c_tokens = {x for x in re.findall(r"[a-z0-9äöüß]+", cname) if len(x) > 2}
+            overlap = len(key_tokens & c_tokens)
+            union = len(key_tokens | c_tokens) or 1
+            score = (overlap / union) * 500.0 - abs(len(cname) - len(key)) * 0.5
+        if score > best_score:
+            best_score = score
+            best = dict(candidate)
+    if best_score < 120.0:
+        best = None
+    _ITEM_MATCH_CACHE[key] = dict(best) if isinstance(best, dict) else None
+    return dict(best) if isinstance(best, dict) else None
+
+
+def _catalog_item_reference_html(item_name: Any, *, primary_href: str = "") -> str:
+    clean_name = _loot_text(item_name) or str(item_name or "Item")
+    item = _catalog_item_match(clean_name)
+    primary = str(primary_href or "").strip()
+    if not item:
+        return f'<a class="link" href="{_e(primary)}">{_e(clean_name)}</a>' if primary else _e(clean_name)
+
+    item_id = int(item.get("id") or 0)
+    db_href = f"/item/{item_id}" if item_id else f"/items?q={urllib.parse.quote(clean_name)}"
+    image_url = str(item.get("manual_image_url") or item.get("image_url") or item.get("icon_url") or "").strip()
+    image_html = (
+        f'<img src="{_e(image_url)}" alt="" loading="lazy" referrerpolicy="no-referrer">'
+        if image_url else '<span class="catalog-item-placeholder">?</span>'
+    )
+    title_href = primary or db_href
+    rarity = str(item.get("rarity") or "").strip()
+    sub = str(item.get("sub_category") or item.get("main_category") or "").strip()
+    stats = _item_stat_preview(item, max_len=110)
+    ability = _item_ability_preview(item, max_len=120)
+    meta_parts = [x for x in (rarity, sub, stats if stats != "—" else "") if x]
+    tooltip_parts = [clean_name] + meta_parts + ([ability] if ability and ability != "—" else [])
+    tooltip = " · ".join(tooltip_parts)
+    return (
+        f'<div class="catalog-item-ref" title="{_e(tooltip)}">'
+        f'<a class="catalog-item-thumb" href="{_e(db_href)}">{image_html}</a>'
+        f'<span class="catalog-item-copy"><a class="link catalog-item-name" href="{_e(title_href)}">{_e(clean_name)}</a>'
+        f'<small>{_e(" · ".join(meta_parts[:3]) or "Item-Datenbank")}</small></span>'
+        f'<a class="catalog-db-link" href="{_e(db_href)}" aria-label="Item-Datenbank öffnen">DB</a>'
+        f'</div>'
+    )
+
+
+def _catalog_item_detail_panel(item_name: Any) -> str:
+    item = _catalog_item_match(item_name)
+    if not item:
+        return ""
+    return (
+        '<section class="panel catalog-linked-panel" id="item-database">'
+        '<h2>📚 Verknüpftes Item aus der Datenbank</h2>'
+        '<p class="muted">Bild, Grundwerte, Fähigkeiten, Zusatzwerte und Traits stammen aus dem importierten Item-Katalog.</p>'
+        f'{_item_card_html(item)}'
+        '</section>'
+    )
+
+
 def _jsonable(value: Any) -> Any:
     try:
         from decimal import Decimal
@@ -9392,6 +9530,24 @@ def items_page(request: Request):
         return HTMLResponse(_html_shell("Item-Datenbank Fehler", f"<section class='panel'><h1>❌ Item-Datenbank Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"), status_code=500)
 
 
+@app.get("/item/{item_id}", response_class=HTMLResponse)
+def item_detail_page(item_id: int, request: Request, _: bool = Depends(_auth)):
+    try:
+        if not get_item_by_id:
+            raise RuntimeError("Item-Katalog-Modul nicht vollständig geladen")
+        item = get_item_by_id(int(item_id))  # type: ignore[misc]
+        if not item:
+            return HTMLResponse(_html_shell("Item nicht gefunden", "<section class='panel'><h1>❌ Item nicht gefunden</h1><p><a class='btn' href='/items'>Zur Item-Datenbank</a></p></section>"), status_code=404)
+        body = f"""
+        <nav class="topnav"><a href="/items">← Item-Datenbank</a><a href="/loot">Loot</a><a href="/member/auctions">Auktionen</a></nav>
+        <section class="hero"><div><div class="eyebrow">Item-Datenbank</div><h1>{_e(item.get('name') or 'Item')}</h1><p class="muted">Questlog-Import · Bild, Werte, Fähigkeiten und Traits.</p></div></section>
+        <section class="panel">{_item_card_html(item, request)}</section>
+        """
+        return HTMLResponse(_html_shell(f"{item.get('name') or 'Item'} · Ebo Dashboard", body, nav_mode="member"))
+    except Exception as exc:
+        return HTMLResponse(_html_shell("Item-Datenbank Fehler", f"<section class='panel'><h1>❌ Item-Datenbank Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"), status_code=500)
+
+
 @app.post("/api/items/{item_id}/image")
 async def api_item_image_override(item_id: int, request: Request, _: bool = Depends(_admin_auth)):
     if not set_item_image_override or not item_source_url_by_id:
@@ -10199,17 +10355,24 @@ def _render_member_portal(data: dict[str, Any], user_id: int, request: Request, 
         auction_preview = _short(_loot_text(active_user_auctions[0].get("item_name") or active_user_auctions[0].get("item") or active_user_auctions[0].get("auction_id")), 56)
 
     portal_nav = '<nav class="topnav"><a href="/">Kommando</a><a href="/portal">Mein Portal</a><a href="/events">Events</a><a href="/loot">Loot</a><a href="/members">Mitglieder</a><a href="/ec">EC</a></nav>' if _is_portal_admin(request) else '<nav class="topnav"><a href="/member">Start</a><a href="/member/events">Events</a><a href="/member/auctions">Auktionen</a><a href="/member/ec">Meine EC</a><a href="/portal">Mein Portal</a></nav>'
-    avatar_html = (
-        f'<img class="portal-discord-avatar" src="{_e(avatar_url)}" alt="Discord-Profilbild von {_e(display)}" loading="lazy" referrerpolicy="no-referrer">'
-        if avatar_url
-        else '<span class="portal-avatar-fallback" aria-hidden="true">👤</span>'
-    )
+    if avatar_url:
+        avatar_html = (
+            f'<span class="portal-avatar-wrap">'
+            f'<img class="portal-discord-avatar" src="{_e(avatar_url)}" alt="Discord-Profilbild von {_e(display)}" '
+            f'loading="eager" referrerpolicy="no-referrer" '
+            f'onerror="this.style.display=\'none\';this.nextElementSibling.style.display=\'grid\';">'
+            f'<span class="portal-avatar-fallback" style="display:none" aria-hidden="true">👤</span>'
+            f'</span>'
+        )
+    else:
+        avatar_html = '<span class="portal-avatar-wrap"><span class="portal-avatar-fallback" aria-hidden="true">👤</span></span>' 
 
     body = f"""
     <style>
       .portal-page-hero{{min-height:180px;}}
       .portal-hero-title{{display:flex;align-items:center;gap:18px;flex-wrap:wrap;}}
-      .portal-discord-avatar,.portal-avatar-fallback{{width:82px;height:82px;flex:0 0 82px;border-radius:50%;border:2px solid rgba(214,168,79,.62);background:#0b0c11;box-shadow:0 12px 28px rgba(0,0,0,.48);object-fit:cover;display:grid;place-items:center;font-size:42px;}}
+      .portal-avatar-wrap{{width:82px;height:82px;flex:0 0 82px;display:grid;place-items:center;}}
+      .portal-discord-avatar,.portal-avatar-fallback{{width:82px;height:82px;border-radius:50%;border:2px solid rgba(214,168,79,.62);background:#0b0c11;box-shadow:0 12px 28px rgba(0,0,0,.48);object-fit:cover;display:grid;place-items:center;font-size:42px;}}
       .portal-profile-card{{display:grid;gap:10px;}}
       .portal-profile-row{{display:grid;grid-template-columns:150px minmax(0,1fr);gap:12px;align-items:center;padding:11px 0;border-bottom:1px solid rgba(214,168,79,.13)}}
       .portal-profile-row:last-child{{border-bottom:0}}
@@ -10239,10 +10402,13 @@ def _render_member_portal(data: dict[str, Any], user_id: int, request: Request, 
     </style>
     {portal_nav}
     <section class="hero portal-page-hero">
-      <div>
-        <div class="eyebrow">Mein Portal</div>
-        <h1>👤 {_e(display)}</h1>
-        <p class="muted">Profil, Event-Anmeldungen, Auktionen und eigene Needliste.</p>
+      <div class="portal-hero-title">
+        {avatar_html}
+        <div>
+          <div class="eyebrow">Mein Portal</div>
+          <h1>{_e(display)}</h1>
+          <p class="muted">Profil, Event-Anmeldungen, Auktionen und eigene Needliste.</p>
+        </div>
       </div>
       <div class="hero-actions">{admin_links}</div>
     </section>

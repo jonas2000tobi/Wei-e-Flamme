@@ -322,6 +322,27 @@ def query_items(
 
 
 
+def get_item_by_id(item_id: int) -> Optional[dict[str, Any]]:
+    """Lädt genau einen aktiven Katalogeintrag inklusive Bild-Override."""
+    ensure_item_catalog_schema()
+    sql = """
+        SELECT
+            ic.id, ic.source, ic.source_url, ic.source_item_id, ic.locale, ic.name, ic.slug,
+            ic.main_category, ic.sub_category, ic.rarity, ic.item_level, ic.required_level,
+            ic.damage_min, ic.damage_max, ic.defense, ic.stats, ic.abilities, ic.traits,
+            ic.image_url, ic.icon_url, ov.image_url AS manual_image_url,
+            ic.classification_confidence, ic.raw_data,
+            ic.is_active, ic.first_seen_at, ic.last_seen_at, ic.updated_at
+        FROM item_catalog ic
+        LEFT JOIN item_catalog_image_overrides ov ON ov.source_url = ic.source_url
+        WHERE ic.id = %s AND ic.is_active = TRUE
+        LIMIT 1
+    """
+    with connect() as conn:
+        row = conn.execute(sql, (int(item_id),)).fetchone()
+    return dict(row) if row else None
+
+
 def set_item_image_override(source_url: str, image_url: str, *, actor_id: str = "", actor_name: str = "") -> None:
     """Speichert eine manuelle Bildkorrektur anhand der Questlog-URL.
 
