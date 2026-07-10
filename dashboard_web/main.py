@@ -10136,8 +10136,9 @@ def _render_member_portal(data: dict[str, Any], user_id: int, request: Request, 
       </details>
     </section>
     """
-    shell_mode = "admin" if _is_portal_admin(request) else "member"
-    return _html_shell(f"{display} Portal · Ebo Dashboard", body, nav_mode=shell_mode)
+    # Admins bleiben im normalen Mitglieder-Dashboard, solange sie nicht bewusst das Admin-Portal öffnen.
+    # Mein Portal soll also nie automatisch die Leader-/Admin-Sidebar anzeigen.
+    return _html_shell(f"{display} Portal · Ebo Dashboard", body, nav_mode="member")
 
 
 
