@@ -1605,7 +1605,9 @@ def extract_questlog_detail_model(text: str, *, name: str, rarity: str | None, s
     stat_label_lows = {
         "stärke", "geschicklichkeit", "weisheit", "wahrnehmung", "trefferchance", "krit. trefferchance",
         "kritische trefferchance", "abklingtempo", "abklingzeit", "spezies-schadensbonus", "wildkin-bonusschaden",
-        "untote-zusatzschaden", "humanoide-zusatzschaden", "konstrukt-zusatzschaden", "eigenschaften", "traits",
+        "untote-zusatzschaden", "humanoide-zusatzschaden", "konstrukt-zusatzschaden", "schildgesundheit", "shield health",
+        "zusatzschaden", "bonusschaden", "chance auf zweitwaffenangriff", "off-hand weapon attack chance",
+        "eigenschaften", "traits",
         "max. gesundheit", "max. leben", "max. mana", "manaregeneration", "trefferchance", "chance auf",
     }
     for i, line in enumerate(lines):
@@ -1631,8 +1633,16 @@ def extract_questlog_detail_model(text: str, *, name: str, rarity: str | None, s
 
     # Bonus-Stats: Label-Zeile, danach Wert und optional ▲-Delta.
     bonus_labels = [
-        "Stärke", "Geschicklichkeit", "Weisheit", "Wahrnehmung", "Trefferchance", "Krit. Trefferchance",
-        "Kritische Trefferchance", "Abklingtempo", "Abklingzeit", "Spezies-Schadensbonus",
+        "Stärke", "Geschicklichkeit", "Weisheit", "Wahrnehmung", "Standhaftigkeit",
+        "Trefferchance", "Nahkampftrefferchance", "Fernkampftrefferchance", "Magietrefferchance",
+        "Krit. Trefferchance", "Kritische Trefferchance", "Krit. Nahkampftrefferchance",
+        "Krit. Fernkampftrefferchance", "Krit. Magietrefferchance",
+        "Schwerer Angriff Chance", "Schwerer-Angriff-Chance", "Chance auf schweren Angriff", "Heavy Attack Chance",
+        "Abklingtempo", "Abklingzeit", "Abklingzeittempo", "Cooldown Speed",
+        "Angriffstempo", "Attack Speed", "Reichweite", "Range", "Zusatzschaden", "Bonusschaden", "Bonus Damage",
+        "Spezies-Schadensbonus", "Fähigkeitsschaden-Bonus", "Skill Damage Bonus",
+        "Chance auf Zweitwaffenangriff", "Off-Hand Weapon Attack Chance",
+        "Schildgesundheit", "Shield Health", "Schildblockchance", "Shield Block Chance",
         "Wildkin-Bonusschaden", "Untote-Zusatzschaden", "Humanoide-Zusatzschaden", "Konstrukt-Zusatzschaden",
         "Max. Gesundheit", "Max. Leben", "Max. Mana", "Manaregeneration", "Mana-Kosteneffizienz",
     ]
