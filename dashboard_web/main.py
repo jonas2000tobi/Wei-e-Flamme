@@ -2118,18 +2118,107 @@ def _table(headers: list[str], rows: list[list[Any]], *, searchable: bool = True
 
 
 def _profile_name_map(snap: dict[str, Any]) -> dict[int, str]:
-    profiles = ((snap.get("profiles") or {}).get("items") or [])
+    """Name je Mitglied: Profilname, sonst Discord-Servername.
+
+    Mitglieder ohne ausgefülltes Profil kommen aus ``insights.members``. Dadurch
+    erscheinen in Listen keine nackten ``User 123...``-Platzhalter mehr, sobald der
+    Bot einen aktuellen Snapshot veröffentlicht hat.
+    """
     names: dict[int, str] = {}
-    for p in profiles:
-        if not isinstance(p, dict):
+    profiles = ((snap.get("profiles") or {}).get("items") or [])
+    for profile in profiles:
+        if not isinstance(profile, dict):
             continue
-        try:
-            uid = int(p.get("user_id") or 0)
-        except Exception:
-            uid = 0
-        if uid:
-            names[uid] = str(p.get("display_name") or p.get("ingame_name") or f"User {uid}")
+        uid = _user_id(profile.get("user_id") or profile.get("id"))
+        if not uid:
+            continue
+        name = str(
+            profile.get("ingame_name")
+            or profile.get("server_name")
+            or profile.get("display_name")
+            or profile.get("discord_name")
+            or ""
+        ).strip()
+        if name:
+            names[uid] = name
+
+    insight_members = ((snap.get("insights") or {}).get("members") or [])
+    for member in insight_members:
+        if not isinstance(member, dict):
+            continue
+        uid = _user_id(member.get("user_id") or member.get("id"))
+        if not uid:
+            continue
+        name = str(
+            member.get("ingame_name")
+            or member.get("server_name")
+            or member.get("display_name")
+            or member.get("discord_name")
+            or ""
+        ).strip()
+        if name and (uid not in names or str(names[uid]).lower().startswith("user ")):
+            names[uid] = name
     return names
+
+
+def _member_directory_items(snap: dict[str, Any]) -> list[dict[str, Any]]:
+    """Vollständige Mitgliederliste aus Profilen + Discord-Rollen-Snapshot."""
+    profiles = ((snap.get("profiles") or {}).get("items") or [])
+    insights = ((snap.get("insights") or {}).get("members") or [])
+    by_uid: dict[int, dict[str, Any]] = {}
+
+    for member in insights:
+        if not isinstance(member, dict):
+            continue
+        uid = _user_id(member.get("user_id") or member.get("id"))
+        if uid:
+            by_uid[uid] = dict(member)
+
+    for profile in profiles:
+        if not isinstance(profile, dict):
+            continue
+        uid = _user_id(profile.get("user_id") or profile.get("id"))
+        if not uid:
+            continue
+        merged = dict(by_uid.get(uid) or {})
+        # Profilfelder ergänzen die Discord-Daten, leere Profilwerte überschreiben
+        # aber keinen bereits vorhandenen Servernamen/Avatar.
+        for key, value in profile.items():
+            if value not in (None, "", [], {}):
+                merged[key] = value
+        merged["user_id"] = uid
+        by_uid[uid] = merged
+
+    rows: list[dict[str, Any]] = []
+    for uid, member in by_uid.items():
+        profile_name = str(member.get("ingame_name") or "").strip()
+        server_name = str(
+            member.get("server_name")
+            or member.get("display_name")
+            or member.get("discord_name")
+            or ""
+        ).strip()
+        member["list_name"] = profile_name or server_name or f"User {uid}"
+        member["user_id"] = uid
+        rows.append(member)
+
+    rows.sort(key=lambda row: str(row.get("list_name") or "").casefold())
+    return rows
+
+
+def _member_record(snap: dict[str, Any], user_id: int) -> dict[str, Any]:
+    uid = int(user_id or 0)
+    for member in _member_directory_items(snap):
+        if _user_id(member.get("user_id")) == uid:
+            return member
+    return {}
+
+
+def _safe_avatar_url(value: Any) -> str:
+    url = str(value or "").strip()
+    if url.startswith("https://") or url.startswith("http://"):
+        return url
+    return ""
 
 
 def _events_items(snap: dict[str, Any]) -> list[dict[str, Any]]:
@@ -2220,13 +2309,33 @@ def _voice_for_user(snap: dict[str, Any], user_id: int, *, limit: int = 30) -> l
 
 
 def _auctions_for_user(snap: dict[str, Any], user_id: int, *, limit: int = 30) -> list[dict[str, Any]]:
+    """Auktionen, an denen der Nutzer tatsächlich beteiligt ist.
+
+    Nicht mehr pauschal alle offenen Müll-/Sale-Items als "Deine Auktionen"
+    zählen. Berücksichtigt werden eigene Gebote, Müll-Würfe, Führung und Gewinn.
+    """
+    uid = int(user_id or 0)
     auctions = (((snap.get("loot") or {}).get("auctions") or {}).get("items") or [])
-    out = []
-    for a in auctions:
-        if not isinstance(a, dict):
+    out: list[dict[str, Any]] = []
+    for auction in auctions:
+        if not isinstance(auction, dict):
             continue
-        if _user_id(a.get("top_bid_user_id")) == int(user_id) or _user_id(a.get("winner_user_id")) == int(user_id):
-            out.append(a)
+        involved = (
+            _user_id(auction.get("top_bid_user_id")) == uid
+            or _user_id(auction.get("winner_user_id") or auction.get("delivered_to_user_id")) == uid
+        )
+        if not involved:
+            involved = any(
+                isinstance(bid, dict) and _user_id(bid.get("user_id") or bid.get("bidder_id")) == uid
+                for bid in (auction.get("bids") or [])
+            )
+        if not involved:
+            involved = any(
+                _user_id(roll.get("user_id")) == uid
+                for roll in _junk_roll_entries_dashboard(auction)
+            )
+        if involved:
+            out.append(auction)
     return out[:limit]
 
 
@@ -2659,7 +2768,7 @@ def _render_member_detail(data: dict[str, Any], user_id: int, current_user: Opti
     <section class="hero">
       <div>
         <div class="eyebrow">Mitglied</div>
-        <h1>👤 {_e(display)}</h1>
+        <h1 class="portal-hero-title">{avatar_html}<span>{_e(display)}</span></h1>
         <p class="muted">User-ID: {_e(user_id)} · Snapshot: {_e(_dt(data.get('published_at')))}</p>
       </div>
       <a class="btn" href="/">Zurück</a>
@@ -2816,6 +2925,8 @@ def _auction_by_id(snap: dict[str, Any], auction_id: str) -> Optional[dict[str, 
 def _phase_label(auction: dict[str, Any]) -> str:
     phase = str(auction.get("phase") or "").strip()
     mode = str(auction.get("eligibility_mode") or "").strip()
+    if auction.get("junk_drop") or auction.get("is_junk"):
+        return "Müll / Würfeln"
     if phase == "need" and mode == "main_need":
         return "Main-Need-Auktion"
     if phase == "need" and mode == "secondary_need":
@@ -2926,9 +3037,12 @@ def _auction_roll_count(auction: dict[str, Any]) -> int:
 
 
 def _auction_count_label(auction: dict[str, Any]) -> tuple[str, int, str]:
-    if auction.get("junk_drop"):
+    if auction.get("junk_drop") or auction.get("is_junk"):
         rolls = _auction_roll_count(auction)
         return "Würfe", rolls, "Müll-Würfe"
+    if _loot_is_sale_like(auction):
+        price = int(_num(auction.get("fixed_price") if auction.get("fixed_price") is not None else auction.get("start_bid"), 0))
+        return "EC Festpreis", price, "Direktkauf"
     return "Gebote", _loot_bid_count(auction), "Gebote"
 
 
@@ -2987,8 +3101,11 @@ def _auction_timer_subtext(auction: dict[str, Any]) -> str:
 
 def _auction_leader_or_roll_text(auction: dict[str, Any], snap: Optional[dict[str, Any]] = None) -> str:
     snap = snap or {}
-    if auction.get("junk_drop"):
-        return _best_junk_roll_text(auction, snap)
+    if auction.get("junk_drop") or auction.get("is_junk"):
+        best = _best_junk_roll_text(auction, snap)
+        return best if best != "—" else "noch kein Wurf"
+    if _loot_is_sale_like(auction):
+        return "noch verfügbar"
     uid = _user_id(auction.get("top_bid_user_id"))
     amount = auction.get("top_bid_amount")
     if uid and amount is not None:
@@ -3700,7 +3817,9 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "member") -> str:
   <style>
     :root {{ --bg:#0f1014; --panel:#181a22; --panel2:#20232d; --text:#f1eadb; --muted:#a8a193; --gold:#d6a84f; --line:#333746; --red:#d96868; --green:#81c784; --side:#11121a; --side2:#171824; }}
     * {{ box-sizing:border-box; }} html {{ scroll-behavior:smooth; }}
-    body {{ margin:0; font-family:Inter, system-ui, Segoe UI, sans-serif; background:linear-gradient(180deg,rgba(5,6,9,.56),rgba(5,6,9,.88)), url("{_asset('dashboard_bg.webp')}") center center / cover fixed no-repeat; color:var(--text); overflow-x:hidden; }}
+    body {{ margin:0; font-family:Inter, system-ui, Segoe UI, sans-serif; background:linear-gradient(180deg,rgba(5,6,9,.56),rgba(5,6,9,.88)), url("{_asset('dashboard_bg.webp')}") center center / cover fixed no-repeat; color:var(--text); overflow-x:hidden; caret-color:transparent; }}
+    input, textarea, [contenteditable="true"] {{ caret-color:auto; }}
+    h1,h2,h3,h4,.eyebrow,.brand,.side-nav,.card-title,.card-value,th,.btn,button,summary,label {{ caret-color:transparent; }}
     .app-shell {{ display:grid; grid-template-columns:260px minmax(0,1fr); min-height:100vh; }}
     .sidebar {{ position:sticky; top:0; height:100vh; overflow:auto; scrollbar-width:none; -ms-overflow-style:none; padding:18px 14px; background:linear-gradient(180deg,rgba(17,18,26,.97),rgba(11,12,18,.97)); border-right:1px solid rgba(214,168,79,.16); box-shadow:16px 0 45px rgba(0,0,0,.35); }}
     .sidebar::-webkit-scrollbar {{ width:0; height:0; display:none; }}
@@ -9897,8 +10016,25 @@ def _portal_event_status_for_user(ev: dict[str, Any], user_id: int) -> str:
 
 
 def _portal_active_auctions(snap: dict[str, Any]) -> list[dict[str, Any]]:
+    """Aktive Auktionen für Mitgliederansicht mit vollständigen Rohdaten.
+
+    Der Loot-Center-View liefert kompakte Einträge. Für Müll-Würfe wurden dabei
+    früher ``junk_drop`` und ``junk_rolls`` verloren, weshalb die Seite fälschlich
+    "0 Gebote" anzeigte. Hier werden Rohdaten und Anzeige-Felder zusammengeführt.
+    """
     try:
-        return list((_loot_center_payload_from_snapshot(snap).get("active") or [])[:40])
+        active = list((_loot_center_payload_from_snapshot(snap).get("active") or [])[:40])
+        normalized: list[dict[str, Any]] = []
+        for entry in active:
+            if not isinstance(entry, dict):
+                continue
+            raw = entry.get("raw") if isinstance(entry.get("raw"), dict) else {}
+            merged = dict(raw)
+            merged.update({key: value for key, value in entry.items() if key != "raw"})
+            merged["junk_drop"] = bool(merged.get("junk_drop") or merged.get("is_junk"))
+            merged["item_name"] = merged.get("item_name") or merged.get("item") or entry.get("item")
+            normalized.append(merged)
+        return normalized
     except Exception:
         return []
 
@@ -9998,23 +10134,21 @@ def _render_member_portal(data: dict[str, Any], user_id: int, request: Request, 
     names = _profile_name_map(snap)
     uid = int(user_id)
 
-    profiles = ((snap.get("profiles") or {}).get("items") or [])
-    profile: dict[str, Any] = {}
-    for p in profiles:
-        if not isinstance(p, dict):
-            continue
-        if _user_id(p.get("user_id") or p.get("member_id") or p.get("discord_id")) == uid:
-            profile = p
-            break
+    profile = _member_record(snap, uid)
 
     display = (
-        profile.get("display_name")
-        or profile.get("ingame_name")
+        profile.get("ingame_name")
+        or profile.get("server_name")
+        or profile.get("display_name")
         or profile.get("discord_name")
         or names.get(uid)
         or f"User {uid}"
     )
-    profile_name = profile.get("ingame_name") or profile.get("display_name") or display
+    profile_name = profile.get("ingame_name") or profile.get("server_name") or profile.get("display_name") or display
+    avatar_url = _safe_avatar_url(profile.get("avatar_url"))
+    current_session = _current_user(request) or {}
+    if not avatar_url and _user_id(current_session.get("user_id")) == uid:
+        avatar_url = _safe_avatar_url(current_session.get("avatar_url"))
     gearscore = profile.get("gearscore") or profile.get("gear_score") or profile.get("gs") or "—"
     main_role = profile.get("main_role") or profile.get("role_name") or profile.get("class_role") or profile.get("role") or "—"
     guild_rank = (
@@ -10043,9 +10177,6 @@ def _render_member_portal(data: dict[str, Any], user_id: int, request: Request, 
     active_events = _portal_active_events(snap, uid)
     user_auctions = [a for a in _auctions_for_user(snap, uid, limit=100) if isinstance(a, dict)]
     active_user_auctions = [a for a in user_auctions if _loot_is_active(a)]
-    if not active_user_auctions:
-        # Fallback: Wenn Snapshot keine userbezogene Auktionszuordnung liefert, wenigstens alle aktiven anzeigen/zählen.
-        active_user_auctions = [a for a in _portal_active_auctions(snap) if isinstance(a, dict)]
 
     msg_html = f'<div class="ok">{_e(msg)}</div>' if msg else ""
     admin_links = ""
@@ -10068,10 +10199,17 @@ def _render_member_portal(data: dict[str, Any], user_id: int, request: Request, 
         auction_preview = _short(_loot_text(active_user_auctions[0].get("item_name") or active_user_auctions[0].get("item") or active_user_auctions[0].get("auction_id")), 56)
 
     portal_nav = '<nav class="topnav"><a href="/">Kommando</a><a href="/portal">Mein Portal</a><a href="/events">Events</a><a href="/loot">Loot</a><a href="/members">Mitglieder</a><a href="/ec">EC</a></nav>' if _is_portal_admin(request) else '<nav class="topnav"><a href="/member">Start</a><a href="/member/events">Events</a><a href="/member/auctions">Auktionen</a><a href="/member/ec">Meine EC</a><a href="/portal">Mein Portal</a></nav>'
+    avatar_html = (
+        f'<img class="portal-discord-avatar" src="{_e(avatar_url)}" alt="Discord-Profilbild von {_e(display)}" loading="lazy" referrerpolicy="no-referrer">'
+        if avatar_url
+        else '<span class="portal-avatar-fallback" aria-hidden="true">👤</span>'
+    )
 
     body = f"""
     <style>
       .portal-page-hero{{min-height:180px;}}
+      .portal-hero-title{{display:flex;align-items:center;gap:18px;flex-wrap:wrap;}}
+      .portal-discord-avatar,.portal-avatar-fallback{{width:82px;height:82px;flex:0 0 82px;border-radius:50%;border:2px solid rgba(214,168,79,.62);background:#0b0c11;box-shadow:0 12px 28px rgba(0,0,0,.48);object-fit:cover;display:grid;place-items:center;font-size:42px;}}
       .portal-profile-card{{display:grid;gap:10px;}}
       .portal-profile-row{{display:grid;grid-template-columns:150px minmax(0,1fr);gap:12px;align-items:center;padding:11px 0;border-bottom:1px solid rgba(214,168,79,.13)}}
       .portal-profile-row:last-child{{border-bottom:0}}
@@ -10289,7 +10427,7 @@ def _render_member_auctions_page(data: dict[str, Any], request: Request) -> str:
     body = f"""
     <nav class="topnav"><a href="/member">Start</a><a href="/member/events">Events</a><a href="/member/auctions">Auktionen</a><a href="/portal">Eigenes Profil</a></nav>
     <section class="hero"><div><div class="eyebrow">Mitgliederbereich</div><h1>🏆 Laufende Auktionen</h1><p class="muted">Alle aktuell offenen Auktionen, Würfelitems und Sales mit Timer.</p></div></section>
-    <section class="panel">{_table(['Item','Bereich','Status','Gebote/Würfe','Führung/Wurf','Timer','Aktion'], rows, placeholder='Auktionen durchsuchen…')}</section>
+    <section class="panel">{_table(['Item','Bereich','Status','Aktivität / Preis','Führung / Stand','Timer','Aktion'], rows, placeholder='Auktionen durchsuchen…')}</section>
     """
     return _html_shell("Auktionen · Mitgliederbereich", body, nav_mode="member")
 
@@ -10298,18 +10436,16 @@ def _render_member_members_page(data: dict[str, Any], request: Request) -> str:
     if not data.get("ok"):
         return _html_shell("Mitglieder · Mitgliederbereich", f"<section class='panel'><h1>👥 Mitglieder</h1><p class='muted'>{_e(data.get('error'))}</p></section>", nav_mode="member")
     snap: dict[str, Any] = data.get("snapshot") or {}
-    profiles = ((snap.get("profiles") or {}).get("items") or [])
     rows = []
-    for p in profiles:
-        if not isinstance(p, dict):
-            continue
-        uid = _user_id(p.get("user_id") or p.get("id"))
+    for member in _member_directory_items(snap):
+        uid = _user_id(member.get("user_id") or member.get("id"))
+        display_name = member.get("list_name") or member.get("server_name") or member.get("display_name") or f"User {uid}"
         rows.append([
-            _member_link(uid, p.get("display_name") or p.get("discord_name") or p.get("ingame_name") or f"User {uid}"),
-            p.get("ingame_name") or "—",
-            p.get("main_role") or "—",
-            p.get("gearscore") or "—",
-            "ja" if p.get("has_needs") else "nein",
+            _member_link(uid, display_name),
+            member.get("ingame_name") or "—",
+            member.get("main_role") or "—",
+            member.get("gearscore") or "—",
+            "ja" if bool(member.get("has_needs")) else "nein",
         ])
     body = f"""
     <nav class="topnav"><a href="/member">Start</a><a href="/member/members">Mitglieder</a><a href="/member/events">Events</a><a href="/member/auctions">Auktionen</a></nav>
@@ -12964,6 +13100,9 @@ def discord_callback(request: Request, code: str = "", state: str = "", error: s
         user = _request_json(f"{DISCORD_API_BASE}/users/@me", token=access_token)
         uid = str(user.get("id") or "")
         username = str(user.get("global_name") or user.get("username") or uid)
+        avatar_hash = str(user.get("avatar") or "").strip()
+        avatar_ext = "gif" if avatar_hash.startswith("a_") else "png"
+        oauth_avatar_url = f"https://cdn.discordapp.com/avatars/{uid}/{avatar_hash}.{avatar_ext}?size=256" if uid and avatar_hash else ""
         auth_lists = _snapshot_auth_lists()
         guild_id = _env("DASHBOARD_GUILD_ID") or str(auth_lists.get("guild_id") or "")
         if not uid:
@@ -12988,6 +13127,7 @@ def discord_callback(request: Request, code: str = "", state: str = "", error: s
         session = {
             "user_id": uid,
             "username": username,
+            "avatar_url": oauth_avatar_url,
             "role": "admin" if is_admin else "member",
             "roles": ["snapshot_admin"] if is_admin else ["snapshot_member"],
             "guild_id": str(guild_id),
