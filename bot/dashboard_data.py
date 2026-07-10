@@ -71,6 +71,8 @@ def _member_is_active(guild: discord.Guild, user_id: int) -> bool:
 DASHBOARD_MEMBER_ROLE_SETTING = "dashboard_member_role_id"
 DASHBOARD_ADMIN_ROLE_SETTING = "dashboard_admin_role_ids"
 DASHBOARD_ALLOWED_ROLE_SETTING = "dashboard_allowed_role_ids"
+DASHBOARD_NEWS_CHANNEL_NAME_SETTING = "dashboard_news_channel_name"
+DASHBOARD_GUIDES_CHANNEL_NAME_SETTING = "dashboard_guides_channel_name"
 
 
 def _dashboard_member_role_config_value(guild_id: int) -> Any:
@@ -1494,6 +1496,25 @@ def _dashboard_insights(guild: discord.Guild, snapshot: dict[str, Any]) -> dict[
     }
 
 
+def _dashboard_feed_channel_name(kind: str) -> str:
+    """Discord-Kanalname für Dashboard-News/Guides aus Runtime-DB oder Env lesen.
+
+    Absichtlich name-basiert, damit der Betreiber per Slash-Command z. B.
+    `news` oder `guides` setzen kann, ohne Kanal-IDs aus Discord kopieren zu müssen.
+    """
+    kind_up = str(kind or "").upper()
+    setting = DASHBOARD_GUIDES_CHANNEL_NAME_SETTING if kind_up == "GUIDES" else DASHBOARD_NEWS_CHANNEL_NAME_SETTING
+    env_names = [f"DASHBOARD_{kind_up}_CHANNEL_NAME", f"DISCORD_{kind_up}_CHANNEL_NAME", f"TNL_{kind_up}_CHANNEL_NAME"]
+    if kind_up == "NEWS":
+        env_names.extend(["NEWS_CHANNEL_NAME", "DASHBOARD_TNL_NEWS_CHANNEL_NAME"])
+    if kind_up == "GUIDES":
+        env_names.extend(["GUIDES_CHANNEL_NAME", "DASHBOARD_TNL_GUIDES_CHANNEL_NAME", "GUIDE_CHANNEL_NAME"])
+
+    # Runtime-DB ist guildbezogen; weil diese Helper-Funktion keine guild_id kennt,
+    # wird die eigentliche DB-Lesung in _dashboard_feed_channel_config gemacht.
+    return ""
+
+
 def _dashboard_feed_channel_id(kind: str) -> int:
     kind = str(kind or "").upper()
     names = [f"DASHBOARD_{kind}_CHANNEL_ID", f"DISCORD_{kind}_CHANNEL_ID", f"TNL_{kind}_CHANNEL_ID"]
@@ -1512,6 +1533,48 @@ def _dashboard_feed_channel_id(kind: str) -> int:
     return 0
 
 
+def _dashboard_feed_channel_config(guild_id: int, kind: str) -> dict[str, Any]:
+    kind_up = str(kind or "").upper()
+    name_setting = DASHBOARD_GUIDES_CHANNEL_NAME_SETTING if kind_up == "GUIDES" else DASHBOARD_NEWS_CHANNEL_NAME_SETTING
+    configured_name = ""
+    try:
+        configured_name = str(runtime_db.get_guild_setting(int(guild_id), name_setting, "") or "").strip()
+    except Exception:
+        configured_name = ""
+
+    if not configured_name:
+        env_names = [f"DASHBOARD_{kind_up}_CHANNEL_NAME", f"DISCORD_{kind_up}_CHANNEL_NAME", f"TNL_{kind_up}_CHANNEL_NAME"]
+        if kind_up == "NEWS":
+            env_names.extend(["NEWS_CHANNEL_NAME", "DASHBOARD_TNL_NEWS_CHANNEL_NAME"])
+        if kind_up == "GUIDES":
+            env_names.extend(["GUIDES_CHANNEL_NAME", "DASHBOARD_TNL_GUIDES_CHANNEL_NAME", "GUIDE_CHANNEL_NAME"])
+        for env in env_names:
+            raw = os.getenv(env, "").strip()
+            if raw:
+                configured_name = raw
+                break
+
+    return {"name": configured_name, "id": _dashboard_feed_channel_id(kind_up)}
+
+
+def _normal_channel_name(value: Any) -> str:
+    return str(value or "").strip().lower().lstrip("#").replace(" ", "-").replace("_", "-")
+
+
+def _find_feed_channel_by_name(guild: discord.Guild, raw_name: str) -> Optional[Any]:
+    wanted = _normal_channel_name(raw_name)
+    if not wanted:
+        return None
+    # Erst exakter normalisierter Treffer, dann contains-Fallback.
+    channels = [ch for ch in getattr(guild, "channels", []) if hasattr(ch, "history")]
+    for ch in channels:
+        if _normal_channel_name(getattr(ch, "name", "")) == wanted:
+            return ch
+    for ch in channels:
+        if wanted in _normal_channel_name(getattr(ch, "name", "")):
+            return ch
+    return None
+
 def _message_jump_url(guild_id: int, channel_id: int, message_id: int) -> str:
     if not guild_id or not channel_id or not message_id:
         return ""
@@ -1519,18 +1582,29 @@ def _message_jump_url(guild_id: int, channel_id: int, message_id: int) -> str:
 
 
 async def _dashboard_fetch_channel_feed(guild: discord.Guild, *, kind: str, limit: int = 30) -> dict[str, Any]:
-    channel_id = _dashboard_feed_channel_id(kind)
-    out: dict[str, Any] = {"kind": str(kind or "").lower(), "channel_id": int(channel_id or 0), "channel_name": "", "configured": bool(channel_id), "fetched_at": _now_iso(), "messages": []}
-    if not channel_id:
-        return out
-    channel = guild.get_channel(int(channel_id))
+    cfg = _dashboard_feed_channel_config(int(guild.id), kind)
+    channel_name = str(cfg.get("name") or "").strip()
+    channel_id = int(cfg.get("id") or 0)
+    out: dict[str, Any] = {"kind": str(kind or "").lower(), "channel_id": int(channel_id or 0), "channel_name": channel_name, "configured_name": channel_name, "configured": bool(channel_name or channel_id), "fetched_at": _now_iso(), "messages": []}
+    channel = None
+    if channel_name:
+        channel = _find_feed_channel_by_name(guild, channel_name)
+        if channel is not None:
+            channel_id = int(getattr(channel, "id", 0) or 0)
+            out["channel_id"] = channel_id
+            out["channel_name"] = str(getattr(channel, "name", "") or channel_name)
+    if channel is None and channel_id:
+        channel = guild.get_channel(int(channel_id))
+        if channel is None:
+            try:
+                channel = await guild.fetch_channel(int(channel_id))  # type: ignore[attr-defined]
+            except Exception as exc:
+                out["error"] = f"Kanal konnte nicht geladen werden: {type(exc).__name__}: {exc}"
+                return out
+        out["channel_name"] = str(getattr(channel, "name", "") or channel_id)
     if channel is None:
-        try:
-            channel = await guild.fetch_channel(int(channel_id))  # type: ignore[attr-defined]
-        except Exception as exc:
-            out["error"] = f"Kanal konnte nicht geladen werden: {type(exc).__name__}: {exc}"
-            return out
-    out["channel_name"] = str(getattr(channel, "name", "") or channel_id)
+        out["error"] = "Kein Kanal gesetzt. Nutze /dashboard_set_feed_channel feed:news channel_name:<kanalname>."
+        return out
     if not hasattr(channel, "history"):
         out["error"] = "Kanal unterstützt keine Nachrichten-History."
         return out
@@ -1565,6 +1639,15 @@ async def _dashboard_fetch_channel_feed(guild: discord.Guild, *, kind: str, limi
 
 async def _dashboard_discord_feeds_snapshot(guild: discord.Guild) -> dict[str, Any]:
     return {"news": await _dashboard_fetch_channel_feed(guild, kind="news"), "guides": await _dashboard_fetch_channel_feed(guild, kind="guides")}
+
+
+async def _publish_snapshot_with_feeds(bot: commands.Bot, guild: discord.Guild) -> int:
+    snapshot = await asyncio.to_thread(build_dashboard_snapshot, bot, guild)
+    try:
+        snapshot["discord_feeds"] = await _dashboard_discord_feeds_snapshot(guild)
+    except Exception as feed_exc:
+        snapshot["discord_feeds"] = {"error": f"{type(feed_exc).__name__}: {feed_exc}"}
+    return int(await asyncio.to_thread(runtime_db.save_dashboard_snapshot, guild_id=int(guild.id), guild_name=guild.name, snapshot=snapshot) or 0)
 
 def build_dashboard_snapshot(bot: commands.Bot, guild: discord.Guild) -> dict[str, Any]:
     """Read-only Daten-Snapshot für das spätere Web-Dashboard.
@@ -1772,6 +1855,59 @@ async def setup_dashboard_data(bot: commands.Bot, tree: app_commands.CommandTree
         except Exception as exc:
             await inter.followup.send(f"❌ Konnte Adminrolle nicht speichern: `{type(exc).__name__}: {exc}`", ephemeral=True)
 
+    @tree.command(name="dashboard_set_feed_channel", description="Setzt den Discord-Kanal für Dashboard-News oder Guides per Kanalname.")
+    @app_commands.describe(feed="news oder guides", channel_name="Kanalname ohne ID, z. B. news oder guides")
+    @app_commands.choices(feed=[app_commands.Choice(name="News", value="news"), app_commands.Choice(name="Guides", value="guides")])
+    async def dashboard_set_feed_channel(inter: discord.Interaction, feed: app_commands.Choice[str], channel_name: str):
+        if inter.guild is None:
+            await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
+            return
+        if not _is_admin(inter):
+            await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True)
+            return
+
+        clean_name = str(channel_name or "").strip().lstrip("#")
+        if not clean_name:
+            await inter.response.send_message("❌ Bitte einen Kanalnamen angeben, z. B. `news` oder `guides`.", ephemeral=True)
+            return
+
+        await inter.response.defer(ephemeral=True, thinking=True)
+        kind = str(feed.value or "news").lower()
+        setting = DASHBOARD_GUIDES_CHANNEL_NAME_SETTING if kind == "guides" else DASHBOARD_NEWS_CHANNEL_NAME_SETTING
+        channel = _find_feed_channel_by_name(inter.guild, clean_name)
+        if channel is None:
+            names = sorted(str(getattr(ch, "name", "")) for ch in getattr(inter.guild, "channels", []) if hasattr(ch, "history") and getattr(ch, "name", ""))
+            sample = ", ".join(f"#{n}" for n in names[:15]) or "keine lesbaren Textkanäle gefunden"
+            await inter.followup.send(f"❌ Kanal `#{clean_name}` nicht gefunden. Sichtbare Textkanäle: {sample}", ephemeral=True)
+            return
+
+        try:
+            runtime_db.set_guild_setting(int(inter.guild.id), setting, str(getattr(channel, "name", clean_name)))
+            try:
+                runtime_db.write_audit_log(
+                    guild_id=int(inter.guild.id),
+                    actor_id=int(inter.user.id),
+                    action="dashboard_feed_channel_set",
+                    target_type="channel",
+                    target_id=str(getattr(channel, "id", "")),
+                    summary=f"Dashboard-{kind}-Kanal gesetzt: #{getattr(channel, 'name', clean_name)}",
+                    new_value={"feed": kind, "channel_name": str(getattr(channel, "name", clean_name)), "channel_id_resolved": int(getattr(channel, "id", 0) or 0)},
+                )
+            except Exception:
+                pass
+            try:
+                await _publish_snapshot_with_feeds(bot, inter.guild)
+            except Exception as pub_exc:
+                await inter.followup.send(f"✅ Dashboard-{kind}-Kanal gesetzt: {getattr(channel, 'mention', '#' + clean_name)}\n⚠️ Snapshot konnte noch nicht aktualisiert werden: `{type(pub_exc).__name__}: {pub_exc}`", ephemeral=True)
+                return
+            await inter.followup.send(
+                f"✅ Dashboard-{kind}-Kanal gesetzt: {getattr(channel, 'mention', '#' + clean_name)}\n"
+                "Die Website liest ab jetzt diesen Kanal nach Namen. Nachrichten erscheinen nach dem nächsten Snapshot bzw. jetzt direkt nach der Aktualisierung.",
+                ephemeral=True,
+            )
+        except Exception as exc:
+            await inter.followup.send(f"❌ Konnte Feed-Kanal nicht speichern: `{type(exc).__name__}: {exc}`", ephemeral=True)
+
     @tree.command(name="dashboard_status", description="Zeigt den Status der read-only Dashboard-Datenbasis.")
     async def dashboard_status(inter: discord.Interaction):
         if inter.guild is None:
@@ -1876,4 +2012,4 @@ async def setup_dashboard_data(bot: commands.Bot, tree: app_commands.CommandTree
         emb = discord.Embed(title="📁 Dashboard-Quellen", description=txt, color=0xD6A84F)
         await inter.response.send_message(embed=emb, ephemeral=True)
 
-    print("📊 Dashboard-Datenlayer registriert: /dashboard_set_member_role, /dashboard_set_admin_role, /dashboard_status, /dashboard_export, /dashboard_sources")
+    print("📊 Dashboard-Datenlayer registriert: /dashboard_set_member_role, /dashboard_set_admin_role, /dashboard_set_feed_channel, /dashboard_status, /dashboard_export, /dashboard_sources")
