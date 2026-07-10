@@ -212,6 +212,7 @@ def _dashboard_auth_info(guild: discord.Guild) -> dict[str, Any]:
     """
     member_role = _dashboard_member_role(guild)
     member_ids = set(_dashboard_member_ids(guild))
+    member_id_strings = sorted(str(x) for x in member_ids)
 
     allowed_roles = _dashboard_allowed_roles(guild)
     allowed_role_rows: list[dict[str, Any]] = []
@@ -244,6 +245,7 @@ def _dashboard_auth_info(guild: discord.Guild) -> dict[str, Any]:
             "role_id": str(member_role.id) if member_role else "",
             "role_name": str(member_role.name) if member_role else "",
             "member_count": len(member_ids),
+            "member_ids": member_id_strings,
             "configured": member_role is not None,
         },
         "allowed_roles": allowed_role_rows,
@@ -1274,8 +1276,15 @@ def _dashboard_insights(guild: discord.Guild, snapshot: dict[str, Any]) -> dict[
     gebauten Snapshot plus die gesetzte Dashboard-Gildenrolle.
     """
     try:
-        role_ids = sorted(_dashboard_member_ids(guild))
+        member_role = _dashboard_member_role(guild)
+        role_member_map = {
+            int(member.id): member
+            for member in (getattr(member_role, "members", []) if member_role is not None else [])
+            if getattr(member, "id", None)
+        }
+        role_ids = sorted(role_member_map.keys())
     except Exception:
+        role_member_map = {}
         role_ids = []
 
     profiles = ((snapshot.get("profiles") or {}).get("items") or [])
@@ -1412,7 +1421,7 @@ def _dashboard_insights(guild: discord.Guild, snapshot: dict[str, Any]) -> dict[
 
     members: list[dict[str, Any]] = []
     for uid in role_ids:
-        member = guild.get_member(uid)
+        member = role_member_map.get(uid) or guild.get_member(uid)
         p = profile_by_uid.get(uid, {})
         n = need_by_uid.get(uid, {})
         evs = event_stats.get(uid, {"responses": 0, "yes": 0, "maybe": 0, "no": 0})
