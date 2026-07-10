@@ -700,7 +700,66 @@ def _portal_protected_titles() -> set[str]:
         "📜 Regeln & Lootsystem",
         "📜 Regeln & Lootsystem – ebolus",
         "🎁 Needliste – ebolus",
+        "⚜️ Gildenzentrale",
+        "⚜️ Ebolus Gildenzentrale",
     }
+
+
+def _is_auction_message(msg: discord.Message) -> bool:
+    """Schützt Auktions-/Loot-DMs vor der RSVP-Aufräumroutine.
+
+    Nach einer Rollen-/RSVP-Auswahl sollen alte Event-DMs verschwinden.
+    Gildenzentrale und Auktions-/Loot-Tracking-DMs dürfen aber bleiben.
+    """
+    try:
+        title = ""
+        desc = ""
+        if msg.embeds:
+            title = str(msg.embeds[0].title or "")
+            desc = str(msg.embeds[0].description or "")
+        content = str(getattr(msg, "content", "") or "")
+        hay = f"{title}\n{desc}\n{content}".lower()
+
+        auction_needles = (
+            "auktion",
+            "auktionen",
+            "need-auktion",
+            "main-need-auktion",
+            "second-need-auktion",
+            "freie auktion",
+            "loot-auktion",
+            "sale-kauf",
+            "müll-item",
+            "sofortkauf",
+            "ec-gebot",
+            "gebot",
+        )
+        return any(n in hay for n in auction_needles)
+    except Exception:
+        return False
+
+
+def _is_protected_bot_dm_message(client: discord.Client, msg: discord.Message, user_id: int) -> bool:
+    """Alles, was nach einer RSVP-Auswahl im DM-Verlauf bleiben darf."""
+    try:
+        if int(msg.id) in _portal_message_ids_to_keep(client, int(user_id)):
+            return True
+    except Exception:
+        pass
+
+    try:
+        if _is_portal_message(msg):
+            return True
+    except Exception:
+        pass
+
+    try:
+        if _is_auction_message(msg):
+            return True
+    except Exception:
+        pass
+
+    return False
 
 
 def _is_portal_message(msg: discord.Message) -> bool:
@@ -855,22 +914,15 @@ async def _delete_irrelevant_bot_dm_messages_for_user(
                 if msg.author.id != client.user.id:
                     continue
 
-                if msg.id in portal_keep_ids:
-                    continue
-
-                if _is_portal_message(msg):
-                    continue
-
-                # Do not delete arbitrary bot DMs anymore. Only delete RSVP-DMs
-                # that are actually stored in event dm_messages. This prevents
-                # accidental deletion of the Gildenzentrale while it shows an admin,
-                # auction or need subpage with a title not in the old allow-list.
-                if msg.id not in known_dm_ids:
+                if _is_protected_bot_dm_message(client, msg, int(user_id)):
                     continue
 
                 if msg.id in keep_dm_ids:
                     continue
 
+                # Nach einer erfolgreichen Rollen-/RSVP-Auswahl soll der Bot-DM-Verlauf sauber sein.
+                # Behalten werden nur Gildenzentrale/Portal, offene Event-DMs anderer Events
+                # und Auktions-/Loot-DMs. Alles andere vom Bot darf weg.
                 await msg.delete()
                 deleted += 1
                 deleted_or_stale_dm_ids.add(int(msg.id))
