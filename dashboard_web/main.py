@@ -10190,6 +10190,7 @@ def _render_member_home(data: dict[str, Any], request: Request) -> str:
     return _html_shell("Mitgliederbereich · Ebo Dashboard", body, nav_mode="member")
 
 
+def _settings_change_requests_for_dashboard(guild_id: int, limit: int = 80) -> list[dict[str, Any]]:
     """Letzte Dashboard-Einstellungsanträge.
 
     Das Dashboard schreibt keine Bot-JSON. Es legt nur Änderungsanträge in Postgres ab.
