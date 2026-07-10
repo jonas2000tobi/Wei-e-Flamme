@@ -509,9 +509,14 @@ def _summarize_profiles(data: Any, guild: discord.Guild, *, limit: int = 500) ->
         if not _is_dashboard_member(guild, user_id):
             stale_count += 1
             continue
+        discord_display = _safe_text(getattr(member, "display_name", "") if member is not None else "", 120)
+        avatar_url = _safe_text(str(getattr(getattr(member, "display_avatar", None), "url", "") or "") if member is not None else "", 500)
         items.append({
             "user_id": user_id,
-            "display_name": _safe_text(getattr(member, "display_name", "") if member is not None else profile.get("ingame_name") or f"User {user_id}", 120),
+            "display_name": discord_display or _safe_text(profile.get("ingame_name") or f"User {user_id}", 120),
+            "server_name": discord_display,
+            "discord_name": _safe_text(getattr(member, "name", "") if member is not None else "", 120),
+            "avatar_url": avatar_url,
             "ingame_name": _safe_text(profile.get("ingame_name"), 120),
             "main_role": _safe_text(profile.get("main_role"), 80),
             "gearscore": _safe_text(profile.get("gearscore"), 40),
@@ -1431,9 +1436,14 @@ def _dashboard_insights(guild: discord.Guild, snapshot: dict[str, Any]) -> dict[
             risk_flags.append("keine Eventantwort")
         if voice_seconds <= 0:
             risk_flags.append("keine Voice-Zeit")
+        discord_display = _safe_text(getattr(member, "display_name", "") or "", 120)
+        avatar_url = _safe_text(str(getattr(getattr(member, "display_avatar", None), "url", "") or ""), 500)
         members.append({
             "user_id": uid,
-            "display_name": _safe_text(getattr(member, "display_name", "") or p.get("display_name") or p.get("ingame_name") or f"User {uid}", 120),
+            "display_name": discord_display or _safe_text(p.get("display_name") or p.get("ingame_name") or f"User {uid}", 120),
+            "server_name": discord_display,
+            "discord_name": _safe_text(getattr(member, "name", "") or "", 120),
+            "avatar_url": avatar_url,
             "ingame_name": _safe_text(p.get("ingame_name") if isinstance(p, dict) else "", 120),
             "main_role": _safe_text(p.get("main_role") if isinstance(p, dict) else "", 80),
             "gearscore": _safe_text(p.get("gearscore") if isinstance(p, dict) else "", 40),
