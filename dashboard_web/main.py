@@ -2117,18 +2117,50 @@ def _table(headers: list[str], rows: list[list[Any]], *, searchable: bool = True
     return f"{search}<div class='table-wrap'><table class='searchable-table'><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div>"
 
 
+def _clean_member_name(value: Any, user_id: Any = 0) -> str:
+    text = str(value or "").strip()
+    uid = _user_id(user_id)
+    if not text:
+        return ""
+    compact = re.sub(r"\s+", "", text).lower()
+    if uid and compact in {str(uid), f"user{uid}"}:
+        return ""
+    return text
+
+
+def _preferred_member_name(profile: dict[str, Any], user_id: Any = 0) -> str:
+    """Profilname bevorzugen, sonst Discord-Servername; niemals rohe User-ID als Name."""
+    uid = _user_id(user_id or profile.get("user_id") or profile.get("id"))
+    profile_name = _clean_member_name(
+        profile.get("profile_name") or profile.get("ingame_name") or profile.get("character_name"), uid
+    )
+    if profile_name:
+        return profile_name
+    for key in ("server_name", "guild_display_name", "display_name", "discord_name", "nickname", "username", "name"):
+        name = _clean_member_name(profile.get(key), uid)
+        if name:
+            return name
+    return f"Mitglied {uid}" if uid else "Unbekannt"
+
+
+def _profile_avatar_url(profile: dict[str, Any]) -> str:
+    return str(
+        profile.get("avatar_url")
+        or profile.get("discord_avatar_url")
+        or profile.get("display_avatar_url")
+        or ""
+    ).strip()
+
+
 def _profile_name_map(snap: dict[str, Any]) -> dict[int, str]:
     profiles = ((snap.get("profiles") or {}).get("items") or [])
     names: dict[int, str] = {}
     for p in profiles:
         if not isinstance(p, dict):
             continue
-        try:
-            uid = int(p.get("user_id") or 0)
-        except Exception:
-            uid = 0
+        uid = _user_id(p.get("user_id") or p.get("id"))
         if uid:
-            names[uid] = str(p.get("display_name") or p.get("ingame_name") or f"User {uid}")
+            names[uid] = _preferred_member_name(p, uid)
     return names
 
 
@@ -3603,7 +3635,7 @@ def _sidebar_html() -> str:
       <button class="mobile-nav-toggle" type="button" onclick="document.body.classList.toggle('nav-open')">☰ Menü</button>
 
       <nav class="side-nav">
-        <a class="admin-back" href="/"><span>←</span> Zur normalen Ansicht</a>
+        <a class="home-button" href="/"><span>⌂</span> Zur Startseite</a>
         <details open>
           <summary>Admin</summary>
           <a href="/admin"><img class="nav-ico" src="{_asset('nav_admin_portal.png')}" alt="">Admin-Portal</a>
@@ -3642,6 +3674,7 @@ def _member_sidebar_html() -> str:
       <button class="mobile-nav-toggle" type="button" onclick="document.body.classList.toggle('nav-open')">☰ Menü</button>
 
       <nav class="side-nav">
+        <a class="home-button" href="/"><span>⌂</span> Zur Startseite</a>
         <a class="admin-portal-button" href="/admin"><img class="nav-ico" src="{_asset('nav_admin_portal.png')}" alt="">Admin-Portal</a>
 
         <details open>
@@ -3700,8 +3733,8 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "member") -> str:
     :root {{ --bg:#0f1014; --panel:#181a22; --panel2:#20232d; --text:#f1eadb; --muted:#a8a193; --gold:#d6a84f; --line:#333746; --red:#d96868; --green:#81c784; --side:#11121a; --side2:#171824; }}
     * {{ box-sizing:border-box; }} html {{ scroll-behavior:smooth; }}
     body {{ margin:0; font-family:Inter, system-ui, Segoe UI, sans-serif; background:linear-gradient(180deg,rgba(5,6,9,.56),rgba(5,6,9,.88)), url("{_asset('dashboard_bg.webp')}") center center / cover fixed no-repeat; color:var(--text); overflow-x:hidden; }}
-    .app-shell {{ display:grid; grid-template-columns:260px minmax(0,1fr); min-height:100vh; }}
-    .sidebar {{ position:sticky; top:0; height:100vh; overflow:auto; scrollbar-width:none; -ms-overflow-style:none; padding:18px 14px; background:linear-gradient(180deg,rgba(17,18,26,.97),rgba(11,12,18,.97)); border-right:1px solid rgba(214,168,79,.16); box-shadow:16px 0 45px rgba(0,0,0,.35); }}
+    .app-shell {{ display:grid; grid-template-columns:286px minmax(0,1fr); min-height:100vh; }}
+    .sidebar {{ position:sticky; top:0; height:100vh; overflow:auto; scrollbar-width:none; -ms-overflow-style:none; padding:30px 25px 28px; background:linear-gradient(rgba(7,13,22,.12),rgba(7,13,22,.18)),url("{_asset('sidebar_frame.webp')}") center top / 100% 100% no-repeat; border-right:1px solid rgba(214,168,79,.34); box-shadow:18px 0 48px rgba(0,0,0,.48); }}
     .sidebar::-webkit-scrollbar {{ width:0; height:0; display:none; }}
     .mobile-nav-toggle {{ display:none; border:1px solid rgba(214,168,79,.24); border-radius:12px; background:linear-gradient(180deg,rgba(32,35,45,.92),rgba(13,14,20,.86)); color:var(--text); font-weight:800; padding:10px 12px; cursor:pointer; }}
     .brand {{ display:flex; align-items:center; gap:12px; padding:8px 8px 18px; margin-bottom:8px; border-bottom:1px solid rgba(214,168,79,.14); }}
@@ -3719,6 +3752,9 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "member") -> str:
     .side-nav details a {{ margin-left:8px; padding:9px 11px; font-size:13px; color:#ded7c8; }}
     .side-nav .admin-portal-button {{ margin:0 0 6px 0; border:1px solid rgba(214,168,79,.34); background:linear-gradient(90deg,rgba(214,168,79,.18),rgba(77,52,18,.18)); color:var(--gold); font-weight:800; }}
     .side-nav .admin-back {{ margin:0 0 6px 0; border:1px solid rgba(129,199,132,.25); background:rgba(129,199,132,.08); color:#bfe8c1; font-weight:800; }}
+    .side-nav .home-button {{ margin:0 0 7px 0; border:1px solid rgba(214,168,79,.42); background:linear-gradient(90deg,rgba(214,168,79,.20),rgba(25,20,17,.30)); color:#f3d391; font-weight:900; box-shadow:inset 0 0 20px rgba(214,168,79,.04); }}
+    h1,h2,h3,h4,.brand,.eyebrow,.card-title,.card-value,.side-nav summary,.side-nav a,.topnav a,.btn,label,th,td {{ caret-color:transparent; }}
+    input,textarea,select,[contenteditable="true"] {{ caret-color:auto; user-select:text; }}
 
     .sidebar-footer {{ margin-top:18px; padding-top:14px; border-top:1px solid rgba(214,168,79,.12); display:grid; gap:8px; }}
     .sidebar-footer a {{ color:var(--muted); text-decoration:none; font-size:13px; padding:8px 10px; border-radius:10px; }} .sidebar-footer a:hover {{ color:var(--gold); background:rgba(214,168,79,.08); }}
@@ -3850,7 +3886,7 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "member") -> str:
     /* Ebolus Gothic/Whale Visual Pass v1 */
     body::before {{ content:""; position:fixed; inset:0; pointer-events:none; z-index:-1; background:radial-gradient(circle at 50% 0%,rgba(214,168,79,.12),transparent 34%), linear-gradient(90deg,rgba(0,0,0,.58),rgba(0,0,0,.12) 22%,rgba(0,0,0,.12) 78%,rgba(0,0,0,.62)); }}
     .app-shell {{ grid-template-columns:286px minmax(0,1fr); }}
-    .sidebar {{ background:linear-gradient(180deg,rgba(33,15,10,.84),rgba(12,8,8,.92)); border-right:1px solid rgba(214,168,79,.32); box-shadow:22px 0 58px rgba(0,0,0,.52), inset -1px 0 0 rgba(255,216,140,.05); }}
+    .sidebar {{ background:linear-gradient(rgba(7,13,22,.10),rgba(7,13,22,.16)),url("{_asset('sidebar_frame.webp')}") center top / 100% 100% no-repeat; border-right:1px solid rgba(214,168,79,.32); box-shadow:22px 0 58px rgba(0,0,0,.52), inset -1px 0 0 rgba(255,216,140,.05); }}
     .brand {{ justify-content:center; flex-direction:column; text-align:center; gap:9px; padding:10px 10px 22px; margin-bottom:14px; }}
     .brand-mark {{ width:108px; height:108px; border-radius:24px; padding:9px; background:radial-gradient(circle at 50% 28%,rgba(214,168,79,.22),rgba(13,8,8,.78)); border:1px solid rgba(214,168,79,.42); box-shadow:0 18px 38px rgba(0,0,0,.42), inset 0 0 0 1px rgba(255,222,150,.06); }}
     .brand-mark img {{ width:100%; height:100%; object-fit:contain; }}
@@ -10003,14 +10039,14 @@ def _render_member_portal(data: dict[str, Any], user_id: int, request: Request, 
             profile = p
             break
 
-    display = (
-        profile.get("display_name")
-        or profile.get("ingame_name")
-        or profile.get("discord_name")
-        or names.get(uid)
-        or f"User {uid}"
+    display = _preferred_member_name(profile, uid)
+    profile_name = _clean_member_name(profile.get("ingame_name"), uid) or display
+    avatar_url = _profile_avatar_url(profile)
+    avatar_html = (
+        f'<img class="profile-avatar" src="{_e(avatar_url)}" alt="Discord-Profilbild von {_e(display)}" loading="lazy" referrerpolicy="no-referrer">'
+        if avatar_url else
+        f'<div class="profile-avatar profile-avatar-fallback">{_e(display[:1].upper() if display else "?")}</div>'
     )
-    profile_name = profile.get("ingame_name") or profile.get("display_name") or display
     gearscore = profile.get("gearscore") or profile.get("gear_score") or profile.get("gs") or "—"
     main_role = profile.get("main_role") or profile.get("role_name") or profile.get("class_role") or profile.get("role") or "—"
     guild_rank = (
@@ -10068,6 +10104,9 @@ def _render_member_portal(data: dict[str, Any], user_id: int, request: Request, 
     body = f"""
     <style>
       .portal-page-hero{{min-height:180px;}}
+      .profile-hero-main{{display:flex;align-items:center;gap:20px;min-width:0}}
+      .profile-avatar{{width:104px;height:104px;flex:0 0 104px;border-radius:50%;object-fit:cover;border:2px solid rgba(214,168,79,.62);box-shadow:0 12px 30px rgba(0,0,0,.5),0 0 0 5px rgba(214,168,79,.08)}}
+      .profile-avatar-fallback{{display:grid;place-items:center;background:radial-gradient(circle at 35% 25%,#384762,#111722);color:var(--gold);font:700 42px Georgia,serif}}
       .portal-profile-card{{display:grid;gap:10px;}}
       .portal-profile-row{{display:grid;grid-template-columns:150px minmax(0,1fr);gap:12px;align-items:center;padding:11px 0;border-bottom:1px solid rgba(214,168,79,.13)}}
       .portal-profile-row:last-child{{border-bottom:0}}
@@ -10097,10 +10136,13 @@ def _render_member_portal(data: dict[str, Any], user_id: int, request: Request, 
     </style>
     {portal_nav}
     <section class="hero portal-page-hero">
-      <div>
-        <div class="eyebrow">Mein Portal</div>
-        <h1>👤 {_e(display)}</h1>
-        <p class="muted">Profil, Event-Anmeldungen, Auktionen und eigene Needliste.</p>
+      <div class="profile-hero-main">
+        {avatar_html}
+        <div>
+          <div class="eyebrow">Mein Portal</div>
+          <h1>{_e(display)}</h1>
+          <p class="muted">Profil, Event-Anmeldungen, Auktionen und eigene Needliste.</p>
+        </div>
       </div>
       <div class="hero-actions">{admin_links}</div>
     </section>
@@ -10300,8 +10342,8 @@ def _render_member_members_page(data: dict[str, Any], request: Request) -> str:
             continue
         uid = _user_id(p.get("user_id") or p.get("id"))
         rows.append([
-            _member_link(uid, p.get("display_name") or p.get("discord_name") or p.get("ingame_name") or f"User {uid}"),
-            p.get("ingame_name") or "—",
+            _member_link(uid, _preferred_member_name(p, uid)),
+            _clean_member_name(p.get("ingame_name"), uid) or "—",
             p.get("main_role") or "—",
             p.get("gearscore") or "—",
             "ja" if p.get("has_needs") else "nein",
