@@ -5,6 +5,7 @@ import json
 import os
 import secrets
 import csv
+import difflib
 import re
 import io
 import base64
@@ -48,10 +49,12 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
-ASSET_VER = "member-avatar-itemdb-v1-20260711"
-DASHBOARD_RELEASE_VERSION = "1.2.2 · Mitgliederfilter + Discord-Avatar + Item-Verknüpfung"
+ASSET_VER = "item-match-v2-20260711"
+DASHBOARD_RELEASE_VERSION = "1.2.3 · robuste Item-Verknüpfung"
 
 _ITEM_MATCH_CACHE: dict[str, Optional[dict[str, Any]]] = {}
+_ITEM_CATALOG_POOL_CACHE: dict[str, Any] = {"loaded_at": 0.0, "items": []}
+_ITEM_CATALOG_POOL_TTL_SECONDS = 300.0
 
 
 def _database_url() -> str:
@@ -8135,54 +8138,229 @@ def _item_catalog_available() -> bool:
     return bool(catalog_stats and ensure_item_catalog_schema and query_items)
 
 
+_ITEM_LOOKUP_STOPWORDS = frozenset({
+    "der", "die", "das", "des", "den", "dem", "ein", "eine", "einer", "eines", "einem", "einen",
+    "von", "vom", "für", "fur", "und", "mit", "zu", "zur", "zum", "aus", "im", "in", "auf", "an",
+})
+_ITEM_LOOKUP_TYPE_WORDS = frozenset({
+    "ring", "ringe", "ohrring", "ohrringe", "robe", "handschutz", "handschuh", "handschuhe",
+    "kette", "halskette", "armband", "brosche", "gürtel", "guertel", "gurtel", "umhang", "mantel",
+    "helm", "hut", "maske", "schleier", "hose", "schuhe", "stiefel", "brust", "rüstung", "ruestung",
+    "rustung", "stulpen",
+})
+
+
 def _normalize_item_lookup_name(value: Any) -> str:
     text = _loot_text(value)
     text = re.sub(r"^[🔒✅🎁🧹\s]+", "", text).strip()
-    text = re.sub(r"\s+\((?:Schwert\s*&\s*Schild|Großschwert|Grossschwert|Dolche?|Langbogen|Armbrust|Zauberstab|Stab|Kugel|Speer)\)\s*$", "", text, flags=re.I)
-    text = re.sub(r"\s+", " ", text).strip().casefold()
-    return text
+    text = re.sub(
+        r"\s+\((?:Schwert\s*&\s*Schild|Großschwert|Grossschwert|Dolche?|Langbogen|Armbrust|Zauberstab|Stab|Kugel|Speer)\)\s*$",
+        "",
+        text,
+        flags=re.I,
+    )
+    # Eigene Kurzbezeichnungen wie "Ring DaVinci" oder Bindestriche sollen
+    # mit den offiziellen Questlog-Namen (z. B. "Da Vincis Ring …") matchen.
+    text = re.sub(r"(?<=[a-zäöüß])(?=[A-ZÄÖÜ])", " ", text)
+    text = text.casefold().replace("ß", "ss").replace("ä", "a").replace("ö", "o").replace("ü", "u")
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _item_lookup_stem(token: str) -> str:
+    value = str(token or "")
+    # Kleine, bewusst konservative deutsche Endungs-Normalisierung. Dadurch
+    # werden z. B. "Hunger" und "Hungers" oder "Blutjäger" und
+    # "Blutjägers" gleich behandelt, ohne eine externe NLP-Abhängigkeit.
+    for suffix in ("ungen", "ern", "ens", "en", "es", "er", "em", "e", "s"):
+        if len(value) > max(6, len(suffix) + 3) and value.endswith(suffix):
+            return value[: -len(suffix)]
+    return value
+
+
+def _item_lookup_features(value: Any) -> dict[str, Any]:
+    normalized = _normalize_item_lookup_name(value)
+    tokens = [
+        _item_lookup_stem(token)
+        for token in normalized.split()
+        if token and token not in _ITEM_LOOKUP_STOPWORDS
+    ]
+    core_tokens = [token for token in tokens if token not in _ITEM_LOOKUP_TYPE_WORDS]
+    return {
+        "normalized": normalized,
+        "tokens": tokens,
+        "core_tokens": core_tokens,
+        "compact": "".join(tokens),
+        "core_compact": "".join(core_tokens),
+        "token_set": {token for token in tokens if len(token) > 2},
+        "core_set": {token for token in core_tokens if len(token) > 2},
+    }
+
+
+def _item_lookup_slot_hint(features: dict[str, Any]) -> str:
+    tokens = set(features.get("tokens") or [])
+    checks = [
+        ({"ring", "ringe"}, "ring"),
+        ({"ohrring", "ohrringe"}, "ohrringe"),
+        ({"handschutz", "handschuh", "handschuhe"}, "handschuhe"),
+        ({"robe", "brust", "rustung", "ruestung"}, "brust"),
+        ({"kette", "halskette"}, "kette"),
+        ({"armband"}, "armband"),
+        ({"brosche"}, "brosche"),
+        ({"gurtel", "guertel"}, "gurtel"),
+        ({"umhang", "mantel"}, "umhang"),
+        ({"helm", "hut", "maske", "schleier"}, "helm"),
+        ({"hose"}, "hose"),
+        ({"schuhe", "stiefel"}, "schuhe"),
+    ]
+    for aliases, hint in checks:
+        if tokens & aliases:
+            return hint
+    return ""
+
+
+def _catalog_match_pool() -> list[dict[str, Any]]:
+    """Lädt den aktiven Itemkatalog kurzzeitig in einen lokalen Match-Cache.
+
+    Die alte Version suchte nur mit ``ILIKE %kompletter Auktionsname%``. Das
+    funktionierte lediglich bei exakt gleichen Namen. Dieser Pool ermöglicht
+    einen robusten Vergleich gegen alle importierten deutschen Itemnamen.
+    """
+    now = time.monotonic()
+    cached_items = _ITEM_CATALOG_POOL_CACHE.get("items")
+    loaded_at = float(_ITEM_CATALOG_POOL_CACHE.get("loaded_at") or 0.0)
+    if isinstance(cached_items, list) and cached_items and now - loaded_at < _ITEM_CATALOG_POOL_TTL_SECONDS:
+        return [dict(item) for item in cached_items if isinstance(item, dict)]
+    if not _item_catalog_available():
+        return []
+
+    items: list[dict[str, Any]] = []
+    try:
+        ensure_item_catalog_schema()  # type: ignore[misc]
+        offset = 0
+        page_size = 500
+        # Sicherheitsgrenze gegen eine versehentlich riesige/falsche Tabelle.
+        while offset < 10000:
+            batch = query_items(q="", limit=page_size, offset=offset)  # type: ignore[misc]
+            if not batch:
+                break
+            items.extend(dict(item) for item in batch if isinstance(item, dict))
+            if len(batch) < page_size:
+                break
+            offset += page_size
+    except Exception:
+        return []
+
+    _ITEM_CATALOG_POOL_CACHE["loaded_at"] = now
+    _ITEM_CATALOG_POOL_CACHE["items"] = [dict(item) for item in items]
+    return items
+
+
+def _catalog_candidate_score(search_features: dict[str, Any], candidate: dict[str, Any]) -> float:
+    candidate_features = _item_lookup_features(candidate.get("name"))
+    a_normalized = str(search_features.get("normalized") or "")
+    b_normalized = str(candidate_features.get("normalized") or "")
+    a_compact = str(search_features.get("compact") or "")
+    b_compact = str(candidate_features.get("compact") or "")
+    a_core = str(search_features.get("core_compact") or "")
+    b_core = str(candidate_features.get("core_compact") or "")
+    a_tokens = set(search_features.get("token_set") or set())
+    b_tokens = set(candidate_features.get("token_set") or set())
+    a_core_tokens = set(search_features.get("core_set") or set())
+    b_core_tokens = set(candidate_features.get("core_set") or set())
+
+    score = 0.0
+    if a_normalized and a_normalized == b_normalized:
+        score = max(score, 2200.0)
+    if a_compact and a_compact == b_compact:
+        score = max(score, 1900.0)
+    if a_core and a_core == b_core:
+        score = max(score, 1800.0)
+    if min(len(a_compact), len(b_compact)) >= 6 and (a_compact in b_compact or b_compact in a_compact):
+        score = max(score, 1150.0 - abs(len(a_compact) - len(b_compact)) * 3.0)
+    if min(len(a_core), len(b_core)) >= 5 and (a_core in b_core or b_core in a_core):
+        score = max(score, 1280.0 - abs(len(a_core) - len(b_core)) * 3.0)
+
+    score += difflib.SequenceMatcher(None, a_compact, b_compact).ratio() * 420.0
+    if a_core and b_core:
+        score += difflib.SequenceMatcher(None, a_core, b_core).ratio() * 560.0
+
+    token_union = len(a_tokens | b_tokens) or 1
+    core_union = len(a_core_tokens | b_core_tokens) or 1
+    score += (len(a_tokens & b_tokens) / token_union) * 330.0
+    score += (len(a_core_tokens & b_core_tokens) / core_union) * 700.0
+
+    if a_core_tokens and all(
+        any(left == right or left in right or right in left for right in b_core_tokens)
+        for left in a_core_tokens
+    ):
+        score += 430.0
+
+    hint = _item_lookup_slot_hint(search_features)
+    candidate_sub = _normalize_item_lookup_name(candidate.get("sub_category") or candidate.get("main_category"))
+    if hint and hint in candidate_sub:
+        score += 180.0
+    elif hint and candidate_sub:
+        score -= 100.0
+
+    # Nur gleiche Slot-Wörter reichen nicht. Mindestens ein echter Namensbestandteil
+    # muss passen, sonst würden beliebige Ringe miteinander verknüpft.
+    has_core_overlap = bool(a_core_tokens & b_core_tokens)
+    has_compact_containment = bool(a_core and b_core and (a_core in b_core or b_core in a_core))
+    if not has_core_overlap and not has_compact_containment:
+        score -= 320.0
+
+    score -= abs(len(a_compact) - len(b_compact)) * 1.2
+    return score
 
 
 def _catalog_item_match(item_name: Any) -> Optional[dict[str, Any]]:
-    """Bestmöglicher Item-Katalogtreffer für einen Loot-/Need-Namen."""
+    """Bestmöglicher Item-Katalogtreffer auch für Gilden-Kurznamen."""
     key = _normalize_item_lookup_name(item_name)
     if not key or len(key) < 3 or not _item_catalog_available():
         return None
     if key in _ITEM_MATCH_CACHE:
         cached = _ITEM_MATCH_CACHE[key]
         return dict(cached) if isinstance(cached, dict) else None
-    try:
-        ensure_item_catalog_schema()  # type: ignore[misc]
-        candidates = query_items(q=str(_loot_text(item_name)).strip(), limit=18, offset=0)  # type: ignore[misc]
-        if not candidates and key != str(_loot_text(item_name)).strip().casefold():
-            candidates = query_items(q=key, limit=18, offset=0)  # type: ignore[misc]
-    except Exception:
-        _ITEM_MATCH_CACHE[key] = None
-        return None
 
-    key_tokens = {x for x in re.findall(r"[a-z0-9äöüß]+", key) if len(x) > 2}
+    search_features = _item_lookup_features(item_name)
+    candidates = _catalog_match_pool()
+
+    # Fallback, falls der vollständige Pool wegen einer temporären DB-Störung
+    # nicht geladen werden konnte: mit den aussagekräftigsten Einzelwörtern suchen.
+    if not candidates:
+        candidate_map: dict[str, dict[str, Any]] = {}
+        try:
+            terms = sorted(
+                set(search_features.get("core_tokens") or search_features.get("tokens") or []),
+                key=len,
+                reverse=True,
+            )[:5]
+            for term in terms:
+                for candidate in query_items(q=term, limit=80, offset=0):  # type: ignore[misc]
+                    if not isinstance(candidate, dict):
+                        continue
+                    identity = str(candidate.get("id") or candidate.get("source_url") or candidate.get("name") or "")
+                    candidate_map[identity] = dict(candidate)
+            candidates = list(candidate_map.values())
+        except Exception:
+            candidates = []
+
     best: Optional[dict[str, Any]] = None
-    best_score = -1.0
-    for candidate in candidates or []:
-        if not isinstance(candidate, dict):
+    best_score = float("-inf")
+    for candidate in candidates:
+        if not isinstance(candidate, dict) or not candidate.get("name"):
             continue
-        cname = _normalize_item_lookup_name(candidate.get("name"))
-        if not cname:
-            continue
-        if cname == key:
-            score = 1000.0
-        elif cname in key or key in cname:
-            score = 700.0 - abs(len(cname) - len(key))
-        else:
-            c_tokens = {x for x in re.findall(r"[a-z0-9äöüß]+", cname) if len(x) > 2}
-            overlap = len(key_tokens & c_tokens)
-            union = len(key_tokens | c_tokens) or 1
-            score = (overlap / union) * 500.0 - abs(len(cname) - len(key)) * 0.5
+        score = _catalog_candidate_score(search_features, candidate)
         if score > best_score:
             best_score = score
             best = dict(candidate)
-    if best_score < 120.0:
+
+    # Absichtlich deutlich über dem Niveau eines bloßen Slot-Treffers. Ein
+    # falscher DB-Eintrag wäre schlimmer als ein ungelöster Suchlink.
+    if best_score < 850.0:
         best = None
+
     _ITEM_MATCH_CACHE[key] = dict(best) if isinstance(best, dict) else None
     return dict(best) if isinstance(best, dict) else None
 
