@@ -46,7 +46,7 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
-ASSET_VER = "ebo-gothic-whale-dashboard-portal-v1"
+ASSET_VER = "ebo-sidebar-icons-v1"
 DASHBOARD_RELEASE_VERSION = "1.2.1 · Status Playwright Worker + Questlog Items"
 
 
@@ -3831,7 +3831,7 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "admin") -> str:
     .side-nav a::after {{ content:""; position:absolute; left:13px; right:13px; bottom:-3px; height:1px; background:linear-gradient(90deg,transparent,rgba(214,168,79,.20),transparent); }}
     .side-nav a:hover {{ background:linear-gradient(90deg,rgba(214,168,79,.16),rgba(214,168,79,.045)); border-color:rgba(214,168,79,.18); }}
     .side-nav a.active {{ background:linear-gradient(90deg,rgba(214,168,79,.24),rgba(214,168,79,.07)); border-color:rgba(214,168,79,.36); box-shadow:inset 3px 0 0 rgba(236,194,104,.86), 0 8px 20px rgba(0,0,0,.24); }}
-    .nav-ico {{ width:22px; height:22px; object-fit:contain; flex:0 0 22px; filter:drop-shadow(0 2px 5px rgba(0,0,0,.75)); opacity:.92; }}
+    .nav-ico {{ width:24px; height:24px; object-fit:contain; flex:0 0 24px; filter:drop-shadow(0 2px 5px rgba(0,0,0,.75)); opacity:.96; transform:translateY(-1px); }}
     .side-nav a.active .nav-ico, .side-nav a:hover .nav-ico {{ opacity:1; }}
     .side-nav details {{ border-top:1px solid rgba(214,168,79,.16); margin-top:10px; padding-top:10px; }}
     .side-nav summary {{ color:#b9a783; font-size:10px; min-height:28px; padding:6px 12px; }}
@@ -3989,7 +3989,7 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "admin") -> str:
         margin-top:12px; padding-top:12px; border-top:1px solid rgba(214,168,79,.16);
       }}
       .side-nav a,.side-nav summary {{ min-height:44px; padding:11px 12px; font-size:13px; border-radius:12px; }}
-      .nav-ico {{ width:22px; height:22px; flex-basis:22px; }}
+      .nav-ico {{ width:24px; height:24px; flex-basis:24px; }}
       .version-pill {{ grid-column:1/-1; text-align:center; }}
 
       .topnav {{
