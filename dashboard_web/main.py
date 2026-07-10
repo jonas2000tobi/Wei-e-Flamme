@@ -8556,6 +8556,36 @@ def _need_builder_load(guild_id: int, user_id: int) -> dict[str, Any]:
         conn.close()
 
 
+def _need_builder_detail_payload(item: dict[str, Any]) -> dict[str, Any]:
+    """Kompakte Questlog-Werte für den Need-Baukasten / Frontend-Rechner."""
+    detail = _item_detail_model(item)
+    stats = item.get("stats") or {}
+    if not isinstance(stats, dict):
+        stats = {}
+    traits = detail.get("traits") if isinstance(detail, dict) else None
+    if not isinstance(traits, list) or not traits:
+        traits = item.get("traits") or []
+    bonus = detail.get("bonus_stats") if isinstance(detail, dict) else []
+    if not isinstance(bonus, list):
+        bonus = []
+    primary = detail.get("primary") if isinstance(detail, dict) else []
+    if not isinstance(primary, list):
+        primary = []
+    passive = detail.get("passive") if isinstance(detail, dict) else {}
+    if not isinstance(passive, dict):
+        passive = {}
+    return {
+        "primary": _jsonable(primary[:8]),
+        "bonus": _jsonable(bonus[:12]),
+        "traits": _jsonable(traits[:12]) if isinstance(traits, list) else [],
+        "stats": _jsonable(stats),
+        "passive": _jsonable(passive),
+        "damage_min": _jsonable(item.get("damage_min")),
+        "damage_max": _jsonable(item.get("damage_max")),
+        "defense": _jsonable(item.get("defense")),
+    }
+
+
 def _need_builder_items() -> list[dict[str, Any]]:
     if not _item_catalog_available():
         return []
@@ -8582,6 +8612,7 @@ def _need_builder_items() -> list[dict[str, Any]]:
                 "level": item.get("item_level") or "",
                 "image": str(item.get("manual_image_url") or item.get("image_url") or item.get("icon_url") or ""),
                 "source_url": str(item.get("source_url") or ""),
+                "detail": _need_builder_detail_payload(item),
             })
         return out
     except Exception:
@@ -8598,7 +8629,8 @@ def _need_builder_item_by_id(item_id: int) -> dict[str, Any]:
             cur.execute(
                 """
                 SELECT ic.id, ic.name, ic.source_url, ic.main_category, ic.sub_category, ic.rarity,
-                       ic.item_level, COALESCE(ov.image_url, ic.image_url, ic.icon_url, '') AS image_url
+                       ic.item_level, ic.damage_min, ic.damage_max, ic.defense, ic.stats, ic.abilities, ic.traits, ic.raw_data,
+                       COALESCE(ov.image_url, ic.image_url, ic.icon_url, '') AS image_url
                 FROM item_catalog ic
                 LEFT JOIN item_catalog_image_overrides ov ON ov.source_url = ic.source_url
                 WHERE ic.id = %s AND ic.is_active = TRUE
@@ -8835,7 +8867,7 @@ def _render_need_builder_dashboard(data: dict[str, Any], request: Request, msg: 
         return f"""
         <div class="nb-slot" data-slot="{_e(slot)}">
           <label>{_e(slot)}</label>
-          <button type="button" class="nb-picker" onclick="nbOpenPicker(this)">
+          <button type="button" class="nb-picker" onclick="nbOpenPicker(this)" onmouseenter="nbSlotTip(this,event)" onmousemove="nbMoveTip(event)" onmouseleave="nbHideTip()">
             <span class="nb-thumb">{image_html}</span>
             <span class="nb-picked" data-empty="Item auswählen">{_e(name or 'Item auswählen')}</span>
             <b>⌄</b>
@@ -8859,7 +8891,8 @@ def _render_need_builder_dashboard(data: dict[str, Any], request: Request, msg: 
     <style>
       .need-builder-shell{display:grid;grid-template-columns:260px minmax(0,1fr);gap:16px;align-items:start}
       .need-builder-side,.need-builder-main{border:1px solid rgba(212,164,74,.22);background:linear-gradient(135deg,rgba(24,16,10,.86),rgba(0,0,0,.62));border-radius:18px;padding:16px;box-shadow:0 18px 60px rgba(0,0,0,.22)}
-      .need-builder-side h2,.nb-section h3{margin:0 0 12px;color:#e8c579;font-family:Georgia,serif;letter-spacing:.03em}.nb-builds{display:grid;gap:10px}.nb-build{display:grid;grid-template-columns:42px 1fr auto;gap:10px;align-items:center;padding:10px;border:1px solid rgba(255,255,255,.08);border-radius:14px;text-decoration:none;color:inherit;background:rgba(0,0,0,.18)}.nb-build.active{border-color:rgba(212,164,74,.75);background:linear-gradient(90deg,rgba(121,75,18,.32),rgba(0,0,0,.2))}.nb-build-icon{display:grid;place-items:center;width:40px;height:40px;border-radius:12px;background:rgba(120,88,180,.14);border:1px solid rgba(182,137,255,.3)}.nb-main-badge{display:block;color:#ffd05d;font-size:12px;margin-top:2px}.nb-build em{color:#b7a88c;font-style:normal}.nb-side-actions{display:grid;gap:8px;margin-top:14px}.nb-side-actions .btn{width:100%;justify-content:center}.nb-toolbar{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:16px}.nb-toolbar input{min-width:220px;padding:11px 12px;border-radius:12px;border:1px solid rgba(255,255,255,.16);background:rgba(0,0,0,.25);color:inherit}.nb-toolbar .btn{min-height:42px}.nb-section{margin-top:18px;padding-top:14px;border-top:1px solid rgba(212,164,74,.16)}.nb-slot-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.nb-slot label{display:block;color:#d9c08a;font-weight:800;font-size:12px;margin:0 0 6px}.nb-picker{width:100%;display:grid;grid-template-columns:44px 1fr auto;gap:10px;align-items:center;text-align:left;border:1px solid rgba(255,255,255,.10);background:rgba(0,0,0,.28);color:inherit;border-radius:14px;padding:9px;min-height:62px;cursor:pointer}.nb-picker:hover,.nb-picker.nb-open{border-color:rgba(212,164,74,.72);box-shadow:0 0 0 2px rgba(212,164,74,.08)}.nb-thumb{display:grid;place-items:center;width:42px;height:42px;border-radius:10px;background:linear-gradient(135deg,rgba(82,45,122,.38),rgba(0,0,0,.2));border:1px solid rgba(182,137,255,.35);overflow:hidden}.nb-thumb img{width:100%;height:100%;object-fit:contain;padding:3px}.nb-picked{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:#d9b4ff;font-weight:700}.nb-picker b{color:#d4a44a}.nb-status{display:flex;gap:14px;flex-wrap:wrap;align-items:center;border:1px solid rgba(117,212,122,.22);background:rgba(27,91,35,.10);border-radius:14px;padding:12px;margin-bottom:16px}.nb-status b{color:#75d47a}.need-builder-memberpick{margin-bottom:14px}.need-builder-memberpick span{display:block;color:#b7a88c;font-size:12px}.need-builder-memberpick select{width:100%;padding:10px;border-radius:12px;border:1px solid rgba(255,255,255,.14);background:rgba(0,0,0,.32);color:inherit}.nb-help{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:18px}.nb-help .soft{border:1px solid rgba(212,164,74,.16);border-radius:14px;padding:12px;background:rgba(0,0,0,.18)}.nb-picker-pop{position:fixed;z-index:9999;width:min(430px,calc(100vw - 24px));max-height:520px;border:1px solid rgba(212,164,74,.65);background:#120e09;border-radius:16px;box-shadow:0 24px 90px rgba(0,0,0,.72);padding:10px}.nb-picker-pop input{width:100%;box-sizing:border-box;padding:12px;border-radius:12px;border:1px solid rgba(212,164,74,.35);background:rgba(0,0,0,.42);color:inherit;margin-bottom:8px}.nb-picker-list{max-height:400px;overflow:auto;display:grid;gap:6px}.nb-item-option{display:grid;grid-template-columns:38px 1fr auto;gap:9px;align-items:center;border:1px solid rgba(255,255,255,.07);background:rgba(255,255,255,.03);border-radius:12px;padding:7px;cursor:pointer}.nb-item-option:hover{border-color:rgba(212,164,74,.45);background:rgba(212,164,74,.08)}.nb-item-option img{width:36px;height:36px;object-fit:contain;border-radius:8px;background:rgba(0,0,0,.3);border:1px solid rgba(182,137,255,.26)}.nb-item-option strong{display:block;color:#e1c0ff;font-size:13px}.nb-item-option small{color:#b7a88c}.nb-item-option em{font-style:normal;color:#d4a44a}.nb-empty{padding:14px;color:#b7a88c}.nb-mobile-note{display:none;color:#b7a88c}.hero .nb-top-actions{display:flex;gap:8px;flex-wrap:wrap}.btn.gold{background:linear-gradient(180deg,#c89b43,#7a531f);color:#1b1208;border-color:#d4a44a;font-weight:900}
+      .need-builder-side h2,.nb-section h3{margin:0 0 12px;color:#e8c579;font-family:Georgia,serif;letter-spacing:.03em}.nb-builds{display:grid;gap:10px}.nb-build{display:grid;grid-template-columns:42px 1fr auto;gap:10px;align-items:center;padding:10px;border:1px solid rgba(255,255,255,.08);border-radius:14px;text-decoration:none;color:inherit;background:rgba(0,0,0,.18)}.nb-build.active{border-color:rgba(212,164,74,.75);background:linear-gradient(90deg,rgba(121,75,18,.32),rgba(0,0,0,.2))}.nb-build-icon{display:grid;place-items:center;width:40px;height:40px;border-radius:12px;background:rgba(120,88,180,.14);border:1px solid rgba(182,137,255,.3)}.nb-main-badge{display:block;color:#ffd05d;font-size:12px;margin-top:2px}.nb-build em{color:#b7a88c;font-style:normal}.nb-side-actions{display:grid;gap:8px;margin-top:14px}.nb-side-actions .btn{width:100%;justify-content:center}.nb-toolbar{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:16px}.nb-toolbar input{min-width:220px;padding:11px 12px;border-radius:12px;border:1px solid rgba(255,255,255,.16);background:rgba(0,0,0,.25);color:inherit}.nb-toolbar .btn{min-height:42px}.nb-section{margin-top:18px;padding-top:14px;border-top:1px solid rgba(212,164,74,.16)}.nb-slot-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.nb-slot label{display:block;color:#d9c08a;font-weight:800;font-size:12px;margin:0 0 6px}.nb-picker{width:100%;display:grid;grid-template-columns:44px 1fr auto;gap:10px;align-items:center;text-align:left;border:1px solid rgba(255,255,255,.10);background:rgba(0,0,0,.28);color:inherit;border-radius:14px;padding:9px;min-height:62px;cursor:pointer}.nb-picker:hover,.nb-picker.nb-open{border-color:rgba(212,164,74,.72);box-shadow:0 0 0 2px rgba(212,164,74,.08)}.nb-thumb{display:grid;place-items:center;width:42px;height:42px;border-radius:10px;background:linear-gradient(135deg,rgba(82,45,122,.38),rgba(0,0,0,.2));border:1px solid rgba(182,137,255,.35);overflow:hidden}.nb-thumb img{width:100%;height:100%;object-fit:contain;padding:3px}.nb-picked{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:#d9b4ff;font-weight:700}.nb-picker b{color:#d4a44a}.nb-status{display:flex;gap:14px;flex-wrap:wrap;align-items:center;border:1px solid rgba(117,212,122,.22);background:rgba(27,91,35,.10);border-radius:14px;padding:12px;margin-bottom:16px}.nb-status b{color:#75d47a}.need-builder-memberpick{margin-bottom:14px}.need-builder-memberpick span{display:block;color:#b7a88c;font-size:12px}.need-builder-memberpick select{width:100%;padding:10px;border-radius:12px;border:1px solid rgba(255,255,255,.14);background:rgba(0,0,0,.32);color:inherit}.nb-build-layout{display:grid;grid-template-columns:minmax(0,1fr) 310px;gap:14px;align-items:start}.nb-stats-panel{position:sticky;top:12px;border:1px solid rgba(212,164,74,.20);border-radius:16px;background:linear-gradient(135deg,rgba(15,12,8,.92),rgba(0,0,0,.66));padding:14px;box-shadow:0 16px 50px rgba(0,0,0,.24)}.nb-stats-panel h3{margin:0 0 10px;color:#e8c579;font-family:Georgia,serif}.nb-power{display:flex;align-items:center;justify-content:space-between;gap:10px;border:1px solid rgba(212,164,74,.18);border-radius:14px;padding:10px;background:rgba(212,164,74,.06);margin-bottom:12px}.nb-power strong{font-size:28px;color:#ffe08a}.nb-attrs{display:grid;gap:8px;margin-bottom:12px}.nb-attr{display:grid;grid-template-columns:1fr auto;gap:8px;border:1px solid rgba(255,255,255,.08);border-radius:12px;padding:8px;background:rgba(255,255,255,.03)}.nb-attr b{font-size:16px}.nb-attr em{font-style:normal;color:#75d47a;font-size:12px}.nb-stat-list{display:grid;gap:6px;max-height:270px;overflow:auto}.nb-stat-row{display:grid;grid-template-columns:1fr auto;gap:8px;border-bottom:1px solid rgba(255,255,255,.06);padding:6px 2px}.nb-stat-row b{color:#e8c579}.nb-trait-list{display:grid;gap:6px;max-height:260px;overflow:auto}.nb-trait-line{border:1px solid rgba(255,255,255,.07);border-radius:10px;padding:7px;background:rgba(255,255,255,.025)}.nb-trait-line b{display:block;color:#e8c579}.nb-trait-line span{color:#d9c08a;font-size:12px}.nb-calc-tabs{display:flex;gap:6px;margin:10px 0}.nb-calc-tabs button{flex:1;border:1px solid rgba(212,164,74,.22);border-radius:10px;background:rgba(0,0,0,.28);color:inherit;padding:8px;cursor:pointer}.nb-calc-tabs button.active{background:rgba(212,164,74,.18);color:#ffe08a;border-color:rgba(212,164,74,.65)}.nb-help{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:18px}.nb-help .soft{border:1px solid rgba(212,164,74,.16);border-radius:14px;padding:12px;background:rgba(0,0,0,.18)}.nb-picker-pop{position:fixed;z-index:9999;width:min(430px,calc(100vw - 24px));max-height:520px;border:1px solid rgba(212,164,74,.65);background:#120e09;border-radius:16px;box-shadow:0 24px 90px rgba(0,0,0,.72);padding:10px}.nb-picker-pop input{width:100%;box-sizing:border-box;padding:12px;border-radius:12px;border:1px solid rgba(212,164,74,.35);background:rgba(0,0,0,.42);color:inherit;margin-bottom:8px}.nb-picker-list{max-height:400px;overflow:auto;display:grid;gap:6px}.nb-item-option{display:grid;grid-template-columns:38px 1fr auto;gap:9px;align-items:center;border:1px solid rgba(255,255,255,.07);background:rgba(255,255,255,.03);border-radius:12px;padding:7px;cursor:pointer}.nb-item-option:hover{border-color:rgba(212,164,74,.45);background:rgba(212,164,74,.08)}.nb-item-option img{width:36px;height:36px;object-fit:contain;border-radius:8px;background:rgba(0,0,0,.3);border:1px solid rgba(182,137,255,.26)}.nb-item-option strong{display:block;color:#e1c0ff;font-size:13px}.nb-item-option small{color:#b7a88c}.nb-item-option em{font-style:normal;color:#d4a44a}.nb-empty{padding:14px;color:#b7a88c}.nb-mobile-note{display:none;color:#b7a88c}.hero .nb-top-actions{display:flex;gap:8px;flex-wrap:wrap}.btn.gold{background:linear-gradient(180deg,#c89b43,#7a531f);color:#1b1208;border-color:#d4a44a;font-weight:900}.nb-values-search{width:100%;box-sizing:border-box;margin:8px 0 10px;padding:9px 10px;border-radius:10px;border:1px solid rgba(255,255,255,.12);background:rgba(0,0,0,.32);color:inherit}.nb-stat-groups{display:grid;gap:8px;max-height:520px;overflow:auto;padding-right:2px}.nb-stat-group{border:1px solid rgba(255,255,255,.07);border-radius:12px;background:rgba(255,255,255,.025);overflow:hidden}.nb-stat-group h4{margin:0;padding:8px 10px;color:#e8c579;background:rgba(212,164,74,.055);font-size:13px}.nb-value-row{display:grid;grid-template-columns:1fr auto;gap:10px;align-items:baseline;padding:6px 10px;border-top:1px solid rgba(255,255,255,.055);font-size:13px}.nb-value-row b{color:#f1ddb4}.nb-value-row small{color:#8edb82;margin-left:6px}.nb-breakpoints{display:grid;gap:4px;margin:8px 0 10px}.nb-bp{display:grid;grid-template-columns:1fr auto;gap:8px;border:1px solid rgba(255,255,255,.07);border-radius:10px;padding:7px;background:rgba(0,0,0,.18);font-size:12px}.nb-bp b{color:#e8c579}.nb-bp span{color:#b7a88c;text-align:right}.nb-item-tooltip{position:fixed;z-index:10050;width:min(360px,calc(100vw - 26px));pointer-events:none;border:1px solid rgba(212,164,74,.72);border-radius:15px;background:linear-gradient(145deg,#17110c,#080604);box-shadow:0 22px 80px rgba(0,0,0,.78);padding:12px;color:#f3ead8}.nb-tip-head{display:grid;grid-template-columns:54px 1fr;gap:10px;align-items:center;margin-bottom:8px}.nb-tip-head img{width:52px;height:52px;object-fit:contain;border-radius:10px;background:rgba(0,0,0,.35);border:1px solid rgba(182,137,255,.32)}.nb-tip-head strong{display:block;color:#e1c0ff}.nb-tip-head small{color:#b7a88c}.nb-tip-sec{border-top:1px solid rgba(255,255,255,.08);padding-top:8px;margin-top:8px}.nb-tip-sec h5{margin:0 0 5px;color:#e8c579;font-size:12px;text-transform:uppercase;letter-spacing:.04em}.nb-tip-row{display:grid;grid-template-columns:1fr auto;gap:8px;font-size:12px;padding:3px 0}.nb-tip-row b{color:#f1ddb4}.nb-tip-trait{font-size:12px;border:1px solid rgba(255,255,255,.06);border-radius:8px;padding:5px;margin-top:4px;background:rgba(255,255,255,.025)}.nb-tip-trait b{display:block;color:#e8c579}.nb-item-option{position:relative}.nb-item-option:hover strong{color:#ffe08a}.nb-stats-note{font-size:12px;color:#b7a88c;margin:8px 0 0}.nb-panel-subtabs{display:flex;gap:6px;margin:10px 0}.nb-panel-subtabs button{flex:1;border:1px solid rgba(212,164,74,.22);border-radius:10px;background:rgba(0,0,0,.28);color:inherit;padding:8px;cursor:pointer}.nb-panel-subtabs button.active{background:rgba(212,164,74,.18);color:#ffe08a;border-color:rgba(212,164,74,.65)}
+      @media(max-width:1180px){.nb-build-layout{grid-template-columns:1fr}.nb-stats-panel{position:relative;top:auto}}
       @media(max-width:980px){.need-builder-shell{grid-template-columns:1fr}.nb-slot-grid{grid-template-columns:1fr 1fr}.nb-help{grid-template-columns:1fr}.nb-mobile-note{display:block}}
       @media(max-width:620px){.nb-slot-grid{grid-template-columns:1fr}.nb-toolbar{display:grid}.nb-toolbar input{min-width:0;width:100%}}
     </style>
@@ -8898,16 +8931,76 @@ def _render_need_builder_dashboard(data: dict[str, Any], request: Request, msg: 
             <button class="btn danger" type="submit" formaction="/needs/builds/delete" onclick="return confirm('Build wirklich löschen?')">🗑 Löschen</button>
             <button class="btn gold" type="submit" formaction="/needs/builds/save-main">⬆ An Bot übertragen</button>
           </div>
-          {''.join(group_html)}
+          <div class="nb-build-layout">
+            <div>{''.join(group_html)}</div>
+            <aside class="nb-stats-panel">
+              <h3>📊 Werte</h3>
+              <div class="nb-power"><span>Kampfkraft<br><small class="muted">Stufe-1 Vorschau</small></span><strong id="nbPower">250</strong></div>
+              <input id="nbValueSearch" class="nb-values-search" type="search" placeholder="Nach Werten suchen..." oninput="nbRenderValues()">
+              <div class="nb-panel-subtabs"><button type="button" class="active" onclick="nbPanelTab('werte', this)">Werte</button><button type="button" onclick="nbPanelTab('traits', this)">Eigenschaften</button><button type="button" onclick="nbPanelTab('breaks', this)">Breakpoints</button></div>
+              <div id="nbValuesBox" class="nb-stat-groups"></div>
+              <div id="nbTraitsBox" class="nb-trait-list" style="display:none"></div>
+              <div id="nbBreaksBox" class="nb-breakpoints" style="display:none"></div>
+              <p class="nb-stats-note">Addiert Grundwerte + Item-Hauptwerte + Zusatzwerte. Runen, Mastery, Skills und echte Questlog-Kampfkraft sind noch nicht enthalten.</p>
+            </aside>
+          </div>
         </form>
-        <div class="nb-help"><div class="soft"><b>Hinweis</b><p class="muted">Klicke in einen Slot und wähle ein Item aus dem importierten Questlog-Katalog. Gespeichert wird erstmal im Dashboard.</p></div><div class="soft"><b>Bot-Übergabe</b><p class="muted">Beim Übertragen erzeugt das Dashboard Queue-Aufträge. Der Bot verarbeitet diese und schreibt die echte Main-Needliste.</p></div></div>
+        <div class="nb-help"><div class="soft"><b>Hinweis</b><p class="muted">Klicke in einen Slot und wähle ein Item aus dem importierten Questlog-Katalog. Gespeichert wird erstmal im Dashboard.</p></div><div class="soft"><b>Werte-Rechner</b><p class="muted">Die rechte Vorschau addiert Hauptwerte, Zusatzwerte und Eigenschaften aus deinen ausgewählten Items. Das ist eine Dashboard-Vorschau, kein 1:1 Questlog-Simulator mit Runen/Skill-Boni.</p></div></div>
       </main>
     </div>
     <script>
       window.NB_ITEMS = {items_json};
       window.NB_FILTERS = {slot_filters_json};
+      const NB_BASE = {{
+        'Angriffstempo': 0.3,
+        'Krit. Nahkampftrefferchance': 55, 'Krit. Chance für Magietreffer': 55, 'Krit. Chance für Fernkampftreffer': 55,
+        'Nahkampftrefferchance': 55, 'Fernkampftrefferchance': 55, 'Magietrefferchance': 55,
+        'Nahkampfverteidigung': 5, 'Fernkampfverteidigung': 5, 'Magieverteidigung': 5,
+        'Nahkampfausweichen': 22, 'Fernkampfausweichen': 22, 'Magieausweichen': 22,
+        'Nahkampfausdauer': 5, 'Fernkampfausdauer': 5, 'Magieausdauer': 5,
+        'Stärke': 11, 'Geschicklichkeit': 11, 'Weisheit': 11, 'Wahrnehmung': 11, 'Standhaftigkeit': 11,
+        'Max. Gesundheit': 6720, 'Gesundheitsregeneration': 18, 'Max. Mana': 5595, 'Manaregeneration': 293,
+        'Buff-Dauer': 0.5,
+        'Schwächungsresistenz': 5, 'Betäubungsresistenz': 5, 'Versteinerungsresistenz': 5, 'Schlafresistenz': 5, 'Stummresistenz': 5, 'Furchtwiderstand': 5, 'Fesselresistenz': 5, 'Kollisionsresistenz': 5,
+        'Chance auf Betäuben': 55, 'Chance auf Furcht': 55, 'Chance auf Fesseln': 55, 'Chance auf Versteinern': 55, 'Chance auf Schlaf': 55, 'Chance auf Kollision': 55, 'Chance auf Stumm': 55, 'Schwächungschance': 55,
+        'Krit. Nahkampftrefferchance im PvP': 55, 'Krit. Chance für Fernkampftreffer im PvP': 55, 'Krit. Chance für Magietreffer im PvP': 55,
+        'PvP-Nahkampfausdauer': 5, 'PvP-Fernkampfausdauer': 5, 'PvP-Magieausdauer': 5, 'PvP-Nahkampftrefferchance': 55, 'PvP-Fernkampftrefferchance': 55, 'PvP-Magietrefferchance': 55, 'PvP-Nahkampfausweichen': 22, 'PvP-Fernkampfausweichen': 22, 'PvP-Magieausweichen': 22,
+        'Krit. Nahkampftrefferchance gegen Bosse': 55, 'Krit. Chance für Fernkampftreffer gegen Bosse': 55, 'Krit. Chance für Magietreffer gegen Bosse': 55,
+        'Boss-Nahkampfausdauer': 5, 'Boss-Fernkampfausdauer': 5, 'Boss-Magieausdauer': 5, 'Nahkampftrefferchance gegen Bosse': 55, 'Chance auf Fernkampftreffer gegen Bosse': 55, 'Magietrefferchance gegen Bosse': 55, 'Boss-Nahkampfausweichen': 22, 'Boss-Fernkampfausweichen': 22, 'Boss-Magieausweichen': 22
+      }};
+      const NB_GROUPS = [
+        ['Angriff', ['Angriffstempo']],
+        ['Kritisch', ['Krit. Nahkampftrefferchance','Krit. Chance für Magietreffer','Krit. Chance für Fernkampftreffer','Krit. Trefferchance']],
+        ['Treffer', ['Nahkampftrefferchance','Fernkampftrefferchance','Magietrefferchance','Trefferchance','Nahkampftrefferchance gegen Bosse','Chance auf Fernkampftreffer gegen Bosse','Magietrefferchance gegen Bosse']],
+        ['Schutz', ['Nahkampfverteidigung','Fernkampfverteidigung','Magieverteidigung','Nahkampfausweichen','Fernkampfausweichen','Magieausweichen','Nahkampfausdauer','Fernkampfausdauer','Magieausdauer']],
+        ['Attribute', ['Stärke','Geschicklichkeit','Weisheit','Wahrnehmung','Standhaftigkeit']],
+        ['Ressourcen', ['Max. Gesundheit','Gesundheitsregeneration','Max. Mana','Manaregeneration']],
+        ['Fähigkeiten', ['Buff-Dauer','Cooldown Speed','Abklingzeittempo','Fähigkeitsschaden-Bonus','Heavy Attack Chance','Schwerer Angriff Chance']],
+        ['Widerstand', ['Schwächungsresistenz','Betäubungsresistenz','Versteinerungsresistenz','Schlafresistenz','Stummresistenz','Furchtwiderstand','Fesselresistenz','Kollisionsresistenz']],
+        ['Massenkontrolle', ['Chance auf Betäuben','Chance auf Furcht','Chance auf Fesseln','Chance auf Versteinern','Chance auf Schlaf','Chance auf Kollision','Chance auf Stumm','Schwächungschance']],
+        ['PvP', ['Krit. Nahkampftrefferchance im PvP','Krit. Chance für Fernkampftreffer im PvP','Krit. Chance für Magietreffer im PvP','PvP-Nahkampfausdauer','PvP-Fernkampfausdauer','PvP-Magieausdauer','PvP-Nahkampftrefferchance','PvP-Fernkampftrefferchance','PvP-Magietrefferchance','PvP-Nahkampfausweichen','PvP-Fernkampfausweichen','PvP-Magieausweichen']],
+        ['Boss', ['Krit. Nahkampftrefferchance gegen Bosse','Krit. Chance für Fernkampftreffer gegen Bosse','Krit. Chance für Magietreffer gegen Bosse','Boss-Nahkampfausdauer','Boss-Fernkampfausdauer','Boss-Magieausdauer','Boss-Nahkampfausweichen','Boss-Fernkampfausweichen','Boss-Magieausweichen']],
+        ['Passive Werte', []]
+      ];
+      const NB_ALIASES = {{
+        'Strength':'Stärke','Dexterity':'Geschicklichkeit','Wisdom':'Weisheit','Perception':'Wahrnehmung','Fortitude':'Standhaftigkeit',
+        'Max Health':'Max. Gesundheit','Max. Mana':'Max. Mana','Mana Regen':'Manaregeneration','Health Regen':'Gesundheitsregeneration',
+        'Hit Chance':'Trefferchance','Melee Hit Chance':'Nahkampftrefferchance','Ranged Hit Chance':'Fernkampftrefferchance','Magic Hit Chance':'Magietrefferchance',
+        'Critical Hit Chance':'Krit. Trefferchance','Crit. Hit Chance':'Krit. Trefferchance','Heavy Attack Chance':'Schwerer Angriff Chance',
+        'Attack Speed':'Angriffstempo','Buff Duration':'Buff-Dauer','Skill Damage Bonus':'Fähigkeitsschaden-Bonus',
+        'Melee Defense':'Nahkampfverteidigung','Ranged Defense':'Fernkampfverteidigung','Magic Defense':'Magieverteidigung',
+        'Melee Evasion':'Nahkampfausweichen','Ranged Evasion':'Fernkampfausweichen','Magic Evasion':'Magieausweichen',
+        'Melee Endurance':'Nahkampfausdauer','Ranged Endurance':'Fernkampfausdauer','Magic Endurance':'Magieausdauer'
+      }};
+      const NB_PERCENT_KEYS = ['tempo','dauer','speed','rate','%'];
       let nbCurrentSlot = null;
       let nbPop = null;
+      let nbTip = null;
+      let nbLastValues = {{stats: {{}}, traits: {{}}, passive: []}};
+      function nbNormLabel(label) {{
+        label = String(label || '').replace(/:$/,'').trim();
+        return NB_ALIASES[label] || label;
+      }}
       function nbMatchesSlot(item, slot) {{
         const f = window.NB_FILTERS[slot] || {{category:'',subs:[]}};
         if (f.category && item.category !== f.category) return false;
@@ -8916,10 +9009,9 @@ def _render_need_builder_dashboard(data: dict[str, Any], request: Request, msg: 
       }}
       function nbClosePicker() {{ if (nbPop) {{ nbPop.remove(); nbPop = null; }} document.querySelectorAll('.nb-picker.nb-open').forEach(x=>x.classList.remove('nb-open')); }}
       function nbOpenPicker(btn) {{
-        nbClosePicker();
+        nbClosePicker(); nbHideTip();
         btn.classList.add('nb-open');
         nbCurrentSlot = btn.closest('.nb-slot');
-        const slot = nbCurrentSlot.dataset.slot;
         const rect = btn.getBoundingClientRect();
         nbPop = document.createElement('div');
         nbPop.className = 'nb-picker-pop';
@@ -8937,7 +9029,7 @@ def _render_need_builder_dashboard(data: dict[str, Any], request: Request, msg: 
         const list = nbPop.querySelector('.nb-picker-list');
         const items = window.NB_ITEMS.filter(i => nbMatchesSlot(i, slot) && (!needle || (i.name||'').toLowerCase().includes(needle))).slice(0, 80);
         if (!items.length) {{ list.innerHTML = '<div class="nb-empty">Keine Items gefunden.</div>'; return; }}
-        list.innerHTML = items.map(i => `<div class="nb-item-option" onclick="nbChooseItem(${{i.id}})"><img src="${{(i.image||'').replaceAll('"','&quot;')}}" onerror="this.style.visibility='hidden'" alt=""><span><strong>${{nbEsc(i.name)}}</strong><small>${{nbEsc(i.sub || i.category)}} · Lv. ${{nbEsc(i.level || '—')}}</small></span><em>＋</em></div>`).join('');
+        list.innerHTML = items.map(i => `<div class="nb-item-option" onclick="nbChooseItem(${{i.id}})" onmouseenter="nbShowItemTip(${{i.id}},event)" onmousemove="nbMoveTip(event)" onmouseleave="nbHideTip()"><img src="${{(i.image||'').replaceAll('"','&quot;')}}" onerror="this.style.visibility='hidden'" alt=""><span><strong>${{nbEsc(i.name)}}</strong><small>${{nbEsc(i.sub || i.category)}} · Lv. ${{nbEsc(i.level || '—')}}</small></span><em>＋</em></div>`).join('');
       }}
       function nbEsc(s) {{ return String(s ?? '').replace(/[&<>"']/g, c => ({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c])); }}
       function nbChooseItem(id) {{
@@ -8947,10 +9039,165 @@ def _render_need_builder_dashboard(data: dict[str, Any], request: Request, msg: 
         nbCurrentSlot.querySelector('.nb-picked').textContent = item.name;
         const thumb = nbCurrentSlot.querySelector('.nb-thumb');
         thumb.innerHTML = item.image ? `<img src="${{nbEsc(item.image)}}" alt="">` : '<span>＋</span>';
-        nbClosePicker();
+        nbClosePicker(); nbHideTip(); nbRecalc();
       }}
+      function nbSlotTip(btn, ev) {{
+        const slot = btn.closest('.nb-slot');
+        const id = slot ? slot.querySelector('input[type="hidden"]')?.value : '';
+        if (id) nbShowItemTip(id, ev);
+      }}
+      function nbShowItemTip(id, ev) {{
+        const item = window.NB_ITEMS.find(i => Number(i.id) === Number(id));
+        if (!item) return;
+        if (!nbTip) {{ nbTip = document.createElement('div'); nbTip.className = 'nb-item-tooltip'; document.body.appendChild(nbTip); }}
+        nbTip.innerHTML = nbItemTipHtml(item);
+        nbTip.style.display = 'block';
+        nbMoveTip(ev);
+      }}
+      function nbMoveTip(ev) {{
+        if (!nbTip || !ev) return;
+        const pad = 16;
+        const w = Math.min(360, window.innerWidth - 26);
+        let x = ev.clientX + 18, y = ev.clientY + 18;
+        if (x + w > window.innerWidth - pad) x = ev.clientX - w - 18;
+        if (y + 420 > window.innerHeight - pad) y = Math.max(pad, window.innerHeight - 430);
+        nbTip.style.left = x + 'px'; nbTip.style.top = y + 'px';
+      }}
+      function nbHideTip() {{ if (nbTip) nbTip.style.display = 'none'; }}
+      function nbItemRows(rows, max=8) {{
+        if (!Array.isArray(rows) || !rows.length) return '';
+        return rows.slice(0,max).map(r => {{
+          if (!r) return '';
+          const label = nbNormLabel(r.label || r.name || '');
+          const val = r.value ?? r.text ?? '';
+          const delta = r.delta ? ` <small>▲ ${{nbEsc(r.delta)}}</small>` : '';
+          return `<div class="nb-tip-row"><span>${{nbEsc(label)}}</span><b>${{nbEsc(val)}}${{delta}}</b></div>`;
+        }}).join('');
+      }}
+      function nbItemTipHtml(item) {{
+        const d = item.detail || {{}};
+        const primary = nbItemRows(d.primary || [], 6);
+        const bonus = nbItemRows(d.bonus || [], 8);
+        const statsObj = d.stats || {{}};
+        const statsRows = Object.entries(statsObj).slice(0,8).map(([k,v])=>`<div class="nb-tip-row"><span>${{nbEsc(nbNormLabel(k))}}</span><b>${{nbEsc(v)}}</b></div>`).join('');
+        const traits = Array.isArray(d.traits) ? d.traits.slice(0,8).map(t => `<div class="nb-tip-trait"><b>${{nbEsc(nbNormLabel(t.name || ''))}}</b><span>${{nbEsc(Array.isArray(t.values) ? t.values.join(' | ') : (t.values || ''))}}</span></div>`).join('') : '';
+        const passive = d.passive && (d.passive.name || d.passive.text) ? `<div class="nb-tip-sec"><h5>Passiv / Effekt</h5><div class="nb-tip-trait"><b>${{nbEsc(d.passive.name || 'Effekt')}}</b><span>${{nbEsc(d.passive.text || '')}}</span></div></div>` : '';
+        return `<div class="nb-tip-head"><img src="${{nbEsc(item.image || '')}}" onerror="this.style.visibility='hidden'" alt=""><div><strong>${{nbEsc(item.name)}}</strong><small>${{nbEsc(item.rarity || '—')}} · ${{nbEsc(item.sub || item.category)}} · Lv. ${{nbEsc(item.level || '—')}}</small></div></div>${{primary ? `<div class="nb-tip-sec"><h5>Hauptwerte</h5>${{primary}}</div>` : ''}}${{bonus || statsRows ? `<div class="nb-tip-sec"><h5>Zusatzwerte</h5>${{bonus || statsRows}}</div>` : ''}}${{traits ? `<div class="nb-tip-sec"><h5>Eigenschaften</h5>${{traits}}</div>` : ''}}${{passive}}`;
+      }}
+      function nbNum(v) {{
+        if (v === null || v === undefined) return 0;
+        let s = String(v).replace(/▲/g,'').replace(/%/g,'').replace(/,/g,'.').replace(/[^0-9.\-]/g,'');
+        if (!s || s === '-' || s === '.') return 0;
+        const n = parseFloat(s);
+        return isNaN(n) ? 0 : n;
+      }}
+      function nbAdd(map, label, value) {{
+        label = nbNormLabel(label);
+        const n = nbNum(value);
+        if (!label || !n) return;
+        map[label] = (map[label] || 0) + n;
+      }}
+      function nbSelectedItems() {{
+        const byId = new Map((window.NB_ITEMS || []).map(x => [String(x.id), x]));
+        const out = [];
+        document.querySelectorAll('#needBuilderForm input[type="hidden"][name^="slot_"]').forEach(inp => {{
+          const item = byId.get(String(inp.value || ''));
+          if (item) out.push(item);
+        }});
+        return out;
+      }}
+      function nbFmt(v, label='') {{
+        const isPct = NB_PERCENT_KEYS.some(k => String(label).toLowerCase().includes(k));
+        const rounded = Math.abs(v - Math.round(v)) < 0.001 ? String(Math.round(v)) : String(Math.round(v * 10) / 10).replace('.', ',');
+        return isPct ? rounded + ' %' : rounded;
+      }}
+      function nbBuildValues() {{
+        const items = nbSelectedItems();
+        const stats = Object.assign({{}}, NB_BASE);
+        const traits = {{}};
+        const passive = [];
+        items.forEach(item => {{
+          const d = item.detail || {{}};
+          if (d.damage_min || d.damage_max) {{ nbAdd(stats, 'Min. Schaden', d.damage_min); nbAdd(stats, 'Max. Schaden', d.damage_max); }}
+          if (d.defense) nbAdd(stats, item.category === 'accessory' ? 'Magieverteidigung' : 'Verteidigung', d.defense);
+          (d.primary || []).forEach(r => {{ if(r && r.label) nbAdd(stats, r.label, r.value); }});
+          (d.bonus || []).forEach(r => {{ if(r && r.label) nbAdd(stats, r.label, r.value); }});
+          const raw = d.stats || {{}};
+          Object.keys(raw).forEach(k => nbAdd(stats, k, raw[k]));
+          (d.traits || []).forEach(t => {{
+            if(!t || !t.name) return;
+            const name = nbNormLabel(t.name);
+            const vals = Array.isArray(t.values) ? t.values : [];
+            traits[name] = vals.length ? vals.join(' | ') : (t.values || '');
+          }});
+          if (d.passive && (d.passive.name || d.passive.text)) passive.push(d.passive.name || d.passive.text);
+        }});
+        return {{stats, traits, passive, items}};
+      }}
+      function nbRenderValues() {{
+        const q = (document.getElementById('nbValueSearch')?.value || '').toLowerCase().trim();
+        const box = document.getElementById('nbValuesBox');
+        if (!box) return;
+        const stats = nbLastValues.stats || {{}};
+        const used = new Set();
+        let html = '';
+        NB_GROUPS.forEach(([title, keys]) => {{
+          const rows = [];
+          keys.forEach(k => {{ if(Object.prototype.hasOwnProperty.call(stats,k)) {{ used.add(k); rows.push([k, stats[k]]); }} }});
+          if (title === 'Passive Werte') {{ (nbLastValues.passive || []).forEach((p,i)=>rows.push([String(p), 'aktiv'])); }}
+          const filtered = rows.filter(([k,v]) => !q || String(k).toLowerCase().includes(q));
+          if (!filtered.length) return;
+          html += `<section class="nb-stat-group"><h4>${{nbEsc(title)}}</h4>` + filtered.map(([k,v]) => {{
+            const base = NB_BASE[k]; const diff = (base !== undefined) ? (nbNum(v) - nbNum(base)) : 0;
+            const diffHtml = diff ? `<small>${{diff>0?'+':''}}${{nbFmt(diff,k)}}</small>` : '';
+            return `<div class="nb-value-row"><span>${{nbEsc(k)}}</span><b>${{nbFmt(nbNum(v),k)}}${{diffHtml}}</b></div>`;
+          }}).join('') + `</section>`;
+        }});
+        const rest = Object.entries(stats).filter(([k]) => !used.has(k) && (!q || String(k).toLowerCase().includes(q))).sort((a,b)=>String(a[0]).localeCompare(String(b[0])));
+        if (rest.length) html += `<section class="nb-stat-group"><h4>Weitere Werte</h4>` + rest.map(([k,v])=>`<div class="nb-value-row"><span>${{nbEsc(k)}}</span><b>${{nbFmt(nbNum(v),k)}}</b></div>`).join('') + `</section>`;
+        box.innerHTML = html || '<p class="muted">Keine Werte gefunden.</p>';
+      }}
+      function nbRenderTraits() {{
+        const traitsBox = document.getElementById('nbTraitsBox');
+        const sortedTraits = Object.entries(nbLastValues.traits || {{}}).sort((a,b)=>String(a[0]).localeCompare(String(b[0])));
+        if (traitsBox) traitsBox.innerHTML = sortedTraits.length ? sortedTraits.map(([k,v]) => `<div class="nb-trait-line"><b>${{nbEsc(k)}}</b><span>${{nbEsc(v)}}</span></div>`).join('') : '<p class="muted">Noch keine Eigenschaften ausgewählt.</p>';
+      }}
+      function nbRenderBreakpoints() {{
+        const box = document.getElementById('nbBreaksBox');
+        if (!box) return;
+        const s = nbLastValues.stats || {{}};
+        const defs = {{
+          'Stärke': ['30: Max. Gesundheit +750','40: Schadensverringerung +15','50: Schwerer Angriff +100','60: Max. Gesundheit +900'],
+          'Geschicklichkeit': ['30: Krit. Treffer +100','40: Bonusschaden +15','50: Bewegungsgeschwindigkeit +5%','60: Krit. Treffer +120'],
+          'Weisheit': ['30: Max. Mana +750','40: Debuff-Dauer -5%','50: Cooldown Speed +5%','60: Max. Mana +900'],
+          'Wahrnehmung': ['30: Treffer +100','40: Buff-Dauer +5%','50: Reichweite +7,5%','60: Treffer +120']
+        }};
+        box.innerHTML = Object.entries(defs).map(([attr, lines]) => `<div class="nb-bp"><b>${{attr}} ${{nbFmt(nbNum(s[attr]||0))}}</b><span>${{lines.join('<br>')}}</span></div>`).join('') + '<p class="muted">Breakpoints nach öffentlich verfügbaren Guides; Standhaftigkeit/weitere Formeln später exakt ergänzen.</p>';
+      }}
+      function nbRecalc() {{
+        nbLastValues = nbBuildValues();
+        const itemCount = (nbLastValues.items || []).length;
+        const statSum = Object.entries(nbLastValues.stats || {{}}).reduce((acc,[k,v]) => acc + Math.min(25, Math.abs(nbNum(v) - nbNum(NB_BASE[k] || 0))/12), 0);
+        const powerBox = document.getElementById('nbPower');
+        if (powerBox) powerBox.textContent = nbFmt(250 + itemCount * 8 + statSum);
+        nbRenderValues(); nbRenderTraits(); nbRenderBreakpoints();
+      }}
+      function nbPanelTab(tab, btn) {{
+        document.querySelectorAll('.nb-panel-subtabs button').forEach(x=>x.classList.remove('active'));
+        if (btn) btn.classList.add('active');
+        const values = document.getElementById('nbValuesBox');
+        const traits = document.getElementById('nbTraitsBox');
+        const breaks = document.getElementById('nbBreaksBox');
+        if (values && traits && breaks) {{
+          values.style.display = tab === 'werte' ? 'grid' : 'none';
+          traits.style.display = tab === 'traits' ? 'grid' : 'none';
+          breaks.style.display = tab === 'breaks' ? 'grid' : 'none';
+        }}
+      }}
+      function nbCalcTab(tab, btn) {{ nbPanelTab(tab === 'stats' ? 'werte' : tab, btn); }}
       document.addEventListener('click', e => {{ if (nbPop && !nbPop.contains(e.target) && !e.target.closest('.nb-picker')) nbClosePicker(); }});
-      document.addEventListener('keydown', e => {{ if (e.key === 'Escape') nbClosePicker(); }});
+      document.addEventListener('keydown', e => {{ if (e.key === 'Escape') {{ nbClosePicker(); nbHideTip(); }} }});
+      document.addEventListener('DOMContentLoaded', nbRecalc);
     </script>
     """
     return _html_shell("Needliste · Ebo Dashboard", body)
