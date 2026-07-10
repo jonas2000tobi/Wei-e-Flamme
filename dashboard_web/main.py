@@ -3577,7 +3577,7 @@ def _sidebar_html() -> str:
       <button class="mobile-nav-toggle" type="button" onclick="document.body.classList.toggle('nav-open')">☰ Menü</button>
 
       <nav class="side-nav">
-        <a class="admin-back" href="/"><img class="nav-ico" src="{_asset('ebolus_logo.png')}" alt="">Startseite / normale Ansicht</a>
+        <a class="admin-back" href="/"><span>←</span> Zur normalen Ansicht</a>
         <details open>
           <summary>Admin</summary>
           <a href="/admin"><img class="nav-ico" src="{_asset('nav_admin_portal.png')}" alt="">Admin-Portal</a>
@@ -3616,7 +3616,6 @@ def _member_sidebar_html() -> str:
       <button class="mobile-nav-toggle" type="button" onclick="document.body.classList.toggle('nav-open')">☰ Menü</button>
 
       <nav class="side-nav">
-        <a class="home-nav-button" href="/"><img class="nav-ico" src="{_asset('ebolus_logo.png')}" alt="">Startseite</a>
         <a class="admin-portal-button" href="/admin"><img class="nav-ico" src="{_asset('nav_admin_portal.png')}" alt="">Admin-Portal</a>
 
         <details open>
@@ -3720,8 +3719,6 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "member") -> str:
     .topnav a[href="/system"]::before {{ display:block; background-image:url("{_asset('nav_system.png')}"); }}
     .topnav a[href="/exports"]::before {{ display:block; background-image:url("{_asset('nav_exports.png')}"); }}
     .topnav a:hover {{ border-color:var(--gold); color:var(--gold); transform:translateY(-1px); }}
-    @media (min-width:901px) {{ .topnav {{ display:none !important; }} }}
-    .side-nav .home-nav-button {{ margin:0 0 6px 0; border:1px solid rgba(214,168,79,.28); background:linear-gradient(90deg,rgba(214,168,79,.14),rgba(32,18,8,.10)); color:#ffe2a0; font-weight:900; }}
     .hero {{ position:relative; overflow:hidden; display:flex; justify-content:space-between; gap:18px; align-items:center; padding:34px; border:1px solid rgba(214,168,79,.38); background:linear-gradient(90deg,rgba(6,8,14,.88) 0%,rgba(9,12,20,.66) 48%,rgba(9,12,20,.26) 100%), url("{_asset('hero_banner.webp')}") center center / cover no-repeat; border-radius:22px; margin-bottom:18px; box-shadow:0 24px 60px rgba(0,0,0,.50), inset 0 0 0 1px rgba(255,222,150,.06); }}
     .hero::after {{ content:""; position:absolute; inset:0; pointer-events:none; background:radial-gradient(circle at 76% 50%,rgba(214,168,79,.16),transparent 34%), linear-gradient(180deg,transparent,rgba(0,0,0,.24)); }}
     .hero > * {{ position:relative; z-index:1; }}
@@ -8919,51 +8916,15 @@ def _render_need_builder_dashboard(data: dict[str, Any], request: Request, msg: 
       @media(max-width:1180px){.nb-build-layout{grid-template-columns:1fr}.nb-stats-panel{position:relative;top:auto}}
       @media(max-width:980px){.need-builder-shell{grid-template-columns:1fr}.nb-slot-grid{grid-template-columns:1fr 1fr}.nb-help{grid-template-columns:1fr}.nb-mobile-note{display:block}}
       @media(max-width:620px){.nb-slot-grid{grid-template-columns:1fr}.nb-toolbar{display:grid}.nb-toolbar input{min-width:0;width:100%}}
-
-      /* Professionelleres Needlisten-Layout: kompakter, ruhiger, weniger Questlog-Überbreite */
-      .need-builder-hero{padding:20px 24px;margin-bottom:14px;border-radius:18px;min-height:0}
-      .need-builder-hero h1{font-size:clamp(34px,3.5vw,52px);letter-spacing:.08em;line-height:1.02}
-      .need-builder-hero .muted{font-size:14px;max-width:760px}
-      .need-builder-hero .btn{min-height:38px;padding:9px 14px;border-radius:12px;font-size:13px}
-      .need-builder-shell{grid-template-columns:230px minmax(0,1fr);gap:14px}
-      .need-builder-side{padding:14px;border-radius:16px;background:linear-gradient(145deg,rgba(18,12,8,.88),rgba(0,0,0,.62))}
-      .need-builder-side h2{font-size:22px;margin-bottom:10px}
-      .need-builder-memberpick{margin-bottom:10px}
-      .need-builder-memberpick select{min-height:38px;padding:8px 10px}
-      .nb-builds{gap:8px}
-      .nb-build{grid-template-columns:34px 1fr auto;padding:8px;border-radius:12px;min-height:50px}
-      .nb-build-icon{width:32px;height:32px;border-radius:9px;font-size:16px}
-      .nb-build strong{font-size:13px}
-      .nb-main-badge{font-size:11px}
-      .need-builder-side form.nb-side-actions{display:inline-flex;width:auto;margin:10px 5px 0 0}
-      .nb-side-actions .btn{width:auto!important;min-height:34px;padding:8px 10px;border-radius:10px;font-size:12px;line-height:1.1}
-      .need-builder-side>p.muted{font-size:12px;line-height:1.35;margin-top:10px}
-      .need-builder-main{padding:15px;border-radius:16px;background:linear-gradient(145deg,rgba(16,10,6,.82),rgba(0,0,0,.58))}
-      .nb-status{padding:9px 11px;margin-bottom:12px;border-radius:12px;font-size:13px}
-      .nb-toolbar{gap:8px;margin-bottom:12px;padding:10px;border:1px solid rgba(212,164,74,.14);border-radius:14px;background:rgba(0,0,0,.18)}
-      .nb-toolbar input{min-width:190px;max-width:260px;min-height:38px;padding:8px 10px;border-radius:10px}
-      .nb-toolbar .btn{min-height:36px;padding:8px 11px;border-radius:10px;font-size:12px}
-      .nb-section{margin-top:14px;padding-top:12px}
-      .nb-section h3{font-size:18px;margin-bottom:10px}
-      .nb-slot-grid{gap:10px}
-      .nb-slot label{font-size:11px;letter-spacing:.03em}
-      .nb-picker{min-height:56px;padding:8px;border-radius:12px;grid-template-columns:40px 1fr auto}
-      .nb-thumb{width:38px;height:38px;border-radius:9px}
-      .nb-picked{font-size:13px}
-      .nb-stats-panel{border-radius:16px;padding:12px}
-      .nb-stats-panel h3{font-size:20px}
-      .nb-help{margin-top:14px}
-      .nb-help .soft{border-radius:12px}
-      @media(max-width:1320px){.need-builder-shell{grid-template-columns:210px minmax(0,1fr)}.nb-build-layout{grid-template-columns:1fr}.nb-stats-panel{position:relative;top:auto}.nb-slot-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
-      @media(max-width:980px){.need-builder-hero h1{font-size:30px}.need-builder-shell{grid-template-columns:1fr}.need-builder-side{display:block}.need-builder-side form.nb-side-actions{display:inline-flex}.nb-slot-grid{grid-template-columns:1fr 1fr}}
-      @media(max-width:620px){.nb-slot-grid{grid-template-columns:1fr}.nb-toolbar{display:grid}.nb-toolbar input{max-width:none}.need-builder-side form.nb-side-actions{display:flex;width:100%}.nb-side-actions .btn{width:100%!important}}
+      @media(max-width:760px){body.nb-picker-open{overflow:hidden}.need-builder-shell{gap:12px}.need-builder-side,.need-builder-main{padding:14px}.need-builder-side h2{margin-bottom:10px}.nb-builds{gap:8px}.nb-build{padding:9px 10px;grid-template-columns:36px 1fr 18px}.nb-build-icon{width:34px;height:34px;border-radius:10px}.nb-side-actions{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px}.nb-side-actions .btn{width:100%;min-height:42px;padding:8px 10px;font-size:13px;border-radius:10px}.nb-status{display:grid;grid-template-columns:1fr;gap:8px;padding:10px}.nb-toolbar{display:grid;grid-template-columns:1fr 1fr;gap:8px}.nb-toolbar input{grid-column:1/-1;max-width:none!important;width:100%;min-width:0}.nb-toolbar .btn{width:100%;min-height:42px;padding:8px 10px;font-size:13px;white-space:nowrap}.nb-build-layout{gap:12px}.nb-slot-grid{grid-template-columns:1fr;gap:10px}.nb-picker{min-height:56px;padding:8px}.nb-thumb{width:38px;height:38px}.nb-picked{font-size:14px}.nb-stats-panel{padding:12px}.nb-power strong{font-size:24px}.nb-panel-subtabs{display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px}.nb-panel-subtabs button{padding:8px 6px;font-size:12px}.nb-stat-groups,.nb-trait-list,.nb-breakpoints{max-height:none}.nb-help{grid-template-columns:1fr;gap:10px}.nb-picker-pop.mobile{left:12px!important;right:12px!important;top:auto!important;bottom:calc(12px + env(safe-area-inset-bottom));width:auto!important;max-height:min(76vh,680px);border-radius:18px;padding:10px}.nb-picker-pop.mobile input{position:sticky;top:0;z-index:2}.nb-picker-pop.mobile .nb-picker-list{max-height:calc(76vh - 72px)}.nb-item-tooltip{display:none!important}}
+      @media(max-width:480px){.need-builder-side,.need-builder-main{padding:12px}.nb-side-actions{grid-template-columns:1fr}.nb-toolbar{grid-template-columns:1fr}.nb-toolbar .btn{font-size:12px}.nb-power{padding:8px 10px}.nb-status span{font-size:13px}}
     </style>
     """
 
     body = f"""
     <nav class="topnav"><a href="/">← Übersicht</a><a href="/items">Item-Datenbank</a><a href="/loot">Loot</a><a href="/members">Mitglieder</a><a href="/api/needs">API</a></nav>
-    <section class="hero need-builder-hero">
-      <div><div class="eyebrow">Needliste · Build-Baukasten</div><h1>Needliste</h1><p class="muted">Mehrere Builds pro Spieler. Nur der aktive <b>Main-Need-Build</b> wird an den Bot übertragen.</p></div>
+    <section class="hero">
+      <div><div class="eyebrow">Needliste · Build-Baukasten</div><h1>🎁 Needliste</h1><p class="muted">Mehrere Builds pro Spieler. Nur der aktive <b>Main-Need-Build</b> wird an den Bot übertragen.</p></div>
       <div class="nb-top-actions"><a class="btn" href="/items">Item-Datenbank</a></div>
     </section>
     {css}
@@ -9069,7 +9030,9 @@ def _render_need_builder_dashboard(data: dict[str, Any], request: Request, msg: 
         if (f.subs && f.subs.length && !f.subs.includes(item.sub)) return false;
         return true;
       }}
-      function nbClosePicker() {{ if (nbPop) {{ nbPop.remove(); nbPop = null; }} document.querySelectorAll('.nb-picker.nb-open').forEach(x=>x.classList.remove('nb-open')); }}
+      function nbCanHover() {{ return window.matchMedia('(hover:hover) and (pointer:fine)').matches; }}
+      function nbIsMobileLayout() {{ return window.innerWidth <= 760; }}
+      function nbClosePicker() {{ if (nbPop) {{ nbPop.remove(); nbPop = null; }} document.body.classList.remove('nb-picker-open'); document.querySelectorAll('.nb-picker.nb-open').forEach(x=>x.classList.remove('nb-open')); }}
       function nbOpenPicker(btn) {{
         nbClosePicker(); nbHideTip();
         btn.classList.add('nb-open');
@@ -9077,8 +9040,13 @@ def _render_need_builder_dashboard(data: dict[str, Any], request: Request, msg: 
         const rect = btn.getBoundingClientRect();
         nbPop = document.createElement('div');
         nbPop.className = 'nb-picker-pop';
-        nbPop.style.left = Math.min(rect.left, window.innerWidth - 580) + 'px';
-        nbPop.style.top = Math.min(rect.bottom + 8, window.innerHeight - 680) + 'px';
+        if (nbIsMobileLayout()) {{
+          nbPop.classList.add('mobile');
+          document.body.classList.add('nb-picker-open');
+        }} else {{
+          nbPop.style.left = Math.min(rect.left, window.innerWidth - 580) + 'px';
+          nbPop.style.top = Math.min(rect.bottom + 8, window.innerHeight - 680) + 'px';
+        }}
         nbPop.innerHTML = `<input type="search" placeholder="Nach Items suchen..." oninput="nbRenderOptions(this.value)"><div class="nb-picker-list"></div>`;
         document.body.appendChild(nbPop);
         nbRenderOptions('');
@@ -9104,11 +9072,13 @@ def _render_need_builder_dashboard(data: dict[str, Any], request: Request, msg: 
         nbClosePicker(); nbHideTip(); nbRecalc();
       }}
       function nbSlotTip(btn, ev) {{
+        if (!nbCanHover() || nbIsMobileLayout()) return;
         const slot = btn.closest('.nb-slot');
         const id = slot ? slot.querySelector('input[type="hidden"]')?.value : '';
         if (id) nbShowItemTip(id, ev);
       }}
       function nbShowItemTip(id, ev) {{
+        if (!nbCanHover() || nbIsMobileLayout()) return;
         const item = window.NB_ITEMS.find(i => Number(i.id) === Number(id));
         if (!item) return;
         if (!nbTip) {{ nbTip = document.createElement('div'); nbTip.className = 'nb-item-tooltip'; document.body.appendChild(nbTip); }}
@@ -9117,7 +9087,7 @@ def _render_need_builder_dashboard(data: dict[str, Any], request: Request, msg: 
         nbMoveTip(ev);
       }}
       function nbMoveTip(ev) {{
-        if (!nbTip || !ev) return;
+        if (!nbTip || !ev || nbIsMobileLayout()) return;
         const pad = 16;
         const w = Math.min(360, window.innerWidth - 26);
         let x = ev.clientX + 18, y = ev.clientY + 18;
@@ -9259,6 +9229,7 @@ def _render_need_builder_dashboard(data: dict[str, Any], request: Request, msg: 
       function nbCalcTab(tab, btn) {{ nbPanelTab(tab === 'stats' ? 'werte' : tab, btn); }}
       document.addEventListener('click', e => {{ if (nbPop && !nbPop.contains(e.target) && !e.target.closest('.nb-picker')) nbClosePicker(); }});
       document.addEventListener('keydown', e => {{ if (e.key === 'Escape') {{ nbClosePicker(); nbHideTip(); }} }});
+      window.addEventListener('resize', () => {{ if (nbPop && !nbIsMobileLayout()) nbClosePicker(); nbHideTip(); }});
       document.addEventListener('DOMContentLoaded', nbRecalc);
     </script>
     """
@@ -10136,9 +10107,8 @@ def _render_member_portal(data: dict[str, Any], user_id: int, request: Request, 
       </details>
     </section>
     """
-    # Admins bleiben im normalen Mitglieder-Dashboard, solange sie nicht bewusst das Admin-Portal öffnen.
-    # Mein Portal soll also nie automatisch die Leader-/Admin-Sidebar anzeigen.
-    return _html_shell(f"{display} Portal · Ebo Dashboard", body, nav_mode="member")
+    shell_mode = "admin" if _is_portal_admin(request) else "member"
+    return _html_shell(f"{display} Portal · Ebo Dashboard", body, nav_mode=shell_mode)
 
 
 
