@@ -46,7 +46,7 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
-ASSET_VER = "ebo-sidebar-icons-v1"
+ASSET_VER = "ebo-member-default-admin-button-v1"
 DASHBOARD_RELEASE_VERSION = "1.2.1 · Status Playwright Worker + Questlog Items"
 
 
@@ -1774,7 +1774,7 @@ def _render_admin_actions_dashboard(data: dict[str, Any]) -> str:
     <section class="panel"><h2>👥 Markierte Mitglieder</h2>{_table(['Mitglied','Status','Notiz','Geändert von','Geändert am'], rows, placeholder='Markierungen durchsuchen…')}</section>
     <section class="panel"><h2>🧾 Web-Admin-Aktionslog</h2>{_table(['Zeit','Aktion','Ziel','Akteur'], log_rows, placeholder='Adminlog durchsuchen…')}</section>
     """
-    return _html_shell("Leitung · Ebo Dashboard", body)
+    return _html_shell("Leitung · Ebo Dashboard", body, nav_mode="admin")
 
 
 # ---------------------------------------------------------------------------
@@ -2028,7 +2028,7 @@ def _render_admin_center_dashboard(data: dict[str, Any]) -> str:
     <section class="panel"><h2>🧩 Datenquellen</h2>{_table(['Key','Datei','vorhanden','Status','Bytes','Geändert'], source_rows, placeholder='Quellen durchsuchen…')}</section>
     <section class="panel"><h2>🧾 Web-Admin-Aktionslog</h2>{_table(['Zeit','Aktion','Ziel','Akteur'], log_rows, placeholder='Adminlog durchsuchen…')}</section>
     """
-    return _html_shell("Admin-Zentrale · Ebo Dashboard", body)
+    return _html_shell("Admin-Zentrale · Ebo Dashboard", body, nav_mode="admin")
 
 
 def _card(title: str, value: Any, sub: str = "") -> str:
@@ -3567,46 +3567,32 @@ def _render_auction_detail(data: dict[str, Any], auction_id: str, current_user: 
 
 
 def _sidebar_html() -> str:
+    """Admin-/Leader-Sidebar. Diese Ansicht erscheint nur im Admin-Modus."""
     return f"""
-    <aside class="sidebar">
+    <aside class="sidebar admin-sidebar">
       <div class="brand">
         <div class="brand-mark"><img src="{_asset('ebolus_logo.png')}" alt="Ebolus"></div>
-        <div><strong>Ebolus</strong><span>Gilden-Dashboard</span></div>
+        <div><strong>Ebolus</strong><span>Admin-Portal</span></div>
       </div>
       <button class="mobile-nav-toggle" type="button" onclick="document.body.classList.toggle('nav-open')">☰ Menü</button>
 
       <nav class="side-nav">
+        <a class="admin-back" href="/"><span>←</span> Zur normalen Ansicht</a>
         <details open>
           <summary>Admin</summary>
-          <a href="/admin"><img class="nav-ico" src="{_asset('nav_leitung.png')}" alt="">Admin-Portal</a>
+          <a href="/admin"><img class="nav-ico" src="{_asset('nav_admin_portal.png')}" alt="">Admin-Portal</a>
           <a href="/settings"><img class="nav-ico" src="{_asset('nav_einstellungen.png')}" alt="">Einstellungen</a>
           <a href="/audit"><img class="nav-ico" src="{_asset('nav_audit.png')}" alt="">Audit</a>
           <a href="/system"><img class="nav-ico" src="{_asset('nav_system.png')}" alt="">System</a>
-          <a href="/database"><img class="nav-ico" src="{_asset('nav_system.png')}" alt="">Datenbank</a>
+          <a href="/database"><img class="nav-ico" src="{_asset('nav_database.png')}" alt="">Datenbank</a>
         </details>
 
         <details open>
-          <summary>Mein Portal</summary>
-          <a href="/portal"><img class="nav-ico" src="{_asset('nav_portal.png')}" alt="">Mein Profil</a>
-          <a href="/needs"><img class="nav-ico" src="{_asset('nav_needs.png')}" alt="">Needliste</a>
-        </details>
-
-        <details open>
-          <summary>Gilde</summary>
-          <a href="/members"><img class="nav-ico" src="{_asset('nav_mitglieder.png')}" alt="">Mitglieder</a>
-          <a href="/auctions"><img class="nav-ico" src="{_asset('nav_loot.png')}" alt="">Auktionen</a>
-          <a href="/events"><img class="nav-ico" src="{_asset('nav_events.png')}" alt="">Events</a>
-          <a href="/ec"><img class="nav-ico" src="{_asset('nav_ec.png')}" alt="">EC-Verlauf</a>
-          <a href="/announcements"><img class="nav-ico" src="{_asset('nav_kommando.png')}" alt="">Ankündigungen</a>
+          <summary>Leader-Werkzeuge</summary>
+          <a href="/loot"><img class="nav-ico" src="{_asset('nav_auktionen.png')}" alt="">Loot & Auktionen</a>
+          <a href="/events-admin"><img class="nav-ico" src="{_asset('nav_events.png')}" alt="">Event-Verwaltung</a>
           <a href="/attendance"><img class="nav-ico" src="{_asset('nav_anwesenheit.png')}" alt="">Anwesenheit</a>
-        </details>
-
-        <details open>
-          <summary>TnL</summary>
-          <a href="/tnl/news"><img class="nav-ico" src="{_asset('nav_status.png')}" alt="">News</a>
-          <a href="/tnl/builds"><img class="nav-ico" src="{_asset('nav_planung.png')}" alt="">Builds</a>
-          <a href="/tnl/guides"><img class="nav-ico" src="{_asset('nav_hilfe.png')}" alt="">Guides</a>
-          <a href="/items"><img class="nav-ico" src="{_asset('nav_loot.png')}" alt="">Item-Datenbank</a>
+          <a href="/ec-queue"><img class="nav-ico" src="{_asset('nav_ec.png')}" alt="">EC-Queue</a>
         </details>
       </nav>
 
@@ -3619,38 +3605,54 @@ def _sidebar_html() -> str:
     </aside>
     """
 
-
-
-
 def _member_sidebar_html() -> str:
+    """Normale Dashboard-Sidebar. Auch Admins sehen standardmäßig diese Ansicht."""
     return f"""
-    <aside class="sidebar">
+    <aside class="sidebar member-default-sidebar">
       <div class="brand">
         <div class="brand-mark"><img src="{_asset('ebolus_logo.png')}" alt="Ebolus"></div>
-        <div><strong>Ebolus</strong><span>Mitgliederbereich</span></div>
+        <div><strong>Ebolus</strong><span>Gilden-Dashboard</span></div>
       </div>
       <button class="mobile-nav-toggle" type="button" onclick="document.body.classList.toggle('nav-open')">☰ Menü</button>
 
       <nav class="side-nav">
-        <a href="/member" data-nav="member-home"><img class="nav-ico" src="{_asset('nav_status.png')}" alt="">Status</a>
-        <a href="/member/members" data-nav="member-members"><img class="nav-ico" src="{_asset('nav_mitglieder.png')}" alt="">Mitglieder</a>
-        <a href="/member/events" data-nav="member-events"><img class="nav-ico" src="{_asset('nav_events.png')}" alt="">Events</a>
-        <a href="/member/auctions" data-nav="member-auctions"><img class="nav-ico" src="{_asset('nav_loot.png')}" alt="">Auktionen</a>
-        <a href="/member/ec" data-nav="member-ec"><img class="nav-ico" src="{_asset('nav_ec.png')}" alt="">Meine EC</a>
-        <a href="/portal" data-nav="member-profile"><img class="nav-ico" src="{_asset('nav_portal.png')}" alt="">Eigenes Profil</a>
-        <a href="/portal#needs" data-nav="member-needs"><img class="nav-ico" src="{_asset('nav_needs.png')}" alt="">Meine Needs</a>
+        <a class="admin-portal-button" href="/admin"><img class="nav-ico" src="{_asset('nav_admin_portal.png')}" alt="">Admin-Portal</a>
+
+        <details open>
+          <summary>Mein Portal</summary>
+          <a href="/portal"><img class="nav-ico" src="{_asset('nav_portal.png')}" alt="">Mein Profil</a>
+          <a href="/needs"><img class="nav-ico" src="{_asset('nav_needs.png')}" alt="">Needliste</a>
+        </details>
+
+        <details open>
+          <summary>Gilde</summary>
+          <a href="/member/members"><img class="nav-ico" src="{_asset('nav_mitglieder.png')}" alt="">Mitglieder</a>
+          <a href="/member/auctions"><img class="nav-ico" src="{_asset('nav_auktionen.png')}" alt="">Auktionen</a>
+          <a href="/member/events"><img class="nav-ico" src="{_asset('nav_events.png')}" alt="">Events</a>
+          <a href="/member/ec"><img class="nav-ico" src="{_asset('nav_ec.png')}" alt="">EC-Verlauf</a>
+          <a href="/announcements"><img class="nav-ico" src="{_asset('nav_announcements.png')}" alt="">Ankündigungen</a>
+          <a href="/attendance"><img class="nav-ico" src="{_asset('nav_anwesenheit.png')}" alt="">Anwesenheit</a>
+        </details>
+
+        <details open>
+          <summary>TnL</summary>
+          <a href="/tnl/news"><img class="nav-ico" src="{_asset('nav_news.png')}" alt="">News</a>
+          <a href="/tnl/builds"><img class="nav-ico" src="{_asset('nav_builds.png')}" alt="">Builds</a>
+          <a href="/tnl/guides"><img class="nav-ico" src="{_asset('nav_guides.png')}" alt="">Guides</a>
+          <a href="/items"><img class="nav-ico" src="{_asset('nav_item_database.png')}" alt="">Item-Datenbank</a>
+        </details>
       </nav>
 
       <div class="sidebar-footer">
         <a href="/me">Mein Login</a>
+        <a href="/release">Release</a>
         <a href="/logout">Logout</a>
         <span class="version-pill">v{_e(DASHBOARD_RELEASE_VERSION)}</span>
       </div>
     </aside>
     """
 
-
-def _html_shell(title: str, body: str, *, nav_mode: str = "admin") -> str:
+def _html_shell(title: str, body: str, *, nav_mode: str = "member") -> str:
     auth_note = ""
     if _discord_oauth_enabled():
         auth_note = '<div class="authbar">🔐 Discord-Login aktiv · <a href="/me">Mein Login</a> · <a href="/logout">Logout</a></div>'
@@ -3689,6 +3691,9 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "admin") -> str:
     .side-nav summary {{ color:var(--muted); text-transform:uppercase; letter-spacing:.08em; font-size:11px; font-weight:800; list-style:none; }}
     .side-nav summary::-webkit-details-marker {{ display:none; }}
     .side-nav details a {{ margin-left:8px; padding:9px 11px; font-size:13px; color:#ded7c8; }}
+    .side-nav .admin-portal-button {{ margin:0 0 6px 0; border:1px solid rgba(214,168,79,.34); background:linear-gradient(90deg,rgba(214,168,79,.18),rgba(77,52,18,.18)); color:var(--gold); font-weight:800; }}
+    .side-nav .admin-back {{ margin:0 0 6px 0; border:1px solid rgba(129,199,132,.25); background:rgba(129,199,132,.08); color:#bfe8c1; font-weight:800; }}
+
     .sidebar-footer {{ margin-top:18px; padding-top:14px; border-top:1px solid rgba(214,168,79,.12); display:grid; gap:8px; }}
     .sidebar-footer a {{ color:var(--muted); text-decoration:none; font-size:13px; padding:8px 10px; border-radius:10px; }} .sidebar-footer a:hover {{ color:var(--gold); background:rgba(214,168,79,.08); }}
     main.content {{ max-width:1380px; width:100%; margin:0 auto; padding:22px 24px 70px; }}
@@ -5547,7 +5552,7 @@ def _render_settings_dashboard(data: dict[str, Any]) -> str:
     <section class="panel"><h2>🎭 Rollen</h2>{_table(['Quelle','Setting','Rolle','ID'], role_rows, placeholder='Rollen durchsuchen…')}</section>
     <section class="panel"><h2>🔧 Erkannte Einstellungen</h2>{_table(['Quelle','Key','Wert'], setting_rows, placeholder='Settings durchsuchen…')}</section>
     """
-    return _html_shell("Einstellungen · Ebo Dashboard", body)
+    return _html_shell("Einstellungen · Ebo Dashboard", body, nav_mode="admin")
 
 
 def _render_audit_dashboard(data: dict[str, Any]) -> str:
@@ -5578,7 +5583,7 @@ def _render_audit_dashboard(data: dict[str, Any]) -> str:
     <section class="panel"><h2>Akteure als Tabelle</h2>{_table(['Actor ID','Anzahl'], actor_rows, placeholder='Akteure durchsuchen…')}</section>
     <section class="panel" id="logs"><h2>Letzte Audit-Einträge</h2>{_table(['Zeit','Aktion','Actor','Zusammenfassung'], log_rows, placeholder='Audit durchsuchen…')}</section>
     """
-    return _html_shell("Audit · Ebo Dashboard", body)
+    return _html_shell("Audit · Ebo Dashboard", body, nav_mode="admin")
 
 
 def _render_system_dashboard(data: dict[str, Any]) -> str:
@@ -5608,7 +5613,7 @@ def _render_system_dashboard(data: dict[str, Any]) -> str:
     <section class="panel"><h2>Guild</h2>{_table(['Key','Wert'], guild_rows, placeholder='Guild durchsuchen…')}</section>
     <section class="panel"><h2>JSON-Quellen</h2>{_table(['Key','Datei','vorhanden','Status','Bytes','Geändert'], source_rows, placeholder='Quellen durchsuchen…')}</section>
     """
-    return _html_shell("System · Ebo Dashboard", body)
+    return _html_shell("System · Ebo Dashboard", body, nav_mode="admin")
 
 
 
@@ -7933,7 +7938,7 @@ def _render_audit_dashboard(data: dict[str, Any], *, action: str = "", actor: st
     <section class="panel"><h2>Akteure als Tabelle</h2>{_table(['Actor ID','Anzahl'], actor_rows, placeholder='Akteure durchsuchen…')}</section>
     <section class="panel" id="logs"><h2>Letzte Audit-Einträge</h2>{_table(['Zeit','Aktion','Actor','Zusammenfassung'], log_rows, placeholder='Audit durchsuchen…')}</section>
     """
-    return _html_shell("Audit · Ebo Dashboard", body)
+    return _html_shell("Audit · Ebo Dashboard", body, nav_mode="admin")
 
 
 def _item_catalog_available() -> bool:
@@ -9288,9 +9293,10 @@ def api_voice(_: bool = Depends(_auth)):
     return JSONResponse({"ok": True, "voice": ((payload.get("snapshot") or {}).get("voice") or {})})
 
 @app.get("/members", response_class=HTMLResponse)
-def members_page(_: bool = Depends(_auth)):
+def members_page(request: Request, _: bool = Depends(_auth)):
     try:
-        return HTMLResponse(_render_members_dashboard(_snapshot_payload()))
+        # Normale Mitgliederansicht – auch für Admins. Admin-Funktionen bleiben im Admin-Portal.
+        return HTMLResponse(_render_member_members_page(_snapshot_payload(), request))
     except Exception as exc:
         return HTMLResponse(_html_shell("Ebo Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"), status_code=500)
 
@@ -10618,7 +10624,7 @@ def _render_admin_settings_editor(data: dict[str, Any], msg: str = "") -> str:
 
     <section class="panel"><h2>🧾 Änderungsqueue</h2><p class="muted">Offene Anträge können abgebrochen werden. Fehlgeschlagene/blockierte/abgebrochene Anträge können neu geöffnet werden.</p>{_table(['Zeit','Status','Aktion','Details','Akteur','Aktion'], req_rows, placeholder='Änderungen durchsuchen…')}</section>
     """
-    return _html_shell("Admin-Einstellungen · Ebo Dashboard", body)
+    return _html_shell("Admin-Einstellungen · Ebo Dashboard", body, nav_mode="admin")
 
 def _dashboard_event_action_requests(guild_id: int, limit: int = 80, event_id: str = "") -> list[dict[str, Any]]:
     if not _database_url() or not guild_id:
@@ -10781,7 +10787,7 @@ def _dashboard_event_type_select_html() -> str:
     values = ["Nicht DKP-relevant", "Gildenboss", "Normal Raid", "HM Raid", "NM Raid", "Übungsrun HM Raid", "Übungsrun Trials", "Segensstein PvP"]
     return '<select name="dkp_event_type">' + ''.join(f'<option value="{_e(v)}">{_e(v)}</option>' for v in values) + '</select>'
 
-def _render_events_center(data: dict[str, Any], current_user: Optional[dict[str, Any]] = None, msg: str = "") -> str:
+def _render_events_center(data: dict[str, Any], current_user: Optional[dict[str, Any]] = None, msg: str = "", *, nav_mode: str = "member") -> str:
     if not data.get("ok"):
         return _html_shell("Events · Ebo Dashboard", f"<section class='panel'><h1>📅 Events</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
 
@@ -11027,17 +11033,26 @@ def _render_events_center(data: dict[str, Any], current_user: Optional[dict[str,
     </section>
     <section class="panel" id="actions"><h2>🧾 Event-Aktionsqueue</h2><p class="muted">Zeigt Erstellen/Bearbeiten/Löschen aus dem Dashboard und den Bot-Status.</p>{_table(['Zeit','Aktion','Event','Status','Von','Ergebnis'], action_table_rows, placeholder='Queue durchsuchen…')}</section>
     """
-    return _html_shell("Events · Ebo Dashboard", body)
+    return _html_shell("Events · Ebo Dashboard", body, nav_mode=nav_mode)
 
 
 @app.get("/events", response_class=HTMLResponse)
 def events_page(request: Request, _: bool = Depends(_auth), msg: str = ""):
     try:
-        return HTMLResponse(_render_events_center(_snapshot_payload(), _current_user(request), msg))
+        # Normale Eventansicht – Admin-Verwaltung nur im Admin-Portal/Event-Verwaltung.
+        return HTMLResponse(_render_member_events_page(_snapshot_payload(), request))
     except Exception as exc:
         return HTMLResponse(_html_shell("Ebo Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"), status_code=500)
 
 
+
+
+@app.get("/events-admin", response_class=HTMLResponse)
+def events_admin_page(request: Request, _: bool = Depends(_admin_auth), msg: str = ""):
+    try:
+        return HTMLResponse(_render_events_center(_snapshot_payload(), _current_user(request), msg, nav_mode="admin"))
+    except Exception as exc:
+        return HTMLResponse(_html_shell("Ebo Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>", nav_mode="admin"), status_code=500)
 @app.get("/api/events-center")
 def api_events_center(_: bool = Depends(_auth)):
     payload = _snapshot_payload()
@@ -12232,7 +12247,7 @@ def _game_status_from_snapshot(snap: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _render_status_dashboard(data: dict[str, Any], request: Optional[Request] = None, *, nav_mode: str = "admin") -> str:
+def _render_status_dashboard(data: dict[str, Any], request: Optional[Request] = None, *, nav_mode: str = "member") -> str:
     if not data.get("ok"):
         return _html_shell(
             "Status · Ebo Dashboard",
@@ -13479,7 +13494,7 @@ def api_admin_member_states(_: bool = Depends(_admin_auth)):
 
 
 @app.get("/settings", response_class=HTMLResponse)
-def settings_page(_: bool = Depends(_auth)):
+def settings_page(_: bool = Depends(_admin_auth)):
     try:
         return HTMLResponse(_render_settings_dashboard(_snapshot_payload()))
     except Exception as exc:
@@ -13674,7 +13689,7 @@ def my_profile_alias() -> RedirectResponse:
 
 @app.get("/auctions", response_class=HTMLResponse)
 def auctions_alias() -> RedirectResponse:
-    return RedirectResponse(url="/loot", status_code=307)
+    return RedirectResponse(url="/member/auctions", status_code=307)
 
 
 @app.get("/announcements", response_class=HTMLResponse)
@@ -13756,7 +13771,7 @@ def api_release_status(_: bool = Depends(_auth)):
 
 
 @app.get("/audit", response_class=HTMLResponse)
-def audit_page(q: str = "", action: str = "", actor: str = "", _: bool = Depends(_auth)):
+def audit_page(q: str = "", action: str = "", actor: str = "", _: bool = Depends(_admin_auth)):
     try:
         return HTMLResponse(_render_audit_dashboard(_snapshot_payload(), q=q, action=action, actor=actor))
     except Exception as exc:
@@ -13767,7 +13782,7 @@ def audit_page(q: str = "", action: str = "", actor: str = "", _: bool = Depends
 
 
 @app.get("/system", response_class=HTMLResponse)
-def system_page(_: bool = Depends(_auth)):
+def system_page(_: bool = Depends(_admin_auth)):
     try:
         return HTMLResponse(_render_system_dashboard(_snapshot_payload()))
     except Exception as exc:
@@ -13816,10 +13831,8 @@ def overview(_: bool = Depends(_auth)):
 
 @app.get("/", response_class=HTMLResponse)
 def index(request: Request, _: bool = Depends(_auth)):
-    user = _current_user(request) or {}
-    nav_mode = "member" if str(user.get("role") or "") == "member" else "admin"
     try:
-        return HTMLResponse(_render_status_dashboard(_snapshot_payload(), request, nav_mode=nav_mode))
+        return HTMLResponse(_render_status_dashboard(_snapshot_payload(), request, nav_mode="member"))
     except Exception as exc:
         return HTMLResponse(
             _html_shell("Ebo Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
@@ -13829,9 +13842,7 @@ def index(request: Request, _: bool = Depends(_auth)):
 
 @app.get("/status", response_class=HTMLResponse)
 def status_page(request: Request, _: bool = Depends(_auth)):
-    user = _current_user(request) or {}
-    nav_mode = "member" if str(user.get("role") or "") == "member" else "admin"
-    return HTMLResponse(_render_status_dashboard(_snapshot_payload(), request, nav_mode=nav_mode))
+    return HTMLResponse(_render_status_dashboard(_snapshot_payload(), request, nav_mode="member"))
 
 
 @app.get("/api/game-status-live")
@@ -17070,11 +17081,11 @@ def _render_phase3_database_page(payload: dict[str, Any]) -> str:
     {warn_html}
     <section class='panel'><h2>Letzte Spiegelungen</h2>{_table(['Zeit','Modus','Status','Zahlen','Notiz'], run_rows or [['—','—','—','Noch keine Spiegelung','']], searchable=False)}</section>
     <section class='panel'><h2>Sicherheitsregeln</h2><ul><li>Diese Seite löscht keine Daten.</li><li>Dashboard ist Postgres-first, sobald die Phase-3-Tabellen Daten liefern.</li><li>JSON bleibt bewusst erhalten und darf nicht überschrieben oder gelöscht werden.</li><li>Spiegelung ist idempotent: erneutes Ausführen aktualisiert vorhandene DB-Zeilen.</li></ul></section>
-    """)
+    """, nav_mode="admin")
 
 
 @app.get("/database", response_class=HTMLResponse)
-def database_page(_: bool = Depends(_auth)):
+def database_page(_: bool = Depends(_admin_auth)):
     try:
         return HTMLResponse(_render_phase3_database_page(_snapshot_payload()))
     except Exception as exc:
