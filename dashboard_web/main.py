@@ -3576,47 +3576,37 @@ def _sidebar_html() -> str:
       <button class="mobile-nav-toggle" type="button" onclick="document.body.classList.toggle('nav-open')">☰ Menü</button>
 
       <nav class="side-nav">
-        <a href="/" data-nav="home"><img class="nav-ico" src="{_asset('nav_status.png')}" alt="">Status</a>
-        <a href="/overview" data-nav="overview"><img class="nav-ico" src="{_asset('nav_kommando.png')}" alt="">Kommando</a>
+        <details open>
+          <summary>Admin</summary>
+          <a href="/admin"><img class="nav-ico" src="{_asset('nav_leitung.png')}" alt="">Admin-Portal</a>
+          <a href="/settings"><img class="nav-ico" src="{_asset('nav_einstellungen.png')}" alt="">Einstellungen</a>
+          <a href="/audit"><img class="nav-ico" src="{_asset('nav_audit.png')}" alt="">Audit</a>
+          <a href="/system"><img class="nav-ico" src="{_asset('nav_system.png')}" alt="">System</a>
+          <a href="/database"><img class="nav-ico" src="{_asset('nav_system.png')}" alt="">Datenbank</a>
+        </details>
+
+        <details open>
+          <summary>Mein Portal</summary>
+          <a href="/portal"><img class="nav-ico" src="{_asset('nav_portal.png')}" alt="">Mein Profil</a>
+          <a href="/needs"><img class="nav-ico" src="{_asset('nav_needs.png')}" alt="">Needliste</a>
+        </details>
 
         <details open>
           <summary>Gilde</summary>
           <a href="/members"><img class="nav-ico" src="{_asset('nav_mitglieder.png')}" alt="">Mitglieder</a>
-        <a href="/portal"><img class="nav-ico" src="{_asset('nav_portal.png')}" alt="">Mein Portal</a>
+          <a href="/auctions"><img class="nav-ico" src="{_asset('nav_loot.png')}" alt="">Auktionen</a>
           <a href="/events"><img class="nav-ico" src="{_asset('nav_events.png')}" alt="">Events</a>
-          <a href="/attendance"><img class="nav-ico" src="{_asset('nav_anwesenheit.png')}" alt="">Anwesenheit</a>
-          <a href="/attendance-stats"><img class="nav-ico" src="{_asset('nav_analytics.png')}" alt="">Stats</a>
-          <a href="/attendance-archive"><img class="nav-ico" src="{_asset('nav_exports.png')}" alt="">Archiv</a>
-        </details>
-
-        <details open>
-          <summary>Loot & Auktionen</summary>
-          <a href="/loot"><img class="nav-ico" src="{_asset('nav_loot.png')}" alt="">Loot-Zentrale</a>
-          <a href="/loot-check"><img class="nav-ico" src="{_asset('nav_loot.png')}" alt="">Truhencheck</a>
-          <a href="/loot-history"><img class="nav-ico" src="{_asset('nav_exports.png')}" alt="">Loot-Verlauf</a>
-          <a href="/needs"><img class="nav-ico" src="{_asset('nav_needs.png')}" alt="">Needs</a>
-          <a href="/fairness"><img class="nav-ico" src="{_asset('nav_fairness.png')}" alt="">Fairness</a>
-        </details>
-
-        <details open>
-          <summary>EC</summary>
           <a href="/ec"><img class="nav-ico" src="{_asset('nav_ec.png')}" alt="">EC-Verlauf</a>
-          <a href="/ec-queue"><img class="nav-ico" src="{_asset('nav_ec.png')}" alt="">EC-Queue</a>
+          <a href="/announcements"><img class="nav-ico" src="{_asset('nav_kommando.png')}" alt="">Ankündigungen</a>
+          <a href="/attendance"><img class="nav-ico" src="{_asset('nav_anwesenheit.png')}" alt="">Anwesenheit</a>
         </details>
 
-        <details>
-          <summary>Auswertung</summary>
-          <a href="/analytics"><img class="nav-ico" src="{_asset('nav_analytics.png')}" alt="">Analytics</a>
-          <a href="/voice"><img class="nav-ico" src="{_asset('nav_voice.png')}" alt="">Voice</a>
-          <a href="/exports"><img class="nav-ico" src="{_asset('nav_exports.png')}" alt="">Exports</a>
-        </details>
-
-        <details>
-          <summary>Leitung & System</summary>
-          <a href="/admin"><img class="nav-ico" src="{_asset('nav_leitung.png')}" alt="">Admin</a>
-          <a href="/settings"><img class="nav-ico" src="{_asset('nav_einstellungen.png')}" alt="">Einstellungen</a>
-          <a href="/audit"><img class="nav-ico" src="{_asset('nav_audit.png')}" alt="">Audit</a>
-          <a href="/system"><img class="nav-ico" src="{_asset('nav_system.png')}" alt="">System</a>
+        <details open>
+          <summary>TnL</summary>
+          <a href="/tnl/news"><img class="nav-ico" src="{_asset('nav_status.png')}" alt="">News</a>
+          <a href="/tnl/builds"><img class="nav-ico" src="{_asset('nav_planung.png')}" alt="">Builds</a>
+          <a href="/tnl/guides"><img class="nav-ico" src="{_asset('nav_hilfe.png')}" alt="">Guides</a>
+          <a href="/items"><img class="nav-ico" src="{_asset('nav_loot.png')}" alt="">Item-Datenbank</a>
         </details>
       </nav>
 
@@ -13641,6 +13631,115 @@ def _render_release_dashboard(data: dict[str, Any]) -> str:
     </div></section>
     """)
 
+
+
+
+def _simple_dashboard_page(title: str, subtitle: str, cards: list[tuple[str, str, str]]) -> str:
+    card_html = "".join(
+        f"""
+        <a class="home-item" href="{_e(href)}">
+          <div class="home-icon">{_e(icon)}</div>
+          <div><div class="home-title">{_e(card_title)}</div><div class="home-meta">{_e(text)}</div></div>
+          <div class="pill">Öffnen</div>
+        </a>
+        """
+        for icon, card_title, href_text in cards
+        for href, text in [href_text.split("|", 1) if "|" in href_text else (href_text, "")]
+    )
+    return _html_shell(
+        f"{title} · Ebo Dashboard",
+        f"""
+        <section class="hero">
+          <div>
+            <h1>{_e(title)}</h1>
+            <p>{_e(subtitle)}</p>
+          </div>
+        </section>
+        <section class="panel">
+          <div class="home-list">{card_html}</div>
+        </section>
+        """,
+    )
+
+
+@app.get("/admin-portal", response_class=HTMLResponse)
+def admin_portal_alias() -> RedirectResponse:
+    return RedirectResponse(url="/admin", status_code=307)
+
+
+@app.get("/my-profile", response_class=HTMLResponse)
+def my_profile_alias() -> RedirectResponse:
+    return RedirectResponse(url="/portal", status_code=307)
+
+
+@app.get("/auctions", response_class=HTMLResponse)
+def auctions_alias() -> RedirectResponse:
+    return RedirectResponse(url="/loot", status_code=307)
+
+
+@app.get("/announcements", response_class=HTMLResponse)
+def announcements_page() -> HTMLResponse:
+    body = """
+    <section class="hero">
+      <div>
+        <h1>📣 Ankündigungen</h1>
+        <p>Gildenankündigungen, wichtige Hinweise und geplante News-Beiträge.</p>
+      </div>
+      <div class="hero-actions">
+        <a class="hero-action" href="/events"><span>📅</span><strong>Events</strong><small>Termine prüfen</small></a>
+        <a class="hero-action" href="/loot"><span>🎁</span><strong>Auktionen</strong><small>Loot & Gebote</small></a>
+        <a class="hero-action" href="/admin"><span>⚙️</span><strong>Admin</strong><small>Leitung</small></a>
+      </div>
+    </section>
+    <section class="panel">
+      <h2>Ankündigungs-Zentrale</h2>
+      <p class="muted">Platzhalter-Seite. Hier können später Discord-Ankündigungen, geplante Posts und Gilden-News aus dem Bot-Snapshot angezeigt werden.</p>
+      <div class="subpanel">
+        <strong>Geplant:</strong>
+        <ul>
+          <li>Letzte Discord-Ankündigungen spiegeln</li>
+          <li>Neue Ankündigung als Admin vorbereiten</li>
+          <li>Wichtige Gildeninfos oben anpinnen</li>
+        </ul>
+      </div>
+    </section>
+    """
+    return _html_shell("Ankündigungen · Ebo Dashboard", body)
+
+
+@app.get("/tnl/news", response_class=HTMLResponse)
+def tnl_news_page() -> HTMLResponse:
+    body = """
+    <section class="hero">
+      <div><h1>📰 TnL News</h1><p>News-Bereich für Throne and Liberty. Später können hier Patchnotes, Serverinfos und Bot-Newsfeeds landen.</p></div>
+      <div class="hero-actions"><a class="hero-action" href="/items"><span>🧰</span><strong>Item-Datenbank</strong><small>Questlog-Import</small></a></div>
+    </section>
+    <section class="panel"><h2>News</h2><p class="muted">Platzhalter-Seite. Integration kann später per News-Feed oder manuellem Admin-Post kommen.</p></section>
+    """
+    return _html_shell("TnL News · Ebo Dashboard", body)
+
+
+@app.get("/tnl/builds", response_class=HTMLResponse)
+def tnl_builds_page() -> HTMLResponse:
+    body = """
+    <section class="hero">
+      <div><h1>🧩 TnL Builds</h1><p>Build-Bereich. Deine spielbaren Need-Builds liegen weiterhin unter Mein Portal → Needliste.</p></div>
+      <div class="hero-actions"><a class="hero-action" href="/needs"><span>🎁</span><strong>Needliste</strong><small>Builds verwalten</small></a><a class="hero-action" href="/items"><span>🔎</span><strong>Items</strong><small>Datenbank</small></a></div>
+    </section>
+    <section class="panel"><h2>Builds</h2><p class="muted">Platzhalter-Seite für spätere öffentliche/empfohlene Gilden-Builds, Rollen-Guides oder externe Questlog-Build-Links.</p></section>
+    """
+    return _html_shell("TnL Builds · Ebo Dashboard", body)
+
+
+@app.get("/tnl/guides", response_class=HTMLResponse)
+def tnl_guides_page() -> HTMLResponse:
+    body = """
+    <section class="hero">
+      <div><h1>📚 TnL Guides</h1><p>Guide-Bereich für Bossmechaniken, Rollen, PvP, Lootsystem und Gildenabläufe.</p></div>
+    </section>
+    <section class="panel"><h2>Guides</h2><p class="muted">Platzhalter-Seite. Hier können später eigene Gilden-Guides oder kuratierte Links rein.</p></section>
+    """
+    return _html_shell("TnL Guides · Ebo Dashboard", body)
 
 @app.get("/release", response_class=HTMLResponse)
 def release_page(_: bool = Depends(_auth)):

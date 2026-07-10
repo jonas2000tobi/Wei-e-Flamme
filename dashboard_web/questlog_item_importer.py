@@ -2846,6 +2846,11 @@ def parse_detail_page(page, url: str, main_category_hint: str, locale: str, sour
         image_url=image_url or icon_url,
     )
 
+    # Waffen: Zusatzwerte generisch aus der Itemkarte nachlesen, damit seltene Werte
+    # wie Schildgesundheit nicht fehlen.
+    if main_category == "weapon":
+        detail_model = _sanitize_weapon_detail_model(detail_model, raw_text)
+
     # Zubehör/Schmuck hat ein anderes Questlog-Layout als Armor:
     # - Zusatzwerte stehen nur vor "Eigenschaften"
     # - Eigenschaften dürfen nicht als Bonusstats oder Passive/Effekt landen
@@ -4481,6 +4486,194 @@ def _sanitize_accessory_detail_model(detail: dict[str, Any], raw_text: str) -> d
     # Trait-Zeilen wie Fähigkeitsschaden-Bonus als Passive/Effekt missverstanden.
     cleaned.pop("passive", None)
     cleaned["accessory_parser"] = "section_bonus_traits_v1"
+    return cleaned
+
+
+
+# ---------------------------------------------------------------------------
+# Waffen-Fix: generische Zusatzwerte aus Questlog-Detailkarte lesen
+# ---------------------------------------------------------------------------
+def _weapon_num_tokens(text: str) -> list[str]:
+    s = clean_text(str(text or ""))
+    if not s or s == "|":
+        return []
+    # Entfernt Questlog-Delta-Pfeil, behält Prozent, Sekunden, Meter.
+    s = s.replace("▲", " ")
+    return [clean_text(x) for x in re.findall(r"[+\-]?\d+(?:[.,]\d+)?\s*(?:%|m|s|Sek\.)?", s, flags=re.I)]
+
+
+def _weapon_clean_label(text: str) -> str:
+    label = clean_text(str(text or "")).strip(" :")
+    if not label or len(label) > 80:
+        return ""
+    low = label.lower()
+    bad_exact = {
+        "episch", "heroisch", "selten", "ungewöhnlich", "gewöhnlich", "uncommon", "common", "rare", "epic", "heroic",
+        "item level", "level", "passiv", "passive", "eigenschaften", "traits", "runes", "runen",
+        "skill core", "not equipped", "auction house", "auktionshaus", "stats", "enchanting", "lucent-wert", "kampfkraft",
+    }
+    if low.strip(" :") in bad_exact:
+        return ""
+    if re.fullmatch(r"[+\-]?\d+(?:[.,]\d+)?\s*(?:%|m|s|Sek\.)?", label, flags=re.I):
+        return ""
+    if label == "|" or label.startswith("▲"):
+        return ""
+    # Keine offensichtlichen Beschreibungs-/Fließtextzeilen als Label.
+    if len(label.split()) > 5 and not label.endswith(":"):
+        return ""
+    return label
+
+
+def _weapon_stop_line(text: str) -> bool:
+    low = clean_text(str(text or "")).lower().strip(" :[]{}")
+    if not low:
+        return False
+    exact = {
+        "eigenschaften", "traits", "runes", "runen", "skill core", "auction house", "auktionshaus",
+        "stats", "enchanting", "kommentare", "comments", "remove ads", "learn more", "teilen", "share",
+        "verkaufspreis", "lucent-wert", "preisverlauf", "bestandsverlauf",
+    }
+    if low in exact:
+        return True
+    return low.startswith(("dieser gegenstand hat resonanzeigenschaften", "ausrüstungseffekte", "heroische effekte"))
+
+
+def _weapon_primary_labels() -> set[str]:
+    return {
+        "max. schaden", "max damage", "schaden", "damage",
+        "reichweite", "range", "angriffstempo", "attack speed", "angriffsgeschwindigkeit",
+    }
+
+
+def _parse_weapon_bonus_stats_generic(raw_text: str) -> list[dict[str, Any]]:
+    """Liest Waffen-Zusatzwerte generisch statt per starrer Whitelist.
+
+    Questlog zeigt bei Waffen nach den Hauptwerten weitere Extra-Stats, z. B.
+    Stärke, Wahrnehmung, Chance auf Zweitwaffenangriff, Schildgesundheit usw.
+    Dieser Parser nimmt jedes Label mit direkt folgendem Zahlenwert vor dem
+    Eigenschaften-Abschnitt auf und verliert dadurch neue/seltene Statnamen nicht.
+    """
+    lines = [clean_text(x) for x in re.split(r"[\n\r]+", normalize_raw_text(raw_text)) if clean_text(x)]
+    if not lines:
+        return []
+
+    primary = _weapon_primary_labels()
+    end = len(lines)
+    for idx, line in enumerate(lines):
+        low = clean_text(line).lower().strip(" :")
+        if low in {"eigenschaften", "traits"}:
+            end = idx
+            break
+
+    # Erst nach der letzten Hauptwert-Zeile beginnen, damit Max. Schaden/Reichweite/
+    # Grund-Angriffstempo nicht doppelt als Zusatzwert erscheinen.
+    start = 0
+    for idx, line in enumerate(lines[:end]):
+        low = clean_text(line).lower().strip(" :")
+        if low in primary or any(low.startswith(p + " ") for p in primary):
+            j = idx + 1
+            while j < end:
+                nxt = clean_text(lines[j]).strip()
+                nl = nxt.lower().strip(" :")
+                if not nxt or nxt == "|" or nxt.startswith("▲") or _weapon_num_tokens(nxt):
+                    j += 1
+                    continue
+                break
+            start = max(start, j)
+
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    i = start
+    while i < end:
+        tok = clean_text(lines[i]).strip()
+        if not tok or tok == "|" or _weapon_stop_line(tok):
+            i += 1
+            continue
+        low = tok.lower().strip(" :")
+        if low in primary:
+            i += 1
+            continue
+        if low in {"passiv", "passive"}:
+            # Passive-Name/Beschreibung nicht als Stat lesen; Zahlen innerhalb der Beschreibung ignorieren.
+            i += 1
+            # bis zum nächsten klaren Label mit numerischem Wert oder Eigenschaften weiterlaufen
+            continue
+
+        label = ""
+        inline = ""
+        if ":" in tok:
+            left, right = tok.split(":", 1)
+            label = _weapon_clean_label(left)
+            inline = right
+        else:
+            label = _weapon_clean_label(tok)
+        if not label:
+            i += 1
+            continue
+        key = label.lower().strip(" :")
+        if key in seen or key in primary:
+            i += 1
+            continue
+
+        vals: list[str] = []
+        if inline:
+            vals.extend(_weapon_num_tokens(inline))
+        j = i + 1
+        while j < end and len(vals) < 2:
+            nxt = clean_text(lines[j]).strip()
+            nl = nxt.lower().strip(" :")
+            if not nxt or nxt == "|":
+                j += 1
+                continue
+            if _weapon_stop_line(nxt) or nl in primary:
+                break
+            # Wenn die nächste Zeile selbst ein Label ist und keine Zahl enthält, endet dieser Stat.
+            if not _weapon_num_tokens(nxt) and _weapon_clean_label(nxt):
+                break
+            vals.extend(_weapon_num_tokens(nxt))
+            j += 1
+
+        if vals:
+            entry: dict[str, Any] = {"label": label, "value": vals[0]}
+            if len(vals) >= 2:
+                entry["delta"] = vals[1]
+            out.append(entry)
+            seen.add(key)
+            i = max(j, i + 1)
+            continue
+        i += 1
+
+    return out
+
+
+def _sanitize_weapon_detail_model(detail: dict[str, Any], raw_text: str) -> dict[str, Any]:
+    if not isinstance(detail, dict):
+        detail = {}
+    cleaned = dict(detail)
+    old_bonus = cleaned.get("bonus_stats") if isinstance(cleaned.get("bonus_stats"), list) else []
+    merged: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for row in old_bonus:
+        if not isinstance(row, dict):
+            continue
+        label = clean_text(row.get("label") or row.get("name") or "")
+        if not label:
+            continue
+        key = label.lower().strip(" :")
+        if key in seen:
+            continue
+        merged.append(row)
+        seen.add(key)
+    for row in _parse_weapon_bonus_stats_generic(raw_text):
+        label = clean_text(row.get("label") or "")
+        key = label.lower().strip(" :")
+        if not label or key in seen:
+            continue
+        merged.append(row)
+        seen.add(key)
+    if merged:
+        cleaned["bonus_stats"] = merged
+    cleaned["weapon_parser"] = "generic_bonus_stats_v2"
     return cleaned
 
 def build_arg_parser() -> argparse.ArgumentParser:
