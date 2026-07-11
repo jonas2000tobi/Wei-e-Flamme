@@ -49,8 +49,8 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
-ASSET_VER = "item-match-v2-20260711"
-DASHBOARD_RELEASE_VERSION = "1.2.3 · robuste Item-Verknüpfung"
+ASSET_VER = "member-item-id-v1-20260711"
+DASHBOARD_RELEASE_VERSION = "1.3.0 · feste Item-IDs + aktive Mitgliedersynchronisierung"
 
 _ITEM_MATCH_CACHE: dict[str, Optional[dict[str, Any]]] = {}
 _ITEM_CATALOG_POOL_CACHE: dict[str, Any] = {"loaded_at": 0.0, "items": []}
@@ -1086,6 +1086,24 @@ def _apply_phase3_loot_read_cutover(payload: dict[str, Any]) -> dict[str, Any]:
 # Der Bot/Snapshot bleibt weiterhin kompatibel; kein Write-Cutover.
 
 
+def _snapshot_active_member_ids(snap: dict[str, Any]) -> set[int]:
+    out: set[int] = set()
+    if not isinstance(snap, dict):
+        return out
+    auth = snap.get("auth") if isinstance(snap.get("auth"), dict) else {}
+    member_role = auth.get("member_role") if isinstance(auth.get("member_role"), dict) else {}
+    for value in member_role.get("member_ids") or []:
+        uid = _user_id(value)
+        if uid:
+            out.add(uid)
+    profiles = snap.get("profiles") if isinstance(snap.get("profiles"), dict) else {}
+    for value in profiles.get("active_member_ids") or []:
+        uid = _user_id(value)
+        if uid:
+            out.add(uid)
+    return out
+
+
 def _phase3_events_pg_payload(guild_id: Any, snap: dict[str, Any]) -> Optional[dict[str, Any]]:
     if not _database_url():
         return None
@@ -1098,19 +1116,43 @@ def _phase3_events_pg_payload(guild_id: Any, snap: dict[str, Any]) -> Optional[d
         return None
     try:
         with conn.cursor() as cur:
+            member_source = "guild_members"
             try:
                 cur.execute(
                     """
-                    SELECT user_id, discord_name, ingame_name, roles_json, raw_json, source, updated_at
-                    FROM phase3_members
-                    WHERE guild_id = %s
-                    ORDER BY COALESCE(NULLIF(ingame_name,''), NULLIF(discord_name,''), user_id) ASC
+                    SELECT user_id, server_name, discord_username, avatar_url, ingame_name,
+                           main_role, gearscore, member_role_id, is_active, joined_at,
+                           roles_json, profile_json, updated_at
+                    FROM guild_members
+                    WHERE guild_id = %s AND is_active = TRUE
+                    ORDER BY COALESCE(NULLIF(ingame_name,''), NULLIF(server_name,''), user_id::text) ASC
                     """,
                     (gid,),
                 )
                 member_rows = cur.fetchall() or []
             except Exception:
-                member_rows = []
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                member_source = "phase3_members_fallback"
+                try:
+                    cur.execute(
+                        """
+                        SELECT user_id, discord_name, ingame_name, roles_json, raw_json, source, updated_at
+                        FROM phase3_members
+                        WHERE guild_id = %s
+                        ORDER BY COALESCE(NULLIF(ingame_name,''), NULLIF(discord_name,''), user_id) ASC
+                        """,
+                        (gid,),
+                    )
+                    member_rows = cur.fetchall() or []
+                except Exception:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                    member_rows = []
 
             try:
                 cur.execute(
@@ -1125,6 +1167,10 @@ def _phase3_events_pg_payload(guild_id: Any, snap: dict[str, Any]) -> Optional[d
                 )
                 event_rows = cur.fetchall() or []
             except Exception:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
                 event_rows = []
 
             try:
@@ -1140,6 +1186,10 @@ def _phase3_events_pg_payload(guild_id: Any, snap: dict[str, Any]) -> Optional[d
                 )
                 rsvp_rows = cur.fetchall() or []
             except Exception:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
                 rsvp_rows = []
 
             try:
@@ -1155,6 +1205,10 @@ def _phase3_events_pg_payload(guild_id: Any, snap: dict[str, Any]) -> Optional[d
                 )
                 absence_rows = cur.fetchall() or []
             except Exception:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
                 absence_rows = []
     finally:
         try:
@@ -1167,25 +1221,44 @@ def _phase3_events_pg_payload(guild_id: Any, snap: dict[str, Any]) -> Optional[d
 
     # Mitglieder/Profile aus DB vorbereiten.
     fallback_names = _profile_name_map(snap)
+    active_snapshot_ids = _snapshot_active_member_ids(snap)
     member_items: list[dict[str, Any]] = []
     names: dict[int, str] = dict(fallback_names)
     member_ids: set[int] = set()
     for row in member_rows:
-        raw = _phase3_json(row.get("raw_json"), {}) if isinstance(row, dict) else {}
-        uid = _user_id((row or {}).get("user_id") or raw.get("user_id"))
+        if not isinstance(row, dict):
+            continue
+        profile_json = _phase3_json(row.get("profile_json"), {})
+        legacy_raw = _phase3_json(row.get("raw_json"), {})
+        raw = profile_json if profile_json else legacy_raw
+        uid = _user_id(row.get("user_id") or raw.get("user_id"))
         if not uid:
             continue
-        roles = _phase3_json((row or {}).get("roles_json"), [])
-        display = raw.get("display_name") or raw.get("name") or (row or {}).get("ingame_name") or (row or {}).get("discord_name") or f"User {uid}"
+        # Der aktuelle Discord-Rollen-Snapshot ist die letzte Wahrheit. So können
+        # alte Phase-3-Zeilen niemals wieder ehemalige Mitglieder einblenden.
+        if active_snapshot_ids and uid not in active_snapshot_ids:
+            continue
+        roles = _phase3_json(row.get("roles_json"), [])
+        server_name = str(row.get("server_name") or raw.get("server_name") or raw.get("display_name") or row.get("discord_name") or "").strip()
+        discord_name = str(row.get("discord_username") or row.get("discord_name") or raw.get("discord_name") or raw.get("username") or server_name).strip()
+        ingame_name = str(row.get("ingame_name") or raw.get("ingame_name") or raw.get("tl_name") or "").strip()
+        display = ingame_name or server_name or discord_name or f"User {uid}"
         item = {
-            **raw,
+            **(raw if isinstance(raw, dict) else {}),
             "user_id": uid,
             "display_name": display,
-            "discord_name": (row or {}).get("discord_name") or raw.get("discord_name") or raw.get("username") or display,
-            "ingame_name": (row or {}).get("ingame_name") or raw.get("ingame_name") or raw.get("tl_name") or display,
+            "server_name": server_name or display,
+            "discord_name": discord_name or server_name or display,
+            "discord_username": discord_name or server_name or display,
+            "avatar_url": str(row.get("avatar_url") or raw.get("avatar_url") or raw.get("discord_avatar_url") or ""),
+            "ingame_name": ingame_name,
+            "main_role": str(row.get("main_role") or raw.get("main_role") or ""),
+            "gearscore": str(row.get("gearscore") or raw.get("gearscore") or ""),
+            "joined_at": str(row.get("joined_at") or raw.get("joined_at") or ""),
             "roles": roles if isinstance(roles, list) else [],
             "is_dashboard_member": True,
-            "source": "postgres_phase3",
+            "is_active": True,
+            "source": member_source,
         }
         names[uid] = str(display)
         member_ids.add(uid)
@@ -2018,7 +2091,7 @@ def _render_admin_center_dashboard(data: dict[str, Any]) -> str:
         result = r.get("result") if isinstance(r.get("result"), dict) else {}
         item = payload.get("item_name") or payload.get("item") or r.get("auction_id")
         status = _ec_award_status_label(r.get("status")).replace("EC", "")
-        loot_rows.append([_dt(r.get("requested_at")), status, _auction_link(r.get("auction_id"), item), r.get("action_type"), _fmt_ec(r.get("amount")), r.get("actor_name") or r.get("actor_id") or "—", _short(result.get("error") or result.get("message") or r.get("request_id"), 100)])
+        loot_rows.append([_dt(r.get("requested_at")), status, _auction_link(r.get("auction_id"), item, payload or r), r.get("action_type"), _fmt_ec(r.get("amount")), r.get("actor_name") or r.get("actor_id") or "—", _short(result.get("error") or result.get("message") or r.get("request_id"), 100)])
 
     setting_req_rows = []
     for r in p.get("settings_requests") or []:
@@ -2100,12 +2173,12 @@ def _event_link(event_id: Any, label: Any) -> dict[str, str]:
     return _raw(f'<a class="link" href="/event/{_e(eid)}">{text}</a>')
 
 
-def _auction_link(auction_id: Any, label: Any) -> dict[str, str]:
+def _auction_link(auction_id: Any, label: Any, reference: Any = None) -> dict[str, str]:
     aid = str(auction_id or "").strip()
     item_name = label or aid or "Auktion"
     primary_href = f"/auction/{aid}" if aid else ""
     try:
-        return _raw(_catalog_item_reference_html(item_name, primary_href=primary_href))
+        return _raw(_catalog_item_reference_html(item_name, primary_href=primary_href, reference=reference))
     except Exception:
         text = _e(item_name)
         return _raw(f'<a class="link" href="{_e(primary_href)}">{text}</a>' if primary_href else text)
@@ -2451,7 +2524,7 @@ def _render_need_slot_board(
         locked = bool(entry and _need_is_received(entry))
         if entry:
             item = _need_item_display(entry)
-            item_html = _catalog_item_reference_html(item)
+            item_html = _catalog_item_reference_html(item, reference=entry)
             value_html = f'<span class="need-lock" aria-label="erhalten">🔒</span>{item_html}' if locked else item_html
         else:
             value_html = "—"
@@ -2655,7 +2728,7 @@ def _render_dashboard(data: dict[str, Any]) -> str:
         uid = int(_num(a.get("top_bid_user_id"), 0))
         if a.get("top_bid_amount") is not None:
             leader = f"{names.get(uid, f'User {uid}')} / {_fmt_ec(a.get('top_bid_amount'))} EC"
-        auction_rows.append([_auction_link(a.get("auction_id"), a.get("item_name")), a.get("status"), a.get("phase"), a.get("bid_count"), leader, _dt(a.get("ends_at"))])
+        auction_rows.append([_auction_link(a.get("auction_id"), a.get("item_name"), a), a.get("status"), a.get("phase"), a.get("bid_count"), leader, _dt(a.get("ends_at"))])
 
     voice_rows = []
     for v in voice.get("recent_sessions") or []:
@@ -3562,7 +3635,7 @@ def _enqueue_loot_action_request(guild_id: int, auction: dict[str, Any], action_
 
 
 
-def _enqueue_loot_drop_request(guild_id: int, drop_type: str, item_query: str, actor: dict[str, Any]) -> dict[str, Any]:
+def _enqueue_loot_drop_request(guild_id: int, drop_type: str, item_query: str, actor: dict[str, Any], catalog_item_id: int = 0) -> dict[str, Any]:
     """Dashboard -> Bot Queue: normale Drops/Müll-Drops anlegen.
 
     Das Dashboard erstellt die Auktion nicht selbst. Es legt nur eine Anfrage in
@@ -3579,6 +3652,18 @@ def _enqueue_loot_drop_request(guild_id: int, drop_type: str, item_query: str, a
         return {"ok": False, "error": "Itemname fehlt."}
     if len(item) > 160:
         item = item[:160]
+    try:
+        resolved_catalog_id = int(catalog_item_id or 0)
+    except Exception:
+        resolved_catalog_id = 0
+    if not resolved_catalog_id:
+        try:
+            matched_catalog = _catalog_item_match(item)
+            resolved_catalog_id = int((matched_catalog or {}).get("id") or 0)
+            if matched_catalog and matched_catalog.get("name"):
+                item = str(matched_catalog.get("name"))[:160]
+        except Exception:
+            resolved_catalog_id = 0
     actor_id = str(actor.get("user_id") or actor.get("id") or "").strip()
     actor_name = str(actor.get("username") or actor.get("global_name") or actor_id or "Dashboard")
     if not actor_id:
@@ -3600,6 +3685,7 @@ def _enqueue_loot_drop_request(guild_id: int, drop_type: str, item_query: str, a
         "drop_type": dtype,
         "item_query": item,
         "item_name": item,
+        "catalog_item_id": int(resolved_catalog_id or 0),
         "requested_by": {"id": actor_id, "name": actor_name},
         "requested_at": datetime.now(timezone.utc).isoformat(),
         "source": "dashboard_loot_drop",
@@ -3714,7 +3800,7 @@ def _render_auction_detail(data: dict[str, Any], auction_id: str, current_user: 
         </section>
         """
 
-    item_panel = _catalog_item_detail_panel(auction.get("item_name") or auction.get("item") or auction_id)
+    item_panel = _catalog_item_detail_panel(auction.get("item_name") or auction.get("item") or auction_id, reference=auction)
 
     body = f"""
     <nav class="topnav"><a href="/">← Übersicht</a><a href="/loot">Loot</a><a href="#item-database">Item</a><a href="#bid">Bieten/Kaufen</a><a href="#loot-actions">Queue</a><a href="#bids">Gebote</a><a href="#eligible">Berechtigte</a><a href="#tech">Technik</a><a href="/api/snapshot">JSON</a></nav>
@@ -6134,7 +6220,7 @@ def _render_loot_dashboard(data: dict[str, Any]) -> str:
             continue
         leader = _auction_leader_or_roll_text(a, snap)
         _, count_value, _ = _auction_count_label(a)
-        row = [_auction_link(a.get("auction_id"), a.get("item_name")), _phase_label(a), _loot_effective_status_label(a), count_value, leader, _member_link(a.get("winner_user_id"), _snapshot_display_name(snap, a.get("winner_user_id"), a.get("winner_name"))) if a.get("winner_user_id") else "—", _auction_timer_text(a)]
+        row = [_auction_link(a.get("auction_id"), a.get("item_name"), a), _phase_label(a), _loot_effective_status_label(a), count_value, leader, _member_link(a.get("winner_user_id"), _snapshot_display_name(snap, a.get("winner_user_id"), a.get("winner_name"))) if a.get("winner_user_id") else "—", _auction_timer_text(a)]
         if _loot_is_active(a):
             active_rows.append(row)
         else:
@@ -6669,7 +6755,7 @@ def _render_loot_check(data: dict[str, Any], item_query: str = "") -> str:
     for a in check.get("auction_matches") or []:
         aid = a.get("auction_id")
         auction_rows.append([
-            _auction_link(aid, a.get("item")) if aid else a.get("item"),
+            _auction_link(aid, a.get("item"), a.get("raw") or a) if aid else a.get("item"),
             a.get("score") if q else "—",
             a.get("mode"),
             a.get("status_label") or _loot_status_label(a.get("status")),
@@ -6734,6 +6820,21 @@ def _loot_catalog_items(snap: dict[str, Any], limit: int = 800) -> list[dict[str
         for row in obj.get("items") or []:
             if isinstance(row, dict):
                 add(row.get("raw_item_name") or row.get("item_name") or row.get("item") or row.get("new_item") or row.get("old_item") or row, row.get("slot") or row.get("slot_name"))
+    if query_items is not None and _item_catalog_available():
+        try:
+            for catalog_item in query_items(limit=min(max(int(limit), 200), 500), offset=0):  # type: ignore[misc]
+                if not isinstance(catalog_item, dict):
+                    continue
+                name = str(catalog_item.get("name") or "").strip()
+                if not name:
+                    continue
+                key = _loot_key(name)
+                row = found.setdefault(key, {"name": name, "slot": str(catalog_item.get("sub_category") or catalog_item.get("main_category") or "")})
+                row["catalog_item_id"] = int(catalog_item.get("id") or 0)
+                row["catalog_source_item_id"] = str(catalog_item.get("source_item_id") or "")
+                row["catalog_source_url"] = str(catalog_item.get("source_url") or "")
+        except Exception:
+            pass
     items = sorted(found.values(), key=lambda x: x.get("name", "").lower())
     return items[:limit]
 
@@ -6745,24 +6846,30 @@ def _loot_catalog_item_names(snap: dict[str, Any], limit: int = 650) -> list[str
 def _loot_item_picker_html(snap: dict[str, Any], *, input_id: str, name: str = "item", required: bool = True, placeholder: str = "Item auswählen oder tippen", slot_select_id: str = "") -> str:
     items = _loot_catalog_items(snap)
     datalist_id = f"{input_id}-list"
+    hidden_id = f"{input_id}-catalog-id"
     required_attr = " required" if required else ""
     options = "".join(f'<option value="{_e(item.get("name"))}"></option>' for item in items)
-    select_options = "".join(f'<option value="{_e(item.get("name"))}" data-slot="{_e(item.get("slot"))}">{_e(item.get("name"))}{(" · " + _e(item.get("slot"))) if item.get("slot") else ""}</option>' for item in items[:500])
+    select_options = "".join(
+        f'<option value="{_e(item.get("name"))}" data-slot="{_e(item.get("slot"))}" data-catalog-id="{_e(item.get("catalog_item_id") or 0)}">'
+        f'{_e(item.get("name"))}{(" · " + _e(item.get("slot"))) if item.get("slot") else ""}</option>'
+        for item in items[:500]
+    )
     filter_attr = f' data-slot-source="{_e(slot_select_id)}"' if slot_select_id else ""
     select = ""
     if items:
         select = (
             f'<select class="item-picker-select"{filter_attr} '
-            f'onchange="var el=document.getElementById(\'{_e(input_id)}\'); '
-            f'if(el && this.value) el.value=this.value; this.selectedIndex=0;">'
+            f'onchange="var el=document.getElementById(\'{_e(input_id)}\'); var hid=document.getElementById(\'{_e(hidden_id)}\'); '
+            f'if(el && this.value) el.value=this.value; if(hid) hid.value=this.options[this.selectedIndex].dataset.catalogId || 0; this.selectedIndex=0;">'
             f'<option value="">Item aus Liste anklicken ...</option>{select_options}</select>'
         )
     return (
-        f'{select}<input id="{_e(input_id)}" list="{_e(datalist_id)}" name="{_e(name)}"{required_attr} '
+        f'{select}<input type="hidden" id="{_e(hidden_id)}" name="catalog_item_id" value="0">'
+        f'<input id="{_e(input_id)}" list="{_e(datalist_id)}" name="{_e(name)}"{required_attr} '
+        f'oninput="var hid=document.getElementById(\'{_e(hidden_id)}\'); if(hid) hid.value=0;" '
         f'placeholder="{_e(placeholder)}" autocomplete="off">'
         f'<datalist id="{_e(datalist_id)}">{options}</datalist>'
-        f'<small class="muted">{len(items)} bekannte Items aus Online-Datenbank/Needs/Auktionen. '
-        f'Bei Slot-Auswahl wird die Klickliste gefiltert.</small>'
+        f'<small class="muted">{len(items)} bekannte Items. Auswahl aus der Liste speichert die feste Datenbank-ID; Freitext bleibt als Fallback möglich.</small>'
     )
 
 
@@ -6849,48 +6956,78 @@ def _need_item_slot_matches(item_slot: str, target_slot: str, item_name: str = "
 
 
 def _need_slot_picker_html(snap: dict[str, Any], *, input_id: str, slot: str, name: str = "item_text", required: bool = False, placeholder: str = "Item auswählen oder tippen") -> str:
-    """Kompakter Slot-Picker.
+    """Kompakter Slot-Picker mit stabiler Item-Katalog-ID.
 
-    Waffen: zuerst Waffenart wählen, danach werden rechts nur passende Waffen angezeigt.
-    Andere Slots: direkt passende Items für den Slot anzeigen.
+    Eine Auswahl aus dem Dropdown speichert zusätzlich ``item_catalog_id``. Bei
+    Freitext wird die ID bewusst auf 0 gesetzt und bleibt nur ein Legacy-Fallback.
     """
     items = _loot_catalog_items(snap)
     slot_kind = _need_slot_kind(slot)
     required_attr = " required" if required else ""
     datalist_id = f"{input_id}-list"
-    # Kandidaten stark auf den Slot begrenzen; wenn keine Treffer, fallback auf alle bekannten Items.
+    hidden_id = f"{input_id}-catalog-id"
     filtered = [it for it in items if _need_item_slot_matches(it.get("slot", ""), slot, it.get("name", ""))]
     if not filtered:
         filtered = items
     options = "".join(f'<option value="{_e(it.get("name"))}"></option>' for it in filtered[:650])
+
+    input_html = (
+        f'<input type="hidden" id="{_e(hidden_id)}" name="item_catalog_id" value="0">'
+        f'<input id="{_e(input_id)}" list="{_e(datalist_id)}" name="{_e(name)}"{required_attr} '
+        f'oninput="var hid=document.getElementById(\'{_e(hidden_id)}\'); if(hid) hid.value=0;" '
+        f'placeholder="{_e(placeholder)}" autocomplete="off">'
+        f'<datalist id="{_e(datalist_id)}">{options}</datalist>'
+    )
+
     if slot_kind == "weapon":
-        # Waffenarten sind der erste Klick. Die Itemliste rechts wird per JS gefiltert.
-        weapon_opts = ''.join(f'<option value="{_e(w)}">{_e(w)}</option>' for w in _WEAPON_TYPES)
-        select_options = []
+        weapon_opts = "".join(f'<option value="{_e(w)}">{_e(w)}</option>' for w in _WEAPON_TYPES)
+        select_options: list[str] = []
         for it in filtered[:650]:
-            name_val = it.get("name") or ""
+            name_val = str(it.get("name") or "")
             wt = _weapon_type_from_text(name_val)
             if not wt and it.get("slot") and str(it.get("slot")).lower().startswith("waffe"):
                 wt = ""
-            select_options.append(f'<option value="{_e(name_val)}" data-weapon="{_e(wt)}">{_e(name_val)}{(" · " + _e(wt)) if wt else ""}</option>')
+            select_options.append(
+                f'<option value="{_e(name_val)}" data-weapon="{_e(wt)}" '
+                f'data-catalog-id="{_e(it.get("catalog_item_id") or 0)}">'
+                f'{_e(name_val)}{(" · " + _e(wt)) if wt else ""}</option>'
+            )
+        choose_js = (
+            f"var opt=this.options[this.selectedIndex];"
+            f"var el=document.getElementById('{_e(input_id)}');"
+            f"var hid=document.getElementById('{_e(hidden_id)}');"
+            "if(el && this.value) el.value=this.value;"
+            "if(hid) hid.value=(opt && opt.dataset.catalogId) || 0;"
+            "this.selectedIndex=0;"
+        )
         return (
             f'<div class="need-two-step-picker" data-need-picker="weapon">'
             f'<select class="weapon-type-picker" name="weapon_type" onchange="refreshNeedWeaponPicker(this)">'
             f'<option value="">1. Waffenart wählen</option>{weapon_opts}</select>'
-            f'<select class="item-picker-select weapon-item-picker" onchange="var el=document.getElementById(\'{_e(input_id)}\'); if(el && this.value) el.value=this.value; this.selectedIndex=0;">'
+            f'<select class="item-picker-select weapon-item-picker" onchange="{_e(choose_js)}">'
             f'<option value="">2. Item rechts auswählen ...</option>{"".join(select_options)}</select>'
-            f'<input id="{_e(input_id)}" list="{_e(datalist_id)}" name="{_e(name)}"{required_attr} placeholder="{_e(placeholder)}" autocomplete="off">'
-            f'<datalist id="{_e(datalist_id)}">{options}</datalist>'
-            f'<small class="muted">Erst Waffenart, dann passendes Item. Freitext bleibt möglich.</small>'
+            f'{input_html}'
+            f'<small class="muted">Erst Waffenart, dann Item. Dropdown-Auswahl speichert die feste Datenbank-ID.</small>'
             f'</div>'
         )
-    select_options = ''.join(f'<option value="{_e(it.get("name"))}">{_e(it.get("name"))}</option>' for it in filtered[:650])
+
+    select_options = "".join(
+        f'<option value="{_e(it.get("name"))}" data-catalog-id="{_e(it.get("catalog_item_id") or 0)}">{_e(it.get("name"))}</option>'
+        for it in filtered[:650]
+    )
+    choose_js = (
+        f"var opt=this.options[this.selectedIndex];"
+        f"var el=document.getElementById('{_e(input_id)}');"
+        f"var hid=document.getElementById('{_e(hidden_id)}');"
+        "if(el && this.value) el.value=this.value;"
+        "if(hid) hid.value=(opt && opt.dataset.catalogId) || 0;"
+        "this.selectedIndex=0;"
+    )
     return (
-        f'<select class="item-picker-select" onchange="var el=document.getElementById(\'{_e(input_id)}\'); if(el && this.value) el.value=this.value; this.selectedIndex=0;">'
+        f'<select class="item-picker-select" onchange="{_e(choose_js)}">'
         f'<option value="">Passendes Item für {_e(slot)} auswählen ... ({len(filtered)})</option>{select_options}</select>'
-        f'<input id="{_e(input_id)}" list="{_e(datalist_id)}" name="{_e(name)}"{required_attr} placeholder="{_e(placeholder)}" autocomplete="off">'
-        f'<datalist id="{_e(datalist_id)}">{options}</datalist>'
-        f'<small class="muted">{len(filtered)} bekannte Treffer für diesen Slot. Freitext bleibt möglich.</small>'
+        f'{input_html}'
+        f'<small class="muted">{len(filtered)} Treffer. Dropdown-Auswahl speichert die feste Datenbank-ID.</small>'
     )
 
 def _render_loot_center(data: dict[str, Any], request: Optional[Request] = None, msg: str = "") -> str:
@@ -6914,7 +7051,7 @@ def _render_loot_center(data: dict[str, Any], request: Optional[Request] = None,
     for a in center["next_actions"][:80]:
         aid = a.get("auction_id")
         action_rows.append([
-            _auction_link(aid, a.get("item")) if aid else a.get("item"),
+            _auction_link(aid, a.get("item"), a.get("raw") or a) if aid else a.get("item"),
             a.get("mode"),
             a.get("status_label") or _loot_status_label(a.get("status")),
             (_auction_count_label(a.get("raw") or {})[1] if isinstance(a.get("raw"), dict) else a.get("bid_count")),
@@ -6928,7 +7065,7 @@ def _render_loot_center(data: dict[str, Any], request: Optional[Request] = None,
     for a in center["active"]:
         aid = a.get("auction_id")
         active_rows.append([
-            _auction_link(aid, a.get("item")) if aid else a.get("item"),
+            _auction_link(aid, a.get("item"), a.get("raw") or a) if aid else a.get("item"),
             a.get("mode"),
             a.get("status_label") or _loot_status_label(a.get("status")),
             (_auction_count_label(a.get("raw") or {})[1] if isinstance(a.get("raw"), dict) else a.get("bid_count")),
@@ -6942,7 +7079,7 @@ def _render_loot_center(data: dict[str, Any], request: Optional[Request] = None,
     for a in center["handover"]:
         aid = a.get("auction_id")
         handover_rows.append([
-            _auction_link(aid, a.get("item")) if aid else a.get("item"),
+            _auction_link(aid, a.get("item"), a.get("raw") or a) if aid else a.get("item"),
             _loot_winner_cell(a.get("raw") or {}, names),
             a.get("leader"),
             (_auction_timer_text(a.get("raw") or {}) if isinstance(a.get("raw"), dict) else _dt(a.get("ends_at"))),
@@ -6953,7 +7090,7 @@ def _render_loot_center(data: dict[str, Any], request: Optional[Request] = None,
     for a in center["no_bid"][:80]:
         aid = a.get("auction_id")
         no_bid_rows.append([
-            _auction_link(aid, a.get("item")) if aid else a.get("item"),
+            _auction_link(aid, a.get("item"), a.get("raw") or a) if aid else a.get("item"),
             a.get("mode"),
             f"{a.get('main_need_count', 0)} / {a.get('secondary_need_count', 0)}",
             (_auction_timer_text(a.get("raw") or {}) if isinstance(a.get("raw"), dict) else _dt(a.get("ends_at"))),
@@ -6975,7 +7112,7 @@ def _render_loot_center(data: dict[str, Any], request: Optional[Request] = None,
     for a in center["history"][:250]:
         aid = a.get("auction_id")
         history_rows.append([
-            _auction_link(aid, a.get("item")) if aid else a.get("item"),
+            _auction_link(aid, a.get("item"), a.get("raw") or a) if aid else a.get("item"),
             a.get("mode"),
             _loot_status_label(a.get("status")),
             (_auction_count_label(a.get("raw") or {})[1] if isinstance(a.get("raw"), dict) else a.get("bid_count")),
@@ -7001,7 +7138,7 @@ def _render_loot_center(data: dict[str, Any], request: Optional[Request] = None,
             <form method="post" action="/admin/loot/drop" style="display:grid;gap:10px;">
               <h3>🧹 Müll gedroppt</h3>
               <input type="hidden" name="drop_type" value="junk_drop">
-              <label>Freier Itemname<br><input name="item" required placeholder="z. B. Restitem aus Truhe" style="width:100%;padding:12px;border-radius:12px;border:1px solid rgba(255,255,255,.16);background:rgba(0,0,0,.22);color:inherit"></label>
+              <label>Item aus Datenbank oder Freitext<br>{_loot_item_picker_html(snap, input_id="junk-drop-item", placeholder="z. B. Restitem aus Truhe")}</label>
               <button class="btn" type="submit" onclick="return confirm('Müll-Drop an den Bot senden?');">Müll-Drop erstellen</button>
               <p class="muted">Bot erstellt ein kostenloses Müll-/Würfelitem.</p>
             </form>
@@ -7228,6 +7365,7 @@ def _loot_history_payload_from_snapshot(snap: dict[str, Any], guild_id: int = 0)
                 "amount": amount,
                 "created_at": btime,
                 "status": bstatus,
+                "raw": a,
             }
             bid_rows.append(bid_entry)
             if uid:
@@ -7284,7 +7422,7 @@ def _render_loot_history(data: dict[str, Any]) -> str:
     for r in hist.get("winner_rows") or []:
         aid = r.get("auction_id")
         winner_rows.append([
-            _auction_link(aid, r.get("item")) if aid else r.get("item"),
+            _auction_link(aid, r.get("item"), r.get("raw") or r) if aid else r.get("item"),
             r.get("mode"),
             _member_link(r.get("winner_user_id"), r.get("winner_name")) if r.get("winner_user_id") else r.get("winner_name"),
             _fmt_ec(r.get("winning_amount")),
@@ -7298,7 +7436,7 @@ def _render_loot_history(data: dict[str, Any]) -> str:
         aid = b.get("auction_id")
         bid_rows.append([
             _dt(b.get("created_at")),
-            _auction_link(aid, b.get("item")) if aid else b.get("item"),
+            _auction_link(aid, b.get("item"), b.get("raw") or b) if aid else b.get("item"),
             b.get("mode"),
             _member_link(b.get("user_id"), b.get("display_name")) if b.get("user_id") else b.get("display_name"),
             _fmt_ec(b.get("amount")),
@@ -7327,7 +7465,7 @@ def _render_loot_history(data: dict[str, Any]) -> str:
             _dt(a.get("requested_at")),
             a.get("actor_name") or a.get("actor_id") or "—",
             _loot_action_type_label(a.get("action_type")),
-            _auction_link(aid, item) if aid else item,
+            _auction_link(aid, item, payload or a) if aid else item,
             _fmt_ec(a.get("amount")),
             _loot_action_status_label(a.get("status")),
             _loot_result_text(a),
@@ -7337,7 +7475,7 @@ def _render_loot_history(data: dict[str, Any]) -> str:
     for r in hist.get("auction_rows") or []:
         aid = r.get("auction_id")
         all_auction_rows.append([
-            _auction_link(aid, r.get("item")) if aid else r.get("item"),
+            _auction_link(aid, r.get("item"), r.get("raw") or r) if aid else r.get("item"),
             r.get("mode"),
             _loot_status_label(r.get("status")),
             r.get("bid_count"),
@@ -7389,19 +7527,19 @@ def _render_member_loot_history(data: dict[str, Any], user_id: int) -> str:
     win_rows = []
     for r in payload.get("wins") or []:
         aid = r.get("auction_id")
-        win_rows.append([_auction_link(aid, r.get("item")) if aid else r.get("item"), r.get("mode"), _fmt_ec(r.get("winning_amount")), r.get("bid_count"), _dt(r.get("closed_at"))])
+        win_rows.append([_auction_link(aid, r.get("item"), r.get("raw") or r) if aid else r.get("item"), r.get("mode"), _fmt_ec(r.get("winning_amount")), r.get("bid_count"), _dt(r.get("closed_at"))])
 
     bid_rows = []
     for b in payload.get("bids") or []:
         aid = b.get("auction_id")
-        bid_rows.append([_dt(b.get("created_at")), _auction_link(aid, b.get("item")) if aid else b.get("item"), b.get("mode"), _fmt_ec(b.get("amount")), b.get("status")])
+        bid_rows.append([_dt(b.get("created_at")), _auction_link(aid, b.get("item"), b.get("raw") or b) if aid else b.get("item"), b.get("mode"), _fmt_ec(b.get("amount")), b.get("status")])
 
     action_rows = []
     for a in payload.get("actions") or []:
         p = a.get("payload") if isinstance(a.get("payload"), dict) else {}
         item = p.get("item_name") or p.get("item") or a.get("auction_id")
         aid = str(a.get("auction_id") or p.get("auction_id") or "")
-        action_rows.append([_dt(a.get("requested_at")), _loot_action_type_label(a.get("action_type")), _auction_link(aid, item) if aid else item, _fmt_ec(a.get("amount")), _loot_action_status_label(a.get("status")), _loot_result_text(a)])
+        action_rows.append([_dt(a.get("requested_at")), _loot_action_type_label(a.get("action_type")), _auction_link(aid, item, p or a) if aid else item, _fmt_ec(a.get("amount")), _loot_action_status_label(a.get("status")), _loot_result_text(a)])
 
     body = f"""
     <nav class="topnav"><a href="/member/{_e(user_id)}">← Mitglied</a><a href="/loot-history">Loot-Verlauf</a><a href="/loot">Loot</a><a href="/ec">EC</a></nav>
@@ -7938,7 +8076,7 @@ def _render_member_detail(data: dict[str, Any], user_id: int, current_user: Opti
 
     auction_rows = []
     for a in _auctions_for_user(snap, user_id, limit=80):
-        auction_rows.append([_auction_link(a.get("auction_id"), a.get("item_name")), a.get("status"), _phase_label(a), _fmt_ec(a.get("top_bid_amount")) if a.get("top_bid_amount") is not None else "—", _dt(a.get("ends_at"))])
+        auction_rows.append([_auction_link(a.get("auction_id"), a.get("item_name"), a), a.get("status"), _phase_label(a), _fmt_ec(a.get("top_bid_amount")) if a.get("top_bid_amount") is not None else "—", _dt(a.get("ends_at"))])
 
     event_rows = _member_event_rows(snap, int(user_id))
     cards = "".join([
@@ -8365,9 +8503,27 @@ def _catalog_item_match(item_name: Any) -> Optional[dict[str, Any]]:
     return dict(best) if isinstance(best, dict) else None
 
 
-def _catalog_item_reference_html(item_name: Any, *, primary_href: str = "") -> str:
+def _catalog_item_from_reference(reference: Any) -> Optional[dict[str, Any]]:
+    if isinstance(reference, dict):
+        try:
+            direct_id = int(reference.get("catalog_item_id") or reference.get("item_catalog_id") or 0)
+        except Exception:
+            direct_id = 0
+        if direct_id and get_item_by_id is not None:
+            try:
+                item = get_item_by_id(direct_id)  # type: ignore[misc]
+                if item:
+                    return dict(item)
+            except Exception:
+                pass
+        name = reference.get("catalog_item_name") or reference.get("item_name") or reference.get("item") or reference.get("name")
+        return _catalog_item_match(name)
+    return _catalog_item_match(reference)
+
+
+def _catalog_item_reference_html(item_name: Any, *, primary_href: str = "", reference: Any = None) -> str:
     clean_name = _loot_text(item_name) or str(item_name or "Item")
-    item = _catalog_item_match(clean_name)
+    item = _catalog_item_from_reference(reference if reference is not None else item_name)
     primary = str(primary_href or "").strip()
     if not item:
         return f'<a class="link" href="{_e(primary)}">{_e(clean_name)}</a>' if primary else _e(clean_name)
@@ -8385,7 +8541,7 @@ def _catalog_item_reference_html(item_name: Any, *, primary_href: str = "") -> s
     stats = _item_stat_preview(item, max_len=110)
     ability = _item_ability_preview(item, max_len=120)
     meta_parts = [x for x in (rarity, sub, stats if stats != "—" else "") if x]
-    tooltip_parts = [clean_name] + meta_parts + ([ability] if ability and ability != "—" else [])
+    tooltip_parts = [str(item.get("name") or clean_name)] + meta_parts + ([ability] if ability and ability != "—" else [])
     tooltip = " · ".join(tooltip_parts)
     return (
         f'<div class="catalog-item-ref" title="{_e(tooltip)}">'
@@ -8397,14 +8553,14 @@ def _catalog_item_reference_html(item_name: Any, *, primary_href: str = "") -> s
     )
 
 
-def _catalog_item_detail_panel(item_name: Any) -> str:
-    item = _catalog_item_match(item_name)
+def _catalog_item_detail_panel(item_name: Any, *, reference: Any = None) -> str:
+    item = _catalog_item_from_reference(reference if reference is not None else item_name)
     if not item:
         return ""
     return (
         '<section class="panel catalog-linked-panel" id="item-database">'
         '<h2>📚 Verknüpftes Item aus der Datenbank</h2>'
-        '<p class="muted">Bild, Grundwerte, Fähigkeiten, Zusatzwerte und Traits stammen aus dem importierten Item-Katalog.</p>'
+        '<p class="muted">Bild, Grundwerte, Fähigkeiten, Zusatzwerte und Traits stammen über die feste Item-ID aus dem importierten Item-Katalog.</p>'
         f'{_item_card_html(item)}'
         '</section>'
     )
@@ -9894,10 +10050,14 @@ async def admin_loot_drop_dashboard(request: Request, _: bool = Depends(_admin_a
         form = _parse_urlencoded_body(raw)
         drop_type = str(form.get("drop_type") or "loot_drop").strip().lower()
         item = str(form.get("item") or "").strip()
+        try:
+            catalog_item_id = int(form.get("catalog_item_id") or 0)
+        except Exception:
+            catalog_item_id = 0
         payload = _snapshot_payload()
         guild_id = _safe_guild_id(payload)
         actor = _current_user(request) or {}
-        result = _enqueue_loot_drop_request(int(guild_id), drop_type, item, actor)
+        result = _enqueue_loot_drop_request(int(guild_id), drop_type, item, actor, catalog_item_id=catalog_item_id)
         if result.get("ok"):
             msg = "✅ " + str(result.get("message") or "Drop wurde an den Bot gesendet.")
         else:
@@ -10644,7 +10804,7 @@ def _member_home_auction_rows(auctions: list[dict[str, Any]], snap: dict[str, An
         title = _loot_text(a.get("item_name") or a.get("item") or aid)
         count_title, count_value, _ = _auction_count_label(a)
         meta = f"{_phase_label(a)} · {count_value} {count_title} · {_auction_leader_or_roll_text(a, snap)} · {_auction_timer_text(a)}"
-        items.append(f'<div class="member-summary-item"><div><div class="member-summary-title">{_cell(_auction_link(aid, title))}</div><div class="member-summary-meta">{_e(meta)}</div></div></div>')
+        items.append(f'<div class="member-summary-item"><div><div class="member-summary-title">{_cell(_auction_link(aid, title, a))}</div><div class="member-summary-meta">{_e(meta)}</div></div></div>')
     return '<div class="member-summary-list">' + ''.join(items) + '</div>'
 
 def _render_member_home(data: dict[str, Any], request: Request) -> str:
@@ -10760,7 +10920,7 @@ def _render_member_auctions_page(data: dict[str, Any], request: Request) -> str:
         aid = str(a.get("auction_id") or "")
         count_title, count_value, _ = _auction_count_label(a)
         rows.append([
-            _auction_link(aid, a.get("item_name") or a.get("item") or aid),
+            _auction_link(aid, a.get("item_name") or a.get("item") or aid, a),
             _phase_label(a),
             _loot_effective_status_label(a),
             f"{count_value} {count_title}",
@@ -13130,7 +13290,7 @@ def _render_leadership_dashboard(data: dict[str, Any]) -> str:
         if not isinstance(a, dict):
             continue
         auction_rows.append([
-            _auction_link(a.get("auction_id"), a.get("item_name") or a.get("title")),
+            _auction_link(a.get("auction_id"), a.get("item_name") or a.get("title"), a),
             a.get("status") or "—",
             a.get("phase") or "—",
             _auction_leader_text(a, names),
@@ -13793,11 +13953,36 @@ async def portal_need_change(user_id: int, request: Request, _: bool = Depends(_
     if action_type == "set" and not item_text:
         raise HTTPException(status_code=400, detail="Itemname fehlt.")
     actor = _current_user(request) or {"user_id": "basic-admin", "username": "Basic Admin"}
+    try:
+        item_catalog_id = int(form.get("item_catalog_id") or 0)
+    except Exception:
+        item_catalog_id = 0
+    selected_catalog_item = None
+    if item_catalog_id and get_item_by_id is not None:
+        try:
+            selected_catalog_item = get_item_by_id(item_catalog_id)  # type: ignore[misc]
+        except Exception:
+            selected_catalog_item = None
+    if selected_catalog_item is None and item_text:
+        try:
+            selected_catalog_item = _catalog_item_match(item_text)
+            item_catalog_id = int((selected_catalog_item or {}).get("id") or 0)
+            if selected_catalog_item and selected_catalog_item.get("name"):
+                item_text = str(selected_catalog_item.get("name"))
+        except Exception:
+            selected_catalog_item = None
     payload = {
         "target_user_id": int(user_id),
         "tab": tab,
         "slot": slot,
         "item_text": item_text,
+        "item_catalog_id": int(item_catalog_id or 0),
+        "item_name": str((selected_catalog_item or {}).get("name") or item_text),
+        "item_source_url": str((selected_catalog_item or {}).get("source_url") or ""),
+        "catalog_source_item_id": str((selected_catalog_item or {}).get("source_item_id") or ""),
+        "item_image_url": str((selected_catalog_item or {}).get("manual_image_url") or (selected_catalog_item or {}).get("image_url") or (selected_catalog_item or {}).get("icon_url") or ""),
+        "main_category": str((selected_catalog_item or {}).get("main_category") or ""),
+        "sub_category": str((selected_catalog_item or {}).get("sub_category") or ""),
         "weapon_type": weapon_type if slot.startswith("Waffe") else "",
         "source": "dashboard_portal",
         "admin_override": bool(_is_portal_admin(request) and _current_user_id(request) != int(user_id)),
@@ -16965,12 +17150,21 @@ def _phase3_member_rows_from_snapshot(snap: dict[str, Any]) -> list[dict[str, An
         candidates.extend(_phase3_list(quality.get("users_without_needs") or []))
         risk_members = insights_raw.get("risk_members") or []
         candidates.extend(_phase3_list(risk_members))
+    active_ids = _snapshot_active_member_ids(snap)
     out: dict[str, dict[str, Any]] = {}
     for row in candidates:
         if not isinstance(row, dict):
             continue
         uid = _phase3_first_id(row, ["user_id", "discord_id", "id", "member_id"])
         if not uid:
+            continue
+        try:
+            uid_int = int(uid)
+        except Exception:
+            uid_int = 0
+        if active_ids and uid_int not in active_ids:
+            continue
+        if row.get("is_dashboard_member") is False or row.get("is_active") is False:
             continue
         current = out.get(uid, {})
         merged = dict(current)
