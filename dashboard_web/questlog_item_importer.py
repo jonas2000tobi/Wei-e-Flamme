@@ -4122,7 +4122,7 @@ def run_images_only(args: argparse.Namespace) -> int:
         FROM item_catalog ic
         LEFT JOIN item_catalog_image_overrides ov ON ov.source_url = ic.source_url
         WHERE ic.source = 'questlog' AND ic.is_active = TRUE
-          AND source_url LIKE %s
+          AND ic.source_url LIKE %s
     """
     params: list[Any] = ["%/db/item/%"]
     if wanted:
