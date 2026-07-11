@@ -2258,30 +2258,53 @@ def page_title(page) -> str:
 
 
 def _safe_item_asset_url(url: Any, expected_main_category: str = "", expected_sub_category: str = "") -> bool:
-    """True nur für echte Questlog-Equip-Icons, nie für Perks/Skills/ähnliche Inhalte."""
-    low = str(url or "").strip().lower()
+    """Akzeptiert echte Questlog/TL-Itemicons, lehnt Skills/Perks/Navigation ab.
+
+    Questlog liefert Zubehörbilder nicht auf jeder Seite unter einem ``/Equip/``-
+    Unterordner. Neuere CDN-Varianten liegen teilweise direkt unter
+    ``/Icon/Item_128/...``. Die alte harte ``/Equip/Accessory/``-Prüfung hat deshalb
+    sämtliche Broschen und Ringe verworfen. Kategoriepfade werden nur noch dann als
+    Ausschluss verwendet, wenn sie *eindeutig* einer anderen Gegenstandsart angehören.
+    """
+    raw = str(url or "").strip()
+    low = raw.lower()
     if not low or low.startswith("data:") or low.endswith(".svg"):
         return False
     if any(x in low for x in (
-        "perk_", "/misc/perk", "/skill/", "/ability/", "/passive/", "/trait/",
-        "avatar", "profile", "logo", "favicon", "map", "youtube", "discord",
-        "doubleclick", "googleads", "advertisement",
+        "perk_", "/misc/perk", "/misc/skill", "/skill/", "/ability/", "/passive/", "/trait/",
+        "avatar", "profile", "logo", "favicon", "worldmap", "/map/", "youtube", "discord",
+        "doubleclick", "googleads", "advertisement", "banner", "background", "placeholder",
     )):
         return False
-    # Questlog/TL-Itemicons liegen im Equip-Zweig. Ohne dieses Signal lieber kein
-    # Bild als ein falsches Bild von Fähigkeit, ähnlichem Item oder Werbung.
-    if "/equip/" not in low and "/icon/item_128/equip/" not in low:
+
+    # Questlog-Itemicons. Neben dem älteren /Equip/-Pfad existiert ein generischer
+    # Item_128-Pfad ohne Equip-Segment. Genau dieser fehlte bisher.
+    is_item128 = "/icon/item_128/" in low or "/item_128/" in low
+    is_equip = "/equip/" in low
+    filename = low.rsplit("/", 1)[-1].split("?", 1)[0]
+    looks_like_item_file = bool(re.search(r"(?:^|[_-])it[_-][a-z0-9_-]+\.(?:png|webp|jpe?g)$", filename))
+    if not (is_item128 or is_equip or looks_like_item_file):
         return False
+
     main = clean_text(expected_main_category).lower()
     sub = clean_text(expected_sub_category).lower()
-    if main == "weapon" and "/weapon/" not in low:
+
+    # Nur eindeutige Widersprüche ablehnen. Ein generischer Item_128-Pfad enthält
+    # häufig weder "accessory" noch den Slotnamen und ist trotzdem das richtige Bild.
+    has_weapon = any(x in low for x in ("/weapon/", "_weapon_", "it_p_sword", "it_p_dagger", "it_p_bow", "it_p_crossbow", "it_p_staff", "it_p_wand", "it_p_spear", "it_p_orb", "it_p_gauntlet"))
+    has_armor = any(x in low for x in ("/armor/", "/equipment/", "_helmet_", "_chest_", "_glove_", "_boots_", "_pants_", "_cloak_"))
+    has_accessory = any(x in low for x in ("/accessory/", "_accessory_", "_ring_", "_brooch_", "_earring_", "_necklace_", "_bracelet_", "_belt_"))
+
+    if main == "weapon" and (has_armor or has_accessory) and not has_weapon:
         return False
-    if main == "accessory" and "/accessory/" not in low:
+    if main == "armor" and (has_weapon or has_accessory) and not has_armor:
         return False
-    if main == "armor" and not any(x in low for x in ("/armor/", "/equipment/")):
+    if main == "accessory" and (has_weapon or has_armor) and not has_accessory:
         return False
-    # Unterkategorie als zusätzlicher Schutz, soweit der CDN-Pfad sie enthält.
-    slot_aliases = {
+
+    # Falls der Pfad ausdrücklich einen anderen Zubehörslot nennt, verwerfen. Fehlt
+    # ein Slotsignal komplett, bleibt das Bild als möglicher exakter Itemtreffer erlaubt.
+    slot_tokens = {
         "brosche": ("brooch", "brosche"),
         "ring": ("ring",),
         "ohrringe": ("earring", "earrings", "ohrring"),
@@ -2291,11 +2314,13 @@ def _safe_item_asset_url(url: Any, expected_main_category: str = "", expected_su
         "gürtel": ("belt", "guertel", "gurtel"),
         "guertel": ("belt", "guertel", "gurtel"),
     }
-    aliases = slot_aliases.get(sub, ())
-    # Nicht hart ablehnen, wenn Questlog im Pfad nur "Accessory" nutzt.
-    # Das Slotsignal wird später nur zum Scoring verwendet.
+    if main == "accessory" and sub in slot_tokens:
+        all_slot_words = {w for vals in slot_tokens.values() for w in vals}
+        explicit = {w for w in all_slot_words if w in low}
+        wanted = set(slot_tokens[sub])
+        if explicit and explicit.isdisjoint(wanted):
+            return False
     return True
-
 
 def _exact_item_image_from_json(page, detail_id: str, expected_main_category: str = "", expected_sub_category: str = "") -> str | None:
     """Liest das Bild aus genau dem JSON-Objekt der geöffneten Item-ID.
@@ -2429,11 +2454,12 @@ def collect_image_urls(page, expected_main_category: str = "", expected_sub_cate
         # - Passiv-/Fähigkeitsbilder liegen oft unter .../Icon/Item_128/Misc/Perk_...
         #   und enthalten manchmal sogar die Item-ID. Deshalb muss Perk stärker verlieren
         #   als die ID gewinnen kann.
+        is_item128_asset = "/icon/item_128/" in low or "/item_128/" in low
         is_equip_asset = "/icon/item_128/equip/" in low or "/equip/" in low
-        is_weapon_asset = "/equip/weapon/" in low
+        is_weapon_asset = "/equip/weapon/" in low or "/weapon/" in low
         is_accessory_asset = "/equip/accessory/" in low or "/accessory/" in low
-        is_plain_armor_asset = "/equip/armor/" in low
-        is_armor_asset = is_plain_armor_asset or is_accessory_asset or "/equip/equipment/" in low
+        is_plain_armor_asset = "/equip/armor/" in low or "/armor/" in low
+        is_armor_asset = is_plain_armor_asset or "/equip/equipment/" in low
         is_perk_asset = "/misc/perk" in low or "perk_" in low
 
         # Eindeutige Kategorie-Widersprüche sofort verwerfen. Das verhindert,
@@ -2448,10 +2474,16 @@ def collect_image_urls(page, expected_main_category: str = "", expected_sub_cate
 
         if is_weapon_asset:
             score += 820
+        elif is_accessory_asset:
+            score += 800
         elif is_armor_asset:
             score += 760
         elif is_equip_asset:
             score += 520
+        elif is_item128_asset:
+            # Neue Questlog-CDN-Struktur: echte Itemicons liegen teilweise direkt
+            # unter Item_128 und besitzen keinen /Equip/-Teil mehr.
+            score += 460
 
         if is_perk_asset:
             score -= 900
@@ -2459,10 +2491,15 @@ def collect_image_urls(page, expected_main_category: str = "", expected_sub_cate
         # Bestes Signal nur noch, wenn es kein Perk-/Fähigkeitsasset ist.
         # Sonst gewinnt z.B. Perk_dagger_... fälschlich gegen IT_P_Dagger_....
         if detail_id and detail_id in low and not is_perk_asset:
-            score += 220
+            score += 700
+        elif detail_id and not is_perk_asset:
+            compact_id = re.sub(r"[^a-z0-9]", "", detail_id)
+            compact_url = re.sub(r"[^a-z0-9]", "", low.rsplit("/", 1)[-1].split("?", 1)[0])
+            if compact_id and len(compact_id) >= 8 and compact_id in compact_url:
+                score += 620
 
         # Pfad-Hinweise. Skill-/Ability-Assets dürfen nicht gegen Itembilder gewinnen.
-        if any(x in low for x in ["/item", "items", "equipment", "weapon", "armor"]):
+        if any(x in low for x in ["/item", "items", "item_128", "equipment", "weapon", "armor", "accessory"]):
             score += 70
         if "icon" in low:
             score += 10
@@ -2484,6 +2521,8 @@ def collect_image_urls(page, expected_main_category: str = "", expected_sub_cate
             score += 20
         elif source == "srcset":
             score += 16
+        elif source == "resource":
+            score += 8
         elif source == "meta":
             score -= 30
         if w and h:
@@ -2676,6 +2715,24 @@ def collect_image_urls(page, expected_main_category: str = "", expected_sub_cate
     except Exception:
         pass
 
+    # Manche Questlog-Versionen rendern das Icon über eine Komponente, deren URL
+    # weder als <img> noch als direktes background-image im fertigen DOM steht. Der
+    # Browser hat die Datei dann trotzdem geladen; PerformanceResourceTiming liefert
+    # die echte CDN-URL. Nur Item_128-/Icon-Ressourcen werden berücksichtigt.
+    try:
+        resources = page.evaluate(
+            r"""
+            () => performance.getEntriesByType('resource')
+              .map(e => ({src: String(e.name || ''), kind: String(e.initiatorType || '')}))
+              .filter(x => /item_128|\/icon\/|\/icons\//i.test(x.src))
+              .slice(-500)
+            """
+        ) or []
+        for row in resources:
+            add_candidate(row.get("src"), source="resource")
+    except Exception:
+        pass
+
     # Meta nur als letzter Fallback; oft ist das Preview/Share-Bild, nicht das Itembild.
     try:
         metas = page.locator("meta[property='og:image'], meta[name='twitter:image']").evaluate_all(
@@ -2697,13 +2754,13 @@ def collect_image_urls(page, expected_main_category: str = "", expected_sub_cate
     if not valid:
         return None, None
 
-    # Nur echte Equip-Assets zulassen. Damit wird im Zweifel kein Bild gespeichert,
-    # statt erneut ein Skill-/Perk-/"ähnliches Item"-Bild zuzuordnen.
+    # Nur echte Itemassets zulassen. Das umfasst sowohl den alten /Equip/-Pfad als
+    # auch Questlogs neuen generischen /Icon/Item_128/-Pfad.
     valid = [c for c in valid if _safe_item_asset_url(c.get("src"), expected_main_category, expected_sub_category)]
     if not valid:
         return None, None
     valid.sort(key=lambda x: (int(x.get("score") or 0), int(x.get("w") or 0) * int(x.get("h") or 0)), reverse=True)
-    if int(valid[0].get("score") or 0) < 500:
+    if int(valid[0].get("score") or 0) < 440:
         return None, None
     best = valid[0].get("src")
     return best, best
@@ -4168,7 +4225,34 @@ def run_images_only(args: argparse.Namespace) -> int:
                 image_url, icon_url = collect_image_urls(page, str(row.get("main_category") or ""), str(row.get("sub_category") or ""))
                 if not image_url:
                     skipped += 1
-                    print(f"⚠️ Kein sicheres Itembild: {row.get('name')}", flush=True)
+                    # Bei einem ausdrücklichen Reparaturlauf ist ein leeres Bild besser
+                    # als ein nachweislich falsches Schwert-/Skillbild. Die feste Item-ID,
+                    # Stats und Traits bleiben unberührt.
+                    if bool(getattr(args, "clear_image_overrides", False)):
+                        conn.execute(
+                            "DELETE FROM item_catalog_image_overrides WHERE source_url = %s",
+                            (str(row.get("source_url") or ""),),
+                        )
+                        conn.execute(
+                            "UPDATE item_catalog SET image_url = NULL, icon_url = NULL, updated_at = now() WHERE id = %s",
+                            (int(row.get("id") or 0),),
+                        )
+                        for savepoint, statement in (
+                            ("sp_clear_guild_item_links", "UPDATE guild_item_links SET image_url = NULL, updated_at = now() WHERE catalog_item_id = %s"),
+                            ("sp_clear_need_build_slots", "UPDATE need_build_slots SET item_image_url = NULL, updated_at = now() WHERE item_catalog_id = %s"),
+                        ):
+                            try:
+                                conn.execute(f"SAVEPOINT {savepoint}")
+                                conn.execute(statement, (int(row.get("id") or 0),))
+                                conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+                            except Exception:
+                                try:
+                                    conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                                    conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+                                except Exception:
+                                    pass
+                        conn.commit()
+                    print(f"⚠️ Kein sicheres Itembild: {row.get('name')} (altes falsches Bild entfernt)", flush=True)
                     continue
                 if bool(getattr(args, "clear_image_overrides", False)):
                     conn.execute(
