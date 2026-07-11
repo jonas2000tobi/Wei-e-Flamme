@@ -1415,7 +1415,7 @@ def extract_armor_traits_from_dom_textnodes(page, *, sub_category: str | None, i
 
     try:
         tokens = page.evaluate(
-            """
+            r"""
             (itemName) => {
               const clean = (s) => (s || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
               const visible = (el) => {
@@ -2425,7 +2425,7 @@ def collect_image_urls(page, expected_main_category: str = "", expected_sub_cate
     # eine globale Suche kann diese sonst fälschlich wählen.
     try:
         card_assets = page.evaluate(
-            """
+            r"""
             ({titleText}) => {
               const norm = s => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
               const wanted = norm(titleText);
@@ -2860,7 +2860,7 @@ def get_questlog_item_card_text(page, item_name: str = "") -> str:
     """
     try:
         return str(page.evaluate(
-            """
+            r"""
             (itemName) => {
               const wanted = (itemName || '').toLowerCase().trim();
               const norm = (s) => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
@@ -3962,9 +3962,9 @@ def run_images_only(args: argparse.Namespace) -> int:
         SELECT id, source_url, name, main_category, sub_category, image_url, icon_url
         FROM item_catalog
         WHERE source = 'questlog' AND is_active = TRUE
-          AND source_url LIKE '%/db/item/%'
+          AND source_url LIKE %s
     """
-    params: list[Any] = []
+    params: list[Any] = ["%/db/item/%"]
     if wanted:
         sql += " AND main_category = ANY(%s)"
         params.append(sorted(wanted))
