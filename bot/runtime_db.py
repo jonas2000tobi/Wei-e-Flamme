@@ -1160,12 +1160,102 @@ def _json_loads(value: Any, default: Any) -> Any:
 
 
 def _normalize_item_reference(value: Any) -> str:
-    text = str(value or "").casefold().strip()
+    raw = str(value or "").strip()
+    # Eigene Kurzformen wie "DaVinci" vor dem casefold in "Da Vinci" teilen.
+    raw = re.sub(r"(?<=[a-zäöüß])(?=[A-ZÄÖÜ])", " ", raw)
+    text = raw.casefold()
     text = text.replace("ä", "ae").replace("ö", "oe").replace("ü", "ue").replace("ß", "ss")
     text = re.sub(r"[^a-z0-9]+", " ", text)
     stop = {"der", "die", "das", "des", "den", "dem", "von", "vom", "zur", "zum", "und", "of", "the"}
     parts = [p for p in text.split() if p and p not in stop]
     return " ".join(parts)
+
+
+_ITEM_REFERENCE_TYPE_SUFFIXES = (
+    "siegelring", "fingerring", "ring", "ohrring", "ohrringe", "brosche", "halskette", "kette",
+    "armband", "guertel", "gurtel", "umhang", "mantel", "handschutz", "handschuh", "handschuhe",
+    "stiefel", "schuhe", "helm", "hut", "maske", "schleier", "robe", "brust", "ruestung", "rustung", "hose",
+)
+
+
+def _item_reference_stem(token: str) -> str:
+    value = str(token or "")
+    for suffix in ("ungen", "ern", "ens", "en", "es", "er", "em", "e", "s"):
+        if len(value) >= max(6, len(suffix) + 3) and value.endswith(suffix):
+            return value[:-len(suffix)]
+    return value
+
+
+def _item_reference_is_type_token(token: str) -> bool:
+    value = str(token or "")
+    return any(value.endswith(suffix) for suffix in _ITEM_REFERENCE_TYPE_SUFFIXES)
+
+
+def _item_reference_slot_hint(value: Any) -> str:
+    tokens = _normalize_item_reference(value).split()
+    for token in tokens:
+        if token.endswith("ohrring") or token.endswith("ohrringe"):
+            return "ohrringe"
+        if token.endswith("siegelring") or token.endswith("fingerring") or token == "ring":
+            return "ring"
+        if token.endswith("brosche"):
+            return "brosche"
+        if token.endswith("handschutz") or token.endswith("handschuh") or token.endswith("handschuhe"):
+            return "handschuhe"
+        if token.endswith("robe") or token in {"brust", "ruestung", "rustung"}:
+            return "brust"
+        if token.endswith("halskette") or token == "kette":
+            return "kette"
+        if token.endswith("armband"):
+            return "armband"
+        if token.endswith("guertel") or token.endswith("gurtel"):
+            return "gurtel"
+        if token.endswith("umhang") or token.endswith("mantel"):
+            return "umhang"
+        if token.endswith("helm") or token.endswith("hut") or token.endswith("maske") or token.endswith("schleier"):
+            return "helm"
+        if token.endswith("hose"):
+            return "hose"
+        if token.endswith("schuhe") or token.endswith("stiefel"):
+            return "schuhe"
+    return ""
+
+
+def _item_reference_core_tokens(value: Any) -> set[str]:
+    out: set[str] = set()
+    for token in _normalize_item_reference(value).split():
+        stem = _item_reference_stem(token)
+        if len(stem) >= 2 and not _item_reference_is_type_token(stem):
+            out.add(stem)
+    return out
+
+
+def _catalog_reference_consistent(item_name: Any, item: dict[str, Any]) -> bool:
+    clean_name = str(item_name or "").strip()
+    if not clean_name:
+        return True
+    wanted_slot = _item_reference_slot_hint(clean_name)
+    candidate_slot = _item_reference_slot_hint(item.get("sub_category") or item.get("name") or item.get("main_category"))
+    wanted_family = "accessory" if wanted_slot in {"ring", "ohrringe", "brosche", "kette", "armband", "gurtel"} else ("armor" if wanted_slot in {"handschuhe", "brust", "umhang", "helm", "hose", "schuhe"} else "")
+    candidate_family = _normalize_item_reference(item.get("main_category"))
+    if wanted_family and candidate_family and wanted_family not in candidate_family:
+        return False
+    if wanted_slot and candidate_slot and wanted_slot != candidate_slot:
+        return False
+    if wanted_slot and not candidate_slot and item.get("sub_category"):
+        return False
+
+    wanted_core = _item_reference_core_tokens(clean_name)
+    candidate_core = _item_reference_core_tokens(item.get("name"))
+    if not wanted_core:
+        return True
+    if wanted_core & candidate_core:
+        return True
+    a = "".join(sorted(wanted_core))
+    b = "".join(sorted(candidate_core))
+    if a and b and (a in b or b in a):
+        return True
+    return difflib.SequenceMatcher(None, a, b).ratio() >= 0.72
 
 
 def sync_guild_members(*, guild_id: int, members: list[dict[str, Any]], member_role_id: int = 0) -> dict[str, Any]:
@@ -1527,26 +1617,33 @@ def resolve_catalog_item_reference(*, guild_id: int, local_item_id: str = "", it
     confidence = 0.0
 
     if explicit_id:
-        item = fetch_one("ic.id = %s", (explicit_id,))
-        method, confidence = "catalog_id", 1.0
+        candidate = fetch_one("ic.id = %s", (explicit_id,))
+        if candidate and _catalog_reference_consistent(item_name, candidate):
+            item = candidate
+            method, confidence = "catalog_id", 1.0
 
     if item is None and local_key:
         link = get_guild_item_link(int(guild_id), "local_item", local_key)
         if link and int(link.get("catalog_item_id") or 0):
-            item = fetch_one("ic.id = %s", (int(link.get("catalog_item_id") or 0),))
-            method, confidence = "stored_local_link", float(link.get("confidence") or 1.0)
+            candidate = fetch_one("ic.id = %s", (int(link.get("catalog_item_id") or 0),))
+            if candidate and _catalog_reference_consistent(item_name, candidate):
+                item = candidate
+                method, confidence = "stored_local_link", float(link.get("confidence") or 1.0)
 
     if item is None and alias_key:
         link = get_guild_item_link(int(guild_id), "alias", alias_key)
         if link and int(link.get("catalog_item_id") or 0):
-            item = fetch_one("ic.id = %s", (int(link.get("catalog_item_id") or 0),))
-            method, confidence = "stored_alias", float(link.get("confidence") or 1.0)
+            candidate = fetch_one("ic.id = %s", (int(link.get("catalog_item_id") or 0),))
+            if candidate and _catalog_reference_consistent(item_name, candidate):
+                item = candidate
+                method, confidence = "stored_alias", float(link.get("confidence") or 1.0)
 
     source_candidates = [str(source_item_id or "").strip(), local_key]
     if item is None:
         for source in [x for x in source_candidates if x and not x.startswith("junk:")]:
-            item = fetch_one("ic.source_item_id = %s", (source,))
-            if item:
+            candidate = fetch_one("ic.source_item_id = %s", (source,))
+            if candidate and _catalog_reference_consistent(item_name, candidate):
+                item = candidate
                 method, confidence = "source_item_id", 1.0
                 break
 
@@ -1557,8 +1654,9 @@ def resolve_catalog_item_reference(*, guild_id: int, local_item_id: str = "", it
             method, confidence = "exact_name", 0.99
 
     if item is None and clean_name and allow_fuzzy:
-        tokens = [t for t in alias_key.split() if len(t) >= 3]
-        query = max(tokens, key=len, default=clean_name)
+        core_tokens = sorted(_item_reference_core_tokens(clean_name), key=len, reverse=True)
+        all_tokens = [t for t in alias_key.split() if len(t) >= 3]
+        query = (core_tokens or all_tokens or [clean_name])[0]
         conn = _pg_connect()
         try:
             with conn.cursor() as cur:
@@ -1571,27 +1669,35 @@ def resolve_catalog_item_reference(*, guild_id: int, local_item_id: str = "", it
                     FROM item_catalog ic
                     LEFT JOIN item_catalog_image_overrides ov ON ov.source_url = ic.source_url
                     WHERE ic.is_active = TRUE AND ic.name ILIKE %s
-                    LIMIT 120
+                    LIMIT 160
                     """,
                     (f"%{query}%",),
                 )
                 candidates = [dict(r) for r in (cur.fetchall() or [])]
         finally:
             conn.close()
+
+        wanted_slot = _item_reference_slot_hint(clean_name)
+        wanted_core = _item_reference_core_tokens(clean_name)
         best = None
         best_score = 0.0
-        wanted_tokens = set(alias_key.split())
         for cand in candidates:
-            cname = _normalize_item_reference(cand.get("name"))
-            seq = difflib.SequenceMatcher(None, alias_key, cname).ratio()
-            candidate_tokens = set(cname.split())
-            overlap = len(wanted_tokens & candidate_tokens) / max(1, len(wanted_tokens | candidate_tokens))
-            score = seq * 0.62 + overlap * 0.38
+            if not _catalog_reference_consistent(clean_name, cand):
+                continue
+            candidate_slot = _item_reference_slot_hint(cand.get("sub_category") or cand.get("name") or cand.get("main_category"))
+            candidate_core = _item_reference_core_tokens(cand.get("name"))
+            seq = difflib.SequenceMatcher(None, alias_key, _normalize_item_reference(cand.get("name"))).ratio()
+            overlap = len(wanted_core & candidate_core) / max(1, len(wanted_core | candidate_core))
+            score = seq * 0.48 + overlap * 0.42
+            if wanted_slot and candidate_slot == wanted_slot:
+                score += 0.18
             if score > best_score:
                 best, best_score = cand, score
-        if best is not None and best_score >= 0.90:
+        # Slotgleichheit + echter Namenskern reichen für Gilden-Kurznamen wie
+        # "Ring DaVinci" -> "Da Vincis Siegelring". Slotfremde Treffer sind oben blockiert.
+        if best is not None and best_score >= 0.72:
             item = best
-            method, confidence = "safe_fuzzy_name", float(best_score)
+            method, confidence = "slot_safe_fuzzy_name", float(min(best_score, 1.0))
 
     if item is None:
         return None
