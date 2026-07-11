@@ -10948,14 +10948,59 @@ def _settings_change_requests_for_dashboard(guild_id: int, limit: int = 80) -> l
         return []
 
 
+def _stable_discord_media_url(value: Any) -> str:
+    url = str(value or "").strip()
+    if not (url.startswith("https://") or url.startswith("http://")):
+        return ""
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        host = (parsed.netloc or "").lower()
+        if host in {"media.discordapp.net", "cdn.discordapp.com"} and parsed.path.startswith("/attachments/"):
+            return urllib.parse.urlunsplit(("https", "cdn.discordapp.com", parsed.path, "", ""))
+    except Exception:
+        pass
+    return url
+
+
 def _event_image_url(event: dict[str, Any]) -> str:
-    """Sichere Event-Titelbild-URL aus Snapshot/Phase-3-Rohdaten."""
+    """Sichere Event-Titelbild-URL aus alten/neuen Snapshot-Strukturen."""
     if not isinstance(event, dict):
         return ""
-    for key in ("image_url", "title_image_url", "banner_url", "thumbnail_url", "cover_url"):
-        url = str(event.get(key) or "").strip()
-        if url.startswith("https://") or url.startswith("http://"):
-            return url
+
+    candidates: list[Any] = []
+    for key in (
+        "image_url", "title_image_url", "event_image_url", "banner_url",
+        "thumbnail_url", "cover_url", "image", "thumbnail", "banner", "cover",
+    ):
+        candidates.append(event.get(key))
+
+    for key in ("embed", "discord_embed", "message_embed", "media"):
+        nested = event.get(key)
+        if isinstance(nested, dict):
+            for sub_key in ("image_url", "thumbnail_url", "banner_url", "cover_url", "url", "proxy_url", "image", "thumbnail"):
+                candidates.append(nested.get(sub_key))
+        elif isinstance(nested, list):
+            candidates.extend(nested[:4])
+
+    attachments = event.get("attachments")
+    if isinstance(attachments, list):
+        candidates.extend(attachments[:6])
+
+    def unpack(raw: Any) -> list[Any]:
+        if isinstance(raw, dict):
+            return [raw.get("url"), raw.get("proxy_url"), raw.get("image_url"), raw.get("thumbnail_url")]
+        if isinstance(raw, list):
+            out: list[Any] = []
+            for item in raw[:6]:
+                out.extend(unpack(item))
+            return out
+        return [raw]
+
+    for candidate in candidates:
+        for raw in unpack(candidate):
+            url = _stable_discord_media_url(raw)
+            if url:
+                return url
     return ""
 
 
@@ -12284,62 +12329,95 @@ def _attendance_review_still_needs_ec(snap: dict[str, Any], guild_id: int, revie
 
 
 def _attendance_events_with_review_fallbacks(snap: dict[str, Any], guild_id: int) -> list[dict[str, Any]]:
-    """Nur wirklich offene Anwesenheits-/EC-Fälle anzeigen.
+    """Die letzten acht gestarteten Events für die Anwesenheitsseite.
 
-    Normale Snapshot-Events verschwinden hier, sobald EC bereits vergeben wurde
-    oder eine Dashboard-Queue erfolgreich abgeschlossen ist. Kommende Events
-    gehören auf die Eventseite, nicht in den Anwesenheits-Review.
+    Anders als früher verschwinden fertig gebuchte Events nicht mehr. Sie bleiben
+    in der letzten-8-Liste und werden mit einem grünen Fertig-Haken markiert.
+    Kommende Events werden erst ab ihrem Startzeitpunkt aufgenommen.
     """
-    events = _events_with_pending_ec_checks(snap)
-    by_id: dict[str, dict[str, Any]] = {}
     now = datetime.now(timezone.utc)
-    for ev in events:
+    by_id: dict[str, dict[str, Any]] = {}
+
+    # 1) Normale Snapshot-Events.
+    for ev in ((snap.get("events") or {}).get("items") or []):
         if not isinstance(ev, dict):
             continue
         eid = str(ev.get("event_id") or ev.get("id") or "").strip()
         if not eid:
             continue
-
-        # Bereits gebuchte EC = erledigt. Das Event bleibt weiterhin im Archiv/
-        # in den Eventdetails sichtbar, aber nicht mehr unter "Anwesenheit".
-        try:
-            if (_event_award_state(snap, eid) or {}).get("awarded"):
-                continue
-        except Exception:
-            pass
-        try:
-            latest = _latest_ec_award_request(guild_id, eid) or {}
-            if str(latest.get("status") or "").strip().lower() == "done":
-                continue
-        except Exception:
-            pass
-
-        review = _attendance_review_load(guild_id, eid) if guild_id else {}
-        review_status = str((review or {}).get("status") or "").strip().lower()
-        if review_status in {"closed", "archived"}:
+        event_dt = _dt_obj(
+            ev.get("when_iso") or ev.get("start_at") or ev.get("start_time")
+            or ev.get("created_at")
+        )
+        if event_dt and event_dt > now:
             continue
+        by_id[eid] = dict(ev)
 
-        # Ein explizit offener EC-Check/Review bleibt sichtbar. Normale Events
-        # erscheinen erst ab ihrem Startzeitpunkt.
-        explicit_open = bool(ev.get("_pending_ec_check") or ev.get("_attendance_review_only") or review_status in {"draft", "open", "reviewed", "locked"})
-        event_dt = _dt_obj(ev.get("when_iso") or ev.get("start_at") or ev.get("created_at"))
-        if not explicit_open and event_dt and event_dt > now:
+    # 2) EC-/DKP-Checks ergänzen auch Events, die aus dem normalen Snapshot
+    # bereits verschwunden sind. Dabei bewusst auch erledigte Checks übernehmen.
+    for chk in _event_check_items(snap):
+        if not isinstance(chk, dict):
             continue
-        if explicit_open or not event_dt or event_dt <= now:
-            by_id[eid] = ev
+        eid = str(chk.get("event_id") or chk.get("check_id") or "").strip()
+        if not eid:
+            continue
+        row = by_id.get(eid) or {
+            "event_id": eid,
+            "title": chk.get("title") or chk.get("event_title") or "Anwesenheits-Event",
+            "when_iso": chk.get("when_iso") or chk.get("event_when") or chk.get("created_at") or chk.get("posted_at") or "",
+            "created_at": chk.get("created_at") or chk.get("posted_at") or "",
+            "participant_count": chk.get("attendee_count") or chk.get("participant_count") or 0,
+            "voice_enabled": False,
+            "participants": {"yes": [], "maybe": [], "no": []},
+            "source": "event_check",
+        }
+        row["_event_check"] = dict(chk)
+        by_id[eid] = row
 
+    # 3) Gespeicherte Reviews ergänzen die Historie, falls Bot/Discord das Event
+    # nicht mehr liefert. Geschlossene Reviews bleiben absichtlich enthalten.
     if guild_id:
         for review in _attendance_all_reviews(guild_id, limit=300):
-            if not _attendance_review_still_needs_ec(snap, guild_id, review):
+            if not isinstance(review, dict):
                 continue
             eid = str(review.get("event_id") or ((review.get("payload") or {}).get("event_id")) or "").strip()
-            if not eid or eid in by_id:
+            if not eid:
                 continue
-            stub = _event_stub_from_attendance_review(guild_id, eid)
-            if stub:
-                by_id[eid] = stub
+            if eid not in by_id:
+                stub = _event_stub_from_attendance_review(guild_id, eid)
+                if stub:
+                    by_id[eid] = stub
+            if eid in by_id:
+                by_id[eid]["_attendance_review"] = review
 
-    return list(by_id.values())
+    # Erst nach Datum sortieren, dann nur für die letzten acht die DB-Queue lesen.
+    candidates: list[dict[str, Any]] = []
+    for eid, ev in by_id.items():
+        event_dt = _dt_obj(
+            ev.get("when_iso") or ev.get("start_at") or ev.get("start_time")
+            or ev.get("created_at")
+        )
+        if event_dt and event_dt > now:
+            continue
+        candidates.append({**ev, "_attendance_dt": event_dt})
+
+    floor = datetime.min.replace(tzinfo=timezone.utc)
+    candidates.sort(key=lambda ev: ev.get("_attendance_dt") or floor, reverse=True)
+    latest_eight = candidates[:8]
+
+    for ev in latest_eight:
+        eid = str(ev.get("event_id") or ev.get("id") or "").strip()
+        award_state = _event_award_state(snap, eid) if eid else {}
+        latest_request = _latest_ec_award_request(guild_id, eid) if guild_id and eid else {}
+        queue_status = str(latest_request.get("status") or "").strip().lower()
+        ev["_attendance_ec_done"] = bool(award_state.get("awarded")) or queue_status == "done"
+        ev["_attendance_queue_status"] = queue_status
+        review = ev.get("_attendance_review") if isinstance(ev.get("_attendance_review"), dict) else {}
+        if not review and guild_id and eid:
+            review = _attendance_review_load(guild_id, eid) or {}
+        ev["_attendance_review"] = review
+
+    return latest_eight
 
 
 def _open_attendance_review_events_for_homepage(snap: dict[str, Any], guild_id: int, *, limit: int = 12) -> list[dict[str, Any]]:
@@ -15405,35 +15483,65 @@ def _render_attendance_list(data: dict[str, Any]) -> str:
     for ev in events:
         eid = str(ev.get("event_id") or ev.get("id") or "")
         voice = _voice_event_analysis(snap, ev)
-        review = _attendance_review_load(guild_id, eid) if eid else {}
-        payload = review.get("payload") or {}
+        review = ev.get("_attendance_review") if isinstance(ev.get("_attendance_review"), dict) else {}
+        payload = review.get("payload") if isinstance(review.get("payload"), dict) else {}
         items = payload.get("items") or []
-        queue_badge = _event_ec_queue_badge(guild_id, eid) if eid else _raw("<span class='pill'>—</span>")
+        ec_done = bool(ev.get("_attendance_ec_done"))
+        queue_status = str(ev.get("_attendance_queue_status") or "").strip().lower()
+
+        image_url = _event_image_url(ev)
+        thumb = (
+            f'<img class="attendance-event-thumb" src="{_e(image_url)}" alt="" loading="lazy" referrerpolicy="no-referrer" '
+            'onerror="this.remove()">'
+            if image_url else ""
+        )
+        title_cell = _raw(
+            f'<a class="attendance-event-link" href="/attendance/{_e(eid)}">'
+            f'{thumb}<span><strong>{_e(ev.get("title") or eid)}</strong>'
+            f'<small>{_e(_dt(ev.get("when_iso") or ev.get("created_at")))}</small></span></a>'
+        )
+
+        if ec_done:
+            ec_badge = _raw("<span class='queue-badge ok'>✅ Fertig<small>EC gebucht</small></span>")
+        elif queue_status in {"pending", "processing"}:
+            ec_badge = _raw("<span class='queue-badge wait'>⏳ EC läuft</span>")
+        elif queue_status in {"failed", "rejected"}:
+            ec_badge = _raw("<span class='queue-badge bad'>❌ EC-Fehler</span>")
+        else:
+            ec_badge = _raw("<span class='queue-badge wait'>🟡 Offen<small>noch nicht gebucht</small></span>")
+
+        review_label = "✅ abgeschlossen" if ec_done else _attendance_status_label(review.get("status") or ("reviewed" if items else "open"))
         rows.append([
-            _raw(f'<a class="link" href="/attendance/{_e(eid)}">{_e(ev.get("title") or eid)}</a>' + (" <span class='pill'>aus Review</span>" if ev.get("_attendance_review_only") else "")),
-            _dt(ev.get("when_iso")),
+            title_cell,
             ev.get("participant_count", 0),
             "ja" if ev.get("voice_enabled") else "nein",
             voice.get("voice_user_count", 0),
-            _attendance_status_label(review.get("status") or ("reviewed" if items else "open")),
+            review_label,
             len(items),
-            queue_badge,
-            _pending_ec_check_label(ev),
+            ec_badge,
+            _raw(f'<a class="btn" href="/attendance/{_e(eid)}">Öffnen</a>'),
         ])
     body = f"""
+    <style>
+      .attendance-event-link{{display:grid;grid-template-columns:86px minmax(0,1fr);gap:11px;align-items:center;text-decoration:none;color:inherit;min-width:260px}}
+      .attendance-event-thumb{{width:86px;height:50px;object-fit:cover;border-radius:9px;border:1px solid rgba(214,168,79,.28);background:#080706}}
+      .attendance-event-link strong{{display:block;color:var(--gold);line-height:1.25}}
+      .attendance-event-link small{{display:block;color:var(--muted);font-size:11px;margin-top:4px}}
+      @media(max-width:720px){{.attendance-event-link{{grid-template-columns:68px minmax(0,1fr);min-width:210px}}.attendance-event-thumb{{width:68px;height:44px}}}}
+    </style>
     <nav class="topnav"><a href="/">Kommando</a><a href="/planning">Planung</a><a href="/attendance-stats">Anwesenheit-Stats</a><a href="/attendance-archive">Archiv</a><a href="/voice">Voice</a><a href="/ec-queue">EC-Queue</a><a href="/admin">Leitung</a></nav>
     <section class="hero">
       <div>
-        <div class="eyebrow">Ebene 3 · sichere Admin-Aktion</div>
-        <h1>📝 Anwesenheits-Review</h1>
-        <p>Hier kann die Leitung Anmeldung und Voice-Zeit vergleichen und einen Review speichern. Es wird noch kein EC gebucht.</p>
-        <p class="muted">Snapshot: {_e(_dt(data.get('published_at')))} · Alte Events mit gespeichertem Review bleiben sichtbar, solange EC noch nicht als erledigt erkannt wurde.</p>
+        <div class="eyebrow">Letzte 8 gestartete Events</div>
+        <h1>📝 Anwesenheit</h1>
+        <p>Hier bleiben immer die letzten acht Events sichtbar. Bereits gebuchte Events tragen einen grünen Haken und verschwinden nicht mehr aus der Liste.</p>
+        <p class="muted">Snapshot: {_e(_dt(data.get('published_at')))}</p>
       </div>
       <a class="btn" href="/planning">Planung</a>
     </section>
     <section class="panel">
-      <h2>📅 Events</h2>
-      {_table(['Event','Zeit','Anmeldungen','Voice','Voice-User','Review','Review-Zeilen','EC-Queue','EC-Check'], rows, placeholder='Events durchsuchen…')}
+      <h2>📅 Letzte Events</h2>
+      {_table(['Event','Anmeldungen','Voice','Voice-User','Review','Review-Zeilen','EC-Status','Aktion'], rows, placeholder='Events durchsuchen…')}
     </section>
     """
     return _html_shell("Anwesenheit · Ebo Dashboard", body)
