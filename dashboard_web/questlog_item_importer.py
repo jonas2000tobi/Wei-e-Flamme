@@ -2256,7 +2256,7 @@ def page_title(page) -> str:
         return ""
 
 
-def collect_image_urls(page) -> tuple[str | None, str | None]:
+def collect_image_urls(page, expected_main_category: str = "", expected_sub_category: str = "") -> tuple[str | None, str | None]:
     """Findet bevorzugt das echte Item-/Waffenbild auf Questlog-Detailseiten.
 
     Questlog hat auf der Detailseite mehrere kleine Bilder: Itembild oben rechts,
@@ -2274,6 +2274,8 @@ def collect_image_urls(page) -> tuple[str | None, str | None]:
         item_name = ""
     name_tokens = [t for t in re.split(r"[^a-zA-ZäöüÄÖÜß0-9]+", item_name) if len(t) >= 4][:8]
     candidates: list[dict[str, Any]] = []
+    expected_main = clean_text(expected_main_category).lower()
+    expected_sub = clean_text(expected_sub_category).lower()
 
     def add_candidate(
         src: Any,
@@ -2310,8 +2312,20 @@ def collect_image_urls(page) -> tuple[str | None, str | None]:
         #   als die ID gewinnen kann.
         is_equip_asset = "/icon/item_128/equip/" in low or "/equip/" in low
         is_weapon_asset = "/equip/weapon/" in low
-        is_armor_asset = "/equip/armor/" in low or "/equip/accessory/" in low or "/equip/equipment/" in low
+        is_accessory_asset = "/equip/accessory/" in low or "/accessory/" in low
+        is_plain_armor_asset = "/equip/armor/" in low
+        is_armor_asset = is_plain_armor_asset or is_accessory_asset or "/equip/equipment/" in low
         is_perk_asset = "/misc/perk" in low or "perk_" in low
+
+        # Eindeutige Kategorie-Widersprüche sofort verwerfen. Das verhindert,
+        # dass bei Broschen ein Schwert-, Stiefel- oder Rüstungsbild aus "ähnliche Items"
+        # gewinnt. Unklare generische Equip-Pfade bleiben als Fallback erlaubt.
+        if expected_main == "accessory" and (is_weapon_asset or is_plain_armor_asset):
+            return
+        if expected_main == "weapon" and (is_accessory_asset or is_plain_armor_asset):
+            return
+        if expected_main == "armor" and (is_weapon_asset or is_accessory_asset):
+            return
 
         if is_weapon_asset:
             score += 820
@@ -2339,7 +2353,13 @@ def collect_image_urls(page) -> tuple[str | None, str | None]:
             score += 8
 
         # Quelle/Grafikgröße.
-        if source == "css":
+        if source == "item_card_css":
+            score += 1900
+        elif source == "item_card_img":
+            score += 1850
+        elif source == "item_card_srcset":
+            score += 1820
+        elif source == "css":
             score += 45
         elif source == "img":
             score += 20
@@ -2399,6 +2419,67 @@ def collect_image_urls(page) -> tuple[str | None, str | None]:
             "source": source,
             "score": score,
         })
+
+    # Zuerst ausschließlich im echten Item-Kopfbereich suchen. Questlog zeigt auf
+    # Detailseiten weiter unten Fähigkeiten und ähnliche Gegenstände mit eigenen Bildern;
+    # eine globale Suche kann diese sonst fälschlich wählen.
+    try:
+        card_assets = page.evaluate(
+            """
+            ({titleText}) => {
+              const norm = s => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+              const wanted = norm(titleText);
+              const titleNodes = Array.from(document.querySelectorAll('h1,[data-testid*="title"],main h2'));
+              let title = titleNodes.find(e => wanted && norm(e.innerText).includes(wanted)) || titleNodes[0] || null;
+              if (!title) return [];
+              let node = title;
+              let best = null;
+              for (let i = 0; i < 9 && node; i++, node = node.parentElement) {
+                const rect = node.getBoundingClientRect();
+                const text = norm(node.innerText).slice(0, 5000);
+                const imgs = node.querySelectorAll('img').length;
+                let score = 0;
+                if (wanted && text.includes(wanted)) score += 120;
+                if (text.includes('gegenstandsstufe') || text.includes('item level')) score += 90;
+                if (text.includes('eigenschaften') || text.includes('traits')) score += 50;
+                if (text.includes('max. schaden') || text.includes('verteidigung') || text.includes('angriffstempo')) score += 45;
+                if (imgs > 0) score += Math.min(imgs, 5) * 12;
+                if (rect.width >= 260 && rect.width <= 1050) score += 25;
+                if (rect.height >= 140 && rect.height <= 1200) score += 20;
+                if (text.includes('ähnliche') || text.includes('similar items') || text.includes('kommentare')) score -= 150;
+                if (!best || score > best.score) best = {node, score};
+              }
+              if (!best || best.score < 120) return [];
+              const root = best.node;
+              const out = [];
+              for (const img of root.querySelectorAll('img')) {
+                const box = img.getBoundingClientRect();
+                out.push({kind:'img', src:img.currentSrc || img.src || img.getAttribute('data-src') || '', srcset:img.srcset || img.getAttribute('data-srcset') || '', alt:img.alt || '', w:Math.round(img.naturalWidth || box.width || 0), h:Math.round(img.naturalHeight || box.height || 0), x:Math.round(box.left || 0), y:Math.round(box.top || 0), local:(img.parentElement?.innerText || ''), broad:(root.innerText || '').slice(0,1800)});
+              }
+              for (const el of root.querySelectorAll('*')) {
+                const bg = getComputedStyle(el).backgroundImage || '';
+                if (!bg || bg === 'none') continue;
+                const box = el.getBoundingClientRect();
+                out.push({kind:'css', src:bg, w:Math.round(box.width || 0), h:Math.round(box.height || 0), x:Math.round(box.left || 0), y:Math.round(box.top || 0), local:(el.innerText || '').slice(0,500), broad:(root.innerText || '').slice(0,1800)});
+              }
+              return out;
+            }
+            """,
+            {"titleText": item_name},
+        )
+        for asset in card_assets or []:
+            kind = str(asset.get("kind") or "")
+            if kind == "css":
+                for m in re.finditer(r"url\([\"']?([^\"')]+)[\"']?\)", str(asset.get("src") or "")):
+                    add_candidate(m.group(1), w=int(asset.get("w") or 0), h=int(asset.get("h") or 0), x=int(asset.get("x") or 0), y=int(asset.get("y") or 0), source="item_card_css", local_context=str(asset.get("local") or ""), broad_context=str(asset.get("broad") or ""))
+            else:
+                add_candidate(asset.get("src"), w=int(asset.get("w") or 0), h=int(asset.get("h") or 0), x=int(asset.get("x") or 0), y=int(asset.get("y") or 0), source="item_card_img", alt=str(asset.get("alt") or ""), local_context=str(asset.get("local") or ""), broad_context=str(asset.get("broad") or ""))
+                for part in str(asset.get("srcset") or "").split(","):
+                    first = part.strip().split(" ")[0]
+                    if first:
+                        add_candidate(first, w=int(asset.get("w") or 0), h=int(asset.get("h") or 0), x=int(asset.get("x") or 0), y=int(asset.get("y") or 0), source="item_card_srcset", alt=str(asset.get("alt") or ""), local_context=str(asset.get("local") or ""), broad_context=str(asset.get("broad") or ""))
+    except Exception:
+        pass
 
     try:
         imgs = page.locator("img").evaluate_all(
@@ -2858,7 +2939,7 @@ def parse_detail_page(page, url: str, main_category_hint: str, locale: str, sour
     damage_min, damage_max = extract_damage(raw_text)
     item_level = extract_level(raw_text, "Item Level", "Gegenstandsstufe", "Level")
     required_level = extract_level(raw_text, "Required Level", "Benötigte Stufe")
-    image_url, icon_url = collect_image_urls(page)
+    image_url, icon_url = collect_image_urls(page, main_category, sub_category or "")
     dom_stats = extract_stat_pairs_from_dom(page)
     text_stats = extract_stats_from_lines(raw_text)
     stats = dict(text_stats)
@@ -3863,9 +3944,93 @@ def run_debug(args: argparse.Namespace) -> int:
             browser.close()
     return 0
 
+def run_images_only(args: argparse.Namespace) -> int:
+    """Liest ausschließlich die echten Itembilder neu ein.
+
+    Namen, Stats, Traits und feste item_catalog.id bleiben unverändert. Damit kann
+    ein bereits produktiver Katalog gefahrlos von alten falsch erkannten Bildern
+    repariert werden.
+    """
+    if not os.getenv("DATABASE_URL"):
+        raise RuntimeError("DATABASE_URL fehlt. Setze die Postgres-Variable im Importer-Service.")
+    from playwright.sync_api import sync_playwright
+
+    wanted = {normalize_main_category_arg(x.strip()) for x in str(getattr(args, "only", "") or "").split(",") if x.strip()}
+    conn = connect()
+    ensure_item_catalog_schema(conn)
+    sql = """
+        SELECT id, source_url, name, main_category, sub_category, image_url, icon_url
+        FROM item_catalog
+        WHERE source = 'questlog' AND is_active = TRUE
+          AND source_url LIKE '%/db/item/%'
+    """
+    params: list[Any] = []
+    if wanted:
+        sql += " AND main_category = ANY(%s)"
+        params.append(sorted(wanted))
+    sql += " ORDER BY main_category, sub_category, name"
+    rows = [dict(r) for r in (conn.execute(sql, tuple(params)).fetchall() or [])]
+    print(f"🖼️ Bilder-only Reparatur: {len(rows)} Items", flush=True)
+    if not rows:
+        conn.close()
+        return 0
+
+    updated = 0
+    skipped = 0
+    with sync_playwright() as pw:
+        launch_kwargs: dict[str, Any] = {
+            "headless": HEADLESS,
+            "args": ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--disable-extensions", "--disable-background-networking"],
+        }
+        exe = os.getenv("PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH", "").strip()
+        if exe:
+            launch_kwargs["executable_path"] = exe
+        browser = pw.chromium.launch(**launch_kwargs)
+        context = browser.new_context(viewport={"width": 1440, "height": 1200}, user_agent=BROWSER_UA, locale="de-DE", timezone_id="Europe/Berlin", extra_http_headers={"Accept-Language": "de-DE,de;q=0.9,en;q=0.7"})
+        try:
+            context.route("**/*", lambda route, request: route.abort() if request.resource_type in {"font", "media"} else route.continue_())
+        except Exception:
+            pass
+        page = context.new_page()
+        try:
+            for row in rows:
+                url = force_de_locale_url(str(row.get("source_url") or ""))
+                if not url or not goto_page(page, url):
+                    skipped += 1
+                    print(f"⚠️ Bild übersprungen: {row.get('name')} (Seite nicht erreichbar)", flush=True)
+                    continue
+                image_url, icon_url = collect_image_urls(page, str(row.get("main_category") or ""), str(row.get("sub_category") or ""))
+                if not image_url:
+                    skipped += 1
+                    print(f"⚠️ Kein sicheres Itembild: {row.get('name')}", flush=True)
+                    continue
+                conn.execute(
+                    """
+                    UPDATE item_catalog
+                    SET image_url = %s, icon_url = %s, updated_at = now(),
+                        raw_data = jsonb_set(COALESCE(raw_data, '{}'::jsonb), '{image_repaired_at}', to_jsonb(%s::text), true)
+                    WHERE id = %s
+                    """,
+                    (image_url, icon_url or image_url, now_iso(), int(row.get("id") or 0)),
+                )
+                conn.commit()
+                updated += 1
+                print(f"✅ Bild: {row.get('name')}", flush=True)
+                time.sleep(REQUEST_DELAY)
+        finally:
+            page.close()
+            context.close()
+            browser.close()
+            conn.close()
+    print(f"✅ Bilder-only fertig. Aktualisiert: {updated}, übersprungen: {skipped}", flush=True)
+    return updated
+
+
 def run_import(args: argparse.Namespace) -> int:
     if getattr(args, "debug_url", ""):
         return run_debug(args)
+    if getattr(args, "images_only", False):
+        return run_images_only(args)
 
     # Kombi-Modus: vorhandene Armor-Items korrigieren, ohne Reset und ohne Bilder/Namen/Kategorien anzufassen.
     # Reihenfolge: erst DEF/Zusatzwerte, dann Eigenschaften. So sind beide Datenbereiche aktuell.
@@ -4713,6 +4878,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--reset-category", action="store_true", help="Vor dem Import questlog-Items der gewählten Hauptkategorie löschen")
     p.add_argument("--debug-url", default="", help="Eine oder mehrere Questlog-Detailseiten debuggen. Schreibt nichts in Postgres.")
     p.add_argument("--traits-only", action="store_true", help="Nur vorhandene Armor-Eigenschaften neu lesen und aktualisieren. Kein Reset, keine Bild-/Item-Änderung.")
+    p.add_argument("--images-only", action="store_true", help="Nur echte Itembilder neu von den Questlog-Detailseiten lesen. IDs, Namen, Stats und Traits bleiben unverändert.")
     p.add_argument("--armor-stats-only", action="store_true", help="Nur vorhandene Armor-DEF/Zusatzwerte neu lesen und aktualisieren. Kein Reset, keine Bild-/Item-Änderung. Kann mit --traits-only kombiniert werden.")
     p.add_argument("--failed-only", action="store_true", help="Nur Armor-Items erneut prüfen, deren bisherige Zusatzwerte/Traits laut gespeicherten Counts unvollständig sind.")
     return p

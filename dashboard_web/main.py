@@ -49,8 +49,8 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
-ASSET_VER = "member-item-id-v1-20260711"
-DASHBOARD_RELEASE_VERSION = "1.3.0 · feste Item-IDs + aktive Mitgliedersynchronisierung"
+ASSET_VER = "item-image-match-v2-20260711"
+DASHBOARD_RELEASE_VERSION = "1.3.1 · sichere Item-Zuordnung + Bildreparatur"
 
 _ITEM_MATCH_CACHE: dict[str, Optional[dict[str, Any]]] = {}
 _ITEM_CATALOG_POOL_CACHE: dict[str, Any] = {"loaded_at": 0.0, "items": []}
@@ -8286,6 +8286,19 @@ _ITEM_LOOKUP_TYPE_WORDS = frozenset({
     "helm", "hut", "maske", "schleier", "hose", "schuhe", "stiefel", "brust", "rüstung", "ruestung",
     "rustung", "stulpen",
 })
+_ITEM_LOOKUP_TYPE_SUFFIXES = (
+    "siegelring", "fingerring", "ring", "ohrring", "ohrringe", "brosche", "halskette", "kette",
+    "armband", "guertel", "gurtel", "umhang", "mantel", "handschutz", "handschuh", "handschuhe",
+    "stiefel", "schuhe", "helm", "hut", "maske", "schleier", "robe", "brust", "rustung", "hose",
+)
+
+
+def _item_lookup_is_type_token(token: str) -> bool:
+    value = str(token or "")
+    if value in _ITEM_LOOKUP_TYPE_WORDS:
+        return True
+    return any(value.endswith(suffix) for suffix in _ITEM_LOOKUP_TYPE_SUFFIXES)
+
 
 
 def _normalize_item_lookup_name(value: Any) -> str:
@@ -8323,7 +8336,7 @@ def _item_lookup_features(value: Any) -> dict[str, Any]:
         for token in normalized.split()
         if token and token not in _ITEM_LOOKUP_STOPWORDS
     ]
-    core_tokens = [token for token in tokens if token not in _ITEM_LOOKUP_TYPE_WORDS]
+    core_tokens = [token for token in tokens if not _item_lookup_is_type_token(token)]
     return {
         "normalized": normalized,
         "tokens": tokens,
@@ -8336,25 +8349,72 @@ def _item_lookup_features(value: Any) -> dict[str, Any]:
 
 
 def _item_lookup_slot_hint(features: dict[str, Any]) -> str:
-    tokens = set(features.get("tokens") or [])
-    checks = [
-        ({"ring", "ringe"}, "ring"),
-        ({"ohrring", "ohrringe"}, "ohrringe"),
-        ({"handschutz", "handschuh", "handschuhe"}, "handschuhe"),
-        ({"robe", "brust", "rustung", "ruestung"}, "brust"),
-        ({"kette", "halskette"}, "kette"),
-        ({"armband"}, "armband"),
-        ({"brosche"}, "brosche"),
-        ({"gurtel", "guertel"}, "gurtel"),
-        ({"umhang", "mantel"}, "umhang"),
-        ({"helm", "hut", "maske", "schleier"}, "helm"),
-        ({"hose"}, "hose"),
-        ({"schuhe", "stiefel"}, "schuhe"),
-    ]
-    for aliases, hint in checks:
-        if tokens & aliases:
-            return hint
+    tokens = {str(token or "") for token in (features.get("tokens") or [])}
+    for token in tokens:
+        if token.endswith("ohrring") or token.endswith("ohrringe"):
+            return "ohrringe"
+        if token.endswith("siegelring") or token == "ring" or token == "ringe" or token.endswith("fingerring"):
+            return "ring"
+        if token.endswith("brosche"):
+            return "brosche"
+        if token.endswith("handschutz") or token.endswith("handschuh") or token.endswith("handschuhe"):
+            return "handschuhe"
+        if token.endswith("robe") or token in {"brust", "rustung", "ruestung"}:
+            return "brust"
+        if token.endswith("halskette") or token == "kette":
+            return "kette"
+        if token.endswith("armband"):
+            return "armband"
+        if token.endswith("gurtel") or token.endswith("guertel"):
+            return "gurtel"
+        if token.endswith("umhang") or token.endswith("mantel"):
+            return "umhang"
+        if token.endswith("helm") or token.endswith("hut") or token.endswith("maske") or token.endswith("schleier"):
+            return "helm"
+        if token.endswith("hose"):
+            return "hose"
+        if token.endswith("schuhe") or token.endswith("stiefel"):
+            return "schuhe"
     return ""
+
+
+def _catalog_candidate_slot_hint(candidate: dict[str, Any]) -> str:
+    sub = _normalize_item_lookup_name(candidate.get("sub_category") or candidate.get("main_category"))
+    sub_features = _item_lookup_features(sub)
+    direct = _item_lookup_slot_hint(sub_features)
+    if direct:
+        return direct
+    return _item_lookup_slot_hint(_item_lookup_features(candidate.get("name")))
+
+
+def _catalog_reference_is_consistent(item_name: Any, candidate: dict[str, Any]) -> bool:
+    """Verhindert, dass eine alte/falsche Katalog-ID einen Ring als Waffe anzeigt."""
+    search = _item_lookup_features(item_name)
+    if not search.get("normalized"):
+        return True
+    wanted_slot = _item_lookup_slot_hint(search)
+    candidate_slot = _catalog_candidate_slot_hint(candidate)
+    wanted_family = "accessory" if wanted_slot in {"ring", "ohrringe", "brosche", "kette", "armband", "gurtel"} else ("armor" if wanted_slot in {"handschuhe", "brust", "umhang", "helm", "hose", "schuhe"} else "")
+    candidate_family = _normalize_item_lookup_name(candidate.get("main_category"))
+    if wanted_family and candidate_family and wanted_family not in candidate_family:
+        return False
+    if wanted_slot and candidate_slot and wanted_slot != candidate_slot:
+        return False
+    if wanted_slot and not candidate_slot and candidate.get("sub_category"):
+        return False
+
+    wanted_core = set(search.get("core_set") or set())
+    candidate_features = _item_lookup_features(candidate.get("name"))
+    candidate_core = set(candidate_features.get("core_set") or set())
+    if not wanted_core:
+        return True
+    if wanted_core & candidate_core:
+        return True
+    a = str(search.get("core_compact") or "")
+    b = str(candidate_features.get("core_compact") or "")
+    if a and b and (a in b or b in a):
+        return True
+    return difflib.SequenceMatcher(None, a, b).ratio() >= 0.72
 
 
 def _catalog_match_pool() -> list[dict[str, Any]]:
@@ -8435,11 +8495,15 @@ def _catalog_candidate_score(search_features: dict[str, Any], candidate: dict[st
         score += 430.0
 
     hint = _item_lookup_slot_hint(search_features)
+    candidate_hint = _catalog_candidate_slot_hint(candidate)
     candidate_sub = _normalize_item_lookup_name(candidate.get("sub_category") or candidate.get("main_category"))
-    if hint and hint in candidate_sub:
-        score += 180.0
-    elif hint and candidate_sub:
-        score -= 100.0
+    if hint:
+        if candidate_hint == hint or hint in candidate_sub:
+            score += 520.0
+        elif candidate_hint or candidate_sub:
+            # Harter Abbruch: Ein als Ring benanntes Gildenitem darf nie auf Schwert,
+            # Handschuhe oder einen anderen Slot zeigen.
+            return -100000.0
 
     # Nur gleiche Slot-Wörter reichen nicht. Mindestens ein echter Namensbestandteil
     # muss passen, sonst würden beliebige Ringe miteinander verknüpft.
@@ -8505,6 +8569,7 @@ def _catalog_item_match(item_name: Any) -> Optional[dict[str, Any]]:
 
 def _catalog_item_from_reference(reference: Any) -> Optional[dict[str, Any]]:
     if isinstance(reference, dict):
+        name = reference.get("catalog_item_name") or reference.get("item_name") or reference.get("item") or reference.get("name")
         try:
             direct_id = int(reference.get("catalog_item_id") or reference.get("item_catalog_id") or 0)
         except Exception:
@@ -8512,11 +8577,11 @@ def _catalog_item_from_reference(reference: Any) -> Optional[dict[str, Any]]:
         if direct_id and get_item_by_id is not None:
             try:
                 item = get_item_by_id(direct_id)  # type: ignore[misc]
-                if item:
+                if item and _catalog_reference_is_consistent(name, dict(item)):
                     return dict(item)
             except Exception:
                 pass
-        name = reference.get("catalog_item_name") or reference.get("item_name") or reference.get("item") or reference.get("name")
+        # Eine alte falsche ID wird bewusst verworfen und anhand Name + Slot neu gelöst.
         return _catalog_item_match(name)
     return _catalog_item_match(reference)
 
