@@ -4082,6 +4082,38 @@ def run_images_only(args: argparse.Namespace) -> int:
     from playwright.sync_api import sync_playwright
 
     wanted = {normalize_main_category_arg(x.strip()) for x in str(getattr(args, "only", "") or "").split(",") if x.strip()}
+
+    # Optional nur bestimmte Zubehör-Slots neu bebildern. Das ist für gezielte
+    # Reparaturläufe gedacht, z. B. Broschen + alle Ringe, ohne den gesamten
+    # Zubehörkatalog erneut abzuarbeiten.
+    raw_image_slots = [
+        clean_text(x).lower()
+        for x in str(getattr(args, "image_slots", "") or "").split(",")
+        if clean_text(x)
+    ]
+    image_slot_aliases = {
+        "brosche": "brosche",
+        "brooch": "brosche",
+        "ring": "ring",
+        "ringe": "ring",
+        "ohrring": "ohrringe",
+        "ohrringe": "ohrringe",
+        "earring": "ohrringe",
+        "kette": "kette",
+        "halskette": "kette",
+        "necklace": "kette",
+        "armband": "armband",
+        "bracelet": "armband",
+        "gürtel": "gürtel",
+        "guertel": "gürtel",
+        "belt": "gürtel",
+    }
+    wanted_image_slots = {image_slot_aliases.get(x, x) for x in raw_image_slots}
+
+    def normalized_catalog_slot(value: Any) -> str:
+        low = clean_text(value).lower()
+        return image_slot_aliases.get(low, low)
+
     conn = connect()
     ensure_item_catalog_schema(conn)
     sql = """
@@ -4098,7 +4130,13 @@ def run_images_only(args: argparse.Namespace) -> int:
         params.append(sorted(wanted))
     sql += " ORDER BY ic.main_category, ic.sub_category, ic.name"
     rows = [dict(r) for r in (conn.execute(sql, tuple(params)).fetchall() or [])]
-    print(f"🖼️ Bilder-only Reparatur: {len(rows)} Items", flush=True)
+    if wanted_image_slots:
+        rows = [
+            row for row in rows
+            if normalized_catalog_slot(row.get("sub_category")) in wanted_image_slots
+        ]
+    slot_note = f" | Slots: {', '.join(sorted(wanted_image_slots))}" if wanted_image_slots else ""
+    print(f"🖼️ Bilder-only Reparatur: {len(rows)} Items{slot_note}", flush=True)
     if not rows:
         conn.close()
         return 0
@@ -5035,6 +5073,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--debug-url", default="", help="Eine oder mehrere Questlog-Detailseiten debuggen. Schreibt nichts in Postgres.")
     p.add_argument("--traits-only", action="store_true", help="Nur vorhandene Armor-Eigenschaften neu lesen und aktualisieren. Kein Reset, keine Bild-/Item-Änderung.")
     p.add_argument("--images-only", action="store_true", help="Nur echte Itembilder neu von den Questlog-Detailseiten lesen. IDs, Namen, Stats und Traits bleiben unverändert.")
+    p.add_argument("--image-slots", default="", help="Optional bei --images-only nur bestimmte Zubehör-Slots aktualisieren, z. B. brosche,ring")
     p.add_argument("--clear-image-overrides", action="store_true", help="Bei --images-only auch alte manuelle Bild-Overrides der bearbeiteten Items löschen.")
     p.add_argument("--armor-stats-only", action="store_true", help="Nur vorhandene Armor-DEF/Zusatzwerte neu lesen und aktualisieren. Kein Reset, keine Bild-/Item-Änderung. Kann mit --traits-only kombiniert werden.")
     p.add_argument("--failed-only", action="store_true", help="Nur Armor-Items erneut prüfen, deren bisherige Zusatzwerte/Traits laut gespeicherten Counts unvollständig sind.")
