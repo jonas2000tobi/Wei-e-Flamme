@@ -4,6 +4,8 @@ import json
 import os
 import sqlite3
 import threading
+import re
+import difflib
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -139,6 +141,50 @@ def _init_sqlite() -> dict[str, Any]:
 
             CREATE INDEX IF NOT EXISTS idx_dashboard_snapshots_guild_published
                 ON dashboard_snapshots (guild_id, published_at DESC);
+
+
+            CREATE TABLE IF NOT EXISTS guild_members (
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                server_name TEXT NOT NULL DEFAULT '',
+                discord_username TEXT NOT NULL DEFAULT '',
+                avatar_url TEXT NOT NULL DEFAULT '',
+                ingame_name TEXT NOT NULL DEFAULT '',
+                main_role TEXT NOT NULL DEFAULT '',
+                gearscore TEXT NOT NULL DEFAULT '',
+                member_role_id INTEGER NOT NULL DEFAULT 0,
+                is_active INTEGER NOT NULL DEFAULT 1,
+                joined_at TEXT,
+                first_seen_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
+                left_at TEXT,
+                roles_json TEXT NOT NULL DEFAULT '[]',
+                profile_json TEXT NOT NULL DEFAULT '{}',
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (guild_id, user_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_guild_members_active_name
+                ON guild_members (guild_id, is_active, server_name);
+
+            CREATE TABLE IF NOT EXISTS guild_item_links (
+                guild_id INTEGER NOT NULL,
+                reference_type TEXT NOT NULL,
+                reference_key TEXT NOT NULL,
+                catalog_item_id INTEGER,
+                source_item_id TEXT,
+                canonical_name TEXT,
+                source_url TEXT,
+                image_url TEXT,
+                match_method TEXT,
+                confidence REAL NOT NULL DEFAULT 0,
+                aliases_json TEXT NOT NULL DEFAULT '[]',
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (guild_id, reference_type, reference_key)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_guild_item_links_catalog
+                ON guild_item_links (guild_id, catalog_item_id);
             """
         )
         conn.execute(
@@ -276,6 +322,62 @@ def _init_postgres() -> dict[str, Any]:
                 """
                 CREATE INDEX IF NOT EXISTS idx_dashboard_snapshots_guild_published
                     ON dashboard_snapshots (guild_id, published_at DESC)
+                """
+            )
+
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS guild_members (
+                    guild_id BIGINT NOT NULL,
+                    user_id BIGINT NOT NULL,
+                    server_name TEXT NOT NULL DEFAULT '',
+                    discord_username TEXT NOT NULL DEFAULT '',
+                    avatar_url TEXT NOT NULL DEFAULT '',
+                    ingame_name TEXT NOT NULL DEFAULT '',
+                    main_role TEXT NOT NULL DEFAULT '',
+                    gearscore TEXT NOT NULL DEFAULT '',
+                    member_role_id BIGINT NOT NULL DEFAULT 0,
+                    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+                    joined_at TEXT,
+                    first_seen_at TEXT NOT NULL,
+                    last_seen_at TEXT NOT NULL,
+                    left_at TEXT,
+                    roles_json TEXT NOT NULL DEFAULT '[]',
+                    profile_json TEXT NOT NULL DEFAULT '{}',
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (guild_id, user_id)
+                )
+                """
+            )
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_guild_members_active_name
+                    ON guild_members (guild_id, is_active, server_name)
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS guild_item_links (
+                    guild_id BIGINT NOT NULL,
+                    reference_type TEXT NOT NULL,
+                    reference_key TEXT NOT NULL,
+                    catalog_item_id BIGINT,
+                    source_item_id TEXT,
+                    canonical_name TEXT,
+                    source_url TEXT,
+                    image_url TEXT,
+                    match_method TEXT,
+                    confidence DOUBLE PRECISION NOT NULL DEFAULT 0,
+                    aliases_json TEXT NOT NULL DEFAULT '[]',
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (guild_id, reference_type, reference_key)
+                )
+                """
+            )
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_guild_item_links_catalog
+                    ON guild_item_links (guild_id, catalog_item_id)
                 """
             )
             cur.execute(
@@ -1041,3 +1143,464 @@ def count_dashboard_snapshots(guild_id: Optional[int] = None) -> int:
             return int(row["c"] if row else 0)
         finally:
             conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 foundation: zentrale Mitglieder-Synchronisierung + feste Item-Links
+# ---------------------------------------------------------------------------
+
+
+def _json_loads(value: Any, default: Any) -> Any:
+    if isinstance(value, (dict, list)):
+        return value
+    try:
+        return json.loads(str(value or ""))
+    except Exception:
+        return default
+
+
+def _normalize_item_reference(value: Any) -> str:
+    text = str(value or "").casefold().strip()
+    text = text.replace("ä", "ae").replace("ö", "oe").replace("ü", "ue").replace("ß", "ss")
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    stop = {"der", "die", "das", "des", "den", "dem", "von", "vom", "zur", "zum", "und", "of", "the"}
+    parts = [p for p in text.split() if p and p not in stop]
+    return " ".join(parts)
+
+
+def sync_guild_members(*, guild_id: int, members: list[dict[str, Any]], member_role_id: int = 0) -> dict[str, Any]:
+    """Spiegelt die aktuell berechtigten Gildenmitglieder in eine zentrale Tabelle.
+
+    Historische Profile bleiben erhalten. Wer die Gildenrolle verliert, wird nur
+    auf ``is_active = false`` gesetzt und verschwindet damit aus aktiven Listen.
+    """
+    if not _INITIALIZED:
+        init_runtime_db()
+    now = _now_iso()
+    rows: dict[int, dict[str, Any]] = {}
+    for raw in members or []:
+        if not isinstance(raw, dict):
+            continue
+        try:
+            uid = int(raw.get("user_id") or raw.get("id") or 0)
+        except Exception:
+            uid = 0
+        if not uid:
+            continue
+        rows[uid] = dict(raw)
+
+    with _DB_LOCK:
+        if _BACKEND == "postgres":
+            conn = _pg_connect()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT user_id, is_active FROM guild_members WHERE guild_id = %s", (int(guild_id),))
+                    existing = {int(r.get("user_id") or 0): bool(r.get("is_active")) for r in (cur.fetchall() or [])}
+                    for uid, raw in rows.items():
+                        roles = raw.get("roles") if isinstance(raw.get("roles"), list) else []
+                        profile = raw.get("profile") if isinstance(raw.get("profile"), dict) else {}
+                        cur.execute(
+                            """
+                            INSERT INTO guild_members (
+                                guild_id, user_id, server_name, discord_username, avatar_url,
+                                ingame_name, main_role, gearscore, member_role_id, is_active,
+                                joined_at, first_seen_at, last_seen_at, left_at,
+                                roles_json, profile_json, updated_at
+                            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,TRUE,%s,%s,%s,NULL,%s,%s,%s)
+                            ON CONFLICT (guild_id, user_id) DO UPDATE SET
+                                server_name = EXCLUDED.server_name,
+                                discord_username = EXCLUDED.discord_username,
+                                avatar_url = EXCLUDED.avatar_url,
+                                ingame_name = EXCLUDED.ingame_name,
+                                main_role = EXCLUDED.main_role,
+                                gearscore = EXCLUDED.gearscore,
+                                member_role_id = EXCLUDED.member_role_id,
+                                is_active = TRUE,
+                                joined_at = COALESCE(NULLIF(EXCLUDED.joined_at,''), guild_members.joined_at),
+                                last_seen_at = EXCLUDED.last_seen_at,
+                                left_at = NULL,
+                                roles_json = EXCLUDED.roles_json,
+                                profile_json = EXCLUDED.profile_json,
+                                updated_at = EXCLUDED.updated_at
+                            """,
+                            (
+                                int(guild_id), uid,
+                                str(raw.get("server_name") or raw.get("display_name") or ""),
+                                str(raw.get("discord_username") or raw.get("discord_name") or ""),
+                                str(raw.get("avatar_url") or ""),
+                                str(raw.get("ingame_name") or ""),
+                                str(raw.get("main_role") or ""),
+                                str(raw.get("gearscore") or ""),
+                                int(member_role_id or raw.get("member_role_id") or 0),
+                                str(raw.get("joined_at") or ""), now, now,
+                                json.dumps(roles, ensure_ascii=False),
+                                json.dumps(profile, ensure_ascii=False), now,
+                            ),
+                        )
+                    inactive_ids = [uid for uid, was_active in existing.items() if was_active and uid not in rows]
+                    for uid in inactive_ids:
+                        cur.execute(
+                            """
+                            UPDATE guild_members
+                            SET is_active = FALSE, left_at = COALESCE(left_at, %s), updated_at = %s
+                            WHERE guild_id = %s AND user_id = %s
+                            """,
+                            (now, now, int(guild_id), int(uid)),
+                        )
+                conn.commit()
+                return {"ok": True, "backend": _BACKEND, "active": len(rows), "deactivated": len(inactive_ids)}
+            finally:
+                conn.close()
+
+        conn = _sqlite_connect()
+        try:
+            existing_rows = conn.execute("SELECT user_id, is_active FROM guild_members WHERE guild_id = ?", (int(guild_id),)).fetchall()
+            existing = {int(r["user_id"]): bool(r["is_active"]) for r in existing_rows}
+            for uid, raw in rows.items():
+                roles = raw.get("roles") if isinstance(raw.get("roles"), list) else []
+                profile = raw.get("profile") if isinstance(raw.get("profile"), dict) else {}
+                conn.execute(
+                    """
+                    INSERT INTO guild_members (
+                        guild_id, user_id, server_name, discord_username, avatar_url,
+                        ingame_name, main_role, gearscore, member_role_id, is_active,
+                        joined_at, first_seen_at, last_seen_at, left_at,
+                        roles_json, profile_json, updated_at
+                    ) VALUES (?,?,?,?,?,?,?,?,?,1,?,?,?,?,?,?,?)
+                    ON CONFLICT (guild_id, user_id) DO UPDATE SET
+                        server_name=excluded.server_name,
+                        discord_username=excluded.discord_username,
+                        avatar_url=excluded.avatar_url,
+                        ingame_name=excluded.ingame_name,
+                        main_role=excluded.main_role,
+                        gearscore=excluded.gearscore,
+                        member_role_id=excluded.member_role_id,
+                        is_active=1,
+                        joined_at=CASE WHEN excluded.joined_at <> '' THEN excluded.joined_at ELSE guild_members.joined_at END,
+                        last_seen_at=excluded.last_seen_at,
+                        left_at=NULL,
+                        roles_json=excluded.roles_json,
+                        profile_json=excluded.profile_json,
+                        updated_at=excluded.updated_at
+                    """,
+                    (
+                        int(guild_id), uid,
+                        str(raw.get("server_name") or raw.get("display_name") or ""),
+                        str(raw.get("discord_username") or raw.get("discord_name") or ""),
+                        str(raw.get("avatar_url") or ""),
+                        str(raw.get("ingame_name") or ""),
+                        str(raw.get("main_role") or ""),
+                        str(raw.get("gearscore") or ""),
+                        int(member_role_id or raw.get("member_role_id") or 0),
+                        str(raw.get("joined_at") or ""), now, now, None,
+                        json.dumps(roles, ensure_ascii=False),
+                        json.dumps(profile, ensure_ascii=False), now,
+                    ),
+                )
+            inactive_ids = [uid for uid, was_active in existing.items() if was_active and uid not in rows]
+            for uid in inactive_ids:
+                conn.execute(
+                    "UPDATE guild_members SET is_active = 0, left_at = COALESCE(left_at, ?), updated_at = ? WHERE guild_id = ? AND user_id = ?",
+                    (now, now, int(guild_id), int(uid)),
+                )
+            conn.commit()
+            return {"ok": True, "backend": _BACKEND, "active": len(rows), "deactivated": len(inactive_ids)}
+        finally:
+            conn.close()
+
+
+def fetch_guild_members(guild_id: int, *, active_only: bool = True) -> list[dict[str, Any]]:
+    if not _INITIALIZED:
+        init_runtime_db()
+    with _DB_LOCK:
+        if _BACKEND == "postgres":
+            conn = _pg_connect()
+            try:
+                with conn.cursor() as cur:
+                    sql = "SELECT * FROM guild_members WHERE guild_id = %s"
+                    params: tuple[Any, ...] = (int(guild_id),)
+                    if active_only:
+                        sql += " AND is_active = TRUE"
+                    sql += " ORDER BY COALESCE(NULLIF(ingame_name,''), NULLIF(server_name,''), user_id::text)"
+                    cur.execute(sql, params)
+                    rows = [dict(r) for r in (cur.fetchall() or [])]
+            finally:
+                conn.close()
+        else:
+            conn = _sqlite_connect()
+            try:
+                sql = "SELECT * FROM guild_members WHERE guild_id = ?"
+                if active_only:
+                    sql += " AND is_active = 1"
+                sql += " ORDER BY CASE WHEN ingame_name <> '' THEN ingame_name ELSE server_name END"
+                rows = [dict(r) for r in conn.execute(sql, (int(guild_id),)).fetchall()]
+            finally:
+                conn.close()
+    for row in rows:
+        row["is_active"] = bool(row.get("is_active"))
+        row["roles"] = _json_loads(row.pop("roles_json", "[]"), [])
+        row["profile"] = _json_loads(row.pop("profile_json", "{}"), {})
+    return rows
+
+
+def get_guild_item_link(guild_id: int, reference_type: str, reference_key: str) -> Optional[dict[str, Any]]:
+    if not _INITIALIZED:
+        init_runtime_db()
+    rtype = str(reference_type or "local_item").strip() or "local_item"
+    rkey = str(reference_key or "").strip()
+    if not rkey:
+        return None
+    with _DB_LOCK:
+        if _BACKEND == "postgres":
+            conn = _pg_connect()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT * FROM guild_item_links WHERE guild_id=%s AND reference_type=%s AND reference_key=%s", (int(guild_id), rtype, rkey))
+                    row = cur.fetchone()
+            finally:
+                conn.close()
+        else:
+            conn = _sqlite_connect()
+            try:
+                row = conn.execute("SELECT * FROM guild_item_links WHERE guild_id=? AND reference_type=? AND reference_key=?", (int(guild_id), rtype, rkey)).fetchone()
+            finally:
+                conn.close()
+    if not row:
+        return None
+    out = dict(row)
+    out["aliases"] = _json_loads(out.pop("aliases_json", "[]"), [])
+    return out
+
+
+def upsert_guild_item_link(*, guild_id: int, reference_type: str, reference_key: str, item: dict[str, Any], match_method: str, confidence: float = 1.0, aliases: Optional[list[str]] = None) -> bool:
+    if not _INITIALIZED:
+        init_runtime_db()
+    rtype = str(reference_type or "local_item").strip() or "local_item"
+    rkey = str(reference_key or "").strip()
+    try:
+        catalog_item_id = int(item.get("id") or item.get("catalog_item_id") or 0)
+    except Exception:
+        catalog_item_id = 0
+    if not rkey or not catalog_item_id:
+        return False
+    now = _now_iso()
+    values = (
+        int(guild_id), rtype, rkey, catalog_item_id,
+        str(item.get("source_item_id") or ""), str(item.get("name") or item.get("canonical_name") or ""),
+        str(item.get("source_url") or ""), str(item.get("manual_image_url") or item.get("image_url") or item.get("icon_url") or ""),
+        str(match_method or "manual"), float(confidence or 0), json.dumps(aliases or [], ensure_ascii=False), now,
+    )
+    with _DB_LOCK:
+        if _BACKEND == "postgres":
+            conn = _pg_connect()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO guild_item_links (guild_id, reference_type, reference_key, catalog_item_id, source_item_id, canonical_name, source_url, image_url, match_method, confidence, aliases_json, updated_at)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                        ON CONFLICT (guild_id, reference_type, reference_key) DO UPDATE SET
+                            catalog_item_id=EXCLUDED.catalog_item_id, source_item_id=EXCLUDED.source_item_id,
+                            canonical_name=EXCLUDED.canonical_name, source_url=EXCLUDED.source_url,
+                            image_url=EXCLUDED.image_url, match_method=EXCLUDED.match_method,
+                            confidence=EXCLUDED.confidence, aliases_json=EXCLUDED.aliases_json,
+                            updated_at=EXCLUDED.updated_at
+                        """,
+                        values,
+                    )
+                conn.commit()
+            finally:
+                conn.close()
+        else:
+            conn = _sqlite_connect()
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO guild_item_links (guild_id, reference_type, reference_key, catalog_item_id, source_item_id, canonical_name, source_url, image_url, match_method, confidence, aliases_json, updated_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT (guild_id, reference_type, reference_key) DO UPDATE SET
+                        catalog_item_id=excluded.catalog_item_id, source_item_id=excluded.source_item_id,
+                        canonical_name=excluded.canonical_name, source_url=excluded.source_url,
+                        image_url=excluded.image_url, match_method=excluded.match_method,
+                        confidence=excluded.confidence, aliases_json=excluded.aliases_json,
+                        updated_at=excluded.updated_at
+                    """,
+                    values,
+                )
+                conn.commit()
+            finally:
+                conn.close()
+    return True
+
+
+def search_catalog_items(query: str = "", *, limit: int = 25) -> list[dict[str, Any]]:
+    """Sucht aktive Katalogitems für Discord-Autocomplete/Picker.
+
+    Die Funktion liefert immer die feste ``item_catalog.id`` mit aus. Bei SQLite
+    ist der externe Questlog-Katalog nicht vorhanden, deshalb wird dort leer
+    zurückgegeben statt auf unsichere Namen auszuweichen.
+    """
+    if not _INITIALIZED:
+        init_runtime_db()
+    if _BACKEND != "postgres":
+        return []
+    text = str(query or "").strip()
+    safe_limit = max(1, min(int(limit or 25), 50))
+    conn = _pg_connect()
+    try:
+        with conn.cursor() as cur:
+            if text:
+                cur.execute(
+                    """
+                    SELECT id, source, source_url, source_item_id, name,
+                           main_category, sub_category, rarity, image_url, icon_url
+                    FROM item_catalog
+                    WHERE is_active = TRUE AND name ILIKE %s
+                    ORDER BY CASE WHEN lower(name) = lower(%s) THEN 0
+                                  WHEN lower(name) LIKE lower(%s) THEN 1
+                                  ELSE 2 END,
+                             name ASC
+                    LIMIT %s
+                    """,
+                    (f"%{text}%", text, f"{text}%", safe_limit),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT id, source, source_url, source_item_id, name,
+                           main_category, sub_category, rarity, image_url, icon_url
+                    FROM item_catalog
+                    WHERE is_active = TRUE
+                    ORDER BY updated_at DESC NULLS LAST, name ASC
+                    LIMIT %s
+                    """,
+                    (safe_limit,),
+                )
+            return [dict(row) for row in (cur.fetchall() or [])]
+    finally:
+        conn.close()
+
+
+def resolve_catalog_item_reference(*, guild_id: int, local_item_id: str = "", item_name: str = "", catalog_item_id: int = 0, source_item_id: str = "", allow_fuzzy: bool = True) -> Optional[dict[str, Any]]:
+    """Löst eine Bot-/Auktionsreferenz auf die feste ``item_catalog.id`` auf.
+
+    Priorität: explizite ID → gespeicherter Link → Questlog/source_item_id →
+    exakter Name → sehr sicherer Fuzzy-Treffer. Unsichere Treffer werden nicht
+    gespeichert, damit ähnlich benannte Ringe nicht falsch verknüpft werden.
+    """
+    if not _INITIALIZED:
+        init_runtime_db()
+    if _BACKEND != "postgres":
+        return None
+
+    local_key = str(local_item_id or "").strip()
+    alias_key = _normalize_item_reference(item_name)
+    try:
+        explicit_id = int(catalog_item_id or 0)
+    except Exception:
+        explicit_id = 0
+
+    def fetch_one(where: str, params: tuple[Any, ...]) -> Optional[dict[str, Any]]:
+        conn = _pg_connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"""
+                    SELECT ic.id, ic.source, ic.source_url, ic.source_item_id, ic.name,
+                           ic.main_category, ic.sub_category, ic.rarity, ic.stats,
+                           ic.abilities, ic.traits, ic.image_url, ic.icon_url,
+                           ov.image_url AS manual_image_url
+                    FROM item_catalog ic
+                    LEFT JOIN item_catalog_image_overrides ov ON ov.source_url = ic.source_url
+                    WHERE ic.is_active = TRUE AND ({where})
+                    LIMIT 1
+                    """,
+                    params,
+                )
+                row = cur.fetchone()
+                return dict(row) if row else None
+        finally:
+            conn.close()
+
+    item: Optional[dict[str, Any]] = None
+    method = ""
+    confidence = 0.0
+
+    if explicit_id:
+        item = fetch_one("ic.id = %s", (explicit_id,))
+        method, confidence = "catalog_id", 1.0
+
+    if item is None and local_key:
+        link = get_guild_item_link(int(guild_id), "local_item", local_key)
+        if link and int(link.get("catalog_item_id") or 0):
+            item = fetch_one("ic.id = %s", (int(link.get("catalog_item_id") or 0),))
+            method, confidence = "stored_local_link", float(link.get("confidence") or 1.0)
+
+    if item is None and alias_key:
+        link = get_guild_item_link(int(guild_id), "alias", alias_key)
+        if link and int(link.get("catalog_item_id") or 0):
+            item = fetch_one("ic.id = %s", (int(link.get("catalog_item_id") or 0),))
+            method, confidence = "stored_alias", float(link.get("confidence") or 1.0)
+
+    source_candidates = [str(source_item_id or "").strip(), local_key]
+    if item is None:
+        for source in [x for x in source_candidates if x and not x.startswith("junk:")]:
+            item = fetch_one("ic.source_item_id = %s", (source,))
+            if item:
+                method, confidence = "source_item_id", 1.0
+                break
+
+    clean_name = str(item_name or "").strip()
+    if item is None and clean_name:
+        item = fetch_one("lower(ic.name) = lower(%s)", (clean_name,))
+        if item:
+            method, confidence = "exact_name", 0.99
+
+    if item is None and clean_name and allow_fuzzy:
+        tokens = [t for t in alias_key.split() if len(t) >= 3]
+        query = max(tokens, key=len, default=clean_name)
+        conn = _pg_connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT ic.id, ic.source, ic.source_url, ic.source_item_id, ic.name,
+                           ic.main_category, ic.sub_category, ic.rarity, ic.stats,
+                           ic.abilities, ic.traits, ic.image_url, ic.icon_url,
+                           ov.image_url AS manual_image_url
+                    FROM item_catalog ic
+                    LEFT JOIN item_catalog_image_overrides ov ON ov.source_url = ic.source_url
+                    WHERE ic.is_active = TRUE AND ic.name ILIKE %s
+                    LIMIT 120
+                    """,
+                    (f"%{query}%",),
+                )
+                candidates = [dict(r) for r in (cur.fetchall() or [])]
+        finally:
+            conn.close()
+        best = None
+        best_score = 0.0
+        wanted_tokens = set(alias_key.split())
+        for cand in candidates:
+            cname = _normalize_item_reference(cand.get("name"))
+            seq = difflib.SequenceMatcher(None, alias_key, cname).ratio()
+            candidate_tokens = set(cname.split())
+            overlap = len(wanted_tokens & candidate_tokens) / max(1, len(wanted_tokens | candidate_tokens))
+            score = seq * 0.62 + overlap * 0.38
+            if score > best_score:
+                best, best_score = cand, score
+        if best is not None and best_score >= 0.90:
+            item = best
+            method, confidence = "safe_fuzzy_name", float(best_score)
+
+    if item is None:
+        return None
+    item = dict(item)
+    item["catalog_item_id"] = int(item.get("id") or 0)
+    item["match_method"] = method
+    item["match_confidence"] = confidence
+    if local_key:
+        upsert_guild_item_link(guild_id=int(guild_id), reference_type="local_item", reference_key=local_key, item=item, match_method=method, confidence=confidence, aliases=[clean_name] if clean_name else [])
+    if alias_key:
+        upsert_guild_item_link(guild_id=int(guild_id), reference_type="alias", reference_key=alias_key, item=item, match_method=method, confidence=confidence, aliases=[clean_name] if clean_name else [])
+    return item

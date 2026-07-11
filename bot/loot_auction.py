@@ -26,6 +26,11 @@ try:
 except Exception:
     from channel_picker import send_text_channel_picker, send_voice_channel_picker  # type: ignore
 
+try:
+    from bot import runtime_db  # type: ignore
+except Exception:
+    import runtime_db  # type: ignore
+
 TZ = ZoneInfo("Europe/Berlin")
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -326,6 +331,258 @@ def _find_item(guild_id: int, query: str) -> tuple[str, str, list[tuple[str, str
     if len(matches) == 1:
         return matches[0][0], matches[0][1], matches
     return "", str(query or "Unbekanntes Item"), matches
+
+
+def _catalog_slot_from_item(item: dict[str, Any]) -> tuple[str, str]:
+    """Übersetzt Questlog-Kategorien in das bestehende lokale Loot-Schema."""
+    name = str(item.get("name") or "")
+    main = str(item.get("main_category") or "")
+    sub = str(item.get("sub_category") or "")
+    text = f"{main} {sub} {name}".casefold()
+    weapon_map = {
+        "schwert & schild": "Schwert & Schild", "schwert und schild": "Schwert & Schild",
+        "großschwert": "Großschwert", "grossschwert": "Großschwert",
+        "dolch": "Dolche", "armbrust": "Armbrust", "langbogen": "Langbogen",
+        "zauberstab": "Zauberstab", "stab": "Stab", "speer": "Speer",
+        "kugel": "Kugel", "fäustling": "Fäustlinge", "faeustling": "Fäustlinge",
+    }
+    for needle, label in weapon_map.items():
+        if needle in text:
+            return "Waffe", label
+    slot_hints = [
+        (("fähigkeitskern", "faehigkeitskern"), "Fähigkeitskern"),
+        (("kopfschutz", "helm", "hut", "haube"), "Helm"),
+        (("oberkörper", "oberkoerper", "brustschutz", "rüstung", "ruestung", "robe"), "Brust"),
+        (("beinschutz", "hose"), "Hose"),
+        (("handschutz", "handschuh", "stulpen"), "Handschuhe"),
+        (("fußschutz", "fussschutz", "schuh", "stiefel"), "Schuhe"),
+        (("brosche",), "Brosche"),
+        (("ohrring",), "Ohrringe"),
+        (("halskette", "kette"), "Kette"),
+        (("armband", "armreif"), "Armband"),
+        (("ring",), "Ring"),
+        (("gürtel", "guertel"), "Gürtel"),
+        (("umhang", "mantel"), "Umhang"),
+    ]
+    for hints, slot in slot_hints:
+        if any(h in text for h in hints):
+            return slot, ""
+    return str(sub or main or "Sonstiges"), ""
+
+
+def _ensure_local_catalog_item(
+    guild_id: int,
+    *,
+    catalog_item_id: int = 0,
+    item_name: str = "",
+    local_item_id: str = "",
+    source_item_id: str = "",
+) -> tuple[str, str, Optional[dict[str, Any]]]:
+    """Legt/aktualisiert ein lokales Lootitem mit fester Katalog-ID an."""
+    try:
+        linked = runtime_db.resolve_catalog_item_reference(
+            guild_id=int(guild_id),
+            local_item_id=str(local_item_id or ""),
+            item_name=str(item_name or ""),
+            catalog_item_id=int(catalog_item_id or 0),
+            source_item_id=str(source_item_id or ""),
+        )
+    except Exception as exc:
+        print(f"[loot_auction] Katalogitem konnte nicht aufgelöst werden: {exc!r}")
+        linked = None
+    if not linked:
+        return str(local_item_id or ""), str(item_name or ""), None
+
+    cid = int(linked.get("id") or linked.get("catalog_item_id") or 0)
+    canonical_name = str(linked.get("name") or item_name or local_item_id or "Unbekanntes Item")
+    stable_local_id = str(local_item_id or (f"ql-{cid}" if cid else str(linked.get("source_item_id") or ""))).strip()
+    if not stable_local_id:
+        stable_local_id = f"ql-{abs(hash(canonical_name))}"
+    slot, weapon_type = _catalog_slot_from_item(linked)
+
+    data = _load_items()
+    guild_data = data.get(str(int(guild_id))) if isinstance(data.get(str(int(guild_id))), dict) else {}
+    items = guild_data.get("items") if isinstance(guild_data.get("items"), dict) else {}
+    current = items.get(stable_local_id) if isinstance(items.get(stable_local_id), dict) else {}
+    merged = dict(current or {})
+    merged.update({
+        "name": canonical_name,
+        "slot": slot,
+        "weapon_type": weapon_type,
+        "source": "item_catalog",
+        "catalog_item_id": cid,
+        "catalog_source_item_id": str(linked.get("source_item_id") or ""),
+        "source_url": str(linked.get("source_url") or ""),
+        "image_url": str(linked.get("manual_image_url") or linked.get("image_url") or linked.get("icon_url") or ""),
+        "main_category": str(linked.get("main_category") or ""),
+        "sub_category": str(linked.get("sub_category") or ""),
+        "catalog_linked_at": _now_iso(),
+    })
+    items[stable_local_id] = merged
+    guild_data["items"] = items
+    data[str(int(guild_id))] = guild_data
+    _save_json(LOOT_ITEMS_FILE, data)
+    return stable_local_id, canonical_name, linked
+
+
+def _catalog_token_id(value: str) -> int:
+    raw = str(value or "").strip()
+    if not raw.lower().startswith("db:"):
+        return 0
+    try:
+        return int(raw.split(":", 1)[1].split("|", 1)[0])
+    except Exception:
+        return 0
+
+
+def _resolve_item_request(guild_id: int, query: str, *, catalog_item_id: int = 0) -> tuple[str, str, list[tuple[str, str]], Optional[dict[str, Any]]]:
+    """Löst Dropdown-/Freitext-Eingaben auf lokale ID + feste Katalog-ID."""
+    explicit_catalog_id = int(catalog_item_id or _catalog_token_id(query) or 0)
+    if explicit_catalog_id:
+        local_id, canonical_name, linked = _ensure_local_catalog_item(
+            int(guild_id), catalog_item_id=explicit_catalog_id, item_name=str(query or "")
+        )
+        if linked and local_id:
+            return local_id, canonical_name, [(local_id, canonical_name)], linked
+
+    local_id, display, matches = _find_item(int(guild_id), query)
+    if local_id:
+        ensured_id, canonical_name, linked = _ensure_local_catalog_item(
+            int(guild_id), local_item_id=local_id, item_name=display
+        )
+        return ensured_id or local_id, canonical_name or display, matches, linked
+
+    # Nur sehr sichere exakte/fuzzy Katalogtreffer werden akzeptiert. Unsichere
+    # Namen bleiben abgelehnt, statt versehentlich den falschen Ring zu verknüpfen.
+    ensured_id, canonical_name, linked = _ensure_local_catalog_item(
+        int(guild_id), item_name=str(query or "")
+    )
+    if linked and ensured_id:
+        return ensured_id, canonical_name, [(ensured_id, canonical_name)], linked
+    return "", display, matches, None
+
+
+async def _catalog_item_autocomplete(inter: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+    if inter.guild is None:
+        return []
+    try:
+        rows = await asyncio.to_thread(runtime_db.search_catalog_items, str(current or ""), limit=25)
+    except Exception:
+        rows = []
+    choices: list[app_commands.Choice[str]] = []
+    for row in rows[:25]:
+        try:
+            cid = int(row.get("id") or 0)
+        except Exception:
+            cid = 0
+        if not cid:
+            continue
+        name = str(row.get("name") or f"Item {cid}")
+        sub = str(row.get("sub_category") or row.get("main_category") or "")
+        label = f"{name} · {sub}" if sub else name
+        choices.append(app_commands.Choice(name=label[:100], value=f"db:{cid}"))
+    return choices
+
+
+def _catalog_reference_fields(
+    guild_id: int,
+    local_item_id: str,
+    item_name: str,
+    *,
+    catalog_item_id: int = 0,
+    source_item_id: str = "",
+) -> dict[str, Any]:
+    try:
+        linked = runtime_db.resolve_catalog_item_reference(
+            guild_id=int(guild_id),
+            local_item_id=str(local_item_id or ""),
+            item_name=str(item_name or ""),
+            catalog_item_id=int(catalog_item_id or 0),
+            source_item_id=str(source_item_id or ""),
+        )
+    except Exception as exc:
+        print(f"[loot_auction] Item-Katalog-Link fehlgeschlagen: {exc!r}")
+        linked = None
+    if not linked:
+        return {}
+    return {
+        "catalog_item_id": int(linked.get("id") or linked.get("catalog_item_id") or 0),
+        "catalog_source_item_id": str(linked.get("source_item_id") or ""),
+        "catalog_item_name": str(linked.get("name") or ""),
+        "catalog_source_url": str(linked.get("source_url") or ""),
+        "catalog_image_url": str(linked.get("manual_image_url") or linked.get("image_url") or linked.get("icon_url") or ""),
+        "catalog_match_method": str(linked.get("match_method") or ""),
+        "catalog_match_confidence": float(linked.get("match_confidence") or 0),
+        "catalog_linked_at": _now_iso(),
+    }
+
+
+def _apply_catalog_reference(auction: dict[str, Any], guild_id: int) -> bool:
+    fields = _catalog_reference_fields(
+        int(guild_id),
+        str(auction.get("item_id") or ""),
+        str(auction.get("item_name") or auction.get("item") or ""),
+        catalog_item_id=int(auction.get("catalog_item_id") or 0),
+        source_item_id=str(auction.get("catalog_source_item_id") or ""),
+    )
+    if not fields:
+        return False
+    changed = any(auction.get(k) != v for k, v in fields.items())
+    if changed:
+        auction.update(fields)
+    return changed
+
+
+def _migrate_local_item_links() -> dict[str, int]:
+    """Backfillt sichere Kataloglinks für bestehende Lootitems ohne JSON-Umbau."""
+    checked = linked = 0
+    data = _load_items()
+    for gid_raw, guild_data in (data.items() if isinstance(data, dict) else []):
+        try:
+            guild_id = int(gid_raw)
+        except Exception:
+            continue
+        items = guild_data.get("items") if isinstance(guild_data, dict) else {}
+        if not isinstance(items, dict):
+            continue
+        for local_id, raw in items.items():
+            if not isinstance(raw, dict):
+                continue
+            checked += 1
+            try:
+                result = runtime_db.resolve_catalog_item_reference(
+                    guild_id=guild_id,
+                    local_item_id=str(local_id),
+                    item_name=str(raw.get("name") or local_id),
+                    catalog_item_id=int(raw.get("catalog_item_id") or 0),
+                    source_item_id=str(raw.get("catalog_source_item_id") or raw.get("source_item_id") or ""),
+                )
+            except Exception:
+                result = None
+            if result:
+                linked += 1
+    return {"checked": checked, "linked": linked}
+
+
+def _migrate_existing_auction_item_links() -> dict[str, int]:
+    checked = linked = 0
+    for gid_raw, guild_data in list(auction_state.items()):
+        try:
+            guild_id = int(gid_raw)
+        except Exception:
+            continue
+        auctions = guild_data.get("auctions") if isinstance(guild_data, dict) else {}
+        if not isinstance(auctions, dict):
+            continue
+        for auction in auctions.values():
+            if not isinstance(auction, dict):
+                continue
+            checked += 1
+            if _apply_catalog_reference(auction, guild_id):
+                linked += 1
+    if linked:
+        save_auctions()
+    return {"checked": checked, "linked": linked}
 
 
 def _slot_obj(value: Any) -> dict:
@@ -1066,6 +1323,7 @@ async def start_junk_sale_drop(
     item_title: str,
     actor_id: int | None = None,
     duration_hours: int = SALE_HOURS,
+    catalog_item_id: int = 0,
 ) -> dict:
     """Startet ein kostenloses Sale-Item für Müll-/Restdrops aus dem Adminbereich der Gildenzentrale.
 
@@ -1084,6 +1342,14 @@ async def start_junk_sale_drop(
     # Müll-/Restitems laufen anders als normale Sales:
     # 0-24 Stunden live würfeln, danach gewinnt der höchste eindeutige Wurf.
     # Wenn bis dahin niemand würfelt, bleibt das Item ohne Ablauf als Gratis-Sofortkauf offen.
+    linked_item: Optional[dict[str, Any]] = None
+    local_item_id = ""
+    if int(catalog_item_id or 0):
+        local_item_id, canonical_name, linked_item = _ensure_local_catalog_item(
+            int(guild.id), catalog_item_id=int(catalog_item_id), item_name=title
+        )
+        if linked_item:
+            title = canonical_name or title
     aid = _new_auction_id()
     interest_until = _now() + timedelta(hours=JUNK_INTEREST_HOURS)
     auc = {
@@ -1091,7 +1357,7 @@ async def start_junk_sale_drop(
         "guild_id": int(guild.id),
         "kind": "sale",
         "phase": "sale",
-        "item_id": f"junk:{aid}",
+        "item_id": local_item_id or f"junk:{aid}",
         "item_name": title,
         "created_at": _now_iso(),
         "created_by": int(actor_id or getattr(inter.user, "id", 0) or 0),
@@ -1116,6 +1382,10 @@ async def start_junk_sale_drop(
         "junk_drop": True,
         "created_note": "Kostenloses Müll-/Restitem",
     }
+    auc.update(_catalog_reference_fields(
+        int(guild.id), str(auc.get("item_id") or ""), title,
+        catalog_item_id=int((linked_item or {}).get("id") or catalog_item_id or 0),
+    ))
     _gauctions(guild.id).setdefault("auctions", {})[aid] = auc
     save_auctions()
 
@@ -2302,6 +2572,10 @@ async def _dashboard_apply_sale_or_junk(client: discord.Client, guild: discord.G
 async def _dashboard_apply_drop_create(client: discord.Client, guild: discord.Guild, row: dict, member: discord.Member, action_type: str) -> dict:
     payload = _dashboard_row_payload(row)
     item_query = _safe_text(str(payload.get("item_query") or payload.get("item_name") or payload.get("item") or "").strip())[:160]
+    try:
+        requested_catalog_item_id = int(payload.get("catalog_item_id") or 0)
+    except Exception:
+        requested_catalog_item_id = 0
     if not item_query:
         return {"ok": False, "status": "rejected", "error": "Itemname fehlt."}
     if not _is_leader_or_admin_member(guild, member):
@@ -2309,7 +2583,7 @@ async def _dashboard_apply_drop_create(client: discord.Client, guild: discord.Gu
 
     ctx = _DashboardDropContext(client, guild, member)
     if action_type == "junk_drop":
-        result = await start_junk_sale_drop(ctx, int(guild.id), item_query, actor_id=int(member.id))  # type: ignore[arg-type]
+        result = await start_junk_sale_drop(ctx, int(guild.id), item_query, actor_id=int(member.id), catalog_item_id=requested_catalog_item_id)  # type: ignore[arg-type]
         ok = bool(result.get("ok", True)) if isinstance(result, dict) else True
         if not ok:
             return {"ok": False, "status": "failed", "error": str(result.get("error") or "Müll-Drop konnte nicht erstellt werden.")}
@@ -2319,14 +2593,17 @@ async def _dashboard_apply_drop_create(client: discord.Client, guild: discord.Gu
             "message": "Müll-Drop erstellt.",
             "auction_id": result.get("auction_id") if isinstance(result, dict) else "",
             "item_name": item_query,
+            "catalog_item_id": int((result.get("auction") or {}).get("catalog_item_id") or requested_catalog_item_id) if isinstance(result, dict) else requested_catalog_item_id,
             "kind": "junk_drop",
         }
 
-    item_id, display, matches = _find_item(int(guild.id), item_query)
+    item_id, display, matches, linked_item = _resolve_item_request(
+        int(guild.id), item_query, catalog_item_id=requested_catalog_item_id
+    )
     if not item_id:
         suggestions = ", ".join(str(m[1]) for m in (matches or [])[:8])
         suffix = f" Vorschläge: {suggestions}" if suggestions else ""
-        return {"ok": False, "status": "rejected", "error": f"Item nicht eindeutig im Loot-Katalog gefunden.{suffix}"}
+        return {"ok": False, "status": "rejected", "error": f"Item nicht eindeutig im Loot-/Item-Katalog gefunden.{suffix}"}
     result = await start_loot_drop_auction(ctx, guild, str(item_id), actor_id=int(member.id))  # type: ignore[arg-type]
     return {
         "ok": True,
@@ -2335,6 +2612,7 @@ async def _dashboard_apply_drop_create(client: discord.Client, guild: discord.Gu
         "auction_id": result.get("auction_id") if isinstance(result, dict) else "",
         "item_id": str(item_id),
         "item_name": result.get("item_name") if isinstance(result, dict) else display,
+        "catalog_item_id": int((linked_item or {}).get("id") or requested_catalog_item_id or 0),
         "phase": result.get("phase") if isinstance(result, dict) else "",
         "eligibility_mode": result.get("eligibility_mode") if isinstance(result, dict) else "",
         "eligible_count": len(result.get("eligible_user_ids") or []) if isinstance(result, dict) else 0,
@@ -3334,6 +3612,8 @@ async def start_loot_drop_auction(inter: discord.Interaction, guild: discord.Gui
         "created_by": actor_id,
         "expires_at": (_now() + timedelta(hours=SALE_HOURS + FREE_AUCTION_HOURS + (NEED_AUCTION_HOURS if phase == "need" else 0))).isoformat(),
     }
+    catalog_fields = _catalog_reference_fields(int(guild.id), str(item_id), item_name)
+    chest_obj.update(catalog_fields)
     _gchest(guild.id).setdefault("items", {})[chest_id] = chest_obj
     save_chest()
 
@@ -3358,6 +3638,7 @@ async def start_loot_drop_auction(inter: discord.Interaction, guild: discord.Gui
         "message_id": 0,
         "channel_id": 0,
     }
+    auc.update(catalog_fields)
     _gauctions(guild.id).setdefault("auctions", {})[aid] = auc
     save_auctions()
 
@@ -3411,6 +3692,7 @@ async def start_loot_drop_auction(inter: discord.Interaction, guild: discord.Gui
         "phase": phase,
         "eligibility_mode": mode,
         "item_name": item_name,
+        "catalog_item_id": int(auc.get("catalog_item_id") or 0),
         "eligible_user_ids": eligible,
         "notified": notified,
         "failed": failed,
@@ -3474,6 +3756,17 @@ async def _purge_auction_messages(client: discord.Client, auction: dict) -> int:
 async def setup_loot_auction(client: discord.Client, tree: app_commands.CommandTree):
     global _client_ref
     _client_ref = client
+
+    try:
+        local_migration = await asyncio.to_thread(_migrate_local_item_links)
+        auction_migration = await asyncio.to_thread(_migrate_existing_auction_item_links)
+        print(
+            "🔗 Itemlinks geprüft: "
+            f"Katalog {local_migration.get('checked', 0)} / verknüpft {local_migration.get('linked', 0)} · "
+            f"Auktionen {auction_migration.get('checked', 0)} / aktualisiert {auction_migration.get('linked', 0)}"
+        )
+    except Exception as exc:
+        print(f"[loot_auction] Itemlink-Migration beim Start fehlgeschlagen: {exc!r}")
 
     # Re-register persistent views for active/closed auctions after restart.
     try:
@@ -3608,13 +3901,16 @@ async def setup_loot_auction(client: discord.Client, tree: app_commands.CommandT
             await inter.response.send_message("❌ Ungültige Werte. 0 = Regelwert. Dauer: 0 oder 1–240 Stunden.", ephemeral=True)
             return
         guild = inter.guild
-        item_id, item_name, matches = _find_item(guild.id, item)
+        item_id, item_name, matches, linked_item = _resolve_item_request(guild.id, item)
         if not item_id and len(matches) > 1:
             lines = "\n".join(f"• `{mid}` – {name}" for mid, name in matches[:10])
             await inter.response.send_message(
                 "❌ Mehrere Items gefunden. Bitte genauer schreiben oder die Item-ID nutzen:\n" + lines,
                 ephemeral=True,
             )
+            return
+        if not item_id:
+            await inter.response.send_message("❌ Item nicht gefunden. Nutze die Autovervollständigung aus der Item-Datenbank.", ephemeral=True)
             return
         mode, eligible_ids = _eligible_user_ids(guild, item_id, eligibility)
         if eligibility in {"main_need", "secondary_need"} and not eligible_ids:
@@ -3649,6 +3945,10 @@ async def setup_loot_auction(client: discord.Client, tree: app_commands.CommandT
             "message_id": 0,
             "channel_id": 0,
         }
+        auc.update(_catalog_reference_fields(
+            int(guild.id), str(item_id), item_name,
+            catalog_item_id=int((linked_item or {}).get("id") or 0),
+        ))
         _gauctions(guild.id).setdefault("auctions", {})[aid] = auc
         save_auctions()
 
@@ -3668,6 +3968,9 @@ async def setup_loot_auction(client: discord.Client, tree: app_commands.CommandT
             ephemeral=True,
         )
 
+    @auction_start.autocomplete("item")
+    async def auction_start_item_autocomplete(inter: discord.Interaction, current: str):
+        return await _catalog_item_autocomplete(inter, current)
 
 
     @group.command(name="sale_start", description="Startet einen Sofortkauf/Sale-Kauf mit festem EC-Preis")
@@ -3684,13 +3987,16 @@ async def setup_loot_auction(client: discord.Client, tree: app_commands.CommandT
             await inter.response.send_message("❌ Ungültige Werte. Preis mindestens 1 EC, Dauer 1–720 Stunden.", ephemeral=True)
             return
         guild = inter.guild
-        item_id, item_name, matches = _find_item(guild.id, item)
+        item_id, item_name, matches, linked_item = _resolve_item_request(guild.id, item)
         if not item_id and len(matches) > 1:
             lines = "\n".join(f"• `{mid}` – {name}" for mid, name in matches[:10])
             await inter.response.send_message(
                 "❌ Mehrere Items gefunden. Bitte genauer schreiben oder die Item-ID nutzen:\n" + lines,
                 ephemeral=True,
             )
+            return
+        if not item_id:
+            await inter.response.send_message("❌ Item nicht gefunden. Nutze die Autovervollständigung aus der Item-Datenbank.", ephemeral=True)
             return
         aid = _new_auction_id()
         ends = _now() + timedelta(hours=int(duration_hours))
@@ -3713,6 +4019,10 @@ async def setup_loot_auction(client: discord.Client, tree: app_commands.CommandT
             "message_id": 0,
             "channel_id": 0,
         }
+        auc.update(_catalog_reference_fields(
+            int(guild.id), str(item_id), item_name,
+            catalog_item_id=int((linked_item or {}).get("id") or 0),
+        ))
         _gauctions(guild.id).setdefault("auctions", {})[aid] = auc
         save_auctions()
         ch = _auction_channel(client, guild.id, inter.channel)
@@ -3726,6 +4036,10 @@ async def setup_loot_auction(client: discord.Client, tree: app_commands.CommandT
         await _post_or_refresh_active_auction_message(client, guild.id, auc)
         await _post_or_refresh_market_message(client, guild.id, auc)
         await inter.response.send_message(f"✅ Sale-Kauf gestartet: `{aid}` in {ch.mention}", ephemeral=True)
+
+    @auction_sale_start.autocomplete("item")
+    async def auction_sale_start_item_autocomplete(inter: discord.Interaction, current: str):
+        return await _catalog_item_autocomplete(inter, current)
 
     @group.command(name="list", description="Zeigt aktive Loot-Auktionen")
     async def auction_list(inter: discord.Interaction):

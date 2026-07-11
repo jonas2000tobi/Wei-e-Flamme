@@ -26,6 +26,11 @@ try:
 except Exception:
     from channel_picker import send_text_channel_picker, send_voice_channel_picker  # type: ignore
 
+try:
+    from bot import runtime_db  # type: ignore
+except Exception:
+    import runtime_db  # type: ignore
+
 TZ = ZoneInfo("Europe/Berlin")
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -221,6 +226,8 @@ def _gstate(guild_id: int) -> dict:
 def _blank_slot() -> dict:
     return {
         "item_id": "",
+        "catalog_item_id": 0,
+        "catalog_source_item_id": "",
         "received": False,
         "locked": False,
         "received_at": "",
@@ -232,6 +239,8 @@ def _slot_obj(value: Any) -> dict:
     if isinstance(value, dict):
         obj = dict(value)
         obj.setdefault("item_id", "")
+        obj.setdefault("catalog_item_id", 0)
+        obj.setdefault("catalog_source_item_id", "")
         obj.setdefault("received", False)
         obj.setdefault("locked", bool(obj.get("received", False)))
         obj.setdefault("received_at", "")
@@ -265,10 +274,20 @@ def _slot_received(value: Any) -> bool:
     return bool(_slot_obj(value).get("received", False))
 
 
-def _set_slot_item(data: dict, tab: str, slot: str, item_id: str) -> None:
+def _set_slot_item(
+    data: dict,
+    tab: str,
+    slot: str,
+    item_id: str,
+    *,
+    catalog_item_id: int = 0,
+    catalog_source_item_id: str = "",
+) -> None:
     data.setdefault(tab, {})
     data[tab][slot] = {
         "item_id": str(item_id),
+        "catalog_item_id": int(catalog_item_id or 0),
+        "catalog_source_item_id": str(catalog_source_item_id or ""),
         "received": False,
         "locked": False,
         "received_at": "",
@@ -2237,11 +2256,17 @@ def _ensure_dashboard_catalog_item(guild_id: int, need_slot: str, item_text: str
         weapon_type = _normalize_weapon_type(sub) or sub
     current = items.get(item_id) if isinstance(items.get(item_id), dict) else {}
     merged = dict(current or {})
+    try:
+        catalog_item_id = int(payload.get("item_catalog_id") or 0)
+    except Exception:
+        catalog_item_id = 0
     merged.update({
         "name": name,
         "slot": slot,
         "weapon_type": weapon_type,
         "source": "questlog_dashboard",
+        "catalog_item_id": catalog_item_id,
+        "catalog_source_item_id": str(payload.get("catalog_source_item_id") or payload.get("source_item_id") or ""),
         "source_url": str(payload.get("item_source_url") or ""),
         "image_url": str(payload.get("item_image_url") or ""),
         "main_category": category,
@@ -2249,6 +2274,25 @@ def _ensure_dashboard_catalog_item(guild_id: int, need_slot: str, item_text: str
     })
     items[item_id] = merged
     save_items()
+    if catalog_item_id:
+        try:
+            runtime_db.upsert_guild_item_link(
+                guild_id=int(guild_id),
+                reference_type="local_item",
+                reference_key=item_id,
+                item={
+                    "id": catalog_item_id,
+                    "source_item_id": merged.get("catalog_source_item_id") or "",
+                    "name": name,
+                    "source_url": merged.get("source_url") or "",
+                    "image_url": merged.get("image_url") or "",
+                },
+                match_method="dashboard_catalog_id",
+                confidence=1.0,
+                aliases=[name],
+            )
+        except Exception as exc:
+            print(f"[loot_needs] Itemlink konnte nicht gespeichert werden: {exc!r}")
     return item_id
 
 def _find_item_for_dashboard_need(guild_id: int, need_slot: str, text: str) -> tuple[str, str]:
@@ -2317,12 +2361,21 @@ def _process_dashboard_need_request(row: dict) -> tuple[str, dict]:
     if action == "set":
         item_text = str(payload.get("item_id") or payload.get("item_text") or payload.get("item_name") or "").strip()
         item_id, err = _find_item_for_dashboard_need(guild_id, slot, item_text)
-        if err and str(payload.get("source") or "") == "dashboard_need_build":
+        if err and str(payload.get("source") or "") in {"dashboard_need_build", "dashboard_portal"}:
             item_id = _ensure_dashboard_catalog_item(guild_id, slot, item_text, payload)
             err = "" if item_id else err
         if err:
             return "rejected", {"ok": False, "error": err}
-        _set_slot_item(data, tab, slot, item_id)
+        local_item = _all_items(guild_id).get(str(item_id)) or {}
+        try:
+            catalog_item_id = int(payload.get("item_catalog_id") or local_item.get("catalog_item_id") or 0)
+        except Exception:
+            catalog_item_id = 0
+        _set_slot_item(
+            data, tab, slot, item_id,
+            catalog_item_id=catalog_item_id,
+            catalog_source_item_id=str(payload.get("catalog_source_item_id") or local_item.get("catalog_source_item_id") or ""),
+        )
         save_needs()
         new_name = _item_name(guild_id, item_id, with_type=True)
         result = {"ok": True, "message": f"{tab} – {slot}: {new_name} gespeichert.", "old_item": old_name, "new_item": new_name, "item_id": item_id}

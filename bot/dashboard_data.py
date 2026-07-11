@@ -495,46 +495,111 @@ def _summarize_events(data: Any, guild: discord.Guild, *, limit: int = 200) -> d
 
 
 def _summarize_profiles(data: Any, guild: discord.Guild, *, limit: int = 500) -> dict[str, Any]:
+    """Aktive Gildenmitglieder aus der gesetzten Discord-Rolle.
+
+    Der alte Code lief primär über vorhandene Profil-JSONs. Dadurch konnten alte
+    Profile aus Postgres wieder in die Mitgliederliste geraten und aktive Spieler
+    ohne Profil fehlten. Jetzt ist die Discord-Rolle die Wahrheit; Profildaten
+    werden nur dazugemischt.
+    """
     g = _guild_dict(data, guild.id)
     users = g.get("users") if isinstance(g.get("users"), dict) else {}
     absences = g.get("absences") if isinstance(g.get("absences"), dict) else {}
+    member_role = _dashboard_member_role(guild)
+    active_members = [
+        m for m in (getattr(member_role, "members", []) if member_role is not None else [])
+        if getattr(m, "id", None) and not bool(getattr(m, "bot", False))
+    ]
+    active_ids = {int(m.id) for m in active_members}
+    stale_count = sum(1 for uid in users.keys() if str(uid).isdigit() and int(uid) not in active_ids)
     items: list[dict[str, Any]] = []
-    stale_count = 0
-    for uid, profile in users.items():
-        if not isinstance(profile, dict):
-            continue
-        try:
-            user_id = int(uid)
-        except Exception:
-            continue
-        member = guild.get_member(user_id)
-        if not _is_dashboard_member(guild, user_id):
-            stale_count += 1
-            continue
-        discord_display = _safe_text(getattr(member, "display_name", "") if member is not None else "", 120)
-        avatar_url = _safe_text(str(getattr(getattr(member, "display_avatar", None), "url", "") or "") if member is not None else "", 500)
+
+    for member in active_members:
+        user_id = int(member.id)
+        profile = users.get(str(user_id)) if isinstance(users.get(str(user_id)), dict) else {}
+        server_name = _safe_text(getattr(member, "display_name", "") or getattr(member, "name", "") or f"User {user_id}", 120)
+        discord_name = _safe_text(getattr(member, "name", "") or server_name, 120)
+        ingame_name = _safe_text(profile.get("ingame_name") or profile.get("name") or "", 120)
+        display_name = ingame_name or server_name
+        avatar_url = _safe_text(str(getattr(getattr(member, "display_avatar", None), "url", "") or ""), 500)
+        joined_at = getattr(member, "joined_at", None)
+        roles = [
+            {"role_id": int(r.id), "role_name": str(r.name)}
+            for r in getattr(member, "roles", [])
+            if getattr(r, "id", None) and not bool(getattr(r, "is_default", lambda: False)())
+        ]
         items.append({
             "user_id": user_id,
-            "display_name": discord_display or _safe_text(profile.get("ingame_name") or f"User {user_id}", 120),
-            "server_name": discord_display,
-            "discord_name": _safe_text(getattr(member, "name", "") if member is not None else "", 120),
+            "display_name": display_name,
+            "server_name": server_name,
+            "discord_name": discord_name,
+            "discord_username": discord_name,
             "avatar_url": avatar_url,
-            "ingame_name": _safe_text(profile.get("ingame_name"), 120),
+            "ingame_name": ingame_name,
+            "profile_name_set": bool(ingame_name),
             "main_role": _safe_text(profile.get("main_role"), 80),
             "gearscore": _safe_text(profile.get("gearscore"), 40),
             "created_at": str(profile.get("created_at") or ""),
+            "joined_at": joined_at.isoformat() if joined_at else "",
+            "roles": roles,
+            "is_dashboard_member": True,
+            "is_active": True,
+            "profile_exists": bool(profile),
             "in_discord_cache": True,
+            "profile": profile,
         })
-    items.sort(key=lambda x: (str(x.get("display_name") or "")).lower())
+
+    items.sort(key=lambda x: (str(x.get("display_name") or "")).casefold())
     return {
         "count": len(items),
         "total_json_count": len(users),
         "stale_count": stale_count,
+        "without_profile_count": sum(1 for x in items if not x.get("profile_exists")),
         "absences_count": len(absences),
+        "member_role_id": int(getattr(member_role, "id", 0) or 0),
+        "member_role_name": str(getattr(member_role, "name", "") or ""),
+        "active_member_ids": [str(x.get("user_id")) for x in items],
         "items": items[:limit],
         "filter": "dashboard_member_role_only",
     }
 
+
+def _sync_member_directory(guild: discord.Guild, profile_summary: dict[str, Any]) -> dict[str, Any]:
+    # Ohne bewusst gesetzte Mitgliederrolle niemals alle bisherigen Mitglieder
+    # deaktivieren. Das schützt Multi-Guild-Installationen vor Fehlkonfiguration.
+    member_role_id = int(profile_summary.get("member_role_id") or 0)
+    if not member_role_id:
+        return {
+            "ok": False,
+            "skipped": True,
+            "error": "Keine Dashboard-Gildenrolle gesetzt. Nutze /dashboard_set_member_role.",
+            "active": 0,
+            "deactivated": 0,
+        }
+    try:
+        rows = []
+        for item in profile_summary.get("items") or []:
+            if not isinstance(item, dict):
+                continue
+            rows.append({
+                "user_id": int(item.get("user_id") or 0),
+                "server_name": item.get("server_name") or item.get("display_name") or "",
+                "discord_username": item.get("discord_username") or item.get("discord_name") or "",
+                "avatar_url": item.get("avatar_url") or "",
+                "ingame_name": item.get("ingame_name") or "",
+                "main_role": item.get("main_role") or "",
+                "gearscore": item.get("gearscore") or "",
+                "joined_at": item.get("joined_at") or "",
+                "roles": item.get("roles") or [],
+                "profile": item.get("profile") or {},
+            })
+        return runtime_db.sync_guild_members(
+            guild_id=int(guild.id),
+            members=rows,
+            member_role_id=member_role_id,
+        )
+    except Exception as exc:
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
 def _summarize_balances(data: Any, guild: discord.Guild, *, limit: int = 500) -> dict[str, Any]:
     g = _guild_dict(data, guild.id)
@@ -801,10 +866,30 @@ def _summarize_auctions(data: Any, guild: discord.Guild, *, limit: int = 300) ->
             junk_rolls.append({"user_id": iuid, "display_name": member_name(iuid), "roll": roll})
         junk_rolls.sort(key=lambda x: int(x.get("roll") or 0), reverse=True)
 
+        local_item_id = str(auc.get("item_id") or "")
+        raw_item_name = _safe_text(auc.get("item_name") or auc.get("item") or auc.get("title"), 180)
+        catalog_link = None
+        try:
+            catalog_link = runtime_db.resolve_catalog_item_reference(
+                guild_id=guild_id,
+                local_item_id=local_item_id,
+                item_name=raw_item_name,
+                catalog_item_id=int(auc.get("catalog_item_id") or 0),
+                source_item_id=str(auc.get("catalog_source_item_id") or ""),
+            )
+        except Exception:
+            catalog_link = None
         items.append({
             "auction_id": str(aid),
-            "item_id": str(auc.get("item_id") or ""),
-            "item_name": _safe_text(auc.get("item_name") or auc.get("item") or auc.get("title"), 180),
+            "item_id": local_item_id,
+            "item_name": raw_item_name,
+            "catalog_item_id": int((catalog_link or {}).get("id") or auc.get("catalog_item_id") or 0),
+            "catalog_source_item_id": str((catalog_link or {}).get("source_item_id") or auc.get("catalog_source_item_id") or ""),
+            "catalog_item_name": str((catalog_link or {}).get("name") or auc.get("catalog_item_name") or ""),
+            "catalog_source_url": str((catalog_link or {}).get("source_url") or auc.get("catalog_source_url") or ""),
+            "catalog_image_url": str((catalog_link or {}).get("manual_image_url") or (catalog_link or {}).get("image_url") or (catalog_link or {}).get("icon_url") or auc.get("catalog_image_url") or ""),
+            "catalog_match_method": str((catalog_link or {}).get("match_method") or auc.get("catalog_match_method") or ""),
+            "catalog_match_confidence": float((catalog_link or {}).get("match_confidence") or auc.get("catalog_match_confidence") or 0),
             "status": status,
             "kind": _safe_text(auc.get("kind") or "", 80),
             "phase": _safe_text(auc.get("phase") or auc.get("mode") or auc.get("auction_type") or "", 80),
@@ -963,6 +1048,46 @@ def _extract_need_tab(raw: dict[str, Any], tab_names: set[str], catalog: dict[st
     return []
 
 
+def _extract_need_items(raw: dict[str, Any], tab_names: set[str], catalog: dict[str, Any], guild_id: int) -> list[dict[str, Any]]:
+    names = {x.casefold() for x in tab_names}
+    out: list[dict[str, Any]] = []
+    for root in _need_roots(raw):
+        for key, bucket in root.items():
+            if str(key).strip().casefold() not in names or not isinstance(bucket, dict):
+                continue
+            for slot_name, value in bucket.items():
+                obj = value if isinstance(value, dict) else {"item_id": value}
+                if not isinstance(obj, dict) or _is_received_slot(obj):
+                    continue
+                local_id = str(obj.get("item_id") or obj.get("itemId") or obj.get("item") or "").strip()
+                direct_name = str(obj.get("item_name") or obj.get("name") or obj.get("title") or "").strip()
+                item_name = _item_label_from_catalog(catalog, local_id) if local_id else _safe_text(direct_name, 180)
+                if not item_name:
+                    continue
+                linked = None
+                try:
+                    linked = runtime_db.resolve_catalog_item_reference(
+                        guild_id=int(guild_id), local_item_id=local_id, item_name=item_name,
+                        catalog_item_id=int(obj.get("catalog_item_id") or 0),
+                        source_item_id=str(obj.get("catalog_source_item_id") or ""),
+                    )
+                except Exception:
+                    linked = None
+                out.append({
+                    "slot_name": _safe_text(slot_name, 80),
+                    "item_id": local_id,
+                    "item_name": item_name,
+                    "catalog_item_id": int((linked or {}).get("id") or obj.get("catalog_item_id") or 0),
+                    "catalog_source_item_id": str((linked or {}).get("source_item_id") or obj.get("catalog_source_item_id") or ""),
+                    "catalog_item_name": str((linked or {}).get("name") or obj.get("catalog_item_name") or ""),
+                    "catalog_source_url": str((linked or {}).get("source_url") or obj.get("catalog_source_url") or ""),
+                    "catalog_image_url": str((linked or {}).get("manual_image_url") or (linked or {}).get("image_url") or (linked or {}).get("icon_url") or obj.get("catalog_image_url") or ""),
+                    "received": False,
+                })
+            return out
+    return out
+
+
 def _summarize_needs(data: Any, guild: discord.Guild, item_catalog_data: Any = None, *, limit: int = 500) -> dict[str, Any]:
     g = _guild_dict(data, guild.id)
     users = g.get("users") if isinstance(g.get("users"), dict) else g
@@ -985,8 +1110,10 @@ def _summarize_needs(data: Any, guild: discord.Guild, item_catalog_data: Any = N
                 continue
             member = guild.get_member(user_id)
 
-            main_needs = _extract_need_tab(raw, {"main", "Main", "main_needs", "mainNeeds", "haupt", "mainspec"}, catalog)
-            secondary_needs = _extract_need_tab(raw, {"secondary", "Secondary", "sec", "secondary_needs", "secondaryNeeds", "zweite", "zweitspec", "offspec"}, catalog)
+            main_items = _extract_need_items(raw, {"main", "Main", "main_needs", "mainNeeds", "haupt", "mainspec"}, catalog, int(guild.id))
+            secondary_items = _extract_need_items(raw, {"secondary", "Secondary", "sec", "secondary_needs", "secondaryNeeds", "zweite", "zweitspec", "offspec"}, catalog, int(guild.id))
+            main_needs = [str(x.get("item_name") or "") for x in main_items if x.get("item_name")]
+            secondary_needs = [str(x.get("item_name") or "") for x in secondary_items if x.get("item_name")]
 
             # Fallback für sehr alte Strukturen ohne Main/Secondary: nur dann alles als Main interpretieren.
             if not main_needs and not secondary_needs:
@@ -1020,6 +1147,8 @@ def _summarize_needs(data: Any, guild: discord.Guild, item_catalog_data: Any = N
                     "display_name": _safe_text(getattr(member, "display_name", "") or f"User {user_id}", 120),
                     "main": main_needs,
                     "secondary": secondary_needs,
+                    "main_items": main_items,
+                    "secondary_items": secondary_items,
                     "main_count": len(main_needs),
                     "secondary_count": len(secondary_needs),
                     "need_entries_estimated": cnt,
@@ -1679,6 +1808,9 @@ def build_dashboard_snapshot(bot: commands.Bot, guild: discord.Guild) -> dict[st
     sources = {key: _load_json_file(filename, {}) for key, filename in JSON_SOURCES.items()}
     status = runtime_db.db_status()
 
+    profile_summary = _summarize_profiles(sources.get("member_profiles"), guild)
+    member_sync = _sync_member_directory(guild, profile_summary)
+
     snapshot = {
         "schema_version": DASHBOARD_SCHEMA_VERSION,
         "generated_at": _now_iso(),
@@ -1698,7 +1830,9 @@ def build_dashboard_snapshot(bot: commands.Bot, guild: discord.Guild) -> dict[st
         },
         "source_health": _source_health(),
         "auth": _dashboard_auth_info(guild),
-        "profiles": _summarize_profiles(sources.get("member_profiles"), guild),
+        "profiles": profile_summary,
+        "members": profile_summary,
+        "member_directory": member_sync,
         "events": _summarize_events(sources.get("events"), guild),
         "event_checks": _summarize_event_checks(sources.get("dkp_event_checks"), guild_id),
         "ec": {
