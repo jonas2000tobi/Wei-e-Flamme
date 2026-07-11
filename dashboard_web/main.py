@@ -49,12 +49,13 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
-ASSET_VER = "item-image-match-v2-20260711"
-DASHBOARD_RELEASE_VERSION = "1.3.1 · sichere Item-Zuordnung + Bildreparatur"
+ASSET_VER = "item-image-exact-v3-20260711"
+DASHBOARD_RELEASE_VERSION = "1.3.2 · exakte Itembilder + Cache-Reparatur"
 
-_ITEM_MATCH_CACHE: dict[str, Optional[dict[str, Any]]] = {}
+_ITEM_MATCH_CACHE: dict[str, tuple[float, Optional[dict[str, Any]]]] = {}
 _ITEM_CATALOG_POOL_CACHE: dict[str, Any] = {"loaded_at": 0.0, "items": []}
-_ITEM_CATALOG_POOL_TTL_SECONDS = 300.0
+_ITEM_CATALOG_POOL_TTL_SECONDS = 120.0
+_ITEM_MATCH_CACHE_TTL_SECONDS = 120.0
 
 
 def _database_url() -> str:
@@ -8521,9 +8522,12 @@ def _catalog_item_match(item_name: Any) -> Optional[dict[str, Any]]:
     key = _normalize_item_lookup_name(item_name)
     if not key or len(key) < 3 or not _item_catalog_available():
         return None
-    if key in _ITEM_MATCH_CACHE:
-        cached = _ITEM_MATCH_CACHE[key]
-        return dict(cached) if isinstance(cached, dict) else None
+    cached_entry = _ITEM_MATCH_CACHE.get(key)
+    if isinstance(cached_entry, tuple) and len(cached_entry) == 2:
+        cached_at, cached = cached_entry
+        if time.monotonic() - float(cached_at or 0.0) < _ITEM_MATCH_CACHE_TTL_SECONDS:
+            return dict(cached) if isinstance(cached, dict) else None
+        _ITEM_MATCH_CACHE.pop(key, None)
 
     search_features = _item_lookup_features(item_name)
     candidates = _catalog_match_pool()
@@ -8563,7 +8567,7 @@ def _catalog_item_match(item_name: Any) -> Optional[dict[str, Any]]:
     if best_score < 850.0:
         best = None
 
-    _ITEM_MATCH_CACHE[key] = dict(best) if isinstance(best, dict) else None
+    _ITEM_MATCH_CACHE[key] = (time.monotonic(), dict(best) if isinstance(best, dict) else None)
     return dict(best) if isinstance(best, dict) else None
 
 

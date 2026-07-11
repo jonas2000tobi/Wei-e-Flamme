@@ -2256,6 +2256,119 @@ def page_title(page) -> str:
         return ""
 
 
+
+def _safe_item_asset_url(url: Any, expected_main_category: str = "", expected_sub_category: str = "") -> bool:
+    """True nur für echte Questlog-Equip-Icons, nie für Perks/Skills/ähnliche Inhalte."""
+    low = str(url or "").strip().lower()
+    if not low or low.startswith("data:") or low.endswith(".svg"):
+        return False
+    if any(x in low for x in (
+        "perk_", "/misc/perk", "/skill/", "/ability/", "/passive/", "/trait/",
+        "avatar", "profile", "logo", "favicon", "map", "youtube", "discord",
+        "doubleclick", "googleads", "advertisement",
+    )):
+        return False
+    # Questlog/TL-Itemicons liegen im Equip-Zweig. Ohne dieses Signal lieber kein
+    # Bild als ein falsches Bild von Fähigkeit, ähnlichem Item oder Werbung.
+    if "/equip/" not in low and "/icon/item_128/equip/" not in low:
+        return False
+    main = clean_text(expected_main_category).lower()
+    sub = clean_text(expected_sub_category).lower()
+    if main == "weapon" and "/weapon/" not in low:
+        return False
+    if main == "accessory" and "/accessory/" not in low:
+        return False
+    if main == "armor" and not any(x in low for x in ("/armor/", "/equipment/")):
+        return False
+    # Unterkategorie als zusätzlicher Schutz, soweit der CDN-Pfad sie enthält.
+    slot_aliases = {
+        "brosche": ("brooch", "brosche"),
+        "ring": ("ring",),
+        "ohrringe": ("earring", "earrings", "ohrring"),
+        "kette": ("necklace", "kette"),
+        "halskette": ("necklace", "kette"),
+        "armband": ("bracelet", "armband"),
+        "gürtel": ("belt", "guertel", "gurtel"),
+        "guertel": ("belt", "guertel", "gurtel"),
+    }
+    aliases = slot_aliases.get(sub, ())
+    # Nicht hart ablehnen, wenn Questlog im Pfad nur "Accessory" nutzt.
+    # Das Slotsignal wird später nur zum Scoring verwendet.
+    return True
+
+
+def _exact_item_image_from_json(page, detail_id: str, expected_main_category: str = "", expected_sub_category: str = "") -> str | None:
+    """Liest das Bild aus genau dem JSON-Objekt der geöffneten Item-ID.
+
+    Das ist deutlich sicherer als eine globale DOM-Bildsuche, weil Questlog auf derselben
+    Seite auch Fähigkeiten und ähnliche Items rendert. Nur Dicts, deren eigene skalare
+    Werte exakt auf die URL-Item-ID verweisen, werden ausgewertet.
+    """
+    wanted = str(detail_id or "").strip().lower()
+    if not wanted:
+        return None
+    try:
+        payloads = collect_json_candidates(page)
+    except Exception:
+        payloads = []
+    scored: list[tuple[int, str]] = []
+    id_keys = {
+        "id", "itemid", "item_id", "itemcode", "item_code", "code", "slug",
+        "url", "href", "sourceitemid", "source_item_id",
+    }
+    image_keys = {str(k).lower() for k in JSON_IMAGE_KEYS}
+
+    for payload in payloads:
+        try:
+            dicts = walk_json(payload)
+        except Exception:
+            continue
+        for obj in dicts:
+            if not isinstance(obj, dict):
+                continue
+            own_scalars: list[str] = []
+            key_match = False
+            for key, value in obj.items():
+                if isinstance(value, (str, int, float)):
+                    txt = str(value).strip().lower()
+                    own_scalars.append(txt)
+                    if str(key).replace("-", "").replace("_", "").lower() in {k.replace("_", "") for k in id_keys}:
+                        if txt == wanted or txt.rstrip("/").endswith("/" + wanted) or wanted in txt:
+                            key_match = True
+            if not key_match and not any(v == wanted or v.rstrip("/").endswith("/" + wanted) for v in own_scalars):
+                continue
+
+            # Nur innerhalb dieses exakt zugeordneten Itemobjekts nach Bildfeldern suchen.
+            stack: list[Any] = [obj]
+            seen_nodes = 0
+            while stack and seen_nodes < 600:
+                node = stack.pop()
+                seen_nodes += 1
+                if isinstance(node, dict):
+                    for key, value in node.items():
+                        low_key = str(key).lower()
+                        if isinstance(value, str) and (low_key in image_keys or any(x in low_key for x in ("image", "icon", "thumbnail"))):
+                            url = to_abs_url(value)
+                            if _safe_item_asset_url(url, expected_main_category, expected_sub_category):
+                                low = url.lower()
+                                score = 1000
+                                if wanted in low:
+                                    score += 500
+                                if "/icon/item_128/equip/" in low:
+                                    score += 300
+                                if clean_text(expected_sub_category).lower() in low:
+                                    score += 80
+                                scored.append((score, url))
+                        elif isinstance(value, (dict, list)):
+                            stack.append(value)
+                elif isinstance(node, list):
+                    stack.extend(node[:250])
+    if not scored:
+        return None
+    scored.sort(key=lambda row: row[0], reverse=True)
+    return scored[0][1]
+
+
 def collect_image_urls(page, expected_main_category: str = "", expected_sub_category: str = "") -> tuple[str | None, str | None]:
     """Findet bevorzugt das echte Item-/Waffenbild auf Questlog-Detailseiten.
 
@@ -2268,6 +2381,12 @@ def collect_image_urls(page, expected_main_category: str = "", expected_sub_cate
         detail_id = item_detail_id(page.url).lower()
     except Exception:
         detail_id = ""
+    exact_json_image = _exact_item_image_from_json(
+        page, detail_id, expected_main_category, expected_sub_category
+    )
+    if exact_json_image:
+        return exact_json_image, exact_json_image
+
     try:
         item_name = page_title(page).lower()
     except Exception:
@@ -2578,7 +2697,14 @@ def collect_image_urls(page, expected_main_category: str = "", expected_sub_cate
     if not valid:
         return None, None
 
+    # Nur echte Equip-Assets zulassen. Damit wird im Zweifel kein Bild gespeichert,
+    # statt erneut ein Skill-/Perk-/"ähnliches Item"-Bild zuzuordnen.
+    valid = [c for c in valid if _safe_item_asset_url(c.get("src"), expected_main_category, expected_sub_category)]
+    if not valid:
+        return None, None
     valid.sort(key=lambda x: (int(x.get("score") or 0), int(x.get("w") or 0) * int(x.get("h") or 0)), reverse=True)
+    if int(valid[0].get("score") or 0) < 500:
+        return None, None
     best = valid[0].get("src")
     return best, best
 
@@ -3959,16 +4085,18 @@ def run_images_only(args: argparse.Namespace) -> int:
     conn = connect()
     ensure_item_catalog_schema(conn)
     sql = """
-        SELECT id, source_url, name, main_category, sub_category, image_url, icon_url
-        FROM item_catalog
-        WHERE source = 'questlog' AND is_active = TRUE
+        SELECT ic.id, ic.source_url, ic.source_item_id, ic.name, ic.main_category, ic.sub_category,
+               ic.image_url, ic.icon_url, ov.image_url AS manual_image_url
+        FROM item_catalog ic
+        LEFT JOIN item_catalog_image_overrides ov ON ov.source_url = ic.source_url
+        WHERE ic.source = 'questlog' AND ic.is_active = TRUE
           AND source_url LIKE %s
     """
     params: list[Any] = ["%/db/item/%"]
     if wanted:
-        sql += " AND main_category = ANY(%s)"
+        sql += " AND ic.main_category = ANY(%s)"
         params.append(sorted(wanted))
-    sql += " ORDER BY main_category, sub_category, name"
+    sql += " ORDER BY ic.main_category, ic.sub_category, ic.name"
     rows = [dict(r) for r in (conn.execute(sql, tuple(params)).fetchall() or [])]
     print(f"🖼️ Bilder-only Reparatur: {len(rows)} Items", flush=True)
     if not rows:
@@ -4004,6 +4132,11 @@ def run_images_only(args: argparse.Namespace) -> int:
                     skipped += 1
                     print(f"⚠️ Kein sicheres Itembild: {row.get('name')}", flush=True)
                     continue
+                if bool(getattr(args, "clear_image_overrides", False)):
+                    conn.execute(
+                        "DELETE FROM item_catalog_image_overrides WHERE source_url = %s",
+                        (str(row.get("source_url") or ""),),
+                    )
                 conn.execute(
                     """
                     UPDATE item_catalog
@@ -4013,6 +4146,29 @@ def run_images_only(args: argparse.Namespace) -> int:
                     """,
                     (image_url, icon_url or image_url, now_iso(), int(row.get("id") or 0)),
                 )
+                # Bereits gespeicherte Verknüpfungen/Build-Slots hatten das alte Bild
+                # teilweise als Text kopiert. Diese Caches direkt mitziehen. Fehlende
+                # optionale Tabellen dürfen das eigentliche Katalogupdate nicht zurückrollen.
+                for savepoint, statement in (
+                    (
+                        "sp_guild_item_links",
+                        "UPDATE guild_item_links SET image_url = %s, updated_at = now() WHERE catalog_item_id = %s",
+                    ),
+                    (
+                        "sp_need_build_slots",
+                        "UPDATE need_build_slots SET item_image_url = %s, updated_at = now() WHERE item_catalog_id = %s",
+                    ),
+                ):
+                    try:
+                        conn.execute(f"SAVEPOINT {savepoint}")
+                        conn.execute(statement, (image_url, int(row.get("id") or 0)))
+                        conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+                    except Exception:
+                        try:
+                            conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                            conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+                        except Exception:
+                            pass
                 conn.commit()
                 updated += 1
                 print(f"✅ Bild: {row.get('name')}", flush=True)
@@ -4879,6 +5035,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--debug-url", default="", help="Eine oder mehrere Questlog-Detailseiten debuggen. Schreibt nichts in Postgres.")
     p.add_argument("--traits-only", action="store_true", help="Nur vorhandene Armor-Eigenschaften neu lesen und aktualisieren. Kein Reset, keine Bild-/Item-Änderung.")
     p.add_argument("--images-only", action="store_true", help="Nur echte Itembilder neu von den Questlog-Detailseiten lesen. IDs, Namen, Stats und Traits bleiben unverändert.")
+    p.add_argument("--clear-image-overrides", action="store_true", help="Bei --images-only auch alte manuelle Bild-Overrides der bearbeiteten Items löschen.")
     p.add_argument("--armor-stats-only", action="store_true", help="Nur vorhandene Armor-DEF/Zusatzwerte neu lesen und aktualisieren. Kein Reset, keine Bild-/Item-Änderung. Kann mit --traits-only kombiniert werden.")
     p.add_argument("--failed-only", action="store_true", help="Nur Armor-Items erneut prüfen, deren bisherige Zusatzwerte/Traits laut gespeicherten Counts unvollständig sind.")
     return p
