@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import asyncio
+import urllib.parse
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -54,6 +55,68 @@ def _safe_text(value: Any, limit: int = 300) -> str:
     if len(txt) > limit:
         return txt[: limit - 1] + "…"
     return txt
+
+
+def _stable_discord_media_url(value: Any) -> str:
+    """Discord-Anhangslinks ohne ablaufende Signatur zurückgeben.
+
+    Der Bot speichert bei Event-Presets oft media.discordapp.net-URLs mit
+    ``?ex=...&hm=...``. Diese Query läuft ab. Der unveränderte Attachment-Pfad
+    auf cdn.discordapp.com bleibt dagegen verwendbar, solange der Anhang existiert.
+    """
+    url = str(value or "").strip()
+    if not (url.startswith("https://") or url.startswith("http://")):
+        return ""
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        host = (parsed.netloc or "").lower()
+        if host in {"media.discordapp.net", "cdn.discordapp.com"} and parsed.path.startswith("/attachments/"):
+            return urllib.parse.urlunsplit(("https", "cdn.discordapp.com", parsed.path, "", ""))
+    except Exception:
+        pass
+    return url
+
+
+def _event_image_url_from_raw(event: Any) -> str:
+    """Titelbild aus alten und neuen Event-Strukturen lesen."""
+    if not isinstance(event, dict):
+        return ""
+
+    candidates: list[Any] = []
+    for key in (
+        "image_url", "title_image_url", "event_image_url", "banner_url",
+        "thumbnail_url", "cover_url", "image", "thumbnail", "banner", "cover",
+    ):
+        candidates.append(event.get(key))
+
+    for key in ("embed", "discord_embed", "message_embed", "media"):
+        nested = event.get(key)
+        if isinstance(nested, dict):
+            for sub_key in ("image_url", "thumbnail_url", "banner_url", "cover_url", "url", "proxy_url", "image", "thumbnail"):
+                candidates.append(nested.get(sub_key))
+        elif isinstance(nested, list):
+            candidates.extend(nested[:4])
+
+    attachments = event.get("attachments")
+    if isinstance(attachments, list):
+        candidates.extend(attachments[:6])
+
+    def unpack(raw: Any) -> list[Any]:
+        if isinstance(raw, dict):
+            return [raw.get("url"), raw.get("proxy_url"), raw.get("image_url"), raw.get("thumbnail_url")]
+        if isinstance(raw, list):
+            out: list[Any] = []
+            for item in raw[:6]:
+                out.extend(unpack(item))
+            return out
+        return [raw]
+
+    for candidate in candidates:
+        for raw in unpack(candidate):
+            url = _stable_discord_media_url(raw)
+            if url:
+                return url
+    return ""
 
 
 def _member_is_active(guild: discord.Guild, user_id: int) -> bool:
@@ -487,13 +550,7 @@ def _summarize_events(data: Any, guild: discord.Guild, *, limit: int = 200) -> d
                 "participant_count": _event_user_count(ev),
                 "participants": participant_detail,
                 "description": _safe_text(ev.get("description") or ev.get("desc") or "", 600),
-                "image_url": str(
-                    ev.get("image_url")
-                    or ev.get("title_image_url")
-                    or ev.get("banner_url")
-                    or ev.get("thumbnail_url")
-                    or ""
-                ).strip(),
+                "image_url": _event_image_url_from_raw(ev),
             })
     events.sort(key=lambda x: str(x.get("when_iso") or ""), reverse=True)
     return {
