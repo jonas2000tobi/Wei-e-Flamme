@@ -2999,6 +2999,7 @@ def _render_event_detail(data: dict[str, Any], event_id: str) -> str:
 
     body = f"""
     <nav class="topnav"><a href="/">← Übersicht</a><a href="#signups">Zusagen</a><a href="#maybe">Vielleicht</a><a href="#no">Abgemeldet</a><a href="/api/snapshot">JSON</a></nav>
+    <style>.event-title-image{{margin-left:auto;width:min(360px,38vw);height:190px;border:1px solid rgba(214,168,79,.3);border-radius:14px;overflow:hidden;background:#070707;box-shadow:0 14px 40px rgba(0,0,0,.35)}}.event-title-image img{{width:100%;height:100%;object-fit:cover}}@media(max-width:760px){{.event-title-image{{width:100%;height:170px;margin:10px 0 0}}}}</style>
     <section class="hero">
       <div>
         <div class="eyebrow">Event</div>
@@ -3006,6 +3007,7 @@ def _render_event_detail(data: dict[str, Any], event_id: str) -> str:
         <p class="muted">Event-ID: {_e(event_id)} · Zeit: {_e(_dt(event.get('when_iso')))} · Snapshot: {_e(_dt(data.get('published_at')))}</p>
         {f"<p>{_e(event.get('description'))}</p>" if event.get('description') else ""}
       </div>
+      {_event_image_hero_side(event)}
       <a class="btn" href="/#events">Zurück</a>
     </section>
     <section class="grid">{cards}</section>
@@ -8033,7 +8035,7 @@ def _member_event_rows(snap: dict[str, Any], user_id: int) -> list[list[Any]]:
         if status == "—" and any(isinstance(p, dict) and _user_id(p.get("user_id")) == uid for p in participants.get("no") or []):
             status = "❌ Abgemeldet"
         if status != "—":
-            rows.append([_event_link(ev.get("event_id"), ev.get("title")), _dt(ev.get("when_iso")), status])
+            rows.append([_member_event_title_cell(ev), _dt(ev.get("when_iso")), status])
     return rows[:80]
 
 
@@ -8150,6 +8152,7 @@ def _render_event_detail(data: dict[str, Any], event_id: str) -> str:
 
     body = f"""
     <nav class="topnav"><a href="/planning">← Planung</a><a href="#signups">Zusagen</a><a href="#voicecheck">Voice-Abgleich</a><a href="#maybe">Vielleicht</a><a href="#no">Abgemeldet</a></nav>
+    <style>.event-title-image{{margin-left:auto;width:min(360px,38vw);height:190px;border:1px solid rgba(214,168,79,.3);border-radius:14px;overflow:hidden;background:#070707;box-shadow:0 14px 40px rgba(0,0,0,.35)}}.event-title-image img{{width:100%;height:100%;object-fit:cover}}@media(max-width:760px){{.event-title-image{{width:100%;height:170px;margin:10px 0 0}}}}</style>
     <section class="hero">
       <div>
         <div class="eyebrow">Event · Voice-/Teilnahme-Abgleich</div>
@@ -8157,6 +8160,7 @@ def _render_event_detail(data: dict[str, Any], event_id: str) -> str:
         <p class="muted">Event-ID: {_e(event_id)} · Zeit: {_e(_dt(event.get('when_iso')))} · Snapshot: {_e(_dt(data.get('published_at')))}</p>
         {f"<p>{_e(event.get('description'))}</p>" if event.get('description') else ""}
       </div>
+      {_event_image_hero_side(event)}
       <a class="btn" href="/planning">Zurück</a>
     </section>
     <section class="grid">{cards}</section>
@@ -10944,6 +10948,42 @@ def _settings_change_requests_for_dashboard(guild_id: int, limit: int = 80) -> l
         return []
 
 
+def _event_image_url(event: dict[str, Any]) -> str:
+    """Sichere Event-Titelbild-URL aus Snapshot/Phase-3-Rohdaten."""
+    if not isinstance(event, dict):
+        return ""
+    for key in ("image_url", "title_image_url", "banner_url", "thumbnail_url", "cover_url"):
+        url = str(event.get(key) or "").strip()
+        if url.startswith("https://") or url.startswith("http://"):
+            return url
+    return ""
+
+
+def _member_event_title_cell(event: dict[str, Any]) -> dict[str, str]:
+    eid = str(event.get("event_id") or event.get("id") or "")
+    title = str(event.get("title") or event.get("name") or eid or "Event")
+    image_url = _event_image_url(event)
+    thumb = (
+        f'<img class="member-event-thumb" src="{_e(image_url)}" alt="" loading="lazy" '
+        'onerror="this.closest(\'.member-event-entry\').classList.add(\'no-image\');this.remove()">'
+        if image_url else ""
+    )
+    return _raw(
+        f'<a class="member-event-entry {"" if image_url else "no-image"}" href="/event/{_e(eid)}">'
+        f'{thumb}<span><strong>{_e(title)}</strong><small>{_e(_event_status_text(event))}</small></span></a>'
+    )
+
+
+def _event_image_hero_side(event: dict[str, Any]) -> str:
+    image_url = _event_image_url(event)
+    if not image_url:
+        return ""
+    return (
+        f'<div class="event-title-image"><img src="{_e(image_url)}" alt="Titelbild {_e(event.get("title") or "Event")}" '
+        'loading="lazy" onerror="this.parentElement.remove()"></div>'
+    )
+
+
 def _member_event_role_summary_text(ev: dict[str, Any]) -> str:
     try:
         s = _event_role_summary(ev)
@@ -10962,7 +11002,7 @@ def _render_member_events_page(data: dict[str, Any], request: Request) -> str:
     for ev in events:
         eid = str(ev.get("event_id") or ev.get("id") or "")
         rows.append([
-            _event_link(eid, ev.get("title") or ev.get("name") or eid),
+            _member_event_title_cell(ev),
             _dt(ev.get("when_iso") or ev.get("start_at") or ev.get("created_at")),
             _event_status_text(ev),
             _member_event_role_summary_text(ev),
@@ -10971,6 +11011,14 @@ def _render_member_events_page(data: dict[str, Any], request: Request) -> str:
         ])
     history_rows = _member_event_rows(snap, int(uid or 0)) if uid else []
     body = f"""
+    <style>
+      .member-event-entry{{display:grid;grid-template-columns:92px minmax(0,1fr);gap:12px;align-items:center;text-decoration:none;color:inherit;min-width:260px}}
+      .member-event-entry.no-image{{grid-template-columns:minmax(0,1fr)}}
+      .member-event-thumb{{width:92px;height:54px;object-fit:cover;border-radius:10px;border:1px solid rgba(214,168,79,.28);background:#080706}}
+      .member-event-entry strong{{display:block;color:var(--gold);line-height:1.25}}
+      .member-event-entry small{{display:block;color:var(--muted);font-size:11px;margin-top:4px}}
+      @media(max-width:720px){{.member-event-entry{{grid-template-columns:72px minmax(0,1fr);min-width:210px}}.member-event-thumb{{width:72px;height:46px}}}}
+    </style>
     <nav class="topnav"><a href="/member">Start</a><a href="/member/events">Events</a><a href="/member/auctions">Auktionen</a><a href="/portal">Eigenes Profil</a></nav>
     <section class="hero"><div><div class="eyebrow">Mitgliederbereich</div><h1>📅 Events</h1><p class="muted">Eigene Eventseite mit mehr Infos als die Startseite.</p></div></section>
     <section class="panel"><h2>📆 Laufende & kommende Events</h2>{_table(['Event','Zeit','Status','Rollen','Deine Anmeldung','Aktion'], rows, placeholder='Events durchsuchen…')}</section>
@@ -12236,14 +12284,48 @@ def _attendance_review_still_needs_ec(snap: dict[str, Any], guild_id: int, revie
 
 
 def _attendance_events_with_review_fallbacks(snap: dict[str, Any], guild_id: int) -> list[dict[str, Any]]:
-    """Events für /attendance: aktuelle Events + offene EC-Checks + Review-Fallbacks."""
+    """Nur wirklich offene Anwesenheits-/EC-Fälle anzeigen.
+
+    Normale Snapshot-Events verschwinden hier, sobald EC bereits vergeben wurde
+    oder eine Dashboard-Queue erfolgreich abgeschlossen ist. Kommende Events
+    gehören auf die Eventseite, nicht in den Anwesenheits-Review.
+    """
     events = _events_with_pending_ec_checks(snap)
     by_id: dict[str, dict[str, Any]] = {}
+    now = datetime.now(timezone.utc)
     for ev in events:
         if not isinstance(ev, dict):
             continue
         eid = str(ev.get("event_id") or ev.get("id") or "").strip()
-        if eid:
+        if not eid:
+            continue
+
+        # Bereits gebuchte EC = erledigt. Das Event bleibt weiterhin im Archiv/
+        # in den Eventdetails sichtbar, aber nicht mehr unter "Anwesenheit".
+        try:
+            if (_event_award_state(snap, eid) or {}).get("awarded"):
+                continue
+        except Exception:
+            pass
+        try:
+            latest = _latest_ec_award_request(guild_id, eid) or {}
+            if str(latest.get("status") or "").strip().lower() == "done":
+                continue
+        except Exception:
+            pass
+
+        review = _attendance_review_load(guild_id, eid) if guild_id else {}
+        review_status = str((review or {}).get("status") or "").strip().lower()
+        if review_status in {"closed", "archived"}:
+            continue
+
+        # Ein explizit offener EC-Check/Review bleibt sichtbar. Normale Events
+        # erscheinen erst ab ihrem Startzeitpunkt.
+        explicit_open = bool(ev.get("_pending_ec_check") or ev.get("_attendance_review_only") or review_status in {"draft", "open", "reviewed", "locked"})
+        event_dt = _dt_obj(ev.get("when_iso") or ev.get("start_at") or ev.get("created_at"))
+        if not explicit_open and event_dt and event_dt > now:
+            continue
+        if explicit_open or not event_dt or event_dt <= now:
             by_id[eid] = ev
 
     if guild_id:
@@ -14574,33 +14656,14 @@ def auctions_alias() -> RedirectResponse:
 
 
 @app.get("/announcements", response_class=HTMLResponse)
-def announcements_page() -> HTMLResponse:
-    body = """
-    <section class="hero">
-      <div>
-        <h1>📣 Ankündigungen</h1>
-        <p>Gildenankündigungen, wichtige Hinweise und geplante News-Beiträge.</p>
-      </div>
-      <div class="hero-actions">
-        <a class="hero-action" href="/events"><span>📅</span><strong>Events</strong><small>Termine prüfen</small></a>
-        <a class="hero-action" href="/loot"><span>🎁</span><strong>Auktionen</strong><small>Loot & Gebote</small></a>
-        <a class="hero-action" href="/admin"><span>⚙️</span><strong>Admin</strong><small>Leitung</small></a>
-      </div>
-    </section>
-    <section class="panel">
-      <h2>Ankündigungs-Zentrale</h2>
-      <p class="muted">Platzhalter-Seite. Hier können später Discord-Ankündigungen, geplante Posts und Gilden-News aus dem Bot-Snapshot angezeigt werden.</p>
-      <div class="subpanel">
-        <strong>Geplant:</strong>
-        <ul>
-          <li>Letzte Discord-Ankündigungen spiegeln</li>
-          <li>Neue Ankündigung als Admin vorbereiten</li>
-          <li>Wichtige Gildeninfos oben anpinnen</li>
-        </ul>
-      </div>
-    </section>
-    """
-    return _html_shell("Ankündigungen · Ebo Dashboard", body)
+def announcements_page(_: bool = Depends(_auth)) -> HTMLResponse:
+    return HTMLResponse(_render_discord_feed_page(
+        _snapshot_payload(),
+        key="announcements",
+        title="📣 Gilden-Ankündigungen",
+        subtitle="Jede Nachricht aus dem gesetzten Discord-Ankündigungskanal wird hier vollständig mit Bildern, Embeds und Anhängen gespiegelt.",
+        env_hint="DASHBOARD_ANNOUNCEMENTS_CHANNEL_ID",
+    ))
 
 
 @app.get("/tnl/news", response_class=HTMLResponse)
