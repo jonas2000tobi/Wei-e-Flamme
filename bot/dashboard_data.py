@@ -73,6 +73,7 @@ DASHBOARD_ADMIN_ROLE_SETTING = "dashboard_admin_role_ids"
 DASHBOARD_ALLOWED_ROLE_SETTING = "dashboard_allowed_role_ids"
 DASHBOARD_NEWS_CHANNEL_NAME_SETTING = "dashboard_news_channel_name"
 DASHBOARD_GUIDES_CHANNEL_NAME_SETTING = "dashboard_guides_channel_name"
+DASHBOARD_ANNOUNCEMENTS_CHANNEL_NAME_SETTING = "dashboard_announcements_channel_name"
 
 
 def _dashboard_member_role_config_value(guild_id: int) -> Any:
@@ -486,6 +487,13 @@ def _summarize_events(data: Any, guild: discord.Guild, *, limit: int = 200) -> d
                 "participant_count": _event_user_count(ev),
                 "participants": participant_detail,
                 "description": _safe_text(ev.get("description") or ev.get("desc") or "", 600),
+                "image_url": str(
+                    ev.get("image_url")
+                    or ev.get("title_image_url")
+                    or ev.get("banner_url")
+                    or ev.get("thumbnail_url")
+                    or ""
+                ).strip(),
             })
     events.sort(key=lambda x: str(x.get("when_iso") or ""), reverse=True)
     return {
@@ -1670,6 +1678,13 @@ def _dashboard_feed_channel_id(kind: str) -> int:
         names.extend(["NEWS_CHANNEL_ID", "DASHBOARD_TNL_NEWS_CHANNEL_ID"])
     if kind == "GUIDES":
         names.extend(["GUIDES_CHANNEL_ID", "DASHBOARD_TNL_GUIDES_CHANNEL_ID", "GUIDE_CHANNEL_ID"])
+    if kind == "ANNOUNCEMENTS":
+        names.extend([
+            "ANNOUNCEMENTS_CHANNEL_ID",
+            "ANNOUNCEMENT_CHANNEL_ID",
+            "DASHBOARD_ANNOUNCEMENTS_CHANNEL_ID",
+            "GUILD_ANNOUNCEMENTS_CHANNEL_ID",
+        ])
     for name in names:
         raw = os.getenv(name, "").strip()
         if not raw:
@@ -1683,7 +1698,12 @@ def _dashboard_feed_channel_id(kind: str) -> int:
 
 def _dashboard_feed_channel_config(guild_id: int, kind: str) -> dict[str, Any]:
     kind_up = str(kind or "").upper()
-    name_setting = DASHBOARD_GUIDES_CHANNEL_NAME_SETTING if kind_up == "GUIDES" else DASHBOARD_NEWS_CHANNEL_NAME_SETTING
+    if kind_up == "GUIDES":
+        name_setting = DASHBOARD_GUIDES_CHANNEL_NAME_SETTING
+    elif kind_up == "ANNOUNCEMENTS":
+        name_setting = DASHBOARD_ANNOUNCEMENTS_CHANNEL_NAME_SETTING
+    else:
+        name_setting = DASHBOARD_NEWS_CHANNEL_NAME_SETTING
     configured_name = ""
     try:
         configured_name = str(runtime_db.get_guild_setting(int(guild_id), name_setting, "") or "").strip()
@@ -1696,6 +1716,13 @@ def _dashboard_feed_channel_config(guild_id: int, kind: str) -> dict[str, Any]:
             env_names.extend(["NEWS_CHANNEL_NAME", "DASHBOARD_TNL_NEWS_CHANNEL_NAME"])
         if kind_up == "GUIDES":
             env_names.extend(["GUIDES_CHANNEL_NAME", "DASHBOARD_TNL_GUIDES_CHANNEL_NAME", "GUIDE_CHANNEL_NAME"])
+        if kind_up == "ANNOUNCEMENTS":
+            env_names.extend([
+                "ANNOUNCEMENTS_CHANNEL_NAME",
+                "ANNOUNCEMENT_CHANNEL_NAME",
+                "DASHBOARD_ANNOUNCEMENTS_CHANNEL_NAME",
+                "GUILD_ANNOUNCEMENTS_CHANNEL_NAME",
+            ])
         for env in env_names:
             raw = os.getenv(env, "").strip()
             if raw:
@@ -1751,7 +1778,7 @@ async def _dashboard_fetch_channel_feed(guild: discord.Guild, *, kind: str, limi
                 return out
         out["channel_name"] = str(getattr(channel, "name", "") or channel_id)
     if channel is None:
-        out["error"] = "Kein Kanal gesetzt. Nutze /dashboard_set_feed_channel feed:news channel_name:<kanalname>."
+        out["error"] = f"Kein Kanal gesetzt. Nutze /dashboard_set_feed_channel feed:{str(kind or 'news').lower()} channel_name:<kanalname>."
         return out
     if not hasattr(channel, "history"):
         out["error"] = "Kanal unterstützt keine Nachrichten-History."
@@ -1786,7 +1813,11 @@ async def _dashboard_fetch_channel_feed(guild: discord.Guild, *, kind: str, limi
 
 
 async def _dashboard_discord_feeds_snapshot(guild: discord.Guild) -> dict[str, Any]:
-    return {"news": await _dashboard_fetch_channel_feed(guild, kind="news"), "guides": await _dashboard_fetch_channel_feed(guild, kind="guides")}
+    return {
+        "news": await _dashboard_fetch_channel_feed(guild, kind="news"),
+        "guides": await _dashboard_fetch_channel_feed(guild, kind="guides"),
+        "announcements": await _dashboard_fetch_channel_feed(guild, kind="announcements"),
+    }
 
 
 async def _publish_snapshot_with_feeds(bot: commands.Bot, guild: discord.Guild) -> int:
@@ -2008,9 +2039,13 @@ async def setup_dashboard_data(bot: commands.Bot, tree: app_commands.CommandTree
         except Exception as exc:
             await inter.followup.send(f"❌ Konnte Adminrolle nicht speichern: `{type(exc).__name__}: {exc}`", ephemeral=True)
 
-    @tree.command(name="dashboard_set_feed_channel", description="Setzt den Discord-Kanal für Dashboard-News oder Guides per Kanalname.")
-    @app_commands.describe(feed="news oder guides", channel_name="Kanalname ohne ID, z. B. news oder guides")
-    @app_commands.choices(feed=[app_commands.Choice(name="News", value="news"), app_commands.Choice(name="Guides", value="guides")])
+    @tree.command(name="dashboard_set_feed_channel", description="Setzt den Discord-Kanal für News, Guides oder Ankündigungen im Dashboard.")
+    @app_commands.describe(feed="News, Guides oder Ankündigungen", channel_name="Kanalname ohne ID, z. B. news, guides oder ankündigungen")
+    @app_commands.choices(feed=[
+        app_commands.Choice(name="News", value="news"),
+        app_commands.Choice(name="Guides", value="guides"),
+        app_commands.Choice(name="Ankündigungen", value="announcements"),
+    ])
     async def dashboard_set_feed_channel(inter: discord.Interaction, feed: app_commands.Choice[str], channel_name: str):
         if inter.guild is None:
             await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
@@ -2026,7 +2061,12 @@ async def setup_dashboard_data(bot: commands.Bot, tree: app_commands.CommandTree
 
         await inter.response.defer(ephemeral=True, thinking=True)
         kind = str(feed.value or "news").lower()
-        setting = DASHBOARD_GUIDES_CHANNEL_NAME_SETTING if kind == "guides" else DASHBOARD_NEWS_CHANNEL_NAME_SETTING
+        if kind == "guides":
+            setting = DASHBOARD_GUIDES_CHANNEL_NAME_SETTING
+        elif kind == "announcements":
+            setting = DASHBOARD_ANNOUNCEMENTS_CHANNEL_NAME_SETTING
+        else:
+            setting = DASHBOARD_NEWS_CHANNEL_NAME_SETTING
         channel = _find_feed_channel_by_name(inter.guild, clean_name)
         if channel is None:
             names = sorted(str(getattr(ch, "name", "")) for ch in getattr(inter.guild, "channels", []) if hasattr(ch, "history") and getattr(ch, "name", ""))
@@ -2165,4 +2205,4 @@ async def setup_dashboard_data(bot: commands.Bot, tree: app_commands.CommandTree
         emb = discord.Embed(title="📁 Dashboard-Quellen", description=txt, color=0xD6A84F)
         await inter.response.send_message(embed=emb, ephemeral=True)
 
-    print("📊 Dashboard-Datenlayer registriert: /dashboard_set_member_role, /dashboard_set_admin_role, /dashboard_set_feed_channel, /dashboard_status, /dashboard_export, /dashboard_sources")
+    print("📊 Dashboard-Datenlayer registriert: Mitglieder-/Adminrolle, News/Guides/Ankündigungen-Feeds, Status und Export")
