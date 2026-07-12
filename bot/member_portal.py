@@ -5250,6 +5250,235 @@ class BackOnlyView(PortalSafeView):
         await inter.response.edit_message(embed=_main_menu_embed(guild, member), view=MemberPortalMainView())
 
 
+class GuildBroadcastConfirmView(discord.ui.View):
+    """Bestätigungsansicht für private Rundnachrichten an die Gildenrolle."""
+
+    def __init__(
+        self,
+        *,
+        author_id: int,
+        guild_id: int,
+        role_id: int,
+        title: str,
+        message: str,
+        image_url: str = "",
+    ) -> None:
+        super().__init__(timeout=600)
+        self.author_id = int(author_id)
+        self.guild_id = int(guild_id)
+        self.role_id = int(role_id)
+        self.broadcast_title = str(title or "").strip()
+        self.broadcast_message = str(message or "").strip()
+        self.image_url = str(image_url or "").strip()
+        self._sending = False
+
+    async def interaction_check(self, inter: discord.Interaction) -> bool:
+        if int(inter.user.id) != self.author_id:
+            await inter.response.send_message(
+                "❌ Nur die Person, die diese Rundnachricht erstellt hat, kann sie versenden.",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    def _build_embed(self, guild: Optional[discord.Guild], sender: discord.abc.User) -> discord.Embed:
+        embed = discord.Embed(
+            title=self.broadcast_title or "📣 Nachricht der Gildenleitung",
+            description=self.broadcast_message,
+            color=discord.Color.gold(),
+            timestamp=datetime.now(TZ),
+        )
+
+        if guild is not None:
+            icon_url = str(guild.icon.url) if guild.icon else None
+            embed.set_author(name=f"{guild.name} • Gildenleitung", icon_url=icon_url)
+
+        if self.image_url and re.match(r"^https?://", self.image_url, flags=re.IGNORECASE):
+            embed.set_image(url=self.image_url)
+
+        embed.set_footer(text=f"Persönliche Rundnachricht • gesendet von {getattr(sender, 'display_name', sender.name)}")
+        return embed
+
+    def _disable_all(self) -> None:
+        for child in self.children:
+            if hasattr(child, "disabled"):
+                child.disabled = True
+
+    @discord.ui.button(label="Test an mich", emoji="🧪", style=discord.ButtonStyle.secondary)
+    async def test_send(self, inter: discord.Interaction, _button: discord.ui.Button):
+        if self._sending:
+            await inter.response.send_message("⏳ Der Versand läuft bereits.", ephemeral=True)
+            return
+
+        guild = inter.client.get_guild(self.guild_id)
+        embed = self._build_embed(guild, inter.user)
+
+        await inter.response.defer(ephemeral=True, thinking=True)
+        try:
+            await inter.user.send(
+                embed=embed,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            await inter.followup.send("✅ Testnachricht wurde dir privat geschickt.", ephemeral=True)
+        except discord.Forbidden:
+            await inter.followup.send(
+                "❌ Ich kann dir keine DM schicken. Aktiviere Direktnachrichten für diesen Server.",
+                ephemeral=True,
+            )
+        except Exception as exc:
+            await inter.followup.send(f"❌ Testversand fehlgeschlagen: `{type(exc).__name__}`", ephemeral=True)
+
+    @discord.ui.button(label="An alle senden", emoji="📨", style=discord.ButtonStyle.danger)
+    async def send_all(self, inter: discord.Interaction, _button: discord.ui.Button):
+        if self._sending:
+            await inter.response.send_message("⏳ Der Versand läuft bereits.", ephemeral=True)
+            return
+
+        self._sending = True
+        self._disable_all()
+        await inter.response.defer(ephemeral=True, thinking=True)
+        await inter.edit_original_response(view=self)
+
+        guild = inter.client.get_guild(self.guild_id)
+        if guild is None:
+            await inter.edit_original_response(content="❌ Server nicht gefunden.", embed=None, view=None)
+            return
+
+        role = guild.get_role(self.role_id)
+        if role is None:
+            await inter.edit_original_response(content="❌ Gildenmitglied-Rolle nicht mehr gefunden.", embed=None, view=None)
+            return
+
+        members = [member for member in role.members if not member.bot]
+        embed = self._build_embed(guild, inter.user)
+
+        sent = 0
+        closed = 0
+        failed = 0
+        failed_names: list[str] = []
+
+        for member in members:
+            try:
+                await member.send(
+                    embed=embed,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+                sent += 1
+            except discord.Forbidden:
+                closed += 1
+                if len(failed_names) < 15:
+                    failed_names.append(f"{member.display_name} (DMs zu)")
+            except Exception as exc:
+                failed += 1
+                if len(failed_names) < 15:
+                    failed_names.append(f"{member.display_name} ({type(exc).__name__})")
+
+            # Bewusst langsam versenden, damit Discord-Ratelimits sauber abgefangen werden.
+            await asyncio.sleep(0.30)
+
+        result = discord.Embed(
+            title="📨 Rundnachricht abgeschlossen",
+            color=discord.Color.green() if sent else discord.Color.orange(),
+        )
+        result.add_field(name="Empfänger geprüft", value=str(len(members)), inline=True)
+        result.add_field(name="Erfolgreich", value=str(sent), inline=True)
+        result.add_field(name="DMs geschlossen", value=str(closed), inline=True)
+        result.add_field(name="Andere Fehler", value=str(failed), inline=True)
+        if failed_names:
+            result.add_field(
+                name="Nicht erreichbar",
+                value="\n".join(f"• {name}" for name in failed_names),
+                inline=False,
+            )
+        result.set_footer(text="Mitglieder ohne geöffnete Server-DMs können nicht privat erreicht werden.")
+
+        await inter.edit_original_response(content=None, embed=result, view=None)
+        self.stop()
+
+    @discord.ui.button(label="Abbrechen", emoji="✖️", style=discord.ButtonStyle.secondary)
+    async def cancel(self, inter: discord.Interaction, _button: discord.ui.Button):
+        self._disable_all()
+        await inter.response.edit_message(content="❌ Rundnachricht abgebrochen.", embed=None, view=None)
+        self.stop()
+
+
+class GuildBroadcastModal(discord.ui.Modal, title="📨 Private Rundnachricht"):
+    subject = discord.ui.TextInput(
+        label="Betreff",
+        placeholder="z. B. Wichtige Gildeninformation",
+        required=False,
+        max_length=256,
+    )
+    message = discord.ui.TextInput(
+        label="Nachricht",
+        placeholder="Schreibe hier die Nachricht, die jedes Mitglied privat erhalten soll ...",
+        style=discord.TextStyle.paragraph,
+        required=True,
+        min_length=1,
+        max_length=4000,
+    )
+    image_url = discord.ui.TextInput(
+        label="Bild-URL (optional)",
+        placeholder="https://...",
+        required=False,
+        max_length=500,
+    )
+
+    def __init__(self, *, author_id: int, guild_id: int, role_id: int) -> None:
+        super().__init__(timeout=600)
+        self.author_id = int(author_id)
+        self.guild_id = int(guild_id)
+        self.role_id = int(role_id)
+
+    async def on_submit(self, inter: discord.Interaction) -> None:
+        guild = inter.client.get_guild(self.guild_id)
+        if guild is None:
+            await inter.response.send_message("❌ Server nicht gefunden.", ephemeral=True)
+            return
+
+        role = guild.get_role(self.role_id)
+        if role is None:
+            await inter.response.send_message("❌ Gildenmitglied-Rolle nicht gefunden.", ephemeral=True)
+            return
+
+        clean_title = _safe_text(str(self.subject.value or "").strip())
+        clean_message = _safe_text(str(self.message.value or "").strip())
+        clean_image = str(self.image_url.value or "").strip()
+
+        if not clean_message:
+            await inter.response.send_message("❌ Die Nachricht darf nicht leer sein.", ephemeral=True)
+            return
+
+        if clean_image and not re.match(r"^https?://", clean_image, flags=re.IGNORECASE):
+            await inter.response.send_message("❌ Die Bild-URL muss mit `http://` oder `https://` beginnen.", ephemeral=True)
+            return
+
+        recipients = [member for member in role.members if not member.bot]
+        preview = discord.Embed(
+            title=clean_title or "📣 Nachricht der Gildenleitung",
+            description=clean_message,
+            color=discord.Color.gold(),
+        )
+        if clean_image:
+            preview.set_image(url=clean_image)
+        preview.add_field(
+            name="Empfänger",
+            value=f"**{len(recipients)}** Mitglieder mit {role.mention}",
+            inline=False,
+        )
+        preview.set_footer(text="Erst testen oder anschließend bewusst an alle senden.")
+
+        view = GuildBroadcastConfirmView(
+            author_id=self.author_id,
+            guild_id=self.guild_id,
+            role_id=self.role_id,
+            title=clean_title,
+            message=clean_message,
+            image_url=clean_image,
+        )
+        await inter.response.send_message(embed=preview, view=view, ephemeral=True)
+
+
 async def setup_member_portal(client: discord.Client, tree: app_commands.CommandTree):
     persistent_view_factories = [
         PortalOpenView,
@@ -5440,6 +5669,50 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
             f"✉️ Geöffnet/aktualisiert: **{sent_or_updated}**\n"
             f"❌ Fehlgeschlagen/DMs zu: **{failed}**",
             ephemeral=True
+        )
+
+    @tree.command(
+        name="portal_rundnachricht",
+        description="(Admin) Sendet eine private Rundnachricht an alle Gildenmitglieder",
+    )
+    async def portal_rundnachricht(inter: discord.Interaction):
+        if not _is_admin(inter):
+            await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True)
+            return
+
+        if inter.guild is None or inter.guild_id is None:
+            await inter.response.send_message("❌ Nur auf einem Server nutzbar.", ephemeral=True)
+            return
+
+        c = _gcfg(inter.guild_id)
+        member_role_id = int(c.get("member_role_id", 0) or 0)
+
+        if not member_role_id:
+            await inter.response.send_message(
+                "❌ Keine Gildenmitglied-Rolle gesetzt. Nutze zuerst `/portal_set_member_role`.",
+                ephemeral=True,
+            )
+            return
+
+        role = inter.guild.get_role(member_role_id)
+        if role is None:
+            await inter.response.send_message("❌ Die gesetzte Gildenmitglied-Rolle wurde nicht gefunden.", ephemeral=True)
+            return
+
+        recipients = [member for member in role.members if not member.bot]
+        if not recipients:
+            await inter.response.send_message(
+                f"❌ In {role.mention} wurden keine erreichbaren Mitglieder gefunden.",
+                ephemeral=True,
+            )
+            return
+
+        await inter.response.send_modal(
+            GuildBroadcastModal(
+                author_id=inter.user.id,
+                guild_id=inter.guild_id,
+                role_id=role.id,
+            )
         )
 
     @tree.command(name="portal_resend_user", description="(Admin) Öffnet/aktualisiert bei einem Spieler die Gildenzentrale")
