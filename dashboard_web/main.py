@@ -17,6 +17,7 @@ import urllib.request
 import urllib.error
 from collections import Counter
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 from typing import Any, Optional
 from pathlib import Path
 
@@ -50,7 +51,7 @@ if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 ASSET_VER = "item-image-exact-v3-20260711"
-DASHBOARD_RELEASE_VERSION = "1.3.2 · exakte Itembilder + Cache-Reparatur"
+DASHBOARD_RELEASE_VERSION = "1.4.0 · Eventkalender + Discord-Termine"
 
 _ITEM_MATCH_CACHE: dict[str, tuple[float, Optional[dict[str, Any]]]] = {}
 _ITEM_CATALOG_POOL_CACHE: dict[str, Any] = {"loaded_at": 0.0, "items": []}
@@ -1279,8 +1280,19 @@ def _phase3_events_pg_payload(guild_id: Any, snap: dict[str, Any]) -> Optional[d
         eid = str((row or {}).get("event_id") or raw.get("event_id") or raw.get("id") or "").strip()
         if not eid:
             continue
-        base = dict(event_by_id.get(eid) or {})
+        snapshot_base = dict(event_by_id.get(eid) or {})
+        base = dict(snapshot_base)
         base.update(raw if isinstance(raw, dict) else {})
+        # Phase-3 raw_json kann noch eine alte, signierte Discord-Bild-URL enthalten.
+        # Der aktuelle Bot-Snapshot hat dagegen die frisch vom Discord-Post geladene
+        # Proxy-URL. Diese Medienfelder dürfen deshalb nicht vom DB-Fallback
+        # überschrieben werden.
+        for media_key in (
+            "image_url", "discord_image_url", "title_image_url", "event_image_url",
+            "thumbnail_url", "banner_url", "cover_url", "jump_url", "channel_id",
+        ):
+            if snapshot_base.get(media_key):
+                base[media_key] = snapshot_base.get(media_key)
         base.update({
             "event_id": eid,
             "id": base.get("id") or eid,
@@ -3855,6 +3867,7 @@ def _sidebar_html() -> str:
           <summary>Leader-Werkzeuge</summary>
           <a href="/loot"><img class="nav-ico" src="{_asset('nav_auktionen.png')}" alt="">Loot & Auktionen</a>
           <a href="/events-admin"><img class="nav-ico" src="{_asset('nav_events.png')}" alt="">Event-Verwaltung</a>
+          <a href="/event-calendar"><img class="nav-ico" src="{_asset('nav_events.png')}" alt="">Event-Kalender</a>
           <a href="/attendance"><img class="nav-ico" src="{_asset('nav_anwesenheit.png')}" alt="">Anwesenheit</a>
           <a href="/ec-queue"><img class="nav-ico" src="{_asset('nav_ec.png')}" alt="">EC-Queue</a>
         </details>
@@ -3894,6 +3907,7 @@ def _member_sidebar_html() -> str:
           <a href="/member/members"><img class="nav-ico" src="{_asset('nav_mitglieder.png')}" alt="">Mitglieder</a>
           <a href="/member/auctions"><img class="nav-ico" src="{_asset('nav_auktionen.png')}" alt="">Auktionen</a>
           <a href="/member/events"><img class="nav-ico" src="{_asset('nav_events.png')}" alt="">Events</a>
+          <a href="/event-calendar"><img class="nav-ico" src="{_asset('nav_events.png')}" alt="">Event-Kalender</a>
           <a href="/member/ec"><img class="nav-ico" src="{_asset('nav_ec.png')}" alt="">EC-Verlauf</a>
           <a href="/announcements"><img class="nav-ico" src="{_asset('nav_announcements.png')}" alt="">Ankündigungen</a>
           <a href="/attendance"><img class="nav-ico" src="{_asset('nav_anwesenheit.png')}" alt="">Anwesenheit</a>
@@ -11063,13 +11077,264 @@ def _render_member_events_page(data: dict[str, Any], request: Request) -> str:
       .member-event-entry small{{display:block;color:var(--muted);font-size:11px;margin-top:4px}}
       @media(max-width:720px){{.member-event-entry{{grid-template-columns:72px minmax(0,1fr);min-width:210px}}.member-event-thumb{{width:72px;height:46px}}}}
     </style>
-    <nav class="topnav"><a href="/member">Start</a><a href="/member/events">Events</a><a href="/member/auctions">Auktionen</a><a href="/portal">Eigenes Profil</a></nav>
+    <nav class="topnav"><a href="/member">Start</a><a href="/member/events">Events</a><a href="/event-calendar">Kalender</a><a href="/member/auctions">Auktionen</a><a href="/portal">Eigenes Profil</a></nav>
     <section class="hero"><div><div class="eyebrow">Mitgliederbereich</div><h1>📅 Events</h1><p class="muted">Eigene Eventseite mit mehr Infos als die Startseite.</p></div></section>
     <section class="panel"><h2>📆 Laufende & kommende Events</h2>{_table(['Event','Zeit','Status','Rollen','Deine Anmeldung','Aktion'], rows, placeholder='Events durchsuchen…')}</section>
     <section class="panel"><h2>🧾 Deine Event-Historie</h2>{_table(['Event','Zeit','Deine Anmeldung'], history_rows, placeholder='Historie durchsuchen…')}</section>
     """
     return _html_shell("Events · Mitgliederbereich", body, nav_mode="member")
 
+
+
+_CALENDAR_TZ = ZoneInfo("Europe/Berlin")
+_CALENDAR_START_HOUR = 4
+_CALENDAR_END_HOUR = 24
+_CALENDAR_ROW_HEIGHT = 48
+
+
+def _calendar_week_monday(value: str = "") -> datetime:
+    today = datetime.now(_CALENDAR_TZ).date()
+    if value:
+        try:
+            today = datetime.strptime(str(value).strip(), "%Y-%m-%d").date()
+        except Exception:
+            pass
+    monday = today - timedelta(days=today.weekday())
+    return datetime(monday.year, monday.month, monday.day, tzinfo=_CALENDAR_TZ)
+
+
+def _calendar_event_local_dt(event: dict[str, Any]) -> Optional[datetime]:
+    dt = _dt_obj(event.get("when_iso") or event.get("start_at") or event.get("created_at"))
+    return dt.astimezone(_CALENDAR_TZ) if dt else None
+
+
+def _calendar_event_end_local(event: dict[str, Any], start: datetime) -> datetime:
+    end = _dt_obj(event.get("end_at") or event.get("end_time"))
+    if end:
+        end_local = end.astimezone(_CALENDAR_TZ)
+        if end_local > start:
+            return end_local
+    try:
+        minutes = max(30, min(720, int(float(event.get("duration_minutes") or 120))))
+    except Exception:
+        minutes = 120
+    return start + timedelta(minutes=minutes)
+
+
+def _calendar_category(event: dict[str, Any]) -> str:
+    text = " ".join([
+        str(event.get("event_type") or ""),
+        str(event.get("dkp_event_type") or ""),
+        str(event.get("title") or event.get("name") or ""),
+    ]).lower()
+    if any(x in text for x in ("pvp", "krieg", "boon", "rift", "siege", "belager")):
+        return "pvp"
+    if any(x in text for x in ("gildenboss", "archboss", "arch boss", "boss")):
+        return "boss"
+    if any(x in text for x in ("nightmare", "nm raid")):
+        return "nightmare"
+    if any(x in text for x in ("hard raid", "hm raid", "hardmode")):
+        return "hard"
+    if any(x in text for x in ("trial", "prüfung")):
+        return "trial"
+    if "raid" in text:
+        return "raid"
+    return "other"
+
+
+def _calendar_category_label(category: str) -> str:
+    return {
+        "pvp": "PvP", "boss": "Gildenboss", "nightmare": "Nightmare",
+        "hard": "Hard Raid", "trial": "Trials", "raid": "Raid", "other": "Sonstiges",
+    }.get(category, "Sonstiges")
+
+
+def _calendar_event_url(event: dict[str, Any]) -> str:
+    scheduled_id = str(event.get("scheduled_event_id") or "").strip()
+    guild_id = str(event.get("guild_id") or "").strip()
+    if scheduled_id and guild_id:
+        return f"https://discord.com/events/{guild_id}/{scheduled_id}"
+    eid = str(event.get("event_id") or event.get("id") or "").strip()
+    return f"/event/{urllib.parse.quote(eid)}" if eid else "#"
+
+
+def _render_event_calendar_page(data: dict[str, Any], request: Request, week: str = "", msg: str = "") -> str:
+    if not data.get("ok"):
+        return _html_shell("Event-Kalender · Ebo Dashboard", f"<section class='panel'><h1>📅 Event-Kalender</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+
+    snap: dict[str, Any] = data.get("snapshot") or {}
+    guild_id = _safe_guild_id(data)
+    monday = _calendar_week_monday(week)
+    week_end = monday + timedelta(days=7)
+    prev_week = (monday - timedelta(days=7)).date().isoformat()
+    next_week = (monday + timedelta(days=7)).date().isoformat()
+    today_week = _calendar_week_monday().date().isoformat()
+    is_admin = _is_dashboard_admin(request)
+
+    events: list[dict[str, Any]] = []
+    for raw in ((snap.get("events") or {}).get("items") or []):
+        if not isinstance(raw, dict):
+            continue
+        ev = dict(raw)
+        dt = _calendar_event_local_dt(ev)
+        if not dt:
+            continue
+        ev["_calendar_dt"] = dt
+        if monday <= dt < week_end:
+            events.append(ev)
+    events.sort(key=lambda e: e.get("_calendar_dt") or monday)
+
+    day_names = ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag"]
+    day_headers = "".join(
+        f'<div class="calendar-day-head"><strong>{day_names[i]}</strong><span>{(monday + timedelta(days=i)).strftime("%d.%m.")}</span></div>'
+        for i in range(7)
+    )
+    hour_labels = "".join(
+        f'<div class="calendar-hour-label" style="height:{_CALENDAR_ROW_HEIGHT}px">{hour:02d}:00</div>'
+        for hour in range(_CALENDAR_START_HOUR, _CALENDAR_END_HOUR)
+    )
+
+    lanes: list[str] = []
+    for day_idx in range(7):
+        blocks: list[str] = []
+        for ev in events:
+            start = ev.get("_calendar_dt")
+            if not isinstance(start, datetime) or start.weekday() != day_idx:
+                continue
+            end = _calendar_event_end_local(ev, start)
+            start_minutes = max(0, (start.hour - _CALENDAR_START_HOUR) * 60 + start.minute)
+            end_minutes = max(start_minutes + 30, (end.hour - _CALENDAR_START_HOUR) * 60 + end.minute)
+            max_minutes = (_CALENDAR_END_HOUR - _CALENDAR_START_HOUR) * 60
+            if start_minutes >= max_minutes:
+                continue
+            end_minutes = min(max_minutes, end_minutes)
+            top = round(start_minutes / 60 * _CALENDAR_ROW_HEIGHT, 2)
+            height = max(34, round((end_minutes - start_minutes) / 60 * _CALENDAR_ROW_HEIGHT - 3, 2))
+            category = _calendar_category(ev)
+            title = str(ev.get("title") or ev.get("name") or "Event")
+            eid = str(ev.get("event_id") or ev.get("id") or "")
+            image = _event_image_url(ev)
+            thumb = f'<img src="{_e(image)}" alt="" loading="lazy">' if image else ""
+            scheduled_badge = " · Discord" if ev.get("scheduled_event_id") else ""
+            blocks.append(
+                f'<a class="calendar-event cat-{_e(category)}" href="{_e(_calendar_event_url(ev))}" '
+                f'style="top:{top}px;height:{height}px" title="{_e(title)}">'
+                f'{thumb}<span><strong>{_e(start.strftime("%H:%M"))} · {_e(title)}</strong>'
+                f'<small>{_e(_calendar_category_label(category))}{_e(scheduled_badge)}</small></span></a>'
+            )
+        lanes.append(f'<div class="calendar-day-lane">{"".join(blocks)}</div>')
+
+    upcoming_rows: list[list[Any]] = []
+    all_events = [dict(e) for e in ((snap.get("events") or {}).get("items") or []) if isinstance(e, dict)]
+    now_local = datetime.now(_CALENDAR_TZ)
+    upcoming_all = []
+    for ev in all_events:
+        dt = _calendar_event_local_dt(ev)
+        if dt and dt >= now_local - timedelta(hours=2):
+            ev["_calendar_dt"] = dt
+            upcoming_all.append(ev)
+    upcoming_all.sort(key=lambda e: e.get("_calendar_dt") or now_local)
+    for ev in upcoming_all[:20]:
+        dt = ev.get("_calendar_dt")
+        eid = str(ev.get("event_id") or ev.get("id") or "")
+        title_cell = _member_event_title_cell(ev)
+        discord_link = "—"
+        if ev.get("scheduled_event_id"):
+            discord_link = _raw(f'<a class="btn mini-btn" href="{_e(_calendar_event_url(ev))}" target="_blank" rel="noopener">Discord-Termin</a>')
+        upcoming_rows.append([
+            title_cell,
+            dt.strftime("%a, %d.%m.%Y %H:%M") if isinstance(dt, datetime) else "—",
+            _calendar_category_label(_calendar_category(ev)),
+            ev.get("location") or "—",
+            discord_link,
+            _raw(f'<a class="btn mini-btn" href="/event/{_e(eid)}">Details</a>') if eid else "—",
+        ])
+
+    queue_rows: list[list[Any]] = []
+    for row in (_dashboard_event_action_requests(guild_id, limit=30) if guild_id else []):
+        result = ""
+        try:
+            result_obj = json.loads(str(row.get("result_json") or "{}"))
+            result = result_obj.get("message") or result_obj.get("error") or ""
+        except Exception:
+            result = str(row.get("result_json") or "")[:180]
+        queue_rows.append([row.get("requested_at"), row.get("action_type"), row.get("status"), row.get("actor_name"), result])
+
+    admin_form = ""
+    if is_admin:
+        admin_form = f"""
+        <section class="panel" id="calendar-create">
+          <h2>➕ Termin eintragen</h2>
+          <p class="muted">Erstellt den normalen Discord-Eventpost, trägt den Termin in den Gildenkalender ein und legt auf Wunsch zusätzlich ein echtes Discord-Serverevent an.</p>
+          <form method="post" action="/admin/event-calendar/create" style="display:grid;gap:12px">
+            <div class="event-form-grid">
+              <label>Titel<br><input name="title" required placeholder="z. B. Gildenbosse Sonntag"></label>
+              <label>Datum<br><input name="date" type="date" required value="{_e(monday.date().isoformat())}"></label>
+              <label>Uhrzeit<br><input name="time" type="time" required value="20:00"></label>
+              <label>Dauer in Minuten<br><input name="duration_minutes" type="number" min="30" max="720" step="15" value="120"></label>
+              <label>Wiederholungen wöchentlich<br><input name="repeat_count" type="number" min="1" max="12" value="1"></label>
+              <label>Eventtyp / EC-Regel<br>{_dashboard_event_type_select_html()}</label>
+              <label>Kategorie<br><select name="event_type"><option value="Standard">Standard</option><option value="Gildenbosse">Gildenbosse</option><option value="Normal Raid">Normal Raid</option><option value="Hard Raid">Hard Raid</option><option value="Nightmare">Nightmare</option><option value="Trials">Trials</option><option value="PvP">PvP</option></select></label>
+              <label>Zielkanal<br>{_dashboard_channel_select_html(snap, required=True)}</label>
+              <label>Zielrolle optional<br>{_dashboard_role_select_html(snap)}</label>
+              <label>Ort im Discord-Kalender<br><input name="location" value="Ebolus Discord" maxlength="100"></label>
+              <label>Bildtyp<br><select name="image_type"><option value="none">Kein Bild</option><option value="custom">Eigene URL</option><option value="normal">Normal Raid</option><option value="hard">Hard Raid</option><option value="nightmare">Nightmare</option><option value="trials">Trials</option><option value="pvp">PvP</option></select></label>
+            </div>
+            <label>Beschreibung<br><textarea name="description" rows="4" placeholder="Was ist geplant?"></textarea></label>
+            <label>Eigene Bild-URL<br><input name="image_url" placeholder="https://..."></label>
+            <div class="calendar-checks">
+              <label><input type="checkbox" name="sync_discord_event" value="1" checked> Im Discord-Serverkalender anlegen</label>
+              <label><input type="checkbox" name="send_dms" value="1"> Mitglieder zusätzlich per DM informieren</label>
+            </div>
+            <button class="btn" type="submit" onclick="return confirm('Termin an den Bot senden?')">Termin erstellen</button>
+          </form>
+        </section>
+        <section class="panel"><h2>🧾 Kalender-Queue</h2>{_table(['Zeit','Aktion','Status','Von','Ergebnis'], queue_rows, placeholder='Queue durchsuchen…')}</section>
+        """
+
+    msg_panel = f"<section class='panel'><p>{_e(msg)}</p></section>" if msg else ""
+    body = f"""
+    <style>
+      .calendar-toolbar{{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:14px}}
+      .calendar-toolbar .actions-inline{{margin:0}}
+      .calendar-scroll{{overflow:auto;border:1px solid var(--line);border-radius:16px;background:#0a0908}}
+      .calendar-shell{{min-width:1120px}}
+      .calendar-head{{display:grid;grid-template-columns:72px repeat(7,minmax(140px,1fr));border-bottom:1px solid var(--line);position:sticky;top:0;z-index:8;background:#0d0c0b}}
+      .calendar-day-head{{padding:10px;border-left:1px solid rgba(255,255,255,.08);text-align:center;display:flex;justify-content:center;gap:8px}}
+      .calendar-day-head span{{color:var(--muted)}}
+      .calendar-body{{display:grid;grid-template-columns:72px 1fr}}
+      .calendar-hours{{background:#0d0c0b;border-right:1px solid var(--line)}}
+      .calendar-hour-label{{padding:5px 8px;color:var(--muted);font-size:12px;border-bottom:1px solid rgba(255,255,255,.065)}}
+      .calendar-days{{display:grid;grid-template-columns:repeat(7,minmax(140px,1fr));height:{(_CALENDAR_END_HOUR-_CALENDAR_START_HOUR)*_CALENDAR_ROW_HEIGHT}px}}
+      .calendar-day-lane{{position:relative;border-right:1px solid rgba(255,255,255,.08);background:repeating-linear-gradient(to bottom,transparent 0,transparent {_CALENDAR_ROW_HEIGHT-1}px,rgba(255,255,255,.07) {_CALENDAR_ROW_HEIGHT-1}px,rgba(255,255,255,.07) {_CALENDAR_ROW_HEIGHT}px)}}
+      .calendar-event{{position:absolute;left:4px;right:4px;z-index:3;border-radius:8px;padding:5px 7px;text-decoration:none;color:#fff;overflow:hidden;display:flex;gap:6px;align-items:flex-start;border:1px solid rgba(255,255,255,.16);box-shadow:0 5px 16px rgba(0,0,0,.35)}}
+      .calendar-event img{{width:28px;height:28px;object-fit:cover;border-radius:5px;flex:0 0 auto}}
+      .calendar-event strong,.calendar-event small{{display:block;line-height:1.15}}
+      .calendar-event strong{{font-size:12px}}
+      .calendar-event small{{font-size:10px;opacity:.82;margin-top:3px}}
+      .cat-pvp{{background:#8f2828}} .cat-boss{{background:#7b2d2a}} .cat-nightmare{{background:#7b3d71}} .cat-hard{{background:#8a4b2c}} .cat-trial{{background:#196d78}} .cat-raid{{background:#2d6e49}} .cat-other{{background:#493079}}
+      .calendar-legend{{display:flex;flex-wrap:wrap;gap:10px;margin-top:12px}}
+      .calendar-legend span{{display:inline-flex;gap:6px;align-items:center;color:var(--muted)}}
+      .calendar-dot{{width:10px;height:10px;border-radius:50%;display:inline-block}}
+      .calendar-checks{{display:flex;gap:18px;flex-wrap:wrap}}
+      .calendar-checks label{{display:flex;gap:7px;align-items:center}}
+      .mini-btn{{padding:7px 10px}}
+    </style>
+    <nav class="topnav"><a href="/member/events">Events</a><a href="/event-calendar">Kalender</a>{'<a href="/events-admin">Event-Verwaltung</a>' if is_admin else ''}<a href="/attendance">Anwesenheit</a></nav>
+    <section class="hero"><div><div class="eyebrow">Gildenkalender</div><h1>📅 Event-Kalender</h1><p class="muted">Wochenübersicht aus den echten Bot-Events. Dashboard, Gildenzentrale und Discord-Serverkalender greifen auf dieselben Termine zu.</p></div></section>
+    {msg_panel}
+    <section class="panel">
+      <div class="calendar-toolbar">
+        <div><h2>{_e(monday.strftime('%d.%m.%Y'))} – {_e((week_end-timedelta(days=1)).strftime('%d.%m.%Y'))}</h2><p class="muted">Europe/Berlin</p></div>
+        <div class="actions-inline"><a class="btn" href="/event-calendar?week={_e(prev_week)}">← Vorherige</a><a class="btn" href="/event-calendar?week={_e(today_week)}">Heute</a><a class="btn" href="/event-calendar?week={_e(next_week)}">Nächste →</a>{'<a class="btn" href="#calendar-create">Termin eintragen</a>' if is_admin else ''}</div>
+      </div>
+      <div class="calendar-scroll"><div class="calendar-shell"><div class="calendar-head"><div></div>{day_headers}</div><div class="calendar-body"><div class="calendar-hours">{hour_labels}</div><div class="calendar-days">{''.join(lanes)}</div></div></div></div>
+      <div class="calendar-legend"><span><i class="calendar-dot cat-boss"></i>Gildenboss</span><span><i class="calendar-dot cat-raid"></i>Raid</span><span><i class="calendar-dot cat-hard"></i>Hard Raid</span><span><i class="calendar-dot cat-nightmare"></i>Nightmare</span><span><i class="calendar-dot cat-trial"></i>Trials</span><span><i class="calendar-dot cat-pvp"></i>PvP</span><span><i class="calendar-dot cat-other"></i>Sonstiges</span></div>
+    </section>
+    <section class="panel"><h2>📌 Nächste Termine</h2>{_table(['Event','Zeit','Kategorie','Ort','Discord','Details'], upcoming_rows, placeholder='Termine durchsuchen…')}</section>
+    {admin_form}
+    """
+    return _html_shell("Event-Kalender · Ebo Dashboard", body, nav_mode="member")
 
 def _auction_dashboard_bucket(auction: dict[str, Any]) -> str:
     """Drei verständliche Bereiche für die Mitglieder-Auktionsseite."""
@@ -11944,7 +12209,7 @@ def _render_events_center(data: dict[str, Any], current_user: Optional[dict[str,
       .event-form-grid input, .event-form-grid textarea, .event-form-grid select {{ width:100%; }}
       @media(max-width:720px) {{ .event-card-head {{ flex-direction:column; }} .actions-inline .link {{ flex:1 1 auto; text-align:center; }} }}
     </style>
-    <nav class="topnav"><a href="/">← Kommando</a><a href="/attendance">Anwesenheit</a><a href="/ec">EC</a><a href="/overview">Gesamtübersicht</a><a href="/api/events-center">API</a><a href="/export/events_center.csv">CSV</a></nav>
+    <nav class="topnav"><a href="/">← Kommando</a><a href="/event-calendar">Kalender</a><a href="/attendance">Anwesenheit</a><a href="/ec">EC</a><a href="/overview">Gesamtübersicht</a><a href="/api/events-center">API</a><a href="/export/events_center.csv">CSV</a></nav>
     <section class="hero">
       <div><div class="eyebrow">Event-Zentrale</div><h1>📅 Events & Planung</h1><p class="muted">Kommende Events, laufende Events, Eventstatus, Rollenverteilung, Teilnehmerübersicht und direkte Links zu Attendance, Review und EC.</p></div>
       <div class="hero-actions"><a class="hero-action attendance" href="#create"><span>➕</span><strong>Event erstellen</strong><small>Bot-Queue</small></a><a class="hero-action loot" href="#overview"><span>📋</span><strong>Events prüfen</strong><small>Status & Rollen</small></a><a class="hero-action members" href="#actions"><span>🧾</span><strong>Queue</strong><small>Erstellen/Bearbeiten/Löschen</small></a></div>
@@ -12002,6 +12267,65 @@ def _render_events_center(data: dict[str, Any], current_user: Optional[dict[str,
     """
     return _html_shell("Events · Ebo Dashboard", body, nav_mode=nav_mode)
 
+
+
+@app.get("/event-calendar", response_class=HTMLResponse)
+def event_calendar_page(request: Request, week: str = "", msg: str = "", _: bool = Depends(_auth)):
+    try:
+        return HTMLResponse(_render_event_calendar_page(_snapshot_payload(), request, week=week, msg=msg))
+    except Exception as exc:
+        return HTMLResponse(_html_shell("Ebo Dashboard Fehler", f"<section class='panel'><h1>❌ Kalender-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"), status_code=500)
+
+
+@app.post("/admin/event-calendar/create")
+async def admin_event_calendar_create(request: Request, _: bool = Depends(_admin_auth)):
+    payload = _snapshot_payload()
+    guild_id = _safe_guild_id(payload)
+    actor = _current_user(request) or {"username": "Dashboard"}
+    form = _parse_urlencoded_body(await request.body())
+    date_s = str(form.get("date") or "").strip()
+    time_s = str(form.get("time") or "").strip()
+    try:
+        base_date = datetime.strptime(date_s, "%Y-%m-%d").date()
+        datetime.strptime(time_s, "%H:%M")
+    except Exception:
+        return RedirectResponse("/event-calendar?msg=" + urllib.parse.quote("Ungültiges Datum oder Uhrzeit."), status_code=303)
+    try:
+        repeat_count = max(1, min(12, int(form.get("repeat_count") or 1)))
+    except Exception:
+        repeat_count = 1
+    clean_base = {
+        "title": str(form.get("title") or "").strip(),
+        "time": time_s,
+        "event_type": str(form.get("event_type") or "").strip(),
+        "dkp_event_type": str(form.get("dkp_event_type") or "").strip(),
+        "channel_id": str(form.get("channel_id") or "").strip(),
+        "target_role_id": str(form.get("target_role_id") or "").strip(),
+        "description": str(form.get("description") or "").strip(),
+        "image_type": str(form.get("image_type") or "").strip(),
+        "image_url": str(form.get("image_url") or "").strip(),
+        "location": str(form.get("location") or "Ebolus Discord").strip(),
+        "duration_minutes": str(form.get("duration_minutes") or "120").strip(),
+        "send_dms": str(form.get("send_dms") or "") == "1",
+        "sync_discord_event": str(form.get("sync_discord_event") or "") == "1",
+        "created_from": "dashboard_calendar",
+    }
+    results = []
+    for index in range(repeat_count):
+        item = dict(clean_base)
+        item["date"] = (base_date + timedelta(days=7 * index)).isoformat()
+        item["repeat_index"] = index + 1
+        item["repeat_count"] = repeat_count
+        results.append(_enqueue_event_action_request(guild_id, "create", item, actor))
+    created = sum(1 for result in results if result.get("ok"))
+    errors = [str(result.get("error")) for result in results if not result.get("ok") and result.get("error")]
+    message = f"{created} Termin-Antrag/Anträge an den Bot gesendet."
+    if errors:
+        message += " Fehler: " + "; ".join(errors[:3])
+    return RedirectResponse(
+        "/event-calendar?week=" + urllib.parse.quote(date_s) + "&msg=" + urllib.parse.quote(message),
+        status_code=303,
+    )
 
 @app.get("/events", response_class=HTMLResponse)
 def events_page(request: Request, _: bool = Depends(_auth), msg: str = ""):
@@ -12098,11 +12422,18 @@ async def admin_events_action(request: Request, _: bool = Depends(_admin_auth)):
         "description": str(form.get("description") or "").strip(),
         "image_type": str(form.get("image_type") or "").strip(),
         "image_url": str(form.get("image_url") or "").strip(),
+        "location": str(form.get("location") or "").strip(),
+        "duration_minutes": str(form.get("duration_minutes") or "").strip(),
+        "sync_discord_event": str(form.get("sync_discord_event") or "") == "1",
         "send_dms": str(form.get("send_dms") or "") == "1",
     }
     res = _enqueue_event_action_request(guild_id, action, clean_payload, actor)
     msg = "Event-Aktion wurde an den Bot gesendet." if res.get("ok") else f"Fehler: {res.get('error')}"
-    return RedirectResponse("/events?msg=" + urllib.parse.quote(msg), status_code=303)
+    return_to = str(form.get("return_to") or "/events-admin").strip()
+    if return_to not in {"/events-admin", "/event-calendar", "/events"}:
+        return_to = "/events-admin"
+    sep = "&" if "?" in return_to else "?"
+    return RedirectResponse(return_to + sep + "msg=" + urllib.parse.quote(msg), status_code=303)
 
 
 @app.get("/planning", response_class=HTMLResponse)
