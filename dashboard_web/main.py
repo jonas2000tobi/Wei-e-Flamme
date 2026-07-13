@@ -10949,16 +10949,15 @@ def _settings_change_requests_for_dashboard(guild_id: int, limit: int = 80) -> l
 
 
 def _stable_discord_media_url(value: Any) -> str:
+    """Discord-Medien-URL unverändert verwenden.
+
+    Moderne Discord-Anhangs- und Proxy-URLs sind signiert. Das frühere Entfernen
+    von ``?ex=...&hm=...`` führte deshalb zu 403/404 und unsichtbaren
+    Event-Titelbildern. Der Bot erneuert die URL bei jedem Snapshot.
+    """
     url = str(value or "").strip()
     if not (url.startswith("https://") or url.startswith("http://")):
         return ""
-    try:
-        parsed = urllib.parse.urlsplit(url)
-        host = (parsed.netloc or "").lower()
-        if host in {"media.discordapp.net", "cdn.discordapp.com"} and parsed.path.startswith("/attachments/"):
-            return urllib.parse.urlunsplit(("https", "cdn.discordapp.com", parsed.path, "", ""))
-    except Exception:
-        pass
     return url
 
 
@@ -11072,28 +11071,151 @@ def _render_member_events_page(data: dict[str, Any], request: Request) -> str:
     return _html_shell("Events · Mitgliederbereich", body, nav_mode="member")
 
 
+def _auction_dashboard_bucket(auction: dict[str, Any]) -> str:
+    """Drei verständliche Bereiche für die Mitglieder-Auktionsseite."""
+    phase = str(auction.get("phase") or auction.get("mode") or "").strip().lower()
+    mode = str(auction.get("eligibility_mode") or auction.get("need_type") or "").strip().lower()
+    kind = str(auction.get("kind") or auction.get("auction_type") or "").strip().lower()
+    text = " ".join([
+        phase, mode, kind,
+        str(auction.get("item_name") or auction.get("item") or "").lower(),
+    ])
+    if mode in {"main_need", "main", "mainneed"} or "main need" in text or "main-need" in text:
+        return "main"
+    if mode in {"secondary_need", "second_need", "secondary", "second", "offspec"} or any(x in text for x in ("second need", "second-need", "secondary need", "secondary-need")):
+        return "second"
+    # Freie Auktionen, Lithographien, Sales und Würfelitems werden gemeinsam
+    # unter Litho/Müll angezeigt, damit kein aktiver Eintrag verschwindet.
+    return "junk"
+
+
+def _auction_bucket_label(auction: dict[str, Any]) -> str:
+    bucket = _auction_dashboard_bucket(auction)
+    return {"main": "Main Need", "second": "Second Need", "junk": "Litho / Müll"}.get(bucket, "Litho / Müll")
+
+
+def _auction_completed_at(auction: dict[str, Any]) -> Any:
+    for key in ("delivered_at", "sold_at", "closed_at", "ended_at", "completed_at", "updated_at", "ends_at", "created_at"):
+        if auction.get(key):
+            return auction.get(key)
+    return ""
+
+
+def _auction_history_result(auction: dict[str, Any], snap: dict[str, Any]) -> str:
+    if auction.get("junk_drop") or auction.get("is_junk"):
+        roll = int(_num(auction.get("junk_roll_winner_roll"), 0))
+        if not roll:
+            entries = _junk_roll_entries_dashboard(auction)
+            roll = int(_num((entries[0] if entries else {}).get("roll"), 0))
+        return f"Wurf {roll}" if roll else "Würfelvergabe"
+    amount = _loot_winning_amount(auction)
+    return f"{amount} EC" if amount else "vergeben"
+
+
 def _render_member_auctions_page(data: dict[str, Any], request: Request) -> str:
     if not data.get("ok"):
         return _html_shell("Auktionen · Mitgliederbereich", f"<section class='panel'><h1>🏆 Auktionen</h1><p class='muted'>{_e(data.get('error'))}</p></section>", nav_mode="member")
     snap: dict[str, Any] = data.get("snapshot") or {}
     auctions = _portal_active_auctions(snap)
-    rows = []
-    for a in auctions:
+    buckets: dict[str, list[dict[str, Any]]] = {"main": [], "second": [], "junk": []}
+    for auction in auctions:
+        buckets[_auction_dashboard_bucket(auction)].append(auction)
+
+    row_html: list[str] = []
+    for bucket_name in ("main", "second", "junk"):
+        for a in buckets[bucket_name]:
+            aid = str(a.get("auction_id") or "")
+            count_title, count_value, _ = _auction_count_label(a)
+            item_cell = _cell(_auction_link(aid, a.get("item_name") or a.get("item") or aid, a))
+            action = f'<a class="btn" href="/auction/{_e(aid)}">Öffnen</a>' if aid else "—"
+            search_text = " ".join([
+                str(a.get("item_name") or a.get("item") or ""),
+                _phase_label(a), _auction_bucket_label(a),
+                _auction_leader_or_roll_text(a, snap),
+            ]).lower()
+            row_html.append(
+                f'<tr data-auction-bucket="{_e(bucket_name)}" data-auction-search="{_e(search_text)}">'
+                f'<td>{item_cell}</td>'
+                f'<td>{_e(_phase_label(a))}</td>'
+                f'<td>{_cell(_loot_effective_status_label(a))}</td>'
+                f'<td>{_e(f"{count_value} {count_title}")}</td>'
+                f'<td>{_e(_auction_leader_or_roll_text(a, snap))}</td>'
+                f'<td>{_e(_auction_timer_text(a))}</td>'
+                f'<td>{action}</td>'
+                '</tr>'
+            )
+
+    if not row_html:
+        row_html.append('<tr class="auction-empty-row"><td colspan="7" class="muted">Keine laufenden Auktionen.</td></tr>')
+
+    # Letzte zehn abgeschlossene Vergaben/Verkäufe aus dem vollständigen Snapshot.
+    all_auctions = [dict(a) for a in (((snap.get("loot") or {}).get("auctions") or {}).get("items") or []) if isinstance(a, dict)]
+    completed = [a for a in all_auctions if _loot_is_done(a)]
+    completed.sort(key=lambda a: _dt_obj(_auction_completed_at(a)) or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+    names = _profile_name_map(snap)
+    history_rows: list[list[Any]] = []
+    for a in completed[:10]:
         aid = str(a.get("auction_id") or "")
-        count_title, count_value, _ = _auction_count_label(a)
-        rows.append([
+        winner = _loot_winner_name_text(a, names)
+        if not winner or winner == "—":
+            winner = a.get("winner_name") or a.get("top_bid_user_name") or "—"
+        history_rows.append([
             _auction_link(aid, a.get("item_name") or a.get("item") or aid, a),
-            _phase_label(a),
-            _loot_effective_status_label(a),
-            f"{count_value} {count_title}",
-            _auction_leader_or_roll_text(a, snap),
-            _auction_timer_text(a),
-            _raw(f'<a class="btn" href="/auction/{_e(aid)}">Öffnen</a>') if aid else "—",
+            _auction_bucket_label(a),
+            winner,
+            _auction_history_result(a, snap),
+            _dt(_auction_completed_at(a)),
+            _raw(f'<a class="link" href="/auction/{_e(aid)}">Details</a>') if aid else "—",
         ])
+
     body = f"""
+    <style>
+      .auction-category-menu{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-bottom:18px}}
+      .auction-category-tab{{appearance:none;border:1px solid rgba(214,168,79,.28);border-radius:14px;background:linear-gradient(180deg,rgba(28,23,17,.92),rgba(10,9,8,.94));color:var(--text);padding:14px 16px;text-align:left;cursor:pointer;transition:.18s ease;box-shadow:0 10px 25px rgba(0,0,0,.18)}}
+      .auction-category-tab strong{{display:block;font-family:Georgia,serif;color:var(--gold);font-size:18px}}
+      .auction-category-tab span{{display:block;font-size:30px;font-weight:900;margin-top:3px}}
+      .auction-category-tab small{{display:block;color:var(--muted);margin-top:2px}}
+      .auction-category-tab:hover,.auction-category-tab.active{{border-color:rgba(214,168,79,.72);background:linear-gradient(180deg,rgba(86,59,22,.65),rgba(24,18,12,.95));transform:translateY(-1px)}}
+      .auction-search{{width:min(480px,100%);margin:0 0 14px}}
+      .auction-table tbody tr[hidden]{{display:none}}
+      .auction-table td:first-child{{min-width:300px}}
+      .auction-no-results{{padding:18px;color:var(--muted);display:none}}
+      @media(max-width:800px){{.auction-category-menu{{grid-template-columns:1fr}}.auction-category-tab{{display:grid;grid-template-columns:1fr auto;align-items:center}}.auction-category-tab span{{grid-row:1/3;grid-column:2;font-size:28px}}}}
+    </style>
     <nav class="topnav"><a href="/member">Start</a><a href="/member/events">Events</a><a href="/member/auctions">Auktionen</a><a href="/portal">Eigenes Profil</a></nav>
-    <section class="hero"><div><div class="eyebrow">Mitgliederbereich</div><h1>🏆 Laufende Auktionen</h1><p class="muted">Alle aktuell offenen Auktionen, Würfelitems und Sales mit Timer.</p></div></section>
-    <section class="panel">{_table(['Item','Bereich','Status','Aktivität / Preis','Führung / Stand','Timer','Aktion'], rows, placeholder='Auktionen durchsuchen…')}</section>
+    <section class="hero"><div><div class="eyebrow">Mitgliederbereich</div><h1>🏆 Laufende Auktionen</h1><p class="muted">Nach Need-Stufe getrennt. Lithographien, freie Auktionen, Sales und Würfelitems liegen gesammelt unter Litho / Müll.</p></div></section>
+    <section class="panel">
+      <div class="auction-category-menu" role="tablist" aria-label="Auktionsbereiche">
+        <button type="button" class="auction-category-tab active" data-auction-tab="main"><strong>Main Need</strong><span>{len(buckets['main'])}</span><small>aktive Auktionen</small></button>
+        <button type="button" class="auction-category-tab" data-auction-tab="second"><strong>Second Need</strong><span>{len(buckets['second'])}</span><small>aktive Auktionen</small></button>
+        <button type="button" class="auction-category-tab" data-auction-tab="junk"><strong>Litho / Müll</strong><span>{len(buckets['junk'])}</span><small>frei, Sale und Würfeln</small></button>
+      </div>
+      <input id="auctionSearch" class="auction-search" type="search" placeholder="Items durchsuchen…" autocomplete="off">
+      <div class="table-wrap"><table class="auction-table"><thead><tr><th>Item</th><th>Bereich</th><th>Status</th><th>Aktivität / Preis</th><th>Führung / Stand</th><th>Timer</th><th>Aktion</th></tr></thead><tbody>{''.join(row_html)}</tbody></table></div>
+      <div id="auctionNoResults" class="auction-no-results">In diesem Bereich wurden keine passenden Items gefunden.</div>
+    </section>
+    <section class="panel"><h2>💰 Verkaufsübersicht</h2><p class="muted">Die letzten 10 abgeschlossenen Verkäufe und Vergaben.</p>{_table(['Item','Bereich','Käufer / Gewinner','Preis / Ergebnis','Abgeschlossen','Aktion'], history_rows, placeholder='Verkäufe durchsuchen…')}</section>
+    <script>
+    (() => {{
+      const tabs=[...document.querySelectorAll('[data-auction-tab]')];
+      const rows=[...document.querySelectorAll('tr[data-auction-bucket]')];
+      const search=document.getElementById('auctionSearch');
+      const noResults=document.getElementById('auctionNoResults');
+      let active='main';
+      const firstNonEmpty=tabs.find(btn=>Number((btn.querySelector('span')||{{}}).textContent||0)>0);
+      if(firstNonEmpty && Number((tabs[0].querySelector('span')||{{}}).textContent||0)===0) active=firstNonEmpty.dataset.auctionTab;
+      function apply(){{
+        const q=(search?.value||'').trim().toLowerCase();
+        let shown=0;
+        rows.forEach(row=>{{const okBucket=row.dataset.auctionBucket===active;const okSearch=!q||(row.dataset.auctionSearch||'').includes(q);row.hidden=!(okBucket&&okSearch);if(!row.hidden)shown++;}});
+        tabs.forEach(btn=>btn.classList.toggle('active',btn.dataset.auctionTab===active));
+        if(noResults) noResults.style.display=shown?'none':'block';
+      }}
+      tabs.forEach(btn=>btn.addEventListener('click',()=>{{active=btn.dataset.auctionTab;apply();}}));
+      search?.addEventListener('input',apply);
+      apply();
+    }})();
+    </script>
     """
     return _html_shell("Auktionen · Mitgliederbereich", body, nav_mode="member")
 
