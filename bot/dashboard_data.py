@@ -527,8 +527,16 @@ def _summarize_events(data: Any, guild: discord.Guild, *, limit: int = 200) -> d
             participant_detail = _event_participants(guild, ev)
             events.append({
                 "event_id": str(message_id),
+                "guild_id": int(guild_id),
+                "message_id": int(message_id) if str(message_id).isdigit() else 0,
                 "title": _safe_text(ev.get("title") or ev.get("name") or ev.get("event_name"), 160),
                 "when_iso": str(ev.get("when_iso") or ev.get("start_time") or ev.get("time") or ""),
+                "end_at": str(ev.get("end_at") or ev.get("end_time") or ""),
+                "duration_minutes": int(ev.get("duration_minutes", 0) or 0),
+                "location": _safe_text(ev.get("location") or "", 120),
+                "scheduled_event_id": int(ev.get("scheduled_event_id", 0) or 0),
+                "scheduled_event_url": str(ev.get("scheduled_event_url") or ""),
+                "scheduled_event_error": _safe_text(ev.get("scheduled_event_error") or "", 300),
                 "channel_id": int(ev.get("channel_id", 0) or 0),
                 "scope": str(ev.get("scope") or "single"),
                 "is_mirror_for_this_guild": bool(mirror_match and home_gid != int(guild_id)),
