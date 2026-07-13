@@ -145,15 +145,41 @@ def _is_admin(inter: discord.Interaction) -> bool:
     return bool(perms and (perms.administrator or perms.manage_guild))
 
 
+def _leadership_role_ids(guild_id: int) -> set[int]:
+    """Alle Rollen mit Leitungsrechten: Meister, Berater und Wächter."""
+    out: set[int] = set()
+    try:
+        cfg = _load_leader_cfg().get(str(int(guild_id))) or {}
+        rid = int(cfg.get("leader_role_id", 0) or 0)
+        if rid:
+            out.add(rid)
+    except Exception:
+        pass
+    try:
+        portal = _load_portal_cfg().get(str(int(guild_id))) or {}
+        roles = portal.get("position_roles") or {}
+        for key in ("leader", "advisor", "guardian"):
+            rid = int(roles.get(key, 0) or 0)
+            if rid:
+                out.add(rid)
+    except Exception:
+        pass
+    return out
+
+
+def _member_has_leadership_role(guild: discord.Guild, member: Optional[discord.Member]) -> bool:
+    if member is None or getattr(member, "bot", False):
+        return False
+    member_ids = {int(role.id) for role in getattr(member, "roles", [])}
+    return bool(member_ids.intersection(_leadership_role_ids(int(guild.id))))
+
+
 def _is_leader_or_admin(inter: discord.Interaction) -> bool:
     if _is_admin(inter):
         return True
     if inter.guild is None or not isinstance(inter.user, discord.Member):
         return False
-    cfg = _load_leader_cfg().get(str(inter.guild.id)) or {}
-    role_id = int(cfg.get("leader_role_id", 0) or 0)
-    role = inter.guild.get_role(role_id) if role_id else None
-    return bool(role and role in inter.user.roles)
+    return _member_has_leadership_role(inter.guild, inter.user)
 
 
 def _is_leader_or_admin_member(guild: discord.Guild, member: Optional[discord.Member]) -> bool:
@@ -162,10 +188,7 @@ def _is_leader_or_admin_member(guild: discord.Guild, member: Optional[discord.Me
     perms = getattr(member, "guild_permissions", None)
     if perms and (getattr(perms, "administrator", False) or getattr(perms, "manage_guild", False)):
         return True
-    cfg = _load_leader_cfg().get(str(int(guild.id))) or {}
-    role_id = int(cfg.get("leader_role_id", 0) or 0)
-    role = guild.get_role(role_id) if role_id else None
-    return bool(role and role in getattr(member, "roles", []))
+    return _member_has_leadership_role(guild, member)
 
 
 class _DashboardDropContext:

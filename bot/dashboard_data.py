@@ -234,8 +234,42 @@ def _dashboard_role_config_values(guild_id: int, setting_name: str, env_name: st
     return values
 
 
+def _portal_position_role_ids(guild_id: int) -> list[int]:
+    """Leitungsrollen aus der Gildenzentrale lesen.
+
+    Gildenmeister, Gildenberater und Gildenwächter sollen im Dashboard dieselben
+    Adminrechte erhalten wie eine explizit gesetzte Dashboard-Adminrolle. Die
+    Rollen werden aus ``member_portal_cfg.json`` gelesen, damit keine zweite
+    Rollenpflege nötig ist.
+    """
+    try:
+        raw = _load_json_file(JSON_SOURCES["member_portal_cfg"], {})
+        scoped = raw.get(str(int(guild_id))) if isinstance(raw, dict) else {}
+        if not isinstance(scoped, dict):
+            scoped = {}
+        roles = scoped.get("position_roles") or {}
+        if not isinstance(roles, dict):
+            return []
+        out: list[int] = []
+        for key in ("leader", "advisor", "guardian"):
+            try:
+                rid = int(roles.get(key, 0) or 0)
+            except Exception:
+                rid = 0
+            if rid and rid not in out:
+                out.append(rid)
+        return out
+    except Exception as exc:
+        print(f"⚠️ Portal-Positionsrollen konnten nicht gelesen werden: {exc!r}", flush=True)
+        return []
+
+
 def _dashboard_admin_role_config_values(guild_id: int) -> list[int]:
-    return _dashboard_role_config_values(guild_id, DASHBOARD_ADMIN_ROLE_SETTING, "DASHBOARD_ADMIN_ROLE_IDS")
+    values = _dashboard_role_config_values(guild_id, DASHBOARD_ADMIN_ROLE_SETTING, "DASHBOARD_ADMIN_ROLE_IDS")
+    for rid in _portal_position_role_ids(guild_id):
+        if rid not in values:
+            values.append(rid)
+    return values
 
 
 def _dashboard_allowed_role_config_values(guild_id: int) -> list[int]:

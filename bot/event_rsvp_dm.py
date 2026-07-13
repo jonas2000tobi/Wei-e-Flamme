@@ -8,7 +8,7 @@ import secrets
 import time
 from pathlib import Path
 from typing import Dict, Optional, Iterable, List, Any
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 try:
@@ -17,6 +17,7 @@ except Exception:
     from json_store import load_json_file, save_json_atomic, warn_json_store  # type: ignore
 
 import discord
+import aiohttp
 from discord import app_commands
 from discord.ext import tasks
 from discord.ui import View, button
@@ -78,6 +79,7 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 RSVP_FILE = DATA_DIR / "event_rsvp.json"
 DM_CFG_FILE = DATA_DIR / "event_rsvp_cfg.json"
 LEADER_CONTACT_CFG_FILE = DATA_DIR / "leader_contact_cfg.json"
+MEMBER_PORTAL_CFG_FILE = DATA_DIR / "member_portal_cfg.json"
 ATTENDANCE_FILE = DATA_DIR / "event_attendance.json"
 
 
@@ -619,6 +621,14 @@ def build_embed(guild: discord.Guild, obj: dict) -> discord.Embed:
             emb.add_field(name="🔊 Voice", value=f"<#{voice_id}>", inline=False)
         else:
             emb.add_field(name="🔊 Voice", value="wird 1 Stunde vor Event automatisch erstellt", inline=False)
+
+    scheduled_event_id = int(obj.get("scheduled_event_id", 0) or 0)
+    if scheduled_event_id:
+        emb.add_field(
+            name="📅 Discord-Serverkalender",
+            value=f"[Termin öffnen](https://discord.com/events/{int(guild.id)}/{scheduled_event_id})",
+            inline=False,
+        )
 
     if obj.get("image_url"):
         emb.set_image(url=obj["image_url"])
@@ -2016,26 +2026,37 @@ def _is_admin(inter: discord.Interaction) -> bool:
     return bool(perms and (perms.administrator or perms.manage_guild))
 
 
+def _leadership_role_ids(guild_id: int) -> set[int]:
+    """Alle Rollen mit Leitungsrechten: Meister, Berater und Wächter."""
+    out: set[int] = set()
+    try:
+        leader_cfg = _load(LEADER_CONTACT_CFG_FILE, {})
+        c = leader_cfg.get(str(int(guild_id))) or {}
+        rid = int(c.get("leader_role_id", 0) or 0)
+        if rid:
+            out.add(rid)
+    except Exception:
+        pass
+    try:
+        portal_cfg = _load(MEMBER_PORTAL_CFG_FILE, {})
+        c = portal_cfg.get(str(int(guild_id))) or {}
+        roles = c.get("position_roles") or {}
+        for key in ("leader", "advisor", "guardian"):
+            rid = int(roles.get(key, 0) or 0)
+            if rid:
+                out.add(rid)
+    except Exception:
+        pass
+    return out
+
+
 def _is_leader_or_admin(inter: discord.Interaction) -> bool:
     if _is_admin(inter):
         return True
-
     if inter.guild is None or not isinstance(inter.user, discord.Member):
         return False
-
-    try:
-        leader_cfg = _load(LEADER_CONTACT_CFG_FILE, {})
-        c = leader_cfg.get(str(inter.guild.id)) or {}
-        role_id = int(c.get("leader_role_id", 0) or 0)
-
-        if not role_id:
-            return False
-
-        role = inter.guild.get_role(role_id)
-        return bool(role and role in inter.user.roles)
-
-    except Exception:
-        return False
+    member_role_ids = {int(role.id) for role in getattr(inter.user, "roles", [])}
+    return bool(member_role_ids.intersection(_leadership_role_ids(int(inter.guild.id))))
 
 
 def _alliance_home_guild_id(default: int = 0) -> int:
@@ -2619,11 +2640,22 @@ def _dashboard_event_parse_when(payload: dict[str, Any], fallback_iso: str = "")
 
 
 _DASHBOARD_EVENT_IMAGE_PRESETS = {
-    "Normal Raid": "https://media.discordapp.net/attachments/1488142284812714085/1516086614957494312/282b2b20-5a8f-4251-b038-15fde2ac723d.png?ex=6a315d30&is=6a300bb0&hm=767b9ad51564019a71be77906c480350e29137f24e08b6abd99f67a9c9edad33&=&format=webp&quality=lossless",
-    "Hard Raid": "https://media.discordapp.net/attachments/1488142284812714085/1513816935832228033/7225f274-cc4f-4eda-ba74-ca401f4e572b.png?ex=6a310462&is=6a2fb2e2&hm=9aa88c9c5b45f6eea14ec33541344421b7d467b3b5969f2c8d7faeebb3b30df2&=&format=webp&quality=lossless",
-    "Nightmare": "https://media.discordapp.net/attachments/1488142284812714085/1513816992358858842/d6ee8bc1-432a-4d28-914d-31be80adf835.png?ex=6a310470&is=6a2fb2f0&hm=77fbec16dae3b00858a4dd20000eec86150d99de8823aab5acc7a3189f39092c&=&format=webp&quality=lossless",
-    "Trials": "https://media.discordapp.net/attachments/1488142284812714085/1491660359952502825/file_000000007dcc7246bb6e57ae41860769.png?ex=6a30d4f7&is=6a2f8377&hm=40ae17883015fa630db3155e0d922cdfbf8fea9ca88a43a0b20a51d6852a9e64&=&format=webp&quality=lossless&width=1440&height=960",
-    "PvP": "https://media.discordapp.net/attachments/1488142284812714085/1513202292302811186/1780845919107.png?ex=6a30c234&is=6a2f70b4&hm=eb19a0dbc88e29a962ba726adc39f397f6240652dfd5b377a87c74b311f680b5&=&format=webp&quality=lossless",
+    "normal raid": "https://media.discordapp.net/attachments/1488142284812714085/1516086614957494312/282b2b20-5a8f-4251-b038-15fde2ac723d.png?ex=6a315d30&is=6a300bb0&hm=767b9ad51564019a71be77906c480350e29137f24e08b6abd99f67a9c9edad33&=&format=webp&quality=lossless",
+    "hard raid": "https://media.discordapp.net/attachments/1488142284812714085/1513816935832228033/7225f274-cc4f-4eda-ba74-ca401f4e572b.png?ex=6a310462&is=6a2fb2e2&hm=9aa88c9c5b45f6eea14ec33541344421b7d467b3b5969f2c8d7faeebb3b30df2&=&format=webp&quality=lossless",
+    "nightmare": "https://media.discordapp.net/attachments/1488142284812714085/1513816992358858842/d6ee8bc1-432a-4d28-914d-31be80adf835.png?ex=6a310470&is=6a2fb2f0&hm=77fbec16dae3b00858a4dd20000eec86150d99de8823aab5acc7a3189f39092c&=&format=webp&quality=lossless",
+    "trials": "https://media.discordapp.net/attachments/1488142284812714085/1491660359952502825/file_000000007dcc7246bb6e57ae41860769.png?ex=6a30d4f7&is=6a2f8377&hm=40ae17883015fa630db3155e0d922cdfbf8fea9ca88a43a0b20a51d6852a9e64&=&format=webp&quality=lossless&width=1440&height=960",
+    "pvp": "https://media.discordapp.net/attachments/1488142284812714085/1513202292302811186/1780845919107.png?ex=6a30c234&is=6a2f70b4&hm=eb19a0dbc88e29a962ba726adc39f397f6240652dfd5b377a87c74b311f680b5&=&format=webp&quality=lossless",
+}
+
+_DASHBOARD_EVENT_IMAGE_ALIASES = {
+    "normal": "normal raid",
+    "hard": "hard raid",
+    "hm raid": "hard raid",
+    "nightmare": "nightmare",
+    "nm raid": "nightmare",
+    "trial": "trials",
+    "trials": "trials",
+    "pvp": "pvp",
 }
 
 
@@ -2631,10 +2663,143 @@ def _dashboard_event_image_url_from_payload(payload: dict[str, Any]) -> str | No
     direct = str(payload.get("image_url") or "").strip()
     if direct:
         return direct
-    image_type = str(payload.get("image_type") or "").strip()
+    image_type = str(payload.get("image_type") or "").strip().lower()
     if image_type in {"", "none", "custom"}:
         return None
-    return _DASHBOARD_EVENT_IMAGE_PRESETS.get(image_type)
+    key = _DASHBOARD_EVENT_IMAGE_ALIASES.get(image_type, image_type)
+    return _DASHBOARD_EVENT_IMAGE_PRESETS.get(key)
+
+
+def _dashboard_event_duration_minutes(payload: dict[str, Any], fallback: int = 120) -> int:
+    try:
+        return max(30, min(720, int(float(payload.get("duration_minutes") or fallback))))
+    except Exception:
+        return int(fallback)
+
+
+def _dashboard_event_end_time(start: datetime, payload: dict[str, Any], fallback_minutes: int = 120) -> datetime:
+    end_iso = str(payload.get("end_at") or payload.get("end_time") or "").strip()
+    if end_iso:
+        try:
+            end = datetime.fromisoformat(end_iso.replace("Z", "+00:00"))
+            if end.tzinfo is None:
+                end = end.replace(tzinfo=TZ)
+            end = end.astimezone(TZ)
+            if end > start:
+                return end
+        except Exception:
+            pass
+    return start + timedelta(minutes=_dashboard_event_duration_minutes(payload, fallback_minutes))
+
+
+async def _dashboard_event_image_bytes(url: str, *, max_bytes: int = 8 * 1024 * 1024) -> bytes | None:
+    url = str(url or "").strip()
+    if not url.startswith(("https://", "http://")):
+        return None
+    timeout = aiohttp.ClientTimeout(total=15)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url, allow_redirects=True, headers={"User-Agent": "EbolusBot/1.0"}) as response:
+                if response.status != 200:
+                    return None
+                content_length = int(response.headers.get("Content-Length") or 0)
+                if content_length and content_length > max_bytes:
+                    return None
+                data = await response.read()
+                return data if 0 < len(data) <= max_bytes else None
+    except Exception:
+        return None
+
+
+async def _dashboard_create_discord_scheduled_event(
+    guild: discord.Guild,
+    obj: dict[str, Any],
+    payload: dict[str, Any],
+    channel: discord.abc.GuildChannel | discord.Thread | None = None,
+) -> dict[str, Any]:
+    if not bool(payload.get("sync_discord_event", False)):
+        return {"created": False, "reason": "sync_disabled"}
+    start = _dashboard_event_parse_when(payload, str(obj.get("when_iso") or ""))
+    if start <= datetime.now(TZ) + timedelta(seconds=30):
+        return {"created": False, "error": "Discord-Serverevent kann nur für einen zukünftigen Termin erstellt werden."}
+    end = _dashboard_event_end_time(start, payload, int(obj.get("duration_minutes") or 120))
+    title = str(obj.get("title") or payload.get("title") or "Gildenevent").strip()[:100]
+    description = str(obj.get("description") or payload.get("description") or "").strip()[:1000]
+    location = str(payload.get("location") or obj.get("location") or "").strip()
+    if not location and channel is not None:
+        location = f"#{getattr(channel, 'name', 'Ebolus Discord')}"
+    location = (location or "Ebolus Discord")[:100]
+    image_bytes = await _dashboard_event_image_bytes(str(obj.get("image_url") or ""))
+    kwargs: dict[str, Any] = {
+        "name": title,
+        "start_time": start.astimezone(timezone.utc),
+        "end_time": end.astimezone(timezone.utc),
+        "entity_type": discord.EntityType.external,
+        "privacy_level": discord.PrivacyLevel.guild_only,
+        "location": location,
+        "description": description,
+        "reason": "Ebolus Dashboard/Gildenkalender",
+    }
+    if image_bytes:
+        kwargs["image"] = image_bytes
+    scheduled = await guild.create_scheduled_event(**kwargs)
+    obj["scheduled_event_id"] = int(scheduled.id)
+    obj["scheduled_event_url"] = f"https://discord.com/events/{int(guild.id)}/{int(scheduled.id)}"
+    obj["end_at"] = end.isoformat()
+    obj["duration_minutes"] = int((end - start).total_seconds() // 60)
+    obj["location"] = location
+    obj["sync_discord_event"] = True
+    return {"created": True, "scheduled_event_id": int(scheduled.id), "scheduled_event_url": obj["scheduled_event_url"]}
+
+
+async def _dashboard_update_discord_scheduled_event(
+    guild: discord.Guild,
+    obj: dict[str, Any],
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    scheduled_id = int(obj.get("scheduled_event_id", 0) or 0)
+    if not scheduled_id:
+        if bool(payload.get("sync_discord_event", False)):
+            channel = guild.get_channel(int(obj.get("channel_id", 0) or 0))
+            return await _dashboard_create_discord_scheduled_event(guild, obj, payload, channel)
+        return {"updated": False, "reason": "not_linked"}
+    scheduled = await guild.fetch_scheduled_event(scheduled_id)
+    start = _dashboard_event_parse_when(payload, str(obj.get("when_iso") or ""))
+    end = _dashboard_event_end_time(start, payload, int(obj.get("duration_minutes") or 120))
+    title = str(obj.get("title") or "Gildenevent").strip()[:100]
+    description = str(obj.get("description") or "").strip()[:1000]
+    location = str(payload.get("location") or obj.get("location") or "Ebolus Discord").strip()[:100]
+    kwargs: dict[str, Any] = {
+        "name": title,
+        "description": description,
+        "start_time": start.astimezone(timezone.utc),
+        "end_time": end.astimezone(timezone.utc),
+        "location": location,
+        "reason": "Ebolus Dashboard/Gildenkalender bearbeitet",
+    }
+    if "image_url" in payload or "image_type" in payload:
+        image_bytes = await _dashboard_event_image_bytes(str(obj.get("image_url") or ""))
+        if image_bytes:
+            kwargs["image"] = image_bytes
+    updated = await scheduled.edit(**kwargs)
+    obj["scheduled_event_id"] = int(updated.id)
+    obj["scheduled_event_url"] = f"https://discord.com/events/{int(guild.id)}/{int(updated.id)}"
+    obj["end_at"] = end.isoformat()
+    obj["duration_minutes"] = int((end - start).total_seconds() // 60)
+    obj["location"] = location
+    return {"updated": True, "scheduled_event_id": int(updated.id), "scheduled_event_url": obj["scheduled_event_url"]}
+
+
+async def _dashboard_delete_discord_scheduled_event(guild: discord.Guild, obj: dict[str, Any]) -> dict[str, Any]:
+    scheduled_id = int(obj.get("scheduled_event_id", 0) or 0)
+    if not scheduled_id:
+        return {"deleted": False, "reason": "not_linked"}
+    try:
+        scheduled = await guild.fetch_scheduled_event(scheduled_id)
+        await scheduled.delete(reason="Ebolus Event gelöscht")
+        return {"deleted": True, "scheduled_event_id": scheduled_id}
+    except discord.NotFound:
+        return {"deleted": False, "reason": "already_missing", "scheduled_event_id": scheduled_id}
 
 
 def _dashboard_event_dkp_type_from_payload(payload: dict[str, Any]) -> str:
@@ -2675,6 +2840,10 @@ async def _dashboard_event_create(client: discord.Client, guild_id: int, payload
         "dkp_enabled": bool(dkp_event_type),
         "dkp_event_type": dkp_event_type,
         "when_iso": when.isoformat(),
+        "end_at": _dashboard_event_end_time(when, payload).isoformat(),
+        "duration_minutes": _dashboard_event_duration_minutes(payload),
+        "location": str(payload.get("location") or "Ebolus Discord").strip(),
+        "sync_discord_event": bool(payload.get("sync_discord_event", False)),
         "image_url": _dashboard_event_image_url_from_payload(payload),
         "yes": {"TANK": [], "HEAL": [], "DPS": [], "BANK": []},
         "maybe": {},
@@ -2689,10 +2858,16 @@ async def _dashboard_event_create(client: discord.Client, guild_id: int, payload
     msg = await ch.send(embed=emb)
     msg_id = int(msg.id)
     obj["message_id"] = msg_id
+    scheduled_result: dict[str, Any] = {}
+    try:
+        scheduled_result = await _dashboard_create_discord_scheduled_event(guild, obj, payload, ch)
+    except Exception as exc:
+        scheduled_result = {"created": False, "error": f"{type(exc).__name__}: {exc}"}
+        obj["scheduled_event_error"] = scheduled_result["error"]
     store[str(msg_id)] = obj
     save_store()
     try:
-        await msg.edit(view=ServerRaidView(msg_id))
+        await msg.edit(embed=build_embed(guild, obj), view=ServerRaidView(msg_id))
     except Exception:
         pass
     sent = 0
@@ -2719,7 +2894,15 @@ async def _dashboard_event_create(client: discord.Client, guild_id: int, payload
         save_store()
     _schedule_portal_refresh_for_event(client, guild, obj)
     await _log(client, guild.id, f"Dashboard-Event erstellt: {title} ({msg_id})")
-    return {"event_id": str(msg_id), "jump_url": getattr(msg, "jump_url", ""), "dm_sent": sent, "dm_skipped_opt_out": skipped_opt_out}
+    return {
+        "event_id": str(msg_id),
+        "jump_url": getattr(msg, "jump_url", ""),
+        "dm_sent": sent,
+        "dm_skipped_opt_out": skipped_opt_out,
+        "scheduled_event_id": int(obj.get("scheduled_event_id", 0) or 0),
+        "scheduled_event_url": str(obj.get("scheduled_event_url") or ""),
+        "scheduled_event_error": str((scheduled_result or {}).get("error") or ""),
+    }
 
 
 async def _dashboard_event_edit(client: discord.Client, guild_id: int, payload: dict[str, Any]) -> dict[str, Any]:
@@ -2754,14 +2937,34 @@ async def _dashboard_event_edit(client: discord.Client, guild_id: int, payload: 
     if str(payload.get("target_role_id") or "").strip():
         obj["target_role_id"] = _dashboard_event_int(payload.get("target_role_id"))
         changed.append("Zielrolle")
+    if str(payload.get("duration_minutes") or "").strip():
+        obj["duration_minutes"] = _dashboard_event_duration_minutes(payload, int(obj.get("duration_minutes") or 120))
+        start_dt = _dashboard_event_parse_when(payload, str(obj.get("when_iso") or ""))
+        obj["end_at"] = _dashboard_event_end_time(start_dt, payload, int(obj.get("duration_minutes") or 120)).isoformat()
+        changed.append("Dauer")
+    if str(payload.get("location") or "").strip():
+        obj["location"] = str(payload.get("location") or "").strip()
+        changed.append("Ort")
+    if "sync_discord_event" in payload:
+        obj["sync_discord_event"] = bool(payload.get("sync_discord_event")) or bool(obj.get("scheduled_event_id"))
+    guild = client.get_guild(int(guild_id))
+    scheduled_result: dict[str, Any] = {}
+    if guild is not None and (obj.get("scheduled_event_id") or payload.get("sync_discord_event")):
+        try:
+            scheduled_result = await _dashboard_update_discord_scheduled_event(guild, obj, payload)
+            if scheduled_result.get("updated") or scheduled_result.get("created"):
+                changed.append("Discord-Kalender")
+            obj.pop("scheduled_event_error", None)
+        except Exception as exc:
+            obj["scheduled_event_error"] = f"{type(exc).__name__}: {exc}"
+            scheduled_result = {"error": obj["scheduled_event_error"]}
     store[event_id] = obj
     save_store()
     await _push_overview(client, event_id, obj)
-    guild = client.get_guild(int(guild_id))
     if guild is not None:
         _schedule_portal_refresh_for_event(client, guild, obj)
     await _log(client, int(guild_id), f"Dashboard-Event bearbeitet: {obj.get('title')} ({event_id})")
-    return {"event_id": event_id, "changed": changed or ["keine sichtbaren Felder"]}
+    return {"event_id": event_id, "changed": changed or ["keine sichtbaren Felder"], "scheduled_event": scheduled_result}
 
 
 async def _dashboard_event_delete(client: discord.Client, guild_id: int, payload: dict[str, Any]) -> dict[str, Any]:
@@ -2819,10 +3022,18 @@ async def _dashboard_event_delete(client: discord.Client, guild_id: int, payload
         await _cleanup_event_voice_for_obj(client, obj)
     except Exception:
         pass
+    scheduled_result: dict[str, Any] = {}
+    guild_for_schedule = client.get_guild(int(guild_id))
+    if guild_for_schedule is not None and obj.get("scheduled_event_id"):
+        try:
+            scheduled_result = await _dashboard_delete_discord_scheduled_event(guild_for_schedule, obj)
+        except Exception as exc:
+            scheduled_result = {"deleted": False, "error": f"{type(exc).__name__}: {exc}"}
+            failed_posts.append("Discord-Serverevent konnte nicht gelöscht werden")
     store.pop(event_id, None)
     save_store()
     await _log(client, int(guild_id), f"Dashboard-Event gelöscht: {obj.get('title')} ({event_id})")
-    return {"event_id": event_id, "deleted_posts": deleted_posts, "deleted_dms": deleted_dms, "failed_posts": failed_posts[:10]}
+    return {"event_id": event_id, "deleted_posts": deleted_posts, "deleted_dms": deleted_dms, "failed_posts": failed_posts[:10], "scheduled_event": scheduled_result}
 
 
 async def _dashboard_event_process_request(client: discord.Client, row: dict[str, Any]) -> tuple[bool, str, dict[str, Any]]:

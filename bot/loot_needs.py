@@ -174,23 +174,35 @@ def _load_leader_cfg() -> dict:
     return _load_json(LEADER_CONTACT_CFG_FILE, {})
 
 
+def _leadership_role_ids(guild_id: int) -> set[int]:
+    """Alle Rollen mit Leitungsrechten: Meister, Berater und Wächter."""
+    out: set[int] = set()
+    try:
+        c = _load_leader_cfg().get(str(int(guild_id))) or {}
+        rid = int(c.get("leader_role_id", 0) or 0)
+        if rid:
+            out.add(rid)
+    except Exception:
+        pass
+    try:
+        c = _load_portal_cfg().get(str(int(guild_id))) or {}
+        roles = c.get("position_roles") or {}
+        for key in ("leader", "advisor", "guardian"):
+            rid = int(roles.get(key, 0) or 0)
+            if rid:
+                out.add(rid)
+    except Exception:
+        pass
+    return out
+
+
 def _is_leader_or_admin(inter: discord.Interaction) -> bool:
     if _is_admin(inter):
         return True
-
     if inter.guild is None or not isinstance(inter.user, discord.Member):
         return False
-
-    leader_cfg = _load_leader_cfg()
-    c = leader_cfg.get(str(inter.guild.id)) or {}
-    role_id = int(c.get("leader_role_id", 0) or 0)
-
-    if not role_id:
-        return False
-
-    role = inter.guild.get_role(role_id)
-
-    return bool(role and role in inter.user.roles)
+    member_role_ids = {int(role.id) for role in getattr(inter.user, "roles", [])}
+    return bool(member_role_ids.intersection(_leadership_role_ids(int(inter.guild.id))))
 
 
 def _gitems(guild_id: int) -> dict:
