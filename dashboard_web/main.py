@@ -3650,7 +3650,7 @@ def _enqueue_loot_action_request(guild_id: int, auction: dict[str, Any], action_
 
 
 
-def _enqueue_loot_drop_request(guild_id: int, drop_type: str, item_query: str, actor: dict[str, Any], catalog_item_id: int = 0) -> dict[str, Any]:
+def _enqueue_loot_drop_request(guild_id: int, drop_type: str, item_query: str, actor: dict[str, Any], catalog_item_id: int = 0, slot: str = "") -> dict[str, Any]:
     """Dashboard -> Bot Queue: normale Drops/Müll-Drops anlegen.
 
     Das Dashboard erstellt die Auktion nicht selbst. Es legt nur eine Anfrage in
@@ -3701,6 +3701,7 @@ def _enqueue_loot_drop_request(guild_id: int, drop_type: str, item_query: str, a
         "item_query": item,
         "item_name": item,
         "catalog_item_id": int(resolved_catalog_id or 0),
+        "slot": str(slot or "").strip(),
         "requested_by": {"id": actor_id, "name": actor_name},
         "requested_at": datetime.now(timezone.utc).isoformat(),
         "source": "dashboard_loot_drop",
@@ -5072,20 +5073,41 @@ function refreshNeedWeaponPicker(source) {{
   picker.selectedIndex = 0;
 }}
 
+function canonicalLootSlot(value) {{
+  const raw = (value || '').toString().toLowerCase().trim();
+  if (!raw) return '';
+  if (raw.includes('waffe') || raw.includes('weapon') || raw.includes('schwert') || raw.includes('dolch') || raw.includes('bogen') || raw.includes('armbrust') || raw.includes('stab') || raw.includes('kugel')) return 'waffe';
+  if (raw.includes('fähigkeitskern') || raw.includes('faehigkeitskern') || raw.includes('skill core') || raw === 'kern') return 'fähigkeitskern';
+  if (raw.includes('helm') || raw.includes('hut') || raw.includes('haube') || raw.includes('head')) return 'helm';
+  if (raw.includes('brust') || raw.includes('rüstung') || raw.includes('ruestung') || raw.includes('robe') || raw.includes('chest')) return 'brust';
+  if (raw.includes('hose') || raw.includes('bein') || raw.includes('pants')) return 'hose';
+  if (raw.includes('handschuh') || raw.includes('stulpen') || raw.includes('glove')) return 'handschuhe';
+  if (raw.includes('schuh') || raw.includes('stiefel') || raw.includes('boot')) return 'schuhe';
+  if (raw.includes('brosche') || raw.includes('brooch')) return 'brosche';
+  if (raw.includes('ohrring') || raw.includes('earring')) return 'ohrringe';
+  if (raw.includes('halskette') || raw.includes('kette') || raw.includes('necklace')) return 'kette';
+  if (raw.includes('armband') || raw.includes('armreif') || raw.includes('bracelet')) return 'armband';
+  if (raw.includes('ring') || raw.includes('band') || raw.includes('siegel') || raw.includes('spule')) return 'ring';
+  if (raw.includes('gürtel') || raw.includes('guertel') || raw.includes('belt')) return 'gürtel';
+  if (raw.includes('umhang') || raw.includes('mantel') || raw.includes('cape') || raw.includes('cloak')) return 'umhang';
+  return raw.replace(/\\s*[12]$/, '');
+}}
+
 function refreshItemPickerFilters() {{
   for (const picker of document.querySelectorAll('select.item-picker-select[data-slot-source]')) {{
     const source = document.getElementById(picker.dataset.slotSource);
-    const slot = (source && source.value ? source.value : '').toLowerCase();
+    const slot = canonicalLootSlot(source && source.value ? source.value : '');
     let visible = 0;
     for (const opt of picker.options) {{
       if (!opt.value) {{ opt.hidden = false; continue; }}
-      const optSlot = (opt.dataset.slot || '').toLowerCase();
-      const ok = !slot || !optSlot || optSlot === slot || (slot.startsWith('waffe') && optSlot.startsWith('waffe'));
+      const optSlot = canonicalLootSlot(opt.dataset.slot || '');
+      const ok = !slot || !optSlot || optSlot === slot;
       opt.hidden = !ok;
       if (ok) visible++;
     }}
     const first = picker.options[0];
-    if (first) first.textContent = visible ? `Item aus Liste anklicken ... (${{visible}})` : 'Keine bekannten Items für diesen Slot – Freitext nutzen';
+    if (first) first.textContent = slot ? (visible ? `2. Item auswählen ... (${{visible}})` : 'Keine bekannten Items für diesen Slot – Freitext nutzen') : '2. Erst Slot auswählen';
+    if (picker.value && picker.options[picker.selectedIndex] && picker.options[picker.selectedIndex].hidden) picker.selectedIndex = 0;
   }}
 }}
 document.addEventListener('change', function(ev) {{
@@ -6860,6 +6882,51 @@ def _loot_catalog_item_names(snap: dict[str, Any], limit: int = 650) -> list[str
     return [x.get("name", "") for x in _loot_catalog_items(snap, limit=limit) if x.get("name")]
 
 
+def _loot_picker_slot_key(item: dict[str, Any]) -> str:
+    """Einheitlicher Slot-Schlüssel für den zweistufigen Drop-Picker."""
+    raw = " ".join([
+        str(item.get("slot") or ""),
+        str(item.get("name") or ""),
+        str(item.get("main_category") or ""),
+        str(item.get("sub_category") or ""),
+    ]).lower()
+    if any(x in raw for x in ("waffe", "weapon", "schwert", "dolch", "bogen", "armbrust", "stab", "kugel")):
+        return "Waffe"
+    if any(x in raw for x in ("fähigkeitskern", "faehigkeitskern", "skill core")):
+        return "Fähigkeitskern"
+    mapping = [
+        ("Helm", ("helm", "hut", "haube", "head")),
+        ("Brust", ("brust", "rüstung", "ruestung", "robe", "chest")),
+        ("Hose", ("hose", "beinschutz", "pants")),
+        ("Handschuhe", ("handschuh", "stulpen", "glove")),
+        ("Schuhe", ("schuh", "stiefel", "boot")),
+        ("Brosche", ("brosche", "brooch")),
+        ("Ohrringe", ("ohrring", "earring")),
+        ("Kette", ("halskette", "kette", "necklace")),
+        ("Armband", ("armband", "armreif", "bracelet")),
+        ("Ring", ("ring", "band", "siegel", "spule")),
+        ("Gürtel", ("gürtel", "guertel", "belt")),
+        ("Umhang", ("umhang", "mantel", "cape", "cloak")),
+    ]
+    for label, hints in mapping:
+        if any(h in raw for h in hints):
+            return label
+    return str(item.get("slot") or item.get("sub_category") or item.get("main_category") or "")
+
+
+def _loot_drop_slot_select_html(select_id: str, *, required: bool = True) -> str:
+    required_attr = " required" if required else ""
+    groups = []
+    for title, slots in _NEED_SLOT_GROUPS:
+        options = "".join(f'<option value="{_e(slot)}">{_e(slot)}</option>' for slot in slots)
+        groups.append(f'<optgroup label="{_e(title)}">{options}</optgroup>')
+    return (
+        f'<select id="{_e(select_id)}" name="slot" class="need-slot-select"{required_attr} '
+        f'onchange="refreshItemPickerFilters()">'
+        f'<option value="">1. Slot auswählen</option>{"".join(groups)}</select>'
+    )
+
+
 def _loot_item_picker_html(snap: dict[str, Any], *, input_id: str, name: str = "item", required: bool = True, placeholder: str = "Item auswählen oder tippen", slot_select_id: str = "") -> str:
     items = _loot_catalog_items(snap)
     datalist_id = f"{input_id}-list"
@@ -6867,7 +6934,7 @@ def _loot_item_picker_html(snap: dict[str, Any], *, input_id: str, name: str = "
     required_attr = " required" if required else ""
     options = "".join(f'<option value="{_e(item.get("name"))}"></option>' for item in items)
     select_options = "".join(
-        f'<option value="{_e(item.get("name"))}" data-slot="{_e(item.get("slot"))}" data-catalog-id="{_e(item.get("catalog_item_id") or 0)}">'
+        f'<option value="{_e(item.get("name"))}" data-slot="{_e(_loot_picker_slot_key(item))}" data-catalog-id="{_e(item.get("catalog_item_id") or 0)}">'
         f'{_e(item.get("name"))}{(" · " + _e(item.get("slot"))) if item.get("slot") else ""}</option>'
         for item in items[:500]
     )
@@ -6947,7 +7014,7 @@ def _need_item_slot_matches(item_slot: str, target_slot: str, item_name: str = "
     if item_slot_l == target_l:
         return True
     if target_l.startswith("waffe"):
-        return item_slot_l.startswith("waffe") or bool(_weapon_type_from_text(item_name))
+        return item_slot_l.startswith("waffe") or bool(_weapon_type_from_text(item_slot)) or bool(_weapon_type_from_text(item_name))
     if target_l.startswith("ring"):
         return item_slot_l.startswith("ring") or "ring" in name_l
     if target_l in item_slot_l or item_slot_l in target_l:
@@ -7148,14 +7215,16 @@ def _render_loot_center(data: dict[str, Any], request: Optional[Request] = None,
             <form method="post" action="/admin/loot/drop" style="display:grid;gap:10px;">
               <h3>📦 Loot gedroppt</h3>
               <input type="hidden" name="drop_type" value="loot_drop">
-              <label>Item aus Loot-Katalog<br>{_loot_item_picker_html(snap, input_id="loot-drop-item", placeholder="z. B. Aridus Stab")}</label>
+              <label>1. Slot<br>{_loot_drop_slot_select_html("loot-drop-slot")}</label>
+              <label>2. Item dieses Slots<br>{_loot_item_picker_html(snap, input_id="loot-drop-item", placeholder="Item des gewählten Slots", slot_select_id="loot-drop-slot")}</label>
               <button class="btn" type="submit" onclick="return confirm('Loot-Drop an den Bot senden?');">Loot-Drop erstellen</button>
-              <p class="muted">Bot prüft Main-Need → Second-Need → freie Auktion.</p>
+              <p class="muted">Wie im Discord-Menü: erst Slot, dann Item. Bot prüft Main-Need → Second-Need → freie Auktion.</p>
             </form>
             <form method="post" action="/admin/loot/drop" style="display:grid;gap:10px;">
               <h3>🧹 Müll gedroppt</h3>
               <input type="hidden" name="drop_type" value="junk_drop">
-              <label>Item aus Datenbank oder Freitext<br>{_loot_item_picker_html(snap, input_id="junk-drop-item", placeholder="z. B. Restitem aus Truhe")}</label>
+              <label>1. Slot<br>{_loot_drop_slot_select_html("junk-drop-slot")}</label>
+              <label>2. Item dieses Slots<br>{_loot_item_picker_html(snap, input_id="junk-drop-item", placeholder="Item des gewählten Slots", slot_select_id="junk-drop-slot")}</label>
               <button class="btn" type="submit" onclick="return confirm('Müll-Drop an den Bot senden?');">Müll-Drop erstellen</button>
               <p class="muted">Bot erstellt ein kostenloses Müll-/Würfelitem.</p>
             </form>
@@ -10137,14 +10206,29 @@ async def admin_loot_drop_dashboard(request: Request, _: bool = Depends(_admin_a
         form = _parse_urlencoded_body(raw)
         drop_type = str(form.get("drop_type") or "loot_drop").strip().lower()
         item = str(form.get("item") or "").strip()
+        slot = str(form.get("slot") or "").strip()
+        valid_slots = set(_NEED_SLOTS)
+        if slot not in valid_slots:
+            raise ValueError("Bitte zuerst einen gültigen Slot auswählen.")
         try:
             catalog_item_id = int(form.get("catalog_item_id") or 0)
         except Exception:
             catalog_item_id = 0
+        if catalog_item_id and get_item_by_id is not None:
+            try:
+                selected = get_item_by_id(catalog_item_id)  # type: ignore[misc]
+            except Exception:
+                selected = None
+            if selected:
+                selected_slot = str(selected.get("sub_category") or selected.get("main_category") or selected.get("slot") or "")
+                selected_name = str(selected.get("name") or item)
+                if not _need_item_slot_matches(selected_slot, slot, selected_name):
+                    raise ValueError(f"{selected_name} passt nicht zum ausgewählten Slot {slot}.")
+                item = selected_name
         payload = _snapshot_payload()
         guild_id = _safe_guild_id(payload)
         actor = _current_user(request) or {}
-        result = _enqueue_loot_drop_request(int(guild_id), drop_type, item, actor, catalog_item_id=catalog_item_id)
+        result = _enqueue_loot_drop_request(int(guild_id), drop_type, item, actor, catalog_item_id=catalog_item_id, slot=slot)
         if result.get("ok"):
             msg = "✅ " + str(result.get("message") or "Drop wurde an den Bot gesendet.")
         else:
@@ -11103,6 +11187,26 @@ def _calendar_week_monday(value: str = "") -> datetime:
     return datetime(monday.year, monday.month, monday.day, tzinfo=_CALENDAR_TZ)
 
 
+def _calendar_month_start(value: str = "") -> datetime:
+    today = datetime.now(_CALENDAR_TZ).date()
+    raw = str(value or "").strip()
+    if raw:
+        for fmt in ("%Y-%m", "%Y-%m-%d"):
+            try:
+                parsed = datetime.strptime(raw, fmt).date()
+                today = parsed
+                break
+            except Exception:
+                continue
+    return datetime(today.year, today.month, 1, tzinfo=_CALENDAR_TZ)
+
+
+def _calendar_shift_month(start: datetime, delta: int) -> datetime:
+    index = start.year * 12 + (start.month - 1) + int(delta)
+    year, month0 = divmod(index, 12)
+    return datetime(year, month0 + 1, 1, tzinfo=_CALENDAR_TZ)
+
+
 def _calendar_event_local_dt(event: dict[str, Any]) -> Optional[datetime]:
     dt = _dt_obj(event.get("when_iso") or event.get("start_at") or event.get("created_at"))
     return dt.astimezone(_CALENDAR_TZ) if dt else None
@@ -11158,20 +11262,22 @@ def _calendar_event_url(event: dict[str, Any]) -> str:
     return f"/event/{urllib.parse.quote(eid)}" if eid else "#"
 
 
-def _render_event_calendar_page(data: dict[str, Any], request: Request, week: str = "", msg: str = "") -> str:
+def _render_event_calendar_page(data: dict[str, Any], request: Request, month: str = "", msg: str = "") -> str:
     if not data.get("ok"):
         return _html_shell("Event-Kalender · Ebo Dashboard", f"<section class='panel'><h1>📅 Event-Kalender</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
 
     snap: dict[str, Any] = data.get("snapshot") or {}
     guild_id = _safe_guild_id(data)
-    monday = _calendar_week_monday(week)
-    week_end = monday + timedelta(days=7)
-    prev_week = (monday - timedelta(days=7)).date().isoformat()
-    next_week = (monday + timedelta(days=7)).date().isoformat()
-    today_week = _calendar_week_monday().date().isoformat()
+    month_start = _calendar_month_start(month)
+    next_month_start = _calendar_shift_month(month_start, 1)
+    prev_month_start = _calendar_shift_month(month_start, -1)
+    grid_start = month_start - timedelta(days=month_start.weekday())
+    grid_end = grid_start + timedelta(days=42)
+    today = datetime.now(_CALENDAR_TZ).date()
     is_admin = _is_dashboard_admin(request)
 
-    events: list[dict[str, Any]] = []
+    events_by_day: dict[Any, list[dict[str, Any]]] = {}
+    all_events: list[dict[str, Any]] = []
     for raw in ((snap.get("events") or {}).get("items") or []):
         if not isinstance(raw, dict):
             continue
@@ -11180,69 +11286,55 @@ def _render_event_calendar_page(data: dict[str, Any], request: Request, week: st
         if not dt:
             continue
         ev["_calendar_dt"] = dt
-        if monday <= dt < week_end:
-            events.append(ev)
-    events.sort(key=lambda e: e.get("_calendar_dt") or monday)
+        all_events.append(ev)
+        if grid_start <= dt < grid_end:
+            events_by_day.setdefault(dt.date(), []).append(ev)
+    for rows in events_by_day.values():
+        rows.sort(key=lambda ev: ev.get("_calendar_dt") or month_start)
 
-    day_names = ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag"]
-    day_headers = "".join(
-        f'<div class="calendar-day-head"><strong>{day_names[i]}</strong><span>{(monday + timedelta(days=i)).strftime("%d.%m.")}</span></div>'
-        for i in range(7)
-    )
-    hour_labels = "".join(
-        f'<div class="calendar-hour-label" style="height:{_CALENDAR_ROW_HEIGHT}px">{hour:02d}:00</div>'
-        for hour in range(_CALENDAR_START_HOUR, _CALENDAR_END_HOUR)
-    )
-
-    lanes: list[str] = []
-    for day_idx in range(7):
-        blocks: list[str] = []
-        for ev in events:
-            start = ev.get("_calendar_dt")
-            if not isinstance(start, datetime) or start.weekday() != day_idx:
-                continue
-            end = _calendar_event_end_local(ev, start)
-            start_minutes = max(0, (start.hour - _CALENDAR_START_HOUR) * 60 + start.minute)
-            end_minutes = max(start_minutes + 30, (end.hour - _CALENDAR_START_HOUR) * 60 + end.minute)
-            max_minutes = (_CALENDAR_END_HOUR - _CALENDAR_START_HOUR) * 60
-            if start_minutes >= max_minutes:
-                continue
-            end_minutes = min(max_minutes, end_minutes)
-            top = round(start_minutes / 60 * _CALENDAR_ROW_HEIGHT, 2)
-            height = max(34, round((end_minutes - start_minutes) / 60 * _CALENDAR_ROW_HEIGHT - 3, 2))
-            category = _calendar_category(ev)
+    day_names = ["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"]
+    day_headers = "".join(f'<div class="month-weekday">{name}</div>' for name in day_names)
+    day_cells: list[str] = []
+    for offset in range(42):
+        day_dt = grid_start + timedelta(days=offset)
+        day = day_dt.date()
+        rows = events_by_day.get(day, [])
+        classes = ["month-day"]
+        if day_dt.month != month_start.month:
+            classes.append("outside")
+        if day == today:
+            classes.append("today")
+        cards: list[str] = []
+        for ev in rows[:5]:
+            start_dt = ev.get("_calendar_dt")
             title = str(ev.get("title") or ev.get("name") or "Event")
-            eid = str(ev.get("event_id") or ev.get("id") or "")
+            category = _calendar_category(ev)
             image = _event_image_url(ev)
             thumb = f'<img src="{_e(image)}" alt="" loading="lazy">' if image else ""
-            scheduled_badge = " · Discord" if ev.get("scheduled_event_id") else ""
-            blocks.append(
-                f'<a class="calendar-event cat-{_e(category)}" href="{_e(_calendar_event_url(ev))}" '
-                f'style="top:{top}px;height:{height}px" title="{_e(title)}">'
-                f'{thumb}<span><strong>{_e(start.strftime("%H:%M"))} · {_e(title)}</strong>'
-                f'<small>{_e(_calendar_category_label(category))}{_e(scheduled_badge)}</small></span></a>'
+            scheduled = '<span class="month-discord">Discord</span>' if ev.get("scheduled_event_id") else ""
+            cards.append(
+                f'<a class="month-event cat-{_e(category)}" href="{_e(_calendar_event_url(ev))}" title="{_e(title)}">'
+                f'{thumb}<span><strong>{_e(start_dt.strftime("%H:%M") if isinstance(start_dt, datetime) else "")} · {_e(title)}</strong>'
+                f'<small>{_e(_calendar_category_label(category))} {scheduled}</small></span></a>'
             )
-        lanes.append(f'<div class="calendar-day-lane">{"".join(blocks)}</div>')
+        more = f'<div class="month-more">+ {len(rows) - 5} weitere</div>' if len(rows) > 5 else ""
+        day_cells.append(
+            f'<div class="{" ".join(classes)}"><div class="month-day-number">{day.day}</div>'
+            f'<div class="month-events">{"".join(cards)}{more}</div></div>'
+        )
 
     upcoming_rows: list[list[Any]] = []
-    all_events = [dict(e) for e in ((snap.get("events") or {}).get("items") or []) if isinstance(e, dict)]
     now_local = datetime.now(_CALENDAR_TZ)
-    upcoming_all = []
-    for ev in all_events:
-        dt = _calendar_event_local_dt(ev)
-        if dt and dt >= now_local - timedelta(hours=2):
-            ev["_calendar_dt"] = dt
-            upcoming_all.append(ev)
-    upcoming_all.sort(key=lambda e: e.get("_calendar_dt") or now_local)
+    upcoming_all = [ev for ev in all_events if isinstance(ev.get("_calendar_dt"), datetime) and ev.get("_calendar_dt") >= now_local - timedelta(hours=2)]
+    upcoming_all.sort(key=lambda ev: ev.get("_calendar_dt") or now_local)
     for ev in upcoming_all[:20]:
         dt = ev.get("_calendar_dt")
         eid = str(ev.get("event_id") or ev.get("id") or "")
-        title_cell = _member_event_title_cell(ev)
         discord_link = "—"
         if ev.get("scheduled_event_id"):
             discord_link = _raw(f'<a class="btn mini-btn" href="{_e(_calendar_event_url(ev))}" target="_blank" rel="noopener">Discord-Termin</a>')
         upcoming_rows.append([
-            title_cell,
+            _member_event_title_cell(ev),
             dt.strftime("%a, %d.%m.%Y %H:%M") if isinstance(dt, datetime) else "—",
             _calendar_category_label(_calendar_category(ev)),
             ev.get("location") or "—",
@@ -11260,6 +11352,7 @@ def _render_event_calendar_page(data: dict[str, Any], request: Request, week: st
             result = str(row.get("result_json") or "")[:180]
         queue_rows.append([row.get("requested_at"), row.get("action_type"), row.get("status"), row.get("actor_name"), result])
 
+    default_date = today if today.year == month_start.year and today.month == month_start.month else month_start.date()
     admin_form = ""
     if is_admin:
         admin_form = f"""
@@ -11269,7 +11362,7 @@ def _render_event_calendar_page(data: dict[str, Any], request: Request, week: st
           <form method="post" action="/admin/event-calendar/create" style="display:grid;gap:12px">
             <div class="event-form-grid">
               <label>Titel<br><input name="title" required placeholder="z. B. Gildenbosse Sonntag"></label>
-              <label>Datum<br><input name="date" type="date" required value="{_e(monday.date().isoformat())}"></label>
+              <label>Datum<br><input name="date" type="date" required value="{_e(default_date.isoformat())}"></label>
               <label>Uhrzeit<br><input name="time" type="time" required value="20:00"></label>
               <label>Dauer in Minuten<br><input name="duration_minutes" type="number" min="30" max="720" step="15" value="120"></label>
               <label>Wiederholungen wöchentlich<br><input name="repeat_count" type="number" min="1" max="12" value="1"></label>
@@ -11292,26 +11385,29 @@ def _render_event_calendar_page(data: dict[str, Any], request: Request, week: st
         <section class="panel"><h2>🧾 Kalender-Queue</h2>{_table(['Zeit','Aktion','Status','Von','Ergebnis'], queue_rows, placeholder='Queue durchsuchen…')}</section>
         """
 
+    month_names = ["Januar", "Februar", "März", "April", "Mai", "Juni", "Juli", "August", "September", "Oktober", "November", "Dezember"]
+    month_title = f"{month_names[month_start.month - 1]} {month_start.year}"
     msg_panel = f"<section class='panel'><p>{_e(msg)}</p></section>" if msg else ""
     body = f"""
     <style>
       .calendar-toolbar{{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:14px}}
       .calendar-toolbar .actions-inline{{margin:0}}
-      .calendar-scroll{{overflow:auto;border:1px solid var(--line);border-radius:16px;background:#0a0908}}
-      .calendar-shell{{min-width:1120px}}
-      .calendar-head{{display:grid;grid-template-columns:72px repeat(7,minmax(140px,1fr));border-bottom:1px solid var(--line);position:sticky;top:0;z-index:8;background:#0d0c0b}}
-      .calendar-day-head{{padding:10px;border-left:1px solid rgba(255,255,255,.08);text-align:center;display:flex;justify-content:center;gap:8px}}
-      .calendar-day-head span{{color:var(--muted)}}
-      .calendar-body{{display:grid;grid-template-columns:72px 1fr}}
-      .calendar-hours{{background:#0d0c0b;border-right:1px solid var(--line)}}
-      .calendar-hour-label{{padding:5px 8px;color:var(--muted);font-size:12px;border-bottom:1px solid rgba(255,255,255,.065)}}
-      .calendar-days{{display:grid;grid-template-columns:repeat(7,minmax(140px,1fr));height:{(_CALENDAR_END_HOUR-_CALENDAR_START_HOUR)*_CALENDAR_ROW_HEIGHT}px}}
-      .calendar-day-lane{{position:relative;border-right:1px solid rgba(255,255,255,.08);background:repeating-linear-gradient(to bottom,transparent 0,transparent {_CALENDAR_ROW_HEIGHT-1}px,rgba(255,255,255,.07) {_CALENDAR_ROW_HEIGHT-1}px,rgba(255,255,255,.07) {_CALENDAR_ROW_HEIGHT}px)}}
-      .calendar-event{{position:absolute;left:4px;right:4px;z-index:3;border-radius:8px;padding:5px 7px;text-decoration:none;color:#fff;overflow:hidden;display:flex;gap:6px;align-items:flex-start;border:1px solid rgba(255,255,255,.16);box-shadow:0 5px 16px rgba(0,0,0,.35)}}
-      .calendar-event img{{width:28px;height:28px;object-fit:cover;border-radius:5px;flex:0 0 auto}}
-      .calendar-event strong,.calendar-event small{{display:block;line-height:1.15}}
-      .calendar-event strong{{font-size:12px}}
-      .calendar-event small{{font-size:10px;opacity:.82;margin-top:3px}}
+      .month-scroll{{overflow:auto;border:1px solid var(--line);border-radius:16px;background:#0a0908}}
+      .month-shell{{min-width:1050px}}
+      .month-weekdays,.month-grid{{display:grid;grid-template-columns:repeat(7,minmax(140px,1fr))}}
+      .month-weekday{{padding:11px;text-align:center;font-weight:800;color:var(--gold);border-right:1px solid rgba(255,255,255,.08);border-bottom:1px solid var(--line);background:#0d0c0b}}
+      .month-day{{min-height:150px;padding:8px;border-right:1px solid rgba(255,255,255,.08);border-bottom:1px solid rgba(255,255,255,.08);background:rgba(10,9,8,.72)}}
+      .month-day.outside{{opacity:.42;background:#080808}}
+      .month-day.today{{box-shadow:inset 0 0 0 2px var(--gold)}}
+      .month-day-number{{font-weight:900;color:var(--gold);margin-bottom:7px}}
+      .month-events{{display:grid;gap:5px}}
+      .month-event{{border-radius:8px;padding:5px 6px;text-decoration:none;color:#fff;display:grid;grid-template-columns:auto minmax(0,1fr);gap:6px;align-items:center;border:1px solid rgba(255,255,255,.16);box-shadow:0 4px 12px rgba(0,0,0,.25);min-width:0}}
+      .month-event img{{width:30px;height:30px;object-fit:cover;border-radius:5px}}
+      .month-event strong,.month-event small{{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
+      .month-event strong{{font-size:11px;line-height:1.2}}
+      .month-event small{{font-size:9px;opacity:.85;margin-top:2px}}
+      .month-discord{{font-size:8px;border:1px solid rgba(255,255,255,.3);border-radius:8px;padding:1px 4px}}
+      .month-more{{font-size:10px;color:var(--muted);padding:2px 4px}}
       .cat-pvp{{background:#8f2828}} .cat-boss{{background:#7b2d2a}} .cat-nightmare{{background:#7b3d71}} .cat-hard{{background:#8a4b2c}} .cat-trial{{background:#196d78}} .cat-raid{{background:#2d6e49}} .cat-other{{background:#493079}}
       .calendar-legend{{display:flex;flex-wrap:wrap;gap:10px;margin-top:12px}}
       .calendar-legend span{{display:inline-flex;gap:6px;align-items:center;color:var(--muted)}}
@@ -11319,16 +11415,17 @@ def _render_event_calendar_page(data: dict[str, Any], request: Request, week: st
       .calendar-checks{{display:flex;gap:18px;flex-wrap:wrap}}
       .calendar-checks label{{display:flex;gap:7px;align-items:center}}
       .mini-btn{{padding:7px 10px}}
+      @media(max-width:700px){{.month-day{{min-height:125px}}}}
     </style>
     <nav class="topnav"><a href="/member/events">Events</a><a href="/event-calendar">Kalender</a>{'<a href="/events-admin">Event-Verwaltung</a>' if is_admin else ''}<a href="/attendance">Anwesenheit</a></nav>
-    <section class="hero"><div><div class="eyebrow">Gildenkalender</div><h1>📅 Event-Kalender</h1><p class="muted">Wochenübersicht aus den echten Bot-Events. Dashboard, Gildenzentrale und Discord-Serverkalender greifen auf dieselben Termine zu.</p></div></section>
+    <section class="hero"><div><div class="eyebrow">Gildenkalender</div><h1>📅 Event-Kalender</h1><p class="muted">Monatsübersicht aus den echten Bot-Events. Dashboard, Gildenzentrale und Discord-Serverkalender greifen auf dieselben Termine zu.</p></div></section>
     {msg_panel}
     <section class="panel">
       <div class="calendar-toolbar">
-        <div><h2>{_e(monday.strftime('%d.%m.%Y'))} – {_e((week_end-timedelta(days=1)).strftime('%d.%m.%Y'))}</h2><p class="muted">Europe/Berlin</p></div>
-        <div class="actions-inline"><a class="btn" href="/event-calendar?week={_e(prev_week)}">← Vorherige</a><a class="btn" href="/event-calendar?week={_e(today_week)}">Heute</a><a class="btn" href="/event-calendar?week={_e(next_week)}">Nächste →</a>{'<a class="btn" href="#calendar-create">Termin eintragen</a>' if is_admin else ''}</div>
+        <div><h2>{_e(month_title)}</h2><p class="muted">Europe/Berlin</p></div>
+        <div class="actions-inline"><a class="btn" href="/event-calendar?month={_e(prev_month_start.strftime('%Y-%m'))}">← Vorheriger Monat</a><a class="btn" href="/event-calendar?month={_e(datetime.now(_CALENDAR_TZ).strftime('%Y-%m'))}">Heute</a><a class="btn" href="/event-calendar?month={_e(next_month_start.strftime('%Y-%m'))}">Nächster Monat →</a>{'<a class="btn" href="#calendar-create">Termin eintragen</a>' if is_admin else ''}</div>
       </div>
-      <div class="calendar-scroll"><div class="calendar-shell"><div class="calendar-head"><div></div>{day_headers}</div><div class="calendar-body"><div class="calendar-hours">{hour_labels}</div><div class="calendar-days">{''.join(lanes)}</div></div></div></div>
+      <div class="month-scroll"><div class="month-shell"><div class="month-weekdays">{day_headers}</div><div class="month-grid">{''.join(day_cells)}</div></div></div>
       <div class="calendar-legend"><span><i class="calendar-dot cat-boss"></i>Gildenboss</span><span><i class="calendar-dot cat-raid"></i>Raid</span><span><i class="calendar-dot cat-hard"></i>Hard Raid</span><span><i class="calendar-dot cat-nightmare"></i>Nightmare</span><span><i class="calendar-dot cat-trial"></i>Trials</span><span><i class="calendar-dot cat-pvp"></i>PvP</span><span><i class="calendar-dot cat-other"></i>Sonstiges</span></div>
     </section>
     <section class="panel"><h2>📌 Nächste Termine</h2>{_table(['Event','Zeit','Kategorie','Ort','Discord','Details'], upcoming_rows, placeholder='Termine durchsuchen…')}</section>
@@ -12270,9 +12367,10 @@ def _render_events_center(data: dict[str, Any], current_user: Optional[dict[str,
 
 
 @app.get("/event-calendar", response_class=HTMLResponse)
-def event_calendar_page(request: Request, week: str = "", msg: str = "", _: bool = Depends(_auth)):
+def event_calendar_page(request: Request, month: str = "", week: str = "", msg: str = "", _: bool = Depends(_auth)):
     try:
-        return HTMLResponse(_render_event_calendar_page(_snapshot_payload(), request, week=week, msg=msg))
+        # ``week`` bleibt als Legacy-Parameter kompatibel; angezeigt wird immer der Monat.
+        return HTMLResponse(_render_event_calendar_page(_snapshot_payload(), request, month=(month or week), msg=msg))
     except Exception as exc:
         return HTMLResponse(_html_shell("Ebo Dashboard Fehler", f"<section class='panel'><h1>❌ Kalender-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"), status_code=500)
 
@@ -12323,7 +12421,7 @@ async def admin_event_calendar_create(request: Request, _: bool = Depends(_admin
     if errors:
         message += " Fehler: " + "; ".join(errors[:3])
     return RedirectResponse(
-        "/event-calendar?week=" + urllib.parse.quote(date_s) + "&msg=" + urllib.parse.quote(message),
+        "/event-calendar?month=" + urllib.parse.quote(date_s[:7]) + "&msg=" + urllib.parse.quote(message),
         status_code=303,
     )
 
