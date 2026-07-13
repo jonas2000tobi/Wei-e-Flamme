@@ -596,13 +596,21 @@ def _is_ebolus_member(client: discord.Client, home_guild_id: int, user_id: int) 
     return bool(role and role in member.roles)
 
 
-def _display_member(client: discord.Client, home_guild_id: int, user_id: int) -> str:
+def _display_member(client: discord.Client, home_guild_id: int, user_id: int, fallback: str = "") -> str:
+    """Klartextname statt Discord-Mention oder roher User-ID."""
     guild = client.get_guild(int(home_guild_id))
     if guild:
         member = guild.get_member(int(user_id))
         if member:
-            return member.display_name
-    return f"User {user_id}"
+            name = str(getattr(member, "display_name", "") or getattr(member, "global_name", "") or getattr(member, "name", "")).strip()
+            if name:
+                return discord.utils.escape_markdown(name)
+    text = str(fallback or "").strip()
+    uid = str(int(user_id or 0)) if int(user_id or 0) else ""
+    compact = text.replace("<", "").replace(">", "").replace("@", "").replace("!", "").strip()
+    if text and not text.isdigit() and (not uid or compact != uid) and text.casefold() not in {f"user {uid}".casefold(), f"spieler {uid}".casefold()}:
+        return discord.utils.escape_markdown(text)
+    return "Unbekannter Spieler"
 
 
 async def _log_to_channel(client: discord.Client, guild_id: int, embed: discord.Embed) -> None:
@@ -704,9 +712,15 @@ def _participant_display_name(client: discord.Client, guild_id: int, participant
         uid = int(participant.get("id", 0) or 0)
     except Exception:
         uid = 0
+    stored = ""
+    for key in ("name", "display_name", "server_name", "username", "target_name"):
+        candidate = str(participant.get(key, "") or "").strip()
+        if candidate:
+            stored = candidate
+            break
     if uid:
-        return _display_member(client, guild_id, uid)
-    return str(participant.get("name", "Spieler") or "Spieler")
+        return _display_member(client, guild_id, uid, stored)
+    return discord.utils.escape_markdown(stored or "Unbekannter Spieler")
 
 
 def _attendance_status_counts(event: dict) -> dict[str, int]:
@@ -794,7 +808,8 @@ def _attendance_check_embed(client: discord.Client, home_guild_id: int, event: d
         role = _signup_label(signup)
         manual = " *(nachgetragen)*" if bool(p.get("manual")) or str(p.get("source", "") or "") == "manual" or signup == "MANUAL" else ""
         marker = "EC" if _is_ebolus_member(client, home_guild_id, uid) else "Allianz"
-        lines.append(f"• {status_label} {marker} <@{uid}> – {role}{manual}")
+        player_name = _participant_display_name(client, int(home_guild_id), p)
+        lines.append(f"• {status_label} {marker} **{player_name}** – {role}{manual}")
     if len(participants) > 25:
         lines.append(f"… {len(participants) - 25} weitere")
     emb.add_field(name="Anmeldungen / EC-Vorschlag", value="\n".join(lines)[:1000] if lines else "—", inline=False)
@@ -2158,7 +2173,10 @@ def _dashboard_ec_award_embed(payload: dict, applied: list[dict], skipped: list[
         amount = int(row.get("amount", 0) or 0)
         requested = int(row.get("requested_amount", amount) or amount)
         suffix = f" (Limit: statt {requested} EC)" if amount < requested else ""
-        lines.append(f"• <@{uid}>: **+{amount} EC**{suffix}")
+        display_name = str(row.get("display_name") or "").strip()
+        if not display_name or display_name.isdigit() or display_name.casefold() == f"user {uid}".casefold():
+            display_name = "Unbekannter Spieler"
+        lines.append(f"• **{discord.utils.escape_markdown(display_name)}**: **+{amount} EC**{suffix}")
     if len(applied) > 25:
         lines.append(f"… {len(applied) - 25} weitere")
     emb.add_field(name="Gebucht", value="\n".join(lines)[:1000] if lines else "—", inline=False)
@@ -2773,7 +2791,7 @@ def _attendance_summary_for_award(client: discord.Client, home_guild_id: int, ev
         is_reserve = status == "reserve" or (status == "present" and signup == "BANK")
         row = {
             "user_id": uid,
-            "name": str(p.get("name", "") or _display_member(client, home_guild_id, uid)),
+            "name": _participant_display_name(client, int(home_guild_id), p),
             "signup": signup,
             "status": status or "open",
         }
@@ -3337,7 +3355,7 @@ def _award_preview_embed(event: dict, event_type: str, present: list[dict], rese
         emb.add_field(name="⚠️ Hinweis", value="Für dieses Event und diesen Typ wurden bereits DKP vergeben.", inline=False)
     lines = [
         (
-            f"• <@{x['user_id']}>: **+{x['points']} EC**"
+            f"• **{discord.utils.escape_markdown(str(x.get('name') or 'Unbekannter Spieler'))}**: **+{x['points']} EC**"
             + (f" (Limit: statt {x.get('requested_points')} EC)" if x.get("weekly_limited") else "")
         )
         for x in present
@@ -3345,7 +3363,7 @@ def _award_preview_embed(event: dict, event_type: str, present: list[dict], rese
     emb.add_field(name="✅ Ebolus – Teilnahme", value="\n".join(lines)[:1000] if lines else "—", inline=False)
     lines = [
         (
-            f"• <@{x['user_id']}>: **+{x['points']} EC**"
+            f"• **{discord.utils.escape_markdown(str(x.get('name') or 'Unbekannter Spieler'))}**: **+{x['points']} EC**"
             + (f" (Limit: statt {x.get('requested_points')} EC)" if x.get("weekly_limited") else "")
         )
         for x in reserve

@@ -58,22 +58,15 @@ def _safe_text(value: Any, limit: int = 300) -> str:
 
 
 def _stable_discord_media_url(value: Any) -> str:
-    """Discord-Anhangslinks ohne ablaufende Signatur zurückgeben.
+    """Discord-Medien-URL inklusive Signatur behalten.
 
-    Der Bot speichert bei Event-Presets oft media.discordapp.net-URLs mit
-    ``?ex=...&hm=...``. Diese Query läuft ab. Der unveränderte Attachment-Pfad
-    auf cdn.discordapp.com bleibt dagegen verwendbar, solange der Anhang existiert.
+    Discord schützt Attachment-/Proxy-URLs inzwischen mit Query-Signaturen.
+    Werden ``ex/is/hm`` entfernt, liefert Discord häufig 403/404. Frische URLs
+    werden unten direkt aus dem Eventpost gelesen und bei jedem Snapshot erneuert.
     """
     url = str(value or "").strip()
     if not (url.startswith("https://") or url.startswith("http://")):
         return ""
-    try:
-        parsed = urllib.parse.urlsplit(url)
-        host = (parsed.netloc or "").lower()
-        if host in {"media.discordapp.net", "cdn.discordapp.com"} and parsed.path.startswith("/attachments/"):
-            return urllib.parse.urlunsplit(("https", "cdn.discordapp.com", parsed.path, "", ""))
-    except Exception:
-        pass
     return url
 
 
@@ -1877,8 +1870,88 @@ async def _dashboard_discord_feeds_snapshot(guild: discord.Guild) -> dict[str, A
     }
 
 
+_EVENT_MEDIA_CACHE: dict[int, tuple[float, str]] = {}
+
+
+def _message_event_image_url(message: Any) -> str:
+    """Bevorzugt Discords frische Proxy-URL des tatsächlich geposteten Bildes."""
+    candidates: list[Any] = []
+    for attachment in getattr(message, "attachments", []) or []:
+        content_type = str(getattr(attachment, "content_type", "") or "").lower()
+        filename = str(getattr(attachment, "filename", "") or "").lower()
+        if content_type.startswith("image/") or filename.endswith((".png", ".jpg", ".jpeg", ".webp", ".gif")):
+            candidates.extend([getattr(attachment, "proxy_url", None), getattr(attachment, "url", None)])
+    for embed in getattr(message, "embeds", []) or []:
+        image = getattr(embed, "image", None)
+        thumbnail = getattr(embed, "thumbnail", None)
+        candidates.extend([
+            getattr(image, "proxy_url", None), getattr(image, "url", None),
+            getattr(thumbnail, "proxy_url", None), getattr(thumbnail, "url", None),
+        ])
+    for raw in candidates:
+        url = _stable_discord_media_url(raw)
+        if url:
+            return url
+    return ""
+
+
+async def _dashboard_hydrate_event_media(guild: discord.Guild, snapshot: dict[str, Any]) -> None:
+    """Event-Titelbilder aus den echten Discord-Eventposts in den Snapshot übernehmen.
+
+    Der Event-JSON-Eintrag kann eine alte/abgelaufene Bild-URL enthalten. Der
+    Discord-Post selbst besitzt dagegen eine aktuelle Embed-Proxy-URL. Es werden
+    nur die neuesten Events geprüft und Ergebnisse 25 Minuten gecacht, damit die
+    5-Minuten-Snapshot-Schleife Discord nicht unnötig belastet.
+    """
+    events = ((snapshot.get("events") or {}).get("items") or [])
+    if not isinstance(events, list):
+        return
+    now_ts = datetime.now(timezone.utc).timestamp()
+    try:
+        max_events = max(1, min(80, int(os.getenv("DASHBOARD_EVENT_IMAGE_FETCH_LIMIT", "40") or 40)))
+    except Exception:
+        max_events = 40
+    for event in events[:max_events]:
+        if not isinstance(event, dict):
+            continue
+        try:
+            message_id = int(event.get("event_id") or event.get("message_id") or 0)
+            channel_id = int(event.get("channel_id") or 0)
+        except Exception:
+            continue
+        if not message_id or not channel_id:
+            continue
+        cached = _EVENT_MEDIA_CACHE.get(message_id)
+        if cached and now_ts - float(cached[0]) < 1500 and cached[1]:
+            event["image_url"] = cached[1]
+            continue
+        channel = guild.get_channel(channel_id)
+        if channel is None:
+            try:
+                channel = await guild.fetch_channel(channel_id)  # type: ignore[attr-defined]
+            except Exception:
+                channel = None
+        if channel is None or not hasattr(channel, "fetch_message"):
+            continue
+        try:
+            message = await channel.fetch_message(message_id)  # type: ignore[attr-defined]
+            image_url = _message_event_image_url(message)
+            if image_url:
+                event["image_url"] = image_url
+                event["discord_image_url"] = image_url
+                event["jump_url"] = str(getattr(message, "jump_url", "") or _message_jump_url(int(guild.id), channel_id, message_id))
+                _EVENT_MEDIA_CACHE[message_id] = (now_ts, image_url)
+        except Exception:
+            # Gespeicherte image_url bleibt als Fallback erhalten.
+            continue
+
+
 async def _publish_snapshot_with_feeds(bot: commands.Bot, guild: discord.Guild) -> int:
     snapshot = await asyncio.to_thread(build_dashboard_snapshot, bot, guild)
+    try:
+        await _dashboard_hydrate_event_media(guild, snapshot)
+    except Exception as media_exc:
+        print(f"⚠️ Eventbilder konnten nicht aktualisiert werden: {media_exc!r}")
     try:
         snapshot["discord_feeds"] = await _dashboard_discord_feeds_snapshot(guild)
     except Exception as feed_exc:
@@ -1983,6 +2056,10 @@ async def _dashboard_publish_loop(bot: commands.Bot):
             # "Die Anwendung reagiert nicht" enden. Discord-News/Guides werden
             # danach asynchron aus den konfigurierten Kanälen ergänzt.
             snapshot = await asyncio.to_thread(build_dashboard_snapshot, bot, guild)
+            try:
+                await _dashboard_hydrate_event_media(guild, snapshot)
+            except Exception as media_exc:
+                print(f"⚠️ Eventbilder für {getattr(guild, 'id', '?')} konnten nicht aktualisiert werden: {media_exc!r}")
             try:
                 snapshot["discord_feeds"] = await _dashboard_discord_feeds_snapshot(guild)
             except Exception as feed_exc:
@@ -2172,6 +2249,7 @@ async def setup_dashboard_data(bot: commands.Bot, tree: app_commands.CommandTree
             # Nicht im Discord-Eventloop bauen: der Snapshot kann bei vielen
             # Profilen/Needs/Auktionen/Voice-Sessions kurz dauern.
             snap = await asyncio.to_thread(build_dashboard_snapshot, bot, inter.guild)
+            await _dashboard_hydrate_event_media(inter.guild, snap)
         except Exception as exc:
             await inter.followup.send(f"❌ Dashboard-Status fehlgeschlagen: `{type(exc).__name__}: {exc}`", ephemeral=True)
             return
