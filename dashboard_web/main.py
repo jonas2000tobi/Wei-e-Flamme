@@ -12361,9 +12361,8 @@ def _render_status_dashboard(data: dict[str, Any], request: Optional[Request] = 
         .status-main-hero{{padding:30px 32px;background:linear-gradient(90deg,rgba(6,8,12,.88) 0%,rgba(7,9,14,.62) 52%,rgba(7,9,14,.18) 100%), url("{_asset('hero_banner.webp')}") center center / cover no-repeat;border:1px solid rgba(218,166,74,.38);box-shadow:0 22px 56px rgba(0,0,0,.48), inset 0 0 0 1px rgba(255,220,150,.05);}}
         .status-hero-inner{{width:100%;display:flex;flex-direction:column;align-items:center;gap:18px;}}
         .status-hero-head{{display:flex;flex-direction:column;align-items:center;text-align:center;gap:12px;width:100%;}}
-        .status-hero-logo{{width:154px;height:154px;border-radius:32px;padding:12px;margin:0 auto;background:radial-gradient(circle at 35% 25%,rgba(218,166,74,.24),rgba(11,14,22,.66));border:1px solid rgba(218,166,74,.42);box-shadow:0 22px 50px rgba(0,0,0,.42),0 0 0 1px rgba(255,221,151,.06) inset;}}
-        .status-hero-logo img{{width:100%;height:100%;object-fit:contain;filter:drop-shadow(0 6px 16px rgba(0,0,0,.72));}}
-        .status-hero-title h1{{font-size:clamp(38px,6vw,68px);line-height:1;margin:.05em 0 .08em;}}
+        .status-hero-brand-wrap{{display:flex;flex-direction:column;align-items:center;gap:10px;width:100%;}}
+        .status-hero-brand{{display:block;width:min(640px,92%);height:auto;filter:drop-shadow(0 10px 28px rgba(0,0,0,.72));}}
         .status-welcome{{font-size:clamp(18px,2.6vw,26px);color:#efe3c8;margin:.15em 0 0;}}
         .status-welcome strong{{color:var(--gold);}}
         .status-hero-stats{{display:grid;grid-template-columns:repeat(6,minmax(120px,1fr));gap:12px;margin-top:2px;width:100%;}}
@@ -12375,7 +12374,7 @@ def _render_status_dashboard(data: dict[str, Any], request: Optional[Request] = 
         .status-hero-stat.compact strong{{font-size:1.12rem;}}
         .status-main-hero .btn{{align-self:center;}}
         @media(max-width:1100px){{.status-hero-stats{{grid-template-columns:repeat(3,minmax(130px,1fr));}}}}
-        @media(max-width:640px){{.status-topnav-shell{{padding:8px;border-radius:18px;}}.status-main-hero{{padding:22px 20px;}}.status-hero-logo{{width:132px;height:132px;border-radius:28px;}}.status-hero-stats{{grid-template-columns:1fr 1fr;}}.status-hero-stat{{padding:12px}}.status-hero-stat strong{{font-size:1.18rem;}}}}
+        @media(max-width:640px){{.status-topnav-shell{{padding:8px;border-radius:18px;}}.status-main-hero{{padding:22px 20px;}}.status-hero-brand{{width:min(520px,100%);}}.status-hero-stats{{grid-template-columns:1fr 1fr;}}.status-hero-stat{{padding:12px}}.status-hero-stat strong{{font-size:1.18rem;}}}}
       </style>
     """
     map_url = str(game.get("map_url") or "https://tldb.info/map/world")
@@ -12400,10 +12399,9 @@ def _render_status_dashboard(data: dict[str, Any], request: Optional[Request] = 
     <section class="hero status-main-hero">
       <div class="status-hero-inner">
         <div class="status-hero-head">
-          <div class="status-hero-logo"><img src="{_asset('ebolus_logo.png')}" alt="Weisse Flamme"></div>
-          <div class="status-hero-title">
+          <div class="status-hero-brand-wrap">
             <div class="eyebrow">Dashboard Status</div>
-            <h1>{_e(guild_name)}</h1>
+            <img class="status-hero-brand" src="{_asset('weisse_flamme_header.png')}" alt="Weisse Flamme">
             <p class="status-welcome">Willkommen, <strong>{_e(welcome_name)}</strong></p>
           </div>
         </div>
