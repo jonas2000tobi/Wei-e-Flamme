@@ -45,15 +45,101 @@ def _get_ec_balance_safe(guild_id: int, user_id: int) -> int:
         return 0
 
 
-# Custom Discord-Emojis für Rollen/RSVP
+# Custom Discord-Emojis für Rollen, RSVP und Gildenzentrale.
+#
+# Wichtig für Serverwechsel: Die IDs werden nicht mehr fest vorausgesetzt.
+# Der Bot sucht die Emojis beim Start automatisch anhand ihrer Namen auf dem
+# aktuellen Discord-Server. Dadurch bleiben deine hochgeladenen Emojis erhalten,
+# auch wenn der neue Server andere Emoji-IDs vergeben hat.
+_PORTAL_EMOJI_ALIASES: dict[str, tuple[str, ...]] = {
+    "tank": ("tank",),
+    "heal": ("heal",),
+    "dps": ("dps", "dd"),
+    "reserve": ("reserve", "bank"),
+    "maybe": ("maybe", "vielleicht"),
+    "no": ("no", "nichtda", "abmelden"),
+    "home": ("weisseflamme", "weisse_flamme", "gilde", "ebolus"),
+    "personal": ("persoenlich", "persönlich", "personal"),
+    "loot": ("loot",),
+    "guild": ("gilde", "guild", "weisseflamme", "weisse_flamme", "ebolus"),
+    "contact": ("kontakt", "contact"),
+    "admin": ("admin",),
+    "time": ("time", "zeit"),
+    "voted": ("voted", "abgestimmt"),
+    "target": ("target", "ziel"),
+    "absence": ("abwesenheit", "nichtda", "absence"),
+    "calendar": ("kalender", "calendar"),
+    "back": ("zurueck", "zurück", "back"),
+    "help": ("hilfe", "help"),
+    "member": ("mitglieder", "member", "members"),
+}
+
+_PORTAL_EMOJI_FALLBACKS: dict[str, str] = {
+    "tank": "🛡️",
+    "heal": "💚",
+    "dps": "⚔️",
+    "reserve": "🪑",
+    "maybe": "❔",
+    "no": "❌",
+    "home": "🔥",
+    "personal": "👤",
+    "loot": "🎁",
+    "guild": "🏰",
+    "contact": "📨",
+    "admin": "⚙️",
+    "time": "🕒",
+    "voted": "✅",
+    "target": "🎯",
+    "absence": "🏖️",
+    "calendar": "📅",
+    "back": "↩️",
+    "help": "❓",
+    "member": "👥",
+}
+
+_PORTAL_LEGACY_NAME_TO_KEY: dict[str, str] = {
+    "tank": "tank",
+    "heal": "heal",
+    "dps": "dps",
+    "dd": "dps",
+    "reserve": "reserve",
+    "bank": "reserve",
+    "maybe": "maybe",
+    "vielleicht": "maybe",
+    "no": "no",
+    "nichtda": "absence",
+    "abwesenheit": "absence",
+    "ebolus": "home",
+    "weisseflamme": "home",
+    "weisse_flamme": "home",
+    "gilde": "guild",
+    "persoenlich": "personal",
+    "persönlich": "personal",
+    "loot": "loot",
+    "kontakt": "contact",
+    "admin": "admin",
+    "time": "time",
+    "zeit": "time",
+    "voted": "voted",
+    "target": "target",
+    "kalender": "calendar",
+    "calendar": "calendar",
+    "zurueck": "back",
+    "zurück": "back",
+    "hilfe": "help",
+    "member": "member",
+    "mitglieder": "member",
+}
+
+# Alte Werte dienen nur als semantische Platzhalter beim Laden der View-Klassen.
+# Vor dem tatsächlichen Senden werden sie anhand der Namen gegen die Emojis des
+# neuen Servers ausgetauscht.
 EMOJI_TANK = "<:tank:1516465336054972456>"
 EMOJI_HEAL = "<:heal:1516478246001049690>"
 EMOJI_DPS = "<:dps:1516476505918668940>"
 EMOJI_BANK = "<:reserve:1516465611243520201>"
 EMOJI_MAYBE = "<:maybe:1516465379445047497>"
 EMOJI_NO = "<:no:1516465299359273070>"
-
-# Custom Discord-Emojis für die Gildenzentrale
 EMOJI_EBOLUS = "<:ebolus:1516448234355163208>"
 EMOJI_PERSONAL = "<:persoenlich:1516459694997372949>"
 EMOJI_LOOT = "<:loot:1516459736659136672>"
@@ -69,14 +155,122 @@ EMOJI_BACK = "<:zurueck:1516470839120498778>"
 EMOJI_HELP = "<:hilfe:1516470888818802900>"
 EMOJI_MEMBER = "<:member:1516474249492168734>"
 
+_PORTAL_SERVER_EMOJIS: dict[str, discord.Emoji] = {}
+
+
+def _normalise_emoji_name(value: object) -> str:
+    if isinstance(value, (discord.Emoji, discord.PartialEmoji)):
+        return str(getattr(value, "name", "") or "").strip().lower()
+    raw = str(value or "").strip()
+    if raw.startswith("<:") or raw.startswith("<a:"):
+        try:
+            return str(discord.PartialEmoji.from_str(raw).name or "").strip().lower()
+        except Exception:
+            pass
+    return raw.strip(":").lower()
+
+
+def _portal_key_for_value(value: object) -> str:
+    name = _normalise_emoji_name(value)
+    return _PORTAL_LEGACY_NAME_TO_KEY.get(name, name)
+
+
+def _server_emoji_for_key(key: str) -> Optional[discord.Emoji]:
+    for alias in _PORTAL_EMOJI_ALIASES.get(key, (key,)):
+        found = _PORTAL_SERVER_EMOJIS.get(str(alias).lower())
+        if found is not None:
+            return found
+    return None
+
+
+def _portal_component_emoji(value: object):
+    key = _portal_key_for_value(value)
+    found = _server_emoji_for_key(key)
+    if found is not None:
+        return found
+    raw = str(value or "")
+    if raw and not (raw.startswith("<:") or raw.startswith("<a:")):
+        return raw
+    return _PORTAL_EMOJI_FALLBACKS.get(key, "•")
+
+
+def _portal_emoji_text(key: str, env_name: str = "") -> str:
+    # Optional kann weiterhin gezielt eine ID per Railway überschrieben werden.
+    if env_name:
+        configured = str(os.getenv(env_name) or "").strip()
+        if configured:
+            return configured
+    found = _server_emoji_for_key(key)
+    if found is not None:
+        return str(found)
+    return _PORTAL_EMOJI_FALLBACKS.get(key, "•")
+
+
+def _refresh_portal_emojis(guild: Optional[discord.Guild]) -> None:
+    """Server-Emojis anhand ihrer Namen übernehmen und globale Texte aktualisieren."""
+    if guild is None:
+        return
+
+    _PORTAL_SERVER_EMOJIS.clear()
+    for emoji in list(getattr(guild, "emojis", []) or []):
+        name = str(getattr(emoji, "name", "") or "").strip().lower()
+        if name:
+            _PORTAL_SERVER_EMOJIS[name] = emoji
+
+    global EMOJI_TANK, EMOJI_HEAL, EMOJI_DPS, EMOJI_BANK, EMOJI_MAYBE, EMOJI_NO
+    global EMOJI_EBOLUS, EMOJI_PERSONAL, EMOJI_LOOT, EMOJI_GUILD, EMOJI_CONTACT
+    global EMOJI_ADMIN, EMOJI_TIME, EMOJI_VOTED, EMOJI_TARGET, EMOJI_ABSENCE
+    global EMOJI_CALENDAR, EMOJI_BACK, EMOJI_HELP, EMOJI_MEMBER
+
+    EMOJI_TANK = _portal_emoji_text("tank", "PORTAL_EMOJI_TANK")
+    EMOJI_HEAL = _portal_emoji_text("heal", "PORTAL_EMOJI_HEAL")
+    EMOJI_DPS = _portal_emoji_text("dps", "PORTAL_EMOJI_DPS")
+    EMOJI_BANK = _portal_emoji_text("reserve", "PORTAL_EMOJI_RESERVE")
+    EMOJI_MAYBE = _portal_emoji_text("maybe", "PORTAL_EMOJI_MAYBE")
+    EMOJI_NO = _portal_emoji_text("no", "PORTAL_EMOJI_NO")
+    EMOJI_EBOLUS = _portal_emoji_text("home", "PORTAL_EMOJI_HOME")
+    EMOJI_PERSONAL = _portal_emoji_text("personal", "PORTAL_EMOJI_PERSONAL")
+    EMOJI_LOOT = _portal_emoji_text("loot", "PORTAL_EMOJI_LOOT")
+    EMOJI_GUILD = _portal_emoji_text("guild", "PORTAL_EMOJI_GUILD")
+    EMOJI_CONTACT = _portal_emoji_text("contact", "PORTAL_EMOJI_CONTACT")
+    EMOJI_ADMIN = _portal_emoji_text("admin", "PORTAL_EMOJI_ADMIN")
+    EMOJI_TIME = _portal_emoji_text("time", "PORTAL_EMOJI_TIME")
+    EMOJI_VOTED = _portal_emoji_text("voted", "PORTAL_EMOJI_VOTED")
+    EMOJI_TARGET = _portal_emoji_text("target", "PORTAL_EMOJI_TARGET")
+    EMOJI_ABSENCE = _portal_emoji_text("absence", "PORTAL_EMOJI_ABSENCE")
+    EMOJI_CALENDAR = _portal_emoji_text("calendar", "PORTAL_EMOJI_CALENDAR")
+    EMOJI_BACK = _portal_emoji_text("back", "PORTAL_EMOJI_BACK")
+    EMOJI_HELP = _portal_emoji_text("help", "PORTAL_EMOJI_HELP")
+    EMOJI_MEMBER = _portal_emoji_text("member", "PORTAL_EMOJI_MEMBER")
+
+    resolved = sorted(_PORTAL_SERVER_EMOJIS)
+    print(
+        f"[member_portal] Server-Emojis geladen für {guild.name}: "
+        f"{', '.join(resolved) if resolved else 'keine'}",
+        flush=True,
+    )
+
 
 def _menu_emoji(value: str):
-    try:
-        if isinstance(value, str) and (value.startswith("<:") or value.startswith("<a:")):
-            return discord.PartialEmoji.from_str(value)
-    except Exception:
-        pass
-    return value
+    return _portal_component_emoji(value)
+
+
+def _rebind_portal_view_emojis(view: discord.ui.View) -> None:
+    """In Decorators gespeicherte alte Emoji-IDs vor dem Senden ersetzen."""
+    for child in list(getattr(view, "children", []) or []):
+        try:
+            current = getattr(child, "emoji", None)
+            if current is not None:
+                child.emoji = _portal_component_emoji(current)
+        except Exception:
+            pass
+        try:
+            for option in list(getattr(child, "options", []) or []):
+                if getattr(option, "emoji", None) is not None:
+                    option.emoji = _portal_component_emoji(option.emoji)
+        except Exception:
+            pass
+
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
@@ -132,6 +326,27 @@ PORTAL_REPAIR_MEMBER_DELAY_SECONDS = max(0.05, float(os.getenv("PORTAL_REPAIR_ME
 PORTAL_RESET_ON_START = str(os.getenv("PORTAL_RESET_ON_START", "true") or "true").strip().lower() not in {"0", "false", "no", "off"}
 NEW_MEMBER_LOOT_LOCK_DAYS = 7
 _portal_repair_task: Optional[asyncio.Task] = None
+_portal_last_dm_errors: dict[tuple[int, int], str] = {}
+
+
+def _portal_dm_error_message(guild_id: int, user_id: int) -> str:
+    return _portal_last_dm_errors.get((int(guild_id), int(user_id)), "Unbekannter Discord-Fehler")
+
+
+def _remember_portal_dm_error(guild_id: int, user_id: int, exc: Exception) -> None:
+    if isinstance(exc, discord.Forbidden):
+        code = getattr(exc, "code", None)
+        if code == 50007:
+            reason = "Discord blockiert die DM. Beim Nutzer müssen Direktnachrichten vom Server erlaubt sein und der Bot darf nicht blockiert sein."
+        else:
+            reason = f"Discord verweigert die DM (Forbidden, Code {code or 'unbekannt'})."
+    elif isinstance(exc, discord.HTTPException):
+        code = getattr(exc, "code", None)
+        status = getattr(exc, "status", None)
+        reason = f"Discord-HTTP-Fehler {status or '?'} / Code {code or '?'}: {str(exc)[:220]}"
+    else:
+        reason = f"{type(exc).__name__}: {str(exc)[:240]}"
+    _portal_last_dm_errors[(int(guild_id), int(user_id))] = reason
 
 
 def save_cfg() -> None:
@@ -916,12 +1131,12 @@ def _main_menu_embed(guild: discord.Guild, member: Optional[discord.Member] = No
     ])
 
     emb = discord.Embed(
-        title=f"{EMOJI_EBOLUS} {_bold_sans('Ebolus Gildenzentrale')}",
+        title=f"{EMOJI_EBOLUS} {_bold_sans('Weisse Flamme Gildenzentrale')}",
         description="\n".join(sections),
         color=discord.Color.gold(),
     )
 
-    emb.set_footer(text=f"Server: {guild.name} • Ebolus Gildenbot")
+    emb.set_footer(text=f"Server: {guild.name} • Weisse Flamme Gildenbot")
 
     return emb
 
@@ -956,40 +1171,106 @@ def _profile_embed(guild: discord.Guild, member: discord.Member) -> discord.Embe
 
 
 def _events_embed(guild_id: int) -> discord.Embed:
+    """Gildenkalender aus den echten Bot-Events plus alten festen Terminen."""
     c = _gcfg(guild_id)
-    events = c.get("events") or []
-
+    legacy_events = c.get("events") or []
     emb = discord.Embed(
-        title=f"{EMOJI_CALENDAR} Ebolus Gildenkalender",
-        color=discord.Color.gold()
+        title=f"{EMOJI_CALENDAR} Weisse Flamme Gildenkalender",
+        color=discord.Color.gold(),
     )
 
-    if not events:
-        emb.description = "Aktuell sind keine festen Gilden-Events hinterlegt."
+    dynamic_events: list[tuple[datetime, str, dict[str, Any]]] = []
+    try:
+        try:
+            from bot.event_rsvp_dm import store as event_store  # type: ignore
+        except ModuleNotFoundError:
+            from event_rsvp_dm import store as event_store  # type: ignore
+
+        now = datetime.now(TZ)
+        for event_id, obj in list((event_store or {}).items()):
+            if not isinstance(obj, dict):
+                continue
+            try:
+                home_gid = int(obj.get("guild_id", 0) or 0)
+            except Exception:
+                home_gid = 0
+            mirror_match = False
+            for mirror in (obj.get("mirrors") or []):
+                if not isinstance(mirror, dict):
+                    continue
+                try:
+                    if int(mirror.get("guild_id", 0) or 0) == int(guild_id):
+                        mirror_match = True
+                        break
+                except Exception:
+                    pass
+            if home_gid != int(guild_id) and not mirror_match:
+                continue
+            if obj.get("deleted") or str(obj.get("status") or "").lower() in {"deleted", "cancelled", "canceled"}:
+                continue
+            try:
+                when = datetime.fromisoformat(str(obj.get("when_iso") or "").replace("Z", "+00:00"))
+                if when.tzinfo is None:
+                    when = when.replace(tzinfo=TZ)
+                when = when.astimezone(TZ)
+            except Exception:
+                continue
+            if when < now - timedelta(hours=2):
+                continue
+            dynamic_events.append((when, str(event_id), obj))
+    except Exception:
+        dynamic_events = []
+
+    dynamic_events.sort(key=lambda row: row[0])
+    lines: list[str] = []
+    for when, event_id, obj in dynamic_events[:15]:
+        title = str(obj.get("title") or "Event")
+        title_l = title.lower()
+        icon = "📌"
+        if "boss" in title_l:
+            icon = "🔥"
+        elif "pvp" in title_l or "krieg" in title_l:
+            icon = "⚔️"
+        elif "raid" in title_l:
+            icon = "🛡️"
+        scheduled_id = int(obj.get("scheduled_event_id", 0) or 0)
+        channel_id = int(obj.get("channel_id", 0) or 0)
+        link = ""
+        if scheduled_id:
+            link = f" · [Discord-Termin](https://discord.com/events/{int(guild_id)}/{scheduled_id})"
+        elif channel_id and str(event_id).isdigit():
+            link = f" · [Eventpost](https://discord.com/channels/{int(guild_id)}/{channel_id}/{event_id})"
+        event_type = str(obj.get("dkp_event_type") or obj.get("event_type") or "").strip()
+        type_line = f" · {event_type}" if event_type else ""
+        lines.append(
+            f"{icon} **{when.strftime('%a, %d.%m.%Y · %H:%M')} Uhr**\n"
+            f"{title}{type_line}{link}"
+        )
+
+    if legacy_events:
+        legacy_lines: list[str] = []
+        for e in legacy_events[:10]:
+            weekday = str(e.get("weekday", "—"))
+            event_time = str(e.get("time", "—"))
+            title = str(e.get("title", "Event"))
+            legacy_lines.append(f"• **{weekday}, {event_time} Uhr** – {title}")
+        if legacy_lines:
+            lines.append("**Feste Wochenübersicht**\n" + "\n".join(legacy_lines))
+
+    if not lines:
+        emb.description = "Aktuell sind keine kommenden Gilden-Events hinterlegt."
         return emb
 
-    lines = []
-
-    for e in events:
-        weekday = str(e.get("weekday", "—"))
-        time = str(e.get("time", "—"))
-        title = str(e.get("title", "Event"))
-
-        icon = "📌"
-        title_l = title.lower()
-
-        if "gildenboss" in title_l or "boss" in title_l:
-            icon = "🔥"
-        elif "raid" in title_l:
-            icon = "⚔️"
-        elif "fenrir" in title_l:
-            icon = "🐺"
-
-        lines.append(f"{icon} **{weekday}**\n{time} Uhr – {title}")
-
     emb.description = "\n\n".join(lines)
-    emb.set_footer(text="Reine Übersicht. Keine Anmeldung / keine RSVP-Funktion.")
-
+    first_image = ""
+    for _when, _event_id, obj in dynamic_events:
+        image_url = str(obj.get("image_url") or "").strip()
+        if image_url.startswith(("https://", "http://")):
+            first_image = image_url
+            break
+    if first_image:
+        emb.set_image(url=first_image)
+    emb.set_footer(text="Live aus den Bot-Events · Dashboard und Discord-Kalender werden gemeinsam aktualisiert.")
     return emb
 
 
@@ -1003,7 +1284,7 @@ def _member_sort_key(guild: discord.Guild, member: discord.Member) -> Tuple[int,
 
 def _members_list_embed(guild: discord.Guild) -> discord.Embed:
     emb = discord.Embed(
-        title="👥 Ebolus Mitglieder",
+        title="👥 Weisse Flamme Mitglieder",
         color=discord.Color.gold()
     )
 
@@ -1236,13 +1517,20 @@ async def _fetch_portal_message(client: discord.Client, guild_id: int, user_id: 
 
 async def _send_new_portal_menu(user: discord.abc.User, guild: discord.Guild) -> Optional[discord.Message]:
     member = guild.get_member(user.id)
+    _refresh_portal_emojis(guild)
 
     try:
         msg = await user.send(embed=_main_menu_embed(guild, member), view=MemberPortalMainView())
         _mark_portal_sent(guild.id, user.id, msg.id)
+        _portal_last_dm_errors.pop((int(guild.id), int(user.id)), None)
         return msg
     except Exception as e:
-        print(f"[member_portal] DM-Send Fehler für user={getattr(user, 'id', '?')} guild={guild.id}: {e!r}")
+        _remember_portal_dm_error(guild.id, user.id, e)
+        print(
+            f"[member_portal] DM-Send Fehler für user={getattr(user, 'id', '?')} "
+            f"guild={guild.id}: {e!r}",
+            flush=True,
+        )
         return None
 
 
@@ -1257,6 +1545,7 @@ async def ensure_portal_menu_for_user(
     if not guild:
         return False
 
+    _refresh_portal_emojis(guild)
     member = guild.get_member(user_id)
 
     if not member:
@@ -1556,23 +1845,23 @@ async def _delete_old_bot_dms_for_member(
     active_menu_id = _portal_message_id(member.guild.id, member.id)
 
     protected_titles = {
-        "⚜️ Ebolus Gildenzentrale",
-        f"{EMOJI_EBOLUS} Ebolus Gildenzentrale",
-        "🏰 ebolus – Gildenzentrale",
+        "⚜️ Weisse Flamme Gildenzentrale",
+        f"{EMOJI_EBOLUS} Weisse Flamme Gildenzentrale",
+        "🏰 Weisse Flamme – Gildenzentrale",
         "👤 Dein Gildenprofil",
         f"{EMOJI_PERSONAL} Dein Gildenprofil",
-        "📅 Ebolus Gildenkalender",
-        "📅 Gildenkalender – ebolus",
+        "📅 Weisse Flamme Gildenkalender",
+        "📅 Gildenkalender – Weisse Flamme",
         "📅 Gilden-Events",
         "🏖️ Abwesenheitskalender",
         "📬 Raid-/Event-DMs",
-        "❓ Hilfe – Ebolus Gildenbot",
-        "❓ Hilfe – ebolus Gildenbot",
-        "👥 Ebolus Mitglieder",
-        "👥 Mitgliederliste – ebolus",
+        "❓ Hilfe – Weisse Flamme Gildenbot",
+        "❓ Hilfe – Weisse Flamme Gildenbot",
+        "👥 Weisse Flamme Mitglieder",
+        "👥 Mitgliederliste – Weisse Flamme",
         "📜 Regeln & Lootsystem",
-        "📜 Regeln & Lootsystem – ebolus",
-        "🎁 Needliste – ebolus",
+        "📜 Regeln & Lootsystem – Weisse Flamme",
+        "🎁 Needliste – Weisse Flamme",
         "👤 Persönlich",
         f"{EMOJI_PERSONAL} Persönlich",
         "🎁 Loot & Bedarf",
@@ -1994,6 +2283,7 @@ class PortalSafeView(View):
         # bis der Bot neu startet oder die Nachricht ersetzt wird.
         kwargs.setdefault("timeout", None)
         super().__init__(*args, **kwargs)
+        _rebind_portal_view_emojis(self)
 
     async def on_error(self, inter: discord.Interaction, error: Exception, item) -> None:
         await _auto_reset_portal_after_view_error(inter, error)
@@ -2332,7 +2622,7 @@ class LootMenuView(PortalSafeView):
 
         except Exception:
             emb = discord.Embed(
-                title="🎁 Needliste – ebolus",
+                title="🎁 Needliste – Weisse Flamme",
                 description="Die Needliste ist noch nicht aktiv. Das Modul `loot_needs.py` muss noch eingebaut werden.",
                 color=discord.Color.gold()
             )
@@ -5061,7 +5351,7 @@ class SupportMenuView(PortalSafeView):
             _mark_portal_sent(guild.id, member.id, inter.message.id)
 
         emb = discord.Embed(
-            title="❓ Hilfe – Ebolus Gildenbot",
+            title="❓ Hilfe – Weisse Flamme Gildenbot",
             description=(
                 "**👤 Profil**\n"
                 "Hier pflegst du Ingame-Name, Main-Rolle und Gearscore.\n\n"
@@ -5480,6 +5770,11 @@ class GuildBroadcastModal(discord.ui.Modal, title="📨 Private Rundnachricht"):
 
 
 async def setup_member_portal(client: discord.Client, tree: app_commands.CommandTree):
+    # Beim Serverwechsel haben Custom-Emojis neue IDs. Der Bot übernimmt sie
+    # automatisch anhand der Emoji-Namen, bevor persistente Views registriert werden.
+    for guild in list(getattr(client, "guilds", []) or []):
+        _refresh_portal_emojis(guild)
+
     persistent_view_factories = [
         PortalOpenView,
         MemberPortalMainView,
@@ -5728,7 +6023,13 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
         if ok:
             await inter.followup.send(f"✅ Gildenzentrale bei **{member.display_name}** geöffnet/aktualisiert.", ephemeral=True)
         else:
-            await inter.followup.send(f"❌ Konnte **{member.display_name}** keine DM senden.", ephemeral=True)
+            reason = _portal_dm_error_message(inter.guild_id, member.id)
+            await inter.followup.send(
+                f"❌ Konnte **{member.display_name}** keine Gildenzentrale senden.\n"
+                f"**Grund:** {reason}\n"
+                f"Die Portal-Emojis werden automatisch anhand ihrer Servernamen geladen.",
+                ephemeral=True,
+            )
 
     @tree.command(name="portal_force_new_user", description="(Admin) Erzwingt eine komplett neue Gildenzentrale per DM")
     async def portal_force_new_user(inter: discord.Interaction, member: discord.Member):
@@ -5756,10 +6057,11 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
                 ephemeral=True
             )
         else:
+            reason = _portal_dm_error_message(inter.guild_id, member.id)
             await inter.followup.send(
-                f"❌ Konnte **{member.display_name}** keine neue DM senden. "
-                f"Prüfe, ob DMs vom Server erlaubt sind.",
-                ephemeral=True
+                f"❌ Konnte **{member.display_name}** keine neue Gildenzentrale senden.\n"
+                f"**Grund:** {reason}",
+                ephemeral=True,
             )
 
     @tree.command(name="portal_force_new_all", description="(Admin) Erzwingt eine komplett neue Gildenzentrale bei allen Gildenmitgliedern")
@@ -6003,7 +6305,7 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
 
         async def _picked(pick_inter: discord.Interaction, ch: discord.TextChannel):
             emb = discord.Embed(
-                title="⚜️ Ebolus Gildenbot",
+                title="⚜️ Weisse Flamme Gildenbot",
                 description=(
                     "Öffne hier deine persönliche Gildenzentrale im Privatchat.\n\n"
                     "Dort findest du:\n"

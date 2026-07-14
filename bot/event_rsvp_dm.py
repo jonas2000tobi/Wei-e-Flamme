@@ -42,7 +42,10 @@ except ModuleNotFoundError:
 TZ = ZoneInfo("Europe/Berlin")
 
 
-# Custom Discord-Emojis für RSVP/Rollen
+# Custom Discord-Emojis für RSVP/Rollen.
+# Beim Serverwechsel ändern sich die IDs. Deshalb sucht der Bot die neuen
+# Server-Emojis automatisch anhand der Namen Tank, Heal, DD/DPS, bank,
+# vielleicht und nichtda.
 EMOJI_TANK = "<:tank:1516465336054972456>"
 EMOJI_HEAL = "<:heal:1516478246001049690>"
 EMOJI_DPS = "<:dps:1516476505918668940>"
@@ -63,14 +66,112 @@ EMOJI_TARGET = "<:target:1516461644471865365>"
 EMOJI_ABSENCE = "<:nichtda:1516463499872833616>"
 EMOJI_CALENDAR = "<:Kalender:1516462026468098181>"
 
+_RSVP_EMOJI_ALIASES: dict[str, tuple[str, ...]] = {
+    "tank": ("tank",),
+    "heal": ("heal",),
+    "dps": ("dps", "dd"),
+    "reserve": ("reserve", "bank"),
+    "maybe": ("maybe", "vielleicht"),
+    "no": ("no", "nichtda", "abmelden"),
+}
+_RSVP_EMOJI_FALLBACKS: dict[str, str] = {
+    "tank": "🛡️",
+    "heal": "💚",
+    "dps": "⚔️",
+    "reserve": "🪑",
+    "maybe": "❔",
+    "no": "❌",
+}
+_RSVP_LEGACY_TO_KEY: dict[str, str] = {
+    "tank": "tank",
+    "heal": "heal",
+    "dps": "dps",
+    "dd": "dps",
+    "reserve": "reserve",
+    "bank": "reserve",
+    "maybe": "maybe",
+    "vielleicht": "maybe",
+    "no": "no",
+    "nichtda": "no",
+    "abmelden": "no",
+}
+_RSVP_SERVER_EMOJIS: dict[str, discord.Emoji] = {}
+
+
+def _rsvp_emoji_name(value: object) -> str:
+    if isinstance(value, (discord.Emoji, discord.PartialEmoji)):
+        return str(getattr(value, "name", "") or "").strip().lower()
+    raw = str(value or "").strip()
+    if raw.startswith("<:") or raw.startswith("<a:"):
+        try:
+            return str(discord.PartialEmoji.from_str(raw).name or "").strip().lower()
+        except Exception:
+            pass
+    return raw.strip(":").lower()
+
+
+def _rsvp_key(value: object) -> str:
+    name = _rsvp_emoji_name(value)
+    return _RSVP_LEGACY_TO_KEY.get(name, name)
+
+
+def _rsvp_server_emoji(key: str) -> Optional[discord.Emoji]:
+    for alias in _RSVP_EMOJI_ALIASES.get(key, (key,)):
+        emoji = _RSVP_SERVER_EMOJIS.get(alias.lower())
+        if emoji is not None:
+            return emoji
+    return None
+
+
+def _rsvp_component_emoji(value: object):
+    key = _rsvp_key(value)
+    emoji = _rsvp_server_emoji(key)
+    if emoji is not None:
+        return emoji
+    raw = str(value or "")
+    if raw and not (raw.startswith("<:") or raw.startswith("<a:")):
+        return raw
+    return _RSVP_EMOJI_FALLBACKS.get(key, "•")
+
+
+def _refresh_rsvp_emojis(guild: Optional[discord.Guild]) -> None:
+    if guild is None:
+        return
+    _RSVP_SERVER_EMOJIS.clear()
+    for emoji in list(getattr(guild, "emojis", []) or []):
+        name = str(getattr(emoji, "name", "") or "").strip().lower()
+        if name:
+            _RSVP_SERVER_EMOJIS[name] = emoji
+
+    global EMOJI_TANK, EMOJI_HEAL, EMOJI_DPS, EMOJI_BANK, EMOJI_MAYBE, EMOJI_NO
+    EMOJI_TANK = str(_rsvp_server_emoji("tank") or _RSVP_EMOJI_FALLBACKS["tank"])
+    EMOJI_HEAL = str(_rsvp_server_emoji("heal") or _RSVP_EMOJI_FALLBACKS["heal"])
+    EMOJI_DPS = str(_rsvp_server_emoji("dps") or _RSVP_EMOJI_FALLBACKS["dps"])
+    EMOJI_BANK = str(_rsvp_server_emoji("reserve") or _RSVP_EMOJI_FALLBACKS["reserve"])
+    EMOJI_MAYBE = str(_rsvp_server_emoji("maybe") or _RSVP_EMOJI_FALLBACKS["maybe"])
+    EMOJI_NO = str(_rsvp_server_emoji("no") or _RSVP_EMOJI_FALLBACKS["no"])
+
+    print(
+        f"[event_rsvp_dm] RSVP-Emojis geladen für {guild.name}: "
+        f"Tank={EMOJI_TANK}, Heal={EMOJI_HEAL}, DPS={EMOJI_DPS}, "
+        f"Reserve={EMOJI_BANK}, Vielleicht={EMOJI_MAYBE}, Abmelden={EMOJI_NO}",
+        flush=True,
+    )
+
 
 def _button_emoji(value: str):
-    try:
-        if isinstance(value, str) and (value.startswith("<:") or value.startswith("<a:")):
-            return discord.PartialEmoji.from_str(value)
-    except Exception:
-        pass
-    return value
+    return _rsvp_component_emoji(value)
+
+
+def _rebind_rsvp_view_emojis(view: discord.ui.View) -> None:
+    for child in list(getattr(view, "children", []) or []):
+        try:
+            current = getattr(child, "emoji", None)
+            if current is not None:
+                child.emoji = _rsvp_component_emoji(current)
+        except Exception:
+            pass
+
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
@@ -79,7 +180,6 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 RSVP_FILE = DATA_DIR / "event_rsvp.json"
 DM_CFG_FILE = DATA_DIR / "event_rsvp_cfg.json"
 LEADER_CONTACT_CFG_FILE = DATA_DIR / "leader_contact_cfg.json"
-MEMBER_PORTAL_CFG_FILE = DATA_DIR / "member_portal_cfg.json"
 ATTENDANCE_FILE = DATA_DIR / "event_attendance.json"
 
 
@@ -1931,6 +2031,7 @@ class BaseRaidView(View):
     def __init__(self, msg_id: int):
         super().__init__(timeout=None)
         self.msg_id = str(msg_id)
+        _rebind_rsvp_view_emojis(self)
 
     async def _send_feedback(self, inter: discord.Interaction, text: str):
         if not inter.response.is_done():
@@ -2026,37 +2127,26 @@ def _is_admin(inter: discord.Interaction) -> bool:
     return bool(perms and (perms.administrator or perms.manage_guild))
 
 
-def _leadership_role_ids(guild_id: int) -> set[int]:
-    """Alle Rollen mit Leitungsrechten: Meister, Berater und Wächter."""
-    out: set[int] = set()
-    try:
-        leader_cfg = _load(LEADER_CONTACT_CFG_FILE, {})
-        c = leader_cfg.get(str(int(guild_id))) or {}
-        rid = int(c.get("leader_role_id", 0) or 0)
-        if rid:
-            out.add(rid)
-    except Exception:
-        pass
-    try:
-        portal_cfg = _load(MEMBER_PORTAL_CFG_FILE, {})
-        c = portal_cfg.get(str(int(guild_id))) or {}
-        roles = c.get("position_roles") or {}
-        for key in ("leader", "advisor", "guardian"):
-            rid = int(roles.get(key, 0) or 0)
-            if rid:
-                out.add(rid)
-    except Exception:
-        pass
-    return out
-
-
 def _is_leader_or_admin(inter: discord.Interaction) -> bool:
     if _is_admin(inter):
         return True
+
     if inter.guild is None or not isinstance(inter.user, discord.Member):
         return False
-    member_role_ids = {int(role.id) for role in getattr(inter.user, "roles", [])}
-    return bool(member_role_ids.intersection(_leadership_role_ids(int(inter.guild.id))))
+
+    try:
+        leader_cfg = _load(LEADER_CONTACT_CFG_FILE, {})
+        c = leader_cfg.get(str(inter.guild.id)) or {}
+        role_id = int(c.get("leader_role_id", 0) or 0)
+
+        if not role_id:
+            return False
+
+        role = inter.guild.get_role(role_id)
+        return bool(role and role in inter.user.roles)
+
+    except Exception:
+        return False
 
 
 def _alliance_home_guild_id(default: int = 0) -> int:
@@ -3085,6 +3175,10 @@ async def dashboard_event_action_loop():
 
 
 async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
+    # Neue Server-IDs automatisch anhand der Emoji-Namen übernehmen.
+    for guild in list(getattr(client, "guilds", []) or []):
+        _refresh_rsvp_emojis(guild)
+
     restored_server_views = 0
     restored_dm_views = 0
 
