@@ -46,7 +46,7 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
-ASSET_VER = "weisse-flamme-rebrand-v1"
+ASSET_VER = "weisse-flamme-header-fix-v2"
 DASHBOARD_RELEASE_VERSION = "1.2.1 · Weisse Flamme Rebrand"
 
 
@@ -12358,11 +12358,11 @@ def _render_status_dashboard(data: dict[str, Any], request: Optional[Request] = 
         .status-topnav-shell{{border:1px solid rgba(218,166,74,.34);border-radius:20px;padding:10px;margin:0 0 18px;background:linear-gradient(180deg,rgba(218,166,74,.09),rgba(11,14,22,.38));box-shadow:0 16px 40px rgba(0,0,0,.22), inset 0 0 0 1px rgba(255,221,151,.04);}}
         .status-topnav{{margin:0;}}
         .status-topnav a{{border-color:rgba(218,166,74,.34);}}
-        .status-main-hero{{padding:30px 32px;background:linear-gradient(90deg,rgba(6,8,12,.88) 0%,rgba(7,9,14,.62) 52%,rgba(7,9,14,.18) 100%), url("{_asset('hero_banner.webp')}") center center / cover no-repeat;border:1px solid rgba(218,166,74,.38);box-shadow:0 22px 56px rgba(0,0,0,.48), inset 0 0 0 1px rgba(255,220,150,.05);}}
+        .status-main-hero{{min-height:420px;padding:30px 32px;background:linear-gradient(90deg,rgba(6,8,12,.88) 0%,rgba(7,9,14,.62) 52%,rgba(7,9,14,.18) 100%), url("{_asset('hero_banner.webp')}") center center / cover no-repeat;border:1px solid rgba(218,166,74,.38);box-shadow:0 22px 56px rgba(0,0,0,.48), inset 0 0 0 1px rgba(255,220,150,.05);}}
         .status-hero-inner{{width:100%;display:flex;flex-direction:column;align-items:center;gap:18px;}}
         .status-hero-head{{display:flex;flex-direction:column;align-items:center;text-align:center;gap:12px;width:100%;}}
         .status-hero-brand-wrap{{display:flex;flex-direction:column;align-items:center;gap:10px;width:100%;}}
-        .status-hero-brand{{display:block;width:min(640px,92%);height:auto;filter:drop-shadow(0 10px 28px rgba(0,0,0,.72));}}
+        .status-hero-brand{{display:block;width:auto;height:215px;max-width:min(560px,92%);object-fit:contain;filter:drop-shadow(0 10px 28px rgba(0,0,0,.72));}}
         .status-welcome{{font-size:clamp(18px,2.6vw,26px);color:#efe3c8;margin:.15em 0 0;}}
         .status-welcome strong{{color:var(--gold);}}
         .status-hero-stats{{display:grid;grid-template-columns:repeat(6,minmax(120px,1fr));gap:12px;margin-top:2px;width:100%;}}
@@ -12374,7 +12374,7 @@ def _render_status_dashboard(data: dict[str, Any], request: Optional[Request] = 
         .status-hero-stat.compact strong{{font-size:1.12rem;}}
         .status-main-hero .btn{{align-self:center;}}
         @media(max-width:1100px){{.status-hero-stats{{grid-template-columns:repeat(3,minmax(130px,1fr));}}}}
-        @media(max-width:640px){{.status-topnav-shell{{padding:8px;border-radius:18px;}}.status-main-hero{{padding:22px 20px;}}.status-hero-brand{{width:min(520px,100%);}}.status-hero-stats{{grid-template-columns:1fr 1fr;}}.status-hero-stat{{padding:12px}}.status-hero-stat strong{{font-size:1.18rem;}}}}
+        @media(max-width:640px){{.status-topnav-shell{{padding:8px;border-radius:18px;}}.status-main-hero{{min-height:0;padding:22px 20px;}}.status-hero-brand{{width:auto;height:170px;max-width:100%;}}.status-hero-stats{{grid-template-columns:1fr 1fr;}}.status-hero-stat{{padding:12px}}.status-hero-stat strong{{font-size:1.18rem;}}}}
       </style>
     """
     map_url = str(game.get("map_url") or "https://tldb.info/map/world")
