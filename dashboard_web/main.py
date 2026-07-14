@@ -5,7 +5,6 @@ import json
 import os
 import secrets
 import csv
-import difflib
 import re
 import io
 import base64
@@ -17,7 +16,6 @@ import urllib.request
 import urllib.error
 from collections import Counter
 from datetime import datetime, timezone, timedelta
-from zoneinfo import ZoneInfo
 from typing import Any, Optional
 from pathlib import Path
 
@@ -30,7 +28,6 @@ try:
     from item_catalog_db import (
         catalog_stats,
         ensure_item_catalog_schema,
-        get_item_by_id,
         item_source_url_by_id,
         query_items,
         set_item_image_override,
@@ -38,25 +35,19 @@ try:
 except Exception:  # Dashboard soll auch ohne Item-Modul starten
     catalog_stats = None  # type: ignore
     ensure_item_catalog_schema = None  # type: ignore
-    get_item_by_id = None  # type: ignore
     item_source_url_by_id = None  # type: ignore
     query_items = None  # type: ignore
     set_item_image_override = None  # type: ignore
 
-app = FastAPI(title="Ebo Dashboard", version="1.0.0")
+app = FastAPI(title="Weisse Flamme Dashboard", version="1.0.0")
 security = HTTPBasic(auto_error=False)
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
-ASSET_VER = "item-image-exact-v3-20260711"
-DASHBOARD_RELEASE_VERSION = "1.4.0 · Eventkalender + Discord-Termine"
-
-_ITEM_MATCH_CACHE: dict[str, tuple[float, Optional[dict[str, Any]]]] = {}
-_ITEM_CATALOG_POOL_CACHE: dict[str, Any] = {"loaded_at": 0.0, "items": []}
-_ITEM_CATALOG_POOL_TTL_SECONDS = 120.0
-_ITEM_MATCH_CACHE_TTL_SECONDS = 120.0
+ASSET_VER = "weisse-flamme-rebrand-v1"
+DASHBOARD_RELEASE_VERSION = "1.2.1 · Weisse Flamme Rebrand"
 
 
 def _database_url() -> str:
@@ -1088,24 +1079,6 @@ def _apply_phase3_loot_read_cutover(payload: dict[str, Any]) -> dict[str, Any]:
 # Der Bot/Snapshot bleibt weiterhin kompatibel; kein Write-Cutover.
 
 
-def _snapshot_active_member_ids(snap: dict[str, Any]) -> set[int]:
-    out: set[int] = set()
-    if not isinstance(snap, dict):
-        return out
-    auth = snap.get("auth") if isinstance(snap.get("auth"), dict) else {}
-    member_role = auth.get("member_role") if isinstance(auth.get("member_role"), dict) else {}
-    for value in member_role.get("member_ids") or []:
-        uid = _user_id(value)
-        if uid:
-            out.add(uid)
-    profiles = snap.get("profiles") if isinstance(snap.get("profiles"), dict) else {}
-    for value in profiles.get("active_member_ids") or []:
-        uid = _user_id(value)
-        if uid:
-            out.add(uid)
-    return out
-
-
 def _phase3_events_pg_payload(guild_id: Any, snap: dict[str, Any]) -> Optional[dict[str, Any]]:
     if not _database_url():
         return None
@@ -1118,43 +1091,19 @@ def _phase3_events_pg_payload(guild_id: Any, snap: dict[str, Any]) -> Optional[d
         return None
     try:
         with conn.cursor() as cur:
-            member_source = "guild_members"
             try:
                 cur.execute(
                     """
-                    SELECT user_id, server_name, discord_username, avatar_url, ingame_name,
-                           main_role, gearscore, member_role_id, is_active, joined_at,
-                           roles_json, profile_json, updated_at
-                    FROM guild_members
-                    WHERE guild_id = %s AND is_active = TRUE
-                    ORDER BY COALESCE(NULLIF(ingame_name,''), NULLIF(server_name,''), user_id::text) ASC
+                    SELECT user_id, discord_name, ingame_name, roles_json, raw_json, source, updated_at
+                    FROM phase3_members
+                    WHERE guild_id = %s
+                    ORDER BY COALESCE(NULLIF(ingame_name,''), NULLIF(discord_name,''), user_id) ASC
                     """,
                     (gid,),
                 )
                 member_rows = cur.fetchall() or []
             except Exception:
-                try:
-                    conn.rollback()
-                except Exception:
-                    pass
-                member_source = "phase3_members_fallback"
-                try:
-                    cur.execute(
-                        """
-                        SELECT user_id, discord_name, ingame_name, roles_json, raw_json, source, updated_at
-                        FROM phase3_members
-                        WHERE guild_id = %s
-                        ORDER BY COALESCE(NULLIF(ingame_name,''), NULLIF(discord_name,''), user_id) ASC
-                        """,
-                        (gid,),
-                    )
-                    member_rows = cur.fetchall() or []
-                except Exception:
-                    try:
-                        conn.rollback()
-                    except Exception:
-                        pass
-                    member_rows = []
+                member_rows = []
 
             try:
                 cur.execute(
@@ -1169,10 +1118,6 @@ def _phase3_events_pg_payload(guild_id: Any, snap: dict[str, Any]) -> Optional[d
                 )
                 event_rows = cur.fetchall() or []
             except Exception:
-                try:
-                    conn.rollback()
-                except Exception:
-                    pass
                 event_rows = []
 
             try:
@@ -1188,10 +1133,6 @@ def _phase3_events_pg_payload(guild_id: Any, snap: dict[str, Any]) -> Optional[d
                 )
                 rsvp_rows = cur.fetchall() or []
             except Exception:
-                try:
-                    conn.rollback()
-                except Exception:
-                    pass
                 rsvp_rows = []
 
             try:
@@ -1207,10 +1148,6 @@ def _phase3_events_pg_payload(guild_id: Any, snap: dict[str, Any]) -> Optional[d
                 )
                 absence_rows = cur.fetchall() or []
             except Exception:
-                try:
-                    conn.rollback()
-                except Exception:
-                    pass
                 absence_rows = []
     finally:
         try:
@@ -1223,44 +1160,25 @@ def _phase3_events_pg_payload(guild_id: Any, snap: dict[str, Any]) -> Optional[d
 
     # Mitglieder/Profile aus DB vorbereiten.
     fallback_names = _profile_name_map(snap)
-    active_snapshot_ids = _snapshot_active_member_ids(snap)
     member_items: list[dict[str, Any]] = []
     names: dict[int, str] = dict(fallback_names)
     member_ids: set[int] = set()
     for row in member_rows:
-        if not isinstance(row, dict):
-            continue
-        profile_json = _phase3_json(row.get("profile_json"), {})
-        legacy_raw = _phase3_json(row.get("raw_json"), {})
-        raw = profile_json if profile_json else legacy_raw
-        uid = _user_id(row.get("user_id") or raw.get("user_id"))
+        raw = _phase3_json(row.get("raw_json"), {}) if isinstance(row, dict) else {}
+        uid = _user_id((row or {}).get("user_id") or raw.get("user_id"))
         if not uid:
             continue
-        # Der aktuelle Discord-Rollen-Snapshot ist die letzte Wahrheit. So können
-        # alte Phase-3-Zeilen niemals wieder ehemalige Mitglieder einblenden.
-        if active_snapshot_ids and uid not in active_snapshot_ids:
-            continue
-        roles = _phase3_json(row.get("roles_json"), [])
-        server_name = str(row.get("server_name") or raw.get("server_name") or raw.get("display_name") or row.get("discord_name") or "").strip()
-        discord_name = str(row.get("discord_username") or row.get("discord_name") or raw.get("discord_name") or raw.get("username") or server_name).strip()
-        ingame_name = str(row.get("ingame_name") or raw.get("ingame_name") or raw.get("tl_name") or "").strip()
-        display = ingame_name or server_name or discord_name or f"User {uid}"
+        roles = _phase3_json((row or {}).get("roles_json"), [])
+        display = raw.get("display_name") or raw.get("name") or (row or {}).get("ingame_name") or (row or {}).get("discord_name") or f"User {uid}"
         item = {
-            **(raw if isinstance(raw, dict) else {}),
+            **raw,
             "user_id": uid,
             "display_name": display,
-            "server_name": server_name or display,
-            "discord_name": discord_name or server_name or display,
-            "discord_username": discord_name or server_name or display,
-            "avatar_url": str(row.get("avatar_url") or raw.get("avatar_url") or raw.get("discord_avatar_url") or ""),
-            "ingame_name": ingame_name,
-            "main_role": str(row.get("main_role") or raw.get("main_role") or ""),
-            "gearscore": str(row.get("gearscore") or raw.get("gearscore") or ""),
-            "joined_at": str(row.get("joined_at") or raw.get("joined_at") or ""),
+            "discord_name": (row or {}).get("discord_name") or raw.get("discord_name") or raw.get("username") or display,
+            "ingame_name": (row or {}).get("ingame_name") or raw.get("ingame_name") or raw.get("tl_name") or display,
             "roles": roles if isinstance(roles, list) else [],
             "is_dashboard_member": True,
-            "is_active": True,
-            "source": member_source,
+            "source": "postgres_phase3",
         }
         names[uid] = str(display)
         member_ids.add(uid)
@@ -1280,19 +1198,8 @@ def _phase3_events_pg_payload(guild_id: Any, snap: dict[str, Any]) -> Optional[d
         eid = str((row or {}).get("event_id") or raw.get("event_id") or raw.get("id") or "").strip()
         if not eid:
             continue
-        snapshot_base = dict(event_by_id.get(eid) or {})
-        base = dict(snapshot_base)
+        base = dict(event_by_id.get(eid) or {})
         base.update(raw if isinstance(raw, dict) else {})
-        # Phase-3 raw_json kann noch eine alte, signierte Discord-Bild-URL enthalten.
-        # Der aktuelle Bot-Snapshot hat dagegen die frisch vom Discord-Post geladene
-        # Proxy-URL. Diese Medienfelder dürfen deshalb nicht vom DB-Fallback
-        # überschrieben werden.
-        for media_key in (
-            "image_url", "discord_image_url", "title_image_url", "event_image_url",
-            "thumbnail_url", "banner_url", "cover_url", "jump_url", "channel_id",
-        ):
-            if snapshot_base.get(media_key):
-                base[media_key] = snapshot_base.get(media_key)
         base.update({
             "event_id": eid,
             "id": base.get("id") or eid,
@@ -1849,7 +1756,7 @@ def _admin_member_panel(data: dict[str, Any], user_id: int, current_user: Option
 
 def _render_admin_actions_dashboard(data: dict[str, Any]) -> str:
     if not data.get("ok"):
-        return _html_shell("Leitung · Ebo Dashboard", f"<section class='panel'><h1>🛡️ Leitung</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+        return _html_shell("Leitung · Weisse Flamme Dashboard", f"<section class='panel'><h1>🛡️ Leitung</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
     snap: dict[str, Any] = data.get("snapshot") or {}
     guild_id = _safe_guild_id(data)
     states = _all_member_admin_states(guild_id)
@@ -1893,7 +1800,7 @@ def _render_admin_actions_dashboard(data: dict[str, Any]) -> str:
     <section class="panel"><h2>👥 Markierte Mitglieder</h2>{_table(['Mitglied','Status','Notiz','Geändert von','Geändert am'], rows, placeholder='Markierungen durchsuchen…')}</section>
     <section class="panel"><h2>🧾 Web-Admin-Aktionslog</h2>{_table(['Zeit','Aktion','Ziel','Akteur'], log_rows, placeholder='Adminlog durchsuchen…')}</section>
     """
-    return _html_shell("Leitung · Ebo Dashboard", body, nav_mode="admin")
+    return _html_shell("Leitung · Weisse Flamme Dashboard", body, nav_mode="admin")
 
 
 # ---------------------------------------------------------------------------
@@ -2067,7 +1974,7 @@ def _admin_center_payload(data: dict[str, Any]) -> dict[str, Any]:
 
 def _render_admin_center_dashboard(data: dict[str, Any]) -> str:
     if not data.get("ok"):
-        return _html_shell("Admin · Ebo Dashboard", f"<section class='panel'><h1>🛡️ Admin-Zentrale</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+        return _html_shell("Admin · Weisse Flamme Dashboard", f"<section class='panel'><h1>🛡️ Admin-Zentrale</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
     snap: dict[str, Any] = data.get("snapshot") or {}
     names = _profile_name_map(snap)
     p = _admin_center_payload(data)
@@ -2104,7 +2011,7 @@ def _render_admin_center_dashboard(data: dict[str, Any]) -> str:
         result = r.get("result") if isinstance(r.get("result"), dict) else {}
         item = payload.get("item_name") or payload.get("item") or r.get("auction_id")
         status = _ec_award_status_label(r.get("status")).replace("EC", "")
-        loot_rows.append([_dt(r.get("requested_at")), status, _auction_link(r.get("auction_id"), item, payload or r), r.get("action_type"), _fmt_ec(r.get("amount")), r.get("actor_name") or r.get("actor_id") or "—", _short(result.get("error") or result.get("message") or r.get("request_id"), 100)])
+        loot_rows.append([_dt(r.get("requested_at")), status, _auction_link(r.get("auction_id"), item), r.get("action_type"), _fmt_ec(r.get("amount")), r.get("actor_name") or r.get("actor_id") or "—", _short(result.get("error") or result.get("message") or r.get("request_id"), 100)])
 
     setting_req_rows = []
     for r in p.get("settings_requests") or []:
@@ -2147,7 +2054,7 @@ def _render_admin_center_dashboard(data: dict[str, Any]) -> str:
     <section class="panel"><h2>🧩 Datenquellen</h2>{_table(['Key','Datei','vorhanden','Status','Bytes','Geändert'], source_rows, placeholder='Quellen durchsuchen…')}</section>
     <section class="panel"><h2>🧾 Web-Admin-Aktionslog</h2>{_table(['Zeit','Aktion','Ziel','Akteur'], log_rows, placeholder='Adminlog durchsuchen…')}</section>
     """
-    return _html_shell("Admin-Zentrale · Ebo Dashboard", body, nav_mode="admin")
+    return _html_shell("Admin-Zentrale · Weisse Flamme Dashboard", body, nav_mode="admin")
 
 
 def _card(title: str, value: Any, sub: str = "") -> str:
@@ -2186,15 +2093,12 @@ def _event_link(event_id: Any, label: Any) -> dict[str, str]:
     return _raw(f'<a class="link" href="/event/{_e(eid)}">{text}</a>')
 
 
-def _auction_link(auction_id: Any, label: Any, reference: Any = None) -> dict[str, str]:
+def _auction_link(auction_id: Any, label: Any) -> dict[str, str]:
     aid = str(auction_id or "").strip()
-    item_name = label or aid or "Auktion"
-    primary_href = f"/auction/{aid}" if aid else ""
-    try:
-        return _raw(_catalog_item_reference_html(item_name, primary_href=primary_href, reference=reference))
-    except Exception:
-        text = _e(item_name)
-        return _raw(f'<a class="link" href="{_e(primary_href)}">{text}</a>' if primary_href else text)
+    text = _e(label or aid or "Auktion")
+    if not aid:
+        return _raw(text)
+    return _raw(f'<a class="link" href="/auction/{_e(aid)}">{text}</a>')
 
 
 def _table(headers: list[str], rows: list[list[Any]], *, searchable: bool = True, placeholder: str = "Tabelle durchsuchen…") -> str:
@@ -2214,124 +2118,18 @@ def _table(headers: list[str], rows: list[list[Any]], *, searchable: bool = True
 
 
 def _profile_name_map(snap: dict[str, Any]) -> dict[int, str]:
-    """Name je Mitglied: Profilname, sonst Discord-Servername.
-
-    Mitglieder ohne ausgefülltes Profil kommen aus ``insights.members``. Dadurch
-    erscheinen in Listen keine nackten ``User 123...``-Platzhalter mehr, sobald der
-    Bot einen aktuellen Snapshot veröffentlicht hat.
-    """
-    names: dict[int, str] = {}
     profiles = ((snap.get("profiles") or {}).get("items") or [])
-    for profile in profiles:
-        if not isinstance(profile, dict):
+    names: dict[int, str] = {}
+    for p in profiles:
+        if not isinstance(p, dict):
             continue
-        uid = _user_id(profile.get("user_id") or profile.get("id"))
-        if not uid:
-            continue
-        name = str(
-            profile.get("ingame_name")
-            or profile.get("server_name")
-            or profile.get("display_name")
-            or profile.get("discord_name")
-            or ""
-        ).strip()
-        if name:
-            names[uid] = name
-
-    insight_members = ((snap.get("insights") or {}).get("members") or [])
-    for member in insight_members:
-        if not isinstance(member, dict):
-            continue
-        uid = _user_id(member.get("user_id") or member.get("id"))
-        if not uid:
-            continue
-        name = str(
-            member.get("ingame_name")
-            or member.get("server_name")
-            or member.get("display_name")
-            or member.get("discord_name")
-            or ""
-        ).strip()
-        if name and (uid not in names or str(names[uid]).lower().startswith("user ")):
-            names[uid] = name
-    return names
-
-
-def _member_directory_items(snap: dict[str, Any]) -> list[dict[str, Any]]:
-    """Aktuelle Mitgliederliste aus dem gesetzten Discord-Gildenrollen-Snapshot.
-
-    Alte Profile bleiben in den produktiven JSON-Dateien erhalten, werden hier aber
-    nicht mehr als aktive Mitglieder angezeigt, sobald ein aktueller Rollen-Snapshot
-    vorhanden ist.
-    """
-    profiles = [x for x in (((snap.get("profiles") or {}).get("items") or [])) if isinstance(x, dict)]
-    insights = [x for x in (((snap.get("insights") or {}).get("members") or [])) if isinstance(x, dict)]
-
-    current_ids: set[int] = {
-        _user_id(row.get("user_id") or row.get("id"))
-        for row in insights
-        if _user_id(row.get("user_id") or row.get("id"))
-    }
-
-    auth = snap.get("auth") or {}
-    member_role = auth.get("member_role") if isinstance(auth, dict) else {}
-    if isinstance(member_role, dict):
-        for raw_uid in member_role.get("member_ids") or []:
-            uid = _user_id(raw_uid)
-            if uid:
-                current_ids.add(uid)
-
-    by_uid: dict[int, dict[str, Any]] = {}
-    for member in insights:
-        uid = _user_id(member.get("user_id") or member.get("id"))
+        try:
+            uid = int(p.get("user_id") or 0)
+        except Exception:
+            uid = 0
         if uid:
-            by_uid[uid] = dict(member)
-
-    # Nur Profile der aktuell gesetzten Gildenrolle ergänzen. Falls noch kein neuer
-    # Rollen-Snapshot existiert, bleibt der alte Fallback erhalten.
-    for profile in profiles:
-        uid = _user_id(profile.get("user_id") or profile.get("id"))
-        if not uid or (current_ids and uid not in current_ids):
-            continue
-        merged = dict(by_uid.get(uid) or {})
-        for key, value in profile.items():
-            if value not in (None, "", [], {}):
-                merged[key] = value
-        merged["user_id"] = uid
-        by_uid[uid] = merged
-
-    rows: list[dict[str, Any]] = []
-    for uid, member in by_uid.items():
-        if current_ids and uid not in current_ids:
-            continue
-        profile_name = str(member.get("ingame_name") or "").strip()
-        server_name = str(
-            member.get("server_name")
-            or member.get("display_name")
-            or member.get("discord_name")
-            or ""
-        ).strip()
-        member["list_name"] = profile_name or server_name or f"User {uid}"
-        member["user_id"] = uid
-        rows.append(member)
-
-    rows.sort(key=lambda row: str(row.get("list_name") or "").casefold())
-    return rows
-
-
-def _member_record(snap: dict[str, Any], user_id: int) -> dict[str, Any]:
-    uid = int(user_id or 0)
-    for member in _member_directory_items(snap):
-        if _user_id(member.get("user_id")) == uid:
-            return member
-    return {}
-
-
-def _safe_avatar_url(value: Any) -> str:
-    url = str(value or "").strip()
-    if url.startswith("https://") or url.startswith("http://"):
-        return url
-    return ""
+            names[uid] = str(p.get("display_name") or p.get("ingame_name") or f"User {uid}")
+    return names
 
 
 def _events_items(snap: dict[str, Any]) -> list[dict[str, Any]]:
@@ -2422,33 +2220,13 @@ def _voice_for_user(snap: dict[str, Any], user_id: int, *, limit: int = 30) -> l
 
 
 def _auctions_for_user(snap: dict[str, Any], user_id: int, *, limit: int = 30) -> list[dict[str, Any]]:
-    """Auktionen, an denen der Nutzer tatsächlich beteiligt ist.
-
-    Nicht mehr pauschal alle offenen Müll-/Sale-Items als "Deine Auktionen"
-    zählen. Berücksichtigt werden eigene Gebote, Müll-Würfe, Führung und Gewinn.
-    """
-    uid = int(user_id or 0)
     auctions = (((snap.get("loot") or {}).get("auctions") or {}).get("items") or [])
-    out: list[dict[str, Any]] = []
-    for auction in auctions:
-        if not isinstance(auction, dict):
+    out = []
+    for a in auctions:
+        if not isinstance(a, dict):
             continue
-        involved = (
-            _user_id(auction.get("top_bid_user_id")) == uid
-            or _user_id(auction.get("winner_user_id") or auction.get("delivered_to_user_id")) == uid
-        )
-        if not involved:
-            involved = any(
-                isinstance(bid, dict) and _user_id(bid.get("user_id") or bid.get("bidder_id")) == uid
-                for bid in (auction.get("bids") or [])
-            )
-        if not involved:
-            involved = any(
-                _user_id(roll.get("user_id")) == uid
-                for roll in _junk_roll_entries_dashboard(auction)
-            )
-        if involved:
-            out.append(auction)
+        if _user_id(a.get("top_bid_user_id")) == int(user_id) or _user_id(a.get("winner_user_id")) == int(user_id):
+            out.append(a)
     return out[:limit]
 
 
@@ -2534,15 +2312,13 @@ def _render_need_slot_board(
     blocks: list[str] = []
 
     def row_read(slot: str, entry: Any) -> str:
-        locked = bool(entry and _need_is_received(entry))
         if entry:
             item = _need_item_display(entry)
-            item_html = _catalog_item_reference_html(item, reference=entry)
-            value_html = f'<span class="need-lock" aria-label="erhalten">🔒</span>{item_html}' if locked else item_html
+            value = f"🔒 {item}" if _need_is_received(entry) else item
         else:
-            value_html = "—"
-        cls = " locked" if locked else ""
-        return f'<div class="need-slot-row{cls}"><span>{_e(slot)}:</span><div class="need-item-linked">{value_html}</div></div>'
+            value = "—"
+        cls = " locked" if entry and _need_is_received(entry) else ""
+        return f'<div class="need-slot-row{cls}"><span>{_e(slot)}:</span><strong>{_e(value)}</strong></div>'
 
     def row_edit(slot: str, entry: Any, idx: int) -> str:
         locked = bool(entry and _need_is_received(entry))
@@ -2670,10 +2446,10 @@ def _bars(items: list[tuple[Any, Any]], *, max_items: int = 8) -> str:
 def _render_dashboard(data: dict[str, Any]) -> str:
     if not data.get("ok"):
         return _html_shell(
-            "Ebo Dashboard",
+            "Weisse Flamme Dashboard",
             f"""
             <section class="panel">
-              <h1>📊 Ebo Dashboard</h1>
+              <h1>📊 Weisse Flamme Dashboard</h1>
               <p class="muted">{_e(data.get('error'))}</p>
               <p>Starte den Bot mit der aktuellen Version und warte bis zu 5 Minuten. Oder nutze im Discord <code>/dashboard_status</code>, damit direkt ein Snapshot veröffentlicht wird.</p>
             </section>
@@ -2741,7 +2517,7 @@ def _render_dashboard(data: dict[str, Any]) -> str:
         uid = int(_num(a.get("top_bid_user_id"), 0))
         if a.get("top_bid_amount") is not None:
             leader = f"{names.get(uid, f'User {uid}')} / {_fmt_ec(a.get('top_bid_amount'))} EC"
-        auction_rows.append([_auction_link(a.get("auction_id"), a.get("item_name"), a), a.get("status"), a.get("phase"), a.get("bid_count"), leader, _dt(a.get("ends_at"))])
+        auction_rows.append([_auction_link(a.get("auction_id"), a.get("item_name")), a.get("status"), a.get("phase"), a.get("bid_count"), leader, _dt(a.get("ends_at"))])
 
     voice_rows = []
     for v in voice.get("recent_sessions") or []:
@@ -2792,7 +2568,7 @@ def _render_dashboard(data: dict[str, Any]) -> str:
     <section class="hero" id="overview">
       <div>
         <div class="eyebrow">Read-only Dashboard</div>
-        <h1>🏰 {_e(guild.get('name') or data.get('guild_name') or 'Ebolus')}</h1>
+        <h1>🏰 {_e('Weisse Flamme')}</h1>
         <p>Snapshot veröffentlicht: <strong>{_e(_dt(data.get('published_at')))}</strong> · generiert: {_e(_dt(data.get('generated_at')))}</p>
         <p class="muted">{_e(role_line)} · alte JSON-Einträge werden nur ausgeblendet, nicht gelöscht.</p>
       </div>
@@ -2830,12 +2606,12 @@ def _render_dashboard(data: dict[str, Any]) -> str:
     <section class="panel"><h2>🎙️ Voice-Sessions</h2>{_table(['Spieler','Kanal','Rein','Raus','Minuten'], voice_rows, placeholder='Voice-Sessions durchsuchen…')}</section>
     <section class="panel" id="logs"><h2>🧾 Audit-Log</h2>{_table(['Zeit','Aktion','Zusammenfassung','Actor'], audit_rows, placeholder='Audit-Logs durchsuchen…')}</section>
     """
-    return _html_shell("Ebo Dashboard", body)
+    return _html_shell("Weisse Flamme Dashboard", body)
 
 
 def _render_member_detail(data: dict[str, Any], user_id: int, current_user: Optional[dict[str, Any]] = None) -> str:
     if not data.get("ok"):
-        return _html_shell("Ebo Dashboard", f"<section class='panel'><h1>📊 Ebo Dashboard</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+        return _html_shell("Weisse Flamme Dashboard", f"<section class='panel'><h1>📊 Weisse Flamme Dashboard</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
     snap: dict[str, Any] = data.get("snapshot") or {}
     profiles = ((snap.get("profiles") or {}).get("items") or [])
     balances = _balance_map(snap)
@@ -2883,7 +2659,7 @@ def _render_member_detail(data: dict[str, Any], user_id: int, current_user: Opti
     <section class="hero">
       <div>
         <div class="eyebrow">Mitglied</div>
-        <h1 class="portal-hero-title">{avatar_html}<span>{_e(display)}</span></h1>
+        <h1>👤 {_e(display)}</h1>
         <p class="muted">User-ID: {_e(user_id)} · Snapshot: {_e(_dt(data.get('published_at')))}</p>
       </div>
       <a class="btn" href="/">Zurück</a>
@@ -2901,7 +2677,7 @@ def _render_member_detail(data: dict[str, Any], user_id: int, current_user: Opti
     <section class="panel"><h2>🎁 Auktionen mit aktueller Führung/Gewinn</h2>{_table(['Item','Status','Phase','Gebot','Ende'], auction_rows, placeholder='Auktionen durchsuchen…')}</section>
     <section class="panel" id="voice"><h2>🎙️ Voice-Sessions</h2>{_table(['Kanal','Rein','Raus','Minuten'], voice_rows, placeholder='Voice durchsuchen…')}</section>
     """
-    return _html_shell(f"{display} · Ebo Dashboard", body)
+    return _html_shell(f"{display} · Weisse Flamme Dashboard", body)
 
 
 def _event_by_id(snap: dict[str, Any], event_id: str) -> Optional[dict[str, Any]]:
@@ -2986,7 +2762,7 @@ def _role_signup_html(event: dict[str, Any]) -> str:
 
 def _render_event_detail(data: dict[str, Any], event_id: str) -> str:
     if not data.get("ok"):
-        return _html_shell("Ebo Dashboard", f"<section class='panel'><h1>📊 Ebo Dashboard</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+        return _html_shell("Weisse Flamme Dashboard", f"<section class='panel'><h1>📊 Weisse Flamme Dashboard</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
     snap: dict[str, Any] = data.get("snapshot") or {}
     guild_id = _safe_guild_id(data)
     event = _event_by_id(snap, event_id) or _event_stub_from_attendance_review(guild_id, event_id)
@@ -3011,7 +2787,6 @@ def _render_event_detail(data: dict[str, Any], event_id: str) -> str:
 
     body = f"""
     <nav class="topnav"><a href="/">← Übersicht</a><a href="#signups">Zusagen</a><a href="#maybe">Vielleicht</a><a href="#no">Abgemeldet</a><a href="/api/snapshot">JSON</a></nav>
-    <style>.event-title-image{{margin-left:auto;width:min(360px,38vw);height:190px;border:1px solid rgba(214,168,79,.3);border-radius:14px;overflow:hidden;background:#070707;box-shadow:0 14px 40px rgba(0,0,0,.35)}}.event-title-image img{{width:100%;height:100%;object-fit:cover}}@media(max-width:760px){{.event-title-image{{width:100%;height:170px;margin:10px 0 0}}}}</style>
     <section class="hero">
       <div>
         <div class="eyebrow">Event</div>
@@ -3019,7 +2794,6 @@ def _render_event_detail(data: dict[str, Any], event_id: str) -> str:
         <p class="muted">Event-ID: {_e(event_id)} · Zeit: {_e(_dt(event.get('when_iso')))} · Snapshot: {_e(_dt(data.get('published_at')))}</p>
         {f"<p>{_e(event.get('description'))}</p>" if event.get('description') else ""}
       </div>
-      {_event_image_hero_side(event)}
       <a class="btn" href="/#events">Zurück</a>
     </section>
     <section class="grid">{cards}</section>
@@ -3029,7 +2803,7 @@ def _render_event_detail(data: dict[str, Any], event_id: str) -> str:
     <section class="panel" id="no"><h2>❌ Abgemeldet</h2>{_table(['Spieler','Gildenrolle'], no_rows, placeholder='Abmeldungen durchsuchen…')}</section>
     {_event_ec_queue_panel(_safe_guild_id(data), str(event_id))}
     """
-    return _html_shell(f"{event.get('title') or 'Event'} · Ebo Dashboard", body)
+    return _html_shell(f"{event.get('title') or 'Event'} · Weisse Flamme Dashboard", body)
 
 
 def _auction_by_id(snap: dict[str, Any], auction_id: str) -> Optional[dict[str, Any]]:
@@ -3042,8 +2816,6 @@ def _auction_by_id(snap: dict[str, Any], auction_id: str) -> Optional[dict[str, 
 def _phase_label(auction: dict[str, Any]) -> str:
     phase = str(auction.get("phase") or "").strip()
     mode = str(auction.get("eligibility_mode") or "").strip()
-    if auction.get("junk_drop") or auction.get("is_junk"):
-        return "Müll / Würfeln"
     if phase == "need" and mode == "main_need":
         return "Main-Need-Auktion"
     if phase == "need" and mode == "secondary_need":
@@ -3154,12 +2926,9 @@ def _auction_roll_count(auction: dict[str, Any]) -> int:
 
 
 def _auction_count_label(auction: dict[str, Any]) -> tuple[str, int, str]:
-    if auction.get("junk_drop") or auction.get("is_junk"):
+    if auction.get("junk_drop"):
         rolls = _auction_roll_count(auction)
         return "Würfe", rolls, "Müll-Würfe"
-    if _loot_is_sale_like(auction):
-        price = int(_num(auction.get("fixed_price") if auction.get("fixed_price") is not None else auction.get("start_bid"), 0))
-        return "EC Festpreis", price, "Direktkauf"
     return "Gebote", _loot_bid_count(auction), "Gebote"
 
 
@@ -3218,11 +2987,8 @@ def _auction_timer_subtext(auction: dict[str, Any]) -> str:
 
 def _auction_leader_or_roll_text(auction: dict[str, Any], snap: Optional[dict[str, Any]] = None) -> str:
     snap = snap or {}
-    if auction.get("junk_drop") or auction.get("is_junk"):
-        best = _best_junk_roll_text(auction, snap)
-        return best if best != "—" else "noch kein Wurf"
-    if _loot_is_sale_like(auction):
-        return "noch verfügbar"
+    if auction.get("junk_drop"):
+        return _best_junk_roll_text(auction, snap)
     uid = _user_id(auction.get("top_bid_user_id"))
     amount = auction.get("top_bid_amount")
     if uid and amount is not None:
@@ -3650,7 +3416,7 @@ def _enqueue_loot_action_request(guild_id: int, auction: dict[str, Any], action_
 
 
 
-def _enqueue_loot_drop_request(guild_id: int, drop_type: str, item_query: str, actor: dict[str, Any], catalog_item_id: int = 0, slot: str = "") -> dict[str, Any]:
+def _enqueue_loot_drop_request(guild_id: int, drop_type: str, item_query: str, actor: dict[str, Any]) -> dict[str, Any]:
     """Dashboard -> Bot Queue: normale Drops/Müll-Drops anlegen.
 
     Das Dashboard erstellt die Auktion nicht selbst. Es legt nur eine Anfrage in
@@ -3667,18 +3433,6 @@ def _enqueue_loot_drop_request(guild_id: int, drop_type: str, item_query: str, a
         return {"ok": False, "error": "Itemname fehlt."}
     if len(item) > 160:
         item = item[:160]
-    try:
-        resolved_catalog_id = int(catalog_item_id or 0)
-    except Exception:
-        resolved_catalog_id = 0
-    if not resolved_catalog_id:
-        try:
-            matched_catalog = _catalog_item_match(item)
-            resolved_catalog_id = int((matched_catalog or {}).get("id") or 0)
-            if matched_catalog and matched_catalog.get("name"):
-                item = str(matched_catalog.get("name"))[:160]
-        except Exception:
-            resolved_catalog_id = 0
     actor_id = str(actor.get("user_id") or actor.get("id") or "").strip()
     actor_name = str(actor.get("username") or actor.get("global_name") or actor_id or "Dashboard")
     if not actor_id:
@@ -3700,8 +3454,6 @@ def _enqueue_loot_drop_request(guild_id: int, drop_type: str, item_query: str, a
         "drop_type": dtype,
         "item_query": item,
         "item_name": item,
-        "catalog_item_id": int(resolved_catalog_id or 0),
-        "slot": str(slot or "").strip(),
         "requested_by": {"id": actor_id, "name": actor_name},
         "requested_at": datetime.now(timezone.utc).isoformat(),
         "source": "dashboard_loot_drop",
@@ -3742,7 +3494,7 @@ def _enqueue_loot_drop_request(guild_id: int, drop_type: str, item_query: str, a
 
 def _render_auction_detail(data: dict[str, Any], auction_id: str, current_user: Optional[dict[str, Any]] = None, msg: str = "") -> str:
     if not data.get("ok"):
-        return _html_shell("Ebo Dashboard", f"<section class='panel'><h1>📊 Ebo Dashboard</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+        return _html_shell("Weisse Flamme Dashboard", f"<section class='panel'><h1>📊 Weisse Flamme Dashboard</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
     snap: dict[str, Any] = data.get("snapshot") or {}
     auction = _auction_by_id(snap, auction_id)
     if not auction:
@@ -3816,10 +3568,8 @@ def _render_auction_detail(data: dict[str, Any], auction_id: str, current_user: 
         </section>
         """
 
-    item_panel = _catalog_item_detail_panel(auction.get("item_name") or auction.get("item") or auction_id, reference=auction)
-
     body = f"""
-    <nav class="topnav"><a href="/">← Übersicht</a><a href="/loot">Loot</a><a href="#item-database">Item</a><a href="#bid">Bieten/Kaufen</a><a href="#loot-actions">Queue</a><a href="#bids">Gebote</a><a href="#eligible">Berechtigte</a><a href="#tech">Technik</a><a href="/api/snapshot">JSON</a></nav>
+    <nav class="topnav"><a href="/">← Übersicht</a><a href="/loot">Loot</a><a href="#bid">Bieten/Kaufen</a><a href="#loot-actions">Queue</a><a href="#bids">Gebote</a><a href="#eligible">Berechtigte</a><a href="#tech">Technik</a><a href="/api/snapshot">JSON</a></nav>
     <section class="hero">
       <div>
         <div class="eyebrow">Auktion</div>
@@ -3832,7 +3582,6 @@ def _render_auction_detail(data: dict[str, Any], auction_id: str, current_user: 
     {state_panel}
     {refresh_panel}
     <section class="grid">{cards}</section>
-    {item_panel}
     {action_panel}
     {queue_panel}
     <section class="panel" id="bids"><h2>💰 Gebotshistorie</h2>{_table(['Spieler','Gebot','Zeit'], bid_rows, placeholder='Gebote durchsuchen…')}</section>
@@ -3840,7 +3589,7 @@ def _render_auction_detail(data: dict[str, Any], auction_id: str, current_user: 
     <section class="panel" id="eligible"><h2>✅ Berechtigte Spieler</h2><p class="muted">Bei freien Auktionen/Sale kann die Liste leer sein, weil dann alle berechtigt sind.</p>{_table(['Spieler'], eligible_rows, placeholder='Berechtigte durchsuchen…')}</section>
     <section class="panel" id="tech"><h2>🧾 Technische Infos</h2>{_table(['Bereich','Kanal-ID','Nachricht-ID'], channel_info, searchable=False)}</section>
     """
-    return _html_shell(f"{_loot_text(auction.get('item_name') or 'Auktion')} · Ebo Dashboard", body)
+    return _html_shell(f"{_loot_text(auction.get('item_name') or 'Auktion')} · Weisse Flamme Dashboard", body)
 
 
 def _sidebar_html() -> str:
@@ -3848,13 +3597,13 @@ def _sidebar_html() -> str:
     return f"""
     <aside class="sidebar admin-sidebar">
       <div class="brand">
-        <div class="brand-mark"><img src="{_asset('ebolus_logo.png')}" alt="Ebolus"></div>
-        <div><strong>Ebolus</strong><span>Admin-Portal</span></div>
+        <div class="brand-mark"><img src="{_asset('ebolus_logo.png')}" alt="Weisse Flamme"></div>
+        <div><strong>Weisse Flamme</strong><span>Admin-Portal</span></div>
       </div>
       <button class="mobile-nav-toggle" type="button" onclick="document.body.classList.toggle('nav-open')">☰ Menü</button>
 
       <nav class="side-nav">
-        <a class="admin-back" href="/"><span>⌂</span> Zur Startseite</a>
+        <a class="admin-back" href="/"><span>←</span> Zur normalen Ansicht</a>
         <details open>
           <summary>Admin</summary>
           <a href="/admin"><img class="nav-ico" src="{_asset('nav_admin_portal.png')}" alt="">Admin-Portal</a>
@@ -3868,7 +3617,6 @@ def _sidebar_html() -> str:
           <summary>Leader-Werkzeuge</summary>
           <a href="/loot"><img class="nav-ico" src="{_asset('nav_auktionen.png')}" alt="">Loot & Auktionen</a>
           <a href="/events-admin"><img class="nav-ico" src="{_asset('nav_events.png')}" alt="">Event-Verwaltung</a>
-          <a href="/event-calendar"><img class="nav-ico" src="{_asset('nav_events.png')}" alt="">Event-Kalender</a>
           <a href="/attendance"><img class="nav-ico" src="{_asset('nav_anwesenheit.png')}" alt="">Anwesenheit</a>
           <a href="/ec-queue"><img class="nav-ico" src="{_asset('nav_ec.png')}" alt="">EC-Queue</a>
         </details>
@@ -3888,13 +3636,12 @@ def _member_sidebar_html() -> str:
     return f"""
     <aside class="sidebar member-default-sidebar">
       <div class="brand">
-        <div class="brand-mark"><img src="{_asset('ebolus_logo.png')}" alt="Ebolus"></div>
-        <div><strong>Ebolus</strong><span>Gilden-Dashboard</span></div>
+        <div class="brand-mark"><img src="{_asset('ebolus_logo.png')}" alt="Weisse Flamme"></div>
+        <div><strong>Weisse Flamme</strong><span>Gilden-Dashboard</span></div>
       </div>
       <button class="mobile-nav-toggle" type="button" onclick="document.body.classList.toggle('nav-open')">☰ Menü</button>
 
       <nav class="side-nav">
-        <a class="home-sidebar-button" href="/"><span class="nav-home-glyph" aria-hidden="true">⌂</span>Zur Startseite</a>
         <a class="admin-portal-button" href="/admin"><img class="nav-ico" src="{_asset('nav_admin_portal.png')}" alt="">Admin-Portal</a>
 
         <details open>
@@ -3908,7 +3655,6 @@ def _member_sidebar_html() -> str:
           <a href="/member/members"><img class="nav-ico" src="{_asset('nav_mitglieder.png')}" alt="">Mitglieder</a>
           <a href="/member/auctions"><img class="nav-ico" src="{_asset('nav_auktionen.png')}" alt="">Auktionen</a>
           <a href="/member/events"><img class="nav-ico" src="{_asset('nav_events.png')}" alt="">Events</a>
-          <a href="/event-calendar"><img class="nav-ico" src="{_asset('nav_events.png')}" alt="">Event-Kalender</a>
           <a href="/member/ec"><img class="nav-ico" src="{_asset('nav_ec.png')}" alt="">EC-Verlauf</a>
           <a href="/announcements"><img class="nav-ico" src="{_asset('nav_announcements.png')}" alt="">Ankündigungen</a>
           <a href="/attendance"><img class="nav-ico" src="{_asset('nav_anwesenheit.png')}" alt="">Anwesenheit</a>
@@ -3953,9 +3699,7 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "member") -> str:
   <style>
     :root {{ --bg:#0f1014; --panel:#181a22; --panel2:#20232d; --text:#f1eadb; --muted:#a8a193; --gold:#d6a84f; --line:#333746; --red:#d96868; --green:#81c784; --side:#11121a; --side2:#171824; }}
     * {{ box-sizing:border-box; }} html {{ scroll-behavior:smooth; }}
-    body {{ margin:0; font-family:Inter, system-ui, Segoe UI, sans-serif; background:linear-gradient(180deg,rgba(5,6,9,.56),rgba(5,6,9,.88)), url("{_asset('dashboard_bg.webp')}") center center / cover fixed no-repeat; color:var(--text); overflow-x:hidden; caret-color:transparent; }}
-    input, textarea, [contenteditable="true"] {{ caret-color:auto; }}
-    h1,h2,h3,h4,.eyebrow,.brand,.side-nav,.card-title,.card-value,th,.btn,button,summary,label {{ caret-color:transparent; }}
+    body {{ margin:0; font-family:Inter, system-ui, Segoe UI, sans-serif; background:linear-gradient(180deg,rgba(5,6,9,.56),rgba(5,6,9,.88)), url("{_asset('dashboard_bg.webp')}") center center / cover fixed no-repeat; color:var(--text); overflow-x:hidden; }}
     .app-shell {{ display:grid; grid-template-columns:260px minmax(0,1fr); min-height:100vh; }}
     .sidebar {{ position:sticky; top:0; height:100vh; overflow:auto; scrollbar-width:none; -ms-overflow-style:none; padding:18px 14px; background:linear-gradient(180deg,rgba(17,18,26,.97),rgba(11,12,18,.97)); border-right:1px solid rgba(214,168,79,.16); box-shadow:16px 0 45px rgba(0,0,0,.35); }}
     .sidebar::-webkit-scrollbar {{ width:0; height:0; display:none; }}
@@ -3973,11 +3717,8 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "member") -> str:
     .side-nav summary {{ color:var(--muted); text-transform:uppercase; letter-spacing:.08em; font-size:11px; font-weight:800; list-style:none; }}
     .side-nav summary::-webkit-details-marker {{ display:none; }}
     .side-nav details a {{ margin-left:8px; padding:9px 11px; font-size:13px; color:#ded7c8; }}
-    .side-nav .home-sidebar-button {{ margin:0 0 6px 0; border:1px solid rgba(214,168,79,.42); background:linear-gradient(90deg,rgba(214,168,79,.20),rgba(55,30,14,.26)); color:var(--gold); font-weight:800; }}
-    .side-nav .home-sidebar-button:hover {{ background:linear-gradient(90deg,rgba(214,168,79,.29),rgba(71,38,16,.34)); border-color:rgba(232,190,101,.62); }}
-    .nav-home-glyph {{ width:24px; flex:0 0 24px; display:grid; place-items:center; font-size:19px; line-height:1; color:#e2b75c; filter:drop-shadow(0 2px 4px rgba(0,0,0,.72)); }}
     .side-nav .admin-portal-button {{ margin:0 0 6px 0; border:1px solid rgba(214,168,79,.34); background:linear-gradient(90deg,rgba(214,168,79,.18),rgba(77,52,18,.18)); color:var(--gold); font-weight:800; }}
-    .side-nav .admin-back {{ margin:0 0 6px 0; border:1px solid rgba(214,168,79,.34); background:linear-gradient(90deg,rgba(214,168,79,.18),rgba(77,52,18,.18)); color:var(--gold); font-weight:800; }}
+    .side-nav .admin-back {{ margin:0 0 6px 0; border:1px solid rgba(129,199,132,.25); background:rgba(129,199,132,.08); color:#bfe8c1; font-weight:800; }}
 
     .sidebar-footer {{ margin-top:18px; padding-top:14px; border-top:1px solid rgba(214,168,79,.12); display:grid; gap:8px; }}
     .sidebar-footer a {{ color:var(--muted); text-decoration:none; font-size:13px; padding:8px 10px; border-radius:10px; }} .sidebar-footer a:hover {{ color:var(--gold); background:rgba(214,168,79,.08); }}
@@ -4099,18 +3840,6 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "member") -> str:
     .actions-inline form {{ display:inline-flex; gap:8px; flex-wrap:wrap; align-items:center; }}
     .responsive-table {{ width:100%; overflow-x:auto; -webkit-overflow-scrolling:touch; border-radius:12px; }}
     .responsive-table > table {{ min-width:680px; }}
-    .catalog-item-ref {{ display:grid; grid-template-columns:42px minmax(120px,1fr) auto; gap:9px; align-items:center; min-width:220px; max-width:520px; }}
-    .catalog-item-thumb {{ width:42px; height:42px; display:grid; place-items:center; border:1px solid rgba(214,168,79,.28); border-radius:10px; background:rgba(0,0,0,.34); overflow:hidden; }}
-    .catalog-item-thumb img,.catalog-item-placeholder {{ width:100%; height:100%; object-fit:contain; display:grid; place-items:center; color:var(--gold); font-weight:900; }}
-    .catalog-item-copy {{ min-width:0; display:grid; gap:2px; }}
-    .catalog-item-name {{ overflow-wrap:anywhere; font-weight:800; }}
-    .catalog-item-copy small {{ color:var(--muted); font-size:10px; line-height:1.25; overflow-wrap:anywhere; }}
-    .catalog-db-link {{ color:#f0c56b; border:1px solid rgba(214,168,79,.34); background:rgba(214,168,79,.08); border-radius:8px; padding:5px 7px; font-size:10px; font-weight:900; text-decoration:none; }}
-    .catalog-db-link:hover {{ background:rgba(214,168,79,.18); }}
-    .need-item-linked {{ min-width:0; display:flex; gap:7px; align-items:center; }}
-    .need-item-linked .catalog-item-ref {{ min-width:0; width:100%; }}
-    .need-lock {{ flex:0 0 auto; }}
-    .catalog-linked-panel .item-card {{ margin-top:12px; }}
     .item-picker-select {{ width:100%; margin:0 0 8px; border:1px solid var(--line); background:#08090d; color:var(--text); border-radius:10px; padding:10px 12px; }}
     .need-two-step-picker {{ display:grid; grid-template-columns:minmax(160px,.55fr) minmax(220px,1fr); gap:8px; align-items:start; }}
     .need-two-step-picker input, .need-two-step-picker small {{ grid-column:1 / -1; }}
@@ -4118,10 +3847,10 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "member") -> str:
     td {{ overflow-wrap:anywhere; }}
     .skip-mobile {{ display:inline; }}
 
-    /* Ebolus Gothic/Whale Visual Pass v1 */
+    /* Weisse Flamme Gothic/Whale Visual Pass v1 */
     body::before {{ content:""; position:fixed; inset:0; pointer-events:none; z-index:-1; background:radial-gradient(circle at 50% 0%,rgba(214,168,79,.12),transparent 34%), linear-gradient(90deg,rgba(0,0,0,.58),rgba(0,0,0,.12) 22%,rgba(0,0,0,.12) 78%,rgba(0,0,0,.62)); }}
     .app-shell {{ grid-template-columns:286px minmax(0,1fr); }}
-    .sidebar {{ background-color:#100b08; background-image:linear-gradient(180deg,rgba(26,13,8,.34),rgba(9,7,6,.47)),url("{_asset('sidebar_panel_warm.webp')}"); background-position:center center,center center; background-size:100% 100%,100% 100%; background-repeat:no-repeat,no-repeat; border-right:1px solid rgba(214,168,79,.48); box-shadow:22px 0 58px rgba(0,0,0,.58), inset -1px 0 0 rgba(255,216,140,.08); }}
+    .sidebar {{ background:linear-gradient(180deg,rgba(33,15,10,.84),rgba(12,8,8,.92)); border-right:1px solid rgba(214,168,79,.32); box-shadow:22px 0 58px rgba(0,0,0,.52), inset -1px 0 0 rgba(255,216,140,.05); }}
     .brand {{ justify-content:center; flex-direction:column; text-align:center; gap:9px; padding:10px 10px 22px; margin-bottom:14px; }}
     .brand-mark {{ width:108px; height:108px; border-radius:24px; padding:9px; background:radial-gradient(circle at 50% 28%,rgba(214,168,79,.22),rgba(13,8,8,.78)); border:1px solid rgba(214,168,79,.42); box-shadow:0 18px 38px rgba(0,0,0,.42), inset 0 0 0 1px rgba(255,222,150,.06); }}
     .brand-mark img {{ width:100%; height:100%; object-fit:contain; }}
@@ -5073,41 +4802,20 @@ function refreshNeedWeaponPicker(source) {{
   picker.selectedIndex = 0;
 }}
 
-function canonicalLootSlot(value) {{
-  const raw = (value || '').toString().toLowerCase().trim();
-  if (!raw) return '';
-  if (raw.includes('waffe') || raw.includes('weapon') || raw.includes('schwert') || raw.includes('dolch') || raw.includes('bogen') || raw.includes('armbrust') || raw.includes('stab') || raw.includes('kugel')) return 'waffe';
-  if (raw.includes('fähigkeitskern') || raw.includes('faehigkeitskern') || raw.includes('skill core') || raw === 'kern') return 'fähigkeitskern';
-  if (raw.includes('helm') || raw.includes('hut') || raw.includes('haube') || raw.includes('head')) return 'helm';
-  if (raw.includes('brust') || raw.includes('rüstung') || raw.includes('ruestung') || raw.includes('robe') || raw.includes('chest')) return 'brust';
-  if (raw.includes('hose') || raw.includes('bein') || raw.includes('pants')) return 'hose';
-  if (raw.includes('handschuh') || raw.includes('stulpen') || raw.includes('glove')) return 'handschuhe';
-  if (raw.includes('schuh') || raw.includes('stiefel') || raw.includes('boot')) return 'schuhe';
-  if (raw.includes('brosche') || raw.includes('brooch')) return 'brosche';
-  if (raw.includes('ohrring') || raw.includes('earring')) return 'ohrringe';
-  if (raw.includes('halskette') || raw.includes('kette') || raw.includes('necklace')) return 'kette';
-  if (raw.includes('armband') || raw.includes('armreif') || raw.includes('bracelet')) return 'armband';
-  if (raw.includes('ring') || raw.includes('band') || raw.includes('siegel') || raw.includes('spule')) return 'ring';
-  if (raw.includes('gürtel') || raw.includes('guertel') || raw.includes('belt')) return 'gürtel';
-  if (raw.includes('umhang') || raw.includes('mantel') || raw.includes('cape') || raw.includes('cloak')) return 'umhang';
-  return raw.replace(/\\s*[12]$/, '');
-}}
-
 function refreshItemPickerFilters() {{
   for (const picker of document.querySelectorAll('select.item-picker-select[data-slot-source]')) {{
     const source = document.getElementById(picker.dataset.slotSource);
-    const slot = canonicalLootSlot(source && source.value ? source.value : '');
+    const slot = (source && source.value ? source.value : '').toLowerCase();
     let visible = 0;
     for (const opt of picker.options) {{
       if (!opt.value) {{ opt.hidden = false; continue; }}
-      const optSlot = canonicalLootSlot(opt.dataset.slot || '');
-      const ok = !slot || !optSlot || optSlot === slot;
+      const optSlot = (opt.dataset.slot || '').toLowerCase();
+      const ok = !slot || !optSlot || optSlot === slot || (slot.startsWith('waffe') && optSlot.startsWith('waffe'));
       opt.hidden = !ok;
       if (ok) visible++;
     }}
     const first = picker.options[0];
-    if (first) first.textContent = slot ? (visible ? `2. Item auswählen ... (${{visible}})` : 'Keine bekannten Items für diesen Slot – Freitext nutzen') : '2. Erst Slot auswählen';
-    if (picker.value && picker.options[picker.selectedIndex] && picker.options[picker.selectedIndex].hidden) picker.selectedIndex = 0;
+    if (first) first.textContent = visible ? `Item aus Liste anklicken ... (${{visible}})` : 'Keine bekannten Items für diesen Slot – Freitext nutzen';
   }}
 }}
 document.addEventListener('change', function(ev) {{
@@ -5407,7 +5115,7 @@ def _update_ec_award_request_status(guild_id: int, request_id: str, new_status: 
 
 def _render_ec_queue_dashboard(data: dict[str, Any], current_user: Optional[dict[str, Any]] = None, msg: str = "") -> str:
     if not data.get("ok"):
-        return _html_shell("EC-Queue · Ebo Dashboard", f"<section class='panel'><h1>🌐 EC-Queue</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+        return _html_shell("EC-Queue · Weisse Flamme Dashboard", f"<section class='panel'><h1>🌐 EC-Queue</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
     snap: dict[str, Any] = data.get("snapshot") or {}
     guild_id = _safe_guild_id(data)
     rows = _ec_award_requests_for_dashboard(guild_id, limit=200) if guild_id else []
@@ -5444,12 +5152,12 @@ def _render_ec_queue_dashboard(data: dict[str, Any], current_user: Optional[dict
       {_table(['Angefragt','Status','Event','Typ','EC','Gebucht','Übersprungen','Admin','Details','Aktion'], table_rows, placeholder='EC-Queue durchsuchen…')}
     </section>
     """
-    return _html_shell("EC-Queue · Ebo Dashboard", body)
+    return _html_shell("EC-Queue · Weisse Flamme Dashboard", body)
 
 
 def _render_ec_dashboard(data: dict[str, Any]) -> str:
     if not data.get("ok"):
-        return _html_shell("Ebo Dashboard", f"<section class='panel'><h1>🪙 EC-Verlauf</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+        return _html_shell("Weisse Flamme Dashboard", f"<section class='panel'><h1>🪙 EC-Verlauf</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
     snap: dict[str, Any] = data.get("snapshot") or {}
     names = _profile_name_map(snap)
     txs = _ec_transactions(snap)
@@ -5536,7 +5244,7 @@ def _render_ec_dashboard(data: dict[str, Any]) -> str:
     <section class="panel" id="recent"><h2>🧾 Letzte EC-Buchungen</h2>{_table(['Zeit','Spieler','Betrag','Typ','Grund','Quelle'], recent_rows, placeholder='Buchungen durchsuchen…')}</section>
     <section class="panel" id="balances"><h2>🪙 Alle EC-Konten</h2>{_table(['Spieler','EC'], balance_rows, placeholder='EC-Konten durchsuchen…')}</section>
     """
-    return _html_shell("EC-Verlauf · Ebo Dashboard", body)
+    return _html_shell("EC-Verlauf · Weisse Flamme Dashboard", body)
 
 
 
@@ -5689,7 +5397,7 @@ def _activity_analytics(snap: dict[str, Any]) -> dict[str, Any]:
 
 def _render_activity_analytics(data: dict[str, Any]) -> str:
     if not data.get("ok"):
-        return _html_shell("Analytics · Ebo Dashboard", f"<section class='panel'><h1>📈 Analytics</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+        return _html_shell("Analytics · Weisse Flamme Dashboard", f"<section class='panel'><h1>📈 Analytics</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
     snap: dict[str, Any] = data.get("snapshot") or {}
     act = _activity_analytics(snap)
     base = _analytics_from_snapshot(snap)
@@ -5774,7 +5482,7 @@ def _render_activity_analytics(data: dict[str, Any]) -> str:
     <section class="panel"><h2>📅 Events im Vergleich</h2>{_table(['Event','Zeit','Zusagen','Vielleicht','Nein','Nicht abgestimmt','Antwortquote'], event_rows[:200], placeholder='Events durchsuchen…')}</section>
     <section class="panel" id="voice"><h2>🎙️ Voice-Zeit</h2>{_table(['Spieler','Voice-Zeit','Sessions','zuletzt'], voice_rows[:120], placeholder='Voice durchsuchen…')}</section>
     """
-    return _html_shell("Analytics · Ebo Dashboard", body)
+    return _html_shell("Analytics · Weisse Flamme Dashboard", body)
 
 
 
@@ -5797,7 +5505,7 @@ def _source_health_rows(snap: dict[str, Any]) -> list[list[Any]]:
 
 def _render_settings_dashboard(data: dict[str, Any]) -> str:
     if not data.get("ok"):
-        return _html_shell("Ebo Dashboard", f"<section class='panel'><h1>⚙️ Einstellungen</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+        return _html_shell("Weisse Flamme Dashboard", f"<section class='panel'><h1>⚙️ Einstellungen</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
     snap: dict[str, Any] = data.get("snapshot") or {}
     guild = snap.get("guild") or {}
     settings = snap.get("settings") or {}
@@ -5870,12 +5578,12 @@ def _render_settings_dashboard(data: dict[str, Any]) -> str:
     <section class="panel"><h2>🎭 Rollen</h2>{_table(['Quelle','Setting','Rolle','ID'], role_rows, placeholder='Rollen durchsuchen…')}</section>
     <section class="panel"><h2>🔧 Erkannte Einstellungen</h2>{_table(['Quelle','Key','Wert'], setting_rows, placeholder='Settings durchsuchen…')}</section>
     """
-    return _html_shell("Einstellungen · Ebo Dashboard", body, nav_mode="admin")
+    return _html_shell("Einstellungen · Weisse Flamme Dashboard", body, nav_mode="admin")
 
 
 def _render_audit_dashboard(data: dict[str, Any]) -> str:
     if not data.get("ok"):
-        return _html_shell("Ebo Dashboard", f"<section class='panel'><h1>🧾 Audit</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+        return _html_shell("Weisse Flamme Dashboard", f"<section class='panel'><h1>🧾 Audit</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
     snap: dict[str, Any] = data.get("snapshot") or {}
     audit = snap.get("audit") or {}
     logs = [x for x in (audit.get("recent_logs") or []) if isinstance(x, dict)]
@@ -5901,12 +5609,12 @@ def _render_audit_dashboard(data: dict[str, Any]) -> str:
     <section class="panel"><h2>Akteure als Tabelle</h2>{_table(['Actor ID','Anzahl'], actor_rows, placeholder='Akteure durchsuchen…')}</section>
     <section class="panel" id="logs"><h2>Letzte Audit-Einträge</h2>{_table(['Zeit','Aktion','Actor','Zusammenfassung'], log_rows, placeholder='Audit durchsuchen…')}</section>
     """
-    return _html_shell("Audit · Ebo Dashboard", body, nav_mode="admin")
+    return _html_shell("Audit · Weisse Flamme Dashboard", body, nav_mode="admin")
 
 
 def _render_system_dashboard(data: dict[str, Any]) -> str:
     if not data.get("ok"):
-        return _html_shell("Ebo Dashboard", f"<section class='panel'><h1>🛠️ System</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+        return _html_shell("Weisse Flamme Dashboard", f"<section class='panel'><h1>🛠️ System</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
     snap: dict[str, Any] = data.get("snapshot") or {}
     storage = snap.get("storage") or {}
     guild = snap.get("guild") or {}
@@ -5931,7 +5639,7 @@ def _render_system_dashboard(data: dict[str, Any]) -> str:
     <section class="panel"><h2>Guild</h2>{_table(['Key','Wert'], guild_rows, placeholder='Guild durchsuchen…')}</section>
     <section class="panel"><h2>JSON-Quellen</h2>{_table(['Key','Datei','vorhanden','Status','Bytes','Geändert'], source_rows, placeholder='Quellen durchsuchen…')}</section>
     """
-    return _html_shell("System · Ebo Dashboard", body, nav_mode="admin")
+    return _html_shell("System · Weisse Flamme Dashboard", body, nav_mode="admin")
 
 
 
@@ -6148,7 +5856,7 @@ def _member_center_payload(data: dict[str, Any]) -> dict[str, Any]:
 
 def _render_members_dashboard(data: dict[str, Any]) -> str:
     if not data.get("ok"):
-        return _html_shell("Mitglieder · Ebo Dashboard", f"<section class='panel'><h1>👥 Mitglieder</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+        return _html_shell("Mitglieder · Weisse Flamme Dashboard", f"<section class='panel'><h1>👥 Mitglieder</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
     payload = _member_center_payload(data)
     rows = payload.get("rows") or []
 
@@ -6204,11 +5912,11 @@ def _render_members_dashboard(data: dict[str, Any]) -> str:
     <section class="panel"><details class="soft-details"><summary><strong>⚠️ Prüfliste optional anzeigen</strong> <span class="muted">({len(problem_rows)} Einträge)</span></summary><p class="muted">Auffällige Mitglieder aus Profil-/EC-/Need-Daten, Attendance-Historie, Loot-Verlauf und internen Leitungsnotizen.</p>{_table(['Spieler','Leitung','Attendance','EC','Hinweis','Letzte Aktivität'], problem_rows, placeholder='Prüfliste durchsuchen…')}</details></section>
     <section class="panel"><h2>👥 Alle Mitglieder</h2>{_table(['Name','Ingame','Rolle','GS','EC','Needs M/S','Anwesenheit','Review-Zähler','Voice','Loot/EC','Leitung','Hinweise','Loot'], member_rows, placeholder='Mitglieder durchsuchen…')}</section>
     """
-    return _html_shell("Mitgliederzentrale · Ebo Dashboard", body)
+    return _html_shell("Mitgliederzentrale · Weisse Flamme Dashboard", body)
 
 def _render_needs_dashboard(data: dict[str, Any]) -> str:
     if not data.get("ok"):
-        return _html_shell("Needs · Ebo Dashboard", f"<section class='panel'><h1>🎁 Needs</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+        return _html_shell("Needs · Weisse Flamme Dashboard", f"<section class='panel'><h1>🎁 Needs</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
     snap: dict[str, Any] = data.get("snapshot") or {}
     ins = _insights(snap)
     need_ins = ins.get("needs") if isinstance(ins.get("needs"), dict) else {}
@@ -6240,12 +5948,12 @@ def _render_needs_dashboard(data: dict[str, Any]) -> str:
     <section class="panel"><h2>🧹 Mitglieder ohne Needliste</h2>{_table(['Spieler','Rolle','GS'], without_rows, placeholder='Ohne Needliste durchsuchen…')}</section>
     <section class="panel"><h2>Alle Need-Einträge</h2>{_table(['Spieler','Main','Secondary','Main-Needs','Secondary-Needs'], all_rows, placeholder='Need-Einträge durchsuchen…')}</section>
     """
-    return _html_shell("Needs · Ebo Dashboard", body)
+    return _html_shell("Needs · Weisse Flamme Dashboard", body)
 
 
 def _render_loot_dashboard(data: dict[str, Any]) -> str:
     if not data.get("ok"):
-        return _html_shell("Loot · Ebo Dashboard", f"<section class='panel'><h1>🎁 Loot</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+        return _html_shell("Loot · Weisse Flamme Dashboard", f"<section class='panel'><h1>🎁 Loot</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
     snap: dict[str, Any] = data.get("snapshot") or {}
     ins = _insights(snap)
     loot_ins = ins.get("loot") if isinstance(ins.get("loot"), dict) else {}
@@ -6259,7 +5967,7 @@ def _render_loot_dashboard(data: dict[str, Any]) -> str:
             continue
         leader = _auction_leader_or_roll_text(a, snap)
         _, count_value, _ = _auction_count_label(a)
-        row = [_auction_link(a.get("auction_id"), a.get("item_name"), a), _phase_label(a), _loot_effective_status_label(a), count_value, leader, _member_link(a.get("winner_user_id"), _snapshot_display_name(snap, a.get("winner_user_id"), a.get("winner_name"))) if a.get("winner_user_id") else "—", _auction_timer_text(a)]
+        row = [_auction_link(a.get("auction_id"), a.get("item_name")), _phase_label(a), _loot_effective_status_label(a), count_value, leader, _member_link(a.get("winner_user_id"), _snapshot_display_name(snap, a.get("winner_user_id"), a.get("winner_name"))) if a.get("winner_user_id") else "—", _auction_timer_text(a)]
         if _loot_is_active(a):
             active_rows.append(row)
         else:
@@ -6291,7 +5999,7 @@ def _render_loot_dashboard(data: dict[str, Any]) -> str:
     <section class="panel"><h2>🟢 Aktive Auktionen</h2>{_table(['Item','Bereich','Status','Gebote/Würfe','Führung/Wurf','Gewinner','Timer'], active_rows, placeholder='Aktive Auktionen durchsuchen…')}</section>
     <section class="panel"><h2>📜 Auktionshistorie</h2>{_table(['Item','Bereich','Status','Gebote/Würfe','Führung/Wurf','Gewinner','Timer'], closed_rows[:250], placeholder='Auktionshistorie durchsuchen…')}</section>
     """
-    return _html_shell("Loot · Ebo Dashboard", body)
+    return _html_shell("Loot · Weisse Flamme Dashboard", body)
 
 
 
@@ -6766,7 +6474,7 @@ def _loot_check_payload_from_snapshot(snap: dict[str, Any], item_query: str = ""
 
 def _render_loot_check(data: dict[str, Any], item_query: str = "") -> str:
     if not data.get("ok"):
-        return _html_shell("Truhencheck · Ebo Dashboard", f"<section class='panel'><h1>🔎 Truhencheck</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+        return _html_shell("Truhencheck · Weisse Flamme Dashboard", f"<section class='panel'><h1>🔎 Truhencheck</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
     snap: dict[str, Any] = data.get("snapshot") or {}
     check = _loot_check_payload_from_snapshot(snap, item_query)
     names = _profile_name_map(snap)
@@ -6794,7 +6502,7 @@ def _render_loot_check(data: dict[str, Any], item_query: str = "") -> str:
     for a in check.get("auction_matches") or []:
         aid = a.get("auction_id")
         auction_rows.append([
-            _auction_link(aid, a.get("item"), a.get("raw") or a) if aid else a.get("item"),
+            _auction_link(aid, a.get("item")) if aid else a.get("item"),
             a.get("score") if q else "—",
             a.get("mode"),
             a.get("status_label") or _loot_status_label(a.get("status")),
@@ -6822,7 +6530,7 @@ def _render_loot_check(data: dict[str, Any], item_query: str = "") -> str:
     <section class="panel"><h2>🎯 Need-Treffer</h2>{_table(['Item','Match','Main','Main-Spieler','Second','Second-Spieler'], need_rows, placeholder='Need-Treffer durchsuchen…')}</section>
     <section class="panel"><h2>🏷️ Passende Auktionen</h2>{_table(['Item','Match','Bereich','Status','Gebote','Führend','Gewinner','Ende','Nächster Schritt'], auction_rows, placeholder='Auktionen durchsuchen…')}</section>
     """
-    return _html_shell("Truhencheck · Ebo Dashboard", body)
+    return _html_shell("Truhencheck · Weisse Flamme Dashboard", body)
 
 
 def _loot_catalog_items(snap: dict[str, Any], limit: int = 800) -> list[dict[str, str]]:
@@ -6859,21 +6567,6 @@ def _loot_catalog_items(snap: dict[str, Any], limit: int = 800) -> list[dict[str
         for row in obj.get("items") or []:
             if isinstance(row, dict):
                 add(row.get("raw_item_name") or row.get("item_name") or row.get("item") or row.get("new_item") or row.get("old_item") or row, row.get("slot") or row.get("slot_name"))
-    if query_items is not None and _item_catalog_available():
-        try:
-            for catalog_item in query_items(limit=min(max(int(limit), 200), 500), offset=0):  # type: ignore[misc]
-                if not isinstance(catalog_item, dict):
-                    continue
-                name = str(catalog_item.get("name") or "").strip()
-                if not name:
-                    continue
-                key = _loot_key(name)
-                row = found.setdefault(key, {"name": name, "slot": str(catalog_item.get("sub_category") or catalog_item.get("main_category") or "")})
-                row["catalog_item_id"] = int(catalog_item.get("id") or 0)
-                row["catalog_source_item_id"] = str(catalog_item.get("source_item_id") or "")
-                row["catalog_source_url"] = str(catalog_item.get("source_url") or "")
-        except Exception:
-            pass
     items = sorted(found.values(), key=lambda x: x.get("name", "").lower())
     return items[:limit]
 
@@ -6882,78 +6575,27 @@ def _loot_catalog_item_names(snap: dict[str, Any], limit: int = 650) -> list[str
     return [x.get("name", "") for x in _loot_catalog_items(snap, limit=limit) if x.get("name")]
 
 
-def _loot_picker_slot_key(item: dict[str, Any]) -> str:
-    """Einheitlicher Slot-Schlüssel für den zweistufigen Drop-Picker."""
-    raw = " ".join([
-        str(item.get("slot") or ""),
-        str(item.get("name") or ""),
-        str(item.get("main_category") or ""),
-        str(item.get("sub_category") or ""),
-    ]).lower()
-    if any(x in raw for x in ("waffe", "weapon", "schwert", "dolch", "bogen", "armbrust", "stab", "kugel")):
-        return "Waffe"
-    if any(x in raw for x in ("fähigkeitskern", "faehigkeitskern", "skill core")):
-        return "Fähigkeitskern"
-    mapping = [
-        ("Helm", ("helm", "hut", "haube", "head")),
-        ("Brust", ("brust", "rüstung", "ruestung", "robe", "chest")),
-        ("Hose", ("hose", "beinschutz", "pants")),
-        ("Handschuhe", ("handschuh", "stulpen", "glove")),
-        ("Schuhe", ("schuh", "stiefel", "boot")),
-        ("Brosche", ("brosche", "brooch")),
-        ("Ohrringe", ("ohrring", "earring")),
-        ("Kette", ("halskette", "kette", "necklace")),
-        ("Armband", ("armband", "armreif", "bracelet")),
-        ("Ring", ("ring", "band", "siegel", "spule")),
-        ("Gürtel", ("gürtel", "guertel", "belt")),
-        ("Umhang", ("umhang", "mantel", "cape", "cloak")),
-    ]
-    for label, hints in mapping:
-        if any(h in raw for h in hints):
-            return label
-    return str(item.get("slot") or item.get("sub_category") or item.get("main_category") or "")
-
-
-def _loot_drop_slot_select_html(select_id: str, *, required: bool = True) -> str:
-    required_attr = " required" if required else ""
-    groups = []
-    for title, slots in _NEED_SLOT_GROUPS:
-        options = "".join(f'<option value="{_e(slot)}">{_e(slot)}</option>' for slot in slots)
-        groups.append(f'<optgroup label="{_e(title)}">{options}</optgroup>')
-    return (
-        f'<select id="{_e(select_id)}" name="slot" class="need-slot-select"{required_attr} '
-        f'onchange="refreshItemPickerFilters()">'
-        f'<option value="">1. Slot auswählen</option>{"".join(groups)}</select>'
-    )
-
-
 def _loot_item_picker_html(snap: dict[str, Any], *, input_id: str, name: str = "item", required: bool = True, placeholder: str = "Item auswählen oder tippen", slot_select_id: str = "") -> str:
     items = _loot_catalog_items(snap)
     datalist_id = f"{input_id}-list"
-    hidden_id = f"{input_id}-catalog-id"
     required_attr = " required" if required else ""
     options = "".join(f'<option value="{_e(item.get("name"))}"></option>' for item in items)
-    select_options = "".join(
-        f'<option value="{_e(item.get("name"))}" data-slot="{_e(_loot_picker_slot_key(item))}" data-catalog-id="{_e(item.get("catalog_item_id") or 0)}">'
-        f'{_e(item.get("name"))}{(" · " + _e(item.get("slot"))) if item.get("slot") else ""}</option>'
-        for item in items[:500]
-    )
+    select_options = "".join(f'<option value="{_e(item.get("name"))}" data-slot="{_e(item.get("slot"))}">{_e(item.get("name"))}{(" · " + _e(item.get("slot"))) if item.get("slot") else ""}</option>' for item in items[:500])
     filter_attr = f' data-slot-source="{_e(slot_select_id)}"' if slot_select_id else ""
     select = ""
     if items:
         select = (
             f'<select class="item-picker-select"{filter_attr} '
-            f'onchange="var el=document.getElementById(\'{_e(input_id)}\'); var hid=document.getElementById(\'{_e(hidden_id)}\'); '
-            f'if(el && this.value) el.value=this.value; if(hid) hid.value=this.options[this.selectedIndex].dataset.catalogId || 0; this.selectedIndex=0;">'
+            f'onchange="var el=document.getElementById(\'{_e(input_id)}\'); '
+            f'if(el && this.value) el.value=this.value; this.selectedIndex=0;">'
             f'<option value="">Item aus Liste anklicken ...</option>{select_options}</select>'
         )
     return (
-        f'{select}<input type="hidden" id="{_e(hidden_id)}" name="catalog_item_id" value="0">'
-        f'<input id="{_e(input_id)}" list="{_e(datalist_id)}" name="{_e(name)}"{required_attr} '
-        f'oninput="var hid=document.getElementById(\'{_e(hidden_id)}\'); if(hid) hid.value=0;" '
+        f'{select}<input id="{_e(input_id)}" list="{_e(datalist_id)}" name="{_e(name)}"{required_attr} '
         f'placeholder="{_e(placeholder)}" autocomplete="off">'
         f'<datalist id="{_e(datalist_id)}">{options}</datalist>'
-        f'<small class="muted">{len(items)} bekannte Items. Auswahl aus der Liste speichert die feste Datenbank-ID; Freitext bleibt als Fallback möglich.</small>'
+        f'<small class="muted">{len(items)} bekannte Items aus Online-Datenbank/Needs/Auktionen. '
+        f'Bei Slot-Auswahl wird die Klickliste gefiltert.</small>'
     )
 
 
@@ -7014,7 +6656,7 @@ def _need_item_slot_matches(item_slot: str, target_slot: str, item_name: str = "
     if item_slot_l == target_l:
         return True
     if target_l.startswith("waffe"):
-        return item_slot_l.startswith("waffe") or bool(_weapon_type_from_text(item_slot)) or bool(_weapon_type_from_text(item_name))
+        return item_slot_l.startswith("waffe") or bool(_weapon_type_from_text(item_name))
     if target_l.startswith("ring"):
         return item_slot_l.startswith("ring") or "ring" in name_l
     if target_l in item_slot_l or item_slot_l in target_l:
@@ -7040,83 +6682,53 @@ def _need_item_slot_matches(item_slot: str, target_slot: str, item_name: str = "
 
 
 def _need_slot_picker_html(snap: dict[str, Any], *, input_id: str, slot: str, name: str = "item_text", required: bool = False, placeholder: str = "Item auswählen oder tippen") -> str:
-    """Kompakter Slot-Picker mit stabiler Item-Katalog-ID.
+    """Kompakter Slot-Picker.
 
-    Eine Auswahl aus dem Dropdown speichert zusätzlich ``item_catalog_id``. Bei
-    Freitext wird die ID bewusst auf 0 gesetzt und bleibt nur ein Legacy-Fallback.
+    Waffen: zuerst Waffenart wählen, danach werden rechts nur passende Waffen angezeigt.
+    Andere Slots: direkt passende Items für den Slot anzeigen.
     """
     items = _loot_catalog_items(snap)
     slot_kind = _need_slot_kind(slot)
     required_attr = " required" if required else ""
     datalist_id = f"{input_id}-list"
-    hidden_id = f"{input_id}-catalog-id"
+    # Kandidaten stark auf den Slot begrenzen; wenn keine Treffer, fallback auf alle bekannten Items.
     filtered = [it for it in items if _need_item_slot_matches(it.get("slot", ""), slot, it.get("name", ""))]
     if not filtered:
         filtered = items
     options = "".join(f'<option value="{_e(it.get("name"))}"></option>' for it in filtered[:650])
-
-    input_html = (
-        f'<input type="hidden" id="{_e(hidden_id)}" name="item_catalog_id" value="0">'
-        f'<input id="{_e(input_id)}" list="{_e(datalist_id)}" name="{_e(name)}"{required_attr} '
-        f'oninput="var hid=document.getElementById(\'{_e(hidden_id)}\'); if(hid) hid.value=0;" '
-        f'placeholder="{_e(placeholder)}" autocomplete="off">'
-        f'<datalist id="{_e(datalist_id)}">{options}</datalist>'
-    )
-
     if slot_kind == "weapon":
-        weapon_opts = "".join(f'<option value="{_e(w)}">{_e(w)}</option>' for w in _WEAPON_TYPES)
-        select_options: list[str] = []
+        # Waffenarten sind der erste Klick. Die Itemliste rechts wird per JS gefiltert.
+        weapon_opts = ''.join(f'<option value="{_e(w)}">{_e(w)}</option>' for w in _WEAPON_TYPES)
+        select_options = []
         for it in filtered[:650]:
-            name_val = str(it.get("name") or "")
+            name_val = it.get("name") or ""
             wt = _weapon_type_from_text(name_val)
             if not wt and it.get("slot") and str(it.get("slot")).lower().startswith("waffe"):
                 wt = ""
-            select_options.append(
-                f'<option value="{_e(name_val)}" data-weapon="{_e(wt)}" '
-                f'data-catalog-id="{_e(it.get("catalog_item_id") or 0)}">'
-                f'{_e(name_val)}{(" · " + _e(wt)) if wt else ""}</option>'
-            )
-        choose_js = (
-            f"var opt=this.options[this.selectedIndex];"
-            f"var el=document.getElementById('{_e(input_id)}');"
-            f"var hid=document.getElementById('{_e(hidden_id)}');"
-            "if(el && this.value) el.value=this.value;"
-            "if(hid) hid.value=(opt && opt.dataset.catalogId) || 0;"
-            "this.selectedIndex=0;"
-        )
+            select_options.append(f'<option value="{_e(name_val)}" data-weapon="{_e(wt)}">{_e(name_val)}{(" · " + _e(wt)) if wt else ""}</option>')
         return (
             f'<div class="need-two-step-picker" data-need-picker="weapon">'
             f'<select class="weapon-type-picker" name="weapon_type" onchange="refreshNeedWeaponPicker(this)">'
             f'<option value="">1. Waffenart wählen</option>{weapon_opts}</select>'
-            f'<select class="item-picker-select weapon-item-picker" onchange="{_e(choose_js)}">'
+            f'<select class="item-picker-select weapon-item-picker" onchange="var el=document.getElementById(\'{_e(input_id)}\'); if(el && this.value) el.value=this.value; this.selectedIndex=0;">'
             f'<option value="">2. Item rechts auswählen ...</option>{"".join(select_options)}</select>'
-            f'{input_html}'
-            f'<small class="muted">Erst Waffenart, dann Item. Dropdown-Auswahl speichert die feste Datenbank-ID.</small>'
+            f'<input id="{_e(input_id)}" list="{_e(datalist_id)}" name="{_e(name)}"{required_attr} placeholder="{_e(placeholder)}" autocomplete="off">'
+            f'<datalist id="{_e(datalist_id)}">{options}</datalist>'
+            f'<small class="muted">Erst Waffenart, dann passendes Item. Freitext bleibt möglich.</small>'
             f'</div>'
         )
-
-    select_options = "".join(
-        f'<option value="{_e(it.get("name"))}" data-catalog-id="{_e(it.get("catalog_item_id") or 0)}">{_e(it.get("name"))}</option>'
-        for it in filtered[:650]
-    )
-    choose_js = (
-        f"var opt=this.options[this.selectedIndex];"
-        f"var el=document.getElementById('{_e(input_id)}');"
-        f"var hid=document.getElementById('{_e(hidden_id)}');"
-        "if(el && this.value) el.value=this.value;"
-        "if(hid) hid.value=(opt && opt.dataset.catalogId) || 0;"
-        "this.selectedIndex=0;"
-    )
+    select_options = ''.join(f'<option value="{_e(it.get("name"))}">{_e(it.get("name"))}</option>' for it in filtered[:650])
     return (
-        f'<select class="item-picker-select" onchange="{_e(choose_js)}">'
+        f'<select class="item-picker-select" onchange="var el=document.getElementById(\'{_e(input_id)}\'); if(el && this.value) el.value=this.value; this.selectedIndex=0;">'
         f'<option value="">Passendes Item für {_e(slot)} auswählen ... ({len(filtered)})</option>{select_options}</select>'
-        f'{input_html}'
-        f'<small class="muted">{len(filtered)} Treffer. Dropdown-Auswahl speichert die feste Datenbank-ID.</small>'
+        f'<input id="{_e(input_id)}" list="{_e(datalist_id)}" name="{_e(name)}"{required_attr} placeholder="{_e(placeholder)}" autocomplete="off">'
+        f'<datalist id="{_e(datalist_id)}">{options}</datalist>'
+        f'<small class="muted">{len(filtered)} bekannte Treffer für diesen Slot. Freitext bleibt möglich.</small>'
     )
 
 def _render_loot_center(data: dict[str, Any], request: Optional[Request] = None, msg: str = "") -> str:
     if not data.get("ok"):
-        return _html_shell("Loot · Ebo Dashboard", f"<section class='panel'><h1>🎁 Loot</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+        return _html_shell("Loot · Weisse Flamme Dashboard", f"<section class='panel'><h1>🎁 Loot</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
     snap: dict[str, Any] = data.get("snapshot") or {}
     names = _profile_name_map(snap)
     center = _loot_center_payload_from_snapshot(snap)
@@ -7135,7 +6747,7 @@ def _render_loot_center(data: dict[str, Any], request: Optional[Request] = None,
     for a in center["next_actions"][:80]:
         aid = a.get("auction_id")
         action_rows.append([
-            _auction_link(aid, a.get("item"), a.get("raw") or a) if aid else a.get("item"),
+            _auction_link(aid, a.get("item")) if aid else a.get("item"),
             a.get("mode"),
             a.get("status_label") or _loot_status_label(a.get("status")),
             (_auction_count_label(a.get("raw") or {})[1] if isinstance(a.get("raw"), dict) else a.get("bid_count")),
@@ -7149,7 +6761,7 @@ def _render_loot_center(data: dict[str, Any], request: Optional[Request] = None,
     for a in center["active"]:
         aid = a.get("auction_id")
         active_rows.append([
-            _auction_link(aid, a.get("item"), a.get("raw") or a) if aid else a.get("item"),
+            _auction_link(aid, a.get("item")) if aid else a.get("item"),
             a.get("mode"),
             a.get("status_label") or _loot_status_label(a.get("status")),
             (_auction_count_label(a.get("raw") or {})[1] if isinstance(a.get("raw"), dict) else a.get("bid_count")),
@@ -7163,7 +6775,7 @@ def _render_loot_center(data: dict[str, Any], request: Optional[Request] = None,
     for a in center["handover"]:
         aid = a.get("auction_id")
         handover_rows.append([
-            _auction_link(aid, a.get("item"), a.get("raw") or a) if aid else a.get("item"),
+            _auction_link(aid, a.get("item")) if aid else a.get("item"),
             _loot_winner_cell(a.get("raw") or {}, names),
             a.get("leader"),
             (_auction_timer_text(a.get("raw") or {}) if isinstance(a.get("raw"), dict) else _dt(a.get("ends_at"))),
@@ -7174,7 +6786,7 @@ def _render_loot_center(data: dict[str, Any], request: Optional[Request] = None,
     for a in center["no_bid"][:80]:
         aid = a.get("auction_id")
         no_bid_rows.append([
-            _auction_link(aid, a.get("item"), a.get("raw") or a) if aid else a.get("item"),
+            _auction_link(aid, a.get("item")) if aid else a.get("item"),
             a.get("mode"),
             f"{a.get('main_need_count', 0)} / {a.get('secondary_need_count', 0)}",
             (_auction_timer_text(a.get("raw") or {}) if isinstance(a.get("raw"), dict) else _dt(a.get("ends_at"))),
@@ -7196,7 +6808,7 @@ def _render_loot_center(data: dict[str, Any], request: Optional[Request] = None,
     for a in center["history"][:250]:
         aid = a.get("auction_id")
         history_rows.append([
-            _auction_link(aid, a.get("item"), a.get("raw") or a) if aid else a.get("item"),
+            _auction_link(aid, a.get("item")) if aid else a.get("item"),
             a.get("mode"),
             _loot_status_label(a.get("status")),
             (_auction_count_label(a.get("raw") or {})[1] if isinstance(a.get("raw"), dict) else a.get("bid_count")),
@@ -7215,16 +6827,14 @@ def _render_loot_center(data: dict[str, Any], request: Optional[Request] = None,
             <form method="post" action="/admin/loot/drop" style="display:grid;gap:10px;">
               <h3>📦 Loot gedroppt</h3>
               <input type="hidden" name="drop_type" value="loot_drop">
-              <label>1. Slot<br>{_loot_drop_slot_select_html("loot-drop-slot")}</label>
-              <label>2. Item dieses Slots<br>{_loot_item_picker_html(snap, input_id="loot-drop-item", placeholder="Item des gewählten Slots", slot_select_id="loot-drop-slot")}</label>
+              <label>Item aus Loot-Katalog<br>{_loot_item_picker_html(snap, input_id="loot-drop-item", placeholder="z. B. Aridus Stab")}</label>
               <button class="btn" type="submit" onclick="return confirm('Loot-Drop an den Bot senden?');">Loot-Drop erstellen</button>
-              <p class="muted">Wie im Discord-Menü: erst Slot, dann Item. Bot prüft Main-Need → Second-Need → freie Auktion.</p>
+              <p class="muted">Bot prüft Main-Need → Second-Need → freie Auktion.</p>
             </form>
             <form method="post" action="/admin/loot/drop" style="display:grid;gap:10px;">
               <h3>🧹 Müll gedroppt</h3>
               <input type="hidden" name="drop_type" value="junk_drop">
-              <label>1. Slot<br>{_loot_drop_slot_select_html("junk-drop-slot")}</label>
-              <label>2. Item dieses Slots<br>{_loot_item_picker_html(snap, input_id="junk-drop-item", placeholder="Item des gewählten Slots", slot_select_id="junk-drop-slot")}</label>
+              <label>Freier Itemname<br><input name="item" required placeholder="z. B. Restitem aus Truhe" style="width:100%;padding:12px;border-radius:12px;border:1px solid rgba(255,255,255,.16);background:rgba(0,0,0,.22);color:inherit"></label>
               <button class="btn" type="submit" onclick="return confirm('Müll-Drop an den Bot senden?');">Müll-Drop erstellen</button>
               <p class="muted">Bot erstellt ein kostenloses Müll-/Würfelitem.</p>
             </form>
@@ -7251,7 +6861,7 @@ def _render_loot_center(data: dict[str, Any], request: Optional[Request] = None,
     <section class="panel"><h2>🎯 Need-Spieler pro Item</h2><p class="muted">Damit sieht man direkt, ob ein Drop Main-/Second-Need-Spieler hat und ob schon eine Auktion dazu läuft.</p>{_table(['Item','Main','Main-Spieler','Second','Second-Spieler','aktive Auktionen'], need_rows, placeholder='Need-Item suchen…')}</section>
     <section class="panel"><h2>📜 Auktionshistorie</h2>{_table(['Item','Bereich','Status','Gebote/Würfe','Führung/Wurf','Gewinner','Timer'], history_rows, placeholder='Historie durchsuchen…')}</section>
     """
-    return _html_shell("Loot · Ebo Dashboard", body)
+    return _html_shell("Loot · Weisse Flamme Dashboard", body)
 
 
 # ---------------------------------------------------------------------------
@@ -7451,7 +7061,6 @@ def _loot_history_payload_from_snapshot(snap: dict[str, Any], guild_id: int = 0)
                 "amount": amount,
                 "created_at": btime,
                 "status": bstatus,
-                "raw": a,
             }
             bid_rows.append(bid_entry)
             if uid:
@@ -7492,7 +7101,7 @@ def _loot_result_text(row: dict[str, Any]) -> str:
 
 def _render_loot_history(data: dict[str, Any]) -> str:
     if not data.get("ok"):
-        return _html_shell("Loot-Verlauf · Ebo Dashboard", f"<section class='panel'><h1>📜 Loot-Verlauf</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+        return _html_shell("Loot-Verlauf · Weisse Flamme Dashboard", f"<section class='panel'><h1>📜 Loot-Verlauf</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
     snap: dict[str, Any] = data.get("snapshot") or {}
     guild_id = _safe_guild_id(data)
     hist = _loot_history_payload_from_snapshot(snap, int(guild_id or 0))
@@ -7508,7 +7117,7 @@ def _render_loot_history(data: dict[str, Any]) -> str:
     for r in hist.get("winner_rows") or []:
         aid = r.get("auction_id")
         winner_rows.append([
-            _auction_link(aid, r.get("item"), r.get("raw") or r) if aid else r.get("item"),
+            _auction_link(aid, r.get("item")) if aid else r.get("item"),
             r.get("mode"),
             _member_link(r.get("winner_user_id"), r.get("winner_name")) if r.get("winner_user_id") else r.get("winner_name"),
             _fmt_ec(r.get("winning_amount")),
@@ -7522,7 +7131,7 @@ def _render_loot_history(data: dict[str, Any]) -> str:
         aid = b.get("auction_id")
         bid_rows.append([
             _dt(b.get("created_at")),
-            _auction_link(aid, b.get("item"), b.get("raw") or b) if aid else b.get("item"),
+            _auction_link(aid, b.get("item")) if aid else b.get("item"),
             b.get("mode"),
             _member_link(b.get("user_id"), b.get("display_name")) if b.get("user_id") else b.get("display_name"),
             _fmt_ec(b.get("amount")),
@@ -7551,7 +7160,7 @@ def _render_loot_history(data: dict[str, Any]) -> str:
             _dt(a.get("requested_at")),
             a.get("actor_name") or a.get("actor_id") or "—",
             _loot_action_type_label(a.get("action_type")),
-            _auction_link(aid, item, payload or a) if aid else item,
+            _auction_link(aid, item) if aid else item,
             _fmt_ec(a.get("amount")),
             _loot_action_status_label(a.get("status")),
             _loot_result_text(a),
@@ -7561,7 +7170,7 @@ def _render_loot_history(data: dict[str, Any]) -> str:
     for r in hist.get("auction_rows") or []:
         aid = r.get("auction_id")
         all_auction_rows.append([
-            _auction_link(aid, r.get("item"), r.get("raw") or r) if aid else r.get("item"),
+            _auction_link(aid, r.get("item")) if aid else r.get("item"),
             r.get("mode"),
             _loot_status_label(r.get("status")),
             r.get("bid_count"),
@@ -7581,7 +7190,7 @@ def _render_loot_history(data: dict[str, Any]) -> str:
     <section class="panel"><h2>📨 Dashboard-Aktionen</h2><p class="muted">Queue-Anfragen aus dem Dashboard: Bieten, Sale kaufen oder Müll-Wurf. Hilft beim Nachvollziehen, wenn etwas blockiert/fehlgeschlagen ist.</p>{_table(['Zeit','Spieler','Aktion','Item','EC','Status','Ergebnis'], action_rows, placeholder='Aktionen durchsuchen…')}</section>
     <section class="panel"><h2>📦 Alle Auktionen</h2>{_table(['Item','Bereich','Status','Gebote','Führend','Gewinner','EC','Zeit'], all_auction_rows, placeholder='Auktionen durchsuchen…')}</section>
     """
-    return _html_shell("Loot-Verlauf · Ebo Dashboard", body)
+    return _html_shell("Loot-Verlauf · Weisse Flamme Dashboard", body)
 
 
 def _loot_member_payload_from_snapshot(snap: dict[str, Any], user_id: int, guild_id: int = 0) -> dict[str, Any]:
@@ -7595,7 +7204,7 @@ def _loot_member_payload_from_snapshot(snap: dict[str, Any], user_id: int, guild
 
 def _render_member_loot_history(data: dict[str, Any], user_id: int) -> str:
     if not data.get("ok"):
-        return _html_shell("Mitglied-Loot · Ebo Dashboard", f"<section class='panel'><h1>🎁 Mitglied-Loot</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+        return _html_shell("Mitglied-Loot · Weisse Flamme Dashboard", f"<section class='panel'><h1>🎁 Mitglied-Loot</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
     snap: dict[str, Any] = data.get("snapshot") or {}
     names = _profile_name_map(snap)
     guild_id = _safe_guild_id(data)
@@ -7613,19 +7222,19 @@ def _render_member_loot_history(data: dict[str, Any], user_id: int) -> str:
     win_rows = []
     for r in payload.get("wins") or []:
         aid = r.get("auction_id")
-        win_rows.append([_auction_link(aid, r.get("item"), r.get("raw") or r) if aid else r.get("item"), r.get("mode"), _fmt_ec(r.get("winning_amount")), r.get("bid_count"), _dt(r.get("closed_at"))])
+        win_rows.append([_auction_link(aid, r.get("item")) if aid else r.get("item"), r.get("mode"), _fmt_ec(r.get("winning_amount")), r.get("bid_count"), _dt(r.get("closed_at"))])
 
     bid_rows = []
     for b in payload.get("bids") or []:
         aid = b.get("auction_id")
-        bid_rows.append([_dt(b.get("created_at")), _auction_link(aid, b.get("item"), b.get("raw") or b) if aid else b.get("item"), b.get("mode"), _fmt_ec(b.get("amount")), b.get("status")])
+        bid_rows.append([_dt(b.get("created_at")), _auction_link(aid, b.get("item")) if aid else b.get("item"), b.get("mode"), _fmt_ec(b.get("amount")), b.get("status")])
 
     action_rows = []
     for a in payload.get("actions") or []:
         p = a.get("payload") if isinstance(a.get("payload"), dict) else {}
         item = p.get("item_name") or p.get("item") or a.get("auction_id")
         aid = str(a.get("auction_id") or p.get("auction_id") or "")
-        action_rows.append([_dt(a.get("requested_at")), _loot_action_type_label(a.get("action_type")), _auction_link(aid, item, p or a) if aid else item, _fmt_ec(a.get("amount")), _loot_action_status_label(a.get("status")), _loot_result_text(a)])
+        action_rows.append([_dt(a.get("requested_at")), _loot_action_type_label(a.get("action_type")), _auction_link(aid, item) if aid else item, _fmt_ec(a.get("amount")), _loot_action_status_label(a.get("status")), _loot_result_text(a)])
 
     body = f"""
     <nav class="topnav"><a href="/member/{_e(user_id)}">← Mitglied</a><a href="/loot-history">Loot-Verlauf</a><a href="/loot">Loot</a><a href="/ec">EC</a></nav>
@@ -7635,12 +7244,12 @@ def _render_member_loot_history(data: dict[str, Any], user_id: int) -> str:
     <section class="panel"><h2>🪙 Gebote</h2>{_table(['Zeit','Item','Bereich','EC','Status'], bid_rows, placeholder='Gebote durchsuchen…')}</section>
     <section class="panel"><h2>📨 Dashboard-Aktionen</h2>{_table(['Zeit','Aktion','Item','EC','Status','Ergebnis'], action_rows, placeholder='Aktionen durchsuchen…')}</section>
     """
-    return _html_shell(f"{display} Loot · Ebo Dashboard", body)
+    return _html_shell(f"{display} Loot · Weisse Flamme Dashboard", body)
 
 
 def _render_exports_dashboard(data: dict[str, Any]) -> str:
     if not data.get("ok"):
-        return _html_shell("Exports · Ebo Dashboard", f"<section class='panel'><h1>⬇️ Exports</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+        return _html_shell("Exports · Weisse Flamme Dashboard", f"<section class='panel'><h1>⬇️ Exports</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
     snap: dict[str, Any] = data.get("snapshot") or {}
     cards = "".join([
         _card("Snapshot", data.get("id"), _dt(data.get("published_at"))),
@@ -7663,7 +7272,7 @@ def _render_exports_dashboard(data: dict[str, Any]) -> str:
     <section class="grid">{cards}</section>
     <section class="panel"><h2>Downloads</h2>{_table(['Bereich','Datei','Inhalt'], rows, searchable=False)}</section>
     """
-    return _html_shell("Exports · Ebo Dashboard", body)
+    return _html_shell("Exports · Weisse Flamme Dashboard", body)
 
 
 def _csv_response(filename: str, headers: list[str], rows: list[list[Any]]) -> Response:
@@ -7840,7 +7449,7 @@ def _fairness_analytics(snap: dict[str, Any]) -> dict[str, Any]:
 
 def _render_planning_dashboard(data: dict[str, Any]) -> str:
     if not data.get("ok"):
-        return _html_shell("Planung · Ebo Dashboard", f"<section class='panel'><h1>📅 Planung</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+        return _html_shell("Planung · Weisse Flamme Dashboard", f"<section class='panel'><h1>📅 Planung</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
     snap: dict[str, Any] = data.get("snapshot") or {}
     plan = _planning_analytics(snap)
     cards = "".join([
@@ -7876,12 +7485,12 @@ def _render_planning_dashboard(data: dict[str, Any]) -> str:
     <section class="panel"><h2>Event-Bereitschaft</h2>{_table(['Event','Zeit','Teilnehmer','Tank','Heiler','DPS','Reserve','Score','Hinweise','Voice'], event_rows, placeholder='Events durchsuchen…')}</section>
     <section class="panel"><h2>Bedarfs-Hotspots</h2><div class="split"><div><h3>Main-Needs</h3>{_table(['Item','Anzahl'], main_rows, placeholder='Main-Needs durchsuchen…')}</div><div><h3>Secondary-Needs</h3>{_table(['Item','Anzahl'], sec_rows, placeholder='Secondary-Needs durchsuchen…')}</div></div></section>
     """
-    return _html_shell("Planung · Ebo Dashboard", body)
+    return _html_shell("Planung · Weisse Flamme Dashboard", body)
 
 
 def _render_fairness_dashboard(data: dict[str, Any]) -> str:
     if not data.get("ok"):
-        return _html_shell("Fairness · Ebo Dashboard", f"<section class='panel'><h1>⚖️ Fairness</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+        return _html_shell("Fairness · Weisse Flamme Dashboard", f"<section class='panel'><h1>⚖️ Fairness</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
     snap: dict[str, Any] = data.get("snapshot") or {}
     fair = _fairness_analytics(snap)
     cards = "".join([
@@ -7916,7 +7525,7 @@ def _render_fairness_dashboard(data: dict[str, Any]) -> str:
     <section class="panel"><h2>Loot-Gewinner</h2>{_table(['Spieler','Loot','EC ausgegeben','EC aktuell','Zusagen','Voice h'], loot_rows, placeholder='Loot-Gewinner durchsuchen…')}</section>
     <section class="panel"><h2>Hohe EC-Konten</h2>{_table(['Spieler','EC','Verdient','Ausgegeben','Loot','Needs'], ec_rows, placeholder='EC durchsuchen…')}</section>
     """
-    return _html_shell("Fairness · Ebo Dashboard", body)
+    return _html_shell("Fairness · Weisse Flamme Dashboard", body)
 
 
 
@@ -8118,13 +7727,13 @@ def _member_event_rows(snap: dict[str, Any], user_id: int) -> list[list[Any]]:
         if status == "—" and any(isinstance(p, dict) and _user_id(p.get("user_id")) == uid for p in participants.get("no") or []):
             status = "❌ Abgemeldet"
         if status != "—":
-            rows.append([_member_event_title_cell(ev), _dt(ev.get("when_iso")), status])
+            rows.append([_event_link(ev.get("event_id"), ev.get("title")), _dt(ev.get("when_iso")), status])
     return rows[:80]
 
 
 def _render_member_detail(data: dict[str, Any], user_id: int, current_user: Optional[dict[str, Any]] = None) -> str:
     if not data.get("ok"):
-        return _html_shell("Ebo Dashboard", f"<section class='panel'><h1>📊 Ebo Dashboard</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+        return _html_shell("Weisse Flamme Dashboard", f"<section class='panel'><h1>📊 Weisse Flamme Dashboard</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
     snap: dict[str, Any] = data.get("snapshot") or {}
     profiles = ((snap.get("profiles") or {}).get("items") or [])
     balances = _balance_map(snap)
@@ -8162,7 +7771,7 @@ def _render_member_detail(data: dict[str, Any], user_id: int, current_user: Opti
 
     auction_rows = []
     for a in _auctions_for_user(snap, user_id, limit=80):
-        auction_rows.append([_auction_link(a.get("auction_id"), a.get("item_name"), a), a.get("status"), _phase_label(a), _fmt_ec(a.get("top_bid_amount")) if a.get("top_bid_amount") is not None else "—", _dt(a.get("ends_at"))])
+        auction_rows.append([_auction_link(a.get("auction_id"), a.get("item_name")), a.get("status"), _phase_label(a), _fmt_ec(a.get("top_bid_amount")) if a.get("top_bid_amount") is not None else "—", _dt(a.get("ends_at"))])
 
     event_rows = _member_event_rows(snap, int(user_id))
     cards = "".join([
@@ -8198,12 +7807,12 @@ def _render_member_detail(data: dict[str, Any], user_id: int, current_user: Opti
     <section class="panel"><h2>🎁 Auktionen mit aktueller Führung/Gewinn</h2>{_table(['Item','Status','Phase','Gebot','Ende'], auction_rows, placeholder='Auktionen durchsuchen…')}</section>
     <section class="panel" id="voice"><h2>🎙️ Voice-Sessions</h2>{_table(['Kanal','Rein','Raus','Minuten'], voice_rows, placeholder='Voice durchsuchen…')}</section>
     """
-    return _html_shell(f"{display} · Ebo Dashboard", body)
+    return _html_shell(f"{display} · Weisse Flamme Dashboard", body)
 
 
 def _render_event_detail(data: dict[str, Any], event_id: str) -> str:
     if not data.get("ok"):
-        return _html_shell("Ebo Dashboard", f"<section class='panel'><h1>📊 Ebo Dashboard</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+        return _html_shell("Weisse Flamme Dashboard", f"<section class='panel'><h1>📊 Weisse Flamme Dashboard</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
     snap: dict[str, Any] = data.get("snapshot") or {}
     guild_id = _safe_guild_id(data)
     event = _event_by_id(snap, event_id) or _event_stub_from_attendance_review(guild_id, event_id)
@@ -8235,7 +7844,6 @@ def _render_event_detail(data: dict[str, Any], event_id: str) -> str:
 
     body = f"""
     <nav class="topnav"><a href="/planning">← Planung</a><a href="#signups">Zusagen</a><a href="#voicecheck">Voice-Abgleich</a><a href="#maybe">Vielleicht</a><a href="#no">Abgemeldet</a></nav>
-    <style>.event-title-image{{margin-left:auto;width:min(360px,38vw);height:190px;border:1px solid rgba(214,168,79,.3);border-radius:14px;overflow:hidden;background:#070707;box-shadow:0 14px 40px rgba(0,0,0,.35)}}.event-title-image img{{width:100%;height:100%;object-fit:cover}}@media(max-width:760px){{.event-title-image{{width:100%;height:170px;margin:10px 0 0}}}}</style>
     <section class="hero">
       <div>
         <div class="eyebrow">Event · Voice-/Teilnahme-Abgleich</div>
@@ -8243,7 +7851,6 @@ def _render_event_detail(data: dict[str, Any], event_id: str) -> str:
         <p class="muted">Event-ID: {_e(event_id)} · Zeit: {_e(_dt(event.get('when_iso')))} · Snapshot: {_e(_dt(data.get('published_at')))}</p>
         {f"<p>{_e(event.get('description'))}</p>" if event.get('description') else ""}
       </div>
-      {_event_image_hero_side(event)}
       <a class="btn" href="/planning">Zurück</a>
     </section>
     <section class="grid">{cards}</section>
@@ -8262,12 +7869,12 @@ def _render_event_detail(data: dict[str, Any], event_id: str) -> str:
     <section class="panel" id="maybe"><h2>🟡 Vielleicht</h2>{_table(['Spieler','Gildenrolle'], maybe_rows, placeholder='Vielleicht durchsuchen…')}</section>
     <section class="panel" id="no"><h2>❌ Abgemeldet</h2>{_table(['Spieler','Gildenrolle'], no_rows, placeholder='Abmeldungen durchsuchen…')}</section>
     """
-    return _html_shell(f"{event.get('title') or 'Event'} · Ebo Dashboard", body)
+    return _html_shell(f"{event.get('title') or 'Event'} · Weisse Flamme Dashboard", body)
 
 
 def _render_voice_dashboard(data: dict[str, Any]) -> str:
     if not data.get("ok"):
-        return _html_shell("Ebo Dashboard", f"<section class='panel'><h1>🎙️ Voice</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+        return _html_shell("Weisse Flamme Dashboard", f"<section class='panel'><h1>🎙️ Voice</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
     snap: dict[str, Any] = data.get("snapshot") or {}
     names = _profile_name_map(snap)
     voice = snap.get("voice") or {}
@@ -8296,7 +7903,7 @@ def _render_voice_dashboard(data: dict[str, Any]) -> str:
     <section class="panel" id="users"><h2>Voice-Zeit pro Spieler</h2>{_table(['Spieler','Stunden','Sessions','letzter Join','letztes Ende'], user_rows, placeholder='Spieler durchsuchen…')}</section>
     <section class="panel" id="sessions"><h2>Letzte Sessions</h2>{_table(['Spieler','Kanal','Rein','Raus','Minuten'], session_rows, placeholder='Sessions durchsuchen…')}</section>
     """
-    return _html_shell("Voice · Ebo Dashboard", body)
+    return _html_shell("Voice · Weisse Flamme Dashboard", body)
 
 
 def _audit_filtered_logs(logs: list[dict[str, Any]], action: str = "", actor: str = "", q: str = "") -> list[dict[str, Any]]:
@@ -8320,7 +7927,7 @@ def _audit_filtered_logs(logs: list[dict[str, Any]], action: str = "", actor: st
 
 def _render_audit_dashboard(data: dict[str, Any], *, action: str = "", actor: str = "", q: str = "") -> str:
     if not data.get("ok"):
-        return _html_shell("Ebo Dashboard", f"<section class='panel'><h1>🧾 Audit</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+        return _html_shell("Weisse Flamme Dashboard", f"<section class='panel'><h1>🧾 Audit</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
     snap: dict[str, Any] = data.get("snapshot") or {}
     audit = snap.get("audit") or {}
     all_logs = [x for x in (audit.get("recent_logs") or []) if isinstance(x, dict)]
@@ -8357,369 +7964,11 @@ def _render_audit_dashboard(data: dict[str, Any], *, action: str = "", actor: st
     <section class="panel"><h2>Akteure als Tabelle</h2>{_table(['Actor ID','Anzahl'], actor_rows, placeholder='Akteure durchsuchen…')}</section>
     <section class="panel" id="logs"><h2>Letzte Audit-Einträge</h2>{_table(['Zeit','Aktion','Actor','Zusammenfassung'], log_rows, placeholder='Audit durchsuchen…')}</section>
     """
-    return _html_shell("Audit · Ebo Dashboard", body, nav_mode="admin")
+    return _html_shell("Audit · Weisse Flamme Dashboard", body, nav_mode="admin")
 
 
 def _item_catalog_available() -> bool:
     return bool(catalog_stats and ensure_item_catalog_schema and query_items)
-
-
-_ITEM_LOOKUP_STOPWORDS = frozenset({
-    "der", "die", "das", "des", "den", "dem", "ein", "eine", "einer", "eines", "einem", "einen",
-    "von", "vom", "für", "fur", "und", "mit", "zu", "zur", "zum", "aus", "im", "in", "auf", "an",
-})
-_ITEM_LOOKUP_TYPE_WORDS = frozenset({
-    "ring", "ringe", "ohrring", "ohrringe", "robe", "handschutz", "handschuh", "handschuhe",
-    "kette", "halskette", "armband", "brosche", "gürtel", "guertel", "gurtel", "umhang", "mantel",
-    "helm", "hut", "maske", "schleier", "hose", "schuhe", "stiefel", "brust", "rüstung", "ruestung",
-    "rustung", "stulpen",
-})
-_ITEM_LOOKUP_TYPE_SUFFIXES = (
-    "siegelring", "fingerring", "ring", "ohrring", "ohrringe", "brosche", "halskette", "kette",
-    "armband", "guertel", "gurtel", "umhang", "mantel", "handschutz", "handschuh", "handschuhe",
-    "stiefel", "schuhe", "helm", "hut", "maske", "schleier", "robe", "brust", "rustung", "hose",
-)
-
-
-def _item_lookup_is_type_token(token: str) -> bool:
-    value = str(token or "")
-    if value in _ITEM_LOOKUP_TYPE_WORDS:
-        return True
-    return any(value.endswith(suffix) for suffix in _ITEM_LOOKUP_TYPE_SUFFIXES)
-
-
-
-def _normalize_item_lookup_name(value: Any) -> str:
-    text = _loot_text(value)
-    text = re.sub(r"^[🔒✅🎁🧹\s]+", "", text).strip()
-    text = re.sub(
-        r"\s+\((?:Schwert\s*&\s*Schild|Großschwert|Grossschwert|Dolche?|Langbogen|Armbrust|Zauberstab|Stab|Kugel|Speer)\)\s*$",
-        "",
-        text,
-        flags=re.I,
-    )
-    # Eigene Kurzbezeichnungen wie "Ring DaVinci" oder Bindestriche sollen
-    # mit den offiziellen Questlog-Namen (z. B. "Da Vincis Ring …") matchen.
-    text = re.sub(r"(?<=[a-zäöüß])(?=[A-ZÄÖÜ])", " ", text)
-    text = text.casefold().replace("ß", "ss").replace("ä", "a").replace("ö", "o").replace("ü", "u")
-    text = re.sub(r"[^a-z0-9]+", " ", text)
-    return re.sub(r"\s+", " ", text).strip()
-
-
-def _item_lookup_stem(token: str) -> str:
-    value = str(token or "")
-    # Kleine, bewusst konservative deutsche Endungs-Normalisierung. Dadurch
-    # werden z. B. "Hunger" und "Hungers" oder "Blutjäger" und
-    # "Blutjägers" gleich behandelt, ohne eine externe NLP-Abhängigkeit.
-    for suffix in ("ungen", "ern", "ens", "en", "es", "er", "em", "e", "s"):
-        if len(value) > max(6, len(suffix) + 3) and value.endswith(suffix):
-            return value[: -len(suffix)]
-    return value
-
-
-def _item_lookup_features(value: Any) -> dict[str, Any]:
-    normalized = _normalize_item_lookup_name(value)
-    tokens = [
-        _item_lookup_stem(token)
-        for token in normalized.split()
-        if token and token not in _ITEM_LOOKUP_STOPWORDS
-    ]
-    core_tokens = [token for token in tokens if not _item_lookup_is_type_token(token)]
-    return {
-        "normalized": normalized,
-        "tokens": tokens,
-        "core_tokens": core_tokens,
-        "compact": "".join(tokens),
-        "core_compact": "".join(core_tokens),
-        "token_set": {token for token in tokens if len(token) > 2},
-        "core_set": {token for token in core_tokens if len(token) > 2},
-    }
-
-
-def _item_lookup_slot_hint(features: dict[str, Any]) -> str:
-    tokens = {str(token or "") for token in (features.get("tokens") or [])}
-    for token in tokens:
-        if token.endswith("ohrring") or token.endswith("ohrringe"):
-            return "ohrringe"
-        if token.endswith("siegelring") or token == "ring" or token == "ringe" or token.endswith("fingerring"):
-            return "ring"
-        if token.endswith("brosche"):
-            return "brosche"
-        if token.endswith("handschutz") or token.endswith("handschuh") or token.endswith("handschuhe"):
-            return "handschuhe"
-        if token.endswith("robe") or token in {"brust", "rustung", "ruestung"}:
-            return "brust"
-        if token.endswith("halskette") or token == "kette":
-            return "kette"
-        if token.endswith("armband"):
-            return "armband"
-        if token.endswith("gurtel") or token.endswith("guertel"):
-            return "gurtel"
-        if token.endswith("umhang") or token.endswith("mantel"):
-            return "umhang"
-        if token.endswith("helm") or token.endswith("hut") or token.endswith("maske") or token.endswith("schleier"):
-            return "helm"
-        if token.endswith("hose"):
-            return "hose"
-        if token.endswith("schuhe") or token.endswith("stiefel"):
-            return "schuhe"
-    return ""
-
-
-def _catalog_candidate_slot_hint(candidate: dict[str, Any]) -> str:
-    sub = _normalize_item_lookup_name(candidate.get("sub_category") or candidate.get("main_category"))
-    sub_features = _item_lookup_features(sub)
-    direct = _item_lookup_slot_hint(sub_features)
-    if direct:
-        return direct
-    return _item_lookup_slot_hint(_item_lookup_features(candidate.get("name")))
-
-
-def _catalog_reference_is_consistent(item_name: Any, candidate: dict[str, Any]) -> bool:
-    """Verhindert, dass eine alte/falsche Katalog-ID einen Ring als Waffe anzeigt."""
-    search = _item_lookup_features(item_name)
-    if not search.get("normalized"):
-        return True
-    wanted_slot = _item_lookup_slot_hint(search)
-    candidate_slot = _catalog_candidate_slot_hint(candidate)
-    wanted_family = "accessory" if wanted_slot in {"ring", "ohrringe", "brosche", "kette", "armband", "gurtel"} else ("armor" if wanted_slot in {"handschuhe", "brust", "umhang", "helm", "hose", "schuhe"} else "")
-    candidate_family = _normalize_item_lookup_name(candidate.get("main_category"))
-    if wanted_family and candidate_family and wanted_family not in candidate_family:
-        return False
-    if wanted_slot and candidate_slot and wanted_slot != candidate_slot:
-        return False
-    if wanted_slot and not candidate_slot and candidate.get("sub_category"):
-        return False
-
-    wanted_core = set(search.get("core_set") or set())
-    candidate_features = _item_lookup_features(candidate.get("name"))
-    candidate_core = set(candidate_features.get("core_set") or set())
-    if not wanted_core:
-        return True
-    if wanted_core & candidate_core:
-        return True
-    a = str(search.get("core_compact") or "")
-    b = str(candidate_features.get("core_compact") or "")
-    if a and b and (a in b or b in a):
-        return True
-    return difflib.SequenceMatcher(None, a, b).ratio() >= 0.72
-
-
-def _catalog_match_pool() -> list[dict[str, Any]]:
-    """Lädt den aktiven Itemkatalog kurzzeitig in einen lokalen Match-Cache.
-
-    Die alte Version suchte nur mit ``ILIKE %kompletter Auktionsname%``. Das
-    funktionierte lediglich bei exakt gleichen Namen. Dieser Pool ermöglicht
-    einen robusten Vergleich gegen alle importierten deutschen Itemnamen.
-    """
-    now = time.monotonic()
-    cached_items = _ITEM_CATALOG_POOL_CACHE.get("items")
-    loaded_at = float(_ITEM_CATALOG_POOL_CACHE.get("loaded_at") or 0.0)
-    if isinstance(cached_items, list) and cached_items and now - loaded_at < _ITEM_CATALOG_POOL_TTL_SECONDS:
-        return [dict(item) for item in cached_items if isinstance(item, dict)]
-    if not _item_catalog_available():
-        return []
-
-    items: list[dict[str, Any]] = []
-    try:
-        ensure_item_catalog_schema()  # type: ignore[misc]
-        offset = 0
-        page_size = 500
-        # Sicherheitsgrenze gegen eine versehentlich riesige/falsche Tabelle.
-        while offset < 10000:
-            batch = query_items(q="", limit=page_size, offset=offset)  # type: ignore[misc]
-            if not batch:
-                break
-            items.extend(dict(item) for item in batch if isinstance(item, dict))
-            if len(batch) < page_size:
-                break
-            offset += page_size
-    except Exception:
-        return []
-
-    _ITEM_CATALOG_POOL_CACHE["loaded_at"] = now
-    _ITEM_CATALOG_POOL_CACHE["items"] = [dict(item) for item in items]
-    return items
-
-
-def _catalog_candidate_score(search_features: dict[str, Any], candidate: dict[str, Any]) -> float:
-    candidate_features = _item_lookup_features(candidate.get("name"))
-    a_normalized = str(search_features.get("normalized") or "")
-    b_normalized = str(candidate_features.get("normalized") or "")
-    a_compact = str(search_features.get("compact") or "")
-    b_compact = str(candidate_features.get("compact") or "")
-    a_core = str(search_features.get("core_compact") or "")
-    b_core = str(candidate_features.get("core_compact") or "")
-    a_tokens = set(search_features.get("token_set") or set())
-    b_tokens = set(candidate_features.get("token_set") or set())
-    a_core_tokens = set(search_features.get("core_set") or set())
-    b_core_tokens = set(candidate_features.get("core_set") or set())
-
-    score = 0.0
-    if a_normalized and a_normalized == b_normalized:
-        score = max(score, 2200.0)
-    if a_compact and a_compact == b_compact:
-        score = max(score, 1900.0)
-    if a_core and a_core == b_core:
-        score = max(score, 1800.0)
-    if min(len(a_compact), len(b_compact)) >= 6 and (a_compact in b_compact or b_compact in a_compact):
-        score = max(score, 1150.0 - abs(len(a_compact) - len(b_compact)) * 3.0)
-    if min(len(a_core), len(b_core)) >= 5 and (a_core in b_core or b_core in a_core):
-        score = max(score, 1280.0 - abs(len(a_core) - len(b_core)) * 3.0)
-
-    score += difflib.SequenceMatcher(None, a_compact, b_compact).ratio() * 420.0
-    if a_core and b_core:
-        score += difflib.SequenceMatcher(None, a_core, b_core).ratio() * 560.0
-
-    token_union = len(a_tokens | b_tokens) or 1
-    core_union = len(a_core_tokens | b_core_tokens) or 1
-    score += (len(a_tokens & b_tokens) / token_union) * 330.0
-    score += (len(a_core_tokens & b_core_tokens) / core_union) * 700.0
-
-    if a_core_tokens and all(
-        any(left == right or left in right or right in left for right in b_core_tokens)
-        for left in a_core_tokens
-    ):
-        score += 430.0
-
-    hint = _item_lookup_slot_hint(search_features)
-    candidate_hint = _catalog_candidate_slot_hint(candidate)
-    candidate_sub = _normalize_item_lookup_name(candidate.get("sub_category") or candidate.get("main_category"))
-    if hint:
-        if candidate_hint == hint or hint in candidate_sub:
-            score += 520.0
-        elif candidate_hint or candidate_sub:
-            # Harter Abbruch: Ein als Ring benanntes Gildenitem darf nie auf Schwert,
-            # Handschuhe oder einen anderen Slot zeigen.
-            return -100000.0
-
-    # Nur gleiche Slot-Wörter reichen nicht. Mindestens ein echter Namensbestandteil
-    # muss passen, sonst würden beliebige Ringe miteinander verknüpft.
-    has_core_overlap = bool(a_core_tokens & b_core_tokens)
-    has_compact_containment = bool(a_core and b_core and (a_core in b_core or b_core in a_core))
-    if not has_core_overlap and not has_compact_containment:
-        score -= 320.0
-
-    score -= abs(len(a_compact) - len(b_compact)) * 1.2
-    return score
-
-
-def _catalog_item_match(item_name: Any) -> Optional[dict[str, Any]]:
-    """Bestmöglicher Item-Katalogtreffer auch für Gilden-Kurznamen."""
-    key = _normalize_item_lookup_name(item_name)
-    if not key or len(key) < 3 or not _item_catalog_available():
-        return None
-    cached_entry = _ITEM_MATCH_CACHE.get(key)
-    if isinstance(cached_entry, tuple) and len(cached_entry) == 2:
-        cached_at, cached = cached_entry
-        if time.monotonic() - float(cached_at or 0.0) < _ITEM_MATCH_CACHE_TTL_SECONDS:
-            return dict(cached) if isinstance(cached, dict) else None
-        _ITEM_MATCH_CACHE.pop(key, None)
-
-    search_features = _item_lookup_features(item_name)
-    candidates = _catalog_match_pool()
-
-    # Fallback, falls der vollständige Pool wegen einer temporären DB-Störung
-    # nicht geladen werden konnte: mit den aussagekräftigsten Einzelwörtern suchen.
-    if not candidates:
-        candidate_map: dict[str, dict[str, Any]] = {}
-        try:
-            terms = sorted(
-                set(search_features.get("core_tokens") or search_features.get("tokens") or []),
-                key=len,
-                reverse=True,
-            )[:5]
-            for term in terms:
-                for candidate in query_items(q=term, limit=80, offset=0):  # type: ignore[misc]
-                    if not isinstance(candidate, dict):
-                        continue
-                    identity = str(candidate.get("id") or candidate.get("source_url") or candidate.get("name") or "")
-                    candidate_map[identity] = dict(candidate)
-            candidates = list(candidate_map.values())
-        except Exception:
-            candidates = []
-
-    best: Optional[dict[str, Any]] = None
-    best_score = float("-inf")
-    for candidate in candidates:
-        if not isinstance(candidate, dict) or not candidate.get("name"):
-            continue
-        score = _catalog_candidate_score(search_features, candidate)
-        if score > best_score:
-            best_score = score
-            best = dict(candidate)
-
-    # Absichtlich deutlich über dem Niveau eines bloßen Slot-Treffers. Ein
-    # falscher DB-Eintrag wäre schlimmer als ein ungelöster Suchlink.
-    if best_score < 850.0:
-        best = None
-
-    _ITEM_MATCH_CACHE[key] = (time.monotonic(), dict(best) if isinstance(best, dict) else None)
-    return dict(best) if isinstance(best, dict) else None
-
-
-def _catalog_item_from_reference(reference: Any) -> Optional[dict[str, Any]]:
-    if isinstance(reference, dict):
-        name = reference.get("catalog_item_name") or reference.get("item_name") or reference.get("item") or reference.get("name")
-        try:
-            direct_id = int(reference.get("catalog_item_id") or reference.get("item_catalog_id") or 0)
-        except Exception:
-            direct_id = 0
-        if direct_id and get_item_by_id is not None:
-            try:
-                item = get_item_by_id(direct_id)  # type: ignore[misc]
-                if item and _catalog_reference_is_consistent(name, dict(item)):
-                    return dict(item)
-            except Exception:
-                pass
-        # Eine alte falsche ID wird bewusst verworfen und anhand Name + Slot neu gelöst.
-        return _catalog_item_match(name)
-    return _catalog_item_match(reference)
-
-
-def _catalog_item_reference_html(item_name: Any, *, primary_href: str = "", reference: Any = None) -> str:
-    clean_name = _loot_text(item_name) or str(item_name or "Item")
-    item = _catalog_item_from_reference(reference if reference is not None else item_name)
-    primary = str(primary_href or "").strip()
-    if not item:
-        return f'<a class="link" href="{_e(primary)}">{_e(clean_name)}</a>' if primary else _e(clean_name)
-
-    item_id = int(item.get("id") or 0)
-    db_href = f"/item/{item_id}" if item_id else f"/items?q={urllib.parse.quote(clean_name)}"
-    image_url = str(item.get("manual_image_url") or item.get("image_url") or item.get("icon_url") or "").strip()
-    image_html = (
-        f'<img src="{_e(image_url)}" alt="" loading="lazy" referrerpolicy="no-referrer">'
-        if image_url else '<span class="catalog-item-placeholder">?</span>'
-    )
-    title_href = primary or db_href
-    rarity = str(item.get("rarity") or "").strip()
-    sub = str(item.get("sub_category") or item.get("main_category") or "").strip()
-    stats = _item_stat_preview(item, max_len=110)
-    ability = _item_ability_preview(item, max_len=120)
-    meta_parts = [x for x in (rarity, sub, stats if stats != "—" else "") if x]
-    tooltip_parts = [str(item.get("name") or clean_name)] + meta_parts + ([ability] if ability and ability != "—" else [])
-    tooltip = " · ".join(tooltip_parts)
-    return (
-        f'<div class="catalog-item-ref" title="{_e(tooltip)}">'
-        f'<a class="catalog-item-thumb" href="{_e(db_href)}">{image_html}</a>'
-        f'<span class="catalog-item-copy"><a class="link catalog-item-name" href="{_e(title_href)}">{_e(clean_name)}</a>'
-        f'<small>{_e(" · ".join(meta_parts[:3]) or "Item-Datenbank")}</small></span>'
-        f'<a class="catalog-db-link" href="{_e(db_href)}" aria-label="Item-Datenbank öffnen">DB</a>'
-        f'</div>'
-    )
-
-
-def _catalog_item_detail_panel(item_name: Any, *, reference: Any = None) -> str:
-    item = _catalog_item_from_reference(reference if reference is not None else item_name)
-    if not item:
-        return ""
-    return (
-        '<section class="panel catalog-linked-panel" id="item-database">'
-        '<h2>📚 Verknüpftes Item aus der Datenbank</h2>'
-        '<p class="muted">Bild, Grundwerte, Fähigkeiten, Zusatzwerte und Traits stammen über die feste Item-ID aus dem importierten Item-Katalog.</p>'
-        f'{_item_card_html(item)}'
-        '</section>'
-    )
 
 
 def _jsonable(value: Any) -> Any:
@@ -9011,7 +8260,7 @@ def _render_item_catalog(request: Optional[Request] = None) -> str:
         <section class="hero"><div><div class="eyebrow">Questlog Item-Katalog</div><h1>📚 Item-Datenbank</h1><p class="muted">Noch keine Item-Daten verfügbar oder Postgres/Schema fehlt.</p></div></section>
         <section class="panel"><h2>Fehler</h2><p class="muted">{_e(payload.get('error'))}</p><p>Importer starten:</p><pre>python questlog_item_importer.py --category-url https://questlog.gg/throne-and-liberty/de/db/items/weapons?grade=41 --only weapon</pre></section>
         """
-        return _html_shell("Item-Datenbank · Ebo Dashboard", body)
+        return _html_shell("Item-Datenbank · Weisse Flamme Dashboard", body)
 
     items: list[dict[str, Any]] = payload.get("items") or []
     stats: dict[str, Any] = payload.get("stats") or {}
@@ -9126,7 +8375,7 @@ def _render_item_catalog(request: Optional[Request] = None) -> str:
     <section class="panel"><h2>Kategorien</h2>{_table(['Kategorie','Unterkategorie','Items'], cat_rows, placeholder='Kategorien durchsuchen…')}</section>
     <section class="panel"><h2>Items</h2><div class="item-card-grid">{item_cards}</div></section>
     """
-    return _html_shell("Item-Datenbank · Ebo Dashboard", body)
+    return _html_shell("Item-Datenbank · Weisse Flamme Dashboard", body)
 
 
 
@@ -9589,12 +8838,12 @@ def _need_builder_queue_main(guild_id: int, user_id: int, build_id: str, actor: 
 
 def _render_need_builder_dashboard(data: dict[str, Any], request: Request, msg: str = "") -> str:
     if not data.get("ok"):
-        return _html_shell("Needs · Ebo Dashboard", f"<section class='panel'><h1>🎁 Needliste</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+        return _html_shell("Needs · Weisse Flamme Dashboard", f"<section class='panel'><h1>🎁 Needliste</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
     snap: dict[str, Any] = data.get("snapshot") or {}
     guild_id = _safe_guild_id(data)
     user_id, display_name, members = _need_builder_target_user(request, snap)
     if not guild_id or not user_id:
-        return _html_shell("Needs · Ebo Dashboard", "<section class='panel'><h1>🎁 Needliste</h1><p class='muted'>Keine Guild-ID oder kein Zielmitglied gefunden. Melde dich per Discord an oder öffne die Seite als Dashboard-Admin.</p></section>")
+        return _html_shell("Needs · Weisse Flamme Dashboard", "<section class='panel'><h1>🎁 Needliste</h1><p class='muted'>Keine Guild-ID oder kein Zielmitglied gefunden. Melde dich per Discord an oder öffne die Seite als Dashboard-Admin.</p></section>")
     state = _need_builder_load(guild_id, user_id)
     builds = state.get("builds") or []
     slots_by_build = state.get("slots") or {}
@@ -10010,30 +9259,12 @@ def _render_need_builder_dashboard(data: dict[str, Any], request: Request, msg: 
       document.addEventListener('DOMContentLoaded', nbRecalc);
     </script>
     """
-    return _html_shell("Needliste · Ebo Dashboard", body)
+    return _html_shell("Needliste · Weisse Flamme Dashboard", body)
 
 @app.get("/items", response_class=HTMLResponse)
 def items_page(request: Request):
     try:
         return HTMLResponse(_render_item_catalog(request))
-    except Exception as exc:
-        return HTMLResponse(_html_shell("Item-Datenbank Fehler", f"<section class='panel'><h1>❌ Item-Datenbank Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"), status_code=500)
-
-
-@app.get("/item/{item_id}", response_class=HTMLResponse)
-def item_detail_page(item_id: int, request: Request, _: bool = Depends(_auth)):
-    try:
-        if not get_item_by_id:
-            raise RuntimeError("Item-Katalog-Modul nicht vollständig geladen")
-        item = get_item_by_id(int(item_id))  # type: ignore[misc]
-        if not item:
-            return HTMLResponse(_html_shell("Item nicht gefunden", "<section class='panel'><h1>❌ Item nicht gefunden</h1><p><a class='btn' href='/items'>Zur Item-Datenbank</a></p></section>"), status_code=404)
-        body = f"""
-        <nav class="topnav"><a href="/items">← Item-Datenbank</a><a href="/loot">Loot</a><a href="/member/auctions">Auktionen</a></nav>
-        <section class="hero"><div><div class="eyebrow">Item-Datenbank</div><h1>{_e(item.get('name') or 'Item')}</h1><p class="muted">Questlog-Import · Bild, Werte, Fähigkeiten und Traits.</p></div></section>
-        <section class="panel">{_item_card_html(item, request)}</section>
-        """
-        return HTMLResponse(_html_shell(f"{item.get('name') or 'Item'} · Ebo Dashboard", body, nav_mode="member"))
     except Exception as exc:
         return HTMLResponse(_html_shell("Item-Datenbank Fehler", f"<section class='panel'><h1>❌ Item-Datenbank Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"), status_code=500)
 
@@ -10087,7 +9318,7 @@ def voice_page(_: bool = Depends(_auth)):
         return HTMLResponse(_render_voice_dashboard(_snapshot_payload()))
     except Exception as exc:
         return HTMLResponse(
-            _html_shell("Ebo Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
+            _html_shell("Weisse Flamme Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
             status_code=500,
         )
 
@@ -10105,7 +9336,7 @@ def members_page(request: Request, _: bool = Depends(_auth)):
         # Normale Mitgliederansicht – auch für Admins. Admin-Funktionen bleiben im Admin-Portal.
         return HTMLResponse(_render_member_members_page(_snapshot_payload(), request))
     except Exception as exc:
-        return HTMLResponse(_html_shell("Ebo Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"), status_code=500)
+        return HTMLResponse(_html_shell("Weisse Flamme Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"), status_code=500)
 
 
 @app.get("/needs", response_class=HTMLResponse)
@@ -10113,7 +9344,7 @@ def needs_page(request: Request, msg: str = "", _: bool = Depends(_auth)):
     try:
         return HTMLResponse(_render_need_builder_dashboard(_snapshot_payload(), request, msg=msg))
     except Exception as exc:
-        return HTMLResponse(_html_shell("Ebo Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"), status_code=500)
+        return HTMLResponse(_html_shell("Weisse Flamme Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"), status_code=500)
 
 
 @app.post("/needs/builds/new")
@@ -10195,7 +9426,7 @@ def loot_page(request: Request, msg: str = "", _: bool = Depends(_auth)):
     try:
         return HTMLResponse(_render_loot_center(_snapshot_payload(), request, msg=msg))
     except Exception as exc:
-        return HTMLResponse(_html_shell("Ebo Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"), status_code=500)
+        return HTMLResponse(_html_shell("Weisse Flamme Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"), status_code=500)
 
 
 
@@ -10206,29 +9437,10 @@ async def admin_loot_drop_dashboard(request: Request, _: bool = Depends(_admin_a
         form = _parse_urlencoded_body(raw)
         drop_type = str(form.get("drop_type") or "loot_drop").strip().lower()
         item = str(form.get("item") or "").strip()
-        slot = str(form.get("slot") or "").strip()
-        valid_slots = set(_NEED_SLOTS)
-        if slot not in valid_slots:
-            raise ValueError("Bitte zuerst einen gültigen Slot auswählen.")
-        try:
-            catalog_item_id = int(form.get("catalog_item_id") or 0)
-        except Exception:
-            catalog_item_id = 0
-        if catalog_item_id and get_item_by_id is not None:
-            try:
-                selected = get_item_by_id(catalog_item_id)  # type: ignore[misc]
-            except Exception:
-                selected = None
-            if selected:
-                selected_slot = str(selected.get("sub_category") or selected.get("main_category") or selected.get("slot") or "")
-                selected_name = str(selected.get("name") or item)
-                if not _need_item_slot_matches(selected_slot, slot, selected_name):
-                    raise ValueError(f"{selected_name} passt nicht zum ausgewählten Slot {slot}.")
-                item = selected_name
         payload = _snapshot_payload()
         guild_id = _safe_guild_id(payload)
         actor = _current_user(request) or {}
-        result = _enqueue_loot_drop_request(int(guild_id), drop_type, item, actor, catalog_item_id=catalog_item_id, slot=slot)
+        result = _enqueue_loot_drop_request(int(guild_id), drop_type, item, actor)
         if result.get("ok"):
             msg = "✅ " + str(result.get("message") or "Drop wurde an den Bot gesendet.")
         else:
@@ -10244,14 +9456,14 @@ def loot_check_page(item: str = "", _: bool = Depends(_auth)):
     try:
         return HTMLResponse(_render_loot_check(_snapshot_payload(), item))
     except Exception as exc:
-        return HTMLResponse(_html_shell("Ebo Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"), status_code=500)
+        return HTMLResponse(_html_shell("Weisse Flamme Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"), status_code=500)
 
 @app.get("/exports", response_class=HTMLResponse)
 def exports_page(_: bool = Depends(_auth)):
     try:
         return HTMLResponse(_render_exports_dashboard(_snapshot_payload()))
     except Exception as exc:
-        return HTMLResponse(_html_shell("Ebo Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"), status_code=500)
+        return HTMLResponse(_html_shell("Weisse Flamme Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"), status_code=500)
 
 
 @app.get("/api/members")
@@ -10402,7 +9614,7 @@ def loot_history_page(_: bool = Depends(_auth)):
     try:
         return HTMLResponse(_render_loot_history(_snapshot_payload()))
     except Exception as exc:
-        return HTMLResponse(_html_shell("Ebo Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"), status_code=500)
+        return HTMLResponse(_html_shell("Weisse Flamme Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"), status_code=500)
 
 
 @app.get("/api/loot-history")
@@ -10681,25 +9893,8 @@ def _portal_event_status_for_user(ev: dict[str, Any], user_id: int) -> str:
 
 
 def _portal_active_auctions(snap: dict[str, Any]) -> list[dict[str, Any]]:
-    """Aktive Auktionen für Mitgliederansicht mit vollständigen Rohdaten.
-
-    Der Loot-Center-View liefert kompakte Einträge. Für Müll-Würfe wurden dabei
-    früher ``junk_drop`` und ``junk_rolls`` verloren, weshalb die Seite fälschlich
-    "0 Gebote" anzeigte. Hier werden Rohdaten und Anzeige-Felder zusammengeführt.
-    """
     try:
-        active = list((_loot_center_payload_from_snapshot(snap).get("active") or [])[:40])
-        normalized: list[dict[str, Any]] = []
-        for entry in active:
-            if not isinstance(entry, dict):
-                continue
-            raw = entry.get("raw") if isinstance(entry.get("raw"), dict) else {}
-            merged = dict(raw)
-            merged.update({key: value for key, value in entry.items() if key != "raw"})
-            merged["junk_drop"] = bool(merged.get("junk_drop") or merged.get("is_junk"))
-            merged["item_name"] = merged.get("item_name") or merged.get("item") or entry.get("item")
-            normalized.append(merged)
-        return normalized
+        return list((_loot_center_payload_from_snapshot(snap).get("active") or [])[:40])
     except Exception:
         return []
 
@@ -10790,7 +9985,7 @@ def _render_need_editor_panel(user_id: int, current_user: Optional[dict[str, Any
 
 def _render_member_portal(data: dict[str, Any], user_id: int, request: Request, msg: str = "") -> str:
     if not data.get("ok"):
-        return _html_shell("Portal · Ebo Dashboard", f"<section class='panel'><h1>👤 Portal</h1><p class='muted'>{_e(data.get('error'))}</p></section>", nav_mode="member")
+        return _html_shell("Portal · Weisse Flamme Dashboard", f"<section class='panel'><h1>👤 Portal</h1><p class='muted'>{_e(data.get('error'))}</p></section>", nav_mode="member")
     if not _portal_can_view(request, int(user_id)):
         raise HTTPException(status_code=403, detail="Du darfst nur dein eigenes Portal sehen. Leitung/Admins sehen alle Mitglieder.")
 
@@ -10799,21 +9994,23 @@ def _render_member_portal(data: dict[str, Any], user_id: int, request: Request, 
     names = _profile_name_map(snap)
     uid = int(user_id)
 
-    profile = _member_record(snap, uid)
+    profiles = ((snap.get("profiles") or {}).get("items") or [])
+    profile: dict[str, Any] = {}
+    for p in profiles:
+        if not isinstance(p, dict):
+            continue
+        if _user_id(p.get("user_id") or p.get("member_id") or p.get("discord_id")) == uid:
+            profile = p
+            break
 
     display = (
-        profile.get("ingame_name")
-        or profile.get("server_name")
-        or profile.get("display_name")
+        profile.get("display_name")
+        or profile.get("ingame_name")
         or profile.get("discord_name")
         or names.get(uid)
         or f"User {uid}"
     )
-    profile_name = profile.get("ingame_name") or profile.get("server_name") or profile.get("display_name") or display
-    avatar_url = _safe_avatar_url(profile.get("avatar_url"))
-    current_session = _current_user(request) or {}
-    if not avatar_url and _user_id(current_session.get("user_id")) == uid:
-        avatar_url = _safe_avatar_url(current_session.get("avatar_url"))
+    profile_name = profile.get("ingame_name") or profile.get("display_name") or display
     gearscore = profile.get("gearscore") or profile.get("gear_score") or profile.get("gs") or "—"
     main_role = profile.get("main_role") or profile.get("role_name") or profile.get("class_role") or profile.get("role") or "—"
     guild_rank = (
@@ -10842,6 +10039,9 @@ def _render_member_portal(data: dict[str, Any], user_id: int, request: Request, 
     active_events = _portal_active_events(snap, uid)
     user_auctions = [a for a in _auctions_for_user(snap, uid, limit=100) if isinstance(a, dict)]
     active_user_auctions = [a for a in user_auctions if _loot_is_active(a)]
+    if not active_user_auctions:
+        # Fallback: Wenn Snapshot keine userbezogene Auktionszuordnung liefert, wenigstens alle aktiven anzeigen/zählen.
+        active_user_auctions = [a for a in _portal_active_auctions(snap) if isinstance(a, dict)]
 
     msg_html = f'<div class="ok">{_e(msg)}</div>' if msg else ""
     admin_links = ""
@@ -10864,24 +10064,10 @@ def _render_member_portal(data: dict[str, Any], user_id: int, request: Request, 
         auction_preview = _short(_loot_text(active_user_auctions[0].get("item_name") or active_user_auctions[0].get("item") or active_user_auctions[0].get("auction_id")), 56)
 
     portal_nav = '<nav class="topnav"><a href="/">Kommando</a><a href="/portal">Mein Portal</a><a href="/events">Events</a><a href="/loot">Loot</a><a href="/members">Mitglieder</a><a href="/ec">EC</a></nav>' if _is_portal_admin(request) else '<nav class="topnav"><a href="/member">Start</a><a href="/member/events">Events</a><a href="/member/auctions">Auktionen</a><a href="/member/ec">Meine EC</a><a href="/portal">Mein Portal</a></nav>'
-    if avatar_url:
-        avatar_html = (
-            f'<span class="portal-avatar-wrap">'
-            f'<img class="portal-discord-avatar" src="{_e(avatar_url)}" alt="Discord-Profilbild von {_e(display)}" '
-            f'loading="eager" referrerpolicy="no-referrer" '
-            f'onerror="this.style.display=\'none\';this.nextElementSibling.style.display=\'grid\';">'
-            f'<span class="portal-avatar-fallback" style="display:none" aria-hidden="true">👤</span>'
-            f'</span>'
-        )
-    else:
-        avatar_html = '<span class="portal-avatar-wrap"><span class="portal-avatar-fallback" aria-hidden="true">👤</span></span>' 
 
     body = f"""
     <style>
       .portal-page-hero{{min-height:180px;}}
-      .portal-hero-title{{display:flex;align-items:center;gap:18px;flex-wrap:wrap;}}
-      .portal-avatar-wrap{{width:82px;height:82px;flex:0 0 82px;display:grid;place-items:center;}}
-      .portal-discord-avatar,.portal-avatar-fallback{{width:82px;height:82px;border-radius:50%;border:2px solid rgba(214,168,79,.62);background:#0b0c11;box-shadow:0 12px 28px rgba(0,0,0,.48);object-fit:cover;display:grid;place-items:center;font-size:42px;}}
       .portal-profile-card{{display:grid;gap:10px;}}
       .portal-profile-row{{display:grid;grid-template-columns:150px minmax(0,1fr);gap:12px;align-items:center;padding:11px 0;border-bottom:1px solid rgba(214,168,79,.13)}}
       .portal-profile-row:last-child{{border-bottom:0}}
@@ -10911,13 +10097,10 @@ def _render_member_portal(data: dict[str, Any], user_id: int, request: Request, 
     </style>
     {portal_nav}
     <section class="hero portal-page-hero">
-      <div class="portal-hero-title">
-        {avatar_html}
-        <div>
-          <div class="eyebrow">Mein Portal</div>
-          <h1>{_e(display)}</h1>
-          <p class="muted">Profil, Event-Anmeldungen, Auktionen und eigene Needliste.</p>
-        </div>
+      <div>
+        <div class="eyebrow">Mein Portal</div>
+        <h1>👤 {_e(display)}</h1>
+        <p class="muted">Profil, Event-Anmeldungen, Auktionen und eigene Needliste.</p>
       </div>
       <div class="hero-actions">{admin_links}</div>
     </section>
@@ -10951,7 +10134,7 @@ def _render_member_portal(data: dict[str, Any], user_id: int, request: Request, 
     </section>
     """
     shell_mode = "admin" if _is_portal_admin(request) else "member"
-    return _html_shell(f"{display} Portal · Ebo Dashboard", body, nav_mode=shell_mode)
+    return _html_shell(f"{display} Portal · Weisse Flamme Dashboard", body, nav_mode=shell_mode)
 
 
 
@@ -10975,12 +10158,12 @@ def _member_home_auction_rows(auctions: list[dict[str, Any]], snap: dict[str, An
         title = _loot_text(a.get("item_name") or a.get("item") or aid)
         count_title, count_value, _ = _auction_count_label(a)
         meta = f"{_phase_label(a)} · {count_value} {count_title} · {_auction_leader_or_roll_text(a, snap)} · {_auction_timer_text(a)}"
-        items.append(f'<div class="member-summary-item"><div><div class="member-summary-title">{_cell(_auction_link(aid, title, a))}</div><div class="member-summary-meta">{_e(meta)}</div></div></div>')
+        items.append(f'<div class="member-summary-item"><div><div class="member-summary-title">{_cell(_auction_link(aid, title))}</div><div class="member-summary-meta">{_e(meta)}</div></div></div>')
     return '<div class="member-summary-list">' + ''.join(items) + '</div>'
 
 def _render_member_home(data: dict[str, Any], request: Request) -> str:
     if not data.get("ok"):
-        return _html_shell("Mitgliederbereich · Ebo Dashboard", f"<section class='panel'><h1>🏠 Mitgliederbereich</h1><p class='muted'>{_e(data.get('error'))}</p></section>", nav_mode="member")
+        return _html_shell("Mitgliederbereich · Weisse Flamme Dashboard", f"<section class='panel'><h1>🏠 Mitgliederbereich</h1><p class='muted'>{_e(data.get('error'))}</p></section>", nav_mode="member")
     user = _current_user(request) or {}
     uid = _current_user_id(request)
     snap: dict[str, Any] = data.get("snapshot") or {}
@@ -10996,14 +10179,13 @@ def _render_member_home(data: dict[str, Any], request: Request) -> str:
     cards = "".join([_card("Meine EC", _fmt_ec(my_ec_balance) if my_ec_balance is not None else "—", "aktueller Stand"), _card("Uhrzeit", now_text, "lokale Dashboard-Zeit"), _card("Events", len(running_events), "max. 2 auf Startseite"), _card("Auktionen", len(active_auctions), "max. 4 auf Startseite")])
     body = f"""
     <nav class="topnav"><a href="/member">Start</a><a href="/member/events">Events</a><a href="/member/auctions">Auktionen</a><a href="/member/members">Mitglieder</a><a href="/member/ec">Meine EC</a><a href="/portal">Eigenes Profil</a><a href="/portal#needs">Meine Needs</a></nav>
-    <section class="hero member-home-hero"><div style="display:flex;gap:16px;align-items:center;flex-wrap:wrap;"><div class="member-start-logo"><img src="{_asset('ebolus_logo.png')}" alt="Ebolus"></div><div><div class="eyebrow">Mitgliederbereich</div><h1>Willkommen, {_e(display)}</h1><p class="muted">Kurzüberblick. Weitere Bereiche erreichst du links über die Leiste.</p></div></div></section>
+    <section class="hero member-home-hero"><div style="display:flex;gap:16px;align-items:center;flex-wrap:wrap;"><div class="member-start-logo"><img src="{_asset('ebolus_logo.png')}" alt="Weisse Flamme"></div><div><div class="eyebrow">Mitgliederbereich</div><h1>Willkommen, {_e(display)}</h1><p class="muted">Kurzüberblick. Weitere Bereiche erreichst du links über die Leiste.</p></div></div></section>
     <section class="grid">{cards}</section>
     <section class="split"><div class="panel" id="events"><h2>📅 Nächste 2 Events</h2>{_member_home_event_rows(running_events, int(uid or 0))}</div><div class="panel" id="auctions"><h2>🏆 Max. 4 laufende Auktionen</h2>{_member_home_auction_rows(active_auctions, snap)}</div></section>
     """
-    return _html_shell("Mitgliederbereich · Ebo Dashboard", body, nav_mode="member")
+    return _html_shell("Mitgliederbereich · Weisse Flamme Dashboard", body, nav_mode="member")
 
 
-def _settings_change_requests_for_dashboard(guild_id: int, limit: int = 80) -> list[dict[str, Any]]:
     """Letzte Dashboard-Einstellungsanträge.
 
     Das Dashboard schreibt keine Bot-JSON. Es legt nur Änderungsanträge in Postgres ab.
@@ -11046,86 +10228,6 @@ def _settings_change_requests_for_dashboard(guild_id: int, limit: int = 80) -> l
         return []
 
 
-def _stable_discord_media_url(value: Any) -> str:
-    """Discord-Medien-URL unverändert verwenden.
-
-    Moderne Discord-Anhangs- und Proxy-URLs sind signiert. Das frühere Entfernen
-    von ``?ex=...&hm=...`` führte deshalb zu 403/404 und unsichtbaren
-    Event-Titelbildern. Der Bot erneuert die URL bei jedem Snapshot.
-    """
-    url = str(value or "").strip()
-    if not (url.startswith("https://") or url.startswith("http://")):
-        return ""
-    return url
-
-
-def _event_image_url(event: dict[str, Any]) -> str:
-    """Sichere Event-Titelbild-URL aus alten/neuen Snapshot-Strukturen."""
-    if not isinstance(event, dict):
-        return ""
-
-    candidates: list[Any] = []
-    for key in (
-        "image_url", "title_image_url", "event_image_url", "banner_url",
-        "thumbnail_url", "cover_url", "image", "thumbnail", "banner", "cover",
-    ):
-        candidates.append(event.get(key))
-
-    for key in ("embed", "discord_embed", "message_embed", "media"):
-        nested = event.get(key)
-        if isinstance(nested, dict):
-            for sub_key in ("image_url", "thumbnail_url", "banner_url", "cover_url", "url", "proxy_url", "image", "thumbnail"):
-                candidates.append(nested.get(sub_key))
-        elif isinstance(nested, list):
-            candidates.extend(nested[:4])
-
-    attachments = event.get("attachments")
-    if isinstance(attachments, list):
-        candidates.extend(attachments[:6])
-
-    def unpack(raw: Any) -> list[Any]:
-        if isinstance(raw, dict):
-            return [raw.get("url"), raw.get("proxy_url"), raw.get("image_url"), raw.get("thumbnail_url")]
-        if isinstance(raw, list):
-            out: list[Any] = []
-            for item in raw[:6]:
-                out.extend(unpack(item))
-            return out
-        return [raw]
-
-    for candidate in candidates:
-        for raw in unpack(candidate):
-            url = _stable_discord_media_url(raw)
-            if url:
-                return url
-    return ""
-
-
-def _member_event_title_cell(event: dict[str, Any]) -> dict[str, str]:
-    eid = str(event.get("event_id") or event.get("id") or "")
-    title = str(event.get("title") or event.get("name") or eid or "Event")
-    image_url = _event_image_url(event)
-    thumb = (
-        f'<img class="member-event-thumb" src="{_e(image_url)}" alt="" loading="lazy" '
-        'onerror="this.closest(\'.member-event-entry\').classList.add(\'no-image\');this.remove()">'
-        if image_url else ""
-    )
-    return _raw(
-        f'<a class="member-event-entry {"" if image_url else "no-image"}" href="/event/{_e(eid)}">'
-        f'{thumb}<span><strong>{_e(title)}</strong><small>{_e(_event_status_text(event))}</small></span></a>'
-    )
-
-
-def _event_image_hero_side(event: dict[str, Any]) -> str:
-    image_url = _event_image_url(event)
-    if not image_url:
-        return ""
-    return (
-        f'<div class="event-title-image"><img src="{_e(image_url)}" alt="Titelbild {_e(event.get("title") or "Event")}" '
-        'loading="lazy" onerror="this.parentElement.remove()"></div>'
-    )
-
-
 def _member_event_role_summary_text(ev: dict[str, Any]) -> str:
     try:
         s = _event_role_summary(ev)
@@ -11144,7 +10246,7 @@ def _render_member_events_page(data: dict[str, Any], request: Request) -> str:
     for ev in events:
         eid = str(ev.get("event_id") or ev.get("id") or "")
         rows.append([
-            _member_event_title_cell(ev),
+            _event_link(eid, ev.get("title") or ev.get("name") or eid),
             _dt(ev.get("when_iso") or ev.get("start_at") or ev.get("created_at")),
             _event_status_text(ev),
             _member_event_role_summary_text(ev),
@@ -11153,15 +10255,7 @@ def _render_member_events_page(data: dict[str, Any], request: Request) -> str:
         ])
     history_rows = _member_event_rows(snap, int(uid or 0)) if uid else []
     body = f"""
-    <style>
-      .member-event-entry{{display:grid;grid-template-columns:92px minmax(0,1fr);gap:12px;align-items:center;text-decoration:none;color:inherit;min-width:260px}}
-      .member-event-entry.no-image{{grid-template-columns:minmax(0,1fr)}}
-      .member-event-thumb{{width:92px;height:54px;object-fit:cover;border-radius:10px;border:1px solid rgba(214,168,79,.28);background:#080706}}
-      .member-event-entry strong{{display:block;color:var(--gold);line-height:1.25}}
-      .member-event-entry small{{display:block;color:var(--muted);font-size:11px;margin-top:4px}}
-      @media(max-width:720px){{.member-event-entry{{grid-template-columns:72px minmax(0,1fr);min-width:210px}}.member-event-thumb{{width:72px;height:46px}}}}
-    </style>
-    <nav class="topnav"><a href="/member">Start</a><a href="/member/events">Events</a><a href="/event-calendar">Kalender</a><a href="/member/auctions">Auktionen</a><a href="/portal">Eigenes Profil</a></nav>
+    <nav class="topnav"><a href="/member">Start</a><a href="/member/events">Events</a><a href="/member/auctions">Auktionen</a><a href="/portal">Eigenes Profil</a></nav>
     <section class="hero"><div><div class="eyebrow">Mitgliederbereich</div><h1>📅 Events</h1><p class="muted">Eigene Eventseite mit mehr Infos als die Startseite.</p></div></section>
     <section class="panel"><h2>📆 Laufende & kommende Events</h2>{_table(['Event','Zeit','Status','Rollen','Deine Anmeldung','Aktion'], rows, placeholder='Events durchsuchen…')}</section>
     <section class="panel"><h2>🧾 Deine Event-Historie</h2>{_table(['Event','Zeit','Deine Anmeldung'], history_rows, placeholder='Historie durchsuchen…')}</section>
@@ -11169,415 +10263,28 @@ def _render_member_events_page(data: dict[str, Any], request: Request) -> str:
     return _html_shell("Events · Mitgliederbereich", body, nav_mode="member")
 
 
-
-_CALENDAR_TZ = ZoneInfo("Europe/Berlin")
-_CALENDAR_START_HOUR = 4
-_CALENDAR_END_HOUR = 24
-_CALENDAR_ROW_HEIGHT = 48
-
-
-def _calendar_week_monday(value: str = "") -> datetime:
-    today = datetime.now(_CALENDAR_TZ).date()
-    if value:
-        try:
-            today = datetime.strptime(str(value).strip(), "%Y-%m-%d").date()
-        except Exception:
-            pass
-    monday = today - timedelta(days=today.weekday())
-    return datetime(monday.year, monday.month, monday.day, tzinfo=_CALENDAR_TZ)
-
-
-def _calendar_month_start(value: str = "") -> datetime:
-    today = datetime.now(_CALENDAR_TZ).date()
-    raw = str(value or "").strip()
-    if raw:
-        for fmt in ("%Y-%m", "%Y-%m-%d"):
-            try:
-                parsed = datetime.strptime(raw, fmt).date()
-                today = parsed
-                break
-            except Exception:
-                continue
-    return datetime(today.year, today.month, 1, tzinfo=_CALENDAR_TZ)
-
-
-def _calendar_shift_month(start: datetime, delta: int) -> datetime:
-    index = start.year * 12 + (start.month - 1) + int(delta)
-    year, month0 = divmod(index, 12)
-    return datetime(year, month0 + 1, 1, tzinfo=_CALENDAR_TZ)
-
-
-def _calendar_event_local_dt(event: dict[str, Any]) -> Optional[datetime]:
-    dt = _dt_obj(event.get("when_iso") or event.get("start_at") or event.get("created_at"))
-    return dt.astimezone(_CALENDAR_TZ) if dt else None
-
-
-def _calendar_event_end_local(event: dict[str, Any], start: datetime) -> datetime:
-    end = _dt_obj(event.get("end_at") or event.get("end_time"))
-    if end:
-        end_local = end.astimezone(_CALENDAR_TZ)
-        if end_local > start:
-            return end_local
-    try:
-        minutes = max(30, min(720, int(float(event.get("duration_minutes") or 120))))
-    except Exception:
-        minutes = 120
-    return start + timedelta(minutes=minutes)
-
-
-def _calendar_category(event: dict[str, Any]) -> str:
-    text = " ".join([
-        str(event.get("event_type") or ""),
-        str(event.get("dkp_event_type") or ""),
-        str(event.get("title") or event.get("name") or ""),
-    ]).lower()
-    if any(x in text for x in ("pvp", "krieg", "boon", "rift", "siege", "belager")):
-        return "pvp"
-    if any(x in text for x in ("gildenboss", "archboss", "arch boss", "boss")):
-        return "boss"
-    if any(x in text for x in ("nightmare", "nm raid")):
-        return "nightmare"
-    if any(x in text for x in ("hard raid", "hm raid", "hardmode")):
-        return "hard"
-    if any(x in text for x in ("trial", "prüfung")):
-        return "trial"
-    if "raid" in text:
-        return "raid"
-    return "other"
-
-
-def _calendar_category_label(category: str) -> str:
-    return {
-        "pvp": "PvP", "boss": "Gildenboss", "nightmare": "Nightmare",
-        "hard": "Hard Raid", "trial": "Trials", "raid": "Raid", "other": "Sonstiges",
-    }.get(category, "Sonstiges")
-
-
-def _calendar_event_url(event: dict[str, Any]) -> str:
-    scheduled_id = str(event.get("scheduled_event_id") or "").strip()
-    guild_id = str(event.get("guild_id") or "").strip()
-    if scheduled_id and guild_id:
-        return f"https://discord.com/events/{guild_id}/{scheduled_id}"
-    eid = str(event.get("event_id") or event.get("id") or "").strip()
-    return f"/event/{urllib.parse.quote(eid)}" if eid else "#"
-
-
-def _render_event_calendar_page(data: dict[str, Any], request: Request, month: str = "", msg: str = "") -> str:
-    if not data.get("ok"):
-        return _html_shell("Event-Kalender · Ebo Dashboard", f"<section class='panel'><h1>📅 Event-Kalender</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
-
-    snap: dict[str, Any] = data.get("snapshot") or {}
-    guild_id = _safe_guild_id(data)
-    month_start = _calendar_month_start(month)
-    next_month_start = _calendar_shift_month(month_start, 1)
-    prev_month_start = _calendar_shift_month(month_start, -1)
-    grid_start = month_start - timedelta(days=month_start.weekday())
-    grid_end = grid_start + timedelta(days=42)
-    today = datetime.now(_CALENDAR_TZ).date()
-    is_admin = _is_dashboard_admin(request)
-
-    events_by_day: dict[Any, list[dict[str, Any]]] = {}
-    all_events: list[dict[str, Any]] = []
-    for raw in ((snap.get("events") or {}).get("items") or []):
-        if not isinstance(raw, dict):
-            continue
-        ev = dict(raw)
-        dt = _calendar_event_local_dt(ev)
-        if not dt:
-            continue
-        ev["_calendar_dt"] = dt
-        all_events.append(ev)
-        if grid_start <= dt < grid_end:
-            events_by_day.setdefault(dt.date(), []).append(ev)
-    for rows in events_by_day.values():
-        rows.sort(key=lambda ev: ev.get("_calendar_dt") or month_start)
-
-    day_names = ["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"]
-    day_headers = "".join(f'<div class="month-weekday">{name}</div>' for name in day_names)
-    day_cells: list[str] = []
-    for offset in range(42):
-        day_dt = grid_start + timedelta(days=offset)
-        day = day_dt.date()
-        rows = events_by_day.get(day, [])
-        classes = ["month-day"]
-        if day_dt.month != month_start.month:
-            classes.append("outside")
-        if day == today:
-            classes.append("today")
-        cards: list[str] = []
-        for ev in rows[:5]:
-            start_dt = ev.get("_calendar_dt")
-            title = str(ev.get("title") or ev.get("name") or "Event")
-            category = _calendar_category(ev)
-            image = _event_image_url(ev)
-            thumb = f'<img src="{_e(image)}" alt="" loading="lazy">' if image else ""
-            scheduled = '<span class="month-discord">Discord</span>' if ev.get("scheduled_event_id") else ""
-            cards.append(
-                f'<a class="month-event cat-{_e(category)}" href="{_e(_calendar_event_url(ev))}" title="{_e(title)}">'
-                f'{thumb}<span><strong>{_e(start_dt.strftime("%H:%M") if isinstance(start_dt, datetime) else "")} · {_e(title)}</strong>'
-                f'<small>{_e(_calendar_category_label(category))} {scheduled}</small></span></a>'
-            )
-        more = f'<div class="month-more">+ {len(rows) - 5} weitere</div>' if len(rows) > 5 else ""
-        day_cells.append(
-            f'<div class="{" ".join(classes)}"><div class="month-day-number">{day.day}</div>'
-            f'<div class="month-events">{"".join(cards)}{more}</div></div>'
-        )
-
-    upcoming_rows: list[list[Any]] = []
-    now_local = datetime.now(_CALENDAR_TZ)
-    upcoming_all = [ev for ev in all_events if isinstance(ev.get("_calendar_dt"), datetime) and ev.get("_calendar_dt") >= now_local - timedelta(hours=2)]
-    upcoming_all.sort(key=lambda ev: ev.get("_calendar_dt") or now_local)
-    for ev in upcoming_all[:20]:
-        dt = ev.get("_calendar_dt")
-        eid = str(ev.get("event_id") or ev.get("id") or "")
-        discord_link = "—"
-        if ev.get("scheduled_event_id"):
-            discord_link = _raw(f'<a class="btn mini-btn" href="{_e(_calendar_event_url(ev))}" target="_blank" rel="noopener">Discord-Termin</a>')
-        upcoming_rows.append([
-            _member_event_title_cell(ev),
-            dt.strftime("%a, %d.%m.%Y %H:%M") if isinstance(dt, datetime) else "—",
-            _calendar_category_label(_calendar_category(ev)),
-            ev.get("location") or "—",
-            discord_link,
-            _raw(f'<a class="btn mini-btn" href="/event/{_e(eid)}">Details</a>') if eid else "—",
-        ])
-
-    queue_rows: list[list[Any]] = []
-    for row in (_dashboard_event_action_requests(guild_id, limit=30) if guild_id else []):
-        result = ""
-        try:
-            result_obj = json.loads(str(row.get("result_json") or "{}"))
-            result = result_obj.get("message") or result_obj.get("error") or ""
-        except Exception:
-            result = str(row.get("result_json") or "")[:180]
-        queue_rows.append([row.get("requested_at"), row.get("action_type"), row.get("status"), row.get("actor_name"), result])
-
-    default_date = today if today.year == month_start.year and today.month == month_start.month else month_start.date()
-    admin_form = ""
-    if is_admin:
-        admin_form = f"""
-        <section class="panel" id="calendar-create">
-          <h2>➕ Termin eintragen</h2>
-          <p class="muted">Erstellt den normalen Discord-Eventpost, trägt den Termin in den Gildenkalender ein und legt auf Wunsch zusätzlich ein echtes Discord-Serverevent an.</p>
-          <form method="post" action="/admin/event-calendar/create" style="display:grid;gap:12px">
-            <div class="event-form-grid">
-              <label>Titel<br><input name="title" required placeholder="z. B. Gildenbosse Sonntag"></label>
-              <label>Datum<br><input name="date" type="date" required value="{_e(default_date.isoformat())}"></label>
-              <label>Uhrzeit<br><input name="time" type="time" required value="20:00"></label>
-              <label>Dauer in Minuten<br><input name="duration_minutes" type="number" min="30" max="720" step="15" value="120"></label>
-              <label>Wiederholungen wöchentlich<br><input name="repeat_count" type="number" min="1" max="12" value="1"></label>
-              <label>Eventtyp / EC-Regel<br>{_dashboard_event_type_select_html()}</label>
-              <label>Kategorie<br><select name="event_type"><option value="Standard">Standard</option><option value="Gildenbosse">Gildenbosse</option><option value="Normal Raid">Normal Raid</option><option value="Hard Raid">Hard Raid</option><option value="Nightmare">Nightmare</option><option value="Trials">Trials</option><option value="PvP">PvP</option></select></label>
-              <label>Zielkanal<br>{_dashboard_channel_select_html(snap, required=True)}</label>
-              <label>Zielrolle optional<br>{_dashboard_role_select_html(snap)}</label>
-              <label>Ort im Discord-Kalender<br><input name="location" value="Ebolus Discord" maxlength="100"></label>
-              <label>Bildtyp<br><select name="image_type"><option value="none">Kein Bild</option><option value="custom">Eigene URL</option><option value="normal">Normal Raid</option><option value="hard">Hard Raid</option><option value="nightmare">Nightmare</option><option value="trials">Trials</option><option value="pvp">PvP</option></select></label>
-            </div>
-            <label>Beschreibung<br><textarea name="description" rows="4" placeholder="Was ist geplant?"></textarea></label>
-            <label>Eigene Bild-URL<br><input name="image_url" placeholder="https://..."></label>
-            <div class="calendar-checks">
-              <label><input type="checkbox" name="sync_discord_event" value="1" checked> Im Discord-Serverkalender anlegen</label>
-              <label><input type="checkbox" name="send_dms" value="1"> Mitglieder zusätzlich per DM informieren</label>
-            </div>
-            <button class="btn" type="submit" onclick="return confirm('Termin an den Bot senden?')">Termin erstellen</button>
-          </form>
-        </section>
-        <section class="panel"><h2>🧾 Kalender-Queue</h2>{_table(['Zeit','Aktion','Status','Von','Ergebnis'], queue_rows, placeholder='Queue durchsuchen…')}</section>
-        """
-
-    month_names = ["Januar", "Februar", "März", "April", "Mai", "Juni", "Juli", "August", "September", "Oktober", "November", "Dezember"]
-    month_title = f"{month_names[month_start.month - 1]} {month_start.year}"
-    msg_panel = f"<section class='panel'><p>{_e(msg)}</p></section>" if msg else ""
-    body = f"""
-    <style>
-      .calendar-toolbar{{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:14px}}
-      .calendar-toolbar .actions-inline{{margin:0}}
-      .month-scroll{{overflow:auto;border:1px solid var(--line);border-radius:16px;background:#0a0908}}
-      .month-shell{{min-width:1050px}}
-      .month-weekdays,.month-grid{{display:grid;grid-template-columns:repeat(7,minmax(140px,1fr))}}
-      .month-weekday{{padding:11px;text-align:center;font-weight:800;color:var(--gold);border-right:1px solid rgba(255,255,255,.08);border-bottom:1px solid var(--line);background:#0d0c0b}}
-      .month-day{{min-height:150px;padding:8px;border-right:1px solid rgba(255,255,255,.08);border-bottom:1px solid rgba(255,255,255,.08);background:rgba(10,9,8,.72)}}
-      .month-day.outside{{opacity:.42;background:#080808}}
-      .month-day.today{{box-shadow:inset 0 0 0 2px var(--gold)}}
-      .month-day-number{{font-weight:900;color:var(--gold);margin-bottom:7px}}
-      .month-events{{display:grid;gap:5px}}
-      .month-event{{border-radius:8px;padding:5px 6px;text-decoration:none;color:#fff;display:grid;grid-template-columns:auto minmax(0,1fr);gap:6px;align-items:center;border:1px solid rgba(255,255,255,.16);box-shadow:0 4px 12px rgba(0,0,0,.25);min-width:0}}
-      .month-event img{{width:30px;height:30px;object-fit:cover;border-radius:5px}}
-      .month-event strong,.month-event small{{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
-      .month-event strong{{font-size:11px;line-height:1.2}}
-      .month-event small{{font-size:9px;opacity:.85;margin-top:2px}}
-      .month-discord{{font-size:8px;border:1px solid rgba(255,255,255,.3);border-radius:8px;padding:1px 4px}}
-      .month-more{{font-size:10px;color:var(--muted);padding:2px 4px}}
-      .cat-pvp{{background:#8f2828}} .cat-boss{{background:#7b2d2a}} .cat-nightmare{{background:#7b3d71}} .cat-hard{{background:#8a4b2c}} .cat-trial{{background:#196d78}} .cat-raid{{background:#2d6e49}} .cat-other{{background:#493079}}
-      .calendar-legend{{display:flex;flex-wrap:wrap;gap:10px;margin-top:12px}}
-      .calendar-legend span{{display:inline-flex;gap:6px;align-items:center;color:var(--muted)}}
-      .calendar-dot{{width:10px;height:10px;border-radius:50%;display:inline-block}}
-      .calendar-checks{{display:flex;gap:18px;flex-wrap:wrap}}
-      .calendar-checks label{{display:flex;gap:7px;align-items:center}}
-      .mini-btn{{padding:7px 10px}}
-      @media(max-width:700px){{.month-day{{min-height:125px}}}}
-    </style>
-    <nav class="topnav"><a href="/member/events">Events</a><a href="/event-calendar">Kalender</a>{'<a href="/events-admin">Event-Verwaltung</a>' if is_admin else ''}<a href="/attendance">Anwesenheit</a></nav>
-    <section class="hero"><div><div class="eyebrow">Gildenkalender</div><h1>📅 Event-Kalender</h1><p class="muted">Monatsübersicht aus den echten Bot-Events. Dashboard, Gildenzentrale und Discord-Serverkalender greifen auf dieselben Termine zu.</p></div></section>
-    {msg_panel}
-    <section class="panel">
-      <div class="calendar-toolbar">
-        <div><h2>{_e(month_title)}</h2><p class="muted">Europe/Berlin</p></div>
-        <div class="actions-inline"><a class="btn" href="/event-calendar?month={_e(prev_month_start.strftime('%Y-%m'))}">← Vorheriger Monat</a><a class="btn" href="/event-calendar?month={_e(datetime.now(_CALENDAR_TZ).strftime('%Y-%m'))}">Heute</a><a class="btn" href="/event-calendar?month={_e(next_month_start.strftime('%Y-%m'))}">Nächster Monat →</a>{'<a class="btn" href="#calendar-create">Termin eintragen</a>' if is_admin else ''}</div>
-      </div>
-      <div class="month-scroll"><div class="month-shell"><div class="month-weekdays">{day_headers}</div><div class="month-grid">{''.join(day_cells)}</div></div></div>
-      <div class="calendar-legend"><span><i class="calendar-dot cat-boss"></i>Gildenboss</span><span><i class="calendar-dot cat-raid"></i>Raid</span><span><i class="calendar-dot cat-hard"></i>Hard Raid</span><span><i class="calendar-dot cat-nightmare"></i>Nightmare</span><span><i class="calendar-dot cat-trial"></i>Trials</span><span><i class="calendar-dot cat-pvp"></i>PvP</span><span><i class="calendar-dot cat-other"></i>Sonstiges</span></div>
-    </section>
-    <section class="panel"><h2>📌 Nächste Termine</h2>{_table(['Event','Zeit','Kategorie','Ort','Discord','Details'], upcoming_rows, placeholder='Termine durchsuchen…')}</section>
-    {admin_form}
-    """
-    return _html_shell("Event-Kalender · Ebo Dashboard", body, nav_mode="member")
-
-def _auction_dashboard_bucket(auction: dict[str, Any]) -> str:
-    """Drei verständliche Bereiche für die Mitglieder-Auktionsseite."""
-    phase = str(auction.get("phase") or auction.get("mode") or "").strip().lower()
-    mode = str(auction.get("eligibility_mode") or auction.get("need_type") or "").strip().lower()
-    kind = str(auction.get("kind") or auction.get("auction_type") or "").strip().lower()
-    text = " ".join([
-        phase, mode, kind,
-        str(auction.get("item_name") or auction.get("item") or "").lower(),
-    ])
-    if mode in {"main_need", "main", "mainneed"} or "main need" in text or "main-need" in text:
-        return "main"
-    if mode in {"secondary_need", "second_need", "secondary", "second", "offspec"} or any(x in text for x in ("second need", "second-need", "secondary need", "secondary-need")):
-        return "second"
-    # Freie Auktionen, Lithographien, Sales und Würfelitems werden gemeinsam
-    # unter Litho/Müll angezeigt, damit kein aktiver Eintrag verschwindet.
-    return "junk"
-
-
-def _auction_bucket_label(auction: dict[str, Any]) -> str:
-    bucket = _auction_dashboard_bucket(auction)
-    return {"main": "Main Need", "second": "Second Need", "junk": "Litho / Müll"}.get(bucket, "Litho / Müll")
-
-
-def _auction_completed_at(auction: dict[str, Any]) -> Any:
-    for key in ("delivered_at", "sold_at", "closed_at", "ended_at", "completed_at", "updated_at", "ends_at", "created_at"):
-        if auction.get(key):
-            return auction.get(key)
-    return ""
-
-
-def _auction_history_result(auction: dict[str, Any], snap: dict[str, Any]) -> str:
-    if auction.get("junk_drop") or auction.get("is_junk"):
-        roll = int(_num(auction.get("junk_roll_winner_roll"), 0))
-        if not roll:
-            entries = _junk_roll_entries_dashboard(auction)
-            roll = int(_num((entries[0] if entries else {}).get("roll"), 0))
-        return f"Wurf {roll}" if roll else "Würfelvergabe"
-    amount = _loot_winning_amount(auction)
-    return f"{amount} EC" if amount else "vergeben"
-
-
 def _render_member_auctions_page(data: dict[str, Any], request: Request) -> str:
     if not data.get("ok"):
         return _html_shell("Auktionen · Mitgliederbereich", f"<section class='panel'><h1>🏆 Auktionen</h1><p class='muted'>{_e(data.get('error'))}</p></section>", nav_mode="member")
     snap: dict[str, Any] = data.get("snapshot") or {}
     auctions = _portal_active_auctions(snap)
-    buckets: dict[str, list[dict[str, Any]]] = {"main": [], "second": [], "junk": []}
-    for auction in auctions:
-        buckets[_auction_dashboard_bucket(auction)].append(auction)
-
-    row_html: list[str] = []
-    for bucket_name in ("main", "second", "junk"):
-        for a in buckets[bucket_name]:
-            aid = str(a.get("auction_id") or "")
-            count_title, count_value, _ = _auction_count_label(a)
-            item_cell = _cell(_auction_link(aid, a.get("item_name") or a.get("item") or aid, a))
-            action = f'<a class="btn" href="/auction/{_e(aid)}">Öffnen</a>' if aid else "—"
-            search_text = " ".join([
-                str(a.get("item_name") or a.get("item") or ""),
-                _phase_label(a), _auction_bucket_label(a),
-                _auction_leader_or_roll_text(a, snap),
-            ]).lower()
-            row_html.append(
-                f'<tr data-auction-bucket="{_e(bucket_name)}" data-auction-search="{_e(search_text)}">'
-                f'<td>{item_cell}</td>'
-                f'<td>{_e(_phase_label(a))}</td>'
-                f'<td>{_cell(_loot_effective_status_label(a))}</td>'
-                f'<td>{_e(f"{count_value} {count_title}")}</td>'
-                f'<td>{_e(_auction_leader_or_roll_text(a, snap))}</td>'
-                f'<td>{_e(_auction_timer_text(a))}</td>'
-                f'<td>{action}</td>'
-                '</tr>'
-            )
-
-    if not row_html:
-        row_html.append('<tr class="auction-empty-row"><td colspan="7" class="muted">Keine laufenden Auktionen.</td></tr>')
-
-    # Letzte zehn abgeschlossene Vergaben/Verkäufe aus dem vollständigen Snapshot.
-    all_auctions = [dict(a) for a in (((snap.get("loot") or {}).get("auctions") or {}).get("items") or []) if isinstance(a, dict)]
-    completed = [a for a in all_auctions if _loot_is_done(a)]
-    completed.sort(key=lambda a: _dt_obj(_auction_completed_at(a)) or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
-    names = _profile_name_map(snap)
-    history_rows: list[list[Any]] = []
-    for a in completed[:10]:
+    rows = []
+    for a in auctions:
         aid = str(a.get("auction_id") or "")
-        winner = _loot_winner_name_text(a, names)
-        if not winner or winner == "—":
-            winner = a.get("winner_name") or a.get("top_bid_user_name") or "—"
-        history_rows.append([
-            _auction_link(aid, a.get("item_name") or a.get("item") or aid, a),
-            _auction_bucket_label(a),
-            winner,
-            _auction_history_result(a, snap),
-            _dt(_auction_completed_at(a)),
-            _raw(f'<a class="link" href="/auction/{_e(aid)}">Details</a>') if aid else "—",
+        count_title, count_value, _ = _auction_count_label(a)
+        rows.append([
+            _auction_link(aid, a.get("item_name") or a.get("item") or aid),
+            _phase_label(a),
+            _loot_effective_status_label(a),
+            f"{count_value} {count_title}",
+            _auction_leader_or_roll_text(a, snap),
+            _auction_timer_text(a),
+            _raw(f'<a class="btn" href="/auction/{_e(aid)}">Öffnen</a>') if aid else "—",
         ])
-
     body = f"""
-    <style>
-      .auction-category-menu{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-bottom:18px}}
-      .auction-category-tab{{appearance:none;border:1px solid rgba(214,168,79,.28);border-radius:14px;background:linear-gradient(180deg,rgba(28,23,17,.92),rgba(10,9,8,.94));color:var(--text);padding:14px 16px;text-align:left;cursor:pointer;transition:.18s ease;box-shadow:0 10px 25px rgba(0,0,0,.18)}}
-      .auction-category-tab strong{{display:block;font-family:Georgia,serif;color:var(--gold);font-size:18px}}
-      .auction-category-tab span{{display:block;font-size:30px;font-weight:900;margin-top:3px}}
-      .auction-category-tab small{{display:block;color:var(--muted);margin-top:2px}}
-      .auction-category-tab:hover,.auction-category-tab.active{{border-color:rgba(214,168,79,.72);background:linear-gradient(180deg,rgba(86,59,22,.65),rgba(24,18,12,.95));transform:translateY(-1px)}}
-      .auction-search{{width:min(480px,100%);margin:0 0 14px}}
-      .auction-table tbody tr[hidden]{{display:none}}
-      .auction-table td:first-child{{min-width:300px}}
-      .auction-no-results{{padding:18px;color:var(--muted);display:none}}
-      @media(max-width:800px){{.auction-category-menu{{grid-template-columns:1fr}}.auction-category-tab{{display:grid;grid-template-columns:1fr auto;align-items:center}}.auction-category-tab span{{grid-row:1/3;grid-column:2;font-size:28px}}}}
-    </style>
     <nav class="topnav"><a href="/member">Start</a><a href="/member/events">Events</a><a href="/member/auctions">Auktionen</a><a href="/portal">Eigenes Profil</a></nav>
-    <section class="hero"><div><div class="eyebrow">Mitgliederbereich</div><h1>🏆 Laufende Auktionen</h1><p class="muted">Nach Need-Stufe getrennt. Lithographien, freie Auktionen, Sales und Würfelitems liegen gesammelt unter Litho / Müll.</p></div></section>
-    <section class="panel">
-      <div class="auction-category-menu" role="tablist" aria-label="Auktionsbereiche">
-        <button type="button" class="auction-category-tab active" data-auction-tab="main"><strong>Main Need</strong><span>{len(buckets['main'])}</span><small>aktive Auktionen</small></button>
-        <button type="button" class="auction-category-tab" data-auction-tab="second"><strong>Second Need</strong><span>{len(buckets['second'])}</span><small>aktive Auktionen</small></button>
-        <button type="button" class="auction-category-tab" data-auction-tab="junk"><strong>Litho / Müll</strong><span>{len(buckets['junk'])}</span><small>frei, Sale und Würfeln</small></button>
-      </div>
-      <input id="auctionSearch" class="auction-search" type="search" placeholder="Items durchsuchen…" autocomplete="off">
-      <div class="table-wrap"><table class="auction-table"><thead><tr><th>Item</th><th>Bereich</th><th>Status</th><th>Aktivität / Preis</th><th>Führung / Stand</th><th>Timer</th><th>Aktion</th></tr></thead><tbody>{''.join(row_html)}</tbody></table></div>
-      <div id="auctionNoResults" class="auction-no-results">In diesem Bereich wurden keine passenden Items gefunden.</div>
-    </section>
-    <section class="panel"><h2>💰 Verkaufsübersicht</h2><p class="muted">Die letzten 10 abgeschlossenen Verkäufe und Vergaben.</p>{_table(['Item','Bereich','Käufer / Gewinner','Preis / Ergebnis','Abgeschlossen','Aktion'], history_rows, placeholder='Verkäufe durchsuchen…')}</section>
-    <script>
-    (() => {{
-      const tabs=[...document.querySelectorAll('[data-auction-tab]')];
-      const rows=[...document.querySelectorAll('tr[data-auction-bucket]')];
-      const search=document.getElementById('auctionSearch');
-      const noResults=document.getElementById('auctionNoResults');
-      let active='main';
-      const firstNonEmpty=tabs.find(btn=>Number((btn.querySelector('span')||{{}}).textContent||0)>0);
-      if(firstNonEmpty && Number((tabs[0].querySelector('span')||{{}}).textContent||0)===0) active=firstNonEmpty.dataset.auctionTab;
-      function apply(){{
-        const q=(search?.value||'').trim().toLowerCase();
-        let shown=0;
-        rows.forEach(row=>{{const okBucket=row.dataset.auctionBucket===active;const okSearch=!q||(row.dataset.auctionSearch||'').includes(q);row.hidden=!(okBucket&&okSearch);if(!row.hidden)shown++;}});
-        tabs.forEach(btn=>btn.classList.toggle('active',btn.dataset.auctionTab===active));
-        if(noResults) noResults.style.display=shown?'none':'block';
-      }}
-      tabs.forEach(btn=>btn.addEventListener('click',()=>{{active=btn.dataset.auctionTab;apply();}}));
-      search?.addEventListener('input',apply);
-      apply();
-    }})();
-    </script>
+    <section class="hero"><div><div class="eyebrow">Mitgliederbereich</div><h1>🏆 Laufende Auktionen</h1><p class="muted">Alle aktuell offenen Auktionen, Würfelitems und Sales mit Timer.</p></div></section>
+    <section class="panel">{_table(['Item','Bereich','Status','Gebote/Würfe','Führung/Wurf','Timer','Aktion'], rows, placeholder='Auktionen durchsuchen…')}</section>
     """
     return _html_shell("Auktionen · Mitgliederbereich", body, nav_mode="member")
 
@@ -11586,16 +10293,18 @@ def _render_member_members_page(data: dict[str, Any], request: Request) -> str:
     if not data.get("ok"):
         return _html_shell("Mitglieder · Mitgliederbereich", f"<section class='panel'><h1>👥 Mitglieder</h1><p class='muted'>{_e(data.get('error'))}</p></section>", nav_mode="member")
     snap: dict[str, Any] = data.get("snapshot") or {}
+    profiles = ((snap.get("profiles") or {}).get("items") or [])
     rows = []
-    for member in _member_directory_items(snap):
-        uid = _user_id(member.get("user_id") or member.get("id"))
-        display_name = member.get("list_name") or member.get("server_name") or member.get("display_name") or f"User {uid}"
+    for p in profiles:
+        if not isinstance(p, dict):
+            continue
+        uid = _user_id(p.get("user_id") or p.get("id"))
         rows.append([
-            _member_link(uid, display_name),
-            member.get("ingame_name") or "—",
-            member.get("main_role") or "—",
-            member.get("gearscore") or "—",
-            "ja" if bool(member.get("has_needs")) else "nein",
+            _member_link(uid, p.get("display_name") or p.get("discord_name") or p.get("ingame_name") or f"User {uid}"),
+            p.get("ingame_name") or "—",
+            p.get("main_role") or "—",
+            p.get("gearscore") or "—",
+            "ja" if p.get("has_needs") else "nein",
         ])
     body = f"""
     <nav class="topnav"><a href="/member">Start</a><a href="/member/members">Mitglieder</a><a href="/member/events">Events</a><a href="/member/auctions">Auktionen</a></nav>
@@ -11860,7 +10569,7 @@ def _settings_request_admin_action(guild_id: int, request_id: str, action: str, 
 
 def _render_admin_settings_editor(data: dict[str, Any], msg: str = "") -> str:
     if not data.get("ok"):
-        return _html_shell("Admin-Einstellungen · Ebo Dashboard", f"<section class='panel'><h1>⚙️ Admin-Einstellungen</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+        return _html_shell("Admin-Einstellungen · Weisse Flamme Dashboard", f"<section class='panel'><h1>⚙️ Admin-Einstellungen</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
     snap: dict[str, Any] = data.get("snapshot") or {}
     guild_id = _safe_guild_id(data)
     cfg = _current_dkp_settings_from_snapshot(snap)
@@ -11953,7 +10662,7 @@ def _render_admin_settings_editor(data: dict[str, Any], msg: str = "") -> str:
 
     <section class="panel"><h2>🧾 Änderungsqueue</h2><p class="muted">Offene Anträge können abgebrochen werden. Fehlgeschlagene/blockierte/abgebrochene Anträge können neu geöffnet werden.</p>{_table(['Zeit','Status','Aktion','Details','Akteur','Aktion'], req_rows, placeholder='Änderungen durchsuchen…')}</section>
     """
-    return _html_shell("Admin-Einstellungen · Ebo Dashboard", body, nav_mode="admin")
+    return _html_shell("Admin-Einstellungen · Weisse Flamme Dashboard", body, nav_mode="admin")
 
 def _dashboard_event_action_requests(guild_id: int, limit: int = 80, event_id: str = "") -> list[dict[str, Any]]:
     if not _database_url() or not guild_id:
@@ -12118,7 +10827,7 @@ def _dashboard_event_type_select_html() -> str:
 
 def _render_events_center(data: dict[str, Any], current_user: Optional[dict[str, Any]] = None, msg: str = "", *, nav_mode: str = "member") -> str:
     if not data.get("ok"):
-        return _html_shell("Events · Ebo Dashboard", f"<section class='panel'><h1>📅 Events</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+        return _html_shell("Events · Weisse Flamme Dashboard", f"<section class='panel'><h1>📅 Events</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
 
     snap: dict[str, Any] = data.get("snapshot") or {}
     guild_id = _safe_guild_id(data)
@@ -12306,7 +11015,7 @@ def _render_events_center(data: dict[str, Any], current_user: Optional[dict[str,
       .event-form-grid input, .event-form-grid textarea, .event-form-grid select {{ width:100%; }}
       @media(max-width:720px) {{ .event-card-head {{ flex-direction:column; }} .actions-inline .link {{ flex:1 1 auto; text-align:center; }} }}
     </style>
-    <nav class="topnav"><a href="/">← Kommando</a><a href="/event-calendar">Kalender</a><a href="/attendance">Anwesenheit</a><a href="/ec">EC</a><a href="/overview">Gesamtübersicht</a><a href="/api/events-center">API</a><a href="/export/events_center.csv">CSV</a></nav>
+    <nav class="topnav"><a href="/">← Kommando</a><a href="/attendance">Anwesenheit</a><a href="/ec">EC</a><a href="/overview">Gesamtübersicht</a><a href="/api/events-center">API</a><a href="/export/events_center.csv">CSV</a></nav>
     <section class="hero">
       <div><div class="eyebrow">Event-Zentrale</div><h1>📅 Events & Planung</h1><p class="muted">Kommende Events, laufende Events, Eventstatus, Rollenverteilung, Teilnehmerübersicht und direkte Links zu Attendance, Review und EC.</p></div>
       <div class="hero-actions"><a class="hero-action attendance" href="#create"><span>➕</span><strong>Event erstellen</strong><small>Bot-Queue</small></a><a class="hero-action loot" href="#overview"><span>📋</span><strong>Events prüfen</strong><small>Status & Rollen</small></a><a class="hero-action members" href="#actions"><span>🧾</span><strong>Queue</strong><small>Erstellen/Bearbeiten/Löschen</small></a></div>
@@ -12362,68 +11071,8 @@ def _render_events_center(data: dict[str, Any], current_user: Optional[dict[str,
     </section>
     <section class="panel" id="actions"><h2>🧾 Event-Aktionsqueue</h2><p class="muted">Zeigt Erstellen/Bearbeiten/Löschen aus dem Dashboard und den Bot-Status.</p>{_table(['Zeit','Aktion','Event','Status','Von','Ergebnis'], action_table_rows, placeholder='Queue durchsuchen…')}</section>
     """
-    return _html_shell("Events · Ebo Dashboard", body, nav_mode=nav_mode)
+    return _html_shell("Events · Weisse Flamme Dashboard", body, nav_mode=nav_mode)
 
-
-
-@app.get("/event-calendar", response_class=HTMLResponse)
-def event_calendar_page(request: Request, month: str = "", week: str = "", msg: str = "", _: bool = Depends(_auth)):
-    try:
-        # ``week`` bleibt als Legacy-Parameter kompatibel; angezeigt wird immer der Monat.
-        return HTMLResponse(_render_event_calendar_page(_snapshot_payload(), request, month=(month or week), msg=msg))
-    except Exception as exc:
-        return HTMLResponse(_html_shell("Ebo Dashboard Fehler", f"<section class='panel'><h1>❌ Kalender-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"), status_code=500)
-
-
-@app.post("/admin/event-calendar/create")
-async def admin_event_calendar_create(request: Request, _: bool = Depends(_admin_auth)):
-    payload = _snapshot_payload()
-    guild_id = _safe_guild_id(payload)
-    actor = _current_user(request) or {"username": "Dashboard"}
-    form = _parse_urlencoded_body(await request.body())
-    date_s = str(form.get("date") or "").strip()
-    time_s = str(form.get("time") or "").strip()
-    try:
-        base_date = datetime.strptime(date_s, "%Y-%m-%d").date()
-        datetime.strptime(time_s, "%H:%M")
-    except Exception:
-        return RedirectResponse("/event-calendar?msg=" + urllib.parse.quote("Ungültiges Datum oder Uhrzeit."), status_code=303)
-    try:
-        repeat_count = max(1, min(12, int(form.get("repeat_count") or 1)))
-    except Exception:
-        repeat_count = 1
-    clean_base = {
-        "title": str(form.get("title") or "").strip(),
-        "time": time_s,
-        "event_type": str(form.get("event_type") or "").strip(),
-        "dkp_event_type": str(form.get("dkp_event_type") or "").strip(),
-        "channel_id": str(form.get("channel_id") or "").strip(),
-        "target_role_id": str(form.get("target_role_id") or "").strip(),
-        "description": str(form.get("description") or "").strip(),
-        "image_type": str(form.get("image_type") or "").strip(),
-        "image_url": str(form.get("image_url") or "").strip(),
-        "location": str(form.get("location") or "Ebolus Discord").strip(),
-        "duration_minutes": str(form.get("duration_minutes") or "120").strip(),
-        "send_dms": str(form.get("send_dms") or "") == "1",
-        "sync_discord_event": str(form.get("sync_discord_event") or "") == "1",
-        "created_from": "dashboard_calendar",
-    }
-    results = []
-    for index in range(repeat_count):
-        item = dict(clean_base)
-        item["date"] = (base_date + timedelta(days=7 * index)).isoformat()
-        item["repeat_index"] = index + 1
-        item["repeat_count"] = repeat_count
-        results.append(_enqueue_event_action_request(guild_id, "create", item, actor))
-    created = sum(1 for result in results if result.get("ok"))
-    errors = [str(result.get("error")) for result in results if not result.get("ok") and result.get("error")]
-    message = f"{created} Termin-Antrag/Anträge an den Bot gesendet."
-    if errors:
-        message += " Fehler: " + "; ".join(errors[:3])
-    return RedirectResponse(
-        "/event-calendar?month=" + urllib.parse.quote(date_s[:7]) + "&msg=" + urllib.parse.quote(message),
-        status_code=303,
-    )
 
 @app.get("/events", response_class=HTMLResponse)
 def events_page(request: Request, _: bool = Depends(_auth), msg: str = ""):
@@ -12431,7 +11080,7 @@ def events_page(request: Request, _: bool = Depends(_auth), msg: str = ""):
         # Normale Eventansicht – Admin-Verwaltung nur im Admin-Portal/Event-Verwaltung.
         return HTMLResponse(_render_member_events_page(_snapshot_payload(), request))
     except Exception as exc:
-        return HTMLResponse(_html_shell("Ebo Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"), status_code=500)
+        return HTMLResponse(_html_shell("Weisse Flamme Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"), status_code=500)
 
 
 
@@ -12441,7 +11090,7 @@ def events_admin_page(request: Request, _: bool = Depends(_admin_auth), msg: str
     try:
         return HTMLResponse(_render_events_center(_snapshot_payload(), _current_user(request), msg, nav_mode="admin"))
     except Exception as exc:
-        return HTMLResponse(_html_shell("Ebo Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>", nav_mode="admin"), status_code=500)
+        return HTMLResponse(_html_shell("Weisse Flamme Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>", nav_mode="admin"), status_code=500)
 @app.get("/api/events-center")
 def api_events_center(_: bool = Depends(_auth)):
     payload = _snapshot_payload()
@@ -12520,18 +11169,11 @@ async def admin_events_action(request: Request, _: bool = Depends(_admin_auth)):
         "description": str(form.get("description") or "").strip(),
         "image_type": str(form.get("image_type") or "").strip(),
         "image_url": str(form.get("image_url") or "").strip(),
-        "location": str(form.get("location") or "").strip(),
-        "duration_minutes": str(form.get("duration_minutes") or "").strip(),
-        "sync_discord_event": str(form.get("sync_discord_event") or "") == "1",
         "send_dms": str(form.get("send_dms") or "") == "1",
     }
     res = _enqueue_event_action_request(guild_id, action, clean_payload, actor)
     msg = "Event-Aktion wurde an den Bot gesendet." if res.get("ok") else f"Fehler: {res.get('error')}"
-    return_to = str(form.get("return_to") or "/events-admin").strip()
-    if return_to not in {"/events-admin", "/event-calendar", "/events"}:
-        return_to = "/events-admin"
-    sep = "&" if "?" in return_to else "?"
-    return RedirectResponse(return_to + sep + "msg=" + urllib.parse.quote(msg), status_code=303)
+    return RedirectResponse("/events?msg=" + urllib.parse.quote(msg), status_code=303)
 
 
 @app.get("/planning", response_class=HTMLResponse)
@@ -12540,7 +11182,7 @@ def planning_page(_: bool = Depends(_auth)):
         return HTMLResponse(_render_planning_dashboard(_snapshot_payload()))
     except Exception as exc:
         return HTMLResponse(
-            _html_shell("Ebo Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
+            _html_shell("Weisse Flamme Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
             status_code=500,
         )
 
@@ -12551,7 +11193,7 @@ def fairness_page(_: bool = Depends(_auth)):
         return HTMLResponse(_render_fairness_dashboard(_snapshot_payload()))
     except Exception as exc:
         return HTMLResponse(
-            _html_shell("Ebo Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
+            _html_shell("Weisse Flamme Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
             status_code=500,
         )
 
@@ -12880,95 +11522,28 @@ def _attendance_review_still_needs_ec(snap: dict[str, Any], guild_id: int, revie
 
 
 def _attendance_events_with_review_fallbacks(snap: dict[str, Any], guild_id: int) -> list[dict[str, Any]]:
-    """Die letzten acht gestarteten Events für die Anwesenheitsseite.
-
-    Anders als früher verschwinden fertig gebuchte Events nicht mehr. Sie bleiben
-    in der letzten-8-Liste und werden mit einem grünen Fertig-Haken markiert.
-    Kommende Events werden erst ab ihrem Startzeitpunkt aufgenommen.
-    """
-    now = datetime.now(timezone.utc)
+    """Events für /attendance: aktuelle Events + offene EC-Checks + Review-Fallbacks."""
+    events = _events_with_pending_ec_checks(snap)
     by_id: dict[str, dict[str, Any]] = {}
-
-    # 1) Normale Snapshot-Events.
-    for ev in ((snap.get("events") or {}).get("items") or []):
+    for ev in events:
         if not isinstance(ev, dict):
             continue
         eid = str(ev.get("event_id") or ev.get("id") or "").strip()
-        if not eid:
-            continue
-        event_dt = _dt_obj(
-            ev.get("when_iso") or ev.get("start_at") or ev.get("start_time")
-            or ev.get("created_at")
-        )
-        if event_dt and event_dt > now:
-            continue
-        by_id[eid] = dict(ev)
+        if eid:
+            by_id[eid] = ev
 
-    # 2) EC-/DKP-Checks ergänzen auch Events, die aus dem normalen Snapshot
-    # bereits verschwunden sind. Dabei bewusst auch erledigte Checks übernehmen.
-    for chk in _event_check_items(snap):
-        if not isinstance(chk, dict):
-            continue
-        eid = str(chk.get("event_id") or chk.get("check_id") or "").strip()
-        if not eid:
-            continue
-        row = by_id.get(eid) or {
-            "event_id": eid,
-            "title": chk.get("title") or chk.get("event_title") or "Anwesenheits-Event",
-            "when_iso": chk.get("when_iso") or chk.get("event_when") or chk.get("created_at") or chk.get("posted_at") or "",
-            "created_at": chk.get("created_at") or chk.get("posted_at") or "",
-            "participant_count": chk.get("attendee_count") or chk.get("participant_count") or 0,
-            "voice_enabled": False,
-            "participants": {"yes": [], "maybe": [], "no": []},
-            "source": "event_check",
-        }
-        row["_event_check"] = dict(chk)
-        by_id[eid] = row
-
-    # 3) Gespeicherte Reviews ergänzen die Historie, falls Bot/Discord das Event
-    # nicht mehr liefert. Geschlossene Reviews bleiben absichtlich enthalten.
     if guild_id:
         for review in _attendance_all_reviews(guild_id, limit=300):
-            if not isinstance(review, dict):
+            if not _attendance_review_still_needs_ec(snap, guild_id, review):
                 continue
             eid = str(review.get("event_id") or ((review.get("payload") or {}).get("event_id")) or "").strip()
-            if not eid:
+            if not eid or eid in by_id:
                 continue
-            if eid not in by_id:
-                stub = _event_stub_from_attendance_review(guild_id, eid)
-                if stub:
-                    by_id[eid] = stub
-            if eid in by_id:
-                by_id[eid]["_attendance_review"] = review
+            stub = _event_stub_from_attendance_review(guild_id, eid)
+            if stub:
+                by_id[eid] = stub
 
-    # Erst nach Datum sortieren, dann nur für die letzten acht die DB-Queue lesen.
-    candidates: list[dict[str, Any]] = []
-    for eid, ev in by_id.items():
-        event_dt = _dt_obj(
-            ev.get("when_iso") or ev.get("start_at") or ev.get("start_time")
-            or ev.get("created_at")
-        )
-        if event_dt and event_dt > now:
-            continue
-        candidates.append({**ev, "_attendance_dt": event_dt})
-
-    floor = datetime.min.replace(tzinfo=timezone.utc)
-    candidates.sort(key=lambda ev: ev.get("_attendance_dt") or floor, reverse=True)
-    latest_eight = candidates[:8]
-
-    for ev in latest_eight:
-        eid = str(ev.get("event_id") or ev.get("id") or "").strip()
-        award_state = _event_award_state(snap, eid) if eid else {}
-        latest_request = _latest_ec_award_request(guild_id, eid) if guild_id and eid else {}
-        queue_status = str(latest_request.get("status") or "").strip().lower()
-        ev["_attendance_ec_done"] = bool(award_state.get("awarded")) or queue_status == "done"
-        ev["_attendance_queue_status"] = queue_status
-        review = ev.get("_attendance_review") if isinstance(ev.get("_attendance_review"), dict) else {}
-        if not review and guild_id and eid:
-            review = _attendance_review_load(guild_id, eid) or {}
-        ev["_attendance_review"] = review
-
-    return latest_eight
+    return list(by_id.values())
 
 
 def _open_attendance_review_events_for_homepage(snap: dict[str, Any], guild_id: int, *, limit: int = 12) -> list[dict[str, Any]]:
@@ -13713,7 +12288,7 @@ def _game_status_from_snapshot(snap: dict[str, Any]) -> dict[str, Any]:
 def _render_status_dashboard(data: dict[str, Any], request: Optional[Request] = None, *, nav_mode: str = "member") -> str:
     if not data.get("ok"):
         return _html_shell(
-            "Status · Ebo Dashboard",
+            "Status · Weisse Flamme Dashboard",
             f"<section class='panel'><h1>📡 Status</h1><p class='muted'>{_e(data.get('error'))}</p></section>",
             nav_mode=nav_mode,
         )
@@ -13722,7 +12297,7 @@ def _render_status_dashboard(data: dict[str, Any], request: Optional[Request] = 
     li = _leadership_insights(snap)
     member_filter = guild.get("member_filter") if isinstance(guild.get("member_filter"), dict) else {}
     member_count = int(_num(member_filter.get("eligible_count"), li.get("member_count", 0)))
-    guild_name = str(guild.get("name") or "Ebolus")
+    guild_name = "Weisse Flamme"
     current_user = _current_user(request) if request is not None else None
     current_uid = _user_id((current_user or {}).get("user_id"))
     status_names = _profile_name_map(snap)
@@ -13825,7 +12400,7 @@ def _render_status_dashboard(data: dict[str, Any], request: Optional[Request] = 
     <section class="hero status-main-hero">
       <div class="status-hero-inner">
         <div class="status-hero-head">
-          <div class="status-hero-logo"><img src="{_asset('ebolus_logo.png')}" alt="Ebolus"></div>
+          <div class="status-hero-logo"><img src="{_asset('ebolus_logo.png')}" alt="Weisse Flamme"></div>
           <div class="status-hero-title">
             <div class="eyebrow">Dashboard Status</div>
             <h1>{_e(guild_name)}</h1>
@@ -13980,13 +12555,13 @@ def _render_status_dashboard(data: dict[str, Any], request: Optional[Request] = 
       </script>
     </section>
     """
-    return _html_shell("Status · Ebo Dashboard", body, nav_mode=nav_mode)
+    return _html_shell("Status · Weisse Flamme Dashboard", body, nav_mode=nav_mode)
 
 
 def _render_leadership_dashboard(data: dict[str, Any]) -> str:
     if not data.get("ok"):
         return _html_shell(
-            "Ebo Dashboard",
+            "Weisse Flamme Dashboard",
             f"""
             <section class="panel">
               <h1>🏰 Gildenleitung</h1>
@@ -14070,7 +12645,7 @@ def _render_leadership_dashboard(data: dict[str, Any]) -> str:
         if not isinstance(a, dict):
             continue
         auction_rows.append([
-            _auction_link(a.get("auction_id"), a.get("item_name") or a.get("title"), a),
+            _auction_link(a.get("auction_id"), a.get("item_name") or a.get("title")),
             a.get("status") or "—",
             a.get("phase") or "—",
             _auction_leader_text(a, names),
@@ -14255,7 +12830,7 @@ def _render_leadership_dashboard(data: dict[str, Any]) -> str:
       </aside>
     </section>
     """
-    return _html_shell("Kommando · Ebo Dashboard", body)
+    return _html_shell("Kommando · Weisse Flamme Dashboard", body)
 
 
 @app.get("/api/leadership")
@@ -14298,11 +12873,11 @@ def login_page(request: Request, next: str = "/"):
         </div>
         """
     body = f"""
-    <section class="hero"><div><div class="eyebrow">Ebo Dashboard</div><h1>🔐 Login</h1><p class="muted">Read-only Dashboard für Gildenleitung und berechtigte Mitglieder.</p></div></section>
+    <section class="hero"><div><div class="eyebrow">Weisse Flamme Dashboard</div><h1>🔐 Login</h1><p class="muted">Dashboard für Gildenleitung und berechtigte Mitglieder.</p></div></section>
     {discord_block}
     {basic_block}
     """
-    return HTMLResponse(_html_shell("Login · Ebo Dashboard", body))
+    return HTMLResponse(_html_shell("Login · Weisse Flamme Dashboard", body))
 
 
 @app.get("/auth/discord/debug")
@@ -14384,9 +12959,6 @@ def discord_callback(request: Request, code: str = "", state: str = "", error: s
         user = _request_json(f"{DISCORD_API_BASE}/users/@me", token=access_token)
         uid = str(user.get("id") or "")
         username = str(user.get("global_name") or user.get("username") or uid)
-        avatar_hash = str(user.get("avatar") or "").strip()
-        avatar_ext = "gif" if avatar_hash.startswith("a_") else "png"
-        oauth_avatar_url = f"https://cdn.discordapp.com/avatars/{uid}/{avatar_hash}.{avatar_ext}?size=256" if uid and avatar_hash else ""
         auth_lists = _snapshot_auth_lists()
         guild_id = _env("DASHBOARD_GUILD_ID") or str(auth_lists.get("guild_id") or "")
         if not uid:
@@ -14411,7 +12983,6 @@ def discord_callback(request: Request, code: str = "", state: str = "", error: s
         session = {
             "user_id": uid,
             "username": username,
-            "avatar_url": oauth_avatar_url,
             "role": "admin" if is_admin else "member",
             "roles": ["snapshot_admin"] if is_admin else ["snapshot_member"],
             "guild_id": str(guild_id),
@@ -14447,7 +13018,7 @@ def me(request: Request, _: bool = Depends(_auth)):
     else:
         rows = [[k, v if k != "roles" else ", ".join(v[:12]) + (" …" if len(v) > 12 else "")] for k, v in user.items()]
         body = f"<nav class='topnav'><a href='/'>← Übersicht</a><a href='/logout'>Logout</a></nav><section class='panel'><h1>👤 Mein Dashboard-Login</h1>{_table(['Key','Wert'], rows, searchable=False)}</section>"
-    return HTMLResponse(_html_shell("Mein Login · Ebo Dashboard", body))
+    return HTMLResponse(_html_shell("Mein Login · Weisse Flamme Dashboard", body))
 
 @app.get("/healthz")
 def healthz():
@@ -14478,7 +13049,7 @@ def analytics_page(_: bool = Depends(_auth)):
         return HTMLResponse(_render_activity_analytics(_snapshot_payload()))
     except Exception as exc:
         return HTMLResponse(
-            _html_shell("Ebo Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
+            _html_shell("Weisse Flamme Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
             status_code=500,
         )
 
@@ -14490,7 +13061,7 @@ def ec_dashboard(_: bool = Depends(_auth)):
         return HTMLResponse(_render_ec_dashboard(_snapshot_payload()))
     except Exception as exc:
         return HTMLResponse(
-            _html_shell("Ebo Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
+            _html_shell("Weisse Flamme Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
             status_code=500,
         )
 
@@ -14558,7 +13129,7 @@ def auction_detail(request: Request, auction_id: str, msg: str = "", _: bool = D
         return HTMLResponse(_render_auction_detail(_snapshot_payload(), str(auction_id), _current_user(request), msg=msg))
     except Exception as exc:
         return HTMLResponse(
-            _html_shell("Ebo Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
+            _html_shell("Weisse Flamme Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
             status_code=500,
         )
 
@@ -14642,7 +13213,7 @@ def event_detail(event_id: str, _: bool = Depends(_auth)):
         return HTMLResponse(_render_event_detail(_snapshot_payload(), str(event_id)))
     except Exception as exc:
         return HTMLResponse(
-            _html_shell("Ebo Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
+            _html_shell("Weisse Flamme Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
             status_code=500,
         )
 
@@ -14701,7 +13272,7 @@ def portal_home(request: Request, _: bool = Depends(_auth), msg: str = ""):
     body = """
     <section class='panel'><h1>👤 Mein Portal</h1><p class='muted'>Für das persönliche Portal brauchst du Discord-Login, damit das Dashboard deine Discord-ID kennt.</p><p><a class='btn' href='/auth/discord/start'>Mit Discord einloggen</a></p></section>
     """
-    return HTMLResponse(_html_shell("Mein Portal · Ebo Dashboard", body))
+    return HTMLResponse(_html_shell("Mein Portal · Weisse Flamme Dashboard", body))
 
 
 @app.get("/portal/member/{user_id}", response_class=HTMLResponse)
@@ -14733,36 +13304,11 @@ async def portal_need_change(user_id: int, request: Request, _: bool = Depends(_
     if action_type == "set" and not item_text:
         raise HTTPException(status_code=400, detail="Itemname fehlt.")
     actor = _current_user(request) or {"user_id": "basic-admin", "username": "Basic Admin"}
-    try:
-        item_catalog_id = int(form.get("item_catalog_id") or 0)
-    except Exception:
-        item_catalog_id = 0
-    selected_catalog_item = None
-    if item_catalog_id and get_item_by_id is not None:
-        try:
-            selected_catalog_item = get_item_by_id(item_catalog_id)  # type: ignore[misc]
-        except Exception:
-            selected_catalog_item = None
-    if selected_catalog_item is None and item_text:
-        try:
-            selected_catalog_item = _catalog_item_match(item_text)
-            item_catalog_id = int((selected_catalog_item or {}).get("id") or 0)
-            if selected_catalog_item and selected_catalog_item.get("name"):
-                item_text = str(selected_catalog_item.get("name"))
-        except Exception:
-            selected_catalog_item = None
     payload = {
         "target_user_id": int(user_id),
         "tab": tab,
         "slot": slot,
         "item_text": item_text,
-        "item_catalog_id": int(item_catalog_id or 0),
-        "item_name": str((selected_catalog_item or {}).get("name") or item_text),
-        "item_source_url": str((selected_catalog_item or {}).get("source_url") or ""),
-        "catalog_source_item_id": str((selected_catalog_item or {}).get("source_item_id") or ""),
-        "item_image_url": str((selected_catalog_item or {}).get("manual_image_url") or (selected_catalog_item or {}).get("image_url") or (selected_catalog_item or {}).get("icon_url") or ""),
-        "main_category": str((selected_catalog_item or {}).get("main_category") or ""),
-        "sub_category": str((selected_catalog_item or {}).get("sub_category") or ""),
         "weapon_type": weapon_type if slot.startswith("Waffe") else "",
         "source": "dashboard_portal",
         "admin_override": bool(_is_portal_admin(request) and _current_user_id(request) != int(user_id)),
@@ -14803,7 +13349,7 @@ def member_loot_page(user_id: int, _: bool = Depends(_auth)):
     try:
         return HTMLResponse(_render_member_loot_history(_snapshot_payload(), int(user_id)))
     except Exception as exc:
-        return HTMLResponse(_html_shell("Ebo Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"), status_code=500)
+        return HTMLResponse(_html_shell("Weisse Flamme Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"), status_code=500)
 
 
 @app.get("/api/member/{user_id}/loot")
@@ -14837,7 +13383,7 @@ def member_detail(user_id: int, request: Request, _: bool = Depends(_auth)):
         return HTMLResponse(_render_member_detail(_snapshot_payload(), int(user_id), _current_user(request)))
     except Exception as exc:
         return HTMLResponse(
-            _html_shell("Ebo Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
+            _html_shell("Weisse Flamme Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
             status_code=500,
         )
 
@@ -14850,7 +13396,7 @@ def admin_actions_page(_: bool = Depends(_admin_auth)):
         return HTMLResponse(_render_admin_center_dashboard(_snapshot_payload()))
     except Exception as exc:
         return HTMLResponse(
-            _html_shell("Ebo Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
+            _html_shell("Weisse Flamme Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
             status_code=500,
         )
 
@@ -14861,7 +13407,7 @@ def admin_legacy_page(_: bool = Depends(_admin_auth)):
         return HTMLResponse(_render_admin_actions_dashboard(_snapshot_payload()))
     except Exception as exc:
         return HTMLResponse(
-            _html_shell("Ebo Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
+            _html_shell("Weisse Flamme Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
             status_code=500,
         )
 
@@ -14901,7 +13447,7 @@ def ec_queue_dashboard(request: Request, _: bool = Depends(_auth)):
         return HTMLResponse(_render_ec_queue_dashboard(_snapshot_payload(), _current_user(request), str(request.query_params.get("msg") or "")))
     except Exception as exc:
         return HTMLResponse(
-            _html_shell("Ebo Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
+            _html_shell("Weisse Flamme Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
             status_code=500,
         )
 
@@ -14991,7 +13537,7 @@ def settings_page(_: bool = Depends(_admin_auth)):
         return HTMLResponse(_render_settings_dashboard(_snapshot_payload()))
     except Exception as exc:
         return HTMLResponse(
-            _html_shell("Ebo Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
+            _html_shell("Weisse Flamme Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
             status_code=500,
         )
 
@@ -15002,7 +13548,7 @@ def admin_settings_page(_: bool = Depends(_admin_auth), msg: str = ""):
         return HTMLResponse(_render_admin_settings_editor(_snapshot_payload(), msg=msg))
     except Exception as exc:
         return HTMLResponse(
-            _html_shell("Ebo Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
+            _html_shell("Weisse Flamme Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
             status_code=500,
         )
 
@@ -15127,7 +13673,7 @@ def _render_release_dashboard(data: dict[str, Any]) -> str:
         ok = bool(checks.get(key))
         rows.append([label, "✅ ok" if ok else "⚠️ prüfen"])
     warn_html = "" if not warnings else "<section class='panel'><h2>Warnungen</h2><ul>" + "".join(f"<li>{_e(w)}</li>" for w in warnings) + "</ul></section>"
-    return _html_shell("Release & Stabilität · Ebo Dashboard", f"""
+    return _html_shell("Release & Stabilität · Weisse Flamme Dashboard", f"""
     <nav class='topnav'><a href='/'>← Kommando</a><a href='/system'>System</a><a href='/admin'>Admin</a><a href='/api/release-status'>API</a></nav>
     <section class='hero'><div><h1>Release & Stabilität</h1><p>Version {_e(p.get('version'))} · kompakte Systemübersicht für den Livebetrieb.</p></div><div class='page-actions'><a class='btn' href='/'>Startseite</a><a class='btn' href='/system'>System prüfen</a></div></section>
     <section class='panel'><h2>Live-Status</h2><div class='release-grid'>{cards}</div><div class='mobile-note'>Mobile Optimierung ist aktiv: Sidebar klappt ein, Tabellen werden horizontal scrollbar, Aktionen werden auf Handybreite sauber gestapelt.</div></section>
@@ -15154,7 +13700,7 @@ def _simple_dashboard_page(title: str, subtitle: str, cards: list[tuple[str, str
         for href, text in [href_text.split("|", 1) if "|" in href_text else (href_text, "")]
     )
     return _html_shell(
-        f"{title} · Ebo Dashboard",
+        f"{title} · Weisse Flamme Dashboard",
         f"""
         <section class="hero">
           <div>
@@ -15267,7 +13813,7 @@ def _render_discord_feed_page(data: dict[str, Any], *, key: str, title: str, sub
     </section>
     <section class="panel"><h2>{_e(title)}</h2><div class="discord-feed-list">{cards}</div></section>
     """
-    return _html_shell(f"{title} · Ebo Dashboard", body)
+    return _html_shell(f"{title} · Weisse Flamme Dashboard", body)
 
 @app.get("/admin-portal", response_class=HTMLResponse)
 def admin_portal_alias() -> RedirectResponse:
@@ -15285,14 +13831,33 @@ def auctions_alias() -> RedirectResponse:
 
 
 @app.get("/announcements", response_class=HTMLResponse)
-def announcements_page(_: bool = Depends(_auth)) -> HTMLResponse:
-    return HTMLResponse(_render_discord_feed_page(
-        _snapshot_payload(),
-        key="announcements",
-        title="📣 Gilden-Ankündigungen",
-        subtitle="Jede Nachricht aus dem gesetzten Discord-Ankündigungskanal wird hier vollständig mit Bildern, Embeds und Anhängen gespiegelt.",
-        env_hint="DASHBOARD_ANNOUNCEMENTS_CHANNEL_ID",
-    ))
+def announcements_page() -> HTMLResponse:
+    body = """
+    <section class="hero">
+      <div>
+        <h1>📣 Ankündigungen</h1>
+        <p>Gildenankündigungen, wichtige Hinweise und geplante News-Beiträge.</p>
+      </div>
+      <div class="hero-actions">
+        <a class="hero-action" href="/events"><span>📅</span><strong>Events</strong><small>Termine prüfen</small></a>
+        <a class="hero-action" href="/loot"><span>🎁</span><strong>Auktionen</strong><small>Loot & Gebote</small></a>
+        <a class="hero-action" href="/admin"><span>⚙️</span><strong>Admin</strong><small>Leitung</small></a>
+      </div>
+    </section>
+    <section class="panel">
+      <h2>Ankündigungs-Zentrale</h2>
+      <p class="muted">Platzhalter-Seite. Hier können später Discord-Ankündigungen, geplante Posts und Gilden-News aus dem Bot-Snapshot angezeigt werden.</p>
+      <div class="subpanel">
+        <strong>Geplant:</strong>
+        <ul>
+          <li>Letzte Discord-Ankündigungen spiegeln</li>
+          <li>Neue Ankündigung als Admin vorbereiten</li>
+          <li>Wichtige Gildeninfos oben anpinnen</li>
+        </ul>
+      </div>
+    </section>
+    """
+    return _html_shell("Ankündigungen · Weisse Flamme Dashboard", body)
 
 
 @app.get("/tnl/news", response_class=HTMLResponse)
@@ -15315,7 +13880,7 @@ def tnl_builds_page() -> HTMLResponse:
     </section>
     <section class="panel"><h2>Builds</h2><p class="muted">Platzhalter-Seite für spätere öffentliche/empfohlene Gilden-Builds, Rollen-Guides oder externe Questlog-Build-Links.</p></section>
     """
-    return _html_shell("TnL Builds · Ebo Dashboard", body)
+    return _html_shell("TnL Builds · Weisse Flamme Dashboard", body)
 
 
 @app.get("/tnl/guides", response_class=HTMLResponse)
@@ -15333,7 +13898,7 @@ def release_page(_: bool = Depends(_auth)):
     try:
         return HTMLResponse(_render_release_dashboard(_snapshot_payload()))
     except Exception as exc:
-        return HTMLResponse(_html_shell("Ebo Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"), status_code=500)
+        return HTMLResponse(_html_shell("Weisse Flamme Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"), status_code=500)
 
 
 @app.get("/api/release-status")
@@ -15348,7 +13913,7 @@ def audit_page(q: str = "", action: str = "", actor: str = "", _: bool = Depends
         return HTMLResponse(_render_audit_dashboard(_snapshot_payload(), q=q, action=action, actor=actor))
     except Exception as exc:
         return HTMLResponse(
-            _html_shell("Ebo Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
+            _html_shell("Weisse Flamme Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
             status_code=500,
         )
 
@@ -15359,7 +13924,7 @@ def system_page(_: bool = Depends(_admin_auth)):
         return HTMLResponse(_render_system_dashboard(_snapshot_payload()))
     except Exception as exc:
         return HTMLResponse(
-            _html_shell("Ebo Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
+            _html_shell("Weisse Flamme Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
             status_code=500,
         )
 
@@ -15396,7 +13961,7 @@ def overview(_: bool = Depends(_auth)):
         return HTMLResponse(_render_dashboard(_snapshot_payload()))
     except Exception as exc:
         return HTMLResponse(
-            _html_shell("Ebo Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
+            _html_shell("Weisse Flamme Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
             status_code=500,
         )
 
@@ -15407,7 +13972,7 @@ def index(request: Request, _: bool = Depends(_auth)):
         return HTMLResponse(_render_status_dashboard(_snapshot_payload(), request, nav_mode="member"))
     except Exception as exc:
         return HTMLResponse(
-            _html_shell("Ebo Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
+            _html_shell("Weisse Flamme Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
             status_code=500,
         )
 
@@ -15948,7 +14513,7 @@ def _attendance_stats_payload(data: dict[str, Any]) -> dict[str, Any]:
 
 def _render_attendance_stats_dashboard(data: dict[str, Any]) -> str:
     if not data.get("ok"):
-        return _html_shell("Anwesenheit-Stats · Ebo Dashboard", f"<section class='panel'><h1>📊 Anwesenheit-Stats</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+        return _html_shell("Anwesenheit-Stats · Weisse Flamme Dashboard", f"<section class='panel'><h1>📊 Anwesenheit-Stats</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
     payload = _attendance_stats_payload(data)
     cards = "".join([
         _card("Reviews", payload.get("review_count", 0), f"locked: {payload.get('locked_count', 0)} · reviewed: {payload.get('reviewed_count', 0)}"),
@@ -16021,12 +14586,12 @@ def _render_attendance_stats_dashboard(data: dict[str, Any]) -> str:
     <section class="panel"><h2>👥 Spieler-Statistik</h2>{_table(['Spieler','Reviews','War da','Teilweise','Nicht da','Ignoriert','Offen','Quote','Voice','Letzter Status','Letztes Event'], player_table, placeholder='Spieler durchsuchen…')}</section>
     <section class="panel"><h2>📅 Event-Reviews</h2>{_table(['Event','Zeit','Review','Zeilen','War da','Teilweise','Nicht da','Offen','Quote','Queue','Geändert'], event_table, placeholder='Events durchsuchen…')}</section>
     """
-    return _html_shell("Anwesenheit-Stats · Ebo Dashboard", body)
+    return _html_shell("Anwesenheit-Stats · Weisse Flamme Dashboard", body)
 
 
 def _render_attendance_list(data: dict[str, Any]) -> str:
     if not data.get("ok"):
-        return _html_shell("Anwesenheit · Ebo Dashboard", f"<section class='panel'><h1>📝 Anwesenheit</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+        return _html_shell("Anwesenheit · Weisse Flamme Dashboard", f"<section class='panel'><h1>📝 Anwesenheit</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
     snap: dict[str, Any] = data.get("snapshot") or {}
     guild_id = _safe_guild_id(data)
     events = _attendance_events_with_review_fallbacks(snap, guild_id)
@@ -16034,68 +14599,38 @@ def _render_attendance_list(data: dict[str, Any]) -> str:
     for ev in events:
         eid = str(ev.get("event_id") or ev.get("id") or "")
         voice = _voice_event_analysis(snap, ev)
-        review = ev.get("_attendance_review") if isinstance(ev.get("_attendance_review"), dict) else {}
-        payload = review.get("payload") if isinstance(review.get("payload"), dict) else {}
+        review = _attendance_review_load(guild_id, eid) if eid else {}
+        payload = review.get("payload") or {}
         items = payload.get("items") or []
-        ec_done = bool(ev.get("_attendance_ec_done"))
-        queue_status = str(ev.get("_attendance_queue_status") or "").strip().lower()
-
-        image_url = _event_image_url(ev)
-        thumb = (
-            f'<img class="attendance-event-thumb" src="{_e(image_url)}" alt="" loading="lazy" referrerpolicy="no-referrer" '
-            'onerror="this.remove()">'
-            if image_url else ""
-        )
-        title_cell = _raw(
-            f'<a class="attendance-event-link" href="/attendance/{_e(eid)}">'
-            f'{thumb}<span><strong>{_e(ev.get("title") or eid)}</strong>'
-            f'<small>{_e(_dt(ev.get("when_iso") or ev.get("created_at")))}</small></span></a>'
-        )
-
-        if ec_done:
-            ec_badge = _raw("<span class='queue-badge ok'>✅ Fertig<small>EC gebucht</small></span>")
-        elif queue_status in {"pending", "processing"}:
-            ec_badge = _raw("<span class='queue-badge wait'>⏳ EC läuft</span>")
-        elif queue_status in {"failed", "rejected"}:
-            ec_badge = _raw("<span class='queue-badge bad'>❌ EC-Fehler</span>")
-        else:
-            ec_badge = _raw("<span class='queue-badge wait'>🟡 Offen<small>noch nicht gebucht</small></span>")
-
-        review_label = "✅ abgeschlossen" if ec_done else _attendance_status_label(review.get("status") or ("reviewed" if items else "open"))
+        queue_badge = _event_ec_queue_badge(guild_id, eid) if eid else _raw("<span class='pill'>—</span>")
         rows.append([
-            title_cell,
+            _raw(f'<a class="link" href="/attendance/{_e(eid)}">{_e(ev.get("title") or eid)}</a>' + (" <span class='pill'>aus Review</span>" if ev.get("_attendance_review_only") else "")),
+            _dt(ev.get("when_iso")),
             ev.get("participant_count", 0),
             "ja" if ev.get("voice_enabled") else "nein",
             voice.get("voice_user_count", 0),
-            review_label,
+            _attendance_status_label(review.get("status") or ("reviewed" if items else "open")),
             len(items),
-            ec_badge,
-            _raw(f'<a class="btn" href="/attendance/{_e(eid)}">Öffnen</a>'),
+            queue_badge,
+            _pending_ec_check_label(ev),
         ])
     body = f"""
-    <style>
-      .attendance-event-link{{display:grid;grid-template-columns:86px minmax(0,1fr);gap:11px;align-items:center;text-decoration:none;color:inherit;min-width:260px}}
-      .attendance-event-thumb{{width:86px;height:50px;object-fit:cover;border-radius:9px;border:1px solid rgba(214,168,79,.28);background:#080706}}
-      .attendance-event-link strong{{display:block;color:var(--gold);line-height:1.25}}
-      .attendance-event-link small{{display:block;color:var(--muted);font-size:11px;margin-top:4px}}
-      @media(max-width:720px){{.attendance-event-link{{grid-template-columns:68px minmax(0,1fr);min-width:210px}}.attendance-event-thumb{{width:68px;height:44px}}}}
-    </style>
     <nav class="topnav"><a href="/">Kommando</a><a href="/planning">Planung</a><a href="/attendance-stats">Anwesenheit-Stats</a><a href="/attendance-archive">Archiv</a><a href="/voice">Voice</a><a href="/ec-queue">EC-Queue</a><a href="/admin">Leitung</a></nav>
     <section class="hero">
       <div>
-        <div class="eyebrow">Letzte 8 gestartete Events</div>
-        <h1>📝 Anwesenheit</h1>
-        <p>Hier bleiben immer die letzten acht Events sichtbar. Bereits gebuchte Events tragen einen grünen Haken und verschwinden nicht mehr aus der Liste.</p>
-        <p class="muted">Snapshot: {_e(_dt(data.get('published_at')))}</p>
+        <div class="eyebrow">Ebene 3 · sichere Admin-Aktion</div>
+        <h1>📝 Anwesenheits-Review</h1>
+        <p>Hier kann die Leitung Anmeldung und Voice-Zeit vergleichen und einen Review speichern. Es wird noch kein EC gebucht.</p>
+        <p class="muted">Snapshot: {_e(_dt(data.get('published_at')))} · Alte Events mit gespeichertem Review bleiben sichtbar, solange EC noch nicht als erledigt erkannt wurde.</p>
       </div>
       <a class="btn" href="/planning">Planung</a>
     </section>
     <section class="panel">
-      <h2>📅 Letzte Events</h2>
-      {_table(['Event','Anmeldungen','Voice','Voice-User','Review','Review-Zeilen','EC-Status','Aktion'], rows, placeholder='Events durchsuchen…')}
+      <h2>📅 Events</h2>
+      {_table(['Event','Zeit','Anmeldungen','Voice','Voice-User','Review','Review-Zeilen','EC-Queue','EC-Check'], rows, placeholder='Events durchsuchen…')}
     </section>
     """
-    return _html_shell("Anwesenheit · Ebo Dashboard", body)
+    return _html_shell("Anwesenheit · Weisse Flamme Dashboard", body)
 
 
 def _attendance_review_control_panel(guild_id: int, event_id: str, review: dict[str, Any]) -> str:
@@ -16131,7 +14666,7 @@ def _attendance_review_control_panel(guild_id: int, event_id: str, review: dict[
 
 def _render_attendance_event(data: dict[str, Any], event_id: str, saved: bool = False) -> str:
     if not data.get("ok"):
-        return _html_shell("Anwesenheit · Ebo Dashboard", f"<section class='panel'><h1>📝 Anwesenheit</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+        return _html_shell("Anwesenheit · Weisse Flamme Dashboard", f"<section class='panel'><h1>📝 Anwesenheit</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
     snap: dict[str, Any] = data.get("snapshot") or {}
     guild_id = _safe_guild_id(data)
     event = _event_by_id(snap, event_id) or _event_stub_from_attendance_review(guild_id, event_id)
@@ -16280,7 +14815,7 @@ def _attendance_review_counts(payload: dict[str, Any]) -> dict[str, int]:
 
 def _render_attendance_archive(data: dict[str, Any]) -> str:
     if not data.get("ok"):
-        return _html_shell("Attendance-Archiv · Ebo Dashboard", f"<section class='panel'><h1>📦 Attendance-Archiv</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+        return _html_shell("Attendance-Archiv · Weisse Flamme Dashboard", f"<section class='panel'><h1>📦 Attendance-Archiv</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
     snap: dict[str, Any] = data.get("snapshot") or {}
     guild_id = _safe_guild_id(data)
     reviews = _attendance_all_reviews(guild_id, limit=500) if guild_id else []
@@ -16342,7 +14877,7 @@ def _render_attendance_archive(data: dict[str, Any]) -> str:
       {_table(['Event','Zeit','Review','Queue','Zeilen','War da','Teilweise','Nicht da','Offen','Geändert','Aktion'], rows, placeholder='Archiv durchsuchen…')}
     </section>
     """
-    return _html_shell("Attendance-Archiv · Ebo Dashboard", body)
+    return _html_shell("Attendance-Archiv · Weisse Flamme Dashboard", body)
 
 
 @app.get("/attendance-archive", response_class=HTMLResponse)
@@ -16941,7 +15476,7 @@ def _event_ec_defaults(snap: dict[str, Any], event: dict[str, Any]) -> dict[str,
                 break
 
     partial = 5.0 if full > 0 else 0.0
-    # Ebolus-Regel aus dem Bot: Reserve/Teilweise bekommt fix 5 EC.
+    # Weisse Flamme-Regel aus dem Bot: Reserve/Teilweise bekommt fix 5 EC.
     return {"full_ec": full, "partial_ec": partial, "detected_from": detected_from, "event_type": event_type}
 
 
@@ -17941,21 +16476,12 @@ def _phase3_member_rows_from_snapshot(snap: dict[str, Any]) -> list[dict[str, An
         candidates.extend(_phase3_list(quality.get("users_without_needs") or []))
         risk_members = insights_raw.get("risk_members") or []
         candidates.extend(_phase3_list(risk_members))
-    active_ids = _snapshot_active_member_ids(snap)
     out: dict[str, dict[str, Any]] = {}
     for row in candidates:
         if not isinstance(row, dict):
             continue
         uid = _phase3_first_id(row, ["user_id", "discord_id", "id", "member_id"])
         if not uid:
-            continue
-        try:
-            uid_int = int(uid)
-        except Exception:
-            uid_int = 0
-        if active_ids and uid_int not in active_ids:
-            continue
-        if row.get("is_dashboard_member") is False or row.get("is_active") is False:
             continue
         current = out.get(uid, {})
         merged = dict(current)
@@ -18674,7 +17200,7 @@ def _render_phase3_database_page(payload: dict[str, Any]) -> str:
     ]
     cut_warn = cutover.get("warnings") or []
     cut_warn_html = "" if not cut_warn else "<div class='notice'><b>Cutover-Hinweise</b><ul>" + "".join(f"<li>{_e(w)}</li>" for w in cut_warn) + "</ul></div>"
-    return _html_shell("Phase 3 · Datenbank · Ebo Dashboard", f"""
+    return _html_shell("Phase 3 · Datenbank · Weisse Flamme Dashboard", f"""
     <nav class='topnav'><a href='/'>← Kommando</a><a href='/release'>Release</a><a href='/admin'>Admin</a><a href='/database-audit'>Cutover-Prüfung</a><a href='/api/database-cutover-status'>Cutover API</a><a href='/api/database-status'>Status API</a><a href='/api/database-live-status'>Live API</a></nav>
     <section class='hero'><div><h1>Phase 3.9 · Online-Datenbank</h1><p>{_e(status_text)} · Dashboard liest Postgres-first. Bot schreibt sicher weiter lokal JSON und spiegelt direkt nach Postgres, damit JSON als Backup/Fallback erhalten bleibt.</p></div><div class='page-actions'><a class='btn' href='/database/init'>Tabellen vorbereiten</a><a class='btn' href='/database/mirror-snapshot'>Snapshot nachspiegeln</a></div></section>
     <section class='panel'><h2>Cutover-Stand</h2><p>Das ist der relevante Zustand: Nicht ob JSON-Dateien noch existieren, sondern ob das Dashboard die Live-Bereiche aus Postgres liest.</p>{_table(['Bereich','Status','Quelle','Zeilen/Einträge'], cut_rows, searchable=False)}{cut_warn_html}</section>
@@ -18958,7 +17484,7 @@ def _render_phase3_audit_page() -> str:
         ["RSVPs ohne User-ID", counts.get("rsvps_empty_user", 0)],
         ["Gebote ohne User-ID", counts.get("bids_empty_user", 0)],
     ]
-    return _html_shell("Phase 3.5 · Cutover-Prüfung · Ebo Dashboard", f"""
+    return _html_shell("Phase 3.5 · Cutover-Prüfung · Weisse Flamme Dashboard", f"""
     <nav class='topnav'><a href='/database'>← Datenbank</a><a href='/'>Kommando</a><a href='/release'>Release</a><a href='/api/database-audit'>API</a></nav>
     <section class='hero'><div><h1>Phase 3.5 · Cutover-Prüfung</h1><p>{_e(status_label)} · { _e(status_hint) }</p></div><div class='page-actions'><a class='btn' href='/database'>Datenbank</a><a class='btn' href='/api/database-audit'>API öffnen</a></div></section>
     <section class='panel'><h2>Bereitschaft</h2><div class='grid'>{card_html}</div></section>
