@@ -124,7 +124,15 @@ class _TextChannelSelect(Select):
         if not isinstance(channel, discord.TextChannel):
             await inter.response.send_message("❌ Kanal nicht gefunden oder kein normaler Textkanal.", ephemeral=True)
             return
-        await parent.on_select(inter, channel)
+        try:
+            await parent.on_select(inter, channel)
+        except Exception as exc:
+            print(f"[channel_picker] text channel callback failed: {exc!r}", flush=True)
+            message = f"❌ Kanal konnte nicht gespeichert werden: {type(exc).__name__}: {exc}"
+            if inter.response.is_done():
+                await inter.followup.send(message, ephemeral=True)
+            else:
+                await inter.response.send_message(message, ephemeral=True)
 
 
 class TextChannelPickerView(View):
@@ -213,7 +221,15 @@ class _VoiceChannelSelect(Select):
         if not isinstance(channel, discord.VoiceChannel):
             await inter.response.send_message("❌ Kanal nicht gefunden oder kein Voice-Kanal.", ephemeral=True)
             return
-        await parent.on_select(inter, channel)
+        try:
+            await parent.on_select(inter, channel)
+        except Exception as exc:
+            print(f"[channel_picker] voice channel callback failed: {exc!r}", flush=True)
+            message = f"❌ Voice-Kanal konnte nicht gespeichert werden: {type(exc).__name__}: {exc}"
+            if inter.response.is_done():
+                await inter.followup.send(message, ephemeral=True)
+            else:
+                await inter.response.send_message(message, ephemeral=True)
 
 
 class VoiceChannelPickerView(View):
@@ -270,17 +286,43 @@ class VoiceChannelPickerView(View):
 
 async def send_text_channel_picker(inter: discord.Interaction, title: str, on_select: TextChannelCallback, *, ephemeral: bool = True) -> None:
     if inter.guild is None:
-        await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
+        if inter.response.is_done():
+            await inter.followup.send("❌ Nur im Server nutzbar.", ephemeral=True)
+        else:
+            await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
         return
+
+    # Discord erwartet innerhalb weniger Sekunden eine Bestätigung. fetch_channels()
+    # kann bei größeren Servern oder langsamer REST-Antwort länger dauern.
+    deferred_here = False
+    if not inter.response.is_done():
+        await inter.response.defer(ephemeral=ephemeral, thinking=True)
+        deferred_here = True
+
     channels = await _fetch_text_channels(inter.guild)
     view = TextChannelPickerView(inter.guild, int(inter.user.id), on_select, title=title, channels=channels)
-    await inter.response.send_message(view.message_text(), view=view, ephemeral=ephemeral)
+    if deferred_here:
+        await inter.edit_original_response(content=view.message_text(), view=view)
+    else:
+        await inter.followup.send(view.message_text(), view=view, ephemeral=ephemeral)
 
 
 async def send_voice_channel_picker(inter: discord.Interaction, title: str, on_select: VoiceChannelCallback, *, ephemeral: bool = True) -> None:
     if inter.guild is None:
-        await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
+        if inter.response.is_done():
+            await inter.followup.send("❌ Nur im Server nutzbar.", ephemeral=True)
+        else:
+            await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
         return
+
+    deferred_here = False
+    if not inter.response.is_done():
+        await inter.response.defer(ephemeral=ephemeral, thinking=True)
+        deferred_here = True
+
     channels = await _fetch_voice_channels(inter.guild)
     view = VoiceChannelPickerView(inter.guild, int(inter.user.id), on_select, title=title, channels=channels)
-    await inter.response.send_message(view.message_text(), view=view, ephemeral=ephemeral)
+    if deferred_here:
+        await inter.edit_original_response(content=view.message_text(), view=view)
+    else:
+        await inter.followup.send(view.message_text(), view=view, ephemeral=ephemeral)

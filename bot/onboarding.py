@@ -441,8 +441,11 @@ async def setup_onboarding(client: discord.Client, tree: app_commands.CommandTre
             c = _gcfg(pick_inter.guild)
             c["review_channel"] = int(channel.id)
             cfg[str(pick_inter.guild_id)] = c
-            save_cfg()
-            await pick_inter.response.edit_message(content=f"✅ Review-/Log-Kanal gesetzt: {channel.mention}", view=None)
+            _save_cfg(cfg)
+            await pick_inter.response.edit_message(
+                content=f"✅ Review-/Log-Kanal gesetzt: {channel.mention}",
+                view=None,
+            )
 
         await send_text_channel_picker(inter, "📝 Onboarding-Review-Kanal auswählen", _picked)
 
