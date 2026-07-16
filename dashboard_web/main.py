@@ -1352,8 +1352,28 @@ def _phase3_events_pg_payload(guild_id: Any, snap: dict[str, Any]) -> Optional[d
     if not member_rows and not event_rows and not rsvp_rows and not absence_rows:
         return None
 
-    # Mitglieder/Profile aus DB vorbereiten.
+    # Mitglieder/Profile aus DB vorbereiten. Der aktuelle Discord-Snapshot ist
+    # die Wahrheit für aktive Mitglieder und Namen. Phase-3 ergänzt Historie,
+    # darf aber keine alten User-ID-Platzhalter zurück in die Liste drücken.
     fallback_names = _profile_name_map(snap)
+    snapshot_members: dict[int, dict[str, Any]] = {}
+    for snap_row in _phase3_member_rows_from_snapshot(snap):
+        if not isinstance(snap_row, dict):
+            continue
+        snap_uid = _user_id(snap_row.get("user_id") or snap_row.get("id"))
+        if snap_uid:
+            snapshot_members[snap_uid] = dict(snap_row)
+    active_snapshot_ids = set(snapshot_members)
+
+    def meaningful_name(value: Any, uid: int) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        lowered = text.casefold()
+        if text.isdigit() or lowered in {f"user {uid}".casefold(), f"spieler {uid}".casefold()}:
+            return ""
+        return text
+
     member_items: list[dict[str, Any]] = []
     names: dict[int, str] = dict(fallback_names)
     member_ids: set[int] = set()
@@ -1362,21 +1382,80 @@ def _phase3_events_pg_payload(guild_id: Any, snap: dict[str, Any]) -> Optional[d
         uid = _user_id((row or {}).get("user_id") or raw.get("user_id"))
         if not uid:
             continue
-        roles = _phase3_json((row or {}).get("roles_json"), [])
-        display = raw.get("display_name") or raw.get("name") or (row or {}).get("ingame_name") or (row or {}).get("discord_name") or f"User {uid}"
+        # Sobald ein aktueller Snapshot Mitglieder enthält, werden alte Phase-3-
+        # Zeilen außerhalb dieses Roster konsequent ausgeblendet.
+        if active_snapshot_ids and uid not in active_snapshot_ids:
+            continue
+        base = dict(snapshot_members.get(uid) or {})
+        roles = base.get("roles") or _phase3_json((row or {}).get("roles_json"), [])
+        display = (
+            meaningful_name(base.get("display_name"), uid)
+            or meaningful_name(base.get("server_name"), uid)
+            or meaningful_name(base.get("discord_name"), uid)
+            or meaningful_name(raw.get("display_name"), uid)
+            or meaningful_name(raw.get("name"), uid)
+            or meaningful_name((row or {}).get("discord_name"), uid)
+            or meaningful_name((row or {}).get("ingame_name"), uid)
+            or fallback_names.get(uid)
+            or f"User {uid}"
+        )
+        ingame = (
+            meaningful_name(base.get("ingame_name"), uid)
+            or meaningful_name((row or {}).get("ingame_name"), uid)
+            or meaningful_name(raw.get("ingame_name"), uid)
+            or meaningful_name(raw.get("tl_name"), uid)
+        )
+        discord_name = (
+            meaningful_name(base.get("discord_name"), uid)
+            or meaningful_name(base.get("server_name"), uid)
+            or meaningful_name((row or {}).get("discord_name"), uid)
+            or meaningful_name(raw.get("discord_name"), uid)
+            or meaningful_name(raw.get("username"), uid)
+            or display
+        )
         item = {
             **raw,
+            **base,
             "user_id": uid,
             "display_name": display,
-            "discord_name": (row or {}).get("discord_name") or raw.get("discord_name") or raw.get("username") or display,
-            "ingame_name": (row or {}).get("ingame_name") or raw.get("ingame_name") or raw.get("tl_name") or display,
+            "discord_name": discord_name,
+            "ingame_name": ingame,
             "roles": roles if isinstance(roles, list) else [],
             "is_dashboard_member": True,
-            "source": "postgres_phase3",
+            "is_active": True,
+            "source": "postgres_phase3+discord_snapshot",
         }
         names[uid] = str(display)
         member_ids.add(uid)
         member_items.append(item)
+
+    # Neue Mitglieder können bereits im Discord-Snapshot stehen, bevor der
+    # asynchrone Phase-3-Mirror sie geschrieben hat. Sie trotzdem sofort zeigen.
+    for uid, base in snapshot_members.items():
+        if uid in member_ids:
+            continue
+        display = (
+            meaningful_name(base.get("display_name"), uid)
+            or meaningful_name(base.get("server_name"), uid)
+            or meaningful_name(base.get("discord_name"), uid)
+            or fallback_names.get(uid)
+            or f"User {uid}"
+        )
+        item = dict(base)
+        item.update({
+            "user_id": uid,
+            "display_name": display,
+            "discord_name": meaningful_name(base.get("discord_name"), uid) or meaningful_name(base.get("server_name"), uid) or display,
+            "ingame_name": meaningful_name(base.get("ingame_name"), uid),
+            "is_dashboard_member": True,
+            "is_active": True,
+            "source": "discord_snapshot",
+        })
+        names[uid] = str(display)
+        member_ids.add(uid)
+        member_items.append(item)
+
+    member_items.sort(key=lambda item: str(item.get("display_name") or "").casefold())
 
     # Event-Basis: Snapshot als Fallback behalten, Postgres überschreibt/ergänzt.
     event_by_id: dict[str, dict[str, Any]] = {}
