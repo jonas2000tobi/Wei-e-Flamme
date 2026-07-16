@@ -317,9 +317,27 @@ async def on_ready():
 
         try:
             synced = await tree.sync()
-            print(f"✅ Slash-Commands synchronisiert: {len(synced)}")
+            print(f"✅ Globale Slash-Commands synchronisiert: {len(synced)}")
         except Exception as e:
-            print(f"⚠️ Sync-Fehler: {e!r}")
+            print(f"⚠️ Globaler Sync-Fehler: {e!r}")
+
+        # Globale Discord-Commands können verzögert oder im Client veraltet sein.
+        # Deshalb werden sie zusätzlich direkt in jeden verbundenen Server
+        # kopiert. Guild-Commands stehen dort praktisch sofort aktuell bereit.
+        for connected_guild in bot.guilds:
+            guild_object = discord.Object(id=connected_guild.id)
+            try:
+                tree.copy_global_to(guild=guild_object)
+                guild_synced = await tree.sync(guild=guild_object)
+                print(
+                    "✅ Guild-Slash-Commands synchronisiert: "
+                    f"{connected_guild.name} ({connected_guild.id}) · {len(guild_synced)}"
+                )
+            except Exception as e:
+                print(
+                    "⚠️ Guild-Sync-Fehler: "
+                    f"{connected_guild.name} ({connected_guild.id}) · {e!r}"
+                )
 
         _modules_initialized = True
         print(f"✅ Module einmalig initialisiert: {sum(results)}/{len(results)}")
