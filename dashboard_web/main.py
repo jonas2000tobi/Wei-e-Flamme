@@ -39,15 +39,15 @@ except Exception:  # Dashboard soll auch ohne Item-Modul starten
     query_items = None  # type: ignore
     set_item_image_override = None  # type: ignore
 
-app = FastAPI(title="Weisse Flamme Dashboard", version="1.0.0")
+app = FastAPI(title="Guild Platform Dashboard", version="2.0.0")
 security = HTTPBasic(auto_error=False)
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
-ASSET_VER = "weisse-flamme-silver-theme-v1"
-DASHBOARD_RELEASE_VERSION = "1.2.1 · Weisse Flamme Rebrand"
+ASSET_VER = "guild-platform-v2"
+DASHBOARD_RELEASE_VERSION = "2.0.0 · Konfigurierbare Gildenplattform"
 
 
 def _database_url() -> str:
@@ -66,6 +66,189 @@ def _pg_connect():
     from psycopg.rows import dict_row  # type: ignore
 
     return psycopg.connect(_normalized_database_url(), row_factory=dict_row, connect_timeout=10)
+
+
+def _ensure_guild_profile_schema() -> None:
+    if not _database_url():
+        return
+    conn = _pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS guild_profiles (
+                    guild_id BIGINT PRIMARY KEY,
+                    discord_name TEXT NOT NULL DEFAULT '',
+                    display_name TEXT NOT NULL DEFAULT '',
+                    short_name TEXT NOT NULL DEFAULT '',
+                    bot_display_name TEXT NOT NULL DEFAULT '',
+                    timezone_name TEXT NOT NULL DEFAULT 'Europe/Berlin',
+                    logo_url TEXT NOT NULL DEFAULT '',
+                    banner_url TEXT NOT NULL DEFAULT '',
+                    accent_color TEXT NOT NULL DEFAULT '#d6a84f',
+                    invite_url TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT 'active',
+                    previous_guild_id BIGINT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS guild_settings (
+                    guild_id BIGINT NOT NULL,
+                    key TEXT NOT NULL,
+                    value_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (guild_id, key)
+                )
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_guild_profiles_status ON guild_profiles(status, updated_at DESC)")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _guild_profile_row(guild_id: int) -> dict[str, Any]:
+    if not _database_url() or not int(guild_id or 0):
+        return {}
+    try:
+        _ensure_guild_profile_schema()
+        conn = _pg_connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT * FROM guild_profiles WHERE guild_id=%s", (int(guild_id),))
+                row = cur.fetchone()
+                return dict(row) if row else {}
+        finally:
+            conn.close()
+    except Exception:
+        return {}
+
+
+def _active_guild_id() -> int:
+    # Aktives Postgres-Profil hat Vorrang. DASHBOARD_GUILD_ID ist nur noch
+    # ein Notfall-Fallback für alte Deployments ohne Gildenprofil/Snapshot.
+    explicit = str(os.getenv("DASHBOARD_GUILD_ID") or "").strip()
+    if not _database_url():
+        return int(explicit) if explicit.isdigit() else 0
+    try:
+        _ensure_guild_profile_schema()
+        conn = _pg_connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT gp.guild_id
+                    FROM guild_profiles gp
+                    WHERE gp.status='active'
+                      AND EXISTS (SELECT 1 FROM dashboard_snapshots ds WHERE ds.guild_id=gp.guild_id)
+                    ORDER BY gp.updated_at DESC, gp.guild_id DESC
+                    LIMIT 1
+                """)
+                row = cur.fetchone()
+                if row:
+                    return int(row.get("guild_id") or 0)
+                cur.execute("SELECT guild_id FROM dashboard_snapshots ORDER BY published_at DESC, id DESC LIMIT 1")
+                row = cur.fetchone()
+                return int((row or {}).get("guild_id") or 0)
+        finally:
+            conn.close()
+    except Exception:
+        return int(explicit) if explicit.isdigit() else 0
+
+
+def _guild_setting_value(guild_id: int, key: str, default: Any = None) -> Any:
+    if not _database_url() or not guild_id:
+        return default
+    try:
+        _ensure_guild_profile_schema()
+        conn = _pg_connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT value_json FROM guild_settings WHERE guild_id=%s AND key=%s", (int(guild_id), str(key)))
+                row = cur.fetchone()
+            if not row:
+                return default
+            return json.loads(row.get("value_json") or "null")
+        finally:
+            conn.close()
+    except Exception:
+        return default
+
+
+def _set_guild_setting_value(guild_id: int, key: str, value: Any) -> None:
+    _ensure_guild_profile_schema()
+    conn = _pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO guild_settings(guild_id,key,value_json,updated_at)
+                VALUES (%s,%s,%s,%s)
+                ON CONFLICT(guild_id,key) DO UPDATE SET value_json=EXCLUDED.value_json, updated_at=EXCLUDED.updated_at
+            """, (int(guild_id), str(key), json.dumps(value, ensure_ascii=False, separators=(",", ":")), datetime.now(timezone.utc).isoformat()))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _guild_brand(data: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    gid = 0
+    if isinstance(data, dict):
+        try:
+            gid = int(data.get("guild_id") or 0)
+        except Exception:
+            gid = 0
+    if not gid:
+        gid = _active_guild_id()
+    profile = _guild_profile_row(gid) if gid else {}
+    snap = (data or {}).get("snapshot") if isinstance(data, dict) else None
+    if isinstance(snap, dict):
+        embedded = snap.get("guild_config") or ((snap.get("guild") or {}).get("configuration"))
+        if isinstance(embedded, dict) and isinstance(embedded.get("profile"), dict):
+            for key, value in embedded["profile"].items():
+                if value not in (None, ""):
+                    profile.setdefault(key, value)
+        guild_row = snap.get("guild") or {}
+    else:
+        guild_row = {}
+    display = str(profile.get("display_name") or guild_row.get("name") or (data or {}).get("guild_name") or "Gilde")
+    accent = str(profile.get("accent_color") or "#d6a84f").strip()
+    if not re.fullmatch(r"#[0-9a-fA-F]{6}", accent):
+        accent = "#d6a84f"
+    return {
+        "guild_id": gid,
+        "display_name": display,
+        "short_name": str(profile.get("short_name") or display),
+        "bot_display_name": str(profile.get("bot_display_name") or f"{display} Knecht"),
+        "timezone": str(profile.get("timezone_name") or profile.get("timezone") or "Europe/Berlin"),
+        "logo_url": str(profile.get("logo_url") or ""),
+        "banner_url": str(profile.get("banner_url") or ""),
+        "accent_color": accent,
+        "invite_url": str(profile.get("invite_url") or ""),
+        "status": str(profile.get("status") or "active"),
+    }
+
+
+GUILD_LOOT_RULES: dict[str, dict[str, Any]] = {
+    "loot_need_hours": {"setting": "guild_rule_loot_need_hours", "label": "Need-Auktion (Stunden)", "default": 48, "min": 1, "max": 720},
+    "loot_free_hours": {"setting": "guild_rule_loot_free_hours", "label": "Freie Auktion (Stunden)", "default": 24, "min": 1, "max": 720},
+    "loot_sale_hours": {"setting": "guild_rule_loot_sale_hours", "label": "Sale-Laufzeit (Stunden)", "default": 240, "min": 1, "max": 2160},
+    "loot_main_start_bid": {"setting": "guild_rule_loot_main_start_bid", "label": "Main-Need Startgebot", "default": 30, "min": 1, "max": 100000},
+    "loot_secondary_start_bid": {"setting": "guild_rule_loot_secondary_start_bid", "label": "Second-Need Startgebot", "default": 15, "min": 1, "max": 100000},
+    "loot_free_start_bid": {"setting": "guild_rule_loot_free_start_bid", "label": "Freie Auktion Startgebot", "default": 5, "min": 1, "max": 100000},
+    "loot_sale_price": {"setting": "guild_rule_loot_sale_price", "label": "Sale-Preis", "default": 1, "min": 0, "max": 100000},
+    "loot_need_increment": {"setting": "guild_rule_loot_need_increment", "label": "Need-Mindestschritt", "default": 5, "min": 1, "max": 100000},
+    "loot_free_increment": {"setting": "guild_rule_loot_free_increment", "label": "Freier Mindestschritt", "default": 1, "min": 1, "max": 100000},
+    "loot_new_member_lock_days": {"setting": "guild_rule_loot_new_member_lock_days", "label": "Lootsperre neue Mitglieder (Tage)", "default": 7, "min": 0, "max": 365},
+    "loot_junk_roll_hours": {"setting": "guild_rule_loot_junk_roll_hours", "label": "Müll-Rollphase (Stunden)", "default": 24, "min": 1, "max": 720},
+}
+
+
+def _guild_rule_value(guild_id: int, kind: str) -> int:
+    spec = GUILD_LOOT_RULES[kind]
+    try:
+        value = int(_guild_setting_value(int(guild_id), str(spec["setting"]), int(spec["default"])))
+    except Exception:
+        value = int(spec["default"])
+    return max(int(spec["min"]), min(int(spec["max"]), value))
 
 
 # ---------------------------------------------------------------------------
@@ -100,8 +283,14 @@ def _auth_mode() -> str:
 
 
 def _session_secret() -> str:
-    # Eigene Variable ist besser. Fallback auf Dashboard-Passwort, damit bestehende Setups nicht brechen.
-    return _env("DASHBOARD_SESSION_SECRET") or _env("DASHBOARD_PASSWORD") or "dev-dashboard-secret-change-me"
+    configured = _env("DASHBOARD_SESSION_SECRET") or _env("DASHBOARD_PASSWORD")
+    if configured:
+        return configured
+    # Kein öffentlicher Default mehr. DATABASE_URL ist ein technisches Secret und
+    # liefert einen stabilen, deploy-spezifischen Notfallwert. Besser trotzdem
+    # DASHBOARD_SESSION_SECRET in Railway setzen.
+    seed = _database_url() or "dashboard-session-not-configured"
+    return hashlib.sha256(("guild-dashboard:" + seed).encode("utf-8")).hexdigest()
 
 
 def _b64e(raw: bytes) -> str:
@@ -252,8 +441,7 @@ def _cookie_secure() -> bool:
 def _basic_auth(credentials: Optional[HTTPBasicCredentials]) -> bool:
     password = _env("DASHBOARD_PASSWORD")
     if not password:
-        # Für den allerersten Test erlaubt. Auf Railway danach unbedingt setzen oder Discord OAuth nutzen.
-        return True
+        raise HTTPException(status_code=503, detail="Dashboard-Login ist nicht konfiguriert. Setze DASHBOARD_PASSWORD oder aktiviere Discord OAuth.")
     username = _env("DASHBOARD_USERNAME", "admin") or "admin"
     if not credentials:
         raise HTTPException(status_code=401, detail="Auth required", headers={"WWW-Authenticate": "Basic"})
@@ -355,6 +543,18 @@ def _asset(name: str) -> str:
     return f"/static/{name}?v={ASSET_VER}"
 
 
+def _brand_image(kind: str, fallback_asset: str) -> str:
+    brand = _guild_brand()
+    raw = str(brand.get("logo_url" if kind == "logo" else "banner_url") or "").strip()
+    if raw.startswith("https://") or raw.startswith("http://") or raw.startswith("/static/"):
+        return raw
+    return _asset(fallback_asset)
+
+
+def _css_url(value: str) -> str:
+    return urllib.parse.quote(str(value or ""), safe="/:?#[]@!$&()*+,;=%-._~")
+
+
 def _dt(value: Any) -> str:
     s = str(value or "")
     if not s:
@@ -385,7 +585,7 @@ def _num(value: Any, default: float = 0.0) -> float:
 def _latest_snapshot_row() -> Optional[dict[str, Any]]:
     if not _database_url():
         return None
-    guild_id = str(os.getenv("DASHBOARD_GUILD_ID") or "").strip()
+    guild_id = _active_guild_id()
     conn = _pg_connect()
     try:
         with conn.cursor() as cur:
@@ -400,13 +600,7 @@ def _latest_snapshot_row() -> Optional[dict[str, Any]]:
                     (int(guild_id),),
                 )
             else:
-                cur.execute(
-                    """
-                    SELECT * FROM dashboard_snapshots
-                    ORDER BY published_at DESC, id DESC
-                    LIMIT 1
-                    """
-                )
+                cur.execute("SELECT * FROM dashboard_snapshots ORDER BY published_at DESC, id DESC LIMIT 1")
             row = cur.fetchone()
             return dict(row) if row else None
     finally:
@@ -1396,13 +1590,10 @@ def _admin_auth(request: Request, credentials: Optional[HTTPBasicCredentials] = 
 
 
 def _safe_guild_id(data: Optional[dict[str, Any]] = None) -> int:
-    raw = _env("DASHBOARD_GUILD_ID")
-    if not raw and data:
-        raw = str(data.get("guild_id") or "")
-    try:
-        return int(str(raw).strip())
-    except Exception:
-        return 0
+    raw = str((data or {}).get("guild_id") or "").strip() if data else ""
+    if raw.isdigit():
+        return int(raw)
+    return _active_guild_id()
 
 
 def _ensure_admin_tables() -> None:
@@ -3594,11 +3785,13 @@ def _render_auction_detail(data: dict[str, Any], auction_id: str, current_user: 
 
 def _sidebar_html() -> str:
     """Admin-/Leader-Sidebar. Diese Ansicht erscheint nur im Admin-Modus."""
+    brand = _guild_brand()
+    logo = _brand_image("logo", "weisse_flamme_sidebar_logo.png")
     return f"""
     <aside class="sidebar admin-sidebar">
       <div class="brand">
-        <div class="brand-mark sidebar-brand-logo"><img src="{_asset('weisse_flamme_sidebar_logo.png')}" alt="Weisse Flamme"></div>
-        <div class="brand-subtitle"><span>Admin-Portal</span></div>
+        <div class="brand-mark sidebar-brand-logo"><img src="{_e(logo)}" alt="{_e(brand['display_name'])}"></div>
+        <div class="brand-subtitle"><strong>{_e(brand['short_name'])}</strong><span>Admin-Portal</span></div>
       </div>
       <button class="mobile-nav-toggle" type="button" onclick="document.body.classList.toggle('nav-open')">☰ Menü</button>
 
@@ -3607,7 +3800,8 @@ def _sidebar_html() -> str:
         <details open>
           <summary>Admin</summary>
           <a href="/admin"><img class="nav-ico" src="{_asset('nav_admin_portal.png')}" alt="">Admin-Portal</a>
-          <a href="/settings"><img class="nav-ico" src="{_asset('nav_einstellungen.png')}" alt="">Einstellungen</a>
+          <a href="/admin/guild-config"><img class="nav-ico" src="{_asset('nav_einstellungen.png')}" alt="">Gilde & Discord</a>
+          <a href="/settings"><img class="nav-ico" src="{_asset('nav_einstellungen.png')}" alt="">System-Setup</a>
           <a href="/audit"><img class="nav-ico" src="{_asset('nav_audit.png')}" alt="">Audit</a>
           <a href="/system"><img class="nav-ico" src="{_asset('nav_system.png')}" alt="">System</a>
           <a href="/database"><img class="nav-ico" src="{_asset('nav_database.png')}" alt="">Datenbank</a>
@@ -3633,11 +3827,13 @@ def _sidebar_html() -> str:
 
 def _member_sidebar_html() -> str:
     """Normale Dashboard-Sidebar. Auch Admins sehen standardmäßig diese Ansicht."""
+    brand = _guild_brand()
+    logo = _brand_image("logo", "weisse_flamme_sidebar_logo.png")
     return f"""
     <aside class="sidebar member-default-sidebar">
       <div class="brand">
-        <div class="brand-mark sidebar-brand-logo"><img src="{_asset('weisse_flamme_sidebar_logo.png')}" alt="Weisse Flamme"></div>
-        <div class="brand-subtitle"><span>Gilden-Dashboard</span></div>
+        <div class="brand-mark sidebar-brand-logo"><img src="{_e(logo)}" alt="{_e(brand['display_name'])}"></div>
+        <div class="brand-subtitle"><strong>{_e(brand['short_name'])}</strong><span>Gilden-Dashboard</span></div>
       </div>
       <button class="mobile-nav-toggle" type="button" onclick="document.body.classList.toggle('nav-open')">☰ Menü</button>
 
@@ -3679,11 +3875,18 @@ def _member_sidebar_html() -> str:
     """
 
 def _html_shell(title: str, body: str, *, nav_mode: str = "member") -> str:
+    brand = _guild_brand()
+    brand_name = str(brand.get("display_name") or "Gilde")
+    hero_banner = _css_url(_brand_image("banner", "hero_banner.webp"))
+    brand_logo = _css_url(_brand_image("logo", "ebolus_logo.png"))
+    for old_name in ("Weisse Flamme", "Weiße Flamme", "Ebolus", "ebolus"):
+        title = str(title).replace(old_name, brand_name)
+        body = str(body).replace(old_name, brand_name)
     auth_note = ""
     if _discord_oauth_enabled():
         auth_note = '<div class="authbar">🔐 Discord-Login aktiv · <a href="/me">Mein Login</a> · <a href="/logout">Logout</a></div>'
     elif not _env("DASHBOARD_PASSWORD"):
-        auth_note = '<div class="warn">⚠️ DASHBOARD_PASSWORD ist nicht gesetzt. Dashboard ist aktuell ohne Login erreichbar.</div>'
+        auth_note = '<div class="warn">⛔ Dashboard-Login ist nicht konfiguriert. Zugriff bleibt gesperrt, bis Passwort oder Discord OAuth gesetzt ist.</div>'
     else:
         auth_note = '<div class="authbar">🔐 Passwort-Login aktiv</div>'
     return f"""<!doctype html>
@@ -3694,10 +3897,10 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "member") -> str:
   <title>{_e(title)}</title>
   <link rel="icon" type="image/png" href="{_asset('favicon.png')}">
   <meta property="og:title" content="{_e(title)}">
-  <meta property="og:image" content="{_asset('opengraph.webp')}">
-  <meta name="theme-color" content="#0b0e14">
+  <meta property="og:image" content="{_e(_brand_image('banner', 'opengraph.webp'))}">
+  <meta name="theme-color" content="{_e(brand['accent_color'])}">
   <style>
-    :root {{ --bg:#090b10; --panel:#141923; --panel2:#1b2230; --text:#eef2f7; --muted:#9da8b6; --gold:#d6e0ea; --line:#303947; --red:#d96868; --green:#81c784; --side:#0b0e14; --side2:#131923; }}
+    :root {{ --bg:#090b10; --panel:#141923; --panel2:#1b2230; --text:#eef2f7; --muted:#9da8b6; --gold:{_e(brand['accent_color'])}; --line:#303947; --red:#d96868; --green:#81c784; --side:#0b0e14; --side2:#131923; }}
     * {{ box-sizing:border-box; }} html {{ scroll-behavior:smooth; }}
     body {{ margin:0; font-family:Inter, system-ui, Segoe UI, sans-serif; background:linear-gradient(180deg,rgba(5,6,9,.56),rgba(5,6,9,.88)), url("{_asset('dashboard_bg.webp')}") center center / cover fixed no-repeat; color:var(--text); overflow-x:hidden; }}
     .app-shell {{ display:grid; grid-template-columns:260px minmax(0,1fr); min-height:100vh; }}
@@ -3745,10 +3948,10 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "member") -> str:
     .topnav a[href="/system"]::before {{ display:block; background-image:url("{_asset('nav_system.png')}"); }}
     .topnav a[href="/exports"]::before {{ display:block; background-image:url("{_asset('nav_exports.png')}"); }}
     .topnav a:hover {{ border-color:var(--gold); color:var(--gold); transform:translateY(-1px); }}
-    .hero {{ position:relative; overflow:hidden; display:flex; justify-content:space-between; gap:18px; align-items:center; padding:34px; border:1px solid rgba(184,201,220,.38); background:linear-gradient(90deg,rgba(6,8,14,.88) 0%,rgba(9,12,20,.66) 48%,rgba(9,12,20,.26) 100%), url("{_asset('hero_banner.webp')}") center center / cover no-repeat; border-radius:22px; margin-bottom:18px; box-shadow:0 24px 60px rgba(0,0,0,.50), inset 0 0 0 1px rgba(232,239,247,.06); }}
+    .hero {{ position:relative; overflow:hidden; display:flex; justify-content:space-between; gap:18px; align-items:center; padding:34px; border:1px solid rgba(184,201,220,.38); background:linear-gradient(90deg,rgba(6,8,14,.88) 0%,rgba(9,12,20,.66) 48%,rgba(9,12,20,.26) 100%), url("{hero_banner}") center center / cover no-repeat; border-radius:22px; margin-bottom:18px; box-shadow:0 24px 60px rgba(0,0,0,.50), inset 0 0 0 1px rgba(232,239,247,.06); }}
     .hero::after {{ content:""; position:absolute; inset:0; pointer-events:none; background:radial-gradient(circle at 76% 50%,rgba(184,201,220,.16),transparent 34%), linear-gradient(180deg,transparent,rgba(0,0,0,.24)); }}
     .hero > * {{ position:relative; z-index:1; }}
-    .hero h1::before {{ content:""; display:inline-block; width:38px; height:38px; margin-right:10px; vertical-align:-8px; background:url("{_asset('ebolus_logo.png')}") center / contain no-repeat; filter:drop-shadow(0 2px 7px rgba(0,0,0,.8)); }}
+    .hero h1::before {{ content:""; display:inline-block; width:38px; height:38px; margin-right:10px; vertical-align:-8px; background:url("{brand_logo}") center / contain no-repeat; filter:drop-shadow(0 2px 7px rgba(0,0,0,.8)); }}
     .hero-actions {{ display:grid; grid-template-columns:repeat(3,minmax(142px,1fr)); gap:12px; min-width:min(520px,100%); }}
     .hero-action {{ position:relative; overflow:hidden; color:var(--text); text-decoration:none; border:1px solid rgba(184,201,220,.22); border-radius:18px; padding:14px 15px; background:linear-gradient(135deg,rgba(32,35,45,.86),rgba(12,13,19,.78)); box-shadow:inset 0 1px 0 rgba(255,255,255,.05), 0 14px 26px rgba(0,0,0,.22); display:grid; gap:3px; min-height:82px; }}
     .hero-action::before {{ content:""; position:absolute; inset:-60% -30%; background:radial-gradient(circle at 25% 18%,rgba(184,201,220,.20),transparent 32%); opacity:.9; pointer-events:none; }}
@@ -9147,7 +9350,7 @@ def _render_need_builder_dashboard(data: dict[str, Any], request: Request, msg: 
       }}
       function nbNum(v) {{
         if (v === null || v === undefined) return 0;
-        let s = String(v).replace(/▲/g,'').replace(/%/g,'').replace(/,/g,'.').replace(/[^0-9.\-]/g,'');
+        let s = String(v).replace(/▲/g,'').replace(/%/g,'').replace(/,/g,'.').replace(/[^0-9.\\-]/g,'');
         if (!s || s === '-' || s === '.') return 0;
         const n = parseFloat(s);
         return isNaN(n) ? 0 : n;
@@ -10182,7 +10385,7 @@ def _render_member_home(data: dict[str, Any], request: Request) -> str:
     cards = "".join([_card("Meine EC", _fmt_ec(my_ec_balance) if my_ec_balance is not None else "—", "aktueller Stand"), _card("Uhrzeit", now_text, "lokale Dashboard-Zeit"), _card("Events", len(running_events), "max. 2 auf Startseite"), _card("Auktionen", len(active_auctions), "max. 4 auf Startseite")])
     body = f"""
     <nav class="topnav"><a href="/member">Start</a><a href="/member/events">Events</a><a href="/member/auctions">Auktionen</a><a href="/member/members">Mitglieder</a><a href="/member/ec">Meine EC</a><a href="/portal">Eigenes Profil</a><a href="/portal#needs">Meine Needs</a></nav>
-    <section class="hero member-home-hero"><div style="display:flex;gap:16px;align-items:center;flex-wrap:wrap;"><div class="member-start-logo"><img src="{_asset('ebolus_logo.png')}" alt="Weisse Flamme"></div><div><div class="eyebrow">Mitgliederbereich</div><h1>Willkommen, {_e(display)}</h1><p class="muted">Kurzüberblick. Weitere Bereiche erreichst du links über die Leiste.</p></div></div></section>
+    <section class="hero member-home-hero"><div style="display:flex;gap:16px;align-items:center;flex-wrap:wrap;"><div class="member-start-logo"><img src="{_e(_brand_image('logo', 'ebolus_logo.png'))}" alt="{_e(_guild_brand().get('display_name') or 'Gilde')}"></div><div><div class="eyebrow">Mitgliederbereich</div><h1>Willkommen, {_e(display)}</h1><p class="muted">Kurzüberblick. Weitere Bereiche erreichst du links über die Leiste.</p></div></div></section>
     <section class="grid">{cards}</section>
     <section class="split"><div class="panel" id="events"><h2>📅 Nächste 2 Events</h2>{_member_home_event_rows(running_events, int(uid or 0))}</div><div class="panel" id="auctions"><h2>🏆 Max. 4 laufende Auktionen</h2>{_member_home_auction_rows(active_auctions, snap)}</div></section>
     """
@@ -12300,7 +12503,7 @@ def _render_status_dashboard(data: dict[str, Any], request: Optional[Request] = 
     li = _leadership_insights(snap)
     member_filter = guild.get("member_filter") if isinstance(guild.get("member_filter"), dict) else {}
     member_count = int(_num(member_filter.get("eligible_count"), li.get("member_count", 0)))
-    guild_name = "Weisse Flamme"
+    guild_name = str(_guild_brand(snap).get("display_name") or "Gilde")
     current_user = _current_user(request) if request is not None else None
     current_uid = _user_id((current_user or {}).get("user_id"))
     status_names = _profile_name_map(snap)
@@ -12361,7 +12564,7 @@ def _render_status_dashboard(data: dict[str, Any], request: Optional[Request] = 
         .status-topnav-shell{{border:1px solid rgba(218,166,74,.34);border-radius:20px;padding:10px;margin:0 0 18px;background:linear-gradient(180deg,rgba(218,166,74,.09),rgba(11,14,22,.38));box-shadow:0 16px 40px rgba(0,0,0,.22), inset 0 0 0 1px rgba(232,239,247,.04);}}
         .status-topnav{{margin:0;}}
         .status-topnav a{{border-color:rgba(218,166,74,.34);}}
-        .status-main-hero{{min-height:420px;padding:30px 32px;background:linear-gradient(90deg,rgba(6,8,12,.88) 0%,rgba(7,9,14,.62) 52%,rgba(7,9,14,.18) 100%), url("{_asset('hero_banner.webp')}") center center / cover no-repeat;border:1px solid rgba(218,166,74,.38);box-shadow:0 22px 56px rgba(0,0,0,.48), inset 0 0 0 1px rgba(255,220,150,.05);}}
+        .status-main-hero{{min-height:420px;padding:30px 32px;background:linear-gradient(90deg,rgba(6,8,12,.88) 0%,rgba(7,9,14,.62) 52%,rgba(7,9,14,.18) 100%), url("{_css_url(_brand_image('banner', 'hero_banner.webp'))}") center center / cover no-repeat;border:1px solid rgba(218,166,74,.38);box-shadow:0 22px 56px rgba(0,0,0,.48), inset 0 0 0 1px rgba(255,220,150,.05);}}
         .status-hero-inner{{width:100%;display:flex;flex-direction:column;align-items:center;gap:18px;}}
         .status-hero-head{{display:flex;flex-direction:column;align-items:center;text-align:center;gap:12px;width:100%;}}
         .status-hero-brand-wrap{{display:flex;flex-direction:column;align-items:center;gap:10px;width:100%;}}
@@ -12404,7 +12607,7 @@ def _render_status_dashboard(data: dict[str, Any], request: Optional[Request] = 
         <div class="status-hero-head">
           <div class="status-hero-brand-wrap">
             <div class="eyebrow">Dashboard Status</div>
-            <img class="status-hero-brand" src="{_asset('weisse_flamme_header.png')}" alt="Weisse Flamme">
+            <img class="status-hero-brand" src="{_e(_brand_image('logo', 'weisse_flamme_header.png'))}" alt="{_e(_guild_brand().get('display_name') or 'Gilde')}">
             <p class="status-welcome">Willkommen, <strong>{_e(welcome_name)}</strong></p>
           </div>
         </div>
@@ -12961,11 +13164,11 @@ def discord_callback(request: Request, code: str = "", state: str = "", error: s
         uid = str(user.get("id") or "")
         username = str(user.get("global_name") or user.get("username") or uid)
         auth_lists = _snapshot_auth_lists()
-        guild_id = _env("DASHBOARD_GUILD_ID") or str(auth_lists.get("guild_id") or "")
+        guild_id = str(auth_lists.get("guild_id") or "") or _env("DASHBOARD_GUILD_ID")
         if not uid:
             raise RuntimeError("Discord hat keine User-ID zurückgegeben.")
         if not guild_id:
-            raise RuntimeError("DASHBOARD_GUILD_ID ist nicht gesetzt und konnte nicht aus dem Snapshot gelesen werden.")
+            raise RuntimeError("Keine aktive Guild-ID konnte aus Gildenprofil oder Snapshot gelesen werden.")
 
         allowed_ids = set(auth_lists.get("allowed_member_ids") or set())
         admin_ids = set(auth_lists.get("admin_member_ids") or set())
@@ -13530,6 +13733,310 @@ def api_admin_member_states(_: bool = Depends(_admin_auth)):
     payload = _snapshot_payload()
     guild_id = _safe_guild_id(payload)
     return JSONResponse({"ok": True, "guild_id": guild_id, "states": _all_member_admin_states(guild_id), "actions": _admin_action_log(guild_id, 200)})
+
+
+
+def _dashboard_upsert_guild_profile(guild_id: int, values: dict[str, Any]) -> None:
+    _ensure_guild_profile_schema()
+    current = _guild_profile_row(guild_id)
+    now = datetime.now(timezone.utc).isoformat()
+    merged = {
+        "discord_name": str(values.get("discord_name") if values.get("discord_name") is not None else current.get("discord_name") or "")[:120],
+        "display_name": str(values.get("display_name") or current.get("display_name") or "Gilde")[:120],
+        "short_name": str(values.get("short_name") or current.get("short_name") or values.get("display_name") or "Gilde")[:60],
+        "bot_display_name": str(values.get("bot_display_name") or current.get("bot_display_name") or "Gildenknecht")[:120],
+        "timezone_name": str(values.get("timezone_name") or current.get("timezone_name") or "Europe/Berlin")[:80],
+        "logo_url": str(values.get("logo_url") if values.get("logo_url") is not None else current.get("logo_url") or "")[:1200],
+        "banner_url": str(values.get("banner_url") if values.get("banner_url") is not None else current.get("banner_url") or "")[:1200],
+        "accent_color": str(values.get("accent_color") or current.get("accent_color") or "#d6a84f")[:20],
+        "invite_url": str(values.get("invite_url") if values.get("invite_url") is not None else current.get("invite_url") or "")[:1200],
+        "status": str(values.get("status") or current.get("status") or "active")[:30],
+        "previous_guild_id": values.get("previous_guild_id") if values.get("previous_guild_id") is not None else current.get("previous_guild_id"),
+        "created_at": str(current.get("created_at") or now),
+        "updated_at": now,
+    }
+    conn = _pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO guild_profiles(
+                    guild_id,discord_name,display_name,short_name,bot_display_name,timezone_name,
+                    logo_url,banner_url,accent_color,invite_url,status,previous_guild_id,created_at,updated_at
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                ON CONFLICT(guild_id) DO UPDATE SET
+                    discord_name=EXCLUDED.discord_name, display_name=EXCLUDED.display_name,
+                    short_name=EXCLUDED.short_name, bot_display_name=EXCLUDED.bot_display_name,
+                    timezone_name=EXCLUDED.timezone_name, logo_url=EXCLUDED.logo_url,
+                    banner_url=EXCLUDED.banner_url, accent_color=EXCLUDED.accent_color,
+                    invite_url=EXCLUDED.invite_url, status=EXCLUDED.status,
+                    previous_guild_id=EXCLUDED.previous_guild_id, updated_at=EXCLUDED.updated_at
+            """, (
+                int(guild_id), merged["discord_name"], merged["display_name"], merged["short_name"],
+                merged["bot_display_name"], merged["timezone_name"], merged["logo_url"], merged["banner_url"],
+                merged["accent_color"], merged["invite_url"], merged["status"], merged["previous_guild_id"],
+                merged["created_at"], merged["updated_at"],
+            ))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _catalog_from_snapshot(data: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    snap = data.get("snapshot") or {}
+    guild = snap.get("guild") or {}
+    catalog = guild.get("discord_catalog") or {}
+    roles = [x for x in (catalog.get("roles") or []) if isinstance(x, dict)]
+    channels = [x for x in (catalog.get("channels") or []) if isinstance(x, dict)]
+    return roles, channels
+
+
+def _role_select(name: str, roles: list[dict[str, Any]], selected: list[int], *, multiple: bool = False) -> str:
+    sel = {int(x) for x in selected if int(x or 0)}
+    attrs = " multiple size='8'" if multiple else ""
+    options = ["<option value=''>— nicht gesetzt —</option>"] if not multiple else []
+    for role in roles:
+        try:
+            rid = int(role.get("id") or 0)
+        except Exception:
+            continue
+        chosen = " selected" if rid in sel else ""
+        options.append(f"<option value='{rid}'{chosen}>{_e(role.get('name') or rid)} · {int(role.get('member_count') or 0)} Mitglieder</option>")
+    return f"<select name='{_e(name)}'{attrs}>" + "".join(options) + "</select>"
+
+
+def _channel_select(name: str, channels: list[dict[str, Any]], selected: int, *, kinds: Optional[set[str]] = None) -> str:
+    options = ["<option value=''>— nicht gesetzt —</option>"]
+    for ch in channels:
+        kind = str(ch.get("kind") or "other")
+        if kinds and kind not in kinds:
+            continue
+        try:
+            cid = int(ch.get("id") or 0)
+        except Exception:
+            continue
+        chosen = " selected" if cid == int(selected or 0) else ""
+        options.append(f"<option value='{cid}'{chosen}>#{_e(ch.get('name') or cid)} · {_e(kind)}</option>")
+    return f"<select name='{_e(name)}'>" + "".join(options) + "</select>"
+
+
+def _render_guild_config_dashboard(data: dict[str, Any], msg: str = "") -> str:
+    if not data.get("ok"):
+        return _html_shell("Gilde & Discord", f"<section class='panel'><h1>⚙️ Gilde & Discord</h1><p class='muted'>{_e(data.get('error'))}</p></section>", nav_mode="admin")
+    gid = _safe_guild_id(data)
+    profile = _guild_profile_row(gid)
+    snap = data.get("snapshot") or {}
+    guild_row = snap.get("guild") or {}
+    if not profile:
+        profile = {
+            "guild_id": gid,
+            "discord_name": guild_row.get("discord_name") or guild_row.get("name") or "",
+            "display_name": guild_row.get("name") or data.get("guild_name") or "Gilde",
+            "short_name": guild_row.get("name") or "Gilde",
+            "bot_display_name": f"{guild_row.get('name') or 'Gilde'} Knecht",
+            "timezone_name": "Europe/Berlin",
+            "accent_color": "#d6a84f",
+            "status": "active",
+        }
+    roles, channels = _catalog_from_snapshot(data)
+    member = int(_guild_setting_value(gid, "dashboard_member_role_id", 0) or 0)
+    admins = _guild_setting_value(gid, "dashboard_admin_role_ids", []) or []
+    allowed = _guild_setting_value(gid, "dashboard_allowed_role_ids", []) or []
+    if not isinstance(admins, list): admins = [admins]
+    if not isinstance(allowed, list): allowed = [allowed]
+    leader = int(_guild_setting_value(gid, "guild_role_leader_id", 0) or 0)
+    advisor = int(_guild_setting_value(gid, "guild_role_advisor_id", 0) or 0)
+    guardian = int(_guild_setting_value(gid, "guild_role_guardian_id", 0) or 0)
+    voice_allowed = _guild_setting_value(gid, "guild_role_voice_allowed_ids", []) or []
+    voice_blocked = _guild_setting_value(gid, "guild_role_voice_blocked_ids", []) or []
+    if not isinstance(voice_allowed, list): voice_allowed = [voice_allowed]
+    if not isinstance(voice_blocked, list): voice_blocked = [voice_blocked]
+    channel_keys = {
+        "events": "guild_channel_events_id", "loot": "guild_channel_loot_id", "ec_log": "guild_channel_ec_log_id",
+        "audit": "guild_channel_audit_id", "welcome": "guild_channel_welcome_id",
+        "announcements": "guild_channel_announcements_id", "news": "guild_channel_news_id",
+        "guides": "guild_channel_guides_id", "voice_category": "guild_channel_voice_category_id",
+        "voice_return": "guild_channel_voice_return_id", "absences": "guild_channel_absences_id",
+        "member_portal": "guild_channel_member_portal_id",
+        "leader_contact_public": "guild_channel_leader_contact_public_id",
+        "leader_contact_internal": "guild_channel_leader_contact_internal_id",
+        "weekly_report": "guild_channel_weekly_report_id",
+        "auction_active": "guild_channel_auction_active_id", "auction_market": "guild_channel_auction_market_id",
+    }
+    cv = {k: int(_guild_setting_value(gid, v, 0) or 0) for k, v in channel_keys.items()}
+    loot_rules = {kind: _guild_rule_value(gid, kind) for kind in GUILD_LOOT_RULES}
+    profiles = []
+    try:
+        _ensure_guild_profile_schema()
+        conn = _pg_connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT guild_id,discord_name,display_name,status,previous_guild_id,updated_at FROM guild_profiles ORDER BY updated_at DESC")
+                profiles = [dict(x) for x in cur.fetchall()]
+        finally:
+            conn.close()
+    except Exception:
+        profiles = []
+    profile_rows = [[r.get("display_name") or r.get("discord_name"), r.get("guild_id"), r.get("status"), r.get("previous_guild_id") or "—", _dt(r.get("updated_at"))] for r in profiles]
+    msg_panel = f"<section class='panel'><p>{_e(msg)}</p></section>" if msg else ""
+    body = f"""
+    <nav class='topnav'><a href='/admin'>← Admin</a><a href='/admin-settings'>EC & Regeln</a><a href='/settings'>System-Setup</a></nav>
+    <section class='hero'><div><div class='eyebrow'>Mandantenfähige Konfiguration</div><h1>⚙️ Gilde & Discord</h1><p class='muted'>Gildenname, Branding, Rollen und Kanäle liegen in Postgres. Railway bleibt bei Tokens, OAuth-Secrets, DATABASE_URL und Session-Secret.</p></div></section>
+    {msg_panel}
+    <section class='grid'>{_card('Aktive Guild-ID', gid, 'automatisch aus Bot-Snapshot')}{_card('Discord-Server', profile.get('discord_name') or guild_row.get('discord_name') or '—', 'technischer Servername')}{_card('Gildenname', profile.get('display_name') or '—', 'frei änderbar')}{_card('Rollen im Snapshot', len(roles), 'Auswahl ohne IDs kopieren')}</section>
+    <form method='post' action='/admin/guild-config' style='display:grid;gap:18px;'>
+      <section class='split'>
+        <section class='panel'><h2>🏰 Name & Branding</h2>
+          <label>Gildenname<br><input name='display_name' value='{_e(profile.get('display_name') or '')}' required></label>
+          <label>Kurzname<br><input name='short_name' value='{_e(profile.get('short_name') or '')}'></label>
+          <label>Bot-Anzeigename<br><input name='bot_display_name' value='{_e(profile.get('bot_display_name') or '')}'></label>
+          <label>Zeitzone<br><input name='timezone_name' value='{_e(profile.get('timezone_name') or 'Europe/Berlin')}'></label>
+          <label>Logo-URL<br><input name='logo_url' value='{_e(profile.get('logo_url') or '')}' placeholder='https://…'></label>
+          <label>Banner-URL<br><input name='banner_url' value='{_e(profile.get('banner_url') or '')}' placeholder='https://…'></label>
+          <label>Akzentfarbe<br><input name='accent_color' value='{_e(profile.get('accent_color') or '#d6a84f')}' placeholder='#d6a84f'></label>
+          <label>Discord-Einladungslink<br><input name='invite_url' value='{_e(profile.get('invite_url') or '')}' placeholder='https://discord.gg/…'></label>
+        </section>
+        <section class='panel'><h2>🛡️ Rollen</h2>
+          <label>Mitgliederrolle<br>{_role_select('member_role_id', roles, [member])}</label>
+          <label>Dashboard-Adminrollen<br>{_role_select('admin_role_ids', roles, [int(x) for x in admins if str(x).isdigit()], multiple=True)}</label>
+          <label>Zusätzliche Zugriffsrollen<br>{_role_select('allowed_role_ids', roles, [int(x) for x in allowed if str(x).isdigit()], multiple=True)}</label>
+          <label>Gildenmeister/Leitung<br>{_role_select('leader_role_id', roles, [leader])}</label>
+          <label>Gildenberater<br>{_role_select('advisor_role_id', roles, [advisor])}</label>
+          <label>Gildenwächter<br>{_role_select('guardian_role_id', roles, [guardian])}</label>
+          <label>Voice-Zugriffsrollen<br>{_role_select('voice_allowed_role_ids', roles, [int(x) for x in voice_allowed if str(x).isdigit()], multiple=True)}</label>
+          <label>Vom Voice ausgeschlossene Rollen<br>{_role_select('voice_blocked_role_ids', roles, [int(x) for x in voice_blocked if str(x).isdigit()], multiple=True)}</label>
+        </section>
+      </section>
+      <section class='panel'><h2>💬 Kanäle</h2><div class='grid'>
+        <label>Events<br>{_channel_select('channel_events', channels, cv['events'], kinds={'text','forum'})}</label>
+        <label>Loot/Auktionen<br>{_channel_select('channel_loot', channels, cv['loot'], kinds={'text','forum'})}</label>
+        <label>EC-/Loot-Log<br>{_channel_select('channel_ec_log', channels, cv['ec_log'], kinds={'text'})}</label>
+        <label>Audit/Technik<br>{_channel_select('channel_audit', channels, cv['audit'], kinds={'text'})}</label>
+        <label>Willkommen<br>{_channel_select('channel_welcome', channels, cv['welcome'], kinds={'text'})}</label>
+        <label>Ankündigungen<br>{_channel_select('channel_announcements', channels, cv['announcements'], kinds={'text','forum'})}</label>
+        <label>News<br>{_channel_select('channel_news', channels, cv['news'], kinds={'text','forum'})}</label>
+        <label>Guides<br>{_channel_select('channel_guides', channels, cv['guides'], kinds={'text','forum'})}</label>
+        <label>Voice-Kategorie<br>{_channel_select('channel_voice_category', channels, cv['voice_category'], kinds={'category'})}</label>
+        <label>Voice-Rückkehrkanal<br>{_channel_select('channel_voice_return', channels, cv['voice_return'], kinds={'voice','stage'})}</label>
+        <label>Abwesenheiten<br>{_channel_select('channel_absences', channels, cv['absences'], kinds={'text','forum'})}</label>
+        <label>Mitgliederportal-Post<br>{_channel_select('channel_member_portal', channels, cv['member_portal'], kinds={'text'})}</label>
+        <label>Leaderkontakt öffentlich<br>{_channel_select('channel_leader_contact_public', channels, cv['leader_contact_public'], kinds={'text','forum'})}</label>
+        <label>Leaderkontakt intern<br>{_channel_select('channel_leader_contact_internal', channels, cv['leader_contact_internal'], kinds={'text','forum'})}</label>
+        <label>Wochenbericht<br>{_channel_select('channel_weekly_report', channels, cv['weekly_report'], kinds={'text','forum'})}</label>
+        <label>Aktive Auktionen<br>{_channel_select('channel_auction_active', channels, cv['auction_active'], kinds={'text','forum'})}</label>
+        <label>Auktionsmarkt/Sale<br>{_channel_select('channel_auction_market', channels, cv['auction_market'], kinds={'text','forum'})}</label>
+      </div></section>
+      <section class='panel'><h2>🎁 Loot- und Auktionsregeln</h2><p class='muted'>Diese Werte gelten sofort für neu gestartete Auktionen. Bereits laufende Auktionen behalten ihre gespeicherten Zeiten und Preise.</p><div class='grid'>
+        {''.join(f"<label>{_e(spec['label'])}<br><input type='number' name='rule_{_e(kind)}' value='{loot_rules[kind]}' min='{int(spec['min'])}' max='{int(spec['max'])}'></label>" for kind, spec in GUILD_LOOT_RULES.items())}
+      </div><p class='muted'>EC-Punkte, Wochenlimit und Verfall bleiben im Bereich <a href='/admin-settings'>EC & Regeln</a> einstellbar. Dieselben Lootwerte gehen auch per <code>/guild set_rule</code>.</p></section>
+      <section class='panel'><button class='btn' type='submit'>Konfiguration speichern</button><p class='muted'>Der Bot übernimmt diese Werte direkt aus Postgres. Für neue Zugriffsrollen danach einmal <code>/dashboard_status</code> ausführen und neu einloggen.</p></section>
+    </form>
+    <section class='panel'><h2>🚚 Serverwechsel</h2><p>Auf dem neuen Discord-Server: <code>/guild setup</code>, Rollen/Kanäle auswählen und danach <code>/guild rehome source_guild_id:ALTE_ID</code>. Es werden nur mitgekommene Mitglieder und sichere Historie übernommen.</p></section>
+    <section class='panel'><h2>🗃️ Bekannte Gilden</h2>{_table(['Name','Guild-ID','Status','Vorherige Guild','Aktualisiert'], profile_rows, placeholder='Gilden durchsuchen…')}</section>
+    """
+    return _html_shell("Gilde & Discord", body, nav_mode="admin")
+
+
+@app.get("/admin/guild-config", response_class=HTMLResponse)
+def guild_config_page(_: bool = Depends(_admin_auth), msg: str = ""):
+    return HTMLResponse(_render_guild_config_dashboard(_snapshot_payload(), msg=msg))
+
+
+@app.post("/admin/guild-config")
+async def guild_config_save(request: Request, _: bool = Depends(_admin_auth)):
+    data = _snapshot_payload()
+    gid = _safe_guild_id(data)
+    if not gid:
+        raise HTTPException(status_code=409, detail="Keine aktive Guild-ID verfügbar.")
+    raw_body = (await request.body()).decode("utf-8", errors="replace")
+    parsed_form = urllib.parse.parse_qs(raw_body, keep_blank_values=True)
+    def form_one(name: str, default: str = "") -> str:
+        values = parsed_form.get(name) or [default]
+        return str(values[0] if values else default)
+    def form_many(name: str) -> list[str]:
+        return [str(x) for x in (parsed_form.get(name) or [])]
+    display_name = form_one("display_name").strip()
+    if not display_name:
+        raise HTTPException(status_code=400, detail="Gildenname fehlt.")
+    accent = form_one("accent_color", "#d6a84f").strip()
+    if not re.fullmatch(r"#[0-9a-fA-F]{6}", accent):
+        accent = "#d6a84f"
+    snap = data.get("snapshot") or {}
+    guild_row = snap.get("guild") or {}
+    before = _guild_profile_row(gid)
+    _dashboard_upsert_guild_profile(gid, {
+        "discord_name": guild_row.get("discord_name") or guild_row.get("name") or before.get("discord_name") or "",
+        "display_name": display_name,
+        "short_name": form_one("short_name", display_name).strip(),
+        "bot_display_name": form_one("bot_display_name", f"{display_name} Knecht").strip(),
+        "timezone_name": form_one("timezone_name", "Europe/Berlin").strip(),
+        "logo_url": form_one("logo_url").strip(),
+        "banner_url": form_one("banner_url").strip(),
+        "accent_color": accent,
+        "invite_url": form_one("invite_url").strip(),
+        "status": "active",
+    })
+    def one_int(name: str) -> int:
+        raw = form_one(name).strip()
+        return int(raw) if raw.isdigit() else 0
+    def many_int(name: str) -> list[int]:
+        out = []
+        for raw in form_many(name):
+            value = str(raw or "").strip()
+            if value.isdigit() and int(value) not in out:
+                out.append(int(value))
+        return out
+    settings = {
+        "dashboard_member_role_id": one_int("member_role_id"),
+        "dashboard_admin_role_ids": many_int("admin_role_ids"),
+        "dashboard_allowed_role_ids": many_int("allowed_role_ids"),
+        "guild_role_leader_id": one_int("leader_role_id"),
+        "guild_role_advisor_id": one_int("advisor_role_id"),
+        "guild_role_guardian_id": one_int("guardian_role_id"),
+        "guild_role_voice_allowed_ids": many_int("voice_allowed_role_ids"),
+        "guild_role_voice_blocked_ids": many_int("voice_blocked_role_ids"),
+        "guild_channel_events_id": one_int("channel_events"),
+        "guild_channel_loot_id": one_int("channel_loot"),
+        "guild_channel_ec_log_id": one_int("channel_ec_log"),
+        "guild_channel_audit_id": one_int("channel_audit"),
+        "guild_channel_welcome_id": one_int("channel_welcome"),
+        "guild_channel_announcements_id": one_int("channel_announcements"),
+        "guild_channel_news_id": one_int("channel_news"),
+        "guild_channel_guides_id": one_int("channel_guides"),
+        "guild_channel_voice_category_id": one_int("channel_voice_category"),
+        "guild_channel_voice_return_id": one_int("channel_voice_return"),
+        "guild_channel_absences_id": one_int("channel_absences"),
+        "guild_channel_member_portal_id": one_int("channel_member_portal"),
+        "guild_channel_leader_contact_public_id": one_int("channel_leader_contact_public"),
+        "guild_channel_leader_contact_internal_id": one_int("channel_leader_contact_internal"),
+        "guild_channel_weekly_report_id": one_int("channel_weekly_report"),
+        "guild_channel_auction_active_id": one_int("channel_auction_active"),
+        "guild_channel_auction_market_id": one_int("channel_auction_market"),
+    }
+    for kind, spec in GUILD_LOOT_RULES.items():
+        raw = form_one("rule_" + kind, str(spec["default"])).strip()
+        try:
+            value = int(raw)
+        except Exception:
+            value = int(spec["default"])
+        settings[str(spec["setting"])] = max(int(spec["min"]), min(int(spec["max"]), value))
+    for key, value in settings.items():
+        _set_guild_setting_value(gid, key, value)
+    try:
+        _ensure_admin_tables()
+        actor = _current_user(request) or {}
+        conn = _pg_connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO dashboard_admin_action_log(guild_id,action_type,target_type,target_id,actor_id,actor_name,payload_json)
+                    VALUES (%s,'guild_config_save','guild',%s,%s,%s,%s)
+                """, (gid, str(gid), str(actor.get("user_id") or ""), str(actor.get("username") or "Dashboard"), json.dumps({"profile_before": before, "profile_after": _guild_profile_row(gid), "settings": settings}, ensure_ascii=False)))
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        pass
+    return RedirectResponse("/admin/guild-config?" + urllib.parse.urlencode({"msg": "Konfiguration gespeichert. Der Bot übernimmt Rollen und Kanäle automatisch innerhalb von spätestens 45 Sekunden."}), status_code=303)
 
 
 @app.get("/settings", response_class=HTMLResponse)
