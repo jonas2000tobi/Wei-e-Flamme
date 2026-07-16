@@ -1,1712 +1,880 @@
 from __future__ import annotations
 
 import json
-import os
-import sqlite3
-import threading
-import re
-import difflib
+import asyncio
 from pathlib import Path
-from datetime import datetime, timezone
-from typing import Any, Optional
-from urllib.parse import urlparse
+from typing import Optional, List
+from datetime import datetime, timedelta, date
+
+try:
+    from bot.json_store import load_json_file, save_json_atomic, warn_json_store  # type: ignore
+except Exception:
+    from json_store import load_json_file, save_json_atomic, warn_json_store  # type: ignore
+
+import discord
+
+try:
+    from bot.channel_picker import send_text_channel_picker, send_voice_channel_picker  # type: ignore
+except Exception:
+    from channel_picker import send_text_channel_picker, send_voice_channel_picker  # type: ignore
+from discord import app_commands
+from discord.ext import tasks
+
+try:
+    from bot.event_dm_prefs import is_dm_enabled  # type: ignore
+except ModuleNotFoundError:
+    from event_dm_prefs import is_dm_enabled  # type: ignore
+
+try:
+    from bot.event_rsvp_dm import (
+        store,
+        save_store,
+        TZ,
+        build_embed,
+        ServerRaidView,
+        RaidView,
+        _eligible_members,
+        _format_dm_text,
+    )  # type: ignore
+except ModuleNotFoundError:
+    from event_rsvp_dm import (
+        store,
+        save_store,
+        TZ,
+        build_embed,
+        ServerRaidView,
+        RaidView,
+        _eligible_members,
+        _format_dm_text,
+    )  # type: ignore
+
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-SQLITE_PATH = DATA_DIR / "ebo_runtime.sqlite3"
-_DB_LOCK = threading.RLock()
-_INITIALIZED = False
-_BACKEND = "sqlite"
-_POSTGRES_ERROR = ""
+TEMPLATE_FILE = DATA_DIR / "raid_templates.json"
+AUTO_STATE_FILE = DATA_DIR / "raid_template_auto_state.json"
+
+_client_ref: Optional[discord.Client] = None
 
 
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+def _load() -> dict:
+    return load_json_file(TEMPLATE_FILE, {}, context=__name__)
 
 
-def _database_url() -> str:
-    return str(os.getenv("DATABASE_URL") or "").strip()
+def _save(obj: dict) -> None:
+    save_json_atomic(TEMPLATE_FILE, obj, context=__name__)
 
 
-def _normalized_database_url() -> str:
-    url = _database_url()
-    # Railway/Heroku style is often postgres://. psycopg accepts postgresql:// reliably.
-    if url.startswith("postgres://"):
-        return "postgresql://" + url[len("postgres://"):]
-    return url
+def _load_auto_state() -> dict:
+    return load_json_file(AUTO_STATE_FILE, {}, context=__name__)
 
 
-def _want_postgres() -> bool:
-    url = _database_url().lower()
-    return url.startswith("postgres://") or url.startswith("postgresql://")
+def _save_auto_state(obj: dict) -> None:
+    save_json_atomic(AUTO_STATE_FILE, obj, context=__name__)
 
 
-def _pg_connect():
-    # Lazy import: the bot can still run locally without psycopg installed.
-    import psycopg  # type: ignore
-    from psycopg.rows import dict_row  # type: ignore
-
-    return psycopg.connect(_normalized_database_url(), row_factory=dict_row, connect_timeout=10)
+templates: dict = _load()
+auto_state: dict = _load_auto_state()
 
 
-def _sqlite_connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(str(SQLITE_PATH), timeout=10)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
-    return conn
+def _is_admin(inter: discord.Interaction) -> bool:
+    perms = getattr(inter.user, "guild_permissions", None)
+    return bool(perms and (perms.administrator or perms.manage_guild))
 
 
-def _init_sqlite() -> dict[str, Any]:
-    global _INITIALIZED, _BACKEND
-    conn = _sqlite_connect()
-    try:
-        conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS schema_migrations (
-                version INTEGER PRIMARY KEY,
-                name TEXT NOT NULL,
-                applied_at TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS guild_settings (
-                guild_id INTEGER NOT NULL,
-                key TEXT NOT NULL,
-                value_json TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                PRIMARY KEY (guild_id, key)
-            );
-
-            CREATE TABLE IF NOT EXISTS module_settings (
-                guild_id INTEGER NOT NULL,
-                module TEXT NOT NULL,
-                key TEXT NOT NULL,
-                value_json TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                PRIMARY KEY (guild_id, module, key)
-            );
-
-            CREATE TABLE IF NOT EXISTS audit_logs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                guild_id INTEGER,
-                actor_id INTEGER,
-                action TEXT NOT NULL,
-                target_type TEXT,
-                target_id TEXT,
-                summary TEXT,
-                old_value_json TEXT,
-                new_value_json TEXT,
-                metadata_json TEXT,
-                created_at TEXT NOT NULL
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_audit_logs_guild_created
-                ON audit_logs (guild_id, created_at DESC);
-            CREATE INDEX IF NOT EXISTS idx_audit_logs_actor_created
-                ON audit_logs (actor_id, created_at DESC);
-            CREATE INDEX IF NOT EXISTS idx_audit_logs_action_created
-                ON audit_logs (action, created_at DESC);
-
-            CREATE TABLE IF NOT EXISTS voice_sessions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                guild_id INTEGER NOT NULL,
-                user_id INTEGER NOT NULL,
-                channel_id INTEGER NOT NULL,
-                joined_at TEXT NOT NULL,
-                left_at TEXT,
-                duration_seconds INTEGER,
-                event_id TEXT,
-                source TEXT NOT NULL DEFAULT 'voice_state',
-                metadata_json TEXT
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_voice_sessions_guild_user_joined
-                ON voice_sessions (guild_id, user_id, joined_at DESC);
-            CREATE INDEX IF NOT EXISTS idx_voice_sessions_guild_channel_joined
-                ON voice_sessions (guild_id, channel_id, joined_at DESC);
-            CREATE INDEX IF NOT EXISTS idx_voice_sessions_event
-                ON voice_sessions (guild_id, event_id);
-            
-            CREATE TABLE IF NOT EXISTS dashboard_snapshots (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                guild_id INTEGER NOT NULL,
-                guild_name TEXT,
-                schema_version INTEGER NOT NULL,
-                generated_at TEXT NOT NULL,
-                published_at TEXT NOT NULL,
-                snapshot_json TEXT NOT NULL
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_dashboard_snapshots_guild_published
-                ON dashboard_snapshots (guild_id, published_at DESC);
+def _gcfg(guild_id: int) -> dict:
+    g = templates.get(str(guild_id)) or {}
+    g.setdefault("templates", {})
+    templates[str(guild_id)] = g
+    return g
 
 
-            CREATE TABLE IF NOT EXISTS guild_members (
-                guild_id INTEGER NOT NULL,
-                user_id INTEGER NOT NULL,
-                server_name TEXT NOT NULL DEFAULT '',
-                discord_username TEXT NOT NULL DEFAULT '',
-                avatar_url TEXT NOT NULL DEFAULT '',
-                ingame_name TEXT NOT NULL DEFAULT '',
-                main_role TEXT NOT NULL DEFAULT '',
-                gearscore TEXT NOT NULL DEFAULT '',
-                member_role_id INTEGER NOT NULL DEFAULT 0,
-                is_active INTEGER NOT NULL DEFAULT 1,
-                joined_at TEXT,
-                first_seen_at TEXT NOT NULL,
-                last_seen_at TEXT NOT NULL,
-                left_at TEXT,
-                roles_json TEXT NOT NULL DEFAULT '[]',
-                profile_json TEXT NOT NULL DEFAULT '{}',
-                updated_at TEXT NOT NULL,
-                PRIMARY KEY (guild_id, user_id)
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_guild_members_active_name
-                ON guild_members (guild_id, is_active, server_name);
-
-            CREATE TABLE IF NOT EXISTS guild_item_links (
-                guild_id INTEGER NOT NULL,
-                reference_type TEXT NOT NULL,
-                reference_key TEXT NOT NULL,
-                catalog_item_id INTEGER,
-                source_item_id TEXT,
-                canonical_name TEXT,
-                source_url TEXT,
-                image_url TEXT,
-                match_method TEXT,
-                confidence REAL NOT NULL DEFAULT 0,
-                aliases_json TEXT NOT NULL DEFAULT '[]',
-                updated_at TEXT NOT NULL,
-                PRIMARY KEY (guild_id, reference_type, reference_key)
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_guild_item_links_catalog
-                ON guild_item_links (guild_id, catalog_item_id);
-            """
-        )
-        conn.execute(
-            "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at) VALUES (?, ?, ?)",
-            (1, "runtime_db_audit_voice_base", _now_iso()),
-        )
-        conn.commit()
-        _INITIALIZED = True
-        _BACKEND = "sqlite"
-        return {"ok": True, "backend": _BACKEND, "path": str(SQLITE_PATH)}
-    finally:
-        conn.close()
+def _g_auto_state(guild_id: int) -> dict:
+    g = auto_state.get(str(guild_id)) or {}
+    g.setdefault("posted", {})
+    auto_state[str(guild_id)] = g
+    return g
 
 
-def _init_postgres() -> dict[str, Any]:
-    global _INITIALIZED, _BACKEND, _POSTGRES_ERROR
-    conn = _pg_connect()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS schema_migrations (
-                    version INTEGER PRIMARY KEY,
-                    name TEXT NOT NULL,
-                    applied_at TEXT NOT NULL
-                )
-                """
-            )
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS guild_settings (
-                    guild_id BIGINT NOT NULL,
-                    key TEXT NOT NULL,
-                    value_json TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    PRIMARY KEY (guild_id, key)
-                )
-                """
-            )
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS module_settings (
-                    guild_id BIGINT NOT NULL,
-                    module TEXT NOT NULL,
-                    key TEXT NOT NULL,
-                    value_json TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    PRIMARY KEY (guild_id, module, key)
-                )
-                """
-            )
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS audit_logs (
-                    id BIGSERIAL PRIMARY KEY,
-                    guild_id BIGINT,
-                    actor_id BIGINT,
-                    action TEXT NOT NULL,
-                    target_type TEXT,
-                    target_id TEXT,
-                    summary TEXT,
-                    old_value_json TEXT,
-                    new_value_json TEXT,
-                    metadata_json TEXT,
-                    created_at TEXT NOT NULL
-                )
-                """
-            )
-            cur.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_audit_logs_guild_created
-                    ON audit_logs (guild_id, created_at DESC)
-                """
-            )
-            cur.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_audit_logs_actor_created
-                    ON audit_logs (actor_id, created_at DESC)
-                """
-            )
-            cur.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_audit_logs_action_created
-                    ON audit_logs (action, created_at DESC)
-                """
-            )
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS voice_sessions (
-                    id BIGSERIAL PRIMARY KEY,
-                    guild_id BIGINT NOT NULL,
-                    user_id BIGINT NOT NULL,
-                    channel_id BIGINT NOT NULL,
-                    joined_at TEXT NOT NULL,
-                    left_at TEXT,
-                    duration_seconds INTEGER,
-                    event_id TEXT,
-                    source TEXT NOT NULL DEFAULT 'voice_state',
-                    metadata_json TEXT
-                )
-                """
-            )
-            cur.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_voice_sessions_guild_user_joined
-                    ON voice_sessions (guild_id, user_id, joined_at DESC)
-                """
-            )
-            cur.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_voice_sessions_guild_channel_joined
-                    ON voice_sessions (guild_id, channel_id, joined_at DESC)
-                """
-            )
-            cur.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_voice_sessions_event
-                    ON voice_sessions (guild_id, event_id)
-                """
-            )
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS dashboard_snapshots (
-                    id BIGSERIAL PRIMARY KEY,
-                    guild_id BIGINT NOT NULL,
-                    guild_name TEXT,
-                    schema_version INTEGER NOT NULL,
-                    generated_at TEXT NOT NULL,
-                    published_at TEXT NOT NULL,
-                    snapshot_json TEXT NOT NULL
-                )
-                """
-            )
-            cur.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_dashboard_snapshots_guild_published
-                    ON dashboard_snapshots (guild_id, published_at DESC)
-                """
-            )
-
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS guild_members (
-                    guild_id BIGINT NOT NULL,
-                    user_id BIGINT NOT NULL,
-                    server_name TEXT NOT NULL DEFAULT '',
-                    discord_username TEXT NOT NULL DEFAULT '',
-                    avatar_url TEXT NOT NULL DEFAULT '',
-                    ingame_name TEXT NOT NULL DEFAULT '',
-                    main_role TEXT NOT NULL DEFAULT '',
-                    gearscore TEXT NOT NULL DEFAULT '',
-                    member_role_id BIGINT NOT NULL DEFAULT 0,
-                    is_active BOOLEAN NOT NULL DEFAULT TRUE,
-                    joined_at TEXT,
-                    first_seen_at TEXT NOT NULL,
-                    last_seen_at TEXT NOT NULL,
-                    left_at TEXT,
-                    roles_json TEXT NOT NULL DEFAULT '[]',
-                    profile_json TEXT NOT NULL DEFAULT '{}',
-                    updated_at TEXT NOT NULL,
-                    PRIMARY KEY (guild_id, user_id)
-                )
-                """
-            )
-            cur.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_guild_members_active_name
-                    ON guild_members (guild_id, is_active, server_name)
-                """
-            )
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS guild_item_links (
-                    guild_id BIGINT NOT NULL,
-                    reference_type TEXT NOT NULL,
-                    reference_key TEXT NOT NULL,
-                    catalog_item_id BIGINT,
-                    source_item_id TEXT,
-                    canonical_name TEXT,
-                    source_url TEXT,
-                    image_url TEXT,
-                    match_method TEXT,
-                    confidence DOUBLE PRECISION NOT NULL DEFAULT 0,
-                    aliases_json TEXT NOT NULL DEFAULT '[]',
-                    updated_at TEXT NOT NULL,
-                    PRIMARY KEY (guild_id, reference_type, reference_key)
-                )
-                """
-            )
-            cur.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_guild_item_links_catalog
-                    ON guild_item_links (guild_id, catalog_item_id)
-                """
-            )
-            cur.execute(
-                """
-                INSERT INTO schema_migrations(version, name, applied_at)
-                VALUES (%s, %s, %s)
-                ON CONFLICT (version) DO NOTHING
-                """,
-                (1, "runtime_db_audit_voice_base", _now_iso()),
-            )
-        conn.commit()
-        _INITIALIZED = True
-        _BACKEND = "postgres"
-        _POSTGRES_ERROR = ""
-        return {"ok": True, "backend": _BACKEND, "path": "PostgreSQL über DATABASE_URL"}
-    finally:
-        conn.close()
+def _normalize_name(name: str) -> str:
+    return (name or "").strip().lower().replace(" ", "_")
 
 
-def init_runtime_db() -> dict[str, Any]:
-    """Initialisiert die Runtime-Datenbank.
-
-    Production/Railway: Wenn DATABASE_URL auf postgres/postgresql zeigt, wird Postgres genutzt.
-    Fallback: Ohne DATABASE_URL oder bei lokalem Test nutzt der Bot SQLite, damit bestehende Deploys nicht brechen.
-    """
-    global _INITIALIZED, _BACKEND, _POSTGRES_ERROR
-    with _DB_LOCK:
-        if _want_postgres():
-            try:
-                return _init_postgres()
-            except Exception as e:
-                _POSTGRES_ERROR = repr(e)
-                print(f"[runtime_db] PostgreSQL konnte nicht initialisiert werden, SQLite-Fallback aktiv: {e!r}")
-                info = _init_sqlite()
-                _BACKEND = "sqlite_fallback"
-                return {**info, "backend": _BACKEND, "postgres_error": _POSTGRES_ERROR}
-        return _init_sqlite()
+def _weekday_name(weekday: int) -> str:
+    names = {
+        0: "Montag",
+        1: "Dienstag",
+        2: "Mittwoch",
+        3: "Donnerstag",
+        4: "Freitag",
+        5: "Samstag",
+        6: "Sonntag",
+    }
+    return names.get(int(weekday), str(weekday))
 
 
-def db_status() -> dict[str, Any]:
-    parsed = urlparse(_database_url()) if _database_url() else None
-    exists = SQLITE_PATH.exists()
-    size = SQLITE_PATH.stat().st_size if exists else 0
-    return {
-        "backend": _BACKEND,
-        "path": str(SQLITE_PATH) if _BACKEND != "postgres" else "PostgreSQL über DATABASE_URL",
-        "exists": exists,
-        "size_bytes": size,
-        "initialized": _INITIALIZED,
-        "database_url_configured": bool(_database_url()),
-        "database_url_kind": (parsed.scheme if parsed else ""),
-        "postgres_error": _POSTGRES_ERROR,
+def _parse_weekday(value: str) -> int:
+    v = (value or "").strip().lower()
+
+    mapping = {
+        "mo": 0,
+        "montag": 0,
+        "monday": 0,
+        "di": 1,
+        "dienstag": 1,
+        "tuesday": 1,
+        "mi": 2,
+        "mittwoch": 2,
+        "wednesday": 2,
+        "do": 3,
+        "donnerstag": 3,
+        "thursday": 3,
+        "fr": 4,
+        "freitag": 4,
+        "friday": 4,
+        "sa": 5,
+        "samstag": 5,
+        "saturday": 5,
+        "so": 6,
+        "sonntag": 6,
+        "sunday": 6,
     }
 
+    if v in mapping:
+        return mapping[v]
 
-def _json_dumps(value: Any) -> str:
     try:
-        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        num = int(v)
+        if 0 <= num <= 6:
+            return num
     except Exception:
-        return json.dumps(str(value), ensure_ascii=False)
+        pass
+
+    raise ValueError("Wochentag ungültig. Nutze z.B. Montag, Dienstag, Donnerstag, Freitag oder 0-6.")
 
 
+def _next_date_for_weekday(target_weekday: int) -> date:
+    today = datetime.now(TZ).date()
+    days_ahead = (target_weekday - today.weekday()) % 7
 
-def get_guild_setting(guild_id: int, key: str, default: Any = None) -> Any:
-    """Liest eine serverbezogene Einstellung aus der Runtime-DB.
+    if days_ahead == 0:
+        days_ahead = 7
 
-    Wird u.a. fürs spätere Multi-Guild-/Dashboard-Setup genutzt.
-    Werte werden als JSON gespeichert, damit Zahlen, Strings und Dicts sauber
-    erhalten bleiben. Gibt `default` zurück, wenn kein Wert existiert oder JSON
-    defekt ist.
-    """
-    if not _INITIALIZED:
-        init_runtime_db()
-    key = str(key or "").strip()
-    if not key:
-        return default
-    with _DB_LOCK:
-        if _BACKEND == "postgres":
-            conn = _pg_connect()
-            try:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        "SELECT value_json FROM guild_settings WHERE guild_id = %s AND key = %s",
-                        (int(guild_id), key),
-                    )
-                    row = cur.fetchone()
-            finally:
-                conn.close()
-        else:
-            conn = _sqlite_connect()
-            try:
-                row = conn.execute(
-                    "SELECT value_json FROM guild_settings WHERE guild_id = ? AND key = ?",
-                    (int(guild_id), key),
-                ).fetchone()
-            finally:
-                conn.close()
-    if not row:
-        return default
+    return today + timedelta(days=days_ahead)
+
+
+def _parse_time_hhmm(value: str) -> tuple[int, int]:
     try:
-        return json.loads(dict(row).get("value_json") or "null")
+        hh, mm = [int(x) for x in value.strip().split(":")]
+        if not (0 <= hh <= 23 and 0 <= mm <= 59):
+            raise ValueError
+        return hh, mm
     except Exception:
-        return default
+        raise ValueError("Zeit ungültig. Nutze HH:MM, z.B. 21:30.")
 
 
-def set_guild_setting(guild_id: int, key: str, value: Any) -> bool:
-    """Speichert eine serverbezogene Einstellung in der Runtime-DB."""
-    if not _INITIALIZED:
-        init_runtime_db()
-    key = str(key or "").strip()
-    if not key:
-        return False
-    value_json = _json_dumps(value)
-    updated_at = _now_iso()
-    with _DB_LOCK:
-        if _BACKEND == "postgres":
-            conn = _pg_connect()
-            try:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        """
-                        INSERT INTO guild_settings(guild_id, key, value_json, updated_at)
-                        VALUES (%s, %s, %s, %s)
-                        ON CONFLICT (guild_id, key)
-                        DO UPDATE SET value_json = EXCLUDED.value_json, updated_at = EXCLUDED.updated_at
-                        """,
-                        (int(guild_id), key, value_json, updated_at),
-                    )
-                conn.commit()
-                return True
-            finally:
-                conn.close()
-
-        conn = _sqlite_connect()
+def _parse_date(value: Optional[str], weekday: int) -> date:
+    if value and value.strip():
         try:
-            conn.execute(
-                """
-                INSERT INTO guild_settings(guild_id, key, value_json, updated_at)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(guild_id, key)
-                DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at
-                """,
-                (int(guild_id), key, value_json, updated_at),
-            )
-            conn.commit()
-            return True
-        finally:
-            conn.close()
-
-
-def delete_guild_setting(guild_id: int, key: str) -> bool:
-    """Löscht eine serverbezogene Einstellung."""
-    if not _INITIALIZED:
-        init_runtime_db()
-    key = str(key or "").strip()
-    if not key:
-        return False
-    with _DB_LOCK:
-        if _BACKEND == "postgres":
-            conn = _pg_connect()
-            try:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        "DELETE FROM guild_settings WHERE guild_id = %s AND key = %s",
-                        (int(guild_id), key),
-                    )
-                conn.commit()
-                return True
-            finally:
-                conn.close()
-        conn = _sqlite_connect()
-        try:
-            conn.execute(
-                "DELETE FROM guild_settings WHERE guild_id = ? AND key = ?",
-                (int(guild_id), key),
-            )
-            conn.commit()
-            return True
-        finally:
-            conn.close()
-
-
-def write_audit_log(
-    *,
-    guild_id: Optional[int],
-    actor_id: Optional[int],
-    action: str,
-    target_type: str = "",
-    target_id: str = "",
-    summary: str = "",
-    old_value: Any = None,
-    new_value: Any = None,
-    metadata: Any = None,
-) -> int:
-    if not _INITIALIZED:
-        init_runtime_db()
-
-    values = (
-        int(guild_id) if guild_id is not None else None,
-        int(actor_id) if actor_id is not None else None,
-        str(action or "unknown")[:120],
-        str(target_type or "")[:80],
-        str(target_id or "")[:160],
-        str(summary or "")[:1200],
-        _json_dumps(old_value) if old_value is not None else None,
-        _json_dumps(new_value) if new_value is not None else None,
-        _json_dumps(metadata) if metadata is not None else None,
-        _now_iso(),
-    )
-
-    with _DB_LOCK:
-        if _BACKEND == "postgres":
-            conn = _pg_connect()
-            try:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        """
-                        INSERT INTO audit_logs(
-                            guild_id, actor_id, action, target_type, target_id, summary,
-                            old_value_json, new_value_json, metadata_json, created_at
-                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                        RETURNING id
-                        """,
-                        values,
-                    )
-                    row = cur.fetchone()
-                conn.commit()
-                return int((row or {}).get("id") or 0)
-            finally:
-                conn.close()
-
-        conn = _sqlite_connect()
-        try:
-            cur = conn.execute(
-                """
-                INSERT INTO audit_logs(
-                    guild_id, actor_id, action, target_type, target_id, summary,
-                    old_value_json, new_value_json, metadata_json, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                values,
-            )
-            conn.commit()
-            return int(cur.lastrowid or 0)
-        finally:
-            conn.close()
-
-
-def fetch_audit_logs(guild_id: Optional[int], limit: int = 10) -> list[dict[str, Any]]:
-    if not _INITIALIZED:
-        init_runtime_db()
-    limit = max(1, min(int(limit or 10), 50))
-    with _DB_LOCK:
-        if _BACKEND == "postgres":
-            conn = _pg_connect()
-            try:
-                with conn.cursor() as cur:
-                    if guild_id is None:
-                        cur.execute(
-                            "SELECT * FROM audit_logs ORDER BY created_at DESC, id DESC LIMIT %s",
-                            (limit,),
-                        )
-                    else:
-                        cur.execute(
-                            "SELECT * FROM audit_logs WHERE guild_id = %s ORDER BY created_at DESC, id DESC LIMIT %s",
-                            (int(guild_id), limit),
-                        )
-                    return [dict(row) for row in cur.fetchall()]
-            finally:
-                conn.close()
-
-        conn = _sqlite_connect()
-        try:
-            if guild_id is None:
-                rows = conn.execute(
-                    "SELECT * FROM audit_logs ORDER BY created_at DESC, id DESC LIMIT ?",
-                    (limit,),
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    "SELECT * FROM audit_logs WHERE guild_id = ? ORDER BY created_at DESC, id DESC LIMIT ?",
-                    (int(guild_id), limit),
-                ).fetchall()
-            return [dict(row) for row in rows]
-        finally:
-            conn.close()
-
-
-def count_audit_logs(guild_id: Optional[int] = None) -> int:
-    if not _INITIALIZED:
-        init_runtime_db()
-    with _DB_LOCK:
-        if _BACKEND == "postgres":
-            conn = _pg_connect()
-            try:
-                with conn.cursor() as cur:
-                    if guild_id is None:
-                        cur.execute("SELECT COUNT(*) AS c FROM audit_logs")
-                    else:
-                        cur.execute("SELECT COUNT(*) AS c FROM audit_logs WHERE guild_id = %s", (int(guild_id),))
-                    row = cur.fetchone()
-                    return int((row or {}).get("c") or 0)
-            finally:
-                conn.close()
-
-        conn = _sqlite_connect()
-        try:
-            if guild_id is None:
-                row = conn.execute("SELECT COUNT(*) AS c FROM audit_logs").fetchone()
-            else:
-                row = conn.execute("SELECT COUNT(*) AS c FROM audit_logs WHERE guild_id = ?", (int(guild_id),)).fetchone()
-            return int(row["c"] if row else 0)
-        finally:
-            conn.close()
-
-def _parse_iso_utc(value: str) -> datetime:
-    try:
-        dt = datetime.fromisoformat(str(value or ""))
-    except Exception:
-        return datetime.now(timezone.utc)
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
-
-
-def _duration_seconds(joined_at: str, left_at: str) -> int:
-    start = _parse_iso_utc(joined_at)
-    end = _parse_iso_utc(left_at)
-    return max(0, int((end - start).total_seconds()))
-
-
-def start_voice_session(*, guild_id: int, user_id: int, channel_id: int, member_name: str = "", channel_name: str = "", metadata: Any = None) -> int:
-    """Startet eine Voice-Session und schließt vorher offene Alt-Sessions dieses Users.
-
-    Dadurch entstehen nach Gateway-Reconnects oder verpassten Voice-Events keine
-    dauerhaft offenen Doppel-Sessions.
-    """
-    if not _INITIALIZED:
-        init_runtime_db()
-
-    joined_at = _now_iso()
-    meta = {"member_name": member_name or "", "channel_name": channel_name or ""}
-    if isinstance(metadata, dict):
-        meta.update(metadata)
-
-    with _DB_LOCK:
-        # Erst alle offenen Sessions des Users im Server sauber beenden.
-        close_open_voice_sessions_for_user(int(guild_id), int(user_id), left_at=joined_at)
-
-        if _BACKEND == "postgres":
-            conn = _pg_connect()
-            try:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        """
-                        INSERT INTO voice_sessions(
-                            guild_id, user_id, channel_id, joined_at, left_at, duration_seconds,
-                            event_id, source, metadata_json
-                        ) VALUES (%s, %s, %s, %s, NULL, NULL, NULL, %s, %s)
-                        RETURNING id
-                        """,
-                        (int(guild_id), int(user_id), int(channel_id), joined_at, "voice_state", _json_dumps(meta)),
-                    )
-                    row = cur.fetchone()
-                conn.commit()
-                return int((row or {}).get("id") or 0)
-            finally:
-                conn.close()
-
-        conn = _sqlite_connect()
-        try:
-            cur = conn.execute(
-                """
-                INSERT INTO voice_sessions(
-                    guild_id, user_id, channel_id, joined_at, left_at, duration_seconds,
-                    event_id, source, metadata_json
-                ) VALUES (?, ?, ?, ?, NULL, NULL, NULL, ?, ?)
-                """,
-                (int(guild_id), int(user_id), int(channel_id), joined_at, "voice_state", _json_dumps(meta)),
-            )
-            conn.commit()
-            return int(cur.lastrowid or 0)
-        finally:
-            conn.close()
-
-
-def close_open_voice_sessions_for_user(guild_id: int, user_id: int, *, left_at: Optional[str] = None, channel_id: Optional[int] = None) -> int:
-    """Schließt offene Voice-Sessions eines Users und trägt duration_seconds nach."""
-    if not _INITIALIZED:
-        init_runtime_db()
-    closed_at = str(left_at or _now_iso())
-
-    with _DB_LOCK:
-        if _BACKEND == "postgres":
-            conn = _pg_connect()
-            try:
-                with conn.cursor() as cur:
-                    if channel_id is None:
-                        cur.execute(
-                            "SELECT id, joined_at FROM voice_sessions WHERE guild_id = %s AND user_id = %s AND left_at IS NULL",
-                            (int(guild_id), int(user_id)),
-                        )
-                    else:
-                        cur.execute(
-                            "SELECT id, joined_at FROM voice_sessions WHERE guild_id = %s AND user_id = %s AND channel_id = %s AND left_at IS NULL",
-                            (int(guild_id), int(user_id), int(channel_id)),
-                        )
-                    rows = [dict(row) for row in cur.fetchall()]
-                    for row in rows:
-                        cur.execute(
-                            "UPDATE voice_sessions SET left_at = %s, duration_seconds = %s WHERE id = %s",
-                            (closed_at, _duration_seconds(str(row.get("joined_at", "")), closed_at), int(row.get("id") or 0)),
-                        )
-                conn.commit()
-                return len(rows)
-            finally:
-                conn.close()
-
-        conn = _sqlite_connect()
-        try:
-            if channel_id is None:
-                rows = conn.execute(
-                    "SELECT id, joined_at FROM voice_sessions WHERE guild_id = ? AND user_id = ? AND left_at IS NULL",
-                    (int(guild_id), int(user_id)),
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    "SELECT id, joined_at FROM voice_sessions WHERE guild_id = ? AND user_id = ? AND channel_id = ? AND left_at IS NULL",
-                    (int(guild_id), int(user_id), int(channel_id)),
-                ).fetchall()
-            for row in rows:
-                conn.execute(
-                    "UPDATE voice_sessions SET left_at = ?, duration_seconds = ? WHERE id = ?",
-                    (closed_at, _duration_seconds(str(row["joined_at"]), closed_at), int(row["id"])),
-                )
-            conn.commit()
-            return len(rows)
-        finally:
-            conn.close()
-
-
-def fetch_voice_sessions(
-    guild_id: int,
-    *,
-    since_iso: Optional[str] = None,
-    until_iso: Optional[str] = None,
-    channel_ids: Optional[list[int]] = None,
-    user_ids: Optional[list[int]] = None,
-    limit: int = 500,
-) -> list[dict[str, Any]]:
-    """Liest Voice-Sessions, die ein Zeitfenster überlappen.
-
-    Overlap-Logik: joined_at < until AND (left_at IS NULL OR left_at > since).
-    """
-    if not _INITIALIZED:
-        init_runtime_db()
-    limit = max(1, min(int(limit or 500), 5000))
-    since = str(since_iso or "1970-01-01T00:00:00+00:00")
-    until = str(until_iso or _now_iso())
-    channel_ids = [int(x) for x in (channel_ids or []) if int(x or 0)]
-    user_ids = [int(x) for x in (user_ids or []) if int(x or 0)]
-
-    def _filter_py(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        out = []
-        ch_set = set(channel_ids) if channel_ids else None
-        u_set = set(user_ids) if user_ids else None
-        for r in rows:
-            try:
-                if ch_set is not None and int(r.get("channel_id") or 0) not in ch_set:
-                    continue
-                if u_set is not None and int(r.get("user_id") or 0) not in u_set:
-                    continue
-                out.append(r)
-            except Exception:
-                continue
-        return out
-
-    with _DB_LOCK:
-        if _BACKEND == "postgres":
-            conn = _pg_connect()
-            try:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        """
-                        SELECT * FROM voice_sessions
-                        WHERE guild_id = %s
-                          AND joined_at < %s
-                          AND (left_at IS NULL OR left_at > %s)
-                        ORDER BY joined_at DESC, id DESC
-                        LIMIT %s
-                        """,
-                        (int(guild_id), until, since, limit),
-                    )
-                    return _filter_py([dict(row) for row in cur.fetchall()])
-            finally:
-                conn.close()
-
-        conn = _sqlite_connect()
-        try:
-            rows = conn.execute(
-                """
-                SELECT * FROM voice_sessions
-                WHERE guild_id = ?
-                  AND joined_at < ?
-                  AND (left_at IS NULL OR left_at > ?)
-                ORDER BY joined_at DESC, id DESC
-                LIMIT ?
-                """,
-                (int(guild_id), until, since, limit),
-            ).fetchall()
-            return _filter_py([dict(row) for row in rows])
-        finally:
-            conn.close()
-
-
-def count_voice_sessions(guild_id: Optional[int] = None, *, open_only: bool = False) -> int:
-    if not _INITIALIZED:
-        init_runtime_db()
-    clauses = []
-    params_pg: list[Any] = []
-    params_sqlite: list[Any] = []
-    if guild_id is not None:
-        clauses.append("guild_id = {}")
-        params_pg.append(int(guild_id))
-        params_sqlite.append(int(guild_id))
-    if open_only:
-        clauses.append("left_at IS NULL")
-    where = ""
-    if clauses:
-        pg_parts = []
-        sqlite_parts = []
-        pgi = 0
-        for c in clauses:
-            if "{}" in c:
-                pg_parts.append(c.format("%s"))
-                sqlite_parts.append(c.format("?"))
-                pgi += 1
-            else:
-                pg_parts.append(c)
-                sqlite_parts.append(c)
-        where_pg = " WHERE " + " AND ".join(pg_parts)
-        where_sqlite = " WHERE " + " AND ".join(sqlite_parts)
-    else:
-        where_pg = where_sqlite = ""
-
-    with _DB_LOCK:
-        if _BACKEND == "postgres":
-            conn = _pg_connect()
-            try:
-                with conn.cursor() as cur:
-                    cur.execute("SELECT COUNT(*) AS c FROM voice_sessions" + where_pg, tuple(params_pg))
-                    row = cur.fetchone()
-                    return int((row or {}).get("c") or 0)
-            finally:
-                conn.close()
-        conn = _sqlite_connect()
-        try:
-            row = conn.execute("SELECT COUNT(*) AS c FROM voice_sessions" + where_sqlite, tuple(params_sqlite)).fetchone()
-            return int(row["c"] if row else 0)
-        finally:
-            conn.close()
-
-
-def aggregate_voice_seconds(
-    guild_id: int,
-    *,
-    since_iso: str,
-    until_iso: str,
-    channel_ids: Optional[list[int]] = None,
-    user_ids: Optional[list[int]] = None,
-) -> dict[int, int]:
-    """Summiert Voice-Zeit pro User im Zeitfenster, auf das Fenster gekürzt."""
-    rows = fetch_voice_sessions(
-        int(guild_id),
-        since_iso=since_iso,
-        until_iso=until_iso,
-        channel_ids=channel_ids,
-        user_ids=user_ids,
-        limit=5000,
-    )
-    start = _parse_iso_utc(since_iso)
-    end = _parse_iso_utc(until_iso)
-    now = datetime.now(timezone.utc)
-    totals: dict[int, int] = {}
-    for r in rows:
-        try:
-            uid = int(r.get("user_id") or 0)
-            if not uid:
-                continue
-            a = _parse_iso_utc(str(r.get("joined_at") or ""))
-            b_raw = r.get("left_at")
-            b = _parse_iso_utc(str(b_raw)) if b_raw else min(now, end)
-            overlap_start = max(start, a)
-            overlap_end = min(end, b)
-            sec = max(0, int((overlap_end - overlap_start).total_seconds()))
-            if sec > 0:
-                totals[uid] = totals.get(uid, 0) + sec
+            y, m, d = [int(x) for x in value.strip().split("-")]
+            return date(y, m, d)
         except Exception:
-            continue
-    return totals
+            raise ValueError("Datum ungültig. Nutze YYYY-MM-DD.")
+
+    return _next_date_for_weekday(weekday)
 
 
-
-def save_dashboard_snapshot(*, guild_id: int, guild_name: str, snapshot: Any) -> int:
-    """Speichert den read-only Dashboard-Snapshot in der Runtime-DB.
-
-    Das ist bewusst KEINE Migration produktiver Bot-Daten. Alte JSON-Systeme bleiben
-    die Quelle. Diese Tabelle ist nur die Brücke für den separaten Web-Service.
-    """
-    if not _INITIALIZED:
-        init_runtime_db()
-
-    schema_version = 0
-    generated_at = _now_iso()
-    if isinstance(snapshot, dict):
-        try:
-            schema_version = int(snapshot.get("schema_version") or 0)
-        except Exception:
-            schema_version = 0
-        generated_at = str(snapshot.get("generated_at") or generated_at)
-
-    values = (
-        int(guild_id),
-        str(guild_name or "")[:200],
-        int(schema_version),
-        generated_at,
-        _now_iso(),
-        _json_dumps(snapshot),
-    )
-
-    with _DB_LOCK:
-        if _BACKEND == "postgres":
-            conn = _pg_connect()
-            try:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        """
-                        INSERT INTO dashboard_snapshots(
-                            guild_id, guild_name, schema_version, generated_at, published_at, snapshot_json
-                        ) VALUES (%s, %s, %s, %s, %s, %s)
-                        RETURNING id
-                        """,
-                        values,
-                    )
-                    row = cur.fetchone()
-                    # Kleine Aufräumung: pro Gilde die letzten 50 Snapshots behalten.
-                    cur.execute(
-                        """
-                        DELETE FROM dashboard_snapshots
-                        WHERE guild_id = %s
-                          AND id NOT IN (
-                            SELECT id FROM dashboard_snapshots
-                            WHERE guild_id = %s
-                            ORDER BY published_at DESC, id DESC
-                            LIMIT 50
-                          )
-                        """,
-                        (int(guild_id), int(guild_id)),
-                    )
-                conn.commit()
-                return int((row or {}).get("id") or 0)
-            finally:
-                conn.close()
-
-        conn = _sqlite_connect()
-        try:
-            cur = conn.execute(
-                """
-                INSERT INTO dashboard_snapshots(
-                    guild_id, guild_name, schema_version, generated_at, published_at, snapshot_json
-                ) VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                values,
-            )
-            conn.execute(
-                """
-                DELETE FROM dashboard_snapshots
-                WHERE guild_id = ?
-                  AND id NOT IN (
-                    SELECT id FROM dashboard_snapshots
-                    WHERE guild_id = ?
-                    ORDER BY published_at DESC, id DESC
-                    LIMIT 50
-                  )
-                """,
-                (int(guild_id), int(guild_id)),
-            )
-            conn.commit()
-            return int(cur.lastrowid or 0)
-        finally:
-            conn.close()
-
-
-def fetch_latest_dashboard_snapshot(guild_id: Optional[int] = None) -> Optional[dict[str, Any]]:
-    if not _INITIALIZED:
-        init_runtime_db()
-
-    with _DB_LOCK:
-        if _BACKEND == "postgres":
-            conn = _pg_connect()
-            try:
-                with conn.cursor() as cur:
-                    if guild_id is None:
-                        cur.execute(
-                            "SELECT * FROM dashboard_snapshots ORDER BY published_at DESC, id DESC LIMIT 1"
-                        )
-                    else:
-                        cur.execute(
-                            "SELECT * FROM dashboard_snapshots WHERE guild_id = %s ORDER BY published_at DESC, id DESC LIMIT 1",
-                            (int(guild_id),),
-                        )
-                    row = cur.fetchone()
-            finally:
-                conn.close()
-        else:
-            conn = _sqlite_connect()
-            try:
-                if guild_id is None:
-                    row = conn.execute(
-                        "SELECT * FROM dashboard_snapshots ORDER BY published_at DESC, id DESC LIMIT 1"
-                    ).fetchone()
-                else:
-                    row = conn.execute(
-                        "SELECT * FROM dashboard_snapshots WHERE guild_id = ? ORDER BY published_at DESC, id DESC LIMIT 1",
-                        (int(guild_id),),
-                    ).fetchone()
-            finally:
-                conn.close()
-
-    if not row:
-        return None
-    d = dict(row)
-    try:
-        d["snapshot"] = json.loads(d.get("snapshot_json") or "{}")
-    except Exception:
-        d["snapshot"] = {}
-    d.pop("snapshot_json", None)
-    return d
-
-
-def count_dashboard_snapshots(guild_id: Optional[int] = None) -> int:
-    if not _INITIALIZED:
-        init_runtime_db()
-    with _DB_LOCK:
-        if _BACKEND == "postgres":
-            conn = _pg_connect()
-            try:
-                with conn.cursor() as cur:
-                    if guild_id is None:
-                        cur.execute("SELECT COUNT(*) AS c FROM dashboard_snapshots")
-                    else:
-                        cur.execute("SELECT COUNT(*) AS c FROM dashboard_snapshots WHERE guild_id = %s", (int(guild_id),))
-                    row = cur.fetchone()
-                    return int((row or {}).get("c") or 0)
-            finally:
-                conn.close()
-        conn = _sqlite_connect()
-        try:
-            if guild_id is None:
-                row = conn.execute("SELECT COUNT(*) AS c FROM dashboard_snapshots").fetchone()
-            else:
-                row = conn.execute("SELECT COUNT(*) AS c FROM dashboard_snapshots WHERE guild_id = ?", (int(guild_id),)).fetchone()
-            return int(row["c"] if row else 0)
-        finally:
-            conn.close()
-
-
-# ---------------------------------------------------------------------------
-# Phase 4 foundation: zentrale Mitglieder-Synchronisierung + feste Item-Links
-# ---------------------------------------------------------------------------
-
-
-def _json_loads(value: Any, default: Any) -> Any:
-    if isinstance(value, (dict, list)):
-        return value
-    try:
-        return json.loads(str(value or ""))
-    except Exception:
-        return default
-
-
-def _normalize_item_reference(value: Any) -> str:
-    raw = str(value or "").strip()
-    # Eigene Kurzformen wie "DaVinci" vor dem casefold in "Da Vinci" teilen.
-    raw = re.sub(r"(?<=[a-zäöüß])(?=[A-ZÄÖÜ])", " ", raw)
-    text = raw.casefold()
-    text = text.replace("ä", "ae").replace("ö", "oe").replace("ü", "ue").replace("ß", "ss")
-    text = re.sub(r"[^a-z0-9]+", " ", text)
-    stop = {"der", "die", "das", "des", "den", "dem", "von", "vom", "zur", "zum", "und", "of", "the"}
-    parts = [p for p in text.split() if p and p not in stop]
-    return " ".join(parts)
-
-
-_ITEM_REFERENCE_TYPE_SUFFIXES = (
-    "siegelring", "fingerring", "ring", "ohrring", "ohrringe", "brosche", "halskette", "kette",
-    "armband", "guertel", "gurtel", "umhang", "mantel", "handschutz", "handschuh", "handschuhe",
-    "stiefel", "schuhe", "helm", "hut", "maske", "schleier", "robe", "brust", "ruestung", "rustung", "hose",
-)
-
-
-def _item_reference_stem(token: str) -> str:
-    value = str(token or "")
-    for suffix in ("ungen", "ern", "ens", "en", "es", "er", "em", "e", "s"):
-        if len(value) >= max(6, len(suffix) + 3) and value.endswith(suffix):
-            return value[:-len(suffix)]
-    return value
-
-
-def _item_reference_is_type_token(token: str) -> bool:
-    value = str(token or "")
-    return any(value.endswith(suffix) for suffix in _ITEM_REFERENCE_TYPE_SUFFIXES)
-
-
-def _item_reference_slot_hint(value: Any) -> str:
-    tokens = _normalize_item_reference(value).split()
-    for token in tokens:
-        if token.endswith("ohrring") or token.endswith("ohrringe"):
-            return "ohrringe"
-        if token.endswith("siegelring") or token.endswith("fingerring") or token == "ring":
-            return "ring"
-        if token.endswith("brosche"):
-            return "brosche"
-        if token.endswith("handschutz") or token.endswith("handschuh") or token.endswith("handschuhe"):
-            return "handschuhe"
-        if token.endswith("robe") or token in {"brust", "ruestung", "rustung"}:
-            return "brust"
-        if token.endswith("halskette") or token == "kette":
-            return "kette"
-        if token.endswith("armband"):
-            return "armband"
-        if token.endswith("guertel") or token.endswith("gurtel"):
-            return "gurtel"
-        if token.endswith("umhang") or token.endswith("mantel"):
-            return "umhang"
-        if token.endswith("helm") or token.endswith("hut") or token.endswith("maske") or token.endswith("schleier"):
-            return "helm"
-        if token.endswith("hose"):
-            return "hose"
-        if token.endswith("schuhe") or token.endswith("stiefel"):
-            return "schuhe"
-    return ""
-
-
-def _item_reference_core_tokens(value: Any) -> set[str]:
-    out: set[str] = set()
-    for token in _normalize_item_reference(value).split():
-        stem = _item_reference_stem(token)
-        if len(stem) >= 2 and not _item_reference_is_type_token(stem):
-            out.add(stem)
-    return out
-
-
-def _catalog_reference_consistent(item_name: Any, item: dict[str, Any]) -> bool:
-    clean_name = str(item_name or "").strip()
-    if not clean_name:
-        return True
-    wanted_slot = _item_reference_slot_hint(clean_name)
-    candidate_slot = _item_reference_slot_hint(item.get("sub_category") or item.get("name") or item.get("main_category"))
-    wanted_family = "accessory" if wanted_slot in {"ring", "ohrringe", "brosche", "kette", "armband", "gurtel"} else ("armor" if wanted_slot in {"handschuhe", "brust", "umhang", "helm", "hose", "schuhe"} else "")
-    candidate_family = _normalize_item_reference(item.get("main_category"))
-    if wanted_family and candidate_family and wanted_family not in candidate_family:
-        return False
-    if wanted_slot and candidate_slot and wanted_slot != candidate_slot:
-        return False
-    if wanted_slot and not candidate_slot and item.get("sub_category"):
-        return False
-
-    wanted_core = _item_reference_core_tokens(clean_name)
-    candidate_core = _item_reference_core_tokens(item.get("name"))
-    if not wanted_core:
-        return True
-    if wanted_core & candidate_core:
-        return True
-    a = "".join(sorted(wanted_core))
-    b = "".join(sorted(candidate_core))
-    if a and b and (a in b or b in a):
-        return True
-    return difflib.SequenceMatcher(None, a, b).ratio() >= 0.72
-
-
-def sync_guild_members(*, guild_id: int, members: list[dict[str, Any]], member_role_id: int = 0) -> dict[str, Any]:
-    """Spiegelt die aktuell berechtigten Gildenmitglieder in eine zentrale Tabelle.
-
-    Historische Profile bleiben erhalten. Wer die Gildenrolle verliert, wird nur
-    auf ``is_active = false`` gesetzt und verschwindet damit aus aktiven Listen.
-    """
-    if not _INITIALIZED:
-        init_runtime_db()
-    now = _now_iso()
-    rows: dict[int, dict[str, Any]] = {}
-    for raw in members or []:
-        if not isinstance(raw, dict):
-            continue
-        try:
-            uid = int(raw.get("user_id") or raw.get("id") or 0)
-        except Exception:
-            uid = 0
-        if not uid:
-            continue
-        rows[uid] = dict(raw)
-
-    with _DB_LOCK:
-        if _BACKEND == "postgres":
-            conn = _pg_connect()
-            try:
-                with conn.cursor() as cur:
-                    cur.execute("SELECT user_id, is_active FROM guild_members WHERE guild_id = %s", (int(guild_id),))
-                    existing = {int(r.get("user_id") or 0): bool(r.get("is_active")) for r in (cur.fetchall() or [])}
-                    for uid, raw in rows.items():
-                        roles = raw.get("roles") if isinstance(raw.get("roles"), list) else []
-                        profile = raw.get("profile") if isinstance(raw.get("profile"), dict) else {}
-                        cur.execute(
-                            """
-                            INSERT INTO guild_members (
-                                guild_id, user_id, server_name, discord_username, avatar_url,
-                                ingame_name, main_role, gearscore, member_role_id, is_active,
-                                joined_at, first_seen_at, last_seen_at, left_at,
-                                roles_json, profile_json, updated_at
-                            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,TRUE,%s,%s,%s,NULL,%s,%s,%s)
-                            ON CONFLICT (guild_id, user_id) DO UPDATE SET
-                                server_name = EXCLUDED.server_name,
-                                discord_username = EXCLUDED.discord_username,
-                                avatar_url = EXCLUDED.avatar_url,
-                                ingame_name = EXCLUDED.ingame_name,
-                                main_role = EXCLUDED.main_role,
-                                gearscore = EXCLUDED.gearscore,
-                                member_role_id = EXCLUDED.member_role_id,
-                                is_active = TRUE,
-                                joined_at = COALESCE(NULLIF(EXCLUDED.joined_at,''), guild_members.joined_at),
-                                last_seen_at = EXCLUDED.last_seen_at,
-                                left_at = NULL,
-                                roles_json = EXCLUDED.roles_json,
-                                profile_json = EXCLUDED.profile_json,
-                                updated_at = EXCLUDED.updated_at
-                            """,
-                            (
-                                int(guild_id), uid,
-                                str(raw.get("server_name") or raw.get("display_name") or ""),
-                                str(raw.get("discord_username") or raw.get("discord_name") or ""),
-                                str(raw.get("avatar_url") or ""),
-                                str(raw.get("ingame_name") or ""),
-                                str(raw.get("main_role") or ""),
-                                str(raw.get("gearscore") or ""),
-                                int(member_role_id or raw.get("member_role_id") or 0),
-                                str(raw.get("joined_at") or ""), now, now,
-                                json.dumps(roles, ensure_ascii=False),
-                                json.dumps(profile, ensure_ascii=False), now,
-                            ),
-                        )
-                    inactive_ids = [uid for uid, was_active in existing.items() if was_active and uid not in rows]
-                    for uid in inactive_ids:
-                        cur.execute(
-                            """
-                            UPDATE guild_members
-                            SET is_active = FALSE, left_at = COALESCE(left_at, %s), updated_at = %s
-                            WHERE guild_id = %s AND user_id = %s
-                            """,
-                            (now, now, int(guild_id), int(uid)),
-                        )
-                conn.commit()
-                return {"ok": True, "backend": _BACKEND, "active": len(rows), "deactivated": len(inactive_ids)}
-            finally:
-                conn.close()
-
-        conn = _sqlite_connect()
-        try:
-            existing_rows = conn.execute("SELECT user_id, is_active FROM guild_members WHERE guild_id = ?", (int(guild_id),)).fetchall()
-            existing = {int(r["user_id"]): bool(r["is_active"]) for r in existing_rows}
-            for uid, raw in rows.items():
-                roles = raw.get("roles") if isinstance(raw.get("roles"), list) else []
-                profile = raw.get("profile") if isinstance(raw.get("profile"), dict) else {}
-                conn.execute(
-                    """
-                    INSERT INTO guild_members (
-                        guild_id, user_id, server_name, discord_username, avatar_url,
-                        ingame_name, main_role, gearscore, member_role_id, is_active,
-                        joined_at, first_seen_at, last_seen_at, left_at,
-                        roles_json, profile_json, updated_at
-                    ) VALUES (?,?,?,?,?,?,?,?,?,1,?,?,?,?,?,?,?)
-                    ON CONFLICT (guild_id, user_id) DO UPDATE SET
-                        server_name=excluded.server_name,
-                        discord_username=excluded.discord_username,
-                        avatar_url=excluded.avatar_url,
-                        ingame_name=excluded.ingame_name,
-                        main_role=excluded.main_role,
-                        gearscore=excluded.gearscore,
-                        member_role_id=excluded.member_role_id,
-                        is_active=1,
-                        joined_at=CASE WHEN excluded.joined_at <> '' THEN excluded.joined_at ELSE guild_members.joined_at END,
-                        last_seen_at=excluded.last_seen_at,
-                        left_at=NULL,
-                        roles_json=excluded.roles_json,
-                        profile_json=excluded.profile_json,
-                        updated_at=excluded.updated_at
-                    """,
-                    (
-                        int(guild_id), uid,
-                        str(raw.get("server_name") or raw.get("display_name") or ""),
-                        str(raw.get("discord_username") or raw.get("discord_name") or ""),
-                        str(raw.get("avatar_url") or ""),
-                        str(raw.get("ingame_name") or ""),
-                        str(raw.get("main_role") or ""),
-                        str(raw.get("gearscore") or ""),
-                        int(member_role_id or raw.get("member_role_id") or 0),
-                        str(raw.get("joined_at") or ""), now, now, None,
-                        json.dumps(roles, ensure_ascii=False),
-                        json.dumps(profile, ensure_ascii=False), now,
-                    ),
-                )
-            inactive_ids = [uid for uid, was_active in existing.items() if was_active and uid not in rows]
-            for uid in inactive_ids:
-                conn.execute(
-                    "UPDATE guild_members SET is_active = 0, left_at = COALESCE(left_at, ?), updated_at = ? WHERE guild_id = ? AND user_id = ?",
-                    (now, now, int(guild_id), int(uid)),
-                )
-            conn.commit()
-            return {"ok": True, "backend": _BACKEND, "active": len(rows), "deactivated": len(inactive_ids)}
-        finally:
-            conn.close()
-
-
-def fetch_guild_members(guild_id: int, *, active_only: bool = True) -> list[dict[str, Any]]:
-    if not _INITIALIZED:
-        init_runtime_db()
-    with _DB_LOCK:
-        if _BACKEND == "postgres":
-            conn = _pg_connect()
-            try:
-                with conn.cursor() as cur:
-                    sql = "SELECT * FROM guild_members WHERE guild_id = %s"
-                    params: tuple[Any, ...] = (int(guild_id),)
-                    if active_only:
-                        sql += " AND is_active = TRUE"
-                    sql += " ORDER BY COALESCE(NULLIF(ingame_name,''), NULLIF(server_name,''), user_id::text)"
-                    cur.execute(sql, params)
-                    rows = [dict(r) for r in (cur.fetchall() or [])]
-            finally:
-                conn.close()
-        else:
-            conn = _sqlite_connect()
-            try:
-                sql = "SELECT * FROM guild_members WHERE guild_id = ?"
-                if active_only:
-                    sql += " AND is_active = 1"
-                sql += " ORDER BY CASE WHEN ingame_name <> '' THEN ingame_name ELSE server_name END"
-                rows = [dict(r) for r in conn.execute(sql, (int(guild_id),)).fetchall()]
-            finally:
-                conn.close()
-    for row in rows:
-        row["is_active"] = bool(row.get("is_active"))
-        row["roles"] = _json_loads(row.pop("roles_json", "[]"), [])
-        row["profile"] = _json_loads(row.pop("profile_json", "{}"), {})
-    return rows
-
-
-def get_guild_item_link(guild_id: int, reference_type: str, reference_key: str) -> Optional[dict[str, Any]]:
-    if not _INITIALIZED:
-        init_runtime_db()
-    rtype = str(reference_type or "local_item").strip() or "local_item"
-    rkey = str(reference_key or "").strip()
-    if not rkey:
-        return None
-    with _DB_LOCK:
-        if _BACKEND == "postgres":
-            conn = _pg_connect()
-            try:
-                with conn.cursor() as cur:
-                    cur.execute("SELECT * FROM guild_item_links WHERE guild_id=%s AND reference_type=%s AND reference_key=%s", (int(guild_id), rtype, rkey))
-                    row = cur.fetchone()
-            finally:
-                conn.close()
-        else:
-            conn = _sqlite_connect()
-            try:
-                row = conn.execute("SELECT * FROM guild_item_links WHERE guild_id=? AND reference_type=? AND reference_key=?", (int(guild_id), rtype, rkey)).fetchone()
-            finally:
-                conn.close()
-    if not row:
-        return None
-    out = dict(row)
-    out["aliases"] = _json_loads(out.pop("aliases_json", "[]"), [])
-    return out
-
-
-def upsert_guild_item_link(*, guild_id: int, reference_type: str, reference_key: str, item: dict[str, Any], match_method: str, confidence: float = 1.0, aliases: Optional[list[str]] = None) -> bool:
-    if not _INITIALIZED:
-        init_runtime_db()
-    rtype = str(reference_type or "local_item").strip() or "local_item"
-    rkey = str(reference_key or "").strip()
-    try:
-        catalog_item_id = int(item.get("id") or item.get("catalog_item_id") or 0)
-    except Exception:
-        catalog_item_id = 0
-    if not rkey or not catalog_item_id:
-        return False
-    now = _now_iso()
-    values = (
-        int(guild_id), rtype, rkey, catalog_item_id,
-        str(item.get("source_item_id") or ""), str(item.get("name") or item.get("canonical_name") or ""),
-        str(item.get("source_url") or ""), str(item.get("manual_image_url") or item.get("image_url") or item.get("icon_url") or ""),
-        str(match_method or "manual"), float(confidence or 0), json.dumps(aliases or [], ensure_ascii=False), now,
-    )
-    with _DB_LOCK:
-        if _BACKEND == "postgres":
-            conn = _pg_connect()
-            try:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        """
-                        INSERT INTO guild_item_links (guild_id, reference_type, reference_key, catalog_item_id, source_item_id, canonical_name, source_url, image_url, match_method, confidence, aliases_json, updated_at)
-                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                        ON CONFLICT (guild_id, reference_type, reference_key) DO UPDATE SET
-                            catalog_item_id=EXCLUDED.catalog_item_id, source_item_id=EXCLUDED.source_item_id,
-                            canonical_name=EXCLUDED.canonical_name, source_url=EXCLUDED.source_url,
-                            image_url=EXCLUDED.image_url, match_method=EXCLUDED.match_method,
-                            confidence=EXCLUDED.confidence, aliases_json=EXCLUDED.aliases_json,
-                            updated_at=EXCLUDED.updated_at
-                        """,
-                        values,
-                    )
-                conn.commit()
-            finally:
-                conn.close()
-        else:
-            conn = _sqlite_connect()
-            try:
-                conn.execute(
-                    """
-                    INSERT INTO guild_item_links (guild_id, reference_type, reference_key, catalog_item_id, source_item_id, canonical_name, source_url, image_url, match_method, confidence, aliases_json, updated_at)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
-                    ON CONFLICT (guild_id, reference_type, reference_key) DO UPDATE SET
-                        catalog_item_id=excluded.catalog_item_id, source_item_id=excluded.source_item_id,
-                        canonical_name=excluded.canonical_name, source_url=excluded.source_url,
-                        image_url=excluded.image_url, match_method=excluded.match_method,
-                        confidence=excluded.confidence, aliases_json=excluded.aliases_json,
-                        updated_at=excluded.updated_at
-                    """,
-                    values,
-                )
-                conn.commit()
-            finally:
-                conn.close()
-    return True
-
-
-def search_catalog_items(query: str = "", *, limit: int = 25) -> list[dict[str, Any]]:
-    """Sucht aktive Katalogitems für Discord-Autocomplete/Picker.
-
-    Die Funktion liefert immer die feste ``item_catalog.id`` mit aus. Bei SQLite
-    ist der externe Questlog-Katalog nicht vorhanden, deshalb wird dort leer
-    zurückgegeben statt auf unsichere Namen auszuweichen.
-    """
-    if not _INITIALIZED:
-        init_runtime_db()
-    if _BACKEND != "postgres":
+def _parse_reminders(value: str) -> List[int]:
+    if not value or not value.strip():
         return []
-    text = str(query or "").strip()
-    safe_limit = max(1, min(int(limit or 25), 50))
-    conn = _pg_connect()
+
+    out: List[int] = []
+
+    for part in value.split(","):
+        p = part.strip()
+        if not p:
+            continue
+        try:
+            out.append(int(p))
+        except Exception:
+            continue
+
+    return out
+
+
+def _event_datetime_for_template(tpl: dict, event_date: date) -> datetime:
+    hh, mi = _parse_time_hhmm(str(tpl.get("time", "21:30")))
+    return datetime(event_date.year, event_date.month, event_date.day, hh, mi, tzinfo=TZ)
+
+
+def _current_or_next_event_date_for_template(tpl: dict, now: datetime) -> date:
+    weekday = int(tpl.get("weekday", 0) or 0)
+    today = now.date()
+    days_ahead = (weekday - today.weekday()) % 7
+    return today + timedelta(days=days_ahead)
+
+
+def _auto_key(template_key: str, event_date: date) -> str:
+    return f"{template_key}:{event_date.isoformat()}"
+
+
+def _template_auto_enabled(tpl: dict) -> bool:
+    return bool(tpl.get("auto_weekly", False))
+
+
+def _post_before_minutes(tpl: dict) -> int:
+    if "post_before_minutes" in tpl:
+        try:
+            return max(0, int(tpl.get("post_before_minutes", 0) or 0))
+        except Exception:
+            return 1440
+
     try:
-        with conn.cursor() as cur:
-            if text:
-                cur.execute(
-                    """
-                    SELECT id, source, source_url, source_item_id, name,
-                           main_category, sub_category, rarity, image_url, icon_url
-                    FROM item_catalog
-                    WHERE is_active = TRUE AND name ILIKE %s
-                    ORDER BY CASE WHEN lower(name) = lower(%s) THEN 0
-                                  WHEN lower(name) LIKE lower(%s) THEN 1
-                                  ELSE 2 END,
-                             name ASC
-                    LIMIT %s
-                    """,
-                    (f"%{text}%", text, f"{text}%", safe_limit),
-                )
-            else:
-                cur.execute(
-                    """
-                    SELECT id, source, source_url, source_item_id, name,
-                           main_category, sub_category, rarity, image_url, icon_url
-                    FROM item_catalog
-                    WHERE is_active = TRUE
-                    ORDER BY updated_at DESC NULLS LAST, name ASC
-                    LIMIT %s
-                    """,
-                    (safe_limit,),
-                )
-            return [dict(row) for row in (cur.fetchall() or [])]
-    finally:
-        conn.close()
-
-
-def resolve_catalog_item_reference(*, guild_id: int, local_item_id: str = "", item_name: str = "", catalog_item_id: int = 0, source_item_id: str = "", allow_fuzzy: bool = True) -> Optional[dict[str, Any]]:
-    """Löst eine Bot-/Auktionsreferenz auf die feste ``item_catalog.id`` auf.
-
-    Priorität: explizite ID → gespeicherter Link → Questlog/source_item_id →
-    exakter Name → sehr sicherer Fuzzy-Treffer. Unsichere Treffer werden nicht
-    gespeichert, damit ähnlich benannte Ringe nicht falsch verknüpft werden.
-    """
-    if not _INITIALIZED:
-        init_runtime_db()
-    if _BACKEND != "postgres":
-        return None
-
-    local_key = str(local_item_id or "").strip()
-    alias_key = _normalize_item_reference(item_name)
-    try:
-        explicit_id = int(catalog_item_id or 0)
+        return max(0, int(tpl.get("post_before_hours", 24) or 24) * 60)
     except Exception:
-        explicit_id = 0
+        return 1440
 
-    def fetch_one(where: str, params: tuple[Any, ...]) -> Optional[dict[str, Any]]:
-        conn = _pg_connect()
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    f"""
-                    SELECT ic.id, ic.source, ic.source_url, ic.source_item_id, ic.name,
-                           ic.main_category, ic.sub_category, ic.rarity, ic.stats,
-                           ic.abilities, ic.traits, ic.image_url, ic.icon_url,
-                           ov.image_url AS manual_image_url
-                    FROM item_catalog ic
-                    LEFT JOIN item_catalog_image_overrides ov ON ov.source_url = ic.source_url
-                    WHERE ic.is_active = TRUE AND ({where})
-                    LIMIT 1
-                    """,
-                    params,
-                )
-                row = cur.fetchone()
-                return dict(row) if row else None
-        finally:
-            conn.close()
 
-    item: Optional[dict[str, Any]] = None
-    method = ""
-    confidence = 0.0
+async def _resolve_media_url(client: discord.Client, guild: discord.Guild, tpl: dict) -> Optional[str]:
+    image_url = (tpl.get("image_url") or "").strip()
 
-    if explicit_id:
-        candidate = fetch_one("ic.id = %s", (explicit_id,))
-        if candidate and _catalog_reference_consistent(item_name, candidate):
-            item = candidate
-            method, confidence = "catalog_id", 1.0
+    if image_url:
+        return image_url
 
-    if item is None and local_key:
-        link = get_guild_item_link(int(guild_id), "local_item", local_key)
-        if link and int(link.get("catalog_item_id") or 0):
-            candidate = fetch_one("ic.id = %s", (int(link.get("catalog_item_id") or 0),))
-            if candidate and _catalog_reference_consistent(item_name, candidate):
-                item = candidate
-                method, confidence = "stored_local_link", float(link.get("confidence") or 1.0)
+    media_channel_id = int(tpl.get("media_channel_id", 0) or 0)
+    media_message_id = int(tpl.get("media_message_id", 0) or 0)
+    attachment_index = int(tpl.get("attachment_index", 0) or 0)
 
-    if item is None and alias_key:
-        link = get_guild_item_link(int(guild_id), "alias", alias_key)
-        if link and int(link.get("catalog_item_id") or 0):
-            candidate = fetch_one("ic.id = %s", (int(link.get("catalog_item_id") or 0),))
-            if candidate and _catalog_reference_consistent(item_name, candidate):
-                item = candidate
-                method, confidence = "stored_alias", float(link.get("confidence") or 1.0)
-
-    source_candidates = [str(source_item_id or "").strip(), local_key]
-    if item is None:
-        for source in [x for x in source_candidates if x and not x.startswith("junk:")]:
-            candidate = fetch_one("ic.source_item_id = %s", (source,))
-            if candidate and _catalog_reference_consistent(item_name, candidate):
-                item = candidate
-                method, confidence = "source_item_id", 1.0
-                break
-
-    clean_name = str(item_name or "").strip()
-    if item is None and clean_name:
-        item = fetch_one("lower(ic.name) = lower(%s)", (clean_name,))
-        if item:
-            method, confidence = "exact_name", 0.99
-
-    if item is None and clean_name and allow_fuzzy:
-        core_tokens = sorted(_item_reference_core_tokens(clean_name), key=len, reverse=True)
-        all_tokens = [t for t in alias_key.split() if len(t) >= 3]
-        query = (core_tokens or all_tokens or [clean_name])[0]
-        conn = _pg_connect()
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT ic.id, ic.source, ic.source_url, ic.source_item_id, ic.name,
-                           ic.main_category, ic.sub_category, ic.rarity, ic.stats,
-                           ic.abilities, ic.traits, ic.image_url, ic.icon_url,
-                           ov.image_url AS manual_image_url
-                    FROM item_catalog ic
-                    LEFT JOIN item_catalog_image_overrides ov ON ov.source_url = ic.source_url
-                    WHERE ic.is_active = TRUE AND ic.name ILIKE %s
-                    LIMIT 160
-                    """,
-                    (f"%{query}%",),
-                )
-                candidates = [dict(r) for r in (cur.fetchall() or [])]
-        finally:
-            conn.close()
-
-        wanted_slot = _item_reference_slot_hint(clean_name)
-        wanted_core = _item_reference_core_tokens(clean_name)
-        best = None
-        best_score = 0.0
-        for cand in candidates:
-            if not _catalog_reference_consistent(clean_name, cand):
-                continue
-            candidate_slot = _item_reference_slot_hint(cand.get("sub_category") or cand.get("name") or cand.get("main_category"))
-            candidate_core = _item_reference_core_tokens(cand.get("name"))
-            seq = difflib.SequenceMatcher(None, alias_key, _normalize_item_reference(cand.get("name"))).ratio()
-            overlap = len(wanted_core & candidate_core) / max(1, len(wanted_core | candidate_core))
-            score = seq * 0.48 + overlap * 0.42
-            if wanted_slot and candidate_slot == wanted_slot:
-                score += 0.18
-            if score > best_score:
-                best, best_score = cand, score
-        # Slotgleichheit + echter Namenskern reichen für Gilden-Kurznamen wie
-        # "Ring DaVinci" -> "Da Vincis Siegelring". Slotfremde Treffer sind oben blockiert.
-        if best is not None and best_score >= 0.72:
-            item = best
-            method, confidence = "slot_safe_fuzzy_name", float(min(best_score, 1.0))
-
-    if item is None:
+    if not media_channel_id or not media_message_id:
         return None
-    item = dict(item)
-    item["catalog_item_id"] = int(item.get("id") or 0)
-    item["match_method"] = method
-    item["match_confidence"] = confidence
-    if local_key:
-        upsert_guild_item_link(guild_id=int(guild_id), reference_type="local_item", reference_key=local_key, item=item, match_method=method, confidence=confidence, aliases=[clean_name] if clean_name else [])
-    if alias_key:
-        upsert_guild_item_link(guild_id=int(guild_id), reference_type="alias", reference_key=alias_key, item=item, match_method=method, confidence=confidence, aliases=[clean_name] if clean_name else [])
-    return item
+
+    ch = guild.get_channel(media_channel_id)
+
+    if not isinstance(ch, (discord.TextChannel, discord.Thread)):
+        return None
+
+    try:
+        msg = await ch.fetch_message(media_message_id)
+
+        if not msg.attachments:
+            return None
+
+        if attachment_index < 0 or attachment_index >= len(msg.attachments):
+            attachment_index = 0
+
+        return msg.attachments[attachment_index].url
+
+    except Exception:
+        return None
+
+
+async def _create_event_from_template(
+    client: discord.Client,
+    guild: discord.Guild,
+    tpl: dict,
+    event_date: date,
+    override_channel: Optional[discord.TextChannel] = None,
+) -> tuple[Optional[discord.Message], int, int]:
+    when = _event_datetime_for_template(tpl, event_date)
+
+    channel_id = int(tpl.get("channel_id", 0) or 0)
+    target_role_id = int(tpl.get("target_role_id", 0) or 0)
+
+    ch = override_channel or guild.get_channel(channel_id)
+
+    if not isinstance(ch, (discord.TextChannel, discord.Thread)):
+        raise RuntimeError("Zielchannel nicht gefunden oder ungültig.")
+
+    image_url = await _resolve_media_url(client, guild, tpl)
+
+    obj = {
+        "guild_id": int(guild.id),
+        "channel_id": int(ch.id),
+        "title": str(tpl.get("title", "Event")).strip(),
+        "description": str(tpl.get("description", "") or "").strip(),
+        "when_iso": when.isoformat(),
+        "image_url": image_url,
+        "yes": {"TANK": [], "HEAL": [], "DPS": [], "BANK": []},
+        "maybe": {},
+        "no": [],
+        "target_role_id": target_role_id,
+        "dm_messages": {},
+        "template_name": str(tpl.get("name", "") or ""),
+    }
+
+    emb = build_embed(guild, obj)
+    msg = await ch.send(embed=emb)
+
+    store[str(msg.id)] = obj
+    save_store()
+
+    try:
+        await msg.edit(view=ServerRaidView(int(msg.id)))
+    except Exception:
+        pass
+
+    send_dm = bool(tpl.get("send_dm", True))
+
+    sent = 0
+    skipped_opt_out = 0
+
+    if send_dm:
+        for m in _eligible_members(guild, obj):
+            if not is_dm_enabled(guild.id, m.id):
+                skipped_opt_out += 1
+                continue
+
+            try:
+                dm_text = _format_dm_text(
+                    title=obj["title"],
+                    when=when,
+                    channel_name_or_ref=f"Übersicht im Server: #{ch.name}",
+                    description=obj.get("description"),
+                    intro_line="Wähle unten deine Teilnahme:",
+                )
+
+                dm_msg = await m.send(dm_text, view=RaidView(int(msg.id)))
+                obj["dm_messages"][str(m.id)] = int(dm_msg.id)
+                sent += 1
+                await asyncio.sleep(0.05)
+
+            except Exception:
+                pass
+
+        save_store()
+
+    return msg, sent, skipped_opt_out
+
+
+async def _auto_post_due_templates(client: discord.Client) -> None:
+    now = datetime.now(TZ)
+
+    for guild_id_str, g in list(templates.items()):
+        try:
+            guild_id = int(guild_id_str)
+        except Exception:
+            continue
+
+        guild = client.get_guild(guild_id)
+
+        if not guild:
+            continue
+
+        all_tpl = g.get("templates") or {}
+        state = _g_auto_state(guild_id)
+        posted = state.setdefault("posted", {})
+
+        for key, tpl in list(all_tpl.items()):
+            try:
+                if not _template_auto_enabled(tpl):
+                    continue
+
+                event_date = _current_or_next_event_date_for_template(tpl, now)
+                event_dt = _event_datetime_for_template(tpl, event_date)
+                post_dt = event_dt - timedelta(minutes=_post_before_minutes(tpl))
+
+                unique_key = _auto_key(key, event_date)
+
+                if unique_key in posted:
+                    continue
+
+                if now < post_dt:
+                    continue
+
+                if now > event_dt + timedelta(hours=2):
+                    continue
+
+                msg, sent, skipped = await _create_event_from_template(
+                    client=client,
+                    guild=guild,
+                    tpl=tpl,
+                    event_date=event_date,
+                    override_channel=None,
+                )
+
+                posted[unique_key] = {
+                    "posted_at": now.isoformat(),
+                    "event_date": event_date.isoformat(),
+                    "template": key,
+                    "message_id": int(msg.id) if msg else 0,
+                    "sent_dm": int(sent),
+                    "skipped_opt_out": int(skipped),
+                }
+
+                _save_auto_state(auto_state)
+
+                print(
+                    f"✅ Auto-Raid-Vorlage gepostet: guild={guild_id} template={key} "
+                    f"event_date={event_date.isoformat()} msg={msg.id if msg else '—'}"
+                )
+
+                await asyncio.sleep(1)
+
+            except Exception as e:
+                print(f"[raid_template_auto] Fehler bei Vorlage {key}: {e!r}")
+
+
+@tasks.loop(minutes=1)
+async def raid_template_auto_loop():
+    if _client_ref is None:
+        return
+
+    try:
+        await _auto_post_due_templates(_client_ref)
+    except Exception as e:
+        print(f"[raid_template_auto] Loop-Fehler: {e!r}")
+
+
+async def setup_raid_templates(client: discord.Client, tree: app_commands.CommandTree):
+    global _client_ref
+    _client_ref = client
+
+    if not raid_template_auto_loop.is_running():
+        raid_template_auto_loop.start()
+        print("📋 Raid-Template Auto-Task gestartet.")
+
+    @tree.command(name="raid_template_create", description="(Admin) Erstellt eine Raid-/Event-Vorlage")
+    @app_commands.describe(
+        name="Interner Vorlagenname, z.B. gildenraid",
+        title="Titel des Events",
+        weekday="Wochentag, z.B. Donnerstag/Freitag/Samstag oder 0-6",
+        time="Uhrzeit HH:MM",
+        target_role="Optionale Zielrolle für DMs und Abstimmquote",
+        description="Beschreibung",
+        duration_min="Dauer in Minuten",
+        image_url="Direkte Bild-URL optional",
+        send_dm="Soll der Bot DMs verschicken?",
+        auto_weekly="Soll diese Vorlage jede Woche automatisch gepostet werden?",
+        post_before_hours="Wie viele Stunden vor Eventstart automatisch posten?"
+    )
+    async def raid_template_create(
+        inter: discord.Interaction,
+        name: str,
+        title: str,
+        weekday: str,
+        time: str,
+        target_role: Optional[discord.Role] = None,
+        description: Optional[str] = None,
+        duration_min: int = 120,
+        image_url: Optional[str] = None,
+        send_dm: bool = True,
+        auto_weekly: bool = False,
+        post_before_hours: int = 24,
+    ):
+        if not _is_admin(inter):
+            await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True)
+            return
+
+        try:
+            wd = _parse_weekday(weekday)
+            _parse_time_hhmm(time)
+            post_before_hours = max(0, int(post_before_hours))
+        except Exception as e:
+            await inter.response.send_message(f"❌ {e}", ephemeral=True)
+            return
+
+        key = _normalize_name(name)
+
+        async def _picked(pick_inter: discord.Interaction, channel: discord.TextChannel):
+            g = _gcfg(pick_inter.guild_id)
+            g["templates"][key] = {
+                "name": key,
+                "title": title.strip(),
+                "description": (description or "").strip(),
+                "weekday": wd,
+                "time": time.strip(),
+                "duration_min": int(duration_min),
+                "channel_id": int(channel.id),
+                "target_role_id": int(target_role.id) if target_role else 0,
+                "image_url": (image_url or "").strip(),
+                "media_channel_id": 0,
+                "media_message_id": 0,
+                "attachment_index": 0,
+                "pre_reminders": [],
+                "send_dm": bool(send_dm),
+                "post_server": True,
+                "auto_weekly": bool(auto_weekly),
+                "post_before_hours": int(post_before_hours),
+                "post_before_minutes": int(post_before_hours) * 60,
+            }
+
+            templates[str(pick_inter.guild_id)] = g
+            _save(templates)
+            await pick_inter.response.edit_message(
+                content=(
+                    f"✅ Vorlage `{key}` erstellt.\n"
+                    f"📅 Wochentag: `{wd}` ({_weekday_name(wd)})\n"
+                    f"🕒 Zeit: `{time}`\n"
+                    f"📢 Channel: {channel.mention}\n"
+                    f"🎯 Zielrolle: {target_role.mention if target_role else '—'}\n"
+                    f"🔁 Automatisch wöchentlich: **{'Ja' if auto_weekly else 'Nein'}**\n"
+                    f"⏰ Auto-Post: **{post_before_hours}h vorher**"
+                ),
+                view=None,
+            )
+
+        await send_text_channel_picker(inter, "📢 Zielchannel für Vorlage auswählen", _picked)
+
+    @tree.command(name="raid_template_set_media", description="(Admin) Speichert Mediennachricht/Bild für eine Vorlage")
+    async def raid_template_set_media(
+        inter: discord.Interaction,
+        name: str,
+        message_id: str,
+        attachment_index: int = 0,
+    ):
+        if not _is_admin(inter):
+            await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True)
+            return
+
+        key = _normalize_name(name)
+        g = _gcfg(inter.guild_id)
+        tpl = g["templates"].get(key)
+
+        if not tpl:
+            await inter.response.send_message("❌ Vorlage nicht gefunden.", ephemeral=True)
+            return
+
+        async def _picked(pick_inter: discord.Interaction, ch: discord.TextChannel):
+            try:
+                msg = await ch.fetch_message(int(message_id))
+            except Exception:
+                await pick_inter.response.edit_message(content="❌ Nachricht nicht gefunden.", view=None)
+                return
+
+            if not msg.attachments:
+                await pick_inter.response.edit_message(content="❌ Diese Nachricht hat kein Attachment/Bild.", view=None)
+                return
+
+            idx = int(attachment_index)
+            if idx < 0 or idx >= len(msg.attachments):
+                idx = 0
+
+            tpl["media_channel_id"] = int(ch.id)
+            tpl["media_message_id"] = int(msg.id)
+            tpl["attachment_index"] = int(idx)
+            tpl["image_url"] = ""
+            _save(templates)
+            await pick_inter.response.edit_message(
+                content=f"✅ Medium für `{key}` gespeichert.\nChannel: <#{ch.id}>\nMessage-ID: `{msg.id}`\nAttachment: `{idx}`",
+                view=None,
+            )
+
+        await send_text_channel_picker(inter, "🖼️ Kanal der Mediennachricht auswählen", _picked)
+
+    @tree.command(name="raid_template_set_description", description="(Admin) Ändert Beschreibung einer Vorlage")
+    async def raid_template_set_description(inter: discord.Interaction, name: str, description: str):
+        await inter.response.defer(ephemeral=True, thinking=False)
+
+        if not _is_admin(inter):
+            await inter.followup.send("❌ Nur Admin/Manage Server.", ephemeral=True)
+            return
+
+        key = _normalize_name(name)
+        g = _gcfg(inter.guild_id)
+        tpl = g["templates"].get(key)
+
+        if not tpl:
+            await inter.followup.send("❌ Vorlage nicht gefunden.", ephemeral=True)
+            return
+
+        tpl["description"] = description.strip()
+        _save(templates)
+
+        await inter.followup.send(f"✅ Beschreibung für `{key}` geändert.", ephemeral=True)
+
+    @tree.command(name="raid_template_set_target", description="(Admin) Setzt Zielrolle einer Vorlage")
+    async def raid_template_set_target(inter: discord.Interaction, name: str, target_role: Optional[discord.Role] = None):
+        await inter.response.defer(ephemeral=True, thinking=False)
+
+        if not _is_admin(inter):
+            await inter.followup.send("❌ Nur Admin/Manage Server.", ephemeral=True)
+            return
+
+        key = _normalize_name(name)
+        g = _gcfg(inter.guild_id)
+        tpl = g["templates"].get(key)
+
+        if not tpl:
+            await inter.followup.send("❌ Vorlage nicht gefunden.", ephemeral=True)
+            return
+
+        tpl["target_role_id"] = int(target_role.id) if target_role else 0
+        _save(templates)
+
+        await inter.followup.send(
+            f"✅ Zielrolle für `{key}` gesetzt: {target_role.mention if target_role else '—'}",
+            ephemeral=True
+        )
+
+    @tree.command(name="raid_template_set_channel", description="(Admin) Setzt Zielchannel einer Vorlage")
+    async def raid_template_set_channel(inter: discord.Interaction, name: str):
+        if not _is_admin(inter):
+            await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True)
+            return
+
+        key = _normalize_name(name)
+        g = _gcfg(inter.guild_id)
+        tpl = g["templates"].get(key)
+
+        if not tpl:
+            await inter.response.send_message("❌ Vorlage nicht gefunden.", ephemeral=True)
+            return
+
+        async def _picked(pick_inter: discord.Interaction, channel: discord.TextChannel):
+            tpl["channel_id"] = int(channel.id)
+            _save(templates)
+            await pick_inter.response.edit_message(content=f"✅ Channel für `{key}` gesetzt: {channel.mention}", view=None)
+
+        await send_text_channel_picker(inter, "📢 Zielchannel für Vorlage auswählen", _picked)
+
+    @tree.command(name="raid_template_set_reminders", description="(Admin) Setzt Reminder-Minuten, z.B. 1440,180,60")
+    async def raid_template_set_reminders(inter: discord.Interaction, name: str, minutes: str):
+        await inter.response.defer(ephemeral=True, thinking=False)
+
+        if not _is_admin(inter):
+            await inter.followup.send("❌ Nur Admin/Manage Server.", ephemeral=True)
+            return
+
+        key = _normalize_name(name)
+        g = _gcfg(inter.guild_id)
+        tpl = g["templates"].get(key)
+
+        if not tpl:
+            await inter.followup.send("❌ Vorlage nicht gefunden.", ephemeral=True)
+            return
+
+        tpl["pre_reminders"] = _parse_reminders(minutes)
+        _save(templates)
+
+        await inter.followup.send(
+            f"✅ Reminder für `{key}` gesetzt: `{tpl['pre_reminders']}` Minuten vorher.",
+            ephemeral=True
+        )
+
+    @tree.command(name="raid_template_auto_set", description="(Admin) Aktiviert/deaktiviert wöchentliches Auto-Posting für eine Vorlage")
+    async def raid_template_auto_set(
+        inter: discord.Interaction,
+        name: str,
+        enabled: bool,
+        post_before_hours: int = 24,
+    ):
+        await inter.response.defer(ephemeral=True, thinking=False)
+
+        if not _is_admin(inter):
+            await inter.followup.send("❌ Nur Admin/Manage Server.", ephemeral=True)
+            return
+
+        key = _normalize_name(name)
+        g = _gcfg(inter.guild_id)
+        tpl = g["templates"].get(key)
+
+        if not tpl:
+            await inter.followup.send("❌ Vorlage nicht gefunden.", ephemeral=True)
+            return
+
+        post_before_hours = max(0, int(post_before_hours))
+
+        tpl["auto_weekly"] = bool(enabled)
+        tpl["post_before_hours"] = int(post_before_hours)
+        tpl["post_before_minutes"] = int(post_before_hours) * 60
+
+        _save(templates)
+
+        await inter.followup.send(
+            f"✅ Auto-Posting für `{key}`: **{'AN' if enabled else 'AUS'}**\n"
+            f"⏰ Postet **{post_before_hours}h vorher**.",
+            ephemeral=True
+        )
+
+    @tree.command(name="raid_template_auto_status", description="Zeigt Auto-Posting-Status aller Vorlagen")
+    async def raid_template_auto_status(inter: discord.Interaction):
+        g = _gcfg(inter.guild_id)
+        all_tpl = g.get("templates") or {}
+
+        if not all_tpl:
+            await inter.response.send_message("📋 Keine Vorlagen vorhanden.", ephemeral=True)
+            return
+
+        now = datetime.now(TZ)
+        lines = []
+
+        for key, tpl in all_tpl.items():
+            auto = _template_auto_enabled(tpl)
+            wd = int(tpl.get("weekday", 0) or 0)
+            time = str(tpl.get("time", "—"))
+            event_date = _current_or_next_event_date_for_template(tpl, now)
+            event_dt = _event_datetime_for_template(tpl, event_date)
+            post_dt = event_dt - timedelta(minutes=_post_before_minutes(tpl))
+            ch_id = int(tpl.get("channel_id", 0) or 0)
+
+            lines.append(
+                f"• `{key}` — **{'AN' if auto else 'AUS'}**\n"
+                f"  Event: {_weekday_name(wd)} `{time}` | nächstes Datum: `{event_date.strftime('%d.%m.%Y')}`\n"
+                f"  Auto-Post: `{post_dt.strftime('%d.%m.%Y %H:%M')}` | Channel: <#{ch_id}>"
+            )
+
+        await inter.response.send_message("\n\n".join(lines), ephemeral=True)
+
+    @tree.command(name="raid_template_auto_reset", description="(Admin) Löscht Auto-Post-Merker einer Vorlage für ein Datum")
+    async def raid_template_auto_reset(
+        inter: discord.Interaction,
+        name: str,
+        event_date: str,
+    ):
+        await inter.response.defer(ephemeral=True, thinking=False)
+
+        if not _is_admin(inter):
+            await inter.followup.send("❌ Nur Admin/Manage Server.", ephemeral=True)
+            return
+
+        key = _normalize_name(name)
+
+        try:
+            y, m, d = [int(x) for x in event_date.strip().split("-")]
+            d_obj = date(y, m, d)
+        except Exception:
+            await inter.followup.send("❌ Datum ungültig. Nutze YYYY-MM-DD.", ephemeral=True)
+            return
+
+        state = _g_auto_state(inter.guild_id)
+        posted = state.setdefault("posted", {})
+        marker = _auto_key(key, d_obj)
+
+        if marker in posted:
+            posted.pop(marker, None)
+            _save_auto_state(auto_state)
+            await inter.followup.send(f"✅ Auto-Merker `{marker}` gelöscht.", ephemeral=True)
+        else:
+            await inter.followup.send(f"ℹ️ Kein Auto-Merker für `{marker}` gefunden.", ephemeral=True)
+
+    @tree.command(name="raid_template_run", description="(Admin) Erstellt ein Event aus Vorlage")
+    @app_commands.describe(
+        name="Vorlagenname",
+        date_override="Optional: YYYY-MM-DD"
+    )
+    async def raid_template_run(
+        inter: discord.Interaction,
+        name: str,
+        date_override: Optional[str] = None,
+    ):
+        if not _is_admin(inter):
+            await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True)
+            return
+
+        key = _normalize_name(name)
+        g = _gcfg(inter.guild_id)
+        tpl = g["templates"].get(key)
+
+        if not tpl:
+            await inter.response.send_message("❌ Vorlage nicht gefunden.", ephemeral=True)
+            return
+
+        async def _picked(pick_inter: discord.Interaction, channel: discord.TextChannel):
+            await pick_inter.response.edit_message(content=f"⏳ Erstelle Event aus `{key}` in {channel.mention} …", view=None)
+            try:
+                event_date = _parse_date(date_override, int(tpl.get("weekday", 4)))
+                msg, sent, skipped = await _create_event_from_template(
+                    client=client,
+                    guild=pick_inter.guild,
+                    tpl=tpl,
+                    event_date=event_date,
+                    override_channel=channel,
+                )
+            except Exception as e:
+                await pick_inter.followup.send(f"❌ Event konnte nicht erstellt werden: {e}", ephemeral=True)
+                return
+
+            await pick_inter.followup.send(
+                f"✅ Event aus Vorlage `{key}` erstellt.\n"
+                f"📅 Datum: `{event_date.strftime('%d.%m.%Y')}`\n"
+                f"🔗 {msg.jump_url if msg else 'Kein Link'}\n"
+                f"✉️ DMs versendet: {sent}\n"
+                f"🔕 Opt-out übersprungen: {skipped}",
+                ephemeral=True,
+            )
+
+        await send_text_channel_picker(inter, "📢 Zielchannel für Event aus Vorlage auswählen", _picked)
+
+    @tree.command(name="raid_template_list", description="Zeigt alle Raid-/Event-Vorlagen")
+    async def raid_template_list(inter: discord.Interaction):
+        g = _gcfg(inter.guild_id)
+        all_tpl = g.get("templates") or {}
+
+        if not all_tpl:
+            await inter.response.send_message("📋 Keine Vorlagen vorhanden.", ephemeral=True)
+            return
+
+        lines = []
+
+        for key, tpl in all_tpl.items():
+            ch_id = int(tpl.get("channel_id", 0) or 0)
+            role_id = int(tpl.get("target_role_id", 0) or 0)
+            auto = bool(tpl.get("auto_weekly", False))
+
+            lines.append(
+                f"• `{key}` — **{tpl.get('title', 'Event')}** "
+                f"| Wochentag `{tpl.get('weekday')}` "
+                f"| `{tpl.get('time')}` "
+                f"| <#{ch_id}> "
+                f"| Zielrolle: {f'<@&{role_id}>' if role_id else '—'} "
+                f"| Auto: **{'AN' if auto else 'AUS'}**"
+            )
+
+        await inter.response.send_message("\n".join(lines), ephemeral=True)
+
+    @tree.command(name="raid_template_show", description="Zeigt Details einer Vorlage")
+    async def raid_template_show(inter: discord.Interaction, name: str):
+        key = _normalize_name(name)
+        g = _gcfg(inter.guild_id)
+        tpl = g["templates"].get(key)
+
+        if not tpl:
+            await inter.response.send_message("❌ Vorlage nicht gefunden.", ephemeral=True)
+            return
+
+        role_id = int(tpl.get("target_role_id", 0) or 0)
+        ch_id = int(tpl.get("channel_id", 0) or 0)
+        wd = int(tpl.get("weekday", 0) or 0)
+
+        text = (
+            f"**Vorlage `{key}`**\n"
+            f"**Titel:** {tpl.get('title', '—')}\n"
+            f"**Beschreibung:** {tpl.get('description', '—') or '—'}\n"
+            f"**Wochentag:** `{tpl.get('weekday')}` ({_weekday_name(wd)})\n"
+            f"**Zeit:** `{tpl.get('time')}`\n"
+            f"**Dauer:** `{tpl.get('duration_min')}` Minuten\n"
+            f"**Channel:** <#{ch_id}>\n"
+            f"**Zielrolle:** {f'<@&{role_id}>' if role_id else '—'}\n"
+            f"**Image URL:** `{tpl.get('image_url') or '—'}`\n"
+            f"**Media Channel ID:** `{tpl.get('media_channel_id', 0)}`\n"
+            f"**Media Message ID:** `{tpl.get('media_message_id', 0)}`\n"
+            f"**Attachment Index:** `{tpl.get('attachment_index', 0)}`\n"
+            f"**Reminder:** `{tpl.get('pre_reminders', [])}`\n"
+            f"**DMs:** `{'Ja' if tpl.get('send_dm', True) else 'Nein'}`\n"
+            f"**Auto wöchentlich:** `{'Ja' if tpl.get('auto_weekly', False) else 'Nein'}`\n"
+            f"**Auto-Post vorher:** `{_post_before_minutes(tpl)} Minuten`"
+        )
+
+        await inter.response.send_message(text, ephemeral=True)
+
+    @tree.command(name="raid_template_delete", description="(Admin) Löscht eine Vorlage")
+    async def raid_template_delete(inter: discord.Interaction, name: str):
+        await inter.response.defer(ephemeral=True, thinking=False)
+
+        if not _is_admin(inter):
+            await inter.followup.send("❌ Nur Admin/Manage Server.", ephemeral=True)
+            return
+
+        key = _normalize_name(name)
+        g = _gcfg(inter.guild_id)
+
+        if key not in g["templates"]:
+            await inter.followup.send("❌ Vorlage nicht gefunden.", ephemeral=True)
+            return
+
+        g["templates"].pop(key, None)
+        _save(templates)
+
+        await inter.followup.send(f"✅ Vorlage `{key}` gelöscht.", ephemeral=True)

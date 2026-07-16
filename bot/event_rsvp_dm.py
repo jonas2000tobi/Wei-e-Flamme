@@ -1,2125 +1,2164 @@
 from __future__ import annotations
 
 import json
-import asyncio
-import re
 import os
-import secrets
-import time
+import asyncio
+import urllib.parse
 from pathlib import Path
-from typing import Dict, Optional, Iterable, List, Any
-from datetime import datetime, timedelta, timezone
-from zoneinfo import ZoneInfo
-
-try:
-    from bot.json_store import load_json_file, save_json_atomic, warn_json_store  # type: ignore
-except Exception:
-    from json_store import load_json_file, save_json_atomic, warn_json_store  # type: ignore
+from datetime import datetime, timezone
+from typing import Any, Optional
 
 import discord
-import aiohttp
 from discord import app_commands
-from discord.ext import tasks
-from discord.ui import View, button
-from discord.enums import ButtonStyle
+from discord.ext import commands, tasks
 
 try:
-    from bot.channel_picker import send_text_channel_picker, send_voice_channel_picker  # type: ignore
-except Exception:
-    from channel_picker import send_text_channel_picker, send_voice_channel_picker  # type: ignore
+    from bot import runtime_db  # type: ignore
+except Exception:  # pragma: no cover - root fallback for old starts
+    import runtime_db  # type: ignore
 
 try:
-    from bot.event_dm_prefs import is_dm_enabled  # type: ignore
-except ModuleNotFoundError:
-    from event_dm_prefs import is_dm_enabled  # type: ignore
-
-try:
-    from bot.raid_stats import record_response  # type: ignore
-except ModuleNotFoundError:
-    from raid_stats import record_response  # type: ignore
-
-
-TZ = ZoneInfo("Europe/Berlin")
-
-
-# Custom Discord-Emojis für RSVP/Rollen.
-# Beim Serverwechsel ändern sich die IDs. Deshalb sucht der Bot die neuen
-# Server-Emojis automatisch anhand der Namen Tank, Heal, DD/DPS, bank,
-# vielleicht und nichtda.
-EMOJI_TANK = "<:tank:1516465336054972456>"
-EMOJI_HEAL = "<:heal:1516478246001049690>"
-EMOJI_DPS = "<:dps:1516476505918668940>"
-EMOJI_BANK = "<:reserve:1516465611243520201>"
-EMOJI_MAYBE = "<:maybe:1516465379445047497>"
-EMOJI_NO = "<:no:1516465299359273070>"
-
-# Portal-Menü-Emojis zum Schutz vor DM-Cleanup
-EMOJI_EBOLUS = "<:ebolus:1516448234355163208>"
-EMOJI_PERSONAL = "<:persoenlich:1516459694997372949>"
-EMOJI_LOOT = "<:loot:1516459736659136672>"
-EMOJI_GUILD = "<:ebolus:1516448234355163208>"
-EMOJI_CONTACT = "<:kontakt:1516459812999921775>"
-EMOJI_ADMIN = "<:admin:1516459630572601487>"
-EMOJI_TIME = "<:time:1516461870146523379>"
-EMOJI_VOTED = "<:voted:1516461766761119936>"
-EMOJI_TARGET = "<:target:1516461644471865365>"
-EMOJI_ABSENCE = "<:nichtda:1516463499872833616>"
-EMOJI_CALENDAR = "<:Kalender:1516462026468098181>"
-
-_RSVP_EMOJI_ALIASES: dict[str, tuple[str, ...]] = {
-    "tank": ("tank",),
-    "heal": ("heal",),
-    "dps": ("dps", "dd"),
-    "reserve": ("reserve", "bank"),
-    "maybe": ("maybe", "vielleicht"),
-    "no": ("no", "nichtda", "abmelden"),
-}
-_RSVP_EMOJI_FALLBACKS: dict[str, str] = {
-    "tank": "🛡️",
-    "heal": "💚",
-    "dps": "⚔️",
-    "reserve": "🪑",
-    "maybe": "❔",
-    "no": "❌",
-}
-_RSVP_LEGACY_TO_KEY: dict[str, str] = {
-    "tank": "tank",
-    "heal": "heal",
-    "dps": "dps",
-    "dd": "dps",
-    "reserve": "reserve",
-    "bank": "reserve",
-    "maybe": "maybe",
-    "vielleicht": "maybe",
-    "no": "no",
-    "nichtda": "no",
-    "abmelden": "no",
-}
-_RSVP_SERVER_EMOJIS: dict[str, discord.Emoji] = {}
-
-
-def _rsvp_emoji_name(value: object) -> str:
-    if isinstance(value, (discord.Emoji, discord.PartialEmoji)):
-        return str(getattr(value, "name", "") or "").strip().lower()
-    raw = str(value or "").strip()
-    if raw.startswith("<:") or raw.startswith("<a:"):
-        try:
-            return str(discord.PartialEmoji.from_str(raw).name or "").strip().lower()
-        except Exception:
-            pass
-    return raw.strip(":").lower()
-
-
-def _rsvp_key(value: object) -> str:
-    name = _rsvp_emoji_name(value)
-    return _RSVP_LEGACY_TO_KEY.get(name, name)
-
-
-def _rsvp_server_emoji(key: str) -> Optional[discord.Emoji]:
-    for alias in _RSVP_EMOJI_ALIASES.get(key, (key,)):
-        emoji = _RSVP_SERVER_EMOJIS.get(alias.lower())
-        if emoji is not None:
-            return emoji
-    return None
-
-
-def _rsvp_component_emoji(value: object):
-    key = _rsvp_key(value)
-    emoji = _rsvp_server_emoji(key)
-    if emoji is not None:
-        return emoji
-    raw = str(value or "")
-    if raw and not (raw.startswith("<:") or raw.startswith("<a:")):
-        return raw
-    return _RSVP_EMOJI_FALLBACKS.get(key, "•")
-
-
-def _refresh_rsvp_emojis(guild: Optional[discord.Guild]) -> None:
-    if guild is None:
-        return
-    _RSVP_SERVER_EMOJIS.clear()
-    for emoji in list(getattr(guild, "emojis", []) or []):
-        name = str(getattr(emoji, "name", "") or "").strip().lower()
-        if name:
-            _RSVP_SERVER_EMOJIS[name] = emoji
-
-    global EMOJI_TANK, EMOJI_HEAL, EMOJI_DPS, EMOJI_BANK, EMOJI_MAYBE, EMOJI_NO
-    EMOJI_TANK = str(_rsvp_server_emoji("tank") or _RSVP_EMOJI_FALLBACKS["tank"])
-    EMOJI_HEAL = str(_rsvp_server_emoji("heal") or _RSVP_EMOJI_FALLBACKS["heal"])
-    EMOJI_DPS = str(_rsvp_server_emoji("dps") or _RSVP_EMOJI_FALLBACKS["dps"])
-    EMOJI_BANK = str(_rsvp_server_emoji("reserve") or _RSVP_EMOJI_FALLBACKS["reserve"])
-    EMOJI_MAYBE = str(_rsvp_server_emoji("maybe") or _RSVP_EMOJI_FALLBACKS["maybe"])
-    EMOJI_NO = str(_rsvp_server_emoji("no") or _RSVP_EMOJI_FALLBACKS["no"])
-
-    print(
-        f"[event_rsvp_dm] RSVP-Emojis geladen für {guild.name}: "
-        f"Tank={EMOJI_TANK}, Heal={EMOJI_HEAL}, DPS={EMOJI_DPS}, "
-        f"Reserve={EMOJI_BANK}, Vielleicht={EMOJI_MAYBE}, Abmelden={EMOJI_NO}",
-        flush=True,
-    )
-
-
-def _button_emoji(value: str):
-    return _rsvp_component_emoji(value)
-
-
-def _rebind_rsvp_view_emojis(view: discord.ui.View) -> None:
-    for child in list(getattr(view, "children", []) or []):
-        try:
-            current = getattr(child, "emoji", None)
-            if current is not None:
-                child.emoji = _rsvp_component_emoji(current)
-        except Exception:
-            pass
-
+    from bot import guild_config as central_guild_config  # type: ignore
+except Exception:  # pragma: no cover
+    try:
+        import guild_config as central_guild_config  # type: ignore
+    except Exception:
+        central_guild_config = None  # type: ignore
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
-DATA_DIR.mkdir(parents=True, exist_ok=True)
+EXPORT_DIR = DATA_DIR / "dashboard_exports"
+EXPORT_DIR.mkdir(parents=True, exist_ok=True)
 
-RSVP_FILE = DATA_DIR / "event_rsvp.json"
-DM_CFG_FILE = DATA_DIR / "event_rsvp_cfg.json"
-LEADER_CONTACT_CFG_FILE = DATA_DIR / "leader_contact_cfg.json"
-ATTENDANCE_FILE = DATA_DIR / "event_attendance.json"
+DASHBOARD_SCHEMA_VERSION = 1
 
-
-def _load(p: Path, default):
-    return load_json_file(p, default, context=__name__)
-
-
-def _save(p: Path, obj):
-    save_json_atomic(p, obj, context=__name__)
-
-
-store: Dict[str, dict] = _load(RSVP_FILE, {})
-cfg: Dict[str, dict] = _load(DM_CFG_FILE, {})
-attendance_store: Dict[str, dict] = _load(ATTENDANCE_FILE, {})
-
-
-def save_store():
-    _save(RSVP_FILE, store)
-    try:
-        _phase3_mirror_events_from_store()
-    except NameError:
-        # Während des Modulimports ist die Spiegel-Funktion noch nicht definiert.
-        pass
-    except Exception as e:
-        print(f"[phase3-events] Event-Spiegelung übersprungen: {e!r}", flush=True)
+JSON_SOURCES: dict[str, str] = {
+    "member_profiles": "member_profiles.json",
+    "member_portal_cfg": "member_portal_cfg.json",
+    "events": "event_rsvp.json",
+    "event_attendance": "event_attendance.json",
+    "dkp_cfg": "dkp_cfg.json",
+    "dkp_balances": "dkp_balances.json",
+    "dkp_transactions": "dkp_transactions.json",
+    "dkp_event_checks": "dkp_event_checks.json",
+    "loot_items": "loot_items.json",
+    "loot_needs": "loot_needs.json",
+    "loot_cfg": "loot_cfg.json",
+    "loot_auctions": "loot_auctions.json",
+    "loot_auction_cfg": "loot_auction_cfg.json",
+    "guild_chest": "guild_chest.json",
+    "raid_templates": "raid_templates.json",
+    "alliance_config": "alliance_config.json",
+    "weekly_report_cfg": "weekly_report_cfg.json",
+    "leader_contact_cfg": "leader_contact_cfg.json",
+}
 
 
-def save_cfg():
-    _save(DM_CFG_FILE, cfg)
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
-def save_attendance():
-    _save(ATTENDANCE_FILE, attendance_store)
+def _safe_text(value: Any, limit: int = 300) -> str:
+    txt = str(value or "").replace("@", "@\u200b").strip()
+    if len(txt) > limit:
+        return txt[: limit - 1] + "…"
+    return txt
 
 
-async def _log(client: discord.Client, guild_id: int, text: str):
-    gcfg = cfg.get(str(guild_id)) or {}
-    ch_id = int(gcfg.get("LOG_CH", 0) or 0)
+def _stable_discord_media_url(value: Any) -> str:
+    """Discord-Medien-URL inklusive Signatur behalten.
 
-    if not ch_id:
-        return
-
-    guild = client.get_guild(guild_id)
-
-    if not guild:
-        return
-
-    ch = guild.get_channel(ch_id)
-
-    if isinstance(ch, (discord.TextChannel, discord.Thread)):
-        try:
-            await ch.send(f"[RSVP-DM] {text}")
-        except Exception:
-            pass
+    Discord schützt Attachment-/Proxy-URLs inzwischen mit Query-Signaturen.
+    Werden ``ex/is/hm`` entfernt, liefert Discord häufig 403/404. Frische URLs
+    werden unten direkt aus dem Eventpost gelesen und bei jedem Snapshot erneuert.
+    """
+    url = str(value or "").strip()
+    if not (url.startswith("https://") or url.startswith("http://")):
+        return ""
+    return url
 
 
-def _safe_name(name: str) -> str:
-    return (name or "").replace("@", "@\u200b").strip() or "Unbekannt"
-
-
-def _current_display_name(
-    member: Optional[discord.Member],
-    fallback_user: Optional[discord.abc.User] = None
-) -> str:
-    if member is not None:
-        return _safe_name(member.display_name)
-
-    if fallback_user is not None:
-        return _safe_name(
-            getattr(fallback_user, "display_name", None)
-            or getattr(fallback_user, "name", "Unbekannt")
-        )
-
-    return "Unbekannt"
-
-
-def _participant_entry(
-    uid: int,
-    name: str,
-    guild_label: str = "",
-    source_guild_id: int = 0,
-) -> dict:
-    obj = {
-        "id": int(uid),
-        "name": _safe_name(name),
-    }
-
-    if guild_label:
-        obj["guild_label"] = str(guild_label).strip()
-
-    if source_guild_id:
-        obj["source_guild_id"] = int(source_guild_id)
-
-    return obj
-
-
-def _entry_user_id(entry: Any) -> int:
-    try:
-        if isinstance(entry, dict):
-            return int(entry.get("id", 0) or 0)
-        return int(entry)
-    except Exception:
-        return 0
-
-
-def _entry_name(entry: Any, guild: Optional[discord.Guild] = None) -> str:
-    if isinstance(entry, dict):
-        stored = _safe_name(str(entry.get("name", "") or ""))
-        uid = _entry_user_id(entry)
-
-        if guild and uid:
-            member = guild.get_member(uid)
-
-            if member:
-                return _safe_name(member.display_name)
-
-        return stored or (f"User {uid}" if uid else "Unbekannt")
-
-    try:
-        uid = int(entry)
-    except Exception:
-        return "Unbekannt"
-
-    if guild:
-        member = guild.get_member(uid)
-
-        if member:
-            return _safe_name(member.display_name)
-
-    return f"User {uid}"
-
-
-def _short_guild_label(label: str) -> str:
-    label = (label or "").strip()
-
-    if not label:
+def _event_image_url_from_raw(event: Any) -> str:
+    """Titelbild aus alten und neuen Event-Strukturen lesen."""
+    if not isinstance(event, dict):
         return ""
 
-    clean = "".join(ch for ch in label if ch.isalnum())
+    candidates: list[Any] = []
+    for key in (
+        "image_url", "title_image_url", "event_image_url", "banner_url",
+        "thumbnail_url", "cover_url", "image", "thumbnail", "banner", "cover",
+    ):
+        candidates.append(event.get(key))
 
-    if len(clean) <= 4:
-        return clean
+    for key in ("embed", "discord_embed", "message_embed", "media"):
+        nested = event.get(key)
+        if isinstance(nested, dict):
+            for sub_key in ("image_url", "thumbnail_url", "banner_url", "cover_url", "url", "proxy_url", "image", "thumbnail"):
+                candidates.append(nested.get(sub_key))
+        elif isinstance(nested, list):
+            candidates.extend(nested[:4])
 
-    return clean[:3].title()
+    attachments = event.get("attachments")
+    if isinstance(attachments, list):
+        candidates.extend(attachments[:6])
 
-
-def _entry_display_name(entry: Any, guild: Optional[discord.Guild] = None) -> str:
-    name = _entry_name(entry, guild)
-
-    if isinstance(entry, dict):
-        label = str(entry.get("guild_label", "") or "").strip()
-        short = _short_guild_label(label)
-
-        if short:
-            return f"{name} ({short})"
-
-    return name
-
-def _source_label_for_inter(inter: discord.Interaction, obj: dict) -> tuple[str, int]:
-    source_guild_id = int(inter.guild_id or 0)
-
-    if not source_guild_id:
-        source_guild_id = int(obj.get("guild_id", 0) or 0)
-
-    for mirror in obj.get("mirrors", []) or []:
-        try:
-            if int(mirror.get("guild_id", 0) or 0) == source_guild_id:
-                return str(mirror.get("short_label", "") or mirror.get("label", "") or mirror.get("discord_name", "") or "").strip(), source_guild_id
-        except Exception:
-            continue
-
-    guild = inter.client.get_guild(source_guild_id) if source_guild_id else None
-    return (guild.name if guild else ""), source_guild_id
-
-
-def _is_alliance_event(obj: dict) -> bool:
-    return str(obj.get("scope", "") or "").lower() == "alliance"
-
-
-def _maybe_entry(uid: int, name: str, label: str) -> dict:
-    return {
-        "id": int(uid),
-        "name": _safe_name(name),
-        "label": (label or "").strip(),
-    }
-
-
-def _maybe_name_and_label(
-    entry: Any,
-    uid_fallback: int,
-    guild: Optional[discord.Guild] = None
-) -> tuple[str, str]:
-    if isinstance(entry, dict):
-        uid = int(entry.get("id", uid_fallback) or uid_fallback)
-        label = str(entry.get("label", "") or "").strip()
-        name = _entry_name({"id": uid, "name": entry.get("name", "")}, guild)
-        return name, label
-
-    label = str(entry or "").strip()
-
-    if guild:
-        member = guild.get_member(uid_fallback)
-
-        if member:
-            return _safe_name(member.display_name), label
-
-    return f"User {uid_fallback}", label
-
-
-def _format_dm_text(
-    title: str,
-    when: datetime,
-    channel_name_or_ref: str,
-    description: str | None,
-    intro_line: str | None = None
-) -> str:
-    desc = (description or "").strip()
-
-    dm_text = (
-        f"{EMOJI_CALENDAR} **{title}**\n"
-        f"{EMOJI_TIME} {when.strftime('%a, %d.%m.%Y %H:%M')} (Europe/Berlin)\n"
-        f"📍 {channel_name_or_ref}\n"
-    )
-
-    if desc:
-        dm_text += f"\n📝 **Beschreibung:**\n{desc[:500]}\n"
-
-    if intro_line:
-        dm_text += f"\n👇 **{intro_line}**"
-    else:
-        dm_text += "\n👇 **Wähle unten deine Teilnahme:**"
-
-    return dm_text
-
-
-def _init_event_shape(obj: dict):
-    if "yes" not in obj or not isinstance(obj["yes"], dict):
-        obj["yes"] = {"TANK": [], "HEAL": [], "DPS": [], "BANK": []}
-
-    for k in ("TANK", "HEAL", "DPS", "BANK"):
-        if k not in obj["yes"] or not isinstance(obj["yes"][k], list):
-            obj["yes"][k] = []
-
-    if "maybe" not in obj or not isinstance(obj["maybe"], dict):
-        obj["maybe"] = {}
-
-    if "no" not in obj or not isinstance(obj["no"], list):
-        obj["no"] = []
-
-    obj.setdefault("target_role_id", 0)
-
-    if "dm_messages" not in obj or not isinstance(obj["dm_messages"], dict):
-        obj["dm_messages"] = {}
-
-    if "mirrors" not in obj or not isinstance(obj.get("mirrors"), list):
-        obj["mirrors"] = []
-
-    obj.setdefault("scope", "single")
-    obj.setdefault("voice_enabled", False)
-    obj.setdefault("voice_channel_id", 0)
-    obj.setdefault("voice_last_channel_id", 0)
-    obj.setdefault("voice_category_id", 0)
-    obj.setdefault("voice_return_channel_id", 0)
-    obj.setdefault("voice_cleanup_done", False)
-    obj.setdefault("voice_created_at", "")
-    obj.setdefault("voice_name", "")
-
-    migrated = False
-
-    for role_key in ("TANK", "HEAL", "DPS", "BANK"):
-        new_list = []
-
-        for raw in obj["yes"].get(role_key, []):
-            if isinstance(raw, dict):
-                entry = {
-                    "id": int(raw.get("id", 0) or 0),
-                    "name": _safe_name(str(raw.get("name", "") or f"User {raw.get('id', 0)}")),
-                }
-
-                guild_label = str(raw.get("guild_label", "") or "").strip()
-                source_guild_id = int(raw.get("source_guild_id", 0) or 0)
-
-                if guild_label:
-                    entry["guild_label"] = guild_label
-
-                if source_guild_id:
-                    entry["source_guild_id"] = source_guild_id
-
-                new_list.append(entry)
-            else:
-                try:
-                    uid = int(raw)
-                    new_list.append(_participant_entry(uid, f"User {uid}"))
-                except Exception:
-                    continue
-
-        if obj["yes"].get(role_key) != new_list:
-            obj["yes"][role_key] = new_list
-            migrated = True
-
-    maybe_new = {}
-
-    for uid_str, raw in obj.get("maybe", {}).items():
-        try:
-            uid_i = int(uid_str)
-        except Exception:
-            continue
-
+    def unpack(raw: Any) -> list[Any]:
         if isinstance(raw, dict):
-            entry = {
-                "id": uid_i,
-                "name": _safe_name(str(raw.get("name", "") or f"User {uid_i}")),
-                "label": str(raw.get("label", "") or "").strip(),
-            }
+            return [raw.get("url"), raw.get("proxy_url"), raw.get("image_url"), raw.get("thumbnail_url")]
+        if isinstance(raw, list):
+            out: list[Any] = []
+            for item in raw[:6]:
+                out.extend(unpack(item))
+            return out
+        return [raw]
 
-            guild_label = str(raw.get("guild_label", "") or "").strip()
-            source_guild_id = int(raw.get("source_guild_id", 0) or 0)
-
-            if guild_label:
-                entry["guild_label"] = guild_label
-
-            if source_guild_id:
-                entry["source_guild_id"] = source_guild_id
-
-            maybe_new[str(uid_i)] = entry
-        else:
-            maybe_new[str(uid_i)] = _maybe_entry(
-                uid_i,
-                f"User {uid_i}",
-                str(raw or "").strip()
-            )
-
-    if obj.get("maybe") != maybe_new:
-        obj["maybe"] = maybe_new
-        migrated = True
-
-    no_new = []
-
-    for raw in obj.get("no", []):
-        if isinstance(raw, dict):
-            entry = {
-                "id": int(raw.get("id", 0) or 0),
-                "name": _safe_name(str(raw.get("name", "") or f"User {raw.get('id', 0)}")),
-            }
-
-            guild_label = str(raw.get("guild_label", "") or "").strip()
-            source_guild_id = int(raw.get("source_guild_id", 0) or 0)
-
-            if guild_label:
-                entry["guild_label"] = guild_label
-
-            if source_guild_id:
-                entry["source_guild_id"] = source_guild_id
-
-            no_new.append(entry)
-        else:
-            try:
-                uid = int(raw)
-                no_new.append(_participant_entry(uid, f"User {uid}"))
-            except Exception:
-                continue
-
-    if obj.get("no") != no_new:
-        obj["no"] = no_new
-        migrated = True
-
-    if migrated:
-        save_store()
-
-
-def get_role_ids_for_guild(guild_id: int) -> Dict[str, int]:
-    g = cfg.get(str(guild_id)) or {}
-
-    return {
-        "TANK": int(g.get("TANK", 0) or 0),
-        "HEAL": int(g.get("HEAL", 0) or 0),
-        "DPS": int(g.get("DPS", 0) or 0),
-    }
-
-
-def _primary_label(member: Optional[discord.Member], rid_map: Dict[str, int]) -> str:
-    if member is None:
-        return ""
-
-    guild = member.guild
-
-    r = guild.get_role(rid_map.get("TANK", 0) or 0)
-    if r and r in getattr(member, "roles", []):
-        return "Tank"
-
-    r = guild.get_role(rid_map.get("HEAL", 0) or 0)
-    if r and r in getattr(member, "roles", []):
-        return "Heal"
-
-    r = guild.get_role(rid_map.get("DPS", 0) or 0)
-    if r and r in getattr(member, "roles", []):
-        return "DPS"
-
-    names = [getattr(rr, "name", "").lower() for rr in getattr(member, "roles", [])]
-
-    if any("tank" in n for n in names):
-        return "Tank"
-
-    if any("heal" in n for n in names):
-        return "Heal"
-
-    if any("dps" in n for n in names) or any("dd" in n for n in names):
-        return "DPS"
-
+    for candidate in candidates:
+        for raw in unpack(candidate):
+            url = _stable_discord_media_url(raw)
+            if url:
+                return url
     return ""
 
 
-def _member_from_event(inter: discord.Interaction, obj: dict) -> Optional[discord.Member]:
+def _member_is_active(guild: discord.Guild, user_id: int) -> bool:
+    """True, wenn der User aktuell auf diesem Discord-Server gefunden wird.
+
+    Alte JSON-Daten behalten wir bewusst, aber fürs Dashboard sollen
+    ehemalige Mitglieder standardmäßig nicht mehr in Listen/Counts auftauchen.
+    """
     try:
-        if inter.guild is not None:
-            return inter.guild.get_member(inter.user.id)
+        return guild.get_member(int(user_id)) is not None
+    except Exception:
+        return False
 
-        gid = int(obj.get("guild_id", 0) or 0)
 
-        if not gid:
-            return None
+DASHBOARD_MEMBER_ROLE_SETTING = "dashboard_member_role_id"
+DASHBOARD_ADMIN_ROLE_SETTING = "dashboard_admin_role_ids"
+DASHBOARD_ALLOWED_ROLE_SETTING = "dashboard_allowed_role_ids"
+DASHBOARD_NEWS_CHANNEL_NAME_SETTING = "dashboard_news_channel_name"
+DASHBOARD_GUIDES_CHANNEL_NAME_SETTING = "dashboard_guides_channel_name"
+DASHBOARD_ANNOUNCEMENTS_CHANNEL_NAME_SETTING = "dashboard_announcements_channel_name"
 
-        guild = inter.client.get_guild(gid)
 
-        if not guild:
-            return None
-
-        return guild.get_member(inter.user.id)
-
+def _dashboard_member_role_config_value(guild_id: int) -> Any:
+    """Serverbezogene Dashboard-Gildenrolle aus Postgres/Runtime-DB lesen."""
+    try:
+        return runtime_db.get_guild_setting(int(guild_id), DASHBOARD_MEMBER_ROLE_SETTING, None)
     except Exception:
         return None
 
 
-def _voters_set(obj: dict) -> set[int]:
-    voted: set[int] = set()
+def _dashboard_member_role(guild: discord.Guild) -> Optional[discord.Role]:
+    """Rolle, die fürs Dashboard als echte Gildenmitgliedschaft zählt.
 
-    for k in ("TANK", "HEAL", "DPS", "BANK"):
-        voted.update(_entry_user_id(u) for u in obj["yes"].get(k, []))
+    Für Vermietung/Multi-Guild gibt es keinen festen Default wie `Ebolus`.
+    Jede Gilde setzt ihre Mitgliederrolle aktiv über:
 
-    voted.update(_entry_user_id(u) for u in obj["no"])
+        /dashboard_set_member_role role:<Rolle>
 
-    for uid_str, entry in obj["maybe"].items():
+    Optionaler Notfall-Fallback per Railway:
+    - DASHBOARD_MEMBER_ROLE_ID=123...
+    - DASHBOARD_MEMBER_ROLE_NAME=Gildenmitglied
+    """
+    raw_setting = _dashboard_member_role_config_value(guild.id)
+    if raw_setting not in (None, ""):
         try:
-            uid_i = int(uid_str)
-        except Exception:
-            uid_i = _entry_user_id(entry)
-
-        if uid_i:
-            voted.add(uid_i)
-
-    return voted
-
-
-def _eligible_members(guild: discord.Guild, obj: dict) -> List[discord.Member]:
-    tr_id = int(obj.get("target_role_id", 0) or 0)
-
-    if not tr_id:
-        return [m for m in guild.members if not m.bot]
-
-    role = guild.get_role(tr_id)
-
-    if not role:
-        return [m for m in guild.members if not m.bot]
-
-    return [m for m in role.members if not m.bot]
-
-
-def build_embed(guild: discord.Guild, obj: dict) -> discord.Embed:
-    _init_event_shape(obj)
-
-    when = datetime.fromisoformat(obj["when_iso"])
-    yes = obj["yes"]
-    maybe = obj["maybe"]
-    no = obj["no"]
-
-    voted = _voters_set(obj)
-
-    if _is_alliance_event(obj):
-        vote_line = f"{EMOJI_VOTED} Abgestimmt: **{len(voted)}**"
-        hint_line = "💡 Allianz-Raid: Partner-Server stimmen direkt über diesen Post ab. DMs gibt es nur für den Home-Server."
-    else:
-        eligible = _eligible_members(guild, obj)
-        vote_line = f"{EMOJI_VOTED} Abgestimmt: **{len(voted)}** / **{len(eligible)}**"
-        hint_line = ""
-
-    emb = discord.Embed(
-        title=f"{EMOJI_CALENDAR} {obj['title']}",
-        description=(
-            (obj.get("description", "") or "") +
-            f"\n\n{EMOJI_TIME} Zeit: {when.strftime('%a, %d.%m.%Y %H:%M')} (Europe/Berlin)"
-            f"\n{vote_line}"
-            f"\n{hint_line}"
-        ).strip(),
-        color=discord.Color.blurple()
-    )
-
-    tank_names = [_entry_display_name(u, guild) for u in yes.get("TANK", [])]
-    heal_names = [_entry_display_name(u, guild) for u in yes.get("HEAL", [])]
-    dps_names = [_entry_display_name(u, guild) for u in yes.get("DPS", [])]
-    bank_names = [_entry_display_name(u, guild) for u in yes.get("BANK", [])]
-
-    emb.add_field(name=f"{EMOJI_TANK} Tank ({len(tank_names)})", value="\n".join(tank_names) or "—", inline=True)
-    emb.add_field(name=f"{EMOJI_HEAL} Heal ({len(heal_names)})", value="\n".join(heal_names) or "—", inline=True)
-    emb.add_field(name=f"{EMOJI_DPS} DPS ({len(dps_names)})", value="\n".join(dps_names) or "—", inline=True)
-    emb.add_field(name=f"{EMOJI_BANK} Reserve ({len(bank_names)})", value="\n".join(bank_names) or "—", inline=False)
-
-    maybe_lines = []
-
-    for uid_str, entry in maybe.items():
-        try:
-            uid_i = int(uid_str)
-        except Exception:
-            uid_i = _entry_user_id(entry)
-
-        name, label = _maybe_name_and_label(entry, uid_i, guild)
-        guild_label = str(entry.get("guild_label", "") or "").strip() if isinstance(entry, dict) else ""
-        if guild_label:
-            short = _short_guild_label(guild_label)
-            name = f"{name} ({short})" if short else name
-        label_txt = f" ({label})" if label else ""
-        maybe_lines.append(f"{name}{label_txt}")
-
-    emb.add_field(name=f"{EMOJI_MAYBE} Vielleicht ({len(maybe_lines)})", value="\n".join(maybe_lines) or "—", inline=False)
-
-    no_names = [_entry_display_name(u, guild) for u in no]
-    emb.add_field(name=f"{EMOJI_NO} Abgemeldet ({len(no_names)})", value="\n".join(no_names) or "—", inline=False)
-
-    tr_id = int(obj.get("target_role_id", 0) or 0)
-
-    if tr_id:
-        role = guild.get_role(tr_id)
-
-        if role:
-            emb.add_field(name=f"{EMOJI_TARGET} Zielgruppe", value=role.mention, inline=False)
-
-    if obj.get("voice_enabled"):
-        voice_id = int(obj.get("voice_channel_id", 0) or 0)
-        if voice_id:
-            emb.add_field(name="🔊 Voice", value=f"<#{voice_id}>", inline=False)
-        else:
-            emb.add_field(name="🔊 Voice", value="wird 1 Stunde vor Event automatisch erstellt", inline=False)
-
-    scheduled_event_id = int(obj.get("scheduled_event_id", 0) or 0)
-    if scheduled_event_id:
-        emb.add_field(
-            name="📅 Discord-Serverkalender",
-            value=f"[Termin öffnen](https://discord.com/events/{int(guild.id)}/{scheduled_event_id})",
-            inline=False,
-        )
-
-    if obj.get("image_url"):
-        emb.set_image(url=obj["image_url"])
-
-    emb.set_footer(text="DM-Buttons und Server-Buttons schreiben beide in dieselbe Anmeldung.")
-
-    return emb
-
-
-async def _delete_dm_message_for_user(client: discord.Client, obj: dict, user_id: int) -> bool:
-    _init_event_shape(obj)
-
-    dm_map = obj.get("dm_messages") or {}
-    mid = dm_map.get(str(user_id))
-
-    if not mid:
-        return False
-
-    user = client.get_user(int(user_id))
-
-    if user is None:
-        try:
-            user = await client.fetch_user(int(user_id))
-        except Exception:
-            user = None
-
-    deleted = False
-
-    if user is not None:
-        try:
-            dm = user.dm_channel or await user.create_dm()
-            msg = await dm.fetch_message(int(mid))
-
-            # Safety net: a broken/stale event dm_map must never be allowed to
-            # delete the user's current Gildenzentrale. If such a wrong mapping ever
-            # appears, forget the mapping but keep the menu message alive.
-            if int(mid) in _portal_message_ids_to_keep(client, int(user_id)) or _is_portal_message(msg):
-                dm_map.pop(str(user_id), None)
-                obj["dm_messages"] = dm_map
-                return False
-
-            await msg.delete()
-            deleted = True
+            role = guild.get_role(int(raw_setting))
+            if role is not None:
+                return role
         except Exception:
             pass
 
-    dm_map.pop(str(user_id), None)
-    obj["dm_messages"] = dm_map
-
-    return deleted
-
-
-def _portal_protected_titles() -> set[str]:
-    return {
-        "⚜️ Ebolus Gildenzentrale",
-        f"{EMOJI_EBOLUS} Ebolus Gildenzentrale",
-        "🏰 ebolus – Gildenzentrale",
-
-        "👤 Persönlich",
-        f"{EMOJI_PERSONAL} Persönlich",
-        "🎁 Loot & Bedarf",
-        f"{EMOJI_LOOT} Loot & Bedarf",
-        "📅 Gilde",
-        f"{EMOJI_GUILD} Gilde",
-        "🛡️ Kontakt & Hilfe",
-        f"{EMOJI_CONTACT} Kontakt & Hilfe",
-        f"{EMOJI_ADMIN} Admin",
-        "<:gilde:1516444419040215050> Gilde",
-        "<:gilde:1516444419040215050> Admin – Event",
-
-        "👤 Dein Gildenprofil",
-        "📅 Ebolus Gildenkalender",
-        "📅 Gildenkalender – ebolus",
-        "📅 Gilden-Events",
-        "❓ Hilfe – Ebolus Gildenbot",
-        "❓ Hilfe – ebolus Gildenbot",
-        "👥 Ebolus Mitglieder",
-        "👥 Mitgliederliste – ebolus",
-        "📜 Regeln & Lootsystem",
-        "📜 Regeln & Lootsystem – ebolus",
-        "🎁 Needliste – ebolus",
-        "⚜️ Gildenzentrale",
-        "⚜️ Ebolus Gildenzentrale",
-    }
-
-
-def _is_auction_message(msg: discord.Message) -> bool:
-    """Schützt Auktions-/Loot-DMs vor der RSVP-Aufräumroutine.
-
-    Nach einer Rollen-/RSVP-Auswahl sollen alte Event-DMs verschwinden.
-    Gildenzentrale und Auktions-/Loot-Tracking-DMs dürfen aber bleiben.
-    """
-    try:
-        title = ""
-        desc = ""
-        if msg.embeds:
-            title = str(msg.embeds[0].title or "")
-            desc = str(msg.embeds[0].description or "")
-        content = str(getattr(msg, "content", "") or "")
-        hay = f"{title}\n{desc}\n{content}".lower()
-
-        auction_needles = (
-            "auktion",
-            "auktionen",
-            "need-auktion",
-            "main-need-auktion",
-            "second-need-auktion",
-            "freie auktion",
-            "loot-auktion",
-            "sale-kauf",
-            "müll-item",
-            "sofortkauf",
-            "ec-gebot",
-            "gebot",
-        )
-        return any(n in hay for n in auction_needles)
-    except Exception:
-        return False
-
-
-def _is_protected_bot_dm_message(client: discord.Client, msg: discord.Message, user_id: int) -> bool:
-    """Alles, was nach einer RSVP-Auswahl im DM-Verlauf bleiben darf."""
-    try:
-        if int(msg.id) in _portal_message_ids_to_keep(client, int(user_id)):
-            return True
-    except Exception:
-        pass
-
-    try:
-        if _is_portal_message(msg):
-            return True
-    except Exception:
-        pass
-
-    try:
-        if _is_auction_message(msg):
-            return True
-    except Exception:
-        pass
-
-    return False
-
-
-def _is_portal_message(msg: discord.Message) -> bool:
-    if not msg.embeds:
-        return False
-
-    title = msg.embeds[0].title or ""
-    return title in _portal_protected_titles()
-
-
-def _portal_message_ids_to_keep(client: discord.Client, user_id: int) -> set[int]:
-    """Return stored Gildenzentrale message IDs for this user across all guilds.
-
-    The RSVP cleanup runs from the event module and used to decide mostly by
-    embed title. That was risky because the same saved portal DM can temporarily
-    show admin/event/auction/need wizard pages with titles that are not in the
-    static allow-list. Message-ID protection is the reliable source of truth.
-    """
-    keep: set[int] = set()
-
-    try:
+    raw_role_id = os.getenv("DASHBOARD_MEMBER_ROLE_ID", "").strip()
+    if raw_role_id:
         try:
-            from bot import member_portal as mp  # type: ignore
+            role = guild.get_role(int(raw_role_id))
+            if role is not None:
+                return role
         except Exception:
+            pass
+
+    # Kein Ebolus-Default mehr. Rollenname nur, wenn Betreiber ihn bewusst setzt.
+    role_name = os.getenv("DASHBOARD_MEMBER_ROLE_NAME", "").strip().lower()
+    if role_name:
+        for role in getattr(guild, "roles", []):
             try:
-                import member_portal as mp  # type: ignore
-            except Exception:
-                mp = None  # type: ignore
-
-        if mp is None:
-            return keep
-
-        for guild in getattr(client, "guilds", []) or []:
-            try:
-                member = guild.get_member(int(user_id))
-                if not member or member.bot:
-                    continue
-
-                mid = int(mp._portal_message_id(int(guild.id), int(user_id)) or 0)  # type: ignore[attr-defined]
-                if mid:
-                    keep.add(mid)
+                if str(getattr(role, "name", "")).strip().lower() == role_name:
+                    return role
             except Exception:
                 continue
-
-    except Exception:
-        pass
-
-    return keep
-
-
-def _pending_dm_message_ids_to_keep(user_id: int, current_msg_id: str | None = None) -> set[int]:
-    """
-    Behält offene Raid-DMs anderer Events, wenn:
-    - Event noch nicht vorbei ist
-    - User dort noch nicht abgestimmt hat
-    - es nicht die gerade geklickte Event-DM ist
-    """
-    keep: set[int] = set()
-    now = datetime.now(TZ)
-
-    for msg_id, obj in list(store.items()):
-        try:
-            if current_msg_id and str(msg_id) == str(current_msg_id):
-                continue
-
-            _init_event_shape(obj)
-
-            when = datetime.fromisoformat(obj.get("when_iso"))
-            if now > when + timedelta(hours=2):
-                continue
-
-            if int(user_id) in _voters_set(obj):
-                continue
-
-            dm_map = obj.get("dm_messages") or {}
-            mid = dm_map.get(str(user_id))
-
-            if mid:
-                keep.add(int(mid))
-
-        except Exception:
-            continue
-
-    return keep
-
-
-def _known_dm_message_ids_for_user(user_id: int) -> dict[int, str]:
-    """
-    Map: DM-Message-ID -> Event-Message-ID
-    """
-    known: dict[int, str] = {}
-
-    for msg_id, obj in list(store.items()):
-        try:
-            _init_event_shape(obj)
-            dm_map = obj.get("dm_messages") or {}
-            mid = dm_map.get(str(user_id))
-
-            if mid:
-                known[int(mid)] = str(msg_id)
-
-        except Exception:
-            continue
-
-    return known
-
-
-async def _delete_irrelevant_bot_dm_messages_for_user(
-    client: discord.Client,
-    user_id: int,
-    current_msg_id: str | None = None,
-    limit: int = 200
-) -> int:
-    """
-    Löscht alte/erledigte Bot-DMs.
-    Schützt:
-    - aktive Gildenzentrale und Portal-Unterseiten
-    - offene Raid-DMs anderer Events, bei denen der User noch nicht abgestimmt hat
-
-    Löscht:
-    - aktuelle Raid-DM nach Auswahl
-    - alte Bot-DMs
-    - erledigte Raid-DMs
-    - gestartete/veraltete Raid-DMs
-
-    Wichtig:
-    Die Gildenzentrale wird hier NICHT neu gesendet und NICHT editiert.
-    """
-    if client.user is None:
-        return 0
-
-    user = client.get_user(int(user_id))
-
-    if user is None:
-        try:
-            user = await client.fetch_user(int(user_id))
-        except Exception:
-            return 0
-
-    keep_dm_ids = _pending_dm_message_ids_to_keep(user_id, current_msg_id=current_msg_id)
-    known_dm_ids = _known_dm_message_ids_for_user(user_id)
-    portal_keep_ids = _portal_message_ids_to_keep(client, user_id)
-
-    deleted = 0
-    deleted_or_stale_dm_ids: set[int] = set()
-
-    try:
-        dm = user.dm_channel or await user.create_dm()
-
-        async for msg in dm.history(limit=limit):
-            try:
-                if msg.author.id != client.user.id:
-                    continue
-
-                if _is_protected_bot_dm_message(client, msg, int(user_id)):
-                    continue
-
-                if msg.id in keep_dm_ids:
-                    continue
-
-                # Nach einer erfolgreichen Rollen-/RSVP-Auswahl soll der Bot-DM-Verlauf sauber sein.
-                # Behalten werden nur Gildenzentrale/Portal, offene Event-DMs anderer Events
-                # und Auktions-/Loot-DMs. Alles andere vom Bot darf weg.
-                await msg.delete()
-                deleted += 1
-                deleted_or_stale_dm_ids.add(int(msg.id))
-                await asyncio.sleep(0.05)
-
-            except Exception:
-                pass
-
-    except Exception:
-        pass
-
-    changed_store = False
-
-    for dm_id, event_msg_id in known_dm_ids.items():
-        try:
-            if dm_id in keep_dm_ids:
-                continue
-
-            obj = store.get(str(event_msg_id))
-            if not obj:
-                continue
-
-            dm_map = obj.get("dm_messages") or {}
-
-            if dm_map.get(str(user_id)) == dm_id:
-                dm_map.pop(str(user_id), None)
-                obj["dm_messages"] = dm_map
-                changed_store = True
-
-        except Exception:
-            continue
-
-    if changed_store:
-        save_store()
-
-    return deleted
-
-
-async def _delete_all_pending_dm_messages_for_event(client: discord.Client, obj: dict) -> int:
-    _init_event_shape(obj)
-
-    removed = 0
-
-    for uid_str in list((obj.get("dm_messages") or {}).keys()):
-        try:
-            uid = int(uid_str)
-        except Exception:
-            obj["dm_messages"].pop(uid_str, None)
-            removed += 1
-            continue
-
-        try:
-            ok = await _delete_dm_message_for_user(client, obj, uid)
-
-            if ok or str(uid) not in obj.get("dm_messages", {}):
-                removed += 1
-
-        except Exception:
-            obj["dm_messages"].pop(str(uid), None)
-            removed += 1
-
-    return removed
-
-
-
-def _attendance_guild_bucket(guild_id: int) -> dict:
-    g = attendance_store.get(str(guild_id)) or {}
-    g.setdefault("events", {})
-    attendance_store[str(guild_id)] = g
-    return g
-
-
-def _attendance_participants_from_event(obj: dict) -> list[dict]:
-    _init_event_shape(obj)
-    out: list[dict] = []
-    seen: set[int] = set()
-
-    for role_key in ("TANK", "HEAL", "DPS", "BANK"):
-        for entry in obj.get("yes", {}).get(role_key, []) or []:
-            uid = _entry_user_id(entry)
-            if not uid or uid in seen:
-                continue
-            seen.add(uid)
-            out.append({
-                "id": int(uid),
-                "name": _entry_name(entry),
-                "signup": role_key,
-            })
-
-    return out
-
-
-def ensure_attendance_snapshot(client: discord.Client, msg_id: str, obj: dict) -> dict | None:
-    """
-    Speichert eine Event-/Teilnehmer-Kopie für die spätere Anwesenheitsprüfung.
-    Dadurch bleibt die Anwesenheit auswertbar, auch wenn der normale RSVP-Post später bereinigt wird.
-    """
-    try:
-        _init_event_shape(obj)
-        guild_id = int(obj.get("guild_id", 0) or 0)
-        if not guild_id:
-            return None
-
-        g = _attendance_guild_bucket(guild_id)
-        events = g.setdefault("events", {})
-        event_id = str(msg_id)
-        snap = events.get(event_id)
-
-        participants = _attendance_participants_from_event(obj)
-
-        if not isinstance(snap, dict):
-            snap = {
-                "event_id": event_id,
-                "guild_id": guild_id,
-                "channel_id": int(obj.get("channel_id", 0) or 0),
-                "message_id": event_id,
-                "title": str(obj.get("title", "Event") or "Event"),
-                "description": str(obj.get("description", "") or ""),
-                "when_iso": str(obj.get("when_iso", "") or ""),
-                "created_at": datetime.now(TZ).isoformat(),
-                "participants": participants,
-                "attendance": {},
-                "dkp_enabled": bool(obj.get("dkp_enabled", False)),
-                "dkp_event_type": str(obj.get("dkp_event_type", "") or ""),
-                "voice_channel_id": int(obj.get("voice_channel_id", 0) or 0),
-                "voice_last_channel_id": int(obj.get("voice_last_channel_id", obj.get("voice_channel_id", 0)) or 0),
-                "voice_name": str(obj.get("voice_name", "") or ""),
-            }
-        else:
-            # Teilnehmerliste aktualisieren, aber bereits gesetzte Anwesenheit behalten.
-            # Wichtig: manuell nachgetragene EC-Teilnehmer dürfen dabei nicht verschwinden,
-            # wenn der Snapshot später noch einmal aus der ursprünglichen RSVP-Liste erneuert wird.
-            old_att = snap.get("attendance") if isinstance(snap.get("attendance"), dict) else {}
-            old_participants = snap.get("participants") if isinstance(snap.get("participants"), list) else []
-            seen_ids = set()
-            for _p in participants:
-                try:
-                    _uid = int(_p.get("id", 0) or 0)
-                except Exception:
-                    _uid = 0
-                if _uid:
-                    seen_ids.add(_uid)
-            for _p in old_participants:
-                try:
-                    _uid = int(_p.get("id", 0) or 0)
-                except Exception:
-                    _uid = 0
-                if not _uid or _uid in seen_ids:
-                    continue
-                is_manual = bool(_p.get("manual")) or str(_p.get("source", "") or "") == "manual" or str(_p.get("signup", "") or "") == "MANUAL"
-                has_marked_attendance = str(_uid) in old_att
-                if is_manual or has_marked_attendance:
-                    _copy = dict(_p)
-                    _copy.setdefault("manual", True)
-                    _copy.setdefault("source", "manual")
-                    participants.append(_copy)
-                    seen_ids.add(_uid)
-
-            snap["guild_id"] = guild_id
-            snap["channel_id"] = int(obj.get("channel_id", 0) or 0)
-            snap["message_id"] = event_id
-            snap["title"] = str(obj.get("title", "Event") or "Event")
-            snap["description"] = str(obj.get("description", "") or "")
-            snap["when_iso"] = str(obj.get("when_iso", "") or "")
-            snap["participants"] = participants
-            snap["attendance"] = old_att
-            # EC-/DKP-Metadaten müssen in den Attendance-Snapshot mitwandern.
-            # Sonst kann man in der Gildenzentrale später Anwesenheit bearbeiten,
-            # aber keine EC vergeben, obwohl das ursprüngliche Event EC-relevant war.
-            snap["dkp_enabled"] = bool(obj.get("dkp_enabled", False))
-            snap["dkp_event_type"] = str(obj.get("dkp_event_type", "") or "")
-            snap["voice_channel_id"] = int(obj.get("voice_channel_id", 0) or 0)
-            snap["voice_last_channel_id"] = int(obj.get("voice_last_channel_id", obj.get("voice_channel_id", 0)) or 0)
-            snap["voice_name"] = str(obj.get("voice_name", "") or "")
-
-        events[event_id] = snap
-        save_attendance()
-        return snap
-
-    except Exception as e:
-        print(f"[event_rsvp_dm] Attendance-Snapshot Fehler: {e!r}")
-        return None
-
-
-def get_attendance_events_for_guild(guild_id: int) -> list[dict]:
-    g = _attendance_guild_bucket(int(guild_id))
-    events = list((g.get("events") or {}).values())
-
-    def _key(ev: dict):
-        try:
-            return datetime.fromisoformat(str(ev.get("when_iso", "")))
-        except Exception:
-            return datetime.min.replace(tzinfo=TZ)
-
-    events.sort(key=_key, reverse=True)
-    return events
-
-
-def get_attendance_event(guild_id: int, event_id: str) -> dict | None:
-    g = _attendance_guild_bucket(int(guild_id))
-    ev = (g.get("events") or {}).get(str(event_id))
-    return ev if isinstance(ev, dict) else None
-
-
-def _attendance_find_participant(ev: dict, user_id: int) -> dict | None:
-    participants = ev.setdefault("participants", [])
-    for p in participants:
-        try:
-            if int(p.get("id", 0) or 0) == int(user_id):
-                return p
-        except Exception:
-            continue
     return None
 
 
-def add_attendance_participant(guild_id: int, event_id: str, user_id: int, name: str, signup: str = "DPS", status: str = "present", marked_by: int = 0) -> bool:
-    """Fügt einen Spieler nachträglich zur EC-Anwesenheitsliste hinzu.
+def _dashboard_member_ids(guild: discord.Guild) -> set[int]:
+    role = _dashboard_member_role(guild)
+    if role is not None:
+        return {int(m.id) for m in getattr(role, "members", []) if getattr(m, "id", None)}
+    # Absichtlich kein Fallback auf alle Servermitglieder. Für Massentauglichkeit
+    # muss eine Gildenrolle gesetzt sein.
+    return set()
 
-    signup: TANK/HEAL/DPS/BANK. BANK zählt später als Reserve.
-    status: present/absent/excused/maybe/clear. maybe/offen geben keine EC.
+
+def _parse_role_id_values(raw: Any) -> list[int]:
+    values: list[int] = []
+    if isinstance(raw, list):
+        seq = raw
+    elif isinstance(raw, str):
+        try:
+            loaded = json.loads(raw)
+            seq = loaded if isinstance(loaded, list) else [x.strip() for x in raw.replace(";", ",").split(",") if x.strip()]
+        except Exception:
+            seq = [x.strip() for x in raw.replace(";", ",").split(",") if x.strip()]
+    elif raw not in (None, ""):
+        seq = [raw]
+    else:
+        seq = []
+
+    for item in seq:
+        try:
+            rid = int(item)
+            if rid and rid not in values:
+                values.append(rid)
+        except Exception:
+            continue
+    return values
+
+
+def _dashboard_role_config_values(guild_id: int, setting_name: str, env_name: str) -> list[int]:
+    """Rollen-IDs fürs Dashboard aus Runtime-DB plus optionalem Railway-Fallback."""
+    raw = None
+    try:
+        raw = runtime_db.get_guild_setting(int(guild_id), setting_name, None)
+    except Exception as exc:
+        print(f"⚠️ Dashboard-Rollen-Setting konnte nicht gelesen werden ({setting_name}): {exc!r}", flush=True)
+        raw = None
+
+    values = _parse_role_id_values(raw)
+
+    env_ids = os.getenv(env_name, "").strip()
+    for rid in _parse_role_id_values(env_ids):
+        if rid not in values:
+            values.append(rid)
+    return values
+
+
+def _portal_position_role_ids(guild_id: int) -> list[int]:
+    """Leitungsrollen aus der Gildenzentrale lesen.
+
+    Gildenmeister, Gildenberater und Gildenwächter sollen im Dashboard dieselben
+    Adminrechte erhalten wie eine explizit gesetzte Dashboard-Adminrolle. Die
+    Rollen werden aus ``member_portal_cfg.json`` gelesen, damit keine zweite
+    Rollenpflege nötig ist.
     """
-    ev = get_attendance_event(int(guild_id), str(event_id))
-    if not ev:
-        return False
-    signup = str(signup or "DPS").upper().strip()
-    if signup not in {"TANK", "HEAL", "DPS", "BANK"}:
-        signup = "DPS"
-    p = _attendance_find_participant(ev, int(user_id))
-    if not p:
-        ev.setdefault("participants", []).append({
-            "id": int(user_id),
-            "name": str(name or f"User {user_id}"),
-            "signup": signup,
-            "manual": True,
-            "source": "manual",
-            "added_by": int(marked_by or 0),
-            "added_at": datetime.now(TZ).isoformat(),
+    try:
+        raw = _load_json_file(JSON_SOURCES["member_portal_cfg"], {})
+        scoped = raw.get(str(int(guild_id))) if isinstance(raw, dict) else {}
+        if not isinstance(scoped, dict):
+            scoped = {}
+        roles = scoped.get("position_roles") or {}
+        if not isinstance(roles, dict):
+            return []
+        out: list[int] = []
+        for key in ("leader", "advisor", "guardian"):
+            try:
+                rid = int(roles.get(key, 0) or 0)
+            except Exception:
+                rid = 0
+            if rid and rid not in out:
+                out.append(rid)
+        return out
+    except Exception as exc:
+        print(f"⚠️ Portal-Positionsrollen konnten nicht gelesen werden: {exc!r}", flush=True)
+        return []
+
+
+def _dashboard_admin_role_config_values(guild_id: int) -> list[int]:
+    values = _dashboard_role_config_values(guild_id, DASHBOARD_ADMIN_ROLE_SETTING, "DASHBOARD_ADMIN_ROLE_IDS")
+    for rid in _portal_position_role_ids(guild_id):
+        if rid not in values:
+            values.append(rid)
+    return values
+
+
+def _dashboard_allowed_role_config_values(guild_id: int) -> list[int]:
+    return _dashboard_role_config_values(guild_id, DASHBOARD_ALLOWED_ROLE_SETTING, "DASHBOARD_ALLOWED_ROLE_IDS")
+
+
+def _roles_from_ids(guild: discord.Guild, role_ids: list[int]) -> list[discord.Role]:
+    out: list[discord.Role] = []
+    for rid in role_ids:
+        role = guild.get_role(int(rid))
+        if role is not None and role not in out:
+            out.append(role)
+    return out
+
+
+def _dashboard_admin_roles(guild: discord.Guild) -> list[discord.Role]:
+    return _roles_from_ids(guild, _dashboard_admin_role_config_values(guild.id))
+
+
+def _dashboard_allowed_roles(guild: discord.Guild) -> list[discord.Role]:
+    return _roles_from_ids(guild, _dashboard_allowed_role_config_values(guild.id))
+
+
+def _dashboard_auth_info(guild: discord.Guild) -> dict[str, Any]:
+    """Auth-Lesemodell fürs Web-Dashboard.
+
+    Wichtig: Die Website muss damit für den Discord-Login keine Rollen direkt
+    über Discord OAuth abfragen. Der Bot ist ohnehin im Server und schreibt
+    die erlaubten User-IDs in den Snapshot. Das ist robuster und vermeidet
+    403-Probleme bei guilds.members.read.
+    """
+    member_role = _dashboard_member_role(guild)
+    member_ids = set(_dashboard_member_ids(guild))
+    member_id_strings = sorted(str(x) for x in member_ids)
+
+    allowed_roles = _dashboard_allowed_roles(guild)
+    allowed_role_rows: list[dict[str, Any]] = []
+    role_allowed_ids: set[int] = set()
+    for role in allowed_roles:
+        members = [m for m in getattr(role, "members", []) if getattr(m, "id", None)]
+        role_allowed_ids.update(int(m.id) for m in members)
+        allowed_role_rows.append({
+            "role_id": str(role.id),
+            "role_name": str(role.name),
+            "member_count": len(members),
         })
-    else:
-        p["name"] = str(name or p.get("name") or f"User {user_id}")
-        p["signup"] = signup
-        p["manual"] = bool(p.get("manual", False)) or True
-        p["source"] = str(p.get("source", "") or "manual")
-        p["updated_by"] = int(marked_by or 0)
-        p["updated_at"] = datetime.now(TZ).isoformat()
-    return set_attendance_status(guild_id, event_id, user_id, status, marked_by)
+
+    allowed_ids = sorted(str(x) for x in (member_ids | role_allowed_ids))
+
+    admin_roles = _dashboard_admin_roles(guild)
+    admin_ids: set[int] = set()
+    admin_role_rows: list[dict[str, Any]] = []
+    for role in admin_roles:
+        members = [m for m in getattr(role, "members", []) if getattr(m, "id", None)]
+        admin_ids.update(int(m.id) for m in members)
+        admin_role_rows.append({
+            "role_id": str(role.id),
+            "role_name": str(role.name),
+            "member_count": len(members),
+        })
+    return {
+        "mode": "snapshot_role_check",
+        "member_role": {
+            "role_id": str(member_role.id) if member_role else "",
+            "role_name": str(member_role.name) if member_role else "",
+            "member_count": len(member_ids),
+            "member_ids": member_id_strings,
+            "configured": member_role is not None,
+        },
+        "allowed_roles": allowed_role_rows,
+        "admin_roles": admin_role_rows,
+        "allowed_member_ids": allowed_ids,
+        "admin_member_ids": sorted(str(x) for x in admin_ids),
+        "counts": {
+            "allowed_members": len(allowed_ids),
+            "member_role_members": len(member_ids),
+            "allowed_role_members": len(role_allowed_ids),
+            "admin_members": len(admin_ids),
+            "allowed_roles": len(allowed_role_rows),
+            "admin_roles": len(admin_role_rows),
+        },
+    }
 
 
-def remove_attendance_participant(guild_id: int, event_id: str, user_id: int, marked_by: int = 0) -> bool:
-    """Entfernt einen Spieler komplett aus der EC-Anwesenheitsliste."""
-    ev = get_attendance_event(int(guild_id), str(event_id))
-    if not ev:
-        return False
-    before = len(ev.get("participants") or [])
-    ev["participants"] = [p for p in (ev.get("participants") or []) if int(p.get("id", 0) or 0) != int(user_id)]
-    attendance = ev.setdefault("attendance", {})
-    attendance.pop(str(user_id), None)
-    ev["last_removed_by"] = int(marked_by or 0)
-    ev["last_removed_at"] = datetime.now(TZ).isoformat()
-    save_attendance()
-    return len(ev.get("participants") or []) != before
-
-
-def set_attendance_signup(guild_id: int, event_id: str, user_id: int, signup: str, marked_by: int = 0) -> bool:
-    ev = get_attendance_event(int(guild_id), str(event_id))
-    if not ev:
-        return False
-    p = _attendance_find_participant(ev, int(user_id))
-    if not p:
-        return False
-    signup = str(signup or "DPS").upper().strip()
-    if signup not in {"TANK", "HEAL", "DPS", "BANK"}:
-        signup = "DPS"
-    p["signup"] = signup
-    p["updated_by"] = int(marked_by or 0)
-    p["updated_at"] = datetime.now(TZ).isoformat()
-    save_attendance()
-    return True
-
-
-def set_attendance_status(guild_id: int, event_id: str, user_id: int, status: str, marked_by: int) -> bool:
-    ev = get_attendance_event(int(guild_id), str(event_id))
-    if not ev:
-        return False
-
-    valid = {"present", "absent", "excused", "maybe"}
-    attendance = ev.setdefault("attendance", {})
-
-    if status == "clear":
-        attendance.pop(str(user_id), None)
-    elif status in valid:
-        attendance[str(user_id)] = {
-            "status": status,
-            "marked_by": int(marked_by),
-            "marked_at": datetime.now(TZ).isoformat(),
+def _dashboard_member_filter_info(guild: discord.Guild) -> dict[str, Any]:
+    role = _dashboard_member_role(guild)
+    ids = _dashboard_member_ids(guild)
+    configured = _dashboard_member_role_config_value(guild.id)
+    if role is not None:
+        return {
+            "mode": "discord_role",
+            "role_id": int(role.id),
+            "role_name": str(role.name),
+            "eligible_count": len(ids),
+            "configured": True,
+            "setting_value": str(configured or os.getenv("DASHBOARD_MEMBER_ROLE_ID") or os.getenv("DASHBOARD_MEMBER_ROLE_NAME") or ""),
         }
-    else:
-        return False
-
-    save_attendance()
-    return True
-
-
-def _event_voice_name(title: str) -> str:
-    raw = str(title or "Event").strip() or "Event"
-    raw = re.sub(r"[#@`*_~|<>\n\r]+", "", raw).strip()
-    if len(raw) > 60:
-        raw = raw[:60].strip()
-    return f"🔊 {raw}"
+    return {
+        "mode": "role_not_configured",
+        "role_id": 0,
+        "role_name": "",
+        "eligible_count": 0,
+        "configured": False,
+        "setting_value": str(configured or ""),
+        "hint": "Mit /dashboard_set_member_role role:<Rolle> eine Gildenrolle setzen.",
+    }
 
 
-def _event_voice_window(obj: dict) -> tuple[datetime, datetime]:
-    when = datetime.fromisoformat(str(obj.get("when_iso", "")))
-    return when - timedelta(hours=1), when + timedelta(minutes=30)
-
-
-def _event_voice_category_and_anchor(guild: discord.Guild, obj: dict) -> tuple[Optional[discord.CategoryChannel], Optional[discord.VoiceChannel]]:
-    category = guild.get_channel(int(obj.get("voice_category_id", 0) or 0))
-    if category is not None and not isinstance(category, discord.CategoryChannel):
-        category = None
-
-    anchor = guild.get_channel(int(obj.get("voice_return_channel_id", 0) or 0))
-    if anchor is not None and not isinstance(anchor, discord.VoiceChannel):
-        anchor = None
-
-    if category is None and isinstance(anchor, discord.VoiceChannel) and anchor.category:
-        category = anchor.category
-
-    if category is None:
-        overview = guild.get_channel(int(obj.get("channel_id", 0) or 0))
-        if isinstance(overview, (discord.TextChannel, discord.Thread)):
-            parent = overview.parent if isinstance(overview, discord.Thread) else overview
-            if isinstance(parent, discord.TextChannel) and parent.category:
-                category = parent.category
-
-    return category, anchor
-
-
-async def _position_event_voice(channel: discord.VoiceChannel, anchor: Optional[discord.VoiceChannel]) -> None:
-    """Platziert den Event-Voice möglichst direkt bei den anderen Event-/Sammel-Voices."""
+def _is_dashboard_member(guild: discord.Guild, user_id: int) -> bool:
     try:
-        if isinstance(anchor, discord.VoiceChannel) and anchor.category_id == channel.category_id:
-            await channel.edit(position=anchor.position + 1, reason="Event-Voice bei Sammel-Voice einsortiert")
-            return
-
-        if channel.category:
-            siblings = [c for c in channel.category.voice_channels if c.id != channel.id]
-            if siblings:
-                target = max(c.position for c in siblings) + 1
-                await channel.edit(position=target, reason="Event-Voice in Event-Voice-Kategorie einsortiert")
-    except Exception as e:
-        print(f"[event_rsvp_dm] Event-Voice konnte nicht einsortiert werden: {e!r}")
-
-
-async def _maybe_create_event_voice_for_obj(client: discord.Client, obj: dict) -> bool:
-    """Erstellt den Event-Voice frühestens 1 Stunde vor Eventbeginn."""
-    try:
-        _init_event_shape(obj)
-
-        if not bool(obj.get("voice_enabled", False)):
-            return False
-
-        if bool(obj.get("voice_cleanup_done", False)):
-            return False
-
-        create_at, delete_after = _event_voice_window(obj)
-        now = datetime.now(TZ)
-
-        if now < create_at:
-            return False
-
-        # Wenn der Bot erst nach dem Löschfenster startet, wird kein alter Voice mehr erstellt.
-        if now >= delete_after:
-            return False
-
-        guild_id = int(obj.get("guild_id", 0) or 0)
-        guild = client.get_guild(guild_id) if guild_id else None
-        if guild is None:
-            return False
-
-        existing_id = int(obj.get("voice_channel_id", 0) or 0)
-        if existing_id:
-            existing = guild.get_channel(existing_id)
-            if isinstance(existing, discord.VoiceChannel):
-                return False
-            obj["voice_channel_id"] = 0
-
-        category, anchor = _event_voice_category_and_anchor(guild, obj)
-        name = str(obj.get("voice_name", "") or "").strip() or _event_voice_name(str(obj.get("title", "Event")))
-
-        channel = await guild.create_voice_channel(
-            name=name,
-            category=category,
-            reason="Event-Voice automatisch 1 Stunde vor Event erstellt",
-        )
-        await _position_event_voice(channel, anchor)
-
-        obj["voice_channel_id"] = int(channel.id)
-        obj["voice_last_channel_id"] = int(channel.id)
-        obj["voice_created_at"] = now.isoformat()
-        obj["voice_name"] = name
-        obj["voice_cleanup_done"] = False
-        print(f"[event_rsvp_dm] Event-Voice erstellt: {channel.id} für {obj.get('title')}")
-        return True
-
-    except Exception as e:
-        print(f"[event_rsvp_dm] Event-Voice Erstellung Fehler: {e!r}")
+        return int(user_id) in _dashboard_member_ids(guild)
+    except Exception:
         return False
 
 
-async def _cleanup_event_voice_for_obj(client: discord.Client, obj: dict) -> bool:
-    """Löscht den Event-Voice ab 30 Minuten nach Eventbeginn, sobald niemand mehr drin ist."""
+def _active_member_ids(guild: discord.Guild) -> set[int]:
     try:
-        _init_event_shape(obj)
-
-        if bool(obj.get("voice_cleanup_done", False)):
-            return False
-
-        if not bool(obj.get("voice_enabled", False)):
-            return False
-
-        _create_at, delete_after = _event_voice_window(obj)
-        now = datetime.now(TZ)
-        if now < delete_after:
-            return False
-
-        voice_channel_id = int(obj.get("voice_channel_id", 0) or 0)
-        if not voice_channel_id:
-            # Nach dem Löschfenster gibt es nichts mehr zu tun, wenn nie ein Voice erstellt wurde.
-            obj["voice_cleanup_done"] = True
-            return True
-
-        guild_id = int(obj.get("guild_id", 0) or 0)
-        guild = client.get_guild(guild_id) if guild_id else None
-        if guild is None:
-            return False
-
-        channel = guild.get_channel(voice_channel_id)
-        if not isinstance(channel, discord.VoiceChannel):
-            obj["voice_cleanup_done"] = True
-            if voice_channel_id:
-                obj["voice_last_channel_id"] = int(voice_channel_id)
-            obj["voice_channel_id"] = 0
-            return True
-
-        if len(channel.members) > 0:
-            # Nicht verschieben, nicht kicken. Erst löschen, wenn alle raus sind.
-            return False
-
-        try:
-            await channel.delete(reason="Event-Voice automatisch gelöscht, nachdem er leer war")
-        except Exception as e:
-            print(f"[event_rsvp_dm] Event-Voice konnte nicht gelöscht werden: {e!r}")
-            return False
-
-        obj["voice_cleanup_done"] = True
-        obj["voice_last_channel_id"] = int(voice_channel_id)
-        obj["voice_channel_id"] = 0
-        print(f"[event_rsvp_dm] Event-Voice gelöscht: {voice_channel_id}")
-        return True
-
-    except Exception as e:
-        print(f"[event_rsvp_dm] Event-Voice Cleanup Fehler: {e!r}")
-        return False
-
-
-async def _cleanup_empty_event_voice_by_channel_id(client: discord.Client, channel_id: int) -> bool:
-    changed = False
-    for _msg_id, obj in list(store.items()):
-        try:
-            _init_event_shape(obj)
-            if int(obj.get("voice_channel_id", 0) or 0) != int(channel_id):
-                continue
-            if await _cleanup_event_voice_for_obj(client, obj):
-                changed = True
-        except Exception as e:
-            print(f"[event_rsvp_dm] Voice-State Cleanup Fehler: {e!r}")
-    if changed:
-        save_store()
-    return changed
-
-
-async def delete_pending_dm_messages_for_started_events(client: discord.Client) -> int:
-    changed = 0
-    now = datetime.now(TZ)
-
-    for _msg_id, obj in list(store.items()):
-        try:
-            _init_event_shape(obj)
-            when = datetime.fromisoformat(obj.get("when_iso"))
-        except Exception:
-            continue
-
-        try:
-            if await _cleanup_event_voice_for_obj(client, obj):
-                changed += 1
-        except Exception as e:
-            print(f"[delete_pending_dm_messages_for_started_events] Voice-Cleanup Fehler: {e!r}")
-
-        if now < when:
-            continue
-
-        dm_map = obj.get("dm_messages") or {}
-
-        if not dm_map:
-            continue
-
-        for uid_str in list(dm_map.keys()):
-            try:
-                uid = int(uid_str)
-            except Exception:
-                obj["dm_messages"].pop(uid_str, None)
-                changed += 1
-                continue
-
-            voted = uid in _voters_set(obj)
-
-            try:
-                ok = await _delete_dm_message_for_user(client, obj, uid)
-
-                if ok or voted or str(uid) not in obj.get("dm_messages", {}):
-                    changed += 1
-
-            except Exception:
-                obj["dm_messages"].pop(str(uid), None)
-                changed += 1
-
-    return changed
-
-
-async def _push_overview(client: discord.Client, msg_id: str, obj: dict):
-    _init_event_shape(obj)
-
-    if _is_alliance_event(obj) and obj.get("mirrors"):
-        master_id = int(obj.get("message_id", msg_id) or msg_id)
-
-        for mirror in list(obj.get("mirrors") or []):
-            try:
-                guild = client.get_guild(int(mirror.get("guild_id", 0) or 0))
-
-                if not guild:
-                    continue
-
-                ch = guild.get_channel(int(mirror.get("channel_id", 0) or 0))
-
-                if not isinstance(ch, (discord.TextChannel, discord.Thread)):
-                    continue
-
-                msg = await ch.fetch_message(int(mirror.get("message_id", 0) or 0))
-                emb = build_embed(guild, obj)
-                await msg.edit(embed=emb, view=ServerRaidView(master_id))
-
-            except Exception:
-                continue
-
-        return
-
-    guild = client.get_guild(int(obj["guild_id"]))
-
-    if not guild:
-        return
-
-    ch = guild.get_channel(int(obj["channel_id"]))
-
-    if not isinstance(ch, (discord.TextChannel, discord.Thread)):
-        return
-
-    try:
-        msg = await ch.fetch_message(int(msg_id))
-    except Exception:
-        return
-
-    emb = build_embed(guild, obj)
-
-    try:
-        await msg.edit(embed=emb, view=ServerRaidView(int(msg_id)))
-    except Exception:
-        pass
-
-
-async def _refresh_existing_portal_for_user(client: discord.Client, guild_id: int, user_id: int) -> bool:
-    """
-    Aktualisiert nur eine bereits vorhandene Gildenzentrale per msg.edit(...).
-    Wichtig: Diese Funktion sendet KEINE neue DM.
-    """
-    try:
-        try:
-            from bot.member_portal import (  # type: ignore
-                _fetch_portal_message,
-                _main_menu_embed,
-                MemberPortalMainView,
-            )
-        except ModuleNotFoundError:
-            from member_portal import (  # type: ignore
-                _fetch_portal_message,
-                _main_menu_embed,
-                MemberPortalMainView,
-            )
-
-        guild = client.get_guild(int(guild_id))
-
-        if not guild:
-            return False
-
-        member = guild.get_member(int(user_id))
-
-        if not member or member.bot:
-            return False
-
-        msg = await _fetch_portal_message(client, guild.id, member.id)
-
-        if msg is None:
-            return False
-
-        # Niemals einen Nutzer aus Profil, Auktion, Needliste oder einem
-        # Admin-Assistenten herauswerfen. Eventänderungen aktualisieren nur
-        # Portalnachrichten, die bereits auf der Startseite stehen.
-        current_title = ""
-        if msg.embeds:
-            current_title = str(msg.embeds[0].title or "")
-
-        main_titles = {
-            "⚜️ Ebolus Gildenzentrale",
-            f"{EMOJI_EBOLUS} Ebolus Gildenzentrale",
-            "🏰 ebolus – Gildenzentrale",
-        }
-        if current_title not in main_titles:
-            return False
-
-        await msg.edit(embed=_main_menu_embed(guild, member), view=MemberPortalMainView())
-        return True
-
-    except Exception as e:
-        print(f"[event_rsvp_dm] Portal-Refresh User Fehler: {e!r}")
-        return False
-
-
-async def _refresh_existing_portals_for_members(
-    client: discord.Client,
-    guild: discord.Guild,
-    members: Iterable[discord.Member],
-    delay: float = 0.08,
-) -> int:
-    refreshed = 0
-    seen: set[int] = set()
-
-    for member in members:
-        try:
-            if member.bot or member.id in seen:
-                continue
-
-            seen.add(member.id)
-
-            if await _refresh_existing_portal_for_user(client, guild.id, member.id):
-                refreshed += 1
-
-            if delay > 0:
-                await asyncio.sleep(delay)
-
-        except Exception:
-            continue
-
-    return refreshed
-
-
-async def _refresh_existing_portals_for_event(client: discord.Client, guild: discord.Guild, obj: dict) -> int:
-    """Aktualisiert bestehende Portal-Startseiten der Event-Zielgruppe. Sendet keine neuen DMs."""
-    try:
-        _init_event_shape(obj)
-        members = _eligible_members(guild, obj)
-        return await _refresh_existing_portals_for_members(client, guild, members)
-    except Exception as e:
-        print(f"[event_rsvp_dm] Portal-Refresh Event Fehler: {e!r}")
-        return 0
-
-
-def _schedule_portal_refresh_for_user(client: discord.Client, guild_id: int, user_id: int) -> None:
-    try:
-        asyncio.create_task(_refresh_existing_portal_for_user(client, guild_id, user_id))
-    except Exception:
-        pass
-
-
-def _schedule_portal_refresh_for_event(client: discord.Client, guild: Optional[discord.Guild], obj: dict) -> None:
-    if guild is None:
-        return
-
-    try:
-        asyncio.create_task(_refresh_existing_portals_for_event(client, guild, obj))
-    except Exception:
-        pass
-
-
-async def _member_allowed_for_target_role(inter: discord.Interaction, obj: dict, user_id: int) -> tuple[bool, str]:
-    """Blockt RSVP über Serverbuttons, wenn ein Event eine Zielrolle hat."""
-    role_id = int(obj.get("target_role_id", 0) or 0)
-
-    if not role_id:
-        return True, ""
-
-    guild_id = int(inter.guild_id or obj.get("guild_id", 0) or 0)
-    guild = inter.client.get_guild(guild_id) if guild_id else None
-
-    if guild is None:
-        return False, "Dieses Event hat eine Zielrolle. Dein Server konnte nicht geprüft werden."
-
-    role = guild.get_role(role_id)
-
-    if role is None:
-        return False, "Die Zielrolle dieses Events wurde nicht gefunden. Bitte melde dich bei der Gildenleitung."
-
-    member = guild.get_member(int(user_id))
-
-    if member is None:
-        try:
-            member = await guild.fetch_member(int(user_id))
-        except Exception:
-            member = None
-
-    if member is None or member.bot or role not in getattr(member, "roles", []):
-        return False, f"Du gehörst nicht zur Zielgruppe dieses Events ({role.mention}) und kannst dich dafür nicht anmelden."
-
-    return True, ""
-
-
-def _reminder_label(minutes: int, target: str) -> str:
-    if minutes >= 1440 and minutes % 1440 == 0:
-        time_txt = f"{minutes // 1440} Tag(e) vorher"
-    elif minutes >= 60 and minutes % 60 == 0:
-        time_txt = f"{minutes // 60} Stunde(n) vorher"
-    else:
-        time_txt = f"{minutes} Minute(n) vorher"
-
-    if target == "yes":
-        target_txt = "angemeldete Teilnehmer"
-    elif target == "all":
-        target_txt = "Zielgruppe"
-    else:
-        target_txt = "fehlende Abstimmungen"
-
-    return f"{time_txt} an {target_txt}"
-
-
-def _reminder_voters(obj: dict) -> set[int]:
-    try:
-        _init_event_shape(obj)
-        return _voters_set(obj)
+        return {int(m.id) for m in getattr(guild, "members", []) if getattr(m, "id", None)}
     except Exception:
         return set()
 
 
-def _reminder_yes_participants(obj: dict) -> set[int]:
-    ids: set[int] = set()
+def _load_json_file(name: str, default: Any) -> Any:
+    path = DATA_DIR / name
+    if not path.exists():
+        return default
     try:
-        _init_event_shape(obj)
-        for key in ("TANK", "HEAL", "DPS", "BANK"):
-            for entry in obj.get("yes", {}).get(key, []) or []:
-                uid = _entry_user_id(entry)
-                if uid:
-                    ids.add(uid)
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return {"__dashboard_error__": f"{type(exc).__name__}: {exc}"}
+
+
+def _source_health() -> dict[str, dict[str, Any]]:
+    out: dict[str, dict[str, Any]] = {}
+    for key, filename in JSON_SOURCES.items():
+        path = DATA_DIR / filename
+        if not path.exists():
+            out[key] = {"file": filename, "exists": False, "ok": True, "size_bytes": 0}
+            continue
+        try:
+            json.loads(path.read_text(encoding="utf-8"))
+            ok = True
+            error = ""
+        except Exception as exc:
+            ok = False
+            error = f"{type(exc).__name__}: {exc}"
+        out[key] = {
+            "file": filename,
+            "exists": True,
+            "ok": ok,
+            "error": error,
+            "size_bytes": path.stat().st_size,
+            "modified_at": datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat(),
+        }
+    return out
+
+
+def _guild_dict(data: Any, guild_id: int) -> dict[str, Any]:
+    if not isinstance(data, dict):
+        return {}
+    g = data.get(str(int(guild_id)))
+    return g if isinstance(g, dict) else {}
+
+
+def _guild_list(data: Any, guild_id: int) -> list[Any]:
+    if not isinstance(data, dict):
+        return []
+    g = data.get(str(int(guild_id)))
+    return g if isinstance(g, list) else []
+
+
+def _participant_user_id(raw: Any) -> int:
+    try:
+        if isinstance(raw, dict):
+            for key in ("id", "user_id", "member_id", "discord_id"):
+                if raw.get(key) not in (None, ""):
+                    return int(raw.get(key) or 0)
+        return int(raw or 0)
+    except Exception:
+        return 0
+
+
+def _participant_display_name(guild: discord.Guild, user_id: int, raw: Any = None) -> str:
+    member = guild.get_member(int(user_id)) if user_id else None
+    if member is not None:
+        return _safe_text(getattr(member, "display_name", "") or getattr(member, "name", ""), 120)
+    if isinstance(raw, dict):
+        for key in ("display_name", "name", "nick", "username", "ingame_name"):
+            if raw.get(key):
+                return _safe_text(raw.get(key), 120)
+    return f"User {user_id}" if user_id else "Unbekannt"
+
+
+def _participant_obj(guild: discord.Guild, raw: Any) -> Optional[dict[str, Any]]:
+    uid = _participant_user_id(raw)
+    if not uid:
+        return None
+    return {
+        "user_id": uid,
+        "display_name": _participant_display_name(guild, uid, raw),
+        "is_dashboard_member": _is_dashboard_member(guild, uid),
+    }
+
+
+def _event_user_count(event: dict[str, Any]) -> int:
+    ids: set[int] = set()
+    yes = event.get("yes") if isinstance(event.get("yes"), dict) else {}
+    for arr in yes.values():
+        if not isinstance(arr, list):
+            continue
+        for raw in arr:
+            uid = _participant_user_id(raw)
+            if uid:
+                ids.add(uid)
+    maybe = event.get("maybe") if isinstance(event.get("maybe"), dict) else {}
+    for uid in maybe.keys():
+        try:
+            ids.add(int(uid))
+        except Exception:
+            pass
+    no = event.get("no") if isinstance(event.get("no"), list) else []
+    for raw in no:
+        uid = _participant_user_id(raw)
+        if uid:
+            ids.add(uid)
+    return len(ids)
+
+
+def _event_participants(guild: discord.Guild, event: dict[str, Any]) -> dict[str, Any]:
+    yes_detail: list[dict[str, Any]] = []
+    yes = event.get("yes") if isinstance(event.get("yes"), dict) else {}
+    for role_name, arr in yes.items():
+        people: list[dict[str, Any]] = []
+        if isinstance(arr, list):
+            for raw in arr:
+                obj = _participant_obj(guild, raw)
+                if obj:
+                    people.append(obj)
+        people.sort(key=lambda x: str(x.get("display_name") or "").lower())
+        yes_detail.append({"role": _safe_text(role_name, 80), "count": len(people), "participants": people})
+    yes_detail.sort(key=lambda x: str(x.get("role") or "").lower())
+
+    maybe_people: list[dict[str, Any]] = []
+    maybe = event.get("maybe") if isinstance(event.get("maybe"), dict) else {}
+    for uid_raw, raw_val in maybe.items():
+        raw = raw_val if isinstance(raw_val, dict) else {"id": uid_raw}
+        if isinstance(raw, dict):
+            raw.setdefault("id", uid_raw)
+        obj = _participant_obj(guild, raw)
+        if obj:
+            maybe_people.append(obj)
+    maybe_people.sort(key=lambda x: str(x.get("display_name") or "").lower())
+
+    no_people: list[dict[str, Any]] = []
+    no = event.get("no") if isinstance(event.get("no"), list) else []
+    for raw in no:
+        obj = _participant_obj(guild, raw)
+        if obj:
+            no_people.append(obj)
+    no_people.sort(key=lambda x: str(x.get("display_name") or "").lower())
+    return {"yes": yes_detail, "maybe": maybe_people, "no": no_people}
+
+
+def _summarize_events(data: Any, guild: discord.Guild, *, limit: int = 200) -> dict[str, Any]:
+    guild_id = int(guild.id)
+    events: list[dict[str, Any]] = []
+    if isinstance(data, dict):
+        for message_id, ev in data.items():
+            if not isinstance(ev, dict):
+                continue
+            try:
+                home_gid = int(ev.get("guild_id", 0) or 0)
+            except Exception:
+                home_gid = 0
+            mirror_match = False
+            mirrors = ev.get("mirrors") if isinstance(ev.get("mirrors"), list) else []
+            for m in mirrors:
+                if isinstance(m, dict):
+                    try:
+                        if int(m.get("guild_id", 0) or 0) == int(guild_id):
+                            mirror_match = True
+                            break
+                    except Exception:
+                        pass
+            if home_gid != int(guild_id) and not mirror_match:
+                continue
+            yes = ev.get("yes") if isinstance(ev.get("yes"), dict) else {}
+            role_counts = {str(k): len(v) for k, v in yes.items() if isinstance(v, list)}
+            participant_detail = _event_participants(guild, ev)
+            events.append({
+                "event_id": str(message_id),
+                "guild_id": int(guild_id),
+                "message_id": int(message_id) if str(message_id).isdigit() else 0,
+                "title": _safe_text(ev.get("title") or ev.get("name") or ev.get("event_name"), 160),
+                "when_iso": str(ev.get("when_iso") or ev.get("start_time") or ev.get("time") or ""),
+                "end_at": str(ev.get("end_at") or ev.get("end_time") or ""),
+                "duration_minutes": int(ev.get("duration_minutes", 0) or 0),
+                "location": _safe_text(ev.get("location") or "", 120),
+                "scheduled_event_id": int(ev.get("scheduled_event_id", 0) or 0),
+                "scheduled_event_url": str(ev.get("scheduled_event_url") or ""),
+                "scheduled_event_error": _safe_text(ev.get("scheduled_event_error") or "", 300),
+                "channel_id": int(ev.get("channel_id", 0) or 0),
+                "scope": str(ev.get("scope") or "single"),
+                "is_mirror_for_this_guild": bool(mirror_match and home_gid != int(guild_id)),
+                "voice_enabled": bool(ev.get("voice_enabled")),
+                "voice_channel_id": int(ev.get("voice_channel_id", 0) or 0),
+                "voice_last_channel_id": int(ev.get("voice_last_channel_id", 0) or 0),
+                "dkp_enabled": bool(ev.get("dkp_enabled", False)),
+                "dkp_event_type": _safe_text(ev.get("dkp_event_type") or ev.get("event_type") or ev.get("dkp_type") or "", 80),
+                "yes_counts": role_counts,
+                "maybe_count": len(participant_detail.get("maybe") or []),
+                "no_count": len(participant_detail.get("no") or []),
+                "participant_count": _event_user_count(ev),
+                "participants": participant_detail,
+                "description": _safe_text(ev.get("description") or ev.get("desc") or "", 600),
+                "image_url": _event_image_url_from_raw(ev),
+            })
+    events.sort(key=lambda x: str(x.get("when_iso") or ""), reverse=True)
+    return {
+        "count": len(events),
+        "items": events[:limit],
+    }
+
+
+def _summarize_profiles(data: Any, guild: discord.Guild, *, limit: int = 500) -> dict[str, Any]:
+    """Aktive Gildenmitglieder aus der gesetzten Discord-Rolle.
+
+    Der alte Code lief primär über vorhandene Profil-JSONs. Dadurch konnten alte
+    Profile aus Postgres wieder in die Mitgliederliste geraten und aktive Spieler
+    ohne Profil fehlten. Jetzt ist die Discord-Rolle die Wahrheit; Profildaten
+    werden nur dazugemischt.
+    """
+    g = _guild_dict(data, guild.id)
+    users = g.get("users") if isinstance(g.get("users"), dict) else {}
+    absences = g.get("absences") if isinstance(g.get("absences"), dict) else {}
+    member_role = _dashboard_member_role(guild)
+    active_members = [
+        m for m in (getattr(member_role, "members", []) if member_role is not None else [])
+        if getattr(m, "id", None) and not bool(getattr(m, "bot", False))
+    ]
+    active_ids = {int(m.id) for m in active_members}
+    stale_count = sum(1 for uid in users.keys() if str(uid).isdigit() and int(uid) not in active_ids)
+    items: list[dict[str, Any]] = []
+
+    for member in active_members:
+        user_id = int(member.id)
+        profile = users.get(str(user_id)) if isinstance(users.get(str(user_id)), dict) else {}
+        server_name = _safe_text(getattr(member, "display_name", "") or getattr(member, "name", "") or f"User {user_id}", 120)
+        discord_name = _safe_text(getattr(member, "name", "") or server_name, 120)
+        ingame_name = _safe_text(profile.get("ingame_name") or profile.get("name") or "", 120)
+        display_name = ingame_name or server_name
+        avatar_url = _safe_text(str(getattr(getattr(member, "display_avatar", None), "url", "") or ""), 500)
+        joined_at = getattr(member, "joined_at", None)
+        roles = [
+            {"role_id": int(r.id), "role_name": str(r.name)}
+            for r in getattr(member, "roles", [])
+            if getattr(r, "id", None) and not bool(getattr(r, "is_default", lambda: False)())
+        ]
+        items.append({
+            "user_id": user_id,
+            "display_name": display_name,
+            "server_name": server_name,
+            "discord_name": discord_name,
+            "discord_username": discord_name,
+            "avatar_url": avatar_url,
+            "ingame_name": ingame_name,
+            "profile_name_set": bool(ingame_name),
+            "main_role": _safe_text(profile.get("main_role"), 80),
+            "gearscore": _safe_text(profile.get("gearscore"), 40),
+            "created_at": str(profile.get("created_at") or ""),
+            "joined_at": joined_at.isoformat() if joined_at else "",
+            "roles": roles,
+            "is_dashboard_member": True,
+            "is_active": True,
+            "profile_exists": bool(profile),
+            "in_discord_cache": True,
+            "profile": profile,
+        })
+
+    items.sort(key=lambda x: (str(x.get("display_name") or "")).casefold())
+    return {
+        "count": len(items),
+        "total_json_count": len(users),
+        "stale_count": stale_count,
+        "without_profile_count": sum(1 for x in items if not x.get("profile_exists")),
+        "absences_count": len(absences),
+        "member_role_id": int(getattr(member_role, "id", 0) or 0),
+        "member_role_name": str(getattr(member_role, "name", "") or ""),
+        "active_member_ids": [str(x.get("user_id")) for x in items],
+        "items": items[:limit],
+        "filter": "dashboard_member_role_only",
+    }
+
+
+def _sync_member_directory(guild: discord.Guild, profile_summary: dict[str, Any]) -> dict[str, Any]:
+    # Ohne bewusst gesetzte Mitgliederrolle niemals alle bisherigen Mitglieder
+    # deaktivieren. Das schützt Multi-Guild-Installationen vor Fehlkonfiguration.
+    member_role_id = int(profile_summary.get("member_role_id") or 0)
+    if not member_role_id:
+        return {
+            "ok": False,
+            "skipped": True,
+            "error": "Keine Dashboard-Gildenrolle gesetzt. Nutze /dashboard_set_member_role.",
+            "active": 0,
+            "deactivated": 0,
+        }
+    try:
+        rows = []
+        for item in profile_summary.get("items") or []:
+            if not isinstance(item, dict):
+                continue
+            rows.append({
+                "user_id": int(item.get("user_id") or 0),
+                "server_name": item.get("server_name") or item.get("display_name") or "",
+                "discord_username": item.get("discord_username") or item.get("discord_name") or "",
+                "avatar_url": item.get("avatar_url") or "",
+                "ingame_name": item.get("ingame_name") or "",
+                "main_role": item.get("main_role") or "",
+                "gearscore": item.get("gearscore") or "",
+                "joined_at": item.get("joined_at") or "",
+                "roles": item.get("roles") or [],
+                "profile": item.get("profile") or {},
+            })
+        return runtime_db.sync_guild_members(
+            guild_id=int(guild.id),
+            members=rows,
+            member_role_id=member_role_id,
+        )
+    except Exception as exc:
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+def _summarize_balances(data: Any, guild: discord.Guild, *, limit: int = 500) -> dict[str, Any]:
+    g = _guild_dict(data, guild.id)
+    users = g.get("users") if isinstance(g.get("users"), dict) else {}
+    items: list[dict[str, Any]] = []
+    stale_count = 0
+    for uid, raw in users.items():
+        try:
+            user_id = int(uid)
+        except Exception:
+            continue
+        member = guild.get_member(user_id)
+        if not _is_dashboard_member(guild, user_id):
+            stale_count += 1
+            continue
+        bal = raw
+        if isinstance(raw, dict):
+            bal = raw.get("balance", raw.get("dkp", raw.get("ec", 0)))
+        try:
+            balance = float(bal or 0)
+        except Exception:
+            balance = 0.0
+        items.append({
+            "user_id": user_id,
+            "display_name": _safe_text(getattr(member, "display_name", "") or f"User {user_id}", 120),
+            "balance": balance,
+        })
+    items.sort(key=lambda x: float(x.get("balance") or 0), reverse=True)
+    return {
+        "count": len(items),
+        "total_json_count": len(users),
+        "stale_count": stale_count,
+        "top": items[:limit],
+        "filter": "dashboard_member_role_only",
+    }
+
+
+def _parse_amount(value: Any) -> float:
+    try:
+        if value in (None, ""):
+            return 0.0
+        if isinstance(value, str):
+            txt = value.strip().replace(" ", "")
+            # Deutsch/Discord-tolerant: "1.234,5" -> 1234.5, "12,5" -> 12.5
+            if "," in txt and "." in txt:
+                txt = txt.replace(".", "").replace(",", ".")
+            elif "," in txt:
+                txt = txt.replace(",", ".")
+            return float(txt)
+        return float(value)
+    except Exception:
+        return 0.0
+
+
+def _tx_user_id(tx: dict[str, Any]) -> int:
+    for key in ("user_id", "target_user_id", "member_id", "discord_id", "to_user_id", "recipient_id"):
+        try:
+            if tx.get(key) not in (None, ""):
+                return int(tx.get(key) or 0)
+        except Exception:
+            continue
+    return 0
+
+
+def _transactions_for_guild(data: Any, guild_id: int) -> list[Any]:
+    """Tolerant gegen alte DKP-JSON-Strukturen.
+
+    Unterstützt u. a.:
+    - {guild_id: [tx, tx]}
+    - {guild_id: {"transactions": [tx]}}
+    - {guild_id: {"items": [tx]}}
+    - {"transactions": {guild_id: [tx]}}
+    """
+    if isinstance(data, list):
+        return data
+    if not isinstance(data, dict):
+        return []
+    gid = str(int(guild_id))
+    g = data.get(gid)
+    if isinstance(g, list):
+        return g
+    if isinstance(g, dict):
+        for key in ("transactions", "items", "logs", "history"):
+            if isinstance(g.get(key), list):
+                return g.get(key) or []
+    for top_key in ("transactions", "items", "logs", "history"):
+        top = data.get(top_key)
+        if isinstance(top, dict):
+            x = top.get(gid)
+            if isinstance(x, list):
+                return x
+            if isinstance(x, dict):
+                for key in ("transactions", "items", "logs", "history"):
+                    if isinstance(x.get(key), list):
+                        return x.get(key) or []
+        elif isinstance(top, list):
+            return top
+    return []
+
+
+def _summarize_transactions(data: Any, guild: discord.Guild, *, limit: int = 1000) -> dict[str, Any]:
+    arr = _transactions_for_guild(data, guild.id)
+    items: list[dict[str, Any]] = []
+    stale_count = 0
+
+    def member_name(uid: int, tx: dict[str, Any]) -> str:
+        member = guild.get_member(int(uid)) if uid else None
+        if member is not None:
+            return _safe_text(getattr(member, "display_name", "") or getattr(member, "name", "") or f"User {uid}", 120)
+        for key in ("display_name", "target_name", "member_name", "name", "username"):
+            if tx.get(key):
+                return _safe_text(tx.get(key), 120)
+        return f"User {uid}" if uid else "Unbekannt"
+
+    # Neuste Einträge zuerst, weil alte Dateien meist append-only sind.
+    for idx, tx in enumerate(reversed(arr)):
+        if not isinstance(tx, dict):
+            continue
+        uid = _tx_user_id(tx)
+        if uid and not _is_dashboard_member(guild, uid):
+            stale_count += 1
+            continue
+        amount_raw = tx.get("amount", tx.get("delta", tx.get("change", tx.get("value", 0))))
+        amount = _parse_amount(amount_raw)
+        created_at = str(tx.get("created_at") or tx.get("at") or tx.get("timestamp") or tx.get("time") or "")
+        item = {
+            "created_at": created_at,
+            "user_id": uid,
+            "display_name": member_name(uid, tx),
+            "amount": amount,
+            "amount_raw": amount_raw,
+            "reason": _safe_text(tx.get("reason") or tx.get("summary") or tx.get("note") or tx.get("description") or tx.get("type") or "", 300),
+            "raw_type": _safe_text(tx.get("type") or tx.get("kind") or tx.get("action") or "", 80),
+            "actor_id": int(tx.get("actor_id", 0) or tx.get("admin_id", 0) or tx.get("created_by", 0) or 0),
+            "event_id": str(tx.get("event_id") or tx.get("source_event_id") or ""),
+            "auction_id": str(tx.get("auction_id") or tx.get("source_auction_id") or ""),
+        }
+        items.append(item)
+        if len(items) >= limit:
+            # Für Dashboard reichen 1000 neueste; Count unten bleibt aber echter Rohcount.
+            break
+
+    by_user: dict[int, dict[str, Any]] = {}
+    for item in items:
+        uid = int(item.get("user_id") or 0)
+        if not uid:
+            continue
+        bucket = by_user.setdefault(uid, {
+            "user_id": uid,
+            "display_name": item.get("display_name") or f"User {uid}",
+            "earned": 0.0,
+            "spent": 0.0,
+            "net": 0.0,
+            "count": 0,
+        })
+        amount = _parse_amount(item.get("amount"))
+        bucket["net"] += amount
+        bucket["count"] += 1
+        if amount >= 0:
+            bucket["earned"] += amount
+        else:
+            bucket["spent"] += abs(amount)
+
+    user_rows = list(by_user.values())
+    top_earned = sorted(user_rows, key=lambda x: float(x.get("earned") or 0), reverse=True)[:25]
+    top_spent = sorted(user_rows, key=lambda x: float(x.get("spent") or 0), reverse=True)[:25]
+    top_activity = sorted(user_rows, key=lambda x: int(x.get("count") or 0), reverse=True)[:25]
+    total_earned = sum(float(x.get("earned") or 0) for x in user_rows)
+    total_spent = sum(float(x.get("spent") or 0) for x in user_rows)
+
+    return {
+        "count": len(arr),
+        "loaded_count": len(items),
+        "stale_count": stale_count,
+        "recent": items[:250],
+        "items": items,
+        "total_earned": total_earned,
+        "total_spent": total_spent,
+        "net_loaded": total_earned - total_spent,
+        "by_user": user_rows,
+        "top_earned": top_earned,
+        "top_spent": top_spent,
+        "top_activity": top_activity,
+        "filter": "dashboard_member_role_only",
+    }
+
+
+def _summarize_auctions(data: Any, guild: discord.Guild, *, limit: int = 300) -> dict[str, Any]:
+    """Auktionsdaten fürs Dashboard normalisieren.
+
+    Neu: nicht nur Übersicht, sondern genug Detaildaten für Auktions-Detailseiten:
+    - Gebotshistorie
+    - Gewinner/Empfänger
+    - Startgebot/Mindestschritt/Festpreis
+    - berechtigte Spieler
+    - Müll-Würfe
+    """
+    guild_id = int(guild.id)
+    g = _guild_dict(data, guild_id)
+    auctions = g.get("auctions") if isinstance(g.get("auctions"), dict) else {}
+    items: list[dict[str, Any]] = []
+    counts: dict[str, int] = {}
+
+    def member_name(uid: Any, fallback: str = "") -> str:
+        try:
+            user_id = int(uid or 0)
+        except Exception:
+            user_id = 0
+        if user_id:
+            m = guild.get_member(user_id)
+            if m is not None:
+                return _safe_text(getattr(m, "display_name", "") or getattr(m, "name", "") or f"User {user_id}", 120)
+        return _safe_text(fallback or (f"User {user_id}" if user_id else ""), 120)
+
+    for aid, auc in auctions.items():
+        if not isinstance(auc, dict):
+            continue
+        status = str(auc.get("status") or "unknown")
+        counts[status] = counts.get(status, 0) + 1
+        bids_raw = auc.get("bids") if isinstance(auc.get("bids"), list) else []
+        bids: list[dict[str, Any]] = []
+        for b in bids_raw:
+            if not isinstance(b, dict):
+                continue
+            uid = int(b.get("user_id", 0) or 0)
+            bids.append({
+                "user_id": uid,
+                "display_name": member_name(uid, str(b.get("name") or "")),
+                "amount": b.get("amount"),
+                "created_at": str(b.get("created_at") or b.get("at") or ""),
+            })
+        bids.sort(key=lambda x: (float(x.get("amount") or 0), str(x.get("created_at") or "")), reverse=True)
+        top_bid = bids[0] if bids else None
+
+        winner_id = int(
+            auc.get("winner_user_id", 0)
+            or auc.get("delivered_to", 0)
+            or auc.get("sold_to", 0)
+            or auc.get("junk_roll_winner_id", 0)
+            or auc.get("junk_lottery_winner_id", 0)
+            or 0
+        )
+        if not winner_id and status in {"delivered", "sold", "ended"} and top_bid:
+            winner_id = int(top_bid.get("user_id") or 0)
+
+        eligible_raw = auc.get("eligible_user_ids") if isinstance(auc.get("eligible_user_ids"), list) else []
+        eligible = []
+        for uid in eligible_raw[:250]:
+            try:
+                iuid = int(uid or 0)
+            except Exception:
+                iuid = 0
+            if iuid:
+                eligible.append({"user_id": iuid, "display_name": member_name(iuid)})
+
+        junk_rolls_raw = auc.get("junk_rolls") if isinstance(auc.get("junk_rolls"), dict) else {}
+        junk_rolls = []
+        for uid_raw, roll_raw in junk_rolls_raw.items():
+            try:
+                iuid = int(uid_raw or 0)
+                roll = int(roll_raw or 0)
+            except Exception:
+                continue
+            junk_rolls.append({"user_id": iuid, "display_name": member_name(iuid), "roll": roll})
+        junk_rolls.sort(key=lambda x: int(x.get("roll") or 0), reverse=True)
+
+        local_item_id = str(auc.get("item_id") or "")
+        raw_item_name = _safe_text(auc.get("item_name") or auc.get("item") or auc.get("title"), 180)
+        catalog_link = None
+        try:
+            catalog_link = runtime_db.resolve_catalog_item_reference(
+                guild_id=guild_id,
+                local_item_id=local_item_id,
+                item_name=raw_item_name,
+                catalog_item_id=int(auc.get("catalog_item_id") or 0),
+                source_item_id=str(auc.get("catalog_source_item_id") or ""),
+            )
+        except Exception:
+            catalog_link = None
+        items.append({
+            "auction_id": str(aid),
+            "item_id": local_item_id,
+            "item_name": raw_item_name,
+            "catalog_item_id": int((catalog_link or {}).get("id") or auc.get("catalog_item_id") or 0),
+            "catalog_source_item_id": str((catalog_link or {}).get("source_item_id") or auc.get("catalog_source_item_id") or ""),
+            "catalog_item_name": str((catalog_link or {}).get("name") or auc.get("catalog_item_name") or ""),
+            "catalog_source_url": str((catalog_link or {}).get("source_url") or auc.get("catalog_source_url") or ""),
+            "catalog_image_url": str((catalog_link or {}).get("manual_image_url") or (catalog_link or {}).get("image_url") or (catalog_link or {}).get("icon_url") or auc.get("catalog_image_url") or ""),
+            "catalog_match_method": str((catalog_link or {}).get("match_method") or auc.get("catalog_match_method") or ""),
+            "catalog_match_confidence": float((catalog_link or {}).get("match_confidence") or auc.get("catalog_match_confidence") or 0),
+            "status": status,
+            "kind": _safe_text(auc.get("kind") or "", 80),
+            "phase": _safe_text(auc.get("phase") or auc.get("mode") or auc.get("auction_type") or "", 80),
+            "eligibility_mode": _safe_text(auc.get("eligibility_mode") or "", 80),
+            "created_at": str(auc.get("created_at") or ""),
+            "created_by": int(auc.get("created_by", 0) or 0),
+            "created_by_name": member_name(auc.get("created_by")),
+            "ends_at": str(auc.get("ends_at") or auc.get("end_at") or ""),
+            "start_bid": auc.get("start_bid"),
+            "min_increment": auc.get("min_increment"),
+            "fixed_price": auc.get("fixed_price"),
+            "bid_count": len(bids),
+            "bids": bids[:100],
+            "top_bid_user_id": int((top_bid or {}).get("user_id", 0) or 0) if isinstance(top_bid, dict) else 0,
+            "top_bid_user_name": (top_bid or {}).get("display_name") if isinstance(top_bid, dict) else "",
+            "top_bid_amount": (top_bid or {}).get("amount") if isinstance(top_bid, dict) else None,
+            "winner_user_id": winner_id,
+            "winner_name": member_name(winner_id) if winner_id else "",
+            "delivered_at": str(auc.get("delivered_at") or auc.get("sold_at") or ""),
+            "delivered_by": int(auc.get("delivered_by", 0) or 0),
+            "delivered_by_name": member_name(auc.get("delivered_by")),
+            "message_id": int(auc.get("message_id", 0) or 0),
+            "channel_id": int(auc.get("channel_id", 0) or 0),
+            "market_message_id": int(auc.get("market_message_id", 0) or 0),
+            "active_message_id": int(auc.get("active_message_id", 0) or 0),
+            "eligible_count": len(eligible_raw),
+            "eligible_users": eligible,
+            "junk_drop": bool(auc.get("junk_drop")),
+            "junk_roll_until": str(auc.get("junk_roll_until") or auc.get("junk_interest_until") or ""),
+            "junk_rolls": junk_rolls[:150],
+            "junk_roll_winner_roll": int(auc.get("junk_roll_winner_roll", 0) or 0),
+        })
+    items.sort(key=lambda x: str(x.get("created_at") or x.get("ends_at") or ""), reverse=True)
+    return {"count": len(auctions), "by_status": counts, "items": items[:limit]}
+
+def _catalog_items_for_guild(data: Any, guild_id: int) -> dict[str, Any]:
+    """Item-Katalog dieser Gilde normalisieren.
+
+    loot_items.json ist bei uns normalerweise:
+    {guild_id: {"items": {item_id: {"name": ..., "slot": ..., "weapon_type": ...}}}}
+    Diese Funktion ist bewusst tolerant, falls alte Daten anders liegen.
+    """
+    if not isinstance(data, dict):
+        return {}
+    g = _guild_dict(data, guild_id)
+    if isinstance(g.get("items"), dict):
+        return g.get("items") or {}
+    # Fallback, falls die Datei direkt Items enthält.
+    if "items" in data and isinstance(data.get("items"), dict):
+        return data.get("items") or {}
+    # Sehr alter Fallback: Wenn Werte wie Item-Objekte aussehen.
+    if any(isinstance(v, dict) and ("name" in v or "slot" in v or "weapon_type" in v) for v in data.values()):
+        return data
+    return {}
+
+
+def _item_label_from_catalog(catalog: dict[str, Any], item_id: Any) -> str:
+    iid = str(item_id or "").strip()
+    if not iid:
+        return ""
+    item = catalog.get(iid) if isinstance(catalog, dict) else None
+    if not isinstance(item, dict):
+        return _safe_text(iid, 180)
+    name = str(item.get("name") or item.get("item_name") or iid).strip()
+    weapon_type = str(item.get("weapon_type") or "").strip()
+    if weapon_type:
+        return _safe_text(f"{name} ({weapon_type})", 180)
+    return _safe_text(name, 180)
+
+
+def _is_received_slot(value: dict[str, Any]) -> bool:
+    return bool(value.get("received") or value.get("locked") or value.get("obtained") or value.get("done"))
+
+
+def _need_roots(raw: dict[str, Any]) -> list[dict[str, Any]]:
+    roots = [raw]
+    for key in ("needs", "needlist", "need_list", "data", "tabs"):
+        val = raw.get(key)
+        if isinstance(val, dict) and val not in roots:
+            roots.append(val)
+    return roots
+
+
+def _simplify_need_value(value: Any, catalog: Optional[dict[str, Any]] = None, *, slot_name: str = "") -> list[str]:
+    """Need-Einträge aus verschiedenen alten JSON-Strukturen lesbar machen.
+
+    Der wichtige Fix hier: echte Need-Slots speichern nur `item_id`.
+    Vorher konnte das Dashboard daraus keinen schönen Main-/Secondary-Need machen.
+    Jetzt wird `item_id` über loot_items.json zu Itemnamen aufgelöst.
+    """
+    catalog = catalog or {}
+    out: list[str] = []
+    if value in (None, "", False):
+        return out
+    if isinstance(value, str):
+        txt = _safe_text(value, 180)
+        if txt:
+            out.append(txt)
+        return out
+    if isinstance(value, (int, float)):
+        if value:
+            out.append(str(value))
+        return out
+    if isinstance(value, list):
+        for item in value:
+            out.extend(_simplify_need_value(item, catalog, slot_name=slot_name))
+        return out
+    if isinstance(value, dict):
+        # Standard-Slotobjekt: {item_id, received, locked, ...}
+        raw_item_id = value.get("item_id") or value.get("itemId") or value.get("item")
+        if raw_item_id:
+            if _is_received_slot(value):
+                return out
+            label = _item_label_from_catalog(catalog, raw_item_id)
+            if label:
+                out.append(f"{_safe_text(slot_name, 80)}: {label}" if slot_name else label)
+            return out
+
+        if _is_received_slot(value):
+            # erhaltene Needs im Dashboard nicht als offenen Need zählen
+            return out
+
+        direct = value.get("item_name") or value.get("name") or value.get("title")
+        if direct:
+            label = _safe_text(direct, 180)
+            out.append(f"{_safe_text(slot_name, 80)}: {label}" if slot_name else label)
+            return out
+
+        meta_keys = {"updated_at", "created_at", "user_id", "display_name", "received", "locked", "received_at", "received_by", "obtained", "done"}
+        for key, val in value.items():
+            key_s = str(key)
+            if key_s.lower() in meta_keys or val in (None, "", False):
+                continue
+            if isinstance(val, dict):
+                sub = _simplify_need_value(val, catalog, slot_name=key_s)
+                out.extend(sub)
+            elif isinstance(val, list):
+                for x in _simplify_need_value(val, catalog):
+                    out.append(f"{_safe_text(key_s, 80)}: {x}")
+            elif isinstance(val, str):
+                # Bei Slot: "item_id"-Altwerten ist der String meistens direkt eine Item-ID.
+                label = _item_label_from_catalog(catalog, val)
+                out.append(f"{_safe_text(key_s, 80)}: {label}")
+            elif val:
+                out.append(f"{_safe_text(key_s, 80)}: {_safe_text(val, 180)}")
+        return out
+    return out
+
+
+def _extract_need_tab(raw: dict[str, Any], tab_names: set[str], catalog: dict[str, Any]) -> list[str]:
+    names = {x.lower() for x in tab_names}
+    for root in _need_roots(raw):
+        for key, val in root.items():
+            if str(key).strip().lower() in names:
+                return _simplify_need_value(val, catalog)
+    return []
+
+
+def _extract_need_items(raw: dict[str, Any], tab_names: set[str], catalog: dict[str, Any], guild_id: int) -> list[dict[str, Any]]:
+    names = {x.casefold() for x in tab_names}
+    out: list[dict[str, Any]] = []
+    for root in _need_roots(raw):
+        for key, bucket in root.items():
+            if str(key).strip().casefold() not in names or not isinstance(bucket, dict):
+                continue
+            for slot_name, value in bucket.items():
+                obj = value if isinstance(value, dict) else {"item_id": value}
+                if not isinstance(obj, dict) or _is_received_slot(obj):
+                    continue
+                local_id = str(obj.get("item_id") or obj.get("itemId") or obj.get("item") or "").strip()
+                direct_name = str(obj.get("item_name") or obj.get("name") or obj.get("title") or "").strip()
+                item_name = _item_label_from_catalog(catalog, local_id) if local_id else _safe_text(direct_name, 180)
+                if not item_name:
+                    continue
+                linked = None
+                try:
+                    linked = runtime_db.resolve_catalog_item_reference(
+                        guild_id=int(guild_id), local_item_id=local_id, item_name=item_name,
+                        catalog_item_id=int(obj.get("catalog_item_id") or 0),
+                        source_item_id=str(obj.get("catalog_source_item_id") or ""),
+                    )
+                except Exception:
+                    linked = None
+                out.append({
+                    "slot_name": _safe_text(slot_name, 80),
+                    "item_id": local_id,
+                    "item_name": item_name,
+                    "catalog_item_id": int((linked or {}).get("id") or obj.get("catalog_item_id") or 0),
+                    "catalog_source_item_id": str((linked or {}).get("source_item_id") or obj.get("catalog_source_item_id") or ""),
+                    "catalog_item_name": str((linked or {}).get("name") or obj.get("catalog_item_name") or ""),
+                    "catalog_source_url": str((linked or {}).get("source_url") or obj.get("catalog_source_url") or ""),
+                    "catalog_image_url": str((linked or {}).get("manual_image_url") or (linked or {}).get("image_url") or (linked or {}).get("icon_url") or obj.get("catalog_image_url") or ""),
+                    "received": False,
+                })
+            return out
+    return out
+
+
+def _summarize_needs(data: Any, guild: discord.Guild, item_catalog_data: Any = None, *, limit: int = 500) -> dict[str, Any]:
+    g = _guild_dict(data, guild.id)
+    users = g.get("users") if isinstance(g.get("users"), dict) else g
+    catalog = _catalog_items_for_guild(item_catalog_data, guild.id)
+    total_json_users = len(users) if isinstance(users, dict) else 0
+    stale_count = 0
+    active_user_count = 0
+    total_entries = 0
+    items: list[dict[str, Any]] = []
+    if isinstance(users, dict):
+        for uid, raw in users.items():
+            if not isinstance(raw, dict):
+                continue
+            try:
+                user_id = int(uid)
+            except Exception:
+                user_id = 0
+            if not user_id or not _is_dashboard_member(guild, user_id):
+                stale_count += 1
+                continue
+            member = guild.get_member(user_id)
+
+            main_items = _extract_need_items(raw, {"main", "Main", "main_needs", "mainNeeds", "haupt", "mainspec"}, catalog, int(guild.id))
+            secondary_items = _extract_need_items(raw, {"secondary", "Secondary", "sec", "secondary_needs", "secondaryNeeds", "zweite", "zweitspec", "offspec"}, catalog, int(guild.id))
+            main_needs = [str(x.get("item_name") or "") for x in main_items if x.get("item_name")]
+            secondary_needs = [str(x.get("item_name") or "") for x in secondary_items if x.get("item_name")]
+
+            # Fallback für sehr alte Strukturen ohne Main/Secondary: nur dann alles als Main interpretieren.
+            if not main_needs and not secondary_needs:
+                for key, val in raw.items():
+                    if str(key).lower() in {"updated_at", "created_at", "user_id", "display_name", "needs", "needlist", "need_list", "data", "tabs"}:
+                        continue
+                    main_needs.extend(_simplify_need_value({key: val}, catalog))
+
+            # Duplikate entfernen, Reihenfolge behalten
+            def dedupe(arr: list[str]) -> list[str]:
+                seen: set[str] = set()
+                out: list[str] = []
+                for x in arr:
+                    x = _safe_text(x, 220)
+                    if not x or x in seen:
+                        continue
+                    seen.add(x)
+                    out.append(x)
+                return out
+
+            main_needs = dedupe(main_needs)
+            secondary_needs = dedupe(secondary_needs)
+            cnt = len(main_needs) + len(secondary_needs)
+            if cnt <= 0:
+                continue
+            active_user_count += 1
+            total_entries += cnt
+            if len(items) < limit:
+                items.append({
+                    "user_id": user_id,
+                    "display_name": _safe_text(getattr(member, "display_name", "") or f"User {user_id}", 120),
+                    "main": main_needs,
+                    "secondary": secondary_needs,
+                    "main_items": main_items,
+                    "secondary_items": secondary_items,
+                    "main_count": len(main_needs),
+                    "secondary_count": len(secondary_needs),
+                    "need_entries_estimated": cnt,
+                })
+    items.sort(key=lambda x: str(x.get("display_name") or "").lower())
+    return {
+        "user_count": active_user_count,
+        "total_json_user_count": total_json_users,
+        "stale_count": stale_count,
+        "need_entries_estimated": total_entries,
+        "items": items,
+        "sample": items[:limit],
+        "filter": "dashboard_member_role_only",
+        "catalog_items_known": len(catalog),
+    }
+
+
+
+
+def _looks_like_id(value: Any) -> bool:
+    try:
+        txt = str(value or "").strip()
+        return txt.isdigit() and len(txt) >= 15
+    except Exception:
+        return False
+
+
+def _resolve_channel_name(guild: discord.Guild, raw: Any) -> str:
+    try:
+        cid = int(str(raw).strip())
+        ch = guild.get_channel(cid)
+        if ch is not None:
+            return _safe_text(getattr(ch, "name", "") or str(cid), 120)
     except Exception:
         pass
-    return ids
+    return ""
 
 
-def _reminder_target_members(guild: discord.Guild, obj: dict, target: str) -> list[discord.Member]:
+def _resolve_role_name(guild: discord.Guild, raw: Any) -> str:
     try:
-        members = _eligible_members(guild, obj)
+        rid = int(str(raw).strip())
+        role = guild.get_role(rid)
+        if role is not None:
+            return _safe_text(getattr(role, "name", "") or str(rid), 120)
     except Exception:
-        members = [m for m in guild.members if not m.bot]
-
-    if target == "yes":
-        allowed = _reminder_yes_participants(obj)
-        return [m for m in members if m.id in allowed and not m.bot]
-
-    if target == "all":
-        return [m for m in members if not m.bot]
-
-    voted = _reminder_voters(obj)
-    return [m for m in members if m.id not in voted and not m.bot]
+        pass
+    return ""
 
 
-async def _send_event_reminder(client: discord.Client, msg_id: str, obj: dict, reminder: dict) -> int:
-    guild_id = int(obj.get("guild_id", 0) or 0)
-    guild = client.get_guild(guild_id) if guild_id else None
+def _flatten_config(data: Any, prefix: str = "", *, max_depth: int = 4) -> list[tuple[str, Any]]:
+    """Kleine read-only Flatten-Hilfe für Settings-Seiten.
 
-    if guild is None:
-        return 0
-
-    try:
-        when = datetime.fromisoformat(obj.get("when_iso", ""))
-    except Exception:
-        return 0
-
-    minutes = int(reminder.get("minutes", 0) or 0)
-    target = str(reminder.get("target", "missing") or "missing")
-    label = _reminder_label(minutes, target)
-    members = _reminder_target_members(guild, obj, target)
-
-    sent = 0
-    for member in members:
-        try:
-            if not is_dm_enabled(guild.id, member.id):
-                continue
-
-            if target == "yes":
-                intro = "Reminder: Du bist für dieses Event angemeldet."
-            elif target == "all":
-                intro = "Reminder für dieses Event."
+    Keine Daten werden verändert. Die Funktion ist bewusst defensiv,
+    weil die alten JSON-Dateien je nach Modul unterschiedlich aufgebaut sind.
+    """
+    out: list[tuple[str, Any]] = []
+    if max_depth < 0:
+        return out
+    if isinstance(data, dict):
+        for key, value in data.items():
+            k = f"{prefix}.{key}" if prefix else str(key)
+            if isinstance(value, (dict, list)):
+                out.extend(_flatten_config(value, k, max_depth=max_depth - 1))
             else:
-                intro = "Reminder: Du hast für dieses Event noch nicht abgestimmt."
-
-            dm_text = _format_dm_text(
-                title=str(obj.get("title", "Event")),
-                when=when,
-                channel_name_or_ref=f"Übersicht: <#{obj.get('channel_id')}>",
-                description=obj.get("description"),
-                intro_line=intro,
-            )
-            dm_text += f"\n\n⏰ **Reminder:** {label}"
-
-            dm_msg = await member.send(dm_text, view=RaidView(int(msg_id)))
-            obj.setdefault("dm_messages", {})[str(member.id)] = int(dm_msg.id)
-            sent += 1
-            await asyncio.sleep(0.05)
-        except Exception:
-            pass
-
-    return sent
+                out.append((k, value))
+    elif isinstance(data, list):
+        for idx, value in enumerate(data[:80]):
+            k = f"{prefix}[{idx}]" if prefix else f"[{idx}]"
+            if isinstance(value, (dict, list)):
+                out.extend(_flatten_config(value, k, max_depth=max_depth - 1))
+            else:
+                out.append((k, value))
+    return out
 
 
-@tasks.loop(minutes=1)
-async def event_reminder_loop():
-    now = datetime.now(TZ)
-    changed = False
-
-    for msg_id, obj in list(store.items()):
-        try:
-            _init_event_shape(obj)
-            when = datetime.fromisoformat(obj.get("when_iso", ""))
-            voice_changed = False
-
-            try:
-                if await _maybe_create_event_voice_for_obj(event_reminder_loop._client, obj):  # type: ignore[attr-defined]
-                    changed = True
-                    voice_changed = True
-            except Exception as e:
-                print(f"[event_reminder_loop] Voice-Erstellung Fehler: {e!r}")
-
-            if now >= when:
-                try:
-                    if ensure_attendance_snapshot(event_reminder_loop._client, str(msg_id), obj):  # type: ignore[attr-defined]
-                        changed = True
-                except Exception as e:
-                    print(f"[event_reminder_loop] Attendance-Snapshot Fehler: {e!r}")
-
-            try:
-                if await _cleanup_event_voice_for_obj(event_reminder_loop._client, obj):  # type: ignore[attr-defined]
-                    changed = True
-                    voice_changed = True
-            except Exception as e:
-                print(f"[event_reminder_loop] Voice-Cleanup Fehler: {e!r}")
-
-            if voice_changed:
-                try:
-                    await _push_overview(event_reminder_loop._client, str(msg_id), obj)  # type: ignore[attr-defined]
-                except Exception as e:
-                    print(f"[event_reminder_loop] Voice-Übersicht Update Fehler: {e!r}")
-
-            reminders = obj.get("reminders") or []
-
-            if not isinstance(reminders, list) or not reminders:
-                continue
-
-            if now > when + timedelta(hours=2):
-                continue
-
-            sent_map = obj.setdefault("reminder_sent", {})
-
-            for idx, reminder in enumerate(reminders):
-                try:
-                    minutes = int(reminder.get("minutes", 0) or 0)
-                    if minutes <= 0:
-                        continue
-
-                    due_at = when - timedelta(minutes=minutes)
-                    key = f"{idx}:{minutes}:{reminder.get('target', 'missing')}"
-
-                    if sent_map.get(key):
-                        continue
-
-                    if now < due_at:
-                        continue
-
-                    sent = await _send_event_reminder(event_reminder_loop._client, str(msg_id), obj, reminder)  # type: ignore[attr-defined]
-                    sent_map[key] = {"sent_at": now.isoformat(), "sent": int(sent)}
-                    changed = True
-
-                except Exception as e:
-                    print(f"[event_reminder_loop] Reminder Fehler: {e!r}")
-                    continue
-
-        except Exception as e:
-            print(f"[event_reminder_loop] Event Fehler: {e!r}")
-            continue
-
-    if changed:
-        save_store()
+def _interesting_setting_key(key: str) -> bool:
+    k = key.lower()
+    needles = (
+        "channel", "role", "admin", "leader", "officer", "member",
+        "dkp", "ec", "point", "decay", "verfall", "auction", "market",
+        "log", "loot", "need", "voice", "event", "enabled", "active",
+        "template", "alliance", "weekly", "report", "contact", "price",
+        "bid", "roll", "sale", "guild"
+    )
+    return any(n in k for n in needles)
 
 
-async def apply_rsvp(inter: discord.Interaction, msg_id: str, group: str) -> tuple[bool, str]:
-    obj = store.get(str(msg_id))
-
-    if not obj:
-        return False, "Dieses Event existiert nicht mehr."
-
-    _init_event_shape(obj)
-
-    uid = inter.user.id
-
-    allowed, reason = await _member_allowed_for_target_role(inter, obj, uid)
-    if not allowed:
-        return False, f"❌ {reason}"
-
-    member = _member_from_event(inter, obj)
-    display_name = _current_display_name(member, inter.user)
-    guild_label, source_guild_id = _source_label_for_inter(inter, obj) if _is_alliance_event(obj) else ("", int(inter.guild_id or obj.get("guild_id", 0) or 0))
-
-    if group in ("TANK", "HEAL", "DPS"):
-        response_key = "yes"
-    elif group == "BANK":
-        response_key = "bank"
-    elif group == "MAYBE":
-        response_key = "maybe"
-    else:
-        response_key = "no"
-
-    for k in ("TANK", "HEAL", "DPS", "BANK"):
-        obj["yes"][k] = [
-            entry for entry in obj["yes"].get(k, [])
-            if _entry_user_id(entry) != uid
-        ]
-
-    obj["no"] = [
-        entry for entry in obj.get("no", [])
-        if _entry_user_id(entry) != uid
+def _summarize_settings(sources: dict[str, Any], guild: discord.Guild) -> dict[str, Any]:
+    guild_id = int(guild.id)
+    member_filter = _dashboard_member_filter_info(guild)
+    config_keys = [
+        "member_portal_cfg",
+        "dkp_cfg",
+        "loot_cfg",
+        "loot_auction_cfg",
+        "raid_templates",
+        "alliance_config",
+        "weekly_report_cfg",
+        "leader_contact_cfg",
+        "guild_chest",
     ]
+    channels: dict[str, dict[str, Any]] = {}
+    roles: dict[str, dict[str, Any]] = {}
+    settings_rows: list[dict[str, Any]] = []
+    module_rows: list[dict[str, Any]] = []
 
-    obj["maybe"].pop(str(uid), None)
+    for source_key in config_keys:
+        raw = sources.get(source_key)
+        scoped = _guild_dict(raw, guild_id)
+        if not scoped and isinstance(raw, dict):
+            # Fallback für ältere Configs, die nicht nach guild_id gruppiert sind.
+            scoped = raw
+        exists = not (raw in ({}, [], None))
+        module_rows.append({
+            "module": source_key,
+            "configured": bool(scoped),
+            "source_exists": bool(exists),
+            "top_level_keys": len(scoped) if isinstance(scoped, dict) else (len(scoped) if isinstance(scoped, list) else 0),
+        })
+        if not isinstance(scoped, (dict, list)):
+            continue
+        flat = _flatten_config(scoped, source_key, max_depth=4)
+        for key, value in flat:
+            lk = key.lower()
+            if not _interesting_setting_key(key):
+                continue
+            text_value = _safe_text(value, 240)
+            row = {"source": source_key, "key": key, "value": text_value}
+            settings_rows.append(row)
+            if "channel" in lk and _looks_like_id(value):
+                channels[key] = {
+                    "source": source_key,
+                    "key": key,
+                    "channel_id": str(value),
+                    "name": _resolve_channel_name(guild, value),
+                    "resolved": bool(_resolve_channel_name(guild, value)),
+                }
+            if "role" in lk and _looks_like_id(value):
+                roles[key] = {
+                    "source": source_key,
+                    "key": key,
+                    "role_id": str(value),
+                    "name": _resolve_role_name(guild, value),
+                    "resolved": bool(_resolve_role_name(guild, value)),
+                }
 
-    if group in ("TANK", "HEAL", "DPS"):
-        obj["yes"][group].append(_participant_entry(uid, display_name, guild_label, source_guild_id))
-        text = f"Angemeldet als **{group}**."
+    channels_rows = list(channels.values())[:250]
+    roles_rows = list(roles.values())[:250]
+    settings_rows = settings_rows[:600]
+    return {
+        "member_filter": member_filter,
+        "modules": module_rows,
+        "channels": channels_rows,
+        "roles": roles_rows,
+        "settings": settings_rows,
+        "counts": {
+            "modules": len(module_rows),
+            "channels": len(channels_rows),
+            "roles": len(roles_rows),
+            "settings": len(settings_rows),
+        },
+    }
 
-    elif group == "BANK":
-        obj["yes"]["BANK"].append(_participant_entry(uid, display_name, guild_label, source_guild_id))
-        text = "Als **Reserve** eingetragen."
-
-    elif group == "MAYBE":
-        rid_map = get_role_ids_for_guild(int(obj["guild_id"]))
-        label = _primary_label(member, rid_map)
-        maybe_obj = _maybe_entry(uid, display_name, label)
-        if guild_label:
-            maybe_obj["guild_label"] = guild_label
-        if source_guild_id:
-            maybe_obj["source_guild_id"] = int(source_guild_id)
-        obj["maybe"][str(uid)] = maybe_obj
-        text = "Als **Vielleicht** eingetragen."
-
-    elif group == "NO":
-        obj["no"].append(_participant_entry(uid, display_name, guild_label, source_guild_id))
-        text = "Als **Abgemeldet** eingetragen."
-
-    else:
-        return False, "Ungültige Auswahl."
-
-    save_store()
-    record_response(int(obj["guild_id"]), uid, str(msg_id), response_key)
-    await _push_overview(inter.client, str(msg_id), obj)
-
-    # Gildenzentrale-Startseite aktualisieren, aber nur vorhandene Portal-DM bearbeiten.
-    # Es wird keine neue Portal-DM gesendet.
-    refresh_guild_ids = {int(obj.get("guild_id", 0) or 0)}
-
-    if source_guild_id:
-        refresh_guild_ids.add(int(source_guild_id))
-
-    for gid in refresh_guild_ids:
-        if gid:
-            _schedule_portal_refresh_for_user(inter.client, gid, uid)
-
-    return True, text
+def _summarize_event_checks(data: Any, guild_id: int, *, limit: int = 200) -> dict[str, Any]:
+    g = _guild_dict(data, guild_id)
+    checks = g.get("checks") if isinstance(g.get("checks"), dict) else g
+    if not isinstance(checks, dict):
+        checks = {}
+    items = []
+    for cid, chk in checks.items():
+        if not isinstance(chk, dict):
+            continue
+        attendees = chk.get("attendees") if isinstance(chk.get("attendees"), dict) else {}
+        items.append({
+            "check_id": str(cid),
+            "event_id": str(chk.get("event_id") or cid),
+            "title": _safe_text(chk.get("title") or chk.get("event_title") or "", 160),
+            "created_at": str(chk.get("created_at") or ""),
+            "status": _safe_text(chk.get("status") or "", 80),
+            "attendee_count": len(attendees),
+            "ec_awarded": bool(chk.get("ec_awarded") or chk.get("awarded")),
+        })
+    items.sort(key=lambda x: str(x.get("created_at") or ""), reverse=True)
+    return {"count": len(checks), "items": items[:limit]}
 
 
-class BaseRaidView(View):
-    def __init__(self, msg_id: int):
-        super().__init__(timeout=None)
-        self.msg_id = str(msg_id)
-        _rebind_rsvp_view_emojis(self)
-
-    async def _send_feedback(self, inter: discord.Interaction, text: str):
-        if not inter.response.is_done():
-            await inter.response.send_message(text, ephemeral=True)
-        else:
-            await inter.followup.send(text, ephemeral=True)
-
-    async def _after_success(self, inter: discord.Interaction):
-        try:
-            await _delete_irrelevant_bot_dm_messages_for_user(
-                inter.client,
-                inter.user.id,
-                current_msg_id=self.msg_id,
-                limit=200
-            )
-        except Exception:
-            pass
-
-    async def _handle(self, inter: discord.Interaction, group: str):
-        try:
-            ok, text = await apply_rsvp(inter, self.msg_id, group)
-            await self._send_feedback(inter, text)
-
-            if ok:
-                await self._after_success(inter)
-
-        except Exception as e:
-            await self._send_feedback(inter, "❌ Unerwarteter Fehler. Bitte erneut probieren.")
-
+def _voice_summary(guild_id: int) -> dict[str, Any]:
+    try:
+        # Für das Dashboard/Analytics laden wir mehr als nur die letzten 20 Sessions.
+        # Das ist weiterhin read-only und verändert keine Voice- oder Eventdaten.
+        sessions = runtime_db.fetch_voice_sessions(guild_id, limit=1000)
+        by_user: dict[int, dict[str, Any]] = {}
+        for sess in sessions or []:
+            if not isinstance(sess, dict):
+                continue
             try:
-                gid = 0
-                obj = store.get(self.msg_id) or {}
-                gid = int(obj.get("guild_id", 0) or 0)
-                await _log(inter.client, gid, f"Button-Fehler ({type(self).__name__}): {e!r}")
+                uid = int(sess.get("user_id") or sess.get("member_id") or 0)
+            except Exception:
+                uid = 0
+            if not uid:
+                continue
+            try:
+                dur = int(float(sess.get("duration_seconds") or sess.get("duration") or 0))
+            except Exception:
+                dur = 0
+            bucket = by_user.setdefault(uid, {
+                "user_id": uid,
+                "sessions": 0,
+                "total_seconds": 0,
+                "last_joined_at": "",
+                "last_left_at": "",
+            })
+            bucket["sessions"] += 1
+            bucket["total_seconds"] += max(0, dur)
+            joined = str(sess.get("joined_at") or "")
+            left = str(sess.get("left_at") or "")
+            if joined and joined > str(bucket.get("last_joined_at") or ""):
+                bucket["last_joined_at"] = joined
+            if left and left > str(bucket.get("last_left_at") or ""):
+                bucket["last_left_at"] = left
+
+        by_user_rows = list(by_user.values())
+        by_user_rows.sort(key=lambda x: int(x.get("total_seconds") or 0), reverse=True)
+        total_seconds = sum(int(x.get("total_seconds") or 0) for x in by_user_rows)
+        return {
+            "sessions_total": runtime_db.count_voice_sessions(guild_id),
+            "sessions_open": runtime_db.count_voice_sessions(guild_id, open_only=True),
+            "recent_sessions": sessions[:250],
+            "loaded_sessions": len(sessions or []),
+            "total_seconds_loaded": total_seconds,
+            "total_hours_loaded": round(total_seconds / 3600, 2),
+            "by_user": by_user_rows[:500],
+        }
+    except Exception as exc:
+        return {"error": f"{type(exc).__name__}: {exc}", "sessions_total": 0, "sessions_open": 0, "recent_sessions": [], "by_user": []}
+
+
+def _audit_summary(guild_id: int) -> dict[str, Any]:
+    try:
+        return {
+            "logs_total": runtime_db.count_audit_logs(guild_id),
+            "recent_logs": runtime_db.fetch_audit_logs(guild_id, limit=300),
+        }
+    except Exception as exc:
+        return {"error": f"{type(exc).__name__}: {exc}", "logs_total": 0, "recent_logs": []}
+
+
+
+
+def _dashboard_insights(guild: discord.Guild, snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Zusätzliche read-only Auswertungen für Dashboard/Vertrieb/Massennutzung.
+
+    Wichtig: Diese Funktion verändert keine Bot-Daten. Sie nutzt nur den gerade
+    gebauten Snapshot plus die gesetzte Dashboard-Gildenrolle.
+    """
+    try:
+        member_role = _dashboard_member_role(guild)
+        role_member_map = {
+            int(member.id): member
+            for member in (getattr(member_role, "members", []) if member_role is not None else [])
+            if getattr(member, "id", None)
+        }
+        role_ids = sorted(role_member_map.keys())
+    except Exception:
+        role_member_map = {}
+        role_ids = []
+
+    profiles = ((snapshot.get("profiles") or {}).get("items") or [])
+    balances = (((snapshot.get("ec") or {}).get("balances") or {}).get("top") or [])
+    needs_items = (((snapshot.get("loot") or {}).get("needs") or {}).get("items") or [])
+    events = ((snapshot.get("events") or {}).get("items") or [])
+    auctions = (((snapshot.get("loot") or {}).get("auctions") or {}).get("items") or [])
+    tx_items = ((((snapshot.get("ec") or {}).get("transactions") or {}).get("items") or [])
+                or (((snapshot.get("ec") or {}).get("transactions") or {}).get("recent") or []))
+    voice_by_user = ((snapshot.get("voice") or {}).get("by_user") or [])
+
+    profile_by_uid: dict[int, dict[str, Any]] = {}
+    for p in profiles:
+        if isinstance(p, dict):
+            try:
+                profile_by_uid[int(p.get("user_id") or 0)] = p
             except Exception:
                 pass
 
+    balance_by_uid: dict[int, float] = {}
+    for b in balances:
+        if not isinstance(b, dict):
+            continue
+        try:
+            balance_by_uid[int(b.get("user_id") or 0)] = float(b.get("balance") or 0)
+        except Exception:
+            continue
 
-class RaidView(BaseRaidView):
-    @button(label="Tank", emoji=_button_emoji(EMOJI_TANK), style=ButtonStyle.primary, custom_id="dm_rsvp_tank")
-    async def btn_tank(self, inter: discord.Interaction, _):
-        await self._handle(inter, "TANK")
+    need_by_uid: dict[int, dict[str, Any]] = {}
+    main_need_counter: dict[str, int] = {}
+    secondary_need_counter: dict[str, int] = {}
+    for n in needs_items:
+        if not isinstance(n, dict):
+            continue
+        try:
+            uid = int(n.get("user_id") or 0)
+        except Exception:
+            uid = 0
+        if uid:
+            need_by_uid[uid] = n
+        for label in n.get("main") or []:
+            key = str(label or "").strip()
+            if key:
+                main_need_counter[key] = main_need_counter.get(key, 0) + 1
+        for label in n.get("secondary") or []:
+            key = str(label or "").strip()
+            if key:
+                secondary_need_counter[key] = secondary_need_counter.get(key, 0) + 1
 
-    @button(label="Heal", emoji=_button_emoji(EMOJI_HEAL), style=ButtonStyle.secondary, custom_id="dm_rsvp_heal")
-    async def btn_heal(self, inter: discord.Interaction, _):
-        await self._handle(inter, "HEAL")
+    event_stats: dict[int, dict[str, Any]] = {}
+    def touch_event_user(uid: int) -> dict[str, Any]:
+        return event_stats.setdefault(uid, {"responses": 0, "yes": 0, "maybe": 0, "no": 0})
 
-    @button(label="DPS", emoji=_button_emoji(EMOJI_DPS), style=ButtonStyle.secondary, custom_id="dm_rsvp_dps")
-    async def btn_dps(self, inter: discord.Interaction, _):
-        await self._handle(inter, "DPS")
+    for ev in events:
+        if not isinstance(ev, dict):
+            continue
+        parts = ev.get("participants") or {}
+        for group in (parts.get("yes") or []):
+            if not isinstance(group, dict):
+                continue
+            for p in group.get("participants") or []:
+                if not isinstance(p, dict):
+                    continue
+                try:
+                    uid = int(p.get("user_id") or 0)
+                except Exception:
+                    uid = 0
+                if uid:
+                    st = touch_event_user(uid)
+                    st["responses"] += 1
+                    st["yes"] += 1
+        for key, field in (("maybe", "maybe"), ("no", "no")):
+            for p in parts.get(key) or []:
+                if not isinstance(p, dict):
+                    continue
+                try:
+                    uid = int(p.get("user_id") or 0)
+                except Exception:
+                    uid = 0
+                if uid:
+                    st = touch_event_user(uid)
+                    st["responses"] += 1
+                    st[field] += 1
 
-    @button(label="Reserve", emoji=_button_emoji(EMOJI_BANK), style=ButtonStyle.secondary, custom_id="dm_rsvp_bank")
-    async def btn_bank(self, inter: discord.Interaction, _):
-        await self._handle(inter, "BANK")
+    voice_by_uid: dict[int, dict[str, Any]] = {}
+    for v in voice_by_user:
+        if isinstance(v, dict):
+            try:
+                voice_by_uid[int(v.get("user_id") or 0)] = v
+            except Exception:
+                pass
 
-    @button(label="Vielleicht", emoji=_button_emoji(EMOJI_MAYBE), style=ButtonStyle.secondary, custom_id="dm_rsvp_maybe")
-    async def btn_maybe(self, inter: discord.Interaction, _):
-        await self._handle(inter, "MAYBE")
+    won_by_uid: dict[int, dict[str, Any]] = {}
+    leading_by_uid: dict[int, int] = {}
+    active_statuses = {"open", "active", "running", "bidding", "roll", "sale", "free", "main", "secondary"}
+    for a in auctions:
+        if not isinstance(a, dict):
+            continue
+        try:
+            winner_id = int(a.get("winner_user_id") or 0)
+        except Exception:
+            winner_id = 0
+        if winner_id:
+            bucket = won_by_uid.setdefault(winner_id, {"user_id": winner_id, "won_count": 0, "items": []})
+            bucket["won_count"] += 1
+            if len(bucket["items"]) < 30:
+                bucket["items"].append({"auction_id": a.get("auction_id"), "item_name": a.get("item_name"), "status": a.get("status")})
+        status = str(a.get("status") or "").lower()
+        if status in active_statuses:
+            try:
+                leader_id = int(a.get("top_bid_user_id") or 0)
+            except Exception:
+                leader_id = 0
+            if leader_id:
+                leading_by_uid[leader_id] = leading_by_uid.get(leader_id, 0) + 1
 
-    @button(label="Abmelden", emoji=_button_emoji(EMOJI_NO), style=ButtonStyle.danger, custom_id="dm_rsvp_no")
-    async def btn_no(self, inter: discord.Interaction, _):
-        await self._handle(inter, "NO")
+    tx_by_uid: dict[int, dict[str, Any]] = {}
+    for tx in tx_items:
+        if not isinstance(tx, dict):
+            continue
+        try:
+            uid = int(tx.get("user_id") or 0)
+        except Exception:
+            uid = 0
+        if not uid:
+            continue
+        amount = _parse_amount(tx.get("amount"))
+        b = tx_by_uid.setdefault(uid, {"earned": 0.0, "spent": 0.0, "transactions": 0})
+        b["transactions"] += 1
+        if amount >= 0:
+            b["earned"] += amount
+        else:
+            b["spent"] += abs(amount)
+
+    members: list[dict[str, Any]] = []
+    for uid in role_ids:
+        member = role_member_map.get(uid) or guild.get_member(uid)
+        p = profile_by_uid.get(uid, {})
+        n = need_by_uid.get(uid, {})
+        evs = event_stats.get(uid, {"responses": 0, "yes": 0, "maybe": 0, "no": 0})
+        voice = voice_by_uid.get(uid, {})
+        won = won_by_uid.get(uid, {"won_count": 0})
+        txs = tx_by_uid.get(uid, {"earned": 0.0, "spent": 0.0, "transactions": 0})
+        main_count = int(n.get("main_count") or len(n.get("main") or []) or 0) if isinstance(n, dict) else 0
+        secondary_count = int(n.get("secondary_count") or len(n.get("secondary") or []) or 0) if isinstance(n, dict) else 0
+        has_profile = uid in profile_by_uid
+        has_ec = uid in balance_by_uid
+        has_needs = uid in need_by_uid
+        voice_seconds = int(voice.get("total_seconds") or 0) if isinstance(voice, dict) else 0
+        risk_flags: list[str] = []
+        if not has_profile:
+            risk_flags.append("kein Profil")
+        if not has_ec:
+            risk_flags.append("kein EC-Konto")
+        if not has_needs:
+            risk_flags.append("keine Needliste")
+        if int(evs.get("responses") or 0) <= 0:
+            risk_flags.append("keine Eventantwort")
+        if voice_seconds <= 0:
+            risk_flags.append("keine Voice-Zeit")
+        discord_display = _safe_text(getattr(member, "display_name", "") or "", 120)
+        avatar_url = _safe_text(str(getattr(getattr(member, "display_avatar", None), "url", "") or ""), 500)
+        members.append({
+            "user_id": uid,
+            "display_name": discord_display or _safe_text(p.get("display_name") or p.get("ingame_name") or f"User {uid}", 120),
+            "server_name": discord_display,
+            "discord_name": _safe_text(getattr(member, "name", "") or "", 120),
+            "avatar_url": avatar_url,
+            "ingame_name": _safe_text(p.get("ingame_name") if isinstance(p, dict) else "", 120),
+            "main_role": _safe_text(p.get("main_role") if isinstance(p, dict) else "", 80),
+            "gearscore": _safe_text(p.get("gearscore") if isinstance(p, dict) else "", 40),
+            "ec_balance": balance_by_uid.get(uid),
+            "has_profile": has_profile,
+            "has_ec": has_ec,
+            "has_needs": has_needs,
+            "main_need_count": main_count,
+            "secondary_need_count": secondary_count,
+            "event_responses": int(evs.get("responses") or 0),
+            "event_yes": int(evs.get("yes") or 0),
+            "event_maybe": int(evs.get("maybe") or 0),
+            "event_no": int(evs.get("no") or 0),
+            "voice_seconds": voice_seconds,
+            "voice_hours": round(voice_seconds / 3600, 2),
+            "voice_sessions": int(voice.get("sessions") or 0) if isinstance(voice, dict) else 0,
+            "ec_earned_loaded": round(float(txs.get("earned") or 0), 2),
+            "ec_spent_loaded": round(float(txs.get("spent") or 0), 2),
+            "ec_transactions_loaded": int(txs.get("transactions") or 0),
+            "loot_won_count": int(won.get("won_count") or 0),
+            "active_leads": int(leading_by_uid.get(uid, 0)),
+            "risk_flags": risk_flags,
+            "risk_score": len(risk_flags),
+        })
+
+    members.sort(key=lambda x: (-int(x.get("risk_score") or 0), str(x.get("display_name") or "").lower()))
+    top_main = sorted(main_need_counter.items(), key=lambda x: (-x[1], x[0].lower()))[:80]
+    top_secondary = sorted(secondary_need_counter.items(), key=lambda x: (-x[1], x[0].lower()))[:80]
+    winners = list(won_by_uid.values())
+    winners.sort(key=lambda x: (-int(x.get("won_count") or 0), str(x.get("user_id"))))
+    missing_profile = sum(1 for m in members if not m.get("has_profile"))
+    missing_ec = sum(1 for m in members if not m.get("has_ec"))
+    missing_needs = sum(1 for m in members if not m.get("has_needs"))
+    no_event_response = sum(1 for m in members if int(m.get("event_responses") or 0) <= 0)
+    no_voice = sum(1 for m in members if int(m.get("voice_seconds") or 0) <= 0)
+
+    return {
+        "generated_at": _now_iso(),
+        "member_count": len(members),
+        "quality": {
+            "missing_profile": missing_profile,
+            "missing_ec": missing_ec,
+            "missing_needs": missing_needs,
+            "no_event_response": no_event_response,
+            "no_voice_time": no_voice,
+        },
+        "members": members[:800],
+        "risk_members": [m for m in members if int(m.get("risk_score") or 0) > 0][:200],
+        "needs": {
+            "top_main": [{"label": k, "count": v} for k, v in top_main],
+            "top_secondary": [{"label": k, "count": v} for k, v in top_secondary],
+            "users_without_needs": [m for m in members if not m.get("has_needs")][:200],
+            "main_total": sum(main_need_counter.values()),
+            "secondary_total": sum(secondary_need_counter.values()),
+        },
+        "loot": {
+            "winner_rows": winners[:200],
+            "active_leaders": [{"user_id": uid, "lead_count": cnt} for uid, cnt in sorted(leading_by_uid.items(), key=lambda x: -x[1])[:100]],
+        },
+    }
 
 
-class ServerRaidView(BaseRaidView):
-    @button(label="Tank", emoji=_button_emoji(EMOJI_TANK), style=ButtonStyle.primary, custom_id="srv_rsvp_tank")
-    async def btn_tank(self, inter: discord.Interaction, _):
-        await self._handle(inter, "TANK")
+def _dashboard_feed_channel_name(kind: str) -> str:
+    """Discord-Kanalname für Dashboard-News/Guides aus Runtime-DB oder Env lesen.
 
-    @button(label="Heal", emoji=_button_emoji(EMOJI_HEAL), style=ButtonStyle.secondary, custom_id="srv_rsvp_heal")
-    async def btn_heal(self, inter: discord.Interaction, _):
-        await self._handle(inter, "HEAL")
+    Absichtlich name-basiert, damit der Betreiber per Slash-Command z. B.
+    `news` oder `guides` setzen kann, ohne Kanal-IDs aus Discord kopieren zu müssen.
+    """
+    kind_up = str(kind or "").upper()
+    setting = DASHBOARD_GUIDES_CHANNEL_NAME_SETTING if kind_up == "GUIDES" else DASHBOARD_NEWS_CHANNEL_NAME_SETTING
+    env_names = [f"DASHBOARD_{kind_up}_CHANNEL_NAME", f"DISCORD_{kind_up}_CHANNEL_NAME", f"TNL_{kind_up}_CHANNEL_NAME"]
+    if kind_up == "NEWS":
+        env_names.extend(["NEWS_CHANNEL_NAME", "DASHBOARD_TNL_NEWS_CHANNEL_NAME"])
+    if kind_up == "GUIDES":
+        env_names.extend(["GUIDES_CHANNEL_NAME", "DASHBOARD_TNL_GUIDES_CHANNEL_NAME", "GUIDE_CHANNEL_NAME"])
 
-    @button(label="DPS", emoji=_button_emoji(EMOJI_DPS), style=ButtonStyle.secondary, custom_id="srv_rsvp_dps")
-    async def btn_dps(self, inter: discord.Interaction, _):
-        await self._handle(inter, "DPS")
+    # Runtime-DB ist guildbezogen; weil diese Helper-Funktion keine guild_id kennt,
+    # wird die eigentliche DB-Lesung in _dashboard_feed_channel_config gemacht.
+    return ""
 
-    @button(label="Reserve", emoji=_button_emoji(EMOJI_BANK), style=ButtonStyle.secondary, custom_id="srv_rsvp_bank")
-    async def btn_bank(self, inter: discord.Interaction, _):
-        await self._handle(inter, "BANK")
 
-    @button(label="Vielleicht", emoji=_button_emoji(EMOJI_MAYBE), style=ButtonStyle.secondary, custom_id="srv_rsvp_maybe")
-    async def btn_maybe(self, inter: discord.Interaction, _):
-        await self._handle(inter, "MAYBE")
+def _dashboard_feed_channel_id(kind: str) -> int:
+    kind = str(kind or "").upper()
+    names = [f"DASHBOARD_{kind}_CHANNEL_ID", f"DISCORD_{kind}_CHANNEL_ID", f"TNL_{kind}_CHANNEL_ID"]
+    if kind == "NEWS":
+        names.extend(["NEWS_CHANNEL_ID", "DASHBOARD_TNL_NEWS_CHANNEL_ID"])
+    if kind == "GUIDES":
+        names.extend(["GUIDES_CHANNEL_ID", "DASHBOARD_TNL_GUIDES_CHANNEL_ID", "GUIDE_CHANNEL_ID"])
+    if kind == "ANNOUNCEMENTS":
+        names.extend([
+            "ANNOUNCEMENTS_CHANNEL_ID",
+            "ANNOUNCEMENT_CHANNEL_ID",
+            "DASHBOARD_ANNOUNCEMENTS_CHANNEL_ID",
+            "GUILD_ANNOUNCEMENTS_CHANNEL_ID",
+        ])
+    for name in names:
+        raw = os.getenv(name, "").strip()
+        if not raw:
+            continue
+        try:
+            return int(raw)
+        except Exception:
+            continue
+    return 0
 
-    @button(label="Abmelden", emoji=_button_emoji(EMOJI_NO), style=ButtonStyle.danger, custom_id="srv_rsvp_no")
-    async def btn_no(self, inter: discord.Interaction, _):
-        await self._handle(inter, "NO")
+
+def _dashboard_feed_channel_config(guild_id: int, kind: str) -> dict[str, Any]:
+    kind_up = str(kind or "").upper()
+    if kind_up == "GUIDES":
+        name_setting = DASHBOARD_GUIDES_CHANNEL_NAME_SETTING
+        central_id_setting = "guild_channel_guides_id"
+    elif kind_up == "ANNOUNCEMENTS":
+        name_setting = DASHBOARD_ANNOUNCEMENTS_CHANNEL_NAME_SETTING
+        central_id_setting = "guild_channel_announcements_id"
+    else:
+        name_setting = DASHBOARD_NEWS_CHANNEL_NAME_SETTING
+        central_id_setting = "guild_channel_news_id"
+    configured_name = ""
+    central_id = 0
+    try:
+        central_id = int(runtime_db.get_guild_setting(int(guild_id), central_id_setting, 0) or 0)
+    except Exception:
+        central_id = 0
+    try:
+        configured_name = str(runtime_db.get_guild_setting(int(guild_id), name_setting, "") or "").strip()
+    except Exception:
+        configured_name = ""
+
+    if not configured_name:
+        env_names = [f"DASHBOARD_{kind_up}_CHANNEL_NAME", f"DISCORD_{kind_up}_CHANNEL_NAME", f"TNL_{kind_up}_CHANNEL_NAME"]
+        if kind_up == "NEWS":
+            env_names.extend(["NEWS_CHANNEL_NAME", "DASHBOARD_TNL_NEWS_CHANNEL_NAME"])
+        if kind_up == "GUIDES":
+            env_names.extend(["GUIDES_CHANNEL_NAME", "DASHBOARD_TNL_GUIDES_CHANNEL_NAME", "GUIDE_CHANNEL_NAME"])
+        if kind_up == "ANNOUNCEMENTS":
+            env_names.extend([
+                "ANNOUNCEMENTS_CHANNEL_NAME",
+                "ANNOUNCEMENT_CHANNEL_NAME",
+                "DASHBOARD_ANNOUNCEMENTS_CHANNEL_NAME",
+                "GUILD_ANNOUNCEMENTS_CHANNEL_NAME",
+            ])
+        for env in env_names:
+            raw = os.getenv(env, "").strip()
+            if raw:
+                configured_name = raw
+                break
+
+    return {"name": configured_name, "id": central_id or _dashboard_feed_channel_id(kind_up)}
+
+
+def _normal_channel_name(value: Any) -> str:
+    return str(value or "").strip().lower().lstrip("#").replace(" ", "-").replace("_", "-")
+
+
+def _find_feed_channel_by_name(guild: discord.Guild, raw_name: str) -> Optional[Any]:
+    wanted = _normal_channel_name(raw_name)
+    if not wanted:
+        return None
+    # Erst exakter normalisierter Treffer, dann contains-Fallback.
+    channels = [ch for ch in getattr(guild, "channels", []) if hasattr(ch, "history")]
+    for ch in channels:
+        if _normal_channel_name(getattr(ch, "name", "")) == wanted:
+            return ch
+    for ch in channels:
+        if wanted in _normal_channel_name(getattr(ch, "name", "")):
+            return ch
+    return None
+
+def _message_jump_url(guild_id: int, channel_id: int, message_id: int) -> str:
+    if not guild_id or not channel_id or not message_id:
+        return ""
+    return f"https://discord.com/channels/{int(guild_id)}/{int(channel_id)}/{int(message_id)}"
+
+
+async def _dashboard_fetch_channel_feed(guild: discord.Guild, *, kind: str, limit: int = 30) -> dict[str, Any]:
+    cfg = _dashboard_feed_channel_config(int(guild.id), kind)
+    channel_name = str(cfg.get("name") or "").strip()
+    channel_id = int(cfg.get("id") or 0)
+    out: dict[str, Any] = {"kind": str(kind or "").lower(), "channel_id": int(channel_id or 0), "channel_name": channel_name, "configured_name": channel_name, "configured": bool(channel_name or channel_id), "fetched_at": _now_iso(), "messages": []}
+    channel = None
+    if channel_name:
+        channel = _find_feed_channel_by_name(guild, channel_name)
+        if channel is not None:
+            channel_id = int(getattr(channel, "id", 0) or 0)
+            out["channel_id"] = channel_id
+            out["channel_name"] = str(getattr(channel, "name", "") or channel_name)
+    if channel is None and channel_id:
+        channel = guild.get_channel(int(channel_id))
+        if channel is None:
+            try:
+                channel = await guild.fetch_channel(int(channel_id))  # type: ignore[attr-defined]
+            except Exception as exc:
+                out["error"] = f"Kanal konnte nicht geladen werden: {type(exc).__name__}: {exc}"
+                return out
+        out["channel_name"] = str(getattr(channel, "name", "") or channel_id)
+    if channel is None:
+        out["error"] = f"Kein Kanal gesetzt. Nutze das Dashboard unter Gilde & Discord oder /guild set_channel."
+        return out
+    if not hasattr(channel, "history"):
+        out["error"] = "Kanal unterstützt keine Nachrichten-History."
+        return out
+    rows: list[dict[str, Any]] = []
+    try:
+        async for msg in channel.history(limit=int(os.getenv("DASHBOARD_FEED_LIMIT", str(limit)) or limit), oldest_first=False):  # type: ignore[attr-defined]
+            content = _safe_text(getattr(msg, "clean_content", "") or getattr(msg, "content", ""), limit=2500)
+            attachments = []
+            for a in getattr(msg, "attachments", []) or []:
+                attachments.append({"filename": _safe_text(getattr(a, "filename", "Anhang"), 160), "url": str(getattr(a, "url", "") or ""), "content_type": str(getattr(a, "content_type", "") or ""), "size": int(getattr(a, "size", 0) or 0)})
+            embeds = []
+            for e in getattr(msg, "embeds", []) or []:
+                try:
+                    embeds.append({"title": _safe_text(getattr(e, "title", "") or "", 240), "description": _safe_text(getattr(e, "description", "") or "", 1600), "url": str(getattr(e, "url", "") or ""), "image_url": str(getattr(getattr(e, "image", None), "url", "") or ""), "thumbnail_url": str(getattr(getattr(e, "thumbnail", None), "url", "") or "")})
+                except Exception:
+                    continue
+            if not content and not attachments and not embeds:
+                continue
+            author = getattr(msg, "author", None)
+            avatar_url = ""
+            try:
+                avatar_url = str(getattr(getattr(author, "display_avatar", None), "url", "") or "")
+            except Exception:
+                avatar_url = ""
+            rows.append({"message_id": int(getattr(msg, "id", 0) or 0), "channel_id": int(getattr(getattr(msg, "channel", None), "id", channel_id) or channel_id), "created_at": getattr(getattr(msg, "created_at", None), "isoformat", lambda: "")(), "edited_at": getattr(getattr(msg, "edited_at", None), "isoformat", lambda: "")() if getattr(msg, "edited_at", None) else "", "author_id": int(getattr(author, "id", 0) or 0), "author_name": _safe_text(getattr(author, "display_name", None) or getattr(author, "name", None) or "Discord", 120), "author_avatar_url": avatar_url, "content": content, "attachments": attachments[:6], "embeds": embeds[:4], "jump_url": _message_jump_url(int(guild.id), int(channel_id), int(getattr(msg, "id", 0) or 0))})
+    except Exception as exc:
+        out["error"] = f"Nachrichten konnten nicht gelesen werden: {type(exc).__name__}: {exc}"
+    out["messages"] = rows
+    out["count"] = len(rows)
+    return out
+
+
+async def _dashboard_discord_feeds_snapshot(guild: discord.Guild) -> dict[str, Any]:
+    return {
+        "news": await _dashboard_fetch_channel_feed(guild, kind="news"),
+        "guides": await _dashboard_fetch_channel_feed(guild, kind="guides"),
+        "announcements": await _dashboard_fetch_channel_feed(guild, kind="announcements"),
+    }
+
+
+_EVENT_MEDIA_CACHE: dict[int, tuple[float, str]] = {}
+
+
+def _message_event_image_url(message: Any) -> str:
+    """Bevorzugt Discords frische Proxy-URL des tatsächlich geposteten Bildes."""
+    candidates: list[Any] = []
+    for attachment in getattr(message, "attachments", []) or []:
+        content_type = str(getattr(attachment, "content_type", "") or "").lower()
+        filename = str(getattr(attachment, "filename", "") or "").lower()
+        if content_type.startswith("image/") or filename.endswith((".png", ".jpg", ".jpeg", ".webp", ".gif")):
+            candidates.extend([getattr(attachment, "proxy_url", None), getattr(attachment, "url", None)])
+    for embed in getattr(message, "embeds", []) or []:
+        image = getattr(embed, "image", None)
+        thumbnail = getattr(embed, "thumbnail", None)
+        candidates.extend([
+            getattr(image, "proxy_url", None), getattr(image, "url", None),
+            getattr(thumbnail, "proxy_url", None), getattr(thumbnail, "url", None),
+        ])
+    for raw in candidates:
+        url = _stable_discord_media_url(raw)
+        if url:
+            return url
+    return ""
+
+
+async def _dashboard_hydrate_event_media(guild: discord.Guild, snapshot: dict[str, Any]) -> None:
+    """Event-Titelbilder aus den echten Discord-Eventposts in den Snapshot übernehmen.
+
+    Der Event-JSON-Eintrag kann eine alte/abgelaufene Bild-URL enthalten. Der
+    Discord-Post selbst besitzt dagegen eine aktuelle Embed-Proxy-URL. Es werden
+    nur die neuesten Events geprüft und Ergebnisse 25 Minuten gecacht, damit die
+    5-Minuten-Snapshot-Schleife Discord nicht unnötig belastet.
+    """
+    events = ((snapshot.get("events") or {}).get("items") or [])
+    if not isinstance(events, list):
+        return
+    now_ts = datetime.now(timezone.utc).timestamp()
+    try:
+        max_events = max(1, min(80, int(os.getenv("DASHBOARD_EVENT_IMAGE_FETCH_LIMIT", "40") or 40)))
+    except Exception:
+        max_events = 40
+    for event in events[:max_events]:
+        if not isinstance(event, dict):
+            continue
+        try:
+            message_id = int(event.get("event_id") or event.get("message_id") or 0)
+            channel_id = int(event.get("channel_id") or 0)
+        except Exception:
+            continue
+        if not message_id or not channel_id:
+            continue
+        cached = _EVENT_MEDIA_CACHE.get(message_id)
+        if cached and now_ts - float(cached[0]) < 1500 and cached[1]:
+            event["image_url"] = cached[1]
+            continue
+        channel = guild.get_channel(channel_id)
+        if channel is None:
+            try:
+                channel = await guild.fetch_channel(channel_id)  # type: ignore[attr-defined]
+            except Exception:
+                channel = None
+        if channel is None or not hasattr(channel, "fetch_message"):
+            continue
+        try:
+            message = await channel.fetch_message(message_id)  # type: ignore[attr-defined]
+            image_url = _message_event_image_url(message)
+            if image_url:
+                event["image_url"] = image_url
+                event["discord_image_url"] = image_url
+                event["jump_url"] = str(getattr(message, "jump_url", "") or _message_jump_url(int(guild.id), channel_id, message_id))
+                _EVENT_MEDIA_CACHE[message_id] = (now_ts, image_url)
+        except Exception:
+            # Gespeicherte image_url bleibt als Fallback erhalten.
+            continue
+
+
+async def _publish_snapshot_with_feeds(bot: commands.Bot, guild: discord.Guild) -> int:
+    snapshot = await asyncio.to_thread(build_dashboard_snapshot, bot, guild)
+    try:
+        await _dashboard_hydrate_event_media(guild, snapshot)
+    except Exception as media_exc:
+        print(f"⚠️ Eventbilder konnten nicht aktualisiert werden: {media_exc!r}")
+    try:
+        snapshot["discord_feeds"] = await _dashboard_discord_feeds_snapshot(guild)
+    except Exception as feed_exc:
+        snapshot["discord_feeds"] = {"error": f"{type(feed_exc).__name__}: {feed_exc}"}
+    return int(await asyncio.to_thread(runtime_db.save_dashboard_snapshot, guild_id=int(guild.id), guild_name=str(((snapshot.get("guild") or {}).get("name") or guild.name)), snapshot=snapshot) or 0)
+
+def _central_guild_snapshot(guild: discord.Guild) -> dict[str, Any]:
+    try:
+        if central_guild_config is not None:
+            return central_guild_config.guild_config_snapshot(guild)
+    except Exception as exc:
+        print(f"⚠️ Zentrale Gildenkonfiguration nicht lesbar: {exc!r}", flush=True)
+    profile = {
+        "guild_id": int(guild.id),
+        "discord_name": str(guild.name),
+        "display_name": str(guild.name),
+        "short_name": str(guild.name),
+        "bot_display_name": f"{guild.name} Knecht",
+        "timezone": "Europe/Berlin",
+        "logo_url": "",
+        "banner_url": "",
+        "accent_color": "#d6a84f",
+        "invite_url": "",
+        "status": "active",
+    }
+    return {"profile": profile, "roles": {}, "channels": {}}
+
+
+def _discord_configuration_catalog(guild: discord.Guild) -> dict[str, Any]:
+    roles = []
+    for role in sorted(getattr(guild, "roles", []), key=lambda r: int(getattr(r, "position", 0)), reverse=True):
+        if getattr(role, "is_default", lambda: False)():
+            continue
+        roles.append({
+            "id": int(role.id),
+            "name": str(role.name),
+            "position": int(getattr(role, "position", 0)),
+            "member_count": len(getattr(role, "members", []) or []),
+        })
+    channels = []
+    for ch in getattr(guild, "channels", []):
+        kind = "other"
+        if isinstance(ch, discord.TextChannel):
+            kind = "text"
+        elif isinstance(ch, discord.VoiceChannel):
+            kind = "voice"
+        elif isinstance(ch, discord.CategoryChannel):
+            kind = "category"
+        elif isinstance(ch, discord.ForumChannel):
+            kind = "forum"
+        channels.append({
+            "id": int(ch.id),
+            "name": str(ch.name),
+            "kind": kind,
+            "position": int(getattr(ch, "position", 0)),
+        })
+    channels.sort(key=lambda row: (row.get("kind", ""), int(row.get("position", 0)), row.get("name", "")))
+    return {"roles": roles, "channels": channels}
+
+
+def build_dashboard_snapshot(bot: commands.Bot, guild: discord.Guild) -> dict[str, Any]:
+    """Read-only Daten-Snapshot für das spätere Web-Dashboard.
+
+    Diese Funktion schreibt keine Bot-Daten um. Sie liest nur bestehende JSON-Dateien
+    und die Runtime/Postgres-Datenbank. Das Dashboard kann diese Funktion später direkt
+    importieren oder denselben Schema-Output über eine Web-API ausliefern.
+    """
+    guild_id = int(guild.id)
+    central_config = _central_guild_snapshot(guild)
+    guild_profile = central_config.get("profile") if isinstance(central_config, dict) else {}
+    if not isinstance(guild_profile, dict):
+        guild_profile = {}
+    configured_name = str(guild_profile.get("display_name") or guild.name)
+    sources = {key: _load_json_file(filename, {}) for key, filename in JSON_SOURCES.items()}
+    status = runtime_db.db_status()
+
+    profile_summary = _summarize_profiles(sources.get("member_profiles"), guild)
+    member_sync = _sync_member_directory(guild, profile_summary)
+
+    snapshot = {
+        "schema_version": DASHBOARD_SCHEMA_VERSION,
+        "generated_at": _now_iso(),
+        "guild": {
+            "id": guild_id,
+            "name": configured_name,
+            "discord_name": guild.name,
+            "profile": guild_profile,
+            "configuration": central_config,
+            "discord_catalog": _discord_configuration_catalog(guild),
+            "member_count_cache": getattr(guild, "member_count", None),
+            "cached_members_loaded": len(_active_member_ids(guild)),
+            "member_filter": _dashboard_member_filter_info(guild),
+            "bot_user_id": int(getattr(getattr(bot, "user", None), "id", 0) or 0),
+        },
+        "storage": {
+            "runtime_backend": status.get("backend"),
+            "runtime_path": status.get("path"),
+            "database_url_configured": bool(status.get("database_url_configured")),
+            "database_url_kind": status.get("database_url_kind"),
+        },
+        "source_health": _source_health(),
+        "guild_config": central_config,
+        "auth": _dashboard_auth_info(guild),
+        "profiles": profile_summary,
+        "members": profile_summary,
+        "member_directory": member_sync,
+        "events": _summarize_events(sources.get("events"), guild),
+        "event_checks": _summarize_event_checks(sources.get("dkp_event_checks"), guild_id),
+        "ec": {
+            "balances": _summarize_balances(sources.get("dkp_balances"), guild),
+            "transactions": _summarize_transactions(sources.get("dkp_transactions"), guild),
+        },
+        "loot": {
+            "needs": _summarize_needs(sources.get("loot_needs"), guild, sources.get("loot_items")),
+            "auctions": _summarize_auctions(sources.get("loot_auctions"), guild),
+            "items_known": len(_catalog_items_for_guild(sources.get("loot_items"), guild_id)),
+        },
+        "settings": _summarize_settings(sources, guild),
+        "voice": _voice_summary(guild_id),
+        "audit": _audit_summary(guild_id),
+    }
+    snapshot["insights"] = _dashboard_insights(guild, snapshot)
+    return snapshot
+
+
+def publish_dashboard_snapshot(bot: commands.Bot, guild: discord.Guild) -> int:
+    """Schreibt den aktuellen read-only Snapshot in Postgres/Runtime-DB.
+
+    Der separate Web-Service liest genau diese Tabelle. Produktive Bot-Daten werden
+    nicht verändert; die JSON-Dateien bleiben weiterhin Quelle der alten Systeme.
+    """
+    snapshot = build_dashboard_snapshot(bot, guild)
+    return int(runtime_db.save_dashboard_snapshot(guild_id=int(guild.id), guild_name=str(((snapshot.get("guild") or {}).get("name") or guild.name)), snapshot=snapshot) or 0)
+
+
+def write_dashboard_export(bot: commands.Bot, guild: discord.Guild) -> Path:
+    snapshot = build_dashboard_snapshot(bot, guild)
+    # Zusätzlich in die Runtime-DB schreiben, damit das separate Web-Dashboard
+    # nach einem manuellen Export sofort aktuelle Daten bekommt.
+    try:
+        runtime_db.save_dashboard_snapshot(guild_id=int(guild.id), guild_name=str(((snapshot.get("guild") or {}).get("name") or guild.name)), snapshot=snapshot)
+    except Exception as exc:
+        print(f"⚠️ Dashboard-Snapshot konnte nicht in Runtime-DB veröffentlicht werden: {exc!r}")
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    path = EXPORT_DIR / f"dashboard_snapshot_{guild.id}_{ts}.json"
+    tmp = path.with_name(f".{path.name}.tmp")
+    tmp.write_text(json.dumps(snapshot, indent=2, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, path)
+    return path
 
 
 def _is_admin(inter: discord.Interaction) -> bool:
@@ -2127,2007 +2166,300 @@ def _is_admin(inter: discord.Interaction) -> bool:
     return bool(perms and (perms.administrator or perms.manage_guild))
 
 
-def _is_leader_or_admin(inter: discord.Interaction) -> bool:
-    if _is_admin(inter):
-        return True
-
-    if inter.guild is None or not isinstance(inter.user, discord.Member):
-        return False
-
-    try:
-        leader_cfg = _load(LEADER_CONTACT_CFG_FILE, {})
-        c = leader_cfg.get(str(inter.guild.id)) or {}
-        role_id = int(c.get("leader_role_id", 0) or 0)
-
-        if not role_id:
-            return False
-
-        role = inter.guild.get_role(role_id)
-        return bool(role and role in inter.user.roles)
-
-    except Exception:
-        return False
-
-
-def _alliance_home_guild_id(default: int = 0) -> int:
-    try:
+@tasks.loop(minutes=5)
+async def _dashboard_publish_loop(bot: commands.Bot):
+    await bot.wait_until_ready()
+    if not bot.guilds:
+        return
+    for guild in list(bot.guilds):
         try:
-            from bot.alliance_config import _home_guild_id  # type: ignore
-        except ModuleNotFoundError:
-            from alliance_config import _home_guild_id  # type: ignore
-
-        return int(_home_guild_id(default=default) or default or 0)
-
-    except Exception:
-        return int(default or 0)
-
-
-def _require_alliance_home_leader(inter: discord.Interaction) -> tuple[bool, str]:
-    if inter.guild is None or inter.guild_id is None:
-        return False, "❌ Nur im Server nutzbar."
-
-    home_id = _alliance_home_guild_id(default=inter.guild_id)
-
-    if int(inter.guild_id) != int(home_id):
-        return False, "❌ Allianz-Raids können nur auf dem Home-/Ebolus-Server erstellt werden."
-
-    if not _is_leader_or_admin(inter):
-        return False, "❌ Nur Leader/Admins."
-
-    return True, ""
-
-
-def _import_alliance_config():
-    try:
-        from bot.alliance_config import get_alliance_group  # type: ignore
-        return get_alliance_group
-    except ModuleNotFoundError:
-        from alliance_config import get_alliance_group  # type: ignore
-        return get_alliance_group
-
-
-def _import_alliance_template():
-    try:
-        from bot.alliance_config import get_alliance_template  # type: ignore
-        return get_alliance_template
-    except ModuleNotFoundError:
-        from alliance_config import get_alliance_template  # type: ignore
-        return get_alliance_template
-
-
-ALLIANCE_EVENT_TYPES = [
-    "NM Raid",
-    "HM Raid",
-    "PvP Schlacht",
-    "Dimensionsprüfung",
-]
-
-
-def _normalize_alliance_event_type(value: str) -> str:
-    raw = (value or "").strip().lower()
-
-    aliases = {
-        "nm": "NM Raid",
-        "nm raid": "NM Raid",
-        "normal raid": "NM Raid",
-        "normalraid": "NM Raid",
-        "hm": "HM Raid",
-        "hm raid": "HM Raid",
-        "hardmode": "HM Raid",
-        "hardmode raid": "HM Raid",
-        "pvp": "PvP Schlacht",
-        "pvp schlacht": "PvP Schlacht",
-        "schlacht": "PvP Schlacht",
-        "dimensionsprüfung": "Dimensionsprüfung",
-        "dimensionspruefung": "Dimensionsprüfung",
-        "dimension": "Dimensionsprüfung",
-        "dimensionen": "Dimensionsprüfung",
-    }
-
-    if raw in aliases:
-        return aliases[raw]
-
-    for event_type in ALLIANCE_EVENT_TYPES:
-        if event_type.lower() == raw:
-            return event_type
-
-    return ""
-
-
-def _alliance_event_type_text() -> str:
-    return ", ".join(ALLIANCE_EVENT_TYPES)
-
-
-def _server_channel_id_for_event(server_cfg: dict, event_type: str) -> int:
-    event_channels = server_cfg.get("event_channels") or {}
-    channel_obj = event_channels.get(event_type) or {}
-    cid = int(channel_obj.get("channel_id", 0) or 0)
-
-    if cid:
-        return cid
-
-    return int(server_cfg.get("channel_id", 0) or 0)
-
-
-async def _send_home_dms_for_alliance_event(
-    guild: discord.Guild,
-    obj: dict,
-    master_msg_id: int,
-    channel_name_or_ref: str,
-) -> tuple[int, int]:
-    sent = 0
-    skipped_opt_out = 0
-
-    for member in _eligible_members(guild, obj):
-        if not is_dm_enabled(guild.id, member.id):
-            skipped_opt_out += 1
-            continue
-
-        try:
-            when = datetime.fromisoformat(obj["when_iso"])
-            dm_text = _format_dm_text(
-                title=str(obj.get("title", "Event")),
-                when=when,
-                channel_name_or_ref=channel_name_or_ref,
-                description=obj.get("description"),
-                intro_line="Wähle unten deine Teilnahme:"
-            )
-
-            dm_msg = await member.send(dm_text, view=RaidView(int(master_msg_id)))
-            obj["dm_messages"][str(member.id)] = int(dm_msg.id)
-            sent += 1
-            await asyncio.sleep(0.05)
-
-        except Exception:
-            pass
-
-    return sent, skipped_opt_out
-
-
-def _register_event_view_once(
-    client: discord.Client,
-    view: discord.ui.View,
-    message_id: int | None,
-    label: str,
-) -> bool:
-    """Register a persistent view for exactly one already existing message.
-
-    RSVP buttons use the same custom_id labels for every event. After a deploy
-    they must therefore be registered with the concrete Discord message ID.
-    Without message_id scoping, one restored View can catch clicks from a
-    different event and users get a success message while the visible list does
-    not change.
-    """
-    if not message_id:
-        return False
-
-    try:
-        client.add_view(view, message_id=int(message_id))
-        return True
-    except Exception as e:
-        print(f"[event_rsvp_dm] View-Registrierung fehlgeschlagen ({label}, message_id={message_id}): {e!r}")
-        return False
-
-
-def _register_persistent_views_for_event(client: discord.Client, msg_id: str, obj: dict) -> tuple[int, int]:
-    """Restore server and DM RSVP buttons after a bot restart/deploy."""
-    _init_event_shape(obj)
-
-    registered_server = 0
-    registered_dm = 0
-
-    try:
-        master_id = int(obj.get("message_id", msg_id) or msg_id)
-    except Exception:
-        return 0, 0
-
-    server_message_ids: set[int] = set()
-
-    if _is_alliance_event(obj) and obj.get("mirrors"):
-        for mirror in list(obj.get("mirrors") or []):
+            # Snapshot-Erstellung liest viele JSON-/DB-Daten. Im Thread ausführen,
+            # damit Discord-Interaktionen nicht blockieren und nicht mit
+            # "Die Anwendung reagiert nicht" enden. Discord-News/Guides werden
+            # danach asynchron aus den konfigurierten Kanälen ergänzt.
+            snapshot = await asyncio.to_thread(build_dashboard_snapshot, bot, guild)
             try:
-                mid = int(mirror.get("message_id", 0) or 0)
-                if mid:
-                    server_message_ids.add(mid)
+                await _dashboard_hydrate_event_media(guild, snapshot)
+            except Exception as media_exc:
+                print(f"⚠️ Eventbilder für {getattr(guild, 'id', '?')} konnten nicht aktualisiert werden: {media_exc!r}")
+            try:
+                snapshot["discord_feeds"] = await _dashboard_discord_feeds_snapshot(guild)
+            except Exception as feed_exc:
+                snapshot["discord_feeds"] = {"error": f"{type(feed_exc).__name__}: {feed_exc}"}
+            sid = await asyncio.to_thread(runtime_db.save_dashboard_snapshot, guild_id=int(guild.id), guild_name=str(((snapshot.get("guild") or {}).get("name") or guild.name)), snapshot=snapshot)
+            print(f"📊 Dashboard-Snapshot veröffentlicht: {guild.name} ({guild.id}) snapshot_id={sid}")
+        except Exception as exc:
+            print(f"⚠️ Dashboard-Snapshot für {getattr(guild, 'id', '?')} fehlgeschlagen: {exc!r}")
+
+
+@_dashboard_publish_loop.before_loop
+async def _dashboard_publish_before_loop():
+    # Kurz warten, damit andere Module/JSON-Lader nach on_ready vollständig stehen.
+    import asyncio
+    await asyncio.sleep(20)
+
+
+def start_dashboard_publisher(bot: commands.Bot) -> None:
+    if getattr(bot, "_ebo_dashboard_publisher_started", False):
+        return
+    try:
+        _dashboard_publish_loop.start(bot)
+        setattr(bot, "_ebo_dashboard_publisher_started", True)
+        print("📊 Dashboard-Snapshot-Publisher gestartet: alle 5 Minuten.")
+    except RuntimeError:
+        pass
+
+
+async def setup_dashboard_data(bot: commands.Bot, tree: app_commands.CommandTree):
+    start_dashboard_publisher(bot)
+    @tree.command(name="dashboard_set_member_role", description="Legt die Gildenrolle fest, die im Dashboard als Mitglied zählt.")
+    @app_commands.describe(role="Rolle, die echte Gildenmitglieder haben müssen")
+    async def dashboard_set_member_role(inter: discord.Interaction, role: discord.Role):
+        if inter.guild is None:
+            await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
+            return
+        if not _is_admin(inter):
+            await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True)
+            return
+
+        await inter.response.defer(ephemeral=True)
+        try:
+            runtime_db.set_guild_setting(int(inter.guild.id), DASHBOARD_MEMBER_ROLE_SETTING, int(role.id))
+            try:
+                runtime_db.write_audit_log(
+                    guild_id=int(inter.guild.id),
+                    actor_id=int(inter.user.id),
+                    action="dashboard_member_role_set",
+                    target_type="role",
+                    target_id=str(role.id),
+                    summary=f"Dashboard-Gildenrolle gesetzt: {role.name}",
+                    new_value={"role_id": int(role.id), "role_name": role.name},
+                )
             except Exception:
-                continue
-    else:
-        try:
-            server_message_ids.add(int(msg_id))
-        except Exception:
-            pass
-
-    for server_mid in server_message_ids:
-        if _register_event_view_once(
-            client,
-            ServerRaidView(master_id),
-            server_mid,
-            "server-rsvp",
-        ):
-            registered_server += 1
-
-    for uid_str, dm_mid_raw in list((obj.get("dm_messages") or {}).items()):
-        try:
-            dm_mid = int(dm_mid_raw or 0)
-        except Exception:
-            continue
-
-        if _register_event_view_once(
-            client,
-            RaidView(master_id),
-            dm_mid,
-            f"dm-rsvp user={uid_str}",
-        ):
-            registered_dm += 1
-
-    return registered_server, registered_dm
-
-
-
-
-# ---------------------------------------------------------------------------
-# Dashboard Event-Aktionsqueue
-# ---------------------------------------------------------------------------
-
-def _dashboard_database_url() -> str:
-    return str(os.getenv("DATABASE_URL") or "").strip()
-
-
-def _dashboard_normalized_database_url() -> str:
-    url = _dashboard_database_url()
-    if url.startswith("postgres://"):
-        return "postgresql://" + url[len("postgres://"):]
-    return url
-
-
-def _dashboard_pg_connect():
-    import psycopg  # type: ignore
-    from psycopg.rows import dict_row  # type: ignore
-    return psycopg.connect(_dashboard_normalized_database_url(), row_factory=dict_row, connect_timeout=10)
-
-
-def _dashboard_event_queue_available() -> bool:
-    u = _dashboard_database_url().lower()
-    return u.startswith("postgres://") or u.startswith("postgresql://")
-
-
-def _dashboard_event_result(ok: bool, message: str, **extra: Any) -> str:
-    payload = {"ok": bool(ok), "message": str(message or "")}
-    payload.update(extra)
-    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-
-
-def _dashboard_event_ensure_tables() -> None:
-    if not _dashboard_event_queue_available():
-        return
-    conn = _dashboard_pg_connect()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS dashboard_event_action_requests (
-                    id BIGSERIAL PRIMARY KEY,
-                    request_id TEXT NOT NULL UNIQUE,
-                    guild_id BIGINT NOT NULL,
-                    event_id TEXT NOT NULL DEFAULT '',
-                    action_type TEXT NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'pending',
-                    payload_json TEXT NOT NULL DEFAULT '{}',
-                    actor_id TEXT,
-                    actor_name TEXT,
-                    requested_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                    claimed_at TIMESTAMPTZ,
-                    processed_at TIMESTAMPTZ,
-                    result_json TEXT
-                )
-                """
+                pass
+            snap = await asyncio.to_thread(build_dashboard_snapshot, bot, inter.guild)
+            try:
+                await asyncio.to_thread(runtime_db.save_dashboard_snapshot, guild_id=int(inter.guild.id), guild_name=str(((snap.get("guild") or {}).get("name") or inter.guild.name)), snapshot=snap)
+            except Exception:
+                pass
+            count = (snap.get("guild", {}).get("member_filter") or {}).get("eligible_count", len(getattr(role, "members", []) or []))
+            await inter.followup.send(
+                f"✅ Dashboard-Gildenrolle gesetzt: {role.mention}\n"
+                f"Rollenmitglieder im Dashboard: **{count}**\n"
+                "Dashboard wurde aktualisiert.",
+                ephemeral=True,
             )
-            cur.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_dashboard_event_action_requests_lookup
-                ON dashboard_event_action_requests (guild_id, event_id, status, requested_at DESC)
-                """
-            )
-        conn.commit()
-    finally:
-        conn.close()
+        except Exception as exc:
+            await inter.followup.send(f"❌ Konnte Rolle nicht speichern: `{type(exc).__name__}: {exc}`", ephemeral=True)
 
 
-# ---------------------------------------------------------------------------
-# Phase 3.4b · Event-/RSVP-Spiegelung direkt aus Bot-Store
-# ---------------------------------------------------------------------------
 
-def _phase3_event_ensure_tables() -> None:
-    if not _dashboard_event_queue_available():
-        return
-    conn = _dashboard_pg_connect()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS phase3_events (
-                    guild_id TEXT NOT NULL,
-                    event_id TEXT NOT NULL,
-                    title TEXT,
-                    status TEXT,
-                    start_at_text TEXT,
-                    end_at_text TEXT,
-                    raw_json JSONB NOT NULL DEFAULT '{}'::jsonb,
-                    source TEXT NOT NULL DEFAULT 'bot_event_store',
-                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                    PRIMARY KEY (guild_id, event_id)
-                )
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS phase3_event_rsvps (
-                    guild_id TEXT NOT NULL,
-                    rsvp_id TEXT NOT NULL,
-                    event_id TEXT,
-                    user_id TEXT,
-                    response TEXT,
-                    role_name TEXT,
-                    display_name TEXT,
-                    raw_json JSONB NOT NULL DEFAULT '{}'::jsonb,
-                    source TEXT NOT NULL DEFAULT 'bot_event_store',
-                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                    PRIMARY KEY (guild_id, rsvp_id)
-                )
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS phase3_migration_runs (
-                    run_id TEXT PRIMARY KEY,
-                    guild_id TEXT,
-                    mode TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    counts_json JSONB NOT NULL DEFAULT '{}'::jsonb,
-                    notes TEXT,
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-                )
-            """)
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_phase3_event_rsvps_event ON phase3_event_rsvps (guild_id, event_id)")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_phase3_event_rsvps_user ON phase3_event_rsvps (guild_id, user_id)")
-        conn.commit()
-    finally:
-        conn.close()
+    @tree.command(name="dashboard_set_admin_role", description="Legt die Dashboard-Adminrolle fest.")
+    @app_commands.describe(role="Rolle, die im Dashboard als Admin/Leitung zählt")
+    async def dashboard_set_admin_role(inter: discord.Interaction, role: discord.Role):
+        if inter.guild is None:
+            await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
+            return
+        if not _is_admin(inter):
+            await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True)
+            return
 
-
-def _phase3_event_jsonb(value: Any):
-    from psycopg.types.json import Jsonb  # type: ignore
-    return Jsonb(value if value is not None else {})
-
-def _phase3_event_active_member_ids(guild_id: int | str) -> set[str]:
-    try:
-        gid = str(int(guild_id))
-    except Exception:
-        return set()
-    if not _dashboard_event_queue_available():
-        return set()
-    try:
-        conn = _dashboard_pg_connect()
+        await inter.response.defer(ephemeral=True)
         try:
-            with conn.cursor() as cur:
-                cur.execute("SELECT user_id FROM phase3_members WHERE guild_id=%s", (gid,))
-                return {str(r.get("user_id") or "").strip() for r in (cur.fetchall() or []) if str(r.get("user_id") or "").strip()}
-        finally:
-            conn.close()
-    except Exception:
-        return set()
+            # Als Liste speichern, damit später mehrere Adminrollen möglich sind.
+            runtime_db.set_guild_setting(int(inter.guild.id), DASHBOARD_ADMIN_ROLE_SETTING, [int(role.id)])
+            try:
+                runtime_db.write_audit_log(
+                    guild_id=int(inter.guild.id),
+                    actor_id=int(inter.user.id),
+                    action="dashboard_admin_role_set",
+                    target_type="role",
+                    target_id=str(role.id),
+                    summary=f"Dashboard-Adminrolle gesetzt: {role.name}",
+                    new_value={"role_ids": [int(role.id)], "role_name": role.name},
+                )
+            except Exception:
+                pass
+            snap = await asyncio.to_thread(build_dashboard_snapshot, bot, inter.guild)
+            try:
+                await asyncio.to_thread(runtime_db.save_dashboard_snapshot, guild_id=int(inter.guild.id), guild_name=str(((snap.get("guild") or {}).get("name") or inter.guild.name)), snapshot=snap)
+            except Exception:
+                pass
+            admin_info = (snap.get("auth") or {}).get("counts") or {}
+            await inter.followup.send(
+                f"✅ Dashboard-Adminrolle gesetzt: {role.mention}\n"
+                f"Admin-Mitglieder im Dashboard: **{admin_info.get('admin_members', len(getattr(role, 'members', []) or []))}**\n"
+                "Dashboard wurde aktualisiert.",
+                ephemeral=True,
+            )
+        except Exception as exc:
+            await inter.followup.send(f"❌ Konnte Adminrolle nicht speichern: `{type(exc).__name__}: {exc}`", ephemeral=True)
 
+    @tree.command(name="dashboard_set_feed_channel", description="Setzt den Discord-Kanal für News, Guides oder Ankündigungen im Dashboard.")
+    @app_commands.describe(feed="News, Guides oder Ankündigungen", channel_name="Kanalname ohne ID, z. B. news, guides oder ankündigungen")
+    @app_commands.choices(feed=[
+        app_commands.Choice(name="News", value="news"),
+        app_commands.Choice(name="Guides", value="guides"),
+        app_commands.Choice(name="Ankündigungen", value="announcements"),
+    ])
+    async def dashboard_set_feed_channel(inter: discord.Interaction, feed: app_commands.Choice[str], channel_name: str):
+        if inter.guild is None:
+            await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
+            return
+        if not _is_admin(inter):
+            await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True)
+            return
 
-def _phase3_event_rsvp_rows_from_store(obj: dict, event_id: str) -> list[dict[str, Any]]:
-    _init_event_shape(obj)
-    rows: list[dict[str, Any]] = []
-    title = str(obj.get("title") or "Event")
+        clean_name = str(channel_name or "").strip().lstrip("#")
+        if not clean_name:
+            await inter.response.send_message("❌ Bitte einen Kanalnamen angeben, z. B. `news` oder `guides`.", ephemeral=True)
+            return
 
-    for role_name in ("TANK", "HEAL", "DPS", "BANK"):
-        for entry in obj.get("yes", {}).get(role_name, []) or []:
-            uid = _entry_user_id(entry)
-            name = _entry_name(entry)
-            if not uid and not name:
-                continue
-            raw = dict(entry) if isinstance(entry, dict) else {"value": entry}
-            raw.update({"event_id": event_id, "event_title": title, "response": "yes", "role_name": role_name})
-            rows.append({"event_id": event_id, "user_id": str(uid) if uid else "", "display_name": name, "response": "yes", "role_name": role_name, "raw_json": raw})
+        await inter.response.defer(ephemeral=True, thinking=True)
+        kind = str(feed.value or "news").lower()
+        if kind == "guides":
+            setting = DASHBOARD_GUIDES_CHANNEL_NAME_SETTING
+        elif kind == "announcements":
+            setting = DASHBOARD_ANNOUNCEMENTS_CHANNEL_NAME_SETTING
+        else:
+            setting = DASHBOARD_NEWS_CHANNEL_NAME_SETTING
+        channel = _find_feed_channel_by_name(inter.guild, clean_name)
+        if channel is None:
+            names = sorted(str(getattr(ch, "name", "")) for ch in getattr(inter.guild, "channels", []) if hasattr(ch, "history") and getattr(ch, "name", ""))
+            sample = ", ".join(f"#{n}" for n in names[:15]) or "keine lesbaren Textkanäle gefunden"
+            await inter.followup.send(f"❌ Kanal `#{clean_name}` nicht gefunden. Sichtbare Textkanäle: {sample}", ephemeral=True)
+            return
 
-    maybe_map = obj.get("maybe") if isinstance(obj.get("maybe"), dict) else {}
-    for uid_key, entry in (maybe_map or {}).items():
-        uid = _entry_user_id(entry) or _entry_user_id(uid_key)
-        name = _entry_name(entry) if isinstance(entry, dict) else ""
-        raw = dict(entry) if isinstance(entry, dict) else {"value": entry}
-        raw.update({"event_id": event_id, "event_title": title, "response": "maybe", "role_name": str(raw.get("role") or raw.get("label") or "MAYBE")})
-        rows.append({"event_id": event_id, "user_id": str(uid) if uid else str(uid_key), "display_name": name, "response": "maybe", "role_name": str(raw.get("role_name") or raw.get("role") or "MAYBE"), "raw_json": raw})
+        try:
+            runtime_db.set_guild_setting(int(inter.guild.id), setting, str(getattr(channel, "name", clean_name)))
+            try:
+                runtime_db.write_audit_log(
+                    guild_id=int(inter.guild.id),
+                    actor_id=int(inter.user.id),
+                    action="dashboard_feed_channel_set",
+                    target_type="channel",
+                    target_id=str(getattr(channel, "id", "")),
+                    summary=f"Dashboard-{kind}-Kanal gesetzt: #{getattr(channel, 'name', clean_name)}",
+                    new_value={"feed": kind, "channel_name": str(getattr(channel, "name", clean_name)), "channel_id_resolved": int(getattr(channel, "id", 0) or 0)},
+                )
+            except Exception:
+                pass
+            try:
+                await _publish_snapshot_with_feeds(bot, inter.guild)
+            except Exception as pub_exc:
+                await inter.followup.send(f"✅ Dashboard-{kind}-Kanal gesetzt: {getattr(channel, 'mention', '#' + clean_name)}\n⚠️ Snapshot konnte noch nicht aktualisiert werden: `{type(pub_exc).__name__}: {pub_exc}`", ephemeral=True)
+                return
+            await inter.followup.send(
+                f"✅ Dashboard-{kind}-Kanal gesetzt: {getattr(channel, 'mention', '#' + clean_name)}\n"
+                "Die Website liest ab jetzt diesen Kanal nach Namen. Nachrichten erscheinen nach dem nächsten Snapshot bzw. jetzt direkt nach der Aktualisierung.",
+                ephemeral=True,
+            )
+        except Exception as exc:
+            await inter.followup.send(f"❌ Konnte Feed-Kanal nicht speichern: `{type(exc).__name__}: {exc}`", ephemeral=True)
 
-    for entry in obj.get("no", []) or []:
-        uid = _entry_user_id(entry)
-        name = _entry_name(entry)
-        if not uid and not name:
-            continue
-        raw = dict(entry) if isinstance(entry, dict) else {"value": entry}
-        raw.update({"event_id": event_id, "event_title": title, "response": "no", "role_name": "NO"})
-        rows.append({"event_id": event_id, "user_id": str(uid) if uid else "", "display_name": name, "response": "no", "role_name": "NO", "raw_json": raw})
+    @tree.command(name="dashboard_status", description="Zeigt den Status der read-only Dashboard-Datenbasis.")
+    async def dashboard_status(inter: discord.Interaction):
+        if inter.guild is None:
+            await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
+            return
+        if not _is_admin(inter):
+            await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True)
+            return
 
-    # Pro Event und User nur die aktuelle Antwort spiegeln. Dadurch zählen Abmeldungen/Vielleicht mit,
-    # aber ein Spieler wird nicht doppelt gezählt, falls alte Formen parallel im Objekt liegen.
-    dedup: dict[tuple[str, str], dict[str, Any]] = {}
-    for row in rows:
-        key = (str(row.get("event_id") or ""), str(row.get("user_id") or row.get("display_name") or ""))
-        dedup[key] = row
-    return list(dedup.values())
+        await inter.response.defer(ephemeral=True, thinking=True)
+        try:
+            # Nicht im Discord-Eventloop bauen: der Snapshot kann bei vielen
+            # Profilen/Needs/Auktionen/Voice-Sessions kurz dauern.
+            snap = await asyncio.to_thread(build_dashboard_snapshot, bot, inter.guild)
+            await _dashboard_hydrate_event_media(inter.guild, snap)
+        except Exception as exc:
+            await inter.followup.send(f"❌ Dashboard-Status fehlgeschlagen: `{type(exc).__name__}: {exc}`", ephemeral=True)
+            return
+        try:
+            await asyncio.to_thread(runtime_db.save_dashboard_snapshot, guild_id=int(inter.guild.id), guild_name=str(((snap.get("guild") or {}).get("name") or inter.guild.name)), snapshot=snap)
+        except Exception as exc:
+            print(f"⚠️ Dashboard-Status Snapshot-Publish fehlgeschlagen: {exc!r}")
+        bad_sources = [k for k, v in snap.get("source_health", {}).items() if v.get("exists") and not v.get("ok")]
+        missing_sources = [k for k, v in snap.get("source_health", {}).items() if not v.get("exists")]
 
+        emb = discord.Embed(
+            title="📊 Dashboard-Datenbasis",
+            description="Read-only Snapshot für das spätere Web-Dashboard. Bestehende Bot-Daten werden dabei nicht verändert.",
+            color=0xD6A84F,
+        )
+        emb.add_field(name="Backend", value=str(snap["storage"].get("runtime_backend")), inline=True)
+        emb.add_field(name="DATABASE_URL", value="gesetzt" if snap["storage"].get("database_url_configured") else "nicht gesetzt", inline=True)
+        emb.add_field(name="Guild", value=f"{inter.guild.name}\n`{inter.guild.id}`", inline=False)
+        mf = snap.get("guild", {}).get("member_filter") or {}
+        if isinstance(mf, dict) and mf.get("mode") == "discord_role":
+            filter_head = f"Nur Mitglieder mit Rolle: {mf.get('role_name')} (`{mf.get('role_id')}`)\nRollenmitglieder: {mf.get('eligible_count', 0)}"
+        else:
+            filter_head = f"Nur aktuelle Discord-Servermitglieder fallback\nGefunden: {mf.get('eligible_count', 0) if isinstance(mf, dict) else '?'}"
+        emb.add_field(name="Filter", value=f"{filter_head}\nAlt/ausgefiltert: Profile {snap['profiles'].get('stale_count', 0)} · EC {snap['ec']['balances'].get('stale_count', 0)} · Needs {snap['loot']['needs'].get('stale_count', 0)}", inline=False)
+        emb.add_field(name="Profile", value=str(snap["profiles"].get("count", 0)), inline=True)
+        emb.add_field(name="Events", value=str(snap["events"].get("count", 0)), inline=True)
+        emb.add_field(name="EC-Konten", value=str(snap["ec"]["balances"].get("count", 0)), inline=True)
+        emb.add_field(name="Auktionen", value=str(snap["loot"]["auctions"].get("count", 0)), inline=True)
+        emb.add_field(name="Need-User", value=str(snap["loot"]["needs"].get("user_count", 0)), inline=True)
+        emb.add_field(name="Voice-Sessions", value=str(snap["voice"].get("sessions_total", 0)), inline=True)
+        emb.add_field(name="Audit-Logs", value=str(snap["audit"].get("logs_total", 0)), inline=True)
+        try:
+            latest_pub = runtime_db.fetch_latest_dashboard_snapshot(inter.guild.id)
+            pub_count = runtime_db.count_dashboard_snapshots(inter.guild.id)
+            pub_txt = f"Snapshots: {pub_count}\nLetzter: {(latest_pub or {}).get('published_at') or 'noch keiner'}"
+        except Exception as exc:
+            pub_txt = f"Fehler: {type(exc).__name__}"
+        emb.add_field(name="Web-Dashboard", value=pub_txt, inline=True)
+        emb.add_field(name="JSON-Quellen", value=f"OK: {len(snap.get('source_health', {})) - len(bad_sources)}\nFehler: {len(bad_sources)}\nFehlen: {len(missing_sources)}", inline=True)
+        if bad_sources:
+            emb.add_field(name="Fehlerhafte Quellen", value="\n".join(f"• {x}" for x in bad_sources[:10]), inline=False)
+        emb.set_footer(text="Dashboard ist read-only. Alte JSON-Daten werden nur gefiltert, nicht gelöscht.")
+        await inter.followup.send(embed=emb, ephemeral=True)
 
-def _phase3_mirror_events_from_store(guild_id: int | None = None) -> dict[str, Any]:
-    if not _dashboard_event_queue_available():
-        return {"ok": False, "error": "DATABASE_URL fehlt", "events": 0, "rsvps": 0}
-    _phase3_event_ensure_tables()
-    events_count = 0
-    rsvp_count = 0
-    guild_ids: set[str] = set()
-    conn = _dashboard_pg_connect()
-    try:
-        with conn.cursor() as cur:
-            for event_id, obj in list(store.items()):
-                if not isinstance(obj, dict):
-                    continue
-                _init_event_shape(obj)
-                gid = int(obj.get("guild_id", 0) or 0)
-                if not gid:
-                    continue
-                if guild_id and int(guild_id) != int(gid):
-                    continue
-                gid_s = str(gid)
-                guild_ids.add(gid_s)
-                ev_id = str(event_id)
-                title = str(obj.get("title") or "Event")
-                status = str(obj.get("status") or obj.get("state") or ("deleted" if obj.get("deleted") else "active"))
-                start_at = str(obj.get("when_iso") or obj.get("start_at") or obj.get("date") or "")
-                end_at = str(obj.get("end_at") or "")
-                cur.execute("""
-                    INSERT INTO phase3_events (guild_id, event_id, title, status, start_at_text, end_at_text, raw_json, source, updated_at)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,'bot_event_store',now())
-                    ON CONFLICT (guild_id, event_id) DO UPDATE SET
-                      title=EXCLUDED.title, status=EXCLUDED.status, start_at_text=EXCLUDED.start_at_text,
-                      end_at_text=EXCLUDED.end_at_text, raw_json=EXCLUDED.raw_json, source='bot_event_store', updated_at=now()
-                """, (gid_s, ev_id, title, status, start_at, end_at, _phase3_event_jsonb(obj)))
-                events_count += 1
+    @tree.command(name="dashboard_export", description="Erstellt einen read-only JSON-Export für das spätere Dashboard.")
+    async def dashboard_export(inter: discord.Interaction):
+        if inter.guild is None:
+            await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
+            return
+        if not _is_admin(inter):
+            await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True)
+            return
 
-            # Alte RSVP-Spiegelung pro betroffener Gilde entfernen, dann vollständig aus dem Bot-Store neu schreiben.
-            for gid_s in guild_ids:
-                cur.execute("DELETE FROM phase3_event_rsvps WHERE guild_id = %s", (gid_s,))
+        await inter.response.defer(ephemeral=True, thinking=True)
+        try:
+            path = await asyncio.to_thread(write_dashboard_export, bot, inter.guild)
+            await inter.followup.send(
+                "✅ Dashboard-Snapshot erstellt. Das ist nur ein Export/Lesemodell, keine Datenmigration.",
+                file=discord.File(str(path), filename=path.name),
+                ephemeral=True,
+            )
+        except Exception as exc:
+            await inter.followup.send(f"❌ Dashboard-Export fehlgeschlagen: `{type(exc).__name__}: {exc}`", ephemeral=True)
 
-            for event_id, obj in list(store.items()):
-                if not isinstance(obj, dict):
-                    continue
-                gid = int(obj.get("guild_id", 0) or 0)
-                if not gid or (guild_id and int(guild_id) != int(gid)):
-                    continue
-                gid_s = str(gid)
-                ev_id = str(event_id)
-                active_ids = _phase3_event_active_member_ids(gid_s)
-                skipped_inactive = 0
-                for row in _phase3_event_rsvp_rows_from_store(obj, ev_id):
-                    uid = str(row.get("user_id") or "").strip()
-                    if active_ids and (not uid or uid not in active_ids):
-                        skipped_inactive += 1
-                        continue
-                    display = str(row.get("display_name") or "").strip()
-                    response = str(row.get("response") or "").strip()
-                    role_name = str(row.get("role_name") or "").strip()
-                    rsvp_id = f"{ev_id}:{uid or display}:{response}:{role_name}"
-                    cur.execute("""
-                        INSERT INTO phase3_event_rsvps (guild_id, rsvp_id, event_id, user_id, response, role_name, display_name, raw_json, source, updated_at)
-                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,'bot_event_store',now())
-                        ON CONFLICT (guild_id, rsvp_id) DO UPDATE SET
-                          event_id=EXCLUDED.event_id, user_id=EXCLUDED.user_id, response=EXCLUDED.response,
-                          role_name=EXCLUDED.role_name, display_name=EXCLUDED.display_name, raw_json=EXCLUDED.raw_json,
-                          source='bot_event_store', updated_at=now()
-                    """, (gid_s, rsvp_id, ev_id, uid, response, role_name, display, _phase3_event_jsonb(row.get("raw_json") or row)))
-                    rsvp_count += 1
+    @tree.command(name="dashboard_sources", description="Zeigt, welche JSON-Quellen fürs Dashboard gefunden werden.")
+    async def dashboard_sources(inter: discord.Interaction):
+        if inter.guild is None:
+            await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
+            return
+        if not _is_admin(inter):
+            await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True)
+            return
 
-            run_id = f"event_rsvp_{int(time.time())}_{secrets.token_hex(4)}"
-            cur.execute("""
-                INSERT INTO phase3_migration_runs (run_id, guild_id, mode, status, counts_json, notes, created_at)
-                VALUES (%s,%s,'event_rsvp_parallel_mirror','done',%s,%s,now())
-            """, (run_id, str(guild_id or ""), _phase3_event_jsonb({"events": events_count, "event_rsvps": rsvp_count, "inactive_rsvps_skipped": locals().get("skipped_inactive", 0)}), "Bot hat Events/RSVPs direkt aus event_rsvp.json nach Postgres gespiegelt; ehemalige Mitglieder wurden aus Phase-3-RSVPs ausgelassen."))
-        conn.commit()
-        return {"ok": True, "events": events_count, "event_rsvps": rsvp_count}
-    finally:
-        conn.close()
-
-
-def _phase3_event_status(guild_id: int | None = None) -> dict[str, Any]:
-    if not _dashboard_event_queue_available():
-        return {"ok": False, "error": "DATABASE_URL fehlt"}
-    _phase3_event_ensure_tables()
-    gid_s = str(guild_id or "")
-    conn = _dashboard_pg_connect()
-    try:
-        with conn.cursor() as cur:
-            if gid_s:
-                cur.execute("SELECT COUNT(*) AS c FROM phase3_events WHERE guild_id = %s", (gid_s,))
-                events_db = int((cur.fetchone() or {}).get("c") or 0)
-                cur.execute("SELECT COUNT(*) AS c FROM phase3_event_rsvps WHERE guild_id = %s", (gid_s,))
-                rsvps_db = int((cur.fetchone() or {}).get("c") or 0)
+        health = _source_health()
+        lines = []
+        for key, info in health.items():
+            if info.get("exists") and info.get("ok"):
+                icon = "✅"
+            elif info.get("exists"):
+                icon = "⚠️"
             else:
-                cur.execute("SELECT COUNT(*) AS c FROM phase3_events")
-                events_db = int((cur.fetchone() or {}).get("c") or 0)
-                cur.execute("SELECT COUNT(*) AS c FROM phase3_event_rsvps")
-                rsvps_db = int((cur.fetchone() or {}).get("c") or 0)
-        return {"ok": True, "events_db": events_db, "event_rsvps_db": rsvps_db}
-    finally:
-        conn.close()
-
-
-def _dashboard_event_claim_batch(limit: int = 5) -> list[dict[str, Any]]:
-    if not _dashboard_event_queue_available():
-        return []
-    _dashboard_event_ensure_tables()
-    conn = _dashboard_pg_connect()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                WITH picked AS (
-                    SELECT id
-                    FROM dashboard_event_action_requests
-                    WHERE status = 'pending'
-                    ORDER BY requested_at ASC
-                    LIMIT %s
-                    FOR UPDATE SKIP LOCKED
-                )
-                UPDATE dashboard_event_action_requests r
-                SET status = 'processing', claimed_at = NOW()
-                FROM picked
-                WHERE r.id = picked.id
-                RETURNING r.id, r.request_id, r.guild_id, r.event_id, r.action_type, r.payload_json, r.actor_id, r.actor_name
-                """,
-                (int(limit),),
-            )
-            rows = [dict(x) for x in (cur.fetchall() or [])]
-        conn.commit()
-        return rows
-    finally:
-        conn.close()
-
-
-def _dashboard_event_finish_request(row_id: int, status: str, result_json: str) -> None:
-    if not _dashboard_event_queue_available():
-        return
-    conn = _dashboard_pg_connect()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                UPDATE dashboard_event_action_requests
-                SET status = %s, processed_at = NOW(), result_json = %s
-                WHERE id = %s
-                """,
-                (str(status), str(result_json or "{}"), int(row_id)),
-            )
-        conn.commit()
-    finally:
-        conn.close()
-
-
-def _dashboard_event_parse_when(payload: dict[str, Any], fallback_iso: str = "") -> datetime:
-    when_iso = str(payload.get("when_iso") or "").strip()
-    if when_iso:
-        dt = datetime.fromisoformat(when_iso.replace("Z", "+00:00"))
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=TZ)
-        return dt.astimezone(TZ)
-    date_s = str(payload.get("date") or "").strip()
-    time_s = str(payload.get("time") or "").strip()
-    if date_s and time_s:
-        yyyy, mm, dd = [int(x) for x in date_s.split("-")]
-        hh, mi = [int(x) for x in time_s.split(":")]
-        return datetime(yyyy, mm, dd, hh, mi, tzinfo=TZ)
-    if fallback_iso:
-        dt = datetime.fromisoformat(str(fallback_iso).replace("Z", "+00:00"))
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=TZ)
-        return dt.astimezone(TZ)
-    raise ValueError("Datum/Zeit fehlt oder ist ungültig")
-
-
-
-_DASHBOARD_EVENT_IMAGE_PRESETS = {
-    "normal raid": "https://media.discordapp.net/attachments/1488142284812714085/1516086614957494312/282b2b20-5a8f-4251-b038-15fde2ac723d.png?ex=6a315d30&is=6a300bb0&hm=767b9ad51564019a71be77906c480350e29137f24e08b6abd99f67a9c9edad33&=&format=webp&quality=lossless",
-    "hard raid": "https://media.discordapp.net/attachments/1488142284812714085/1513816935832228033/7225f274-cc4f-4eda-ba74-ca401f4e572b.png?ex=6a310462&is=6a2fb2e2&hm=9aa88c9c5b45f6eea14ec33541344421b7d467b3b5969f2c8d7faeebb3b30df2&=&format=webp&quality=lossless",
-    "nightmare": "https://media.discordapp.net/attachments/1488142284812714085/1513816992358858842/d6ee8bc1-432a-4d28-914d-31be80adf835.png?ex=6a310470&is=6a2fb2f0&hm=77fbec16dae3b00858a4dd20000eec86150d99de8823aab5acc7a3189f39092c&=&format=webp&quality=lossless",
-    "trials": "https://media.discordapp.net/attachments/1488142284812714085/1491660359952502825/file_000000007dcc7246bb6e57ae41860769.png?ex=6a30d4f7&is=6a2f8377&hm=40ae17883015fa630db3155e0d922cdfbf8fea9ca88a43a0b20a51d6852a9e64&=&format=webp&quality=lossless&width=1440&height=960",
-    "pvp": "https://media.discordapp.net/attachments/1488142284812714085/1513202292302811186/1780845919107.png?ex=6a30c234&is=6a2f70b4&hm=eb19a0dbc88e29a962ba726adc39f397f6240652dfd5b377a87c74b311f680b5&=&format=webp&quality=lossless",
-}
-
-_DASHBOARD_EVENT_IMAGE_ALIASES = {
-    "normal": "normal raid",
-    "hard": "hard raid",
-    "hm raid": "hard raid",
-    "nightmare": "nightmare",
-    "nm raid": "nightmare",
-    "trial": "trials",
-    "trials": "trials",
-    "pvp": "pvp",
-}
-
-
-def _dashboard_event_image_url_from_payload(payload: dict[str, Any]) -> str | None:
-    direct = str(payload.get("image_url") or "").strip()
-    if direct:
-        return direct
-    image_type = str(payload.get("image_type") or "").strip().lower()
-    if image_type in {"", "none", "custom"}:
-        return None
-    key = _DASHBOARD_EVENT_IMAGE_ALIASES.get(image_type, image_type)
-    return _DASHBOARD_EVENT_IMAGE_PRESETS.get(key)
-
-
-def _dashboard_event_duration_minutes(payload: dict[str, Any], fallback: int = 120) -> int:
-    try:
-        return max(30, min(720, int(float(payload.get("duration_minutes") or fallback))))
-    except Exception:
-        return int(fallback)
-
-
-def _dashboard_event_end_time(start: datetime, payload: dict[str, Any], fallback_minutes: int = 120) -> datetime:
-    end_iso = str(payload.get("end_at") or payload.get("end_time") or "").strip()
-    if end_iso:
-        try:
-            end = datetime.fromisoformat(end_iso.replace("Z", "+00:00"))
-            if end.tzinfo is None:
-                end = end.replace(tzinfo=TZ)
-            end = end.astimezone(TZ)
-            if end > start:
-                return end
-        except Exception:
-            pass
-    return start + timedelta(minutes=_dashboard_event_duration_minutes(payload, fallback_minutes))
-
-
-async def _dashboard_event_image_bytes(url: str, *, max_bytes: int = 8 * 1024 * 1024) -> bytes | None:
-    url = str(url or "").strip()
-    if not url.startswith(("https://", "http://")):
-        return None
-    timeout = aiohttp.ClientTimeout(total=15)
-    try:
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(url, allow_redirects=True, headers={"User-Agent": "EbolusBot/1.0"}) as response:
-                if response.status != 200:
-                    return None
-                content_length = int(response.headers.get("Content-Length") or 0)
-                if content_length and content_length > max_bytes:
-                    return None
-                data = await response.read()
-                return data if 0 < len(data) <= max_bytes else None
-    except Exception:
-        return None
-
-
-async def _dashboard_create_discord_scheduled_event(
-    guild: discord.Guild,
-    obj: dict[str, Any],
-    payload: dict[str, Any],
-    channel: discord.abc.GuildChannel | discord.Thread | None = None,
-) -> dict[str, Any]:
-    if not bool(payload.get("sync_discord_event", False)):
-        return {"created": False, "reason": "sync_disabled"}
-    start = _dashboard_event_parse_when(payload, str(obj.get("when_iso") or ""))
-    if start <= datetime.now(TZ) + timedelta(seconds=30):
-        return {"created": False, "error": "Discord-Serverevent kann nur für einen zukünftigen Termin erstellt werden."}
-    end = _dashboard_event_end_time(start, payload, int(obj.get("duration_minutes") or 120))
-    title = str(obj.get("title") or payload.get("title") or "Gildenevent").strip()[:100]
-    description = str(obj.get("description") or payload.get("description") or "").strip()[:1000]
-    location = str(payload.get("location") or obj.get("location") or "").strip()
-    if not location and channel is not None:
-        location = f"#{getattr(channel, 'name', 'Ebolus Discord')}"
-    location = (location or "Ebolus Discord")[:100]
-    image_bytes = await _dashboard_event_image_bytes(str(obj.get("image_url") or ""))
-    kwargs: dict[str, Any] = {
-        "name": title,
-        "start_time": start.astimezone(timezone.utc),
-        "end_time": end.astimezone(timezone.utc),
-        "entity_type": discord.EntityType.external,
-        "privacy_level": discord.PrivacyLevel.guild_only,
-        "location": location,
-        "description": description,
-        "reason": "Ebolus Dashboard/Gildenkalender",
-    }
-    if image_bytes:
-        kwargs["image"] = image_bytes
-    scheduled = await guild.create_scheduled_event(**kwargs)
-    obj["scheduled_event_id"] = int(scheduled.id)
-    obj["scheduled_event_url"] = f"https://discord.com/events/{int(guild.id)}/{int(scheduled.id)}"
-    obj["end_at"] = end.isoformat()
-    obj["duration_minutes"] = int((end - start).total_seconds() // 60)
-    obj["location"] = location
-    obj["sync_discord_event"] = True
-    return {"created": True, "scheduled_event_id": int(scheduled.id), "scheduled_event_url": obj["scheduled_event_url"]}
-
-
-async def _dashboard_update_discord_scheduled_event(
-    guild: discord.Guild,
-    obj: dict[str, Any],
-    payload: dict[str, Any],
-) -> dict[str, Any]:
-    scheduled_id = int(obj.get("scheduled_event_id", 0) or 0)
-    if not scheduled_id:
-        if bool(payload.get("sync_discord_event", False)):
-            channel = guild.get_channel(int(obj.get("channel_id", 0) or 0))
-            return await _dashboard_create_discord_scheduled_event(guild, obj, payload, channel)
-        return {"updated": False, "reason": "not_linked"}
-    scheduled = await guild.fetch_scheduled_event(scheduled_id)
-    start = _dashboard_event_parse_when(payload, str(obj.get("when_iso") or ""))
-    end = _dashboard_event_end_time(start, payload, int(obj.get("duration_minutes") or 120))
-    title = str(obj.get("title") or "Gildenevent").strip()[:100]
-    description = str(obj.get("description") or "").strip()[:1000]
-    location = str(payload.get("location") or obj.get("location") or "Ebolus Discord").strip()[:100]
-    kwargs: dict[str, Any] = {
-        "name": title,
-        "description": description,
-        "start_time": start.astimezone(timezone.utc),
-        "end_time": end.astimezone(timezone.utc),
-        "location": location,
-        "reason": "Ebolus Dashboard/Gildenkalender bearbeitet",
-    }
-    if "image_url" in payload or "image_type" in payload:
-        image_bytes = await _dashboard_event_image_bytes(str(obj.get("image_url") or ""))
-        if image_bytes:
-            kwargs["image"] = image_bytes
-    updated = await scheduled.edit(**kwargs)
-    obj["scheduled_event_id"] = int(updated.id)
-    obj["scheduled_event_url"] = f"https://discord.com/events/{int(guild.id)}/{int(updated.id)}"
-    obj["end_at"] = end.isoformat()
-    obj["duration_minutes"] = int((end - start).total_seconds() // 60)
-    obj["location"] = location
-    return {"updated": True, "scheduled_event_id": int(updated.id), "scheduled_event_url": obj["scheduled_event_url"]}
-
-
-async def _dashboard_delete_discord_scheduled_event(guild: discord.Guild, obj: dict[str, Any]) -> dict[str, Any]:
-    scheduled_id = int(obj.get("scheduled_event_id", 0) or 0)
-    if not scheduled_id:
-        return {"deleted": False, "reason": "not_linked"}
-    try:
-        scheduled = await guild.fetch_scheduled_event(scheduled_id)
-        await scheduled.delete(reason="Ebolus Event gelöscht")
-        return {"deleted": True, "scheduled_event_id": scheduled_id}
-    except discord.NotFound:
-        return {"deleted": False, "reason": "already_missing", "scheduled_event_id": scheduled_id}
-
-
-def _dashboard_event_dkp_type_from_payload(payload: dict[str, Any]) -> str:
-    value = str(payload.get("dkp_event_type") or "").strip()
-    if not value:
-        value = str(payload.get("event_type") or "").strip()
-    if value == "Nicht DKP-relevant":
-        return ""
-    return value
-
-def _dashboard_event_int(value: Any, default: int = 0) -> int:
-    try:
-        return int(str(value or "").strip())
-    except Exception:
-        return default
-
-
-async def _dashboard_event_create(client: discord.Client, guild_id: int, payload: dict[str, Any]) -> dict[str, Any]:
-    guild = client.get_guild(int(guild_id))
-    if guild is None:
-        raise RuntimeError("Bot sieht den Server nicht")
-    channel_id = _dashboard_event_int(payload.get("channel_id"))
-    ch = guild.get_channel(channel_id)
-    if not isinstance(ch, (discord.TextChannel, discord.Thread)):
-        raise RuntimeError("Zielkanal wurde nicht gefunden oder ist kein Textkanal")
-    title = str(payload.get("title") or "").strip()
-    if not title:
-        raise RuntimeError("Titel fehlt")
-    when = _dashboard_event_parse_when(payload)
-    target_role_id = _dashboard_event_int(payload.get("target_role_id"))
-    dkp_event_type = _dashboard_event_dkp_type_from_payload(payload)
-    obj = {
-        "guild_id": int(guild.id),
-        "channel_id": int(ch.id),
-        "title": title,
-        "description": str(payload.get("description") or "").strip(),
-        "event_type": str(payload.get("event_type") or "").strip(),
-        "dkp_enabled": bool(dkp_event_type),
-        "dkp_event_type": dkp_event_type,
-        "when_iso": when.isoformat(),
-        "end_at": _dashboard_event_end_time(when, payload).isoformat(),
-        "duration_minutes": _dashboard_event_duration_minutes(payload),
-        "location": str(payload.get("location") or "Ebolus Discord").strip(),
-        "sync_discord_event": bool(payload.get("sync_discord_event", False)),
-        "image_url": _dashboard_event_image_url_from_payload(payload),
-        "yes": {"TANK": [], "HEAL": [], "DPS": [], "BANK": []},
-        "maybe": {},
-        "no": [],
-        "target_role_id": int(target_role_id or 0),
-        "reminders": [],
-        "reminder_sent": {},
-        "dm_messages": {},
-        "created_from": "dashboard",
-    }
-    emb = build_embed(guild, obj)
-    msg = await ch.send(embed=emb)
-    msg_id = int(msg.id)
-    obj["message_id"] = msg_id
-    scheduled_result: dict[str, Any] = {}
-    try:
-        scheduled_result = await _dashboard_create_discord_scheduled_event(guild, obj, payload, ch)
-    except Exception as exc:
-        scheduled_result = {"created": False, "error": f"{type(exc).__name__}: {exc}"}
-        obj["scheduled_event_error"] = scheduled_result["error"]
-    store[str(msg_id)] = obj
-    save_store()
-    try:
-        await msg.edit(embed=build_embed(guild, obj), view=ServerRaidView(msg_id))
-    except Exception:
-        pass
-    sent = 0
-    skipped_opt_out = 0
-    if bool(payload.get("send_dms", True)):
-        for member in _eligible_members(guild, obj):
-            if not is_dm_enabled(guild.id, member.id):
-                skipped_opt_out += 1
-                continue
-            try:
-                dm_text = _format_dm_text(
-                    title=title,
-                    when=when,
-                    channel_name_or_ref=f"Übersicht im Server: #{getattr(ch, 'name', 'event')}",
-                    description=obj.get("description"),
-                    intro_line="Wähle unten deine Teilnahme:",
-                )
-                dm_msg = await member.send(dm_text, view=RaidView(msg_id))
-                obj["dm_messages"][str(member.id)] = int(dm_msg.id)
-                sent += 1
-                await asyncio.sleep(0.05)
-            except Exception:
-                pass
-        save_store()
-    _schedule_portal_refresh_for_event(client, guild, obj)
-    await _log(client, guild.id, f"Dashboard-Event erstellt: {title} ({msg_id})")
-    return {
-        "event_id": str(msg_id),
-        "jump_url": getattr(msg, "jump_url", ""),
-        "dm_sent": sent,
-        "dm_skipped_opt_out": skipped_opt_out,
-        "scheduled_event_id": int(obj.get("scheduled_event_id", 0) or 0),
-        "scheduled_event_url": str(obj.get("scheduled_event_url") or ""),
-        "scheduled_event_error": str((scheduled_result or {}).get("error") or ""),
-    }
-
-
-async def _dashboard_event_edit(client: discord.Client, guild_id: int, payload: dict[str, Any]) -> dict[str, Any]:
-    event_id = str(payload.get("event_id") or "").strip()
-    if not event_id or event_id not in store:
-        raise RuntimeError("Event nicht gefunden")
-    obj = store[event_id]
-    _init_event_shape(obj)
-    if int(obj.get("guild_id", 0) or 0) != int(guild_id):
-        raise RuntimeError("Event gehört nicht zu diesem Server")
-    changed: list[str] = []
-    title = str(payload.get("title") or "").strip()
-    if title:
-        obj["title"] = title
-        changed.append("Titel")
-    # Beschreibung darf bewusst auf leer gesetzt werden, wenn Feld mitgesendet wurde.
-    if "description" in payload and str(payload.get("description") or "").strip():
-        obj["description"] = str(payload.get("description") or "").strip()
-        changed.append("Beschreibung")
-    image_url = _dashboard_event_image_url_from_payload(payload)
-    if image_url:
-        obj["image_url"] = image_url
-        changed.append("Bild")
-    dkp_event_type = _dashboard_event_dkp_type_from_payload(payload)
-    if dkp_event_type:
-        obj["dkp_enabled"] = True
-        obj["dkp_event_type"] = dkp_event_type
-        changed.append("EC-Typ")
-    if str(payload.get("date") or "").strip() or str(payload.get("time") or "").strip() or str(payload.get("when_iso") or "").strip():
-        obj["when_iso"] = _dashboard_event_parse_when(payload, str(obj.get("when_iso") or "")).isoformat()
-        changed.append("Zeit")
-    if str(payload.get("target_role_id") or "").strip():
-        obj["target_role_id"] = _dashboard_event_int(payload.get("target_role_id"))
-        changed.append("Zielrolle")
-    if str(payload.get("duration_minutes") or "").strip():
-        obj["duration_minutes"] = _dashboard_event_duration_minutes(payload, int(obj.get("duration_minutes") or 120))
-        start_dt = _dashboard_event_parse_when(payload, str(obj.get("when_iso") or ""))
-        obj["end_at"] = _dashboard_event_end_time(start_dt, payload, int(obj.get("duration_minutes") or 120)).isoformat()
-        changed.append("Dauer")
-    if str(payload.get("location") or "").strip():
-        obj["location"] = str(payload.get("location") or "").strip()
-        changed.append("Ort")
-    if "sync_discord_event" in payload:
-        obj["sync_discord_event"] = bool(payload.get("sync_discord_event")) or bool(obj.get("scheduled_event_id"))
-    guild = client.get_guild(int(guild_id))
-    scheduled_result: dict[str, Any] = {}
-    if guild is not None and (obj.get("scheduled_event_id") or payload.get("sync_discord_event")):
-        try:
-            scheduled_result = await _dashboard_update_discord_scheduled_event(guild, obj, payload)
-            if scheduled_result.get("updated") or scheduled_result.get("created"):
-                changed.append("Discord-Kalender")
-            obj.pop("scheduled_event_error", None)
-        except Exception as exc:
-            obj["scheduled_event_error"] = f"{type(exc).__name__}: {exc}"
-            scheduled_result = {"error": obj["scheduled_event_error"]}
-    store[event_id] = obj
-    save_store()
-    await _push_overview(client, event_id, obj)
-    if guild is not None:
-        _schedule_portal_refresh_for_event(client, guild, obj)
-    await _log(client, int(guild_id), f"Dashboard-Event bearbeitet: {obj.get('title')} ({event_id})")
-    return {"event_id": event_id, "changed": changed or ["keine sichtbaren Felder"], "scheduled_event": scheduled_result}
-
-
-async def _dashboard_event_delete(client: discord.Client, guild_id: int, payload: dict[str, Any]) -> dict[str, Any]:
-    event_id = str(payload.get("event_id") or "").strip()
-    if not event_id or event_id not in store:
-        raise RuntimeError("Event nicht gefunden")
-    obj = store[event_id]
-    _init_event_shape(obj)
-    if int(obj.get("guild_id", 0) or 0) != int(guild_id):
-        raise RuntimeError("Event gehört nicht zu diesem Server")
-    deleted_posts = 0
-    failed_posts: list[str] = []
-    deleted_dms = 0
-    if _is_alliance_event(obj) and obj.get("mirrors"):
-        for mirror in list(obj.get("mirrors") or []):
-            try:
-                guild = client.get_guild(int(mirror.get("guild_id", 0) or 0))
-                if not guild:
-                    failed_posts.append(f"{mirror.get('label', 'Unbekannt')} — Server nicht gefunden")
-                    continue
-                ch = guild.get_channel(int(mirror.get("channel_id", 0) or 0))
-                if not isinstance(ch, (discord.TextChannel, discord.Thread)):
-                    failed_posts.append(f"{mirror.get('label', guild.name)} — Channel nicht gefunden")
-                    continue
-                try:
-                    msg_obj = await ch.fetch_message(int(mirror.get("message_id", 0) or 0))
-                    await msg_obj.delete()
-                    deleted_posts += 1
-                except Exception:
-                    failed_posts.append(f"{mirror.get('label', guild.name)} — Post nicht gefunden oder keine Rechte")
-                await asyncio.sleep(0.05)
-            except Exception as e:
-                failed_posts.append(f"{mirror.get('label', 'Unbekannt')} — {e}")
-    else:
-        guild = client.get_guild(int(guild_id))
-        if guild is not None:
-            ch = guild.get_channel(int(obj.get("channel_id", 0) or 0))
-            if isinstance(ch, (discord.TextChannel, discord.Thread)):
-                try:
-                    msg_obj = await ch.fetch_message(int(event_id))
-                    await msg_obj.delete()
-                    deleted_posts += 1
-                except Exception:
-                    failed_posts.append("Serverpost nicht gefunden oder keine Rechte")
-    for uid_str in list((obj.get("dm_messages") or {}).keys()):
-        try:
-            uid = int(uid_str)
-            ok = await _delete_dm_message_for_user(client, obj, uid)
-            if ok:
-                deleted_dms += 1
-            await asyncio.sleep(0.05)
-        except Exception:
-            pass
-    try:
-        await _cleanup_event_voice_for_obj(client, obj)
-    except Exception:
-        pass
-    scheduled_result: dict[str, Any] = {}
-    guild_for_schedule = client.get_guild(int(guild_id))
-    if guild_for_schedule is not None and obj.get("scheduled_event_id"):
-        try:
-            scheduled_result = await _dashboard_delete_discord_scheduled_event(guild_for_schedule, obj)
-        except Exception as exc:
-            scheduled_result = {"deleted": False, "error": f"{type(exc).__name__}: {exc}"}
-            failed_posts.append("Discord-Serverevent konnte nicht gelöscht werden")
-    store.pop(event_id, None)
-    save_store()
-    await _log(client, int(guild_id), f"Dashboard-Event gelöscht: {obj.get('title')} ({event_id})")
-    return {"event_id": event_id, "deleted_posts": deleted_posts, "deleted_dms": deleted_dms, "failed_posts": failed_posts[:10], "scheduled_event": scheduled_result}
-
-
-async def _dashboard_event_process_request(client: discord.Client, row: dict[str, Any]) -> tuple[bool, str, dict[str, Any]]:
-    payload = {}
-    try:
-        payload = json.loads(str(row.get("payload_json") or "{}"))
-        if not isinstance(payload, dict):
-            payload = {}
-    except Exception:
-        payload = {}
-    action = str(row.get("action_type") or payload.get("action_type") or "").strip().lower()
-    guild_id = int(row.get("guild_id") or payload.get("guild_id") or 0)
-    if action == "create":
-        result = await _dashboard_event_create(client, guild_id, payload)
-        return True, f"Event erstellt: {result.get('event_id')}", result
-    if action == "edit":
-        result = await _dashboard_event_edit(client, guild_id, payload)
-        return True, f"Event bearbeitet: {result.get('event_id')}", result
-    if action == "delete":
-        result = await _dashboard_event_delete(client, guild_id, payload)
-        return True, f"Event gelöscht: {result.get('event_id')}", result
-    raise RuntimeError("Unbekannte Event-Aktion")
-
-
-@tasks.loop(seconds=20)
-async def dashboard_event_action_loop():
-    client = getattr(dashboard_event_action_loop, "_client", None)
-    if client is None or not _dashboard_event_queue_available():
-        return
-    try:
-        rows = _dashboard_event_claim_batch(limit=4)
-    except Exception as e:
-        print(f"[dashboard_event_action_loop] Claim Fehler: {e!r}")
-        return
-    for row in rows:
-        try:
-            ok, message, details = await _dashboard_event_process_request(client, row)
-            _dashboard_event_finish_request(
-                int(row.get("id")),
-                "done" if ok else "failed",
-                _dashboard_event_result(ok, message, **({"details": details} if isinstance(details, dict) else {})),
-            )
-        except Exception as e:
-            print(f"[dashboard_event_action_loop] Verarbeitung Fehler request={row.get('request_id')}: {e!r}")
-            try:
-                _dashboard_event_finish_request(int(row.get("id")), "failed", _dashboard_event_result(False, str(e)))
-            except Exception:
-                pass
-
-
-async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
-    # Neue Server-IDs automatisch anhand der Emoji-Namen übernehmen.
-    for guild in list(getattr(client, "guilds", []) or []):
-        _refresh_rsvp_emojis(guild)
-
-    restored_server_views = 0
-    restored_dm_views = 0
-
-    for msg_id, obj in list(store.items()):
-        try:
-            srv_count, dm_count = _register_persistent_views_for_event(client, str(msg_id), obj)
-            restored_server_views += srv_count
-            restored_dm_views += dm_count
-        except Exception as e:
-            print(f"[event_rsvp_dm] Event-View Restore Fehler msg_id={msg_id}: {e!r}")
-
-    save_store()
-    print(
-        "✅ RSVP Persistent Views registriert: "
-        f"Server={restored_server_views}, DM={restored_dm_views}"
-    )
-
-    try:
-        event_reminder_loop._client = client  # type: ignore[attr-defined]
-        if not event_reminder_loop.is_running():
-            event_reminder_loop.start()
-            print("⏰ Event-Reminder-Task gestartet.")
-    except Exception as e:
-        print(f"[event_rsvp_dm] Reminder-Task Startfehler: {e!r}")
-
-    try:
-        dashboard_event_action_loop._client = client  # type: ignore[attr-defined]
-        if not dashboard_event_action_loop.is_running():
-            dashboard_event_action_loop.start()
-            print("📅 Dashboard-Event-Aktionsqueue gestartet.")
-    except Exception as e:
-        print(f"[event_rsvp_dm] Dashboard-Event-Queue Startfehler: {e!r}")
-
-    try:
-        if not getattr(client, "_ebolus_event_voice_listener_added", False):
-            async def _ebolus_event_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
-                if before.channel is None:
-                    return
-                if after.channel is not None and before.channel.id == after.channel.id:
-                    return
-                await _cleanup_empty_event_voice_by_channel_id(client, int(before.channel.id))
-
-            client.add_listener(_ebolus_event_voice_state_update, "on_voice_state_update")
-            setattr(client, "_ebolus_event_voice_listener_added", True)
-            print("🔊 Event-Voice-State-Listener gestartet.")
-    except Exception as e:
-        print(f"[event_rsvp_dm] Voice-State-Listener Startfehler: {e!r}")
-
-    @tree.command(name="events_phase3_mirror", description="Leader: Events/RSVPs direkt aus dem Bot-Store nach Postgres spiegeln")
-    async def events_phase3_mirror_cmd(inter: discord.Interaction):
-        await inter.response.defer(ephemeral=True, thinking=True)
-        if not _is_admin(inter):
-            await inter.followup.send("❌ Nur Admin/Manage Server.", ephemeral=True)
-            return
-        try:
-            res = _phase3_mirror_events_from_store(int(inter.guild_id or 0))
-            if not res.get("ok"):
-                await inter.followup.send(f"❌ Phase 3 Event-Spiegelung fehlgeschlagen: {res.get('error')}", ephemeral=True)
-                return
-            await inter.followup.send(f"✅ Events/RSVPs gespiegelt: Events **{res.get('events', 0)}**, RSVPs **{res.get('event_rsvps', 0)}**.", ephemeral=True)
-        except Exception as e:
-            await inter.followup.send(f"❌ Phase 3 Event-Spiegelung Fehler: {type(e).__name__}: {e}", ephemeral=True)
-
-    @tree.command(name="events_phase3_status", description="Leader: Phase-3 Events/RSVP Postgres-Status anzeigen")
-    async def events_phase3_status_cmd(inter: discord.Interaction):
-        await inter.response.defer(ephemeral=True, thinking=True)
-        if not _is_admin(inter):
-            await inter.followup.send("❌ Nur Admin/Manage Server.", ephemeral=True)
-            return
-        try:
-            res = _phase3_event_status(int(inter.guild_id or 0))
-            if not res.get("ok"):
-                await inter.followup.send(f"❌ Phase 3 Event-Status Fehler: {res.get('error')}", ephemeral=True)
-                return
-            await inter.followup.send(f"📅 Phase 3 Events: **{res.get('events_db', 0)}** · RSVPs: **{res.get('event_rsvps_db', 0)}**", ephemeral=True)
-        except Exception as e:
-            await inter.followup.send(f"❌ Phase 3 Event-Status Fehler: {type(e).__name__}: {e}", ephemeral=True)
-
-    @tree.command(name="raid_set_roles_dm", description="(Admin) Primärrollen (Tank/Heal/DPS) für Maybe-Label setzen")
-    @app_commands.describe(tank_role="Rolle: Tank", heal_role="Rolle: Heal", dps_role="Rolle: DPS")
-    async def raid_set_roles_dm(
-        inter: discord.Interaction,
-        tank_role: discord.Role,
-        heal_role: discord.Role,
-        dps_role: discord.Role
-    ):
-        await inter.response.defer(ephemeral=True, thinking=False)
-
-        if not _is_admin(inter):
-            await inter.followup.send("❌ Nur Admin/Manage Server.", ephemeral=True)
-            return
-
-        c = cfg.get(str(inter.guild_id)) or {}
-        c["TANK"] = int(tank_role.id)
-        c["HEAL"] = int(heal_role.id)
-        c["DPS"] = int(dps_role.id)
-        cfg[str(inter.guild_id)] = c
-        save_cfg()
-
-        await inter.followup.send(
-            f"✅ Gespeichert:\n{EMOJI_TANK} {tank_role.mention}\n{EMOJI_HEAL} {heal_role.mention}\n{EMOJI_DPS} {dps_role.mention}",
-            ephemeral=True
-        )
-
-    @tree.command(name="raid_set_log_channel", description="(Admin) Log-Kanal für RSVP-DM (optional)")
-    async def raid_set_log_channel(inter: discord.Interaction):
-        if not _is_admin(inter):
-            await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True)
-            return
-
-        async def _picked(pick_inter: discord.Interaction, channel: discord.TextChannel):
-            c = cfg.get(str(pick_inter.guild_id)) or {}
-            c["LOG_CH"] = int(channel.id)
-            cfg[str(pick_inter.guild_id)] = c
-            save_cfg()
-            await pick_inter.response.edit_message(content=f"✅ Log-Kanal gesetzt: {channel.mention}", view=None)
-
-        await send_text_channel_picker(inter, "🧾 RSVP-Log-Kanal auswählen", _picked)
-
-    @tree.command(name="raid_create_dm", description="(Admin) Raid/Anmeldung erzeugen + Übersicht posten")
-    @app_commands.describe(
-        title="Titel",
-        date="Datum YYYY-MM-DD",
-        time="Zeit HH:MM (24h)",
-        description="Kurzbeschreibung (optional)",
-        target_role="(Optional) Nur an diese Rolle DMs versenden",
-        image_url="Optionales Bild fürs Embed"
-    )
-    async def raid_create_dm(
-        inter: discord.Interaction,
-        title: str,
-        date: str,
-        time: str,
-        description: Optional[str] = None,
-        target_role: Optional[discord.Role] = None,
-        image_url: Optional[str] = None
-    ):
-        if not _is_admin(inter):
-            await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True)
-            return
-
-        try:
-            yyyy, mm, dd = [int(x) for x in date.split("-")]
-            hh, mi = [int(x) for x in time.split(":")]
-            when = datetime(yyyy, mm, dd, hh, mi, tzinfo=TZ)
-        except Exception:
-            await inter.response.send_message("❌ Datum/Zeit ungültig. (YYYY-MM-DD / HH:MM)", ephemeral=True)
-            return
-
-        async def _picked(pick_inter: discord.Interaction, ch: discord.TextChannel):
-            await pick_inter.response.edit_message(content=f"⏳ Erstelle Raid in {ch.mention} …", view=None)
-            obj = {
-                "guild_id": int(pick_inter.guild_id),
-                "channel_id": int(ch.id),
-                "title": title.strip(),
-                "description": (description or "").strip(),
-                "when_iso": when.isoformat(),
-                "image_url": (image_url or "").strip() or None,
-                "yes": {"TANK": [], "HEAL": [], "DPS": [], "BANK": []},
-                "maybe": {},
-                "no": [],
-                "target_role_id": int(target_role.id) if target_role else 0,
-                "reminders": [],
-                "reminder_sent": {},
-                "dm_messages": {}
-            }
-
-            emb = build_embed(pick_inter.guild, obj)
-            msg = await ch.send(embed=emb)
-
-            store[str(msg.id)] = obj
-            save_store()
-
-            try:
-                await msg.edit(view=ServerRaidView(int(msg.id)))
-            except Exception:
-                pass
-
-            sent = 0
-            skipped_opt_out = 0
-            role_obj = pick_inter.guild.get_role(int(obj.get("target_role_id", 0) or 0)) if obj.get("target_role_id") else None
-
-            for member in _eligible_members(pick_inter.guild, obj):
-                if not is_dm_enabled(pick_inter.guild_id, member.id):
-                    skipped_opt_out += 1
-                    continue
-
-                try:
-                    dm_text = _format_dm_text(
-                        title=title,
-                        when=when,
-                        channel_name_or_ref=f"Übersicht im Server: #{ch.name}",
-                        description=description,
-                        intro_line="Wähle unten deine Teilnahme:"
-                    )
-
-                    dm_msg = await member.send(dm_text, view=RaidView(int(msg.id)))
-                    obj["dm_messages"][str(member.id)] = int(dm_msg.id)
-                    sent += 1
-                    await asyncio.sleep(0.05)
-
-                except Exception:
-                    pass
-
-            save_store()
-
-            ziel = role_obj.mention if role_obj else "alle Mitglieder (ohne Bots)"
-
-            await pick_inter.followup.send(
-                f"✅ Raid erstellt: {msg.jump_url}\n"
-                f"{EMOJI_TARGET} Zielgruppe: {ziel}\n"
-                f"✉️ DMs versendet: {sent}\n"
-                f"🔕 Opt-out übersprungen: {skipped_opt_out}\n"
-                f"🖱️ Abstimmung ist zusätzlich direkt unter der Raid-Ankündigung per Button möglich.",
-                ephemeral=True
-            )
-
-            _schedule_portal_refresh_for_event(pick_inter.client, pick_inter.guild, obj)
-
-        await send_text_channel_picker(inter, "📢 Zielkanal für Raid-Ankündigung auswählen", _picked)
-
-    async def _create_alliance_raid_impl(
-        inter: discord.Interaction,
-        group: str,
-        event_type: str,
-        title: str,
-        date: str,
-        time: str,
-        description: Optional[str] = None,
-        target_role: Optional[discord.Role] = None,
-        image_url: Optional[str] = None,
-    ):
-        if inter.guild is None or inter.guild_id is None:
-            await inter.followup.send("❌ Nur im Server nutzbar.", ephemeral=True)
-            return
-
-        ok, msg = _require_alliance_home_leader(inter)
-
-        if not ok:
-            await inter.followup.send(msg, ephemeral=True)
-            return
-
-        normalized_event_type = _normalize_alliance_event_type(event_type)
-
-        if not normalized_event_type:
-            await inter.followup.send(
-                f"❌ Ungültiger Eventtyp. Erlaubt: {_alliance_event_type_text()}",
-                ephemeral=True
-            )
-            return
-
-        try:
-            yyyy, mm, dd = [int(x) for x in date.split("-")]
-            hh, mi = [int(x) for x in time.split(":")]
-            when = datetime(yyyy, mm, dd, hh, mi, tzinfo=TZ)
-        except Exception:
-            await inter.followup.send("❌ Datum/Zeit ungültig. (YYYY-MM-DD / HH:MM)", ephemeral=True)
-            return
-
-        try:
-            get_alliance_group = _import_alliance_config()
-            group_obj = get_alliance_group(group)
-        except Exception as e:
-            await inter.followup.send(f"❌ Allianz-Konfiguration konnte nicht geladen werden: `{e}`", ephemeral=True)
-            return
-
-        if not group_obj:
-            await inter.followup.send("❌ Allianz-Gruppe nicht gefunden.", ephemeral=True)
-            return
-
-        servers = group_obj.get("servers") or {}
-
-        if not servers:
-            await inter.followup.send("❌ In dieser Allianz-Gruppe sind keine Server/Channels hinterlegt.", ephemeral=True)
-            return
-
-        home_server = servers.get(str(inter.guild.id))
-
-        if not home_server:
-            await inter.followup.send(
-                "❌ Der Home-/Ebolus-Server ist in dieser Allianz-Gruppe nicht hinterlegt.\n"
-                "Nutze zuerst `/alliance_server_add_home`.",
-                ephemeral=True
-            )
-            return
-
-        home_channel_id = _server_channel_id_for_event(home_server, normalized_event_type)
-        home_channel = inter.guild.get_channel(home_channel_id)
-
-        if not isinstance(home_channel, (discord.TextChannel, discord.Thread)):
-            await inter.followup.send(
-                f"❌ Home-Zielchannel für **{normalized_event_type}** wurde nicht gefunden.\n"
-                f"Setze ihn mit `/alliance_event_channel_set group:{group} event_type:{normalized_event_type} channel:#channel`.",
-                ephemeral=True
-            )
-            return
-
-        obj = {
-            "scope": "alliance",
-            "alliance_group": str(group_obj.get("name", group)),
-            "event_type": normalized_event_type,
-            "guild_id": int(inter.guild.id),
-            "channel_id": int(home_channel.id),
-            "title": title.strip(),
-            "description": (description or "").strip(),
-            "when_iso": when.isoformat(),
-            "image_url": (image_url or "").strip() or None,
-            "yes": {"TANK": [], "HEAL": [], "DPS": [], "BANK": []},
-            "maybe": {},
-            "no": [],
-            "target_role_id": int(target_role.id) if target_role else 0,
-            "dm_messages": {},
-            "mirrors": [],
-        }
-
-        home_emb = build_embed(inter.guild, obj)
-        home_msg = await home_channel.send(embed=home_emb)
-        master_id = int(home_msg.id)
-        obj["message_id"] = master_id
-
-        obj["mirrors"].append({
-            "guild_id": int(inter.guild.id),
-            "discord_name": inter.guild.name,
-            "label": str(home_server.get("label", inter.guild.name)),
-            "short_label": str(home_server.get("short_label", home_server.get("label", inter.guild.name))),
-            "channel_id": int(home_channel.id),
-            "channel_name": getattr(home_channel, "name", ""),
-            "message_id": master_id,
-            "send_dm": bool(home_server.get("send_dm", True)),
-            "home": True,
-        })
-
-        store[str(master_id)] = obj
-        save_store()
-
-        try:
-            await home_msg.edit(view=ServerRaidView(master_id))
-        except Exception:
-            pass
-
-        posted = [f"✅ **{inter.guild.name}** → {home_channel.mention}"]
-        failed = []
-
-        for guild_id_str, server_cfg in servers.items():
-            try:
-                gid = int(guild_id_str)
-
-                if gid == inter.guild.id:
-                    continue
-
-                guild = inter.client.get_guild(gid)
-
-                if not guild:
-                    failed.append(f"❌ `{server_cfg.get('label', guild_id_str)}` — Bot sieht den Server nicht")
-                    continue
-
-                target_channel_id = _server_channel_id_for_event(server_cfg, normalized_event_type)
-                ch = guild.get_channel(target_channel_id)
-
-                if not isinstance(ch, (discord.TextChannel, discord.Thread)):
-                    failed.append(
-                        f"❌ `{server_cfg.get('label', guild.name)}` — Channel für {normalized_event_type} nicht gefunden"
-                    )
-                    continue
-
-                emb = build_embed(guild, obj)
-                msg = await ch.send(embed=emb, view=ServerRaidView(master_id))
-
-                obj["mirrors"].append({
-                    "guild_id": int(guild.id),
-                    "discord_name": guild.name,
-                    "label": str(server_cfg.get("label", guild.name)),
-                    "short_label": str(server_cfg.get("short_label", server_cfg.get("label", guild.name))),
-                    "channel_id": int(ch.id),
-                    "channel_name": getattr(ch, "name", ""),
-                    "message_id": int(msg.id),
-                    "send_dm": False,
-                    "home": False,
-                })
-
-                posted.append(f"✅ **{server_cfg.get('label', guild.name)}** → <#{ch.id}>")
-                await asyncio.sleep(0.15)
-
-            except Exception as e:
-                failed.append(f"❌ `{server_cfg.get('label', guild_id_str)}` — {e}")
-
-        sent = 0
-        skipped_opt_out = 0
-
-        if bool(home_server.get("send_dm", True)):
-            sent, skipped_opt_out = await _send_home_dms_for_alliance_event(
-                inter.guild,
-                obj,
-                master_id,
-                f"Allianz-Übersicht im Server: #{getattr(home_channel, 'name', 'raid')}"
-            )
-
-        store[str(master_id)] = obj
-        save_store()
-        await _push_overview(inter.client, str(master_id), obj)
-
-        result = (
-            f"✅ Allianz-Raid erstellt.\n"
-            f"Gruppe: **{group_obj.get('name', group)}**\n"
-            f"Eventtyp: **{normalized_event_type}**\n"
-            f"Master-Message-ID: `{master_id}`\n"
-            f"✉️ Home-DMs versendet: **{sent}**\n"
-            f"🔕 Home-Opt-out übersprungen: **{skipped_opt_out}**\n\n"
-            f"**Gepostet:**\n" + "\n".join(posted)
-        )
-
-        if failed:
-            result += "\n\n**Fehler:**\n" + "\n".join(failed)
-
-        if len(result) > 1900:
-            result = result[:1850] + "\n… gekürzt"
-
-        await inter.followup.send(result, ephemeral=True)
-
-        # Home-/Ebolus-Gildenzentralen aktualisieren, ohne neue Portal-DMs zu senden.
-        _schedule_portal_refresh_for_event(inter.client, inter.guild, obj)
-
-    @tree.command(name="alliance_raid_create", description="(Leader) Allianz-Raid auf alle Server einer Allianz-Gruppe posten")
-    @app_commands.describe(
-        group="Name der Allianz-Gruppe",
-        event_type="NM Raid / HM Raid / PvP Schlacht / Dimensionsprüfung",
-        title="Titel",
-        date="Datum YYYY-MM-DD",
-        time="Zeit HH:MM (24h)",
-        description="Kurzbeschreibung (optional)",
-        target_role="Optional: Nur diese Home-/Ebolus-Rolle bekommt DMs",
-        image_url="Optionales Bild fürs Embed"
-    )
-    async def alliance_raid_create(
-        inter: discord.Interaction,
-        group: str,
-        event_type: str,
-        title: str,
-        date: str,
-        time: str,
-        description: Optional[str] = None,
-        target_role: Optional[discord.Role] = None,
-        image_url: Optional[str] = None
-    ):
-        await inter.response.defer(ephemeral=True, thinking=True)
-        await _create_alliance_raid_impl(inter, group, event_type, title, date, time, description, target_role, image_url)
-
-    @tree.command(name="alliance_raid_from_template", description="(Leader) Allianz-Raid aus gespeichertem Template erstellen")
-    @app_commands.describe(
-        name="Name des Templates",
-        date="Datum YYYY-MM-DD",
-        time="Optional: andere Uhrzeit HH:MM",
-        title="Optional: anderer Titel",
-        description="Optional: andere Beschreibung",
-        target_role="Optional: andere Home-/Ebolus-Zielrolle für DMs",
-        image_url="Optionales Bild fürs Embed"
-    )
-    async def alliance_raid_from_template(
-        inter: discord.Interaction,
-        name: str,
-        date: str,
-        time: Optional[str] = None,
-        title: Optional[str] = None,
-        description: Optional[str] = None,
-        target_role: Optional[discord.Role] = None,
-        image_url: Optional[str] = None,
-    ):
-        await inter.response.defer(ephemeral=True, thinking=True)
-
-        try:
-            get_alliance_template = _import_alliance_template()
-            tmpl = get_alliance_template(name)
-        except Exception as e:
-            await inter.followup.send(f"❌ Template-System konnte nicht geladen werden: `{e}`", ephemeral=True)
-            return
-
-        if not tmpl:
-            await inter.followup.send("❌ Template nicht gefunden.", ephemeral=True)
-            return
-
-        if target_role is None and inter.guild is not None:
-            role_id = int(tmpl.get("target_role_id", 0) or 0)
-            if role_id:
-                role = inter.guild.get_role(role_id)
-                if isinstance(role, discord.Role):
-                    target_role = role
-
-        await _create_alliance_raid_impl(
-            inter=inter,
-            group=str(tmpl.get("group", "")),
-            event_type=str(tmpl.get("event_type", "")),
-            title=str(title or tmpl.get("title", "Allianz-Raid")),
-            date=date,
-            time=str(time or tmpl.get("default_time", "21:00")),
-            description=str(description if description is not None else tmpl.get("description", "")),
-            target_role=target_role,
-            image_url=image_url,
-        )
-
-    @tree.command(name="alliance_raid_template", description="(Leader) Zeigt Copy-Paste-Vorlagen für Allianz-Raids")
-    async def alliance_raid_template(inter: discord.Interaction):
-        await inter.response.defer(ephemeral=True, thinking=False)
-
-        ok, msg = _require_alliance_home_leader(inter)
-
-        if not ok:
-            await inter.followup.send(msg, ephemeral=True)
-            return
-
-        text = (
-            "**🤝 Allianz-Raid Vorlagen**\n\n"
-            "**HM Raid:**\n"
-            "`/alliance_raid_create group:HM Raid Allianz title:HM Raid date:2026-05-30 time:21:00 description:HM Raid – bitte Rolle wählen`\n\n"
-            "**Gildenbosse:**\n"
-            "`/alliance_raid_create group:Gildenboss Allianz title:Gildenbosse date:2026-05-30 time:20:00 description:Gildenbosse – Anmeldung für Loot-/Needübersicht`\n\n"
-            "**PvP Event:**\n"
-            "`/alliance_raid_create group:PvP Allianz title:Allianz PvP date:2026-05-30 time:20:30 description:Allianz-PvP – bitte anmelden`\n\n"
-            "**Mit Zielrolle für Home-DMs:**\n"
-            "`/alliance_raid_create group:HM Raid Allianz title:HM Raid date:2026-05-30 time:21:00 description:HM Raid target_role:@Raid`\n\n"
-            "**Hinweis:**\n"
-            "Partner-Server bekommen keine DMs. Dort läuft nur der Channel-Post mit Buttons."
-        )
-
-        await inter.followup.send(text, ephemeral=True)
-
-    @tree.command(name="raid_resend_missing", description="(Admin) DMs an alle, die noch nicht abgestimmt haben")
-    async def raid_resend_missing(inter: discord.Interaction, message_id: str):
-        await inter.response.defer(ephemeral=True, thinking=True)
-
-        if not _is_admin(inter):
-            await inter.followup.send("❌ Nur Admin/Manage Server.", ephemeral=True)
-            return
-
-        obj = store.get(str(message_id))
-
-        if not obj or int(obj.get("guild_id", 0) or 0) != inter.guild_id:
-            await inter.followup.send("❌ Unbekanntes Event/Message-ID.", ephemeral=True)
-            return
-
-        _init_event_shape(obj)
-
-        guild = inter.guild
-        ch = guild.get_channel(int(obj["channel_id"]))
-
-        if not isinstance(ch, (discord.TextChannel, discord.Thread)):
-            await inter.followup.send("❌ Zielkanal existiert nicht mehr.", ephemeral=True)
-            return
-
-        when = datetime.fromisoformat(obj["when_iso"])
-
-        if datetime.now(TZ) > when + timedelta(hours=2):
-            await inter.followup.send("⚠️ Event ist älter als 2h nach Start – keine Resend.", ephemeral=True)
-            return
-
-        eligible = _eligible_members(guild, obj)
-        already = _voters_set(obj)
-        targets = [m for m in eligible if m.id not in already]
-
-        sent = 0
-        skipped_opt_out = 0
-
-        for member in targets:
-            if not is_dm_enabled(inter.guild_id, member.id):
-                skipped_opt_out += 1
-                continue
-
-            try:
-                dm_text = _format_dm_text(
-                    title=str(obj["title"]),
-                    when=when,
-                    channel_name_or_ref=f"Übersicht: <#{obj['channel_id']}>",
-                    description=obj.get("description"),
-                    intro_line="Du hast noch nicht abgestimmt:"
-                )
-
-                dm_msg = await member.send(dm_text, view=RaidView(int(message_id)))
-                obj["dm_messages"][str(member.id)] = int(dm_msg.id)
-                sent += 1
-                await asyncio.sleep(0.05)
-
-            except Exception:
-                pass
-
-        save_store()
-
-        await inter.followup.send(
-            f"✅ Resent an {sent} Nutzer.\n🔕 Opt-out übersprungen: {skipped_opt_out}",
-            ephemeral=True
-        )
-
-    @tree.command(name="raid_resend_to", description="(Admin) DMs gezielt an Rolle oder User für ein Event senden")
-    async def raid_resend_to(
-        inter: discord.Interaction,
-        message_id: str,
-        role: Optional[discord.Role] = None,
-        user: Optional[discord.Member] = None
-    ):
-        await inter.response.defer(ephemeral=True, thinking=True)
-
-        if not _is_admin(inter):
-            await inter.followup.send("❌ Nur Admin/Manage Server.", ephemeral=True)
-            return
-
-        obj = store.get(str(message_id))
-
-        if not obj or int(obj.get("guild_id", 0) or 0) != inter.guild_id:
-            await inter.followup.send("❌ Unbekanntes Event/Message-ID.", ephemeral=True)
-            return
-
-        _init_event_shape(obj)
-
-        when = datetime.fromisoformat(obj["when_iso"])
-
-        if datetime.now(TZ) > when + timedelta(hours=2):
-            await inter.followup.send("⚠️ Event ist älter als 2h nach Start – keine Resend.", ephemeral=True)
-            return
-
-        targets: Iterable[discord.Member]
-
-        if user:
-            targets = [user]
-        elif role:
-            targets = [m for m in role.members if not m.bot]
-        else:
-            await inter.followup.send("❌ Bitte `role` oder `user` angeben.", ephemeral=True)
-            return
-
-        sent = 0
-        skipped_opt_out = 0
-
-        for member in targets:
-            if not is_dm_enabled(inter.guild_id, member.id):
-                skipped_opt_out += 1
-                continue
-
-            try:
-                dm_text = _format_dm_text(
-                    title=str(obj["title"]),
-                    when=when,
-                    channel_name_or_ref=f"Übersicht: <#{obj['channel_id']}>",
-                    description=obj.get("description"),
-                    intro_line="Wähle unten deine Teilnahme:"
-                )
-
-                dm_msg = await member.send(dm_text, view=RaidView(int(message_id)))
-                obj["dm_messages"][str(member.id)] = int(dm_msg.id)
-                sent += 1
-                await asyncio.sleep(0.05)
-
-            except Exception:
-                pass
-
-        save_store()
-
-        await inter.followup.send(
-            f"✅ Resent an {sent} Ziel(e).\n🔕 Opt-out übersprungen: {skipped_opt_out}",
-            ephemeral=True
-        )
-
-    @tree.command(name="raid_delete", description="(Admin) Löscht ein Raid-/Event inkl. Serverpost und DMs")
-    async def raid_delete(inter: discord.Interaction, message_id: str):
-        await inter.response.defer(ephemeral=True, thinking=True)
-
-        if not _is_admin(inter):
-            await inter.followup.send("❌ Nur Admin/Manage Server.", ephemeral=True)
-            return
-
-        obj = store.get(str(message_id))
-
-        if not obj:
-            await inter.followup.send("❌ Unbekanntes Event/Message-ID.", ephemeral=True)
-            return
-
-        _init_event_shape(obj)
-
-        if int(obj.get("guild_id", 0) or 0) != inter.guild_id:
-            await inter.followup.send("❌ Dieses Event gehört nicht zu diesem Home-Server.", ephemeral=True)
-            return
-
-        deleted_posts = 0
-        failed_posts = []
-        deleted_dms = 0
-
-        # Serverposts löschen.
-        if _is_alliance_event(obj) and obj.get("mirrors"):
-            for mirror in list(obj.get("mirrors") or []):
-                try:
-                    guild = inter.client.get_guild(int(mirror.get("guild_id", 0) or 0))
-
-                    if not guild:
-                        failed_posts.append(f"{mirror.get('label', 'Unbekannt')} — Server nicht gefunden")
-                        continue
-
-                    ch = guild.get_channel(int(mirror.get("channel_id", 0) or 0))
-
-                    if not isinstance(ch, (discord.TextChannel, discord.Thread)):
-                        failed_posts.append(f"{mirror.get('label', guild.name)} — Channel nicht gefunden")
-                        continue
-
-                    try:
-                        msg = await ch.fetch_message(int(mirror.get("message_id", 0) or 0))
-                        await msg.delete()
-                        deleted_posts += 1
-                    except Exception:
-                        failed_posts.append(f"{mirror.get('label', guild.name)} — Post nicht gefunden oder keine Rechte")
-
-                    await asyncio.sleep(0.05)
-
-                except Exception as e:
-                    failed_posts.append(f"{mirror.get('label', 'Unbekannt')} — {e}")
-
-        else:
-            guild = inter.guild
-
-            try:
-                ch = guild.get_channel(int(obj["channel_id"]))
-
-                if isinstance(ch, (discord.TextChannel, discord.Thread)):
-                    try:
-                        msg = await ch.fetch_message(int(message_id))
-                        await msg.delete()
-                        deleted_posts += 1
-                    except Exception:
-                        failed_posts.append("Serverpost nicht gefunden oder keine Rechte")
-
-            except Exception as e:
-                failed_posts.append(str(e))
-
-        # DMs löschen.
-        for uid_str in list((obj.get("dm_messages") or {}).keys()):
-            try:
-                uid = int(uid_str)
-                ok = await _delete_dm_message_for_user(inter.client, obj, uid)
-
-                if ok:
-                    deleted_dms += 1
-
-                await asyncio.sleep(0.05)
-
-            except Exception:
-                pass
-
-        try:
-            await _cleanup_event_voice_for_obj(inter.client, obj)
-        except Exception:
-            pass
-
-        refresh_members = []
-
-        try:
-            if inter.guild is not None:
-                refresh_members = list(_eligible_members(inter.guild, obj))
-        except Exception:
-            refresh_members = []
-
-        refresh_members = []
-
-        try:
-            if inter.guild is not None:
-                refresh_members = list(_eligible_members(inter.guild, obj))
-        except Exception:
-            refresh_members = []
-
-        store.pop(str(message_id), None)
-        save_store()
-
-        text = (
-            f"✅ Raid/Event gelöscht.\n"
-            f"🧾 Serverposts gelöscht: **{deleted_posts}**\n"
-            f"✉️ DMs gelöscht: **{deleted_dms}**"
-        )
-
-        if failed_posts:
-            text += "\n\n⚠️ Nicht gelöscht:\n" + "\n".join(f"• {x}" for x in failed_posts[:10])
-
-        if len(text) > 1900:
-            text = text[:1850] + "\n… gekürzt"
-
-        await inter.followup.send(text, ephemeral=True)
-
-        # Nach dem Löschen bestehende Gildenzentralen aktualisieren, damit das Event dort verschwindet.
-        if inter.guild is not None and refresh_members:
-            try:
-                asyncio.create_task(_refresh_existing_portals_for_members(inter.client, inter.guild, refresh_members))
-            except Exception:
-                pass
-
-
-    @tree.command(name="alliance_raid_delete", description="(Leader) Löscht einen Allianz-Raid inkl. aller Mirror-Posts")
-    async def alliance_raid_delete(inter: discord.Interaction, message_id: str):
-        await inter.response.defer(ephemeral=True, thinking=True)
-
-        ok, msg = _require_alliance_home_leader(inter)
-
-        if not ok:
-            await inter.followup.send(msg, ephemeral=True)
-            return
-
-        obj = store.get(str(message_id))
-
-        if not obj:
-            await inter.followup.send("❌ Unbekannter Allianz-Raid / Message-ID nicht gefunden.", ephemeral=True)
-            return
-
-        _init_event_shape(obj)
-
-        if not _is_alliance_event(obj):
-            await inter.followup.send(
-                "❌ Das ist kein Allianz-Raid. Normale Raids bitte mit `/raid_delete` löschen.",
-                ephemeral=True
-            )
-            return
-
-        if int(obj.get("guild_id", 0) or 0) != inter.guild_id:
-            await inter.followup.send("❌ Dieser Allianz-Raid gehört nicht zu diesem Home-/Ebolus-Server.", ephemeral=True)
-            return
-
-        deleted_posts = 0
-        failed_posts = []
-        deleted_dms = 0
-
-        for mirror in list(obj.get("mirrors") or []):
-            try:
-                guild = inter.client.get_guild(int(mirror.get("guild_id", 0) or 0))
-
-                if not guild:
-                    failed_posts.append(f"{mirror.get('label', 'Unbekannt')} — Server nicht gefunden")
-                    continue
-
-                ch = guild.get_channel(int(mirror.get("channel_id", 0) or 0))
-
-                if not isinstance(ch, (discord.TextChannel, discord.Thread)):
-                    failed_posts.append(f"{mirror.get('label', guild.name)} — Channel nicht gefunden")
-                    continue
-
-                try:
-                    msg_obj = await ch.fetch_message(int(mirror.get("message_id", 0) or 0))
-                    await msg_obj.delete()
-                    deleted_posts += 1
-                except Exception:
-                    failed_posts.append(f"{mirror.get('label', guild.name)} — Post nicht gefunden oder keine Rechte")
-
-                await asyncio.sleep(0.05)
-
-            except Exception as e:
-                failed_posts.append(f"{mirror.get('label', 'Unbekannt')} — {e}")
-
-        for uid_str in list((obj.get("dm_messages") or {}).keys()):
-            try:
-                uid = int(uid_str)
-                ok_deleted = await _delete_dm_message_for_user(inter.client, obj, uid)
-
-                if ok_deleted:
-                    deleted_dms += 1
-
-                await asyncio.sleep(0.05)
-
-            except Exception:
-                pass
-
-        try:
-            await _cleanup_event_voice_for_obj(inter.client, obj)
-        except Exception:
-            pass
-
-        store.pop(str(message_id), None)
-        save_store()
-
-        text = (
-            f"✅ Allianz-Raid gelöscht.\n"
-            f"🧾 Mirror-Posts gelöscht: **{deleted_posts}**\n"
-            f"✉️ Home-DMs gelöscht: **{deleted_dms}**"
-        )
-
-        if failed_posts:
-            text += "\n\n⚠️ Nicht gelöscht:\n" + "\n".join(f"• {x}" for x in failed_posts[:10])
-
-        if len(text) > 1900:
-            text = text[:1850] + "\n… gekürzt"
-
-        await inter.followup.send(text, ephemeral=True)
-
-        # Nach dem Löschen bestehende Home-Gildenzentralen aktualisieren, damit der Allianz-Raid dort verschwindet.
-        if inter.guild is not None and refresh_members:
-            try:
-                asyncio.create_task(_refresh_existing_portals_for_members(inter.client, inter.guild, refresh_members))
-            except Exception:
-                pass
-
-
-async def auto_resend_for_new_member(member: discord.Member) -> None:
-    try:
-        if member.bot:
-            return
-
-        if not is_dm_enabled(member.guild.id, member.id):
-            return
-
-        now = datetime.now(TZ)
-        sent = 0
-
-        for mid, obj in list(store.items()):
-            try:
-                _init_event_shape(obj)
-
-                if int(obj.get("guild_id", 0) or 0) != member.guild.id:
-                    continue
-
-                when = datetime.fromisoformat(obj.get("when_iso"))
-
-                if now > when + timedelta(hours=2):
-                    continue
-
-                tr_id = int(obj.get("target_role_id", 0) or 0)
-
-                if tr_id:
-                    role = member.guild.get_role(tr_id)
-
-                    if not (role and role in member.roles):
-                        continue
-
-                text = _format_dm_text(
-                    title=str(obj.get("title", "Event")),
-                    when=when,
-                    channel_name_or_ref=f"Übersicht im Server: <#{obj.get('channel_id')}>",
-                    description=obj.get("description"),
-                    intro_line="Wähle unten deine Teilnahme:"
-                )
-
-                try:
-                    dm_msg = await member.send(text, view=RaidView(int(mid)))
-                    obj["dm_messages"][str(member.id)] = int(dm_msg.id)
-                    sent += 1
-                    await asyncio.sleep(0.05)
-                except Exception:
-                    pass
-
-            except Exception:
-                continue
-
-        if sent:
-            save_store()
-
-        try:
-            if sent and hasattr(member, "_state") and hasattr(member._state, "_get_client"):
-                client = member._state._get_client()
-                await _log(client, member.guild.id, f"Auto-Resend an {member} -> {sent} DM(s).")
-        except Exception:
-            pass
-
-    except Exception:
-        pass
+                icon = "—"
+            size = int(info.get("size_bytes") or 0)
+            lines.append(f"{icon} `{info.get('file')}` — {key} — {size} B")
+        txt = "\n".join(lines) or "Keine Quellen definiert."
+        if len(txt) > 3900:
+            txt = txt[:3900] + "\n… gekürzt"
+        emb = discord.Embed(title="📁 Dashboard-Quellen", description=txt, color=0xD6A84F)
+        await inter.response.send_message(embed=emb, ephemeral=True)
+
+    print("📊 Dashboard-Datenlayer registriert: Mitglieder-/Adminrolle, News/Guides/Ankündigungen-Feeds, Status und Export")
