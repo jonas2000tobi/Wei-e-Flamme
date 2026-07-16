@@ -134,12 +134,19 @@ def _phase3_db_member_ids(guild_id: int | str) -> set[str]:
 
 
 def _phase3_active_member_ids(guild_id: int | str) -> set[str]:
-    # DB-Scope gewinnt, sobald Phase 3.4 Mitglieder erfolgreich gespiegelt hat.
-    # Dadurch zählen EC-Konten nicht mehr alle Nicht-Bots auf dem Discord-Server.
-    db_ids = _phase3_db_member_ids(guild_id)
-    if db_ids:
-        return db_ids
-    return set(PHASE3_ACTIVE_MEMBER_IDS_BY_GUILD.get(str(int(guild_id)), set())) if str(guild_id).strip().isdigit() else set()
+    """Aktuellen Live-Roster bevorzugen, Postgres nur als Start-Fallback nutzen.
+
+    ``phase3_members`` enthält historische Spiegelstände und darf deshalb nicht
+    die gerade aus Discord gelesene Mitgliederrolle überstimmen. Sobald der Bot
+    den Server gesehen hat, ist der Live-Cache die Wahrheit – auch wenn er leer ist.
+    """
+    try:
+        key = str(int(guild_id))
+    except Exception:
+        return set()
+    if key in PHASE3_ACTIVE_MEMBER_IDS_BY_GUILD:
+        return set(PHASE3_ACTIVE_MEMBER_IDS_BY_GUILD.get(key, set()))
+    return _phase3_db_member_ids(guild_id)
 
 
 def _phase3_refresh_active_member_cache(client: discord.Client) -> dict[str, int]:
@@ -643,11 +650,17 @@ def _is_ebolus_member(client: discord.Client, home_guild_id: int, user_id: int) 
     member = guild.get_member(int(user_id))
     if not member or member.bot:
         return False
+
+    configured_ids: set[int] = set()
     role_id = _member_role_id(int(home_guild_id))
-    if not role_id:
+    if role_id:
+        configured_ids.add(int(role_id))
+    configured_ids.update(_leadership_role_ids(int(home_guild_id)))
+
+    if not configured_ids:
         return True
-    role = guild.get_role(role_id)
-    return bool(role and role in member.roles)
+    member_ids = {int(role.id) for role in getattr(member, "roles", []) if getattr(role, "id", None)}
+    return bool(member_ids.intersection(configured_ids))
 
 
 def _display_member(client: discord.Client, home_guild_id: int, user_id: int, fallback: str = "") -> str:

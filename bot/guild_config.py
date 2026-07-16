@@ -715,6 +715,31 @@ async def setup_guild_config(bot: commands.Bot, tree: app_commands.CommandTree) 
         emb.add_field(name="Grunddaten", value=f"Bot: {p['bot_display_name']}\nZeitzone: {p['timezone']}\nStatus: {p['status']}", inline=False)
         emb.add_field(name="Rollen", value="\n".join(role_lines)[:1024], inline=False)
         emb.add_field(name="Kanäle", value="\n".join(channel_lines)[:1024], inline=False)
+
+        roster_role_ids = set(
+            role_ids(inter.guild.id, "member")
+            + role_ids(inter.guild.id, "leader")
+            + role_ids(inter.guild.id, "advisor")
+            + role_ids(inter.guild.id, "guardian")
+        )
+        roster_member_ids: set[int] = set()
+        for current_member in getattr(inter.guild, "members", []) or []:
+            if bool(getattr(current_member, "bot", False)):
+                continue
+            current_role_ids = {int(r.id) for r in getattr(current_member, "roles", []) if getattr(r, "id", None)}
+            if current_role_ids.intersection(roster_role_ids):
+                roster_member_ids.add(int(current_member.id))
+        human_server_members = sum(1 for m in (getattr(inter.guild, "members", []) or []) if not bool(getattr(m, "bot", False)))
+        role_names = [str(getattr(inter.guild.get_role(rid), "name", rid)) for rid in sorted(roster_role_ids)]
+        emb.add_field(
+            name="Mitgliederzählung",
+            value=(
+                f"Gildenmitglieder nach Rollen: **{len(roster_member_ids)}**\n"
+                f"Menschen insgesamt auf dem Server: **{human_server_members}**\n"
+                f"Gezählte Rollen: {', '.join(role_names) if role_names else '—'}"
+            )[:1024],
+            inline=False,
+        )
         rule_lines = [f"• {kind}: {value}" for kind, value in cfg.get("rules", {}).items()]
         emb.add_field(name="Regeln", value="\n".join(rule_lines)[:1024] or "—", inline=False)
         await inter.followup.send(embed=emb, ephemeral=True)

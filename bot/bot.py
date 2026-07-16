@@ -315,15 +315,11 @@ async def on_ready():
         except Exception as e:
             print(f"❌ Join-Hook Setup-Fehler: {e!r}")
 
-        try:
-            synced = await tree.sync()
-            print(f"✅ Globale Slash-Commands synchronisiert: {len(synced)}")
-        except Exception as e:
-            print(f"⚠️ Globaler Sync-Fehler: {e!r}")
-
-        # Globale Discord-Commands können verzögert oder im Client veraltet sein.
-        # Deshalb werden sie zusätzlich direkt in jeden verbundenen Server
-        # kopiert. Guild-Commands stehen dort praktisch sofort aktuell bereit.
+        # Commands werden absichtlich serverbezogen synchronisiert. Globale und
+        # serverbezogene Kopien mit identischem Namen führen im Discord-Client zu
+        # alten Command-IDs, "Befehl veraltet" oder "Anwendung reagiert nicht".
+        # Guild-Commands sind sofort aktuell und passen zur Multi-Guild-Architektur.
+        local_global_commands = list(tree.get_commands(guild=None))
         for connected_guild in bot.guilds:
             guild_object = discord.Object(id=connected_guild.id)
             try:
@@ -338,6 +334,23 @@ async def on_ready():
                     "⚠️ Guild-Sync-Fehler: "
                     f"{connected_guild.name} ({connected_guild.id}) · {e!r}"
                 )
+
+        # Alte globale Remote-Commands mit der öffentlichen CommandTree-API
+        # entfernen. Anschließend werden die lokalen Definitionen wieder in den
+        # Tree gelegt, aber nicht global synchronisiert.
+        try:
+            tree.clear_commands(guild=None)
+            removed = await tree.sync(guild=None)
+            for local_command in local_global_commands:
+                tree.add_command(local_command)
+            print(f"✅ Alte globale Slash-Commands entfernt ({len(removed)} verbleibend); Guild-Sync ist aktiv.")
+        except Exception as e:
+            # Falls das Leeren fehlschlägt, lokale Commands sicher wiederherstellen.
+            existing_names = {cmd.name for cmd in tree.get_commands(guild=None)}
+            for local_command in local_global_commands:
+                if local_command.name not in existing_names:
+                    tree.add_command(local_command)
+            print(f"⚠️ Globale Slash-Commands konnten nicht bereinigt werden: {e!r}")
 
         _modules_initialized = True
         print(f"✅ Module einmalig initialisiert: {sum(results)}/{len(results)}")

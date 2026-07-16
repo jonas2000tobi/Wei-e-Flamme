@@ -190,13 +190,41 @@ def _dashboard_member_role(guild: discord.Guild) -> Optional[discord.Role]:
     return None
 
 
+def _dashboard_member_roles(guild: discord.Guild) -> list[discord.Role]:
+    """Alle Rollen, die eine aktive Gildenmitgliedschaft abbilden.
+
+    Die normale Mitgliederrolle bleibt die Hauptrolle. Zusätzlich zählen bewusst
+    konfigurierte Leitungsrollen (Leader/Berater/Wächter), damit Führungskräfte
+    nicht aus Mitgliederzahl, Dashboard und EC-Scope verschwinden, nur weil sie
+    statt ``@MEMBER`` ausschließlich ``@LEITUNG`` tragen.
+    """
+    out: list[discord.Role] = []
+
+    def add(role: Optional[discord.Role]) -> None:
+        if role is not None and role not in out:
+            out.append(role)
+
+    add(_dashboard_member_role(guild))
+    try:
+        if central_guild_config is not None:
+            for kind in ("leader", "advisor", "guardian"):
+                for rid in central_guild_config.role_ids(int(guild.id), kind):
+                    add(guild.get_role(int(rid)))
+    except Exception:
+        pass
+    return out
+
+
 def _dashboard_member_ids(guild: discord.Guild) -> set[int]:
-    role = _dashboard_member_role(guild)
-    if role is not None:
-        return {int(m.id) for m in getattr(role, "members", []) if getattr(m, "id", None)}
-    # Absichtlich kein Fallback auf alle Servermitglieder. Für Massentauglichkeit
-    # muss eine Gildenrolle gesetzt sein.
-    return set()
+    ids: set[int] = set()
+    for role in _dashboard_member_roles(guild):
+        for member in getattr(role, "members", []) or []:
+            if not getattr(member, "id", None) or bool(getattr(member, "bot", False)):
+                continue
+            ids.add(int(member.id))
+    # Absichtlich kein Fallback auf alle Servermitglieder. Gäste, Bewerber und
+    # Allianzspieler dürfen nicht automatisch als Gildenmitglieder zählen.
+    return ids
 
 
 def _parse_role_id_values(raw: Any) -> list[int]:
@@ -363,14 +391,17 @@ def _dashboard_auth_info(guild: discord.Guild) -> dict[str, Any]:
 
 
 def _dashboard_member_filter_info(guild: discord.Guild) -> dict[str, Any]:
+    roles = _dashboard_member_roles(guild)
     role = _dashboard_member_role(guild)
     ids = _dashboard_member_ids(guild)
     configured = _dashboard_member_role_config_value(guild.id)
     if role is not None:
         return {
-            "mode": "discord_role",
+            "mode": "discord_roles",
             "role_id": int(role.id),
-            "role_name": str(role.name),
+            "role_ids": [int(r.id) for r in roles],
+            "role_name": " + ".join(str(r.name) for r in roles),
+            "role_names": [str(r.name) for r in roles],
             "eligible_count": len(ids),
             "configured": True,
             "setting_value": str(configured or os.getenv("DASHBOARD_MEMBER_ROLE_ID") or os.getenv("DASHBOARD_MEMBER_ROLE_NAME") or ""),
@@ -614,11 +645,13 @@ def _summarize_profiles(data: Any, guild: discord.Guild, *, limit: int = 500) ->
     users = g.get("users") if isinstance(g.get("users"), dict) else {}
     absences = g.get("absences") if isinstance(g.get("absences"), dict) else {}
     member_role = _dashboard_member_role(guild)
+    active_ids = _dashboard_member_ids(guild)
     active_members = [
-        m for m in (getattr(member_role, "members", []) if member_role is not None else [])
-        if getattr(m, "id", None) and not bool(getattr(m, "bot", False))
+        m for m in (getattr(guild, "members", []) or [])
+        if getattr(m, "id", None)
+        and int(m.id) in active_ids
+        and not bool(getattr(m, "bot", False))
     ]
-    active_ids = {int(m.id) for m in active_members}
     stale_count = sum(1 for uid in users.keys() if str(uid).isdigit() and int(uid) not in active_ids)
     items: list[dict[str, Any]] = []
 
@@ -2047,7 +2080,7 @@ def _discord_configuration_catalog(guild: discord.Guild) -> dict[str, Any]:
             "id": int(role.id),
             "name": str(role.name),
             "position": int(getattr(role, "position", 0)),
-            "member_count": len(getattr(role, "members", []) or []),
+            "member_count": sum(1 for m in (getattr(role, "members", []) or []) if not bool(getattr(m, "bot", False))),
         })
     channels = []
     for ch in getattr(guild, "channels", []):
