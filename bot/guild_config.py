@@ -520,15 +520,17 @@ async def setup_guild_config(bot: commands.Bot, tree: app_commands.CommandTree) 
         if inter.guild is None:
             await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
             return
-        if not _is_admin(inter):
-            await inter.response.send_message("❌ Dafür brauchst du Server verwalten oder die konfigurierte Adminrolle.", ephemeral=True)
+        await inter.response.defer(ephemeral=True, thinking=True)
+        if not await asyncio.to_thread(_is_admin, inter):
+            await inter.followup.send("❌ Dafür brauchst du Server verwalten oder die konfigurierte Adminrolle.", ephemeral=True)
             return
         clean = str(name or "").strip()[:100]
         if not clean:
-            await inter.response.send_message("❌ Gildenname fehlt.", ephemeral=True)
+            await inter.followup.send("❌ Gildenname fehlt.", ephemeral=True)
             return
-        before = get_profile(inter.guild.id, inter.guild.name)
-        runtime_db.upsert_guild_profile(
+        before = await asyncio.to_thread(get_profile, inter.guild.id, inter.guild.name)
+        await asyncio.to_thread(
+            runtime_db.upsert_guild_profile,
             inter.guild.id,
             display_name=clean,
             short_name=(short_name or clean)[:50],
@@ -538,9 +540,12 @@ async def setup_guild_config(bot: commands.Bot, tree: app_commands.CommandTree) 
             discord_name=inter.guild.name,
         )
         await asyncio.to_thread(_set_alliance_home_guild, inter.guild.id, discord_name=inter.guild.name)
-        await _sync_bot_nickname(inter.guild, get_profile(inter.guild.id, inter.guild.name))
+        profile = await asyncio.to_thread(get_profile, inter.guild.id, inter.guild.name)
+        await _sync_bot_nickname(inter.guild, profile)
         await asyncio.to_thread(sync_legacy_compatibility, inter.guild.id)
-        runtime_db.write_audit_log(
+        after = await asyncio.to_thread(get_profile, inter.guild.id, inter.guild.name)
+        await asyncio.to_thread(
+            runtime_db.write_audit_log,
             guild_id=inter.guild.id,
             actor_id=inter.user.id,
             action="guild_profile_update",
@@ -548,28 +553,41 @@ async def setup_guild_config(bot: commands.Bot, tree: app_commands.CommandTree) 
             target_id=str(inter.guild.id),
             summary=f"Gildenprofil auf {clean} aktualisiert",
             old_value=before,
-            new_value=get_profile(inter.guild.id, inter.guild.name),
+            new_value=after,
         )
-        await inter.response.send_message(f"✅ Gilde konfiguriert: **{clean}**. Railway musste nicht geändert werden.", ephemeral=True)
+        await inter.followup.send(f"✅ Gilde konfiguriert: **{clean}**. Railway musste nicht geändert werden.", ephemeral=True)
 
     @guild_group.command(name="set_role", description="Ordnet eine Discord-Rolle einer Gildenfunktion zu.")
     @app_commands.describe(kind="Funktion der Rolle", role="Discord-Rolle")
     @app_commands.choices(kind=[app_commands.Choice(name=x, value=x) for x in ROLE_KEYS])
     async def guild_set_role(inter: discord.Interaction, kind: app_commands.Choice[str], role: discord.Role):
-        if inter.guild is None or not _is_admin(inter):
-            await inter.response.send_message("❌ Nur für Server-Admins/Leitung.", ephemeral=True)
+        if inter.guild is None:
+            await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
+            return
+        await inter.response.defer(ephemeral=True, thinking=True)
+        if not await asyncio.to_thread(_is_admin, inter):
+            await inter.followup.send("❌ Nur für Server-Admins/Leitung.", ephemeral=True)
             return
         key = ROLE_KEYS[kind.value]
         if kind.value in MULTI_ROLE_KINDS:
-            value = role_ids(inter.guild.id, kind.value)
+            value = await asyncio.to_thread(role_ids, inter.guild.id, kind.value)
             if int(role.id) not in value:
                 value.append(int(role.id))
         else:
             value = int(role.id)
-        runtime_db.set_guild_setting(inter.guild.id, key, value)
+        await asyncio.to_thread(runtime_db.set_guild_setting, inter.guild.id, key, value)
         await asyncio.to_thread(sync_legacy_compatibility, inter.guild.id)
-        runtime_db.write_audit_log(guild_id=inter.guild.id, actor_id=inter.user.id, action="guild_role_map_set", target_type="role", target_id=str(role.id), summary=f"{kind.value}: {role.name}", new_value={"kind": kind.value, "role_id": role.id})
-        await inter.response.send_message(f"✅ **{kind.value}** → {role.mention}", ephemeral=True)
+        await asyncio.to_thread(
+            runtime_db.write_audit_log,
+            guild_id=inter.guild.id,
+            actor_id=inter.user.id,
+            action="guild_role_map_set",
+            target_type="role",
+            target_id=str(role.id),
+            summary=f"{kind.value}: {role.name}",
+            new_value={"kind": kind.value, "role_id": role.id},
+        )
+        await inter.followup.send(f"✅ **{kind.value}** → {role.mention}", ephemeral=True)
 
     @guild_group.command(name="set_channel", description="Ordnet einen Discord-Kanal einer Gildenfunktion zu.")
     @app_commands.describe(kind="Funktion des Kanals", channel="Discord-Kanal")
@@ -579,48 +597,79 @@ async def setup_guild_config(bot: commands.Bot, tree: app_commands.CommandTree) 
         kind: app_commands.Choice[str],
         channel: discord.TextChannel | discord.VoiceChannel | discord.CategoryChannel | discord.ForumChannel,
     ):
-        if inter.guild is None or not _is_admin(inter):
-            await inter.response.send_message("❌ Nur für Server-Admins/Leitung.", ephemeral=True)
+        if inter.guild is None:
+            await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
             return
-        runtime_db.set_guild_setting(inter.guild.id, CHANNEL_KEYS[kind.value], int(channel.id))
+        await inter.response.defer(ephemeral=True, thinking=True)
+        if not await asyncio.to_thread(_is_admin, inter):
+            await inter.followup.send("❌ Nur für Server-Admins/Leitung.", ephemeral=True)
+            return
+        await asyncio.to_thread(runtime_db.set_guild_setting, inter.guild.id, CHANNEL_KEYS[kind.value], int(channel.id))
         await asyncio.to_thread(sync_legacy_compatibility, inter.guild.id)
-        runtime_db.write_audit_log(guild_id=inter.guild.id, actor_id=inter.user.id, action="guild_channel_map_set", target_type="channel", target_id=str(channel.id), summary=f"{kind.value}: {channel.name}", new_value={"kind": kind.value, "channel_id": channel.id})
-        await inter.response.send_message(f"✅ **{kind.value}** → {getattr(channel, 'mention', '#' + channel.name)}", ephemeral=True)
+        await asyncio.to_thread(
+            runtime_db.write_audit_log,
+            guild_id=inter.guild.id,
+            actor_id=inter.user.id,
+            action="guild_channel_map_set",
+            target_type="channel",
+            target_id=str(channel.id),
+            summary=f"{kind.value}: {channel.name}",
+            new_value={"kind": kind.value, "channel_id": channel.id},
+        )
+        await inter.followup.send(f"✅ **{kind.value}** → {getattr(channel, 'mention', '#' + channel.name)}", ephemeral=True)
 
     @guild_group.command(name="clear_role", description="Entfernt eine zentrale Rollenzuordnung.")
     @app_commands.choices(kind=[app_commands.Choice(name=x, value=x) for x in ROLE_KEYS])
     async def guild_clear_role(inter: discord.Interaction, kind: app_commands.Choice[str]):
-        if inter.guild is None or not _is_admin(inter):
-            await inter.response.send_message("❌ Nur für Server-Admins/Leitung.", ephemeral=True)
+        if inter.guild is None:
+            await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
             return
-        runtime_db.set_guild_setting(inter.guild.id, ROLE_KEYS[kind.value], [] if kind.value in MULTI_ROLE_KINDS else 0)
+        await inter.response.defer(ephemeral=True, thinking=True)
+        if not await asyncio.to_thread(_is_admin, inter):
+            await inter.followup.send("❌ Nur für Server-Admins/Leitung.", ephemeral=True)
+            return
+        await asyncio.to_thread(
+            runtime_db.set_guild_setting,
+            inter.guild.id,
+            ROLE_KEYS[kind.value],
+            [] if kind.value in MULTI_ROLE_KINDS else 0,
+        )
         await asyncio.to_thread(sync_legacy_compatibility, inter.guild.id)
-        await inter.response.send_message(f"✅ Rollenzuordnung **{kind.value}** entfernt.", ephemeral=True)
+        await inter.followup.send(f"✅ Rollenzuordnung **{kind.value}** entfernt.", ephemeral=True)
 
     @guild_group.command(name="clear_channel", description="Entfernt eine zentrale Kanalzuordnung.")
     @app_commands.choices(kind=[app_commands.Choice(name=x, value=x) for x in CHANNEL_KEYS])
     async def guild_clear_channel(inter: discord.Interaction, kind: app_commands.Choice[str]):
-        if inter.guild is None or not _is_admin(inter):
-            await inter.response.send_message("❌ Nur für Server-Admins/Leitung.", ephemeral=True)
+        if inter.guild is None:
+            await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
             return
-        runtime_db.set_guild_setting(inter.guild.id, CHANNEL_KEYS[kind.value], 0)
+        await inter.response.defer(ephemeral=True, thinking=True)
+        if not await asyncio.to_thread(_is_admin, inter):
+            await inter.followup.send("❌ Nur für Server-Admins/Leitung.", ephemeral=True)
+            return
+        await asyncio.to_thread(runtime_db.set_guild_setting, inter.guild.id, CHANNEL_KEYS[kind.value], 0)
         await asyncio.to_thread(sync_legacy_compatibility, inter.guild.id)
-        await inter.response.send_message(f"✅ Kanalzuordnung **{kind.value}** entfernt.", ephemeral=True)
+        await inter.followup.send(f"✅ Kanalzuordnung **{kind.value}** entfernt.", ephemeral=True)
 
     @guild_group.command(name="set_rule", description="Ändert eine Gildenregel ohne Code oder Railway.")
     @app_commands.describe(kind="Regel", value="Neuer ganzzahliger Wert")
     @app_commands.choices(kind=[app_commands.Choice(name=x, value=x) for x in RULE_KEYS])
     async def guild_set_rule(inter: discord.Interaction, kind: app_commands.Choice[str], value: int):
-        if inter.guild is None or not _is_admin(inter):
-            await inter.response.send_message("❌ Nur für Server-Admins/Leitung.", ephemeral=True)
+        if inter.guild is None:
+            await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
+            return
+        await inter.response.defer(ephemeral=True, thinking=True)
+        if not await asyncio.to_thread(_is_admin, inter):
+            await inter.followup.send("❌ Nur für Server-Admins/Leitung.", ephemeral=True)
             return
         spec = RULE_KEYS[kind.value]
         if value < int(spec["min"]) or value > int(spec["max"]):
-            await inter.response.send_message(f"❌ Erlaubt: {spec['min']} bis {spec['max']}.", ephemeral=True)
+            await inter.followup.send(f"❌ Erlaubt: {spec['min']} bis {spec['max']}.", ephemeral=True)
             return
-        before = rule_value(inter.guild.id, kind.value)
-        clean = set_rule_value(inter.guild.id, kind.value, value)
-        runtime_db.write_audit_log(
+        before = await asyncio.to_thread(rule_value, inter.guild.id, kind.value)
+        clean = await asyncio.to_thread(set_rule_value, inter.guild.id, kind.value, value)
+        await asyncio.to_thread(
+            runtime_db.write_audit_log,
             guild_id=inter.guild.id,
             actor_id=inter.user.id,
             action="guild_rule_set",
@@ -630,29 +679,35 @@ async def setup_guild_config(bot: commands.Bot, tree: app_commands.CommandTree) 
             old_value={"value": before},
             new_value={"value": clean},
         )
-        await inter.response.send_message(f"✅ **{kind.value}** = **{clean}**", ephemeral=True)
+        await inter.followup.send(f"✅ **{kind.value}** = **{clean}**", ephemeral=True)
 
     @guild_group.command(name="branding", description="Setzt Logo, Banner, Farbe und Einladungslink ohne Railway.")
     async def guild_branding(inter: discord.Interaction, logo_url: str = "", banner_url: str = "", accent_color: str = "#d6a84f", invite_url: str = ""):
-        if inter.guild is None or not _is_admin(inter):
-            await inter.response.send_message("❌ Nur für Server-Admins/Leitung.", ephemeral=True)
+        if inter.guild is None:
+            await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
             return
-        current = get_profile(inter.guild.id, inter.guild.name)
-        runtime_db.upsert_guild_profile(
+        await inter.response.defer(ephemeral=True, thinking=True)
+        if not await asyncio.to_thread(_is_admin, inter):
+            await inter.followup.send("❌ Nur für Server-Admins/Leitung.", ephemeral=True)
+            return
+        current = await asyncio.to_thread(get_profile, inter.guild.id, inter.guild.name)
+        await asyncio.to_thread(
+            runtime_db.upsert_guild_profile,
             inter.guild.id,
             logo_url=(logo_url or current.get("logo_url") or "")[:1000],
             banner_url=(banner_url or current.get("banner_url") or "")[:1000],
             accent_color=(accent_color or current.get("accent_color") or "#d6a84f")[:20],
             invite_url=(invite_url or current.get("invite_url") or "")[:1000],
         )
-        await inter.response.send_message("✅ Branding gespeichert. Das Dashboard übernimmt es mit dem nächsten Snapshot.", ephemeral=True)
+        await inter.followup.send("✅ Branding gespeichert. Das Dashboard übernimmt es mit dem nächsten Snapshot.", ephemeral=True)
 
     @guild_group.command(name="show", description="Zeigt die zentrale Gildenkonfiguration.")
     async def guild_config_cmd(inter: discord.Interaction):
         if inter.guild is None:
             await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
             return
-        cfg = guild_config_snapshot(inter.guild)
+        await inter.response.defer(ephemeral=True, thinking=True)
+        cfg = await asyncio.to_thread(guild_config_snapshot, inter.guild)
         p = cfg["profile"]
         role_lines = [f"• {k}: " + (", ".join(f"<@&{r['id']}>" for r in rows) if rows else "—") for k, rows in cfg["roles"].items()]
         channel_lines = [f"• {k}: " + (f"<#{row['id']}>" if row.get("id") else "—") for k, row in cfg["channels"].items()]
@@ -662,23 +717,26 @@ async def setup_guild_config(bot: commands.Bot, tree: app_commands.CommandTree) 
         emb.add_field(name="Kanäle", value="\n".join(channel_lines)[:1024], inline=False)
         rule_lines = [f"• {kind}: {value}" for kind, value in cfg.get("rules", {}).items()]
         emb.add_field(name="Regeln", value="\n".join(rule_lines)[:1024] or "—", inline=False)
-        await inter.response.send_message(embed=emb, ephemeral=True)
+        await inter.followup.send(embed=emb, ephemeral=True)
 
     @guild_group.command(name="rehome", description="Übernimmt mitgekommene Mitglieder und Historie aus einer alten Guild-ID.")
     @app_commands.describe(source_guild_id="Alte Discord-Guild-ID", copy_legacy_json="Vorhandene JSON-Altdaten zusätzlich kopieren")
     async def guild_rehome(inter: discord.Interaction, source_guild_id: str, copy_legacy_json: bool = True):
-        if inter.guild is None or not _is_admin(inter):
-            await inter.response.send_message("❌ Nur für Server-Admins/Leitung.", ephemeral=True)
+        if inter.guild is None:
+            await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
+            return
+        await inter.response.defer(ephemeral=True, thinking=True)
+        if not await asyncio.to_thread(_is_admin, inter):
+            await inter.followup.send("❌ Nur für Server-Admins/Leitung.", ephemeral=True)
             return
         if not str(source_guild_id).isdigit():
-            await inter.response.send_message("❌ Alte Guild-ID ist ungültig.", ephemeral=True)
+            await inter.followup.send("❌ Alte Guild-ID ist ungültig.", ephemeral=True)
             return
         source_id = int(source_guild_id)
         if source_id == inter.guild.id:
-            await inter.response.send_message("❌ Quelle und Ziel sind identisch.", ephemeral=True)
+            await inter.followup.send("❌ Quelle und Ziel sind identisch.", ephemeral=True)
             return
-        await inter.response.defer(ephemeral=True, thinking=True)
-        configured_member_roles = set(role_ids(inter.guild.id, "member"))
+        configured_member_roles = set(await asyncio.to_thread(role_ids, inter.guild.id, "member"))
         active_ids = {
             int(m.id)
             for m in inter.guild.members
@@ -693,10 +751,19 @@ async def setup_guild_config(bot: commands.Bot, tree: app_commands.CommandTree) 
         try:
             result = await asyncio.to_thread(runtime_db.rehome_guild_data, source_id, inter.guild.id, sorted(active_ids))
             json_counts = await asyncio.to_thread(_copy_scoped_json, source_id, inter.guild.id, active_ids) if copy_legacy_json else {}
-            ensure_profile(inter.guild)
+            await asyncio.to_thread(ensure_profile, inter.guild)
             await asyncio.to_thread(_set_alliance_home_guild, inter.guild.id, source_guild_id=source_id, discord_name=inter.guild.name)
             await asyncio.to_thread(sync_legacy_compatibility, inter.guild.id)
-            runtime_db.write_audit_log(guild_id=inter.guild.id, actor_id=inter.user.id, action="guild_rehome", target_type="guild", target_id=str(source_id), summary=f"Datenübernahme {source_id} → {inter.guild.id}", new_value={"database": result, "json": json_counts})
+            await asyncio.to_thread(
+                runtime_db.write_audit_log,
+                guild_id=inter.guild.id,
+                actor_id=inter.user.id,
+                action="guild_rehome",
+                target_type="guild",
+                target_id=str(source_id),
+                summary=f"Datenübernahme {source_id} → {inter.guild.id}",
+                new_value={"database": result, "json": json_counts},
+            )
             lines = [f"• {k}: {v}" for k, v in (result.get("counts") or {}).items()]
             await inter.followup.send("✅ Umzug abgeschlossen. Rollen, Kanäle, Events und offene Auktionen wurden bewusst **nicht** übernommen.\n" + ("\n".join(lines) if lines else "Keine passenden Altdaten gefunden."), ephemeral=True)
         except Exception as exc:

@@ -3242,12 +3242,14 @@ async def setup_dkp_system(client: discord.Client, tree: app_commands.CommandTre
         if inter.guild is None:
             await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
             return
-        if not _is_leader_or_admin(inter):
-            await inter.response.send_message("❌ Keine Berechtigung.", ephemeral=True)
+        # Sofort bestätigen: Rollen- und Postgres-Prüfungen dürfen Discords
+        # 3-Sekunden-Limit nicht reißen.
+        await inter.response.defer(ephemeral=True, thinking=True)
+        if not await asyncio.to_thread(_is_leader_or_admin, inter):
+            await inter.followup.send("❌ Keine Berechtigung.", ephemeral=True)
             return
-        await inter.response.defer(ephemeral=True)
-        _phase3_refresh_active_member_cache(inter.client)
-        info = _phase3_ec_status(inter.guild.id)
+        await asyncio.to_thread(_phase3_refresh_active_member_cache, inter.client)
+        info = await asyncio.to_thread(_phase3_ec_status, inter.guild.id)
         if not info.get("ok"):
             await inter.followup.send(f"❌ Phase-3 EC Status nicht verfügbar: `{info.get('error')}`", ephemeral=True)
             return

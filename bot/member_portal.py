@@ -2704,53 +2704,54 @@ class GuildMenuView(PortalSafeView):
     def __init__(self):
         super().__init__(timeout=None)
 
+    @staticmethod
+    async def _resolve_after_defer(inter: discord.Interaction) -> tuple[Optional[discord.Guild], Optional[discord.Member]]:
+        # Alte Portal-DMs können Postgres-/Guild-Auflösung benötigen. Die
+        # Interaction wird deshalb vor jeder Arbeit bestätigt.
+        if not inter.response.is_done():
+            await inter.response.defer()
+        return await _resolve_guild_member_from_inter(inter)
+
     @button(label="Kalender", emoji=_menu_emoji(EMOJI_CALENDAR), style=ButtonStyle.secondary, custom_id="portal_guild_calendar")
     async def btn_calendar(self, inter: discord.Interaction, _):
-        guild, member = await _resolve_guild_member_from_inter(inter)
-
+        guild, member = await self._resolve_after_defer(inter)
         if not guild:
-            await inter.response.send_message("❌ Ich konnte deinen Server nicht zuordnen.")
+            await inter.followup.send("❌ Ich konnte deinen Server nicht zuordnen.", ephemeral=True)
             return
-
         if member and inter.message:
-            _mark_portal_sent(guild.id, member.id, inter.message.id)
-
-        await inter.response.edit_message(embed=_events_embed(guild.id), view=EventsInfoView())
+            await asyncio.to_thread(_mark_portal_sent, guild.id, member.id, inter.message.id)
+        embed = await asyncio.to_thread(_events_embed, guild.id)
+        await inter.edit_original_response(embed=embed, view=EventsInfoView())
 
     @button(label="Abwesenheiten", emoji=_menu_emoji(EMOJI_ABSENCE), style=ButtonStyle.secondary, custom_id="portal_guild_absences")
     async def btn_absences(self, inter: discord.Interaction, _):
-        guild, member = await _resolve_guild_member_from_inter(inter)
-
+        guild, member = await self._resolve_after_defer(inter)
         if not guild:
-            await inter.response.send_message("❌ Ich konnte deinen Server nicht zuordnen.")
+            await inter.followup.send("❌ Ich konnte deinen Server nicht zuordnen.", ephemeral=True)
             return
-
         if member and inter.message:
-            _mark_portal_sent(guild.id, member.id, inter.message.id)
-
-        await inter.response.edit_message(embed=_absence_calendar_embed(guild), view=AbsenceCalendarView())
+            await asyncio.to_thread(_mark_portal_sent, guild.id, member.id, inter.message.id)
+        embed = await asyncio.to_thread(_absence_calendar_embed, guild)
+        await inter.edit_original_response(embed=embed, view=AbsenceCalendarView())
 
     @button(label="Mitglieder", emoji=_menu_emoji(EMOJI_MEMBER), style=ButtonStyle.secondary, custom_id="portal_guild_members")
     async def btn_members(self, inter: discord.Interaction, _):
-        guild, member = await _resolve_guild_member_from_inter(inter)
-
+        guild, member = await self._resolve_after_defer(inter)
         if not guild:
-            await inter.response.send_message("❌ Ich konnte deinen Server nicht zuordnen.")
+            await inter.followup.send("❌ Ich konnte deinen Server nicht zuordnen.", ephemeral=True)
             return
-
         if member and inter.message:
-            _mark_portal_sent(guild.id, member.id, inter.message.id)
-
-        await inter.response.edit_message(embed=_members_list_embed(guild), view=BackOnlyView())
+            await asyncio.to_thread(_mark_portal_sent, guild.id, member.id, inter.message.id)
+        embed = await asyncio.to_thread(_members_list_embed, guild)
+        await inter.edit_original_response(embed=embed, view=BackOnlyView())
 
     @button(label="Zurück", emoji=_menu_emoji(EMOJI_BACK), style=ButtonStyle.secondary, custom_id="portal_guild_back")
     async def btn_back(self, inter: discord.Interaction, _):
-        guild, member = await _resolve_guild_member_from_inter(inter)
-
+        guild, member = await self._resolve_after_defer(inter)
         if guild and member and inter.message:
-            _mark_portal_sent(guild.id, member.id, inter.message.id)
-
-        await inter.response.edit_message(embed=_main_menu_embed(guild, member), view=MemberPortalMainView())
+            await asyncio.to_thread(_mark_portal_sent, guild.id, member.id, inter.message.id)
+        embed = await asyncio.to_thread(_main_menu_embed, guild, member)
+        await inter.edit_original_response(embed=embed, view=MemberPortalMainView())
 
 
 class AbsenceCalendarView(PortalSafeView):
@@ -2759,24 +2760,24 @@ class AbsenceCalendarView(PortalSafeView):
 
     @button(label="🔄 Aktualisieren", style=ButtonStyle.secondary, custom_id="portal_absence_calendar_refresh")
     async def btn_refresh(self, inter: discord.Interaction, _):
+        if not inter.response.is_done():
+            await inter.response.defer()
         guild, member = await _resolve_guild_member_from_inter(inter)
-
         if not guild:
-            await inter.response.send_message("❌ Ich konnte deinen Server nicht zuordnen.")
+            await inter.followup.send("❌ Ich konnte deinen Server nicht zuordnen.", ephemeral=True)
             return
-
         if member and inter.message:
-            _mark_portal_sent(guild.id, member.id, inter.message.id)
-
-        await inter.response.edit_message(embed=_absence_calendar_embed(guild), view=AbsenceCalendarView())
+            await asyncio.to_thread(_mark_portal_sent, guild.id, member.id, inter.message.id)
+        embed = await asyncio.to_thread(_absence_calendar_embed, guild)
+        await inter.edit_original_response(embed=embed, view=AbsenceCalendarView())
 
     @button(label="Zurück", emoji=_menu_emoji(EMOJI_BACK), style=ButtonStyle.secondary, custom_id="portal_absence_calendar_back")
     async def btn_back(self, inter: discord.Interaction, _):
+        if not inter.response.is_done():
+            await inter.response.defer()
         guild, member = await _resolve_guild_member_from_inter(inter)
-
         if guild and member and inter.message:
-            _mark_portal_sent(guild.id, member.id, inter.message.id)
-
+            await asyncio.to_thread(_mark_portal_sent, guild.id, member.id, inter.message.id)
         emb = discord.Embed(
             title=f"{EMOJI_GUILD} Gilde",
             description=(
@@ -2790,8 +2791,8 @@ class AbsenceCalendarView(PortalSafeView):
             ),
             color=discord.Color.gold()
         )
+        await inter.edit_original_response(embed=emb, view=GuildMenuView())
 
-        await inter.response.edit_message(embed=emb, view=GuildMenuView())
 
 
 
