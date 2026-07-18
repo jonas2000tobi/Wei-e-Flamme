@@ -66,6 +66,8 @@ TZ = ZoneInfo("Europe/Berlin")
 # Gildenmenue. Alle Portal-Views laufen durch denselben Wrapper.
 # ---------------------------------------------------------------------------
 _PORTAL_INTERACTION_LOCKS: dict[tuple[int, int], asyncio.Lock] = {}
+_PORTAL_ACTION_TIMEOUT_SECONDS = 12.0
+_PORTAL_LOCK_NOTICE_SECONDS = 1.0
 _PORTAL_ERROR_DEDUP: dict[str, dict[str, Any]] = {}
 _PORTAL_MODAL_CUSTOM_IDS = {
     "portal_personal_absence",
@@ -1506,6 +1508,81 @@ def _events_embed(guild_id: int) -> discord.Embed:
     return emb
 
 
+def _cached_portal_role_config(guild: discord.Guild) -> tuple[set[int], dict[str, int], list[str]]:
+    """Return roster role configuration without touching Postgres.
+
+    Component callbacks must never wait indefinitely for a database connection.
+    The in-memory configuration is refreshed elsewhere by the normal guild config
+    workflow and is sufficient for rendering the member overview.
+    """
+    raw = cfg.get(str(guild.id)) or {}
+    positions_raw = raw.get("position_roles") or {}
+    positions: dict[str, int] = {}
+    role_ids: set[int] = set()
+    role_names: list[str] = []
+
+    try:
+        member_role_id = int(raw.get("member_role_id", 0) or 0)
+    except Exception:
+        member_role_id = 0
+    if member_role_id:
+        role_ids.add(member_role_id)
+
+    for kind in ("leader", "advisor", "guardian"):
+        try:
+            role_id = int(positions_raw.get(kind, 0) or 0)
+        except Exception:
+            role_id = 0
+        positions[kind] = role_id
+        if role_id:
+            role_ids.add(role_id)
+
+    # Last-resort fallback for a freshly migrated server whose Postgres mapping
+    # has not yet been mirrored into the legacy in-memory config.
+    if not role_ids:
+        known_names = {
+            "member", "mitglied", "mitglieder", "gildenmitglied",
+            "leader", "leitung", "gildenleitung", "anführer", "anfuehrer",
+            "advisor", "berater", "gildenberater",
+            "guardian", "wächter", "waechter", "gildenwächter", "gildenwaechter",
+        }
+        for role in guild.roles:
+            normalised = str(role.name or "").strip().lower()
+            if normalised in known_names:
+                role_ids.add(int(role.id))
+                if not positions.get("leader") and normalised in {"leader", "leitung", "gildenleitung", "anführer", "anfuehrer"}:
+                    positions["leader"] = int(role.id)
+                elif not positions.get("advisor") and normalised in {"advisor", "berater", "gildenberater"}:
+                    positions["advisor"] = int(role.id)
+                elif not positions.get("guardian") and normalised in {"guardian", "wächter", "waechter", "gildenwächter", "gildenwaechter"}:
+                    positions["guardian"] = int(role.id)
+
+    for role_id in sorted(role_ids):
+        role = guild.get_role(role_id)
+        if role and role.name not in role_names:
+            role_names.append(role.name)
+    return role_ids, positions, role_names
+
+
+def _member_position_cached(member: discord.Member, positions: dict[str, int]) -> str:
+    ids = _member_role_ids(member)
+    if positions.get("leader") in ids:
+        return "Anführer"
+    if positions.get("advisor") in ids:
+        return "Gildenberater"
+    if positions.get("guardian") in ids:
+        return "Wächter"
+    return "Mitglied"
+
+
+def _member_sort_key_cached(member: discord.Member, positions: dict[str, int]) -> Tuple[int, int, str]:
+    p = _user_profile(member.guild.id, member.id)
+    position = _member_position_cached(member, positions)
+    rank = _position_rank(position)
+    gs = _parse_gearscore(p.get("gearscore"))
+    return (rank, -gs, _display_name(member).lower())
+
+
 def _member_sort_key(guild: discord.Guild, member: discord.Member) -> Tuple[int, int, str]:
     p = _user_profile(guild.id, member.id)
     position = _member_position(guild, member)
@@ -1516,56 +1593,46 @@ def _member_sort_key(guild: discord.Guild, member: discord.Member) -> Tuple[int,
 
 def _members_list_embed(guild: discord.Guild) -> discord.Embed:
     emb = discord.Embed(title=f"👥 {_guild_brand_name(guild)} Mitglieder", color=discord.Color.gold())
-    configured_role_ids: set[int] = set()
-    configured_role_names: list[str] = []
-    try:
-        if central_guild_config is not None:
-            for kind in ("member", "leader", "advisor", "guardian"):
-                for role_id in central_guild_config.role_ids(guild.id, kind):
-                    role = guild.get_role(int(role_id))
-                    if role is not None:
-                        configured_role_ids.add(int(role.id))
-                        if role.name not in configured_role_names:
-                            configured_role_names.append(role.name)
-    except Exception as e:
-        print(f"[member_portal] Mitgliederrollen konnten nicht zentral gelesen werden: {e!r}")
+    configured_role_ids, positions, configured_role_names = _cached_portal_role_config(guild)
+
     if not configured_role_ids:
-        c = _gcfg(guild.id)
-        fallback_ids = [int(c.get("member_role_id", 0) or 0), *[int(x or 0) for x in (c.get("position_roles") or {}).values()]]
-        for role_id in fallback_ids:
-            role = guild.get_role(role_id) if role_id else None
-            if role is not None:
-                configured_role_ids.add(int(role.id))
-                if role.name not in configured_role_names:
-                    configured_role_names.append(role.name)
-    if not configured_role_ids:
-        emb.description = "❌ Keine Mitglieder- oder Leitungsrolle konfiguriert. Nutze `/guild set_role`."
+        emb.description = (
+            "❌ Keine Mitglieder- oder Leitungsrolle im Portal-Cache gefunden. "
+            "Speichere die Rollen einmal neu über `/guild set_role` oder das Dashboard."
+        )
         return emb
+
     members: list[discord.Member] = []
-    seen: set[int] = set()
-    for role_id in configured_role_ids:
-        role = guild.get_role(role_id)
-        if role is None:
+    for member in list(guild.members):
+        if member.bot:
             continue
-        for member in role.members:
-            if member.bot or member.id in seen:
-                continue
-            seen.add(member.id)
+        member_roles = _member_role_ids(member)
+        if member_roles.intersection(configured_role_ids):
             members.append(member)
-    members.sort(key=lambda m: _member_sort_key(guild, m))
+
+    members.sort(key=lambda m: _member_sort_key_cached(m, positions))
     lines: list[str] = []
     shown = 0
+    current_length = 0
     for i, member in enumerate(members, start=1):
         profile = _user_profile(guild.id, member.id)
         name = profile.get("ingame_name") or _display_name(member)
-        line = f"**{i}. {name}** — {_member_position(guild, member)} — GS {profile.get('gearscore') or '—'}"
-        if len("\n".join(lines + [line])) > 3900:
+        position = _member_position_cached(member, positions)
+        line = f"**{i}. {name}** — {position} — GS {profile.get('gearscore') or '—'}"
+        additional = len(line) + (1 if lines else 0)
+        if current_length + additional > 3900:
             break
         lines.append(line)
+        current_length += additional
         shown += 1
+
     emb.description = "\n".join(lines) if lines else "Keine Mitglieder mit den konfigurierten Gildenrollen gefunden."
     role_text = ", ".join(configured_role_names) or "konfigurierte Gildenrollen"
-    emb.set_footer(text=(f"{shown} von {len(members)} angezeigt · Rollen: {role_text}" if shown < len(members) else f"{len(members)} Mitglieder · Rollen: {role_text}"))
+    if shown < len(members):
+        footer = f"{shown} von {len(members)} angezeigt · Rollen: {role_text}"
+    else:
+        footer = f"{len(members)} Mitglieder · Rollen: {role_text}"
+    emb.set_footer(text=footer[:2048])
     return emb
 
 def _absence_calendar_embed(guild: discord.Guild) -> discord.Embed:
@@ -2589,7 +2656,33 @@ class PortalSafeView(View):
                 watchdog = asyncio.create_task(_portal_watchdog(inter, component_id))
                 try:
                     async with lock:
-                        await _original(inter)
+                        await asyncio.wait_for(_original(inter), timeout=_PORTAL_ACTION_TIMEOUT_SECONDS)
+                except asyncio.TimeoutError as error:
+                    duration = time.monotonic() - start_time
+                    print(
+                        f"[member_portal] callback_timeout component={component_id} "
+                        f"user={inter.user.id} duration={duration:.3f}s",
+                        flush=True,
+                    )
+                    await _portal_log_event(
+                        inter,
+                        event_type="Timeout",
+                        error=error,
+                        duration=duration,
+                        detail=(
+                            f"Die Menueaktion wurde nach {_PORTAL_ACTION_TIMEOUT_SECONDS:.0f} Sekunden "
+                            "abgebrochen, damit das Gildenmenue nicht dauerhaft gesperrt bleibt."
+                        ),
+                        notify_user=True,
+                    )
+                    try:
+                        guild, member = await _resolve_guild_member_from_inter(inter)
+                        if guild and member:
+                            await ensure_portal_menu_for_user(
+                                inter.client, guild.id, member.id, force_view="main"
+                            )
+                    except Exception as reset_error:
+                        print(f"[member_portal] Timeout-Reset fehlgeschlagen: {reset_error!r}", flush=True)
                 except Exception as error:
                     duration = time.monotonic() - start_time
                     print(
@@ -3014,7 +3107,7 @@ class GuildMenuView(PortalSafeView):
                 return
             if member and inter.message:
                 await asyncio.to_thread(_mark_portal_sent, guild.id, member.id, inter.message.id)
-            await inter.edit_original_response(embed=await asyncio.to_thread(_events_embed, guild.id), view=EventsInfoView())
+            await _portal_edit(inter, embed=await asyncio.to_thread(_events_embed, guild.id), view=EventsInfoView())
         except Exception as error:
             await self._show_error(inter, "Kalender", error)
 
@@ -3027,7 +3120,7 @@ class GuildMenuView(PortalSafeView):
                 return
             if member and inter.message:
                 await asyncio.to_thread(_mark_portal_sent, guild.id, member.id, inter.message.id)
-            await inter.edit_original_response(embed=await asyncio.to_thread(_absence_calendar_embed, guild), view=AbsenceCalendarView())
+            await _portal_edit(inter, embed=await asyncio.to_thread(_absence_calendar_embed, guild), view=AbsenceCalendarView())
         except Exception as error:
             await self._show_error(inter, "Abwesenheiten", error)
 
@@ -3040,7 +3133,7 @@ class GuildMenuView(PortalSafeView):
                 return
             if member and inter.message:
                 await asyncio.to_thread(_mark_portal_sent, guild.id, member.id, inter.message.id)
-            await inter.edit_original_response(embed=await asyncio.to_thread(_members_list_embed, guild), view=BackOnlyView())
+            await _portal_edit(inter, embed=_members_list_embed(guild), view=BackOnlyView())
         except Exception as error:
             await self._show_error(inter, "Mitgliederliste", error)
 
@@ -3050,7 +3143,7 @@ class GuildMenuView(PortalSafeView):
             guild, member = await self._begin(inter)
             if guild and member and inter.message:
                 await asyncio.to_thread(_mark_portal_sent, guild.id, member.id, inter.message.id)
-            await inter.edit_original_response(embed=await asyncio.to_thread(_main_menu_embed, guild, member), view=MemberPortalMainView())
+            await _portal_edit(inter, embed=await asyncio.to_thread(_main_menu_embed, guild, member), view=MemberPortalMainView())
         except Exception as error:
             await self._show_error(inter, "Gildenzentrale", error)
 
