@@ -3686,7 +3686,9 @@ def _enqueue_loot_action_request(guild_id: int, auction: dict[str, Any], action_
 
 
 
-def _enqueue_loot_drop_request(guild_id: int, drop_type: str, item_query: str, actor: dict[str, Any]) -> dict[str, Any]:
+def _enqueue_loot_drop_request(
+    guild_id: int, drop_type: str, item_query: str, actor: dict[str, Any], *, catalog_item_id: int = 0
+) -> dict[str, Any]:
     """Dashboard -> Bot Queue: normale Drops/Müll-Drops anlegen.
 
     Das Dashboard erstellt die Auktion nicht selbst. Es legt nur eine Anfrage in
@@ -3724,6 +3726,7 @@ def _enqueue_loot_drop_request(guild_id: int, drop_type: str, item_query: str, a
         "drop_type": dtype,
         "item_query": item,
         "item_name": item,
+        "catalog_item_id": int(catalog_item_id or 0),
         "requested_by": {"id": actor_id, "name": actor_name},
         "requested_at": datetime.now(timezone.utc).isoformat(),
         "source": "dashboard_loot_drop",
@@ -6818,10 +6821,78 @@ def _render_loot_check(data: dict[str, Any], item_query: str = "") -> str:
     return _html_shell("Truhencheck · Weisse Flamme Dashboard", body)
 
 
-def _loot_catalog_items(snap: dict[str, Any], limit: int = 800) -> list[dict[str, str]]:
-    found: dict[str, dict[str, str]] = {}
+_ITEM_PICKER_DB_CACHE: dict[str, Any] = {"loaded_at": 0.0, "items": []}
 
-    def add(value: Any, slot_hint: Any = "") -> None:
+
+def _dashboard_catalog_slot(item: dict[str, Any]) -> str:
+    main = str(item.get("main_category") or "").strip().lower()
+    sub = str(item.get("sub_category") or "").strip()
+    name = str(item.get("name") or "").strip()
+    low = f"{sub} {name}".lower()
+    if any(x in low for x in ("fähigkeitskern", "faehigkeitskern", "skill core", "skillcore")):
+        return "Fähigkeitskern"
+    if main == "weapon":
+        return "Waffe"
+    known = {"Helm", "Brust", "Hose", "Handschuhe", "Schuhe", "Umhang", "Kette", "Armband", "Brosche", "Ring", "Gürtel", "Ohrringe"}
+    for slot in known:
+        if slot.lower() == sub.lower():
+            return slot
+    aliases = {
+        "necklace": "Kette", "bracelet": "Armband", "brooch": "Brosche", "ring": "Ring",
+        "belt": "Gürtel", "earring": "Ohrringe", "helmet": "Helm", "chest": "Brust",
+        "pants": "Hose", "gloves": "Handschuhe", "boots": "Schuhe", "cloak": "Umhang",
+    }
+    for key, slot in aliases.items():
+        if key in low:
+            return slot
+    return sub
+
+
+def _all_active_catalog_picker_items(cache_seconds: int = 60) -> list[dict[str, Any]]:
+    now = time.time()
+    cached = _ITEM_PICKER_DB_CACHE.get("items") or []
+    if cached and now - float(_ITEM_PICKER_DB_CACHE.get("loaded_at") or 0) < max(5, int(cache_seconds)):
+        return [dict(x) for x in cached]
+    if not _item_catalog_available():
+        return []
+    try:
+        ensure_item_catalog_schema()  # type: ignore[misc]
+        rows: list[dict[str, Any]] = []
+        offset = 0
+        while True:
+            batch = query_items(limit=500, offset=offset)  # type: ignore[misc]
+            current = [dict(x) for x in (batch or [])]
+            rows.extend(current)
+            if len(current) < 500:
+                break
+            offset += 500
+        out = []
+        for row in rows:
+            name = str(row.get("name") or "").strip()
+            if not name:
+                continue
+            out.append({
+                "name": name,
+                "slot": _dashboard_catalog_slot(row),
+                "catalog_item_id": int(row.get("id") or 0),
+                "source_item_id": str(row.get("source_item_id") or ""),
+                "category": str(row.get("main_category") or ""),
+                "sub_category": str(row.get("sub_category") or ""),
+                "rarity": str(row.get("rarity") or ""),
+                "image_url": str(row.get("manual_image_url") or row.get("image_url") or row.get("icon_url") or ""),
+            })
+        _ITEM_PICKER_DB_CACHE["loaded_at"] = now
+        _ITEM_PICKER_DB_CACHE["items"] = out
+        return [dict(x) for x in out]
+    except Exception as exc:
+        print(f"[dashboard] Item-Picker-Katalog fehlgeschlagen: {type(exc).__name__}: {exc}")
+        return [dict(x) for x in cached]
+
+
+def _loot_catalog_items(snap: dict[str, Any], limit: int = 800) -> list[dict[str, Any]]:
+    found: dict[str, dict[str, Any]] = {}
+
+    def add(value: Any, slot_hint: Any = "", catalog_item_id: int = 0, source_item_id: str = "", rarity: str = "", image_url: str = "") -> None:
         text = _loot_text(value)
         if not text or len(text) < 3 or text.lower().startswith("user "):
             return
@@ -6833,9 +6904,29 @@ def _loot_catalog_items(snap: dict[str, Any], limit: int = 800) -> list[dict[str
             slot = _need_slot_from_entry(value)
         old = found.get(key)
         if not old:
-            found[key] = {"name": text, "slot": slot}
-        elif slot and not old.get("slot"):
-            old["slot"] = slot
+            found[key] = {
+                "name": text, "slot": slot, "catalog_item_id": int(catalog_item_id or 0),
+                "source_item_id": str(source_item_id or ""), "rarity": str(rarity or ""),
+                "image_url": str(image_url or ""),
+            }
+        else:
+            if slot and not old.get("slot"):
+                old["slot"] = slot
+            if catalog_item_id and not old.get("catalog_item_id"):
+                old["catalog_item_id"] = int(catalog_item_id)
+            if source_item_id and not old.get("source_item_id"):
+                old["source_item_id"] = str(source_item_id)
+            if rarity and not old.get("rarity"):
+                old["rarity"] = str(rarity)
+            if image_url and not old.get("image_url"):
+                old["image_url"] = str(image_url)
+
+    for row in _all_active_catalog_picker_items():
+        add(
+            row.get("name"), row.get("slot"), int(row.get("catalog_item_id") or 0),
+            str(row.get("source_item_id") or ""), str(row.get("rarity") or ""),
+            str(row.get("image_url") or ""),
+        )
 
     loot = (snap.get("loot") or {}) if isinstance(snap, dict) else {}
     for n in (((loot.get("needs") or {}).get("entries") or [])):
@@ -6860,27 +6951,51 @@ def _loot_catalog_item_names(snap: dict[str, Any], limit: int = 650) -> list[str
     return [x.get("name", "") for x in _loot_catalog_items(snap, limit=limit) if x.get("name")]
 
 
-def _loot_item_picker_html(snap: dict[str, Any], *, input_id: str, name: str = "item", required: bool = True, placeholder: str = "Item auswählen oder tippen", slot_select_id: str = "") -> str:
-    items = _loot_catalog_items(snap)
+def _loot_item_picker_html(
+    snap: dict[str, Any],
+    *,
+    input_id: str,
+    name: str = "item",
+    required: bool = True,
+    placeholder: str = "Item auswählen oder tippen",
+    slot_select_id: str = "",
+    catalog_id_name: str = "catalog_item_id",
+) -> str:
+    items = _loot_catalog_items(snap, limit=10000)
     datalist_id = f"{input_id}-list"
+    hidden_id = f"{input_id}-catalog-id"
     required_attr = " required" if required else ""
     options = "".join(f'<option value="{_e(item.get("name"))}"></option>' for item in items)
-    select_options = "".join(f'<option value="{_e(item.get("name"))}" data-slot="{_e(item.get("slot"))}">{_e(item.get("name"))}{(" · " + _e(item.get("slot"))) if item.get("slot") else ""}</option>' for item in items[:500])
+    select_options = "".join(
+        f'<option value="{_e(item.get("name"))}" data-slot="{_e(item.get("slot"))}" '
+        f'data-catalog-id="{int(item.get("catalog_item_id") or 0)}">'
+        f'{_e(item.get("name"))}'
+        f'{(" · " + _e(item.get("slot"))) if item.get("slot") else ""}'
+        f'{(" · " + _e(item.get("rarity"))) if item.get("rarity") else ""}'
+        f'</option>'
+        for item in items
+    )
     filter_attr = f' data-slot-source="{_e(slot_select_id)}"' if slot_select_id else ""
     select = ""
     if items:
         select = (
             f'<select class="item-picker-select"{filter_attr} '
             f'onchange="var el=document.getElementById(\'{_e(input_id)}\'); '
-            f'if(el && this.value) el.value=this.value; this.selectedIndex=0;">'
-            f'<option value="">Item aus Liste anklicken ...</option>{select_options}</select>'
+            f'var hid=document.getElementById(\'{_e(hidden_id)}\'); '
+            f'if(el && this.value) el.value=this.value; '
+            f'if(hid) hid.value=(this.options[this.selectedIndex].dataset.catalogId||\'0\'); '
+            f'this.selectedIndex=0;">'
+            f'<option value="">Item aus Datenbank anklicken ...</option>{select_options}</select>'
         )
     return (
-        f'{select}<input id="{_e(input_id)}" list="{_e(datalist_id)}" name="{_e(name)}"{required_attr} '
-        f'placeholder="{_e(placeholder)}" autocomplete="off">'
+        f'{select}'
+        f'<input type="hidden" id="{_e(hidden_id)}" name="{_e(catalog_id_name)}" value="0">'
+        f'<input id="{_e(input_id)}" list="{_e(datalist_id)}" name="{_e(name)}"{required_attr} '
+        f'placeholder="{_e(placeholder)}" autocomplete="off" '
+        f'oninput="document.getElementById(\'{_e(hidden_id)}\').value=\'0\'">'
         f'<datalist id="{_e(datalist_id)}">{options}</datalist>'
-        f'<small class="muted">{len(items)} bekannte Items aus Online-Datenbank/Needs/Auktionen. '
-        f'Bei Slot-Auswahl wird die Klickliste gefiltert.</small>'
+        f'<small class="muted">{len(items)} aktive Items aus der zentralen Item-Datenbank. '
+        f'Die Auswahl über die Liste überträgt zusätzlich die feste Katalog-ID.</small>'
     )
 
 
@@ -8671,6 +8786,7 @@ def _render_item_catalog(request: Optional[Request] = None) -> str:
 
 _NEED_BUILDER_SLOT_GROUPS = [
     ("⚔️ Waffen", ["Waffe 1", "Waffe 2"]),
+    ("✨ Fähigkeitskern", ["Fähigkeitskern"]),
     ("🛡️ Rüstung", ["Helm", "Brust", "Handschuhe", "Hose", "Schuhe", "Umhang"]),
     ("💍 Zubehör", ["Kette", "Armband", "Brosche", "Ohrringe", "Ring 1", "Ring 2", "Gürtel"]),
 ]
@@ -8681,7 +8797,9 @@ def _need_builder_slot_filter(slot: str) -> dict[str, Any]:
     """Mappt Dashboard-Slots auf Questlog item_catalog Kategorien."""
     slot = str(slot or "").strip()
     if slot in {"Waffe 1", "Waffe 2"}:
-        return {"category": "weapon", "subs": []}
+        return {"category": "weapon", "subs": [], "special": ""}
+    if slot == "Fähigkeitskern":
+        return {"category": "", "subs": [], "special": "core"}
     armor = {
         "Helm": "Helm",
         "Brust": "Brust",
@@ -8893,35 +9011,48 @@ def _need_builder_detail_payload(item: dict[str, Any]) -> dict[str, Any]:
 
 
 def _need_builder_items() -> list[dict[str, Any]]:
+    """Lädt wirklich alle aktiven Items aus der zentralen Item-Datenbank.
+
+    Früher wurden pro Kategorie nur maximal 500 Datensätze geladen. Dadurch
+    konnten neuere Items im Dashboard fehlen. Jetzt wird in 500er-Seiten bis
+    zum Ende durchgeladen.
+    """
     if not _item_catalog_available():
         return []
     try:
         ensure_item_catalog_schema()  # type: ignore[misc]
         all_items: list[dict[str, Any]] = []
-        for category in ["weapon", "armor", "accessory"]:
-            try:
-                rows = query_items(category=category, limit=500, offset=0)  # type: ignore[misc]
-            except TypeError:
-                rows = query_items(category=category, limit=500)  # type: ignore[misc]
-            all_items.extend([dict(x) for x in (rows or [])])
+        offset = 0
+        while True:
+            rows = query_items(limit=500, offset=offset)  # type: ignore[misc]
+            batch = [dict(x) for x in (rows or [])]
+            all_items.extend(batch)
+            if len(batch) < 500:
+                break
+            offset += 500
         out: list[dict[str, Any]] = []
         for item in all_items:
             iid = item.get("id")
             if iid is None:
                 continue
+            name = str(item.get("name") or "")
+            sub = str(item.get("sub_category") or "")
+            core_text = f"{name} {sub}".lower()
             out.append({
                 "id": int(iid),
-                "name": str(item.get("name") or ""),
+                "name": name,
                 "category": str(item.get("main_category") or ""),
-                "sub": str(item.get("sub_category") or ""),
+                "sub": sub,
                 "rarity": str(item.get("rarity") or ""),
                 "level": item.get("item_level") or "",
                 "image": str(item.get("manual_image_url") or item.get("image_url") or item.get("icon_url") or ""),
                 "source_url": str(item.get("source_url") or ""),
+                "is_core": any(x in core_text for x in ("fähigkeitskern", "faehigkeitskern", "skill core", "skillcore")),
                 "detail": _need_builder_detail_payload(item),
             })
         return out
-    except Exception:
+    except Exception as exc:
+        print(f"[dashboard] Need-Builder-Katalog fehlgeschlagen: {type(exc).__name__}: {exc}")
         return []
 
 
@@ -9339,6 +9470,7 @@ def _render_need_builder_dashboard(data: dict[str, Any], request: Request, msg: 
         const f = window.NB_FILTERS[slot] || {{category:'',subs:[]}};
         if (f.category && item.category !== f.category) return false;
         if (f.subs && f.subs.length && !f.subs.includes(item.sub)) return false;
+        if (f.special === 'core' && !item.is_core) return false;
         return true;
       }}
       function nbCanHover() {{ return window.matchMedia('(hover:hover) and (pointer:fine)').matches; }}
@@ -9722,10 +9854,16 @@ async def admin_loot_drop_dashboard(request: Request, _: bool = Depends(_admin_a
         form = _parse_urlencoded_body(raw)
         drop_type = str(form.get("drop_type") or "loot_drop").strip().lower()
         item = str(form.get("item") or "").strip()
+        try:
+            catalog_item_id = int(form.get("catalog_item_id") or 0)
+        except Exception:
+            catalog_item_id = 0
         payload = _snapshot_payload()
         guild_id = _safe_guild_id(payload)
         actor = _current_user(request) or {}
-        result = _enqueue_loot_drop_request(int(guild_id), drop_type, item, actor)
+        result = _enqueue_loot_drop_request(
+            int(guild_id), drop_type, item, actor, catalog_item_id=catalog_item_id
+        )
         if result.get("ok"):
             msg = "✅ " + str(result.get("message") or "Drop wurde an den Bot gesendet.")
         else:
