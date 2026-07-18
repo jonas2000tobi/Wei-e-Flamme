@@ -3876,12 +3876,15 @@ def _sidebar_html() -> str:
     return f"""
     <aside class="sidebar admin-sidebar">
       <div class="brand">
-        <div class="brand-mark sidebar-brand-logo"><img src="{_e(logo)}" alt="{_e(brand['display_name'])}"></div>
+        <a class="sidebar-logo-link" href="/" aria-label="Zur Startseite" title="Zur Startseite">
+          <div class="brand-mark sidebar-brand-logo"><img src="{_e(logo)}" alt="{_e(brand['display_name'])}"></div>
+        </a>
         <div class="brand-subtitle"><strong>{_e(brand['short_name'])}</strong><span>Admin-Portal</span></div>
       </div>
       <button class="mobile-nav-toggle" type="button" onclick="document.body.classList.toggle('nav-open')">☰ Menü</button>
 
       <nav class="side-nav">
+        <a class="sidebar-home-button" href="/"><img class="nav-ico" src="{_asset('nav_kommando.png')}" alt="">Startseite</a>
         <a class="admin-back" href="/"><span>←</span> Zur normalen Ansicht</a>
         <details open>
           <summary>Admin</summary>
@@ -3918,12 +3921,15 @@ def _member_sidebar_html() -> str:
     return f"""
     <aside class="sidebar member-default-sidebar">
       <div class="brand">
-        <div class="brand-mark sidebar-brand-logo"><img src="{_e(logo)}" alt="{_e(brand['display_name'])}"></div>
+        <a class="sidebar-logo-link" href="/" aria-label="Zur Startseite" title="Zur Startseite">
+          <div class="brand-mark sidebar-brand-logo"><img src="{_e(logo)}" alt="{_e(brand['display_name'])}"></div>
+        </a>
         <div class="brand-subtitle"><strong>{_e(brand['short_name'])}</strong><span>Gilden-Dashboard</span></div>
       </div>
       <button class="mobile-nav-toggle" type="button" onclick="document.body.classList.toggle('nav-open')">☰ Menü</button>
 
       <nav class="side-nav">
+        <a class="sidebar-home-button" href="/"><img class="nav-ico" src="{_asset('nav_kommando.png')}" alt="">Startseite</a>
         <a class="admin-portal-button" href="/admin"><img class="nav-ico" src="{_asset('nav_admin_portal.png')}" alt="">Admin-Portal</a>
 
         <details open>
@@ -4008,6 +4014,10 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "member") -> str:
     .side-nav summary {{ color:var(--muted); text-transform:uppercase; letter-spacing:.08em; font-size:11px; font-weight:800; list-style:none; }}
     .side-nav summary::-webkit-details-marker {{ display:none; }}
     .side-nav details a {{ margin-left:8px; padding:9px 11px; font-size:13px; color:#ead9ae; }}
+    .sidebar-logo-link {{ display:block; flex:0 0 auto; color:inherit; text-decoration:none; border-radius:14px; }}
+    .sidebar-logo-link:focus-visible {{ outline:2px solid var(--gold); outline-offset:3px; }}
+    .side-nav .sidebar-home-button {{ margin:0 0 6px 0; border:1px solid rgba(214,168,79,.42); background:linear-gradient(90deg,rgba(214,168,79,.24),rgba(214,168,79,.08)); color:#f5d891; font-weight:900; box-shadow:inset 0 1px 0 rgba(255,255,255,.05); }}
+    .side-nav .sidebar-home-button:hover {{ background:linear-gradient(90deg,rgba(214,168,79,.34),rgba(214,168,79,.12)); color:#ffe7a8; }}
     .side-nav .admin-portal-button {{ margin:0 0 6px 0; border:1px solid rgba(214,168,79,.34); background:linear-gradient(90deg,rgba(214,168,79,.18),rgba(65,82,101,.18)); color:var(--gold); font-weight:800; }}
     .side-nav .admin-back {{ margin:0 0 6px 0; border:1px solid rgba(129,199,132,.25); background:rgba(129,199,132,.08); color:#bfe8c1; font-weight:800; }}
 
