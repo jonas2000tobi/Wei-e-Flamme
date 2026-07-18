@@ -47,13 +47,78 @@ def _find_role_by_name(guild: discord.Guild, role_name: str) -> Optional[discord
     return None
 
 
-def _voice_channel_overwrites(guild: discord.Guild) -> dict:
+def _unique_roles(roles: list[discord.Role]) -> list[discord.Role]:
+    out: list[discord.Role] = []
+    seen: set[int] = set()
+    for role in roles:
+        rid = int(getattr(role, "id", 0) or 0)
+        if not rid or rid in seen:
+            continue
+        seen.add(rid)
+        out.append(role)
+    return out
+
+
+def _voice_access_roles(guild: discord.Guild) -> tuple[list[discord.Role], list[discord.Role]]:
+    """Löst die sichtbaren und gesperrten Rollen aus der zentralen Guild-Konfiguration auf.
+
+    Normale Mitglieder dürfen nie versehentlich ausgeschlossen werden: Neben
+    ``voice_allowed`` werden deshalb auch member/leader/advisor/guardian
+    berücksichtigt. Kann keine gültige Zugriffsrolle aufgelöst werden, wird
+    die Kanalerstellung abgebrochen statt ein unsichtbarer Kanal erstellt.
     """
-    Voice-Panel-Regel:
-    - Rollenlose sehen/beitreten nicht (@everyone denied)
-    - Raider/Bewerber sehen/beitreten nicht
-    - Konfigurierte Voice-Zugriffsrollen sehen und betreten den Kanal
-    """
+    allowed_roles: list[discord.Role] = []
+    blocked_roles: list[discord.Role] = []
+
+    if central_guild_config is not None:
+        try:
+            for kind in ("voice_allowed", "member", "leader", "advisor", "guardian"):
+                for rid in central_guild_config.role_ids(guild.id, kind):
+                    role = guild.get_role(int(rid))
+                    if role is not None:
+                        allowed_roles.append(role)
+            for rid in central_guild_config.role_ids(guild.id, "voice_blocked"):
+                role = guild.get_role(int(rid))
+                if role is not None:
+                    blocked_roles.append(role)
+        except Exception as exc:
+            print(
+                f"[VOICE-PANEL] zentrale Rollenauflösung fehlgeschlagen guild={guild.id}: {exc!r}",
+                flush=True,
+            )
+
+    # Übergangs-Fallback für alte Installationen ohne zentrale Konfiguration.
+    if not allowed_roles:
+        for role_name in VOICE_ALLOWED_ROLE_NAMES:
+            role = _find_role_by_name(guild, role_name)
+            if role is not None:
+                allowed_roles.append(role)
+    if not blocked_roles:
+        for role_name in VOICE_BLOCKED_ROLE_NAMES:
+            role = _find_role_by_name(guild, role_name)
+            if role is not None:
+                blocked_roles.append(role)
+
+    allowed_roles = _unique_roles(allowed_roles)
+    blocked_roles = _unique_roles(blocked_roles)
+    blocked_ids = {int(role.id) for role in blocked_roles}
+    allowed_roles = [role for role in allowed_roles if int(role.id) not in blocked_ids]
+    return allowed_roles, blocked_roles
+
+
+def _voice_channel_overwrites(
+    guild: discord.Guild,
+    *,
+    creator: Optional[discord.Member] = None,
+) -> tuple[dict, list[discord.Role], list[discord.Role]]:
+    """Baut explizite, nicht von der Kategorie abhängige Voice-Rechte."""
+    allowed_roles, blocked_roles = _voice_access_roles(guild)
+    if not allowed_roles:
+        raise RuntimeError(
+            "Keine gültige Voice-Zugriffsrolle gefunden. Setze /guild set_role "
+            "kind:voice_allowed auf eure Mitgliederrolle."
+        )
+
     overwrites: dict = {
         guild.default_role: discord.PermissionOverwrite(
             view_channel=False,
@@ -61,44 +126,15 @@ def _voice_channel_overwrites(guild: discord.Guild) -> dict:
         )
     }
 
-    missing_allowed: list[str] = []
-    missing_blocked: list[str] = []
-    allowed_roles: list[discord.Role] = []
-    blocked_roles: list[discord.Role] = []
-    allowed_mapping_configured = False
-    blocked_mapping_configured = False
-    member_mapping_configured = False
-    try:
-        if central_guild_config is not None:
-            allowed_mapping_configured = central_guild_config.role_mapping_configured(guild.id, "voice_allowed")
-            blocked_mapping_configured = central_guild_config.role_mapping_configured(guild.id, "voice_blocked")
-            member_mapping_configured = central_guild_config.role_mapping_configured(guild.id, "member")
-            allowed_roles = [r for rid in central_guild_config.role_ids(guild.id, "voice_allowed") if (r := guild.get_role(rid)) is not None]
-            blocked_roles = [r for rid in central_guild_config.role_ids(guild.id, "voice_blocked") if (r := guild.get_role(rid)) is not None]
-            if not allowed_mapping_configured and member_mapping_configured:
-                member_ids = central_guild_config.role_ids(guild.id, "member")
-                allowed_roles = [r for rid in member_ids if (r := guild.get_role(rid)) is not None]
-    except Exception:
-        allowed_roles = []
-        blocked_roles = []
-        allowed_mapping_configured = False
-        blocked_mapping_configured = False
-        member_mapping_configured = False
-
-    if not allowed_roles and not allowed_mapping_configured and not member_mapping_configured:
-        for role_name in VOICE_ALLOWED_ROLE_NAMES:
-            role = _find_role_by_name(guild, role_name)
-            if role is None:
-                missing_allowed.append(role_name)
-                continue
-            allowed_roles.append(role)
-    if not blocked_roles and not blocked_mapping_configured:
-        for role_name in VOICE_BLOCKED_ROLE_NAMES:
-            role = _find_role_by_name(guild, role_name)
-            if role is None:
-                missing_blocked.append(role_name)
-                continue
-            blocked_roles.append(role)
+    bot_member = guild.me
+    if bot_member is not None:
+        overwrites[bot_member] = discord.PermissionOverwrite(
+            view_channel=True,
+            connect=True,
+            speak=True,
+            manage_channels=True,
+            move_members=True,
+        )
 
     for role in allowed_roles:
         overwrites[role] = discord.PermissionOverwrite(
@@ -115,14 +151,14 @@ def _voice_channel_overwrites(guild: discord.Guild) -> dict:
             speak=False,
         )
 
-    if missing_allowed or missing_blocked:
-        print(
-            f"[VOICE-PANEL] role_config_warning guild={guild.id} "
-            f"missing_allowed={missing_allowed} missing_blocked={missing_blocked}",
-            flush=True,
+    if creator is not None:
+        overwrites[creator] = discord.PermissionOverwrite(
+            view_channel=True,
+            connect=True,
+            speak=True,
         )
 
-    return overwrites
+    return overwrites, allowed_roles, blocked_roles
 
 
 def _load_json(path: Path, default):
@@ -291,36 +327,81 @@ class VoiceCreateModal(Modal, title="Sprachkanal erstellen"):
             return
 
         name = _clean_channel_name(str(self.channel_name.value))
+        await inter.response.defer(ephemeral=True, thinking=True)
         try:
-            overwrites = _voice_channel_overwrites(inter.guild)
+            creator = inter.user if isinstance(inter.user, discord.Member) else None
+            overwrites, allowed_roles, blocked_roles = _voice_channel_overwrites(
+                inter.guild,
+                creator=creator,
+            )
+
+            target_category = source.category
+            if central_guild_config is not None:
+                try:
+                    configured_category_id = central_guild_config.channel_id(inter.guild.id, "voice_category")
+                    configured_category = inter.guild.get_channel(int(configured_category_id or 0))
+                    if isinstance(configured_category, discord.CategoryChannel):
+                        target_category = configured_category
+                except Exception as exc:
+                    print(
+                        f"[VOICE-PANEL] voice_category konnte nicht geladen werden guild={inter.guild.id}: {exc!r}",
+                        flush=True,
+                    )
+
             voice = await inter.guild.create_voice_channel(
                 name=name,
-                category=source.category,
+                category=target_category,
                 user_limit=limit,
                 overwrites=overwrites,
                 reason=f"Voice-Panel genutzt von {inter.user} ({inter.user.id})",
             )
             _track_voice_channel(voice, source_channel_id=int(source.id), creator_id=int(inter.user.id), user_limit=limit)
 
-            # Möglichst direkt unter den Textkanal einsortieren.
-            try:
-                await voice.edit(position=int(source.position) + 1)
-            except Exception:
-                pass
+            # Discord übernimmt die Overwrites bereits beim Erstellen. Die
+            # Kontrolle hier verhindert, dass ein stiller Konfigurationsfehler
+            # erneut unsichtbare Kanäle erzeugt.
+            missing_overwrites = [
+                role.name
+                for role in allowed_roles
+                if voice.overwrites_for(role).view_channel is not True
+                or voice.overwrites_for(role).connect is not True
+            ]
+            if missing_overwrites:
+                for role in allowed_roles:
+                    await voice.set_permissions(
+                        role,
+                        view_channel=True,
+                        connect=True,
+                        speak=True,
+                        use_voice_activation=True,
+                        reason="Voice-Zugriffsrechte nach Erstellung absichern",
+                    )
+
             print(
-                f"[VOICE-PANEL] guild={inter.guild.id} creator={inter.user.id} channel={voice.id} name={voice.name} limit={limit} source_text={source.id}",
+                f"[VOICE-PANEL] guild={inter.guild.id} creator={inter.user.id} "
+                f"channel={voice.id} name={voice.name} limit={limit} "
+                f"category={getattr(target_category, 'id', 0)} "
+                f"allowed_roles={[f'{r.name}:{r.id}' for r in allowed_roles]} "
+                f"blocked_roles={[f'{r.name}:{r.id}' for r in blocked_roles]}",
                 flush=True,
             )
-            await inter.response.send_message(
+            await inter.followup.send(
                 f"✅ Sprachkanal erstellt: {voice.mention} • Limit: **{limit}**\n"
+                f"👥 Sichtbar für: **{', '.join(role.name for role in allowed_roles)}**\n"
                 f"ℹ️ Der Kanal wird automatisch gelöscht, sobald der letzte Spieler raus ist.",
                 ephemeral=True,
             )
         except discord.Forbidden:
-            await inter.response.send_message("❌ Mir fehlen Rechte zum Erstellen oder Verschieben von Sprachkanälen.", ephemeral=True)
+            await inter.followup.send(
+                "❌ Mir fehlen **Kanäle verwalten** oder **Rollen verwalten**, um die Voice-Rechte korrekt zu setzen.",
+                ephemeral=True,
+            )
         except Exception as e:
             print(f"[voice_creator] Fehler beim Erstellen: {e!r}", flush=True)
-            await inter.response.send_message(f"❌ Sprachkanal konnte nicht erstellt werden: `{type(e).__name__}`", ephemeral=True)
+            await inter.followup.send(
+                f"❌ Sprachkanal konnte nicht erstellt werden: `{type(e).__name__}: {e}`",
+                ephemeral=True,
+            )
 
 
 class VoiceCreatePanel(View):
