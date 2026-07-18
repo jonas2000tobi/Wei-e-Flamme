@@ -2510,7 +2510,7 @@ def _need_list_html(title: str, items: Any) -> str:
 
 _NEED_SLOT_GROUPS = [
     ("⚔️ Waffen", ["Waffe 1", "Waffe 2"]),
-    ("✨ Fähigkeitskern", ["Fähigkeitskern"]),
+    ("✨ Fähigkeitskerne", ["Fähigkeitskern 1", "Fähigkeitskern 2"]),
     ("🛡️ Rüstung", ["Helm", "Brust", "Hose", "Handschuhe", "Schuhe"]),
     ("💍 Schmuck", ["Brosche", "Ohrringe", "Kette", "Armband", "Ring 1", "Ring 2"]),
     ("🧥 Sonstiges", ["Gürtel", "Umhang"]),
@@ -2524,6 +2524,9 @@ def _need_slot_from_entry(entry: Any) -> str:
     raw_slot = str(entry.get("slot_name") or entry.get("slot") or "").strip()
     raw_text = str(entry.get("raw_item_name") or entry.get("item") or entry.get("item_name") or entry.get("label") or "")
     text = f"{raw_slot} {raw_text}".lower()
+    # Kompatibilität mit dem früheren einzelnen Kern-Slot.
+    if raw_slot.lower() == "fähigkeitskern":
+        return "Fähigkeitskern 1"
     for slot in _NEED_SLOTS:
         sl = slot.lower()
         if raw_slot.lower() == sl or raw_slot.lower().startswith(sl) or sl in text:
@@ -2540,6 +2543,7 @@ def _need_item_display(entry: Any) -> str:
             text = re.sub(r"^\s*\d+\s*:\s*", "", raw).strip()
             for slot in _NEED_SLOTS:
                 text = re.sub(rf"^\s*{re.escape(slot)}\s*:\s*", "", text, flags=re.I).strip()
+            text = re.sub(r"^\s*Fähigkeitskern\s*:\s*", "", text, flags=re.I).strip()
             text = re.sub(r"^\s*[A-Za-zÄÖÜäöüß ]+\s+\d+\s*:\s*", "", text).strip()
             if text:
                 return text
@@ -3988,27 +3992,27 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "member") -> str:
     * {{ box-sizing:border-box; }} html {{ scroll-behavior:smooth; }}
     body {{ margin:0; font-family:Inter, system-ui, Segoe UI, sans-serif; background:linear-gradient(180deg,rgba(5,6,9,.56),rgba(5,6,9,.88)), url("{_asset('dashboard_bg.webp')}") center center / cover fixed no-repeat; color:var(--text); overflow-x:hidden; }}
     .app-shell {{ display:grid; grid-template-columns:260px minmax(0,1fr); min-height:100vh; }}
-    .sidebar {{ position:sticky; top:0; height:100vh; overflow:auto; scrollbar-width:none; -ms-overflow-style:none; padding:18px 14px; background:linear-gradient(180deg,rgba(17,18,26,.97),rgba(11,12,18,.97)); border-right:1px solid rgba(184,201,220,.16); box-shadow:16px 0 45px rgba(0,0,0,.35); }}
+    .sidebar {{ position:sticky; top:0; height:100vh; overflow:auto; scrollbar-width:none; -ms-overflow-style:none; padding:18px 14px; background:linear-gradient(180deg,rgba(17,18,26,.97),rgba(11,12,18,.97)); border-right:1px solid rgba(214,168,79,.16); box-shadow:16px 0 45px rgba(0,0,0,.35); }}
     .sidebar::-webkit-scrollbar {{ width:0; height:0; display:none; }}
-    .mobile-nav-toggle {{ display:none; border:1px solid rgba(184,201,220,.24); border-radius:12px; background:linear-gradient(180deg,rgba(32,35,45,.92),rgba(13,14,20,.86)); color:var(--text); font-weight:800; padding:10px 12px; cursor:pointer; }}
-    .brand {{ display:flex; align-items:center; gap:12px; padding:8px 8px 18px; margin-bottom:8px; border-bottom:1px solid rgba(184,201,220,.14); }}
-    .brand-mark {{ width:54px; height:54px; border-radius:16px; background:radial-gradient(circle at 35% 30%,rgba(184,201,220,.18),rgba(32,35,45,.9)); border:1px solid rgba(184,201,220,.24); display:grid; place-items:center; overflow:hidden; }}
+    .mobile-nav-toggle {{ display:none; border:1px solid rgba(214,168,79,.24); border-radius:12px; background:linear-gradient(180deg,rgba(32,35,45,.92),rgba(13,14,20,.86)); color:var(--text); font-weight:800; padding:10px 12px; cursor:pointer; }}
+    .brand {{ display:flex; align-items:center; gap:12px; padding:8px 8px 18px; margin-bottom:8px; border-bottom:1px solid rgba(214,168,79,.14); }}
+    .brand-mark {{ width:54px; height:54px; border-radius:16px; background:radial-gradient(circle at 35% 30%,rgba(214,168,79,.18),rgba(32,35,45,.9)); border:1px solid rgba(214,168,79,.24); display:grid; place-items:center; overflow:hidden; }}
     .brand-mark img {{ width:52px; height:52px; object-fit:contain; filter:drop-shadow(0 2px 8px rgba(0,0,0,.75)); }}
-    .brand strong {{ display:block; font-size:18px; }} .brand span {{ display:block; color:#c9d4df; font-size:12px; }}
+    .brand strong {{ display:block; font-size:18px; }} .brand span {{ display:block; color:#e5c982; font-size:12px; }}
     .side-nav {{ display:flex; flex-direction:column; gap:6px; scrollbar-width:none; -ms-overflow-style:none; }}
     .side-nav::-webkit-scrollbar, .sidebar-footer::-webkit-scrollbar {{ width:0; height:0; display:none; }}
     .side-nav a, .side-nav summary {{ color:var(--text); text-decoration:none; padding:10px 12px; border-radius:12px; display:flex; align-items:center; gap:9px; font-size:14px; cursor:pointer; }}
-    .side-nav a:hover, .side-nav summary:hover {{ background:rgba(184,201,220,.09); color:var(--gold); }}
-    .side-nav a.active {{ background:linear-gradient(90deg,rgba(184,201,220,.18),rgba(184,201,220,.06)); color:var(--gold); border:1px solid rgba(184,201,220,.24); }}
-    .side-nav details {{ border-top:1px solid rgba(184,201,220,.10); padding-top:8px; margin-top:8px; }}
+    .side-nav a:hover, .side-nav summary:hover {{ background:rgba(214,168,79,.09); color:var(--gold); }}
+    .side-nav a.active {{ background:linear-gradient(90deg,rgba(214,168,79,.18),rgba(214,168,79,.06)); color:var(--gold); border:1px solid rgba(214,168,79,.24); }}
+    .side-nav details {{ border-top:1px solid rgba(214,168,79,.10); padding-top:8px; margin-top:8px; }}
     .side-nav summary {{ color:var(--muted); text-transform:uppercase; letter-spacing:.08em; font-size:11px; font-weight:800; list-style:none; }}
     .side-nav summary::-webkit-details-marker {{ display:none; }}
-    .side-nav details a {{ margin-left:8px; padding:9px 11px; font-size:13px; color:#d7dee6; }}
-    .side-nav .admin-portal-button {{ margin:0 0 6px 0; border:1px solid rgba(184,201,220,.34); background:linear-gradient(90deg,rgba(184,201,220,.18),rgba(65,82,101,.18)); color:var(--gold); font-weight:800; }}
+    .side-nav details a {{ margin-left:8px; padding:9px 11px; font-size:13px; color:#ead9ae; }}
+    .side-nav .admin-portal-button {{ margin:0 0 6px 0; border:1px solid rgba(214,168,79,.34); background:linear-gradient(90deg,rgba(214,168,79,.18),rgba(65,82,101,.18)); color:var(--gold); font-weight:800; }}
     .side-nav .admin-back {{ margin:0 0 6px 0; border:1px solid rgba(129,199,132,.25); background:rgba(129,199,132,.08); color:#bfe8c1; font-weight:800; }}
 
-    .sidebar-footer {{ margin-top:18px; padding-top:14px; border-top:1px solid rgba(184,201,220,.12); display:grid; gap:8px; }}
-    .sidebar-footer a {{ color:var(--muted); text-decoration:none; font-size:13px; padding:8px 10px; border-radius:10px; }} .sidebar-footer a:hover {{ color:var(--gold); background:rgba(184,201,220,.08); }}
+    .sidebar-footer {{ margin-top:18px; padding-top:14px; border-top:1px solid rgba(214,168,79,.12); display:grid; gap:8px; }}
+    .sidebar-footer a {{ color:var(--muted); text-decoration:none; font-size:13px; padding:8px 10px; border-radius:10px; }} .sidebar-footer a:hover {{ color:var(--gold); background:rgba(214,168,79,.08); }}
     main.content {{ max-width:1380px; width:100%; margin:0 auto; padding:22px 24px 70px; }}
     .topnav {{ display:flex; gap:8px; flex-wrap:wrap; padding:0; margin:0 0 18px; background:transparent; border:0; box-shadow:none; }}
     .topnav a {{ color:var(--text); text-decoration:none; padding:8px 11px; border:1px solid var(--line); border-radius:12px; background:linear-gradient(180deg,rgba(32,35,45,.82),rgba(13,14,20,.78)); font-size:12px; display:inline-flex; align-items:center; gap:7px; box-shadow:inset 0 1px 0 rgba(255,255,255,.04); }}
@@ -4033,26 +4037,26 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "member") -> str:
     .topnav a[href="/exports"]::before {{ display:block; background-image:url("{_asset('nav_exports.png')}"); }}
     .topnav a:hover {{ border-color:var(--gold); color:var(--gold); transform:translateY(-1px); }}
     .hero {{ position:relative; overflow:hidden; display:flex; justify-content:space-between; gap:18px; align-items:center; min-height:300px; padding:34px; border:1px solid rgba(218,166,74,.38); background-image:linear-gradient(90deg,rgba(6,8,14,.82) 0%,rgba(9,12,20,.54) 45%,rgba(9,12,20,.12) 100%),url("{hero_banner}"); background-position:center center; background-size:cover; background-repeat:no-repeat; border-radius:22px; margin-bottom:18px; box-shadow:0 24px 60px rgba(0,0,0,.50), inset 0 0 0 1px rgba(255,220,150,.06); }}
-    .hero::after {{ content:""; position:absolute; inset:0; pointer-events:none; background:radial-gradient(circle at 76% 50%,rgba(184,201,220,.16),transparent 34%), linear-gradient(180deg,transparent,rgba(0,0,0,.24)); }}
+    .hero::after {{ content:""; position:absolute; inset:0; pointer-events:none; background:radial-gradient(circle at 76% 50%,rgba(214,168,79,.16),transparent 34%), linear-gradient(180deg,transparent,rgba(0,0,0,.24)); }}
     .hero > * {{ position:relative; z-index:1; }}
     .hero h1::before {{ content:""; display:inline-block; width:38px; height:38px; margin-right:10px; vertical-align:-8px; background:url("{brand_logo}") center / contain no-repeat; filter:drop-shadow(0 2px 7px rgba(0,0,0,.8)); }}
     .hero-actions {{ display:grid; grid-template-columns:repeat(3,minmax(142px,1fr)); gap:12px; min-width:min(520px,100%); }}
-    .hero-action {{ position:relative; overflow:hidden; color:var(--text); text-decoration:none; border:1px solid rgba(184,201,220,.22); border-radius:18px; padding:14px 15px; background:linear-gradient(135deg,rgba(32,35,45,.86),rgba(12,13,19,.78)); box-shadow:inset 0 1px 0 rgba(255,255,255,.05), 0 14px 26px rgba(0,0,0,.22); display:grid; gap:3px; min-height:82px; }}
-    .hero-action::before {{ content:""; position:absolute; inset:-60% -30%; background:radial-gradient(circle at 25% 18%,rgba(184,201,220,.20),transparent 32%); opacity:.9; pointer-events:none; }}
-    .hero-action:hover {{ transform:translateY(-2px); border-color:rgba(184,201,220,.55); box-shadow:inset 0 1px 0 rgba(255,255,255,.08), 0 18px 36px rgba(0,0,0,.34); }}
+    .hero-action {{ position:relative; overflow:hidden; color:var(--text); text-decoration:none; border:1px solid rgba(214,168,79,.22); border-radius:18px; padding:14px 15px; background:linear-gradient(135deg,rgba(32,35,45,.86),rgba(12,13,19,.78)); box-shadow:inset 0 1px 0 rgba(255,255,255,.05), 0 14px 26px rgba(0,0,0,.22); display:grid; gap:3px; min-height:82px; }}
+    .hero-action::before {{ content:""; position:absolute; inset:-60% -30%; background:radial-gradient(circle at 25% 18%,rgba(214,168,79,.20),transparent 32%); opacity:.9; pointer-events:none; }}
+    .hero-action:hover {{ transform:translateY(-2px); border-color:rgba(214,168,79,.55); box-shadow:inset 0 1px 0 rgba(255,255,255,.08), 0 18px 36px rgba(0,0,0,.34); }}
     .hero-action span,.hero-action strong,.hero-action small {{ position:relative; z-index:1; }}
     .hero-action span {{ font-size:22px; line-height:1; }}
     .hero-action strong {{ font-size:15px; letter-spacing:.01em; }}
     .hero-action small {{ color:var(--muted); font-size:11px; }}
     .hero-action.attendance {{ border-color:rgba(129,199,132,.28); }}
-    .hero-action.loot {{ border-color:rgba(184,201,220,.34); }}
+    .hero-action.loot {{ border-color:rgba(214,168,79,.34); }}
     .hero-action.members {{ border-color:rgba(150,130,230,.30); }}
     .eyebrow {{ color:var(--gold); text-transform:uppercase; letter-spacing:.12em; font-size:12px; font-weight:700; }}
     h1,h2,h3 {{ margin:0 0 8px; }} p {{ color:var(--muted); }}
     .muted {{ color:var(--muted); }}
     .grid {{ display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:12px; margin:18px 0; }}
     .mini-grid {{ margin:12px 0 18px; }}
-    .card,.panel {{ background:linear-gradient(180deg,rgba(24,26,34,.94),rgba(16,18,25,.94)), url("{_asset('panel_texture.webp')}") center / cover; border:1px solid rgba(184,201,220,.16); border-radius:16px; box-shadow:0 10px 30px rgba(0,0,0,.32), inset 0 1px 0 rgba(255,255,255,.03); }}
+    .card,.panel {{ background:linear-gradient(180deg,rgba(24,26,34,.94),rgba(16,18,25,.94)), url("{_asset('panel_texture.webp')}") center / cover; border:1px solid rgba(214,168,79,.16); border-radius:16px; box-shadow:0 10px 30px rgba(0,0,0,.32), inset 0 1px 0 rgba(255,255,255,.03); }}
     .card {{ padding:16px; }} .card-title {{ color:var(--muted); font-size:13px; }} .card-value {{ font-size:28px; font-weight:800; color:var(--gold); }} .card-sub {{ color:var(--muted); font-size:12px; }}
     .panel {{ padding:18px; margin:14px 0; scroll-margin-top:70px; }}
     .subpanel {{ background:rgba(32,35,45,.72); border:1px solid var(--line); border-radius:14px; padding:14px; margin:12px 0; }}
@@ -4063,53 +4067,53 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "member") -> str:
     .home-layout {{ display:grid; grid-template-columns:minmax(0,2fr) minmax(300px,1fr); gap:18px; align-items:start; }}
     .home-stack {{ display:grid; gap:14px; }}
     .home-list {{ display:grid; gap:10px; margin-top:12px; }}
-    .home-item {{ display:grid; grid-template-columns:44px minmax(0,1fr) auto; gap:12px; align-items:center; padding:13px 14px; border:1px solid rgba(184,201,220,.14); border-radius:14px; background:rgba(32,35,45,.55); }}
-    .home-icon {{ width:44px; height:44px; border-radius:12px; display:grid; place-items:center; background:rgba(184,201,220,.12); border:1px solid rgba(184,201,220,.18); font-size:20px; }}
+    .home-item {{ display:grid; grid-template-columns:44px minmax(0,1fr) auto; gap:12px; align-items:center; padding:13px 14px; border:1px solid rgba(214,168,79,.14); border-radius:14px; background:rgba(32,35,45,.55); }}
+    .home-icon {{ width:44px; height:44px; border-radius:12px; display:grid; place-items:center; background:rgba(214,168,79,.12); border:1px solid rgba(214,168,79,.18); font-size:20px; }}
     .home-title {{ font-weight:800; color:var(--text); }} .home-meta {{ color:var(--muted); font-size:13px; margin-top:3px; }}
     .action-list {{ display:grid; gap:10px; margin-top:12px; }}
     .action-list .btn {{ display:block; text-align:center; background:transparent; color:var(--text); border:1px solid rgba(241,234,219,.55); }}
     .action-list .btn:hover {{ color:#111; background:var(--gold); border-color:var(--gold); }}
     .bar-row {{ display:grid; grid-template-columns:110px 1fr 44px; gap:10px; align-items:center; margin:8px 0; }} .bar-label,.bar-value {{ color:var(--muted); font-size:13px; }}
-    .bar-track {{ height:10px; background:#0b0c10; border:1px solid var(--line); border-radius:999px; overflow:hidden; }} .bar-fill {{ height:100%; background:linear-gradient(90deg,var(--gold),#e8eef5); }}
+    .bar-track {{ height:10px; background:#0b0c10; border:1px solid var(--line); border-radius:999px; overflow:hidden; }} .bar-fill {{ height:100%; background:linear-gradient(90deg,var(--gold),#f2d58a); }}
     .table-search {{ width:100%; max-width:420px; margin:8px 0 12px; padding:10px 12px; border-radius:10px; border:1px solid var(--line); background:#08090d; color:var(--text); outline:none; }}
     .table-search:focus {{ border-color:var(--gold); }}
     .table-wrap {{ overflow-x:auto; }} table {{ width:100%; border-collapse:collapse; font-size:14px; }} th,td {{ padding:10px 8px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; }} th {{ color:var(--gold); font-size:12px; text-transform:uppercase; letter-spacing:.05em; }} tr:hover td {{ background:rgba(255,255,255,.025); }}
     .btn {{ display:inline-block; padding:10px 14px; border-radius:10px; background:var(--gold); color:#111; font-weight:800; text-decoration:none; white-space:nowrap; }}
     .link {{ color:var(--gold); text-decoration:none; font-weight:700; }} .link:hover {{ text-decoration:underline; }}
     .pill {{ display:inline-block; padding:2px 8px; border:1px solid var(--line); border-radius:999px; color:var(--gold); font-size:12px; vertical-align:middle; }}
-    .queue-badge {{ display:inline-flex; align-items:center; gap:7px; padding:4px 9px; border:1px solid rgba(184,201,220,.30); border-radius:999px; color:var(--gold); background:rgba(184,201,220,.08); text-decoration:none; font-size:12px; font-weight:800; white-space:nowrap; }}
+    .queue-badge {{ display:inline-flex; align-items:center; gap:7px; padding:4px 9px; border:1px solid rgba(214,168,79,.30); border-radius:999px; color:var(--gold); background:rgba(214,168,79,.08); text-decoration:none; font-size:12px; font-weight:800; white-space:nowrap; }}
     .queue-badge small {{ color:var(--muted); font-weight:700; }}
     .queue-badge.ok {{ color:#b7f2bd; border-color:rgba(129,199,132,.42); background:rgba(129,199,132,.10); }}
-    .queue-badge.wait {{ color:#ffe0a3; border-color:rgba(184,201,220,.46); background:rgba(184,201,220,.12); }}
+    .queue-badge.wait {{ color:#ffe0a3; border-color:rgba(214,168,79,.46); background:rgba(214,168,79,.12); }}
     .queue-badge.bad {{ color:#ffb3b3; border-color:rgba(217,104,104,.42); background:rgba(217,104,104,.10); }}
     .need-list {{ margin:8px 0 16px; padding-left:22px; color:var(--text); }} .need-list li {{ margin:5px 0; }}
     .need-board {{ display:grid; gap:12px; }}
     .need-board > h3 {{ font-size:24px; }}
-    .need-slot-group {{ border:1px solid rgba(184,201,220,.14); border-radius:14px; padding:13px 14px; background:rgba(10,11,15,.28); }}
+    .need-slot-group {{ border:1px solid rgba(214,168,79,.14); border-radius:14px; padding:13px 14px; background:rgba(10,11,15,.28); }}
     .need-slot-group h3 {{ color:var(--gold); margin-bottom:9px; }}
     .need-slot-row {{ display:grid; grid-template-columns:150px minmax(0,1fr); gap:10px; padding:7px 0; border-bottom:1px solid rgba(255,255,255,.07); }}
     .need-slot-row:last-child {{ border-bottom:0; }}
     .need-slot-row span {{ color:var(--muted); }}
     .need-slot-row strong {{ color:var(--text); overflow-wrap:anywhere; }}
-    .member-start-logo {{ width:86px; height:86px; border-radius:22px; padding:8px; border:1px solid rgba(184,201,220,.32); background:rgba(184,201,220,.08); box-shadow:0 14px 30px rgba(0,0,0,.35); }}
+    .member-start-logo {{ width:86px; height:86px; border-radius:22px; padding:8px; border:1px solid rgba(214,168,79,.32); background:rgba(214,168,79,.08); box-shadow:0 14px 30px rgba(0,0,0,.35); }}
     .member-start-logo img {{ width:100%; height:100%; object-fit:contain; }}
     .member-home-hero {{ align-items:center; }}
     .member-summary-list {{ display:grid; gap:10px; margin-top:10px; }}
-    .member-summary-item {{ display:grid; grid-template-columns:minmax(0,1fr) auto; gap:12px; align-items:center; padding:12px 13px; border:1px solid rgba(184,201,220,.14); border-radius:14px; background:rgba(32,35,45,.55); }}
+    .member-summary-item {{ display:grid; grid-template-columns:minmax(0,1fr) auto; gap:12px; align-items:center; padding:12px 13px; border:1px solid rgba(214,168,79,.14); border-radius:14px; background:rgba(32,35,45,.55); }}
     .member-summary-title {{ font-weight:800; color:var(--gold); overflow-wrap:anywhere; }}
     .member-summary-meta {{ color:var(--muted); font-size:13px; margin-top:3px; }}
-    .status-hero-logo {{ width:92px; height:92px; border-radius:24px; padding:8px; border:1px solid rgba(184,201,220,.32); background:rgba(184,201,220,.08); box-shadow:0 14px 30px rgba(0,0,0,.35); flex:0 0 auto; }}
+    .status-hero-logo {{ width:92px; height:92px; border-radius:24px; padding:8px; border:1px solid rgba(214,168,79,.32); background:rgba(214,168,79,.08); box-shadow:0 14px 30px rgba(0,0,0,.35); flex:0 0 auto; }}
     .status-hero-logo img {{ width:100%; height:100%; object-fit:contain; }}
     .status-map-frame {{ width:100%; height:min(52vh,600px); min-height:330px; border:0; border-radius:14px; background:#05060a; box-shadow:0 16px 34px rgba(0,0,0,.38); }}
     .status-grid-compact {{ grid-template-columns:repeat(4,minmax(0,1fr)); }}
     .status-source-note {{ display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-top:10px; }}
     code {{ background:#05060a; border:1px solid var(--line); padding:2px 5px; border-radius:6px; }}
-    .empty {{ color:var(--muted); padding:18px 16px 18px 58px; min-height:58px; display:flex; align-items:center; border:1px dashed rgba(184,201,220,.18); border-radius:14px; background:linear-gradient(90deg,rgba(10,11,15,.70),rgba(24,26,34,.54)); position:relative; }}
+    .empty {{ color:var(--muted); padding:18px 16px 18px 58px; min-height:58px; display:flex; align-items:center; border:1px dashed rgba(214,168,79,.18); border-radius:14px; background:linear-gradient(90deg,rgba(10,11,15,.70),rgba(24,26,34,.54)); position:relative; }}
     .empty::before {{ content:""; position:absolute; left:16px; top:50%; width:30px; height:30px; transform:translateY(-50%); background:url("{_asset('status_ec_offen.png')}") center / contain no-repeat; opacity:.78; }}
     .warn {{ background:#3a250d; border:1px solid #8a5b18; padding:12px 14px; border-radius:12px; margin-bottom:14px; color:#ffe0a3; }}
     .authbar {{ display:flex; gap:10px; align-items:center; justify-content:flex-end; background:rgba(24,26,34,.78); border:1px solid var(--line); border-radius:12px; padding:10px 12px; margin-bottom:14px; color:var(--muted); font-size:13px; }} .authbar a {{ color:var(--gold); text-decoration:none; font-weight:700; }}
 
-    .version-pill {{ color:var(--muted); font-size:11px; border:1px solid rgba(184,201,220,.16); background:rgba(184,201,220,.05); border-radius:999px; padding:6px 9px; text-align:center; }}
+    .version-pill {{ color:var(--muted); font-size:11px; border:1px solid rgba(214,168,79,.16); background:rgba(214,168,79,.05); border-radius:999px; padding:6px 9px; text-align:center; }}
     .release-grid {{ display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:12px; margin:12px 0 18px; }}
     .release-card {{ background:rgba(32,35,45,.72); border:1px solid var(--line); border-radius:15px; padding:14px; min-width:0; }}
     .release-card b {{ color:var(--gold); display:block; font-size:20px; margin-bottom:4px; }}
@@ -4121,7 +4125,7 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "member") -> str:
     form {{ max-width:100%; }}
     input, select, textarea, button {{ font:inherit; max-width:100%; }}
     input[type=text], input[type=number], input[type=datetime-local], input[type=date], input[type=url], input[type=search], select, textarea {{ width:100%; border:1px solid var(--line); background:#08090d; color:var(--text); border-radius:10px; padding:10px 12px; outline:none; }}
-    input:focus, select:focus, textarea:focus {{ border-color:var(--gold); box-shadow:0 0 0 3px rgba(184,201,220,.12); }}
+    input:focus, select:focus, textarea:focus {{ border-color:var(--gold); box-shadow:0 0 0 3px rgba(214,168,79,.12); }}
     .form-row, .form-grid {{ display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; align-items:end; }}
     .actions-inline {{ display:flex; gap:8px; flex-wrap:wrap; align-items:center; }}
     .actions-inline form {{ display:inline-flex; gap:8px; flex-wrap:wrap; align-items:center; }}
@@ -4135,70 +4139,91 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "member") -> str:
     .skip-mobile {{ display:inline; }}
 
     /* Beer and Buffs Gothic/Whale Visual Pass v1 */
-    body::before {{ content:""; position:fixed; inset:0; pointer-events:none; z-index:-1; background:radial-gradient(circle at 50% 0%,rgba(142,179,214,.16),transparent 34%), linear-gradient(90deg,rgba(0,0,0,.58),rgba(0,0,0,.12) 22%,rgba(0,0,0,.12) 78%,rgba(0,0,0,.62)); }}
+    body::before {{ content:""; position:fixed; inset:0; pointer-events:none; z-index:-1; background:radial-gradient(circle at 50% 0%,rgba(214,168,79,.16),transparent 34%), linear-gradient(90deg,rgba(0,0,0,.58),rgba(0,0,0,.12) 22%,rgba(0,0,0,.12) 78%,rgba(0,0,0,.62)); }}
     .app-shell {{ grid-template-columns:286px minmax(0,1fr); }}
-    .sidebar {{ background:linear-gradient(180deg,rgba(18,23,31,.96),rgba(6,8,12,.98)); border-right:1px solid rgba(184,201,220,.32); box-shadow:22px 0 58px rgba(0,0,0,.52), inset -1px 0 0 rgba(224,234,244,.05); }}
+    .sidebar {{ background:linear-gradient(180deg,rgba(18,23,31,.96),rgba(6,8,12,.98)); border-right:1px solid rgba(214,168,79,.32); box-shadow:22px 0 58px rgba(0,0,0,.52), inset -1px 0 0 rgba(245,216,145,.05); }}
     .brand {{ justify-content:center; flex-direction:column; text-align:center; gap:9px; padding:10px 10px 22px; margin-bottom:14px; }}
-    .brand-mark {{ width:108px; height:108px; border-radius:24px; padding:9px; background:radial-gradient(circle at 50% 28%,rgba(184,201,220,.22),rgba(9,12,18,.84)); border:1px solid rgba(184,201,220,.42); box-shadow:0 18px 38px rgba(0,0,0,.42), inset 0 0 0 1px rgba(232,239,247,.06); }}
+    .brand-mark {{ width:108px; height:108px; border-radius:24px; padding:9px; background:radial-gradient(circle at 50% 28%,rgba(214,168,79,.22),rgba(9,12,18,.84)); border:1px solid rgba(214,168,79,.42); box-shadow:0 18px 38px rgba(0,0,0,.42), inset 0 0 0 1px rgba(255,232,174,.06); }}
     .brand-mark img {{ width:100%; height:100%; object-fit:contain; }}
     .brand-mark.sidebar-brand-logo {{ width:176px; height:126px; padding:0; border:0; border-radius:0; background:transparent; box-shadow:none; overflow:visible; }}
     .brand-mark.sidebar-brand-logo img {{ width:100%; height:100%; object-fit:contain; filter:drop-shadow(0 8px 18px rgba(0,0,0,.72)); }}
     .brand strong {{ font-family:Georgia,'Times New Roman',serif; text-transform:uppercase; letter-spacing:.12em; color:var(--gold); font-size:20px; }}
-    .brand span {{ letter-spacing:.12em; text-transform:uppercase; color:#c9d4df; font-size:12px; font-weight:700; }}
+    .brand span {{ letter-spacing:.12em; text-transform:uppercase; color:#e5c982; font-size:12px; font-weight:700; }}
     .side-nav {{ gap:5px; }}
     .side-nav a, .side-nav summary {{ border-radius:0; min-height:43px; padding:10px 13px; border:1px solid transparent; background:linear-gradient(90deg,rgba(255,255,255,.015),rgba(0,0,0,.00)); font-family:Georgia,'Times New Roman',serif; text-transform:uppercase; letter-spacing:.065em; }}
     .side-nav a {{ position:relative; font-size:12px; }}
-    .side-nav a::after {{ content:""; position:absolute; left:13px; right:13px; bottom:-3px; height:1px; background:linear-gradient(90deg,transparent,rgba(184,201,220,.20),transparent); }}
-    .side-nav a:hover {{ background:linear-gradient(90deg,rgba(184,201,220,.16),rgba(184,201,220,.045)); border-color:rgba(184,201,220,.18); }}
-    .side-nav a.active {{ background:linear-gradient(90deg,rgba(184,201,220,.24),rgba(184,201,220,.07)); border-color:rgba(184,201,220,.36); box-shadow:inset 3px 0 0 rgba(218,228,238,.86), 0 8px 20px rgba(0,0,0,.24); }}
+    .side-nav a::after {{ content:""; position:absolute; left:13px; right:13px; bottom:-3px; height:1px; background:linear-gradient(90deg,transparent,rgba(214,168,79,.20),transparent); }}
+    .side-nav a:hover {{ background:linear-gradient(90deg,rgba(214,168,79,.16),rgba(214,168,79,.045)); border-color:rgba(214,168,79,.18); }}
+    .side-nav a.active {{ background:linear-gradient(90deg,rgba(214,168,79,.24),rgba(214,168,79,.07)); border-color:rgba(214,168,79,.36); box-shadow:inset 3px 0 0 rgba(236,194,101,.86), 0 8px 20px rgba(0,0,0,.24); }}
     .nav-ico {{ width:24px; height:24px; object-fit:contain; flex:0 0 24px; filter:drop-shadow(0 2px 5px rgba(0,0,0,.75)); opacity:.96; transform:translateY(-1px); }}
     .side-nav a.active .nav-ico, .side-nav a:hover .nav-ico {{ opacity:1; }}
-    .side-nav details {{ border-top:1px solid rgba(184,201,220,.16); margin-top:10px; padding-top:10px; }}
+    .side-nav details {{ border-top:1px solid rgba(214,168,79,.16); margin-top:10px; padding-top:10px; }}
     .side-nav summary {{ color:#aebbc8; font-size:10px; min-height:28px; padding:6px 12px; }}
-    .sidebar-footer {{ border-top:1px solid rgba(184,201,220,.18); }}
+    .sidebar-footer {{ border-top:1px solid rgba(214,168,79,.18); }}
     main.content {{ max-width:1460px; padding:26px 30px 74px; }}
-    .topnav a {{ border-color:rgba(184,201,220,.28); background:linear-gradient(180deg,rgba(28,35,46,.82),rgba(8,11,16,.86)); box-shadow:0 8px 18px rgba(0,0,0,.22), inset 0 1px 0 rgba(238,243,248,.05); }}
-    .hero {{ min-height:245px; border-radius:0; outline:1px solid rgba(234,240,247,.055); outline-offset:-6px; }}
-    .hero::before {{ content:""; position:absolute; inset:0; pointer-events:none; background:linear-gradient(180deg,rgba(255,255,255,.03),transparent 24%,rgba(0,0,0,.38)), radial-gradient(circle at 72% 45%,rgba(61,137,255,.22),transparent 31%); }}
+    .topnav a {{ border-color:rgba(214,168,79,.28); background:linear-gradient(180deg,rgba(28,35,46,.82),rgba(8,11,16,.86)); box-shadow:0 8px 18px rgba(0,0,0,.22), inset 0 1px 0 rgba(255,238,198,.05); }}
+    .hero {{ min-height:245px; border-radius:0; outline:1px solid rgba(255,232,174,.055); outline-offset:-6px; }}
+    .hero::before {{ content:""; position:absolute; inset:0; pointer-events:none; background:linear-gradient(180deg,rgba(255,255,255,.03),transparent 24%,rgba(0,0,0,.38)), radial-gradient(circle at 72% 45%,rgba(214,168,79,.22),transparent 31%); }}
     .hero::after {{ background:linear-gradient(180deg,transparent 58%,rgba(0,0,0,.45)); }}
-    .hero h1 {{ font-family:Georgia,'Times New Roman',serif; font-size:clamp(40px,5vw,70px); line-height:.98; letter-spacing:.05em; text-transform:uppercase; color:#e6edf5; text-shadow:0 3px 15px rgba(0,0,0,.76); }}
+    .hero h1 {{ font-family:Georgia,'Times New Roman',serif; font-size:clamp(40px,5vw,70px); line-height:.98; letter-spacing:.05em; text-transform:uppercase; color:#f4e4bd; text-shadow:0 3px 15px rgba(0,0,0,.76); }}
     .hero h1::before {{ display:none; }}
-    .eyebrow {{ font-family:Georgia,'Times New Roman',serif; color:#cbd8e5; text-transform:uppercase; letter-spacing:.16em; font-weight:800; }}
+    .eyebrow {{ font-family:Georgia,'Times New Roman',serif; color:#e7cc88; text-transform:uppercase; letter-spacing:.16em; font-weight:800; }}
     .hero p {{ max-width:720px; }}
     .hero-actions {{ max-width:560px; }}
-    .hero-action {{ border-radius:0; background:linear-gradient(180deg,rgba(16,20,27,.78),rgba(7,8,12,.82)); border-color:rgba(184,201,220,.32); box-shadow:inset 0 0 0 1px rgba(232,239,247,.04); }}
-    .hero-action:hover {{ border-color:rgba(184,201,220,.62); background:linear-gradient(180deg,rgba(29,37,48,.82),rgba(9,9,12,.86)); }}
+    .hero-action {{ border-radius:0; background:linear-gradient(180deg,rgba(16,20,27,.78),rgba(7,8,12,.82)); border-color:rgba(214,168,79,.32); box-shadow:inset 0 0 0 1px rgba(255,232,174,.04); }}
+    .hero-action:hover {{ border-color:rgba(214,168,79,.62); background:linear-gradient(180deg,rgba(29,37,48,.82),rgba(9,9,12,.86)); }}
     .hero-action-icon {{ width:34px; height:34px; object-fit:contain; filter:drop-shadow(0 3px 8px rgba(0,0,0,.70)); }}
-    .panel,.card,.metric,.release-card {{ background:linear-gradient(180deg,rgba(19,24,33,.92),rgba(8,11,16,.86)); border:1px solid rgba(184,201,220,.22); box-shadow:0 18px 46px rgba(0,0,0,.34), inset 0 0 0 1px rgba(234,240,247,.035); backdrop-filter:blur(6px); }}
+    .panel,.card,.metric,.release-card {{ background:linear-gradient(180deg,rgba(19,24,33,.92),rgba(8,11,16,.86)); border:1px solid rgba(214,168,79,.22); box-shadow:0 18px 46px rgba(0,0,0,.34), inset 0 0 0 1px rgba(255,232,174,.035); backdrop-filter:blur(6px); }}
     .panel {{ border-radius:0; position:relative; }}
-    .panel::before,.card::before {{ content:""; position:absolute; left:12px; right:12px; top:0; height:1px; background:linear-gradient(90deg,transparent,rgba(184,201,220,.45),transparent); opacity:.72; pointer-events:none; }}
+    .panel::before,.card::before {{ content:""; position:absolute; left:12px; right:12px; top:0; height:1px; background:linear-gradient(90deg,transparent,rgba(214,168,79,.45),transparent); opacity:.72; pointer-events:none; }}
     .panel h2,.panel h3,.card-label {{ font-family:Georgia,'Times New Roman',serif; color:var(--gold); text-transform:uppercase; letter-spacing:.07em; }}
     .card {{ border-radius:0; position:relative; }}
-    .card-value {{ font-family:Georgia,'Times New Roman',serif; color:#e6edf5; }}
+    .card-value {{ font-family:Georgia,'Times New Roman',serif; color:#f4e4bd; }}
     .home-layout {{ grid-template-columns:minmax(0,1.55fr) minmax(330px,.78fr); gap:18px; }}
     .home-list {{ display:grid; gap:10px; }}
-    .home-item {{ background:linear-gradient(90deg,rgba(184,201,220,.075),rgba(8,9,12,.40)); border:1px solid rgba(184,201,220,.16); border-radius:0; }}
-    .home-icon {{ background:radial-gradient(circle at 40% 30%,rgba(184,201,220,.22),rgba(8,9,12,.72)); border-radius:0; border-color:rgba(184,201,220,.26); color:transparent; }}
+    .home-item {{ background:linear-gradient(90deg,rgba(214,168,79,.075),rgba(8,9,12,.40)); border:1px solid rgba(214,168,79,.16); border-radius:0; }}
+    .home-icon {{ background:radial-gradient(circle at 40% 30%,rgba(214,168,79,.22),rgba(8,9,12,.72)); border-radius:0; border-color:rgba(214,168,79,.26); color:transparent; }}
     .home-icon img {{ width:28px; height:28px; object-fit:contain; filter:drop-shadow(0 2px 5px rgba(0,0,0,.7)); }}
-    .btn {{ border-radius:0; background:linear-gradient(180deg,#edf2f7,#8799ad); color:#0b1016; border:1px solid rgba(236,242,248,.34); box-shadow:0 10px 22px rgba(0,0,0,.26), inset 0 1px 0 rgba(255,255,255,.25); }}
+    .btn {{ border-radius:0; background:linear-gradient(180deg,#f0d68d,#9a641c); color:#171006; border:1px solid rgba(255,229,166,.48); box-shadow:0 10px 22px rgba(0,0,0,.26), inset 0 1px 0 rgba(255,255,255,.25); }}
     .btn:hover {{ filter:brightness(1.06); transform:translateY(-1px); }}
-    .btn.ghost,.ghost {{ background:linear-gradient(180deg,rgba(29,36,47,.76),rgba(8,11,16,.88)); color:#dce5ee; border:1px solid rgba(184,201,220,.28); }}
+    .btn.ghost,.ghost {{ background:linear-gradient(180deg,rgba(29,36,47,.76),rgba(8,11,16,.88)); color:#f0dfb5; border:1px solid rgba(214,168,79,.28); }}
     .btn.danger,.danger {{ background:linear-gradient(180deg,#8e3832,#4c1715); color:#ffe1dc; border:1px solid rgba(255,155,140,.35); }}
-    input[type=text], input[type=number], input[type=datetime-local], input[type=date], input[type=url], input[type=search], select, textarea {{ background:rgba(5,6,9,.72); border-color:rgba(184,201,220,.20); }}
-    th {{ color:#cad6e2; }}
-    th,td {{ border-bottom-color:rgba(184,201,220,.15); }}
+    input[type=text], input[type=number], input[type=datetime-local], input[type=date], input[type=url], input[type=search], select, textarea {{ background:rgba(5,6,9,.72); border-color:rgba(214,168,79,.20); }}
+    th {{ color:#e0c27a; }}
+    th,td {{ border-bottom-color:rgba(214,168,79,.15); }}
 
-    @media(max-width:1100px) {{ .app-shell {{ grid-template-columns:1fr; }} .sidebar {{ position:relative; height:auto; border-right:0; border-bottom:1px solid rgba(184,201,220,.16); }} .side-nav {{ display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); }} .side-nav details {{ margin-top:0; }} .home-layout {{ grid-template-columns:1fr; }} }}
+
+    /* Beer and Buffs warm gold palette */
+    :root {{ --panel:#17130d; --panel2:#211a10; --line:#5c4524; --side:#0c0906; --side2:#181108; }}
+    body::before {{ background:radial-gradient(circle at 50% 0%,rgba(214,168,79,.17),transparent 35%),linear-gradient(90deg,rgba(0,0,0,.64),rgba(0,0,0,.14) 22%,rgba(0,0,0,.14) 78%,rgba(0,0,0,.66)); }}
+    .sidebar {{ background:linear-gradient(180deg,rgba(25,18,10,.97),rgba(7,6,5,.99)); border-color:rgba(214,168,79,.34); }}
+    .topnav,.authbar,.panel,.card,.metric,.release-card {{ border-color:rgba(214,168,79,.25); }}
+    .topnav a,.btn.ghost,.ghost {{ background:linear-gradient(180deg,rgba(42,31,18,.86),rgba(12,9,6,.92)); border-color:rgba(214,168,79,.32); color:#f0dfb5; }}
+    .topnav a:hover,.btn.ghost:hover,.ghost:hover {{ border-color:rgba(232,190,99,.72); color:#f4d889; background:linear-gradient(180deg,rgba(66,45,20,.92),rgba(18,12,7,.94)); }}
+    .side-nav a:hover {{ background:linear-gradient(90deg,rgba(214,168,79,.17),rgba(214,168,79,.045)); border-color:rgba(214,168,79,.22); }}
+    .side-nav a.active {{ background:linear-gradient(90deg,rgba(214,168,79,.27),rgba(214,168,79,.075)); border-color:rgba(214,168,79,.42); box-shadow:inset 3px 0 0 rgba(236,194,101,.92),0 8px 20px rgba(0,0,0,.28); }}
+    .panel,.card,.metric,.release-card {{ background:linear-gradient(180deg,rgba(28,21,12,.93),rgba(9,7,5,.90)); box-shadow:0 18px 46px rgba(0,0,0,.38),inset 0 0 0 1px rgba(255,225,155,.035); }}
+    .panel::before,.card::before {{ background:linear-gradient(90deg,transparent,rgba(232,190,99,.50),transparent); }}
+    .home-item {{ background:linear-gradient(90deg,rgba(214,168,79,.085),rgba(10,8,5,.44)); border-color:rgba(214,168,79,.20); }}
+    .home-icon {{ background:radial-gradient(circle at 40% 30%,rgba(214,168,79,.24),rgba(10,8,5,.76)); border-color:rgba(214,168,79,.30); }}
+    .btn {{ background:linear-gradient(180deg,#f0d68d,#9a641c); color:#171006; border-color:rgba(255,229,166,.48); }}
+    input[type=text],input[type=number],input[type=datetime-local],input[type=date],input[type=url],input[type=search],select,textarea {{ background:rgba(12,9,5,.78); border-color:rgba(214,168,79,.24); }}
+    input:focus,select:focus,textarea:focus {{ border-color:var(--gold); box-shadow:0 0 0 3px rgba(214,168,79,.14); }}
+    th,td {{ border-bottom-color:rgba(214,168,79,.16); }}
+    th {{ color:#e0c27a; }}
+    .queue-badge,.pill {{ background:rgba(214,168,79,.08); border-color:rgba(214,168,79,.30); }}
+
+    @media(max-width:1100px) {{ .app-shell {{ grid-template-columns:1fr; }} .sidebar {{ position:relative; height:auto; border-right:0; border-bottom:1px solid rgba(214,168,79,.16); }} .side-nav {{ display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); }} .side-nav details {{ margin-top:0; }} .home-layout {{ grid-template-columns:1fr; }} }}
     @media(max-width:1000px) {{ .grid,.analytics-grid {{ grid-template-columns:repeat(2,minmax(0,1fr)); }} .split {{ grid-template-columns:1fr; }} .hero {{ flex-direction:column; align-items:flex-start; }} .hero-actions {{ grid-template-columns:1fr; width:100%; }} }}
     @media(max-width:760px) {{
       body {{ background-attachment:scroll; }}
       .app-shell {{ display:block; min-height:100vh; }}
-      .sidebar {{ position:sticky; top:0; z-index:60; height:auto; max-height:none; overflow:visible; padding:10px 12px; border-right:0; border-bottom:1px solid rgba(184,201,220,.18); box-shadow:0 14px 28px rgba(0,0,0,.38); backdrop-filter:blur(12px); }}
+      .sidebar {{ position:sticky; top:0; z-index:60; height:auto; max-height:none; overflow:visible; padding:10px 12px; border-right:0; border-bottom:1px solid rgba(214,168,79,.18); box-shadow:0 14px 28px rgba(0,0,0,.38); backdrop-filter:blur(12px); }}
       .brand {{ padding:0; margin:0; border-bottom:0; padding-right:112px; min-height:46px; }}
       .brand-mark {{ width:42px; height:42px; border-radius:13px; }} .brand-mark img {{ width:31px; height:31px; }}
       .mobile-nav-toggle {{ display:inline-flex; align-items:center; gap:6px; position:absolute; right:12px; top:10px; }}
       .side-nav, .sidebar-footer {{ display:none; }}
-      body.nav-open .side-nav {{ display:grid; grid-template-columns:1fr; gap:6px; max-height:calc(100vh - 86px); overflow:auto; scrollbar-width:none; -ms-overflow-style:none; padding-top:12px; margin-top:10px; border-top:1px solid rgba(184,201,220,.12); }}
+      body.nav-open .side-nav {{ display:grid; grid-template-columns:1fr; gap:6px; max-height:calc(100vh - 86px); overflow:auto; scrollbar-width:none; -ms-overflow-style:none; padding-top:12px; margin-top:10px; border-top:1px solid rgba(214,168,79,.12); }}
       body.nav-open .side-nav::-webkit-scrollbar {{ width:0; height:0; display:none; }}
       body.nav-open .sidebar-footer {{ display:grid; grid-template-columns:1fr 1fr; margin-top:10px; padding-top:10px; }}
       .side-nav details {{ margin-top:4px; padding-top:6px; }}
@@ -4251,7 +4276,7 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "member") -> str:
       table.searchable-table {{ min-width:0; display:block; width:100%; }}
       table.searchable-table thead {{ display:none; }}
       table.searchable-table tbody {{ display:grid; gap:10px; }}
-      table.searchable-table tr {{ display:block; border:1px solid rgba(184,201,220,.16); border-radius:14px; padding:8px 10px; background:rgba(16,18,25,.72); }}
+      table.searchable-table tr {{ display:block; border:1px solid rgba(214,168,79,.16); border-radius:14px; padding:8px 10px; background:rgba(16,18,25,.72); }}
       table.searchable-table td {{ display:grid; grid-template-columns:112px minmax(0,1fr); gap:10px; border-bottom:1px solid rgba(255,255,255,.08); padding:8px 0; overflow-wrap:anywhere; }}
       table.searchable-table td:last-child {{ border-bottom:0; }}
       table.searchable-table td::before {{ content:attr(data-label); color:var(--gold); font-size:11px; font-weight:800; text-transform:uppercase; letter-spacing:.04em; }}
@@ -4272,7 +4297,7 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "member") -> str:
         position:sticky; top:0; z-index:100;
         height:auto; min-height:0; max-height:none; overflow:visible;
         padding:8px 12px; border-right:0; border-left:0;
-        border-bottom:1px solid rgba(184,201,220,.22);
+        border-bottom:1px solid rgba(214,168,79,.22);
         background:linear-gradient(180deg,rgba(18,12,10,.96),rgba(8,9,13,.94));
         box-shadow:0 14px 34px rgba(0,0,0,.48);
         backdrop-filter:blur(14px);
@@ -4301,13 +4326,13 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "member") -> str:
       body.nav-open .side-nav {{
         display:grid; grid-template-columns:1fr; gap:7px;
         max-height:none; overflow:visible; margin-top:10px; padding:12px 0 0;
-        border-top:1px solid rgba(184,201,220,.18);
+        border-top:1px solid rgba(214,168,79,.18);
       }}
-      body.nav-open .side-nav details {{ margin-top:6px; padding-top:8px; border-top:1px solid rgba(184,201,220,.14); }}
+      body.nav-open .side-nav details {{ margin-top:6px; padding-top:8px; border-top:1px solid rgba(214,168,79,.14); }}
       body.nav-open .side-nav details a {{ margin-left:0; }}
       body.nav-open .sidebar-footer {{
         display:grid; grid-template-columns:1fr 1fr; gap:8px;
-        margin-top:12px; padding-top:12px; border-top:1px solid rgba(184,201,220,.16);
+        margin-top:12px; padding-top:12px; border-top:1px solid rgba(214,168,79,.16);
       }}
       .side-nav a,.side-nav summary {{ min-height:44px; padding:11px 12px; font-size:13px; border-radius:12px; }}
       .nav-ico {{ width:24px; height:24px; flex-basis:24px; }}
@@ -4386,7 +4411,7 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "member") -> str:
       table.searchable-table {{ min-width:0; display:block; width:100%; }}
       table.searchable-table thead {{ display:none; }}
       table.searchable-table tbody {{ display:grid; gap:10px; }}
-      table.searchable-table tr {{ display:block; border:1px solid rgba(184,201,220,.18); border-radius:14px; padding:8px 10px; background:rgba(16,18,25,.76); }}
+      table.searchable-table tr {{ display:block; border:1px solid rgba(214,168,79,.18); border-radius:14px; padding:8px 10px; background:rgba(16,18,25,.76); }}
       table.searchable-table td {{ display:grid; grid-template-columns:104px minmax(0,1fr); gap:9px; border-bottom:1px solid rgba(255,255,255,.08); padding:8px 0; overflow-wrap:anywhere; }}
       table.searchable-table td:last-child {{ border-bottom:0; }}
       table.searchable-table td::before {{ content:attr(data-label); color:var(--gold); font-size:10px; font-weight:800; text-transform:uppercase; letter-spacing:.04em; }}
@@ -4502,7 +4527,7 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "member") -> str:
         gap:7px !important;
         margin-top:10px !important;
         padding-top:12px !important;
-        border-top:1px solid rgba(184,201,220,.18) !important;
+        border-top:1px solid rgba(214,168,79,.18) !important;
       }}
       body.nav-open .sidebar-footer {{
         display:grid !important;
@@ -4545,7 +4570,7 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "member") -> str:
         -webkit-overflow-scrolling:touch !important;
         scrollbar-width:none !important;
         background:linear-gradient(180deg,rgba(9,10,15,.88),rgba(7,7,10,.98)) !important;
-        border-top:1px solid rgba(184,201,220,.24) !important;
+        border-top:1px solid rgba(214,168,79,.24) !important;
         box-shadow:0 -14px 36px rgba(0,0,0,.50) !important;
       }}
       .topnav::-webkit-scrollbar {{ display:none !important; }}
@@ -4684,7 +4709,7 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "member") -> str:
         -webkit-overflow-scrolling:touch !important;
         scrollbar-width:none !important;
         background:linear-gradient(180deg,rgba(9,10,15,.88),rgba(7,7,10,.98)) !important;
-        border-top:1px solid rgba(184,201,220,.24) !important;
+        border-top:1px solid rgba(214,168,79,.24) !important;
         box-shadow:0 -14px 36px rgba(0,0,0,.50) !important;
       }}
       .topnav::-webkit-scrollbar {{ display:none !important; }}
@@ -4755,7 +4780,7 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "member") -> str:
         -webkit-overflow-scrolling:touch !important;
         scrollbar-width:none !important;
         background:linear-gradient(180deg,rgba(9,10,15,.92),rgba(7,7,10,.96)) !important;
-        border:1px solid rgba(184,201,220,.24) !important;
+        border:1px solid rgba(214,168,79,.24) !important;
         border-radius:16px !important;
         box-shadow:0 10px 24px rgba(0,0,0,.36), inset 0 1px 0 rgba(255,255,255,.04) !important;
       }}
@@ -5011,7 +5036,7 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "member") -> str:
         height:38px !important;
         padding:4px 6px !important;
         gap:5px !important;
-        border:1px solid rgba(184,201,220,.28) !important;
+        border:1px solid rgba(214,168,79,.28) !important;
         border-radius:12px !important;
         background:linear-gradient(180deg,rgba(12,13,18,.84),rgba(7,7,10,.94)) !important;
         box-shadow:0 8px 18px rgba(0,0,0,.30), inset 0 1px 0 rgba(255,255,255,.035) !important;
@@ -5025,7 +5050,7 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "member") -> str:
         font-size:12px !important;
         line-height:1 !important;
         border-radius:10px !important;
-        border:1px solid rgba(184,201,220,.22) !important;
+        border:1px solid rgba(214,168,79,.22) !important;
         display:inline-flex !important;
         align-items:center !important;
       }}
@@ -8952,7 +8977,7 @@ def _render_item_catalog(request: Optional[Request] = None) -> str:
 
 _NEED_BUILDER_SLOT_GROUPS = [
     ("⚔️ Waffen", ["Waffe 1", "Waffe 2"]),
-    ("✨ Fähigkeitskern", ["Fähigkeitskern"]),
+    ("✨ Fähigkeitskerne", ["Fähigkeitskern 1", "Fähigkeitskern 2"]),
     ("🛡️ Rüstung", ["Helm", "Brust", "Handschuhe", "Hose", "Schuhe", "Umhang"]),
     ("💍 Zubehör", ["Kette", "Armband", "Brosche", "Ohrringe", "Ring 1", "Ring 2", "Gürtel"]),
 ]
@@ -8964,7 +8989,7 @@ def _need_builder_slot_filter(slot: str) -> dict[str, Any]:
     slot = str(slot or "").strip()
     if slot in {"Waffe 1", "Waffe 2"}:
         return {"category": "weapon", "subs": [], "special": ""}
-    if slot == "Fähigkeitskern":
+    if slot in {"Fähigkeitskern 1", "Fähigkeitskern 2", "Fähigkeitskern"}:
         return {"category": "", "subs": [], "special": "core"}
     armor = {
         "Helm": "Helm",
@@ -9140,7 +9165,16 @@ def _need_builder_load(guild_id: int, user_id: int) -> dict[str, Any]:
                 )
                 for r in (cur.fetchall() or []):
                     d = dict(r)
-                    slots_by_build.setdefault(str(d.get("build_id") or ""), {})[str(d.get("slot_name") or "")] = d
+                    build_key = str(d.get("build_id") or "")
+                    slot_name = str(d.get("slot_name") or "")
+                    # Alte Builds mit nur einem Fähigkeitskern bleiben erhalten.
+                    if slot_name == "Fähigkeitskern":
+                        slot_name = "Fähigkeitskern 1"
+                        d["slot_name"] = slot_name
+                    bucket = slots_by_build.setdefault(build_key, {})
+                    # Ein bereits explizit gespeicherter Kern 1 hat Vorrang.
+                    if slot_name not in bucket:
+                        bucket[slot_name] = d
         return {"builds": builds, "slots": slots_by_build}
     finally:
         conn.close()
@@ -10658,7 +10692,7 @@ def _render_member_portal(data: dict[str, Any], user_id: int, request: Request, 
     <style>
       .portal-page-hero{{min-height:180px;}}
       .portal-profile-card{{display:grid;gap:10px;}}
-      .portal-profile-row{{display:grid;grid-template-columns:150px minmax(0,1fr);gap:12px;align-items:center;padding:11px 0;border-bottom:1px solid rgba(184,201,220,.13)}}
+      .portal-profile-row{{display:grid;grid-template-columns:150px minmax(0,1fr);gap:12px;align-items:center;padding:11px 0;border-bottom:1px solid rgba(214,168,79,.13)}}
       .portal-profile-row:last-child{{border-bottom:0}}
       .portal-profile-row span{{color:var(--muted);font-size:13px;text-transform:uppercase;letter-spacing:.06em;font-weight:800}}
       .portal-profile-row strong{{color:var(--text);font-size:16px;overflow-wrap:anywhere}}
@@ -12944,7 +12978,7 @@ def _render_status_dashboard(data: dict[str, Any], request: Optional[Request] = 
         <div class="status-hero-stat compact"><span>Wetter</span><strong id="status-weather-value">{_e(_mini_status_value('weather', game.get('weather')))}</strong><small id="status-weather-sub">{_e(game.get('weather_sub') or '—')}</small></div>
       </div>
       <style>
-        .status-topnav-shell{{border:1px solid rgba(218,166,74,.34);border-radius:20px;padding:10px;margin:0 0 18px;background:linear-gradient(180deg,rgba(218,166,74,.09),rgba(11,14,22,.38));box-shadow:0 16px 40px rgba(0,0,0,.22), inset 0 0 0 1px rgba(232,239,247,.04);}}
+        .status-topnav-shell{{border:1px solid rgba(218,166,74,.34);border-radius:20px;padding:10px;margin:0 0 18px;background:linear-gradient(180deg,rgba(218,166,74,.09),rgba(11,14,22,.38));box-shadow:0 16px 40px rgba(0,0,0,.22), inset 0 0 0 1px rgba(255,232,174,.04);}}
         .status-topnav{{margin:0;}}
         .status-topnav a{{border-color:rgba(218,166,74,.34);}}
         .status-main-hero{{min-height:520px;padding:30px 32px;background-image:linear-gradient(180deg,rgba(6,8,12,.10) 0%,rgba(7,9,14,.24) 48%,rgba(7,9,14,.86) 100%),url("{_asset('beer_and_buffs_header_desktop.png')}");background-position:center center;background-size:cover;background-repeat:no-repeat;border:1px solid rgba(218,166,74,.38);box-shadow:0 22px 56px rgba(0,0,0,.48), inset 0 0 0 1px rgba(255,220,150,.05);}}
@@ -13901,11 +13935,13 @@ async def portal_need_change(user_id: int, request: Request, _: bool = Depends(_
         action_type = "set"
     tab = str(form.get("tab") or "Main").strip()
     slot = str(form.get("slot") or "").strip()
+    if slot == "Fähigkeitskern":
+        slot = "Fähigkeitskern 1"
     item_text = str(form.get("item_text") or "").strip()
     weapon_type = str(form.get("weapon_type") or "").strip()
     if tab not in {"Main", "Secondary"}:
         tab = "Main"
-    valid_slots = {"Waffe 1","Waffe 2","Fähigkeitskern","Helm","Brust","Hose","Handschuhe","Schuhe","Brosche","Ohrringe","Kette","Armband","Ring 1","Ring 2","Gürtel","Umhang"}
+    valid_slots = {"Waffe 1","Waffe 2","Fähigkeitskern 1","Fähigkeitskern 2","Helm","Brust","Hose","Handschuhe","Schuhe","Brosche","Ohrringe","Kette","Armband","Ring 1","Ring 2","Gürtel","Umhang"}
     if slot not in valid_slots:
         raise HTTPException(status_code=400, detail="Ungültiger Slot.")
     if action_type == "set" and not item_text:
@@ -14706,9 +14742,9 @@ def _render_discord_feed_page(data: dict[str, Any], *, key: str, title: str, sub
     css = """
     <style>
       .discord-feed-list{display:grid;gap:14px;margin-top:12px}
-      .discord-feed-card{display:grid;grid-template-columns:52px minmax(0,1fr);gap:12px;padding:14px;border:1px solid rgba(184,201,220,.16);border-radius:16px;background:linear-gradient(135deg,rgba(16,21,29,.86),rgba(0,0,0,.46));box-shadow:0 12px 32px rgba(0,0,0,.18)}
-      .discord-feed-avatar{width:52px;height:52px;border-radius:16px;border:1px solid rgba(184,201,220,.28);background:rgba(0,0,0,.28);display:grid;place-items:center;overflow:hidden;color:var(--gold);font-size:24px}
-      .discord-feed-avatar img{width:100%;height:100%;object-fit:cover}.discord-feed-head{display:flex;justify-content:space-between;gap:10px;align-items:center;flex-wrap:wrap}.discord-feed-head strong{color:#dfe7ef}.discord-feed-head span{color:var(--muted);font-size:12px}.discord-feed-content{margin-top:6px;line-height:1.55;white-space:normal}.discord-feed-actions{margin-top:10px}.discord-feed-attachments{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}.discord-feed-image img{max-width:220px;max-height:160px;object-fit:cover;border-radius:12px;border:1px solid rgba(184,201,220,.2)}.discord-embed{margin-top:10px;border-left:3px solid rgba(184,201,220,.55);background:rgba(0,0,0,.22);border-radius:10px;padding:10px}.discord-embed p{margin:5px 0 0}.discord-embed img{display:block;max-width:280px;max-height:180px;object-fit:cover;border-radius:10px;margin-top:8px}.btn.small{padding:7px 10px;font-size:12px}
+      .discord-feed-card{display:grid;grid-template-columns:52px minmax(0,1fr);gap:12px;padding:14px;border:1px solid rgba(214,168,79,.16);border-radius:16px;background:linear-gradient(135deg,rgba(16,21,29,.86),rgba(0,0,0,.46));box-shadow:0 12px 32px rgba(0,0,0,.18)}
+      .discord-feed-avatar{width:52px;height:52px;border-radius:16px;border:1px solid rgba(214,168,79,.28);background:rgba(0,0,0,.28);display:grid;place-items:center;overflow:hidden;color:var(--gold);font-size:24px}
+      .discord-feed-avatar img{width:100%;height:100%;object-fit:cover}.discord-feed-head{display:flex;justify-content:space-between;gap:10px;align-items:center;flex-wrap:wrap}.discord-feed-head strong{color:#dfe7ef}.discord-feed-head span{color:var(--muted);font-size:12px}.discord-feed-content{margin-top:6px;line-height:1.55;white-space:normal}.discord-feed-actions{margin-top:10px}.discord-feed-attachments{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}.discord-feed-image img{max-width:220px;max-height:160px;object-fit:cover;border-radius:12px;border:1px solid rgba(214,168,79,.2)}.discord-embed{margin-top:10px;border-left:3px solid rgba(214,168,79,.55);background:rgba(0,0,0,.22);border-radius:10px;padding:10px}.discord-embed p{margin:5px 0 0}.discord-embed img{display:block;max-width:280px;max-height:180px;object-fit:cover;border-radius:10px;margin-top:8px}.btn.small{padding:7px 10px;font-size:12px}
       @media(max-width:620px){.discord-feed-card{grid-template-columns:40px minmax(0,1fr);padding:12px}.discord-feed-avatar{width:40px;height:40px;border-radius:12px}.discord-feed-image img,.discord-embed img{max-width:100%;height:auto}}
     </style>
     """
