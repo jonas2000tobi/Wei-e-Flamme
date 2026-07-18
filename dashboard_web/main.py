@@ -5034,6 +5034,84 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "member") -> str:
 
 
 
+
+
+    /* Status-Header positioning v8 – mobile without top buttons, text below artwork slogan */
+    .status-main-hero {{
+      min-height:680px !important;
+      padding:34px 32px 28px !important;
+    }}
+    .status-main-hero .status-hero-inner {{
+      min-height:610px !important;
+      justify-content:flex-end !important;
+      padding-top:330px !important;
+    }}
+    .status-main-hero .status-hero-head {{
+      min-height:0 !important;
+      justify-content:flex-end !important;
+    }}
+    .status-main-hero .status-hero-stats {{
+      margin-top:8px !important;
+    }}
+
+    @media(max-width:640px) {{
+      /* Die obere Schnellnavigation ist mobil überflüssig; das Seitenmenü bleibt erhalten. */
+      .status-topnav-shell {{
+        display:none !important;
+      }}
+      main.content {{
+        padding-top:0 !important;
+      }}
+      .status-main-hero {{
+        margin-top:0 !important;
+        min-height:0 !important;
+        padding:0 14px 20px !important;
+        border-radius:16px !important;
+        background-position:center top !important;
+        background-size:100% auto !important;
+      }}
+      .status-main-hero .status-hero-inner {{
+        min-height:0 !important;
+        justify-content:flex-start !important;
+        padding-top:0 !important;
+        gap:10px !important;
+      }}
+      .status-main-hero .status-hero-head {{
+        /* Unterhalb des im Bild enthaltenen Gildenslogans, unmittelbar vor den Karten. */
+        min-height:clamp(500px,116vw,650px) !important;
+        justify-content:flex-end !important;
+        padding:0 4px 6px !important;
+      }}
+      .status-main-hero .status-hero-brand-wrap {{
+        gap:2px !important;
+        padding:9px 8px 7px !important;
+        border-radius:12px !important;
+        background:linear-gradient(180deg,rgba(7,8,12,.05),rgba(7,8,12,.66)) !important;
+        text-shadow:0 2px 10px #000 !important;
+      }}
+      .status-main-hero .eyebrow {{
+        margin:0 !important;
+      }}
+      .status-main-hero .status-welcome {{
+        margin:2px 0 0 !important;
+        font-size:18px !important;
+      }}
+      .status-main-hero .status-hero-stats {{
+        margin-top:0 !important;
+      }}
+      .mobile-nav-toggle {{
+        top:12px !important;
+        right:12px !important;
+        bottom:auto !important;
+      }}
+    }}
+
+    @media(max-width:390px) {{
+      .status-main-hero .status-hero-head {{
+        min-height:clamp(455px,120vw,570px) !important;
+      }}
+    }}
+
     /* Status-Header final responsive override */
     @media(max-width:640px) {{
       .status-topnav-shell .status-topnav {{
