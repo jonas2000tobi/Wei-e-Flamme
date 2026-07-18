@@ -353,6 +353,13 @@ PORTAL_REPAIR_MEMBER_DELAY_SECONDS = max(0.05, float(os.getenv("PORTAL_REPAIR_ME
 PORTAL_RESET_ON_START = str(os.getenv("PORTAL_RESET_ON_START", "true") or "true").strip().lower() not in {"0", "false", "no", "off"}
 NEW_MEMBER_LOOT_LOCK_DAYS = 7
 _portal_repair_task: Optional[asyncio.Task] = None
+
+# DM-Komponenten müssen den zugehörigen Discord-Server sehr häufig auflösen.
+# Ein kurzer RAM-Cache verhindert wiederholte Postgres-/JSON- und Guild-Scans
+# bei jedem Buttonklick. Der Cache wird nur verwendet, solange der Nutzer
+# weiterhin Mitglied des gespeicherten Servers ist.
+_PORTAL_GUILD_RESOLVE_CACHE: dict[int, tuple[int, float]] = {}
+_PORTAL_GUILD_RESOLVE_CACHE_TTL = 300.0
 _portal_last_dm_errors: dict[tuple[int, int], str] = {}
 
 
@@ -650,21 +657,25 @@ def _portal_user_state(guild_id: int, user_id: int) -> dict:
 
 
 def _mark_portal_sent(guild_id: int, user_id: int, message_id: int | None = None) -> None:
+    """Remember the active portal message without writing the volume on every click."""
     g = _sent_guild(guild_id)
-
     arr = set(str(x) for x in g.get("sent_users", []))
+    changed = str(user_id) not in arr
     arr.add(str(user_id))
     g["sent_users"] = sorted(arr)
 
     u = _portal_user_state(guild_id, user_id)
+    old_mid = int(u.get("menu_message_id", 0) or 0)
+    new_mid = int(message_id or old_mid or 0)
+    if new_mid and new_mid != old_mid:
+        u["menu_message_id"] = new_mid
+        changed = True
 
-    if message_id:
-        u["menu_message_id"] = int(message_id)
-
-    u["sent_at"] = datetime.now(TZ).isoformat()
-
-    save_sent()
-
+    # sent_at ist nur ein Zustandsmarker, kein Klick-Tracking. Ein identischer
+    # Buttonklick soll daher keine synchrone Volume-Schreiboperation auslösen.
+    if not u.get("sent_at") or changed:
+        u["sent_at"] = datetime.now(TZ).isoformat()
+        save_sent()
 
 def _portal_was_sent(guild_id: int, user_id: int) -> bool:
     g = _sent_guild(guild_id)
@@ -700,50 +711,72 @@ def _clear_portal_sent(guild_id: int, user_id: int) -> None:
 
 
 def _resolve_guild_for_user(client: discord.Client, user_id: int) -> Optional[discord.Guild]:
-    """Resolve DM interactions to the Ebolus home guild deterministically."""
+    """Resolve a DM interaction to the user's active guild quickly and safely."""
+    uid = int(user_id)
+    now = time.monotonic()
+    cached = _PORTAL_GUILD_RESOLVE_CACHE.get(uid)
+    if cached and (now - cached[1]) < _PORTAL_GUILD_RESOLVE_CACHE_TTL:
+        guild = client.get_guild(int(cached[0]))
+        member = guild.get_member(uid) if guild else None
+        if guild and member and not member.bot:
+            return guild
+        _PORTAL_GUILD_RESOLVE_CACHE.pop(uid, None)
+
+    def remember(guild: Optional[discord.Guild]) -> Optional[discord.Guild]:
+        if guild is not None:
+            _PORTAL_GUILD_RESOLVE_CACHE[uid] = (int(guild.id), now)
+        return guild
 
     try:
         try:
             from bot.alliance_config import _home_guild_id  # type: ignore
         except ModuleNotFoundError:
             from alliance_config import _home_guild_id  # type: ignore
-
         home_id = int(_home_guild_id() or 0)
         if home_id:
             guild = client.get_guild(home_id)
-            member = guild.get_member(user_id) if guild else None
+            member = guild.get_member(uid) if guild else None
             if guild and member and not member.bot:
-                return guild
+                return remember(guild)
     except Exception as e:
         print(f"[member_portal] Home-Server-Auflösung fehlgeschlagen: {e!r}")
 
-    for guild in client.guilds:
+    for guild in list(getattr(client, "guilds", []) or []):
         try:
-            member = guild.get_member(user_id)
-            member_role_id = int(_gcfg(guild.id).get("member_role_id", 0) or 0)
-            if member and not member.bot and member_role_id in _member_role_ids(member):
-                return guild
+            member = guild.get_member(uid)
+            if not member or member.bot:
+                continue
+            role_ids = _member_role_ids(member)
+            configured: set[int] = set()
+            if central_guild_config is not None:
+                for kind in ("member", "leader", "advisor", "guardian"):
+                    configured.update(int(x) for x in central_guild_config.role_ids(guild.id, kind) if int(x))
+            if not configured:
+                member_role_id = int(_gcfg(guild.id).get("member_role_id", 0) or 0)
+                if member_role_id:
+                    configured.add(member_role_id)
+            if configured.intersection(role_ids):
+                return remember(guild)
         except Exception:
             continue
 
     for guild_id_str, state in list(sent_state.items()):
         try:
             guild = client.get_guild(int(guild_id_str))
-            member = guild.get_member(user_id) if guild else None
+            member = guild.get_member(uid) if guild else None
             if not guild or not member or member.bot:
                 continue
             sent_users = {str(x) for x in state.get("sent_users", [])}
             users = state.get("users", {}) or {}
-            if str(user_id) in sent_users or str(user_id) in users:
-                return guild
+            if str(uid) in sent_users or str(uid) in users:
+                return remember(guild)
         except Exception:
             continue
 
-    for guild in client.guilds:
-        member = guild.get_member(user_id)
+    for guild in list(getattr(client, "guilds", []) or []):
+        member = guild.get_member(uid)
         if member and not member.bot:
-            return guild
-
+            return remember(guild)
     return None
 
 def _member_position(guild: discord.Guild, member: discord.Member) -> str:
@@ -1327,50 +1360,58 @@ def _member_sort_key(guild: discord.Guild, member: discord.Member) -> Tuple[int,
 
 
 def _members_list_embed(guild: discord.Guild) -> discord.Embed:
-    emb = discord.Embed(
-        title=f"👥 {_guild_brand_name(guild)} Mitglieder",
-        color=discord.Color.gold()
-    )
-
-    c = _gcfg(guild.id)
-    member_role_id = int(c.get("member_role_id", 0) or 0)
-
-    if not member_role_id:
-        emb.description = "❌ Keine Gildenmitglied-Rolle gesetzt. Nutze zuerst `/portal_set_member_role`."
+    emb = discord.Embed(title=f"👥 {_guild_brand_name(guild)} Mitglieder", color=discord.Color.gold())
+    configured_role_ids: set[int] = set()
+    configured_role_names: list[str] = []
+    try:
+        if central_guild_config is not None:
+            for kind in ("member", "leader", "advisor", "guardian"):
+                for role_id in central_guild_config.role_ids(guild.id, kind):
+                    role = guild.get_role(int(role_id))
+                    if role is not None:
+                        configured_role_ids.add(int(role.id))
+                        if role.name not in configured_role_names:
+                            configured_role_names.append(role.name)
+    except Exception as e:
+        print(f"[member_portal] Mitgliederrollen konnten nicht zentral gelesen werden: {e!r}")
+    if not configured_role_ids:
+        c = _gcfg(guild.id)
+        fallback_ids = [int(c.get("member_role_id", 0) or 0), *[int(x or 0) for x in (c.get("position_roles") or {}).values()]]
+        for role_id in fallback_ids:
+            role = guild.get_role(role_id) if role_id else None
+            if role is not None:
+                configured_role_ids.add(int(role.id))
+                if role.name not in configured_role_names:
+                    configured_role_names.append(role.name)
+    if not configured_role_ids:
+        emb.description = "❌ Keine Mitglieder- oder Leitungsrolle konfiguriert. Nutze `/guild set_role`."
         return emb
-
-    member_role = guild.get_role(member_role_id)
-
-    if not member_role:
-        emb.description = "❌ Die gespeicherte Gildenmitglied-Rolle wurde nicht gefunden."
-        return emb
-
-    members = [m for m in member_role.members if not m.bot]
+    members: list[discord.Member] = []
+    seen: set[int] = set()
+    for role_id in configured_role_ids:
+        role = guild.get_role(role_id)
+        if role is None:
+            continue
+        for member in role.members:
+            if member.bot or member.id in seen:
+                continue
+            seen.add(member.id)
+            members.append(member)
     members.sort(key=lambda m: _member_sort_key(guild, m))
-
-    lines = []
-
-    for i, m in enumerate(members[:40], start=1):
-        p = _user_profile(guild.id, m.id)
-
-        name = p.get("ingame_name") or _display_name(m)
-        pos = _member_position(guild, m)
-        gs = p.get("gearscore") or "—"
-
-        lines.append(f"**{i}. {name}** — {pos} — GS {gs}")
-
-    if not lines:
-        emb.description = "Keine Mitglieder mit der Gildenmitglied-Rolle gefunden."
-    else:
-        emb.description = "\n".join(lines)
-
-    if len(members) > 40:
-        emb.set_footer(text=f"Anzeige begrenzt auf 40 von {len(members)} Mitgliedern. Sortierung: Rang, dann Gearscore.")
-    else:
-        emb.set_footer(text="Angezeigt werden nur Mitglieder mit der Gildenmitglied-Rolle.")
-
+    lines: list[str] = []
+    shown = 0
+    for i, member in enumerate(members, start=1):
+        profile = _user_profile(guild.id, member.id)
+        name = profile.get("ingame_name") or _display_name(member)
+        line = f"**{i}. {name}** — {_member_position(guild, member)} — GS {profile.get('gearscore') or '—'}"
+        if len("\n".join(lines + [line])) > 3900:
+            break
+        lines.append(line)
+        shown += 1
+    emb.description = "\n".join(lines) if lines else "Keine Mitglieder mit den konfigurierten Gildenrollen gefunden."
+    role_text = ", ".join(configured_role_names) or "konfigurierte Gildenrollen"
+    emb.set_footer(text=(f"{shown} von {len(members)} angezeigt · Rollen: {role_text}" if shown < len(members) else f"{len(members)} Mitglieder · Rollen: {role_text}"))
     return emb
-
 
 def _absence_calendar_embed(guild: discord.Guild) -> discord.Embed:
     g = _gdata(guild.id)
@@ -2705,53 +2746,67 @@ class GuildMenuView(PortalSafeView):
         super().__init__(timeout=None)
 
     @staticmethod
-    async def _resolve_after_defer(inter: discord.Interaction) -> tuple[Optional[discord.Guild], Optional[discord.Member]]:
-        # Alte Portal-DMs können Postgres-/Guild-Auflösung benötigen. Die
-        # Interaction wird deshalb vor jeder Arbeit bestätigt.
+    async def _begin(inter: discord.Interaction) -> tuple[Optional[discord.Guild], Optional[discord.Member]]:
         if not inter.response.is_done():
             await inter.response.defer()
         return await _resolve_guild_member_from_inter(inter)
 
+    @staticmethod
+    async def _show_error(inter: discord.Interaction, label: str, error: Exception) -> None:
+        print(f"[member_portal] {label} fehlgeschlagen: {error!r}", flush=True)
+        try:
+            await inter.followup.send(f"❌ {label} konnte nicht geöffnet werden. Fehler: `{type(error).__name__}`", ephemeral=True)
+        except Exception:
+            pass
+
     @button(label="Kalender", emoji=_menu_emoji(EMOJI_CALENDAR), style=ButtonStyle.secondary, custom_id="portal_guild_calendar")
     async def btn_calendar(self, inter: discord.Interaction, _):
-        guild, member = await self._resolve_after_defer(inter)
-        if not guild:
-            await inter.followup.send("❌ Ich konnte deinen Server nicht zuordnen.", ephemeral=True)
-            return
-        if member and inter.message:
-            await asyncio.to_thread(_mark_portal_sent, guild.id, member.id, inter.message.id)
-        embed = await asyncio.to_thread(_events_embed, guild.id)
-        await inter.edit_original_response(embed=embed, view=EventsInfoView())
+        try:
+            guild, member = await self._begin(inter)
+            if not guild:
+                await inter.followup.send("❌ Ich konnte deinen Server nicht zuordnen.", ephemeral=True)
+                return
+            if member and inter.message:
+                await asyncio.to_thread(_mark_portal_sent, guild.id, member.id, inter.message.id)
+            await inter.edit_original_response(embed=await asyncio.to_thread(_events_embed, guild.id), view=EventsInfoView())
+        except Exception as error:
+            await self._show_error(inter, "Kalender", error)
 
     @button(label="Abwesenheiten", emoji=_menu_emoji(EMOJI_ABSENCE), style=ButtonStyle.secondary, custom_id="portal_guild_absences")
     async def btn_absences(self, inter: discord.Interaction, _):
-        guild, member = await self._resolve_after_defer(inter)
-        if not guild:
-            await inter.followup.send("❌ Ich konnte deinen Server nicht zuordnen.", ephemeral=True)
-            return
-        if member and inter.message:
-            await asyncio.to_thread(_mark_portal_sent, guild.id, member.id, inter.message.id)
-        embed = await asyncio.to_thread(_absence_calendar_embed, guild)
-        await inter.edit_original_response(embed=embed, view=AbsenceCalendarView())
+        try:
+            guild, member = await self._begin(inter)
+            if not guild:
+                await inter.followup.send("❌ Ich konnte deinen Server nicht zuordnen.", ephemeral=True)
+                return
+            if member and inter.message:
+                await asyncio.to_thread(_mark_portal_sent, guild.id, member.id, inter.message.id)
+            await inter.edit_original_response(embed=await asyncio.to_thread(_absence_calendar_embed, guild), view=AbsenceCalendarView())
+        except Exception as error:
+            await self._show_error(inter, "Abwesenheiten", error)
 
     @button(label="Mitglieder", emoji=_menu_emoji(EMOJI_MEMBER), style=ButtonStyle.secondary, custom_id="portal_guild_members")
     async def btn_members(self, inter: discord.Interaction, _):
-        guild, member = await self._resolve_after_defer(inter)
-        if not guild:
-            await inter.followup.send("❌ Ich konnte deinen Server nicht zuordnen.", ephemeral=True)
-            return
-        if member and inter.message:
-            await asyncio.to_thread(_mark_portal_sent, guild.id, member.id, inter.message.id)
-        embed = await asyncio.to_thread(_members_list_embed, guild)
-        await inter.edit_original_response(embed=embed, view=BackOnlyView())
+        try:
+            guild, member = await self._begin(inter)
+            if not guild:
+                await inter.followup.send("❌ Ich konnte deinen Server nicht zuordnen.", ephemeral=True)
+                return
+            if member and inter.message:
+                await asyncio.to_thread(_mark_portal_sent, guild.id, member.id, inter.message.id)
+            await inter.edit_original_response(embed=await asyncio.to_thread(_members_list_embed, guild), view=BackOnlyView())
+        except Exception as error:
+            await self._show_error(inter, "Mitgliederliste", error)
 
     @button(label="Zurück", emoji=_menu_emoji(EMOJI_BACK), style=ButtonStyle.secondary, custom_id="portal_guild_back")
     async def btn_back(self, inter: discord.Interaction, _):
-        guild, member = await self._resolve_after_defer(inter)
-        if guild and member and inter.message:
-            await asyncio.to_thread(_mark_portal_sent, guild.id, member.id, inter.message.id)
-        embed = await asyncio.to_thread(_main_menu_embed, guild, member)
-        await inter.edit_original_response(embed=embed, view=MemberPortalMainView())
+        try:
+            guild, member = await self._begin(inter)
+            if guild and member and inter.message:
+                await asyncio.to_thread(_mark_portal_sent, guild.id, member.id, inter.message.id)
+            await inter.edit_original_response(embed=await asyncio.to_thread(_main_menu_embed, guild, member), view=MemberPortalMainView())
+        except Exception as error:
+            await self._show_error(inter, "Gildenzentrale", error)
 
 
 class AbsenceCalendarView(PortalSafeView):
