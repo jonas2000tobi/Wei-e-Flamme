@@ -70,15 +70,17 @@ _PORTAL_ACTION_TIMEOUT_SECONDS = 12.0
 _PORTAL_LOCK_NOTICE_SECONDS = 1.0
 _PORTAL_ERROR_DEDUP: dict[str, dict[str, Any]] = {}
 _PORTAL_MODAL_CUSTOM_IDS = {
+    # Buttons/Selects that must answer with send_modal(). They may never be
+    # auto-deferred by the watchdog before the modal is opened.
     "portal_personal_absence",
     "admin_event_image_select",
     "admin_attendance_add_player",
     "portal_admin_event_create",
     "portal_admin_event_alliance",
-    "portal_admin_loot_junk",
-    "portal_support_contact",
+    "portal_admin_loot_junk_drop",
+    "portal_support_leader",
     "portal_profile_edit",
-    "help_contact_leader",
+    "help_leader_contact",
     "portal_admin_broadcast",
 }
 
@@ -202,17 +204,29 @@ async def _portal_log_event(
 
 
 async def _portal_watchdog(inter: discord.Interaction, component_id: str) -> None:
+    """Acknowledge slow component interactions without detaching the menu.
+
+    For a button/select interaction, ``thinking=True`` creates a new deferred
+    message response. Later calls to ``edit_original_response`` then edit that
+    placeholder instead of the Gildenzentrale message. That was the systemic
+    reason why users clicked a menu entry and apparently nothing happened.
+
+    A normal component defer (thinking=False) keeps the triggering message as
+    the original response, so the subsequent safe edit updates the actual
+    Gildenzentrale in place.
+    """
     if component_id in _PORTAL_MODAL_CUSTOM_IDS:
         return
-    await asyncio.sleep(2.0)
+    await asyncio.sleep(1.5)
     if not inter.response.is_done():
-        await _portal_defer(inter, thinking=True)
-    await asyncio.sleep(6.0)
+        # For component interactions this is DEFERRED_MESSAGE_UPDATE.
+        await _portal_defer(inter, thinking=False)
+    await asyncio.sleep(6.5)
     await _portal_log_event(
         inter,
         event_type="slow",
         duration=8.0,
-        detail="Interaktion laeuft nach 8 Sekunden noch immer. Moegliche langsame Discord-, Postgres- oder Volume-Abfrage.",
+        detail="Interaktion läuft nach 8 Sekunden noch immer. Mögliche langsame Discord-, Postgres- oder Volume-Abfrage.",
         notify_user=False,
     )
 
@@ -340,6 +354,9 @@ EMOJI_HELP = "<:hilfe:1516470888818802900>"
 EMOJI_MEMBER = "<:member:1516474249492168734>"
 
 _PORTAL_SERVER_EMOJIS: dict[str, discord.Emoji] = {}
+_PORTAL_EMOJI_CACHE_GUILD_ID = 0
+_PORTAL_EMOJI_CACHE_SIGNATURE: tuple[tuple[int, str, bool], ...] = ()
+_PORTAL_EMOJI_CACHE_LOCK = threading.RLock()
 
 
 def _normalise_emoji_name(value: object) -> str:
@@ -390,42 +407,75 @@ def _portal_emoji_text(key: str, env_name: str = "") -> str:
     return _PORTAL_EMOJI_FALLBACKS.get(key, "•")
 
 
-def _refresh_portal_emojis(guild: Optional[discord.Guild]) -> None:
-    """Server-Emojis anhand ihrer Namen übernehmen und globale Texte aktualisieren."""
+def _refresh_portal_emojis(
+    guild: Optional[discord.Guild],
+    *,
+    force: bool = False,
+) -> bool:
+    """Server-Emojis einmal pro unverändertem Guild-Emoji-Stand laden.
+
+    Der alte Code hat bei jedem einzelnen Portal-Update sämtliche Server-Emojis
+    erneut aufgebaut und geloggt. Bei einem Startreset oder Massenversand lief
+    das Dutzende Male hintereinander und blockierte unnötig den Event-Loop.
+    """
     if guild is None:
-        return
+        return False
 
-    _PORTAL_SERVER_EMOJIS.clear()
-    for emoji in list(getattr(guild, "emojis", []) or []):
-        name = str(getattr(emoji, "name", "") or "").strip().lower()
-        if name:
-            _PORTAL_SERVER_EMOJIS[name] = emoji
+    signature = tuple(
+        sorted(
+            (
+                int(getattr(emoji, "id", 0) or 0),
+                str(getattr(emoji, "name", "") or "").strip().lower(),
+                bool(getattr(emoji, "animated", False)),
+            )
+            for emoji in list(getattr(guild, "emojis", []) or [])
+            if str(getattr(emoji, "name", "") or "").strip()
+        )
+    )
 
-    global EMOJI_TANK, EMOJI_HEAL, EMOJI_DPS, EMOJI_BANK, EMOJI_MAYBE, EMOJI_NO
-    global EMOJI_EBOLUS, EMOJI_PERSONAL, EMOJI_LOOT, EMOJI_GUILD, EMOJI_CONTACT
-    global EMOJI_ADMIN, EMOJI_TIME, EMOJI_VOTED, EMOJI_TARGET, EMOJI_ABSENCE
-    global EMOJI_CALENDAR, EMOJI_BACK, EMOJI_HELP, EMOJI_MEMBER
+    global _PORTAL_EMOJI_CACHE_GUILD_ID, _PORTAL_EMOJI_CACHE_SIGNATURE
+    with _PORTAL_EMOJI_CACHE_LOCK:
+        if (
+            not force
+            and _PORTAL_EMOJI_CACHE_GUILD_ID == int(guild.id)
+            and _PORTAL_EMOJI_CACHE_SIGNATURE == signature
+        ):
+            return False
 
-    EMOJI_TANK = _portal_emoji_text("tank", "PORTAL_EMOJI_TANK")
-    EMOJI_HEAL = _portal_emoji_text("heal", "PORTAL_EMOJI_HEAL")
-    EMOJI_DPS = _portal_emoji_text("dps", "PORTAL_EMOJI_DPS")
-    EMOJI_BANK = _portal_emoji_text("reserve", "PORTAL_EMOJI_RESERVE")
-    EMOJI_MAYBE = _portal_emoji_text("maybe", "PORTAL_EMOJI_MAYBE")
-    EMOJI_NO = _portal_emoji_text("no", "PORTAL_EMOJI_NO")
-    EMOJI_EBOLUS = _portal_emoji_text("home", "PORTAL_EMOJI_HOME")
-    EMOJI_PERSONAL = _portal_emoji_text("personal", "PORTAL_EMOJI_PERSONAL")
-    EMOJI_LOOT = _portal_emoji_text("loot", "PORTAL_EMOJI_LOOT")
-    EMOJI_GUILD = _portal_emoji_text("guild", "PORTAL_EMOJI_GUILD")
-    EMOJI_CONTACT = _portal_emoji_text("contact", "PORTAL_EMOJI_CONTACT")
-    EMOJI_ADMIN = _portal_emoji_text("admin", "PORTAL_EMOJI_ADMIN")
-    EMOJI_TIME = _portal_emoji_text("time", "PORTAL_EMOJI_TIME")
-    EMOJI_VOTED = _portal_emoji_text("voted", "PORTAL_EMOJI_VOTED")
-    EMOJI_TARGET = _portal_emoji_text("target", "PORTAL_EMOJI_TARGET")
-    EMOJI_ABSENCE = _portal_emoji_text("absence", "PORTAL_EMOJI_ABSENCE")
-    EMOJI_CALENDAR = _portal_emoji_text("calendar", "PORTAL_EMOJI_CALENDAR")
-    EMOJI_BACK = _portal_emoji_text("back", "PORTAL_EMOJI_BACK")
-    EMOJI_HELP = _portal_emoji_text("help", "PORTAL_EMOJI_HELP")
-    EMOJI_MEMBER = _portal_emoji_text("member", "PORTAL_EMOJI_MEMBER")
+        _PORTAL_SERVER_EMOJIS.clear()
+        for emoji in list(getattr(guild, "emojis", []) or []):
+            name = str(getattr(emoji, "name", "") or "").strip().lower()
+            if name:
+                _PORTAL_SERVER_EMOJIS[name] = emoji
+
+        global EMOJI_TANK, EMOJI_HEAL, EMOJI_DPS, EMOJI_BANK, EMOJI_MAYBE, EMOJI_NO
+        global EMOJI_EBOLUS, EMOJI_PERSONAL, EMOJI_LOOT, EMOJI_GUILD, EMOJI_CONTACT
+        global EMOJI_ADMIN, EMOJI_TIME, EMOJI_VOTED, EMOJI_TARGET, EMOJI_ABSENCE
+        global EMOJI_CALENDAR, EMOJI_BACK, EMOJI_HELP, EMOJI_MEMBER
+
+        EMOJI_TANK = _portal_emoji_text("tank", "PORTAL_EMOJI_TANK")
+        EMOJI_HEAL = _portal_emoji_text("heal", "PORTAL_EMOJI_HEAL")
+        EMOJI_DPS = _portal_emoji_text("dps", "PORTAL_EMOJI_DPS")
+        EMOJI_BANK = _portal_emoji_text("reserve", "PORTAL_EMOJI_RESERVE")
+        EMOJI_MAYBE = _portal_emoji_text("maybe", "PORTAL_EMOJI_MAYBE")
+        EMOJI_NO = _portal_emoji_text("no", "PORTAL_EMOJI_NO")
+        EMOJI_EBOLUS = _portal_emoji_text("home", "PORTAL_EMOJI_HOME")
+        EMOJI_PERSONAL = _portal_emoji_text("personal", "PORTAL_EMOJI_PERSONAL")
+        EMOJI_LOOT = _portal_emoji_text("loot", "PORTAL_EMOJI_LOOT")
+        EMOJI_GUILD = _portal_emoji_text("guild", "PORTAL_EMOJI_GUILD")
+        EMOJI_CONTACT = _portal_emoji_text("contact", "PORTAL_EMOJI_CONTACT")
+        EMOJI_ADMIN = _portal_emoji_text("admin", "PORTAL_EMOJI_ADMIN")
+        EMOJI_TIME = _portal_emoji_text("time", "PORTAL_EMOJI_TIME")
+        EMOJI_VOTED = _portal_emoji_text("voted", "PORTAL_EMOJI_VOTED")
+        EMOJI_TARGET = _portal_emoji_text("target", "PORTAL_EMOJI_TARGET")
+        EMOJI_ABSENCE = _portal_emoji_text("absence", "PORTAL_EMOJI_ABSENCE")
+        EMOJI_CALENDAR = _portal_emoji_text("calendar", "PORTAL_EMOJI_CALENDAR")
+        EMOJI_BACK = _portal_emoji_text("back", "PORTAL_EMOJI_BACK")
+        EMOJI_HELP = _portal_emoji_text("help", "PORTAL_EMOJI_HELP")
+        EMOJI_MEMBER = _portal_emoji_text("member", "PORTAL_EMOJI_MEMBER")
+
+        _PORTAL_EMOJI_CACHE_GUILD_ID = int(guild.id)
+        _PORTAL_EMOJI_CACHE_SIGNATURE = signature
 
     resolved = sorted(_PORTAL_SERVER_EMOJIS)
     print(
@@ -433,6 +483,7 @@ def _refresh_portal_emojis(guild: Optional[discord.Guild]) -> None:
         f"{', '.join(resolved) if resolved else 'keine'}",
         flush=True,
     )
+    return True
 
 
 def _menu_emoji(value: str):
@@ -507,7 +558,7 @@ sent_state: dict = _load_json(SENT_FILE, {})
 PORTAL_REPAIR_INTERVAL_SECONDS = max(900, int(os.getenv("PORTAL_REPAIR_INTERVAL_SECONDS", "3600") or "3600"))
 PORTAL_REPAIR_START_DELAY_SECONDS = max(1.0, float(os.getenv("PORTAL_REPAIR_START_DELAY_SECONDS", "5") or "5"))
 PORTAL_REPAIR_MEMBER_DELAY_SECONDS = max(0.05, float(os.getenv("PORTAL_REPAIR_MEMBER_DELAY_SECONDS", "0.25") or "0.25"))
-PORTAL_RESET_ON_START = str(os.getenv("PORTAL_RESET_ON_START", "true") or "true").strip().lower() not in {"0", "false", "no", "off"}
+PORTAL_RESET_ON_START = str(os.getenv("PORTAL_RESET_ON_START", "false") or "false").strip().lower() not in {"0", "false", "no", "off"}
 NEW_MEMBER_LOOT_LOCK_DAYS = 7
 _portal_repair_task: Optional[asyncio.Task] = None
 
@@ -1936,6 +1987,15 @@ async def ensure_portal_exists_for_user(
     return False, "dm_failed"
 
 
+def _portal_member_interaction_busy(guild_id: int, user_id: int) -> bool:
+    """Do not let background repair overwrite a menu a member is using."""
+    for key in ((0, int(user_id)), (int(guild_id), int(user_id))):
+        lock = _PORTAL_INTERACTION_LOCKS.get(key)
+        if lock is not None and lock.locked():
+            return True
+    return False
+
+
 async def repair_portals_for_guild(
     client: discord.Client,
     guild_id: int,
@@ -1957,6 +2017,9 @@ async def repair_portals_for_guild(
 
     for member in list(role.members):
         if member.bot:
+            continue
+        if _portal_member_interaction_busy(guild.id, member.id):
+            summary["skipped"] += 1
             continue
 
         summary["checked"] += 1
@@ -2027,6 +2090,9 @@ async def reset_portals_to_main_for_guild(
     for member in list(role.members):
         if member.bot:
             continue
+        if _portal_member_interaction_busy(guild.id, member.id):
+            summary["skipped"] += 1
+            continue
 
         summary["checked"] += 1
 
@@ -2067,6 +2133,13 @@ async def reset_all_portals_to_main_once(client: discord.Client) -> dict[str, in
 async def _portal_repair_loop(client: discord.Client) -> None:
     await client.wait_until_ready()
     await asyncio.sleep(PORTAL_REPAIR_START_DELAY_SECONDS)
+
+    if not PORTAL_RESET_ON_START:
+        print(
+            "[member_portal] Automatischer Startreset deaktiviert; "
+            "bestehende Portale werden beim Deployment nicht überschrieben.",
+            flush=True,
+        )
 
     if PORTAL_RESET_ON_START:
         try:
@@ -2639,83 +2712,103 @@ class PortalSafeView(View):
         _rebind_portal_view_emojis(self)
         self._wrap_all_callbacks()
 
-    def _wrap_all_callbacks(self) -> None:
-        for child in self.children:
-            original = getattr(child, "callback", None)
-            if original is None or getattr(original, "__portal_wrapped__", False):
-                continue
+    def add_item(self, item):
+        """Also secure components that are added after ``super().__init__``.
 
-            async def wrapped(inter: discord.Interaction, _original=original):
-                component_id = _portal_component_id(inter)
-                start_time = time.monotonic()
-                key = (int(getattr(inter.guild, "id", 0) or 0), int(inter.user.id))
-                lock = _PORTAL_INTERACTION_LOCKS.setdefault(key, asyncio.Lock())
-                if lock.locked():
-                    await _portal_send(inter, "⏳ Deine vorherige Menueaktion wird noch verarbeitet.", ephemeral=True)
-                    return
-                watchdog = asyncio.create_task(_portal_watchdog(inter, component_id))
+        The main menu select and most wizard selects are attached manually in
+        the subclass constructor. Previously they bypassed the safety layer
+        completely, which meant no immediate acknowledgement, no timeout and no
+        error logging for exactly those controls.
+        """
+        result = super().add_item(item)
+        self._wrap_child_callback(item)
+        return result
+
+    def _wrap_child_callback(self, child) -> None:
+        original = getattr(child, "callback", None)
+        if original is None or getattr(original, "__portal_wrapped__", False):
+            return
+
+        async def wrapped(inter: discord.Interaction, _original=original):
+            component_id = _portal_component_id(inter)
+            start_time = time.monotonic()
+            key = (int(getattr(inter.guild, "id", 0) or 0), int(inter.user.id))
+            lock = _PORTAL_INTERACTION_LOCKS.setdefault(key, asyncio.Lock())
+            if lock.locked():
+                await _portal_send(
+                    inter,
+                    "⏳ Deine vorherige Menüaktion wird noch verarbeitet. Bitte kurz warten.",
+                    ephemeral=True,
+                )
+                return
+
+            watchdog = asyncio.create_task(_portal_watchdog(inter, component_id))
+            try:
+                async with lock:
+                    await asyncio.wait_for(_original(inter), timeout=_PORTAL_ACTION_TIMEOUT_SECONDS)
+            except asyncio.TimeoutError as error:
+                duration = time.monotonic() - start_time
+                print(
+                    f"[member_portal] callback_timeout component={component_id} "
+                    f"user={inter.user.id} duration={duration:.3f}s",
+                    flush=True,
+                )
+                await _portal_log_event(
+                    inter,
+                    event_type="Timeout",
+                    error=error,
+                    duration=duration,
+                    detail=(
+                        f"Die Menüaktion wurde nach {_PORTAL_ACTION_TIMEOUT_SECONDS:.0f} Sekunden "
+                        "abgebrochen, damit die Gildenzentrale nicht dauerhaft gesperrt bleibt."
+                    ),
+                    notify_user=True,
+                )
                 try:
-                    async with lock:
-                        await asyncio.wait_for(_original(inter), timeout=_PORTAL_ACTION_TIMEOUT_SECONDS)
-                except asyncio.TimeoutError as error:
-                    duration = time.monotonic() - start_time
-                    print(
-                        f"[member_portal] callback_timeout component={component_id} "
-                        f"user={inter.user.id} duration={duration:.3f}s",
-                        flush=True,
-                    )
+                    guild, member = await _resolve_guild_member_from_inter(inter)
+                    if guild and member:
+                        await ensure_portal_menu_for_user(
+                            inter.client, guild.id, member.id, force_view="main"
+                        )
+                except Exception as reset_error:
+                    print(f"[member_portal] Timeout-Reset fehlgeschlagen: {reset_error!r}", flush=True)
+            except Exception as error:
+                duration = time.monotonic() - start_time
+                print(
+                    f"[member_portal] callback_error component={component_id} "
+                    f"user={inter.user.id} duration={duration:.3f}s error={error!r}",
+                    flush=True,
+                )
+                await _portal_log_event(
+                    inter, event_type="Fehler", error=error, duration=duration, notify_user=True
+                )
+            finally:
+                watchdog.cancel()
+                try:
+                    await watchdog
+                except BaseException:
+                    pass
+                duration = time.monotonic() - start_time
+                print(
+                    f"[member_portal] component={component_id} user={inter.user.id} "
+                    f"duration={duration:.3f}s responded={inter.response.is_done()}",
+                    flush=True,
+                )
+                if duration >= 3.0:
                     await _portal_log_event(
                         inter,
-                        event_type="Timeout",
-                        error=error,
+                        event_type="slow",
                         duration=duration,
-                        detail=(
-                            f"Die Menueaktion wurde nach {_PORTAL_ACTION_TIMEOUT_SECONDS:.0f} Sekunden "
-                            "abgebrochen, damit das Gildenmenue nicht dauerhaft gesperrt bleibt."
-                        ),
-                        notify_user=True,
+                        detail="Buttonaktion war langsamer als 3 Sekunden.",
+                        notify_user=False,
                     )
-                    try:
-                        guild, member = await _resolve_guild_member_from_inter(inter)
-                        if guild and member:
-                            await ensure_portal_menu_for_user(
-                                inter.client, guild.id, member.id, force_view="main"
-                            )
-                    except Exception as reset_error:
-                        print(f"[member_portal] Timeout-Reset fehlgeschlagen: {reset_error!r}", flush=True)
-                except Exception as error:
-                    duration = time.monotonic() - start_time
-                    print(
-                        f"[member_portal] callback_error component={component_id} "
-                        f"user={inter.user.id} duration={duration:.3f}s error={error!r}",
-                        flush=True,
-                    )
-                    await _portal_log_event(
-                        inter, event_type="Fehler", error=error, duration=duration, notify_user=True
-                    )
-                finally:
-                    watchdog.cancel()
-                    try:
-                        await watchdog
-                    except BaseException:
-                        pass
-                    duration = time.monotonic() - start_time
-                    print(
-                        f"[member_portal] component={component_id} user={inter.user.id} "
-                        f"duration={duration:.3f}s responded={inter.response.is_done()}",
-                        flush=True,
-                    )
-                    if duration >= 3.0:
-                        await _portal_log_event(
-                            inter,
-                            event_type="slow",
-                            duration=duration,
-                            detail="Buttonaktion war langsamer als 3 Sekunden.",
-                            notify_user=False,
-                        )
 
-            setattr(wrapped, "__portal_wrapped__", True)
-            child.callback = wrapped
+        setattr(wrapped, "__portal_wrapped__", True)
+        child.callback = wrapped
+
+    def _wrap_all_callbacks(self) -> None:
+        for child in self.children:
+            self._wrap_child_callback(child)
 
     async def on_error(self, inter: discord.Interaction, error: Exception, item) -> None:
         await _portal_log_event(inter, event_type="Fehler", error=error, notify_user=True)
