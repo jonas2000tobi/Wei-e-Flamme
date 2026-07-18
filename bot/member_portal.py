@@ -6217,6 +6217,151 @@ class GuildBroadcastModal(discord.ui.Modal, title="📨 Private Rundnachricht"):
         await _portal_send(inter, embed=preview, view=view, ephemeral=True)
 
 
+def portal_member_role_ids(guild_id: int) -> set[int]:
+    """Return every configured role that makes a user a guild member.
+
+    The central guild configuration is authoritative. The old member_role_id is
+    retained as a compatibility fallback so existing installations do not lose
+    recipients during migration.
+    """
+    guild_id = int(guild_id)
+    result: set[int] = set()
+    try:
+        if central_guild_config is not None:
+            for kind in ("member", "leader", "advisor", "guardian"):
+                for role_id in central_guild_config.role_ids(guild_id, kind):
+                    clean = int(role_id or 0)
+                    if clean:
+                        result.add(clean)
+    except Exception as exc:
+        print(f"[member_portal] Zentrale Portalrollen konnten nicht gelesen werden: {exc!r}", flush=True)
+
+    try:
+        legacy_member_role_id = int(_gcfg(guild_id).get("member_role_id", 0) or 0)
+        if legacy_member_role_id:
+            result.add(legacy_member_role_id)
+    except Exception:
+        pass
+    return result
+
+
+def portal_target_members(guild: discord.Guild) -> list[discord.Member]:
+    """Build the de-duplicated portal recipient list from all guild roles."""
+    configured_role_ids = portal_member_role_ids(guild.id)
+    if not configured_role_ids:
+        return []
+
+    members: dict[int, discord.Member] = {}
+    for member in list(getattr(guild, "members", []) or []):
+        if bool(getattr(member, "bot", False)):
+            continue
+        member_role_ids = {
+            int(role.id)
+            for role in list(getattr(member, "roles", []) or [])
+            if getattr(role, "id", None)
+        }
+        if configured_role_ids.intersection(member_role_ids):
+            members[int(member.id)] = member
+    return sorted(members.values(), key=lambda item: str(item.display_name).casefold())
+
+
+async def refresh_portal_for_member(
+    client: discord.Client,
+    guild: discord.Guild,
+    member: discord.Member,
+    *,
+    force_new: bool = False,
+    timeout_seconds: float = 15.0,
+) -> tuple[bool, str]:
+    """Refresh one portal with a hard timeout and a useful result reason."""
+    if member.bot:
+        return False, "bot"
+    if member.guild.id != guild.id:
+        return False, "wrong_guild"
+
+    async def _run() -> tuple[bool, str]:
+        if force_new:
+            _clear_portal_sent(guild.id, member.id)
+            message = await _send_new_portal_menu(member, guild)
+            if message is not None:
+                return True, "created"
+            return False, _portal_dm_error_message(guild.id, member.id)
+
+        ok = await ensure_portal_menu_for_user(client, guild.id, member.id, force_view="main")
+        if ok:
+            return True, "updated"
+        return False, _portal_dm_error_message(guild.id, member.id)
+
+    try:
+        return await asyncio.wait_for(_run(), timeout=max(5.0, float(timeout_seconds)))
+    except asyncio.TimeoutError:
+        return False, "Zeitüberschreitung beim Öffnen oder Bearbeiten der DM"
+    except Exception as exc:
+        print(
+            f"[member_portal] Portal-Aktualisierung fehlgeschlagen "
+            f"guild={guild.id} user={member.id}: {exc!r}",
+            flush=True,
+        )
+        return False, f"{type(exc).__name__}: {exc}"
+
+
+async def refresh_portals_for_guild(
+    client: discord.Client,
+    guild: discord.Guild,
+    *,
+    force_new: bool = False,
+    concurrency: int = 3,
+    timeout_seconds: float = 15.0,
+) -> dict[str, Any]:
+    """Refresh every configured guild member portal without duplicate DMs.
+
+    A small concurrency limit makes the bulk operation much faster while still
+    leaving Discord's rate-limit handling in control.
+    """
+    members = portal_target_members(guild)
+    result: dict[str, Any] = {
+        "configured_role_ids": sorted(portal_member_role_ids(guild.id)),
+        "checked": len(members),
+        "updated": 0,
+        "created": 0,
+        "failed": 0,
+        "failures": [],
+    }
+    if not members:
+        return result
+
+    semaphore = asyncio.Semaphore(max(1, min(int(concurrency), 5)))
+
+    async def _one(member: discord.Member) -> tuple[discord.Member, bool, str]:
+        async with semaphore:
+            ok, reason = await refresh_portal_for_member(
+                client,
+                guild,
+                member,
+                force_new=force_new,
+                timeout_seconds=timeout_seconds,
+            )
+            return member, ok, reason
+
+    rows = await asyncio.gather(*(_one(member) for member in members))
+    for member, ok, reason in rows:
+        if ok:
+            if reason == "created":
+                result["created"] += 1
+            else:
+                result["updated"] += 1
+            continue
+        result["failed"] += 1
+        result["failures"].append(
+            {
+                "user_id": int(member.id),
+                "display_name": str(member.display_name),
+                "reason": str(reason or "unbekannter Fehler")[:300],
+            }
+        )
+    return result
+
+
 async def setup_member_portal(client: discord.Client, tree: app_commands.CommandTree):
     # Beim Serverwechsel haben Custom-Emojis neue IDs. Der Bot übernimmt sie
     # automatisch anhand der Emoji-Namen, bevor persistente Views registriert werden.
@@ -6366,53 +6511,9 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
         save_cfg()
 
         if cleaned:
-            await _portal_send(inter, "✅ Gildeninfo für die Gildenzentrale gesetzt. Nutze `/portal_send_all force:false`, um bestehende Menüs zu aktualisieren.", ephemeral=True)
+            await _portal_send(inter, "✅ Gildeninfo für die Gildenzentrale gesetzt. Nutze `/guild portal_refresh_all neu_erstellen:false`, um bestehende Menüs zu aktualisieren.", ephemeral=True)
         else:
-            await _portal_send(inter, "✅ Gildeninfo geleert. Nutze `/portal_send_all force:false`, um bestehende Menüs zu aktualisieren.", ephemeral=True)
-
-    @tree.command(name="portal_send_all", description="(Admin) Öffnet/aktualisiert die Gildenzentrale per DM bei allen mit Gildenmitglied-Rolle")
-    async def portal_send_all(inter: discord.Interaction, force: bool = False):
-        await _portal_defer(inter, ephemeral=True, thinking=True)
-
-        if not _is_admin(inter):
-            await inter.followup.send("❌ Nur Admin/Manage Server.", ephemeral=True)
-            return
-
-        c = _gcfg(inter.guild_id)
-        member_role_id = int(c.get("member_role_id", 0) or 0)
-
-        if not member_role_id:
-            await inter.followup.send("❌ Keine Gildenmitglied-Rolle gesetzt. Nutze zuerst `/portal_set_member_role`.", ephemeral=True)
-            return
-
-        role = inter.guild.get_role(member_role_id)
-
-        if not role:
-            await inter.followup.send("❌ Gildenmitglied-Rolle nicht gefunden.", ephemeral=True)
-            return
-
-        sent_or_updated = 0
-        failed = 0
-
-        for member in role.members:
-            if member.bot:
-                continue
-
-            ok = await ensure_portal_menu_for_user(client, inter.guild_id, member.id)
-
-            if ok:
-                sent_or_updated += 1
-            else:
-                failed += 1
-
-            await asyncio.sleep(0.15)
-
-        await inter.followup.send(
-            f"✅ Portal-DM abgeschlossen.\n"
-            f"✉️ Geöffnet/aktualisiert: **{sent_or_updated}**\n"
-            f"❌ Fehlgeschlagen/DMs zu: **{failed}**",
-            ephemeral=True
-        )
+            await _portal_send(inter, "✅ Gildeninfo geleert. Nutze `/guild portal_refresh_all neu_erstellen:false`, um bestehende Menüs zu aktualisieren.", ephemeral=True)
 
     @tree.command(
         name="portal_rundnachricht",
@@ -6457,27 +6558,6 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
                 role_id=role.id,
             )
         )
-
-    @tree.command(name="portal_resend_user", description="(Admin) Öffnet/aktualisiert bei einem Spieler die Gildenzentrale")
-    async def portal_resend_user(inter: discord.Interaction, member: discord.Member):
-        await _portal_defer(inter, ephemeral=True, thinking=True)
-
-        if not _is_admin(inter):
-            await inter.followup.send("❌ Nur Admin/Manage Server.", ephemeral=True)
-            return
-
-        ok = await ensure_portal_menu_for_user(client, inter.guild_id, member.id)
-
-        if ok:
-            await inter.followup.send(f"✅ Gildenzentrale bei **{member.display_name}** geöffnet/aktualisiert.", ephemeral=True)
-        else:
-            reason = _portal_dm_error_message(inter.guild_id, member.id)
-            await inter.followup.send(
-                f"❌ Konnte **{member.display_name}** keine Gildenzentrale senden.\n"
-                f"**Grund:** {reason}\n"
-                f"Die Portal-Emojis werden automatisch anhand ihrer Servernamen geladen.",
-                ephemeral=True,
-            )
 
     @tree.command(name="portal_force_new_user", description="(Admin) Erzwingt eine komplett neue Gildenzentrale per DM")
     async def portal_force_new_user(inter: discord.Interaction, member: discord.Member):

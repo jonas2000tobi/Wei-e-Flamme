@@ -745,6 +745,138 @@ async def setup_guild_config(bot: commands.Bot, tree: app_commands.CommandTree) 
         emb.add_field(name="Regeln", value="\n".join(rule_lines)[:1024] or "—", inline=False)
         await inter.followup.send(embed=emb, ephemeral=True)
 
+    @guild_group.command(
+        name="portal_refresh_all",
+        description="Aktualisiert die Gildenzentrale bei allen Gildenmitgliedern.",
+    )
+    @app_commands.describe(
+        neu_erstellen="Nein: vorhandenes Portal aktualisieren. Ja: zusätzliche komplett neue Portal-DM senden.",
+    )
+    async def guild_portal_refresh_all(
+        inter: discord.Interaction,
+        neu_erstellen: bool = False,
+    ):
+        if inter.guild is None:
+            await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
+            return
+        await inter.response.defer(ephemeral=True, thinking=True)
+        if not await asyncio.to_thread(_is_admin, inter):
+            await inter.followup.send("❌ Nur für Server-Admins/Leitung.", ephemeral=True)
+            return
+
+        try:
+            from bot import member_portal as portal_mod  # type: ignore
+        except Exception:
+            import member_portal as portal_mod  # type: ignore
+
+        try:
+            result = await portal_mod.refresh_portals_for_guild(
+                bot,
+                inter.guild,
+                force_new=bool(neu_erstellen),
+            )
+        except Exception as exc:
+            await inter.followup.send(
+                f"❌ Portal-Aktualisierung fehlgeschlagen: `{type(exc).__name__}: {str(exc)[:500]}`",
+                ephemeral=True,
+            )
+            return
+
+        configured_roles = list(result.get("configured_role_ids") or [])
+        if not configured_roles:
+            await inter.followup.send(
+                "❌ Keine Portalrollen konfiguriert. Setze mindestens **member** über `/guild set_role`.",
+                ephemeral=True,
+            )
+            return
+
+        failures = list(result.get("failures") or [])
+        failure_lines = [
+            f"• {row.get('display_name', 'Unbekannt')}: {row.get('reason', 'Fehler')}"
+            for row in failures[:10]
+        ]
+        more_failures = max(0, len(failures) - len(failure_lines))
+        details = ""
+        if failure_lines:
+            details = "\n\n**Fehlgeschlagen:**\n" + "\n".join(failure_lines)
+            if more_failures:
+                details += f"\n• … und {more_failures} weitere"
+
+        await asyncio.to_thread(
+            runtime_db.write_audit_log,
+            guild_id=inter.guild.id,
+            actor_id=inter.user.id,
+            action="portal_refresh_all",
+            target_type="guild_portal",
+            target_id=str(inter.guild.id),
+            summary="Gildenzentralen vollständig neu gesendet" if neu_erstellen else "Gildenzentralen aktualisiert",
+            new_value={
+                "force_new": bool(neu_erstellen),
+                "checked": int(result.get("checked", 0) or 0),
+                "updated": int(result.get("updated", 0) or 0),
+                "created": int(result.get("created", 0) or 0),
+                "failed": int(result.get("failed", 0) or 0),
+            },
+        )
+
+        await inter.followup.send(
+            "✅ **Gildenzentralen bearbeitet.**\n"
+            f"👥 Mitglieder geprüft: **{int(result.get('checked', 0) or 0)}**\n"
+            f"🔄 Vorhandene Portale aktualisiert: **{int(result.get('updated', 0) or 0)}**\n"
+            f"✉️ Neue Portale gesendet: **{int(result.get('created', 0) or 0)}**\n"
+            f"❌ Fehlgeschlagen/DMs geschlossen: **{int(result.get('failed', 0) or 0)}**"
+            + details,
+            ephemeral=True,
+        )
+
+    @guild_group.command(
+        name="portal_refresh_user",
+        description="Aktualisiert die Gildenzentrale bei einem einzelnen Spieler.",
+    )
+    @app_commands.describe(
+        member="Spieler, dessen Gildenzentrale aktualisiert werden soll.",
+        neu_erstellen="Nein: vorhandenes Portal aktualisieren. Ja: komplett neue Portal-DM senden.",
+    )
+    async def guild_portal_refresh_user(
+        inter: discord.Interaction,
+        member: discord.Member,
+        neu_erstellen: bool = False,
+    ):
+        if inter.guild is None:
+            await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
+            return
+        await inter.response.defer(ephemeral=True, thinking=True)
+        if not await asyncio.to_thread(_is_admin, inter):
+            await inter.followup.send("❌ Nur für Server-Admins/Leitung.", ephemeral=True)
+            return
+        if member.bot:
+            await inter.followup.send("❌ Bots bekommen keine Gildenzentrale.", ephemeral=True)
+            return
+
+        try:
+            from bot import member_portal as portal_mod  # type: ignore
+        except Exception:
+            import member_portal as portal_mod  # type: ignore
+
+        ok, reason = await portal_mod.refresh_portal_for_member(
+            bot,
+            inter.guild,
+            member,
+            force_new=bool(neu_erstellen),
+        )
+        if ok:
+            await inter.followup.send(
+                f"✅ Gildenzentrale bei **{member.display_name}** "
+                + ("komplett neu gesendet." if neu_erstellen else "aktualisiert."),
+                ephemeral=True,
+            )
+            return
+        await inter.followup.send(
+            f"❌ Gildenzentrale bei **{member.display_name}** konnte nicht aktualisiert werden.\n"
+            f"Grund: {str(reason or 'unbekannt')[:700]}",
+            ephemeral=True,
+        )
+
     @guild_group.command(name="cleanup_dms", description="Löscht alle Bot-DMs inkl. alter Gildenmenüs bei aktuellen Servermitgliedern.")
     @app_commands.describe(
         bestaetigen="Muss auf Ja stehen, weil die Löschung nicht rückgängig gemacht werden kann.",

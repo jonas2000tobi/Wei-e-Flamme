@@ -362,9 +362,115 @@ async def on_ready():
         print("🧹 Cleanup-Task gestartet.")
 
 
+def _interaction_option_value(data: dict, option_name: str):
+    """Find an option value in Discord's nested application-command payload."""
+    for option in list((data or {}).get("options") or []):
+        if str(option.get("name") or "") == option_name:
+            return option.get("value")
+        nested = _interaction_option_value(option, option_name)
+        if nested is not None:
+            return nested
+    return None
+
+
+async def _handle_stale_portal_command(inter: discord.Interaction, command_name: str) -> bool:
+    """Keep old cached Discord command IDs functional during command migration."""
+    if command_name not in {"portal_send_all", "portal_resend_user"}:
+        return False
+    if inter.guild is None:
+        if not inter.response.is_done():
+            await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
+        return True
+
+    try:
+        try:
+            from bot import member_portal as portal_mod  # type: ignore
+        except Exception:
+            import member_portal as portal_mod  # type: ignore
+        if not portal_mod._is_admin(inter):
+            if not inter.response.is_done():
+                await inter.response.send_message("❌ Nur für Server-Admins/Leitung.", ephemeral=True)
+            return True
+
+        if not inter.response.is_done():
+            await inter.response.defer(ephemeral=True, thinking=True)
+
+        if command_name == "portal_send_all":
+            force_new = bool(_interaction_option_value(dict(inter.data or {}), "force") or False)
+            result = await portal_mod.refresh_portals_for_guild(
+                bot,
+                inter.guild,
+                force_new=force_new,
+            )
+            if not result.get("configured_role_ids"):
+                await inter.followup.send(
+                    "❌ Keine Portalrollen konfiguriert. Nutze `/guild set_role`.",
+                    ephemeral=True,
+                )
+                return True
+            await inter.followup.send(
+                "✅ Der alte Befehl wurde automatisch auf `/guild portal_refresh_all` umgeleitet.\n"
+                f"👥 Geprüft: **{int(result.get('checked', 0) or 0)}**\n"
+                f"🔄 Aktualisiert: **{int(result.get('updated', 0) or 0)}**\n"
+                f"✉️ Neu gesendet: **{int(result.get('created', 0) or 0)}**\n"
+                f"❌ Fehlgeschlagen: **{int(result.get('failed', 0) or 0)}**",
+                ephemeral=True,
+            )
+            return True
+
+        member_id = _interaction_option_value(dict(inter.data or {}), "member")
+        member = inter.guild.get_member(int(member_id or 0)) if member_id else None
+        if member is None and member_id:
+            try:
+                member = await inter.guild.fetch_member(int(member_id))
+            except Exception:
+                member = None
+        if member is None:
+            await inter.followup.send(
+                "❌ Spieler konnte nicht aufgelöst werden. Nutze `/guild portal_refresh_user`.",
+                ephemeral=True,
+            )
+            return True
+        ok, reason = await portal_mod.refresh_portal_for_member(bot, inter.guild, member)
+        if ok:
+            await inter.followup.send(
+                f"✅ Der alte Befehl wurde automatisch umgeleitet. "
+                f"Gildenzentrale bei **{member.display_name}** aktualisiert.\n"
+                "Künftig: `/guild portal_refresh_user`",
+                ephemeral=True,
+            )
+        else:
+            await inter.followup.send(
+                f"❌ Aktualisierung bei **{member.display_name}** fehlgeschlagen: "
+                f"{str(reason or 'unbekannt')[:600]}",
+                ephemeral=True,
+            )
+        return True
+    except Exception as exc:
+        print(f"❌ Legacy-Portal-Weiterleitung fehlgeschlagen: {exc!r}", flush=True)
+        try:
+            if inter.response.is_done():
+                await inter.followup.send(
+                    f"❌ Portal-Befehl fehlgeschlagen: `{type(exc).__name__}: {str(exc)[:400]}`",
+                    ephemeral=True,
+                )
+            else:
+                await inter.response.send_message(
+                    f"❌ Portal-Befehl fehlgeschlagen: `{type(exc).__name__}: {str(exc)[:400]}`",
+                    ephemeral=True,
+                )
+        except Exception:
+            pass
+        return True
+
+
 @tree.error
 async def on_app_command_error(inter: discord.Interaction, error: app_commands.AppCommandError):
     try:
+        if isinstance(error, app_commands.CommandNotFound):
+            command_name = str((inter.data or {}).get("name") or "")
+            if await _handle_stale_portal_command(inter, command_name):
+                return
         if not inter.response.is_done():
             await inter.response.send_message(f"❌ {error}", ephemeral=True)
         else:
