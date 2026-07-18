@@ -61,6 +61,161 @@ def _guild_bot_name(guild_or_id: Any, fallback: str = "Gildenbot") -> str:
 TZ = ZoneInfo("Europe/Berlin")
 
 
+# ---------------------------------------------------------------------------
+# Zentrale Interaktionssicherheit und Fehlerprotokollierung fuer das komplette
+# Gildenmenue. Alle Portal-Views laufen durch denselben Wrapper.
+# ---------------------------------------------------------------------------
+_PORTAL_INTERACTION_LOCKS: dict[tuple[int, int], asyncio.Lock] = {}
+_PORTAL_ERROR_DEDUP: dict[str, dict[str, Any]] = {}
+_PORTAL_MODAL_CUSTOM_IDS = {
+    "portal_personal_absence",
+    "admin_event_image_select",
+    "admin_attendance_add_player",
+    "portal_admin_event_create",
+    "portal_admin_event_alliance",
+    "portal_admin_loot_junk",
+    "portal_support_contact",
+    "portal_profile_edit",
+    "help_contact_leader",
+    "portal_admin_broadcast",
+}
+
+
+def _portal_component_id(inter: discord.Interaction) -> str:
+    try:
+        return str((inter.data or {}).get("custom_id") or "unbekannt")
+    except Exception:
+        return "unbekannt"
+
+
+def _portal_location(inter: discord.Interaction) -> str:
+    if inter.guild is None:
+        return "Direktnachricht"
+    channel = getattr(inter, "channel", None)
+    return f"#{getattr(channel, 'name', 'unbekannt')}"
+
+
+def _portal_error_key(guild_id: int, component_id: str, error_type: str, detail: str) -> str:
+    clean = re.sub(r"\d+", "#", str(detail or ""))[:180]
+    return f"{guild_id}:{component_id}:{error_type}:{clean}"
+
+
+async def _portal_defer(inter: discord.Interaction, *args, **kwargs) -> None:
+    if inter.response.is_done():
+        return
+    try:
+        await inter.response.defer(*args, **kwargs)
+    except discord.InteractionResponded:
+        return
+
+
+async def _portal_edit(inter: discord.Interaction, *args, **kwargs):
+    try:
+        if not inter.response.is_done():
+            return await inter.response.edit_message(*args, **kwargs)
+        return await inter.edit_original_response(*args, **kwargs)
+    except discord.NotFound:
+        # Die alte DM wurde geloescht oder Discord hat den Original-Response
+        # verworfen. Dann wird die Gildenzentrale sauber neu aufgebaut.
+        guild, member = await _resolve_guild_member_from_inter(inter)
+        if guild and member:
+            await ensure_portal_menu_for_user(inter.client, guild.id, member.id, force_view="main")
+        raise
+
+
+async def _portal_send(inter: discord.Interaction, *args, **kwargs):
+    try:
+        if not inter.response.is_done():
+            return await inter.response.send_message(*args, **kwargs)
+        return await inter.followup.send(*args, **kwargs)
+    except discord.InteractionResponded:
+        return await inter.followup.send(*args, **kwargs)
+
+
+async def _portal_log_event(
+    inter: discord.Interaction,
+    *,
+    event_type: str,
+    error: Exception | None = None,
+    duration: float = 0.0,
+    detail: str = "",
+    notify_user: bool = False,
+) -> str:
+    component_id = _portal_component_id(inter)
+    guild = inter.guild
+    if guild is None:
+        try:
+            guild = _resolve_guild_for_user(inter.client, inter.user.id)
+        except Exception:
+            guild = None
+    guild_id = int(getattr(guild, "id", 0) or 0)
+    error_type = type(error).__name__ if error is not None else event_type
+    technical = detail or (str(error) if error is not None else event_type)
+    key = _portal_error_key(guild_id, component_id, error_type, technical)
+    now = time.monotonic()
+    entry = _PORTAL_ERROR_DEDUP.get(key)
+    if entry and now - float(entry.get("last_post", 0.0)) < 300.0:
+        entry["count"] = int(entry.get("count", 1)) + 1
+        entry["last_seen"] = now
+        error_id = str(entry.get("error_id") or "GM-UNBEKANNT")
+    else:
+        error_id = f"GM-{abs(hash((key, int(now)))) & 0xFFFFFF:06X}"
+        _PORTAL_ERROR_DEDUP[key] = {"count": 1, "last_post": now, "last_seen": now, "error_id": error_id}
+        channel = None
+        try:
+            if guild and central_guild_config is not None:
+                channel_id = int(central_guild_config.channel_id(guild.id, "error_log") or 0)
+                channel = guild.get_channel(channel_id) if channel_id else None
+        except Exception:
+            channel = None
+        if isinstance(channel, (discord.TextChannel, discord.Thread)):
+            user = inter.user
+            embed = discord.Embed(
+                title=f"{'⏱️' if event_type == 'slow' else '❌'} Gildenmenue-{event_type}",
+                color=discord.Color.orange() if event_type == "slow" else discord.Color.red(),
+                timestamp=datetime.now(TZ),
+            )
+            embed.add_field(name="Nutzer", value=f"{getattr(user, 'mention', str(user))}\n`{getattr(user, 'id', 0)}`", inline=True)
+            embed.add_field(name="Server", value=f"{getattr(guild, 'name', 'unbekannt')}\n`{guild_id}`", inline=True)
+            embed.add_field(name="Aktion", value=f"`{component_id}`", inline=False)
+            embed.add_field(name="Ort", value=_portal_location(inter), inline=True)
+            embed.add_field(name="Laufzeit", value=f"{duration:.2f} s" if duration else "—", inline=True)
+            embed.add_field(name="Fehler-ID", value=f"`{error_id}`", inline=True)
+            embed.add_field(name="Ursache", value=f"`{error_type}`\n{technical[:700] or 'Keine Details'}", inline=False)
+            embed.set_footer(text="Vollstaendiger Traceback steht in Railway. Identische Fehler werden 5 Minuten gebuendelt.")
+            try:
+                await channel.send(embed=embed)
+            except Exception as log_error:
+                print(f"[member_portal] Fehlerkanal konnte nicht beschrieben werden: {log_error!r}", flush=True)
+    if notify_user:
+        try:
+            await _portal_send(
+                inter,
+                f"❌ Das Menue konnte nicht geoeffnet werden. Der Fehler wurde gemeldet.\nFehler-ID: `{error_id}`",
+                ephemeral=True,
+            )
+        except Exception:
+            pass
+    return error_id
+
+
+async def _portal_watchdog(inter: discord.Interaction, component_id: str) -> None:
+    if component_id in _PORTAL_MODAL_CUSTOM_IDS:
+        return
+    await asyncio.sleep(2.0)
+    if not inter.response.is_done():
+        await _portal_defer(inter, thinking=True)
+    await asyncio.sleep(6.0)
+    await _portal_log_event(
+        inter,
+        event_type="slow",
+        duration=8.0,
+        detail="Interaktion laeuft nach 8 Sekunden noch immer. Moegliche langsame Discord-, Postgres- oder Volume-Abfrage.",
+        notify_user=False,
+    )
+
+
+
 def _get_ec_balance_safe(guild_id: int, user_id: int) -> int:
     try:
         try:
@@ -2079,7 +2234,47 @@ async def _resolve_guild_member_from_inter(inter: discord.Interaction) -> tuple[
     return guild, member
 
 
-class ProfileEditModal(Modal):
+
+
+class PortalSafeModal(Modal):
+    """Modal-Basis mit einheitlichem Timeout-, Laufzeit- und Fehlerhandling."""
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        original = cls.__dict__.get("on_submit")
+        if original is None or getattr(original, "__portal_wrapped__", False):
+            return
+
+        async def wrapped(self, inter: discord.Interaction):
+            component_id = f"modal:{cls.__name__}"
+            started = time.monotonic()
+            watchdog = asyncio.create_task(_portal_watchdog(inter, component_id))
+            try:
+                await original(self, inter)
+            except Exception as error:
+                duration = time.monotonic() - started
+                print(
+                    f"[member_portal] modal_error modal={cls.__name__} user={inter.user.id} "
+                    f"duration={duration:.3f}s error={error!r}",
+                    flush=True,
+                )
+                await _portal_log_event(
+                    inter, event_type="Modal-Fehler", error=error, duration=duration, notify_user=True
+                )
+            finally:
+                watchdog.cancel()
+                try:
+                    await watchdog
+                except BaseException:
+                    pass
+
+        setattr(wrapped, "__portal_wrapped__", True)
+        cls.on_submit = wrapped
+
+    async def on_error(self, inter: discord.Interaction, error: Exception) -> None:
+        await _portal_log_event(inter, event_type="Modal-Fehler", error=error, notify_user=True)
+
+class ProfileEditModal(PortalSafeModal):
     def __init__(self, guild_id: int, user_id: int):
         super().__init__(title="Profil bearbeiten", timeout=300)
         self.guild_id = guild_id
@@ -2120,7 +2315,7 @@ class ProfileEditModal(Modal):
         gs = _parse_gearscore(gs_raw)
 
         if gs <= 0:
-            await inter.response.send_message("❌ Gearscore ungültig. Bitte nur Zahlen eintragen, z. B. `4200`.")
+            await _portal_send(inter, "❌ Gearscore ungültig. Bitte nur Zahlen eintragen, z. B. `4200`.")
             return
 
         p = _user_profile(self.guild_id, self.user_id)
@@ -2131,14 +2326,14 @@ class ProfileEditModal(Modal):
         save_profiles()
 
         try:
-            await inter.response.defer()
+            await _portal_defer(inter, )
         except Exception:
             pass
 
         await ensure_portal_menu_for_user(inter.client, self.guild_id, self.user_id, force_view="profile")
 
 
-class AbsenceModal(Modal):
+class AbsenceModal(PortalSafeModal):
     def __init__(self, guild_id: int, user_id: int):
         super().__init__(title="Abwesenheit melden", timeout=300)
         self.guild_id = guild_id
@@ -2176,13 +2371,13 @@ class AbsenceModal(Modal):
         reason_s = str(self.reason.value).strip()
 
         if not _valid_ddmm(from_s) or not _valid_ddmm(to_s):
-            await inter.response.send_message("❌ Datum ungültig. Bitte im Format `TT-MM` eintragen, z. B. `15-05`.")
+            await _portal_send(inter, "❌ Datum ungültig. Bitte im Format `TT-MM` eintragen, z. B. `15-05`.")
             return
 
         guild = inter.client.get_guild(self.guild_id)
 
         if not guild:
-            await inter.response.send_message("❌ Server nicht gefunden.")
+            await _portal_send(inter, "❌ Server nicht gefunden.")
             return
 
         member = guild.get_member(self.user_id)
@@ -2194,7 +2389,7 @@ class AbsenceModal(Modal):
                 member = None
 
         if not member:
-            await inter.response.send_message("❌ Mitglied nicht gefunden.")
+            await _portal_send(inter, "❌ Mitglied nicht gefunden.")
             return
 
         g = _gdata(self.guild_id)
@@ -2233,14 +2428,14 @@ class AbsenceModal(Modal):
                 pass
 
         try:
-            await inter.response.defer()
+            await _portal_defer(inter, )
         except Exception:
             pass
 
         await ensure_portal_menu_for_user(inter.client, self.guild_id, self.user_id, force_view="main")
 
 
-class PortalLeaderContactModal(Modal):
+class PortalLeaderContactModal(PortalSafeModal):
     def __init__(self, guild_id: int, user_id: int):
         super().__init__(title="Leader kontaktieren", timeout=300)
         self.guild_id = guild_id
@@ -2268,7 +2463,7 @@ class PortalLeaderContactModal(Modal):
         guild = inter.client.get_guild(self.guild_id)
 
         if not guild:
-            await inter.response.send_message("❌ Server nicht gefunden.")
+            await _portal_send(inter, "❌ Server nicht gefunden.")
             return
 
         member = guild.get_member(self.user_id)
@@ -2280,7 +2475,7 @@ class PortalLeaderContactModal(Modal):
                 member = None
 
         if not member:
-            await inter.response.send_message("❌ Mitglied nicht gefunden.")
+            await _portal_send(inter, "❌ Mitglied nicht gefunden.")
             return
 
         leader_cfg = _get_leader_cfg(self.guild_id)
@@ -2291,7 +2486,7 @@ class PortalLeaderContactModal(Modal):
         leader_role = guild.get_role(leader_role_id) if leader_role_id else None
 
         if not isinstance(internal_ch, (discord.TextChannel, discord.Thread)):
-            await inter.response.send_message("❌ Leader-Kontakt ist noch nicht eingerichtet. Es fehlt der interne Leader-Kanal.")
+            await _portal_send(inter, "❌ Leader-Kontakt ist noch nicht eingerichtet. Es fehlt der interne Leader-Kanal.")
             return
 
         topic = _safe_text(str(self.topic.value))
@@ -2319,11 +2514,11 @@ class PortalLeaderContactModal(Modal):
                 view=_leader_status_view()
             )
         except Exception as e:
-            await inter.response.send_message(f"❌ Konnte Anfrage nicht senden: {e}")
+            await _portal_send(inter, f"❌ Konnte Anfrage nicht senden: {e}")
             return
 
         try:
-            await inter.response.defer()
+            await _portal_defer(inter, )
         except Exception:
             pass
 
@@ -2361,7 +2556,7 @@ async def _auto_reset_portal_after_view_error(inter: discord.Interaction, error:
         )
 
         if not inter.response.is_done():
-            await inter.response.send_message(msg, ephemeral=True)
+            await _portal_send(inter, msg, ephemeral=True)
         else:
             await inter.followup.send(msg, ephemeral=True)
     except Exception:
@@ -2372,14 +2567,65 @@ async def _auto_reset_portal_after_view_error(inter: discord.Interaction, error:
 
 class PortalSafeView(View):
     def __init__(self, *args, **kwargs):
-        # Portal-Menüs sollen nicht nach 3/5/15 Minuten sterben.
-        # Wenn eine Unterklasse kein eigenes Timeout setzt, bleibt die View aktiv,
-        # bis der Bot neu startet oder die Nachricht ersetzt wird.
         kwargs.setdefault("timeout", None)
         super().__init__(*args, **kwargs)
         _rebind_portal_view_emojis(self)
+        self._wrap_all_callbacks()
+
+    def _wrap_all_callbacks(self) -> None:
+        for child in self.children:
+            original = getattr(child, "callback", None)
+            if original is None or getattr(original, "__portal_wrapped__", False):
+                continue
+
+            async def wrapped(inter: discord.Interaction, _original=original):
+                component_id = _portal_component_id(inter)
+                start_time = time.monotonic()
+                key = (int(getattr(inter.guild, "id", 0) or 0), int(inter.user.id))
+                lock = _PORTAL_INTERACTION_LOCKS.setdefault(key, asyncio.Lock())
+                if lock.locked():
+                    await _portal_send(inter, "⏳ Deine vorherige Menueaktion wird noch verarbeitet.", ephemeral=True)
+                    return
+                watchdog = asyncio.create_task(_portal_watchdog(inter, component_id))
+                try:
+                    async with lock:
+                        await _original(inter)
+                except Exception as error:
+                    duration = time.monotonic() - start_time
+                    print(
+                        f"[member_portal] callback_error component={component_id} "
+                        f"user={inter.user.id} duration={duration:.3f}s error={error!r}",
+                        flush=True,
+                    )
+                    await _portal_log_event(
+                        inter, event_type="Fehler", error=error, duration=duration, notify_user=True
+                    )
+                finally:
+                    watchdog.cancel()
+                    try:
+                        await watchdog
+                    except BaseException:
+                        pass
+                    duration = time.monotonic() - start_time
+                    print(
+                        f"[member_portal] component={component_id} user={inter.user.id} "
+                        f"duration={duration:.3f}s responded={inter.response.is_done()}",
+                        flush=True,
+                    )
+                    if duration >= 3.0:
+                        await _portal_log_event(
+                            inter,
+                            event_type="slow",
+                            duration=duration,
+                            detail="Buttonaktion war langsamer als 3 Sekunden.",
+                            notify_user=False,
+                        )
+
+            setattr(wrapped, "__portal_wrapped__", True)
+            child.callback = wrapped
 
     async def on_error(self, inter: discord.Interaction, error: Exception, item) -> None:
+        await _portal_log_event(inter, event_type="Fehler", error=error, notify_user=True)
         await _auto_reset_portal_after_view_error(inter, error)
 
 
@@ -2390,16 +2636,16 @@ class PortalOpenView(PortalSafeView):
     @button(label="⚜️ Gildenzentrale im Privatchat öffnen", style=ButtonStyle.secondary, custom_id="portal_open_dm")
     async def btn_open_dm(self, inter: discord.Interaction, _):
         if inter.guild is None:
-            await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
+            await _portal_send(inter, "❌ Nur im Server nutzbar.", ephemeral=True)
             return
 
         guild = _resolve_guild_for_user(inter.client, inter.user.id) or inter.guild
         ok = await ensure_portal_menu_for_user(inter.client, guild.id, inter.user.id, force_view="main")
 
         if ok:
-            await inter.response.send_message("✅ Ich habe deine Gildenzentrale im Privatchat geöffnet oder aktualisiert.", ephemeral=True)
+            await _portal_send(inter, "✅ Ich habe deine Gildenzentrale im Privatchat geöffnet oder aktualisiert.", ephemeral=True)
         else:
-            await inter.response.send_message(
+            await _portal_send(inter, 
                 "❌ Konnte dir keine Privatnachricht schicken. Prüfe deine Discord-DM-Einstellungen.",
                 ephemeral=True
             )
@@ -2458,7 +2704,7 @@ class PortalMainSelect(Select):
         guild, member = await _resolve_guild_member_from_inter(inter)
 
         if not guild or not member:
-            await inter.response.send_message("❌ Ich konnte deinen Server nicht zuordnen.")
+            await _portal_send(inter, "❌ Ich konnte deinen Server nicht zuordnen.")
             return
 
         if inter.message:
@@ -2489,7 +2735,7 @@ class PortalMainSelect(Select):
                 color=discord.Color.gold()
             )
 
-            await inter.response.edit_message(embed=emb, view=PersonalMenuView())
+            await _portal_edit(inter, embed=emb, view=PersonalMenuView())
             return
 
         if choice == "loot":
@@ -2505,7 +2751,7 @@ class PortalMainSelect(Select):
                 await open_need_menu(inter, guild.id, member.id)
                 return
             except Exception as e:
-                await inter.response.send_message(f"❌ Needliste konnte nicht geöffnet werden: `{e}`", ephemeral=True)
+                await _portal_send(inter, f"❌ Needliste konnte nicht geöffnet werden: `{e}`", ephemeral=True)
                 return
 
         if choice == "auction":
@@ -2517,7 +2763,7 @@ class PortalMainSelect(Select):
                 await open_auction_menu(inter, guild.id, member.id)
                 return
             except Exception as e:
-                await inter.response.send_message(f"❌ Auktionsmenü konnte nicht geöffnet werden: `{e}`", ephemeral=True)
+                await _portal_send(inter, f"❌ Auktionsmenü konnte nicht geöffnet werden: `{e}`", ephemeral=True)
                 return
 
         if choice == "guild":
@@ -2535,7 +2781,7 @@ class PortalMainSelect(Select):
                 color=discord.Color.gold()
             )
 
-            await inter.response.edit_message(embed=emb, view=GuildMenuView())
+            await _portal_edit(inter, embed=emb, view=GuildMenuView())
             return
 
         if choice == "support":
@@ -2551,13 +2797,13 @@ class PortalMainSelect(Select):
                 color=discord.Color.gold()
             )
 
-            await inter.response.edit_message(embed=emb, view=SupportMenuView())
+            await _portal_edit(inter, embed=emb, view=SupportMenuView())
             return
 
 
         if choice == "admin":
             if not _is_portal_admin(guild, member):
-                await inter.response.send_message("❌ Dieser Bereich ist nur für Gildenleitung, Berater oder Wächter.", ephemeral=True)
+                await _portal_send(inter, "❌ Dieser Bereich ist nur für Gildenleitung, Berater oder Wächter.", ephemeral=True)
                 return
 
             emb = discord.Embed(
@@ -2572,7 +2818,7 @@ class PortalMainSelect(Select):
                 color=discord.Color.gold()
             )
 
-            await inter.response.edit_message(embed=emb, view=AdminMenuView())
+            await _portal_edit(inter, embed=emb, view=AdminMenuView())
             return
 
 
@@ -2591,20 +2837,20 @@ class PersonalMenuView(PortalSafeView):
         guild, member = await _resolve_guild_member_from_inter(inter)
 
         if not guild or not member:
-            await inter.response.send_message("❌ Ich konnte deinen Server nicht zuordnen.")
+            await _portal_send(inter, "❌ Ich konnte deinen Server nicht zuordnen.")
             return
 
         if inter.message:
             _mark_portal_sent(guild.id, member.id, inter.message.id)
 
-        await inter.response.edit_message(embed=_profile_embed(guild, member), view=ProfileView())
+        await _portal_edit(inter, embed=_profile_embed(guild, member), view=ProfileView())
 
     @button(label="Abwesenheit melden", emoji=_menu_emoji(EMOJI_ABSENCE), style=ButtonStyle.secondary, custom_id="portal_personal_absence")
     async def btn_absence(self, inter: discord.Interaction, _):
         guild, member = await _resolve_guild_member_from_inter(inter)
 
         if not guild or not member:
-            await inter.response.send_message("❌ Ich konnte deinen Server nicht zuordnen.")
+            await _portal_send(inter, "❌ Ich konnte deinen Server nicht zuordnen.")
             return
 
         if inter.message:
@@ -2617,13 +2863,13 @@ class PersonalMenuView(PortalSafeView):
         guild, member = await _resolve_guild_member_from_inter(inter)
 
         if not guild or not member:
-            await inter.response.send_message("❌ Ich konnte deinen Server nicht zuordnen.")
+            await _portal_send(inter, "❌ Ich konnte deinen Server nicht zuordnen.")
             return
 
         if inter.message:
             _mark_portal_sent(guild.id, member.id, inter.message.id)
 
-        await inter.response.edit_message(embed=_dm_settings_embed(guild, member), view=DmSettingsView())
+        await _portal_edit(inter, embed=_dm_settings_embed(guild, member), view=DmSettingsView())
 
     @button(label="Zurück", emoji=_menu_emoji(EMOJI_BACK), style=ButtonStyle.secondary, custom_id="portal_personal_back")
     async def btn_back(self, inter: discord.Interaction, _):
@@ -2632,7 +2878,7 @@ class PersonalMenuView(PortalSafeView):
         if guild and member and inter.message:
             _mark_portal_sent(guild.id, member.id, inter.message.id)
 
-        await inter.response.edit_message(embed=_main_menu_embed(guild, member), view=MemberPortalMainView())
+        await _portal_edit(inter, embed=_main_menu_embed(guild, member), view=MemberPortalMainView())
 
 
 class DmSettingsView(PortalSafeView):
@@ -2644,11 +2890,11 @@ class DmSettingsView(PortalSafeView):
         guild, member = await _resolve_guild_member_from_inter(inter)
 
         if not guild or not member:
-            await inter.response.send_message("❌ Ich konnte deinen Server nicht zuordnen.")
+            await _portal_send(inter, "❌ Ich konnte deinen Server nicht zuordnen.")
             return
 
         if set_dm_pref is None or is_dm_enabled is None:
-            await inter.response.send_message("❌ DM-Einstellungssystem ist nicht geladen.")
+            await _portal_send(inter, "❌ DM-Einstellungssystem ist nicht geladen.")
             return
 
         current = is_dm_enabled(guild.id, member.id)
@@ -2657,7 +2903,7 @@ class DmSettingsView(PortalSafeView):
         if inter.message:
             _mark_portal_sent(guild.id, member.id, inter.message.id)
 
-        await inter.response.edit_message(embed=_dm_settings_embed(guild, member), view=DmSettingsView())
+        await _portal_edit(inter, embed=_dm_settings_embed(guild, member), view=DmSettingsView())
 
     @button(label="Zurück", emoji=_menu_emoji(EMOJI_BACK), style=ButtonStyle.secondary, custom_id="portal_dm_back")
     async def btn_back(self, inter: discord.Interaction, _):
@@ -2688,7 +2934,7 @@ class DmSettingsView(PortalSafeView):
             color=discord.Color.gold()
         )
 
-        await inter.response.edit_message(embed=emb, view=PersonalMenuView())
+        await _portal_edit(inter, embed=emb, view=PersonalMenuView())
 
 
 class LootMenuView(PortalSafeView):
@@ -2700,7 +2946,7 @@ class LootMenuView(PortalSafeView):
         guild, member = await _resolve_guild_member_from_inter(inter)
 
         if not guild or not member:
-            await inter.response.send_message("❌ Ich konnte deinen Server nicht zuordnen.")
+            await _portal_send(inter, "❌ Ich konnte deinen Server nicht zuordnen.")
             return
 
         if inter.message:
@@ -2720,7 +2966,7 @@ class LootMenuView(PortalSafeView):
                 description="Die Needliste ist noch nicht aktiv. Das Modul `loot_needs.py` muss noch eingebaut werden.",
                 color=discord.Color.gold()
             )
-            await inter.response.edit_message(embed=emb, view=BackOnlyView())
+            await _portal_edit(inter, embed=emb, view=BackOnlyView())
 
     @button(label="Regeln & Loot", emoji=_menu_emoji(EMOJI_LOOT), style=ButtonStyle.secondary, custom_id="portal_loot_rules")
     async def btn_rules(self, inter: discord.Interaction, _):
@@ -2729,7 +2975,7 @@ class LootMenuView(PortalSafeView):
         if guild and member and inter.message:
             _mark_portal_sent(guild.id, member.id, inter.message.id)
 
-        await inter.response.edit_message(embed=_rules_loot_embed(), view=RulesLootView())
+        await _portal_edit(inter, embed=_rules_loot_embed(), view=RulesLootView())
 
     @button(label="Zurück", emoji=_menu_emoji(EMOJI_BACK), style=ButtonStyle.secondary, custom_id="portal_loot_back")
     async def btn_back(self, inter: discord.Interaction, _):
@@ -2738,7 +2984,7 @@ class LootMenuView(PortalSafeView):
         if guild and member and inter.message:
             _mark_portal_sent(guild.id, member.id, inter.message.id)
 
-        await inter.response.edit_message(embed=_main_menu_embed(guild, member), view=MemberPortalMainView())
+        await _portal_edit(inter, embed=_main_menu_embed(guild, member), view=MemberPortalMainView())
 
 
 class GuildMenuView(PortalSafeView):
@@ -2748,7 +2994,7 @@ class GuildMenuView(PortalSafeView):
     @staticmethod
     async def _begin(inter: discord.Interaction) -> tuple[Optional[discord.Guild], Optional[discord.Member]]:
         if not inter.response.is_done():
-            await inter.response.defer()
+            await _portal_defer(inter, )
         return await _resolve_guild_member_from_inter(inter)
 
     @staticmethod
@@ -2816,7 +3062,7 @@ class AbsenceCalendarView(PortalSafeView):
     @button(label="🔄 Aktualisieren", style=ButtonStyle.secondary, custom_id="portal_absence_calendar_refresh")
     async def btn_refresh(self, inter: discord.Interaction, _):
         if not inter.response.is_done():
-            await inter.response.defer()
+            await _portal_defer(inter, )
         guild, member = await _resolve_guild_member_from_inter(inter)
         if not guild:
             await inter.followup.send("❌ Ich konnte deinen Server nicht zuordnen.", ephemeral=True)
@@ -2829,7 +3075,7 @@ class AbsenceCalendarView(PortalSafeView):
     @button(label="Zurück", emoji=_menu_emoji(EMOJI_BACK), style=ButtonStyle.secondary, custom_id="portal_absence_calendar_back")
     async def btn_back(self, inter: discord.Interaction, _):
         if not inter.response.is_done():
-            await inter.response.defer()
+            await _portal_defer(inter, )
         guild, member = await _resolve_guild_member_from_inter(inter)
         if guild and member and inter.message:
             await asyncio.to_thread(_mark_portal_sent, guild.id, member.id, inter.message.id)
@@ -3108,10 +3354,10 @@ class AdminEventCreatedView(PortalSafeView):
     async def back_admin_events(self, inter: discord.Interaction, _):
         guild, member = await _resolve_guild_member_from_inter(inter)
         if not guild or not member:
-            await inter.response.send_message("❌ Ich konnte deinen Server nicht zuordnen.", ephemeral=True)
+            await _portal_send(inter, "❌ Ich konnte deinen Server nicht zuordnen.", ephemeral=True)
             return
         if not _is_portal_admin(guild, member):
-            await inter.response.send_message(
+            await _portal_send(inter, 
                 "❌ Dieser Bereich ist nur für Gildenleitung, Berater oder Wächter.",
                 ephemeral=True,
             )
@@ -3123,7 +3369,7 @@ class AdminEventCreatedView(PortalSafeView):
             description="Wähle eine Event-Aktion.",
             color=discord.Color.gold(),
         )
-        await inter.response.edit_message(embed=emb, view=AdminEventMenuView())
+        await _portal_edit(inter, embed=emb, view=AdminEventMenuView())
 
     @button(
         label="Gildenzentrale",
@@ -3134,11 +3380,11 @@ class AdminEventCreatedView(PortalSafeView):
     async def back_home(self, inter: discord.Interaction, _):
         guild, member = await _resolve_guild_member_from_inter(inter)
         if not guild or not member:
-            await inter.response.send_message("❌ Ich konnte deinen Server nicht zuordnen.", ephemeral=True)
+            await _portal_send(inter, "❌ Ich konnte deinen Server nicht zuordnen.", ephemeral=True)
             return
         if inter.message:
             _mark_portal_sent(guild.id, member.id, inter.message.id)
-        await inter.response.edit_message(
+        await _portal_edit(inter, 
             embed=_main_menu_embed(guild, member),
             view=MemberPortalMainView(),
         )
@@ -3662,7 +3908,7 @@ async def _admin_delete_event_from_menu(inter: discord.Interaction, guild_id: in
     await inter.followup.send(text[:1900], ephemeral=True)
 
 
-class AdminEventCreateModal(Modal):
+class AdminEventCreateModal(PortalSafeModal):
     def __init__(self, guild_id: int, user_id: int):
         super().__init__(title="Event erstellen", timeout=300)
         self.guild_id = int(guild_id)
@@ -3692,10 +3938,10 @@ class AdminEventCreateModal(Modal):
             color=discord.Color.gold()
         )
 
-        await inter.response.send_message(embed=emb, view=AdminEventChannelSelectView(data, inter.client), ephemeral=True)
+        await _portal_send(inter, embed=emb, view=AdminEventChannelSelectView(data, inter.client), ephemeral=True)
 
 
-class AdminAllianceEventCreateModal(Modal):
+class AdminAllianceEventCreateModal(PortalSafeModal):
     def __init__(self, guild_id: int, user_id: int):
         super().__init__(title="Allianz-Event erstellen", timeout=300)
         self.guild_id = int(guild_id)
@@ -3728,7 +3974,7 @@ class AdminAllianceEventCreateModal(Modal):
             ),
             color=discord.Color.gold(),
         )
-        await inter.response.send_message(embed=emb, view=AdminAllianceGroupSelectView(data), ephemeral=True)
+        await _portal_send(inter, embed=emb, view=AdminAllianceGroupSelectView(data), ephemeral=True)
 
 
 class AdminAllianceGroupSelectView(PortalSafeView):
@@ -3739,7 +3985,7 @@ class AdminAllianceGroupSelectView(PortalSafeView):
 
     @button(label="❌ Abbrechen", style=ButtonStyle.secondary, custom_id="admin_alliance_group_cancel")
     async def btn_cancel(self, inter: discord.Interaction, _):
-        await inter.response.edit_message(
+        await _portal_edit(inter, 
             embed=discord.Embed(title="Abgebrochen", description="Das Allianz-Event wurde nicht erstellt.", color=discord.Color.orange()),
             view=AdminEventMenuView(),
         )
@@ -3774,7 +4020,7 @@ class AdminAllianceGroupSelect(Select):
     async def callback(self, inter: discord.Interaction):
         group = str(self.values[0])
         if group == "__none__":
-            await inter.response.send_message("❌ Keine Allianz-Gruppe gefunden. Richte zuerst das Allianz-System ein.", ephemeral=True)
+            await _portal_send(inter, "❌ Keine Allianz-Gruppe gefunden. Richte zuerst das Allianz-System ein.", ephemeral=True)
             return
         self.data["alliance_group"] = group
         emb = discord.Embed(
@@ -3782,7 +4028,7 @@ class AdminAllianceGroupSelect(Select):
             description="Der Eventtyp entscheidet, in welche konfigurierten Allianz-Channels gepostet wird.",
             color=discord.Color.gold(),
         )
-        await inter.response.edit_message(embed=emb, view=AdminAllianceEventTypeSelectView(self.data))
+        await _portal_edit(inter, embed=emb, view=AdminAllianceEventTypeSelectView(self.data))
 
 
 class AdminAllianceEventTypeSelectView(PortalSafeView):
@@ -3794,11 +4040,11 @@ class AdminAllianceEventTypeSelectView(PortalSafeView):
     @button(label="Zurück", emoji=_menu_emoji(EMOJI_BACK), style=ButtonStyle.secondary, custom_id="admin_alliance_type_back", row=1)
     async def btn_back(self, inter: discord.Interaction, _):
         emb = discord.Embed(title="🌐 Allianz-Gruppe wählen", description="Wähle die vorhandene Allianz-Gruppe aus.", color=discord.Color.gold())
-        await inter.response.edit_message(embed=emb, view=AdminAllianceGroupSelectView(self.data))
+        await _portal_edit(inter, embed=emb, view=AdminAllianceGroupSelectView(self.data))
 
     @button(label="❌ Abbrechen", style=ButtonStyle.secondary, custom_id="admin_alliance_type_cancel", row=1)
     async def btn_cancel(self, inter: discord.Interaction, _):
-        await inter.response.edit_message(embed=discord.Embed(title="Abgebrochen", description="Das Allianz-Event wurde nicht erstellt.", color=discord.Color.orange()), view=AdminEventMenuView())
+        await _portal_edit(inter, embed=discord.Embed(title="Abgebrochen", description="Das Allianz-Event wurde nicht erstellt.", color=discord.Color.orange()), view=AdminEventMenuView())
 
 
 class AdminAllianceEventTypeSelect(Select):
@@ -3819,7 +4065,7 @@ class AdminAllianceEventTypeSelect(Select):
             ),
             color=discord.Color.gold(),
         )
-        await inter.response.edit_message(embed=emb, view=AdminAllianceRoleSelectView(self.data, inter.client))
+        await _portal_edit(inter, embed=emb, view=AdminAllianceRoleSelectView(self.data, inter.client))
 
 
 class AdminAllianceRoleSelectView(PortalSafeView):
@@ -3831,11 +4077,11 @@ class AdminAllianceRoleSelectView(PortalSafeView):
     @button(label="Zurück", emoji=_menu_emoji(EMOJI_BACK), style=ButtonStyle.secondary, custom_id="admin_alliance_role_back", row=1)
     async def btn_back(self, inter: discord.Interaction, _):
         emb = discord.Embed(title="🌐 Allianz-Eventtyp wählen", description="Wähle den Eventtyp.", color=discord.Color.gold())
-        await inter.response.edit_message(embed=emb, view=AdminAllianceEventTypeSelectView(self.data))
+        await _portal_edit(inter, embed=emb, view=AdminAllianceEventTypeSelectView(self.data))
 
     @button(label="❌ Abbrechen", style=ButtonStyle.secondary, custom_id="admin_alliance_role_cancel", row=1)
     async def btn_cancel(self, inter: discord.Interaction, _):
-        await inter.response.edit_message(embed=discord.Embed(title="Abgebrochen", description="Das Allianz-Event wurde nicht erstellt.", color=discord.Color.orange()), view=AdminEventMenuView())
+        await _portal_edit(inter, embed=discord.Embed(title="Abgebrochen", description="Das Allianz-Event wurde nicht erstellt.", color=discord.Color.orange()), view=AdminEventMenuView())
 
 
 class AdminAllianceRoleSelect(Select):
@@ -3867,7 +4113,7 @@ class AdminAllianceRoleSelect(Select):
             ),
             color=discord.Color.gold(),
         )
-        await inter.response.edit_message(embed=emb, view=AdminEventDKPSelectView(self.data))
+        await _portal_edit(inter, embed=emb, view=AdminEventDKPSelectView(self.data))
 
 
 class AdminEventChannelSelectView(PortalSafeView):
@@ -3878,7 +4124,7 @@ class AdminEventChannelSelectView(PortalSafeView):
 
     @button(label="❌ Abbrechen", style=ButtonStyle.secondary, custom_id="admin_event_channel_cancel")
     async def btn_cancel(self, inter: discord.Interaction, _):
-        await inter.response.edit_message(
+        await _portal_edit(inter, 
             embed=discord.Embed(
                 title="Abgebrochen",
                 description="Das Event wurde nicht erstellt.",
@@ -3947,7 +4193,7 @@ class AdminEventChannelSelect(Select):
             channel_id = 0
 
         if not channel_id:
-            await inter.response.send_message("❌ Kein gültiger Kanal gefunden. Prüfe, ob der Bot Zugriff auf Server-Textkanäle hat.", ephemeral=True)
+            await _portal_send(inter, "❌ Kein gültiger Kanal gefunden. Prüfe, ob der Bot Zugriff auf Server-Textkanäle hat.", ephemeral=True)
             return
 
         self.data["channel_id"] = channel_id
@@ -3961,7 +4207,7 @@ class AdminEventChannelSelect(Select):
             color=discord.Color.gold()
         )
 
-        await inter.response.edit_message(embed=emb, view=AdminEventRoleSelectView(self.data, inter.client))
+        await _portal_edit(inter, embed=emb, view=AdminEventRoleSelectView(self.data, inter.client))
 
 
 class AdminEventRoleSelectView(PortalSafeView):
@@ -3981,7 +4227,7 @@ class AdminEventRoleSelectView(PortalSafeView):
             ),
             color=discord.Color.gold()
         )
-        await inter.response.edit_message(embed=emb, view=AdminEventImageSelectView(self.data))
+        await _portal_edit(inter, embed=emb, view=AdminEventImageSelectView(self.data))
 
     @button(label="Zurück", emoji=_menu_emoji(EMOJI_BACK), style=ButtonStyle.secondary, custom_id="admin_event_role_back", row=1)
     async def btn_back(self, inter: discord.Interaction, _):
@@ -3990,11 +4236,11 @@ class AdminEventRoleSelectView(PortalSafeView):
             description="Wähle den Discord-Kanal, in dem der Raid/Event-Post erscheinen soll.",
             color=discord.Color.gold()
         )
-        await inter.response.edit_message(embed=emb, view=AdminEventChannelSelectView(self.data, inter.client))
+        await _portal_edit(inter, embed=emb, view=AdminEventChannelSelectView(self.data, inter.client))
 
     @button(label="❌ Abbrechen", style=ButtonStyle.secondary, custom_id="admin_event_role_cancel", row=2)
     async def btn_cancel(self, inter: discord.Interaction, _):
-        await inter.response.edit_message(
+        await _portal_edit(inter, 
             embed=discord.Embed(
                 title="Abgebrochen",
                 description="Das Event wurde nicht erstellt.",
@@ -4065,7 +4311,7 @@ class AdminEventRoleSelect(Select):
             color=discord.Color.gold()
         )
 
-        await inter.response.edit_message(embed=emb, view=AdminEventDKPSelectView(self.data))
+        await _portal_edit(inter, embed=emb, view=AdminEventDKPSelectView(self.data))
 
 
 class AdminEventDKPSelectView(PortalSafeView):
@@ -4076,7 +4322,7 @@ class AdminEventDKPSelectView(PortalSafeView):
 
     @button(label="❌ Abbrechen", style=ButtonStyle.secondary, custom_id="admin_event_dkp_cancel")
     async def btn_cancel(self, inter: discord.Interaction, _):
-        await inter.response.edit_message(
+        await _portal_edit(inter, 
             embed=discord.Embed(
                 title="Abgebrochen",
                 description="Das Event wurde nicht erstellt.",
@@ -4118,7 +4364,7 @@ class AdminEventDKPSelect(Select):
             ),
             color=discord.Color.gold(),
         )
-        await inter.response.edit_message(embed=emb, view=AdminEventImageSelectView(self.data))
+        await _portal_edit(inter, embed=emb, view=AdminEventImageSelectView(self.data))
 
 
 class AdminEventImageSelectView(PortalSafeView):
@@ -4129,7 +4375,7 @@ class AdminEventImageSelectView(PortalSafeView):
 
     @button(label="❌ Abbrechen", style=ButtonStyle.secondary, custom_id="admin_event_image_cancel")
     async def btn_cancel(self, inter: discord.Interaction, _):
-        await inter.response.edit_message(
+        await _portal_edit(inter, 
             embed=discord.Embed(
                 title="Abgebrochen",
                 description="Das Event wurde nicht erstellt.",
@@ -4170,7 +4416,7 @@ class AdminEventImageSelect(Select):
         self.data["image_url"] = image_url or ""
 
         if str(self.data.get("scope", "")) == "alliance":
-            await inter.response.defer(ephemeral=True, thinking=True)
+            await _portal_defer(inter, ephemeral=True, thinking=True)
             await _admin_create_alliance_raid_from_menu(
                 inter,
                 int(self.data["guild_id"]),
@@ -4221,9 +4467,9 @@ async def _admin_show_reminder_select(inter: discord.Interaction, data: dict, se
     )
     view = AdminEventReminderSelectView(data)
     if send_new:
-        await inter.response.send_message(embed=emb, view=view, ephemeral=True)
+        await _portal_send(inter, embed=emb, view=view, ephemeral=True)
     else:
-        await inter.response.edit_message(embed=emb, view=view)
+        await _portal_edit(inter, embed=emb, view=view)
 
 
 class AdminEventReminderSelectView(PortalSafeView):
@@ -4234,7 +4480,7 @@ class AdminEventReminderSelectView(PortalSafeView):
 
     @button(label="❌ Abbrechen", style=ButtonStyle.secondary, custom_id="admin_event_reminder_cancel")
     async def btn_cancel(self, inter: discord.Interaction, _):
-        await inter.response.edit_message(
+        await _portal_edit(inter, 
             embed=discord.Embed(
                 title="Abgebrochen",
                 description="Das Event wurde nicht erstellt.",
@@ -4298,7 +4544,7 @@ async def _admin_show_voice_select(inter: discord.Interaction, data: dict):
         ),
         color=discord.Color.gold(),
     )
-    await inter.response.edit_message(embed=emb, view=AdminEventVoiceSelectView(data))
+    await _portal_edit(inter, embed=emb, view=AdminEventVoiceSelectView(data))
 
 
 class AdminEventVoiceSelectView(PortalSafeView):
@@ -4309,7 +4555,7 @@ class AdminEventVoiceSelectView(PortalSafeView):
 
     @button(label="❌ Abbrechen", style=ButtonStyle.secondary, custom_id="admin_event_voice_cancel")
     async def btn_cancel(self, inter: discord.Interaction, _):
-        await inter.response.edit_message(
+        await _portal_edit(inter, 
             embed=discord.Embed(title="Abgebrochen", description="Das Event wurde nicht erstellt.", color=discord.Color.orange()),
             view=AdminEventMenuView(),
         )
@@ -4335,7 +4581,7 @@ class AdminEventVoiceSelect(Select):
         guild = inter.client.get_guild(int(self.data.get("guild_id", 0) or 0))
         c = _gcfg(guild.id) if guild else {}
 
-        await inter.response.defer(ephemeral=True, thinking=True)
+        await _portal_defer(inter, ephemeral=True, thinking=True)
         await _admin_create_regular_raid_from_menu(
             inter,
             int(self.data["guild_id"]),
@@ -4354,7 +4600,7 @@ class AdminEventVoiceSelect(Select):
         )
 
 
-class AdminEventCustomImageModal(Modal):
+class AdminEventCustomImageModal(PortalSafeModal):
     def __init__(self, data: dict):
         super().__init__(title="Eigene Event-Bild-URL", timeout=300)
         self.data = dict(data)
@@ -4370,13 +4616,13 @@ class AdminEventCustomImageModal(Modal):
         image_url = str(self.url_input.value or "").strip()
 
         if not (image_url.startswith("http://") or image_url.startswith("https://")):
-            await inter.response.send_message("❌ Bitte eine gültige Bild-URL mit http:// oder https:// eingeben.", ephemeral=True)
+            await _portal_send(inter, "❌ Bitte eine gültige Bild-URL mit http:// oder https:// eingeben.", ephemeral=True)
             return
 
         self.data["image_url"] = image_url
 
         if str(self.data.get("scope", "")) == "alliance":
-            await inter.response.defer(ephemeral=True, thinking=True)
+            await _portal_defer(inter, ephemeral=True, thinking=True)
             await _admin_create_alliance_raid_from_menu(
                 inter,
                 int(self.data["guild_id"]),
@@ -4556,7 +4802,7 @@ class AdminEventSelectView(PortalSafeView):
     @button(label="Zurück", emoji=_menu_emoji(EMOJI_BACK), style=ButtonStyle.secondary, custom_id="admin_event_select_back")
     async def btn_back(self, inter: discord.Interaction, _):
         emb = discord.Embed(title=f"{EMOJI_GUILD} Admin – Event", description="Wähle eine Event-Aktion.", color=discord.Color.gold())
-        await inter.response.edit_message(embed=emb, view=AdminEventMenuView())
+        await _portal_edit(inter, embed=emb, view=AdminEventMenuView())
 
 
 class AdminEventSelect(Select):
@@ -4577,7 +4823,7 @@ class AdminEventSelect(Select):
     async def callback(self, inter: discord.Interaction):
         msg_id = str(self.values[0])
         if self.action == "resend":
-            await inter.response.defer(ephemeral=True, thinking=True)
+            await _portal_defer(inter, ephemeral=True, thinking=True)
             await _admin_resend_missing_from_menu(inter, self.guild_id, msg_id)
             return
 
@@ -4587,7 +4833,7 @@ class AdminEventSelect(Select):
                 description=f"Soll dieses Event wirklich gelöscht werden?\n\nMessage-ID: `{msg_id}`",
                 color=discord.Color.orange()
             )
-            await inter.response.edit_message(embed=emb, view=AdminEventDeleteConfirmView(self.guild_id, self.user_id, msg_id))
+            await _portal_edit(inter, embed=emb, view=AdminEventDeleteConfirmView(self.guild_id, self.user_id, msg_id))
             return
 
 
@@ -4600,13 +4846,13 @@ class AdminEventDeleteConfirmView(PortalSafeView):
 
     @button(label="✅ Löschen", style=ButtonStyle.danger, custom_id="admin_event_delete_confirm")
     async def btn_confirm(self, inter: discord.Interaction, _):
-        await inter.response.defer(ephemeral=True, thinking=True)
+        await _portal_defer(inter, ephemeral=True, thinking=True)
         await _admin_delete_event_from_menu(inter, self.guild_id, self.message_id)
 
     @button(label="❌ Abbrechen", style=ButtonStyle.secondary, custom_id="admin_event_delete_cancel")
     async def btn_cancel(self, inter: discord.Interaction, _):
         emb = discord.Embed(title="Abgebrochen", description="Das Event wurde nicht gelöscht.", color=discord.Color.orange())
-        await inter.response.edit_message(embed=emb, view=AdminEventMenuView())
+        await _portal_edit(inter, embed=emb, view=AdminEventMenuView())
 
 
 
@@ -4620,7 +4866,7 @@ class AdminAttendanceEventSelectView(PortalSafeView):
     @button(label="Zurück", emoji=_menu_emoji(EMOJI_BACK), style=ButtonStyle.secondary, custom_id="admin_attendance_event_back")
     async def btn_back(self, inter: discord.Interaction, _):
         emb = discord.Embed(title=f"{EMOJI_GUILD} Admin – Event", description="Wähle eine Event-Aktion.", color=discord.Color.gold())
-        await inter.response.edit_message(embed=emb, view=AdminEventMenuView())
+        await _portal_edit(inter, embed=emb, view=AdminEventMenuView())
 
 
 class AdminAttendanceEventSelect(Select):
@@ -4644,15 +4890,15 @@ class AdminAttendanceEventSelect(Select):
     async def callback(self, inter: discord.Interaction):
         event_id = str(self.values[0])
         if event_id == "0":
-            await inter.response.send_message(f"{EMOJI_CALENDAR} Keine Events gefunden.", ephemeral=True)
+            await _portal_send(inter, f"{EMOJI_CALENDAR} Keine Events gefunden.", ephemeral=True)
             return
         rsvp = _admin_event_module()
         event = rsvp.get_attendance_event(self.guild_id, event_id)
         guild = inter.client.get_guild(self.guild_id)
         if not guild or not event:
-            await inter.response.send_message("❌ Event nicht gefunden.", ephemeral=True)
+            await _portal_send(inter, "❌ Event nicht gefunden.", ephemeral=True)
             return
-        await inter.response.edit_message(embed=_admin_attendance_embed(guild, event), view=AdminAttendanceMemberSelectView(self.guild_id, self.user_id, event_id, event))
+        await _portal_edit(inter, embed=_admin_attendance_embed(guild, event), view=AdminAttendanceMemberSelectView(self.guild_id, self.user_id, event_id, event))
 
 
 class AdminAttendanceMemberSelectView(PortalSafeView):
@@ -4673,7 +4919,7 @@ class AdminAttendanceMemberSelectView(PortalSafeView):
         guild = inter.client.get_guild(self.guild_id)
         events = await _admin_attendance_events(guild)
         emb = discord.Embed(title="✅ Admin – Anwesenheit", description="Wähle ein gestartetes Event aus den letzten 30 Tagen.", color=discord.Color.gold())
-        await inter.response.edit_message(embed=emb, view=AdminAttendanceEventSelectView(self.guild_id, self.user_id, events))
+        await _portal_edit(inter, embed=emb, view=AdminAttendanceEventSelectView(self.guild_id, self.user_id, events))
 
     @button(label="◀️", style=ButtonStyle.secondary, custom_id="admin_attendance_page_prev", row=1)
     async def btn_prev(self, inter: discord.Interaction, _):
@@ -4681,9 +4927,9 @@ class AdminAttendanceMemberSelectView(PortalSafeView):
         guild = inter.client.get_guild(self.guild_id)
         event = rsvp.get_attendance_event(self.guild_id, self.event_id)
         if not guild or not event:
-            await inter.response.send_message("❌ Event nicht gefunden.", ephemeral=True)
+            await _portal_send(inter, "❌ Event nicht gefunden.", ephemeral=True)
             return
-        await inter.response.edit_message(embed=_admin_attendance_embed(guild, event), view=AdminAttendanceMemberSelectView(self.guild_id, self.user_id, self.event_id, event, max(0, self.page - 1)))
+        await _portal_edit(inter, embed=_admin_attendance_embed(guild, event), view=AdminAttendanceMemberSelectView(self.guild_id, self.user_id, self.event_id, event, max(0, self.page - 1)))
 
     @button(label="▶️", style=ButtonStyle.secondary, custom_id="admin_attendance_page_next", row=1)
     async def btn_next(self, inter: discord.Interaction, _):
@@ -4691,11 +4937,11 @@ class AdminAttendanceMemberSelectView(PortalSafeView):
         guild = inter.client.get_guild(self.guild_id)
         event = rsvp.get_attendance_event(self.guild_id, self.event_id)
         if not guild or not event:
-            await inter.response.send_message("❌ Event nicht gefunden.", ephemeral=True)
+            await _portal_send(inter, "❌ Event nicht gefunden.", ephemeral=True)
             return
         participants = event.get("participants") or []
         max_page = max(0, (len(participants) - 1) // 25)
-        await inter.response.edit_message(embed=_admin_attendance_embed(guild, event), view=AdminAttendanceMemberSelectView(self.guild_id, self.user_id, self.event_id, event, min(max_page, self.page + 1)))
+        await _portal_edit(inter, embed=_admin_attendance_embed(guild, event), view=AdminAttendanceMemberSelectView(self.guild_id, self.user_id, self.event_id, event, min(max_page, self.page + 1)))
 
     @button(label="➕ Spieler hinzufügen", style=ButtonStyle.success, custom_id="admin_attendance_add_player", row=2)
     async def btn_add_player(self, inter: discord.Interaction, _):
@@ -4705,16 +4951,16 @@ class AdminAttendanceMemberSelectView(PortalSafeView):
     async def btn_set_ec_type(self, inter: discord.Interaction, _):
         resolved_guild, member = await _resolve_guild_member_from_inter(inter)
         if not _is_portal_admin(resolved_guild, member):
-            await inter.response.send_message("❌ Dieser Bereich ist nur für Gildenleitung, Berater oder Wächter.", ephemeral=True)
+            await _portal_send(inter, "❌ Dieser Bereich ist nur für Gildenleitung, Berater oder Wächter.", ephemeral=True)
             return
         rsvp = _admin_event_module()
         guild = inter.client.get_guild(self.guild_id) or resolved_guild
         event = rsvp.get_attendance_event(self.guild_id, self.event_id)
         if not guild or not event:
-            await inter.response.send_message("❌ Event nicht gefunden.", ephemeral=True)
+            await _portal_send(inter, "❌ Event nicht gefunden.", ephemeral=True)
             return
         if _admin_event_any_ec_awarded(self.guild_id, self.event_id):
-            await inter.response.send_message("❌ Für dieses Event wurden bereits EC vergeben. Der EC-Typ wird danach nicht mehr geändert.", ephemeral=True)
+            await _portal_send(inter, "❌ Für dieses Event wurden bereits EC vergeben. Der EC-Typ wird danach nicht mehr geändert.", ephemeral=True)
             return
         current = _admin_event_ec_type(event, self.event_id) or "nicht gesetzt"
         title = str(event.get("title", "Event") or "Event")
@@ -4728,19 +4974,19 @@ class AdminAttendanceMemberSelectView(PortalSafeView):
             ),
             color=discord.Color.gold(),
         )
-        await inter.response.edit_message(embed=emb, view=AdminAttendanceECTypeSetView(self.guild_id, self.user_id, self.event_id, self.page))
+        await _portal_edit(inter, embed=emb, view=AdminAttendanceECTypeSetView(self.guild_id, self.user_id, self.event_id, self.page))
 
     @button(label="💰 EC vergeben", style=ButtonStyle.primary, custom_id="admin_attendance_award_ec", row=2)
     async def btn_award_ec(self, inter: discord.Interaction, _):
         resolved_guild, member = await _resolve_guild_member_from_inter(inter)
         if not _is_portal_admin(resolved_guild, member):
-            await inter.response.send_message("❌ Dieser Bereich ist nur für Gildenleitung, Berater oder Wächter.", ephemeral=True)
+            await _portal_send(inter, "❌ Dieser Bereich ist nur für Gildenleitung, Berater oder Wächter.", ephemeral=True)
             return
         rsvp = _admin_event_module()
         guild = inter.client.get_guild(self.guild_id) or resolved_guild
         event = rsvp.get_attendance_event(self.guild_id, self.event_id)
         if not guild or not event:
-            await inter.response.send_message("❌ Event nicht gefunden.", ephemeral=True)
+            await _portal_send(inter, "❌ Event nicht gefunden.", ephemeral=True)
             return
 
         event_type = _admin_event_ec_type(event, self.event_id)
@@ -4755,11 +5001,11 @@ class AdminAttendanceMemberSelectView(PortalSafeView):
                 ),
                 color=discord.Color.orange(),
             )
-            await inter.response.edit_message(embed=emb, view=AdminAttendanceECTypeSetView(self.guild_id, self.user_id, self.event_id, self.page))
+            await _portal_edit(inter, embed=emb, view=AdminAttendanceECTypeSetView(self.guild_id, self.user_id, self.event_id, self.page))
             return
 
         if _admin_event_ec_awarded(self.guild_id, self.event_id, event):
-            await inter.response.send_message("❌ Für dieses Event wurden bereits EC vergeben. Korrekturen bitte über `/dkp adjust` machen.", ephemeral=True)
+            await _portal_send(inter, "❌ Für dieses Event wurden bereits EC vergeben. Korrekturen bitte über `/dkp adjust` machen.", ephemeral=True)
             return
 
         base_ec, reserve_ec = _admin_event_ec_points(self.guild_id, event_type)
@@ -4780,7 +5026,7 @@ class AdminAttendanceMemberSelectView(PortalSafeView):
             ),
             color=discord.Color.gold(),
         )
-        await inter.response.edit_message(embed=emb, view=AdminAttendanceAwardConfirmView(self.guild_id, self.user_id, self.event_id, self.page))
+        await _portal_edit(inter, embed=emb, view=AdminAttendanceAwardConfirmView(self.guild_id, self.user_id, self.event_id, self.page))
 
 
 class AdminAttendanceECTypeSetView(PortalSafeView):
@@ -4798,9 +5044,9 @@ class AdminAttendanceECTypeSetView(PortalSafeView):
         guild = inter.client.get_guild(self.guild_id)
         event = rsvp.get_attendance_event(self.guild_id, self.event_id)
         if not guild or not event:
-            await inter.response.send_message("❌ Event nicht gefunden.", ephemeral=True)
+            await _portal_send(inter, "❌ Event nicht gefunden.", ephemeral=True)
             return
-        await inter.response.edit_message(
+        await _portal_edit(inter, 
             embed=_admin_attendance_embed(guild, event),
             view=AdminAttendanceMemberSelectView(self.guild_id, self.user_id, self.event_id, event, self.page),
         )
@@ -4823,17 +5069,17 @@ class AdminAttendanceECTypeSelect(Select):
     async def callback(self, inter: discord.Interaction):
         guild, member = await _resolve_guild_member_from_inter(inter)
         if not _is_portal_admin(guild, member):
-            await inter.response.send_message("❌ Dieser Bereich ist nur für Gildenleitung, Berater oder Wächter.", ephemeral=True)
+            await _portal_send(inter, "❌ Dieser Bereich ist nur für Gildenleitung, Berater oder Wächter.", ephemeral=True)
             return
 
         selected = str(self.values[0] or "").strip()
         ok, msg, event = _admin_set_event_ec_type(self.guild_id, self.event_id, selected, int(inter.user.id))
         guild_obj = inter.client.get_guild(self.guild_id) or guild
         if not ok or not guild_obj or not event:
-            await inter.response.send_message(("❌ " + msg), ephemeral=True)
+            await _portal_send(inter, ("❌ " + msg), ephemeral=True)
             return
 
-        await inter.response.edit_message(
+        await _portal_edit(inter, 
             embed=_admin_attendance_embed(guild_obj, event),
             view=AdminAttendanceMemberSelectView(self.guild_id, self.user_id, self.event_id, event, self.page),
         )
@@ -4855,10 +5101,10 @@ class AdminAttendanceAwardConfirmView(PortalSafeView):
     async def btn_confirm(self, inter: discord.Interaction, _):
         guild, member = await _resolve_guild_member_from_inter(inter)
         if not _is_portal_admin(guild, member):
-            await inter.response.send_message("❌ Dieser Bereich ist nur für Gildenleitung, Berater oder Wächter.", ephemeral=True)
+            await _portal_send(inter, "❌ Dieser Bereich ist nur für Gildenleitung, Berater oder Wächter.", ephemeral=True)
             return
 
-        await inter.response.defer(ephemeral=True, thinking=True)
+        await _portal_defer(inter, ephemeral=True, thinking=True)
 
         try:
             dkp = _admin_dkp_module()
@@ -4889,9 +5135,9 @@ class AdminAttendanceAwardConfirmView(PortalSafeView):
         guild = inter.client.get_guild(self.guild_id)
         event = rsvp.get_attendance_event(self.guild_id, self.event_id)
         if not guild or not event:
-            await inter.response.send_message("❌ Event nicht gefunden.", ephemeral=True)
+            await _portal_send(inter, "❌ Event nicht gefunden.", ephemeral=True)
             return
-        await inter.response.edit_message(
+        await _portal_edit(inter, 
             embed=_admin_attendance_embed(guild, event),
             view=AdminAttendanceMemberSelectView(self.guild_id, self.user_id, self.event_id, event, self.page),
         )
@@ -4913,11 +5159,11 @@ class AdminAttendanceAddModal(Modal, title="Spieler zur Anwesenheit hinzufügen"
         guild = inter.client.get_guild(self.guild_id)
         event = rsvp.get_attendance_event(self.guild_id, self.event_id)
         if not guild or not event:
-            await inter.response.send_message("❌ Event nicht gefunden.", ephemeral=True)
+            await _portal_send(inter, "❌ Event nicht gefunden.", ephemeral=True)
             return
         uid = _parse_user_id_from_text(str(self.user_text.value))
         if not uid:
-            await inter.response.send_message("❌ Keine gültige Discord User-ID erkannt.", ephemeral=True)
+            await _portal_send(inter, "❌ Keine gültige Discord User-ID erkannt.", ephemeral=True)
             return
         member = guild.get_member(uid)
         name = _profile_name(guild, uid, member.display_name if member else f"User {uid}")
@@ -4925,9 +5171,9 @@ class AdminAttendanceAddModal(Modal, title="Spieler zur Anwesenheit hinzufügen"
         ok = rsvp.add_attendance_participant(self.guild_id, self.event_id, uid, name, signup=signup, status=status, marked_by=inter.user.id)
         event = rsvp.get_attendance_event(self.guild_id, self.event_id)
         if not ok or not event:
-            await inter.response.send_message("❌ Spieler konnte nicht hinzugefügt werden.", ephemeral=True)
+            await _portal_send(inter, "❌ Spieler konnte nicht hinzugefügt werden.", ephemeral=True)
             return
-        await inter.response.edit_message(embed=_admin_attendance_embed(guild, event), view=AdminAttendanceMemberSelectView(self.guild_id, self.user_id, self.event_id, event, self.page))
+        await _portal_edit(inter, embed=_admin_attendance_embed(guild, event), view=AdminAttendanceMemberSelectView(self.guild_id, self.user_id, self.event_id, event, self.page))
 
 
 class AdminAttendanceMemberSelect(Select):
@@ -4959,13 +5205,13 @@ class AdminAttendanceMemberSelect(Select):
     async def callback(self, inter: discord.Interaction):
         uid = int(self.values[0])
         if uid == 0:
-            await inter.response.send_message("Keine Teilnehmer gefunden.", ephemeral=True)
+            await _portal_send(inter, "Keine Teilnehmer gefunden.", ephemeral=True)
             return
         rsvp = _admin_event_module()
         event = rsvp.get_attendance_event(self.guild_id, self.event_id)
         guild = inter.client.get_guild(self.guild_id)
         if not guild or not event:
-            await inter.response.send_message("❌ Event nicht gefunden.", ephemeral=True)
+            await _portal_send(inter, "❌ Event nicht gefunden.", ephemeral=True)
             return
 
         name = _profile_name(guild, uid, f"User {uid}")
@@ -4974,7 +5220,7 @@ class AdminAttendanceMemberSelect(Select):
             description=f"Spieler: **{name}**\nEvent: **{event.get('title', 'Event')}**\n\nWähle den Status.",
             color=discord.Color.gold(),
         )
-        await inter.response.edit_message(embed=emb, view=AdminAttendanceMarkView(self.guild_id, self.user_id, self.event_id, uid, self.page))
+        await _portal_edit(inter, embed=emb, view=AdminAttendanceMarkView(self.guild_id, self.user_id, self.event_id, uid, self.page))
 
 
 class AdminAttendanceMarkView(PortalSafeView):
@@ -4995,9 +5241,9 @@ class AdminAttendanceMarkView(PortalSafeView):
         guild = inter.client.get_guild(self.guild_id)
         event = rsvp.get_attendance_event(self.guild_id, self.event_id)
         if not ok or not guild or not event:
-            await inter.response.send_message("❌ Anwesenheit konnte nicht gespeichert werden.", ephemeral=True)
+            await _portal_send(inter, "❌ Anwesenheit konnte nicht gespeichert werden.", ephemeral=True)
             return
-        await inter.response.edit_message(embed=_admin_attendance_embed(guild, event), view=AdminAttendanceMemberSelectView(self.guild_id, self.user_id, self.event_id, event, self.page))
+        await _portal_edit(inter, embed=_admin_attendance_embed(guild, event), view=AdminAttendanceMemberSelectView(self.guild_id, self.user_id, self.event_id, event, self.page))
 
     async def _remove(self, inter: discord.Interaction):
         rsvp = _admin_event_module()
@@ -5005,9 +5251,9 @@ class AdminAttendanceMarkView(PortalSafeView):
         guild = inter.client.get_guild(self.guild_id)
         event = rsvp.get_attendance_event(self.guild_id, self.event_id)
         if not ok or not guild or not event:
-            await inter.response.send_message("❌ Spieler konnte nicht entfernt werden.", ephemeral=True)
+            await _portal_send(inter, "❌ Spieler konnte nicht entfernt werden.", ephemeral=True)
             return
-        await inter.response.edit_message(embed=_admin_attendance_embed(guild, event), view=AdminAttendanceMemberSelectView(self.guild_id, self.user_id, self.event_id, event, self.page))
+        await _portal_edit(inter, embed=_admin_attendance_embed(guild, event), view=AdminAttendanceMemberSelectView(self.guild_id, self.user_id, self.event_id, event, self.page))
 
     @button(label="✅ War da", style=ButtonStyle.success, custom_id="admin_attendance_mark_present", row=0)
     async def btn_present(self, inter: discord.Interaction, _):
@@ -5043,9 +5289,9 @@ class AdminAttendanceMarkView(PortalSafeView):
         guild = inter.client.get_guild(self.guild_id)
         event = rsvp.get_attendance_event(self.guild_id, self.event_id)
         if not guild or not event:
-            await inter.response.send_message("❌ Event nicht gefunden.", ephemeral=True)
+            await _portal_send(inter, "❌ Event nicht gefunden.", ephemeral=True)
             return
-        await inter.response.edit_message(embed=_admin_attendance_embed(guild, event), view=AdminAttendanceMemberSelectView(self.guild_id, self.user_id, self.event_id, event, self.page))
+        await _portal_edit(inter, embed=_admin_attendance_embed(guild, event), view=AdminAttendanceMemberSelectView(self.guild_id, self.user_id, self.event_id, event, self.page))
 
 
 class AdminVoiceSettingsView(PortalSafeView):
@@ -5057,9 +5303,9 @@ class AdminVoiceSettingsView(PortalSafeView):
     async def btn_category(self, inter: discord.Interaction, _):
         guild = inter.client.get_guild(self.guild_id)
         if not guild:
-            await inter.response.send_message("❌ Server nicht gefunden.", ephemeral=True)
+            await _portal_send(inter, "❌ Server nicht gefunden.", ephemeral=True)
             return
-        await inter.response.edit_message(
+        await _portal_edit(inter, 
             embed=discord.Embed(title="📁 Event-Voice-Kategorie", description="Wähle die Kategorie, in der Event-Voices erstellt werden sollen.", color=discord.Color.gold()),
             view=AdminVoiceCategorySelectView(self.guild_id, guild),
         )
@@ -5068,9 +5314,9 @@ class AdminVoiceSettingsView(PortalSafeView):
     async def btn_return(self, inter: discord.Interaction, _):
         guild = inter.client.get_guild(self.guild_id)
         if not guild:
-            await inter.response.send_message("❌ Server nicht gefunden.", ephemeral=True)
+            await _portal_send(inter, "❌ Server nicht gefunden.", ephemeral=True)
             return
-        await inter.response.edit_message(
+        await _portal_edit(inter, 
             embed=discord.Embed(title="🔁 Sammel-Voice", description="Wähle den Voice-Channel, in den Mitglieder nach Eventende verschoben werden sollen.", color=discord.Color.gold()),
             view=AdminVoiceReturnSelectView(self.guild_id, guild),
         )
@@ -5078,7 +5324,7 @@ class AdminVoiceSettingsView(PortalSafeView):
     @button(label="Zurück", emoji=_menu_emoji(EMOJI_BACK), style=ButtonStyle.secondary, custom_id="admin_voice_back", row=1)
     async def btn_back(self, inter: discord.Interaction, _):
         emb = discord.Embed(title=f"{EMOJI_GUILD} Admin – Event", description="Wähle eine Event-Aktion.", color=discord.Color.gold())
-        await inter.response.edit_message(embed=emb, view=AdminEventMenuView())
+        await _portal_edit(inter, embed=emb, view=AdminEventMenuView())
 
 
 class AdminVoiceCategorySelectView(PortalSafeView):
@@ -5106,7 +5352,7 @@ class AdminVoiceCategorySelect(Select):
         c["event_voice_category_id"] = int(self.values[0])
         cfg[str(self.guild_id)] = c
         save_cfg()
-        await inter.response.send_message("✅ Event-Voice-Kategorie gespeichert.", ephemeral=True)
+        await _portal_send(inter, "✅ Event-Voice-Kategorie gespeichert.", ephemeral=True)
 
 
 class AdminVoiceReturnSelectView(PortalSafeView):
@@ -5134,7 +5380,7 @@ class AdminVoiceReturnSelect(Select):
         c["event_voice_return_channel_id"] = int(self.values[0])
         cfg[str(self.guild_id)] = c
         save_cfg()
-        await inter.response.send_message("✅ Sammel-Voice gespeichert.", ephemeral=True)
+        await _portal_send(inter, "✅ Sammel-Voice gespeichert.", ephemeral=True)
 
 
 async def _admin_show_voice_settings(inter: discord.Interaction, guild_id: int):
@@ -5165,7 +5411,7 @@ async def _admin_show_voice_settings(inter: discord.Interaction, guild_id: int):
         ),
         color=discord.Color.gold(),
     )
-    await inter.response.edit_message(embed=emb, view=AdminVoiceSettingsView(int(guild_id)))
+    await _portal_edit(inter, embed=emb, view=AdminVoiceSettingsView(int(guild_id)))
 
 
 class AdminMenuView(PortalSafeView):
@@ -5176,7 +5422,7 @@ class AdminMenuView(PortalSafeView):
     async def btn_event(self, inter: discord.Interaction, _):
         guild, member = await _resolve_guild_member_from_inter(inter)
         if not _is_portal_admin(guild, member):
-            await inter.response.send_message("❌ Dieser Bereich ist nur für Gildenleitung, Berater oder Wächter.", ephemeral=True)
+            await _portal_send(inter, "❌ Dieser Bereich ist nur für Gildenleitung, Berater oder Wächter.", ephemeral=True)
             return
         if guild and member and inter.message:
             _mark_portal_sent(guild.id, member.id, inter.message.id)
@@ -5194,13 +5440,13 @@ class AdminMenuView(PortalSafeView):
             ),
             color=discord.Color.gold()
         )
-        await inter.response.edit_message(embed=emb, view=AdminEventMenuView())
+        await _portal_edit(inter, embed=emb, view=AdminEventMenuView())
 
     @button(label="Loot", emoji=_menu_emoji(EMOJI_LOOT), style=ButtonStyle.secondary, custom_id="portal_admin_loot")
     async def btn_loot(self, inter: discord.Interaction, _):
         guild, member = await _resolve_guild_member_from_inter(inter)
         if not _is_portal_admin(guild, member):
-            await inter.response.send_message("❌ Dieser Bereich ist nur für Gildenleitung, Berater oder Wächter.", ephemeral=True)
+            await _portal_send(inter, "❌ Dieser Bereich ist nur für Gildenleitung, Berater oder Wächter.", ephemeral=True)
             return
         if guild and member and inter.message:
             _mark_portal_sent(guild.id, member.id, inter.message.id)
@@ -5209,14 +5455,14 @@ class AdminMenuView(PortalSafeView):
             description="Wähle eine Loot-Aktion.",
             color=discord.Color.gold()
         )
-        await inter.response.edit_message(embed=emb, view=AdminLootMenuView())
+        await _portal_edit(inter, embed=emb, view=AdminLootMenuView())
 
     @button(label="Zurück", emoji=_menu_emoji(EMOJI_BACK), style=ButtonStyle.secondary, custom_id="portal_admin_back")
     async def btn_back(self, inter: discord.Interaction, _):
         guild, member = await _resolve_guild_member_from_inter(inter)
         if guild and member and inter.message:
             _mark_portal_sent(guild.id, member.id, inter.message.id)
-        await inter.response.edit_message(embed=_main_menu_embed(guild, member), view=MemberPortalMainView())
+        await _portal_edit(inter, embed=_main_menu_embed(guild, member), view=MemberPortalMainView())
 
 
 class AdminEventMenuView(PortalSafeView):
@@ -5227,7 +5473,7 @@ class AdminEventMenuView(PortalSafeView):
     async def btn_create(self, inter: discord.Interaction, _):
         guild, member = await _resolve_guild_member_from_inter(inter)
         if not _is_portal_admin(guild, member):
-            await inter.response.send_message("❌ Dieser Bereich ist nur für Gildenleitung, Berater oder Wächter.", ephemeral=True)
+            await _portal_send(inter, "❌ Dieser Bereich ist nur für Gildenleitung, Berater oder Wächter.", ephemeral=True)
             return
         await inter.response.send_modal(AdminEventCreateModal(guild.id, member.id))
 
@@ -5235,7 +5481,7 @@ class AdminEventMenuView(PortalSafeView):
     async def btn_alliance(self, inter: discord.Interaction, _):
         guild, member = await _resolve_guild_member_from_inter(inter)
         if not _is_portal_admin(guild, member):
-            await inter.response.send_message("❌ Dieser Bereich ist nur für Gildenleitung, Berater oder Wächter.", ephemeral=True)
+            await _portal_send(inter, "❌ Dieser Bereich ist nur für Gildenleitung, Berater oder Wächter.", ephemeral=True)
             return
         if guild and member and inter.message:
             _mark_portal_sent(guild.id, member.id, inter.message.id)
@@ -5245,53 +5491,53 @@ class AdminEventMenuView(PortalSafeView):
     async def btn_delete(self, inter: discord.Interaction, _):
         guild, member = await _resolve_guild_member_from_inter(inter)
         if not _is_portal_admin(guild, member):
-            await inter.response.send_message("❌ Dieser Bereich ist nur für Gildenleitung, Berater oder Wächter.", ephemeral=True)
+            await _portal_send(inter, "❌ Dieser Bereich ist nur für Gildenleitung, Berater oder Wächter.", ephemeral=True)
             return
         events = _admin_active_rsvp_events(guild)
         if not events:
-            await inter.response.send_message(f"{EMOJI_CALENDAR} Keine aktiven Events gefunden.", ephemeral=True)
+            await _portal_send(inter, f"{EMOJI_CALENDAR} Keine aktiven Events gefunden.", ephemeral=True)
             return
         emb = discord.Embed(title="🗑️ Event löschen", description="Wähle das Event, das gelöscht werden soll.", color=discord.Color.gold())
-        await inter.response.edit_message(embed=emb, view=AdminEventSelectView(guild.id, member.id, "delete", events))
+        await _portal_edit(inter, embed=emb, view=AdminEventSelectView(guild.id, member.id, "delete", events))
 
     @button(label="📨 Resend Missing", style=ButtonStyle.secondary, custom_id="portal_admin_event_resend", row=1)
     async def btn_resend(self, inter: discord.Interaction, _):
         guild, member = await _resolve_guild_member_from_inter(inter)
         if not _is_portal_admin(guild, member):
-            await inter.response.send_message("❌ Dieser Bereich ist nur für Gildenleitung, Berater oder Wächter.", ephemeral=True)
+            await _portal_send(inter, "❌ Dieser Bereich ist nur für Gildenleitung, Berater oder Wächter.", ephemeral=True)
             return
         events = _admin_active_rsvp_events(guild)
         if not events:
-            await inter.response.send_message(f"{EMOJI_CALENDAR} Keine aktiven Events gefunden.", ephemeral=True)
+            await _portal_send(inter, f"{EMOJI_CALENDAR} Keine aktiven Events gefunden.", ephemeral=True)
             return
         emb = discord.Embed(title="📨 Resend Missing", description="Wähle das Event, für das fehlende Abstimmungen erneut gesendet werden sollen.", color=discord.Color.gold())
-        await inter.response.edit_message(embed=emb, view=AdminEventSelectView(guild.id, member.id, "resend", events))
+        await _portal_edit(inter, embed=emb, view=AdminEventSelectView(guild.id, member.id, "resend", events))
 
     @button(label="✅ Anwesenheit", style=ButtonStyle.secondary, custom_id="portal_admin_event_attendance", row=2)
     async def btn_attendance(self, inter: discord.Interaction, _):
         guild, member = await _resolve_guild_member_from_inter(inter)
         if not _is_portal_admin(guild, member):
-            await inter.response.send_message("❌ Dieser Bereich ist nur für Gildenleitung, Berater oder Wächter.", ephemeral=True)
+            await _portal_send(inter, "❌ Dieser Bereich ist nur für Gildenleitung, Berater oder Wächter.", ephemeral=True)
             return
         events = await _admin_attendance_events(guild)
         if not events:
-            await inter.response.send_message(f"{EMOJI_CALENDAR} Keine gestarteten Events für Anwesenheit gefunden.", ephemeral=True)
+            await _portal_send(inter, f"{EMOJI_CALENDAR} Keine gestarteten Events für Anwesenheit gefunden.", ephemeral=True)
             return
         emb = discord.Embed(title="✅ Admin – Anwesenheit", description="Wähle ein gestartetes Event aus den letzten 30 Tagen.", color=discord.Color.gold())
-        await inter.response.edit_message(embed=emb, view=AdminAttendanceEventSelectView(guild.id, member.id, events))
+        await _portal_edit(inter, embed=emb, view=AdminAttendanceEventSelectView(guild.id, member.id, events))
 
     @button(label="🔊 Voice-Einstellungen", style=ButtonStyle.secondary, custom_id="portal_admin_event_voice_settings", row=3)
     async def btn_voice_settings(self, inter: discord.Interaction, _):
         guild, member = await _resolve_guild_member_from_inter(inter)
         if not _is_portal_admin(guild, member):
-            await inter.response.send_message("❌ Dieser Bereich ist nur für Gildenleitung, Berater oder Wächter.", ephemeral=True)
+            await _portal_send(inter, "❌ Dieser Bereich ist nur für Gildenleitung, Berater oder Wächter.", ephemeral=True)
             return
         await _admin_show_voice_settings(inter, guild.id)
 
     @button(label="Zurück", emoji=_menu_emoji(EMOJI_BACK), style=ButtonStyle.secondary, custom_id="portal_admin_event_back", row=4)
     async def btn_back(self, inter: discord.Interaction, _):
         emb = discord.Embed(title=f"{EMOJI_ADMIN} Admin", description="Wähle einen Bereich.", color=discord.Color.gold())
-        await inter.response.edit_message(embed=emb, view=AdminMenuView())
+        await _portal_edit(inter, embed=emb, view=AdminMenuView())
 
 
 class AdminJunkDropModal(Modal, title="🧹 Müll gedroppt"):
@@ -5311,7 +5557,7 @@ class AdminJunkDropModal(Modal, title="🧹 Müll gedroppt"):
     async def on_submit(self, inter: discord.Interaction):
         guild = inter.client.get_guild(self.guild_id) or inter.guild
         if guild is None:
-            await inter.response.send_message("❌ Server konnte nicht zugeordnet werden.", ephemeral=True)
+            await _portal_send(inter, "❌ Server konnte nicht zugeordnet werden.", ephemeral=True)
             return
 
         member = guild.get_member(int(inter.user.id))
@@ -5322,15 +5568,15 @@ class AdminJunkDropModal(Modal, title="🧹 Müll gedroppt"):
                 member = None
 
         if int(inter.user.id) != self.user_id or not _is_portal_admin(guild, member):
-            await inter.response.send_message("❌ Dieser Bereich ist nur für Gildenleitung, Berater oder Wächter.", ephemeral=True)
+            await _portal_send(inter, "❌ Dieser Bereich ist nur für Gildenleitung, Berater oder Wächter.", ephemeral=True)
             return
 
         title = str(self.item_title.value or "").strip()
         if not title:
-            await inter.response.send_message("❌ Bitte einen Item-Titel eintragen.", ephemeral=True)
+            await _portal_send(inter, "❌ Bitte einen Item-Titel eintragen.", ephemeral=True)
             return
 
-        await inter.response.defer(ephemeral=True, thinking=True)
+        await _portal_defer(inter, ephemeral=True, thinking=True)
         try:
             try:
                 import bot.loot_auction as auction_mod  # type: ignore
@@ -5379,10 +5625,10 @@ class AdminLootMenuView(PortalSafeView):
     async def _open(self, inter: discord.Interaction, fn_name: str):
         guild, member = await _resolve_guild_member_from_inter(inter)
         if not guild or not member:
-            await inter.response.send_message("❌ Ich konnte deinen Server nicht zuordnen.", ephemeral=True)
+            await _portal_send(inter, "❌ Ich konnte deinen Server nicht zuordnen.", ephemeral=True)
             return
         if not _is_portal_admin(guild, member):
-            await inter.response.send_message("❌ Dieser Bereich ist nur für Gildenleitung, Berater oder Wächter.", ephemeral=True)
+            await _portal_send(inter, "❌ Dieser Bereich ist nur für Gildenleitung, Berater oder Wächter.", ephemeral=True)
             return
         if inter.message:
             _mark_portal_sent(guild.id, member.id, inter.message.id)
@@ -5394,7 +5640,7 @@ class AdminLootMenuView(PortalSafeView):
             fn = getattr(loot_mod, fn_name)
             await fn(inter, guild.id, member.id)
         except Exception as e:
-            await inter.response.send_message(f"❌ Loot-Menü konnte nicht geöffnet werden: `{e}`", ephemeral=True)
+            await _portal_send(inter, f"❌ Loot-Menü konnte nicht geöffnet werden: `{e}`", ephemeral=True)
 
     @button(label="➕ Item hinzufügen", style=ButtonStyle.secondary, custom_id="portal_admin_loot_add", row=0)
     async def btn_add(self, inter: discord.Interaction, _):
@@ -5408,10 +5654,10 @@ class AdminLootMenuView(PortalSafeView):
     async def btn_junk_drop(self, inter: discord.Interaction, _):
         guild, member = await _resolve_guild_member_from_inter(inter)
         if not guild or not member:
-            await inter.response.send_message("❌ Ich konnte deinen Server nicht zuordnen.", ephemeral=True)
+            await _portal_send(inter, "❌ Ich konnte deinen Server nicht zuordnen.", ephemeral=True)
             return
         if not _is_portal_admin(guild, member):
-            await inter.response.send_message("❌ Dieser Bereich ist nur für Gildenleitung, Berater oder Wächter.", ephemeral=True)
+            await _portal_send(inter, "❌ Dieser Bereich ist nur für Gildenleitung, Berater oder Wächter.", ephemeral=True)
             return
         if inter.message:
             _mark_portal_sent(guild.id, member.id, inter.message.id)
@@ -5432,7 +5678,7 @@ class AdminLootMenuView(PortalSafeView):
     @button(label="Zurück", emoji=_menu_emoji(EMOJI_BACK), style=ButtonStyle.secondary, custom_id="portal_admin_loot_back", row=3)
     async def btn_back(self, inter: discord.Interaction, _):
         emb = discord.Embed(title=f"{EMOJI_ADMIN} Admin", description="Wähle einen Bereich.", color=discord.Color.gold())
-        await inter.response.edit_message(embed=emb, view=AdminMenuView())
+        await _portal_edit(inter, embed=emb, view=AdminMenuView())
 
 
 class SupportMenuView(PortalSafeView):
@@ -5444,7 +5690,7 @@ class SupportMenuView(PortalSafeView):
         guild, member = await _resolve_guild_member_from_inter(inter)
 
         if not guild or not member:
-            await inter.response.send_message("❌ Ich konnte deinen Server nicht zuordnen.")
+            await _portal_send(inter, "❌ Ich konnte deinen Server nicht zuordnen.")
             return
 
         if inter.message:
@@ -5480,7 +5726,7 @@ class SupportMenuView(PortalSafeView):
             color=discord.Color.gold()
         )
 
-        await inter.response.edit_message(embed=emb, view=HelpView())
+        await _portal_edit(inter, embed=emb, view=HelpView())
 
     @button(label="Zurück", emoji=_menu_emoji(EMOJI_BACK), style=ButtonStyle.secondary, custom_id="portal_support_back")
     async def btn_back(self, inter: discord.Interaction, _):
@@ -5489,7 +5735,7 @@ class SupportMenuView(PortalSafeView):
         if guild and member and inter.message:
             _mark_portal_sent(guild.id, member.id, inter.message.id)
 
-        await inter.response.edit_message(embed=_main_menu_embed(guild, member), view=MemberPortalMainView())
+        await _portal_edit(inter, embed=_main_menu_embed(guild, member), view=MemberPortalMainView())
 
 
 class ProfileView(PortalSafeView):
@@ -5501,7 +5747,7 @@ class ProfileView(PortalSafeView):
         guild, member = await _resolve_guild_member_from_inter(inter)
 
         if not guild or not member:
-            await inter.response.send_message("❌ Ich konnte deinen Server nicht zuordnen.")
+            await _portal_send(inter, "❌ Ich konnte deinen Server nicht zuordnen.")
             return
 
         if inter.message:
@@ -5514,13 +5760,13 @@ class ProfileView(PortalSafeView):
         guild, member = await _resolve_guild_member_from_inter(inter)
 
         if not guild:
-            await inter.response.send_message("❌ Ich konnte deinen Server nicht zuordnen.")
+            await _portal_send(inter, "❌ Ich konnte deinen Server nicht zuordnen.")
             return
 
         if member and inter.message:
             _mark_portal_sent(guild.id, member.id, inter.message.id)
 
-        await inter.response.edit_message(embed=_members_list_embed(guild), view=BackOnlyView())
+        await _portal_edit(inter, embed=_members_list_embed(guild), view=BackOnlyView())
 
     @button(label="Zurück", emoji=_menu_emoji(EMOJI_BACK), style=ButtonStyle.secondary, custom_id="portal_profile_back")
     async def btn_back(self, inter: discord.Interaction, _):
@@ -5529,7 +5775,7 @@ class ProfileView(PortalSafeView):
         if guild and member and inter.message:
             _mark_portal_sent(guild.id, member.id, inter.message.id)
 
-        await inter.response.edit_message(embed=_main_menu_embed(guild, member), view=MemberPortalMainView())
+        await _portal_edit(inter, embed=_main_menu_embed(guild, member), view=MemberPortalMainView())
 
 
 class EventsInfoView(PortalSafeView):
@@ -5541,13 +5787,13 @@ class EventsInfoView(PortalSafeView):
         guild, member = await _resolve_guild_member_from_inter(inter)
 
         if not guild:
-            await inter.response.send_message("❌ Ich konnte deinen Server nicht zuordnen.")
+            await _portal_send(inter, "❌ Ich konnte deinen Server nicht zuordnen.")
             return
 
         if member and inter.message:
             _mark_portal_sent(guild.id, member.id, inter.message.id)
 
-        await inter.response.edit_message(embed=_events_embed(guild.id), view=EventsInfoView())
+        await _portal_edit(inter, embed=_events_embed(guild.id), view=EventsInfoView())
 
     @button(label="Zurück", emoji=_menu_emoji(EMOJI_BACK), style=ButtonStyle.secondary, custom_id="portal_events_back")
     async def btn_back(self, inter: discord.Interaction, _):
@@ -5570,7 +5816,7 @@ class EventsInfoView(PortalSafeView):
             color=discord.Color.gold()
         )
 
-        await inter.response.edit_message(embed=emb, view=GuildMenuView())
+        await _portal_edit(inter, embed=emb, view=GuildMenuView())
 
 
 class RulesLootView(PortalSafeView):
@@ -5582,7 +5828,7 @@ class RulesLootView(PortalSafeView):
         guild, member = await _resolve_guild_member_from_inter(inter)
 
         if not guild or not member:
-            await inter.response.send_message("❌ Ich konnte deinen Server nicht zuordnen.")
+            await _portal_send(inter, "❌ Ich konnte deinen Server nicht zuordnen.")
             return
 
         if inter.message:
@@ -5596,7 +5842,7 @@ class RulesLootView(PortalSafeView):
 
             await open_need_menu(inter, guild.id, member.id)
         except Exception:
-            await inter.response.edit_message(embed=_rules_loot_embed(), view=RulesLootView())
+            await _portal_edit(inter, embed=_rules_loot_embed(), view=RulesLootView())
 
     @button(label="Zurück", emoji=_menu_emoji(EMOJI_BACK), style=ButtonStyle.secondary, custom_id="rules_back_main")
     async def btn_back(self, inter: discord.Interaction, _):
@@ -5605,7 +5851,7 @@ class RulesLootView(PortalSafeView):
         if guild and member and inter.message:
             _mark_portal_sent(guild.id, member.id, inter.message.id)
 
-        await inter.response.edit_message(embed=_main_menu_embed(guild, member), view=MemberPortalMainView())
+        await _portal_edit(inter, embed=_main_menu_embed(guild, member), view=MemberPortalMainView())
 
 
 class HelpView(PortalSafeView):
@@ -5617,7 +5863,7 @@ class HelpView(PortalSafeView):
         guild, member = await _resolve_guild_member_from_inter(inter)
 
         if not guild or not member:
-            await inter.response.send_message("❌ Ich konnte deinen Server nicht zuordnen.")
+            await _portal_send(inter, "❌ Ich konnte deinen Server nicht zuordnen.")
             return
 
         if inter.message:
@@ -5632,7 +5878,7 @@ class HelpView(PortalSafeView):
         if guild and member and inter.message:
             _mark_portal_sent(guild.id, member.id, inter.message.id)
 
-        await inter.response.edit_message(embed=_main_menu_embed(guild, member), view=MemberPortalMainView())
+        await _portal_edit(inter, embed=_main_menu_embed(guild, member), view=MemberPortalMainView())
 
 
 class BackOnlyView(PortalSafeView):
@@ -5646,7 +5892,7 @@ class BackOnlyView(PortalSafeView):
         if guild and member and inter.message:
             _mark_portal_sent(guild.id, member.id, inter.message.id)
 
-        await inter.response.edit_message(embed=_main_menu_embed(guild, member), view=MemberPortalMainView())
+        await _portal_edit(inter, embed=_main_menu_embed(guild, member), view=MemberPortalMainView())
 
 
 class GuildBroadcastConfirmView(discord.ui.View):
@@ -5673,7 +5919,7 @@ class GuildBroadcastConfirmView(discord.ui.View):
 
     async def interaction_check(self, inter: discord.Interaction) -> bool:
         if int(inter.user.id) != self.author_id:
-            await inter.response.send_message(
+            await _portal_send(inter, 
                 "❌ Nur die Person, die diese Rundnachricht erstellt hat, kann sie versenden.",
                 ephemeral=True,
             )
@@ -5706,13 +5952,13 @@ class GuildBroadcastConfirmView(discord.ui.View):
     @discord.ui.button(label="Test an mich", emoji="🧪", style=discord.ButtonStyle.secondary)
     async def test_send(self, inter: discord.Interaction, _button: discord.ui.Button):
         if self._sending:
-            await inter.response.send_message("⏳ Der Versand läuft bereits.", ephemeral=True)
+            await _portal_send(inter, "⏳ Der Versand läuft bereits.", ephemeral=True)
             return
 
         guild = inter.client.get_guild(self.guild_id)
         embed = self._build_embed(guild, inter.user)
 
-        await inter.response.defer(ephemeral=True, thinking=True)
+        await _portal_defer(inter, ephemeral=True, thinking=True)
         try:
             await inter.user.send(
                 embed=embed,
@@ -5730,12 +5976,12 @@ class GuildBroadcastConfirmView(discord.ui.View):
     @discord.ui.button(label="An alle senden", emoji="📨", style=discord.ButtonStyle.danger)
     async def send_all(self, inter: discord.Interaction, _button: discord.ui.Button):
         if self._sending:
-            await inter.response.send_message("⏳ Der Versand läuft bereits.", ephemeral=True)
+            await _portal_send(inter, "⏳ Der Versand läuft bereits.", ephemeral=True)
             return
 
         self._sending = True
         self._disable_all()
-        await inter.response.defer(ephemeral=True, thinking=True)
+        await _portal_defer(inter, ephemeral=True, thinking=True)
         await inter.edit_original_response(view=self)
 
         guild = inter.client.get_guild(self.guild_id)
@@ -5797,7 +6043,7 @@ class GuildBroadcastConfirmView(discord.ui.View):
     @discord.ui.button(label="Abbrechen", emoji="✖️", style=discord.ButtonStyle.secondary)
     async def cancel(self, inter: discord.Interaction, _button: discord.ui.Button):
         self._disable_all()
-        await inter.response.edit_message(content="❌ Rundnachricht abgebrochen.", embed=None, view=None)
+        await _portal_edit(inter, content="❌ Rundnachricht abgebrochen.", embed=None, view=None)
         self.stop()
 
 
@@ -5832,12 +6078,12 @@ class GuildBroadcastModal(discord.ui.Modal, title="📨 Private Rundnachricht"):
     async def on_submit(self, inter: discord.Interaction) -> None:
         guild = inter.client.get_guild(self.guild_id)
         if guild is None:
-            await inter.response.send_message("❌ Server nicht gefunden.", ephemeral=True)
+            await _portal_send(inter, "❌ Server nicht gefunden.", ephemeral=True)
             return
 
         role = guild.get_role(self.role_id)
         if role is None:
-            await inter.response.send_message("❌ Gildenmitglied-Rolle nicht gefunden.", ephemeral=True)
+            await _portal_send(inter, "❌ Gildenmitglied-Rolle nicht gefunden.", ephemeral=True)
             return
 
         clean_title = _safe_text(str(self.subject.value or "").strip())
@@ -5845,11 +6091,11 @@ class GuildBroadcastModal(discord.ui.Modal, title="📨 Private Rundnachricht"):
         clean_image = str(self.image_url.value or "").strip()
 
         if not clean_message:
-            await inter.response.send_message("❌ Die Nachricht darf nicht leer sein.", ephemeral=True)
+            await _portal_send(inter, "❌ Die Nachricht darf nicht leer sein.", ephemeral=True)
             return
 
         if clean_image and not re.match(r"^https?://", clean_image, flags=re.IGNORECASE):
-            await inter.response.send_message("❌ Die Bild-URL muss mit `http://` oder `https://` beginnen.", ephemeral=True)
+            await _portal_send(inter, "❌ Die Bild-URL muss mit `http://` oder `https://` beginnen.", ephemeral=True)
             return
 
         recipients = [member for member in role.members if not member.bot]
@@ -5875,7 +6121,7 @@ class GuildBroadcastModal(discord.ui.Modal, title="📨 Private Rundnachricht"):
             message=clean_message,
             image_url=clean_image,
         )
-        await inter.response.send_message(embed=preview, view=view, ephemeral=True)
+        await _portal_send(inter, embed=preview, view=view, ephemeral=True)
 
 
 async def setup_member_portal(client: discord.Client, tree: app_commands.CommandTree):
@@ -5977,7 +6223,7 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
     @tree.command(name="portal_set_absence_channel", description="(Admin) Abwesenheitskanal setzen")
     async def portal_set_absence_channel(inter: discord.Interaction):
         if not _is_admin(inter):
-            await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True)
+            await _portal_send(inter, "❌ Nur Admin/Manage Server.", ephemeral=True)
             return
 
         async def _picked(pick_inter: discord.Interaction, channel: discord.TextChannel):
@@ -5992,7 +6238,7 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
     @tree.command(name="portal_set_member_role", description="(Admin) Rolle setzen, deren Mitglieder automatisch die Gildenzentrale bekommen")
     async def portal_set_member_role(inter: discord.Interaction, role: discord.Role):
         if not _is_admin(inter):
-            await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True)
+            await _portal_send(inter, "❌ Nur Admin/Manage Server.", ephemeral=True)
             return
 
         c = _gcfg(inter.guild_id)
@@ -6000,7 +6246,7 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
         cfg[str(inter.guild_id)] = c
         save_cfg()
 
-        await inter.response.send_message(
+        await _portal_send(inter, 
             f"✅ Gildenmitglied-Rolle gesetzt: {role.mention}\n"
             f"Neue Mitglieder mit dieser Rolle bekommen automatisch die Gildenzentrale per DM.",
             ephemeral=True
@@ -6009,31 +6255,31 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
     @tree.command(name="portal_set_guild_info", description="(Admin) Mitteilung in der Gildenzentrale setzen oder leeren")
     async def portal_set_guild_info(inter: discord.Interaction, text: str = ""):
         if not _is_admin(inter):
-            await inter.response.send_message("❌ Nur Admins/Manage Guild.", ephemeral=True)
+            await _portal_send(inter, "❌ Nur Admins/Manage Guild.", ephemeral=True)
             return
 
         if not inter.guild_id:
-            await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
+            await _portal_send(inter, "❌ Nur im Server nutzbar.", ephemeral=True)
             return
 
         c = _gcfg(inter.guild_id)
         cleaned = _safe_text(str(text or "").strip())
 
         if len(cleaned) > 900:
-            await inter.response.send_message("❌ Die Gildeninfo ist zu lang. Bitte maximal ca. 900 Zeichen nutzen.", ephemeral=True)
+            await _portal_send(inter, "❌ Die Gildeninfo ist zu lang. Bitte maximal ca. 900 Zeichen nutzen.", ephemeral=True)
             return
 
         c["guild_info_text"] = cleaned
         save_cfg()
 
         if cleaned:
-            await inter.response.send_message("✅ Gildeninfo für die Gildenzentrale gesetzt. Nutze `/portal_send_all force:false`, um bestehende Menüs zu aktualisieren.", ephemeral=True)
+            await _portal_send(inter, "✅ Gildeninfo für die Gildenzentrale gesetzt. Nutze `/portal_send_all force:false`, um bestehende Menüs zu aktualisieren.", ephemeral=True)
         else:
-            await inter.response.send_message("✅ Gildeninfo geleert. Nutze `/portal_send_all force:false`, um bestehende Menüs zu aktualisieren.", ephemeral=True)
+            await _portal_send(inter, "✅ Gildeninfo geleert. Nutze `/portal_send_all force:false`, um bestehende Menüs zu aktualisieren.", ephemeral=True)
 
     @tree.command(name="portal_send_all", description="(Admin) Öffnet/aktualisiert die Gildenzentrale per DM bei allen mit Gildenmitglied-Rolle")
     async def portal_send_all(inter: discord.Interaction, force: bool = False):
-        await inter.response.defer(ephemeral=True, thinking=True)
+        await _portal_defer(inter, ephemeral=True, thinking=True)
 
         if not _is_admin(inter):
             await inter.followup.send("❌ Nur Admin/Manage Server.", ephemeral=True)
@@ -6081,18 +6327,18 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
     )
     async def portal_rundnachricht(inter: discord.Interaction):
         if not _is_admin(inter):
-            await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True)
+            await _portal_send(inter, "❌ Nur Admin/Manage Server.", ephemeral=True)
             return
 
         if inter.guild is None or inter.guild_id is None:
-            await inter.response.send_message("❌ Nur auf einem Server nutzbar.", ephemeral=True)
+            await _portal_send(inter, "❌ Nur auf einem Server nutzbar.", ephemeral=True)
             return
 
         c = _gcfg(inter.guild_id)
         member_role_id = int(c.get("member_role_id", 0) or 0)
 
         if not member_role_id:
-            await inter.response.send_message(
+            await _portal_send(inter, 
                 "❌ Keine Gildenmitglied-Rolle gesetzt. Nutze zuerst `/portal_set_member_role`.",
                 ephemeral=True,
             )
@@ -6100,12 +6346,12 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
 
         role = inter.guild.get_role(member_role_id)
         if role is None:
-            await inter.response.send_message("❌ Die gesetzte Gildenmitglied-Rolle wurde nicht gefunden.", ephemeral=True)
+            await _portal_send(inter, "❌ Die gesetzte Gildenmitglied-Rolle wurde nicht gefunden.", ephemeral=True)
             return
 
         recipients = [member for member in role.members if not member.bot]
         if not recipients:
-            await inter.response.send_message(
+            await _portal_send(inter, 
                 f"❌ In {role.mention} wurden keine erreichbaren Mitglieder gefunden.",
                 ephemeral=True,
             )
@@ -6121,7 +6367,7 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
 
     @tree.command(name="portal_resend_user", description="(Admin) Öffnet/aktualisiert bei einem Spieler die Gildenzentrale")
     async def portal_resend_user(inter: discord.Interaction, member: discord.Member):
-        await inter.response.defer(ephemeral=True, thinking=True)
+        await _portal_defer(inter, ephemeral=True, thinking=True)
 
         if not _is_admin(inter):
             await inter.followup.send("❌ Nur Admin/Manage Server.", ephemeral=True)
@@ -6142,7 +6388,7 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
 
     @tree.command(name="portal_force_new_user", description="(Admin) Erzwingt eine komplett neue Gildenzentrale per DM")
     async def portal_force_new_user(inter: discord.Interaction, member: discord.Member):
-        await inter.response.defer(ephemeral=True, thinking=True)
+        await _portal_defer(inter, ephemeral=True, thinking=True)
 
         if not _is_admin(inter):
             await inter.followup.send("❌ Nur Admin/Manage Server.", ephemeral=True)
@@ -6175,7 +6421,7 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
 
     @tree.command(name="portal_force_new_all", description="(Admin) Erzwingt eine komplett neue Gildenzentrale bei allen Gildenmitgliedern")
     async def portal_force_new_all(inter: discord.Interaction):
-        await inter.response.defer(ephemeral=True, thinking=True)
+        await _portal_defer(inter, ephemeral=True, thinking=True)
 
         if not _is_admin(inter):
             await inter.followup.send("❌ Nur Admin/Manage Server.", ephemeral=True)
@@ -6239,7 +6485,7 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
         member: discord.Member,
         limit: int = 300
     ):
-        await inter.response.defer(ephemeral=True, thinking=True)
+        await _portal_defer(inter, ephemeral=True, thinking=True)
 
         if not _is_admin(inter):
             await inter.followup.send("❌ Nur Admin/Manage Server.", ephemeral=True)
@@ -6263,7 +6509,7 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
         inter: discord.Interaction,
         limit: int = 300
     ):
-        await inter.response.defer(ephemeral=True, thinking=True)
+        await _portal_defer(inter, ephemeral=True, thinking=True)
 
         if not _is_admin(inter):
             await inter.followup.send("❌ Nur Admin/Manage Server.", ephemeral=True)
@@ -6323,7 +6569,7 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
         waechter: discord.Role,
     ):
         if not _is_admin(inter):
-            await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True)
+            await _portal_send(inter, "❌ Nur Admin/Manage Server.", ephemeral=True)
             return
 
         c = _gcfg(inter.guild_id)
@@ -6336,7 +6582,7 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
         cfg[str(inter.guild_id)] = c
         save_cfg()
 
-        await inter.response.send_message(
+        await _portal_send(inter, 
             f"✅ Positionsrollen gesetzt:\n"
             f"• Anführer: {anfuehrer.mention}\n"
             f"• Gildenberater: {gildenberater.mention}\n"
@@ -6352,7 +6598,7 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
         title: str,
     ):
         if not _is_admin(inter):
-            await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True)
+            await _portal_send(inter, "❌ Nur Admin/Manage Server.", ephemeral=True)
             return
 
         c = _gcfg(inter.guild_id)
@@ -6368,7 +6614,7 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
         cfg[str(inter.guild_id)] = c
         save_cfg()
 
-        await inter.response.send_message(
+        await _portal_send(inter, 
             f"✅ Event hinzugefügt:\n**{weekday}, {time} Uhr** – {title}",
             ephemeral=True
         )
@@ -6376,7 +6622,7 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
     @tree.command(name="portal_events_clear", description="(Admin) Alle festen Gildenzentrale-Events löschen")
     async def portal_events_clear(inter: discord.Interaction):
         if not _is_admin(inter):
-            await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True)
+            await _portal_send(inter, "❌ Nur Admin/Manage Server.", ephemeral=True)
             return
 
         c = _gcfg(inter.guild_id)
@@ -6384,19 +6630,19 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
         cfg[str(inter.guild_id)] = c
         save_cfg()
 
-        await inter.response.send_message("✅ Alle Gildenzentrale-Events gelöscht.", ephemeral=True)
+        await _portal_send(inter, "✅ Alle Gildenzentrale-Events gelöscht.", ephemeral=True)
 
     @tree.command(name="portal_events_list", description="(Admin) Zeigt gespeicherte Gildenzentrale-Events")
     async def portal_events_list(inter: discord.Interaction):
         if not _is_admin(inter):
-            await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True)
+            await _portal_send(inter, "❌ Nur Admin/Manage Server.", ephemeral=True)
             return
 
         c = _gcfg(inter.guild_id)
         events = c.get("events") or []
 
         if not events:
-            await inter.response.send_message(f"{EMOJI_CALENDAR} Keine Events gespeichert.", ephemeral=True)
+            await _portal_send(inter, f"{EMOJI_CALENDAR} Keine Events gespeichert.", ephemeral=True)
             return
 
         lines = []
@@ -6404,12 +6650,12 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
         for i, e in enumerate(events, start=1):
             lines.append(f"{i}. **{e.get('weekday')}**, {e.get('time')} Uhr – {e.get('title')}")
 
-        await inter.response.send_message("\n".join(lines), ephemeral=True)
+        await _portal_send(inter, "\n".join(lines), ephemeral=True)
 
     @tree.command(name="portal_post", description="(Admin) Postet den Button zum Öffnen der privaten Gildenzentrale")
     async def portal_post(inter: discord.Interaction):
         if not _is_admin(inter):
-            await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True)
+            await _portal_send(inter, "❌ Nur Admin/Manage Server.", ephemeral=True)
             return
 
         async def _picked(pick_inter: discord.Interaction, ch: discord.TextChannel):
@@ -6449,7 +6695,7 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
     @tree.command(name="portal_status", description="(Admin) Zeigt Portal-Konfiguration")
     async def portal_status(inter: discord.Interaction):
         if not _is_admin(inter):
-            await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True)
+            await _portal_send(inter, "❌ Nur Admin/Manage Server.", ephemeral=True)
             return
 
         c = _gcfg(inter.guild_id)
@@ -6476,4 +6722,4 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
             f"**Feste Events:** {len(c.get('events') or [])}"
         )
 
-        await inter.response.send_message(text, ephemeral=True)
+        await _portal_send(inter, text, ephemeral=True)

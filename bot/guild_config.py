@@ -49,6 +49,7 @@ CHANNEL_KEYS = {
     "loot": "guild_channel_loot_id",
     "ec_log": "guild_channel_ec_log_id",
     "audit": "guild_channel_audit_id",
+    "error_log": "guild_channel_error_log_id",
     "welcome": "guild_channel_welcome_id",
     "announcements": "guild_channel_announcements_id",
     "news": "guild_channel_news_id",
