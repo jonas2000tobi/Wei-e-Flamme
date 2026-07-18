@@ -5278,27 +5278,38 @@ document.addEventListener('change', function(ev) {{
   if (ev.target && ev.target.matches('select.need-slot-select')) refreshItemPickerFilters();
   if (ev.target && ev.target.matches('select.weapon-type-picker')) refreshNeedWeaponPicker(ev.target);
 }});
-// Beim echten Öffnen immer am Seitenanfang starten. Browser-Scroll-Restoration
-// würde sonst häufig die zuletzt fokussierte Karte bzw. das Karten-iframe wiederherstellen.
+// Beim echten Öffnen immer am Seitenanfang starten. Die Karte wird bewusst
+// NICHT automatisch geladen, damit ein fremdes iframe den Fokus nicht übernimmt.
 (function resetInitialViewport() {{
   try {{ if ('scrollRestoration' in history) history.scrollRestoration = 'manual'; }} catch (_) {{}}
   let userMoved = false;
   const markMoved = () => {{ userMoved = true; }};
-  window.addEventListener('wheel', markMoved, {{passive:true, once:true}});
-  window.addEventListener('touchmove', markMoved, {{passive:true, once:true}});
+  ['wheel', 'touchstart', 'touchmove', 'pointerdown'].forEach((name) =>
+    window.addEventListener(name, markMoved, {{passive:true, once:true}})
+  );
   window.addEventListener('keydown', markMoved, {{once:true}});
+
   const toTop = () => {{
     if (userMoved) return;
-    const hash = String(location.hash || '');
-    // Echte Sprunglinks weiterhin respektieren; nur ungewollte Wiederherstellung verhindern.
-    if (hash && document.querySelector(hash)) return;
+    // Alte versehentliche #map-URLs bereinigen. Andere echte Sprunglinks bleiben erhalten.
+    if (String(location.hash || '').toLowerCase() === '#map') {{
+      try {{ history.replaceState(null, '', location.pathname + location.search); }} catch (_) {{}}
+    }} else if (location.hash && document.querySelector(location.hash)) {{
+      return;
+    }}
     window.scrollTo({{top:0, left:0, behavior:'instant'}});
     document.documentElement.scrollTop = 0;
     if (document.body) document.body.scrollTop = 0;
   }};
+
   toTop();
-  document.addEventListener('DOMContentLoaded', () => {{ toTop(); requestAnimationFrame(toTop); }}, {{once:true}});
-  window.addEventListener('pageshow', () => {{ toTop(); setTimeout(toTop, 60); }}, {{once:true}});
+  document.addEventListener('DOMContentLoaded', () => {{
+    toTop();
+    requestAnimationFrame(() => requestAnimationFrame(toTop));
+    [50, 200, 600, 1400, 2600].forEach((ms) => setTimeout(toTop, ms));
+  }}, {{once:true}});
+  window.addEventListener('load', () => {{ toTop(); setTimeout(toTop, 150); }}, {{once:true}});
+  window.addEventListener('pageshow', () => {{ toTop(); setTimeout(toTop, 100); }}, {{once:true}});
 }})();
 
 document.addEventListener('DOMContentLoaded', function() {{
@@ -13153,14 +13164,17 @@ def _render_status_dashboard(data: dict[str, Any], request: Optional[Request] = 
         <a class="btn ghost" id="statusMapDirect" href="{_e(direct_map_url)}" target="_blank" rel="noopener">Karte groß öffnen</a>
       </div>
       <div class="status-map-wrap" style="position:relative;contain:content;content-visibility:auto;">
-        <div id="statusMapLoader" class="muted" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;z-index:1;background:rgba(0,0,0,.35);border-radius:12px;min-height:420px;">Karte wird geladen …</div>
-        <iframe id="statusMapFrame" class="status-map-frame" title="Solisium Karte" src="about:blank" data-src="{_e(map_url)}" width="100%" height="560" style="border:none;border-radius:8px;background:#05060a;" allowfullscreen loading="eager" referrerpolicy="no-referrer-when-downgrade"></iframe>
+        <div id="statusMapLoader" class="muted" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;z-index:1;background:linear-gradient(180deg,rgba(18,13,7,.82),rgba(4,5,8,.94));border-radius:12px;min-height:420px;">
+          <button class="btn" id="statusMapLoad" type="button">🗺️ Karte laden</button>
+        </div>
+        <iframe id="statusMapFrame" class="status-map-frame" title="Solisium Karte" src="about:blank" data-src="{_e(map_url)}" data-loaded="0" width="100%" height="560" style="border:none;border-radius:8px;background:#05060a;" allowfullscreen loading="lazy" tabindex="-1" referrerpolicy="no-referrer-when-downgrade"></iframe>
       </div>
 
       <script>
       (function() {{
         const frame = document.getElementById('statusMapFrame');
         const loader = document.getElementById('statusMapLoader');
+        const loadButton = document.getElementById('statusMapLoad');
         const direct = document.getElementById('statusMapDirect');
         const source = document.getElementById('statusMapSource');
         if (!frame) return;
@@ -13170,12 +13184,14 @@ def _render_status_dashboard(data: dict[str, Any], request: Optional[Request] = 
         function setMap(src, label) {{
           if (!src) return;
           if (loader) loader.style.display = 'flex';
+          if (loadButton) loadButton.textContent = 'Karte wird geladen …';
+          frame.dataset.loaded = '1';
           frame.src = src;
           if (direct) direct.href = directUrl(src);
           if (source) source.textContent = label || 'Karte';
         }}
         frame.addEventListener('load', function() {{
-          if (loader) loader.style.display = 'none';
+          if (frame.dataset.loaded === '1' && loader) loader.style.display = 'none';
         }});
         document.querySelectorAll('[data-map-src]').forEach(function(btn) {{
           btn.addEventListener('click', function() {{
@@ -13186,12 +13202,11 @@ def _render_status_dashboard(data: dict[str, Any], request: Optional[Request] = 
         }});
         const initial = frame.getAttribute('data-src') || '{_e(tldb_map_url)}';
         const initialLabel = initial.indexOf('interactivemap.app') >= 0 ? 'IMapp' : (initial.indexOf('questlog.gg') >= 0 ? 'Questlog' : 'TLDB');
-        const load = function() {{ setMap(initial, initialLabel); }};
-        if ('requestIdleCallback' in window) {{
-          window.requestIdleCallback(load, {{timeout: 1600}});
-        }} else {{
-          window.addEventListener('load', function() {{ setTimeout(load, 500); }});
+        if (loadButton) {{
+          loadButton.addEventListener('click', function() {{ setMap(initial, initialLabel); }});
         }}
+        // Kein automatisches iframe-Laden: externe Karten dürfen beim Seitenstart
+        // weder Fokus noch Scrollposition übernehmen.
       }})();
       </script>
     </section>
