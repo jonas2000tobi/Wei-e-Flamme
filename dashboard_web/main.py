@@ -14069,7 +14069,7 @@ def _render_guild_config_dashboard(data: dict[str, Any], msg: str = "") -> str:
     if not isinstance(voice_blocked, list): voice_blocked = [voice_blocked]
     channel_keys = {
         "events": "guild_channel_events_id", "loot": "guild_channel_loot_id", "ec_log": "guild_channel_ec_log_id",
-        "audit": "guild_channel_audit_id", "welcome": "guild_channel_welcome_id",
+        "audit": "guild_channel_audit_id", "error_log": "guild_channel_error_log_id", "welcome": "guild_channel_welcome_id",
         "announcements": "guild_channel_announcements_id", "news": "guild_channel_news_id",
         "guides": "guild_channel_guides_id", "voice_category": "guild_channel_voice_category_id",
         "voice_return": "guild_channel_voice_return_id", "absences": "guild_channel_absences_id",
@@ -14128,6 +14128,7 @@ def _render_guild_config_dashboard(data: dict[str, Any], msg: str = "") -> str:
         <label>Loot/Auktionen<br>{_channel_select('channel_loot', channels, cv['loot'], kinds={'text','forum'})}</label>
         <label>EC-/Loot-Log<br>{_channel_select('channel_ec_log', channels, cv['ec_log'], kinds={'text'})}</label>
         <label>Audit/Technik<br>{_channel_select('channel_audit', channels, cv['audit'], kinds={'text'})}</label>
+        <label>Bot-Fehlerkanal<br>{_channel_select('channel_error_log', channels, cv['error_log'], kinds={'text'})}</label>
         <label>Willkommen<br>{_channel_select('channel_welcome', channels, cv['welcome'], kinds={'text'})}</label>
         <label>Ankündigungen<br>{_channel_select('channel_announcements', channels, cv['announcements'], kinds={'text','forum'})}</label>
         <label>News<br>{_channel_select('channel_news', channels, cv['news'], kinds={'text','forum'})}</label>
@@ -14215,6 +14216,7 @@ async def guild_config_save(request: Request, _: bool = Depends(_admin_auth)):
         "guild_channel_loot_id": one_int("channel_loot"),
         "guild_channel_ec_log_id": one_int("channel_ec_log"),
         "guild_channel_audit_id": one_int("channel_audit"),
+        "guild_channel_error_log_id": one_int("channel_error_log"),
         "guild_channel_welcome_id": one_int("channel_welcome"),
         "guild_channel_announcements_id": one_int("channel_announcements"),
         "guild_channel_news_id": one_int("channel_news"),
