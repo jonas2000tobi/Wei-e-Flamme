@@ -20,9 +20,9 @@ BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 
 PROFILE_DEFAULTS: dict[str, Any] = {
-    "display_name": "Gilde",
-    "short_name": "Gilde",
-    "bot_display_name": "Gildenknecht",
+    "display_name": "Beer and Buffs",
+    "short_name": "Beer and Buffs",
+    "bot_display_name": "Beer and Buffs Knecht",
     "timezone": "Europe/Berlin",
     "logo_url": "",
     "banner_url": "",
@@ -743,6 +743,109 @@ async def setup_guild_config(bot: commands.Bot, tree: app_commands.CommandTree) 
         rule_lines = [f"• {kind}: {value}" for kind, value in cfg.get("rules", {}).items()]
         emb.add_field(name="Regeln", value="\n".join(rule_lines)[:1024] or "—", inline=False)
         await inter.followup.send(embed=emb, ephemeral=True)
+
+    @guild_group.command(name="cleanup_dms", description="Löscht alle Bot-DMs inkl. alter Gildenmenüs bei aktuellen Servermitgliedern.")
+    @app_commands.describe(
+        bestaetigen="Muss auf Ja stehen, weil die Löschung nicht rückgängig gemacht werden kann.",
+        neue_gildenzentrale="Nach der Bereinigung direkt eine neue Gildenzentrale an echte Gildenmitglieder senden.",
+        verlauf_limit="Maximal geprüfte DM-Nachrichten pro Person (1–1000).",
+    )
+    async def guild_cleanup_dms(
+        inter: discord.Interaction,
+        bestaetigen: bool,
+        neue_gildenzentrale: bool = False,
+        verlauf_limit: app_commands.Range[int, 1, 1000] = 1000,
+    ):
+        if inter.guild is None:
+            await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
+            return
+        await inter.response.defer(ephemeral=True, thinking=True)
+        if not await asyncio.to_thread(_is_admin, inter):
+            await inter.followup.send("❌ Nur für Server-Admins/Leitung.", ephemeral=True)
+            return
+        if not bestaetigen:
+            await inter.followup.send(
+                "❌ Abgebrochen. Setze **bestaetigen: Ja**, wenn wirklich alle Bot-DMs inklusive Gildenmenüs gelöscht werden sollen.",
+                ephemeral=True,
+            )
+            return
+        if inter.client.user is None:
+            await inter.followup.send("❌ Bot-Nutzer ist noch nicht verfügbar.", ephemeral=True)
+            return
+
+        try:
+            from bot import member_portal as portal_mod  # type: ignore
+        except Exception:
+            import member_portal as portal_mod  # type: ignore
+
+        checked = 0
+        deleted = 0
+        failed = 0
+        resent = 0
+        no_dm = 0
+        guild = inter.guild
+        limit = int(verlauf_limit)
+
+        for member in list(guild.members):
+            if member.bot:
+                continue
+            checked += 1
+            try:
+                dm = member.dm_channel or await member.create_dm()
+                found = 0
+                async for message in dm.history(limit=limit, oldest_first=False):
+                    if message.author.id != inter.client.user.id:
+                        continue
+                    found += 1
+                    try:
+                        await message.delete()
+                        deleted += 1
+                        await asyncio.sleep(0.12)
+                    except Exception:
+                        failed += 1
+                if found == 0:
+                    no_dm += 1
+                try:
+                    portal_mod._clear_portal_sent(guild.id, member.id)
+                except Exception:
+                    pass
+            except Exception:
+                failed += 1
+
+        if neue_gildenzentrale:
+            try:
+                role_ids = {
+                    *globals()["role_ids"](guild.id, "member"),
+                    *globals()["role_ids"](guild.id, "leader"),
+                    *globals()["role_ids"](guild.id, "advisor"),
+                    *globals()["role_ids"](guild.id, "guardian"),
+                }
+                role_ids.discard(0)
+                for member in list(guild.members):
+                    if member.bot:
+                        continue
+                    if role_ids and not any(role.id in role_ids for role in member.roles):
+                        continue
+                    try:
+                        msg = await portal_mod._send_new_portal_menu(member, guild)
+                        if msg:
+                            resent += 1
+                        await asyncio.sleep(0.25)
+                    except Exception:
+                        failed += 1
+            except Exception:
+                failed += 1
+
+        await inter.followup.send(
+            "✅ **Bot-DM-Bereinigung abgeschlossen.**\n"
+            f"👥 Personen geprüft: **{checked}**\n"
+            f"🧹 Bot-Nachrichten gelöscht: **{deleted}**\n"
+            f"📭 Keine Bot-DM gefunden: **{no_dm}**\n"
+            f"✉️ Neue Gildenzentralen gesendet: **{resent}**\n"
+            f"⚠️ Einzelne Fehler: **{failed}**\n\n"
+            "Gelöscht wurden ausschließlich Nachrichten dieses Bots. Nutzer-Nachrichten bleiben bestehen.",
+            ephemeral=True,
+        )
 
     @guild_group.command(name="rehome", description="Übernimmt mitgekommene Mitglieder und Historie aus einer alten Guild-ID.")
     @app_commands.describe(source_guild_id="Alte Discord-Guild-ID", copy_legacy_json="Vorhandene JSON-Altdaten zusätzlich kopieren")
