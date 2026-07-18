@@ -209,7 +209,7 @@ def _guild_brand(data: Optional[dict[str, Any]] = None) -> dict[str, Any]:
         guild_row = snap.get("guild") or {}
     else:
         guild_row = {}
-    display = str(profile.get("display_name") or guild_row.get("name") or (data or {}).get("guild_name") or "Gilde")
+    display = str(profile.get("display_name") or guild_row.get("name") or (data or {}).get("guild_name") or "Beer and Buffs")
     accent = str(profile.get("accent_color") or "#d6a84f").strip()
     if not re.fullmatch(r"#[0-9a-fA-F]{6}", accent):
         accent = "#d6a84f"
@@ -217,7 +217,7 @@ def _guild_brand(data: Optional[dict[str, Any]] = None) -> dict[str, Any]:
         "guild_id": gid,
         "display_name": display,
         "short_name": str(profile.get("short_name") or display),
-        "bot_display_name": str(profile.get("bot_display_name") or f"{display} Knecht"),
+        "bot_display_name": str(profile.get("bot_display_name") or "Beer and Buffs Knecht"),
         "timezone": str(profile.get("timezone_name") or profile.get("timezone") or "Europe/Berlin"),
         "logo_url": str(profile.get("logo_url") or ""),
         "banner_url": str(profile.get("banner_url") or ""),
@@ -2026,7 +2026,7 @@ def _admin_member_panel(data: dict[str, Any], user_id: int, current_user: Option
 
 def _render_admin_actions_dashboard(data: dict[str, Any]) -> str:
     if not data.get("ok"):
-        return _html_shell("Leitung · Weisse Flamme Dashboard", f"<section class='panel'><h1>🛡️ Leitung</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+        return _html_shell("Leitung · Beer and Buffs Dashboard", f"<section class='panel'><h1>🛡️ Leitung</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
     snap: dict[str, Any] = data.get("snapshot") or {}
     guild_id = _safe_guild_id(data)
     states = _all_member_admin_states(guild_id)
@@ -2070,7 +2070,7 @@ def _render_admin_actions_dashboard(data: dict[str, Any]) -> str:
     <section class="panel"><h2>👥 Markierte Mitglieder</h2>{_table(['Mitglied','Status','Notiz','Geändert von','Geändert am'], rows, placeholder='Markierungen durchsuchen…')}</section>
     <section class="panel"><h2>🧾 Web-Admin-Aktionslog</h2>{_table(['Zeit','Aktion','Ziel','Akteur'], log_rows, placeholder='Adminlog durchsuchen…')}</section>
     """
-    return _html_shell("Leitung · Weisse Flamme Dashboard", body, nav_mode="admin")
+    return _html_shell("Leitung · Beer and Buffs Dashboard", body, nav_mode="admin")
 
 
 # ---------------------------------------------------------------------------
@@ -2244,7 +2244,7 @@ def _admin_center_payload(data: dict[str, Any]) -> dict[str, Any]:
 
 def _render_admin_center_dashboard(data: dict[str, Any]) -> str:
     if not data.get("ok"):
-        return _html_shell("Admin · Weisse Flamme Dashboard", f"<section class='panel'><h1>🛡️ Admin-Zentrale</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+        return _html_shell("Admin · Beer and Buffs Dashboard", f"<section class='panel'><h1>🛡️ Admin-Zentrale</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
     snap: dict[str, Any] = data.get("snapshot") or {}
     names = _profile_name_map(snap)
     p = _admin_center_payload(data)
@@ -2324,7 +2324,7 @@ def _render_admin_center_dashboard(data: dict[str, Any]) -> str:
     <section class="panel"><h2>🧩 Datenquellen</h2>{_table(['Key','Datei','vorhanden','Status','Bytes','Geändert'], source_rows, placeholder='Quellen durchsuchen…')}</section>
     <section class="panel"><h2>🧾 Web-Admin-Aktionslog</h2>{_table(['Zeit','Aktion','Ziel','Akteur'], log_rows, placeholder='Adminlog durchsuchen…')}</section>
     """
-    return _html_shell("Admin-Zentrale · Weisse Flamme Dashboard", body, nav_mode="admin")
+    return _html_shell("Admin-Zentrale · Beer and Buffs Dashboard", body, nav_mode="admin")
 
 
 def _card(title: str, value: Any, sub: str = "") -> str:
@@ -2716,10 +2716,10 @@ def _bars(items: list[tuple[Any, Any]], *, max_items: int = 8) -> str:
 def _render_dashboard(data: dict[str, Any]) -> str:
     if not data.get("ok"):
         return _html_shell(
-            "Weisse Flamme Dashboard",
+            "Beer and Buffs Dashboard",
             f"""
             <section class="panel">
-              <h1>📊 Weisse Flamme Dashboard</h1>
+              <h1>📊 Beer and Buffs Dashboard</h1>
               <p class="muted">{_e(data.get('error'))}</p>
               <p>Starte den Bot mit der aktuellen Version und warte bis zu 5 Minuten. Oder nutze im Discord <code>/dashboard_status</code>, damit direkt ein Snapshot veröffentlicht wird.</p>
             </section>
@@ -2838,7 +2838,7 @@ def _render_dashboard(data: dict[str, Any]) -> str:
     <section class="hero" id="overview">
       <div>
         <div class="eyebrow">Read-only Dashboard</div>
-        <h1>🏰 {_e('Weisse Flamme')}</h1>
+        <h1>🏰 {_e('Beer and Buffs')}</h1>
         <p>Snapshot veröffentlicht: <strong>{_e(_dt(data.get('published_at')))}</strong> · generiert: {_e(_dt(data.get('generated_at')))}</p>
         <p class="muted">{_e(role_line)} · alte JSON-Einträge werden nur ausgeblendet, nicht gelöscht.</p>
       </div>
@@ -2876,12 +2876,12 @@ def _render_dashboard(data: dict[str, Any]) -> str:
     <section class="panel"><h2>🎙️ Voice-Sessions</h2>{_table(['Spieler','Kanal','Rein','Raus','Minuten'], voice_rows, placeholder='Voice-Sessions durchsuchen…')}</section>
     <section class="panel" id="logs"><h2>🧾 Audit-Log</h2>{_table(['Zeit','Aktion','Zusammenfassung','Actor'], audit_rows, placeholder='Audit-Logs durchsuchen…')}</section>
     """
-    return _html_shell("Weisse Flamme Dashboard", body)
+    return _html_shell("Beer and Buffs Dashboard", body)
 
 
 def _render_member_detail(data: dict[str, Any], user_id: int, current_user: Optional[dict[str, Any]] = None) -> str:
     if not data.get("ok"):
-        return _html_shell("Weisse Flamme Dashboard", f"<section class='panel'><h1>📊 Weisse Flamme Dashboard</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+        return _html_shell("Beer and Buffs Dashboard", f"<section class='panel'><h1>📊 Beer and Buffs Dashboard</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
     snap: dict[str, Any] = data.get("snapshot") or {}
     profiles = ((snap.get("profiles") or {}).get("items") or [])
     balances = _balance_map(snap)
@@ -2947,7 +2947,7 @@ def _render_member_detail(data: dict[str, Any], user_id: int, current_user: Opti
     <section class="panel"><h2>🎁 Auktionen mit aktueller Führung/Gewinn</h2>{_table(['Item','Status','Phase','Gebot','Ende'], auction_rows, placeholder='Auktionen durchsuchen…')}</section>
     <section class="panel" id="voice"><h2>🎙️ Voice-Sessions</h2>{_table(['Kanal','Rein','Raus','Minuten'], voice_rows, placeholder='Voice durchsuchen…')}</section>
     """
-    return _html_shell(f"{display} · Weisse Flamme Dashboard", body)
+    return _html_shell(f"{display} · Beer and Buffs Dashboard", body)
 
 
 def _event_by_id(snap: dict[str, Any], event_id: str) -> Optional[dict[str, Any]]:
@@ -3032,7 +3032,7 @@ def _role_signup_html(event: dict[str, Any]) -> str:
 
 def _render_event_detail(data: dict[str, Any], event_id: str) -> str:
     if not data.get("ok"):
-        return _html_shell("Weisse Flamme Dashboard", f"<section class='panel'><h1>📊 Weisse Flamme Dashboard</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+        return _html_shell("Beer and Buffs Dashboard", f"<section class='panel'><h1>📊 Beer and Buffs Dashboard</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
     snap: dict[str, Any] = data.get("snapshot") or {}
     guild_id = _safe_guild_id(data)
     event = _event_by_id(snap, event_id) or _event_stub_from_attendance_review(guild_id, event_id)
@@ -3073,7 +3073,7 @@ def _render_event_detail(data: dict[str, Any], event_id: str) -> str:
     <section class="panel" id="no"><h2>❌ Abgemeldet</h2>{_table(['Spieler','Gildenrolle'], no_rows, placeholder='Abmeldungen durchsuchen…')}</section>
     {_event_ec_queue_panel(_safe_guild_id(data), str(event_id))}
     """
-    return _html_shell(f"{event.get('title') or 'Event'} · Weisse Flamme Dashboard", body)
+    return _html_shell(f"{event.get('title') or 'Event'} · Beer and Buffs Dashboard", body)
 
 
 def _auction_by_id(snap: dict[str, Any], auction_id: str) -> Optional[dict[str, Any]]:
@@ -3767,7 +3767,7 @@ def _enqueue_loot_drop_request(
 
 def _render_auction_detail(data: dict[str, Any], auction_id: str, current_user: Optional[dict[str, Any]] = None, msg: str = "") -> str:
     if not data.get("ok"):
-        return _html_shell("Weisse Flamme Dashboard", f"<section class='panel'><h1>📊 Weisse Flamme Dashboard</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+        return _html_shell("Beer and Buffs Dashboard", f"<section class='panel'><h1>📊 Beer and Buffs Dashboard</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
     snap: dict[str, Any] = data.get("snapshot") or {}
     auction = _auction_by_id(snap, auction_id)
     if not auction:
@@ -3862,13 +3862,13 @@ def _render_auction_detail(data: dict[str, Any], auction_id: str, current_user: 
     <section class="panel" id="eligible"><h2>✅ Berechtigte Spieler</h2><p class="muted">Bei freien Auktionen/Sale kann die Liste leer sein, weil dann alle berechtigt sind.</p>{_table(['Spieler'], eligible_rows, placeholder='Berechtigte durchsuchen…')}</section>
     <section class="panel" id="tech"><h2>🧾 Technische Infos</h2>{_table(['Bereich','Kanal-ID','Nachricht-ID'], channel_info, searchable=False)}</section>
     """
-    return _html_shell(f"{_loot_text(auction.get('item_name') or 'Auktion')} · Weisse Flamme Dashboard", body)
+    return _html_shell(f"{_loot_text(auction.get('item_name') or 'Auktion')} · Beer and Buffs Dashboard", body)
 
 
 def _sidebar_html() -> str:
     """Admin-/Leader-Sidebar. Diese Ansicht erscheint nur im Admin-Modus."""
     brand = _guild_brand()
-    logo = _brand_image("logo", "weisse_flamme_sidebar_logo.png")
+    logo = _brand_image("logo", "beer_and_buffs_logo.png")
     return f"""
     <aside class="sidebar admin-sidebar">
       <div class="brand">
@@ -3910,7 +3910,7 @@ def _sidebar_html() -> str:
 def _member_sidebar_html() -> str:
     """Normale Dashboard-Sidebar. Auch Admins sehen standardmäßig diese Ansicht."""
     brand = _guild_brand()
-    logo = _brand_image("logo", "weisse_flamme_sidebar_logo.png")
+    logo = _brand_image("logo", "beer_and_buffs_logo.png")
     return f"""
     <aside class="sidebar member-default-sidebar">
       <div class="brand">
@@ -3960,7 +3960,7 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "member") -> str:
     brand = _guild_brand()
     brand_name = str(brand.get("display_name") or "Gilde")
     hero_banner = _css_url(_brand_image("banner", "hero_banner.webp"))
-    brand_logo = _css_url(_brand_image("logo", "ebolus_logo.png"))
+    brand_logo = _css_url(_brand_image("logo", "beer_and_buffs_logo.png"))
     for old_name in ("Weisse Flamme", "Weiße Flamme", "Ebolus", "ebolus"):
         title = str(title).replace(old_name, brand_name)
         body = str(body).replace(old_name, brand_name)
@@ -3976,10 +3976,10 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "member") -> str:
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{_e(title)}</title>
-  <link rel="icon" type="image/png" href="{_asset('favicon.png')}">
+  <title>{_e(brand_name)} · {_e(title)}</title>
+  <link rel="icon" type="image/png" href="{_asset('beer_and_buffs_favicon.png')}">
   <meta property="og:title" content="{_e(title)}">
-  <meta property="og:image" content="{_e(_brand_image('banner', 'opengraph.webp'))}">
+  <meta property="og:image" content="{_e(_brand_image('banner', 'beer_and_buffs_opengraph.webp'))}">
   <meta name="theme-color" content="{_e(brand['accent_color'])}">
   <style>
     :root {{ --bg:#090b10; --panel:#141923; --panel2:#1b2230; --text:#eef2f7; --muted:#9da8b6; --gold:{_e(brand['accent_color'])}; --line:#303947; --red:#d96868; --green:#81c784; --side:#0b0e14; --side2:#131923; }}
@@ -4132,7 +4132,7 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "member") -> str:
     td {{ overflow-wrap:anywhere; }}
     .skip-mobile {{ display:inline; }}
 
-    /* Weisse Flamme Gothic/Whale Visual Pass v1 */
+    /* Beer and Buffs Gothic/Whale Visual Pass v1 */
     body::before {{ content:""; position:fixed; inset:0; pointer-events:none; z-index:-1; background:radial-gradient(circle at 50% 0%,rgba(142,179,214,.16),transparent 34%), linear-gradient(90deg,rgba(0,0,0,.58),rgba(0,0,0,.12) 22%,rgba(0,0,0,.12) 78%,rgba(0,0,0,.62)); }}
     .app-shell {{ grid-template-columns:286px minmax(0,1fr); }}
     .sidebar {{ background:linear-gradient(180deg,rgba(18,23,31,.96),rgba(6,8,12,.98)); border-right:1px solid rgba(184,201,220,.32); box-shadow:22px 0 58px rgba(0,0,0,.52), inset -1px 0 0 rgba(224,234,244,.05); }}
@@ -5403,7 +5403,7 @@ def _update_ec_award_request_status(guild_id: int, request_id: str, new_status: 
 
 def _render_ec_queue_dashboard(data: dict[str, Any], current_user: Optional[dict[str, Any]] = None, msg: str = "") -> str:
     if not data.get("ok"):
-        return _html_shell("EC-Queue · Weisse Flamme Dashboard", f"<section class='panel'><h1>🌐 EC-Queue</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+        return _html_shell("EC-Queue · Beer and Buffs Dashboard", f"<section class='panel'><h1>🌐 EC-Queue</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
     snap: dict[str, Any] = data.get("snapshot") or {}
     guild_id = _safe_guild_id(data)
     rows = _ec_award_requests_for_dashboard(guild_id, limit=200) if guild_id else []
@@ -5440,12 +5440,12 @@ def _render_ec_queue_dashboard(data: dict[str, Any], current_user: Optional[dict
       {_table(['Angefragt','Status','Event','Typ','EC','Gebucht','Übersprungen','Admin','Details','Aktion'], table_rows, placeholder='EC-Queue durchsuchen…')}
     </section>
     """
-    return _html_shell("EC-Queue · Weisse Flamme Dashboard", body)
+    return _html_shell("EC-Queue · Beer and Buffs Dashboard", body)
 
 
 def _render_ec_dashboard(data: dict[str, Any]) -> str:
     if not data.get("ok"):
-        return _html_shell("Weisse Flamme Dashboard", f"<section class='panel'><h1>🪙 EC-Verlauf</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+        return _html_shell("Beer and Buffs Dashboard", f"<section class='panel'><h1>🪙 EC-Verlauf</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
     snap: dict[str, Any] = data.get("snapshot") or {}
     names = _profile_name_map(snap)
     txs = _ec_transactions(snap)
@@ -5532,7 +5532,7 @@ def _render_ec_dashboard(data: dict[str, Any]) -> str:
     <section class="panel" id="recent"><h2>🧾 Letzte EC-Buchungen</h2>{_table(['Zeit','Spieler','Betrag','Typ','Grund','Quelle'], recent_rows, placeholder='Buchungen durchsuchen…')}</section>
     <section class="panel" id="balances"><h2>🪙 Alle EC-Konten</h2>{_table(['Spieler','EC'], balance_rows, placeholder='EC-Konten durchsuchen…')}</section>
     """
-    return _html_shell("EC-Verlauf · Weisse Flamme Dashboard", body)
+    return _html_shell("EC-Verlauf · Beer and Buffs Dashboard", body)
 
 
 
@@ -5685,7 +5685,7 @@ def _activity_analytics(snap: dict[str, Any]) -> dict[str, Any]:
 
 def _render_activity_analytics(data: dict[str, Any]) -> str:
     if not data.get("ok"):
-        return _html_shell("Analytics · Weisse Flamme Dashboard", f"<section class='panel'><h1>📈 Analytics</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+        return _html_shell("Analytics · Beer and Buffs Dashboard", f"<section class='panel'><h1>📈 Analytics</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
     snap: dict[str, Any] = data.get("snapshot") or {}
     act = _activity_analytics(snap)
     base = _analytics_from_snapshot(snap)
@@ -5770,7 +5770,7 @@ def _render_activity_analytics(data: dict[str, Any]) -> str:
     <section class="panel"><h2>📅 Events im Vergleich</h2>{_table(['Event','Zeit','Zusagen','Vielleicht','Nein','Nicht abgestimmt','Antwortquote'], event_rows[:200], placeholder='Events durchsuchen…')}</section>
     <section class="panel" id="voice"><h2>🎙️ Voice-Zeit</h2>{_table(['Spieler','Voice-Zeit','Sessions','zuletzt'], voice_rows[:120], placeholder='Voice durchsuchen…')}</section>
     """
-    return _html_shell("Analytics · Weisse Flamme Dashboard", body)
+    return _html_shell("Analytics · Beer and Buffs Dashboard", body)
 
 
 
@@ -5793,7 +5793,7 @@ def _source_health_rows(snap: dict[str, Any]) -> list[list[Any]]:
 
 def _render_settings_dashboard(data: dict[str, Any]) -> str:
     if not data.get("ok"):
-        return _html_shell("Weisse Flamme Dashboard", f"<section class='panel'><h1>⚙️ Einstellungen</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+        return _html_shell("Beer and Buffs Dashboard", f"<section class='panel'><h1>⚙️ Einstellungen</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
     snap: dict[str, Any] = data.get("snapshot") or {}
     guild = snap.get("guild") or {}
     settings = snap.get("settings") or {}
@@ -5866,12 +5866,12 @@ def _render_settings_dashboard(data: dict[str, Any]) -> str:
     <section class="panel"><h2>🎭 Rollen</h2>{_table(['Quelle','Setting','Rolle','ID'], role_rows, placeholder='Rollen durchsuchen…')}</section>
     <section class="panel"><h2>🔧 Erkannte Einstellungen</h2>{_table(['Quelle','Key','Wert'], setting_rows, placeholder='Settings durchsuchen…')}</section>
     """
-    return _html_shell("Einstellungen · Weisse Flamme Dashboard", body, nav_mode="admin")
+    return _html_shell("Einstellungen · Beer and Buffs Dashboard", body, nav_mode="admin")
 
 
 def _render_audit_dashboard(data: dict[str, Any]) -> str:
     if not data.get("ok"):
-        return _html_shell("Weisse Flamme Dashboard", f"<section class='panel'><h1>🧾 Audit</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+        return _html_shell("Beer and Buffs Dashboard", f"<section class='panel'><h1>🧾 Audit</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
     snap: dict[str, Any] = data.get("snapshot") or {}
     audit = snap.get("audit") or {}
     logs = [x for x in (audit.get("recent_logs") or []) if isinstance(x, dict)]
@@ -5897,12 +5897,12 @@ def _render_audit_dashboard(data: dict[str, Any]) -> str:
     <section class="panel"><h2>Akteure als Tabelle</h2>{_table(['Actor ID','Anzahl'], actor_rows, placeholder='Akteure durchsuchen…')}</section>
     <section class="panel" id="logs"><h2>Letzte Audit-Einträge</h2>{_table(['Zeit','Aktion','Actor','Zusammenfassung'], log_rows, placeholder='Audit durchsuchen…')}</section>
     """
-    return _html_shell("Audit · Weisse Flamme Dashboard", body, nav_mode="admin")
+    return _html_shell("Audit · Beer and Buffs Dashboard", body, nav_mode="admin")
 
 
 def _render_system_dashboard(data: dict[str, Any]) -> str:
     if not data.get("ok"):
-        return _html_shell("Weisse Flamme Dashboard", f"<section class='panel'><h1>🛠️ System</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+        return _html_shell("Beer and Buffs Dashboard", f"<section class='panel'><h1>🛠️ System</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
     snap: dict[str, Any] = data.get("snapshot") or {}
     storage = snap.get("storage") or {}
     guild = snap.get("guild") or {}
@@ -5927,7 +5927,7 @@ def _render_system_dashboard(data: dict[str, Any]) -> str:
     <section class="panel"><h2>Guild</h2>{_table(['Key','Wert'], guild_rows, placeholder='Guild durchsuchen…')}</section>
     <section class="panel"><h2>JSON-Quellen</h2>{_table(['Key','Datei','vorhanden','Status','Bytes','Geändert'], source_rows, placeholder='Quellen durchsuchen…')}</section>
     """
-    return _html_shell("System · Weisse Flamme Dashboard", body, nav_mode="admin")
+    return _html_shell("System · Beer and Buffs Dashboard", body, nav_mode="admin")
 
 
 
@@ -6144,7 +6144,7 @@ def _member_center_payload(data: dict[str, Any]) -> dict[str, Any]:
 
 def _render_members_dashboard(data: dict[str, Any]) -> str:
     if not data.get("ok"):
-        return _html_shell("Mitglieder · Weisse Flamme Dashboard", f"<section class='panel'><h1>👥 Mitglieder</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+        return _html_shell("Mitglieder · Beer and Buffs Dashboard", f"<section class='panel'><h1>👥 Mitglieder</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
     payload = _member_center_payload(data)
     rows = payload.get("rows") or []
 
@@ -6200,11 +6200,11 @@ def _render_members_dashboard(data: dict[str, Any]) -> str:
     <section class="panel"><details class="soft-details"><summary><strong>⚠️ Prüfliste optional anzeigen</strong> <span class="muted">({len(problem_rows)} Einträge)</span></summary><p class="muted">Auffällige Mitglieder aus Profil-/EC-/Need-Daten, Attendance-Historie, Loot-Verlauf und internen Leitungsnotizen.</p>{_table(['Spieler','Leitung','Attendance','EC','Hinweis','Letzte Aktivität'], problem_rows, placeholder='Prüfliste durchsuchen…')}</details></section>
     <section class="panel"><h2>👥 Alle Mitglieder</h2>{_table(['Name','Ingame','Rolle','GS','EC','Needs M/S','Anwesenheit','Review-Zähler','Voice','Loot/EC','Leitung','Hinweise','Loot'], member_rows, placeholder='Mitglieder durchsuchen…')}</section>
     """
-    return _html_shell("Mitgliederzentrale · Weisse Flamme Dashboard", body)
+    return _html_shell("Mitgliederzentrale · Beer and Buffs Dashboard", body)
 
 def _render_needs_dashboard(data: dict[str, Any]) -> str:
     if not data.get("ok"):
-        return _html_shell("Needs · Weisse Flamme Dashboard", f"<section class='panel'><h1>🎁 Needs</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+        return _html_shell("Needs · Beer and Buffs Dashboard", f"<section class='panel'><h1>🎁 Needs</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
     snap: dict[str, Any] = data.get("snapshot") or {}
     ins = _insights(snap)
     need_ins = ins.get("needs") if isinstance(ins.get("needs"), dict) else {}
@@ -6236,12 +6236,12 @@ def _render_needs_dashboard(data: dict[str, Any]) -> str:
     <section class="panel"><h2>🧹 Mitglieder ohne Needliste</h2>{_table(['Spieler','Rolle','GS'], without_rows, placeholder='Ohne Needliste durchsuchen…')}</section>
     <section class="panel"><h2>Alle Need-Einträge</h2>{_table(['Spieler','Main','Secondary','Main-Needs','Secondary-Needs'], all_rows, placeholder='Need-Einträge durchsuchen…')}</section>
     """
-    return _html_shell("Needs · Weisse Flamme Dashboard", body)
+    return _html_shell("Needs · Beer and Buffs Dashboard", body)
 
 
 def _render_loot_dashboard(data: dict[str, Any]) -> str:
     if not data.get("ok"):
-        return _html_shell("Loot · Weisse Flamme Dashboard", f"<section class='panel'><h1>🎁 Loot</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+        return _html_shell("Loot · Beer and Buffs Dashboard", f"<section class='panel'><h1>🎁 Loot</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
     snap: dict[str, Any] = data.get("snapshot") or {}
     ins = _insights(snap)
     loot_ins = ins.get("loot") if isinstance(ins.get("loot"), dict) else {}
@@ -6287,7 +6287,7 @@ def _render_loot_dashboard(data: dict[str, Any]) -> str:
     <section class="panel"><h2>🟢 Aktive Auktionen</h2>{_table(['Item','Bereich','Status','Gebote/Würfe','Führung/Wurf','Gewinner','Timer'], active_rows, placeholder='Aktive Auktionen durchsuchen…')}</section>
     <section class="panel"><h2>📜 Auktionshistorie</h2>{_table(['Item','Bereich','Status','Gebote/Würfe','Führung/Wurf','Gewinner','Timer'], closed_rows[:250], placeholder='Auktionshistorie durchsuchen…')}</section>
     """
-    return _html_shell("Loot · Weisse Flamme Dashboard", body)
+    return _html_shell("Loot · Beer and Buffs Dashboard", body)
 
 
 
@@ -6762,7 +6762,7 @@ def _loot_check_payload_from_snapshot(snap: dict[str, Any], item_query: str = ""
 
 def _render_loot_check(data: dict[str, Any], item_query: str = "") -> str:
     if not data.get("ok"):
-        return _html_shell("Truhencheck · Weisse Flamme Dashboard", f"<section class='panel'><h1>🔎 Truhencheck</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+        return _html_shell("Truhencheck · Beer and Buffs Dashboard", f"<section class='panel'><h1>🔎 Truhencheck</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
     snap: dict[str, Any] = data.get("snapshot") or {}
     check = _loot_check_payload_from_snapshot(snap, item_query)
     names = _profile_name_map(snap)
@@ -6818,7 +6818,7 @@ def _render_loot_check(data: dict[str, Any], item_query: str = "") -> str:
     <section class="panel"><h2>🎯 Need-Treffer</h2>{_table(['Item','Match','Main','Main-Spieler','Second','Second-Spieler'], need_rows, placeholder='Need-Treffer durchsuchen…')}</section>
     <section class="panel"><h2>🏷️ Passende Auktionen</h2>{_table(['Item','Match','Bereich','Status','Gebote','Führend','Gewinner','Ende','Nächster Schritt'], auction_rows, placeholder='Auktionen durchsuchen…')}</section>
     """
-    return _html_shell("Truhencheck · Weisse Flamme Dashboard", body)
+    return _html_shell("Truhencheck · Beer and Buffs Dashboard", body)
 
 
 _ITEM_PICKER_DB_CACHE: dict[str, Any] = {"loaded_at": 0.0, "items": []}
@@ -7128,7 +7128,7 @@ def _need_slot_picker_html(snap: dict[str, Any], *, input_id: str, slot: str, na
 
 def _render_loot_center(data: dict[str, Any], request: Optional[Request] = None, msg: str = "") -> str:
     if not data.get("ok"):
-        return _html_shell("Loot · Weisse Flamme Dashboard", f"<section class='panel'><h1>🎁 Loot</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+        return _html_shell("Loot · Beer and Buffs Dashboard", f"<section class='panel'><h1>🎁 Loot</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
     snap: dict[str, Any] = data.get("snapshot") or {}
     names = _profile_name_map(snap)
     center = _loot_center_payload_from_snapshot(snap)
@@ -7261,7 +7261,7 @@ def _render_loot_center(data: dict[str, Any], request: Optional[Request] = None,
     <section class="panel"><h2>🎯 Need-Spieler pro Item</h2><p class="muted">Damit sieht man direkt, ob ein Drop Main-/Second-Need-Spieler hat und ob schon eine Auktion dazu läuft.</p>{_table(['Item','Main','Main-Spieler','Second','Second-Spieler','aktive Auktionen'], need_rows, placeholder='Need-Item suchen…')}</section>
     <section class="panel"><h2>📜 Auktionshistorie</h2>{_table(['Item','Bereich','Status','Gebote/Würfe','Führung/Wurf','Gewinner','Timer'], history_rows, placeholder='Historie durchsuchen…')}</section>
     """
-    return _html_shell("Loot · Weisse Flamme Dashboard", body)
+    return _html_shell("Loot · Beer and Buffs Dashboard", body)
 
 
 # ---------------------------------------------------------------------------
@@ -7501,7 +7501,7 @@ def _loot_result_text(row: dict[str, Any]) -> str:
 
 def _render_loot_history(data: dict[str, Any]) -> str:
     if not data.get("ok"):
-        return _html_shell("Loot-Verlauf · Weisse Flamme Dashboard", f"<section class='panel'><h1>📜 Loot-Verlauf</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+        return _html_shell("Loot-Verlauf · Beer and Buffs Dashboard", f"<section class='panel'><h1>📜 Loot-Verlauf</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
     snap: dict[str, Any] = data.get("snapshot") or {}
     guild_id = _safe_guild_id(data)
     hist = _loot_history_payload_from_snapshot(snap, int(guild_id or 0))
@@ -7590,7 +7590,7 @@ def _render_loot_history(data: dict[str, Any]) -> str:
     <section class="panel"><h2>📨 Dashboard-Aktionen</h2><p class="muted">Queue-Anfragen aus dem Dashboard: Bieten, Sale kaufen oder Müll-Wurf. Hilft beim Nachvollziehen, wenn etwas blockiert/fehlgeschlagen ist.</p>{_table(['Zeit','Spieler','Aktion','Item','EC','Status','Ergebnis'], action_rows, placeholder='Aktionen durchsuchen…')}</section>
     <section class="panel"><h2>📦 Alle Auktionen</h2>{_table(['Item','Bereich','Status','Gebote','Führend','Gewinner','EC','Zeit'], all_auction_rows, placeholder='Auktionen durchsuchen…')}</section>
     """
-    return _html_shell("Loot-Verlauf · Weisse Flamme Dashboard", body)
+    return _html_shell("Loot-Verlauf · Beer and Buffs Dashboard", body)
 
 
 def _loot_member_payload_from_snapshot(snap: dict[str, Any], user_id: int, guild_id: int = 0) -> dict[str, Any]:
@@ -7604,7 +7604,7 @@ def _loot_member_payload_from_snapshot(snap: dict[str, Any], user_id: int, guild
 
 def _render_member_loot_history(data: dict[str, Any], user_id: int) -> str:
     if not data.get("ok"):
-        return _html_shell("Mitglied-Loot · Weisse Flamme Dashboard", f"<section class='panel'><h1>🎁 Mitglied-Loot</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+        return _html_shell("Mitglied-Loot · Beer and Buffs Dashboard", f"<section class='panel'><h1>🎁 Mitglied-Loot</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
     snap: dict[str, Any] = data.get("snapshot") or {}
     names = _profile_name_map(snap)
     guild_id = _safe_guild_id(data)
@@ -7644,12 +7644,12 @@ def _render_member_loot_history(data: dict[str, Any], user_id: int) -> str:
     <section class="panel"><h2>🪙 Gebote</h2>{_table(['Zeit','Item','Bereich','EC','Status'], bid_rows, placeholder='Gebote durchsuchen…')}</section>
     <section class="panel"><h2>📨 Dashboard-Aktionen</h2>{_table(['Zeit','Aktion','Item','EC','Status','Ergebnis'], action_rows, placeholder='Aktionen durchsuchen…')}</section>
     """
-    return _html_shell(f"{display} Loot · Weisse Flamme Dashboard", body)
+    return _html_shell(f"{display} Loot · Beer and Buffs Dashboard", body)
 
 
 def _render_exports_dashboard(data: dict[str, Any]) -> str:
     if not data.get("ok"):
-        return _html_shell("Exports · Weisse Flamme Dashboard", f"<section class='panel'><h1>⬇️ Exports</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+        return _html_shell("Exports · Beer and Buffs Dashboard", f"<section class='panel'><h1>⬇️ Exports</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
     snap: dict[str, Any] = data.get("snapshot") or {}
     cards = "".join([
         _card("Snapshot", data.get("id"), _dt(data.get("published_at"))),
@@ -7672,7 +7672,7 @@ def _render_exports_dashboard(data: dict[str, Any]) -> str:
     <section class="grid">{cards}</section>
     <section class="panel"><h2>Downloads</h2>{_table(['Bereich','Datei','Inhalt'], rows, searchable=False)}</section>
     """
-    return _html_shell("Exports · Weisse Flamme Dashboard", body)
+    return _html_shell("Exports · Beer and Buffs Dashboard", body)
 
 
 def _csv_response(filename: str, headers: list[str], rows: list[list[Any]]) -> Response:
@@ -7849,7 +7849,7 @@ def _fairness_analytics(snap: dict[str, Any]) -> dict[str, Any]:
 
 def _render_planning_dashboard(data: dict[str, Any]) -> str:
     if not data.get("ok"):
-        return _html_shell("Planung · Weisse Flamme Dashboard", f"<section class='panel'><h1>📅 Planung</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+        return _html_shell("Planung · Beer and Buffs Dashboard", f"<section class='panel'><h1>📅 Planung</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
     snap: dict[str, Any] = data.get("snapshot") or {}
     plan = _planning_analytics(snap)
     cards = "".join([
@@ -7885,12 +7885,12 @@ def _render_planning_dashboard(data: dict[str, Any]) -> str:
     <section class="panel"><h2>Event-Bereitschaft</h2>{_table(['Event','Zeit','Teilnehmer','Tank','Heiler','DPS','Reserve','Score','Hinweise','Voice'], event_rows, placeholder='Events durchsuchen…')}</section>
     <section class="panel"><h2>Bedarfs-Hotspots</h2><div class="split"><div><h3>Main-Needs</h3>{_table(['Item','Anzahl'], main_rows, placeholder='Main-Needs durchsuchen…')}</div><div><h3>Secondary-Needs</h3>{_table(['Item','Anzahl'], sec_rows, placeholder='Secondary-Needs durchsuchen…')}</div></div></section>
     """
-    return _html_shell("Planung · Weisse Flamme Dashboard", body)
+    return _html_shell("Planung · Beer and Buffs Dashboard", body)
 
 
 def _render_fairness_dashboard(data: dict[str, Any]) -> str:
     if not data.get("ok"):
-        return _html_shell("Fairness · Weisse Flamme Dashboard", f"<section class='panel'><h1>⚖️ Fairness</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+        return _html_shell("Fairness · Beer and Buffs Dashboard", f"<section class='panel'><h1>⚖️ Fairness</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
     snap: dict[str, Any] = data.get("snapshot") or {}
     fair = _fairness_analytics(snap)
     cards = "".join([
@@ -7925,7 +7925,7 @@ def _render_fairness_dashboard(data: dict[str, Any]) -> str:
     <section class="panel"><h2>Loot-Gewinner</h2>{_table(['Spieler','Loot','EC ausgegeben','EC aktuell','Zusagen','Voice h'], loot_rows, placeholder='Loot-Gewinner durchsuchen…')}</section>
     <section class="panel"><h2>Hohe EC-Konten</h2>{_table(['Spieler','EC','Verdient','Ausgegeben','Loot','Needs'], ec_rows, placeholder='EC durchsuchen…')}</section>
     """
-    return _html_shell("Fairness · Weisse Flamme Dashboard", body)
+    return _html_shell("Fairness · Beer and Buffs Dashboard", body)
 
 
 
@@ -8133,7 +8133,7 @@ def _member_event_rows(snap: dict[str, Any], user_id: int) -> list[list[Any]]:
 
 def _render_member_detail(data: dict[str, Any], user_id: int, current_user: Optional[dict[str, Any]] = None) -> str:
     if not data.get("ok"):
-        return _html_shell("Weisse Flamme Dashboard", f"<section class='panel'><h1>📊 Weisse Flamme Dashboard</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+        return _html_shell("Beer and Buffs Dashboard", f"<section class='panel'><h1>📊 Beer and Buffs Dashboard</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
     snap: dict[str, Any] = data.get("snapshot") or {}
     profiles = ((snap.get("profiles") or {}).get("items") or [])
     balances = _balance_map(snap)
@@ -8207,12 +8207,12 @@ def _render_member_detail(data: dict[str, Any], user_id: int, current_user: Opti
     <section class="panel"><h2>🎁 Auktionen mit aktueller Führung/Gewinn</h2>{_table(['Item','Status','Phase','Gebot','Ende'], auction_rows, placeholder='Auktionen durchsuchen…')}</section>
     <section class="panel" id="voice"><h2>🎙️ Voice-Sessions</h2>{_table(['Kanal','Rein','Raus','Minuten'], voice_rows, placeholder='Voice durchsuchen…')}</section>
     """
-    return _html_shell(f"{display} · Weisse Flamme Dashboard", body)
+    return _html_shell(f"{display} · Beer and Buffs Dashboard", body)
 
 
 def _render_event_detail(data: dict[str, Any], event_id: str) -> str:
     if not data.get("ok"):
-        return _html_shell("Weisse Flamme Dashboard", f"<section class='panel'><h1>📊 Weisse Flamme Dashboard</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+        return _html_shell("Beer and Buffs Dashboard", f"<section class='panel'><h1>📊 Beer and Buffs Dashboard</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
     snap: dict[str, Any] = data.get("snapshot") or {}
     guild_id = _safe_guild_id(data)
     event = _event_by_id(snap, event_id) or _event_stub_from_attendance_review(guild_id, event_id)
@@ -8269,12 +8269,12 @@ def _render_event_detail(data: dict[str, Any], event_id: str) -> str:
     <section class="panel" id="maybe"><h2>🟡 Vielleicht</h2>{_table(['Spieler','Gildenrolle'], maybe_rows, placeholder='Vielleicht durchsuchen…')}</section>
     <section class="panel" id="no"><h2>❌ Abgemeldet</h2>{_table(['Spieler','Gildenrolle'], no_rows, placeholder='Abmeldungen durchsuchen…')}</section>
     """
-    return _html_shell(f"{event.get('title') or 'Event'} · Weisse Flamme Dashboard", body)
+    return _html_shell(f"{event.get('title') or 'Event'} · Beer and Buffs Dashboard", body)
 
 
 def _render_voice_dashboard(data: dict[str, Any]) -> str:
     if not data.get("ok"):
-        return _html_shell("Weisse Flamme Dashboard", f"<section class='panel'><h1>🎙️ Voice</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+        return _html_shell("Beer and Buffs Dashboard", f"<section class='panel'><h1>🎙️ Voice</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
     snap: dict[str, Any] = data.get("snapshot") or {}
     names = _profile_name_map(snap)
     voice = snap.get("voice") or {}
@@ -8303,7 +8303,7 @@ def _render_voice_dashboard(data: dict[str, Any]) -> str:
     <section class="panel" id="users"><h2>Voice-Zeit pro Spieler</h2>{_table(['Spieler','Stunden','Sessions','letzter Join','letztes Ende'], user_rows, placeholder='Spieler durchsuchen…')}</section>
     <section class="panel" id="sessions"><h2>Letzte Sessions</h2>{_table(['Spieler','Kanal','Rein','Raus','Minuten'], session_rows, placeholder='Sessions durchsuchen…')}</section>
     """
-    return _html_shell("Voice · Weisse Flamme Dashboard", body)
+    return _html_shell("Voice · Beer and Buffs Dashboard", body)
 
 
 def _audit_filtered_logs(logs: list[dict[str, Any]], action: str = "", actor: str = "", q: str = "") -> list[dict[str, Any]]:
@@ -8327,7 +8327,7 @@ def _audit_filtered_logs(logs: list[dict[str, Any]], action: str = "", actor: st
 
 def _render_audit_dashboard(data: dict[str, Any], *, action: str = "", actor: str = "", q: str = "") -> str:
     if not data.get("ok"):
-        return _html_shell("Weisse Flamme Dashboard", f"<section class='panel'><h1>🧾 Audit</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+        return _html_shell("Beer and Buffs Dashboard", f"<section class='panel'><h1>🧾 Audit</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
     snap: dict[str, Any] = data.get("snapshot") or {}
     audit = snap.get("audit") or {}
     all_logs = [x for x in (audit.get("recent_logs") or []) if isinstance(x, dict)]
@@ -8364,7 +8364,7 @@ def _render_audit_dashboard(data: dict[str, Any], *, action: str = "", actor: st
     <section class="panel"><h2>Akteure als Tabelle</h2>{_table(['Actor ID','Anzahl'], actor_rows, placeholder='Akteure durchsuchen…')}</section>
     <section class="panel" id="logs"><h2>Letzte Audit-Einträge</h2>{_table(['Zeit','Aktion','Actor','Zusammenfassung'], log_rows, placeholder='Audit durchsuchen…')}</section>
     """
-    return _html_shell("Audit · Weisse Flamme Dashboard", body, nav_mode="admin")
+    return _html_shell("Audit · Beer and Buffs Dashboard", body, nav_mode="admin")
 
 
 def _item_catalog_available() -> bool:
@@ -8660,7 +8660,7 @@ def _render_item_catalog(request: Optional[Request] = None) -> str:
         <section class="hero"><div><div class="eyebrow">Questlog Item-Katalog</div><h1>📚 Item-Datenbank</h1><p class="muted">Noch keine Item-Daten verfügbar oder Postgres/Schema fehlt.</p></div></section>
         <section class="panel"><h2>Fehler</h2><p class="muted">{_e(payload.get('error'))}</p><p>Importer starten:</p><pre>python questlog_item_importer.py --category-url https://questlog.gg/throne-and-liberty/de/db/items/weapons?grade=41 --only weapon</pre></section>
         """
-        return _html_shell("Item-Datenbank · Weisse Flamme Dashboard", body)
+        return _html_shell("Item-Datenbank · Beer and Buffs Dashboard", body)
 
     items: list[dict[str, Any]] = payload.get("items") or []
     stats: dict[str, Any] = payload.get("stats") or {}
@@ -8775,7 +8775,7 @@ def _render_item_catalog(request: Optional[Request] = None) -> str:
     <section class="panel"><h2>Kategorien</h2>{_table(['Kategorie','Unterkategorie','Items'], cat_rows, placeholder='Kategorien durchsuchen…')}</section>
     <section class="panel"><h2>Items</h2><div class="item-card-grid">{item_cards}</div></section>
     """
-    return _html_shell("Item-Datenbank · Weisse Flamme Dashboard", body)
+    return _html_shell("Item-Datenbank · Beer and Buffs Dashboard", body)
 
 
 
@@ -9254,12 +9254,12 @@ def _need_builder_queue_main(guild_id: int, user_id: int, build_id: str, actor: 
 
 def _render_need_builder_dashboard(data: dict[str, Any], request: Request, msg: str = "") -> str:
     if not data.get("ok"):
-        return _html_shell("Needs · Weisse Flamme Dashboard", f"<section class='panel'><h1>🎁 Needliste</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+        return _html_shell("Needs · Beer and Buffs Dashboard", f"<section class='panel'><h1>🎁 Needliste</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
     snap: dict[str, Any] = data.get("snapshot") or {}
     guild_id = _safe_guild_id(data)
     user_id, display_name, members = _need_builder_target_user(request, snap)
     if not guild_id or not user_id:
-        return _html_shell("Needs · Weisse Flamme Dashboard", "<section class='panel'><h1>🎁 Needliste</h1><p class='muted'>Keine Guild-ID oder kein Zielmitglied gefunden. Melde dich per Discord an oder öffne die Seite als Dashboard-Admin.</p></section>")
+        return _html_shell("Needs · Beer and Buffs Dashboard", "<section class='panel'><h1>🎁 Needliste</h1><p class='muted'>Keine Guild-ID oder kein Zielmitglied gefunden. Melde dich per Discord an oder öffne die Seite als Dashboard-Admin.</p></section>")
     state = _need_builder_load(guild_id, user_id)
     builds = state.get("builds") or []
     slots_by_build = state.get("slots") or {}
@@ -9676,7 +9676,7 @@ def _render_need_builder_dashboard(data: dict[str, Any], request: Request, msg: 
       document.addEventListener('DOMContentLoaded', nbRecalc);
     </script>
     """
-    return _html_shell("Needliste · Weisse Flamme Dashboard", body)
+    return _html_shell("Needliste · Beer and Buffs Dashboard", body)
 
 @app.get("/items", response_class=HTMLResponse)
 def items_page(request: Request):
@@ -9735,7 +9735,7 @@ def voice_page(_: bool = Depends(_auth)):
         return HTMLResponse(_render_voice_dashboard(_snapshot_payload()))
     except Exception as exc:
         return HTMLResponse(
-            _html_shell("Weisse Flamme Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
+            _html_shell("Beer and Buffs Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
             status_code=500,
         )
 
@@ -9753,7 +9753,7 @@ def members_page(request: Request, _: bool = Depends(_auth)):
         # Normale Mitgliederansicht – auch für Admins. Admin-Funktionen bleiben im Admin-Portal.
         return HTMLResponse(_render_member_members_page(_snapshot_payload(), request))
     except Exception as exc:
-        return HTMLResponse(_html_shell("Weisse Flamme Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"), status_code=500)
+        return HTMLResponse(_html_shell("Beer and Buffs Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"), status_code=500)
 
 
 @app.get("/needs", response_class=HTMLResponse)
@@ -9761,7 +9761,7 @@ def needs_page(request: Request, msg: str = "", _: bool = Depends(_auth)):
     try:
         return HTMLResponse(_render_need_builder_dashboard(_snapshot_payload(), request, msg=msg))
     except Exception as exc:
-        return HTMLResponse(_html_shell("Weisse Flamme Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"), status_code=500)
+        return HTMLResponse(_html_shell("Beer and Buffs Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"), status_code=500)
 
 
 @app.post("/needs/builds/new")
@@ -9843,7 +9843,7 @@ def loot_page(request: Request, msg: str = "", _: bool = Depends(_auth)):
     try:
         return HTMLResponse(_render_loot_center(_snapshot_payload(), request, msg=msg))
     except Exception as exc:
-        return HTMLResponse(_html_shell("Weisse Flamme Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"), status_code=500)
+        return HTMLResponse(_html_shell("Beer and Buffs Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"), status_code=500)
 
 
 
@@ -9879,14 +9879,14 @@ def loot_check_page(item: str = "", _: bool = Depends(_auth)):
     try:
         return HTMLResponse(_render_loot_check(_snapshot_payload(), item))
     except Exception as exc:
-        return HTMLResponse(_html_shell("Weisse Flamme Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"), status_code=500)
+        return HTMLResponse(_html_shell("Beer and Buffs Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"), status_code=500)
 
 @app.get("/exports", response_class=HTMLResponse)
 def exports_page(_: bool = Depends(_auth)):
     try:
         return HTMLResponse(_render_exports_dashboard(_snapshot_payload()))
     except Exception as exc:
-        return HTMLResponse(_html_shell("Weisse Flamme Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"), status_code=500)
+        return HTMLResponse(_html_shell("Beer and Buffs Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"), status_code=500)
 
 
 @app.get("/api/members")
@@ -10037,7 +10037,7 @@ def loot_history_page(_: bool = Depends(_auth)):
     try:
         return HTMLResponse(_render_loot_history(_snapshot_payload()))
     except Exception as exc:
-        return HTMLResponse(_html_shell("Weisse Flamme Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"), status_code=500)
+        return HTMLResponse(_html_shell("Beer and Buffs Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"), status_code=500)
 
 
 @app.get("/api/loot-history")
@@ -10408,7 +10408,7 @@ def _render_need_editor_panel(user_id: int, current_user: Optional[dict[str, Any
 
 def _render_member_portal(data: dict[str, Any], user_id: int, request: Request, msg: str = "") -> str:
     if not data.get("ok"):
-        return _html_shell("Portal · Weisse Flamme Dashboard", f"<section class='panel'><h1>👤 Portal</h1><p class='muted'>{_e(data.get('error'))}</p></section>", nav_mode="member")
+        return _html_shell("Portal · Beer and Buffs Dashboard", f"<section class='panel'><h1>👤 Portal</h1><p class='muted'>{_e(data.get('error'))}</p></section>", nav_mode="member")
     if not _portal_can_view(request, int(user_id)):
         raise HTTPException(status_code=403, detail="Du darfst nur dein eigenes Portal sehen. Leitung/Admins sehen alle Mitglieder.")
 
@@ -10557,7 +10557,7 @@ def _render_member_portal(data: dict[str, Any], user_id: int, request: Request, 
     </section>
     """
     shell_mode = "admin" if _is_portal_admin(request) else "member"
-    return _html_shell(f"{display} Portal · Weisse Flamme Dashboard", body, nav_mode=shell_mode)
+    return _html_shell(f"{display} Portal · Beer and Buffs Dashboard", body, nav_mode=shell_mode)
 
 
 
@@ -10586,7 +10586,7 @@ def _member_home_auction_rows(auctions: list[dict[str, Any]], snap: dict[str, An
 
 def _render_member_home(data: dict[str, Any], request: Request) -> str:
     if not data.get("ok"):
-        return _html_shell("Mitgliederbereich · Weisse Flamme Dashboard", f"<section class='panel'><h1>🏠 Mitgliederbereich</h1><p class='muted'>{_e(data.get('error'))}</p></section>", nav_mode="member")
+        return _html_shell("Mitgliederbereich · Beer and Buffs Dashboard", f"<section class='panel'><h1>🏠 Mitgliederbereich</h1><p class='muted'>{_e(data.get('error'))}</p></section>", nav_mode="member")
     user = _current_user(request) or {}
     uid = _current_user_id(request)
     snap: dict[str, Any] = data.get("snapshot") or {}
@@ -10602,11 +10602,11 @@ def _render_member_home(data: dict[str, Any], request: Request) -> str:
     cards = "".join([_card("Meine EC", _fmt_ec(my_ec_balance) if my_ec_balance is not None else "—", "aktueller Stand"), _card("Uhrzeit", now_text, "lokale Dashboard-Zeit"), _card("Events", len(running_events), "max. 2 auf Startseite"), _card("Auktionen", len(active_auctions), "max. 4 auf Startseite")])
     body = f"""
     <nav class="topnav"><a href="/member">Start</a><a href="/member/events">Events</a><a href="/member/auctions">Auktionen</a><a href="/member/members">Mitglieder</a><a href="/member/ec">Meine EC</a><a href="/portal">Eigenes Profil</a><a href="/portal#needs">Meine Needs</a></nav>
-    <section class="hero member-home-hero"><div style="display:flex;gap:16px;align-items:center;flex-wrap:wrap;"><div class="member-start-logo"><img src="{_e(_brand_image('logo', 'ebolus_logo.png'))}" alt="{_e(_guild_brand().get('display_name') or 'Gilde')}"></div><div><div class="eyebrow">Mitgliederbereich</div><h1>Willkommen, {_e(display)}</h1><p class="muted">Kurzüberblick. Weitere Bereiche erreichst du links über die Leiste.</p></div></div></section>
+    <section class="hero member-home-hero"><div style="display:flex;gap:16px;align-items:center;flex-wrap:wrap;"><div class="member-start-logo"><img src="{_e(_brand_image('logo', 'beer_and_buffs_logo.png'))}" alt="{_e(_guild_brand().get('display_name') or 'Gilde')}"></div><div><div class="eyebrow">Mitgliederbereich</div><h1>Willkommen, {_e(display)}</h1><p class="muted">Kurzüberblick. Weitere Bereiche erreichst du links über die Leiste.</p></div></div></section>
     <section class="grid">{cards}</section>
     <section class="split"><div class="panel" id="events"><h2>📅 Nächste 2 Events</h2>{_member_home_event_rows(running_events, int(uid or 0))}</div><div class="panel" id="auctions"><h2>🏆 Max. 4 laufende Auktionen</h2>{_member_home_auction_rows(active_auctions, snap)}</div></section>
     """
-    return _html_shell("Mitgliederbereich · Weisse Flamme Dashboard", body, nav_mode="member")
+    return _html_shell("Mitgliederbereich · Beer and Buffs Dashboard", body, nav_mode="member")
 
 
     """Letzte Dashboard-Einstellungsanträge.
@@ -10992,7 +10992,7 @@ def _settings_request_admin_action(guild_id: int, request_id: str, action: str, 
 
 def _render_admin_settings_editor(data: dict[str, Any], msg: str = "") -> str:
     if not data.get("ok"):
-        return _html_shell("Admin-Einstellungen · Weisse Flamme Dashboard", f"<section class='panel'><h1>⚙️ Admin-Einstellungen</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+        return _html_shell("Admin-Einstellungen · Beer and Buffs Dashboard", f"<section class='panel'><h1>⚙️ Admin-Einstellungen</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
     snap: dict[str, Any] = data.get("snapshot") or {}
     guild_id = _safe_guild_id(data)
     cfg = _current_dkp_settings_from_snapshot(snap)
@@ -11085,7 +11085,7 @@ def _render_admin_settings_editor(data: dict[str, Any], msg: str = "") -> str:
 
     <section class="panel"><h2>🧾 Änderungsqueue</h2><p class="muted">Offene Anträge können abgebrochen werden. Fehlgeschlagene/blockierte/abgebrochene Anträge können neu geöffnet werden.</p>{_table(['Zeit','Status','Aktion','Details','Akteur','Aktion'], req_rows, placeholder='Änderungen durchsuchen…')}</section>
     """
-    return _html_shell("Admin-Einstellungen · Weisse Flamme Dashboard", body, nav_mode="admin")
+    return _html_shell("Admin-Einstellungen · Beer and Buffs Dashboard", body, nav_mode="admin")
 
 def _dashboard_event_action_requests(guild_id: int, limit: int = 80, event_id: str = "") -> list[dict[str, Any]]:
     if not _database_url() or not guild_id:
@@ -11250,7 +11250,7 @@ def _dashboard_event_type_select_html() -> str:
 
 def _render_events_center(data: dict[str, Any], current_user: Optional[dict[str, Any]] = None, msg: str = "", *, nav_mode: str = "member") -> str:
     if not data.get("ok"):
-        return _html_shell("Events · Weisse Flamme Dashboard", f"<section class='panel'><h1>📅 Events</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+        return _html_shell("Events · Beer and Buffs Dashboard", f"<section class='panel'><h1>📅 Events</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
 
     snap: dict[str, Any] = data.get("snapshot") or {}
     guild_id = _safe_guild_id(data)
@@ -11494,7 +11494,7 @@ def _render_events_center(data: dict[str, Any], current_user: Optional[dict[str,
     </section>
     <section class="panel" id="actions"><h2>🧾 Event-Aktionsqueue</h2><p class="muted">Zeigt Erstellen/Bearbeiten/Löschen aus dem Dashboard und den Bot-Status.</p>{_table(['Zeit','Aktion','Event','Status','Von','Ergebnis'], action_table_rows, placeholder='Queue durchsuchen…')}</section>
     """
-    return _html_shell("Events · Weisse Flamme Dashboard", body, nav_mode=nav_mode)
+    return _html_shell("Events · Beer and Buffs Dashboard", body, nav_mode=nav_mode)
 
 
 @app.get("/events", response_class=HTMLResponse)
@@ -11503,7 +11503,7 @@ def events_page(request: Request, _: bool = Depends(_auth), msg: str = ""):
         # Normale Eventansicht – Admin-Verwaltung nur im Admin-Portal/Event-Verwaltung.
         return HTMLResponse(_render_member_events_page(_snapshot_payload(), request))
     except Exception as exc:
-        return HTMLResponse(_html_shell("Weisse Flamme Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"), status_code=500)
+        return HTMLResponse(_html_shell("Beer and Buffs Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"), status_code=500)
 
 
 
@@ -11513,7 +11513,7 @@ def events_admin_page(request: Request, _: bool = Depends(_admin_auth), msg: str
     try:
         return HTMLResponse(_render_events_center(_snapshot_payload(), _current_user(request), msg, nav_mode="admin"))
     except Exception as exc:
-        return HTMLResponse(_html_shell("Weisse Flamme Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>", nav_mode="admin"), status_code=500)
+        return HTMLResponse(_html_shell("Beer and Buffs Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>", nav_mode="admin"), status_code=500)
 @app.get("/api/events-center")
 def api_events_center(_: bool = Depends(_auth)):
     payload = _snapshot_payload()
@@ -11605,7 +11605,7 @@ def planning_page(_: bool = Depends(_auth)):
         return HTMLResponse(_render_planning_dashboard(_snapshot_payload()))
     except Exception as exc:
         return HTMLResponse(
-            _html_shell("Weisse Flamme Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
+            _html_shell("Beer and Buffs Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
             status_code=500,
         )
 
@@ -11616,7 +11616,7 @@ def fairness_page(_: bool = Depends(_auth)):
         return HTMLResponse(_render_fairness_dashboard(_snapshot_payload()))
     except Exception as exc:
         return HTMLResponse(
-            _html_shell("Weisse Flamme Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
+            _html_shell("Beer and Buffs Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
             status_code=500,
         )
 
@@ -12711,7 +12711,7 @@ def _game_status_from_snapshot(snap: dict[str, Any]) -> dict[str, Any]:
 def _render_status_dashboard(data: dict[str, Any], request: Optional[Request] = None, *, nav_mode: str = "member") -> str:
     if not data.get("ok"):
         return _html_shell(
-            "Status · Weisse Flamme Dashboard",
+            "Status · Beer and Buffs Dashboard",
             f"<section class='panel'><h1>📡 Status</h1><p class='muted'>{_e(data.get('error'))}</p></section>",
             nav_mode=nav_mode,
         )
@@ -12824,7 +12824,7 @@ def _render_status_dashboard(data: dict[str, Any], request: Optional[Request] = 
         <div class="status-hero-head">
           <div class="status-hero-brand-wrap">
             <div class="eyebrow">Dashboard Status</div>
-            <img class="status-hero-brand" src="{_e(_brand_image('logo', 'weisse_flamme_header.png'))}" alt="{_e(_guild_brand().get('display_name') or 'Gilde')}">
+            <img class="status-hero-brand" src="{_e(_brand_image('logo', 'beer_and_buffs_logo.png'))}" alt="{_e(_guild_brand().get('display_name') or 'Gilde')}">
             <p class="status-welcome">Willkommen, <strong>{_e(welcome_name)}</strong></p>
           </div>
         </div>
@@ -12976,13 +12976,13 @@ def _render_status_dashboard(data: dict[str, Any], request: Optional[Request] = 
       </script>
     </section>
     """
-    return _html_shell("Status · Weisse Flamme Dashboard", body, nav_mode=nav_mode)
+    return _html_shell("Status · Beer and Buffs Dashboard", body, nav_mode=nav_mode)
 
 
 def _render_leadership_dashboard(data: dict[str, Any]) -> str:
     if not data.get("ok"):
         return _html_shell(
-            "Weisse Flamme Dashboard",
+            "Beer and Buffs Dashboard",
             f"""
             <section class="panel">
               <h1>🏰 Gildenleitung</h1>
@@ -13251,7 +13251,7 @@ def _render_leadership_dashboard(data: dict[str, Any]) -> str:
       </aside>
     </section>
     """
-    return _html_shell("Kommando · Weisse Flamme Dashboard", body)
+    return _html_shell("Kommando · Beer and Buffs Dashboard", body)
 
 
 @app.get("/api/leadership")
@@ -13294,11 +13294,11 @@ def login_page(request: Request, next: str = "/"):
         </div>
         """
     body = f"""
-    <section class="hero"><div><div class="eyebrow">Weisse Flamme Dashboard</div><h1>🔐 Login</h1><p class="muted">Dashboard für Gildenleitung und berechtigte Mitglieder.</p></div></section>
+    <section class="hero"><div><div class="eyebrow">Beer and Buffs Dashboard</div><h1>🔐 Login</h1><p class="muted">Dashboard für Gildenleitung und berechtigte Mitglieder.</p></div></section>
     {discord_block}
     {basic_block}
     """
-    return HTMLResponse(_html_shell("Login · Weisse Flamme Dashboard", body))
+    return HTMLResponse(_html_shell("Login · Beer and Buffs Dashboard", body))
 
 
 @app.get("/auth/discord/debug")
@@ -13439,7 +13439,7 @@ def me(request: Request, _: bool = Depends(_auth)):
     else:
         rows = [[k, v if k != "roles" else ", ".join(v[:12]) + (" …" if len(v) > 12 else "")] for k, v in user.items()]
         body = f"<nav class='topnav'><a href='/'>← Übersicht</a><a href='/logout'>Logout</a></nav><section class='panel'><h1>👤 Mein Dashboard-Login</h1>{_table(['Key','Wert'], rows, searchable=False)}</section>"
-    return HTMLResponse(_html_shell("Mein Login · Weisse Flamme Dashboard", body))
+    return HTMLResponse(_html_shell("Mein Login · Beer and Buffs Dashboard", body))
 
 @app.get("/healthz")
 def healthz():
@@ -13470,7 +13470,7 @@ def analytics_page(_: bool = Depends(_auth)):
         return HTMLResponse(_render_activity_analytics(_snapshot_payload()))
     except Exception as exc:
         return HTMLResponse(
-            _html_shell("Weisse Flamme Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
+            _html_shell("Beer and Buffs Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
             status_code=500,
         )
 
@@ -13482,7 +13482,7 @@ def ec_dashboard(_: bool = Depends(_auth)):
         return HTMLResponse(_render_ec_dashboard(_snapshot_payload()))
     except Exception as exc:
         return HTMLResponse(
-            _html_shell("Weisse Flamme Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
+            _html_shell("Beer and Buffs Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
             status_code=500,
         )
 
@@ -13550,7 +13550,7 @@ def auction_detail(request: Request, auction_id: str, msg: str = "", _: bool = D
         return HTMLResponse(_render_auction_detail(_snapshot_payload(), str(auction_id), _current_user(request), msg=msg))
     except Exception as exc:
         return HTMLResponse(
-            _html_shell("Weisse Flamme Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
+            _html_shell("Beer and Buffs Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
             status_code=500,
         )
 
@@ -13634,7 +13634,7 @@ def event_detail(event_id: str, _: bool = Depends(_auth)):
         return HTMLResponse(_render_event_detail(_snapshot_payload(), str(event_id)))
     except Exception as exc:
         return HTMLResponse(
-            _html_shell("Weisse Flamme Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
+            _html_shell("Beer and Buffs Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
             status_code=500,
         )
 
@@ -13693,7 +13693,7 @@ def portal_home(request: Request, _: bool = Depends(_auth), msg: str = ""):
     body = """
     <section class='panel'><h1>👤 Mein Portal</h1><p class='muted'>Für das persönliche Portal brauchst du Discord-Login, damit das Dashboard deine Discord-ID kennt.</p><p><a class='btn' href='/auth/discord/start'>Mit Discord einloggen</a></p></section>
     """
-    return HTMLResponse(_html_shell("Mein Portal · Weisse Flamme Dashboard", body))
+    return HTMLResponse(_html_shell("Mein Portal · Beer and Buffs Dashboard", body))
 
 
 @app.get("/portal/member/{user_id}", response_class=HTMLResponse)
@@ -13770,7 +13770,7 @@ def member_loot_page(user_id: int, _: bool = Depends(_auth)):
     try:
         return HTMLResponse(_render_member_loot_history(_snapshot_payload(), int(user_id)))
     except Exception as exc:
-        return HTMLResponse(_html_shell("Weisse Flamme Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"), status_code=500)
+        return HTMLResponse(_html_shell("Beer and Buffs Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"), status_code=500)
 
 
 @app.get("/api/member/{user_id}/loot")
@@ -13804,7 +13804,7 @@ def member_detail(user_id: int, request: Request, _: bool = Depends(_auth)):
         return HTMLResponse(_render_member_detail(_snapshot_payload(), int(user_id), _current_user(request)))
     except Exception as exc:
         return HTMLResponse(
-            _html_shell("Weisse Flamme Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
+            _html_shell("Beer and Buffs Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
             status_code=500,
         )
 
@@ -13817,7 +13817,7 @@ def admin_actions_page(_: bool = Depends(_admin_auth)):
         return HTMLResponse(_render_admin_center_dashboard(_snapshot_payload()))
     except Exception as exc:
         return HTMLResponse(
-            _html_shell("Weisse Flamme Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
+            _html_shell("Beer and Buffs Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
             status_code=500,
         )
 
@@ -13828,7 +13828,7 @@ def admin_legacy_page(_: bool = Depends(_admin_auth)):
         return HTMLResponse(_render_admin_actions_dashboard(_snapshot_payload()))
     except Exception as exc:
         return HTMLResponse(
-            _html_shell("Weisse Flamme Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
+            _html_shell("Beer and Buffs Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
             status_code=500,
         )
 
@@ -13868,7 +13868,7 @@ def ec_queue_dashboard(request: Request, _: bool = Depends(_auth)):
         return HTMLResponse(_render_ec_queue_dashboard(_snapshot_payload(), _current_user(request), str(request.query_params.get("msg") or "")))
     except Exception as exc:
         return HTMLResponse(
-            _html_shell("Weisse Flamme Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
+            _html_shell("Beer and Buffs Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
             status_code=500,
         )
 
@@ -13959,9 +13959,9 @@ def _dashboard_upsert_guild_profile(guild_id: int, values: dict[str, Any]) -> No
     now = datetime.now(timezone.utc).isoformat()
     merged = {
         "discord_name": str(values.get("discord_name") if values.get("discord_name") is not None else current.get("discord_name") or "")[:120],
-        "display_name": str(values.get("display_name") or current.get("display_name") or "Gilde")[:120],
-        "short_name": str(values.get("short_name") or current.get("short_name") or values.get("display_name") or "Gilde")[:60],
-        "bot_display_name": str(values.get("bot_display_name") or current.get("bot_display_name") or "Gildenknecht")[:120],
+        "display_name": str(values.get("display_name") or current.get("display_name") or "Beer and Buffs")[:120],
+        "short_name": str(values.get("short_name") or current.get("short_name") or values.get("display_name") or "Beer and Buffs")[:60],
+        "bot_display_name": str(values.get("bot_display_name") or current.get("bot_display_name") or "Beer and Buffs Knecht")[:120],
         "timezone_name": str(values.get("timezone_name") or current.get("timezone_name") or "Europe/Berlin")[:80],
         "logo_url": str(values.get("logo_url") if values.get("logo_url") is not None else current.get("logo_url") or "")[:1200],
         "banner_url": str(values.get("banner_url") if values.get("banner_url") is not None else current.get("banner_url") or "")[:1200],
@@ -14047,9 +14047,9 @@ def _render_guild_config_dashboard(data: dict[str, Any], msg: str = "") -> str:
         profile = {
             "guild_id": gid,
             "discord_name": guild_row.get("discord_name") or guild_row.get("name") or "",
-            "display_name": guild_row.get("name") or data.get("guild_name") or "Gilde",
-            "short_name": guild_row.get("name") or "Gilde",
-            "bot_display_name": f"{guild_row.get('name') or 'Gilde'} Knecht",
+            "display_name": guild_row.get("name") or data.get("guild_name") or "Beer and Buffs",
+            "short_name": guild_row.get("name") or "Beer and Buffs",
+            "bot_display_name": f"{guild_row.get('name') or 'Beer and Buffs'} Knecht",
             "timezone_name": "Europe/Berlin",
             "accent_color": "#d6a84f",
             "status": "active",
@@ -14262,7 +14262,7 @@ def settings_page(_: bool = Depends(_admin_auth)):
         return HTMLResponse(_render_settings_dashboard(_snapshot_payload()))
     except Exception as exc:
         return HTMLResponse(
-            _html_shell("Weisse Flamme Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
+            _html_shell("Beer and Buffs Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
             status_code=500,
         )
 
@@ -14273,7 +14273,7 @@ def admin_settings_page(_: bool = Depends(_admin_auth), msg: str = ""):
         return HTMLResponse(_render_admin_settings_editor(_snapshot_payload(), msg=msg))
     except Exception as exc:
         return HTMLResponse(
-            _html_shell("Weisse Flamme Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
+            _html_shell("Beer and Buffs Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
             status_code=500,
         )
 
@@ -14398,7 +14398,7 @@ def _render_release_dashboard(data: dict[str, Any]) -> str:
         ok = bool(checks.get(key))
         rows.append([label, "✅ ok" if ok else "⚠️ prüfen"])
     warn_html = "" if not warnings else "<section class='panel'><h2>Warnungen</h2><ul>" + "".join(f"<li>{_e(w)}</li>" for w in warnings) + "</ul></section>"
-    return _html_shell("Release & Stabilität · Weisse Flamme Dashboard", f"""
+    return _html_shell("Release & Stabilität · Beer and Buffs Dashboard", f"""
     <nav class='topnav'><a href='/'>← Kommando</a><a href='/system'>System</a><a href='/admin'>Admin</a><a href='/api/release-status'>API</a></nav>
     <section class='hero'><div><h1>Release & Stabilität</h1><p>Version {_e(p.get('version'))} · kompakte Systemübersicht für den Livebetrieb.</p></div><div class='page-actions'><a class='btn' href='/'>Startseite</a><a class='btn' href='/system'>System prüfen</a></div></section>
     <section class='panel'><h2>Live-Status</h2><div class='release-grid'>{cards}</div><div class='mobile-note'>Mobile Optimierung ist aktiv: Sidebar klappt ein, Tabellen werden horizontal scrollbar, Aktionen werden auf Handybreite sauber gestapelt.</div></section>
@@ -14425,7 +14425,7 @@ def _simple_dashboard_page(title: str, subtitle: str, cards: list[tuple[str, str
         for href, text in [href_text.split("|", 1) if "|" in href_text else (href_text, "")]
     )
     return _html_shell(
-        f"{title} · Weisse Flamme Dashboard",
+        f"{title} · Beer and Buffs Dashboard",
         f"""
         <section class="hero">
           <div>
@@ -14538,7 +14538,7 @@ def _render_discord_feed_page(data: dict[str, Any], *, key: str, title: str, sub
     </section>
     <section class="panel"><h2>{_e(title)}</h2><div class="discord-feed-list">{cards}</div></section>
     """
-    return _html_shell(f"{title} · Weisse Flamme Dashboard", body)
+    return _html_shell(f"{title} · Beer and Buffs Dashboard", body)
 
 @app.get("/admin-portal", response_class=HTMLResponse)
 def admin_portal_alias() -> RedirectResponse:
@@ -14582,7 +14582,7 @@ def announcements_page() -> HTMLResponse:
       </div>
     </section>
     """
-    return _html_shell("Ankündigungen · Weisse Flamme Dashboard", body)
+    return _html_shell("Ankündigungen · Beer and Buffs Dashboard", body)
 
 
 @app.get("/tnl/news", response_class=HTMLResponse)
@@ -14605,7 +14605,7 @@ def tnl_builds_page() -> HTMLResponse:
     </section>
     <section class="panel"><h2>Builds</h2><p class="muted">Platzhalter-Seite für spätere öffentliche/empfohlene Gilden-Builds, Rollen-Guides oder externe Questlog-Build-Links.</p></section>
     """
-    return _html_shell("TnL Builds · Weisse Flamme Dashboard", body)
+    return _html_shell("TnL Builds · Beer and Buffs Dashboard", body)
 
 
 @app.get("/tnl/guides", response_class=HTMLResponse)
@@ -14623,7 +14623,7 @@ def release_page(_: bool = Depends(_auth)):
     try:
         return HTMLResponse(_render_release_dashboard(_snapshot_payload()))
     except Exception as exc:
-        return HTMLResponse(_html_shell("Weisse Flamme Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"), status_code=500)
+        return HTMLResponse(_html_shell("Beer and Buffs Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"), status_code=500)
 
 
 @app.get("/api/release-status")
@@ -14638,7 +14638,7 @@ def audit_page(q: str = "", action: str = "", actor: str = "", _: bool = Depends
         return HTMLResponse(_render_audit_dashboard(_snapshot_payload(), q=q, action=action, actor=actor))
     except Exception as exc:
         return HTMLResponse(
-            _html_shell("Weisse Flamme Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
+            _html_shell("Beer and Buffs Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
             status_code=500,
         )
 
@@ -14649,7 +14649,7 @@ def system_page(_: bool = Depends(_admin_auth)):
         return HTMLResponse(_render_system_dashboard(_snapshot_payload()))
     except Exception as exc:
         return HTMLResponse(
-            _html_shell("Weisse Flamme Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
+            _html_shell("Beer and Buffs Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
             status_code=500,
         )
 
@@ -14686,7 +14686,7 @@ def overview(_: bool = Depends(_auth)):
         return HTMLResponse(_render_dashboard(_snapshot_payload()))
     except Exception as exc:
         return HTMLResponse(
-            _html_shell("Weisse Flamme Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
+            _html_shell("Beer and Buffs Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
             status_code=500,
         )
 
@@ -14697,7 +14697,7 @@ def index(request: Request, _: bool = Depends(_auth)):
         return HTMLResponse(_render_status_dashboard(_snapshot_payload(), request, nav_mode="member"))
     except Exception as exc:
         return HTMLResponse(
-            _html_shell("Weisse Flamme Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
+            _html_shell("Beer and Buffs Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
             status_code=500,
         )
 
@@ -15238,7 +15238,7 @@ def _attendance_stats_payload(data: dict[str, Any]) -> dict[str, Any]:
 
 def _render_attendance_stats_dashboard(data: dict[str, Any]) -> str:
     if not data.get("ok"):
-        return _html_shell("Anwesenheit-Stats · Weisse Flamme Dashboard", f"<section class='panel'><h1>📊 Anwesenheit-Stats</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+        return _html_shell("Anwesenheit-Stats · Beer and Buffs Dashboard", f"<section class='panel'><h1>📊 Anwesenheit-Stats</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
     payload = _attendance_stats_payload(data)
     cards = "".join([
         _card("Reviews", payload.get("review_count", 0), f"locked: {payload.get('locked_count', 0)} · reviewed: {payload.get('reviewed_count', 0)}"),
@@ -15311,12 +15311,12 @@ def _render_attendance_stats_dashboard(data: dict[str, Any]) -> str:
     <section class="panel"><h2>👥 Spieler-Statistik</h2>{_table(['Spieler','Reviews','War da','Teilweise','Nicht da','Ignoriert','Offen','Quote','Voice','Letzter Status','Letztes Event'], player_table, placeholder='Spieler durchsuchen…')}</section>
     <section class="panel"><h2>📅 Event-Reviews</h2>{_table(['Event','Zeit','Review','Zeilen','War da','Teilweise','Nicht da','Offen','Quote','Queue','Geändert'], event_table, placeholder='Events durchsuchen…')}</section>
     """
-    return _html_shell("Anwesenheit-Stats · Weisse Flamme Dashboard", body)
+    return _html_shell("Anwesenheit-Stats · Beer and Buffs Dashboard", body)
 
 
 def _render_attendance_list(data: dict[str, Any]) -> str:
     if not data.get("ok"):
-        return _html_shell("Anwesenheit · Weisse Flamme Dashboard", f"<section class='panel'><h1>📝 Anwesenheit</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+        return _html_shell("Anwesenheit · Beer and Buffs Dashboard", f"<section class='panel'><h1>📝 Anwesenheit</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
     snap: dict[str, Any] = data.get("snapshot") or {}
     guild_id = _safe_guild_id(data)
     events = _attendance_events_with_review_fallbacks(snap, guild_id)
@@ -15355,7 +15355,7 @@ def _render_attendance_list(data: dict[str, Any]) -> str:
       {_table(['Event','Zeit','Anmeldungen','Voice','Voice-User','Review','Review-Zeilen','EC-Queue','EC-Check'], rows, placeholder='Events durchsuchen…')}
     </section>
     """
-    return _html_shell("Anwesenheit · Weisse Flamme Dashboard", body)
+    return _html_shell("Anwesenheit · Beer and Buffs Dashboard", body)
 
 
 def _attendance_review_control_panel(guild_id: int, event_id: str, review: dict[str, Any]) -> str:
@@ -15391,7 +15391,7 @@ def _attendance_review_control_panel(guild_id: int, event_id: str, review: dict[
 
 def _render_attendance_event(data: dict[str, Any], event_id: str, saved: bool = False) -> str:
     if not data.get("ok"):
-        return _html_shell("Anwesenheit · Weisse Flamme Dashboard", f"<section class='panel'><h1>📝 Anwesenheit</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+        return _html_shell("Anwesenheit · Beer and Buffs Dashboard", f"<section class='panel'><h1>📝 Anwesenheit</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
     snap: dict[str, Any] = data.get("snapshot") or {}
     guild_id = _safe_guild_id(data)
     event = _event_by_id(snap, event_id) or _event_stub_from_attendance_review(guild_id, event_id)
@@ -15540,7 +15540,7 @@ def _attendance_review_counts(payload: dict[str, Any]) -> dict[str, int]:
 
 def _render_attendance_archive(data: dict[str, Any]) -> str:
     if not data.get("ok"):
-        return _html_shell("Attendance-Archiv · Weisse Flamme Dashboard", f"<section class='panel'><h1>📦 Attendance-Archiv</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+        return _html_shell("Attendance-Archiv · Beer and Buffs Dashboard", f"<section class='panel'><h1>📦 Attendance-Archiv</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
     snap: dict[str, Any] = data.get("snapshot") or {}
     guild_id = _safe_guild_id(data)
     reviews = _attendance_all_reviews(guild_id, limit=500) if guild_id else []
@@ -15602,7 +15602,7 @@ def _render_attendance_archive(data: dict[str, Any]) -> str:
       {_table(['Event','Zeit','Review','Queue','Zeilen','War da','Teilweise','Nicht da','Offen','Geändert','Aktion'], rows, placeholder='Archiv durchsuchen…')}
     </section>
     """
-    return _html_shell("Attendance-Archiv · Weisse Flamme Dashboard", body)
+    return _html_shell("Attendance-Archiv · Beer and Buffs Dashboard", body)
 
 
 @app.get("/attendance-archive", response_class=HTMLResponse)
@@ -16201,7 +16201,7 @@ def _event_ec_defaults(snap: dict[str, Any], event: dict[str, Any]) -> dict[str,
                 break
 
     partial = 5.0 if full > 0 else 0.0
-    # Weisse Flamme-Regel aus dem Bot: Reserve/Teilweise bekommt fix 5 EC.
+    # Beer and Buffs-Regel aus dem Bot: Reserve/Teilweise bekommt fix 5 EC.
     return {"full_ec": full, "partial_ec": partial, "detected_from": detected_from, "event_type": event_type}
 
 
@@ -17925,7 +17925,7 @@ def _render_phase3_database_page(payload: dict[str, Any]) -> str:
     ]
     cut_warn = cutover.get("warnings") or []
     cut_warn_html = "" if not cut_warn else "<div class='notice'><b>Cutover-Hinweise</b><ul>" + "".join(f"<li>{_e(w)}</li>" for w in cut_warn) + "</ul></div>"
-    return _html_shell("Phase 3 · Datenbank · Weisse Flamme Dashboard", f"""
+    return _html_shell("Phase 3 · Datenbank · Beer and Buffs Dashboard", f"""
     <nav class='topnav'><a href='/'>← Kommando</a><a href='/release'>Release</a><a href='/admin'>Admin</a><a href='/database-audit'>Cutover-Prüfung</a><a href='/api/database-cutover-status'>Cutover API</a><a href='/api/database-status'>Status API</a><a href='/api/database-live-status'>Live API</a></nav>
     <section class='hero'><div><h1>Phase 3.9 · Online-Datenbank</h1><p>{_e(status_text)} · Dashboard liest Postgres-first. Bot schreibt sicher weiter lokal JSON und spiegelt direkt nach Postgres, damit JSON als Backup/Fallback erhalten bleibt.</p></div><div class='page-actions'><a class='btn' href='/database/init'>Tabellen vorbereiten</a><a class='btn' href='/database/mirror-snapshot'>Snapshot nachspiegeln</a></div></section>
     <section class='panel'><h2>Cutover-Stand</h2><p>Das ist der relevante Zustand: Nicht ob JSON-Dateien noch existieren, sondern ob das Dashboard die Live-Bereiche aus Postgres liest.</p>{_table(['Bereich','Status','Quelle','Zeilen/Einträge'], cut_rows, searchable=False)}{cut_warn_html}</section>
@@ -18209,7 +18209,7 @@ def _render_phase3_audit_page() -> str:
         ["RSVPs ohne User-ID", counts.get("rsvps_empty_user", 0)],
         ["Gebote ohne User-ID", counts.get("bids_empty_user", 0)],
     ]
-    return _html_shell("Phase 3.5 · Cutover-Prüfung · Weisse Flamme Dashboard", f"""
+    return _html_shell("Phase 3.5 · Cutover-Prüfung · Beer and Buffs Dashboard", f"""
     <nav class='topnav'><a href='/database'>← Datenbank</a><a href='/'>Kommando</a><a href='/release'>Release</a><a href='/api/database-audit'>API</a></nav>
     <section class='hero'><div><h1>Phase 3.5 · Cutover-Prüfung</h1><p>{_e(status_label)} · { _e(status_hint) }</p></div><div class='page-actions'><a class='btn' href='/database'>Datenbank</a><a class='btn' href='/api/database-audit'>API öffnen</a></div></section>
     <section class='panel'><h2>Bereitschaft</h2><div class='grid'>{card_html}</div></section>
