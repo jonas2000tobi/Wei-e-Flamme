@@ -5032,6 +5032,40 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "member") -> str:
       }}
     }}
 
+
+
+    /* Status-Header final responsive override */
+    @media(max-width:640px) {{
+      .status-topnav-shell .status-topnav {{
+        display:grid !important;
+        grid-template-columns:repeat(3,minmax(0,1fr)) !important;
+        width:100% !important;
+        height:auto !important;
+        min-height:0 !important;
+        overflow:visible !important;
+        padding:6px !important;
+        gap:6px !important;
+      }}
+      .status-topnav-shell .status-topnav a {{
+        width:100% !important;
+        min-width:0 !important;
+        min-height:38px !important;
+        padding:8px 5px !important;
+        justify-content:center !important;
+        text-align:center !important;
+        white-space:normal !important;
+        overflow:visible !important;
+      }}
+      .status-main-hero .status-hero-stat strong {{
+        white-space:normal !important;
+        overflow:visible !important;
+        text-overflow:clip !important;
+      }}
+    }}
+    @media(max-width:390px) {{
+      .status-topnav-shell .status-topnav {{ grid-template-columns:repeat(2,minmax(0,1fr)) !important; }}
+      .status-topnav-shell .status-topnav a:last-child {{ grid-column:1/-1; }}
+    }}
   </style>
 </head>
 <body><div class="app-shell">{_member_sidebar_html() if nav_mode == "member" else _sidebar_html()}<main class="content">{auth_note}{body}</main></div><script>
@@ -12787,7 +12821,7 @@ def _render_status_dashboard(data: dict[str, Any], request: Optional[Request] = 
         .status-hero-inner{{width:100%;display:flex;flex-direction:column;align-items:center;gap:18px;}}
         .status-hero-head{{display:flex;flex-direction:column;align-items:center;text-align:center;gap:12px;width:100%;}}
         .status-hero-brand-wrap{{display:flex;flex-direction:column;align-items:center;gap:10px;width:100%;}}
-        .status-hero-brand{{display:block;width:auto;height:215px;max-width:min(560px,92%);object-fit:contain;filter:drop-shadow(0 10px 28px rgba(0,0,0,.72));}}
+        .status-hero-brand{{display:none !important;}}
         .status-welcome{{font-size:clamp(18px,2.6vw,26px);color:#e3e8ee;margin:.15em 0 0;}}
         .status-welcome strong{{color:var(--gold);}}
         .status-hero-stats{{display:grid;grid-template-columns:repeat(6,minmax(120px,1fr));gap:12px;margin-top:2px;width:100%;}}
@@ -12799,7 +12833,28 @@ def _render_status_dashboard(data: dict[str, Any], request: Optional[Request] = 
         .status-hero-stat.compact strong{{font-size:1.12rem;}}
         .status-main-hero .btn{{align-self:center;}}
         @media(max-width:1100px){{.status-hero-stats{{grid-template-columns:repeat(3,minmax(130px,1fr));}}}}
-        @media(max-width:640px){{.status-topnav-shell{{padding:8px;border-radius:18px;}}.status-main-hero{{min-height:760px;padding:22px 20px;background-image:linear-gradient(180deg,rgba(6,8,12,.08) 0%,rgba(7,9,14,.26) 48%,rgba(7,9,14,.90) 100%),url("{_asset('beer_and_buffs_header_mobile.png')}");background-position:center center;background-size:cover;}}.status-hero-brand{{display:none;}}.status-hero-stats{{grid-template-columns:1fr 1fr;}}.status-hero-stat{{padding:12px}}.status-hero-stat strong{{font-size:1.18rem;}}}}
+        @media(max-width:640px){{
+          .status-topnav-shell{{padding:0;border-radius:14px;margin-bottom:10px;}}
+          .status-topnav{{display:grid !important;grid-template-columns:repeat(3,minmax(0,1fr));height:auto !important;min-height:0 !important;overflow:visible !important;padding:6px !important;gap:6px !important;}}
+          .status-topnav a{{width:100%;min-width:0;min-height:38px !important;padding:8px 6px !important;justify-content:center;text-align:center;font-size:12px !important;white-space:normal !important;line-height:1.1 !important;}}
+          .status-main-hero{{min-height:0;padding:16px 14px 20px;background-image:linear-gradient(180deg,rgba(6,8,12,.04) 0%,rgba(7,9,14,.08) 42%,rgba(7,9,14,.72) 68%,rgba(7,9,14,.96) 100%),url("{_asset('beer_and_buffs_header_mobile.png')}");background-position:center top;background-size:100% auto;background-repeat:no-repeat;background-color:#07080b;}}
+          .status-hero-inner{{gap:12px;}}
+          .status-hero-head{{min-height:clamp(300px,92vw,420px);justify-content:flex-start;}}
+          .status-hero-brand-wrap{{gap:4px;}}
+          .status-hero-brand{{display:none !important;}}
+          .status-welcome{{margin-top:6px;font-size:18px;text-shadow:0 2px 10px #000;}}
+          .status-hero-stats{{grid-template-columns:1fr 1fr;gap:8px;margin-top:0;}}
+          .status-hero-stat{{padding:10px 11px;min-height:102px;border-radius:14px;justify-content:flex-start;}}
+          .status-hero-stat span{{font-size:.76rem;}}
+          .status-hero-stat strong,.status-hero-stat.compact strong{{font-size:1.02rem;white-space:normal;overflow:visible;text-overflow:clip;overflow-wrap:anywhere;}}
+          .status-hero-stat small{{font-size:.72rem;overflow-wrap:anywhere;}}
+        }}
+        @media(max-width:390px){{
+          .status-topnav{{grid-template-columns:repeat(2,minmax(0,1fr));}}
+          .status-topnav a:last-child{{grid-column:1/-1;}}
+          .status-hero-head{{min-height:clamp(290px,96vw,380px);}}
+          .status-hero-stat{{min-height:96px;padding:9px 10px;}}
+        }}
       </style>
     """
     map_url = str(game.get("map_url") or "https://tldb.info/map/world")
@@ -12826,7 +12881,6 @@ def _render_status_dashboard(data: dict[str, Any], request: Optional[Request] = 
         <div class="status-hero-head">
           <div class="status-hero-brand-wrap">
             <div class="eyebrow">Dashboard Status</div>
-            <img class="status-hero-brand" src="{_e(_brand_image('logo', 'beer_and_buffs_logo.png'))}" alt="{_e(_guild_brand().get('display_name') or 'Gilde')}">
             <p class="status-welcome">Willkommen, <strong>{_e(welcome_name)}</strong></p>
           </div>
         </div>
