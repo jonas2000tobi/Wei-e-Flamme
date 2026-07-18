@@ -3959,7 +3959,9 @@ def _member_sidebar_html() -> str:
 def _html_shell(title: str, body: str, *, nav_mode: str = "member") -> str:
     brand = _guild_brand()
     brand_name = str(brand.get("display_name") or "Gilde")
-    hero_banner = _css_url(_brand_image("banner", "hero_banner.webp"))
+    # Separate responsive header assets: wide desktop artwork and portrait mobile artwork.
+    hero_banner = _css_url(_asset("beer_and_buffs_header_desktop.png"))
+    hero_banner_mobile = _css_url(_asset("beer_and_buffs_header_mobile.png"))
     brand_logo = _css_url(_brand_image("logo", "beer_and_buffs_logo.png"))
     for old_name in ("Weisse Flamme", "Weiße Flamme", "Ebolus", "ebolus"):
         title = str(title).replace(old_name, brand_name)
@@ -4030,7 +4032,7 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "member") -> str:
     .topnav a[href="/system"]::before {{ display:block; background-image:url("{_asset('nav_system.png')}"); }}
     .topnav a[href="/exports"]::before {{ display:block; background-image:url("{_asset('nav_exports.png')}"); }}
     .topnav a:hover {{ border-color:var(--gold); color:var(--gold); transform:translateY(-1px); }}
-    .hero {{ position:relative; overflow:hidden; display:flex; justify-content:space-between; gap:18px; align-items:center; padding:34px; border:1px solid rgba(184,201,220,.38); background:linear-gradient(90deg,rgba(6,8,14,.88) 0%,rgba(9,12,20,.66) 48%,rgba(9,12,20,.26) 100%), url("{hero_banner}") center center / cover no-repeat; border-radius:22px; margin-bottom:18px; box-shadow:0 24px 60px rgba(0,0,0,.50), inset 0 0 0 1px rgba(232,239,247,.06); }}
+    .hero {{ position:relative; overflow:hidden; display:flex; justify-content:space-between; gap:18px; align-items:center; min-height:300px; padding:34px; border:1px solid rgba(218,166,74,.38); background-image:linear-gradient(90deg,rgba(6,8,14,.82) 0%,rgba(9,12,20,.54) 45%,rgba(9,12,20,.12) 100%),url("{hero_banner}"); background-position:center center; background-size:cover; background-repeat:no-repeat; border-radius:22px; margin-bottom:18px; box-shadow:0 24px 60px rgba(0,0,0,.50), inset 0 0 0 1px rgba(255,220,150,.06); }}
     .hero::after {{ content:""; position:absolute; inset:0; pointer-events:none; background:radial-gradient(circle at 76% 50%,rgba(184,201,220,.16),transparent 34%), linear-gradient(180deg,transparent,rgba(0,0,0,.24)); }}
     .hero > * {{ position:relative; z-index:1; }}
     .hero h1::before {{ content:""; display:inline-block; width:38px; height:38px; margin-right:10px; vertical-align:-8px; background:url("{brand_logo}") center / contain no-repeat; filter:drop-shadow(0 2px 7px rgba(0,0,0,.8)); }}
@@ -4203,7 +4205,7 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "member") -> str:
       .side-nav details a {{ margin-left:0; padding:10px 12px; }}
       main.content {{ padding:12px 10px 46px; }}
       .authbar {{ justify-content:flex-start; flex-wrap:wrap; font-size:12px; }}
-      .hero {{ padding:18px; border-radius:16px; margin-bottom:12px; }}
+      .hero {{ min-height:560px; padding:18px; border-radius:16px; margin-bottom:12px; background-image:linear-gradient(180deg,rgba(6,8,14,.22) 0%,rgba(6,8,14,.42) 48%,rgba(6,8,14,.88) 100%),url("{hero_banner_mobile}"); background-position:center center; background-size:cover; }}
       .hero h1 {{ font-size:28px; line-height:1.1; }}
       .hero h1::before {{ width:30px; height:30px; margin-right:8px; vertical-align:-6px; }}
       .hero .btn, .hero a.btn {{ width:100%; text-align:center; margin-top:4px; }} .hero-actions {{ grid-template-columns:1fr; }} .hero-action {{ min-height:72px; }}
@@ -12781,7 +12783,7 @@ def _render_status_dashboard(data: dict[str, Any], request: Optional[Request] = 
         .status-topnav-shell{{border:1px solid rgba(218,166,74,.34);border-radius:20px;padding:10px;margin:0 0 18px;background:linear-gradient(180deg,rgba(218,166,74,.09),rgba(11,14,22,.38));box-shadow:0 16px 40px rgba(0,0,0,.22), inset 0 0 0 1px rgba(232,239,247,.04);}}
         .status-topnav{{margin:0;}}
         .status-topnav a{{border-color:rgba(218,166,74,.34);}}
-        .status-main-hero{{min-height:420px;padding:30px 32px;background:linear-gradient(90deg,rgba(6,8,12,.88) 0%,rgba(7,9,14,.62) 52%,rgba(7,9,14,.18) 100%), url("{_css_url(_brand_image('banner', 'hero_banner.webp'))}") center center / cover no-repeat;border:1px solid rgba(218,166,74,.38);box-shadow:0 22px 56px rgba(0,0,0,.48), inset 0 0 0 1px rgba(255,220,150,.05);}}
+        .status-main-hero{{min-height:520px;padding:30px 32px;background-image:linear-gradient(180deg,rgba(6,8,12,.10) 0%,rgba(7,9,14,.24) 48%,rgba(7,9,14,.86) 100%),url("{_asset('beer_and_buffs_header_desktop.png')}");background-position:center center;background-size:cover;background-repeat:no-repeat;border:1px solid rgba(218,166,74,.38);box-shadow:0 22px 56px rgba(0,0,0,.48), inset 0 0 0 1px rgba(255,220,150,.05);}}
         .status-hero-inner{{width:100%;display:flex;flex-direction:column;align-items:center;gap:18px;}}
         .status-hero-head{{display:flex;flex-direction:column;align-items:center;text-align:center;gap:12px;width:100%;}}
         .status-hero-brand-wrap{{display:flex;flex-direction:column;align-items:center;gap:10px;width:100%;}}
@@ -12797,7 +12799,7 @@ def _render_status_dashboard(data: dict[str, Any], request: Optional[Request] = 
         .status-hero-stat.compact strong{{font-size:1.12rem;}}
         .status-main-hero .btn{{align-self:center;}}
         @media(max-width:1100px){{.status-hero-stats{{grid-template-columns:repeat(3,minmax(130px,1fr));}}}}
-        @media(max-width:640px){{.status-topnav-shell{{padding:8px;border-radius:18px;}}.status-main-hero{{min-height:0;padding:22px 20px;}}.status-hero-brand{{width:auto;height:170px;max-width:100%;}}.status-hero-stats{{grid-template-columns:1fr 1fr;}}.status-hero-stat{{padding:12px}}.status-hero-stat strong{{font-size:1.18rem;}}}}
+        @media(max-width:640px){{.status-topnav-shell{{padding:8px;border-radius:18px;}}.status-main-hero{{min-height:760px;padding:22px 20px;background-image:linear-gradient(180deg,rgba(6,8,12,.08) 0%,rgba(7,9,14,.26) 48%,rgba(7,9,14,.90) 100%),url("{_asset('beer_and_buffs_header_mobile.png')}");background-position:center center;background-size:cover;}}.status-hero-brand{{display:none;}}.status-hero-stats{{grid-template-columns:1fr 1fr;}}.status-hero-stat{{padding:12px}}.status-hero-stat strong{{font-size:1.18rem;}}}}
       </style>
     """
     map_url = str(game.get("map_url") or "https://tldb.info/map/world")
