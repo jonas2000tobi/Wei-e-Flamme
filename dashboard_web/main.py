@@ -4404,6 +4404,35 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "member") -> str:
     }}
 
 
+    /* Sidebar logo sizing + stable initial viewport */
+    @media (min-width:761px) {{
+      .sidebar .brand {{
+        padding:8px 8px 14px;
+        gap:6px;
+        overflow:hidden;
+      }}
+      .sidebar .brand-mark.sidebar-brand-logo {{
+        width:92px !important;
+        height:68px !important;
+        max-width:92px !important;
+        max-height:68px !important;
+        flex:0 0 68px !important;
+        margin:0 auto !important;
+        overflow:hidden !important;
+      }}
+      .sidebar .brand-mark.sidebar-brand-logo img {{
+        display:block;
+        width:100% !important;
+        height:100% !important;
+        max-width:92px !important;
+        max-height:68px !important;
+        object-fit:contain !important;
+        object-position:center !important;
+      }}
+      .sidebar .brand strong {{ font-size:16px; line-height:1.08; }}
+      .sidebar .brand span {{ font-size:10px; line-height:1.2; }}
+    }}
+
     /* Mobile UX Patch v2 – Bottom Navigation + cleaner hero */
     @media(max-width:900px) {{
       :root {{ --mobile-bottom-nav-h:58px; --mobile-auth-h:48px; --mobile-menu-h:48px; }}
@@ -5224,6 +5253,29 @@ document.addEventListener('change', function(ev) {{
   if (ev.target && ev.target.matches('select.need-slot-select')) refreshItemPickerFilters();
   if (ev.target && ev.target.matches('select.weapon-type-picker')) refreshNeedWeaponPicker(ev.target);
 }});
+// Beim echten Öffnen immer am Seitenanfang starten. Browser-Scroll-Restoration
+// würde sonst häufig die zuletzt fokussierte Karte bzw. das Karten-iframe wiederherstellen.
+(function resetInitialViewport() {{
+  try {{ if ('scrollRestoration' in history) history.scrollRestoration = 'manual'; }} catch (_) {{}}
+  let userMoved = false;
+  const markMoved = () => {{ userMoved = true; }};
+  window.addEventListener('wheel', markMoved, {{passive:true, once:true}});
+  window.addEventListener('touchmove', markMoved, {{passive:true, once:true}});
+  window.addEventListener('keydown', markMoved, {{once:true}});
+  const toTop = () => {{
+    if (userMoved) return;
+    const hash = String(location.hash || '');
+    // Echte Sprunglinks weiterhin respektieren; nur ungewollte Wiederherstellung verhindern.
+    if (hash && document.querySelector(hash)) return;
+    window.scrollTo({{top:0, left:0, behavior:'instant'}});
+    document.documentElement.scrollTop = 0;
+    if (document.body) document.body.scrollTop = 0;
+  }};
+  toTop();
+  document.addEventListener('DOMContentLoaded', () => {{ toTop(); requestAnimationFrame(toTop); }}, {{once:true}});
+  window.addEventListener('pageshow', () => {{ toTop(); setTimeout(toTop, 60); }}, {{once:true}});
+}})();
+
 document.addEventListener('DOMContentLoaded', function() {{
   refreshItemPickerFilters();
   document.querySelectorAll('select.weapon-type-picker').forEach(refreshNeedWeaponPicker);
