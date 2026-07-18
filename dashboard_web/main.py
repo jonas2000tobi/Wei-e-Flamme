@@ -46,7 +46,7 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
-ASSET_VER = "guild-platform-v2"
+ASSET_VER = "beer-and-buffs-logo-v3"
 DASHBOARD_RELEASE_VERSION = "2.0.0 · Konfigurierbare Gildenplattform"
 
 
