@@ -58,7 +58,8 @@ LEADER_CONTACT_CFG_FILE = DATA_DIR / "leader_contact_cfg.json"
 NEED_SLOTS = [
     "Waffe 1",
     "Waffe 2",
-    "Fähigkeitskern",
+    "Fähigkeitskern 1",
+    "Fähigkeitskern 2",
     "Helm",
     "Brust",
     "Hose",
@@ -364,6 +365,17 @@ def _user_needs(guild_id: int, user_id: int) -> dict:
             u[tab] = {}
             changed = True
 
+        # Migration vom früheren einzelnen Kern-Slot. Ein vorhandener
+        # Eintrag bleibt erhalten und wird künftig als Fähigkeitskern 1 geführt.
+        legacy_core = u[tab].get("Fähigkeitskern")
+        if legacy_core is not None:
+            legacy_obj = _slot_obj(legacy_core)
+            current_core_1 = _slot_obj(u[tab].get("Fähigkeitskern 1"))
+            if legacy_obj.get("item_id") and not current_core_1.get("item_id"):
+                u[tab]["Fähigkeitskern 1"] = legacy_obj
+            u[tab].pop("Fähigkeitskern", None)
+            changed = True
+
         for slot in NEED_SLOTS:
             if slot not in u[tab]:
                 u[tab][slot] = _blank_slot()
@@ -401,7 +413,15 @@ def _normalize_catalog_slot(slot: str) -> str:
         "faehigkeitskern": "Fähigkeitskern",
         "fähigkeitskern": "Fähigkeitskern",
         "fahigkeitskern": "Fähigkeitskern",
+        "faehigkeitskern1": "Fähigkeitskern",
+        "fähigkeitskern1": "Fähigkeitskern",
+        "fahigkeitskern1": "Fähigkeitskern",
+        "faehigkeitskern2": "Fähigkeitskern",
+        "fähigkeitskern2": "Fähigkeitskern",
+        "fahigkeitskern2": "Fähigkeitskern",
         "skillcore": "Fähigkeitskern",
+        "skillcore1": "Fähigkeitskern",
+        "skillcore2": "Fähigkeitskern",
         "skill-core": "Fähigkeitskern",
         "skillkern": "Fähigkeitskern",
         "ring1": "Ring",
@@ -423,12 +443,21 @@ def _normalize_need_slot(slot: str) -> str:
     aliases = {
         "waffe1": "Waffe 1",
         "waffe2": "Waffe 2",
-        "faehigkeitskern": "Fähigkeitskern",
-        "fähigkeitskern": "Fähigkeitskern",
-        "fahigkeitskern": "Fähigkeitskern",
-        "skillcore": "Fähigkeitskern",
-        "skill-core": "Fähigkeitskern",
-        "skillkern": "Fähigkeitskern",
+        # Alte Bezeichnung ohne Nummer bleibt kompatibel und wird Kern 1.
+        "faehigkeitskern": "Fähigkeitskern 1",
+        "fähigkeitskern": "Fähigkeitskern 1",
+        "fahigkeitskern": "Fähigkeitskern 1",
+        "faehigkeitskern1": "Fähigkeitskern 1",
+        "fähigkeitskern1": "Fähigkeitskern 1",
+        "fahigkeitskern1": "Fähigkeitskern 1",
+        "faehigkeitskern2": "Fähigkeitskern 2",
+        "fähigkeitskern2": "Fähigkeitskern 2",
+        "fahigkeitskern2": "Fähigkeitskern 2",
+        "skillcore": "Fähigkeitskern 1",
+        "skillcore1": "Fähigkeitskern 1",
+        "skillcore2": "Fähigkeitskern 2",
+        "skill-core": "Fähigkeitskern 1",
+        "skillkern": "Fähigkeitskern 1",
         "ring1": "Ring 1",
         "ring2": "Ring 2",
     }
@@ -489,6 +518,9 @@ def _normalize_weapon_type(value: str | None) -> str:
 def _catalog_slot_for_need_slot(need_slot: str) -> str:
     if need_slot in ("Waffe 1", "Waffe 2"):
         return "Waffe"
+
+    if need_slot in ("Fähigkeitskern 1", "Fähigkeitskern 2", "Fähigkeitskern"):
+        return "Fähigkeitskern"
 
     if need_slot in ("Ring 1", "Ring 2"):
         return "Ring"
@@ -842,7 +874,7 @@ def _need_embed(guild: discord.Guild, user_id: int, tab: str = "Main") -> discor
 
         if slot in ("Waffe 1", "Waffe 2"):
             weapon_lines.append(line)
-        elif slot == "Fähigkeitskern":
+        elif slot in ("Fähigkeitskern 1", "Fähigkeitskern 2"):
             ability_core_lines.append(line)
         elif slot in ("Helm", "Brust", "Hose", "Handschuhe", "Schuhe"):
             armor_lines.append(line)
@@ -852,7 +884,7 @@ def _need_embed(guild: discord.Guild, user_id: int, tab: str = "Main") -> discor
             other_lines.append(line)
 
     emb.add_field(name="⚔️ Waffen", value="\n".join(weapon_lines) or "—", inline=False)
-    emb.add_field(name="✨ Fähigkeitskern", value="\n".join(ability_core_lines) or "—", inline=False)
+    emb.add_field(name="✨ Fähigkeitskerne", value="\n".join(ability_core_lines) or "—", inline=False)
     emb.add_field(name="🛡️ Rüstung", value="\n".join(armor_lines) or "—", inline=False)
     emb.add_field(name="💍 Schmuck", value="\n".join(jewelry_lines) or "—", inline=False)
     emb.add_field(name="🧥 Sonstiges", value="\n".join(other_lines) or "—", inline=False)
