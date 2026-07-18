@@ -5278,38 +5278,67 @@ document.addEventListener('change', function(ev) {{
   if (ev.target && ev.target.matches('select.need-slot-select')) refreshItemPickerFilters();
   if (ev.target && ev.target.matches('select.weapon-type-picker')) refreshNeedWeaponPicker(ev.target);
 }});
-// Beim echten Öffnen immer am Seitenanfang starten. Die Karte wird bewusst
-// NICHT automatisch geladen, damit ein fremdes iframe den Fokus nicht übernimmt.
-(function resetInitialViewport() {{
+// Beim echten Öffnen am Seitenanfang bleiben. Externe Karten dürfen automatisch
+// laden, aber weder Fokus noch Scrollposition der Hauptseite übernehmen.
+(function installInitialViewportGuard() {{
   try {{ if ('scrollRestoration' in history) history.scrollRestoration = 'manual'; }} catch (_) {{}}
-  let userMoved = false;
-  const markMoved = () => {{ userMoved = true; }};
-  ['wheel', 'touchstart', 'touchmove', 'pointerdown'].forEach((name) =>
-    window.addEventListener(name, markMoved, {{passive:true, once:true}})
-  );
-  window.addEventListener('keydown', markMoved, {{once:true}});
 
-  const toTop = () => {{
-    if (userMoved) return;
-    // Alte versehentliche #map-URLs bereinigen. Andere echte Sprunglinks bleiben erhalten.
-    if (String(location.hash || '').toLowerCase() === '#map') {{
-      try {{ history.replaceState(null, '', location.pathname + location.search); }} catch (_) {{}}
-    }} else if (location.hash && document.querySelector(location.hash)) {{
-      return;
+  const guard = window.__bbViewportGuard = {{
+    active: true,
+    userMoved: false,
+    until: Date.now() + 15000,
+    markUserMoved: function() {{
+      this.userMoved = true;
+      this.active = false;
+    }},
+    keepTop: function() {{
+      if (!this.active || this.userMoved || Date.now() > this.until) {{
+        this.active = false;
+        return;
+      }}
+      if (String(location.hash || '').toLowerCase() === '#map') {{
+        try {{ history.replaceState(null, '', location.pathname + location.search); }} catch (_) {{}}
+      }} else if (location.hash && document.querySelector(location.hash)) {{
+        this.active = false;
+        return;
+      }}
+      if (window.scrollY !== 0 || document.documentElement.scrollTop !== 0 || (document.body && document.body.scrollTop !== 0)) {{
+        window.scrollTo(0, 0);
+        document.documentElement.scrollTop = 0;
+        if (document.body) document.body.scrollTop = 0;
+      }}
+    }},
+    releaseSoon: function(delay) {{
+      const self = this;
+      setTimeout(function() {{ self.active = false; }}, delay || 1200);
     }}
-    window.scrollTo({{top:0, left:0, behavior:'instant'}});
-    document.documentElement.scrollTop = 0;
-    if (document.body) document.body.scrollTop = 0;
   }};
 
-  toTop();
-  document.addEventListener('DOMContentLoaded', () => {{
-    toTop();
-    requestAnimationFrame(() => requestAnimationFrame(toTop));
-    [50, 200, 600, 1400, 2600].forEach((ms) => setTimeout(toTop, ms));
+  ['wheel', 'touchstart', 'touchmove', 'pointerdown', 'mousedown'].forEach(function(name) {{
+    window.addEventListener(name, function(ev) {{
+      if (ev && ev.isTrusted === false) return;
+      guard.markUserMoved();
+    }}, {{passive:true, once:true, capture:true}});
+  }});
+  window.addEventListener('keydown', function(ev) {{
+    if (ev && ev.isTrusted === false) return;
+    guard.markUserMoved();
+  }}, {{once:true, capture:true}});
+
+  // Manche Browser stellen die alte Position oder den iframe-Fokus erst einige
+  // Sekunden nach DOMContentLoaded wieder her. Solange der Nutzer noch nichts
+  // gemacht hat, wird ausschließlich dieser automatische Sprung abgefangen.
+  window.addEventListener('scroll', function() {{ guard.keepTop(); }}, {{passive:true}});
+  guard.keepTop();
+  document.addEventListener('DOMContentLoaded', function() {{
+    guard.keepTop();
+    requestAnimationFrame(function() {{ requestAnimationFrame(function() {{ guard.keepTop(); }}); }});
+    [50, 200, 600, 1400, 3000, 6000, 10000, 14500].forEach(function(ms) {{
+      setTimeout(function() {{ guard.keepTop(); }}, ms);
+    }});
   }}, {{once:true}});
-  window.addEventListener('load', () => {{ toTop(); setTimeout(toTop, 150); }}, {{once:true}});
-  window.addEventListener('pageshow', () => {{ toTop(); setTimeout(toTop, 100); }}, {{once:true}});
+  window.addEventListener('load', function() {{ guard.keepTop(); setTimeout(function() {{ guard.keepTop(); }}, 200); }}, {{once:true}});
+  window.addEventListener('pageshow', function() {{ guard.keepTop(); setTimeout(function() {{ guard.keepTop(); }}, 120); }}, {{once:true}});
 }})();
 
 document.addEventListener('DOMContentLoaded', function() {{
@@ -13164,17 +13193,16 @@ def _render_status_dashboard(data: dict[str, Any], request: Optional[Request] = 
         <a class="btn ghost" id="statusMapDirect" href="{_e(direct_map_url)}" target="_blank" rel="noopener">Karte groß öffnen</a>
       </div>
       <div class="status-map-wrap" style="position:relative;contain:content;content-visibility:auto;">
-        <div id="statusMapLoader" class="muted" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;z-index:1;background:linear-gradient(180deg,rgba(18,13,7,.82),rgba(4,5,8,.94));border-radius:12px;min-height:420px;">
-          <button class="btn" id="statusMapLoad" type="button">🗺️ Karte laden</button>
+        <div id="statusMapLoader" class="muted" style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;z-index:1;background:linear-gradient(180deg,rgba(18,13,7,.82),rgba(4,5,8,.94));border-radius:12px;min-height:420px;pointer-events:none;">
+          <span>🗺️ Karte wird geladen …</span>
         </div>
-        <iframe id="statusMapFrame" class="status-map-frame" title="Solisium Karte" src="about:blank" data-src="{_e(map_url)}" data-loaded="0" width="100%" height="560" style="border:none;border-radius:8px;background:#05060a;" allowfullscreen loading="lazy" tabindex="-1" referrerpolicy="no-referrer-when-downgrade"></iframe>
+        <iframe id="statusMapFrame" class="status-map-frame" title="Solisium Karte" src="about:blank" data-src="{_e(map_url)}" data-loaded="0" width="100%" height="560" style="border:none;border-radius:8px;background:#05060a;" allowfullscreen loading="eager" tabindex="-1" referrerpolicy="no-referrer-when-downgrade"></iframe>
       </div>
 
       <script>
       (function() {{
         const frame = document.getElementById('statusMapFrame');
         const loader = document.getElementById('statusMapLoader');
-        const loadButton = document.getElementById('statusMapLoad');
         const direct = document.getElementById('statusMapDirect');
         const source = document.getElementById('statusMapSource');
         if (!frame) return;
@@ -13184,7 +13212,6 @@ def _render_status_dashboard(data: dict[str, Any], request: Optional[Request] = 
         function setMap(src, label) {{
           if (!src) return;
           if (loader) loader.style.display = 'flex';
-          if (loadButton) loadButton.textContent = 'Karte wird geladen …';
           frame.dataset.loaded = '1';
           frame.src = src;
           if (direct) direct.href = directUrl(src);
@@ -13192,6 +13219,15 @@ def _render_status_dashboard(data: dict[str, Any], request: Optional[Request] = 
         }}
         frame.addEventListener('load', function() {{
           if (frame.dataset.loaded === '1' && loader) loader.style.display = 'none';
+          // Falls der fremde Karteninhalt beim Laden den iframe fokussiert, den
+          // Fokus wieder lösen und nur einen noch aktiven Startsprung korrigieren.
+          try {{ frame.blur(); }} catch (_) {{}}
+          const guard = window.__bbViewportGuard;
+          if (guard && guard.active && !guard.userMoved) {{
+            guard.keepTop();
+            setTimeout(function() {{ guard.keepTop(); }}, 80);
+            setTimeout(function() {{ guard.keepTop(); guard.releaseSoon(500); }}, 300);
+          }}
         }});
         document.querySelectorAll('[data-map-src]').forEach(function(btn) {{
           btn.addEventListener('click', function() {{
@@ -13202,11 +13238,13 @@ def _render_status_dashboard(data: dict[str, Any], request: Optional[Request] = 
         }});
         const initial = frame.getAttribute('data-src') || '{_e(tldb_map_url)}';
         const initialLabel = initial.indexOf('interactivemap.app') >= 0 ? 'IMapp' : (initial.indexOf('questlog.gg') >= 0 ? 'Questlog' : 'TLDB');
-        if (loadButton) {{
-          loadButton.addEventListener('click', function() {{ setMap(initial, initialLabel); }});
+        // Die Standardkarte lädt automatisch. Der Viewport-Guard verhindert nur
+        // den unerwünschten Sprung zur Karte; ein echter Nutzerscroll wird nie zurückgesetzt.
+        if ('requestIdleCallback' in window) {{
+          window.requestIdleCallback(function() {{ setMap(initial, initialLabel); }}, {{timeout: 700}});
+        }} else {{
+          setTimeout(function() {{ setMap(initial, initialLabel); }}, 120);
         }}
-        // Kein automatisches iframe-Laden: externe Karten dürfen beim Seitenstart
-        // weder Fokus noch Scrollposition übernehmen.
       }})();
       </script>
     </section>
