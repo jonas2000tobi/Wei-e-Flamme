@@ -63,6 +63,15 @@ DEFAULT_ACCESSORY_CATEGORY_URLS = [
     "https://questlog.gg/throne-and-liberty/de/db/items/accessories/earring?grade=41",
 ]
 
+# Questlog listet alle Fähigkeitskerne unter Misc -> Perks. Die Liste ist paginiert;
+# der Crawler startet bei Seite 1 und läuft automatisch weiter, bis keine neuen
+# /db/item/perk_* Detailseiten mehr gefunden werden.
+DEFAULT_SKILL_CORE_CATEGORY_URL = (
+    "https://questlog.gg/throne-and-liberty/de/db/items/misc/perk?page=1"
+)
+SKILL_CORE_SUBCATEGORY = "Fähigkeitskern"
+
+
 # Heroische Items nutzt Questlog über grade=51. Diese URLs werden zusätzlich zu Rare+/Epic importiert.
 def _change_grade_in_url(url: str, grade: int) -> str:
     return re.sub(r"grade=\d+", f"grade={int(grade)}", url) if "grade=" in url else (url + ("&" if "?" in url else "?") + f"grade={int(grade)}")
@@ -353,6 +362,28 @@ def is_skill_core_like(url: str, text: str, name: str = "") -> bool:
         "fähigkeits-kerne", "faehigkeits-kerne", "fähigkeitskern",
     ]
     return any(n in hay for n in needles)
+
+
+def is_skill_core_list_url(url: str) -> bool:
+    """True für Questlogs eigene Fähigkeitskern-Liste /items/misc/perk."""
+    try:
+        tail = item_tail(force_de_locale_url(str(url or "")))
+    except Exception:
+        return False
+    return len(tail) >= 2 and tail[0].lower() == "misc" and tail[1].lower() == "perk"
+
+
+def is_skill_core_detail_url(url: str) -> bool:
+    """True nur für echte Questlog-Fähigkeitskern-Detailseiten."""
+    return is_item_detail_url(str(url or "")) and item_detail_id(str(url or "")).lower().startswith("perk_")
+
+
+def expects_skill_core(expected_main_category: str = "", expected_sub_category: str = "") -> bool:
+    main = clean_text(expected_main_category).lower()
+    sub = clean_text(expected_sub_category).lower()
+    return main in {"skill_core", "skillcore", "ability_core", "abilitycore"} or any(
+        token in sub for token in ("fähigkeitskern", "faehigkeitskern", "skill core", "skillcore")
+    )
 
 
 SKIP_REASON_BY_URL: dict[str, str] = {}
@@ -915,6 +946,10 @@ def normalize_main_category_arg(value: Any) -> str:
         "zubehör": "accessory", "zubehoer": "accessory", "schmuck": "accessory", "accessory": "accessory", "accessories": "accessory", "accessoire": "accessory", "accessoires": "accessory",
         "material": "material", "materials": "material",
         "währung": "currency", "waehrung": "currency", "currency": "currency", "currencies": "currency",
+        # Fähigkeitskerne bleiben im bestehenden Katalogschema unter main_category=misc.
+        "fähigkeitskern": "misc", "faehigkeitskern": "misc", "skillcore": "misc",
+        "skill-core": "misc", "skill_core": "misc", "abilitycore": "misc", "ability_core": "misc",
+        "perk": "misc", "perks": "misc", "misc": "misc",
     }
     return mapping.get(low, low)
 
@@ -962,6 +997,8 @@ def detect_sub_category(main_category: str, text: str, url: str = "") -> tuple[s
         return "Material", "medium"
     if main_category == "currency":
         return "Währung", "medium"
+    if main_category == "misc" and (is_skill_core_list_url(url) or is_skill_core_like(url, text)):
+        return SKILL_CORE_SUBCATEGORY, "high"
     return None, "medium"
 
 
@@ -2268,12 +2305,19 @@ def _safe_item_asset_url(url: Any, expected_main_category: str = "", expected_su
     """
     raw = str(url or "").strip()
     low = raw.lower()
+    want_skill_core = expects_skill_core(expected_main_category, expected_sub_category)
     if not low or low.startswith("data:") or low.endswith(".svg"):
         return False
-    if any(x in low for x in (
-        "perk_", "/misc/perk", "/misc/skill", "/skill/", "/ability/", "/passive/", "/trait/",
+    always_bad = (
         "avatar", "profile", "logo", "favicon", "worldmap", "/map/", "youtube", "discord",
         "doubleclick", "googleads", "advertisement", "banner", "background", "placeholder",
+    )
+    if any(x in low for x in always_bad):
+        return False
+    # Bei normalen Ausrüstungsitems sind Perk-/Skillbilder falsche Treffer. Für
+    # Fähigkeitskerne IST /Icon/Item_128/Misc/Perk_* jedoch das echte Itembild.
+    if not want_skill_core and any(x in low for x in (
+        "perk_", "/misc/perk", "/misc/skill", "/skill/", "/ability/", "/passive/", "/trait/",
     )):
         return False
 
@@ -2420,6 +2464,7 @@ def collect_image_urls(page, expected_main_category: str = "", expected_sub_cate
     candidates: list[dict[str, Any]] = []
     expected_main = clean_text(expected_main_category).lower()
     expected_sub = clean_text(expected_sub_category).lower()
+    want_skill_core = expects_skill_core(expected_main_category, expected_sub_category)
 
     def add_candidate(
         src: Any,
@@ -2486,17 +2531,17 @@ def collect_image_urls(page, expected_main_category: str = "", expected_sub_cate
             score += 460
 
         if is_perk_asset:
-            score -= 900
+            score += 1250 if want_skill_core else -900
 
-        # Bestes Signal nur noch, wenn es kein Perk-/Fähigkeitsasset ist.
-        # Sonst gewinnt z.B. Perk_dagger_... fälschlich gegen IT_P_Dagger_....
-        if detail_id and detail_id in low and not is_perk_asset:
-            score += 700
-        elif detail_id and not is_perk_asset:
+        # Bei Ausrüstung müssen Perk-Bilder verlieren. Beim Fähigkeitskern ist die
+        # perk_* Datei dagegen das exakte Itembild und soll durch die Detail-ID gewinnen.
+        if detail_id and detail_id in low and (want_skill_core or not is_perk_asset):
+            score += 900 if want_skill_core else 700
+        elif detail_id and (want_skill_core or not is_perk_asset):
             compact_id = re.sub(r"[^a-z0-9]", "", detail_id)
             compact_url = re.sub(r"[^a-z0-9]", "", low.rsplit("/", 1)[-1].split("?", 1)[0])
             if compact_id and len(compact_id) >= 8 and compact_id in compact_url:
-                score += 620
+                score += 760 if want_skill_core else 620
 
         # Pfad-Hinweise. Skill-/Ability-Assets dürfen nicht gegen Itembilder gewinnen.
         if any(x in low for x in ["/item", "items", "item_128", "equipment", "weapon", "armor", "accessory"]):
@@ -2987,9 +3032,13 @@ def detail_matches_source_list(detail_url: str, list_url: str, main_category: st
     if not is_locale_detail_url(detail_url, DEFAULT_LOCALE):
         return False
     slug = subcategory_slug(list_url)
+    item_id = item_detail_id(detail_url).lower()
     if main_category == "weapon" and slug in WEAPON_SLUG_TO_SUBCATEGORY:
-        item_id = item_detail_id(detail_url).lower()
         return item_id.startswith(f"{slug.lower()}_")
+    if main_category == "misc" and is_skill_core_list_url(list_url):
+        # Die React-Seite verlinkt zusätzlich Waffen, Rezepte und ähnliche Items.
+        # Für den Kernimport akzeptieren wir ausschließlich perk_* Detail-IDs.
+        return item_id.startswith("perk_")
     return True
 
 
@@ -3103,8 +3152,17 @@ def parse_detail_page(page, url: str, main_category_hint: str, locale: str, sour
     if not name or name.lower() in {"items", "weapons", "questlog"}:
         return skip_item(url, "kein echter Itemname erkannt")
     main_category = main_category_hint or classify_main_category(source_list_url or url, raw_text)
+    skill_core_source = is_skill_core_list_url(source_list_url) or is_skill_core_detail_url(url)
+    if skill_core_source:
+        # Im gemeinsamen Katalog bleibt die Hauptkategorie kompatibel als misc,
+        # während der eindeutige Slot über sub_category läuft.
+        main_category = "misc"
     # Unterkategorie kommt bei Questlog am sichersten aus der Listen-URL, z. B. /weapons/bow.
     sub_category, confidence = detect_sub_category(main_category, raw_text, source_list_url or url)
+    if skill_core_source:
+        sub_category, confidence = SKILL_CORE_SUBCATEGORY, "high"
+        if not is_skill_core_like(url, raw_text, name):
+            return skip_item(url, "perk_ Detailseite ist kein erkennbarer Fähigkeitskern")
     if confidence == "low" and main_category in {"weapon", "armor", "accessory"}:
         # Kategorie aus Listen-URL ist sicher, Untertyp aber nicht.
         confidence = "medium"
@@ -3219,7 +3277,8 @@ def parse_detail_page(page, url: str, main_category_hint: str, locale: str, sour
             "main_category_hint": main_category_hint,
             "json_candidate_count": len(json_candidates),
             "source_list_url": source_list_url,
-            "parser": "playwright-detail-page-v16-armor-dom-textnode-traits",
+            "item_kind": "skill_core" if skill_core_source else "item",
+            "parser": "playwright-detail-page-v17-skill-core-import",
         },
     }
 
@@ -3266,6 +3325,29 @@ def reset_imported_category(conn, categories: set[str]) -> int:
     placeholders = ",".join(["%s"] * len(categories))
     sql = f"DELETE FROM item_catalog WHERE source = 'questlog' AND main_category IN ({placeholders})"
     cur = conn.execute(sql, tuple(sorted(categories)))
+    try:
+        deleted = int(cur.rowcount or 0)
+    except Exception:
+        deleted = 0
+    conn.commit()
+    return deleted
+
+
+def reset_imported_skill_cores(conn) -> int:
+    """Löscht nur Questlog-Fähigkeitskerne, niemals alle sonstigen misc-Items."""
+    cur = conn.execute(
+        """
+        DELETE FROM item_catalog
+        WHERE source = 'questlog'
+          AND main_category = 'misc'
+          AND (
+              sub_category = %s
+              OR lower(COALESCE(name, '')) LIKE 'fähigkeitskern%%'
+              OR lower(COALESCE(source_item_id, '')) LIKE 'perk_%%'
+          )
+        """,
+        (SKILL_CORE_SUBCATEGORY,),
+    )
     try:
         deleted = int(cur.rowcount or 0)
     except Exception:
@@ -4366,6 +4448,14 @@ def run_import(args: argparse.Namespace) -> int:
         elif preset in {"accessory", "accessories", "zubehör", "zubehoer", "schmuck", "accessoire", "accessoires"}:
             # Zubehör/Schmuck getrennt von Armor speichern: main_category=accessory.
             seeds = [CategorySeed(force_weapon_grade_filter(u.rstrip("/")), "accessory") for u in default_accessory_urls()]
+        elif preset in {
+            "skillcore", "skillcores", "skill-core", "skill-cores", "skill_core", "skill_cores",
+            "abilitycore", "abilitycores", "ability-core", "ability-cores",
+            "fähigkeitskern", "fähigkeitskerne", "faehigkeitskern", "faehigkeitskerne", "perk", "perks",
+        }:
+            # Start bei Seite 1; crawl_category hängt page=2,3,... automatisch an und
+            # stoppt, sobald keine neuen perk_* Detailseiten mehr vorhanden sind.
+            seeds = [CategorySeed(DEFAULT_SKILL_CORE_CATEGORY_URL, "misc")]
         elif args.category_url:
             raw_urls = [x.strip() for x in re.split(r"[,;\n]+", str(args.category_url or "")) if x.strip()]
             expanded_urls: list[str] = []
@@ -4403,9 +4493,14 @@ def run_import(args: argparse.Namespace) -> int:
                 ensure_item_catalog_schema(conn)
                 reset_requested = bool(args.reset_category) or os.getenv("QUESTLOG_RESET_CATEGORY", "0").lower() in {"1", "true", "yes", "ja"}
                 if reset_requested:
-                    cats = {s.main_category for s in seeds}
-                    deleted = reset_imported_category(conn, cats)
-                    print(f"🧹 Alte Questlog-Items gelöscht: {deleted} ({', '.join(sorted(cats))})", flush=True)
+                    skill_core_only = bool(seeds) and all(is_skill_core_list_url(s.url) for s in seeds)
+                    if skill_core_only:
+                        deleted = reset_imported_skill_cores(conn)
+                        print(f"🧹 Alte Questlog-Fähigkeitskerne gelöscht: {deleted}", flush=True)
+                    else:
+                        cats = {s.main_category for s in seeds}
+                        deleted = reset_imported_category(conn, cats)
+                        print(f"🧹 Alte Questlog-Items gelöscht: {deleted} ({', '.join(sorted(cats))})", flush=True)
             for seed in seeds:
                 remaining = None
                 if MAX_ITEMS > 0:
@@ -5149,7 +5244,7 @@ def _sanitize_weapon_detail_model(detail: dict[str, Any], raw_text: str) -> dict
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Questlog.gg Item-Importer für Ebo Dashboard/Postgres")
     p.add_argument("--category-url", default="", help="Eine oder mehrere Questlog-Kategorien crawlen, getrennt mit Komma/Semikolon, z. B. /db/items/armor,/db/items/accessories")
-    p.add_argument("--preset", default="", help="Vordefinierter Import: weapon, armor oder accessories. accessories = Zubehör/Schmuck ab Rare")
+    p.add_argument("--preset", default="", help="Vordefinierter Import: weapon, armor, accessories oder skillcores. skillcores crawlt /db/items/misc/perk vollständig.")
     p.add_argument("--only", default="", help="Nur Hauptkategorien, z. B. weapon,armor,accessory,material,currency,misc")
     p.add_argument("--discover-only", action="store_true", help="Nur Kategorie-Links anzeigen, nichts importieren")
     p.add_argument("--dry-run", action="store_true", help="Nichts in Postgres schreiben")

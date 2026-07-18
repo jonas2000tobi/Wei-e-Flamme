@@ -1,0 +1,1 @@
+worker: python questlog_item_importer.py --preset skillcores
