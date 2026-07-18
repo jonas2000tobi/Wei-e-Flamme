@@ -483,7 +483,7 @@ def _ensure_local_catalog_item(
 
     cid = int(linked.get("id") or linked.get("catalog_item_id") or 0)
     canonical_name = str(linked.get("name") or item_name or local_item_id or "Unbekanntes Item")
-    stable_local_id = str(local_item_id or (f"ql-{cid}" if cid else str(linked.get("source_item_id") or ""))).strip()
+    stable_local_id = str(local_item_id or (f"catalog:{cid}" if cid else str(linked.get("source_item_id") or ""))).strip()
     if not stable_local_id:
         stable_local_id = f"ql-{abs(hash(canonical_name))}"
     slot, weapon_type = _catalog_slot_from_item(linked)
@@ -689,6 +689,45 @@ def _slot_obj(value: Any) -> dict:
     return {"item_id": "", "received": False, "locked": False}
 
 
+def _local_catalog_item_id(guild_id: int, item_id: str) -> int:
+    """Löst eine lokale Loot-ID auf die feste ``item_catalog.id`` auf.
+
+    Neue Need-/Drop-Auswahlen verwenden ``catalog:<id>``. Für ältere lokale
+    IDs wird zusätzlich das gecachte ``loot_items.json`` geprüft. Dadurch
+    matchen Dashboard, Discord-Needliste und Loot-Drop auch dann zuverlässig,
+    wenn dieselbe Katalog-ID unter einer alten lokalen ID gespeichert war.
+    """
+    raw = str(item_id or "").strip()
+    if raw.lower().startswith("catalog:"):
+        try:
+            return int(raw.split(":", 1)[1])
+        except Exception:
+            pass
+    try:
+        guild_data = (_load_items().get(str(int(guild_id))) or {})
+        items = guild_data.get("items") if isinstance(guild_data, dict) else {}
+        obj = items.get(raw) if isinstance(items, dict) else None
+        return int((obj or {}).get("catalog_item_id") or 0) if isinstance(obj, dict) else 0
+    except Exception:
+        return 0
+
+
+def _need_slot_matches_item(guild_id: int, slot_obj: dict[str, Any], item_id: str) -> bool:
+    slot_item_id = str(slot_obj.get("item_id") or "").strip()
+    target_item_id = str(item_id or "").strip()
+    if slot_item_id and slot_item_id == target_item_id:
+        return True
+
+    try:
+        slot_catalog_id = int(slot_obj.get("catalog_item_id") or 0)
+    except Exception:
+        slot_catalog_id = 0
+    if not slot_catalog_id and slot_item_id:
+        slot_catalog_id = _local_catalog_item_id(guild_id, slot_item_id)
+    target_catalog_id = _local_catalog_item_id(guild_id, target_item_id)
+    return bool(slot_catalog_id and target_catalog_id and slot_catalog_id == target_catalog_id)
+
+
 def _need_user_ids(guild: discord.Guild, item_id: str, tab: str) -> list[int]:
     if not item_id:
         return []
@@ -708,7 +747,7 @@ def _need_user_ids(guild: discord.Guild, item_id: str, tab: str) -> list[int]:
             continue
         for slot_val in bucket.values():
             obj = _slot_obj(slot_val)
-            if str(obj.get("item_id", "") or "") == str(item_id) and not bool(obj.get("received", False)):
+            if _need_slot_matches_item(int(guild.id), obj, item_id) and not bool(obj.get("received", False)):
                 if uid not in out:
                     out.append(uid)
                 break
@@ -2034,7 +2073,7 @@ def _mark_need_received_for_winner(
         bucket = u.get(tab) if isinstance(u.get(tab), dict) else {}
         for slot, val in list(bucket.items()):
             obj = _slot_obj(val)
-            if str(obj.get("item_id", "") or "") != str(item_id):
+            if not _need_slot_matches_item(int(guild_id), obj, item_id):
                 continue
             if bool(obj.get("received", False)) or bool(obj.get("locked", False)):
                 continue

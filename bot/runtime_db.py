@@ -1922,50 +1922,100 @@ def upsert_guild_item_link(*, guild_id: int, reference_type: str, reference_key:
     return True
 
 
-def search_catalog_items(query: str = "", *, limit: int = 25) -> list[dict[str, Any]]:
-    """Sucht aktive Katalogitems für Discord-Autocomplete/Picker.
+def search_catalog_items(
+    query: str = "",
+    *,
+    limit: int = 25,
+    offset: int = 0,
+    main_category: str = "",
+    sub_category: str = "",
+) -> list[dict[str, Any]]:
+    """Sucht aktive Questlog-Katalogitems für Discord-Picker und Autocomplete.
 
-    Die Funktion liefert immer die feste ``item_catalog.id`` mit aus. Bei SQLite
-    ist der externe Questlog-Katalog nicht vorhanden, deshalb wird dort leer
-    zurückgegeben statt auf unsichere Namen auszuweichen.
+    ``main_category`` und ``sub_category`` begrenzen die Suche direkt in
+    Postgres. Dadurch kann Discord trotz des 25-Optionen-Limits durch alle
+    Waffen-/Rüstungs-/Schmuckitems blättern, statt nur eine lokale JSON-Liste
+    anzuzeigen.
     """
     if not _INITIALIZED:
         init_runtime_db()
     if _BACKEND != "postgres":
         return []
     text = str(query or "").strip()
+    category = str(main_category or "").strip()
+    sub = str(sub_category or "").strip()
     safe_limit = max(1, min(int(limit or 25), 50))
+    safe_offset = max(0, int(offset or 0))
+    conditions = ["ic.is_active = TRUE"]
+    params: list[Any] = []
+    if text:
+        conditions.append("ic.name ILIKE %s")
+        params.append(f"%{text}%")
+    if category:
+        conditions.append("lower(ic.main_category) = lower(%s)")
+        params.append(category)
+    if sub:
+        conditions.append("lower(COALESCE(ic.sub_category, '')) = lower(%s)")
+        params.append(sub)
+    where = " AND ".join(conditions)
     conn = _pg_connect()
     try:
         with conn.cursor() as cur:
+            order_sql = ""
             if text:
-                cur.execute(
-                    """
-                    SELECT id, source, source_url, source_item_id, name,
-                           main_category, sub_category, rarity, image_url, icon_url
-                    FROM item_catalog
-                    WHERE is_active = TRUE AND name ILIKE %s
-                    ORDER BY CASE WHEN lower(name) = lower(%s) THEN 0
-                                  WHEN lower(name) LIKE lower(%s) THEN 1
-                                  ELSE 2 END,
-                             name ASC
-                    LIMIT %s
-                    """,
-                    (f"%{text}%", text, f"{text}%", safe_limit),
-                )
-            else:
-                cur.execute(
-                    """
-                    SELECT id, source, source_url, source_item_id, name,
-                           main_category, sub_category, rarity, image_url, icon_url
-                    FROM item_catalog
-                    WHERE is_active = TRUE
-                    ORDER BY updated_at DESC NULLS LAST, name ASC
-                    LIMIT %s
-                    """,
-                    (safe_limit,),
-                )
+                order_sql = "CASE WHEN lower(ic.name) = lower(%s) THEN 0 WHEN lower(ic.name) LIKE lower(%s) THEN 1 ELSE 2 END,"
+                params.extend([text, f"{text}%"])
+            cur.execute(
+                f"""
+                SELECT ic.id, ic.source, ic.source_url, ic.source_item_id, ic.name,
+                       ic.main_category, ic.sub_category, ic.rarity, ic.item_level,
+                       ic.stats, ic.abilities, ic.traits, ic.raw_data,
+                       COALESCE(ov.image_url, ic.image_url, ic.icon_url, '') AS image_url,
+                       ic.icon_url
+                FROM item_catalog ic
+                LEFT JOIN item_catalog_image_overrides ov ON ov.source_url = ic.source_url
+                WHERE {where}
+                ORDER BY {order_sql} COALESCE(ic.sub_category, ''), ic.name ASC
+                LIMIT %s OFFSET %s
+                """,
+                tuple(params + [safe_limit, safe_offset]),
+            )
             return [dict(row) for row in (cur.fetchall() or [])]
+    finally:
+        conn.close()
+
+
+def get_catalog_item(catalog_item_id: int) -> Optional[dict[str, Any]]:
+    """Lädt ein aktives Katalogitem anhand seiner stabilen Postgres-ID."""
+    if not _INITIALIZED:
+        init_runtime_db()
+    if _BACKEND != "postgres":
+        return None
+    try:
+        item_id = int(catalog_item_id or 0)
+    except Exception:
+        item_id = 0
+    if not item_id:
+        return None
+    conn = _pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT ic.id, ic.source, ic.source_url, ic.source_item_id, ic.name,
+                       ic.main_category, ic.sub_category, ic.rarity, ic.item_level,
+                       ic.stats, ic.abilities, ic.traits, ic.raw_data,
+                       COALESCE(ov.image_url, ic.image_url, ic.icon_url, '') AS image_url,
+                       ic.icon_url
+                FROM item_catalog ic
+                LEFT JOIN item_catalog_image_overrides ov ON ov.source_url = ic.source_url
+                WHERE ic.is_active = TRUE AND ic.id = %s
+                LIMIT 1
+                """,
+                (item_id,),
+            )
+            row = cur.fetchone()
+            return dict(row) if row else None
     finally:
         conn.close()
 

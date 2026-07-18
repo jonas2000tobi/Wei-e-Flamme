@@ -550,6 +550,136 @@ def _items_for_need_slot(guild_id: int, need_slot: str, weapon_type: str | None 
     return out
 
 
+CATALOG_PAGE_SIZE = 24
+
+
+def _catalog_row_slot(row: dict[str, Any], fallback_slot: str = "") -> str:
+    main = str(row.get("main_category") or "").strip().lower()
+    sub = str(row.get("sub_category") or "").strip()
+    name = str(row.get("name") or "").strip()
+    low = f"{sub} {name}".lower()
+    if any(x in low for x in ("fähigkeitskern", "faehigkeitskern", "skill core", "skillcore")):
+        return "Fähigkeitskern"
+    if main == "weapon":
+        return "Waffe"
+    for slot in CATALOG_SLOTS:
+        if slot in {"Waffe", "Fähigkeitskern"}:
+            continue
+        if slot.lower() == sub.lower():
+            return slot
+    aliases = {
+        "necklace": "Kette", "bracelet": "Armband", "brooch": "Brosche",
+        "ring": "Ring", "belt": "Gürtel", "earring": "Ohrringe",
+        "helmet": "Helm", "chest": "Brust", "pants": "Hose",
+        "gloves": "Handschuhe", "boots": "Schuhe", "cloak": "Umhang",
+    }
+    for key, slot in aliases.items():
+        if key in low:
+            return slot
+    return _normalize_catalog_slot(fallback_slot) or str(fallback_slot or "")
+
+
+def _catalog_row_weapon_type(row: dict[str, Any]) -> str:
+    for value in (row.get("sub_category"), row.get("name")):
+        wt = _normalize_weapon_type(str(value or ""))
+        if wt:
+            return wt
+    return ""
+
+
+def _catalog_query_filter(slot: str, weapon_type: str | None = None) -> tuple[str, str, str]:
+    catalog_slot = _normalize_catalog_slot(slot) or _catalog_slot_for_need_slot(slot)
+    if catalog_slot == "Waffe":
+        return "weapon", _normalize_weapon_type(weapon_type), ""
+    if catalog_slot in {"Helm", "Brust", "Hose", "Handschuhe", "Schuhe", "Umhang"}:
+        return "armor", catalog_slot, ""
+    if catalog_slot in {"Kette", "Armband", "Brosche", "Ring", "Gürtel", "Ohrringe"}:
+        return "accessory", catalog_slot, ""
+    if catalog_slot == "Fähigkeitskern":
+        return "", "", "kern"
+    return "", "", ""
+
+
+def _catalog_rows_sync(slot: str, weapon_type: str | None = None, query: str = "", page: int = 0) -> tuple[list[dict[str, Any]], bool]:
+    category, sub, default_query = _catalog_query_filter(slot, weapon_type)
+    catalog_slot = _normalize_catalog_slot(slot) or _catalog_slot_for_need_slot(slot)
+    page = max(0, int(page or 0))
+    try:
+        if catalog_slot == "Fähigkeitskern":
+            terms = [str(query or "").strip()] if str(query or "").strip() else ["kern", "core"]
+            merged: dict[int, dict[str, Any]] = {}
+            for term in terms:
+                for row in runtime_db.search_catalog_items(term, limit=50, offset=0):
+                    if _catalog_row_slot(row) != "Fähigkeitskern":
+                        continue
+                    try:
+                        merged[int(row.get("id") or 0)] = dict(row)
+                    except Exception:
+                        continue
+            all_rows = sorted(merged.values(), key=lambda x: str(x.get("name") or "").lower())
+            start_at = page * CATALOG_PAGE_SIZE
+            selected = all_rows[start_at:start_at + CATALOG_PAGE_SIZE + 1]
+            return selected[:CATALOG_PAGE_SIZE], len(selected) > CATALOG_PAGE_SIZE
+
+        text = str(query or "").strip() or default_query
+        offset = page * CATALOG_PAGE_SIZE
+        rows = runtime_db.search_catalog_items(
+            text, limit=CATALOG_PAGE_SIZE + 1, offset=offset,
+            main_category=category, sub_category=sub,
+        )
+    except Exception as exc:
+        print(f"[loot_needs] Katalogsuche fehlgeschlagen: {type(exc).__name__}: {exc}")
+        rows = []
+    has_more = len(rows) > CATALOG_PAGE_SIZE
+    return [dict(r) for r in rows[:CATALOG_PAGE_SIZE]], has_more
+
+
+async def _catalog_rows(slot: str, weapon_type: str | None = None, query: str = "", page: int = 0) -> tuple[list[dict[str, Any]], bool]:
+    return await asyncio.to_thread(_catalog_rows_sync, slot, weapon_type, query, page)
+
+
+def _ensure_local_catalog_item(guild_id: int, catalog_item_id: int, fallback_slot: str = "", weapon_type: str | None = None) -> tuple[str, dict[str, Any]]:
+    row = runtime_db.get_catalog_item(int(catalog_item_id or 0))
+    if not row:
+        raise ValueError("Katalogitem wurde nicht gefunden oder ist inaktiv.")
+    local_id = f"catalog:{int(row.get('id') or catalog_item_id)}"
+    slot = _catalog_row_slot(row, fallback_slot)
+    wt = _catalog_row_weapon_type(row) or _normalize_weapon_type(weapon_type)
+    obj = {
+        "name": str(row.get("name") or local_id),
+        "slot": slot,
+        "weapon_type": wt if slot == "Waffe" else "",
+        "source": "item_catalog",
+        "catalog_item_id": int(row.get("id") or catalog_item_id),
+        "catalog_source_item_id": str(row.get("source_item_id") or ""),
+        "source_url": str(row.get("source_url") or ""),
+        "image_url": str(row.get("image_url") or row.get("icon_url") or ""),
+        "rarity": str(row.get("rarity") or ""),
+        "updated_at": _now_iso(),
+    }
+    _all_items(int(guild_id))[local_id] = obj
+    save_items()
+    return local_id, obj
+
+
+def _catalog_option(row: dict[str, Any]) -> discord.SelectOption:
+    name = str(row.get("name") or f"Item {row.get('id')}")
+    sub = str(row.get("sub_category") or row.get("main_category") or "Item")
+    rarity = str(row.get("rarity") or "")
+    desc = " · ".join(x for x in (sub, rarity) if x)
+    return discord.SelectOption(label=name[:100], value=str(int(row.get("id") or 0)), description=desc[:100])
+
+
+def _catalog_browser_embed(title: str, slot: str, weapon_type: str | None, query: str, page: int, count: int) -> discord.Embed:
+    parts = [f"Slot: **{slot}**"]
+    if weapon_type:
+        parts.append(f"Waffentyp: **{weapon_type}**")
+    parts.append(f"Suche: **{query or 'alle'}**")
+    parts.append(f"Seite: **{page + 1}** · Treffer auf dieser Seite: **{count}**")
+    parts.append("Nutze **Suchen**, wenn das Item nicht direkt sichtbar ist.")
+    return discord.Embed(title=title, description="\n".join(parts), color=discord.Color.gold())
+
+
 def _item_name(guild_id: int, item_id: str, with_type: bool = False) -> str:
     if not item_id:
         return "—"
@@ -1393,41 +1523,8 @@ class NeedSlotSelect(Select):
             )
             return
 
-        items = _items_for_need_slot(self.guild_id, need_slot)
-
-        if not items:
-            catalog_slot = _catalog_slot_for_need_slot(need_slot)
-
-            emb = discord.Embed(
-                title="🎁 Needliste – kein Item hinterlegt",
-                description=(
-                    f"Für den Slot **{need_slot}** gibt es noch keine passenden Items im Katalog.\n\n"
-                    f"Ein Leader muss zuerst ein Item hinzufügen:\n"
-                    f"`/loot_item_add slot:{catalog_slot} name:Itemname`"
-                ),
-                color=discord.Color.orange()
-            )
-
-            await inter.response.edit_message(
-                embed=emb,
-                view=NeedMainView(self.guild_id, self.user_id, self.tab)
-            )
-            return
-
-        emb = discord.Embed(
-            title="🎁 Needliste – Item wählen",
-            description=(
-                f"Bereich: **{self.tab}**\n"
-                f"Slot: **{need_slot}**\n"
-                f"Item-Katalog: **{_catalog_slot_for_need_slot(need_slot)}**\n\n"
-                f"Wähle ein Item aus dem Katalog."
-            ),
-            color=discord.Color.gold()
-        )
-
-        await inter.response.edit_message(
-            embed=emb,
-            view=NeedItemSelectView(self.guild_id, self.user_id, self.tab, need_slot)
+        await _show_need_catalog_browser(
+            inter, self.guild_id, self.user_id, self.tab, need_slot, page=0
         )
 
 
@@ -1476,141 +1573,138 @@ class NeedWeaponTypeSelect(Select):
 
     async def callback(self, inter: discord.Interaction):
         weapon_type = self.values[0]
-        items = _items_for_need_slot(self.guild_id, self.need_slot, weapon_type=weapon_type)
-
-        if not items:
-            emb = discord.Embed(
-                title="🎁 Needliste – kein Item hinterlegt",
-                description=(
-                    f"Für **{weapon_type}** gibt es noch keine Waffen im Katalog.\n\n"
-                    f"Ein Leader muss zuerst ein Item hinzufügen:\n"
-                    f"`/loot_item_add slot:Waffe weapon_type:{weapon_type} name:Itemname`"
-                ),
-                color=discord.Color.orange()
-            )
-
-            await inter.response.edit_message(
-                embed=emb,
-                view=NeedWeaponTypeSelectView(self.guild_id, self.user_id, self.tab, self.need_slot)
-            )
-            return
-
-        emb = discord.Embed(
-            title="🎁 Needliste – Waffe wählen",
-            description=(
-                f"Bereich: **{self.tab}**\n"
-                f"Slot: **{self.need_slot}**\n"
-                f"Waffentyp: **{weapon_type}**\n\n"
-                "Wähle eine Waffe aus dem Katalog."
-            ),
-            color=discord.Color.gold()
-        )
-
-        await inter.response.edit_message(
-            embed=emb,
-            view=NeedItemSelectView(self.guild_id, self.user_id, self.tab, self.need_slot, weapon_type=weapon_type)
+        await _show_need_catalog_browser(
+            inter, self.guild_id, self.user_id, self.tab, self.need_slot,
+            weapon_type=weapon_type, page=0,
         )
 
 
-class NeedItemSelectView(View):
-    def __init__(self, guild_id: int, user_id: int, tab: str, need_slot: str, weapon_type: str | None = None):
-        super().__init__(timeout=None)
+async def _show_need_catalog_browser(
+    inter: discord.Interaction,
+    guild_id: int,
+    user_id: int,
+    tab: str,
+    need_slot: str,
+    *,
+    weapon_type: str | None = None,
+    query: str = "",
+    page: int = 0,
+) -> None:
+    if not inter.response.is_done():
+        await inter.response.defer()
+    rows, has_more = await _catalog_rows(need_slot, weapon_type, query, page)
+    emb = _catalog_browser_embed("🎁 Needliste – Item aus Datenbank wählen", need_slot, weapon_type, query, page, len(rows))
+    if not rows:
+        emb.add_field(name="Keine Treffer", value="Ändere den Suchbegriff oder gehe zurück.", inline=False)
+    await inter.edit_original_response(
+        embed=emb,
+        view=NeedCatalogBrowserView(guild_id, user_id, tab, need_slot, weapon_type, query, page, rows, has_more),
+    )
+
+
+class NeedCatalogSearchModal(Modal, title="Item in Datenbank suchen"):
+    def __init__(self, guild_id: int, user_id: int, tab: str, need_slot: str, weapon_type: str | None, current_query: str):
+        super().__init__(timeout=300)
         self.guild_id = int(guild_id)
         self.user_id = int(user_id)
         self.tab = tab
         self.need_slot = need_slot
         self.weapon_type = weapon_type
-        self.add_item(NeedItemSelect(guild_id, user_id, tab, need_slot, weapon_type=weapon_type))
+        self.query = TextInput(label="Itemname oder Teil davon", default=str(current_query or "")[:100], required=False, max_length=100)
+        self.add_item(self.query)
 
-    @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="need_item_back")
-    async def btn_back(self, inter: discord.Interaction, _):
-        if _catalog_slot_for_need_slot(self.need_slot) == "Waffe":
-            emb = discord.Embed(
-                title="🎁 Needliste – Waffentyp wählen",
-                description=(
-                    f"Bereich: **{self.tab}**\n"
-                    f"Slot: **{self.need_slot}**"
-                ),
-                color=discord.Color.gold()
-            )
-
-            await inter.response.edit_message(
-                embed=emb,
-                view=NeedWeaponTypeSelectView(self.guild_id, self.user_id, self.tab, self.need_slot)
-            )
-            return
-
-        emb = discord.Embed(
-            title="🎁 Needliste – Slot wählen",
-            description=f"Bereich: **{self.tab}**",
-            color=discord.Color.gold()
-        )
-
-        await inter.response.edit_message(
-            embed=emb,
-            view=NeedSlotSelectView(self.guild_id, self.user_id, "set", self.tab)
+    async def on_submit(self, inter: discord.Interaction):
+        await _show_need_catalog_browser(
+            inter, self.guild_id, self.user_id, self.tab, self.need_slot,
+            weapon_type=self.weapon_type, query=str(self.query.value or "").strip(), page=0,
         )
 
 
-class NeedItemSelect(Select):
-    def __init__(self, guild_id: int, user_id: int, tab: str, need_slot: str, weapon_type: str | None = None):
-        self.guild_id = int(guild_id)
-        self.user_id = int(user_id)
-        self.tab = tab
-        self.need_slot = need_slot
-        self.weapon_type = weapon_type
-
-        items = _items_for_need_slot(guild_id, need_slot, weapon_type=weapon_type)[:25]
-
-        options = [
-            discord.SelectOption(
-                label=str(item.get("name", item["id"]))[:100],
-                value=str(item["id"])[:100],
-                description=str(item.get("weapon_type", "") or item.get("slot", ""))[:100]
-            )
-            for item in items
-        ]
-
+class NeedCatalogItemSelect(Select):
+    def __init__(self, view_ref: "NeedCatalogBrowserView", rows: list[dict[str, Any]]):
+        self.view_ref = view_ref
+        options = [_catalog_option(row) for row in rows if int(row.get("id") or 0)]
         super().__init__(
-            placeholder="Item wählen",
-            min_values=1,
-            max_values=1,
-            options=options,
-            custom_id="need_item_select"
+            placeholder="Item aus der Datenbank wählen", min_values=1, max_values=1,
+            options=options, custom_id="need_catalog_item_select",
         )
 
     async def callback(self, inter: discord.Interaction):
-        item_id = self.values[0]
-        data = _user_needs(self.guild_id, self.user_id)
-
-        current_slot = _slot_obj(data.get(self.tab, {}).get(self.need_slot))
-
-        if bool(current_slot.get("received", False)):
-            emb = discord.Embed(
-                title="🔒 Slot gesperrt",
-                description="Dieser Slot ist bereits als erhalten markiert und kann nur durch die Gildenleitung geändert werden.",
-                color=discord.Color.orange()
+        view = self.view_ref
+        await inter.response.defer()
+        try:
+            catalog_id = int(self.values[0])
+            item_id, item = await asyncio.to_thread(
+                _ensure_local_catalog_item, view.guild_id, catalog_id, view.need_slot, view.weapon_type
             )
-
-            await inter.response.edit_message(
-                embed=emb,
-                view=NeedMainView(self.guild_id, self.user_id, self.tab)
+            data = _user_needs(view.guild_id, view.user_id)
+            current_slot = _slot_obj(data.get(view.tab, {}).get(view.need_slot))
+            if bool(current_slot.get("received", False)):
+                emb = discord.Embed(
+                    title="🔒 Slot gesperrt",
+                    description="Dieser Slot ist bereits als erhalten markiert und kann nur durch die Gildenleitung geändert werden.",
+                    color=discord.Color.orange(),
+                )
+                await inter.edit_original_response(embed=emb, view=NeedMainView(view.guild_id, view.user_id, view.tab))
+                return
+            _set_slot_item(
+                data, view.tab, view.need_slot, item_id,
+                catalog_item_id=int(item.get("catalog_item_id") or catalog_id),
+                catalog_source_item_id=str(item.get("catalog_source_item_id") or ""),
             )
+            await asyncio.to_thread(save_needs)
+            guild = inter.client.get_guild(view.guild_id)
+            if guild:
+                await inter.edit_original_response(embed=_need_embed(guild, view.user_id, view.tab), view=NeedMainView(view.guild_id, view.user_id, view.tab))
+            else:
+                await inter.edit_original_response(content="✅ Need gespeichert.", embed=None, view=None)
+        except Exception as exc:
+            await inter.edit_original_response(content=f"❌ Item konnte nicht gespeichert werden: {type(exc).__name__}: {exc}", embed=None, view=None)
+
+
+class NeedCatalogBrowserView(View):
+    def __init__(
+        self, guild_id: int, user_id: int, tab: str, need_slot: str, weapon_type: str | None,
+        query: str, page: int, rows: list[dict[str, Any]], has_more: bool,
+    ):
+        super().__init__(timeout=600)
+        self.guild_id = int(guild_id)
+        self.user_id = int(user_id)
+        self.tab = tab
+        self.need_slot = need_slot
+        self.weapon_type = weapon_type
+        self.query = str(query or "")
+        self.page = max(0, int(page or 0))
+        self.has_more = bool(has_more)
+        if rows:
+            self.add_item(NeedCatalogItemSelect(self, rows))
+        for child in self.children:
+            cid = str(getattr(child, "custom_id", "") or "")
+            if cid == "need_catalog_prev":
+                child.disabled = self.page <= 0
+            elif cid == "need_catalog_next":
+                child.disabled = not self.has_more
+
+    @button(label="🔎 Suchen", style=ButtonStyle.primary, custom_id="need_catalog_search", row=1)
+    async def btn_search(self, inter: discord.Interaction, _):
+        await inter.response.send_modal(NeedCatalogSearchModal(self.guild_id, self.user_id, self.tab, self.need_slot, self.weapon_type, self.query))
+
+    @button(label="◀", style=ButtonStyle.secondary, custom_id="need_catalog_prev", row=1)
+    async def btn_prev(self, inter: discord.Interaction, _):
+        await _show_need_catalog_browser(inter, self.guild_id, self.user_id, self.tab, self.need_slot, weapon_type=self.weapon_type, query=self.query, page=max(0, self.page - 1))
+
+    @button(label="▶", style=ButtonStyle.secondary, custom_id="need_catalog_next", row=1)
+    async def btn_next(self, inter: discord.Interaction, _):
+        await _show_need_catalog_browser(inter, self.guild_id, self.user_id, self.tab, self.need_slot, weapon_type=self.weapon_type, query=self.query, page=self.page + 1)
+
+    @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="need_catalog_back", row=1)
+    async def btn_back(self, inter: discord.Interaction, _):
+        if _catalog_slot_for_need_slot(self.need_slot) == "Waffe":
+            emb = discord.Embed(title="🎁 Needliste – Waffentyp wählen", description=f"Bereich: **{self.tab}**\nSlot: **{self.need_slot}**", color=discord.Color.gold())
+            await inter.response.edit_message(embed=emb, view=NeedWeaponTypeSelectView(self.guild_id, self.user_id, self.tab, self.need_slot))
             return
-
-        _set_slot_item(data, self.tab, self.need_slot, item_id)
-        save_needs()
-
-        guild = inter.client.get_guild(self.guild_id)
-
-        if not guild:
-            await inter.response.send_message("✅ Need gespeichert.")
-            return
-
-        await inter.response.edit_message(
-            embed=_need_embed(guild, self.user_id, self.tab),
-            view=NeedMainView(self.guild_id, self.user_id, self.tab)
-        )
+        emb = discord.Embed(title="🎁 Needliste – Slot wählen", description=f"Bereich: **{self.tab}**", color=discord.Color.gold())
+        await inter.response.edit_message(embed=emb, view=NeedSlotSelectView(self.guild_id, self.user_id, "set", self.tab))
 
 
 class ReceivedReportReviewView(View):
@@ -2257,7 +2351,7 @@ def _is_leader_or_admin_member(guild: discord.Guild, user_id: int) -> bool:
 def _dashboard_catalog_item_id(payload: dict, item_text: str) -> str:
     raw_id = str(payload.get("item_catalog_id") or "").strip()
     if raw_id:
-        return f"ql-{raw_id}"
+        return f"catalog:{raw_id}"
     src = str(payload.get("item_source_url") or "").strip()
     if src:
         return "ql-" + _slug(src)[-80:]
@@ -2269,7 +2363,7 @@ def _ensure_dashboard_catalog_item(guild_id: int, need_slot: str, item_text: str
 
     Der Questlog-Itemkatalog lebt im Dashboard/Postgres. Das bestehende Loot-Need-System
     erwartet aber weiterhin IDs im Bot-Katalog. Für per Dashboard ausgewählte Items
-    erzeugen wir deshalb einen stabilen ql-* Eintrag, damit Anzeige, Needliste und
+    erzeugen wir deshalb einen stabilen catalog:<ID>-Eintrag, damit Anzeige, Needliste und
     Loot-Matching weiter mit dem vorhandenen System funktionieren.
     """
     name = str(payload.get("item_name") or item_text or "").strip()
@@ -3227,8 +3321,18 @@ def _is_loot_admin_user(client: discord.Client, guild_id: int, user_id: int) -> 
     return False
 
 def _need_matches_for_item(guild: discord.Guild, item_id: str, tab_filter: str | None = None, received: bool | None = None) -> list[dict]:
-    """Findet Spieler/Slots, die ein bestimmtes Item in der Needliste haben."""
+    """Findet Spieler/Slots, die ein bestimmtes Item in der Needliste haben.
+
+    Neben der lokalen ID wird auch die feste ``catalog_item_id`` verglichen.
+    Dadurch bleiben ältere ``ql-*``-Einträge mit neuen ``catalog:<ID>``-Drops
+    kompatibel.
+    """
     out: list[dict] = []
+    target_item = _all_items(guild.id).get(str(item_id)) or {}
+    try:
+        target_catalog_id = int(target_item.get("catalog_item_id") or 0)
+    except Exception:
+        target_catalog_id = 0
     g = _gneeds(guild.id)
     users = g.get("users") or {}
 
@@ -3250,7 +3354,20 @@ def _need_matches_for_item(guild: discord.Guild, item_id: str, tab_filter: str |
                 continue
             for slot in NEED_SLOTS:
                 slot_data = _slot_obj((data.get(tab) or {}).get(slot))
-                if str(slot_data.get("item_id", "") or "") != str(item_id):
+                slot_item_id = str(slot_data.get("item_id", "") or "")
+                same_item = slot_item_id == str(item_id)
+                if not same_item and target_catalog_id:
+                    try:
+                        slot_catalog_id = int(slot_data.get("catalog_item_id") or 0)
+                    except Exception:
+                        slot_catalog_id = 0
+                    if not slot_catalog_id and slot_item_id:
+                        try:
+                            slot_catalog_id = int((_all_items(guild.id).get(slot_item_id) or {}).get("catalog_item_id") or 0)
+                        except Exception:
+                            slot_catalog_id = 0
+                    same_item = slot_catalog_id == target_catalog_id
+                if not same_item:
                     continue
                 is_received = bool(slot_data.get("received", False))
                 if received is not None and is_received != bool(received):
@@ -3510,53 +3627,24 @@ class AdminLootSlotSelect(Select):
             await inter.response.send_modal(AdminItemAddModal(self.guild_id, self.user_id, slot, ""))
             return
 
-        if slot == "Waffe" and self.action in {"drop", "mark", "unmark"}:
+        if slot == "Waffe":
             emb = discord.Embed(
                 title="🎁 Waffentyp wählen",
                 description=(
                     f"Aktion: **{self.action}**\n"
-                    "Wähle zuerst den Waffentyp, damit auch bei mehr als 25 Waffen alle Items erreichbar bleiben."
+                    "Wähle zuerst den Waffentyp. Danach kannst du alle Datenbank-Items durchsuchen und durchblättern."
                 ),
-                color=discord.Color.gold()
+                color=discord.Color.gold(),
             )
             await inter.response.edit_message(
                 embed=emb,
-                view=AdminLootActionWeaponTypeSelectView(self.guild_id, self.user_id, self.action, slot)
+                view=AdminLootActionWeaponTypeSelectView(self.guild_id, self.user_id, self.action, slot),
             )
             return
 
-        if self.action == "catalog":
-            items = [dict(v, id=k) for k, v in _all_items(self.guild_id).items() if str(v.get("slot", "")) == slot]
-            items.sort(key=lambda x: (str(x.get("weapon_type", "")), str(x.get("name", "")).lower()))
-            lines = []
-            for item in items[:80]:
-                wt = str(item.get("weapon_type", "") or "")
-                extra = f" — {wt}" if wt else ""
-                lines.append(f"• **{item.get('name')}**{extra}")
-            desc = "\n".join(lines) if lines else "Keine Items in diesem Slot."
-            if len(desc) > 3900:
-                desc = desc[:3800] + "\n… gekürzt"
-            emb = discord.Embed(title=f"📋 Item-Katalog – {slot}", description=desc, color=discord.Color.gold())
-            emb.set_footer(text=f"Items: {len(items)}")
-            await inter.response.edit_message(embed=emb, view=AdminLootSlotSelectView(self.guild_id, self.user_id, "catalog"))
-            return
-
-        items = _items_for_need_slot(self.guild_id, slot)
-        if not items:
-            emb = discord.Embed(
-                title="❌ Kein Item im Katalog",
-                description=f"Für **{slot}** sind noch keine Items hinterlegt. Füge zuerst ein Item hinzu.",
-                color=discord.Color.orange()
-            )
-            await inter.response.edit_message(embed=emb, view=AdminLootSlotSelectView(self.guild_id, self.user_id, self.action))
-            return
-
-        emb = discord.Embed(
-            title="🎁 Item wählen",
-            description=f"Slot: **{slot}**",
-            color=discord.Color.gold()
+        await _show_admin_catalog_browser(
+            inter, self.guild_id, self.user_id, self.action, slot, page=0,
         )
-        await inter.response.edit_message(embed=emb, view=AdminLootItemSelectView(self.guild_id, self.user_id, self.action, slot))
 
 
 class AdminLootWeaponTypeSelectView(View):
@@ -3596,10 +3684,6 @@ class AdminLootActionWeaponTypeSelectView(View):
 
     @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="admin_loot_action_weapon_back")
     async def btn_back(self, inter: discord.Interaction, _):
-        if self.slot == "Waffe" and self.weapon_type:
-            emb = discord.Embed(title="🎁 Waffentyp wählen", description="Wähle den Waffentyp.", color=discord.Color.gold())
-            await inter.response.edit_message(embed=emb, view=AdminLootActionWeaponTypeSelectView(self.guild_id, self.user_id, self.action, self.slot))
-            return
         emb = discord.Embed(title="🎁 Slot wählen", description="Wähle den Slot.", color=discord.Color.gold())
         await inter.response.edit_message(embed=emb, view=AdminLootSlotSelectView(self.guild_id, self.user_id, self.action))
 
@@ -3621,28 +3705,161 @@ class AdminLootActionWeaponTypeSelect(Select):
 
     async def callback(self, inter: discord.Interaction):
         weapon_type = self.values[0]
-        items = _items_for_need_slot(self.guild_id, self.slot, weapon_type=weapon_type)
-        if not items:
-            emb = discord.Embed(
-                title="❌ Kein Item im Katalog",
-                description=f"Für **{weapon_type}** sind noch keine Waffen hinterlegt.",
-                color=discord.Color.orange()
-            )
-            await inter.response.edit_message(
-                embed=emb,
-                view=AdminLootActionWeaponTypeSelectView(self.guild_id, self.user_id, self.action, self.slot)
-            )
-            return
+        await _show_admin_catalog_browser(
+            inter, self.guild_id, self.user_id, self.action, self.slot,
+            weapon_type=weapon_type, page=0,
+        )
 
-        emb = discord.Embed(
-            title="🎁 Item wählen",
-            description=f"Slot: **{self.slot}**\nWaffentyp: **{weapon_type}**",
-            color=discord.Color.gold()
+
+async def _show_admin_catalog_browser(
+    inter: discord.Interaction,
+    guild_id: int,
+    user_id: int,
+    action: str,
+    slot: str,
+    *,
+    weapon_type: str | None = None,
+    query: str = "",
+    page: int = 0,
+) -> None:
+    if not inter.response.is_done():
+        await inter.response.defer()
+    rows, has_more = await _catalog_rows(slot, weapon_type, query, page)
+    title = "📦 Loot gedroppt – Item aus Datenbank wählen" if action == "drop" else "🎁 Item aus Datenbank wählen"
+    emb = _catalog_browser_embed(title, slot, weapon_type, query, page, len(rows))
+    if not rows:
+        emb.add_field(name="Keine Treffer", value="Ändere den Suchbegriff oder gehe zurück.", inline=False)
+    await inter.edit_original_response(
+        embed=emb,
+        view=AdminCatalogBrowserView(guild_id, user_id, action, slot, weapon_type, query, page, rows, has_more),
+    )
+
+
+class AdminCatalogSearchModal(Modal, title="Item in Datenbank suchen"):
+    def __init__(self, guild_id: int, user_id: int, action: str, slot: str, weapon_type: str | None, current_query: str):
+        super().__init__(timeout=300)
+        self.guild_id = int(guild_id)
+        self.user_id = int(user_id)
+        self.action = action
+        self.slot = slot
+        self.weapon_type = weapon_type
+        self.query = TextInput(label="Itemname oder Teil davon", default=str(current_query or "")[:100], required=False, max_length=100)
+        self.add_item(self.query)
+
+    async def on_submit(self, inter: discord.Interaction):
+        await _show_admin_catalog_browser(
+            inter, self.guild_id, self.user_id, self.action, self.slot,
+            weapon_type=self.weapon_type, query=str(self.query.value or "").strip(), page=0,
         )
-        await inter.response.edit_message(
-            embed=emb,
-            view=AdminLootItemSelectView(self.guild_id, self.user_id, self.action, self.slot, weapon_type=weapon_type)
+
+
+class AdminCatalogItemSelect(Select):
+    def __init__(self, view_ref: "AdminCatalogBrowserView", rows: list[dict[str, Any]]):
+        self.view_ref = view_ref
+        super().__init__(
+            placeholder="Item aus der Datenbank wählen", min_values=1, max_values=1,
+            options=[_catalog_option(row) for row in rows if int(row.get("id") or 0)],
+            custom_id=f"admin_catalog_item_{view_ref.action}",
         )
+
+    async def callback(self, inter: discord.Interaction):
+        view = self.view_ref
+        guild = inter.client.get_guild(view.guild_id)
+        if not guild:
+            await inter.response.send_message("❌ Server nicht gefunden.", ephemeral=True)
+            return
+        if inter.guild is not None and not _is_leader_or_admin(inter):
+            await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
+            return
+        await inter.response.defer()
+        try:
+            catalog_id = int(self.values[0])
+            item_id, item = await asyncio.to_thread(
+                _ensure_local_catalog_item, view.guild_id, catalog_id, view.slot, view.weapon_type
+            )
+            item_name = _item_name(view.guild_id, item_id, with_type=True)
+            if view.action == "drop":
+                matches = _need_matches_for_item(guild, item_id, tab_filter="Main", received=False)
+                emb = discord.Embed(
+                    title="📦 Loot gedroppt – Vorschau",
+                    description=(
+                        f"**Item:** {item_name}\n\n"
+                        "Benachrichtigt werden Spieler mit offenem Need nach Priorität: **Main vor Second**.\n\n"
+                        f"**Treffer:**\n{_match_lines(matches)}"
+                    ),
+                    color=discord.Color.gold(),
+                )
+                await inter.edit_original_response(embed=emb, view=AdminLootDropConfirmView(view.guild_id, view.user_id, item_id))
+                return
+            if view.action in {"mark", "unmark"}:
+                matches = _need_matches_for_item(guild, item_id, tab_filter=None, received=(view.action == "unmark"))
+                if not matches:
+                    txt = "offenen" if view.action == "mark" else "als erhalten markierten"
+                    emb = discord.Embed(title="Keine Treffer", description=f"Keine {txt} Need-Einträge für **{item_name}** gefunden.", color=discord.Color.orange())
+                    await inter.edit_original_response(embed=emb, view=AdminLootBackView())
+                    return
+                emb = discord.Embed(title="👤 Spieler wählen", description=f"Item: **{item_name}**", color=discord.Color.gold())
+                await inter.edit_original_response(embed=emb, view=AdminLootUserSelectView(view.guild_id, view.user_id, view.action, item_id, matches))
+                return
+            row = await asyncio.to_thread(runtime_db.get_catalog_item, catalog_id) or item
+            details = [
+                f"**{row.get('name') or item_name}**",
+                f"Kategorie: **{row.get('main_category') or '—'} / {row.get('sub_category') or '—'}**",
+                f"Seltenheit: **{row.get('rarity') or '—'}**",
+                f"Katalog-ID: `{catalog_id}`",
+            ]
+            emb = discord.Embed(title="📋 Item-Datenbank", description="\n".join(details), color=discord.Color.gold())
+            image = str(row.get("image_url") or row.get("icon_url") or "")
+            if image:
+                emb.set_thumbnail(url=image)
+            await inter.edit_original_response(embed=emb, view=AdminCatalogBrowserView(view.guild_id, view.user_id, view.action, view.slot, view.weapon_type, view.query, view.page, [], view.has_more))
+        except Exception as exc:
+            await inter.edit_original_response(content=f"❌ Item konnte nicht verarbeitet werden: {type(exc).__name__}: {exc}", embed=None, view=None)
+
+
+class AdminCatalogBrowserView(View):
+    def __init__(
+        self, guild_id: int, user_id: int, action: str, slot: str, weapon_type: str | None,
+        query: str, page: int, rows: list[dict[str, Any]], has_more: bool,
+    ):
+        super().__init__(timeout=600)
+        self.guild_id = int(guild_id)
+        self.user_id = int(user_id)
+        self.action = action
+        self.slot = slot
+        self.weapon_type = weapon_type
+        self.query = str(query or "")
+        self.page = max(0, int(page or 0))
+        self.has_more = bool(has_more)
+        if rows:
+            self.add_item(AdminCatalogItemSelect(self, rows))
+        for child in self.children:
+            cid = str(getattr(child, "custom_id", "") or "")
+            if cid == "admin_catalog_prev":
+                child.disabled = self.page <= 0
+            elif cid == "admin_catalog_next":
+                child.disabled = not self.has_more
+
+    @button(label="🔎 Suchen", style=ButtonStyle.primary, custom_id="admin_catalog_search", row=1)
+    async def btn_search(self, inter: discord.Interaction, _):
+        await inter.response.send_modal(AdminCatalogSearchModal(self.guild_id, self.user_id, self.action, self.slot, self.weapon_type, self.query))
+
+    @button(label="◀", style=ButtonStyle.secondary, custom_id="admin_catalog_prev", row=1)
+    async def btn_prev(self, inter: discord.Interaction, _):
+        await _show_admin_catalog_browser(inter, self.guild_id, self.user_id, self.action, self.slot, weapon_type=self.weapon_type, query=self.query, page=max(0, self.page - 1))
+
+    @button(label="▶", style=ButtonStyle.secondary, custom_id="admin_catalog_next", row=1)
+    async def btn_next(self, inter: discord.Interaction, _):
+        await _show_admin_catalog_browser(inter, self.guild_id, self.user_id, self.action, self.slot, weapon_type=self.weapon_type, query=self.query, page=self.page + 1)
+
+    @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="admin_catalog_back", row=1)
+    async def btn_back(self, inter: discord.Interaction, _):
+        if self.slot == "Waffe" and self.weapon_type:
+            emb = discord.Embed(title="🎁 Waffentyp wählen", description="Wähle den Waffentyp.", color=discord.Color.gold())
+            await inter.response.edit_message(embed=emb, view=AdminLootActionWeaponTypeSelectView(self.guild_id, self.user_id, self.action, self.slot))
+            return
+        emb = discord.Embed(title="🎁 Slot wählen", description="Wähle den Slot.", color=discord.Color.gold())
+        await inter.response.edit_message(embed=emb, view=AdminLootSlotSelectView(self.guild_id, self.user_id, self.action))
 
 
 class AdminItemAddModal(Modal):
@@ -3793,8 +4010,8 @@ class AdminLootUserSelectView(View):
 
     @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="admin_loot_user_back")
     async def btn_back(self, inter: discord.Interaction, _):
-        emb = discord.Embed(title="🎁 Item wählen", description="Wähle erneut ein Item.", color=discord.Color.gold())
-        await inter.response.edit_message(embed=emb, view=AdminLootItemSelectView(self.guild_id, self.user_id, self.action, _catalog_slot_for_need_slot(self.matches[0]['slot']) if self.matches else "Waffe"))
+        emb = discord.Embed(title="🎁 Slot wählen", description="Wähle den Slot und danach das Item erneut aus der Datenbank.", color=discord.Color.gold())
+        await inter.response.edit_message(embed=emb, view=AdminLootSlotSelectView(self.guild_id, self.user_id, self.action))
 
 
 class AdminLootUserSelect(Select):
