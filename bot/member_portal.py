@@ -66,7 +66,7 @@ TZ = ZoneInfo("Europe/Berlin")
 # Gildenmenue. Alle Portal-Views laufen durch denselben Wrapper.
 # ---------------------------------------------------------------------------
 _PORTAL_INTERACTION_LOCKS: dict[tuple[int, int], asyncio.Lock] = {}
-_PORTAL_ACTION_TIMEOUT_SECONDS = 12.0
+_PORTAL_ACTION_TIMEOUT_SECONDS = 45.0
 _PORTAL_LOCK_NOTICE_SECONDS = 1.0
 _PORTAL_ERROR_DEDUP: dict[str, dict[str, Any]] = {}
 _PORTAL_MODAL_CUSTOM_IDS = {
@@ -82,7 +82,35 @@ _PORTAL_MODAL_CUSTOM_IDS = {
     "portal_profile_edit",
     "help_leader_contact",
     "portal_admin_broadcast",
+    # Need-/Auktions-Untermenüs, die Modals öffnen.
+    "need_catalog_search",
+    "admin_catalog_search",
+    "admin_loot_slot_add",
+    "admin_loot_weapon_type",
 }
+
+
+def _portal_component_opens_modal(component_id: str, inter: discord.Interaction | None = None) -> bool:
+    cid = str(component_id or "")
+    values: list[str] = []
+    if inter is not None:
+        try:
+            values = [str(value) for value in ((inter.data or {}).get("values") or [])]
+        except Exception:
+            values = []
+
+    # Diese Selects öffnen nur bei bestimmten Werten ein Modal. Bei allen
+    # anderen Werten dürfen sie sofort als normales Message-Update bestätigt
+    # werden, damit Discords 3-Sekunden-Frist sicher eingehalten wird.
+    if cid == "admin_event_image_select":
+        return bool(values and values[0] == "custom")
+    if cid == "admin_loot_slot_add":
+        return bool(values and values[0] != "Waffe")
+
+    if cid in _PORTAL_MODAL_CUSTOM_IDS:
+        return True
+    # Auktionsbuttons erhalten dynamische Präfixe, enden aber immer auf :custom.
+    return cid.endswith(":custom") or cid.endswith("_custom")
 
 
 def _portal_component_id(inter: discord.Interaction) -> str:
@@ -114,13 +142,30 @@ async def _portal_defer(inter: discord.Interaction, *args, **kwargs) -> None:
 
 
 async def _portal_edit(inter: discord.Interaction, *args, **kwargs):
+    """Edit the menu message regardless of how the interaction was acknowledged.
+
+    ``thinking=True`` creates a separate interaction response. Editing that
+    response would leave the actual Gildenzentrale unchanged. For portal
+    interactions with a triggering message we therefore edit that message
+    directly whenever the response type is a channel-message defer.
+    """
     try:
         if not inter.response.is_done():
             return await inter.response.edit_message(*args, **kwargs)
+
+        response_type = getattr(inter.response, "type", None)
+        response_type_name = str(getattr(response_type, "name", response_type) or "").lower()
+        if inter.message is not None and "deferred_channel_message" in response_type_name:
+            return await inter.message.edit(*args, **kwargs)
         return await inter.edit_original_response(*args, **kwargs)
-    except discord.NotFound:
-        # Die alte DM wurde geloescht oder Discord hat den Original-Response
-        # verworfen. Dann wird die Gildenzentrale sauber neu aufgebaut.
+    except (discord.InteractionResponded, discord.NotFound, discord.HTTPException):
+        # Last-resort path: interaction tokens can expire, while the bot may
+        # still edit its own DM via the normal message endpoint.
+        if inter.message is not None:
+            try:
+                return await inter.message.edit(*args, **kwargs)
+            except Exception:
+                pass
         guild, member = await _resolve_guild_member_from_inter(inter)
         if guild and member:
             await ensure_portal_menu_for_user(inter.client, guild.id, member.id, force_view="main")
@@ -215,7 +260,7 @@ async def _portal_watchdog(inter: discord.Interaction, component_id: str) -> Non
     the original response, so the subsequent safe edit updates the actual
     Gildenzentrale in place.
     """
-    if component_id in _PORTAL_MODAL_CUSTOM_IDS:
+    if _portal_component_opens_modal(component_id, inter):
         return
     await asyncio.sleep(1.5)
     if not inter.response.is_done():
@@ -556,11 +601,17 @@ profiles: dict = _load_json(PROFILE_FILE, {})
 sent_state: dict = _load_json(SENT_FILE, {})
 
 PORTAL_REPAIR_INTERVAL_SECONDS = max(900, int(os.getenv("PORTAL_REPAIR_INTERVAL_SECONDS", "3600") or "3600"))
-PORTAL_REPAIR_START_DELAY_SECONDS = max(1.0, float(os.getenv("PORTAL_REPAIR_START_DELAY_SECONDS", "5") or "5"))
+PORTAL_REPAIR_START_DELAY_SECONDS = max(0.5, float(os.getenv("PORTAL_REPAIR_START_DELAY_SECONDS", "1") or "1"))
 PORTAL_REPAIR_MEMBER_DELAY_SECONDS = max(0.05, float(os.getenv("PORTAL_REPAIR_MEMBER_DELAY_SECONDS", "0.25") or "0.25"))
 PORTAL_RESET_ON_START = str(os.getenv("PORTAL_RESET_ON_START", "false") or "false").strip().lower() not in {"0", "false", "no", "off"}
+PORTAL_STALE_REPAIR_ON_START = str(os.getenv("PORTAL_STALE_REPAIR_ON_START", "true") or "true").strip().lower() not in {"0", "false", "no", "off"}
+PORTAL_STALE_REPAIR_HISTORY_LIMIT = max(10, min(200, int(os.getenv("PORTAL_STALE_REPAIR_HISTORY_LIMIT", "80") or "80")))
+PORTAL_STALE_REPAIR_CONCURRENCY = max(1, min(8, int(os.getenv("PORTAL_STALE_REPAIR_CONCURRENCY", "4") or "4")))
+PORTAL_OLD_DM_CLEANUP_ON_START = str(os.getenv("PORTAL_OLD_DM_CLEANUP_ON_START", "true") or "true").strip().lower() not in {"0", "false", "no", "off"}
 NEW_MEMBER_LOOT_LOCK_DAYS = 7
 _portal_repair_task: Optional[asyncio.Task] = None
+_portal_old_cleanup_task: Optional[asyncio.Task] = None
+_PORTAL_PERSISTENT_COMPONENT_IDS: set[str] = set()
 
 # DM-Komponenten müssen den zugehörigen Discord-Server sehr häufig auflösen.
 # Ein kurzer RAM-Cache verhindert wiederholte Postgres-/JSON- und Guild-Scans
@@ -1873,6 +1924,294 @@ async def _fetch_portal_message(client: discord.Client, guild_id: int, user_id: 
         return None
 
 
+def _message_component_ids(message: discord.Message | None) -> set[str]:
+    """Return every custom_id currently attached to a Discord message."""
+    out: set[str] = set()
+    if message is None:
+        return out
+    for row in list(getattr(message, "components", []) or []):
+        children = list(getattr(row, "children", []) or getattr(row, "components", []) or [])
+        for child in children:
+            cid = str(getattr(child, "custom_id", "") or "").strip()
+            if cid:
+                out.add(cid)
+    return out
+
+
+def _portal_component_ids_from_view(view: discord.ui.View) -> set[str]:
+    out: set[str] = set()
+    for child in list(getattr(view, "children", []) or []):
+        cid = str(getattr(child, "custom_id", "") or "").strip()
+        if cid:
+            out.add(cid)
+    return out
+
+
+def _is_portal_component_id(custom_id: str) -> bool:
+    cid = str(custom_id or "")
+    prefixes = (
+        "portal_", "portal:", "portalauc:", "portalsale:", "portal_auc_",
+        "need_", "admin_", "rules_", "help_",
+    )
+    return cid.startswith(prefixes)
+
+
+def _looks_like_portal_message(message: discord.Message) -> bool:
+    ids = _message_component_ids(message)
+    if any(_is_portal_component_id(cid) for cid in ids):
+        return True
+    title = ""
+    try:
+        if message.embeds:
+            title = str(message.embeds[0].title or "")
+    except Exception:
+        title = ""
+    return any(token in title.casefold() for token in (
+        "gildenzentrale", "needliste", "auktion", "persönlich", "gilde",
+        "kontakt & hilfe", "admin", "regeln & loot",
+    ))
+
+
+async def _deactivate_old_portal_messages(
+    client: discord.Client,
+    guild_id: int,
+    user_id: int,
+    active_message_id: int,
+    *,
+    limit: int = PORTAL_STALE_REPAIR_HISTORY_LIMIT,
+) -> int:
+    """Remove components from old portal DMs so members cannot click dead menus."""
+    user = client.get_user(int(user_id))
+    if user is None:
+        try:
+            user = await client.fetch_user(int(user_id))
+        except Exception:
+            return 0
+    try:
+        dm = user.dm_channel or await user.create_dm()
+    except Exception:
+        return 0
+    disabled = 0
+    try:
+        async for msg in dm.history(limit=max(10, int(limit))):
+            if int(getattr(msg.author, "id", 0) or 0) != int(getattr(client.user, "id", 0) or 0):
+                continue
+            if int(msg.id) == int(active_message_id or 0):
+                continue
+            if not getattr(msg, "components", None) or not _looks_like_portal_message(msg):
+                continue
+            try:
+                await msg.edit(view=None)
+                disabled += 1
+                await asyncio.sleep(0.05)
+            except Exception:
+                continue
+    except Exception as exc:
+        print(f"[member_portal] Alte Portal-DMs konnten nicht geprüft werden user={user_id}: {exc!r}")
+    return disabled
+
+
+async def _fetch_or_find_active_portal_message(
+    client: discord.Client,
+    guild_id: int,
+    user_id: int,
+) -> Optional[discord.Message]:
+    """Fetch the stored portal message or recover its ID from recent DMs.
+
+    Older installations only stored ``sent_users`` and had no message ID. That
+    made a restart repair impossible even though the portal DM still existed.
+    """
+    message = await _fetch_portal_message(client, guild_id, user_id)
+    if message is not None:
+        return message
+
+    user = client.get_user(int(user_id))
+    if user is None:
+        try:
+            user = await client.fetch_user(int(user_id))
+        except Exception:
+            return None
+    try:
+        dm = user.dm_channel or await user.create_dm()
+        async for candidate in dm.history(limit=PORTAL_STALE_REPAIR_HISTORY_LIMIT):
+            if int(getattr(candidate.author, "id", 0) or 0) != int(getattr(client.user, "id", 0) or 0):
+                continue
+            if not getattr(candidate, "components", None):
+                continue
+            if not _looks_like_portal_message(candidate):
+                continue
+            _mark_portal_sent(guild_id, user_id, candidate.id)
+            return candidate
+    except Exception as exc:
+        print(f"[member_portal] Portal-ID-Recovery fehlgeschlagen user={user_id}: {exc!r}", flush=True)
+    return None
+
+
+async def _repair_stale_active_portal_for_user(
+    client: discord.Client,
+    guild: discord.Guild,
+    member: discord.Member,
+) -> tuple[str, int]:
+    """Reset only an active portal message whose components cannot survive restart."""
+    if _portal_member_interaction_busy(guild.id, member.id):
+        return "busy", 0
+
+    msg = await _fetch_or_find_active_portal_message(client, guild.id, member.id)
+    if msg is None:
+        # Deleted/missing portal: create it for configured guild members instead
+        # of leaving an invisible broken state behind.
+        if any(int(role.id) in portal_member_role_ids(guild.id) for role in member.roles):
+            created = await _send_new_portal_menu(member, guild)
+            return ("created", 0) if created is not None else ("missing", 0)
+        return "missing", 0
+
+    component_ids = _message_component_ids(msg)
+    safe = bool(component_ids) and component_ids.issubset(_PORTAL_PERSISTENT_COMPONENT_IDS)
+    if safe:
+        _mark_portal_sent(guild.id, member.id, msg.id)
+        return "healthy", 0
+
+    if _portal_member_interaction_busy(guild.id, member.id):
+        return "busy", 0
+    try:
+        await msg.edit(embed=_main_menu_embed(guild, member), view=MemberPortalMainView())
+        _mark_portal_sent(guild.id, member.id, msg.id)
+        return "reset", 0
+    except Exception as exc:
+        print(f"[member_portal] Stale-Portal-Reset fehlgeschlagen user={member.id}: {exc!r}", flush=True)
+        return "failed", 0
+
+
+def _portal_repair_members_for_guild(guild: discord.Guild) -> list[discord.Member]:
+    """Union of configured recipients and legacy sent-state users."""
+    members: dict[int, discord.Member] = {int(m.id): m for m in portal_target_members(guild)}
+    state = sent_state.get(str(guild.id)) or {}
+    raw_ids: set[int] = set()
+    for raw in (state.get("sent_users") or []):
+        try:
+            raw_ids.add(int(raw))
+        except Exception:
+            pass
+    for raw in (state.get("users") or {}).keys():
+        try:
+            raw_ids.add(int(raw))
+        except Exception:
+            pass
+    for user_id in raw_ids:
+        member = guild.get_member(user_id)
+        if member is not None and not member.bot:
+            members[int(member.id)] = member
+    return list(members.values())
+
+
+async def repair_stale_portals_once(client: discord.Client) -> dict[str, int]:
+    """Repair active portals first, concurrently, without scanning old DM history."""
+    summary = {
+        "checked": 0, "healthy": 0, "reset": 0, "created": 0,
+        "missing": 0, "busy": 0, "failed": 0, "old_disabled": 0,
+    }
+    semaphore = asyncio.Semaphore(PORTAL_STALE_REPAIR_CONCURRENCY)
+    jobs: list[tuple[discord.Guild, discord.Member]] = []
+    for guild in list(getattr(client, "guilds", []) or []):
+        if not portal_member_role_ids(guild.id) and str(guild.id) not in sent_state:
+            continue
+        jobs.extend((guild, member) for member in _portal_repair_members_for_guild(guild))
+
+    async def _one(guild: discord.Guild, member: discord.Member) -> tuple[str, int]:
+        async with semaphore:
+            return await _repair_stale_active_portal_for_user(client, guild, member)
+
+    results = await asyncio.gather(
+        *(_one(guild, member) for guild, member in jobs),
+        return_exceptions=True,
+    )
+    summary["checked"] = len(jobs)
+    for result in results:
+        if isinstance(result, Exception):
+            summary["failed"] += 1
+            print(f"[member_portal] Stale-Portal-Job fehlgeschlagen: {result!r}", flush=True)
+            continue
+        status, old_disabled = result
+        summary[status] = summary.get(status, 0) + 1
+        summary["old_disabled"] += int(old_disabled or 0)
+    return summary
+
+
+async def diagnose_portal_for_member(
+    client: discord.Client,
+    guild: discord.Guild,
+    member: discord.Member,
+) -> dict[str, Any]:
+    """Return actionable diagnostics for one member's active portal DM."""
+    stored_id = _portal_message_id(guild.id, member.id)
+    message = await _fetch_or_find_active_portal_message(client, guild.id, member.id)
+    component_ids = sorted(_message_component_ids(message)) if message is not None else []
+    unknown_ids = sorted(set(component_ids) - _PORTAL_PERSISTENT_COMPONENT_IDS)
+    persistent = bool(component_ids) and not unknown_ids
+    if message is None:
+        state = "missing"
+    elif persistent:
+        state = "persistent"
+    elif component_ids:
+        state = "dynamic_stale_after_restart"
+    else:
+        state = "no_components"
+    return {
+        "guild_id": int(guild.id),
+        "user_id": int(member.id),
+        "stored_message_id": int(stored_id or 0),
+        "message_id": int(getattr(message, "id", 0) or 0),
+        "message_found": message is not None,
+        "component_ids": component_ids,
+        "unknown_component_ids": unknown_ids,
+        "persistent_component_count": len(_PORTAL_PERSISTENT_COMPONENT_IDS),
+        "persistent": persistent,
+        "busy": _portal_member_interaction_busy(guild.id, member.id),
+        "state": state,
+    }
+
+
+async def repair_portal_for_member_now(
+    client: discord.Client,
+    guild: discord.Guild,
+    member: discord.Member,
+) -> tuple[str, int]:
+    """Public wrapper used by the guild diagnostic command."""
+    return await _repair_stale_active_portal_for_user(client, guild, member)
+
+
+async def cleanup_old_portal_messages_once(client: discord.Client) -> int:
+    """Disable obsolete duplicate portal DMs after active portals are usable."""
+    total = 0
+    for guild in list(getattr(client, "guilds", []) or []):
+        if not portal_member_role_ids(guild.id) and str(guild.id) not in sent_state:
+            continue
+        for member in _portal_repair_members_for_guild(guild):
+            if _portal_member_interaction_busy(guild.id, member.id):
+                continue
+            active_id = _portal_message_id(guild.id, member.id)
+            if not active_id:
+                continue
+            total += await _deactivate_old_portal_messages(
+                client, guild.id, member.id, active_id,
+                limit=PORTAL_STALE_REPAIR_HISTORY_LIMIT,
+            )
+            await asyncio.sleep(0.10)
+    return total
+
+
+async def _cleanup_old_portals_after_start(client: discord.Client) -> None:
+    try:
+        await asyncio.sleep(2.0)
+        count = await cleanup_old_portal_messages_once(client)
+        if count:
+            print(f"[member_portal] Alte doppelte Portal-DMs deaktiviert: {count}", flush=True)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        print(f"[member_portal] Alte Portal-DM-Bereinigung fehlgeschlagen: {exc!r}", flush=True)
+
+
 async def _send_new_portal_menu(user: discord.abc.User, guild: discord.Guild) -> Optional[discord.Message]:
     member = guild.get_member(user.id)
     _refresh_portal_emojis(guild)
@@ -1881,6 +2220,12 @@ async def _send_new_portal_menu(user: discord.abc.User, guild: discord.Guild) ->
         msg = await user.send(embed=_main_menu_embed(guild, member), view=MemberPortalMainView())
         _mark_portal_sent(guild.id, user.id, msg.id)
         _portal_last_dm_errors.pop((int(guild.id), int(user.id)), None)
+        try:
+            asyncio.create_task(
+                _deactivate_old_portal_messages(client=guild._state._get_client(), guild_id=guild.id, user_id=user.id, active_message_id=msg.id)
+            )
+        except Exception:
+            pass
         return msg
     except Exception as e:
         _remember_portal_dm_error(guild.id, user.id, e)
@@ -2154,6 +2499,26 @@ async def _portal_repair_loop(client: discord.Client) -> None:
                 )
         except Exception as e:
             print(f"[member_portal] Startreset Fehler: {e!r}")
+    elif PORTAL_STALE_REPAIR_ON_START:
+        try:
+            total = await repair_stale_portals_once(client)
+            print(
+                "[member_portal] Stale-Portal-Reparatur: "
+                f"geprüft={total.get('checked', 0)} "
+                f"gesund={total.get('healthy', 0)} "
+                f"zurückgesetzt={total.get('reset', 0)} "
+                f"neu erstellt={total.get('created', 0)} "
+                f"fehlend={total.get('missing', 0)} "
+                f"beschäftigt={total.get('busy', 0)} "
+                f"fehler={total.get('failed', 0)}",
+                flush=True,
+            )
+            if PORTAL_OLD_DM_CLEANUP_ON_START:
+                global _portal_old_cleanup_task
+                if _portal_old_cleanup_task is None or _portal_old_cleanup_task.done():
+                    _portal_old_cleanup_task = asyncio.create_task(_cleanup_old_portals_after_start(client))
+        except Exception as e:
+            print(f"[member_portal] Stale-Portal-Reparatur Fehler: {e!r}")
 
     while not client.is_closed():
         try:
@@ -2810,6 +3175,51 @@ class PortalSafeView(View):
         for child in self.children:
             self._wrap_child_callback(child)
 
+    async def interaction_check(self, inter: discord.Interaction) -> bool:
+        """Reject clicks on obsolete duplicate portal DMs.
+
+        Server-channel panels (for example the public portal opener) are not
+        restricted. In a DM, however, only the currently stored portal message
+        may remain interactive.
+        """
+        component_id = _portal_component_id(inter)
+        # ACK every normal button/select immediately, before guild resolution,
+        # cache misses or database work can consume Discord's response window.
+        # Modal-openers are the only exception because send_modal itself must be
+        # the initial response.
+        if not _portal_component_opens_modal(component_id, inter) and not inter.response.is_done():
+            try:
+                await _portal_defer(inter, thinking=False)
+            except Exception as ack_error:
+                print(
+                    f"[member_portal] Sofort-ACK fehlgeschlagen component={component_id} "
+                    f"user={getattr(inter.user, 'id', 0)}: {ack_error!r}",
+                    flush=True,
+                )
+
+        if inter.guild is not None or inter.message is None:
+            return True
+        guild, member = await _resolve_guild_member_from_inter(inter)
+        if not guild or not member:
+            await _portal_send(inter, "❌ Ich konnte deinen Server nicht zuordnen.", ephemeral=True)
+            return False
+        active_id = _portal_message_id(guild.id, member.id)
+        if active_id and int(inter.message.id) != int(active_id):
+            try:
+                await inter.message.edit(view=None)
+            except Exception:
+                pass
+            await _portal_send(
+                inter,
+                "ℹ️ Diese Gildenzentrale ist veraltet. Ich habe die aktuelle Gildenzentrale in diesem Privatchat erneuert.",
+                ephemeral=True,
+            )
+            await ensure_portal_menu_for_user(inter.client, guild.id, member.id, force_view="main")
+            return False
+        if not active_id:
+            _mark_portal_sent(guild.id, member.id, inter.message.id)
+        return True
+
     async def on_error(self, inter: discord.Interaction, error: Exception, item) -> None:
         await _portal_log_event(inter, event_type="Fehler", error=error, notify_user=True)
         await _auto_reset_portal_after_view_error(inter, error)
@@ -2926,31 +3336,25 @@ class PortalMainSelect(Select):
 
         if choice == "loot":
             try:
-                try:
-                    from bot.loot_needs import open_need_menu  # type: ignore
-                except ModuleNotFoundError:
-                    from loot_needs import open_need_menu  # type: ignore
+                from bot.loot_needs import open_need_menu  # type: ignore
+            except ModuleNotFoundError:
+                from loot_needs import open_need_menu  # type: ignore
 
-                if inter.message:
-                    _mark_portal_sent(guild.id, member.id, inter.message.id)
+            if inter.message:
+                _mark_portal_sent(guild.id, member.id, inter.message.id)
 
-                await open_need_menu(inter, guild.id, member.id)
-                return
-            except Exception as e:
-                await _portal_send(inter, f"❌ Needliste konnte nicht geöffnet werden: `{e}`", ephemeral=True)
-                return
+            # Fehler werden bewusst nicht verschluckt. PortalSafeView protokolliert
+            # sie mit Fehler-ID und setzt die aktive Portalnachricht notfalls zurück.
+            await open_need_menu(inter, guild.id, member.id)
+            return
 
         if choice == "auction":
             try:
-                try:
-                    from bot.loot_auction import open_auction_menu  # type: ignore
-                except ModuleNotFoundError:
-                    from loot_auction import open_auction_menu  # type: ignore
-                await open_auction_menu(inter, guild.id, member.id)
-                return
-            except Exception as e:
-                await _portal_send(inter, f"❌ Auktionsmenü konnte nicht geöffnet werden: `{e}`", ephemeral=True)
-                return
+                from bot.loot_auction import open_auction_menu  # type: ignore
+            except ModuleNotFoundError:
+                from loot_auction import open_auction_menu  # type: ignore
+            await open_auction_menu(inter, guild.id, member.id)
+            return
 
         if choice == "guild":
             emb = discord.Embed(
@@ -3139,20 +3543,11 @@ class LootMenuView(PortalSafeView):
             _mark_portal_sent(guild.id, member.id, inter.message.id)
 
         try:
-            try:
-                from bot.loot_needs import open_need_menu  # type: ignore
-            except ModuleNotFoundError:
-                from loot_needs import open_need_menu  # type: ignore
+            from bot.loot_needs import open_need_menu  # type: ignore
+        except ModuleNotFoundError:
+            from loot_needs import open_need_menu  # type: ignore
 
-            await open_need_menu(inter, guild.id, member.id)
-
-        except Exception:
-            emb = discord.Embed(
-                title="🎁 Needliste",
-                description="Die Needliste ist noch nicht aktiv. Das Modul `loot_needs.py` muss noch eingebaut werden.",
-                color=discord.Color.gold()
-            )
-            await _portal_edit(inter, embed=emb, view=BackOnlyView())
+        await open_need_menu(inter, guild.id, member.id)
 
     @button(label="Regeln & Loot", emoji=_menu_emoji(EMOJI_LOOT), style=ButtonStyle.secondary, custom_id="portal_loot_rules")
     async def btn_rules(self, inter: discord.Interaction, _):
@@ -6021,14 +6416,11 @@ class RulesLootView(PortalSafeView):
             _mark_portal_sent(guild.id, member.id, inter.message.id)
 
         try:
-            try:
-                from bot.loot_needs import open_need_menu  # type: ignore
-            except ModuleNotFoundError:
-                from loot_needs import open_need_menu  # type: ignore
+            from bot.loot_needs import open_need_menu  # type: ignore
+        except ModuleNotFoundError:
+            from loot_needs import open_need_menu  # type: ignore
 
-            await open_need_menu(inter, guild.id, member.id)
-        except Exception:
-            await _portal_edit(inter, embed=_rules_loot_embed(), view=RulesLootView())
+        await open_need_menu(inter, guild.id, member.id)
 
     @button(label="Zurück", emoji=_menu_emoji(EMOJI_BACK), style=ButtonStyle.secondary, custom_id="rules_back_main")
     async def btn_back(self, inter: discord.Interaction, _):
@@ -6481,11 +6873,15 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
         AdminLootMenuView,
     ]
 
+    global _PORTAL_PERSISTENT_COMPONENT_IDS
+    _PORTAL_PERSISTENT_COMPONENT_IDS = set()
     registered_views = 0
     failed_views: list[str] = []
     for view_factory in persistent_view_factories:
         try:
-            client.add_view(view_factory())
+            view = view_factory()
+            client.add_view(view)
+            _PORTAL_PERSISTENT_COMPONENT_IDS.update(_portal_component_ids_from_view(view))
             registered_views += 1
         except Exception as e:
             failed_views.append(view_factory.__name__)
@@ -6496,7 +6892,8 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
 
     print(
         f"✅ Member-Portal Persistent Views registriert: "
-        f"{registered_views}/{len(persistent_view_factories)}"
+        f"{registered_views}/{len(persistent_view_factories)} · "
+        f"Komponenten={len(_PORTAL_PERSISTENT_COMPONENT_IDS)}"
     )
     if failed_views:
         print(f"⚠️ Fehlende Persistent Views: {', '.join(failed_views)}")

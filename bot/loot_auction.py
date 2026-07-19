@@ -22,6 +22,41 @@ from discord.ui import View, button, Modal, TextInput
 from discord.enums import ButtonStyle
 
 try:
+    from bot.member_portal import (  # type: ignore
+        PortalSafeView,
+        PortalSafeModal,
+        _portal_edit,
+        _portal_send,
+        _portal_defer,
+    )
+except Exception:
+    try:
+        from member_portal import (  # type: ignore
+            PortalSafeView,
+            PortalSafeModal,
+            _portal_edit,
+            _portal_send,
+            _portal_defer,
+        )
+    except Exception:
+        PortalSafeView = View  # type: ignore
+        PortalSafeModal = Modal  # type: ignore
+
+        async def _portal_edit(inter, *args, **kwargs):
+            if not inter.response.is_done():
+                return await inter.response.edit_message(*args, **kwargs)
+            return await inter.edit_original_response(*args, **kwargs)
+
+        async def _portal_send(inter, *args, **kwargs):
+            if not inter.response.is_done():
+                return await inter.response.send_message(*args, **kwargs)
+            return await inter.followup.send(*args, **kwargs)
+
+        async def _portal_defer(inter, *args, **kwargs):
+            if not inter.response.is_done():
+                return await inter.response.defer(*args, **kwargs)
+
+try:
     from bot.channel_picker import send_text_channel_picker, send_voice_channel_picker  # type: ignore
 except Exception:
     from channel_picker import send_text_channel_picker, send_voice_channel_picker  # type: ignore
@@ -368,7 +403,7 @@ async def _require_loot_unlocked(inter: discord.Interaction, guild: discord.Guil
 
     remaining = _format_timedelta_short(until - _now())
     lock_days = _loot_rule(int(guild.id), "new_member_lock_days")
-    await inter.response.send_message(
+    await _portal_send(inter, 
         "⏳ **Lootsperre für neue Mitglieder**\n"
         f"Du kannst erst nach **{lock_days} Tagen Gildenmitgliedschaft** auf Loot bieten oder Sale-Items kaufen.\n"
         f"Freischaltung: **{until.strftime('%d.%m.%Y %H:%M')}**\n"
@@ -1615,22 +1650,26 @@ async def _announce_bid_log(client: discord.Client, guild_id: int, auction: dict
 async def _place_bid(inter: discord.Interaction, guild_id: int, auction_id: str, amount: int, portal_user_id: int | None = None) -> None:
     guild = inter.guild or inter.client.get_guild(int(guild_id))
     if guild is None:
-        await inter.response.send_message("❌ Server konnte nicht zugeordnet werden.", ephemeral=True)
+        await _portal_send(inter, "❌ Server konnte nicht zugeordnet werden.", ephemeral=True)
         return
     auction = _auction(guild_id, auction_id)
     if not auction:
-        await inter.response.send_message("❌ Auktion nicht gefunden.", ephemeral=True)
+        await _portal_send(inter, "❌ Auktion nicht gefunden.", ephemeral=True)
         return
     user_id = int(inter.user.id)
     if not _is_ebolus_member(guild, user_id):
-        await inter.response.send_message("❌ Nur Gildenmitglieder dürfen mit EC bieten.", ephemeral=True)
+        await _portal_send(inter, "❌ Nur Gildenmitglieder dürfen mit EC bieten.", ephemeral=True)
         return
     if not await _require_loot_unlocked(inter, guild, user_id):
         return
     reason = _bid_rejection_reason(guild, auction, user_id, int(amount))
     if reason:
-        await inter.response.send_message(f"❌ {reason}", ephemeral=True)
+        await _portal_send(inter, f"❌ {reason}", ephemeral=True)
         return
+
+    # Öffentliche Nachrichten, Marktpost und Logs können mehrere Sekunden dauern.
+    # Die Interaktion wird deshalb vor der eigentlichen Verarbeitung bestätigt.
+    await _portal_defer(inter, ephemeral=True, thinking=True)
 
     bids = auction.setdefault("bids", [])
     bids.append({"user_id": user_id, "amount": int(amount), "created_at": _now_iso(), "name": getattr(inter.user, "display_name", str(user_id))})
@@ -1659,10 +1698,10 @@ async def _place_bid(inter: discord.Interaction, guild_id: int, auction_id: str,
         except Exception as e:
             print(f"[loot_auction] portal bid message refresh failed: {e!r}")
 
-    await inter.response.send_message(f"✅ Gebot gesetzt: **{int(amount)} EC** für **{auction.get('item_name','Item')}**.", ephemeral=True)
+    await _portal_send(inter, f"✅ Gebot gesetzt: **{int(amount)} EC** für **{auction.get('item_name','Item')}**.", ephemeral=True)
 
 
-class CustomBidModal(Modal, title="Eigenes EC-Gebot"):
+class CustomBidModal(PortalSafeModal, title="Eigenes EC-Gebot"):
     amount = TextInput(label="Gebot in EC", placeholder="z. B. 50", required=True, max_length=8)
 
     def __init__(self, guild_id: int, auction_id: str, portal_user_id: int | None = None):
@@ -1675,7 +1714,7 @@ class CustomBidModal(Modal, title="Eigenes EC-Gebot"):
         try:
             val = int(str(self.amount.value).strip())
         except Exception:
-            await inter.response.send_message("❌ Bitte gib eine ganze Zahl ein.", ephemeral=True)
+            await _portal_send(inter, "❌ Bitte gib eine ganze Zahl ein.", ephemeral=True)
             return
         await _place_bid(inter, self.guild_id, self.auction_id, val, self.portal_user_id)
 
@@ -1720,7 +1759,7 @@ class AuctionBidView(View):
 
 
 
-class PortalAuctionBidView(View):
+class PortalAuctionBidView(PortalSafeView):
     """Bietansicht in der privaten Gildenzentrale mit Zurück-Buttons."""
     def __init__(self, guild_id: int, user_id: int, auction_id: str):
         super().__init__(timeout=None)
@@ -1734,7 +1773,7 @@ class PortalAuctionBidView(View):
     async def _quick(self, inter: discord.Interaction, add: int) -> None:
         auction = _auction(self.guild_id, self.auction_id)
         if not auction:
-            await inter.response.send_message("❌ Auktion nicht gefunden.", ephemeral=True)
+            await _portal_send(inter, "❌ Auktion nicht gefunden.", ephemeral=True)
             return
         amount = max(_min_next_bid(auction), _current_price(auction) + int(add))
         await _place_bid(inter, self.guild_id, self.auction_id, amount, self.user_id)
@@ -1758,15 +1797,15 @@ class PortalAuctionBidView(View):
     @button(label="Mein EC", style=ButtonStyle.secondary, custom_id="balance")
     async def balance(self, inter: discord.Interaction, btn: discord.ui.Button):
         bal = _ec_balance(self.guild_id, int(inter.user.id))
-        await inter.response.send_message(f"🪙 Dein aktueller Kontostand: **{bal} EC**", ephemeral=True)
+        await _portal_send(inter, f"🪙 Dein aktueller Kontostand: **{bal} EC**", ephemeral=True)
 
     @button(label="Zurück zu Auktion", style=ButtonStyle.secondary, custom_id="back_auction")
     async def back_auction(self, inter: discord.Interaction, btn: discord.ui.Button):
         guild = inter.client.get_guild(self.guild_id)
         if not guild:
-            await inter.response.send_message("❌ Server nicht gefunden.", ephemeral=True)
+            await _portal_send(inter, "❌ Server nicht gefunden.", ephemeral=True)
             return
-        await inter.response.edit_message(embed=_auction_portal_embed(guild, self.user_id), view=AuctionPortalMenuView(self.guild_id, self.user_id))
+        await _portal_edit(inter, embed=_auction_portal_embed(guild, self.user_id), view=AuctionPortalMenuView(self.guild_id, self.user_id))
 
     @button(label="Gildenzentrale", style=ButtonStyle.secondary, custom_id="back_main")
     async def back_main(self, inter: discord.Interaction, btn: discord.ui.Button):
@@ -3333,14 +3372,14 @@ async def _portal_back_to_main(inter: discord.Interaction, guild_id: int, user_i
         guild = inter.client.get_guild(int(guild_id))
         member = guild.get_member(int(user_id)) if guild else None
         if guild and member and hasattr(mp, "_main_menu_embed") and hasattr(mp, "MemberPortalMainView"):
-            await inter.response.edit_message(embed=mp._main_menu_embed(guild, member), view=mp.MemberPortalMainView())  # type: ignore[attr-defined]
+            await _portal_edit(inter, embed=mp._main_menu_embed(guild, member), view=mp.MemberPortalMainView())  # type: ignore[attr-defined]
             return
     except Exception:
         pass
-    await inter.response.edit_message(embed=discord.Embed(title="⚜️ Gildenzentrale", description="Öffne die Gildenzentrale bitte erneut über den Server-Button.", color=discord.Color.gold()), view=None)
+    await _portal_edit(inter, embed=discord.Embed(title="⚜️ Gildenzentrale", description="Öffne die Gildenzentrale bitte erneut über den Server-Button.", color=discord.Color.gold()), view=None)
 
 
-class AuctionPortalMenuView(View):
+class AuctionPortalMenuView(PortalSafeView):
     def __init__(self, guild_id: int, user_id: int):
         super().__init__(timeout=None)
         self.guild_id = int(guild_id)
@@ -3352,7 +3391,7 @@ class AuctionPortalMenuView(View):
     async def _open_category(self, inter: discord.Interaction, mode: str, title: str, empty_text: str, intro: str) -> None:
         guild = inter.client.get_guild(self.guild_id)
         if not guild:
-            await inter.response.send_message("❌ Server nicht gefunden.", ephemeral=True)
+            await _portal_send(inter, "❌ Server nicht gefunden.", ephemeral=True)
             return
         if mode == "main_need":
             auctions = _active_main_need_auctions(self.guild_id)
@@ -3365,10 +3404,10 @@ class AuctionPortalMenuView(View):
         emb = discord.Embed(title=title, color=discord.Color.gold(), timestamp=_now())
         if not auctions:
             emb.description = empty_text
-            await inter.response.edit_message(embed=emb, view=AuctionPortalSubView(self.guild_id, self.user_id))
+            await _portal_edit(inter, embed=emb, view=AuctionPortalSubView(self.guild_id, self.user_id))
             return
         emb.description = intro + "\n\n" + "\n".join(_short_auction_line(a) for a in auctions[:20])
-        await inter.response.edit_message(embed=emb, view=AuctionSelectView(self.guild_id, self.user_id, mode))
+        await _portal_edit(inter, embed=emb, view=AuctionSelectView(self.guild_id, self.user_id, mode))
 
     @button(label="Main Need", emoji="🎯", style=ButtonStyle.primary, custom_id="main_need")
     async def main_need(self, inter: discord.Interaction, btn: discord.ui.Button):
@@ -3415,7 +3454,7 @@ class AuctionPortalMenuView(View):
         await _portal_back_to_main(inter, self.guild_id, self.user_id)
 
 
-class AuctionPortalSubView(View):
+class AuctionPortalSubView(PortalSafeView):
     def __init__(self, guild_id: int, user_id: int):
         super().__init__(timeout=None)
         self.guild_id = int(guild_id)
@@ -3425,9 +3464,9 @@ class AuctionPortalSubView(View):
     async def back_auction(self, inter: discord.Interaction, btn: discord.ui.Button):
         guild = inter.client.get_guild(self.guild_id)
         if not guild:
-            await inter.response.send_message("❌ Server nicht gefunden.", ephemeral=True)
+            await _portal_send(inter, "❌ Server nicht gefunden.", ephemeral=True)
             return
-        await inter.response.edit_message(embed=_auction_portal_embed(guild, self.user_id), view=AuctionPortalMenuView(self.guild_id, self.user_id))
+        await _portal_edit(inter, embed=_auction_portal_embed(guild, self.user_id), view=AuctionPortalMenuView(self.guild_id, self.user_id))
 
     @button(label="Gildenzentrale", style=ButtonStyle.secondary, custom_id="portal_auc_sub_back_main")
     async def back_main(self, inter: discord.Interaction, btn: discord.ui.Button):
@@ -3483,24 +3522,24 @@ class AuctionSelect(discord.ui.Select):
 
     async def callback(self, inter: discord.Interaction):
         if self.values[0] == "none":
-            await inter.response.send_message("Aktuell gibt es hier nichts auszuwählen.", ephemeral=True)
+            await _portal_send(inter, "Aktuell gibt es hier nichts auszuwählen.", ephemeral=True)
             return
         guild = inter.client.get_guild(self.guild_id)
         if not guild:
-            await inter.response.send_message("❌ Server nicht gefunden.", ephemeral=True)
+            await _portal_send(inter, "❌ Server nicht gefunden.", ephemeral=True)
             return
         aid = self.values[0]
         auc = _auction(self.guild_id, aid)
         if not auc:
-            await inter.response.send_message("❌ Auktion nicht gefunden.", ephemeral=True)
+            await _portal_send(inter, "❌ Auktion nicht gefunden.", ephemeral=True)
             return
         if self.mode in {"sale", "junk_sale"}:
-            await inter.response.edit_message(embed=_sale_embed(guild, auc), view=PortalSaleBuyView(self.guild_id, self.user_id, aid))
+            await _portal_edit(inter, embed=_sale_embed(guild, auc), view=PortalSaleBuyView(self.guild_id, self.user_id, aid))
         else:
-            await inter.response.edit_message(embed=_auction_embed(guild, auc), view=PortalAuctionBidView(self.guild_id, self.user_id, aid))
+            await _portal_edit(inter, embed=_auction_embed(guild, auc), view=PortalAuctionBidView(self.guild_id, self.user_id, aid))
 
 
-class AuctionSelectView(View):
+class AuctionSelectView(PortalSafeView):
     def __init__(self, guild_id: int, user_id: int, mode: str):
         super().__init__(timeout=None)
         self.guild_id = int(guild_id)
@@ -3512,9 +3551,9 @@ class AuctionSelectView(View):
     async def back_auction(self, inter: discord.Interaction, btn: discord.ui.Button):
         guild = inter.client.get_guild(self.guild_id)
         if not guild:
-            await inter.response.send_message("❌ Server nicht gefunden.", ephemeral=True)
+            await _portal_send(inter, "❌ Server nicht gefunden.", ephemeral=True)
             return
-        await inter.response.edit_message(embed=_auction_portal_embed(guild, self.user_id), view=AuctionPortalMenuView(self.guild_id, self.user_id))
+        await _portal_edit(inter, embed=_auction_portal_embed(guild, self.user_id), view=AuctionPortalMenuView(self.guild_id, self.user_id))
 
 
 def _sale_embed(guild: discord.Guild, auction: dict) -> discord.Embed:
@@ -3593,7 +3632,7 @@ async def _handle_junk_sale_click(inter: discord.Interaction, guild_id: int, auc
         rolls = _junk_rolls(auc)
         existing = rolls.get(str(int(user_id)))
         if existing:
-            await inter.response.send_message(
+            await _portal_send(inter, 
                 f"ℹ️ Du hast für **{auc.get('item_name','Item')}** bereits gewürfelt: 🎲 **{int(existing.get('roll', 0) or 0)}**.",
                 ephemeral=True,
             )
@@ -3601,7 +3640,7 @@ async def _handle_junk_sale_click(inter: discord.Interaction, guild_id: int, auc
         try:
             roll, roll_max = _next_unique_junk_roll(auc)
         except Exception:
-            await inter.response.send_message("❌ Es konnte kein freier Würfelwert mehr erzeugt werden. Bitte Leader informieren.", ephemeral=True)
+            await _portal_send(inter, "❌ Es konnte kein freier Würfelwert mehr erzeugt werden. Bitte Leader informieren.", ephemeral=True)
             return
         rolls[str(int(user_id))] = {"user_id": int(user_id), "roll": int(roll), "created_at": _now_iso()}
         auc["junk_rolls"] = rolls
@@ -3622,7 +3661,7 @@ async def _handle_junk_sale_click(inter: discord.Interaction, guild_id: int, auc
                 await inter.message.edit(embed=_sale_embed(guild, auc), view=view)
         except Exception as e:
             print(f"[loot_auction] junk roll refresh failed: {e!r}")
-        await inter.response.send_message(
+        await _portal_send(inter, 
             f"🎲 Du hast für **{auc.get('item_name','Item')}** gewürfelt: **{int(roll)}**.",
             ephemeral=True,
         )
@@ -3638,9 +3677,9 @@ async def _handle_junk_sale_click(inter: discord.Interaction, guild_id: int, auc
             except Exception:
                 pass
             if winner == user_id:
-                await inter.response.send_message(f"🎲 Die Würfelphase war vorbei. Gewinner: **du** hast **{auc.get('item_name','Item')}** bekommen.", ephemeral=True)
+                await _portal_send(inter, f"🎲 Die Würfelphase war vorbei. Gewinner: **du** hast **{auc.get('item_name','Item')}** bekommen.", ephemeral=True)
             else:
-                await inter.response.send_message(f"🎲 Die Würfelphase war vorbei. Gewinner: <@{winner}>.", ephemeral=True)
+                await _portal_send(inter, f"🎲 Die Würfelphase war vorbei. Gewinner: <@{winner}>.", ephemeral=True)
             return
         # Keine Würfe vor Ablauf: ab jetzt Sofortkauf, kein Ablauf. Danach weiter zur direkten Übergabe.
 
@@ -3650,28 +3689,32 @@ async def _handle_junk_sale_click(inter: discord.Interaction, guild_id: int, auc
             await inter.message.edit(embed=emb, view=None)
     except Exception:
         pass
-    await inter.response.send_message(embed=emb, ephemeral=True)
+    await _portal_send(inter, embed=emb, ephemeral=True)
 
 
 async def _buy_sale_item(inter: discord.Interaction, guild_id: int, auction_id: str):
     guild = inter.guild or inter.client.get_guild(int(guild_id))
     if guild is None:
-        await inter.response.send_message("❌ Server konnte nicht zugeordnet werden.", ephemeral=True)
+        await _portal_send(inter, "❌ Server konnte nicht zugeordnet werden.", ephemeral=True)
         return
     auc = _auction(guild_id, auction_id)
     if not auc or str(auc.get("status", "")) != "active" or _auction_phase(auc) != "sale":
-        await inter.response.send_message("❌ Sale-Kauf nicht gefunden oder nicht mehr aktiv.", ephemeral=True)
+        await _portal_send(inter, "❌ Sale-Kauf nicht gefunden oder nicht mehr aktiv.", ephemeral=True)
         return
     end_dt = _parse_dt(str(auc.get("ends_at", "") or ""))
     if end_dt and _now() >= end_dt:
-        await inter.response.send_message("❌ Dieses Sale-Item ist bereits abgelaufen.", ephemeral=True)
+        await _portal_send(inter, "❌ Dieses Sale-Item ist bereits abgelaufen.", ephemeral=True)
         return
     user_id = int(inter.user.id)
     if not _is_ebolus_member(guild, user_id):
-        await inter.response.send_message("❌ Nur Gildenmitglieder können mit EC kaufen.", ephemeral=True)
+        await _portal_send(inter, "❌ Nur Gildenmitglieder können mit EC kaufen.", ephemeral=True)
         return
     if not await _require_loot_unlocked(inter, guild, user_id):
         return
+
+    # Sale-Abrechnung, EC-Buchung und Nachrichtenupdates dürfen die 3-Sekunden-
+    # Frist von Discord nicht blockieren.
+    await _portal_defer(inter, ephemeral=True, thinking=True)
 
     price = int(auc.get("fixed_price", auc.get("start_bid", 0)) or 0)
     if _is_junk_interest_sale(auc) and price <= 0:
@@ -3681,7 +3724,7 @@ async def _buy_sale_item(inter: discord.Interaction, guild_id: int, auction_id: 
     if price > 0:
         bal = _ec_balance(guild_id, user_id)
         if bal < price:
-            await inter.response.send_message(f"❌ Du hast aktuell nur **{bal} EC**, benötigst aber **{price} EC**.", ephemeral=True)
+            await _portal_send(inter, f"❌ Du hast aktuell nur **{bal} EC**, benötigst aber **{price} EC**.", ephemeral=True)
             return
         ok = _add_ec_transaction(
             int(guild_id), user_id, -price,
@@ -3690,7 +3733,7 @@ async def _buy_sale_item(inter: discord.Interaction, guild_id: int, auction_id: 
             meta={"auction_id": str(auction_id), "item_id": auc.get("item_id", ""), "item_name": auc.get("item_name", ""), "kind": "sale"},
         )
         if not ok:
-            await inter.response.send_message("❌ DKP/EC-System konnte nicht geladen werden. Keine EC abgebucht.", ephemeral=True)
+            await _portal_send(inter, "❌ DKP/EC-System konnte nicht geladen werden. Keine EC abgebucht.", ephemeral=True)
             return
 
     emb = await _finalize_sale_delivery(inter.client, guild, int(guild_id), auc, str(auction_id), user_id, price, actor_id=user_id, source="sale_direct_buy")
@@ -3699,7 +3742,7 @@ async def _buy_sale_item(inter: discord.Interaction, guild_id: int, auction_id: 
             await inter.message.edit(embed=emb, view=None)
     except Exception:
         pass
-    await inter.response.send_message(embed=emb, ephemeral=True)
+    await _portal_send(inter, embed=emb, ephemeral=True)
 
 
 class SaleBuyView(View):
@@ -3728,7 +3771,7 @@ class SaleBuyView(View):
         await inter.response.send_message(f"🪙 Dein aktueller Kontostand: **{bal} EC**", ephemeral=True)
 
 
-class PortalSaleBuyView(View):
+class PortalSaleBuyView(PortalSafeView):
     """Sale-Kauf Ansicht in der privaten Gildenzentrale mit Zurück-Buttons."""
     def __init__(self, guild_id: int, user_id: int, auction_id: str):
         super().__init__(timeout=None)
@@ -3753,15 +3796,15 @@ class PortalSaleBuyView(View):
     @button(label="Mein EC", style=ButtonStyle.secondary, custom_id="balance")
     async def balance(self, inter: discord.Interaction, btn: discord.ui.Button):
         bal = _ec_balance(self.guild_id, int(inter.user.id))
-        await inter.response.send_message(f"🪙 Dein aktueller Kontostand: **{bal} EC**", ephemeral=True)
+        await _portal_send(inter, f"🪙 Dein aktueller Kontostand: **{bal} EC**", ephemeral=True)
 
     @button(label="Zurück zu Auktion", style=ButtonStyle.secondary, custom_id="back_auction")
     async def back_auction(self, inter: discord.Interaction, btn: discord.ui.Button):
         guild = inter.client.get_guild(self.guild_id)
         if not guild:
-            await inter.response.send_message("❌ Server nicht gefunden.", ephemeral=True)
+            await _portal_send(inter, "❌ Server nicht gefunden.", ephemeral=True)
             return
-        await inter.response.edit_message(embed=_auction_portal_embed(guild, self.user_id), view=AuctionPortalMenuView(self.guild_id, self.user_id))
+        await _portal_edit(inter, embed=_auction_portal_embed(guild, self.user_id), view=AuctionPortalMenuView(self.guild_id, self.user_id))
 
     @button(label="Gildenzentrale", style=ButtonStyle.secondary, custom_id="back_main")
     async def back_main(self, inter: discord.Interaction, btn: discord.ui.Button):
@@ -3771,9 +3814,9 @@ class PortalSaleBuyView(View):
 async def open_auction_menu(inter: discord.Interaction, guild_id: int, user_id: int):
     guild = inter.client.get_guild(int(guild_id))
     if not guild:
-        await inter.response.send_message("❌ Server nicht gefunden.", ephemeral=True)
+        await _portal_send(inter, "❌ Server nicht gefunden.", ephemeral=True)
         return
-    await inter.response.edit_message(embed=_auction_portal_embed(guild, int(user_id)), view=AuctionPortalMenuView(int(guild_id), int(user_id)))
+    await _portal_edit(inter, embed=_auction_portal_embed(guild, int(user_id)), view=AuctionPortalMenuView(int(guild_id), int(user_id)))
 
 
 

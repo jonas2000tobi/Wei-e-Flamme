@@ -22,6 +22,46 @@ from discord.ui import View, button, Select, Modal, TextInput
 from discord.enums import ButtonStyle
 
 try:
+    from bot.member_portal import (  # type: ignore
+        PortalSafeView,
+        PortalSafeModal,
+        _portal_edit,
+        _portal_send,
+        _portal_defer,
+        _portal_log_event,
+    )
+except Exception:
+    try:
+        from member_portal import (  # type: ignore
+            PortalSafeView,
+            PortalSafeModal,
+            _portal_edit,
+            _portal_send,
+            _portal_defer,
+            _portal_log_event,
+        )
+    except Exception:
+        PortalSafeView = View  # type: ignore
+        PortalSafeModal = Modal  # type: ignore
+
+        async def _portal_edit(inter, *args, **kwargs):
+            if not inter.response.is_done():
+                return await inter.response.edit_message(*args, **kwargs)
+            return await _portal_edit(inter, *args, **kwargs)
+
+        async def _portal_send(inter, *args, **kwargs):
+            if not inter.response.is_done():
+                return await inter.response.send_message(*args, **kwargs)
+            return await inter.followup.send(*args, **kwargs)
+
+        async def _portal_defer(inter, *args, **kwargs):
+            if not inter.response.is_done():
+                return await inter.response.defer(*args, **kwargs)
+
+        async def _portal_log_event(*args, **kwargs):
+            return "GM-UNBEKANNT"
+
+try:
     from bot.channel_picker import send_text_channel_picker, send_voice_channel_picker  # type: ignore
 except Exception:
     from channel_picker import send_text_channel_picker, send_voice_channel_picker  # type: ignore
@@ -134,12 +174,46 @@ def save_items() -> None:
     _save_json(ITEMS_FILE, loot_items)
 
 
-def save_needs() -> None:
-    _save_json(NEEDS_FILE, loot_needs)
+_phase3_need_mirror_task: Optional[asyncio.Task] = None
+
+
+async def _phase3_need_mirror_debounced() -> None:
+    global _phase3_need_mirror_task
     try:
-        _phase3_mirror_all_needs()
+        # Mehrere schnelle Slot-Aenderungen werden zu einer Spiegelung gebuendelt.
+        await asyncio.sleep(0.75)
+        await asyncio.to_thread(_phase3_mirror_all_needs)
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
         print(f"[phase3] Need-Spiegelung fehlgeschlagen: {e!r}")
+    finally:
+        _phase3_need_mirror_task = None
+
+
+def _schedule_phase3_need_mirror() -> None:
+    global _phase3_need_mirror_task
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = getattr(_client_ref, "loop", None) if _client_ref is not None else None
+        if loop is not None and getattr(loop, "is_running", lambda: False)():
+            try:
+                loop.call_soon_threadsafe(_schedule_phase3_need_mirror)
+            except Exception:
+                pass
+        return
+    if _phase3_need_mirror_task is not None and not _phase3_need_mirror_task.done():
+        _phase3_need_mirror_task.cancel()
+    _phase3_need_mirror_task = loop.create_task(_phase3_need_mirror_debounced())
+
+
+def save_needs() -> None:
+    # JSON bleibt die unmittelbare produktive Quelle. Die komplette Postgres-
+    # Spiegelung darf keine Discord-Interaktion blockieren und laeuft deshalb
+    # entkoppelt/debounced im Hintergrund.
+    _save_json(NEEDS_FILE, loot_needs)
+    _schedule_phase3_need_mirror()
 
 
 def save_cfg() -> None:
@@ -1105,7 +1179,7 @@ async def _send_received_request(
     ch = _loot_leader_channel(guild)
 
     if not ch:
-        await inter.response.edit_message(
+        await _portal_edit(inter,
             embed=discord.Embed(
                 title="❌ Leaderkanal fehlt",
                 description=(
@@ -1124,7 +1198,7 @@ async def _send_received_request(
     item_id = str(slot_data.get("item_id", "") or "")
 
     if not item_id:
-        await inter.response.edit_message(
+        await _portal_edit(inter,
             embed=discord.Embed(
                 title="❌ Kein Item eingetragen",
                 description=f"In **{tab} – {slot}** ist aktuell kein Item eingetragen.",
@@ -1135,7 +1209,7 @@ async def _send_received_request(
         return False
 
     if bool(slot_data.get("received", False)):
-        await inter.response.edit_message(
+        await _portal_edit(inter,
             embed=discord.Embed(
                 title="🔒 Bereits erhalten",
                 description=f"**{tab} – {slot}** ist bereits als erhalten markiert.",
@@ -1166,7 +1240,7 @@ async def _send_received_request(
     try:
         await ch.send(embed=emb, view=ReceivedReportReviewView())
     except Exception as e:
-        await inter.response.edit_message(
+        await _portal_edit(inter,
             embed=discord.Embed(
                 title="❌ Meldung konnte nicht gesendet werden",
                 description=f"Fehler: `{e}`",
@@ -1176,7 +1250,7 @@ async def _send_received_request(
         )
         return False
 
-    await inter.response.edit_message(
+    await _portal_edit(inter, 
         embed=discord.Embed(
             title="✅ Erhalten-Meldung gesendet",
             description=(
@@ -1240,22 +1314,26 @@ async def _send_long_need_list(
 
 
 async def open_need_menu(inter: discord.Interaction, guild_id: int, user_id: int):
-    guild = inter.client.get_guild(guild_id)
+    guild = inter.client.get_guild(int(guild_id))
 
     if not guild:
-        await inter.response.send_message("❌ Server nicht gefunden.")
+        await _portal_send(inter, "❌ Server nicht gefunden.", ephemeral=True)
         return
 
-    _user_needs(guild_id, user_id)
-    save_needs()
+    # Sofort als Message-Update bestaetigen. Dadurch bleibt die Portal-DM das
+    # Bearbeitungsziel, selbst wenn JSON/Volume kurz langsam sind.
+    await _portal_defer(inter, thinking=False)
+    _user_needs(int(guild_id), int(user_id))
+    await asyncio.to_thread(save_needs)
 
-    await inter.response.edit_message(
-        embed=_need_embed(guild, user_id, "Main"),
-        view=NeedMainView(guild_id, user_id, "Main")
+    await _portal_edit(
+        inter,
+        embed=_need_embed(guild, int(user_id), "Main"),
+        view=NeedMainView(int(guild_id), int(user_id), "Main")
     )
 
 
-class NeedMainView(View):
+class NeedMainView(PortalSafeView):
     def __init__(self, guild_id: int, user_id: int, active_tab: str = "Main"):
         super().__init__(timeout=None)
         self.guild_id = int(guild_id)
@@ -1278,10 +1356,10 @@ class NeedMainView(View):
         guild = inter.client.get_guild(self.guild_id)
 
         if not guild:
-            await inter.response.send_message("❌ Server nicht gefunden.")
+            await _portal_send(inter, "❌ Server nicht gefunden.")
             return
 
-        await inter.response.edit_message(
+        await _portal_edit(inter, 
             embed=_need_embed(guild, self.user_id, "Main"),
             view=NeedMainView(self.guild_id, self.user_id, "Main")
         )
@@ -1291,10 +1369,10 @@ class NeedMainView(View):
         guild = inter.client.get_guild(self.guild_id)
 
         if not guild:
-            await inter.response.send_message("❌ Server nicht gefunden.")
+            await _portal_send(inter, "❌ Server nicht gefunden.")
             return
 
-        await inter.response.edit_message(
+        await _portal_edit(inter, 
             embed=_need_embed(guild, self.user_id, "Secondary"),
             view=NeedMainView(self.guild_id, self.user_id, "Secondary")
         )
@@ -1308,7 +1386,7 @@ class NeedMainView(View):
             color=discord.Color.gold()
         )
 
-        await inter.response.edit_message(
+        await _portal_edit(inter, 
             embed=emb,
             view=NeedSlotSelectView(self.guild_id, self.user_id, "set", tab)
         )
@@ -1326,7 +1404,7 @@ class NeedMainView(View):
             color=discord.Color.gold()
         )
 
-        await inter.response.edit_message(
+        await _portal_edit(inter, 
             embed=emb,
             view=NeedSlotSelectView(self.guild_id, self.user_id, "clear", tab)
         )
@@ -1344,7 +1422,7 @@ class NeedMainView(View):
             color=discord.Color.gold()
         )
 
-        await inter.response.edit_message(
+        await _portal_edit(inter, 
             embed=emb,
             view=NeedSlotSelectView(self.guild_id, self.user_id, "report_received", tab)
         )
@@ -1357,7 +1435,7 @@ class NeedMainView(View):
             except ModuleNotFoundError:
                 from member_portal import ensure_portal_menu_for_user  # type: ignore
 
-            await inter.response.defer()
+            await _portal_defer(inter, )
             await ensure_portal_menu_for_user(inter.client, self.guild_id, self.user_id, force_view="main")
         except Exception:
             emb = discord.Embed(
@@ -1365,10 +1443,10 @@ class NeedMainView(View):
                 description="Zurück zur Gildenzentrale.",
                 color=discord.Color.gold()
             )
-            await inter.response.edit_message(embed=emb, view=None)
+            await _portal_edit(inter, embed=emb, view=None)
 
 
-class NeedTabSelectView(View):
+class NeedTabSelectView(PortalSafeView):
     def __init__(self, guild_id: int, user_id: int, action: str):
         super().__init__(timeout=None)
         self.guild_id = int(guild_id)
@@ -1381,10 +1459,10 @@ class NeedTabSelectView(View):
         guild = inter.client.get_guild(self.guild_id)
 
         if not guild:
-            await inter.response.send_message("❌ Server nicht gefunden.")
+            await _portal_send(inter, "❌ Server nicht gefunden.")
             return
 
-        await inter.response.edit_message(
+        await _portal_edit(inter, 
             embed=_need_embed(guild, self.user_id, "Main"),
             view=NeedMainView(self.guild_id, self.user_id, "Main")
         )
@@ -1426,13 +1504,13 @@ class NeedTabSelect(Select):
             color=discord.Color.gold()
         )
 
-        await inter.response.edit_message(
+        await _portal_edit(inter, 
             embed=emb,
             view=NeedSlotSelectView(self.guild_id, self.user_id, self.action, tab)
         )
 
 
-class NeedSlotSelectView(View):
+class NeedSlotSelectView(PortalSafeView):
     def __init__(self, guild_id: int, user_id: int, action: str, tab: str):
         super().__init__(timeout=None)
         self.guild_id = int(guild_id)
@@ -1446,10 +1524,10 @@ class NeedSlotSelectView(View):
         guild = inter.client.get_guild(self.guild_id)
 
         if not guild:
-            await inter.response.send_message("❌ Server nicht gefunden.")
+            await _portal_send(inter, "❌ Server nicht gefunden.")
             return
 
-        await inter.response.edit_message(
+        await _portal_edit(inter, 
             embed=_need_embed(guild, self.user_id, self.tab),
             view=NeedMainView(self.guild_id, self.user_id, self.tab)
         )
@@ -1494,7 +1572,7 @@ class NeedSlotSelect(Select):
                 color=discord.Color.orange()
             )
 
-            await inter.response.edit_message(
+            await _portal_edit(inter, 
                 embed=emb,
                 view=NeedMainView(self.guild_id, self.user_id, self.tab)
             )
@@ -1507,25 +1585,25 @@ class NeedSlotSelect(Select):
             guild = inter.client.get_guild(self.guild_id)
 
             if guild:
-                await inter.response.edit_message(
+                await _portal_edit(inter, 
                     embed=_need_embed(guild, self.user_id, self.tab),
                     view=NeedMainView(self.guild_id, self.user_id, self.tab)
                 )
             else:
-                await inter.response.send_message("✅ Eintrag entfernt.")
+                await _portal_send(inter, "✅ Eintrag entfernt.")
             return
 
         if self.action == "report_received":
             guild = inter.client.get_guild(self.guild_id)
 
             if not guild:
-                await inter.response.send_message("❌ Server nicht gefunden.")
+                await _portal_send(inter, "❌ Server nicht gefunden.")
                 return
 
             item_id = str(current_slot.get("item_id", "") or "")
 
             if not item_id:
-                await inter.response.edit_message(
+                await _portal_edit(inter, 
                     embed=discord.Embed(
                         title="❌ Kein Item eingetragen",
                         description=f"In **{self.tab} – {need_slot}** ist aktuell kein Item eingetragen.",
@@ -1549,7 +1627,7 @@ class NeedSlotSelect(Select):
                 color=discord.Color.gold()
             )
 
-            await inter.response.edit_message(
+            await _portal_edit(inter, 
                 embed=emb,
                 view=NeedWeaponTypeSelectView(self.guild_id, self.user_id, self.tab, need_slot)
             )
@@ -1560,7 +1638,7 @@ class NeedSlotSelect(Select):
         )
 
 
-class NeedWeaponTypeSelectView(View):
+class NeedWeaponTypeSelectView(PortalSafeView):
     def __init__(self, guild_id: int, user_id: int, tab: str, need_slot: str):
         super().__init__(timeout=None)
         self.guild_id = int(guild_id)
@@ -1577,7 +1655,7 @@ class NeedWeaponTypeSelectView(View):
             color=discord.Color.gold()
         )
 
-        await inter.response.edit_message(
+        await _portal_edit(inter, 
             embed=emb,
             view=NeedSlotSelectView(self.guild_id, self.user_id, "set", self.tab)
         )
@@ -1623,18 +1701,18 @@ async def _show_need_catalog_browser(
     page: int = 0,
 ) -> None:
     if not inter.response.is_done():
-        await inter.response.defer()
+        await _portal_defer(inter, thinking=False)
     rows, has_more = await _catalog_rows(need_slot, weapon_type, query, page)
     emb = _catalog_browser_embed("🎁 Needliste – Item aus Datenbank wählen", need_slot, weapon_type, query, page, len(rows))
     if not rows:
         emb.add_field(name="Keine Treffer", value="Ändere den Suchbegriff oder gehe zurück.", inline=False)
-    await inter.edit_original_response(
+    await _portal_edit(inter, 
         embed=emb,
         view=NeedCatalogBrowserView(guild_id, user_id, tab, need_slot, weapon_type, query, page, rows, has_more),
     )
 
 
-class NeedCatalogSearchModal(Modal, title="Item in Datenbank suchen"):
+class NeedCatalogSearchModal(PortalSafeModal, title="Item in Datenbank suchen"):
     def __init__(self, guild_id: int, user_id: int, tab: str, need_slot: str, weapon_type: str | None, current_query: str):
         super().__init__(timeout=300)
         self.guild_id = int(guild_id)
@@ -1663,7 +1741,7 @@ class NeedCatalogItemSelect(Select):
 
     async def callback(self, inter: discord.Interaction):
         view = self.view_ref
-        await inter.response.defer()
+        await _portal_defer(inter, )
         try:
             catalog_id = int(self.values[0])
             item_id, item = await asyncio.to_thread(
@@ -1677,7 +1755,7 @@ class NeedCatalogItemSelect(Select):
                     description="Dieser Slot ist bereits als erhalten markiert und kann nur durch die Gildenleitung geändert werden.",
                     color=discord.Color.orange(),
                 )
-                await inter.edit_original_response(embed=emb, view=NeedMainView(view.guild_id, view.user_id, view.tab))
+                await _portal_edit(inter, embed=emb, view=NeedMainView(view.guild_id, view.user_id, view.tab))
                 return
             _set_slot_item(
                 data, view.tab, view.need_slot, item_id,
@@ -1687,19 +1765,32 @@ class NeedCatalogItemSelect(Select):
             await asyncio.to_thread(save_needs)
             guild = inter.client.get_guild(view.guild_id)
             if guild:
-                await inter.edit_original_response(embed=_need_embed(guild, view.user_id, view.tab), view=NeedMainView(view.guild_id, view.user_id, view.tab))
+                await _portal_edit(inter, embed=_need_embed(guild, view.user_id, view.tab), view=NeedMainView(view.guild_id, view.user_id, view.tab))
             else:
-                await inter.edit_original_response(content="✅ Need gespeichert.", embed=None, view=None)
+                await _portal_edit(inter, content="✅ Need gespeichert.", embed=None, view=None)
         except Exception as exc:
-            await inter.edit_original_response(content=f"❌ Item konnte nicht gespeichert werden: {type(exc).__name__}: {exc}", embed=None, view=None)
+            error_id = await _portal_log_event(
+                inter, event_type="Need-Speicherfehler", error=exc, notify_user=False
+            )
+            guild = inter.client.get_guild(view.guild_id)
+            embed = discord.Embed(
+                title="❌ Item konnte nicht gespeichert werden",
+                description=f"Der Fehler wurde protokolliert.\nFehler-ID: `{error_id}`",
+                color=discord.Color.red(),
+            )
+            await _portal_edit(
+                inter,
+                embed=embed,
+                view=NeedMainView(view.guild_id, view.user_id, view.tab) if guild else None,
+            )
 
 
-class NeedCatalogBrowserView(View):
+class NeedCatalogBrowserView(PortalSafeView):
     def __init__(
         self, guild_id: int, user_id: int, tab: str, need_slot: str, weapon_type: str | None,
         query: str, page: int, rows: list[dict[str, Any]], has_more: bool,
     ):
-        super().__init__(timeout=600)
+        super().__init__(timeout=None)
         self.guild_id = int(guild_id)
         self.user_id = int(user_id)
         self.tab = tab
@@ -1733,13 +1824,13 @@ class NeedCatalogBrowserView(View):
     async def btn_back(self, inter: discord.Interaction, _):
         if _catalog_slot_for_need_slot(self.need_slot) == "Waffe":
             emb = discord.Embed(title="🎁 Needliste – Waffentyp wählen", description=f"Bereich: **{self.tab}**\nSlot: **{self.need_slot}**", color=discord.Color.gold())
-            await inter.response.edit_message(embed=emb, view=NeedWeaponTypeSelectView(self.guild_id, self.user_id, self.tab, self.need_slot))
+            await _portal_edit(inter, embed=emb, view=NeedWeaponTypeSelectView(self.guild_id, self.user_id, self.tab, self.need_slot))
             return
         emb = discord.Embed(title="🎁 Needliste – Slot wählen", description=f"Bereich: **{self.tab}**", color=discord.Color.gold())
-        await inter.response.edit_message(embed=emb, view=NeedSlotSelectView(self.guild_id, self.user_id, "set", self.tab))
+        await _portal_edit(inter, embed=emb, view=NeedSlotSelectView(self.guild_id, self.user_id, "set", self.tab))
 
 
-class ReceivedReportReviewView(View):
+class ReceivedReportReviewView(PortalSafeView):
     def __init__(self):
         super().__init__(timeout=None)
 
@@ -1758,17 +1849,17 @@ class ReceivedReportReviewView(View):
         data = self._get_request_data(inter)
 
         if not data:
-            await inter.response.send_message("❌ Diese Meldung konnte nicht gelesen werden.", ephemeral=True)
+            await _portal_send(inter, "❌ Diese Meldung konnte nicht gelesen werden.", ephemeral=True)
             return
 
         guild_id, user_id, tab, slot = data
 
         if inter.guild is None or inter.guild.id != guild_id:
-            await inter.response.send_message("❌ Falscher Server.", ephemeral=True)
+            await _portal_send(inter, "❌ Falscher Server.", ephemeral=True)
             return
 
         if not _is_leader_or_admin(inter):
-            await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
+            await _portal_send(inter, "❌ Nur Leader/Admins.", ephemeral=True)
             return
 
         guild = inter.guild
@@ -1777,13 +1868,13 @@ class ReceivedReportReviewView(View):
         item_id = str(slot_data.get("item_id", "") or "")
 
         if not item_id:
-            await inter.response.send_message("❌ Der Spieler hat in diesem Slot kein Item mehr eingetragen.", ephemeral=True)
+            await _portal_send(inter, "❌ Der Spieler hat in diesem Slot kein Item mehr eingetragen.", ephemeral=True)
             return
 
         item_name = _item_name(guild.id, item_id, with_type=True)
 
         if bool(slot_data.get("received", False)):
-            await inter.response.send_message("ℹ️ Dieses Item ist bereits als erhalten markiert.", ephemeral=True)
+            await _portal_send(inter, "ℹ️ Dieses Item ist bereits als erhalten markiert.", ephemeral=True)
             return
 
         _mark_slot_received(needs, tab, slot, inter.user.id)
@@ -1816,24 +1907,24 @@ class ReceivedReportReviewView(View):
         except Exception:
             pass
 
-        await inter.response.edit_message(embed=emb, view=None)
+        await _portal_edit(inter, embed=emb, view=None)
 
     @button(label="❌ Ablehnen", style=ButtonStyle.danger, custom_id="loot_received_deny")
     async def btn_deny(self, inter: discord.Interaction, _):
         data = self._get_request_data(inter)
 
         if not data:
-            await inter.response.send_message("❌ Diese Meldung konnte nicht gelesen werden.", ephemeral=True)
+            await _portal_send(inter, "❌ Diese Meldung konnte nicht gelesen werden.", ephemeral=True)
             return
 
         guild_id, user_id, tab, slot = data
 
         if inter.guild is None or inter.guild.id != guild_id:
-            await inter.response.send_message("❌ Falscher Server.", ephemeral=True)
+            await _portal_send(inter, "❌ Falscher Server.", ephemeral=True)
             return
 
         if not _is_leader_or_admin(inter):
-            await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
+            await _portal_send(inter, "❌ Nur Leader/Admins.", ephemeral=True)
             return
 
         guild = inter.guild
@@ -1869,7 +1960,7 @@ class ReceivedReportReviewView(View):
         except Exception:
             pass
 
-        await inter.response.edit_message(embed=emb, view=None)
+        await _portal_edit(inter, embed=emb, view=None)
 
 
 def _catalog_slot_choices():
@@ -3525,81 +3616,81 @@ async def _notify_main_need_drop(inter: discord.Interaction, guild: discord.Guil
 async def open_admin_item_add_menu(inter: discord.Interaction, guild_id: int, user_id: int):
     guild = inter.client.get_guild(guild_id)
     if not guild:
-        await inter.response.send_message("❌ Server nicht gefunden.", ephemeral=True)
+        await _portal_send(inter, "❌ Server nicht gefunden.", ephemeral=True)
         return
     if inter.guild is not None and not _is_leader_or_admin(inter):
-        await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
+        await _portal_send(inter, "❌ Nur Leader/Admins.", ephemeral=True)
         return
     emb = discord.Embed(
         title="➕ Item hinzufügen",
         description="Wähle zuerst den Slot. Bei Waffen wird danach der Waffentyp abgefragt.",
         color=discord.Color.gold()
     )
-    await inter.response.edit_message(embed=emb, view=AdminLootSlotSelectView(guild_id, user_id, action="add"))
+    await _portal_edit(inter, embed=emb, view=AdminLootSlotSelectView(guild_id, user_id, action="add"))
 
 
 async def open_admin_loot_drop_menu(inter: discord.Interaction, guild_id: int, user_id: int):
     guild = inter.client.get_guild(guild_id)
     if not guild:
-        await inter.response.send_message("❌ Server nicht gefunden.", ephemeral=True)
+        await _portal_send(inter, "❌ Server nicht gefunden.", ephemeral=True)
         return
     if inter.guild is not None and not _is_leader_or_admin(inter):
-        await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
+        await _portal_send(inter, "❌ Nur Leader/Admins.", ephemeral=True)
         return
     emb = discord.Embed(
         title="📦 Loot gedroppt",
         description="Wähle den Slot und danach das Item aus dem Katalog. Danach startet der Bot automatisch Main-Need-, Second-Need- oder freie Auktion.",
         color=discord.Color.gold()
     )
-    await inter.response.edit_message(embed=emb, view=AdminLootSlotSelectView(guild_id, user_id, action="drop"))
+    await _portal_edit(inter, embed=emb, view=AdminLootSlotSelectView(guild_id, user_id, action="drop"))
 
 
 async def open_admin_mark_received_menu(inter: discord.Interaction, guild_id: int, user_id: int):
     guild = inter.client.get_guild(guild_id)
     if not guild:
-        await inter.response.send_message("❌ Server nicht gefunden.", ephemeral=True)
+        await _portal_send(inter, "❌ Server nicht gefunden.", ephemeral=True)
         return
     if inter.guild is not None and not _is_leader_or_admin(inter):
-        await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
+        await _portal_send(inter, "❌ Nur Leader/Admins.", ephemeral=True)
         return
     emb = discord.Embed(
         title="✅ Item erhalten markieren",
         description="Wähle Slot → Item → Spieler. Danach wird dieser Need-Slot als erhalten markiert.",
         color=discord.Color.gold()
     )
-    await inter.response.edit_message(embed=emb, view=AdminLootSlotSelectView(guild_id, user_id, action="mark"))
+    await _portal_edit(inter, embed=emb, view=AdminLootSlotSelectView(guild_id, user_id, action="mark"))
 
 
 async def open_admin_unmark_received_menu(inter: discord.Interaction, guild_id: int, user_id: int):
     guild = inter.client.get_guild(guild_id)
     if not guild:
-        await inter.response.send_message("❌ Server nicht gefunden.", ephemeral=True)
+        await _portal_send(inter, "❌ Server nicht gefunden.", ephemeral=True)
         return
     if inter.guild is not None and not _is_leader_or_admin(inter):
-        await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
+        await _portal_send(inter, "❌ Nur Leader/Admins.", ephemeral=True)
         return
     emb = discord.Embed(
         title="❌ Erhalten-Markierung entfernen",
         description="Wähle Slot → Item → Spieler. Danach wird die Erhalten-Markierung wieder freigegeben.",
         color=discord.Color.gold()
     )
-    await inter.response.edit_message(embed=emb, view=AdminLootSlotSelectView(guild_id, user_id, action="unmark"))
+    await _portal_edit(inter, embed=emb, view=AdminLootSlotSelectView(guild_id, user_id, action="unmark"))
 
 
 async def open_admin_item_catalog_menu(inter: discord.Interaction, guild_id: int, user_id: int):
     guild = inter.client.get_guild(guild_id)
     if not guild:
-        await inter.response.send_message("❌ Server nicht gefunden.", ephemeral=True)
+        await _portal_send(inter, "❌ Server nicht gefunden.", ephemeral=True)
         return
     emb = discord.Embed(
         title="📋 Item-Katalog",
         description="Wähle einen Slot, um die Items aus dem Katalog anzuzeigen.",
         color=discord.Color.gold()
     )
-    await inter.response.edit_message(embed=emb, view=AdminLootSlotSelectView(guild_id, user_id, action="catalog"))
+    await _portal_edit(inter, embed=emb, view=AdminLootSlotSelectView(guild_id, user_id, action="catalog"))
 
 
-class AdminLootBackView(View):
+class AdminLootBackView(PortalSafeView):
     def __init__(self):
         super().__init__(timeout=None)
 
@@ -3615,12 +3706,12 @@ class AdminLootBackView(View):
                 description="Wähle eine Loot-Aktion.",
                 color=discord.Color.gold()
             )
-            await inter.response.edit_message(embed=emb, view=AdminLootMenuView())
+            await _portal_edit(inter, embed=emb, view=AdminLootMenuView())
         except Exception:
-            await inter.response.send_message("✅ Aktion abgeschlossen.", ephemeral=True)
+            await _portal_send(inter, "✅ Aktion abgeschlossen.", ephemeral=True)
 
 
-class AdminLootSlotSelectView(View):
+class AdminLootSlotSelectView(PortalSafeView):
     def __init__(self, guild_id: int, user_id: int, action: str):
         super().__init__(timeout=None)
         self.guild_id = int(guild_id)
@@ -3636,9 +3727,9 @@ class AdminLootSlotSelectView(View):
             except ModuleNotFoundError:
                 from member_portal import AdminLootMenuView  # type: ignore
             emb = discord.Embed(title="🎁 Admin – Loot", description="Wähle eine Loot-Aktion.", color=discord.Color.gold())
-            await inter.response.edit_message(embed=emb, view=AdminLootMenuView())
+            await _portal_edit(inter, embed=emb, view=AdminLootMenuView())
         except Exception:
-            await inter.response.send_message("Zurück.", ephemeral=True)
+            await _portal_send(inter, "Zurück.", ephemeral=True)
 
 
 class AdminLootSlotSelect(Select):
@@ -3654,7 +3745,7 @@ class AdminLootSlotSelect(Select):
         if self.action == "add":
             if slot == "Waffe":
                 emb = discord.Embed(title="➕ Item hinzufügen – Waffentyp", description="Wähle den Waffentyp.", color=discord.Color.gold())
-                await inter.response.edit_message(embed=emb, view=AdminLootWeaponTypeSelectView(self.guild_id, self.user_id, slot))
+                await _portal_edit(inter, embed=emb, view=AdminLootWeaponTypeSelectView(self.guild_id, self.user_id, slot))
                 return
             await inter.response.send_modal(AdminItemAddModal(self.guild_id, self.user_id, slot, ""))
             return
@@ -3668,7 +3759,7 @@ class AdminLootSlotSelect(Select):
                 ),
                 color=discord.Color.gold(),
             )
-            await inter.response.edit_message(
+            await _portal_edit(inter, 
                 embed=emb,
                 view=AdminLootActionWeaponTypeSelectView(self.guild_id, self.user_id, self.action, slot),
             )
@@ -3679,7 +3770,7 @@ class AdminLootSlotSelect(Select):
         )
 
 
-class AdminLootWeaponTypeSelectView(View):
+class AdminLootWeaponTypeSelectView(PortalSafeView):
     def __init__(self, guild_id: int, user_id: int, slot: str):
         super().__init__(timeout=None)
         self.guild_id = int(guild_id)
@@ -3690,7 +3781,7 @@ class AdminLootWeaponTypeSelectView(View):
     @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="admin_loot_weapon_back")
     async def btn_back(self, inter: discord.Interaction, _):
         emb = discord.Embed(title="➕ Item hinzufügen", description="Wähle den Slot.", color=discord.Color.gold())
-        await inter.response.edit_message(embed=emb, view=AdminLootSlotSelectView(self.guild_id, self.user_id, "add"))
+        await _portal_edit(inter, embed=emb, view=AdminLootSlotSelectView(self.guild_id, self.user_id, "add"))
 
 
 class AdminLootWeaponTypeSelect(Select):
@@ -3705,7 +3796,7 @@ class AdminLootWeaponTypeSelect(Select):
         await inter.response.send_modal(AdminItemAddModal(self.guild_id, self.user_id, self.slot, self.values[0]))
 
 
-class AdminLootActionWeaponTypeSelectView(View):
+class AdminLootActionWeaponTypeSelectView(PortalSafeView):
     def __init__(self, guild_id: int, user_id: int, action: str, slot: str):
         super().__init__(timeout=None)
         self.guild_id = int(guild_id)
@@ -3717,7 +3808,7 @@ class AdminLootActionWeaponTypeSelectView(View):
     @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="admin_loot_action_weapon_back")
     async def btn_back(self, inter: discord.Interaction, _):
         emb = discord.Embed(title="🎁 Slot wählen", description="Wähle den Slot.", color=discord.Color.gold())
-        await inter.response.edit_message(embed=emb, view=AdminLootSlotSelectView(self.guild_id, self.user_id, self.action))
+        await _portal_edit(inter, embed=emb, view=AdminLootSlotSelectView(self.guild_id, self.user_id, self.action))
 
 
 class AdminLootActionWeaponTypeSelect(Select):
@@ -3755,19 +3846,19 @@ async def _show_admin_catalog_browser(
     page: int = 0,
 ) -> None:
     if not inter.response.is_done():
-        await inter.response.defer()
+        await _portal_defer(inter, thinking=False)
     rows, has_more = await _catalog_rows(slot, weapon_type, query, page)
     title = "📦 Loot gedroppt – Item aus Datenbank wählen" if action == "drop" else "🎁 Item aus Datenbank wählen"
     emb = _catalog_browser_embed(title, slot, weapon_type, query, page, len(rows))
     if not rows:
         emb.add_field(name="Keine Treffer", value="Ändere den Suchbegriff oder gehe zurück.", inline=False)
-    await inter.edit_original_response(
+    await _portal_edit(inter, 
         embed=emb,
         view=AdminCatalogBrowserView(guild_id, user_id, action, slot, weapon_type, query, page, rows, has_more),
     )
 
 
-class AdminCatalogSearchModal(Modal, title="Item in Datenbank suchen"):
+class AdminCatalogSearchModal(PortalSafeModal, title="Item in Datenbank suchen"):
     def __init__(self, guild_id: int, user_id: int, action: str, slot: str, weapon_type: str | None, current_query: str):
         super().__init__(timeout=300)
         self.guild_id = int(guild_id)
@@ -3798,12 +3889,12 @@ class AdminCatalogItemSelect(Select):
         view = self.view_ref
         guild = inter.client.get_guild(view.guild_id)
         if not guild:
-            await inter.response.send_message("❌ Server nicht gefunden.", ephemeral=True)
+            await _portal_send(inter, "❌ Server nicht gefunden.", ephemeral=True)
             return
         if inter.guild is not None and not _is_leader_or_admin(inter):
-            await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
+            await _portal_send(inter, "❌ Nur Leader/Admins.", ephemeral=True)
             return
-        await inter.response.defer()
+        await _portal_defer(inter, )
         try:
             catalog_id = int(self.values[0])
             item_id, item = await asyncio.to_thread(
@@ -3821,17 +3912,17 @@ class AdminCatalogItemSelect(Select):
                     ),
                     color=discord.Color.gold(),
                 )
-                await inter.edit_original_response(embed=emb, view=AdminLootDropConfirmView(view.guild_id, view.user_id, item_id))
+                await _portal_edit(inter, embed=emb, view=AdminLootDropConfirmView(view.guild_id, view.user_id, item_id))
                 return
             if view.action in {"mark", "unmark"}:
                 matches = _need_matches_for_item(guild, item_id, tab_filter=None, received=(view.action == "unmark"))
                 if not matches:
                     txt = "offenen" if view.action == "mark" else "als erhalten markierten"
                     emb = discord.Embed(title="Keine Treffer", description=f"Keine {txt} Need-Einträge für **{item_name}** gefunden.", color=discord.Color.orange())
-                    await inter.edit_original_response(embed=emb, view=AdminLootBackView())
+                    await _portal_edit(inter, embed=emb, view=AdminLootBackView())
                     return
                 emb = discord.Embed(title="👤 Spieler wählen", description=f"Item: **{item_name}**", color=discord.Color.gold())
-                await inter.edit_original_response(embed=emb, view=AdminLootUserSelectView(view.guild_id, view.user_id, view.action, item_id, matches))
+                await _portal_edit(inter, embed=emb, view=AdminLootUserSelectView(view.guild_id, view.user_id, view.action, item_id, matches))
                 return
             row = await asyncio.to_thread(runtime_db.get_catalog_item, catalog_id) or item
             details = [
@@ -3844,17 +3935,25 @@ class AdminCatalogItemSelect(Select):
             image = str(row.get("image_url") or row.get("icon_url") or "")
             if image:
                 emb.set_thumbnail(url=image)
-            await inter.edit_original_response(embed=emb, view=AdminCatalogBrowserView(view.guild_id, view.user_id, view.action, view.slot, view.weapon_type, view.query, view.page, [], view.has_more))
+            await _portal_edit(inter, embed=emb, view=AdminCatalogBrowserView(view.guild_id, view.user_id, view.action, view.slot, view.weapon_type, view.query, view.page, [], view.has_more))
         except Exception as exc:
-            await inter.edit_original_response(content=f"❌ Item konnte nicht verarbeitet werden: {type(exc).__name__}: {exc}", embed=None, view=None)
+            error_id = await _portal_log_event(
+                inter, event_type="Admin-Katalogfehler", error=exc, notify_user=False
+            )
+            embed = discord.Embed(
+                title="❌ Item konnte nicht verarbeitet werden",
+                description=f"Der Fehler wurde protokolliert.\nFehler-ID: `{error_id}`",
+                color=discord.Color.red(),
+            )
+            await _portal_edit(inter, embed=embed, view=AdminLootBackView())
 
 
-class AdminCatalogBrowserView(View):
+class AdminCatalogBrowserView(PortalSafeView):
     def __init__(
         self, guild_id: int, user_id: int, action: str, slot: str, weapon_type: str | None,
         query: str, page: int, rows: list[dict[str, Any]], has_more: bool,
     ):
-        super().__init__(timeout=600)
+        super().__init__(timeout=None)
         self.guild_id = int(guild_id)
         self.user_id = int(user_id)
         self.action = action
@@ -3888,10 +3987,10 @@ class AdminCatalogBrowserView(View):
     async def btn_back(self, inter: discord.Interaction, _):
         if self.slot == "Waffe" and self.weapon_type:
             emb = discord.Embed(title="🎁 Waffentyp wählen", description="Wähle den Waffentyp.", color=discord.Color.gold())
-            await inter.response.edit_message(embed=emb, view=AdminLootActionWeaponTypeSelectView(self.guild_id, self.user_id, self.action, self.slot))
+            await _portal_edit(inter, embed=emb, view=AdminLootActionWeaponTypeSelectView(self.guild_id, self.user_id, self.action, self.slot))
             return
         emb = discord.Embed(title="🎁 Slot wählen", description="Wähle den Slot.", color=discord.Color.gold())
-        await inter.response.edit_message(embed=emb, view=AdminLootSlotSelectView(self.guild_id, self.user_id, self.action))
+        await _portal_edit(inter, embed=emb, view=AdminLootSlotSelectView(self.guild_id, self.user_id, self.action))
 
 
 class AdminItemAddModal(Modal):
@@ -3906,20 +4005,20 @@ class AdminItemAddModal(Modal):
 
     async def on_submit(self, inter: discord.Interaction):
         if not _is_loot_admin_user(inter.client, self.guild_id, inter.user.id):
-            await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
+            await _portal_send(inter, "❌ Nur Leader/Admins.", ephemeral=True)
             return
         catalog_slot = _normalize_catalog_slot(self.slot)
         clean_name = _safe_text(str(self.name.value or ""))
         if not catalog_slot or not clean_name:
-            await inter.response.send_message("❌ Slot oder Itemname ungültig.", ephemeral=True)
+            await _portal_send(inter, "❌ Slot oder Itemname ungültig.", ephemeral=True)
             return
         wt = _normalize_weapon_type(self.weapon_type) if catalog_slot == "Waffe" else ""
         if catalog_slot == "Waffe" and not wt:
-            await inter.response.send_message("❌ Waffentyp fehlt.", ephemeral=True)
+            await _portal_send(inter, "❌ Waffentyp fehlt.", ephemeral=True)
             return
         existing = _find_item_by_name(self.guild_id, catalog_slot, clean_name)
         if existing:
-            await inter.response.send_message(f"⚠️ Dieses Item existiert bereits: **{clean_name}**", ephemeral=True)
+            await _portal_send(inter, f"⚠️ Dieses Item existiert bereits: **{clean_name}**", ephemeral=True)
             return
         item_id = _make_item_id(self.guild_id, catalog_slot, clean_name)
         obj = {"name": clean_name, "slot": catalog_slot, "created_at": _now_iso(), "created_by": int(inter.user.id)}
@@ -3933,10 +4032,10 @@ class AdminItemAddModal(Modal):
             description=f"**{clean_name}**\nSlot: **{catalog_slot}**{extra}\nID: `{item_id}`",
             color=discord.Color.green()
         )
-        await inter.response.send_message(embed=emb, ephemeral=True)
+        await _portal_send(inter, embed=emb, ephemeral=True)
 
 
-class AdminLootItemSelectView(View):
+class AdminLootItemSelectView(PortalSafeView):
     def __init__(self, guild_id: int, user_id: int, action: str, slot: str, weapon_type: str | None = None):
         super().__init__(timeout=None)
         self.guild_id = int(guild_id)
@@ -3950,10 +4049,10 @@ class AdminLootItemSelectView(View):
     async def btn_back(self, inter: discord.Interaction, _):
         if self.slot == "Waffe" and self.weapon_type:
             emb = discord.Embed(title="🎁 Waffentyp wählen", description="Wähle den Waffentyp.", color=discord.Color.gold())
-            await inter.response.edit_message(embed=emb, view=AdminLootActionWeaponTypeSelectView(self.guild_id, self.user_id, self.action, self.slot))
+            await _portal_edit(inter, embed=emb, view=AdminLootActionWeaponTypeSelectView(self.guild_id, self.user_id, self.action, self.slot))
             return
         emb = discord.Embed(title="🎁 Slot wählen", description="Wähle den Slot.", color=discord.Color.gold())
-        await inter.response.edit_message(embed=emb, view=AdminLootSlotSelectView(self.guild_id, self.user_id, self.action))
+        await _portal_edit(inter, embed=emb, view=AdminLootSlotSelectView(self.guild_id, self.user_id, self.action))
 
 
 class AdminLootItemSelect(Select):
@@ -3977,7 +4076,7 @@ class AdminLootItemSelect(Select):
     async def callback(self, inter: discord.Interaction):
         guild = inter.client.get_guild(self.guild_id)
         if not guild:
-            await inter.response.send_message("❌ Server nicht gefunden.", ephemeral=True)
+            await _portal_send(inter, "❌ Server nicht gefunden.", ephemeral=True)
             return
         item_id = self.values[0]
         item_name = _item_name(self.guild_id, item_id, with_type=True)
@@ -3992,7 +4091,7 @@ class AdminLootItemSelect(Select):
                 ),
                 color=discord.Color.gold()
             )
-            await inter.response.edit_message(embed=emb, view=AdminLootDropConfirmView(self.guild_id, self.user_id, item_id))
+            await _portal_edit(inter, embed=emb, view=AdminLootDropConfirmView(self.guild_id, self.user_id, item_id))
             return
 
         if self.action in {"mark", "unmark"}:
@@ -4000,13 +4099,13 @@ class AdminLootItemSelect(Select):
             if not matches:
                 txt = "offenen" if self.action == "mark" else "als erhalten markierten"
                 emb = discord.Embed(title="Keine Treffer", description=f"Keine {txt} Need-Einträge für **{item_name}** gefunden.", color=discord.Color.orange())
-                await inter.response.edit_message(embed=emb, view=AdminLootBackView())
+                await _portal_edit(inter, embed=emb, view=AdminLootBackView())
                 return
             emb = discord.Embed(title="👤 Spieler wählen", description=f"Item: **{item_name}**", color=discord.Color.gold())
-            await inter.response.edit_message(embed=emb, view=AdminLootUserSelectView(self.guild_id, self.user_id, self.action, item_id, matches))
+            await _portal_edit(inter, embed=emb, view=AdminLootUserSelectView(self.guild_id, self.user_id, self.action, item_id, matches))
 
 
-class AdminLootDropConfirmView(View):
+class AdminLootDropConfirmView(PortalSafeView):
     def __init__(self, guild_id: int, user_id: int, item_id: str):
         super().__init__(timeout=None)
         self.guild_id = int(guild_id)
@@ -4017,20 +4116,20 @@ class AdminLootDropConfirmView(View):
     async def btn_confirm(self, inter: discord.Interaction, _):
         guild = inter.client.get_guild(self.guild_id)
         if not guild:
-            await inter.response.send_message("❌ Server nicht gefunden.", ephemeral=True)
+            await _portal_send(inter, "❌ Server nicht gefunden.", ephemeral=True)
             return
         if inter.guild is not None and not _is_leader_or_admin(inter):
-            await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
+            await _portal_send(inter, "❌ Nur Leader/Admins.", ephemeral=True)
             return
         await _notify_main_need_drop(inter, guild, self.item_id)
 
     @button(label="❌ Abbrechen", style=ButtonStyle.danger, custom_id="admin_loot_drop_cancel")
     async def btn_cancel(self, inter: discord.Interaction, _):
         emb = discord.Embed(title="Abgebrochen", description="Es wurden keine Spieler benachrichtigt.", color=discord.Color.orange())
-        await inter.response.edit_message(embed=emb, view=AdminLootBackView())
+        await _portal_edit(inter, embed=emb, view=AdminLootBackView())
 
 
-class AdminLootUserSelectView(View):
+class AdminLootUserSelectView(PortalSafeView):
     def __init__(self, guild_id: int, user_id: int, action: str, item_id: str, matches: list[dict]):
         super().__init__(timeout=None)
         self.guild_id = int(guild_id)
@@ -4043,7 +4142,7 @@ class AdminLootUserSelectView(View):
     @button(label="⬅️ Zurück", style=ButtonStyle.secondary, custom_id="admin_loot_user_back")
     async def btn_back(self, inter: discord.Interaction, _):
         emb = discord.Embed(title="🎁 Slot wählen", description="Wähle den Slot und danach das Item erneut aus der Datenbank.", color=discord.Color.gold())
-        await inter.response.edit_message(embed=emb, view=AdminLootSlotSelectView(self.guild_id, self.user_id, self.action))
+        await _portal_edit(inter, embed=emb, view=AdminLootSlotSelectView(self.guild_id, self.user_id, self.action))
 
 
 class AdminLootUserSelect(Select):
@@ -4061,28 +4160,28 @@ class AdminLootUserSelect(Select):
     async def callback(self, inter: discord.Interaction):
         guild = inter.client.get_guild(self.guild_id)
         if not guild:
-            await inter.response.send_message("❌ Server nicht gefunden.", ephemeral=True)
+            await _portal_send(inter, "❌ Server nicht gefunden.", ephemeral=True)
             return
         if inter.guild is not None and not _is_leader_or_admin(inter):
-            await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
+            await _portal_send(inter, "❌ Nur Leader/Admins.", ephemeral=True)
             return
         try:
             uid_s, tab, slot = self.values[0].split("|", 2)
             uid = int(uid_s)
         except Exception:
-            await inter.response.send_message("❌ Auswahl konnte nicht gelesen werden.", ephemeral=True)
+            await _portal_send(inter, "❌ Auswahl konnte nicht gelesen werden.", ephemeral=True)
             return
         data = _user_needs(guild.id, uid)
         slot_data = _slot_obj((data.get(tab) or {}).get(slot))
         if str(slot_data.get("item_id", "") or "") != self.item_id:
-            await inter.response.send_message("❌ Der Need-Eintrag hat sich inzwischen geändert.", ephemeral=True)
+            await _portal_send(inter, "❌ Der Need-Eintrag hat sich inzwischen geändert.", ephemeral=True)
             return
         item_name = _item_name(guild.id, self.item_id, with_type=True)
         member = guild.get_member(uid)
         name = _profile_name(guild, uid, member.display_name if member else f"User {uid}")
         if self.action == "mark":
             if bool(slot_data.get("received", False)):
-                await inter.response.send_message("ℹ️ Dieser Slot ist bereits als erhalten markiert.", ephemeral=True)
+                await _portal_send(inter, "ℹ️ Dieser Slot ist bereits als erhalten markiert.", ephemeral=True)
                 return
             _mark_slot_received(data, tab, slot, inter.user.id)
             save_needs()
@@ -4092,14 +4191,14 @@ class AdminLootUserSelect(Select):
             except Exception:
                 pass
             emb = discord.Embed(title="✅ Item erhalten markiert", description=f"**{name}**\n**{tab} – {slot}:** {item_name} ✅ Erhalten", color=discord.Color.green())
-            await inter.response.edit_message(embed=emb, view=AdminLootBackView())
+            await _portal_edit(inter, embed=emb, view=AdminLootBackView())
             return
         if self.action == "unmark":
             if not bool(slot_data.get("received", False)):
-                await inter.response.send_message("ℹ️ Dieser Slot ist nicht als erhalten markiert.", ephemeral=True)
+                await _portal_send(inter, "ℹ️ Dieser Slot ist nicht als erhalten markiert.", ephemeral=True)
                 return
             _unmark_slot_received(data, tab, slot)
             save_needs()
             emb = discord.Embed(title="✅ Erhalten-Markierung entfernt", description=f"**{name}**\n**{tab} – {slot}:** {item_name}", color=discord.Color.green())
-            await inter.response.edit_message(embed=emb, view=AdminLootBackView())
+            await _portal_edit(inter, embed=emb, view=AdminLootBackView())
             return

@@ -877,6 +877,93 @@ async def setup_guild_config(bot: commands.Bot, tree: app_commands.CommandTree) 
             ephemeral=True,
         )
 
+    @guild_group.command(
+        name="portal_diagnose",
+        description="Prüft die aktive Gildenzentrale eines Spielers und repariert sie optional.",
+    )
+    @app_commands.describe(
+        member="Spieler, dessen private Gildenzentrale geprüft werden soll.",
+        reparieren="Setzt nur ein veraltetes/defektes Portal auf die stabile Startseite zurück.",
+    )
+    async def guild_portal_diagnose(
+        inter: discord.Interaction,
+        member: discord.Member,
+        reparieren: bool = False,
+    ):
+        if inter.guild is None:
+            await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
+            return
+        await inter.response.defer(ephemeral=True, thinking=True)
+        if not await asyncio.to_thread(_is_admin, inter):
+            await inter.followup.send("❌ Nur für Server-Admins/Leitung.", ephemeral=True)
+            return
+        if member.bot:
+            await inter.followup.send("❌ Bots besitzen keine Gildenzentrale.", ephemeral=True)
+            return
+
+        try:
+            from bot import member_portal as portal_mod  # type: ignore
+        except Exception:
+            import member_portal as portal_mod  # type: ignore
+
+        repair_status = "nicht ausgeführt"
+        if reparieren:
+            try:
+                status, _ = await portal_mod.repair_portal_for_member_now(
+                    bot, inter.guild, member
+                )
+                repair_status = str(status)
+            except Exception as exc:
+                repair_status = f"Fehler: {type(exc).__name__}: {str(exc)[:180]}"
+
+        try:
+            diag = await portal_mod.diagnose_portal_for_member(
+                bot, inter.guild, member
+            )
+        except Exception as exc:
+            await inter.followup.send(
+                f"❌ Portal-Diagnose fehlgeschlagen: `{type(exc).__name__}: {str(exc)[:500]}`",
+                ephemeral=True,
+            )
+            return
+
+        ids = list(diag.get("component_ids") or [])
+        unknown = list(diag.get("unknown_component_ids") or [])
+        component_text = ", ".join(f"`{cid}`" for cid in ids[:12]) or "—"
+        if len(ids) > 12:
+            component_text += f" … +{len(ids) - 12}"
+        unknown_text = ", ".join(f"`{cid}`" for cid in unknown[:10]) or "—"
+        if len(unknown) > 10:
+            unknown_text += f" … +{len(unknown) - 10}"
+
+        state_labels = {
+            "persistent": "✅ Neustartfest",
+            "dynamic_stale_after_restart": "⚠️ Dynamisches Untermenü / nach Neustart veraltet",
+            "no_components": "⚠️ Keine Buttons/Dropdowns vorhanden",
+            "missing": "❌ Portalnachricht fehlt",
+        }
+        state = str(diag.get("state") or "unbekannt")
+        embed = discord.Embed(
+            title=f"🩺 Portal-Diagnose · {member.display_name}",
+            color=discord.Color.green() if state == "persistent" else discord.Color.orange(),
+        )
+        embed.add_field(name="Status", value=state_labels.get(state, state), inline=False)
+        embed.add_field(
+            name="Nachricht",
+            value=(
+                f"Gespeicherte ID: `{int(diag.get('stored_message_id', 0) or 0)}`\n"
+                f"Gefundene ID: `{int(diag.get('message_id', 0) or 0)}`\n"
+                f"Aktive Aktion: **{'ja' if diag.get('busy') else 'nein'}**"
+            ),
+            inline=False,
+        )
+        embed.add_field(name="Komponenten", value=component_text[:1024], inline=False)
+        embed.add_field(name="Nicht neustartfeste Komponenten", value=unknown_text[:1024], inline=False)
+        if reparieren:
+            embed.add_field(name="Reparatur", value=repair_status[:1024], inline=False)
+        embed.set_footer(text="Dynamische Untermenüs werden nach einem Bot-Neustart bewusst auf die Startseite zurückgesetzt; die Funktionen bleiben erhalten.")
+        await inter.followup.send(embed=embed, ephemeral=True)
+
     @guild_group.command(name="cleanup_dms", description="Löscht alle Bot-DMs inkl. alter Gildenmenüs bei aktuellen Servermitgliedern.")
     @app_commands.describe(
         bestaetigen="Muss auf Ja stehen, weil die Löschung nicht rückgängig gemacht werden kann.",
