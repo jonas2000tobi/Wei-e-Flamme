@@ -15700,59 +15700,120 @@ def _discord_feed_escape_content(text: Any) -> str:
     return _e(text).replace("\n", "<br>")
 
 
-def _discord_feed_card(msg: dict[str, Any]) -> str:
-    author = msg.get("author_name") or msg.get("author") or "Discord"
-    avatar = str(msg.get("author_avatar_url") or "").strip()
-    created = _dt(msg.get("created_at")) if msg.get("created_at") else "—"
+def _discord_news_parts(msg: dict[str, Any]) -> dict[str, Any]:
+    """Bereitet eine Discord-Nachricht als redaktionellen News-Beitrag auf."""
     content = str(msg.get("content") or "").strip()
-    if not content and not (msg.get("embeds") or []) and not (msg.get("attachments") or []):
-        content = "—"
-    avatar_html = f'<img src="{_e(avatar)}" alt="" loading="lazy">' if avatar else '<span>💬</span>'
-    attachments_html = ""
-    atts = msg.get("attachments") if isinstance(msg.get("attachments"), list) else []
-    if atts:
-        links = []
-        for a in atts[:6]:
-            if not isinstance(a, dict):
-                continue
-            url = str(a.get("url") or "").strip()
-            name = str(a.get("filename") or "Anhang").strip()
-            ctype = str(a.get("content_type") or "").lower()
-            if url and ctype.startswith("image"):
-                links.append(f'<a class="discord-feed-image" href="{_e(url)}" target="_blank" rel="noopener"><img src="{_e(url)}" alt="{_e(name)}" loading="lazy"></a>')
-            elif url:
-                links.append(f'<a class="link" href="{_e(url)}" target="_blank" rel="noopener">📎 {_e(name)}</a>')
-        if links:
-            attachments_html = '<div class="discord-feed-attachments">' + ''.join(links) + '</div>'
-    embeds_html = ""
-    embeds = msg.get("embeds") if isinstance(msg.get("embeds"), list) else []
-    if embeds:
-        blocks = []
-        for ebd in embeds[:4]:
-            if not isinstance(ebd, dict):
-                continue
-            title = str(ebd.get("title") or "").strip()
-            desc = str(ebd.get("description") or "").strip()
-            url = str(ebd.get("url") or "").strip()
-            image = str(ebd.get("image_url") or ebd.get("thumbnail_url") or "").strip()
-            if not (title or desc or image):
-                continue
-            title_html = f'<a class="link" href="{_e(url)}" target="_blank" rel="noopener">{_e(title)}</a>' if title and url else (f'<strong>{_e(title)}</strong>' if title else '')
-            img_html = f'<img src="{_e(image)}" alt="" loading="lazy">' if image else ''
-            blocks.append(f'<div class="discord-embed">{title_html}<p>{_discord_feed_escape_content(desc)}</p>{img_html}</div>')
-        if blocks:
-            embeds_html = ''.join(blocks)
-    jump = str(msg.get("jump_url") or "").strip()
-    jump_html = f'<a class="btn small ghost" href="{_e(jump)}" target="_blank" rel="noopener">In Discord öffnen</a>' if jump else ""
+    embeds = [x for x in (msg.get("embeds") or []) if isinstance(x, dict)]
+    attachments = [x for x in (msg.get("attachments") or []) if isinstance(x, dict)]
+
+    embed_title = next((str(x.get("title") or "").strip() for x in embeds if str(x.get("title") or "").strip()), "")
+    embed_desc = next((str(x.get("description") or "").strip() for x in embeds if str(x.get("description") or "").strip()), "")
+
+    lines = [line.strip() for line in content.splitlines() if line.strip()]
+    first_line = lines[0] if lines else ""
+    clean_first = re.sub(r"^[#>*\-\s📣📰📌❗⚠️]+", "", first_line).strip()
+    title = embed_title or clean_first
+    if not title:
+        title = "Gilden-Neuigkeit"
+    if len(title) > 105:
+        title = title[:102].rstrip() + "…"
+
+    body_lines = lines[1:] if first_line and not embed_title else lines
+    body = "\n".join(body_lines).strip() or embed_desc
+    if not body and content != first_line:
+        body = content
+    if not body:
+        body = "Weitere Informationen findest du direkt im Beitrag."
+
+    cover = ""
+    for item in attachments:
+        url = str(item.get("url") or "").strip()
+        ctype = str(item.get("content_type") or "").lower()
+        filename = str(item.get("filename") or "").lower()
+        if url and (ctype.startswith("image") or filename.endswith((".png", ".jpg", ".jpeg", ".webp", ".gif"))):
+            cover = url
+            break
+    if not cover:
+        for item in embeds:
+            cover = str(item.get("image_url") or item.get("thumbnail_url") or "").strip()
+            if cover:
+                break
+
+    search_text = f"{title} {body}".casefold()
+    pinned = bool(msg.get("pinned")) or any(x in search_text for x in ("wichtig", "achtung", "dringend", "pflicht", "📌", "❗"))
+    if any(x in search_text for x in ("wartung", "update", "patch", "server")):
+        category = "Update"
+        category_icon = "🛠️"
+    elif any(x in search_text for x in ("event", "raid", "gildenboss", "termin", "anmeldung")):
+        category = "Event"
+        category_icon = "📅"
+    elif any(x in search_text for x in ("loot", "need", "auktion", "ec", "dkp")):
+        category = "Gildensystem"
+        category_icon = "🎁"
+    elif any(x in search_text for x in ("regel", "leitung", "gilde", "mitglied")):
+        category = "Gilde"
+        category_icon = "🛡️"
+    else:
+        category = "Neuigkeit"
+        category_icon = "📰"
+
+    return {
+        "title": title,
+        "body": body,
+        "cover": cover,
+        "category": category,
+        "category_icon": category_icon,
+        "pinned": pinned,
+        "author": msg.get("author_name") or msg.get("author") or "Beer and Buffs",
+        "avatar": str(msg.get("author_avatar_url") or "").strip(),
+        "created": _dt(msg.get("created_at")) if msg.get("created_at") else "—",
+        "jump": str(msg.get("jump_url") or "").strip(),
+        "attachments": attachments,
+        "embeds": embeds,
+    }
+
+
+def _discord_news_article(msg: dict[str, Any], *, featured: bool = False) -> str:
+    data = _discord_news_parts(msg)
+    cover = str(data.get("cover") or "")
+    cover_html = (
+        f'<div class="news-cover"><img src="{_e(cover)}" alt="" loading="lazy"></div>'
+        if cover else
+        '<div class="news-cover news-cover-placeholder"><span>🍺</span></div>'
+    )
+    avatar = str(data.get("avatar") or "")
+    avatar_html = f'<img src="{_e(avatar)}" alt="" loading="lazy">' if avatar else '<span>🍻</span>'
+    pinned = '<span class="news-priority">📌 Wichtig</span>' if data.get("pinned") else ""
+    jump = str(data.get("jump") or "")
+    jump_html = f'<a class="btn small" href="{_e(jump)}" target="_blank" rel="noopener">Vollständig in Discord lesen</a>' if jump else ""
+
+    extra_links: list[str] = []
+    for att in (data.get("attachments") or [])[:5]:
+        if not isinstance(att, dict):
+            continue
+        url = str(att.get("url") or "").strip()
+        name = str(att.get("filename") or "Anhang").strip()
+        ctype = str(att.get("content_type") or "").lower()
+        if url and not ctype.startswith("image"):
+            extra_links.append(f'<a class="news-file" href="{_e(url)}" target="_blank" rel="noopener">📎 {_e(name)}</a>')
+    file_html = '<div class="news-files">' + ''.join(extra_links) + '</div>' if extra_links else ""
+
+    article_class = "news-article featured" if featured else "news-article"
     return f"""
-    <article class="discord-feed-card">
-      <div class="discord-feed-avatar">{avatar_html}</div>
-      <div class="discord-feed-body">
-        <div class="discord-feed-head"><strong>{_e(author)}</strong><span>{_e(created)}</span></div>
-        <div class="discord-feed-content">{_discord_feed_escape_content(content)}</div>
-        {embeds_html}
-        {attachments_html}
-        <div class="discord-feed-actions">{jump_html}</div>
+    <article class="{article_class}">
+      {cover_html}
+      <div class="news-article-body">
+        <div class="news-label-row">
+          <span class="news-category">{_e(data.get('category_icon'))} {_e(data.get('category'))}</span>
+          {pinned}
+        </div>
+        <h2>{_e(data.get('title'))}</h2>
+        <div class="news-copy">{_discord_feed_escape_content(data.get('body'))}</div>
+        {file_html}
+        <div class="news-footer">
+          <div class="news-author"><span class="news-author-avatar">{avatar_html}</span><span><strong>{_e(data.get('author'))}</strong><small>{_e(data.get('created'))}</small></span></div>
+          {jump_html}
+        </div>
       </div>
     </article>
     """
@@ -15763,35 +15824,79 @@ def _render_discord_feed_page(data: dict[str, Any], *, key: str, title: str, sub
     feeds = snap.get("discord_feeds") if isinstance(snap.get("discord_feeds"), dict) else {}
     feed = feeds.get(key) if isinstance(feeds.get(key), dict) else {}
     messages = [m for m in (feed.get("messages") or []) if isinstance(m, dict)]
+    messages.sort(key=lambda m: str(m.get("created_at") or ""), reverse=True)
     channel_name = feed.get("channel_name") or feed.get("channel_id") or "nicht gesetzt"
-    status = "aktiv" if messages else ("Kanal gesetzt, aber keine Beiträge geladen" if feed.get("channel_id") else "Kanal noch nicht gesetzt")
-    cards = ''.join(_discord_feed_card(m) for m in messages) or f"""
-      <div class="empty">
-        Noch keine Beiträge im Snapshot. Setze im Bot/Railway <code>{_e(env_hint)}</code>, lass den Bot einen neuen Dashboard-Snapshot veröffentlichen und lade diese Seite danach neu.
-      </div>
-    """
+    status = "Aktuell" if messages else ("Kanal verbunden" if feed.get("channel_id") else "Noch nicht verbunden")
+
+    featured_html = ""
+    article_grid = ""
+    if messages:
+        priority_index = next((idx for idx, message in enumerate(messages) if _discord_news_parts(message).get("pinned")), 0)
+        featured_message = messages[priority_index]
+        remaining = [m for idx, m in enumerate(messages) if idx != priority_index]
+        featured_html = _discord_news_article(featured_message, featured=True)
+        article_grid = ''.join(_discord_news_article(message) for message in remaining)
+    else:
+        featured_html = f"""
+        <div class="news-empty">
+          <div class="news-empty-icon">📭</div>
+          <h2>Noch keine Beiträge</h2>
+          <p>Im aktuellen Bot-Snapshot wurden keine Meldungen gefunden.</p>
+          <small>Prüfe den konfigurierten Discord-Kanal und veröffentliche danach einen neuen Dashboard-Snapshot. Technischer Hinweis: <code>{_e(env_hint)}</code></small>
+        </div>
+        """
+
     css = """
     <style>
-      .discord-feed-list{display:grid;gap:14px;margin-top:12px}
-      .discord-feed-card{display:grid;grid-template-columns:52px minmax(0,1fr);gap:12px;padding:14px;border:1px solid rgba(214,168,79,.16);border-radius:16px;background:linear-gradient(135deg,rgba(16,21,29,.86),rgba(0,0,0,.46));box-shadow:0 12px 32px rgba(0,0,0,.18)}
-      .discord-feed-avatar{width:52px;height:52px;border-radius:16px;border:1px solid rgba(214,168,79,.28);background:rgba(0,0,0,.28);display:grid;place-items:center;overflow:hidden;color:var(--gold);font-size:24px}
-      .discord-feed-avatar img{width:100%;height:100%;object-fit:cover}.discord-feed-head{display:flex;justify-content:space-between;gap:10px;align-items:center;flex-wrap:wrap}.discord-feed-head strong{color:#dfe7ef}.discord-feed-head span{color:var(--muted);font-size:12px}.discord-feed-content{margin-top:6px;line-height:1.55;white-space:normal}.discord-feed-actions{margin-top:10px}.discord-feed-attachments{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}.discord-feed-image img{max-width:220px;max-height:160px;object-fit:cover;border-radius:12px;border:1px solid rgba(214,168,79,.2)}.discord-embed{margin-top:10px;border-left:3px solid rgba(214,168,79,.55);background:rgba(0,0,0,.22);border-radius:10px;padding:10px}.discord-embed p{margin:5px 0 0}.discord-embed img{display:block;max-width:280px;max-height:180px;object-fit:cover;border-radius:10px;margin-top:8px}.btn.small{padding:7px 10px;font-size:12px}
-      @media(max-width:620px){.discord-feed-card{grid-template-columns:40px minmax(0,1fr);padding:12px}.discord-feed-avatar{width:40px;height:40px;border-radius:12px}.discord-feed-image img,.discord-embed img{max-width:100%;height:auto}}
+      .news-page-head{display:flex;justify-content:space-between;gap:22px;align-items:end;margin-bottom:18px}
+      .news-page-head h1{margin:.25rem 0 .35rem;font-size:clamp(30px,4vw,52px)}
+      .news-page-head p{max-width:760px;margin:0;color:var(--muted);font-size:16px;line-height:1.6}
+      .news-overview{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin:16px 0 22px}
+      .news-overview-card{padding:14px 16px;border:1px solid rgba(214,168,79,.18);border-radius:16px;background:rgba(7,7,8,.62)}
+      .news-overview-card span{display:block;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.09em;font-weight:900}
+      .news-overview-card strong{display:block;margin-top:5px;color:#f0d490;font-size:16px;overflow-wrap:anywhere}
+      .news-article{display:grid;grid-template-rows:210px minmax(0,1fr);overflow:hidden;border:1px solid rgba(214,168,79,.18);border-radius:22px;background:linear-gradient(160deg,rgba(25,18,11,.96),rgba(8,8,9,.96));box-shadow:0 18px 42px rgba(0,0,0,.25)}
+      .news-article.featured{grid-template-columns:minmax(280px,42%) minmax(0,1fr);grid-template-rows:none;min-height:360px;border-color:rgba(230,186,88,.38);margin-bottom:22px}
+      .news-cover{position:relative;min-height:210px;overflow:hidden;background:radial-gradient(circle at 30% 25%,rgba(222,177,78,.22),rgba(0,0,0,.34))}
+      .news-cover img{width:100%;height:100%;object-fit:cover;display:block;transition:transform .3s ease}
+      .news-article:hover .news-cover img{transform:scale(1.025)}
+      .news-cover-placeholder{display:grid;place-items:center;font-size:72px;color:#e1b75e}
+      .news-article-body{display:flex;flex-direction:column;padding:20px;min-width:0}
+      .news-article.featured .news-article-body{padding:28px}
+      .news-label-row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:11px}
+      .news-category,.news-priority{display:inline-flex;align-items:center;padding:6px 10px;border-radius:999px;font-size:11px;font-weight:950;text-transform:uppercase;letter-spacing:.07em}
+      .news-category{background:rgba(214,168,79,.12);color:#f0d18b;border:1px solid rgba(214,168,79,.24)}
+      .news-priority{background:rgba(186,58,49,.16);color:#ffaaa2;border:1px solid rgba(255,104,92,.24)}
+      .news-article h2{margin:0 0 10px;color:#f5e3b5;font-size:clamp(21px,2.1vw,31px);line-height:1.15}
+      .news-copy{color:#d7d8dc;line-height:1.65;display:-webkit-box;-webkit-line-clamp:7;-webkit-box-orient:vertical;overflow:hidden}
+      .news-article:not(.featured) .news-copy{-webkit-line-clamp:5}
+      .news-footer{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-top:auto;padding-top:18px}
+      .news-author{display:flex;align-items:center;gap:10px;min-width:0}
+      .news-author-avatar{width:38px;height:38px;border-radius:50%;display:grid;place-items:center;overflow:hidden;background:#17120c;border:1px solid rgba(214,168,79,.24)}
+      .news-author-avatar img{width:100%;height:100%;object-fit:cover}
+      .news-author>span:last-child{display:grid;min-width:0}.news-author strong{font-size:13px}.news-author small{font-size:11px;color:var(--muted)}
+      .news-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}
+      .news-files{display:flex;flex-wrap:wrap;gap:7px;margin-top:13px}.news-file{font-size:12px;color:#e2c276;text-decoration:none;padding:6px 9px;border-radius:9px;background:rgba(214,168,79,.08)}
+      .news-empty{display:grid;place-items:center;text-align:center;padding:54px 24px;border:1px dashed rgba(214,168,79,.26);border-radius:22px;background:rgba(0,0,0,.20)}
+      .news-empty-icon{font-size:54px}.news-empty h2{margin:10px 0 5px}.news-empty p{margin:0 0 8px;color:var(--muted)}
+      .btn.small{padding:8px 11px;font-size:12px}
+      @media(max-width:980px){.news-article.featured{grid-template-columns:1fr;grid-template-rows:260px auto}.news-grid{grid-template-columns:1fr}.news-overview{grid-template-columns:1fr 1fr}.news-page-head{align-items:start;flex-direction:column}}
+      @media(max-width:620px){.news-overview{grid-template-columns:1fr}.news-article.featured{grid-template-rows:210px auto}.news-article-body,.news-article.featured .news-article-body{padding:17px}.news-footer{align-items:stretch}.news-footer .btn{width:100%;text-align:center}}
     </style>
     """
     body = f"""
     {css}
-    <section class="hero">
-      <div><div class="eyebrow">Discord → Dashboard</div><h1>{_e(title)}</h1><p>{_e(subtitle)}</p></div>
-      <div class="hero-actions"><a class="hero-action" href="/items"><span>🧰</span><strong>Item-Datenbank</strong><small>Questlog</small></a></div>
+    <section class="news-page-head">
+      <div><div class="eyebrow">Schwarzes Brett</div><h1>{_e(title)}</h1><p>{_e(subtitle)}</p></div>
+      <a class="btn" href="/">Zur Startseite</a>
     </section>
-    <section class="grid">
-      {_card('Status', status, 'Discord Feed')}
-      {_card('Kanal', channel_name, str(feed.get('channel_id') or '—'))}
-      {_card('Beiträge', len(messages), 'geladen')}
-      {_card('Letztes Update', _dt(feed.get('fetched_at')) if feed.get('fetched_at') else '—', 'Bot-Snapshot')}
+    <section class="news-overview">
+      <div class="news-overview-card"><span>Status</span><strong>{_e(status)}</strong></div>
+      <div class="news-overview-card"><span>Quelle</span><strong># {_e(channel_name)}</strong></div>
+      <div class="news-overview-card"><span>Letzte Aktualisierung</span><strong>{_e(_dt(feed.get('fetched_at')) if feed.get('fetched_at') else '—')}</strong></div>
     </section>
-    <section class="panel"><h2>{_e(title)}</h2><div class="discord-feed-list">{cards}</div></section>
+    <section class="news-featured">{featured_html}</section>
+    {f'<section class="news-grid">{article_grid}</section>' if article_grid else ''}
     """
     return _html_shell(f"{title} · Beer and Buffs Dashboard", body)
 
@@ -15811,33 +15916,14 @@ def auctions_alias() -> RedirectResponse:
 
 
 @app.get("/announcements", response_class=HTMLResponse)
-def announcements_page() -> HTMLResponse:
-    body = """
-    <section class="hero">
-      <div>
-        <h1>📣 Ankündigungen</h1>
-        <p>Gildenankündigungen, wichtige Hinweise und geplante News-Beiträge.</p>
-      </div>
-      <div class="hero-actions">
-        <a class="hero-action" href="/events"><span>📅</span><strong>Events</strong><small>Termine prüfen</small></a>
-        <a class="hero-action" href="/loot"><span>🎁</span><strong>Auktionen</strong><small>Loot & Gebote</small></a>
-        <a class="hero-action" href="/admin"><span>⚙️</span><strong>Admin</strong><small>Leitung</small></a>
-      </div>
-    </section>
-    <section class="panel">
-      <h2>Ankündigungs-Zentrale</h2>
-      <p class="muted">Platzhalter-Seite. Hier können später Discord-Ankündigungen, geplante Posts und Gilden-News aus dem Bot-Snapshot angezeigt werden.</p>
-      <div class="subpanel">
-        <strong>Geplant:</strong>
-        <ul>
-          <li>Letzte Discord-Ankündigungen spiegeln</li>
-          <li>Neue Ankündigung als Admin vorbereiten</li>
-          <li>Wichtige Gildeninfos oben anpinnen</li>
-        </ul>
-      </div>
-    </section>
-    """
-    return _html_shell("Ankündigungen · Beer and Buffs Dashboard", body)
+def announcements_page(_: bool = Depends(_auth)) -> HTMLResponse:
+    return HTMLResponse(_render_discord_feed_page(
+        _snapshot_payload(),
+        key="announcements",
+        title="📣 Ankündigungen",
+        subtitle="Wichtige Gildenmeldungen als übersichtliches schwarzes Brett – nicht als Chatverlauf.",
+        env_hint="DASHBOARD_ANNOUNCEMENTS_CHANNEL_ID",
+    ))
 
 
 @app.get("/tnl/news", response_class=HTMLResponse)
@@ -15846,7 +15932,7 @@ def tnl_news_page(_: bool = Depends(_auth)) -> HTMLResponse:
         _snapshot_payload(),
         key="news",
         title="📰 TnL News",
-        subtitle="Jede Nachricht aus dem gesetzten Discord-News-Kanal wird hier als eigener News-Beitrag angezeigt.",
+        subtitle="Aktuelle Spielmeldungen als redaktionelle Übersicht mit Titelbild, Kategorie und hervorgehobenem Hauptbeitrag.",
         env_hint="DASHBOARD_NEWS_CHANNEL_ID",
     ))
 
