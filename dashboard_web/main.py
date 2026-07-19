@@ -7292,38 +7292,59 @@ def _weapon_type_from_text(text: Any) -> str:
 
 
 def _need_item_slot_matches(item_slot: str, target_slot: str, item_name: str = "") -> bool:
+    """Strikte Slot-Zuordnung für Needliste und Builder.
+
+    Ein Helm-Slot darf niemals auf den gesamten Katalog zurückfallen. Nur Items,
+    deren importierte Kategorie oder eindeutiger Name zum Slot passt, werden
+    zugelassen. Nummerierte Doppel-Slots teilen dieselbe Katalogkategorie.
+    """
     item_slot_l = str(item_slot or "").strip().lower()
     target_l = str(target_slot or "").strip().lower()
-    name_l = str(item_name or "").lower()
+    name_l = str(item_name or "").strip().lower()
     if not target_l:
-        return True
-    if item_slot_l == target_l:
-        return True
-    if target_l.startswith("waffe"):
-        return item_slot_l.startswith("waffe") or bool(_weapon_type_from_text(item_name))
-    if target_l.startswith("ring"):
-        return item_slot_l.startswith("ring") or "ring" in name_l
-    if target_l in item_slot_l or item_slot_l in target_l:
-        return True
-    # Wenn kein Slot bekannt ist, einfache Namenshinweise zulassen.
-    if not item_slot_l:
-        hints = {
-            "helm": ["helm", "hut", "kappe", "haube"],
-            "brust": ["rüstung", "robe", "panzer", "brust", "gewand"],
-            "hose": ["hose", "beinschutz", "bein"],
-            "handschuhe": ["handschuh", "stulpen"],
-            "schuhe": ["schuh", "stiefel"],
-            "brosche": ["brosche"],
-            "ohrringe": ["ohrring", "ohrringe"],
-            "kette": ["kette", "halskette"],
-            "armband": ["armband", "armreif"],
-            "gürtel": ["gürtel", "guertel"],
-            "umhang": ["umhang", "mantel"],
-            "fähigkeitskern": ["fähigkeitskern", "faehigkeitskern", "kern"],
-        }
-        return any(h in name_l for h in hints.get(target_l, []))
-    return False
+        return False
 
+    def base_slot(value: str) -> str:
+        value = value.strip().lower()
+        aliases = {
+            "waffe 1": "waffe", "waffe 2": "waffe", "weapon": "waffe",
+            "ring 1": "ring", "ring 2": "ring",
+            "fähigkeitskern 1": "fähigkeitskern", "fähigkeitskern 2": "fähigkeitskern",
+            "faehigkeitskern 1": "fähigkeitskern", "faehigkeitskern 2": "fähigkeitskern",
+            "earring": "ohrringe", "necklace": "kette", "bracelet": "armband",
+            "brooch": "brosche", "belt": "gürtel", "cloak": "umhang",
+            "helmet": "helm", "chest": "brust", "pants": "hose",
+            "gloves": "handschuhe", "boots": "schuhe",
+        }
+        return aliases.get(value, value)
+
+    target_base = base_slot(target_l)
+    item_base = base_slot(item_slot_l)
+
+    if item_base and item_base == target_base:
+        return True
+    if target_base == "waffe":
+        return item_base == "waffe" or bool(_weapon_type_from_text(item_name))
+
+    hints = {
+        "helm": ("helm", "hut", "kappe", "haube"),
+        "brust": ("rüstung", "ruestung", "robe", "panzer", "brust", "gewand"),
+        "hose": ("hose", "beinschutz", "beinpanzer"),
+        "handschuhe": ("handschuh", "stulpen"),
+        "schuhe": ("schuh", "stiefel"),
+        "brosche": ("brosche",),
+        "ohrringe": ("ohrring",),
+        "kette": ("halskette", "kette"),
+        "armband": ("armband", "armreif"),
+        "ring": ("ring", "band der"),
+        "gürtel": ("gürtel", "guertel", "schärpe", "schaerpe"),
+        "umhang": ("umhang", "mantel"),
+        "fähigkeitskern": ("fähigkeitskern", "faehigkeitskern", "skill core", "skillcore"),
+    }
+    # Namensheuristik nur verwenden, wenn der Importer keine Kategorie geliefert hat.
+    if not item_base:
+        return any(h in name_l for h in hints.get(target_base, ()))
+    return False
 
 def _need_slot_picker_html(snap: dict[str, Any], *, input_id: str, slot: str, name: str = "item_text", required: bool = False, placeholder: str = "Item auswählen oder tippen") -> str:
     """Kompakter Slot-Picker.
@@ -7383,8 +7404,6 @@ def _need_slot_select_only_html(
     """Katalogauswahl für die persönliche Needliste – bewusst ohne Freitext."""
     items = _loot_catalog_items(snap, limit=4000)
     filtered = [it for it in items if _need_item_slot_matches(it.get("slot", ""), slot, it.get("name", ""))]
-    if not filtered:
-        filtered = items
     selected = str(selected_value or "").strip()
     required_attr = " required" if required else ""
 
@@ -10733,186 +10752,216 @@ def _render_need_editor_panel(user_id: int, current_user: Optional[dict[str, Any
     catalog_by_name = {_loot_key(it.get("name")): it for it in catalog_items if _loot_key(it.get("name"))}
 
     slot_icons = {
-        "Waffe 1": "⚔️", "Waffe 2": "🗡️", "Fähigkeitskern 1": "✨", "Fähigkeitskern 2": "✨",
+        "Waffe 1": "⚔️", "Waffe 2": "🗡️", "Fähigkeitskern 1": "✨", "Fähigkeitskern 2": "🌟",
         "Helm": "🪖", "Brust": "🦺", "Hose": "👖", "Handschuhe": "🧤", "Schuhe": "🥾",
-        "Umhang": "🧥", "Kette": "📿", "Armband": "🫳", "Brosche": "🎖️", "Ring": "💍",
-        "Gürtel": "🪢", "Ohrringe": "🪙",
+        "Umhang": "🧥", "Kette": "📿", "Armband": "🫳", "Brosche": "🎖️", "Ohrringe": "💠",
+        "Ring 1": "💍", "Ring 2": "💍", "Gürtel": "🪢",
+    }
+    slot_areas = {
+        "Helm": "head", "Kette": "neck", "Ohrringe": "ear", "Umhang": "cloak",
+        "Waffe 1": "weapon1", "Waffe 2": "weapon2", "Brust": "chest", "Handschuhe": "hands",
+        "Hose": "legs", "Schuhe": "feet", "Gürtel": "belt", "Armband": "bracelet",
+        "Brosche": "brooch", "Ring 1": "ring1", "Ring 2": "ring2",
+        "Fähigkeitskern 1": "core1", "Fähigkeitskern 2": "core2",
     }
 
-    def _item_preview_model(entry: Any) -> tuple[str, str, str]:
+    def item_model(entry: Any) -> tuple[str, str, str]:
         current = _need_item_display(entry) if entry else ""
         item = catalog_by_name.get(_loot_key(current), {}) if current else {}
         image_url = str(item.get("image_url") or "").strip() if isinstance(item, dict) else ""
-        rarity = str((item or {}).get("rarity") or "").strip() if isinstance(item, dict) else ""
+        rarity = str(item.get("rarity") or "").strip() if isinstance(item, dict) else ""
         return current, image_url, rarity
 
-    def _character_slots(tab: str, slot_map: dict[str, Any]) -> str:
-        cards: list[str] = []
-        idx = 0
-        for _, slots in _NEED_SLOT_GROUPS:
-            for slot in slots:
-                idx += 1
-                current, image_url, _ = _item_preview_model(slot_map.get(slot))
-                icon = slot_icons.get(slot, "🧩")
-                img_html = f'<img src="{_e(image_url)}" alt="{_e(current or slot)}" loading="lazy">' if image_url else f'<div class="need-slot-placeholder">{_e(icon)}</div>'
-                state = current or 'leer'
-                cards.append(
-                    f'<a class="need-gear-card" href="#need-row-{_e(tab.lower())}-{idx}" data-target-row="need-row-{_e(tab.lower())}-{idx}">'
-                    f'<div class="need-gear-thumb">{img_html}</div>'
-                    f'<div class="need-gear-copy"><strong>{_e(slot)}</strong><small>{_e(_short(state, 42))}</small></div>'
-                    f'</a>'
-                )
-        return ''.join(cards)
+    def preview_html(slot: str, current: str, image_url: str, *, large: bool = False) -> str:
+        cls = "equipment-img large" if large else "equipment-img"
+        if image_url:
+            return f'<img class="{cls}" src="{_e(image_url)}" alt="{_e(current or slot)}" loading="lazy">'
+        return f'<div class="equipment-placeholder{(" large" if large else "")}">{_e(slot_icons.get(slot, "🧩"))}</div>'
 
-    def row_html(tab: str, slot: str, entry: Any, idx: int) -> str:
+    def editor_html(tab: str, slot: str, entry: Any, idx: int) -> str:
         locked = bool(entry and _need_is_received(entry))
-        current, image_url, rarity = _item_preview_model(entry)
-        input_id = f"need-inline-{int(user_id)}-{tab.lower()}-{idx}"
-        slot_id = f"need-slot-fixed-{int(user_id)}-{tab.lower()}-{idx}"
-        row_id = f"need-row-{tab.lower()}-{idx}"
+        current, image_url, rarity = item_model(entry)
+        input_id = f"need-equipment-{int(user_id)}-{tab.lower()}-{idx}"
+        slot_id = f"need-equipment-slot-{int(user_id)}-{tab.lower()}-{idx}"
+        editor_id = f"need-equipment-editor-{tab.lower()}-{idx}"
         hidden_slot = f'<select id="{_e(slot_id)}" class="need-slot-select" name="slot" style="display:none"><option selected value="{_e(slot)}">{_e(slot)}</option></select>'
-        preview_html = f'<img src="{_e(image_url)}" alt="{_e(current or slot)}" loading="lazy">' if image_url else f'<div class="need-slot-placeholder large">{_e(slot_icons.get(slot, "🧩"))}</div>'
-        state_badge = '<span class="need-state locked">erhalten</span>' if locked else ('<span class="need-state filled">gesetzt</span>' if current else '<span class="need-state empty">leer</span>')
+        image = preview_html(slot, current, image_url, large=True)
         if locked:
             return f"""
-            <div class="need-inline-row locked" id="{_e(row_id)}" data-empty-icon="{_e(slot_icons.get(slot, "🧩"))}">
-              <div class="need-inline-preview">{preview_html}</div>
-              <div class="need-inline-content">
-                <div class="need-inline-head"><div><div class="need-inline-slot">{_e(slot)}</div><div class="need-inline-current">{_e(current or '—')}</div></div>{state_badge}</div>
-                <div class="muted">Dieses Item ist bereits erhalten und deshalb gesperrt.</div>
+            <section class="equipment-editor" id="{_e(editor_id)}" data-tab="{_e(tab.lower())}" hidden>
+              <div class="equipment-editor-preview">{image}</div>
+              <div class="equipment-editor-main">
+                <div class="equipment-editor-title"><div><span>{_e(slot)}</span><strong>{_e(current or '—')}</strong></div><span class="need-state locked">Erhalten</span></div>
+                <p class="muted">Dieser Slot ist als erhalten markiert und bleibt gesperrt. Nur die Gildenleitung kann ihn wieder freigeben.</p>
               </div>
-            </div>"""
+            </section>"""
         picker = _need_slot_select_only_html(snap, input_id=input_id, slot=slot, name="item_text", selected_value=current, required=False)
         return f"""
-        <form class="need-inline-row" method="post" action="/portal/member/{int(user_id)}/need-change" id="{_e(row_id)}" data-live-preview="1" data-empty-icon="{_e(slot_icons.get(slot, "🧩"))}">
+        <form class="equipment-editor" id="{_e(editor_id)}" data-tab="{_e(tab.lower())}" data-live-preview="1" data-empty-icon="{_e(slot_icons.get(slot, '🧩'))}" hidden method="post" action="/portal/member/{int(user_id)}/need-change">
           <input type="hidden" name="action_type" value="set">
           <input type="hidden" name="tab" value="{_e(tab)}">
           {hidden_slot}
-          <div class="need-inline-preview" data-preview-box="1">{preview_html}</div>
-          <div class="need-inline-content">
-            <div class="need-inline-head"><div><div class="need-inline-slot">{_e(slot)}</div><div class="need-inline-current" data-preview-label="1">{_e(current or 'Noch nichts ausgewählt')}</div></div>{state_badge}</div>
-            <div class="need-inline-picker">{picker}</div>
-            <div class="need-inline-actions">
-              <button class="btn mini-btn" type="submit">Speichern</button>
-              <button class="btn mini-btn ghost" type="submit" name="action_type" value="clear" onclick="return confirm('Need für {_e(slot)} entfernen?')">Leeren</button>
+          <div class="equipment-editor-preview" data-preview-box="1">{image}</div>
+          <div class="equipment-editor-main">
+            <div class="equipment-editor-title"><div><span>{_e(slot)}</span><strong data-preview-label="1">{_e(current or 'Noch kein Item gewählt')}</strong></div><span class="need-state {('filled' if current else 'empty')}">{('Gesetzt' if current else 'Leer')}</span></div>
+            <div class="equipment-editor-picker">{picker}</div>
+            <div class="equipment-editor-actions">
+              <button class="btn" type="submit">Auswahl speichern</button>
+              <button class="btn ghost" type="submit" name="action_type" value="clear" onclick="return confirm('Need für {_e(slot)} entfernen?')">Slot leeren</button>
             </div>
-            <div class="need-inline-meta">{_e(rarity or 'Katalogeintrag')} · Slot: {_e(slot)}</div>
+            <small class="muted">{_e(rarity or 'Item-Datenbank')} · Es werden ausschließlich passende Items für {_e(slot)} angezeigt.</small>
           </div>
         </form>"""
 
     def board_html(tab: str, slot_map: dict[str, Any]) -> str:
-        blocks = []
+        cards: list[str] = []
+        editors: list[str] = []
         idx = 0
-        for title, slots in _NEED_SLOT_GROUPS:
-            rows = []
+        for _, slots in _NEED_SLOT_GROUPS:
             for slot in slots:
                 idx += 1
-                rows.append(row_html(tab, slot, slot_map.get(slot), idx))
-            blocks.append(f'<div class="need-slot-group"><h3>{_e(title)}</h3><div class="need-slot-group-body">{"".join(rows)}</div></div>')
-        return (
-            f'<div class="need-board edit-board">'
-            f'<div class="need-board-header"><h3>{_e(tab)}</h3><p class="muted">Charakterübersicht oben, darunter die direkte Auswahl. Nur Katalog-Items, kein Freitext.</p></div>'
-            f'<div class="need-gear-grid">{_character_slots(tab, slot_map)}</div>'
-            f'{"".join(blocks)}'
-            f'</div>'
-        )
+                current, image_url, rarity = item_model(slot_map.get(slot))
+                editor_id = f"need-equipment-editor-{tab.lower()}-{idx}"
+                area = slot_areas.get(slot, "auto")
+                locked = bool(slot_map.get(slot) and _need_is_received(slot_map.get(slot)))
+                state_cls = "locked" if locked else ("filled" if current else "empty")
+                state_txt = "🔒" if locked else ("✓" if current else "+")
+                cards.append(f"""
+                <button type="button" class="equipment-slot {state_cls}" style="grid-area:{_e(area)}" data-open-equipment="{_e(editor_id)}" data-tab="{_e(tab.lower())}" aria-controls="{_e(editor_id)}">
+                  <span class="equipment-slot-art">{preview_html(slot, current, image_url)}</span>
+                  <span class="equipment-slot-label">{_e(slot)}</span>
+                  <span class="equipment-slot-item">{_e(_short(current or 'Leer', 33))}</span>
+                  <span class="equipment-slot-state">{state_txt}</span>
+                </button>""")
+                editors.append(editor_html(tab, slot, slot_map.get(slot), idx))
+        return f"""
+        <section class="equipment-tab" data-equipment-tab="{_e(tab.lower())}"{('' if tab == 'Main' else ' hidden')}>
+          <div class="equipment-window">
+            <div class="equipment-window-head"><div><span class="eyebrow">Need-Bereich</span><h3>{_e(tab)}</h3></div><p>Slot anklicken und anschließend ausschließlich passende Items auswählen.</p></div>
+            <div class="equipment-grid">{''.join(cards)}</div>
+            <div class="equipment-editor-empty" data-editor-empty="{_e(tab.lower())}">⬆️ Klicke auf einen Equipment-Slot, um ihn zu bearbeiten.</div>
+            <div class="equipment-editors">{''.join(editors)}</div>
+          </div>
+        </section>"""
 
     actor_hint = "Du bearbeitest deine eigene Needliste." if current_user else "Leitungsbearbeitung für dieses Mitglied."
     history_html = "" if compact else f"<h3>Änderungslog</h3>{_table(['Zeit','Status','Aktion','Bereich','Slot','Ergebnis'], req_rows, placeholder='Need-Änderungen durchsuchen…')}"
+
     return f"""
-    <section class="panel need-editor-panel" id="need-editor">
-      <h2>🎯 Needliste auswählen</h2>
-      <p class="muted">{_e(actor_hint)} Oben siehst du pro Bereich ein kompaktes Charakterfenster. Darunter wählst du die Items direkt aus und speicherst sie slotweise.</p>
-      <style>
-        .need-editor-panel{{overflow:hidden}}
-        .need-editor-layout{{display:grid;grid-template-columns:repeat(auto-fit,minmax(460px,1fr));gap:18px;align-items:start}}
-        .need-board{{border:1px solid rgba(214,168,79,.22);border-radius:22px;background:linear-gradient(180deg,rgba(29,19,11,.95),rgba(9,8,7,.92));padding:18px;box-shadow:0 14px 34px rgba(0,0,0,.28)}}
-        .need-board-header{{margin-bottom:14px}}
-        .need-board h3{{margin:0 0 6px 0;color:#f3d48c}}
-        .need-gear-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin:0 0 16px 0}}
-        .need-gear-card{{display:grid;grid-template-columns:56px minmax(0,1fr);gap:10px;align-items:center;padding:10px 12px;border-radius:16px;text-decoration:none;color:inherit;background:rgba(255,255,255,.03);border:1px solid rgba(214,168,79,.16);transition:transform .12s ease,border-color .12s ease,background .12s ease}}
-        .need-gear-card:hover{{transform:translateY(-1px);border-color:rgba(214,168,79,.36);background:rgba(214,168,79,.06)}}
-        .need-gear-thumb{{width:56px;height:56px;border-radius:14px;overflow:hidden;display:grid;place-items:center;background:radial-gradient(circle at 30% 30%,rgba(255,219,120,.16),rgba(0,0,0,.22));border:1px solid rgba(214,168,79,.2)}}
-        .need-gear-thumb img,.need-inline-preview img{{width:100%;height:100%;object-fit:contain;display:block}}
-        .need-slot-placeholder{{display:grid;place-items:center;width:100%;height:100%;font-size:26px;color:#e3bf73}}
-        .need-slot-placeholder.large{{font-size:40px}}
-        .need-gear-copy{{display:grid;gap:2px;min-width:0}}
-        .need-gear-copy strong{{font-size:14px;color:#f1d79a}}
-        .need-gear-copy small{{font-size:12px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
-        .need-slot-group{{margin-top:14px;border-top:1px solid rgba(214,168,79,.12);padding-top:14px}}
-        .need-slot-group:first-of-type{{margin-top:0;padding-top:0;border-top:0}}
-        .need-slot-group h3{{display:flex;align-items:center;gap:8px;font-size:21px}}
-        .need-slot-group-body{{display:grid;gap:10px}}
-        .need-inline-row{{display:grid;grid-template-columns:94px minmax(0,1fr);gap:14px;align-items:start;padding:14px;border-radius:18px;border:1px solid rgba(214,168,79,.14);background:linear-gradient(180deg,rgba(255,255,255,.03),rgba(0,0,0,.14))}}
-        .need-inline-row.locked{{opacity:.92}}
-        .need-inline-preview{{width:94px;height:94px;border-radius:18px;overflow:hidden;display:grid;place-items:center;background:rgba(0,0,0,.24);border:1px solid rgba(214,168,79,.18)}}
-        .need-inline-content{{display:grid;gap:10px;min-width:0}}
-        .need-inline-head{{display:flex;justify-content:space-between;align-items:start;gap:12px}}
-        .need-inline-slot{{font-weight:900;color:var(--gold);font-size:18px}}
-        .need-inline-current{{font-weight:700;font-size:14px;line-height:1.35;overflow-wrap:anywhere}}
-        .need-state{{display:inline-flex;align-items:center;gap:6px;padding:5px 10px;border-radius:999px;font-size:12px;font-weight:800;text-transform:uppercase;letter-spacing:.05em}}
-        .need-state.filled{{background:rgba(214,168,79,.12);color:#f3d48c;border:1px solid rgba(214,168,79,.24)}}
-        .need-state.empty{{background:rgba(255,255,255,.06);color:#d7d7d7;border:1px solid rgba(255,255,255,.1)}}
-        .need-state.locked{{background:rgba(127,213,132,.12);color:#97e39e;border:1px solid rgba(127,213,132,.22)}}
-        .need-inline-picker{{display:grid;gap:8px}}
-        .need-inline-picker select,.need-inline-picker input,.mini-input{{width:100%;padding:10px 12px;border-radius:12px;background:#0b0b0d;color:var(--text);border:1px solid rgba(214,168,79,.18);min-width:0}}
-        .need-two-step-picker{{display:grid;grid-template-columns:minmax(170px,220px) minmax(0,1fr);gap:8px;align-items:start}}
-        .need-two-step-picker small{{grid-column:1 / -1}}
-        .need-inline-actions{{display:flex;gap:8px;flex-wrap:wrap}}
-        .mini-btn{{padding:10px 14px;border:0;cursor:pointer;white-space:nowrap}}
-        .ghost{{background:#303442;color:var(--text)}}
-        .need-inline-meta{{font-size:12px;color:var(--muted)}}
-        @media(max-width:1360px){{.need-editor-layout{{grid-template-columns:1fr}}}}
-        @media(max-width:860px){{.need-gear-grid{{grid-template-columns:repeat(2,minmax(0,1fr))}}.need-inline-row{{grid-template-columns:80px minmax(0,1fr);padding:12px}}.need-inline-preview{{width:80px;height:80px}}.need-two-step-picker{{grid-template-columns:1fr}}}}
-        @media(max-width:620px){{.need-editor-layout{{gap:12px}}.need-board{{padding:14px}}.need-gear-grid{{grid-template-columns:1fr 1fr}}.need-inline-row{{grid-template-columns:1fr}}.need-inline-preview{{width:100%;max-width:94px;height:94px}}.need-inline-head{{flex-direction:column;align-items:flex-start}}.need-inline-actions .btn{{flex:1 1 100%}}}}
-      </style>
-      <div class="need-editor-layout">
-        {board_html('Main', main_map)}
-        {board_html('Secondary', sec_map)}
+    <section class="panel equipment-need-panel" id="need-editor">
+      <div class="equipment-need-heading">
+        <div><h2>🎯 Needliste</h2><p class="muted">{_e(actor_hint)} Main wird zuerst angezeigt. Über den Umschalter wechselst du zu Secondary.</p></div>
+        <div class="equipment-tabs" role="tablist" aria-label="Need-Bereich wechseln">
+          <button type="button" class="equipment-tab-button active" data-switch-equipment="main" role="tab" aria-selected="true">⭐ Main</button>
+          <button type="button" class="equipment-tab-button" data-switch-equipment="secondary" role="tab" aria-selected="false">🔁 Secondary</button>
+        </div>
       </div>
+      <style>
+        .equipment-need-panel{{overflow:hidden}}
+        .equipment-need-heading{{display:flex;align-items:center;justify-content:space-between;gap:18px;margin-bottom:16px}}
+        .equipment-need-heading h2{{margin:0 0 5px}}
+        .equipment-tabs{{display:flex;gap:8px;padding:5px;border-radius:15px;background:rgba(0,0,0,.28);border:1px solid rgba(214,168,79,.18)}}
+        .equipment-tab-button{{border:0;border-radius:11px;padding:11px 17px;background:transparent;color:#c8c8c8;font-weight:900;cursor:pointer}}
+        .equipment-tab-button.active{{background:linear-gradient(135deg,#b47a20,#e1b754);color:#171009;box-shadow:0 8px 20px rgba(0,0,0,.28)}}
+        .equipment-window{{max-width:980px;margin:0 auto;border:1px solid rgba(214,168,79,.24);border-radius:24px;padding:18px;background:linear-gradient(160deg,rgba(30,22,14,.98),rgba(8,8,9,.96));box-shadow:0 22px 55px rgba(0,0,0,.38)}}
+        .equipment-window-head{{display:flex;justify-content:space-between;align-items:end;gap:18px;margin-bottom:16px}}
+        .equipment-window-head h3{{margin:2px 0 0;color:#f2d083;font-size:28px}}
+        .equipment-window-head p{{margin:0;color:var(--muted);max-width:520px;text-align:right}}
+        .equipment-grid{{display:grid;grid-template-columns:repeat(5,minmax(115px,1fr));grid-template-areas:'cloak head head neck ear' 'weapon1 core1 chest hands brooch' 'weapon2 core2 legs belt ring1' '. bracelet feet . ring2';gap:12px;align-items:stretch;padding:16px;border-radius:20px;background:radial-gradient(circle at center,rgba(128,91,28,.13),rgba(0,0,0,.26) 65%);border:1px solid rgba(255,255,255,.055)}}
+        .equipment-slot{{position:relative;min-width:0;min-height:138px;padding:8px;border-radius:16px;border:1px solid rgba(255,255,255,.12);background:linear-gradient(180deg,rgba(25,25,27,.95),rgba(7,7,8,.96));color:inherit;cursor:pointer;overflow:hidden;display:grid;grid-template-rows:76px auto auto;gap:4px;text-align:center;transition:transform .14s ease,border-color .14s ease,box-shadow .14s ease}}
+        .equipment-slot:hover,.equipment-slot.active{{transform:translateY(-2px);border-color:#d9a846;box-shadow:0 0 0 2px rgba(217,168,70,.14),0 12px 25px rgba(0,0,0,.32)}}
+        .equipment-slot.filled{{border-color:rgba(107,165,255,.55)}}
+        .equipment-slot.locked{{border-color:rgba(93,204,107,.6)}}
+        .equipment-slot-art{{height:76px;display:grid;place-items:center;border-radius:11px;background:radial-gradient(circle at 50% 30%,rgba(104,124,198,.2),rgba(0,0,0,.45));overflow:hidden}}
+        .equipment-img{{width:100%;height:100%;object-fit:contain;padding:5px}}
+        .equipment-placeholder{{display:grid;place-items:center;width:100%;height:100%;font-size:38px;color:#dfb45c;filter:grayscale(.2)}}
+        .equipment-slot-label{{font-size:13px;font-weight:950;color:#e6c06d;text-transform:uppercase;letter-spacing:.035em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
+        .equipment-slot-item{{font-size:11px;color:#b9bec8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
+        .equipment-slot-state{{position:absolute;right:7px;top:7px;width:25px;height:25px;border-radius:8px;display:grid;place-items:center;background:rgba(0,0,0,.72);color:#f2c45f;font-weight:950;border:1px solid rgba(255,255,255,.12)}}
+        .equipment-slot.locked .equipment-slot-state{{color:#91e69a}}
+        .equipment-editor-empty{{margin-top:14px;padding:16px;text-align:center;border-radius:15px;border:1px dashed rgba(214,168,79,.24);color:var(--muted)}}
+        .equipment-editors{{margin-top:14px}}
+        .equipment-editor{{display:grid;grid-template-columns:150px minmax(0,1fr);gap:18px;padding:17px;border-radius:18px;background:rgba(0,0,0,.3);border:1px solid rgba(214,168,79,.2)}}
+        .equipment-editor[hidden]{{display:none!important}}
+        .equipment-editor-preview{{width:150px;height:150px;border-radius:18px;overflow:hidden;display:grid;place-items:center;background:radial-gradient(circle at 35% 25%,rgba(113,93,42,.25),rgba(0,0,0,.5));border:1px solid rgba(214,168,79,.2)}}
+        .equipment-img.large{{padding:10px}}
+        .equipment-placeholder.large{{font-size:58px}}
+        .equipment-editor-main{{display:grid;gap:13px;min-width:0}}
+        .equipment-editor-title{{display:flex;align-items:start;justify-content:space-between;gap:12px}}
+        .equipment-editor-title div{{display:grid;gap:4px}}
+        .equipment-editor-title span:first-child{{color:#e8bd65;font-weight:900;text-transform:uppercase;letter-spacing:.05em;font-size:13px}}
+        .equipment-editor-title strong{{font-size:20px;overflow-wrap:anywhere}}
+        .equipment-editor-picker select{{width:100%;min-width:0;padding:11px 12px;border-radius:11px;background:#08090c;color:var(--text);border:1px solid rgba(214,168,79,.2)}}
+        .need-two-step-picker{{display:grid;grid-template-columns:minmax(170px,220px) minmax(0,1fr);gap:9px}}
+        .need-two-step-picker small{{grid-column:1/-1}}
+        .equipment-editor-actions{{display:flex;gap:9px;flex-wrap:wrap}}
+        .ghost{{background:#303442;color:var(--text)}}
+        .need-state{{display:inline-flex;padding:6px 10px;border-radius:999px;font-size:11px;font-weight:900;text-transform:uppercase}}
+        .need-state.filled{{color:#9dc5ff;background:rgba(80,135,230,.15);border:1px solid rgba(80,135,230,.25)}}
+        .need-state.empty{{color:#bbb;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.1)}}
+        .need-state.locked{{color:#94e49c;background:rgba(65,170,80,.14);border:1px solid rgba(65,170,80,.24)}}
+        @media(max-width:900px){{.equipment-grid{{grid-template-columns:repeat(4,minmax(105px,1fr));grid-template-areas:'head head neck ear' 'weapon1 chest hands brooch' 'weapon2 legs belt ring1' 'core1 feet bracelet ring2' 'core2 cloak cloak cloak'}}.equipment-need-heading,.equipment-window-head{{align-items:flex-start;flex-direction:column}}.equipment-window-head p{{text-align:left}}}}
+        @media(max-width:620px){{.equipment-tabs{{width:100%}}.equipment-tab-button{{flex:1}}.equipment-window{{padding:11px;border-radius:18px}}.equipment-grid{{grid-template-columns:repeat(3,minmax(0,1fr));grid-template-areas:'head neck ear' 'weapon1 chest hands' 'weapon2 legs belt' 'core1 feet ring1' 'core2 cloak ring2' 'brooch bracelet bracelet';gap:7px;padding:9px}}.equipment-slot{{min-height:112px;grid-template-rows:58px auto auto;padding:6px}}.equipment-slot-art{{height:58px}}.equipment-placeholder{{font-size:28px}}.equipment-slot-label{{font-size:10px}}.equipment-slot-item{{font-size:9px}}.equipment-editor{{grid-template-columns:1fr}}.equipment-editor-preview{{width:110px;height:110px}}.need-two-step-picker{{grid-template-columns:1fr}}.equipment-editor-actions .btn{{flex:1 1 100%}}}}
+      </style>
+      {board_html('Main', main_map)}
+      {board_html('Secondary', sec_map)}
       {history_html}
       <script>
-        (function needPreviewEnhancer(){{
-          function updateRowPreview(row){{
-            if (!row) return;
-            const select = row.querySelector('select[data-preview-input="1"]');
-            const label = row.querySelector('[data-preview-label="1"]');
-            const box = row.querySelector('[data-preview-box="1"]');
+        (function equipmentNeedUI(){{
+          const root = document.getElementById('need-editor');
+          if (!root) return;
+          function activateTab(name){{
+            root.querySelectorAll('[data-equipment-tab]').forEach(function(tab){{ tab.hidden = tab.dataset.equipmentTab !== name; }});
+            root.querySelectorAll('[data-switch-equipment]').forEach(function(btn){{
+              const active = btn.dataset.switchEquipment === name;
+              btn.classList.toggle('active', active);
+              btn.setAttribute('aria-selected', active ? 'true' : 'false');
+            }});
+          }}
+          function closeEditors(tabName){{
+            root.querySelectorAll('.equipment-editor[data-tab="' + tabName + '"]').forEach(function(editor){{ editor.hidden = true; }});
+            root.querySelectorAll('.equipment-slot[data-tab="' + tabName + '"]').forEach(function(card){{ card.classList.remove('active'); }});
+            const empty = root.querySelector('[data-editor-empty="' + tabName + '"]');
+            if (empty) empty.hidden = false;
+          }}
+          root.querySelectorAll('[data-switch-equipment]').forEach(function(btn){{
+            btn.addEventListener('click', function(){{ activateTab(btn.dataset.switchEquipment); }});
+          }});
+          root.querySelectorAll('[data-open-equipment]').forEach(function(card){{
+            card.addEventListener('click', function(){{
+              const tabName = card.dataset.tab;
+              const editorId = card.dataset.openEquipment;
+              const editor = document.getElementById(editorId);
+              closeEditors(tabName);
+              if (!editor) return;
+              editor.hidden = false;
+              card.classList.add('active');
+              const empty = root.querySelector('[data-editor-empty="' + tabName + '"]');
+              if (empty) empty.hidden = true;
+              setTimeout(function(){{
+                editor.scrollIntoView({{behavior:'smooth',block:'nearest'}});
+                const first = editor.querySelector('select:not([style*="display:none"]),button');
+                if (first) first.focus({{preventScroll:true}});
+              }},20);
+            }});
+          }});
+          function updatePreview(editor){{
+            const select = editor.querySelector('select[data-preview-input="1"]');
+            const label = editor.querySelector('[data-preview-label="1"]');
+            const box = editor.querySelector('[data-preview-box="1"]');
             if (!select || !label || !box) return;
             const option = select.options[select.selectedIndex];
-            const itemLabel = option && option.value ? (option.dataset.label || option.value) : 'Noch nichts ausgewählt';
+            const itemLabel = option && option.value ? (option.dataset.label || option.value) : 'Noch kein Item gewählt';
             const image = option && option.value ? (option.dataset.image || '') : '';
             label.textContent = itemLabel;
-            if (image) {{
-              box.innerHTML = '<img src="' + image.replace(/"/g, '&quot;') + '" alt="' + itemLabel.replace(/"/g, '&quot;') + '" loading="lazy">';
-            }} else {{
-              const icon = row.getAttribute('data-empty-icon') || '🧩';
-              box.innerHTML = '<div class="need-slot-placeholder large">' + icon + '</div>';
-            }}
+            if (image) box.innerHTML = '<img class="equipment-img large" src="' + image.replace(/"/g,'&quot;') + '" alt="" loading="lazy">';
+            else box.innerHTML = '<div class="equipment-placeholder large">' + (editor.dataset.emptyIcon || '🧩') + '</div>';
           }}
-          function bindRow(row){{
-            if (!row || row.dataset.previewBound === '1') return;
-            row.dataset.previewBound = '1';
-            row.querySelectorAll('select[data-preview-input="1"]').forEach(function(sel){{
-              sel.addEventListener('change', function(){{ updateRowPreview(row); }});
-            }});
-            row.querySelectorAll('select.weapon-type-picker').forEach(function(sel){{
-              sel.addEventListener('change', function(){{ setTimeout(function(){{ updateRowPreview(row); }}, 0); }});
-            }});
-            updateRowPreview(row);
-          }}
-          document.querySelectorAll('[data-live-preview="1"]').forEach(bindRow);
-          document.addEventListener('click', function(ev){{
-            const card = ev.target.closest('[data-target-row]');
-            if (!card) return;
-            const row = document.getElementById(card.getAttribute('data-target-row'));
-            if (row) {{
-              setTimeout(function(){{
-                const input = row.querySelector('select, input');
-                if (input) input.focus();
-              }}, 10);
-            }}
+          root.querySelectorAll('[data-live-preview="1"]').forEach(function(editor){{
+            editor.querySelectorAll('select[data-preview-input="1"]').forEach(function(sel){{ sel.addEventListener('change',function(){{ updatePreview(editor); }}); }});
+            editor.querySelectorAll('select.weapon-type-picker').forEach(function(sel){{ sel.addEventListener('change',function(){{ setTimeout(function(){{ updatePreview(editor); }},0); }}); }});
           }});
+          activateTab('main');
         }})();
       </script>
     </section>
