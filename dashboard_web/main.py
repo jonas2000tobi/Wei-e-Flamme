@@ -9614,6 +9614,7 @@ def _render_need_builder_dashboard(
     embedded: bool = False,
     target_user_id: int = 0,
     display_name_override: str = "",
+    item_catalog_override: Optional[list[dict[str, Any]]] = None,
 ) -> str:
     if not data.get("ok"):
         error_html = f"<section class='panel'><h1>🧰 Charakter-Builder</h1><p class='muted'>{_e(data.get('error'))}</p></section>"
@@ -9642,8 +9643,8 @@ def _render_need_builder_dashboard(
     active = next((b for b in builds if str(b.get("build_id") or "") == active_build_id), (builds[0] if builds else {}))
     active_build_id = str(active.get("build_id") or active_build_id)
     active_slots = slots_by_build.get(active_build_id, {}) if isinstance(slots_by_build, dict) else {}
-    item_catalog = _need_builder_items()
-    items_json = json.dumps(item_catalog, ensure_ascii=False)
+    item_catalog = item_catalog_override if item_catalog_override is not None else _need_builder_items()
+    items_js_expr = "window.BB_SHARED_ITEM_CATALOG || []" if item_catalog_override is not None else json.dumps(item_catalog, ensure_ascii=False)
     slot_filters_json = json.dumps({slot: _need_builder_slot_filter(slot) for slot in _NEED_BUILDER_SLOTS}, ensure_ascii=False)
 
     member_select = ""
@@ -9790,7 +9791,7 @@ def _render_need_builder_dashboard(
       </main>
     </div>
     <script>
-      window.NB_ITEMS = {items_json};
+      window.NB_ITEMS = {items_js_expr};
       window.NB_FILTERS = {slot_filters_json};
       const NB_BASE = {{
         'Angriffstempo': 0.3,
@@ -10736,7 +10737,15 @@ def _weapon_type_options_html() -> str:
     return "".join(f'<option value="{_e(w)}">{_e(w)}</option>' for w in _WEAPON_TYPES)
 
 
-def _render_need_editor_panel(user_id: int, current_user: Optional[dict[str, Any]], requests: list[dict[str, Any]], snap: Optional[dict[str, Any]] = None, *, compact: bool = False) -> str:
+def _render_need_editor_panel(
+    user_id: int,
+    current_user: Optional[dict[str, Any]],
+    requests: list[dict[str, Any]],
+    snap: Optional[dict[str, Any]] = None,
+    *,
+    compact: bool = False,
+    item_catalog: Optional[list[dict[str, Any]]] = None,
+) -> str:
     snap = snap or {}
     req_rows = []
     for r in requests[:30]:
@@ -10748,8 +10757,9 @@ def _render_need_editor_panel(user_id: int, current_user: Optional[dict[str, Any
     need_info = _needs_by_user(snap).get(int(user_id), {})
     main_map = _need_slot_map((need_info or {}).get("main") or (need_info or {}).get("main_needs") or []) if isinstance(need_info, dict) else {}
     sec_map = _need_slot_map((need_info or {}).get("secondary") or (need_info or {}).get("secondary_needs") or (need_info or {}).get("second") or []) if isinstance(need_info, dict) else {}
-    catalog_items = _loot_catalog_items(snap, limit=4000)
-    catalog_by_name = {_loot_key(it.get("name")): it for it in catalog_items if _loot_key(it.get("name"))}
+    rich_items = item_catalog if item_catalog is not None else _need_builder_items()
+    catalog_by_name = {_loot_key(it.get("name")): it for it in rich_items if _loot_key(it.get("name"))}
+    slot_filters_json = json.dumps({slot: _need_builder_slot_filter(slot) for slot in _NEED_SLOTS}, ensure_ascii=False)
 
     slot_icons = {
         "Waffe 1": "⚔️", "Waffe 2": "🗡️", "Fähigkeitskern 1": "✨", "Fähigkeitskern 2": "🌟",
@@ -10768,7 +10778,7 @@ def _render_need_editor_panel(user_id: int, current_user: Optional[dict[str, Any
     def item_model(entry: Any) -> tuple[str, str, str]:
         current = _need_item_display(entry) if entry else ""
         item = catalog_by_name.get(_loot_key(current), {}) if current else {}
-        image_url = str(item.get("image_url") or "").strip() if isinstance(item, dict) else ""
+        image_url = str(item.get("image") or item.get("image_url") or "").strip() if isinstance(item, dict) else ""
         rarity = str(item.get("rarity") or "").strip() if isinstance(item, dict) else ""
         return current, image_url, rarity
 
@@ -10795,9 +10805,37 @@ def _render_need_editor_panel(user_id: int, current_user: Optional[dict[str, Any
                 <p class="muted">Dieser Slot ist als erhalten markiert und bleibt gesperrt. Nur die Gildenleitung kann ihn wieder freigeben.</p>
               </div>
             </section>"""
-        picker = _need_slot_select_only_html(snap, input_id=input_id, slot=slot, name="item_text", selected_value=current, required=False)
+        current_item = catalog_by_name.get(_loot_key(current), {}) if current else {}
+        current_id = int((current_item or {}).get("id") or 0)
+        current_sub = str((current_item or {}).get("sub") or "")
+        current_weapon = _weapon_type_from_text(f"{current_sub} {current}") if slot.startswith("Waffe") else ""
+        weapon_picker = ""
+        if slot.startswith("Waffe"):
+            weapon_options = ['<option value="">Waffenart auswählen</option>']
+            for weapon_type in _WEAPON_TYPES:
+                selected_attr = " selected" if weapon_type == current_weapon else ""
+                weapon_options.append(f'<option value="{_e(weapon_type)}"{selected_attr}>{_e(weapon_type)}</option>')
+            weapon_picker = (
+                '<label class="ne-weapon-label"><span>1. Waffenart</span>'
+                f'<select name="weapon_type" class="ne-weapon-type" data-dirty-field="1">{"".join(weapon_options)}</select></label>'
+            )
+        picker_thumb = f'<img src="{_e(image_url)}" alt="" loading="lazy">' if image_url else f'<span>{_e(slot_icons.get(slot, "🧩"))}</span>'
+        current_meta = " · ".join(x for x in [str((current_item or {}).get("rarity") or ""), str((current_item or {}).get("sub") or "")] if x) or "Passende Katalogeinträge"
+        picker = f"""
+        <div class="ne-picker-wrap" data-ne-slot="{_e(slot)}">
+          {weapon_picker}
+          <label class="ne-item-label"><span>{'2. Item' if slot.startswith('Waffe') else 'Item auswählen'}</span>
+            <button type="button" class="ne-picker-button" data-ne-open-picker="1">
+              <span class="ne-picker-thumb" data-ne-picker-thumb="1">{picker_thumb}</span>
+              <span class="ne-picker-copy"><strong data-ne-picker-label="1">{_e(current or 'Item auswählen')}</strong><small data-ne-picker-meta="1">{_e(current_meta)}</small></span>
+              <span class="ne-picker-arrow">⌄</span>
+            </button>
+          </label>
+          <input id="{_e(input_id)}" type="hidden" name="item_text" value="{_e(current)}" data-ne-item-value="1" data-dirty-field="1" data-item-id="{current_id}" data-image="{_e(image_url)}" data-label="{_e(current)}">
+        </div>
+        """
         return f"""
-        <form class="equipment-editor" id="{_e(editor_id)}" data-tab="{_e(tab.lower())}" data-live-preview="1" data-empty-icon="{_e(slot_icons.get(slot, '🧩'))}" hidden method="post" action="/portal/member/{int(user_id)}/need-change">
+        <form class="equipment-editor" id="{_e(editor_id)}" data-tab="{_e(tab.lower())}" data-live-preview="1" data-empty-icon="{_e(slot_icons.get(slot, '🧩'))}" data-slot-name="{_e(slot)}" hidden method="post" action="/portal/member/{int(user_id)}/need-change">
           <input type="hidden" name="action_type" value="set">
           <input type="hidden" name="tab" value="{_e(tab)}">
           {hidden_slot}
@@ -10805,40 +10843,51 @@ def _render_need_editor_panel(user_id: int, current_user: Optional[dict[str, Any
           <div class="equipment-editor-main">
             <div class="equipment-editor-title"><div><span>{_e(slot)}</span><strong data-preview-label="1">{_e(current or 'Noch kein Item gewählt')}</strong></div><span class="need-state {('filled' if current else 'empty')}">{('Gesetzt' if current else 'Leer')}</span></div>
             <div class="equipment-editor-picker">{picker}</div>
+            <div class="equipment-unsaved" data-unsaved-warning="1" hidden>⚠️ Ungespeicherte Änderung – bitte speichern oder bewusst verwerfen.</div>
             <div class="equipment-editor-actions">
-              <button class="btn" type="submit">Auswahl speichern</button>
+              <button class="btn" type="submit">Speichern &amp; an Bot senden</button>
               <button class="btn ghost" type="submit" name="action_type" value="clear" onclick="return confirm('Need für {_e(slot)} entfernen?')">Slot leeren</button>
             </div>
-            <small class="muted">{_e(rarity or 'Item-Datenbank')} · Es werden ausschließlich passende Items für {_e(slot)} angezeigt.</small>
+            <small class="muted">{_e(rarity or 'Item-Datenbank')} · Bilder und Werte stammen aus derselben Item-Datenbank wie im Charakter-Builder.</small>
           </div>
         </form>"""
 
     def board_html(tab: str, slot_map: dict[str, Any]) -> str:
-        cards: list[str] = []
+        upper_cards: list[str] = []
+        lower_cards: list[str] = []
         editors: list[str] = []
+        upper_slots = {"Helm", "Waffe 1", "Waffe 2", "Brust", "Hose", "Handschuhe", "Schuhe", "Umhang", "Gürtel"}
         idx = 0
         for _, slots in _NEED_SLOT_GROUPS:
             for slot in slots:
                 idx += 1
                 current, image_url, rarity = item_model(slot_map.get(slot))
+                current_item = catalog_by_name.get(_loot_key(current), {}) if current else {}
+                current_item_id = int((current_item or {}).get("id") or 0)
                 editor_id = f"need-equipment-editor-{tab.lower()}-{idx}"
                 area = slot_areas.get(slot, "auto")
                 locked = bool(slot_map.get(slot) and _need_is_received(slot_map.get(slot)))
                 state_cls = "locked" if locked else ("filled" if current else "empty")
                 state_txt = "🔒" if locked else ("✓" if current else "+")
-                cards.append(f"""
-                <button type="button" class="equipment-slot {state_cls}" style="grid-area:{_e(area)}" data-open-equipment="{_e(editor_id)}" data-tab="{_e(tab.lower())}" aria-controls="{_e(editor_id)}">
+                card = f"""
+                <button type="button" class="equipment-slot {state_cls}" style="grid-area:{_e(area)}" data-open-equipment="{_e(editor_id)}" data-tab="{_e(tab.lower())}" data-ne-equipped-item-id="{current_item_id}" aria-controls="{_e(editor_id)}">
                   <span class="equipment-slot-art">{preview_html(slot, current, image_url)}</span>
                   <span class="equipment-slot-label">{_e(slot)}</span>
                   <span class="equipment-slot-item">{_e(_short(current or 'Leer', 33))}</span>
                   <span class="equipment-slot-state">{state_txt}</span>
-                </button>""")
+                </button>"""
+                if slot in upper_slots:
+                    upper_cards.append(card)
+                else:
+                    lower_cards.append(card)
                 editors.append(editor_html(tab, slot, slot_map.get(slot), idx))
         return f"""
         <section class="equipment-tab" data-equipment-tab="{_e(tab.lower())}"{('' if tab == 'Main' else ' hidden')}>
           <div class="equipment-window">
             <div class="equipment-window-head"><div><span class="eyebrow">Need-Bereich</span><h3>{_e(tab)}</h3></div><p>Slot anklicken und anschließend ausschließlich passende Items auswählen.</p></div>
-            <div class="equipment-grid">{''.join(cards)}</div>
+            <div class="equipment-grid equipment-grid-upper">{''.join(upper_cards)}</div>
+            <div class="equipment-section-gap" aria-hidden="true"></div>
+            <div class="equipment-grid equipment-grid-lower">{''.join(lower_cards)}</div>
             <div class="equipment-editor-empty" data-editor-empty="{_e(tab.lower())}">⬆️ Klicke auf einen Equipment-Slot, um ihn zu bearbeiten.</div>
             <div class="equipment-editors">{''.join(editors)}</div>
           </div>
@@ -10867,7 +10916,10 @@ def _render_need_editor_panel(user_id: int, current_user: Optional[dict[str, Any
         .equipment-window-head{{display:flex;justify-content:space-between;align-items:end;gap:18px;margin-bottom:16px}}
         .equipment-window-head h3{{margin:2px 0 0;color:#f2d083;font-size:28px}}
         .equipment-window-head p{{margin:0;color:var(--muted);max-width:520px;text-align:right}}
-        .equipment-grid{{display:grid;grid-template-columns:repeat(5,minmax(115px,1fr));grid-template-areas:'cloak head head neck ear' 'weapon1 core1 chest hands brooch' 'weapon2 core2 legs belt ring1' '. bracelet feet . ring2';gap:12px;align-items:stretch;padding:16px;border-radius:20px;background:radial-gradient(circle at center,rgba(128,91,28,.13),rgba(0,0,0,.26) 65%);border:1px solid rgba(255,255,255,.055)}}
+        .equipment-grid{{display:grid;grid-template-columns:repeat(4,minmax(125px,1fr));gap:12px;align-items:stretch;padding:16px;border-radius:20px;background:radial-gradient(circle at center,rgba(128,91,28,.13),rgba(0,0,0,.26) 65%);border:1px solid rgba(255,255,255,.055)}}
+        .equipment-grid-upper{{grid-template-areas:'. head head .' 'weapon1 chest hands cloak' 'weapon2 legs feet belt'}}
+        .equipment-grid-lower{{grid-template-areas:'core1 . . .' 'core2 ring1 neck brooch' '. ring2 bracelet ear'}}
+        .equipment-section-gap{{height:28px}}
         .equipment-slot{{position:relative;min-width:0;min-height:138px;padding:8px;border-radius:16px;border:1px solid rgba(255,255,255,.12);background:linear-gradient(180deg,rgba(25,25,27,.95),rgba(7,7,8,.96));color:inherit;cursor:pointer;overflow:hidden;display:grid;grid-template-rows:76px auto auto;gap:4px;text-align:center;transition:transform .14s ease,border-color .14s ease,box-shadow .14s ease}}
         .equipment-slot:hover,.equipment-slot.active{{transform:translateY(-2px);border-color:#d9a846;box-shadow:0 0 0 2px rgba(217,168,70,.14),0 12px 25px rgba(0,0,0,.32)}}
         .equipment-slot.filled{{border-color:rgba(107,165,255,.55)}}
@@ -10892,16 +10944,51 @@ def _render_need_editor_panel(user_id: int, current_user: Optional[dict[str, Any
         .equipment-editor-title span:first-child{{color:#e8bd65;font-weight:900;text-transform:uppercase;letter-spacing:.05em;font-size:13px}}
         .equipment-editor-title strong{{font-size:20px;overflow-wrap:anywhere}}
         .equipment-editor-picker select{{width:100%;min-width:0;padding:11px 12px;border-radius:11px;background:#08090c;color:var(--text);border:1px solid rgba(214,168,79,.2)}}
-        .need-two-step-picker{{display:grid;grid-template-columns:minmax(170px,220px) minmax(0,1fr);gap:9px}}
-        .need-two-step-picker small{{grid-column:1/-1}}
+        .ne-picker-wrap{{display:grid;gap:10px}}
+        .ne-weapon-label,.ne-item-label{{display:grid;gap:6px}}
+        .ne-weapon-label>span,.ne-item-label>span{{font-size:12px;font-weight:900;text-transform:uppercase;letter-spacing:.05em;color:#d8bd7a}}
+        .ne-picker-button{{width:100%;display:grid;grid-template-columns:58px minmax(0,1fr) auto;gap:12px;align-items:center;text-align:left;border:1px solid rgba(214,168,79,.24);background:linear-gradient(180deg,rgba(24,18,11,.95),rgba(8,8,10,.96));color:inherit;border-radius:15px;padding:10px;cursor:pointer;transition:border-color .14s ease,box-shadow .14s ease,transform .14s ease}}
+        .ne-picker-button:hover,.ne-picker-button.open{{border-color:rgba(222,183,91,.82);box-shadow:0 0 0 2px rgba(214,168,79,.1),0 12px 30px rgba(0,0,0,.28);transform:translateY(-1px)}}
+        .ne-picker-thumb{{width:56px;height:56px;border-radius:12px;display:grid;place-items:center;overflow:hidden;background:radial-gradient(circle at 35% 25%,rgba(94,74,158,.3),rgba(0,0,0,.42));border:1px solid rgba(150,115,220,.35);font-size:28px}}
+        .ne-picker-thumb img{{width:100%;height:100%;object-fit:contain;padding:4px}}
+        .ne-picker-copy{{display:grid;gap:3px;min-width:0}}
+        .ne-picker-copy strong{{font-size:15px;color:#efd28d;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
+        .ne-picker-copy small{{font-size:12px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
+        .ne-picker-arrow{{font-size:22px;color:#e6bd65}}
+        .ne-picker-pop{{position:fixed;z-index:12000;width:min(520px,calc(100vw - 24px));max-height:min(660px,82vh);border:1px solid rgba(214,168,79,.72);background:linear-gradient(150deg,#11151d,#080a0e);border-radius:18px;box-shadow:0 28px 100px rgba(0,0,0,.78);padding:11px}}
+        .ne-picker-pop.mobile{{left:12px!important;right:12px!important;bottom:calc(12px + env(safe-area-inset-bottom));top:auto!important;width:auto!important;max-height:min(78vh,720px)}}
+        .ne-picker-search{{width:100%;box-sizing:border-box;padding:12px 13px;border-radius:12px;border:1px solid rgba(214,168,79,.34);background:rgba(0,0,0,.46);color:inherit;margin-bottom:9px}}
+        .ne-picker-list{{max-height:520px;overflow:auto;display:grid;grid-template-columns:1fr;gap:7px;padding-right:2px}}
+        .ne-item-option{{display:grid;grid-template-columns:62px minmax(0,1fr) auto;gap:11px;align-items:center;border:1px solid rgba(255,255,255,.075);background:rgba(255,255,255,.035);border-radius:14px;padding:9px;cursor:pointer;text-align:left;color:inherit}}
+        .ne-item-option:hover{{border-color:rgba(214,168,79,.52);background:rgba(214,168,79,.09)}}
+        .ne-item-option img{{width:60px;height:60px;object-fit:contain;border-radius:11px;background:rgba(0,0,0,.34);border:1px solid rgba(150,115,220,.28);padding:4px}}
+        .ne-item-option-copy{{display:grid;gap:3px;min-width:0}}
+        .ne-item-option strong{{color:#e8c986;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
+        .ne-item-option small{{color:#aeb7c4;font-size:12px}}
+        .ne-item-option em{{font-style:normal;color:#e6bd65;font-size:22px}}
+        .ne-picker-empty{{padding:18px;text-align:center;color:#aeb7c4}}
+        .ne-item-tooltip{{position:fixed;z-index:12100;width:min(390px,calc(100vw - 26px));pointer-events:none;border:1px solid rgba(214,168,79,.74);border-radius:16px;background:linear-gradient(145deg,#121722,#070a0f);box-shadow:0 24px 86px rgba(0,0,0,.82);padding:13px;color:#f3ead8}}
+        .ne-tip-head{{display:grid;grid-template-columns:62px minmax(0,1fr);gap:11px;align-items:center;margin-bottom:8px}}
+        .ne-tip-head img{{width:60px;height:60px;object-fit:contain;border-radius:11px;background:rgba(0,0,0,.36);border:1px solid rgba(150,115,220,.34);padding:4px}}
+        .ne-tip-head strong{{display:block;color:#f0cf88;font-size:15px}}
+        .ne-tip-head small{{color:#aeb7c4;font-size:12px}}
+        .ne-tip-sec{{border-top:1px solid rgba(255,255,255,.085);padding-top:8px;margin-top:8px}}
+        .ne-tip-sec h5{{margin:0 0 5px;color:#dce5ef;font-size:11px;text-transform:uppercase;letter-spacing:.055em}}
+        .ne-tip-row{{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:9px;font-size:12px;padding:3px 0}}
+        .ne-tip-row b{{color:#f0f3f7;text-align:right}}
+        .ne-tip-trait{{font-size:12px;border:1px solid rgba(255,255,255,.065);border-radius:9px;padding:6px;margin-top:5px;background:rgba(255,255,255,.025)}}
+        .ne-tip-trait b{{display:block;color:#dce5ef}}
+        .ne-mobile-hint{{display:none;color:#aeb7c4;font-size:11px;margin-top:4px}}
         .equipment-editor-actions{{display:flex;gap:9px;flex-wrap:wrap}}
+        .equipment-unsaved{{padding:10px 12px;border-radius:11px;background:rgba(222,157,39,.12);border:1px solid rgba(222,157,39,.35);color:#f4cf78;font-weight:800;font-size:13px}}
+        .equipment-editor.is-dirty{{border-color:rgba(222,157,39,.58);box-shadow:0 0 0 2px rgba(222,157,39,.1)}}
         .ghost{{background:#303442;color:var(--text)}}
         .need-state{{display:inline-flex;padding:6px 10px;border-radius:999px;font-size:11px;font-weight:900;text-transform:uppercase}}
         .need-state.filled{{color:#9dc5ff;background:rgba(80,135,230,.15);border:1px solid rgba(80,135,230,.25)}}
         .need-state.empty{{color:#bbb;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.1)}}
         .need-state.locked{{color:#94e49c;background:rgba(65,170,80,.14);border:1px solid rgba(65,170,80,.24)}}
-        @media(max-width:900px){{.equipment-grid{{grid-template-columns:repeat(4,minmax(105px,1fr));grid-template-areas:'head head neck ear' 'weapon1 chest hands brooch' 'weapon2 legs belt ring1' 'core1 feet bracelet ring2' 'core2 cloak cloak cloak'}}.equipment-need-heading,.equipment-window-head{{align-items:flex-start;flex-direction:column}}.equipment-window-head p{{text-align:left}}}}
-        @media(max-width:620px){{.equipment-tabs{{width:100%}}.equipment-tab-button{{flex:1}}.equipment-window{{padding:11px;border-radius:18px}}.equipment-grid{{grid-template-columns:repeat(3,minmax(0,1fr));grid-template-areas:'head neck ear' 'weapon1 chest hands' 'weapon2 legs belt' 'core1 feet ring1' 'core2 cloak ring2' 'brooch bracelet bracelet';gap:7px;padding:9px}}.equipment-slot{{min-height:112px;grid-template-rows:58px auto auto;padding:6px}}.equipment-slot-art{{height:58px}}.equipment-placeholder{{font-size:28px}}.equipment-slot-label{{font-size:10px}}.equipment-slot-item{{font-size:9px}}.equipment-editor{{grid-template-columns:1fr}}.equipment-editor-preview{{width:110px;height:110px}}.need-two-step-picker{{grid-template-columns:1fr}}.equipment-editor-actions .btn{{flex:1 1 100%}}}}
+        @media(max-width:900px){{.equipment-grid{{grid-template-columns:repeat(4,minmax(100px,1fr))}}.equipment-grid-upper{{grid-template-areas:'. head head .' 'weapon1 chest hands cloak' 'weapon2 legs feet belt'}}.equipment-grid-lower{{grid-template-areas:'core1 . . .' 'core2 ring1 neck brooch' '. ring2 bracelet ear'}}.equipment-need-heading,.equipment-window-head{{align-items:flex-start;flex-direction:column}}.equipment-window-head p{{text-align:left}}}}
+        @media(max-width:620px){{.equipment-tabs{{width:100%}}.equipment-tab-button{{flex:1}}.equipment-window{{padding:11px;border-radius:18px}}.equipment-grid{{grid-template-columns:repeat(2,minmax(0,1fr));gap:7px;padding:9px}}.equipment-grid-upper{{grid-template-areas:'head head' 'weapon1 chest' 'weapon2 legs' 'hands cloak' 'feet belt'}}.equipment-grid-lower{{grid-template-areas:'core1 core1' 'core2 ring1' 'ring2 neck' 'bracelet brooch' 'ear ear'}}.equipment-section-gap{{height:18px}}.equipment-slot{{min-height:112px;grid-template-rows:58px auto auto;padding:6px}}.equipment-slot-art{{height:58px}}.equipment-placeholder{{font-size:28px}}.equipment-slot-label{{font-size:10px}}.equipment-slot-item{{font-size:9px}}.equipment-editor{{grid-template-columns:1fr}}.equipment-editor-preview{{width:110px;height:110px}}.equipment-editor-actions .btn{{flex:1 1 100%}}.ne-picker-button{{grid-template-columns:50px minmax(0,1fr) auto}}.ne-picker-thumb{{width:48px;height:48px}}.ne-item-tooltip{{display:none!important}}.ne-mobile-hint{{display:block}}body.ne-picker-open{{overflow:hidden}}}}
       </style>
       {board_html('Main', main_map)}
       {board_html('Secondary', sec_map)}
@@ -10910,58 +10997,354 @@ def _render_need_editor_panel(user_id: int, current_user: Optional[dict[str, Any
         (function equipmentNeedUI(){{
           const root = document.getElementById('need-editor');
           if (!root) return;
-          function activateTab(name){{
+          const NE_ITEMS = window.BB_SHARED_ITEM_CATALOG || [];
+          const NE_FILTERS = {slot_filters_json};
+          let allowPageLeave = false;
+          let nePop = null;
+          let neTip = null;
+          let neCurrentEditor = null;
+          let neCurrentButton = null;
+
+          function neEsc(value) {{
+            return String(value ?? '').replace(/[&<>"']/g, function(c) {{
+              return ({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}})[c];
+            }});
+          }}
+          function neNorm(value) {{
+            return String(value || '').trim().toLocaleLowerCase('de-DE');
+          }}
+          function neMatchesSlot(item, slot) {{
+            const filter = NE_FILTERS[slot] || {{category:'',subs:[],special:''}};
+            if (filter.category && neNorm(item.category) !== neNorm(filter.category)) return false;
+            if (filter.subs && filter.subs.length && !filter.subs.some(function(sub) {{ return neNorm(sub) === neNorm(item.sub); }})) return false;
+            if (filter.special === 'core' && !item.is_core) return false;
+            return true;
+          }}
+          function neMatchesWeapon(item, weaponType) {{
+            if (!weaponType) return true;
+            const wanted = neNorm(weaponType);
+            const itemWeapon = neNorm(item.weapon_type || item.sub || '');
+            const haystack = neNorm((item.sub || '') + ' ' + (item.name || ''));
+            return itemWeapon === wanted || haystack.includes(wanted);
+          }}
+          function neCanHover() {{ return window.matchMedia('(hover:hover) and (pointer:fine)').matches; }}
+          function neIsMobile() {{ return window.innerWidth <= 620; }}
+          function neClosePicker() {{
+            if (nePop) {{ nePop.remove(); nePop = null; }}
+            if (neCurrentButton) neCurrentButton.classList.remove('open');
+            neCurrentButton = null;
+            neCurrentEditor = null;
+            document.body.classList.remove('ne-picker-open');
+            neHideTip();
+          }}
+          function neHideTip() {{ if (neTip) neTip.style.display = 'none'; }}
+          function neMoveTip(ev) {{
+            if (!neTip || !ev || neIsMobile()) return;
+            const pad = 16;
+            const width = Math.min(390, window.innerWidth - 26);
+            let x = ev.clientX + 18;
+            let y = ev.clientY + 18;
+            if (x + width > window.innerWidth - pad) x = ev.clientX - width - 18;
+            if (y + 500 > window.innerHeight - pad) y = Math.max(pad, window.innerHeight - 510);
+            neTip.style.left = x + 'px';
+            neTip.style.top = y + 'px';
+          }}
+          function neItemRows(rows, maxRows) {{
+            if (!Array.isArray(rows) || !rows.length) return '';
+            return rows.slice(0, maxRows || 8).map(function(row) {{
+              if (!row) return '';
+              const label = String(row.label || row.name || '').replace(/:$/,'').trim();
+              const value = row.value ?? row.text ?? '';
+              return '<div class="ne-tip-row"><span>' + neEsc(label) + '</span><b>' + neEsc(value) + '</b></div>';
+            }}).join('');
+          }}
+          function neItemTipHtml(item) {{
+            const detail = item.detail || {{}};
+            const primary = neItemRows(detail.primary || [], 7);
+            const bonus = neItemRows(detail.bonus || [], 9);
+            const stats = detail.stats || {{}};
+            const statRows = Object.entries(stats).slice(0, 9).map(function(pair) {{
+              return '<div class="ne-tip-row"><span>' + neEsc(pair[0]) + '</span><b>' + neEsc(pair[1]) + '</b></div>';
+            }}).join('');
+            const traits = Array.isArray(detail.traits) ? detail.traits.slice(0, 8).map(function(trait) {{
+              const values = Array.isArray(trait.values) ? trait.values.join(' | ') : (trait.values || '');
+              return '<div class="ne-tip-trait"><b>' + neEsc(trait.name || '') + '</b><span>' + neEsc(values) + '</span></div>';
+            }}).join('') : '';
+            const passive = detail.passive && (detail.passive.name || detail.passive.text)
+              ? '<div class="ne-tip-sec"><h5>Passiv / Effekt</h5><div class="ne-tip-trait"><b>' + neEsc(detail.passive.name || 'Effekt') + '</b><span>' + neEsc(detail.passive.text || '') + '</span></div></div>'
+              : '';
+            const damage = (detail.damage_min || detail.damage_max)
+              ? '<div class="ne-tip-row"><span>Schaden</span><b>' + neEsc(detail.damage_min || '—') + ' – ' + neEsc(detail.damage_max || '—') + '</b></div>'
+              : '';
+            const defense = detail.defense
+              ? '<div class="ne-tip-row"><span>Verteidigung</span><b>' + neEsc(detail.defense) + '</b></div>'
+              : '';
+            const head = '<div class="ne-tip-head"><img src="' + neEsc(item.image || '') + '" onerror="this.style.visibility=&quot;hidden&quot;" alt=""><div><strong>' + neEsc(item.name) + '</strong><small>' + neEsc(item.rarity || '—') + ' · ' + neEsc(item.sub || item.category || '—') + (item.level ? ' · Lv. ' + neEsc(item.level) : '') + '</small></div></div>';
+            return head
+              + ((damage || defense || primary) ? '<div class="ne-tip-sec"><h5>Hauptwerte</h5>' + damage + defense + primary + '</div>' : '')
+              + ((bonus || statRows) ? '<div class="ne-tip-sec"><h5>Zusatzwerte</h5>' + (bonus || statRows) + '</div>' : '')
+              + (traits ? '<div class="ne-tip-sec"><h5>Eigenschaften</h5>' + traits + '</div>' : '')
+              + passive;
+          }}
+          function neShowTip(itemId, ev) {{
+            if (!neCanHover() || neIsMobile()) return;
+            const item = NE_ITEMS.find(function(row) {{ return Number(row.id) === Number(itemId); }});
+            if (!item) return;
+            if (!neTip) {{
+              neTip = document.createElement('div');
+              neTip.className = 'ne-item-tooltip';
+              document.body.appendChild(neTip);
+            }}
+            neTip.innerHTML = neItemTipHtml(item);
+            neTip.style.display = 'block';
+            neMoveTip(ev);
+          }}
+          function neFilteredItems(editor, query) {{
+            const slot = editor.dataset.slotName || '';
+            const weaponField = editor.querySelector('.ne-weapon-type');
+            const weaponType = weaponField ? weaponField.value : '';
+            const needle = neNorm(query);
+            return NE_ITEMS.filter(function(item) {{
+              if (!neMatchesSlot(item, slot)) return false;
+              if (slot.startsWith('Waffe') && !neMatchesWeapon(item, weaponType)) return false;
+              if (needle && !neNorm(item.name).includes(needle)) return false;
+              return true;
+            }}).slice(0, 160);
+          }}
+          function neRenderOptions(query) {{
+            if (!nePop || !neCurrentEditor) return;
+            const list = nePop.querySelector('.ne-picker-list');
+            const items = neFilteredItems(neCurrentEditor, query || '');
+            if (!items.length) {{
+              list.innerHTML = '<div class="ne-picker-empty">Keine passenden Items für diesen Slot gefunden.</div>';
+              return;
+            }}
+            list.innerHTML = items.map(function(item) {{
+              const image = item.image
+                ? '<img src="' + neEsc(item.image) + '" onerror="this.style.visibility=&quot;hidden&quot;" alt="">'
+                : '<div class="ne-picker-thumb">🧩</div>';
+              const meta = [item.rarity, item.sub || item.category, item.level ? 'Lv. ' + item.level : ''].filter(Boolean).join(' · ');
+              return '<button type="button" class="ne-item-option" data-ne-item-id="' + Number(item.id) + '">' + image + '<span class="ne-item-option-copy"><strong>' + neEsc(item.name) + '</strong><small>' + neEsc(meta || 'Item-Datenbank') + '</small></span><em>＋</em></button>';
+            }}).join('');
+            list.querySelectorAll('[data-ne-item-id]').forEach(function(option) {{
+              const itemId = Number(option.dataset.neItemId || 0);
+              option.addEventListener('click', function() {{ neChooseItem(itemId); }});
+              option.addEventListener('mouseenter', function(ev) {{ neShowTip(itemId, ev); }});
+              option.addEventListener('mousemove', neMoveTip);
+              option.addEventListener('mouseleave', neHideTip);
+            }});
+          }}
+          function neOpenPicker(button) {{
+            const editor = button.closest('.equipment-editor');
+            if (!editor) return;
+            const weaponField = editor.querySelector('.ne-weapon-type');
+            if (editor.dataset.slotName && editor.dataset.slotName.startsWith('Waffe') && weaponField && !weaponField.value) {{
+              weaponField.focus();
+              window.alert('Bitte zuerst die Waffenart auswählen.');
+              return;
+            }}
+            neClosePicker();
+            neCurrentEditor = editor;
+            neCurrentButton = button;
+            button.classList.add('open');
+            const rect = button.getBoundingClientRect();
+            nePop = document.createElement('div');
+            nePop.className = 'ne-picker-pop';
+            if (neIsMobile()) {{
+              nePop.classList.add('mobile');
+              document.body.classList.add('ne-picker-open');
+            }} else {{
+              nePop.style.left = Math.max(12, Math.min(rect.left, window.innerWidth - 540)) + 'px';
+              nePop.style.top = Math.max(12, Math.min(rect.bottom + 8, window.innerHeight - 680)) + 'px';
+            }}
+            nePop.innerHTML = '<input class="ne-picker-search" type="search" placeholder="Items durchsuchen …"><div class="ne-picker-list"></div><div class="ne-mobile-hint">Auf Mobilgeräten antippen, um das Item auszuwählen.</div>';
+            document.body.appendChild(nePop);
+            const search = nePop.querySelector('.ne-picker-search');
+            search.addEventListener('input', function() {{ neRenderOptions(search.value); }});
+            neRenderOptions('');
+            search.focus();
+          }}
+          function neChooseItem(itemId) {{
+            const item = NE_ITEMS.find(function(row) {{ return Number(row.id) === Number(itemId); }});
+            if (!item || !neCurrentEditor) return;
+            const editor = neCurrentEditor;
+            const field = editor.querySelector('[data-ne-item-value="1"]');
+            const button = editor.querySelector('[data-ne-open-picker="1"]');
+            if (!field || !button) return;
+            field.value = item.name || '';
+            field.dataset.itemId = String(item.id || '');
+            field.dataset.image = item.image || '';
+            field.dataset.label = item.name || '';
+            const thumb = button.querySelector('[data-ne-picker-thumb="1"]');
+            const label = button.querySelector('[data-ne-picker-label="1"]');
+            const meta = button.querySelector('[data-ne-picker-meta="1"]');
+            if (thumb) thumb.innerHTML = item.image ? '<img src="' + neEsc(item.image) + '" alt="">' : '<span>' + neEsc(editor.dataset.emptyIcon || '🧩') + '</span>';
+            if (label) label.textContent = item.name || 'Item auswählen';
+            if (meta) meta.textContent = [item.rarity, item.sub || item.category, item.level ? 'Lv. ' + item.level : ''].filter(Boolean).join(' · ') || 'Item-Datenbank';
+            updatePreview(editor);
+            refreshDirty(editor);
+            neClosePicker();
+          }}
+
+          function dirtyEditors(){{
+            return Array.from(root.querySelectorAll('.equipment-editor.is-dirty'));
+          }}
+          function hasUnsavedChanges(){{ return dirtyEditors().length > 0; }}
+          function confirmDiscard(message){{
+            if (!hasUnsavedChanges()) return true;
+            return window.confirm(message || 'Du hast eine Item-Auswahl geändert, aber noch nicht gespeichert. Änderungen wirklich verwerfen?');
+          }}
+          function markDirty(editor, dirty){{
+            if (!editor) return;
+            editor.classList.toggle('is-dirty', !!dirty);
+            const warning = editor.querySelector('[data-unsaved-warning="1"]');
+            if (warning) warning.hidden = !dirty;
+          }}
+          function editorIsDirty(editor){{
+            if (!editor || !editor.matches('form')) return false;
+            return Array.from(editor.querySelectorAll('[data-dirty-field="1"]')).some(function(field){{
+              return String(field.value || '') !== String(field.dataset.initialValue || '');
+            }});
+          }}
+          function refreshDirty(editor){{ markDirty(editor, editorIsDirty(editor)); }}
+
+          function activateTab(name, force){{
+            const activeTab = root.querySelector('[data-equipment-tab]:not([hidden])');
+            if (!force && activeTab && activeTab.dataset.equipmentTab !== name && !confirmDiscard('Du hast eine ungespeicherte Item-Auswahl. Trotzdem zu ' + (name === 'main' ? 'Main' : 'Secondary') + ' wechseln?')) return false;
+            neClosePicker();
+            if (activeTab && activeTab.dataset.equipmentTab !== name) dirtyEditors().forEach(function(editor){{ markDirty(editor, false); }});
             root.querySelectorAll('[data-equipment-tab]').forEach(function(tab){{ tab.hidden = tab.dataset.equipmentTab !== name; }});
             root.querySelectorAll('[data-switch-equipment]').forEach(function(btn){{
               const active = btn.dataset.switchEquipment === name;
               btn.classList.toggle('active', active);
               btn.setAttribute('aria-selected', active ? 'true' : 'false');
             }});
+            return true;
           }}
-          function closeEditors(tabName){{
+          function closeEditors(tabName, force){{
+            if (!force && !confirmDiscard('Du hast eine ungespeicherte Item-Auswahl. Anderen Slot öffnen und Änderung verwerfen?')) return false;
+            neClosePicker();
+            if (force || hasUnsavedChanges()) dirtyEditors().forEach(function(editor){{ markDirty(editor, false); }});
             root.querySelectorAll('.equipment-editor[data-tab="' + tabName + '"]').forEach(function(editor){{ editor.hidden = true; }});
             root.querySelectorAll('.equipment-slot[data-tab="' + tabName + '"]').forEach(function(card){{ card.classList.remove('active'); }});
             const empty = root.querySelector('[data-editor-empty="' + tabName + '"]');
             if (empty) empty.hidden = false;
+            return true;
           }}
           root.querySelectorAll('[data-switch-equipment]').forEach(function(btn){{
-            btn.addEventListener('click', function(){{ activateTab(btn.dataset.switchEquipment); }});
+            btn.addEventListener('click', function(){{ activateTab(btn.dataset.switchEquipment, false); }});
           }});
           root.querySelectorAll('[data-open-equipment]').forEach(function(card){{
             card.addEventListener('click', function(){{
               const tabName = card.dataset.tab;
               const editorId = card.dataset.openEquipment;
               const editor = document.getElementById(editorId);
-              closeEditors(tabName);
               if (!editor) return;
+              if (!closeEditors(tabName, false)) return;
               editor.hidden = false;
               card.classList.add('active');
               const empty = root.querySelector('[data-editor-empty="' + tabName + '"]');
               if (empty) empty.hidden = true;
               setTimeout(function(){{
                 editor.scrollIntoView({{behavior:'smooth',block:'nearest'}});
-                const first = editor.querySelector('select:not([style*="display:none"]),button');
+                const first = editor.querySelector('.ne-weapon-type,[data-ne-open-picker="1"],button');
                 if (first) first.focus({{preventScroll:true}});
               }},20);
             }});
           }});
           function updatePreview(editor){{
-            const select = editor.querySelector('select[data-preview-input="1"]');
+            const field = editor.querySelector('[data-ne-item-value="1"]');
             const label = editor.querySelector('[data-preview-label="1"]');
             const box = editor.querySelector('[data-preview-box="1"]');
-            if (!select || !label || !box) return;
-            const option = select.options[select.selectedIndex];
-            const itemLabel = option && option.value ? (option.dataset.label || option.value) : 'Noch kein Item gewählt';
-            const image = option && option.value ? (option.dataset.image || '') : '';
+            if (!field || !label || !box) return;
+            const itemLabel = field.value || 'Noch kein Item gewählt';
+            const image = field.dataset.image || '';
             label.textContent = itemLabel;
-            if (image) box.innerHTML = '<img class="equipment-img large" src="' + image.replace(/"/g,'&quot;') + '" alt="" loading="lazy">';
-            else box.innerHTML = '<div class="equipment-placeholder large">' + (editor.dataset.emptyIcon || '🧩') + '</div>';
+            if (image) box.innerHTML = '<img class="equipment-img large" src="' + neEsc(image) + '" alt="" loading="lazy">';
+            else box.innerHTML = '<div class="equipment-placeholder large">' + neEsc(editor.dataset.emptyIcon || '🧩') + '</div>';
           }}
           root.querySelectorAll('[data-live-preview="1"]').forEach(function(editor){{
-            editor.querySelectorAll('select[data-preview-input="1"]').forEach(function(sel){{ sel.addEventListener('change',function(){{ updatePreview(editor); }}); }});
-            editor.querySelectorAll('select.weapon-type-picker').forEach(function(sel){{ sel.addEventListener('change',function(){{ setTimeout(function(){{ updatePreview(editor); }},0); }}); }});
+            editor.querySelectorAll('[data-dirty-field="1"]').forEach(function(field){{
+              field.dataset.initialValue = String(field.value || '');
+              field.addEventListener('change', function(){{
+                if (field.classList.contains('ne-weapon-type')) {{
+                  const itemField = editor.querySelector('[data-ne-item-value="1"]');
+                  if (itemField && itemField.value) {{
+                    const selectedItem = NE_ITEMS.find(function(item) {{ return Number(item.id) === Number(itemField.dataset.itemId || 0); }});
+                    if (selectedItem && !neMatchesWeapon(selectedItem, field.value)) {{
+                      itemField.value = '';
+                      itemField.dataset.itemId = '';
+                      itemField.dataset.image = '';
+                      itemField.dataset.label = '';
+                      const pickButton = editor.querySelector('[data-ne-open-picker="1"]');
+                      if (pickButton) {{
+                        const pickLabel = pickButton.querySelector('[data-ne-picker-label="1"]');
+                        const pickMeta = pickButton.querySelector('[data-ne-picker-meta="1"]');
+                        const pickThumb = pickButton.querySelector('[data-ne-picker-thumb="1"]');
+                        if (pickLabel) pickLabel.textContent = 'Item auswählen';
+                        if (pickMeta) pickMeta.textContent = 'Passende Katalogeinträge';
+                        if (pickThumb) pickThumb.innerHTML = '<span>' + neEsc(editor.dataset.emptyIcon || '🧩') + '</span>';
+                      }}
+                    }}
+                  }}
+                }}
+                refreshDirty(editor);
+                updatePreview(editor);
+                neClosePicker();
+              }});
+            }});
+            editor.querySelectorAll('[data-ne-open-picker="1"]').forEach(function(button){{
+              button.addEventListener('click', function(){{ neOpenPicker(button); }});
+              button.addEventListener('mouseenter', function(ev){{
+                const field = editor.querySelector('[data-ne-item-value="1"]');
+                const itemId = Number(field ? field.dataset.itemId || 0 : 0);
+                if (itemId) neShowTip(itemId, ev);
+              }});
+              button.addEventListener('mousemove', neMoveTip);
+              button.addEventListener('mouseleave', neHideTip);
+            }});
+            editor.addEventListener('submit', function(){{
+              allowPageLeave = true;
+              markDirty(editor, false);
+              neClosePicker();
+            }});
           }});
-          activateTab('main');
+
+          root.querySelectorAll('[data-ne-equipped-item-id]').forEach(function(card){{
+            const itemId = Number(card.dataset.neEquippedItemId || 0);
+            if (!itemId) return;
+            card.addEventListener('mouseenter', function(ev){{ neShowTip(itemId, ev); }});
+            card.addEventListener('mousemove', neMoveTip);
+            card.addEventListener('mouseleave', neHideTip);
+          }});
+
+          document.addEventListener('click', function(ev){{
+            if (nePop && !nePop.contains(ev.target) && !(ev.target.closest && ev.target.closest('[data-ne-open-picker="1"]'))) neClosePicker();
+          }});
+          document.addEventListener('keydown', function(ev){{ if (ev.key === 'Escape') neClosePicker(); }});
+          window.addEventListener('resize', neClosePicker);
+
+          document.addEventListener('click', function(ev){{
+            if (!hasUnsavedChanges() || allowPageLeave) return;
+            const link = ev.target.closest('a[href]');
+            if (!link || link.closest('#need-editor')) return;
+            const href = link.getAttribute('href') || '';
+            if (!href || href.startsWith('#') || href.startsWith('javascript:')) return;
+            if (!confirmDiscard('Du hast eine Item-Auswahl geändert, aber nicht gespeichert. Diese Seite wirklich verlassen?')) {{
+              ev.preventDefault();
+              ev.stopImmediatePropagation();
+            }} else {{
+              allowPageLeave = true;
+            }}
+          }}, true);
+          window.addEventListener('beforeunload', function(ev){{
+            if (!hasUnsavedChanges() || allowPageLeave) return;
+            ev.preventDefault();
+            ev.returnValue = '';
+          }});
+
+          const requestedTab = (new URLSearchParams(window.location.search).get('need_area') || 'main').toLowerCase();
+          activateTab(requestedTab === 'secondary' ? 'secondary' : 'main', true);
         }})();
       </script>
     </section>
@@ -11045,13 +11428,23 @@ def _render_member_portal(data: dict[str, Any], user_id: int, request: Request, 
 
     requests = _need_change_requests(int(guild_id), user_id=uid, limit=40) if guild_id else []
     need_editor_actor = current_user if _current_user_id(request) == uid else None
-    need_editor = _render_need_editor_panel(uid, need_editor_actor, requests, snap, compact=True)
+    shared_item_catalog = _need_builder_items()
+    shared_item_catalog_json = json.dumps(shared_item_catalog, ensure_ascii=False)
+    need_editor = _render_need_editor_panel(
+        uid,
+        need_editor_actor,
+        requests,
+        snap,
+        compact=True,
+        item_catalog=shared_item_catalog,
+    )
     builder = _render_need_builder_dashboard(
         data,
         request,
         embedded=True,
         target_user_id=uid,
         display_name_override=display,
+        item_catalog_override=shared_item_catalog,
     )
 
     balance = _balance_map(snap).get(uid)
@@ -11135,6 +11528,7 @@ def _render_member_portal(data: dict[str, Any], user_id: int, request: Request, 
     <section class="panel portal-profile-card">
       <div class="portal-profile-rows">{profile_rows}</div>
     </section>
+    <script>window.BB_SHARED_ITEM_CATALOG = {shared_item_catalog_json};</script>
     <section class="profile-tabs">
       <details class="profile-tab" id="needlist"{need_open}>
         <summary><span>🎯 Needliste</span><small class="muted">Items direkt auswählen</small></summary>
@@ -14388,6 +14782,18 @@ async def portal_need_change(user_id: int, request: Request, _: bool = Depends(_
         raise HTTPException(status_code=400, detail="Ungültiger Slot.")
     if action_type == "set" and not item_text:
         raise HTTPException(status_code=400, detail="Itemname fehlt.")
+    if action_type == "set":
+        snap = data.get("snapshot") or {}
+        catalog_items = _loot_catalog_items(snap, limit=4000)
+        selected_item = next((it for it in catalog_items if _loot_key(it.get("name")) == _loot_key(item_text)), None)
+        if not selected_item:
+            raise HTTPException(status_code=400, detail="Das ausgewählte Item ist nicht in der Item-Datenbank vorhanden.")
+        if not _need_item_slot_matches(selected_item.get("slot", ""), slot, selected_item.get("name", "")):
+            raise HTTPException(status_code=400, detail=f"Das Item passt nicht in den Slot {slot}.")
+        if slot.startswith("Waffe") and weapon_type:
+            detected_weapon_type = _weapon_type_from_text(selected_item.get("name") or "")
+            if detected_weapon_type and detected_weapon_type != weapon_type:
+                raise HTTPException(status_code=400, detail="Die ausgewählte Waffe passt nicht zur gewählten Waffenart.")
     actor = _current_user(request) or {"user_id": "basic-admin", "username": "Basic Admin"}
     payload = {
         "target_user_id": int(user_id),
@@ -14400,7 +14806,7 @@ async def portal_need_change(user_id: int, request: Request, _: bool = Depends(_
     }
     rid = _create_need_change_request(guild_id, int(user_id), action_type, payload, actor)
     msg = urllib.parse.quote(f"Need-Änderung angelegt: {rid}")
-    return RedirectResponse(url=f"/portal/member/{int(user_id)}?profile_tab=needlist&msg={msg}#needlist", status_code=303)
+    return RedirectResponse(url=f"/portal/member/{int(user_id)}?profile_tab=needlist&need_area={tab.lower()}&msg={msg}#needlist", status_code=303)
 
 
 @app.get("/api/portal/member/{user_id}")
