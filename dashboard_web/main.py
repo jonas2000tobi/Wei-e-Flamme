@@ -2820,7 +2820,7 @@ def _render_dashboard(data: dict[str, Any]) -> str:
       <a href="/status">← Statusansicht</a>
       <a href="#overview">Admin-Übersicht</a>
       <a href="/members">Mitglieder</a>
-      <a href="/needs">Needs</a>
+      <a href="/portal?profile_tab=builder#builder">Needs</a>
       <a href="/loot">Loot</a>
       <a href="/planning">Planung</a>
       <a href="/fairness">Fairness</a>
@@ -3935,7 +3935,6 @@ def _member_sidebar_html() -> str:
         <details open>
           <summary>Mein Portal</summary>
           <a href="/portal"><img class="nav-ico" src="{_asset('nav_portal.png')}" alt="">Mein Profil</a>
-          <a href="/needs"><img class="nav-ico" src="{_asset('nav_needs.png')}" alt="">Needliste</a>
         </details>
 
         <details open>
@@ -4031,7 +4030,7 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "member") -> str:
     .topnav a[href="/overview"]::before {{ display:block; background-image:url("{_asset('nav_kommando.png')}"); }}
     .topnav a[href="/planning"]::before {{ display:block; background-image:url("{_asset('nav_planung.png')}"); }}
     .topnav a[href="/members"]::before {{ display:block; background-image:url("{_asset('nav_mitglieder.png')}"); }}
-    .topnav a[href="/needs"]::before {{ display:block; background-image:url("{_asset('nav_needs.png')}"); }}
+    .topnav a[href="/portal?profile_tab=builder#builder"]::before {{ display:block; background-image:url("{_asset('nav_needs.png')}"); }}
     .topnav a[href="/loot"]::before {{ display:block; background-image:url("{_asset('nav_loot.png')}"); }}
     .topnav a[href="/fairness"]::before {{ display:block; background-image:url("{_asset('nav_fairness.png')}"); }}
     .topnav a[href="/analytics"]::before {{ display:block; background-image:url("{_asset('nav_analytics.png')}"); }}
@@ -5210,7 +5209,7 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "member") -> str:
     }}
   </style>
 </head>
-<body><div class="app-shell">{_member_sidebar_html() if nav_mode == "member" else _sidebar_html()}<main class="content">{auth_note}{body}</main></div><script>
+<body><div class="app-shell">{_member_sidebar_html()}<main class="content">{auth_note}{body}</main></div><script>
 function filterNextTable(input) {{
   const wrap = input.nextElementSibling;
   if (!wrap) return;
@@ -5255,6 +5254,7 @@ function refreshNeedWeaponPicker(source) {{
   const wanted = (source.value || '').toLowerCase();
   const picker = wrap.querySelector('select.weapon-item-picker');
   if (!picker) return;
+  const selectionOnly = wrap.classList.contains('need-selection-only');
   let visible = 0;
   for (const opt of picker.options) {{
     if (!opt.value) {{ opt.hidden = false; continue; }}
@@ -5264,8 +5264,11 @@ function refreshNeedWeaponPicker(source) {{
     if (ok) visible++;
   }}
   const first = picker.options[0];
-  if (first) first.textContent = wanted ? (visible ? `2. Item auswählen ... (${{visible}})` : 'Keine bekannten Items für diese Waffenart – Freitext nutzen') : '2. Item rechts auswählen ...';
-  picker.selectedIndex = 0;
+  if (first) first.textContent = wanted
+    ? (visible ? `2. Item auswählen ... (${{visible}})` : (selectionOnly ? 'Keine bekannten Items für diese Waffenart' : 'Keine bekannten Items für diese Waffenart – Freitext nutzen'))
+    : '2. Item auswählen ...';
+  if (!selectionOnly || source.dataset.changed === '1') picker.selectedIndex = 0;
+  source.dataset.changed = '';
 }}
 
 function refreshItemPickerFilters() {{
@@ -6521,7 +6524,7 @@ def _render_loot_dashboard(data: dict[str, Any]) -> str:
         _card("Gewinner", len(winner_rows), "Spieler mit Loot"),
     ])
     body = f"""
-    <nav class="topnav"><a href="/">← Übersicht</a><a href="/members">Mitglieder</a><a href="/needs">Needs</a><a href="/analytics">Analytics</a><a href="/voice">Voice</a><a href="/exports">Exports</a><a href="/api/loot">API</a></nav>
+    <nav class="topnav"><a href="/">← Übersicht</a><a href="/members">Mitglieder</a><a href="/portal?profile_tab=builder#builder">Needs</a><a href="/analytics">Analytics</a><a href="/voice">Voice</a><a href="/exports">Exports</a><a href="/api/loot">API</a></nav>
     <section class="hero"><div><div class="eyebrow">Loot & Auktionen</div><h1>🎁 Loot-Dashboard</h1><p class="muted">Aktive Auktionen, Gewinnerverteilung und Auktionshistorie. Read-only.</p></div><a class="btn" href="/export/auctions.csv">CSV herunterladen</a></section>
     <section class="grid">{cards}</section>
     <section class="split"><div class="panel"><h2>🏆 Loot-Gewinner</h2>{_table(['Spieler','Items'], winner_rows, placeholder='Gewinner durchsuchen…')}</div><div class="panel"><h2>📈 Aktuell führend</h2>{_table(['Spieler','Führungen'], leader_rows, placeholder='Führungen durchsuchen…')}</div></section>
@@ -7045,7 +7048,7 @@ def _render_loot_check(data: dict[str, Any], item_query: str = "") -> str:
     form_value = _e(q)
     csv_link = f"/export/loot_check.csv?item={urllib.parse.quote(q)}" if q else "/export/loot_check.csv"
     body = f"""
-    <nav class="topnav"><a href="/">← Übersicht</a><a href="/loot">Loot</a><a href="/needs">Needs</a><a href="/members">Mitglieder</a><a href="/api/loot-check?item={urllib.parse.quote(q)}">API</a></nav>
+    <nav class="topnav"><a href="/">← Übersicht</a><a href="/loot">Loot</a><a href="/portal?profile_tab=builder#builder">Needs</a><a href="/members">Mitglieder</a><a href="/api/loot-check?item={urllib.parse.quote(q)}">API</a></nav>
     <section class="hero"><div><div class="eyebrow">Loot-Truhencheck</div><h1>🔎 Item prüfen</h1><p class="muted">Prüft ein gedropptes Item gegen Main-/Second-Needs und laufende Auktionen. Read-only, keine Bot-Daten werden verändert.</p></div><a class="btn" href="{_e(csv_link)}">CSV herunterladen</a></section>
     <section class="panel">
       <h2>Item suchen</h2>
@@ -7367,6 +7370,70 @@ def _need_slot_picker_html(snap: dict[str, Any], *, input_id: str, slot: str, na
         f'<small class="muted">{len(filtered)} bekannte Treffer für diesen Slot. Freitext bleibt möglich.</small>'
     )
 
+
+def _need_slot_select_only_html(
+    snap: dict[str, Any],
+    *,
+    input_id: str,
+    slot: str,
+    name: str = "item_text",
+    selected_value: str = "",
+    required: bool = False,
+) -> str:
+    """Katalogauswahl für die persönliche Needliste – bewusst ohne Freitext."""
+    items = _loot_catalog_items(snap)
+    filtered = [it for it in items if _need_item_slot_matches(it.get("slot", ""), slot, it.get("name", ""))]
+    if not filtered:
+        filtered = items
+    selected = str(selected_value or "").strip()
+    required_attr = " required" if required else ""
+
+    def option_rows(rows: list[dict[str, Any]], *, weapon_type: str = "") -> str:
+        out: list[str] = []
+        seen: set[str] = set()
+        if selected:
+            out.append(f'<option value="{_e(selected)}" selected>{_e(selected)} · aktuell</option>')
+            seen.add(selected.casefold())
+        for item in rows[:800]:
+            item_name = str(item.get("name") or "").strip()
+            if not item_name or item_name.casefold() in seen:
+                continue
+            if weapon_type:
+                detected = _weapon_type_from_text(item_name)
+                if detected and detected != weapon_type:
+                    continue
+            seen.add(item_name.casefold())
+            out.append(f'<option value="{_e(item_name)}">{_e(item_name)}</option>')
+        return "".join(out)
+
+    if _need_slot_kind(slot) == "weapon":
+        weapon_opts = ''.join(f'<option value="{_e(w)}">{_e(w)}</option>' for w in _WEAPON_TYPES)
+        item_opts: list[str] = []
+        if selected:
+            item_opts.append(f'<option value="{_e(selected)}" selected data-weapon="{_e(_weapon_type_from_text(selected))}">{_e(selected)} · aktuell</option>')
+        seen = {selected.casefold()} if selected else set()
+        for item in filtered[:800]:
+            item_name = str(item.get("name") or "").strip()
+            if not item_name or item_name.casefold() in seen:
+                continue
+            seen.add(item_name.casefold())
+            item_opts.append(f'<option value="{_e(item_name)}" data-weapon="{_e(_weapon_type_from_text(item_name))}">{_e(item_name)}</option>')
+        return (
+            f'<div class="need-two-step-picker need-selection-only" data-need-picker="weapon">'
+            f'<select class="weapon-type-picker" name="weapon_type" onchange="this.dataset.changed=\'1\';refreshNeedWeaponPicker(this)">'
+            f'<option value="">1. Waffenart wählen</option>{weapon_opts}</select>'
+            f'<select id="{_e(input_id)}" class="item-picker-select weapon-item-picker" name="{_e(name)}"{required_attr}>'
+            f'<option value="">2. Item auswählen</option>{"".join(item_opts)}</select>'
+            f'<small class="muted">Nur Items aus der Item-Datenbank auswählbar.</small>'
+            f'</div>'
+        )
+
+    return (
+        f'<select id="{_e(input_id)}" class="item-picker-select need-selection-only" name="{_e(name)}"{required_attr}>'
+        f'<option value="">Item für {_e(slot)} auswählen</option>{option_rows(filtered)}</select>'
+        f'<small class="muted">{len(filtered)} passende Katalogeinträge · kein Freitext</small>'
+    )
+
 def _render_loot_center(data: dict[str, Any], request: Optional[Request] = None, msg: str = "") -> str:
     if not data.get("ok"):
         return _html_shell("Loot · Beer and Buffs Dashboard", f"<section class='panel'><h1>🎁 Loot</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
@@ -7491,7 +7558,7 @@ def _render_loot_center(data: dict[str, Any], request: Optional[Request] = None,
         """
 
     body = f"""
-    <nav class="topnav"><a href="/">← Übersicht</a><a href="/loot">Loot</a><a href="/loot-history">Loot-Verlauf</a><a href="/loot-check">Truhencheck</a><a href="/needs">Needs</a><a href="/members">Mitglieder</a><a href="/fairness">Fairness</a><a href="/exports">Exports</a><a href="/api/loot-center">API</a></nav>
+    <nav class="topnav"><a href="/">← Übersicht</a><a href="/loot">Loot</a><a href="/loot-history">Loot-Verlauf</a><a href="/loot-check">Truhencheck</a><a href="/portal?profile_tab=builder#builder">Needs</a><a href="/members">Mitglieder</a><a href="/fairness">Fairness</a><a href="/exports">Exports</a><a href="/api/loot-center">API</a></nav>
     <section class="hero"><div><div class="eyebrow">Loot-Zentrale</div><h1>🎁 Loot / Auktionen</h1><p class="muted">Kontrollzentrum für aktive Auktionen, offene Übergaben, Gebote und Need-Spieler. Read-only, keine Bot-Daten werden verändert.</p></div><div style="display:flex;gap:10px;flex-wrap:wrap"><a class="btn" href="/loot-history">Loot-Verlauf</a><a class="btn" href="/export/loot_center.csv">CSV herunterladen</a></div></section>
     <section class="grid">{cards}</section>
     <section class="panel"><h2>🔎 Schneller Truhencheck</h2><form method="get" action="/loot-check" style="display:flex;gap:10px;flex-wrap:wrap;align-items:center"><input name="item" placeholder="Itemname eingeben, z. B. Aridus Stab" style="min-width:280px;flex:1;padding:12px;border-radius:12px;border:1px solid rgba(255,255,255,.16);background:rgba(0,0,0,.22);color:inherit"><button class="btn" type="submit">Need prüfen</button></form><p class="muted">Prüft Main-/Second-Needs und ob dazu schon eine Auktion läuft.</p></section>
@@ -7908,7 +7975,7 @@ def _render_exports_dashboard(data: dict[str, Any]) -> str:
         ["JSON Snapshot", _raw('<a class="link" href="/api/snapshot">api/snapshot</a>'), "voller Snapshot"],
     ]
     body = f"""
-    <nav class="topnav"><a href="/">← Übersicht</a><a href="/members">Mitglieder</a><a href="/needs">Needs</a><a href="/loot">Loot</a><a href="/system">System</a></nav>
+    <nav class="topnav"><a href="/">← Übersicht</a><a href="/members">Mitglieder</a><a href="/portal?profile_tab=builder#builder">Needs</a><a href="/loot">Loot</a><a href="/system">System</a></nav>
     <section class="hero"><div><div class="eyebrow">Read-only Download</div><h1>⬇️ Exports</h1><p class="muted">CSV/JSON für Kontrolle, Excel oder spätere Migration. Es wird nichts verändert.</p></div><a class="btn" href="/api/snapshot">JSON ansehen</a></section>
     <section class="grid">{cards}</section>
     <section class="panel"><h2>Downloads</h2>{_table(['Bereich','Datei','Inhalt'], rows, searchable=False)}</section>
@@ -8119,7 +8186,7 @@ def _render_planning_dashboard(data: dict[str, Any]) -> str:
     main_rows = [[x.get("label"), x.get("count")] for x in plan.get("top_main_needs") or [] if isinstance(x, dict)]
     sec_rows = [[x.get("label"), x.get("count")] for x in plan.get("top_secondary_needs") or [] if isinstance(x, dict)]
     body = f"""
-    <nav class="topnav"><a href="/">← Übersicht</a><a href="/analytics">Analytics</a><a href="/voice">Voice</a><a href="/fairness">Fairness</a><a href="/needs">Needs</a><a href="/api/planning">API</a></nav>
+    <nav class="topnav"><a href="/">← Übersicht</a><a href="/analytics">Analytics</a><a href="/voice">Voice</a><a href="/fairness">Fairness</a><a href="/portal?profile_tab=builder#builder">Needs</a><a href="/api/planning">API</a></nav>
     <section class="hero"><div><div class="eyebrow">Planung</div><h1>📅 Event-/Raid-Planung</h1><p class="muted">Schnellprüfung für Rolle, Teilnehmer, Voice und häufige Needs. Read-only.</p></div><a class="btn" href="/api/planning">API</a></section>
     <section class="grid">{cards}</section>
     <section class="panel"><h2>Rollen-Summen über Events</h2>{_bars(plan.get('role_totals') or [])}</section>
@@ -8990,7 +9057,7 @@ def _render_item_catalog(request: Optional[Request] = None) -> str:
     def selected(value: str, current: str) -> str:
         return ' selected' if value == current else ''
     body = f"""
-    <nav class="topnav"><a href="/">← Übersicht</a><a href="/loot">Loot</a><a href="/loot-check">Truhencheck</a><a href="/needs">Needs</a><a href="/api/items">API</a></nav>
+    <nav class="topnav"><a href="/">← Übersicht</a><a href="/loot">Loot</a><a href="/loot-check">Truhencheck</a><a href="/portal?profile_tab=builder#builder">Needs</a><a href="/api/items">API</a></nav>
     <section class="hero">
       <div>
         <div class="eyebrow">Questlog → Postgres</div>
@@ -9502,14 +9569,33 @@ def _need_builder_queue_main(guild_id: int, user_id: int, build_id: str, actor: 
     return count
 
 
-def _render_need_builder_dashboard(data: dict[str, Any], request: Request, msg: str = "") -> str:
+def _render_need_builder_dashboard(
+    data: dict[str, Any],
+    request: Request,
+    msg: str = "",
+    *,
+    embedded: bool = False,
+    target_user_id: int = 0,
+    display_name_override: str = "",
+) -> str:
     if not data.get("ok"):
-        return _html_shell("Needs · Beer and Buffs Dashboard", f"<section class='panel'><h1>🎁 Needliste</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+        error_html = f"<section class='panel'><h1>🧰 Charakter-Builder</h1><p class='muted'>{_e(data.get('error'))}</p></section>"
+        return error_html if embedded else _html_shell("Builder · Beer and Buffs Dashboard", error_html)
     snap: dict[str, Any] = data.get("snapshot") or {}
     guild_id = _safe_guild_id(data)
-    user_id, display_name, members = _need_builder_target_user(request, snap)
+    if target_user_id:
+        user_id = int(target_user_id)
+        display_name = str(display_name_override or _profile_name_map(snap).get(user_id) or f"User {user_id}")
+        members: list[dict[str, Any]] = []
+    else:
+        user_id, display_name, members = _need_builder_target_user(request, snap)
     if not guild_id or not user_id:
-        return _html_shell("Needs · Beer and Buffs Dashboard", "<section class='panel'><h1>🎁 Needliste</h1><p class='muted'>Keine Guild-ID oder kein Zielmitglied gefunden. Melde dich per Discord an oder öffne die Seite als Dashboard-Admin.</p></section>")
+        error_html = "<section class='panel'><h1>🧰 Charakter-Builder</h1><p class='muted'>Keine Guild-ID oder kein Zielmitglied gefunden.</p></section>"
+        return error_html if embedded else _html_shell("Builder · Beer and Buffs Dashboard", error_html)
+    if request.url.path.startswith("/portal/member/"):
+        builder_profile_url = f"/portal/member/{int(user_id)}"
+    else:
+        builder_profile_url = "/portal"
     state = _need_builder_load(guild_id, user_id)
     builds = state.get("builds") or []
     slots_by_build = state.get("slots") or {}
@@ -9524,7 +9610,7 @@ def _render_need_builder_dashboard(data: dict[str, Any], request: Request, msg: 
     slot_filters_json = json.dumps({slot: _need_builder_slot_filter(slot) for slot in _NEED_BUILDER_SLOTS}, ensure_ascii=False)
 
     member_select = ""
-    if _is_portal_admin(request) or (_auth_mode() in {"basic", "hybrid"} and not _discord_oauth_enabled()):
+    if (not embedded) and (_is_portal_admin(request) or (_auth_mode() in {"basic", "hybrid"} and not _discord_oauth_enabled())):
         opts = "".join(f'<option value="{int(m.get("user_id") or 0)}"{" selected" if int(m.get("user_id") or 0)==int(user_id) else ""}>{_e(m.get("display_name") or m.get("user_id"))}</option>' for m in members)
         member_select = f"""
         <form method="get" action="/needs" class="need-builder-memberpick">
@@ -9539,7 +9625,7 @@ def _render_need_builder_dashboard(data: dict[str, Any], request: Request, msg: 
         main_badge = '<span class="nb-main-badge">★ Main Need</span>' if b.get("is_main") else ""
         img = "⚔️" if bid == active_build_id else "🛡️"
         build_cards.append(f"""
-        <a class="nb-build{active_cls}" href="/needs?user_id={int(user_id)}&build={_e(urllib.parse.quote(bid))}">
+        <a class="nb-build{active_cls}" href="{_e(builder_profile_url)}?profile_tab=builder&build={_e(urllib.parse.quote(bid))}#builder">
           <span class="nb-build-icon">{img}</span><span><strong>{_e(b.get('name') or 'Build')}</strong>{main_badge}</span><em>⋮</em>
         </a>
         """)
@@ -9613,12 +9699,15 @@ def _render_need_builder_dashboard(data: dict[str, Any], request: Request, msg: 
     </style>
     """
 
-    body = f"""
-    <nav class="topnav"><a href="/">← Übersicht</a><a href="/items">Item-Datenbank</a><a href="/loot">Loot</a><a href="/members">Mitglieder</a><a href="/api/needs">API</a></nav>
+    builder_header = "" if embedded else """
+    <nav class="topnav"><a href="/">← Übersicht</a><a href="/items">Item-Datenbank</a><a href="/loot">Loot</a><a href="/members">Mitglieder</a></nav>
     <section class="hero">
-      <div><div class="eyebrow">Needliste · Build-Baukasten</div><h1>🎁 Needliste</h1><p class="muted">Mehrere Builds pro Spieler. Nur der aktive <b>Main-Need-Build</b> wird an den Bot übertragen.</p></div>
+      <div><div class="eyebrow">Charakter-Builder</div><h1>🧰 Charakter-Builder</h1><p class="muted">Mehrere Builds pro Spieler. Nur der aktive Main-Need-Build wird an den Bot übertragen.</p></div>
       <div class="nb-top-actions"><a class="btn" href="/items">Item-Datenbank</a></div>
     </section>
+    """
+    body = f"""
+    {builder_header}
     {css}
     {('<section class="panel"><p class="ok">' + _e(msg) + '</p></section>') if msg else ''}
     <div class="need-builder-shell">
@@ -9926,7 +10015,7 @@ def _render_need_builder_dashboard(data: dict[str, Any], request: Request, msg: 
       document.addEventListener('DOMContentLoaded', nbRecalc);
     </script>
     """
-    return _html_shell("Needliste · Beer and Buffs Dashboard", body)
+    return body if embedded else _html_shell("Charakter-Builder · Beer and Buffs Dashboard", body)
 
 @app.get("/items", response_class=HTMLResponse)
 def items_page(request: Request):
@@ -10006,12 +10095,42 @@ def members_page(request: Request, _: bool = Depends(_auth)):
         return HTMLResponse(_html_shell("Beer and Buffs Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"), status_code=500)
 
 
+
+def _need_builder_profile_redirect(
+    request: Request,
+    user_id: int,
+    *,
+    build_id: str = "",
+    msg: str = "",
+) -> str:
+    me = _current_user_id(request)
+    if _is_portal_admin(request) and int(user_id or 0) != int(me or 0):
+        base = f"/portal/member/{int(user_id)}"
+    else:
+        base = "/portal"
+    params: dict[str, str] = {"profile_tab": "builder"}
+    if build_id:
+        params["build"] = str(build_id)
+    if msg:
+        params["msg"] = str(msg)
+    return base + "?" + urllib.parse.urlencode(params) + "#builder"
+
 @app.get("/needs", response_class=HTMLResponse)
 def needs_page(request: Request, msg: str = "", _: bool = Depends(_auth)):
-    try:
-        return HTMLResponse(_render_need_builder_dashboard(_snapshot_payload(), request, msg=msg))
-    except Exception as exc:
-        return HTMLResponse(_html_shell("Beer and Buffs Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"), status_code=500)
+    data = _snapshot_payload()
+    snap = data.get("snapshot") or {}
+    user_id, _display_name, _members = _need_builder_target_user(request, snap)
+    if not user_id:
+        return RedirectResponse(url="/portal", status_code=303)
+    return RedirectResponse(
+        url=_need_builder_profile_redirect(
+            request,
+            int(user_id),
+            build_id=str(request.query_params.get("build") or ""),
+            msg=msg,
+        ),
+        status_code=303,
+    )
 
 
 @app.post("/needs/builds/new")
@@ -10022,7 +10141,7 @@ async def need_build_new(request: Request, _: bool = Depends(_auth)):
     if not _portal_can_view(request, int(user_id)) and not _is_portal_admin(request):
         raise HTTPException(status_code=403, detail="Keine Berechtigung für diese Needliste.")
     bid = _need_builder_create_default(int(guild_id), int(user_id))
-    return RedirectResponse(url=f"/needs?user_id={int(user_id)}&build={urllib.parse.quote(bid)}&msg={urllib.parse.quote('Build erstellt')}", status_code=303)
+    return RedirectResponse(url=_need_builder_profile_redirect(request, int(user_id), build_id=bid, msg="Build erstellt"), status_code=303)
 
 
 @app.post("/needs/builds/save")
@@ -10034,7 +10153,7 @@ async def need_build_save(request: Request, _: bool = Depends(_auth)):
         raise HTTPException(status_code=403, detail="Keine Berechtigung für diese Needliste.")
     slot_ids = {slot: _user_id(form.get(f"slot_{slot}")) for slot in _NEED_BUILDER_SLOTS}
     bid = _need_builder_save_build(int(guild_id), int(user_id), str(form.get("build_id") or ""), str(form.get("build_name") or "Build"), slot_ids)
-    return RedirectResponse(url=f"/needs?user_id={int(user_id)}&build={urllib.parse.quote(bid)}&msg={urllib.parse.quote('Build gespeichert')}", status_code=303)
+    return RedirectResponse(url=_need_builder_profile_redirect(request, int(user_id), build_id=bid, msg="Build gespeichert"), status_code=303)
 
 
 @app.post("/needs/builds/save-main")
@@ -10048,7 +10167,7 @@ async def need_build_save_main(request: Request, _: bool = Depends(_auth)):
     bid = _need_builder_save_build(int(guild_id), int(user_id), str(form.get("build_id") or ""), str(form.get("build_name") or "Build"), slot_ids)
     actor = _current_user(request) or {"user_id": "basic-admin", "username": "Basic Admin"}
     queued = _need_builder_queue_main(int(guild_id), int(user_id), bid, actor)
-    return RedirectResponse(url=f"/needs?user_id={int(user_id)}&build={urllib.parse.quote(bid)}&msg={urllib.parse.quote(f'Build gespeichert und {queued} Bot-Aufträge angelegt')}", status_code=303)
+    return RedirectResponse(url=_need_builder_profile_redirect(request, int(user_id), build_id=bid, msg=f"Build gespeichert und {queued} Bot-Aufträge angelegt"), status_code=303)
 
 
 @app.post("/needs/builds/main")
@@ -10061,7 +10180,7 @@ async def need_build_main(request: Request, _: bool = Depends(_auth)):
         raise HTTPException(status_code=403, detail="Keine Berechtigung für diese Needliste.")
     actor = _current_user(request) or {"user_id": "basic-admin", "username": "Basic Admin"}
     queued = _need_builder_queue_main(int(guild_id), int(user_id), bid, actor)
-    return RedirectResponse(url=f"/needs?user_id={int(user_id)}&build={urllib.parse.quote(bid)}&msg={urllib.parse.quote(f'Main Need gesetzt: {queued} Bot-Aufträge')}", status_code=303)
+    return RedirectResponse(url=_need_builder_profile_redirect(request, int(user_id), build_id=bid, msg=f"Main Need gesetzt: {queued} Bot-Aufträge"), status_code=303)
 
 
 @app.post("/needs/builds/duplicate")
@@ -10073,7 +10192,7 @@ async def need_build_duplicate(request: Request, _: bool = Depends(_auth)):
     if not _portal_can_view(request, int(user_id)) and not _is_portal_admin(request):
         raise HTTPException(status_code=403, detail="Keine Berechtigung für diese Needliste.")
     new_id = _need_builder_duplicate(int(guild_id), int(user_id), bid)
-    return RedirectResponse(url=f"/needs?user_id={int(user_id)}&build={urllib.parse.quote(new_id)}&msg={urllib.parse.quote('Build dupliziert')}", status_code=303)
+    return RedirectResponse(url=_need_builder_profile_redirect(request, int(user_id), build_id=new_id, msg="Build dupliziert"), status_code=303)
 
 
 @app.post("/needs/builds/delete")
@@ -10085,7 +10204,7 @@ async def need_build_delete(request: Request, _: bool = Depends(_auth)):
     if not _portal_can_view(request, int(user_id)) and not _is_portal_admin(request):
         raise HTTPException(status_code=403, detail="Keine Berechtigung für diese Needliste.")
     _need_builder_delete(int(guild_id), int(user_id), bid)
-    return RedirectResponse(url=f"/needs?user_id={int(user_id)}&msg={urllib.parse.quote('Build gelöscht')}", status_code=303)
+    return RedirectResponse(url=_need_builder_profile_redirect(request, int(user_id), msg="Build gelöscht"), status_code=303)
 
 
 @app.get("/loot", response_class=HTMLResponse)
@@ -10580,7 +10699,7 @@ def _weapon_type_options_html() -> str:
     return "".join(f'<option value="{_e(w)}">{_e(w)}</option>' for w in _WEAPON_TYPES)
 
 
-def _render_need_editor_panel(user_id: int, current_user: Optional[dict[str, Any]], requests: list[dict[str, Any]], snap: Optional[dict[str, Any]] = None) -> str:
+def _render_need_editor_panel(user_id: int, current_user: Optional[dict[str, Any]], requests: list[dict[str, Any]], snap: Optional[dict[str, Any]] = None, *, compact: bool = False) -> str:
     snap = snap or {}
     req_rows = []
     for r in requests[:30]:
@@ -10609,7 +10728,7 @@ def _render_need_editor_panel(user_id: int, current_user: Optional[dict[str, Any
               <div class="need-inline-current">{_e(current or '—')}</div>
               <div class="muted">erhalten · gesperrt</div>
             </div>"""
-        picker = _need_slot_picker_html(snap, input_id=input_id, slot=slot, name="item_text", required=False, placeholder=(current or "Item auswählen oder tippen"))
+        picker = _need_slot_select_only_html(snap, input_id=input_id, slot=slot, name="item_text", selected_value=current, required=False)
         return f"""
         <form class="need-inline-row" method="post" action="/portal/member/{int(user_id)}/need-change">
           <input type="hidden" name="action_type" value="set">
@@ -10630,13 +10749,14 @@ def _render_need_editor_panel(user_id: int, current_user: Optional[dict[str, Any
                 idx += 1
                 rows.append(row_html(tab, slot, slot_map.get(slot), idx))
             blocks.append(f'<div class="need-slot-group"><h3>{_e(title)}</h3>{"".join(rows)}</div>')
-        return f'<div class="need-board edit-board"><h3>{_e(tab)}</h3><p class="muted">Direkt ins Feld klicken, Item wählen oder tippen. Waffen-Slots haben zusätzlich Waffenart.</p>{"".join(blocks)}</div>'
+        return f'<div class="need-board edit-board"><h3>{_e(tab)}</h3><p class="muted">Nur aus der Item-Datenbank auswählen. Waffen-Slots beginnen mit der Waffenart.</p>{"".join(blocks)}</div>'
 
-    actor_hint = "Du bearbeitest deine eigene Needliste." if current_user else "Discord-Login nötig."
+    actor_hint = "Du bearbeitest deine eigene Needliste." if current_user else "Leitungsbearbeitung für dieses Mitglied."
+    history_html = "" if compact else f"<h3>Änderungslog</h3>{_table(['Zeit','Status','Aktion','Bereich','Slot','Ergebnis'], req_rows, placeholder='Need-Änderungen durchsuchen…')}"
     return f"""
     <section class="panel" id="need-editor">
-      <h2>✍️ Needliste bearbeiten</h2>
-      <p class="muted">{_e(actor_hint)} Jede Zeile speichert nur diesen Slot. Der Bot verarbeitet den Antrag und schreibt die echte Needliste.</p>
+      <h2>🎯 Needliste auswählen</h2>
+      <p class="muted">{_e(actor_hint)} Jede Zeile speichert nur diesen Slot. Es sind ausschließlich Items aus der Item-Datenbank auswählbar.</p>
       <style>
         .need-inline-row{{display:grid;grid-template-columns:160px minmax(260px,1fr) auto auto;gap:10px;align-items:end;padding:10px 0;border-bottom:1px solid rgba(255,255,255,.08)}}
         .need-inline-slot{{font-weight:800;color:var(--gold)}}
@@ -10651,163 +10771,229 @@ def _render_need_editor_panel(user_id: int, current_user: Optional[dict[str, Any
         {board_html('Main', main_map)}
         {board_html('Secondary', sec_map)}
       </div>
-      <h3>Änderungslog</h3>
-      {_table(['Zeit','Status','Aktion','Bereich','Slot','Ergebnis'], req_rows, placeholder='Need-Änderungen durchsuchen…')}
+      {history_html}
     </section>
     """
 
+def _guild_membership_duration(value: Any) -> str:
+    joined = _dt_obj(value)
+    if not joined:
+        return "—"
+    if joined.tzinfo is None:
+        joined = joined.replace(tzinfo=timezone.utc)
+    now = datetime.now(timezone.utc)
+    if joined > now:
+        return "seit heute"
+    days = max(0, (now - joined).days)
+    years = int(days // 365)
+    remaining = int(days - years * 365)
+    months = int(remaining // 30)
+    rest_days = int(remaining - months * 30)
+    parts: list[str] = []
+    if years:
+        parts.append(f"{years} Jahr" if years == 1 else f"{years} Jahren")
+    if months and len(parts) < 2:
+        parts.append(f"{months} Monat" if months == 1 else f"{months} Monaten")
+    if not parts or (years == 0 and months == 0):
+        parts.append(f"{rest_days} Tag" if rest_days == 1 else f"{rest_days} Tagen")
+    return "seit " + ", ".join(parts[:2])
+
+
 def _render_member_portal(data: dict[str, Any], user_id: int, request: Request, msg: str = "") -> str:
     if not data.get("ok"):
-        return _html_shell("Portal · Beer and Buffs Dashboard", f"<section class='panel'><h1>👤 Portal</h1><p class='muted'>{_e(data.get('error'))}</p></section>", nav_mode="member")
+        return _html_shell("Profil · Beer and Buffs Dashboard", f"<section class='panel'><h1>👤 Mein Profil</h1><p class='muted'>{_e(data.get('error'))}</p></section>", nav_mode="member")
     if not _portal_can_view(request, int(user_id)):
-        raise HTTPException(status_code=403, detail="Du darfst nur dein eigenes Portal sehen. Leitung/Admins sehen alle Mitglieder.")
+        raise HTTPException(status_code=403, detail="Du darfst nur dein eigenes Profil sehen. Leitung/Admins sehen alle Mitglieder.")
 
     snap: dict[str, Any] = data.get("snapshot") or {}
     guild_id = _safe_guild_id(data)
     names = _profile_name_map(snap)
     uid = int(user_id)
+    current_user = _current_user(request)
 
     profiles = ((snap.get("profiles") or {}).get("items") or [])
     profile: dict[str, Any] = {}
-    for p in profiles:
-        if not isinstance(p, dict):
-            continue
-        if _user_id(p.get("user_id") or p.get("member_id") or p.get("discord_id")) == uid:
-            profile = p
+    for row in profiles:
+        if isinstance(row, dict) and _user_id(row.get("user_id") or row.get("member_id") or row.get("discord_id")) == uid:
+            profile = row
             break
+    stored_profile = profile.get("profile") if isinstance(profile.get("profile"), dict) else {}
 
-    display = (
-        profile.get("display_name")
-        or profile.get("ingame_name")
-        or profile.get("discord_name")
+    def profile_value(*keys: str, default: Any = "") -> Any:
+        for key in keys:
+            value = profile.get(key)
+            if value not in (None, "", [], {}):
+                return value
+            value = stored_profile.get(key)
+            if value not in (None, "", [], {}):
+                return value
+        return default
+
+    display = str(
+        profile_value("display_name", "server_name", "discord_name", "discord_username", "ingame_name")
         or names.get(uid)
         or f"User {uid}"
     )
-    profile_name = profile.get("ingame_name") or profile.get("display_name") or display
-    gearscore = profile.get("gearscore") or profile.get("gear_score") or profile.get("gs") or "—"
-    main_role = profile.get("main_role") or profile.get("role_name") or profile.get("class_role") or profile.get("role") or "—"
-    guild_rank = (
-        profile.get("guild_rank")
-        or profile.get("rank_name")
-        or profile.get("rank")
-        or profile.get("guild_role")
-        or profile.get("member_rank")
-        or "—"
+    avatar_url = str(profile_value("avatar_url", "display_avatar_url", "discord_avatar_url") or "").strip()
+    class_name = str(profile_value("class_name", "main_class", "character_class", "klasse", "class", "build_class", "weapon_combo") or "—")
+    main_role = str(profile_value("main_role", "role_name", "class_role", "role") or "—")
+    joined_raw = profile_value("guild_joined_at", "joined_guild_at", "member_since", "joined_since", "joined_at", "created_at")
+    joined_text = _guild_membership_duration(joined_raw)
+    guild_rank = str(profile_value("guild_rank", "rank_name", "rank", "guild_role", "member_rank") or "").strip()
+    if not guild_rank:
+        role_names = [str(r.get("role_name") or "") for r in (profile.get("roles") or []) if isinstance(r, dict)]
+        preferred = next((name for name in role_names if any(term in name.casefold() for term in ("anführer", "gildenmeister", "leader", "berater", "wächter", "guardian"))), "")
+        guild_rank = preferred or "Mitglied"
+
+    active_tab = str(request.query_params.get("profile_tab") or "").strip().lower()
+    need_open = " open" if active_tab == "needlist" else ""
+    builder_open = " open" if active_tab == "builder" else ""
+    ec_open = " open" if active_tab == "ec" else ""
+    events_open = " open" if active_tab in {"events", "attendance"} else ""
+
+    requests = _need_change_requests(int(guild_id), user_id=uid, limit=40) if guild_id else []
+    need_editor_actor = current_user if _current_user_id(request) == uid else None
+    need_editor = _render_need_editor_panel(uid, need_editor_actor, requests, snap, compact=True)
+    builder = _render_need_builder_dashboard(
+        data,
+        request,
+        embedded=True,
+        target_user_id=uid,
+        display_name_override=display,
     )
-    joined_raw = (
-        profile.get("guild_joined_at")
-        or profile.get("joined_guild_at")
-        or profile.get("member_since")
-        or profile.get("joined_since")
-        or profile.get("joined_at")
-        or profile.get("created_at")
-        or ""
+
+    balance = _balance_map(snap).get(uid)
+    ec_rows = [
+        [_dt(tx.get("created_at")), _fmt_ec(tx.get("amount")), tx.get("raw_type") or tx.get("type") or "—", _short(tx.get("reason"), 180)]
+        for tx in _tx_for_user(snap, uid, limit=140)
+    ]
+    event_rows = _member_event_rows(snap, uid)
+    upcoming_rows: list[list[Any]] = []
+    for ev in _portal_active_events(snap, uid):
+        status = _portal_event_status_for_user(ev, uid)
+        if status == "—":
+            continue
+        eid = str(ev.get("event_id") or ev.get("id") or "")
+        upcoming_rows.append([
+            _event_link(eid, ev.get("title") or ev.get("name") or eid),
+            _dt(ev.get("when_iso") or ev.get("start_at")),
+            status,
+        ])
+
+    attendance_player: dict[str, Any] = {}
+    try:
+        attendance_payload = _attendance_stats_payload(data)
+        attendance_player = next((p for p in (attendance_payload.get("player_rows") or []) if _user_id(p.get("user_id")) == uid), {})
+    except Exception:
+        attendance_player = {}
+
+    avatar_html = (
+        f'<img src="{_e(avatar_url)}" alt="Discord-Profilbild von {_e(display)}" loading="eager">'
+        if avatar_url else
+        f'<img src="{_e(_brand_image("logo", "beer_and_buffs_logo.png"))}" alt="Profilbild" loading="eager">'
     )
-    joined_text = _dt(joined_raw) if joined_raw else "—"
-
-    need_info = _needs_by_user(snap).get(uid, {})
-    main_needs = need_info.get("main") if isinstance(need_info, dict) else []
-    sec_needs = need_info.get("secondary") if isinstance(need_info, dict) else []
-
-    active_events = _portal_active_events(snap, uid)
-    user_auctions = [a for a in _auctions_for_user(snap, uid, limit=100) if isinstance(a, dict)]
-    active_user_auctions = [a for a in user_auctions if _loot_is_active(a)]
-    if not active_user_auctions:
-        # Fallback: Wenn Snapshot keine userbezogene Auktionszuordnung liefert, wenigstens alle aktiven anzeigen/zählen.
-        active_user_auctions = [a for a in _portal_active_auctions(snap) if isinstance(a, dict)]
-
-    msg_html = f'<div class="ok">{_e(msg)}</div>' if msg else ""
-    admin_links = ""
-    if _is_portal_admin(request):
-        admin_links = f'<a class="btn ghost" href="/member/{uid}">Leitungsprüfung</a><a class="btn ghost" href="/member/{uid}/loot">Loot prüfen</a>'
-
     profile_rows = "".join([
-        f'<div class="portal-profile-row"><span>Name</span><strong>{_e(profile_name)}</strong></div>',
-        f'<div class="portal-profile-row"><span>Gearscore</span><strong>{_e(gearscore)}</strong></div>',
+        f'<div class="portal-profile-row"><span>Name</span><strong>{_e(display)}</strong></div>',
+        f'<div class="portal-profile-row"><span>Klasse</span><strong>{_e(class_name)}</strong></div>',
         f'<div class="portal-profile-row"><span>Rolle</span><strong>{_e(main_role)}</strong></div>',
-        f'<div class="portal-profile-row"><span>Gildenrang</span><strong>{_e(guild_rank)}</strong></div>',
-        f'<div class="portal-profile-row"><span>In Gilde seit</span><strong>{_e(joined_text)}</strong></div>',
+        f'<div class="portal-profile-row"><span>In der Gilde</span><strong>{_e(joined_text)}</strong></div>',
+        f'<div class="portal-profile-row"><span>Rang</span><strong>{_e(guild_rank)}</strong></div>',
     ])
 
-    event_preview = "Keine aktive Anmeldung."
-    if active_events:
-        event_preview = _short(active_events[0].get("title") or active_events[0].get("name") or "Nächstes Event", 56)
-    auction_preview = "Keine laufende Auktion."
-    if active_user_auctions:
-        auction_preview = _short(_loot_text(active_user_auctions[0].get("item_name") or active_user_auctions[0].get("item") or active_user_auctions[0].get("auction_id")), 56)
-
-    portal_nav = '<nav class="topnav"><a href="/">Kommando</a><a href="/portal">Mein Portal</a><a href="/events">Events</a><a href="/loot">Loot</a><a href="/members">Mitglieder</a><a href="/ec">EC</a></nav>' if _is_portal_admin(request) else '<nav class="topnav"><a href="/member">Start</a><a href="/member/events">Events</a><a href="/member/auctions">Auktionen</a><a href="/member/ec">Meine EC</a><a href="/portal">Mein Portal</a></nav>'
+    admin_links = ""
+    if _is_portal_admin(request) and _current_user_id(request) != uid:
+        admin_links = f'<a class="btn ghost" href="/member/{uid}">Leitungsprüfung</a>'
+    msg_html = f'<div class="ok">{_e(msg)}</div>' if msg else ""
 
     body = f"""
     <style>
-      .portal-page-hero{{min-height:180px;}}
-      .portal-profile-card{{display:grid;gap:10px;}}
-      .portal-profile-row{{display:grid;grid-template-columns:150px minmax(0,1fr);gap:12px;align-items:center;padding:11px 0;border-bottom:1px solid rgba(214,168,79,.13)}}
+      .profile-hero{{display:grid;grid-template-columns:126px minmax(0,1fr) auto;gap:22px;align-items:center;min-height:0;padding:22px}}
+      .profile-avatar{{width:118px;height:118px;border-radius:28px;overflow:hidden;border:2px solid rgba(226,181,81,.72);background:rgba(0,0,0,.35);box-shadow:0 15px 38px rgba(0,0,0,.42),0 0 0 5px rgba(214,168,79,.08)}}
+      .profile-avatar img{{width:100%;height:100%;object-fit:cover}}
+      .profile-main{{display:grid;gap:12px}}
+      .profile-main h1{{margin:0}}
+      .portal-profile-card{{display:block}}
+      .portal-profile-rows{{display:grid;gap:0}}
+      .portal-profile-row{{display:grid;grid-template-columns:150px minmax(0,1fr);gap:12px;align-items:center;padding:12px 0;border-bottom:1px solid rgba(214,168,79,.14)}}
       .portal-profile-row:last-child{{border-bottom:0}}
-      .portal-profile-row span{{color:var(--muted);font-size:13px;text-transform:uppercase;letter-spacing:.06em;font-weight:800}}
-      .portal-profile-row strong{{color:var(--text);font-size:16px;overflow-wrap:anywhere}}
-      .portal-mini-grid{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin:14px 0}}
-      .portal-kpi{{padding:18px}}
-      .portal-kpi .card-value{{font-size:34px}}
-      .portal-kpi p{{margin:6px 0 0}}
-      .portal-need-card{{margin-top:14px}}
-      .portal-need-head{{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:12px}}
-      .portal-need-card details{{margin-top:14px}}
-      .portal-need-card summary{{cursor:pointer;list-style:none;display:inline-flex;align-items:center;justify-content:center;gap:8px}}
-      .portal-need-card summary::-webkit-details-marker{{display:none}}
-      .portal-need-card .need-board > h3:first-child{{display:none}}
-      .portal-need-card .need-board > p.muted:first-of-type{{display:none}}
-      .portal-need-card .mobile-note{{display:none}}
-      @media(max-width:760px){{
-        .portal-profile-row{{grid-template-columns:1fr;gap:4px;padding:10px 0}}
-        .portal-mini-grid{{grid-template-columns:1fr 1fr;gap:10px}}
-        .portal-kpi{{padding:14px}}
-        .portal-kpi .card-value{{font-size:28px}}
-      }}
-      @media(max-width:380px){{
-        .portal-mini-grid{{grid-template-columns:1fr}}
-      }}
+      .portal-profile-row span{{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.07em;font-weight:900}}
+      .portal-profile-row strong{{font-size:16px;overflow-wrap:anywhere}}
+      .profile-tabs{{display:grid;gap:12px;margin-top:14px}}
+      .profile-tab{{border:1px solid rgba(214,168,79,.28);border-radius:17px;background:linear-gradient(135deg,rgba(35,24,13,.88),rgba(8,7,6,.88));overflow:clip}}
+      .profile-tab>summary{{list-style:none;cursor:pointer;display:flex;align-items:center;justify-content:space-between;gap:14px;padding:17px 19px;color:#f2dda8;font-family:Georgia,serif;font-weight:900;font-size:18px}}
+      .profile-tab>summary::-webkit-details-marker{{display:none}}
+      .profile-tab>summary::after{{content:"＋";font-family:Inter,sans-serif;color:var(--gold);font-size:22px}}
+      .profile-tab[open]>summary::after{{content:"−"}}
+      .profile-tab[open]>summary{{border-bottom:1px solid rgba(214,168,79,.18);background:rgba(214,168,79,.06)}}
+      .profile-tab-content{{padding:16px}}
+      .profile-tab-content>.panel:first-child{{margin-top:0}}
+      .profile-tab-kpis{{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:10px;margin-bottom:14px}}
+      .profile-tab-kpis .card{{min-width:0}}
+      @media(max-width:900px){{.profile-hero{{grid-template-columns:90px minmax(0,1fr)}}.profile-hero .hero-actions{{grid-column:1/-1}}.profile-avatar{{width:84px;height:84px;border-radius:22px}}.portal-profile-card{{display:block}}.profile-tab-kpis{{grid-template-columns:repeat(2,minmax(0,1fr))}}}}
+      @media(max-width:620px){{.profile-hero{{grid-template-columns:70px minmax(0,1fr);padding:16px;gap:13px}}.profile-avatar{{width:66px;height:66px;border-radius:18px}}.portal-profile-row{{grid-template-columns:1fr;gap:4px}}.profile-tab>summary{{padding:15px;font-size:16px}}.profile-tab-content{{padding:10px}}.profile-tab-kpis{{grid-template-columns:1fr 1fr}}}}
     </style>
-    {portal_nav}
-    <section class="hero portal-page-hero">
-      <div>
-        <div class="eyebrow">Mein Portal</div>
-        <h1>👤 {_e(display)}</h1>
-        <p class="muted">Profil, Event-Anmeldungen, Auktionen und eigene Needliste.</p>
-      </div>
+    <nav class="topnav"><a href="/">Startseite</a><a href="#needlist">Needliste</a><a href="#builder">Builder</a><a href="#ec-history">EC-Verlauf</a><a href="#event-history">Eventanmeldungen</a></nav>
+    <section class="hero profile-hero">
+      <div class="profile-avatar">{avatar_html}</div>
+      <div class="profile-main"><div class="eyebrow">Mein Profil</div><h1>{_e(display)}</h1><p class="muted">Deine persönlichen Gildendaten und einklappbaren Bereiche.</p></div>
       <div class="hero-actions">{admin_links}</div>
     </section>
     {msg_html}
     <section class="panel portal-profile-card">
-      <h2>Profil</h2>
-      {profile_rows}
+      <div class="portal-profile-rows">{profile_rows}</div>
     </section>
-    <section class="portal-mini-grid">
-      <div class="card portal-kpi">
-        <div class="card-title">An Events angemeldet</div>
-        <div class="card-value">{len(active_events)}</div>
-        <p class="card-sub">{_e(event_preview)}</p>
-      </div>
-      <div class="card portal-kpi">
-        <div class="card-title">Deine Auktionen</div>
-        <div class="card-value">{len(active_user_auctions)}</div>
-        <p class="card-sub">{_e(auction_preview)}</p>
-      </div>
-    </section>
-    <section class="panel portal-need-card" id="needs">
-      <div class="portal-need-head">
-        <h2>Eigene Needliste</h2>
-        <a class="btn ghost" href="/portal?edit_needs=1#needs">Bearbeiten</a>
-      </div>
-      {_render_need_slot_board(str(display), 'Main', main_needs, editable=False, user_id=uid, snap=snap)}
-      <details>
-        <summary class="btn">Second anzeigen</summary>
-        {_render_need_slot_board(str(display), 'Secondary', sec_needs, editable=False, user_id=uid, snap=snap)}
+    <section class="profile-tabs">
+      <details class="profile-tab" id="needlist"{need_open}>
+        <summary><span>🎯 Needliste</span><small class="muted">Items direkt auswählen</small></summary>
+        <div class="profile-tab-content">{need_editor}</div>
+      </details>
+      <details class="profile-tab" id="builder"{builder_open}>
+        <summary><span>🧰 Charakter-Builder</span><small class="muted">Kompletter Build-Baukasten</small></summary>
+        <div class="profile-tab-content">{builder}</div>
+      </details>
+      <details class="profile-tab" id="ec-history"{ec_open}>
+        <summary><span>🪙 Eigener EC-Verlauf</span><small class="muted">Kontostand und Buchungen</small></summary>
+        <div class="profile-tab-content">
+          <section class="grid">{_card('EC-Kontostand', _fmt_ec(balance) if balance is not None else '—', 'aktueller Stand')}</section>
+          <section class="panel"><h2>Deine EC-Buchungen</h2>{_table(['Zeit','Betrag','Typ','Grund'], ec_rows, placeholder='EC-Verlauf durchsuchen…')}</section>
+        </div>
+      </details>
+      <details class="profile-tab" id="event-history"{events_open}>
+        <summary><span>📅 Eventanmeldungen & Anwesenheiten</span><small class="muted">Eigene Historie</small></summary>
+        <div class="profile-tab-content">
+          <section class="profile-tab-kpis">
+            {_card('Reviews', attendance_player.get('reviews', 0), 'gewertete Events')}
+            {_card('War da', attendance_player.get('present', 0), 'anwesend')}
+            {_card('Teilweise', attendance_player.get('partial', 0), 'teilweise')}
+            {_card('Nicht da', attendance_player.get('absent', 0), 'abwesend')}
+            {_card('Quote', attendance_player.get('rate') or '—', 'Anwesenheit')}
+          </section>
+          <section class="panel"><h2>Laufende und kommende Anmeldungen</h2>{_table(['Event','Zeit','Deine Anmeldung'], upcoming_rows, placeholder='Anmeldungen durchsuchen…')}</section>
+          <section class="panel"><h2>Eigene Event-Historie</h2>{_table(['Event','Zeit','Deine Anmeldung'], event_rows, placeholder='Event-Historie durchsuchen…')}</section>
+        </div>
       </details>
     </section>
+    <script>
+      (function profileTabs(){{
+        function openHashTab(){{
+          const hash = (window.location.hash || '').slice(1);
+          if (!hash) return;
+          const target = document.getElementById(hash);
+          if (target && target.tagName === 'DETAILS') target.open = true;
+        }}
+        document.addEventListener('click', function(ev){{
+          const link = ev.target.closest('a[href^="#"]');
+          if (!link) return;
+          const target = document.querySelector(link.getAttribute('href'));
+          if (target && target.tagName === 'DETAILS') target.open = true;
+        }});
+        window.addEventListener('hashchange', openHashTab);
+        openHashTab();
+      }})();
+    </script>
     """
-    shell_mode = "admin" if _is_portal_admin(request) else "member"
-    return _html_shell(f"{display} Portal · Beer and Buffs Dashboard", body, nav_mode=shell_mode)
+    return _html_shell(f"{display} · Mein Profil", body, nav_mode="member")
+
 
 
 
@@ -10851,7 +11037,7 @@ def _render_member_home(data: dict[str, Any], request: Request) -> str:
     now_text = datetime.now().strftime("%d.%m.%Y %H:%M")
     cards = "".join([_card("Meine EC", _fmt_ec(my_ec_balance) if my_ec_balance is not None else "—", "aktueller Stand"), _card("Uhrzeit", now_text, "lokale Dashboard-Zeit"), _card("Events", len(running_events), "max. 2 auf Startseite"), _card("Auktionen", len(active_auctions), "max. 4 auf Startseite")])
     body = f"""
-    <nav class="topnav"><a href="/member">Start</a><a href="/member/events">Events</a><a href="/member/auctions">Auktionen</a><a href="/member/members">Mitglieder</a><a href="/member/ec">Meine EC</a><a href="/portal">Eigenes Profil</a><a href="/portal#needs">Meine Needs</a></nav>
+    <nav class="topnav"><a href="/member">Start</a><a href="/member/events">Events</a><a href="/member/auctions">Auktionen</a><a href="/member/members">Mitglieder</a><a href="/member/ec">Meine EC</a><a href="/portal">Eigenes Profil</a><a href="/portal?profile_tab=needlist#needlist">Meine Needliste</a></nav>
     <section class="hero member-home-hero"><div style="display:flex;gap:16px;align-items:center;flex-wrap:wrap;"><div class="member-start-logo"><img src="{_e(_brand_image('logo', 'beer_and_buffs_logo.png'))}" alt="{_e(_guild_brand().get('display_name') or 'Gilde')}"></div><div><div class="eyebrow">Mitgliederbereich</div><h1>Willkommen, {_e(display)}</h1><p class="muted">Kurzüberblick. Weitere Bereiche erreichst du links über die Leiste.</p></div></div></section>
     <section class="grid">{cards}</section>
     <section class="split"><div class="panel" id="events"><h2>📅 Nächste 2 Events</h2>{_member_home_event_rows(running_events, int(uid or 0))}</div><div class="panel" id="auctions"><h2>🏆 Max. 4 laufende Auktionen</h2>{_member_home_auction_rows(active_auctions, snap)}</div></section>
@@ -13375,7 +13561,7 @@ def _render_leadership_dashboard(data: dict[str, Any]) -> str:
     ], [
         [_raw('<a class="link" href="/planning">📅 Planung</a>'), "Events mit Rollen-/Teilnehmer-Hinweisen"],
         [_raw('<a class="link" href="/members">👥 Mitglieder</a>'), "Roster, Profile, Datenqualität"],
-        [_raw('<a class="link" href="/needs">🎁 Needs</a>'), "Top-Needs und Mitglieder ohne Needliste"],
+        [_raw('<a class="link" href="/portal?profile_tab=builder#builder">🎁 Needs</a>'), "Top-Needs und Mitglieder ohne Needliste"],
         [_raw('<a class="link" href="/loot">🏆 Loot</a>'), "Aktive Auktionen, Gewinner, Roll-/Bid-Historie"],
         [_raw('<a class="link" href="/fairness">⚖️ Fairness</a>'), "Need/EC/Loot-Hinweise"],
         [_raw('<a class="link" href="/attendance">✅ Anwesenheit</a>'), "Event-Review und EC-Buchung"],
@@ -14021,7 +14207,7 @@ async def portal_need_change(user_id: int, request: Request, _: bool = Depends(_
     }
     rid = _create_need_change_request(guild_id, int(user_id), action_type, payload, actor)
     msg = urllib.parse.quote(f"Need-Änderung angelegt: {rid}")
-    return RedirectResponse(url=f"/portal/member/{int(user_id)}?edit_needs=1&msg={msg}#needs", status_code=303)
+    return RedirectResponse(url=f"/portal/member/{int(user_id)}?profile_tab=needlist&msg={msg}#needlist", status_code=303)
 
 
 @app.get("/api/portal/member/{user_id}")
@@ -14888,7 +15074,7 @@ def tnl_builds_page() -> HTMLResponse:
     body = """
     <section class="hero">
       <div><h1>🧩 TnL Builds</h1><p>Build-Bereich. Deine spielbaren Need-Builds liegen weiterhin unter Mein Portal → Needliste.</p></div>
-      <div class="hero-actions"><a class="hero-action" href="/needs"><span>🎁</span><strong>Needliste</strong><small>Builds verwalten</small></a><a class="hero-action" href="/items"><span>🔎</span><strong>Items</strong><small>Datenbank</small></a></div>
+      <div class="hero-actions"><a class="hero-action" href="/portal?profile_tab=builder#builder"><span>🎁</span><strong>Needliste</strong><small>Builds verwalten</small></a><a class="hero-action" href="/items"><span>🔎</span><strong>Items</strong><small>Datenbank</small></a></div>
     </section>
     <section class="panel"><h2>Builds</h2><p class="muted">Platzhalter-Seite für spätere öffentliche/empfohlene Gilden-Builds, Rollen-Guides oder externe Questlog-Build-Links.</p></section>
     """
