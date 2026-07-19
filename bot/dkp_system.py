@@ -2994,8 +2994,20 @@ async def setup_dkp_system(client: discord.Client, tree: app_commands.CommandTre
         else:
             await inter.response.send_message(f"🔒 Privater Leader-Check: **{target.display_name}** hat aktuell **{bal} EC**.", ephemeral=True)
 
-    @dkp.command(name="adjust", description="Leader: EC/DKP manuell geben oder abziehen")
-    async def dkp_adjust(inter: discord.Interaction, user: discord.Member, amount: int, reason: str):
+    @dkp.command(name="adjust", description="Leader: EC/DKP manuell an Spieler oder Rolle geben/abziehen")
+    @app_commands.describe(
+        amount="Positive Zahl zum Geben, negative Zahl zum Abziehen",
+        reason="Pflichtgrund für die EC-Korrektur",
+        user="Optional: einzelnes Mitglied",
+        role="Optional: alle Mitglieder dieser Rolle",
+    )
+    async def dkp_adjust(
+        inter: discord.Interaction,
+        amount: int,
+        reason: str,
+        user: Optional[discord.Member] = None,
+        role: Optional[discord.Role] = None,
+    ):
         if inter.guild is None:
             await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
             return
@@ -3008,20 +3020,70 @@ async def setup_dkp_system(client: discord.Client, tree: app_commands.CommandTre
         if amount == 0:
             await inter.response.send_message("❌ Betrag darf nicht 0 sein.", ephemeral=True)
             return
+        if bool(user) == bool(role):
+            await inter.response.send_message("❌ Wähle genau ein Ziel: entweder **Mitglied** oder **Rolle**.", ephemeral=True)
+            return
+        if role is not None and role.is_default():
+            await inter.response.send_message("❌ Die @everyone-Rolle ist aus Sicherheitsgründen nicht erlaubt.", ephemeral=True)
+            return
         home_id = _home_guild_id(default=inter.guild.id)
         if int(inter.guild.id) != int(home_id):
             await inter.response.send_message("❌ DKP wird nur auf dem Home-Gildenserver verwaltet.", ephemeral=True)
             return
 
-        tx = _add_transaction(inter.guild.id, user.id, int(amount), reason, inter.user.id, "manual_adjust")
+        if user is not None:
+            targets = [user]
+            target_label = user.mention
+        else:
+            assert role is not None
+            targets = [m for m in inter.guild.members if not m.bot and role in m.roles]
+            target_label = role.mention
+            if not targets:
+                await inter.response.send_message(f"❌ In {role.mention} wurden keine passenden Mitglieder gefunden.", ephemeral=True)
+                return
+
+        await inter.response.defer(ephemeral=True, thinking=True)
+
+        def _apply_all() -> tuple[list[tuple[discord.Member, dict[str, Any]]], list[tuple[discord.Member, str]]]:
+            applied: list[tuple[discord.Member, dict[str, Any]]] = []
+            failed: list[tuple[discord.Member, str]] = []
+            for member in targets:
+                try:
+                    tx = _add_transaction(inter.guild.id, member.id, int(amount), reason, inter.user.id, "manual_adjust")
+                    applied.append((member, tx))
+                except Exception as exc:
+                    failed.append((member, f"{type(exc).__name__}: {exc}"))
+            return applied, failed
+
+        applied, failed = await asyncio.to_thread(_apply_all)
+        if not applied:
+            detail = "\n".join(f"• {m.display_name}: {err}" for m, err in failed[:8]) or "Unbekannter Fehler"
+            await inter.followup.send(f"❌ Keine EC-Korrektur durchgeführt.\n{detail[:1500]}", ephemeral=True)
+            return
+
         emb = discord.Embed(title="🪙 Manuelle EC-Korrektur", color=discord.Color.gold())
-        emb.add_field(name="Spieler", value=user.mention, inline=True)
-        emb.add_field(name="Änderung", value=f"**{_format_amount(amount)} EC**", inline=True)
-        emb.add_field(name="Stand", value="🔒 Nicht öffentlich angezeigt", inline=True)
+        emb.add_field(name="Ziel", value=target_label, inline=True)
+        emb.add_field(name="Mitglieder", value=str(len(applied)), inline=True)
+        emb.add_field(name="Änderung je Mitglied", value=f"**{_format_amount(amount)} EC**", inline=True)
         emb.add_field(name="Grund", value=_safe_text(reason)[:1000], inline=False)
+        names = ", ".join(member.mention for member, _tx in applied[:12])
+        if len(applied) > 12:
+            names += f" … +{len(applied) - 12} weitere"
+        emb.add_field(name="Betroffene Spieler", value=names[:1000], inline=False)
+        if failed:
+            emb.add_field(name="Fehlgeschlagen", value=str(len(failed)), inline=True)
         emb.set_footer(text=f"Ausgeführt von {inter.user} • {datetime.now(TZ).strftime('%d.%m.%Y %H:%M')}")
         await _log_to_channel(client, inter.guild.id, emb)
-        await inter.response.send_message(f"✅ EC angepasst: {user.mention} { _format_amount(amount) } EC. Neuer Stand: **{tx['balance_after']}**", ephemeral=True)
+
+        if user is not None:
+            balance_after = applied[0][1].get("balance_after")
+            result = f"✅ EC angepasst: {user.mention} {_format_amount(amount)} EC. Neuer Stand: **{balance_after}**"
+        else:
+            result = f"✅ EC für **{len(applied)}** Mitglieder aus {target_label} angepasst: je **{_format_amount(amount)} EC**."
+        if failed:
+            failed_names = ", ".join(m.display_name for m, _err in failed[:8])
+            result += f"\n⚠️ Fehlgeschlagen: **{len(failed)}** ({failed_names})"
+        await inter.followup.send(result[:1900], ephemeral=True)
 
     @dkp.command(name="config", description="Zeigt die EC-/DKP-Konfiguration")
     async def dkp_config_show(inter: discord.Interaction):
