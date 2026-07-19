@@ -10772,6 +10772,32 @@ def _render_need_editor_panel(
     sec_map = _need_slot_map((need_info or {}).get("secondary") or (need_info or {}).get("secondary_needs") or (need_info or {}).get("second") or []) if isinstance(need_info, dict) else {}
     rich_items = item_catalog if item_catalog is not None else _need_builder_items()
     catalog_by_name = {_loot_key(it.get("name")): it for it in rich_items if _loot_key(it.get("name"))}
+
+    def catalog_item_for_name(value: Any) -> dict[str, Any]:
+        """Robuste Zuordnung alter Need-Texte zum zentralen Itemkatalog.
+
+        Alte Snapshot-Einträge enthalten teilweise Waffenart, Slotpräfixe oder
+        typografisch andere Apostrophe. Ohne diese Normalisierung hatten
+        belegte Slots keine catalog_id und damit auch keinen Hover-Tooltip.
+        """
+        clean = _clean_item_display_name(value)
+        key = _loot_key(clean)
+        if not key:
+            return {}
+        exact = catalog_by_name.get(key)
+        if exact:
+            return exact
+        compact = re.sub(r"[^a-z0-9äöüß]+", "", key)
+        if not compact:
+            return {}
+        for item_key, item in catalog_by_name.items():
+            item_compact = re.sub(r"[^a-z0-9äöüß]+", "", item_key)
+            if item_compact == compact:
+                return item
+        # Letzter sicherer Fallback für ältere Bezeichnungen mit Zusatztext.
+        matches = [item for item_key, item in catalog_by_name.items() if len(key) >= 8 and (key in item_key or item_key in key)]
+        return matches[0] if len(matches) == 1 else {}
+
     slot_filters_json = json.dumps({slot: _need_builder_slot_filter(slot) for slot in _NEED_SLOTS}, ensure_ascii=False)
 
     slot_icons = {
@@ -10790,7 +10816,7 @@ def _render_need_editor_panel(
 
     def item_model(entry: Any) -> tuple[str, str, str]:
         current = _need_item_display(entry) if entry else ""
-        item = catalog_by_name.get(_loot_key(current), {}) if current else {}
+        item = catalog_item_for_name(current) if current else {}
         image_url = str(item.get("image") or item.get("image_url") or "").strip() if isinstance(item, dict) else ""
         rarity = str(item.get("rarity") or "").strip() if isinstance(item, dict) else ""
         return current, image_url, rarity
@@ -10811,14 +10837,14 @@ def _render_need_editor_panel(
         image = preview_html(slot, current, image_url, large=True)
         if locked:
             return f"""
-            <section class="equipment-editor" id="{_e(editor_id)}" data-tab="{_e(tab.lower())}" hidden>
+            <section class="equipment-editor" id="{_e(editor_id)}" data-tab="{_e(tab.lower())}" data-slot-name="{_e(slot)}" hidden>
               <div class="equipment-editor-preview">{image}</div>
               <div class="equipment-editor-main">
                 <div class="equipment-editor-title"><div><span>{_e(slot)}</span><strong>{_e(current or '—')}</strong></div><span class="need-state locked">Erhalten</span></div>
                 <p class="muted">Dieser Slot ist als erhalten markiert und bleibt gesperrt. Nur die Gildenleitung kann ihn wieder freigeben.</p>
               </div>
             </section>"""
-        current_item = catalog_by_name.get(_loot_key(current), {}) if current else {}
+        current_item = catalog_item_for_name(current) if current else {}
         current_id = int((current_item or {}).get("id") or 0)
         current_sub = str((current_item or {}).get("sub") or "")
         current_weapon = _weapon_type_from_text(f"{current_sub} {current}") if slot.startswith("Waffe") else ""
@@ -10875,7 +10901,7 @@ def _render_need_editor_panel(
             for slot in slots:
                 idx += 1
                 current, image_url, rarity = item_model(slot_map.get(slot))
-                current_item = catalog_by_name.get(_loot_key(current), {}) if current else {}
+                current_item = catalog_item_for_name(current) if current else {}
                 current_item_id = int((current_item or {}).get("id") or 0)
                 editor_id = f"need-equipment-editor-{tab.lower()}-{idx}"
                 area = slot_areas.get(slot, "auto")
@@ -10883,7 +10909,7 @@ def _render_need_editor_panel(
                 state_cls = "locked" if locked else ("filled" if current else "empty")
                 state_txt = "🔒" if locked else ("✓" if current else "+")
                 card = f"""
-                <button type="button" class="equipment-slot {state_cls}" style="grid-area:{_e(area)}" data-open-equipment="{_e(editor_id)}" data-tab="{_e(tab.lower())}" data-ne-equipped-item-id="{current_item_id}" aria-controls="{_e(editor_id)}">
+                <button type="button" class="equipment-slot {state_cls}" style="grid-area:{_e(area)}" data-open-equipment="{_e(editor_id)}" data-tab="{_e(tab.lower())}" data-ne-equipped-item-id="{current_item_id}" data-ne-equipped-item-name="{_e(current)}" aria-controls="{_e(editor_id)}">
                   <span class="equipment-slot-art">{preview_html(slot, current, image_url)}</span>
                   <span class="equipment-slot-label">{_e(slot)}</span>
                   <span class="equipment-slot-item">{_e(_short(current or 'Leer', 33))}</span>
@@ -10894,15 +10920,34 @@ def _render_need_editor_panel(
                 else:
                     lower_cards.append(card)
                 editors.append(editor_html(tab, slot, slot_map.get(slot), idx))
+        attr_rows = "".join(
+            f'<div class="ne-attr-row" data-ne-attr-row="{_e(attr)}"><span>{_e(attr)}</span><div class="ne-attr-controls"><button type="button" data-ne-attr-minus="{_e(attr)}" aria-label="{_e(attr)} verringern">−</button><strong data-ne-attr-value="{_e(attr)}">11</strong><button type="button" data-ne-attr-plus="{_e(attr)}" aria-label="{_e(attr)} erhöhen">＋</button></div></div>'
+            for attr in ("Stärke", "Geschicklichkeit", "Weisheit", "Wahrnehmung", "Standhaftigkeit")
+        )
         return f"""
         <section class="equipment-tab" data-equipment-tab="{_e(tab.lower())}"{('' if tab == 'Main' else ' hidden')}>
-          <div class="equipment-window">
-            <div class="equipment-window-head"><div><span class="eyebrow">Need-Bereich</span><h3>{_e(tab)}</h3></div><p>Slot anklicken und anschließend ausschließlich passende Items auswählen.</p></div>
-            <div class="equipment-grid equipment-grid-upper">{''.join(upper_cards)}</div>
-            <div class="equipment-section-gap" aria-hidden="true"></div>
-            <div class="equipment-grid equipment-grid-lower">{''.join(lower_cards)}</div>
-            <div class="equipment-editor-empty" data-editor-empty="{_e(tab.lower())}">⬆️ Klicke auf einen Equipment-Slot, um ihn zu bearbeiten.</div>
-            <div class="equipment-editors">{''.join(editors)}</div>
+          <div class="need-planner-layout">
+            <aside class="ne-side-panel ne-attributes-panel" data-ne-attributes-panel="{_e(tab.lower())}">
+              <div class="ne-side-head"><span class="eyebrow">Charakter</span><h3>Attribute</h3></div>
+              <div class="ne-attr-points"><span>Verteilte Punkte</span><strong data-ne-spent-points="{_e(tab.lower())}">0</strong></div>
+              <div class="ne-attr-list">{attr_rows}</div>
+              <button type="button" class="btn ghost ne-attr-reset" data-ne-attr-reset="{_e(tab.lower())}">Attribute zurücksetzen</button>
+              <p class="muted">Planungswerte werden für diesen Browser gespeichert und fließen live in die Wertetabelle ein.</p>
+            </aside>
+            <div class="equipment-window">
+              <div class="equipment-window-head"><div><span class="eyebrow">Need-Bereich</span><h3>{_e(tab)}</h3></div><p>Slot anklicken und anschließend ausschließlich passende Items auswählen.</p></div>
+              <div class="equipment-grid equipment-grid-upper">{''.join(upper_cards)}</div>
+              <div class="equipment-section-gap" aria-hidden="true"></div>
+              <div class="equipment-grid equipment-grid-lower">{''.join(lower_cards)}</div>
+              <div class="equipment-editor-empty" data-editor-empty="{_e(tab.lower())}">⬆️ Klicke auf einen Equipment-Slot, um ihn zu bearbeiten.</div>
+              <div class="equipment-editors">{''.join(editors)}</div>
+            </div>
+            <aside class="ne-side-panel ne-values-panel" data-ne-values-panel="{_e(tab.lower())}">
+              <div class="ne-side-head"><span class="eyebrow">Live-Berechnung</span><h3>Wertetabelle</h3></div>
+              <div class="ne-value-summary"><span>Ausgewählte Items</span><strong data-ne-item-count="{_e(tab.lower())}">0</strong></div>
+              <input type="search" class="ne-values-search" data-ne-values-search="{_e(tab.lower())}" placeholder="Wert suchen …">
+              <div class="ne-values-list" data-ne-values-list="{_e(tab.lower())}"><p class="muted">Noch keine Werte berechnet.</p></div>
+            </aside>
           </div>
         </section>"""
 
@@ -10925,7 +10970,27 @@ def _render_need_editor_panel(
         .equipment-tabs{{display:flex;gap:8px;padding:5px;border-radius:15px;background:rgba(0,0,0,.28);border:1px solid rgba(214,168,79,.18)}}
         .equipment-tab-button{{border:0;border-radius:11px;padding:11px 17px;background:transparent;color:#c8c8c8;font-weight:900;cursor:pointer}}
         .equipment-tab-button.active{{background:linear-gradient(135deg,#b47a20,#e1b754);color:#171009;box-shadow:0 8px 20px rgba(0,0,0,.28)}}
-        .equipment-window{{max-width:980px;margin:0 auto;border:1px solid rgba(214,168,79,.24);border-radius:24px;padding:18px;background:linear-gradient(160deg,rgba(30,22,14,.98),rgba(8,8,9,.96));box-shadow:0 22px 55px rgba(0,0,0,.38)}}
+        .need-planner-layout{{display:grid;grid-template-columns:minmax(145px,175px) minmax(0,1fr) minmax(205px,245px);gap:12px;align-items:stretch}}
+        .ne-side-panel{{min-width:0;border:1px solid rgba(214,168,79,.22);border-radius:20px;padding:13px;background:linear-gradient(160deg,rgba(20,17,14,.97),rgba(7,8,10,.96));box-shadow:0 18px 45px rgba(0,0,0,.28);display:flex;flex-direction:column}}
+        .ne-side-head{{margin-bottom:10px}}.ne-side-head h3{{margin:2px 0 0;color:#f1d28a;font-size:20px}}
+        .ne-attr-points,.ne-value-summary{{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:9px 10px;border-radius:12px;background:rgba(214,168,79,.07);border:1px solid rgba(214,168,79,.14);margin-bottom:10px;font-size:12px}}
+        .ne-attr-points strong,.ne-value-summary strong{{font-size:19px;color:#f2d083}}
+        .ne-attr-list{{display:grid;gap:7px}}
+        .ne-attr-row{{display:grid;gap:6px;padding:9px;border-radius:12px;border:1px solid rgba(255,255,255,.075);background:rgba(255,255,255,.025)}}
+        .ne-attr-row>span{{font-size:12px;font-weight:850;color:#d9e1e9}}
+        .ne-attr-controls{{display:grid;grid-template-columns:32px 1fr 32px;gap:6px;align-items:center}}
+        .ne-attr-controls button{{width:32px;height:30px;border-radius:9px;border:1px solid rgba(214,168,79,.24);background:rgba(214,168,79,.08);color:#f1d28a;font-size:18px;font-weight:900;cursor:pointer}}
+        .ne-attr-controls button:hover{{background:rgba(214,168,79,.18)}}
+        .ne-attr-controls strong{{text-align:center;font-size:18px}}
+        .ne-attr-reset{{width:100%;margin-top:10px;justify-content:center}}
+        .ne-attributes-panel p{{font-size:11px;margin:10px 0 0}}
+        .ne-values-search{{width:100%;box-sizing:border-box;padding:9px 10px;border-radius:10px;border:1px solid rgba(255,255,255,.1);background:rgba(0,0,0,.3);color:inherit;margin-bottom:9px}}
+        .ne-values-list{{display:grid;gap:7px;overflow:auto;max-height:760px;padding-right:2px}}
+        .ne-value-group{{border:1px solid rgba(255,255,255,.065);border-radius:11px;overflow:hidden;background:rgba(255,255,255,.02)}}
+        .ne-value-group h4{{margin:0;padding:7px 9px;background:rgba(214,168,79,.055);color:#e3c983;font-size:12px}}
+        .ne-value-row{{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:7px;padding:6px 9px;border-top:1px solid rgba(255,255,255,.05);font-size:12px}}
+        .ne-value-row span{{overflow-wrap:anywhere}}.ne-value-row b{{color:#e8edf2;text-align:right}}.ne-value-row small{{color:#81d58a;margin-left:5px}}
+        .equipment-window{{min-width:0;width:100%;margin:0;border:1px solid rgba(214,168,79,.24);border-radius:24px;padding:18px;background:linear-gradient(160deg,rgba(30,22,14,.98),rgba(8,8,9,.96));box-shadow:0 22px 55px rgba(0,0,0,.38)}}
         .equipment-window-head{{display:flex;justify-content:space-between;align-items:end;gap:18px;margin-bottom:16px}}
         .equipment-window-head h3{{margin:2px 0 0;color:#f2d083;font-size:28px}}
         .equipment-window-head p{{margin:0;color:var(--muted);max-width:520px;text-align:right}}
@@ -11000,8 +11065,9 @@ def _render_need_editor_panel(
         .need-state.filled{{color:#9dc5ff;background:rgba(80,135,230,.15);border:1px solid rgba(80,135,230,.25)}}
         .need-state.empty{{color:#bbb;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.1)}}
         .need-state.locked{{color:#94e49c;background:rgba(65,170,80,.14);border:1px solid rgba(65,170,80,.24)}}
-        @media(max-width:900px){{.equipment-grid{{grid-template-columns:repeat(4,minmax(100px,1fr))}}.equipment-grid-upper{{grid-template-areas:'. head head .' 'weapon1 chest hands cloak' 'weapon2 legs feet belt'}}.equipment-grid-lower{{grid-template-areas:'core1 . . .' 'core2 ring1 neck brooch' '. ring2 bracelet ear'}}.equipment-need-heading,.equipment-window-head{{align-items:flex-start;flex-direction:column}}.equipment-window-head p{{text-align:left}}}}
-        @media(max-width:620px){{.equipment-tabs{{width:100%}}.equipment-tab-button{{flex:1}}.equipment-window{{padding:11px;border-radius:18px}}.equipment-grid{{grid-template-columns:repeat(2,minmax(0,1fr));gap:7px;padding:9px}}.equipment-grid-upper{{grid-template-areas:'head head' 'weapon1 chest' 'weapon2 legs' 'hands cloak' 'feet belt'}}.equipment-grid-lower{{grid-template-areas:'core1 core1' 'core2 ring1' 'ring2 neck' 'bracelet brooch' 'ear ear'}}.equipment-section-gap{{height:18px}}.equipment-slot{{min-height:112px;grid-template-rows:58px auto auto;padding:6px}}.equipment-slot-art{{height:58px}}.equipment-placeholder{{font-size:28px}}.equipment-slot-label{{font-size:10px}}.equipment-slot-item{{font-size:9px}}.equipment-editor{{grid-template-columns:1fr}}.equipment-editor-preview{{width:110px;height:110px}}.equipment-editor-actions .btn{{flex:1 1 100%}}.ne-picker-button{{grid-template-columns:50px minmax(0,1fr) auto}}.ne-picker-thumb{{width:48px;height:48px}}.ne-item-tooltip{{display:none!important}}.ne-mobile-hint{{display:block}}body.ne-picker-open{{overflow:hidden}}}}
+        @media(max-width:1280px){{.need-planner-layout{{grid-template-columns:minmax(140px,165px) minmax(0,1fr) minmax(185px,220px);gap:9px}}.ne-side-panel{{padding:10px}}.equipment-window{{padding:13px}}.equipment-grid{{grid-template-columns:repeat(4,minmax(95px,1fr));gap:8px;padding:11px}}}}
+        @media(max-width:1050px){{.need-planner-layout{{grid-template-columns:1fr 1fr;grid-template-areas:'attributes values' 'equipment equipment'}}.ne-attributes-panel{{grid-area:attributes}}.ne-values-panel{{grid-area:values}}.equipment-window{{grid-area:equipment}}.ne-values-list{{max-height:360px}}.equipment-grid{{grid-template-columns:repeat(4,minmax(100px,1fr))}}.equipment-grid-upper{{grid-template-areas:'. head head .' 'weapon1 chest hands cloak' 'weapon2 legs feet belt'}}.equipment-grid-lower{{grid-template-areas:'core1 . . .' 'core2 ring1 neck brooch' '. ring2 bracelet ear'}}.equipment-need-heading,.equipment-window-head{{align-items:flex-start;flex-direction:column}}.equipment-window-head p{{text-align:left}}}}
+        @media(max-width:620px){{.need-planner-layout{{grid-template-columns:1fr;grid-template-areas:'attributes' 'equipment' 'values'}}.equipment-tabs{{width:100%}}.equipment-tab-button{{flex:1}}.equipment-window{{padding:11px;border-radius:18px}}.equipment-grid{{grid-template-columns:repeat(2,minmax(0,1fr));gap:7px;padding:9px}}.equipment-grid-upper{{grid-template-areas:'head head' 'weapon1 chest' 'weapon2 legs' 'hands cloak' 'feet belt'}}.equipment-grid-lower{{grid-template-areas:'core1 core1' 'core2 ring1' 'ring2 neck' 'bracelet brooch' 'ear ear'}}.equipment-section-gap{{height:18px}}.equipment-slot{{min-height:112px;grid-template-rows:58px auto auto;padding:6px}}.equipment-slot-art{{height:58px}}.equipment-placeholder{{font-size:28px}}.equipment-slot-label{{font-size:10px}}.equipment-slot-item{{font-size:9px}}.equipment-editor{{grid-template-columns:1fr}}.equipment-editor-preview{{width:110px;height:110px}}.equipment-editor-actions .btn{{flex:1 1 100%}}.ne-picker-button{{grid-template-columns:50px minmax(0,1fr) auto}}.ne-picker-thumb{{width:48px;height:48px}}.ne-item-tooltip{{display:none!important}}.ne-mobile-hint{{display:block}}body.ne-picker-open{{overflow:hidden}}.ne-values-list{{max-height:none}}}}
       </style>
       {board_html('Main', main_map)}
       {board_html('Secondary', sec_map)}
@@ -11017,6 +11083,12 @@ def _render_need_editor_panel(
           let neTip = null;
           let neCurrentEditor = null;
           let neCurrentButton = null;
+          const NE_ATTR_NAMES = ['Stärke','Geschicklichkeit','Weisheit','Wahrnehmung','Standhaftigkeit'];
+          const NE_ATTR_BASE = 11;
+          const NE_ATTR_MIN = 1;
+          const NE_ATTR_MAX = 100;
+          const NE_ATTR_STORAGE = 'bb_need_attributes_{int(user_id)}_';
+          const NE_PERCENT_KEYS = ['chance','geschwindigkeit','dauer','reichweite','verringerung','rate','speed','cooldown'];
 
           function neEsc(value) {{
             return String(value ?? '').replace(/[&<>"']/g, function(c) {{
@@ -11099,9 +11171,28 @@ def _render_need_editor_panel(
               + (traits ? '<div class="ne-tip-sec"><h5>Eigenschaften</h5>' + traits + '</div>' : '')
               + passive;
           }}
-          function neShowTip(itemId, ev) {{
+          function neItemKey(value) {{
+            return neNorm(value).replace(/\\([^)]*\\)\\s*$/,'').replace(/[^a-z0-9äöüß]+/g,'');
+          }}
+          function neFindItem(itemId, itemName) {{
+            const numericId = Number(itemId || 0);
+            if (numericId) {{
+              const byId = NE_ITEMS.find(function(row) {{ return Number(row.id) === numericId; }});
+              if (byId) return byId;
+            }}
+            const wanted = neItemKey(itemName || '');
+            if (!wanted) return null;
+            const exact = NE_ITEMS.find(function(row) {{ return neItemKey(row.name || '') === wanted; }});
+            if (exact) return exact;
+            const matches = NE_ITEMS.filter(function(row) {{
+              const key = neItemKey(row.name || '');
+              return key && wanted.length >= 8 && (key.includes(wanted) || wanted.includes(key));
+            }});
+            return matches.length === 1 ? matches[0] : null;
+          }}
+          function neShowTip(itemId, ev, itemName) {{
             if (!neCanHover() || neIsMobile()) return;
-            const item = NE_ITEMS.find(function(row) {{ return Number(row.id) === Number(itemId); }});
+            const item = neFindItem(itemId, itemName);
             if (!item) return;
             if (!neTip) {{
               neTip = document.createElement('div');
@@ -11112,6 +11203,159 @@ def _render_need_editor_panel(
             neTip.style.display = 'block';
             neMoveTip(ev);
           }}
+          function neNum(value) {{
+            if (value === null || value === undefined) return 0;
+            const raw = String(value).replace(/▲/g,'').replace(/%/g,'').replace(/,/g,'.').replace(/[^0-9.\\-]/g,'');
+            if (!raw || raw === '-' || raw === '.') return 0;
+            const num = parseFloat(raw);
+            return Number.isFinite(num) ? num : 0;
+          }}
+          function neLabel(value) {{ return String(value || '').replace(/:$/,'').trim(); }}
+          function neAddValue(map, label, value) {{
+            const clean = neLabel(label);
+            const num = neNum(value);
+            if (!clean || !num) return;
+            map[clean] = (map[clean] || 0) + num;
+          }}
+          function neAttrKey(tabName) {{ return NE_ATTR_STORAGE + String(tabName || 'main'); }}
+          function neLoadAttrs(tabName) {{
+            const base = Object.fromEntries(NE_ATTR_NAMES.map(function(name) {{ return [name, NE_ATTR_BASE]; }}));
+            try {{
+              const saved = JSON.parse(localStorage.getItem(neAttrKey(tabName)) || '{{}}');
+              NE_ATTR_NAMES.forEach(function(name) {{
+                const value = Number(saved[name]);
+                if (Number.isFinite(value)) base[name] = Math.max(NE_ATTR_MIN, Math.min(NE_ATTR_MAX, Math.round(value)));
+              }});
+            }} catch (_) {{}}
+            return base;
+          }}
+          function neSaveAttrs(tabName, attrs) {{
+            try {{ localStorage.setItem(neAttrKey(tabName), JSON.stringify(attrs)); }} catch (_) {{}}
+          }}
+          function neRenderAttrs(tabName, attrs) {{
+            const panel = root.querySelector('[data-ne-attributes-panel="' + tabName + '"]');
+            if (!panel) return;
+            NE_ATTR_NAMES.forEach(function(name) {{
+              const target = panel.querySelector('[data-ne-attr-value="' + name + '"]');
+              if (target) target.textContent = String(attrs[name] ?? NE_ATTR_BASE);
+            }});
+            const spent = panel.querySelector('[data-ne-spent-points="' + tabName + '"]');
+            if (spent) spent.textContent = String(NE_ATTR_NAMES.reduce(function(sum, name) {{ return sum + Math.max(0, Number(attrs[name] || NE_ATTR_BASE) - NE_ATTR_BASE); }}, 0));
+          }}
+          function neSelectedItemsForTab(tabName) {{
+            const tab = root.querySelector('[data-equipment-tab="' + tabName + '"]');
+            if (!tab) return [];
+            const out = [];
+            const usedSlots = new Set();
+            tab.querySelectorAll('.equipment-slot[data-open-equipment]').forEach(function(card) {{
+              const editorId = card.getAttribute('aria-controls') || '';
+              const editor = editorId ? document.getElementById(editorId) : null;
+              const slotName = editor?.dataset.slotName || card.querySelector('.equipment-slot-label')?.textContent || editorId;
+              if (usedSlots.has(slotName)) return;
+              usedSlots.add(slotName);
+              let itemId = Number(card.dataset.neEquippedItemId || 0);
+              let itemName = card.dataset.neEquippedItemName || '';
+              const field = editor ? editor.querySelector('[data-ne-item-value="1"]') : null;
+              if (field) {{
+                itemId = Number(field.dataset.itemId || 0);
+                itemName = field.value || '';
+              }}
+              const item = neFindItem(itemId, itemName);
+              if (item) out.push(item);
+            }});
+            return out;
+          }}
+          function neBuildPlannerValues(tabName) {{
+            const attrs = neLoadAttrs(tabName);
+            const stats = Object.assign({{}}, attrs);
+            const traits = [];
+            const passives = [];
+            const items = neSelectedItemsForTab(tabName);
+            items.forEach(function(item) {{
+              const detail = item.detail || {{}};
+              if (detail.damage_min || detail.damage_max) {{
+                neAddValue(stats, 'Min. Schaden', detail.damage_min);
+                neAddValue(stats, 'Max. Schaden', detail.damage_max);
+              }}
+              if (detail.defense) neAddValue(stats, 'Verteidigung', detail.defense);
+              (detail.primary || []).forEach(function(row) {{ if (row) neAddValue(stats, row.label || row.name, row.value ?? row.text); }});
+              (detail.bonus || []).forEach(function(row) {{ if (row) neAddValue(stats, row.label || row.name, row.value ?? row.text); }});
+              Object.entries(detail.stats || {{}}).forEach(function(pair) {{ neAddValue(stats, pair[0], pair[1]); }});
+              (detail.traits || []).forEach(function(trait) {{
+                if (!trait || !trait.name) return;
+                const values = Array.isArray(trait.values) ? trait.values.join(' | ') : (trait.values || '');
+                traits.push([String(trait.name), String(values)]);
+              }});
+              if (detail.passive && (detail.passive.name || detail.passive.text)) passives.push([detail.passive.name || 'Effekt', detail.passive.text || 'aktiv']);
+            }});
+            return {{attrs:attrs, stats:stats, traits:traits, passives:passives, items:items}};
+          }}
+          function neValueGroup(label) {{
+            const low = neNorm(label);
+            if (NE_ATTR_NAMES.some(function(name) {{ return neNorm(name) === low; }})) return 'Attribute';
+            if (/(schaden|treffer|krit|angriff|bonusschaden|schwerer)/.test(low)) return 'Angriff';
+            if (/(verteid|gesundheit|ausweich|resist|verringer|endurance)/.test(low)) return 'Verteidigung';
+            if (/(mana|cooldown|dauer|reichweite|bewegung|regeneration)/.test(low)) return 'Ressourcen & Tempo';
+            return 'Weitere Werte';
+          }}
+          function neFmtValue(value, label) {{
+            const number = Number(value || 0);
+            const rounded = Math.abs(number - Math.round(number)) < 0.001 ? String(Math.round(number)) : String(Math.round(number * 10) / 10).replace('.', ',');
+            return NE_PERCENT_KEYS.some(function(key) {{ return neNorm(label).includes(key); }}) ? rounded + ' %' : rounded;
+          }}
+          function neRenderValues(tabName) {{
+            const panel = root.querySelector('[data-ne-values-panel="' + tabName + '"]');
+            if (!panel) return;
+            const planner = neBuildPlannerValues(tabName);
+            neRenderAttrs(tabName, planner.attrs);
+            const count = panel.querySelector('[data-ne-item-count="' + tabName + '"]');
+            if (count) count.textContent = String(planner.items.length);
+            const search = panel.querySelector('[data-ne-values-search="' + tabName + '"]');
+            const query = neNorm(search ? search.value : '');
+            const groups = {{'Attribute':[], 'Angriff':[], 'Verteidigung':[], 'Ressourcen & Tempo':[], 'Weitere Werte':[]}};
+            Object.entries(planner.stats || {{}}).forEach(function(pair) {{
+              const label = String(pair[0] || '');
+              if (query && !neNorm(label).includes(query)) return;
+              groups[neValueGroup(label)].push([label, pair[1]]);
+            }});
+            let html = '';
+            Object.entries(groups).forEach(function(entry) {{
+              const rows = entry[1].sort(function(a,b) {{ return String(a[0]).localeCompare(String(b[0]), 'de'); }});
+              if (!rows.length) return;
+              html += '<section class="ne-value-group"><h4>' + neEsc(entry[0]) + '</h4>' + rows.map(function(row) {{
+                return '<div class="ne-value-row"><span>' + neEsc(row[0]) + '</span><b>' + neEsc(neFmtValue(row[1], row[0])) + '</b></div>';
+              }}).join('') + '</section>';
+            }});
+            const extraRows = planner.traits.concat(planner.passives).filter(function(row) {{ return !query || neNorm(row[0]).includes(query) || neNorm(row[1]).includes(query); }});
+            if (extraRows.length) html += '<section class="ne-value-group"><h4>Eigenschaften & Effekte</h4>' + extraRows.slice(0,20).map(function(row) {{ return '<div class="ne-value-row"><span>' + neEsc(row[0]) + '</span><b>' + neEsc(row[1] || 'aktiv') + '</b></div>'; }}).join('') + '</section>';
+            const target = panel.querySelector('[data-ne-values-list="' + tabName + '"]');
+            if (target) target.innerHTML = html || '<p class="muted">Keine passenden Werte vorhanden.</p>';
+          }}
+          function neAdjustAttr(tabName, attrName, delta) {{
+            const attrs = neLoadAttrs(tabName);
+            attrs[attrName] = Math.max(NE_ATTR_MIN, Math.min(NE_ATTR_MAX, Number(attrs[attrName] || NE_ATTR_BASE) + delta));
+            neSaveAttrs(tabName, attrs);
+            neRenderValues(tabName);
+          }}
+          function neInitPlannerPanels() {{
+            root.querySelectorAll('[data-ne-attributes-panel]').forEach(function(panel) {{
+              const tabName = panel.dataset.neAttributesPanel || 'main';
+              panel.querySelectorAll('[data-ne-attr-minus]').forEach(function(button) {{ button.addEventListener('click', function() {{ neAdjustAttr(tabName, button.dataset.neAttrMinus || '', -1); }}); }});
+              panel.querySelectorAll('[data-ne-attr-plus]').forEach(function(button) {{ button.addEventListener('click', function() {{ neAdjustAttr(tabName, button.dataset.neAttrPlus || '', 1); }}); }});
+              const reset = panel.querySelector('[data-ne-attr-reset]');
+              if (reset) reset.addEventListener('click', function() {{
+                const attrs = Object.fromEntries(NE_ATTR_NAMES.map(function(name) {{ return [name, NE_ATTR_BASE]; }}));
+                neSaveAttrs(tabName, attrs);
+                neRenderValues(tabName);
+              }});
+            }});
+            root.querySelectorAll('[data-ne-values-search]').forEach(function(search) {{
+              search.addEventListener('input', function() {{ neRenderValues(search.dataset.neValuesSearch || 'main'); }});
+            }});
+            neRenderValues('main');
+            neRenderValues('secondary');
+          }}
+
           function neFilteredItems(editor, query) {{
             const slot = editor.dataset.slotName || '';
             const weaponField = editor.querySelector('.ne-weapon-type');
@@ -11137,12 +11381,12 @@ def _render_need_editor_panel(
                 ? '<img src="' + neEsc(item.image) + '" onerror="this.style.visibility=&quot;hidden&quot;" alt="">'
                 : '<div class="ne-picker-thumb">🧩</div>';
               const meta = [item.rarity, item.sub || item.category, item.level ? 'Lv. ' + item.level : ''].filter(Boolean).join(' · ');
-              return '<button type="button" class="ne-item-option" data-ne-item-id="' + Number(item.id) + '">' + image + '<span class="ne-item-option-copy"><strong>' + neEsc(item.name) + '</strong><small>' + neEsc(meta || 'Item-Datenbank') + '</small></span><em>＋</em></button>';
+              return '<button type="button" class="ne-item-option" data-ne-item-id="' + Number(item.id) + '" data-ne-item-name="' + neEsc(item.name || '') + '">' + image + '<span class="ne-item-option-copy"><strong>' + neEsc(item.name) + '</strong><small>' + neEsc(meta || 'Item-Datenbank') + '</small></span><em>＋</em></button>';
             }}).join('');
             list.querySelectorAll('[data-ne-item-id]').forEach(function(option) {{
               const itemId = Number(option.dataset.neItemId || 0);
               option.addEventListener('click', function() {{ neChooseItem(itemId); }});
-              option.addEventListener('mouseenter', function(ev) {{ neShowTip(itemId, ev); }});
+              option.addEventListener('mouseenter', function(ev) {{ neShowTip(itemId, ev, option.dataset.neItemName || ''); }});
               option.addEventListener('mousemove', neMoveTip);
               option.addEventListener('mouseleave', neHideTip);
             }});
@@ -11196,6 +11440,7 @@ def _render_need_editor_panel(
             if (meta) meta.textContent = [item.rarity, item.sub || item.category, item.level ? 'Lv. ' + item.level : ''].filter(Boolean).join(' · ') || 'Item-Datenbank';
             updatePreview(editor);
             refreshDirty(editor);
+            neRenderValues(editor.dataset.tab || 'main');
             neClosePicker();
           }}
 
@@ -11232,6 +11477,7 @@ def _render_need_editor_panel(
               btn.classList.toggle('active', active);
               btn.setAttribute('aria-selected', active ? 'true' : 'false');
             }});
+            neRenderValues(name);
             return true;
           }}
           function closeEditors(tabName, force){{
@@ -11303,6 +11549,7 @@ def _render_need_editor_panel(
                 }}
                 refreshDirty(editor);
                 updatePreview(editor);
+                neRenderValues(editor.dataset.tab || 'main');
                 neClosePicker();
               }});
             }});
@@ -11311,7 +11558,7 @@ def _render_need_editor_panel(
               button.addEventListener('mouseenter', function(ev){{
                 const field = editor.querySelector('[data-ne-item-value="1"]');
                 const itemId = Number(field ? field.dataset.itemId || 0 : 0);
-                if (itemId) neShowTip(itemId, ev);
+                if (itemId || (field && field.value)) neShowTip(itemId, ev, field ? field.value : '');
               }});
               button.addEventListener('mousemove', neMoveTip);
               button.addEventListener('mouseleave', neHideTip);
@@ -11325,8 +11572,9 @@ def _render_need_editor_panel(
 
           root.querySelectorAll('[data-ne-equipped-item-id]').forEach(function(card){{
             const itemId = Number(card.dataset.neEquippedItemId || 0);
-            if (!itemId) return;
-            card.addEventListener('mouseenter', function(ev){{ neShowTip(itemId, ev); }});
+            const itemName = card.dataset.neEquippedItemName || '';
+            if (!itemId && !itemName) return;
+            card.addEventListener('mouseenter', function(ev){{ neShowTip(itemId, ev, itemName); }});
             card.addEventListener('mousemove', neMoveTip);
             card.addEventListener('mouseleave', neHideTip);
           }});
@@ -11356,6 +11604,7 @@ def _render_need_editor_panel(
             ev.returnValue = '';
           }});
 
+          neInitPlannerPanels();
           const requestedTab = (new URLSearchParams(window.location.search).get('need_area') || 'main').toLowerCase();
           activateTab(requestedTab === 'secondary' ? 'secondary' : 'main', true);
         }})();
