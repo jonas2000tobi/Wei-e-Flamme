@@ -9674,27 +9674,60 @@ def _render_need_builder_dashboard(
         """)
     build_list = "".join(build_cards) or "<div class='empty'>Noch kein Build.</div>"
 
+    builder_slot_icons = {
+        "Waffe 1": "⚔️", "Waffe 2": "🗡️", "Fähigkeitskern 1": "✨", "Fähigkeitskern 2": "🌟",
+        "Helm": "🪖", "Brust": "🦺", "Hose": "👖", "Handschuhe": "🧤", "Schuhe": "🥾",
+        "Umhang": "🧥", "Kette": "📿", "Armband": "🫳", "Brosche": "🎖️", "Ohrringe": "💠",
+        "Ring 1": "💍", "Ring 2": "💍", "Gürtel": "🪢",
+    }
+    builder_slot_areas = {
+        "Helm": "head", "Kette": "neck", "Ohrringe": "ear", "Umhang": "cloak",
+        "Waffe 1": "weapon1", "Waffe 2": "weapon2", "Brust": "chest", "Handschuhe": "hands",
+        "Hose": "legs", "Schuhe": "feet", "Gürtel": "belt", "Armband": "bracelet",
+        "Brosche": "brooch", "Ring 1": "ring1", "Ring 2": "ring2",
+        "Fähigkeitskern 1": "core1", "Fähigkeitskern 2": "core2",
+    }
+    builder_upper_slots = {"Helm", "Waffe 1", "Waffe 2", "Brust", "Hose", "Handschuhe", "Schuhe", "Umhang", "Gürtel"}
+
     def slot_html(slot: str) -> str:
         row = active_slots.get(slot) or {}
         iid = str(row.get("item_catalog_id") or "")
         name = str(row.get("item_name") or "")
         img = str(row.get("item_image_url") or "")
-        image_html = f'<img src="{_e(img)}" alt="" loading="lazy">' if img else '<span>＋</span>'
+        area = builder_slot_areas.get(slot, "auto")
+        icon = builder_slot_icons.get(slot, "🧩")
+        image_html = f'<img src="{_e(img)}" alt="{_e(name or slot)}" loading="lazy">' if img else f'<span class="nb-equipment-placeholder">{_e(icon)}</span>'
+        state = "filled" if iid else "empty"
         return f"""
-        <div class="nb-slot" data-slot="{_e(slot)}">
-          <label>{_e(slot)}</label>
-          <button type="button" class="nb-picker" onclick="nbOpenPicker(this)" onmouseenter="nbSlotTip(this,event)" onmousemove="nbMoveTip(event)" onmouseleave="nbHideTip()">
-            <span class="nb-thumb">{image_html}</span>
-            <span class="nb-picked" data-empty="Item auswählen">{_e(name or 'Item auswählen')}</span>
-            <b>⌄</b>
+        <div class="nb-slot nb-equipment-slot {state}" data-slot="{_e(slot)}" style="grid-area:{_e(area)}">
+          <button type="button" class="nb-picker nb-equipment-picker" onclick="nbOpenPicker(this)" onmouseenter="nbSlotTip(this,event)" onmousemove="nbMoveTip(event)" onmouseleave="nbHideTip()">
+            <span class="nb-thumb nb-equipment-art">{image_html}</span>
+            <span class="nb-equipment-label">{_e(slot)}</span>
+            <span class="nb-picked" data-empty="Item auswählen">{_e(name or 'Leer')}</span>
+            <span class="nb-equipment-state">{'✓' if iid else '+'}</span>
           </button>
           <input type="hidden" name="slot_{_e(slot)}" value="{_e(iid)}">
         </div>
         """
 
-    group_html = []
-    for title, slots in _NEED_BUILDER_SLOT_GROUPS:
-        group_html.append(f'<section class="nb-section"><h3>{_e(title)}</h3><div class="nb-slot-grid">' + "".join(slot_html(s) for s in slots) + '</div></section>')
+    builder_upper_cards: list[str] = []
+    builder_lower_cards: list[str] = []
+    for _slot in _NEED_BUILDER_SLOTS:
+        (_builder_target := builder_upper_cards if _slot in builder_upper_slots else builder_lower_cards).append(slot_html(_slot))
+
+    builder_equipment_html = f"""
+    <section class="nb-equipment-window">
+      <div class="nb-equipment-window-head"><div><span class="eyebrow">Equipment</span><h3>{_e(active.get('name') or 'Build')}</h3></div><p>Die Slot-Anordnung und Itemauswahl entsprechen exakt der Needliste.</p></div>
+      <div class="nb-equipment-grid nb-equipment-grid-upper">{''.join(builder_upper_cards)}</div>
+      <div class="nb-equipment-gap" aria-hidden="true"></div>
+      <div class="nb-equipment-grid nb-equipment-grid-lower">{''.join(builder_lower_cards)}</div>
+    </section>
+    """
+
+    builder_attr_rows = "".join(
+        f'<div class="nb-manual-attr" data-nb-attr-row="{_e(attr)}"><span>{_e(attr)}</span><div><button type="button" data-nb-attr-minus="{_e(attr)}">−</button><strong data-nb-attr-value="{_e(attr)}">11</strong><button type="button" data-nb-attr-plus="{_e(attr)}">＋</button></div></div>'
+        for attr in ("Stärke", "Geschicklichkeit", "Weisheit", "Wahrnehmung", "Standhaftigkeit")
+    )
 
     analytics_hint = ""
     try:
@@ -9739,6 +9772,22 @@ def _render_need_builder_dashboard(
       @media(max-width:620px){.nb-slot-grid{grid-template-columns:1fr}.nb-toolbar{display:grid}.nb-toolbar input{min-width:0;width:100%}}
       @media(max-width:760px){body.nb-picker-open{overflow:hidden}.need-builder-shell{gap:12px}.need-builder-side,.need-builder-main{padding:14px}.need-builder-side h2{margin-bottom:10px}.nb-builds{gap:8px}.nb-build{padding:9px 10px;grid-template-columns:36px 1fr 18px}.nb-build-icon{width:34px;height:34px;border-radius:10px}.nb-side-actions{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px}.nb-side-actions .btn{width:100%;min-height:42px;padding:8px 10px;font-size:13px;border-radius:10px}.nb-status{display:grid;grid-template-columns:1fr;gap:8px;padding:10px}.nb-toolbar{display:grid;grid-template-columns:1fr 1fr;gap:8px}.nb-toolbar input{grid-column:1/-1;max-width:none!important;width:100%;min-width:0}.nb-toolbar .btn{width:100%;min-height:42px;padding:8px 10px;font-size:13px;white-space:nowrap}.nb-build-layout{gap:12px}.nb-slot-grid{grid-template-columns:1fr;gap:10px}.nb-picker{min-height:56px;padding:8px}.nb-thumb{width:38px;height:38px}.nb-picked{font-size:14px}.nb-stats-panel{padding:12px}.nb-power strong{font-size:24px}.nb-panel-subtabs{display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px}.nb-panel-subtabs button{padding:8px 6px;font-size:12px}.nb-stat-groups,.nb-trait-list,.nb-breakpoints{max-height:none}.nb-help{grid-template-columns:1fr;gap:10px}.nb-picker-pop.mobile{left:12px!important;right:12px!important;top:auto!important;bottom:calc(12px + env(safe-area-inset-bottom));width:auto!important;max-height:min(76vh,680px);border-radius:18px;padding:10px}.nb-picker-pop.mobile input{position:sticky;top:0;z-index:2}.nb-picker-pop.mobile .nb-picker-list{max-height:calc(76vh - 72px)}.nb-item-tooltip{display:none!important}}
       @media(max-width:480px){.need-builder-side,.need-builder-main{padding:12px}.nb-side-actions{grid-template-columns:1fr}.nb-toolbar{grid-template-columns:1fr}.nb-toolbar .btn{font-size:12px}.nb-power{padding:8px 10px}.nb-status span{font-size:13px}}
+
+      /* Charakter-Editor: exakt dasselbe Equipment-Fenster wie die Needliste */
+      .nb-character-layout{display:grid;grid-template-columns:minmax(155px,185px) minmax(0,1fr) minmax(245px,300px);gap:12px;align-items:start}
+      .nb-attribute-panel,.nb-stats-panel{position:sticky;top:12px;min-width:0;border:1px solid rgba(214,168,79,.22);border-radius:20px;background:linear-gradient(160deg,rgba(20,17,14,.97),rgba(7,8,10,.96));padding:13px;box-shadow:0 18px 45px rgba(0,0,0,.28)}
+      .nb-attribute-panel h3{margin:2px 0 12px;color:#f1d28a;font-size:20px}
+      .nb-attribute-summary{display:flex;justify-content:space-between;gap:8px;padding:9px 10px;border-radius:12px;background:rgba(214,168,79,.07);border:1px solid rgba(214,168,79,.14);margin-bottom:10px;font-size:12px}.nb-attribute-summary strong{font-size:19px;color:#f2d083}
+      .nb-manual-attrs{display:grid;gap:7px}.nb-manual-attr{display:grid;gap:6px;padding:9px;border-radius:12px;border:1px solid rgba(255,255,255,.075);background:rgba(255,255,255,.025)}.nb-manual-attr>span{font-size:12px;font-weight:850;color:#d9e1e9}.nb-manual-attr>div{display:grid;grid-template-columns:32px 1fr 32px;gap:6px;align-items:center}.nb-manual-attr button{width:32px;height:30px;border-radius:9px;border:1px solid rgba(214,168,79,.24);background:rgba(214,168,79,.08);color:#f1d28a;font-size:18px;font-weight:900;cursor:pointer}.nb-manual-attr button:hover{background:rgba(214,168,79,.18)}.nb-manual-attr strong{text-align:center;font-size:18px}.nb-attr-reset{width:100%;margin-top:10px;justify-content:center}
+      .nb-equipment-window{min-width:0;width:100%;border:1px solid rgba(214,168,79,.24);border-radius:24px;padding:18px;background:linear-gradient(160deg,rgba(30,22,14,.98),rgba(8,8,9,.96));box-shadow:0 22px 55px rgba(0,0,0,.38)}
+      .nb-equipment-window-head{display:flex;justify-content:space-between;align-items:end;gap:18px;margin-bottom:16px}.nb-equipment-window-head h3{margin:2px 0 0;color:#f2d083;font-size:28px}.nb-equipment-window-head p{margin:0;color:var(--muted);max-width:420px;text-align:right}
+      .nb-equipment-grid{display:grid;grid-template-columns:repeat(4,minmax(105px,1fr));gap:12px;align-items:stretch;padding:16px;border-radius:20px;background:radial-gradient(circle at center,rgba(128,91,28,.13),rgba(0,0,0,.26) 65%);border:1px solid rgba(255,255,255,.055)}
+      .nb-equipment-grid-upper{grid-template-areas:'. head head .' 'weapon1 chest hands cloak' 'weapon2 legs feet belt'}.nb-equipment-grid-lower{grid-template-areas:'core1 . . .' 'core2 ring1 neck brooch' '. ring2 bracelet ear'}.nb-equipment-gap{height:28px}
+      .nb-equipment-slot{min-width:0}.nb-equipment-picker{position:relative;width:100%;min-height:138px;padding:8px;border-radius:16px;border:1px solid rgba(255,255,255,.12);background:linear-gradient(180deg,rgba(25,25,27,.95),rgba(7,7,8,.96));color:inherit;cursor:pointer;overflow:hidden;display:grid;grid-template-columns:1fr;grid-template-rows:76px auto auto;gap:4px;text-align:center;transition:transform .14s ease,border-color .14s ease,box-shadow .14s ease}.nb-equipment-picker:hover,.nb-equipment-picker.nb-open{transform:translateY(-2px);border-color:#d9a846;box-shadow:0 0 0 2px rgba(217,168,70,.14),0 12px 25px rgba(0,0,0,.32)}.nb-equipment-slot.filled .nb-equipment-picker{border-color:rgba(107,165,255,.55)}
+      .nb-equipment-art{width:100%;height:76px;border-radius:11px;background:radial-gradient(circle at 50% 30%,rgba(104,124,198,.2),rgba(0,0,0,.45));border:0;overflow:hidden}.nb-equipment-art img{width:100%;height:100%;object-fit:contain;padding:4px}.nb-equipment-placeholder{font-size:36px;color:#d6b365}.nb-equipment-label{font-size:11px;text-transform:uppercase;letter-spacing:.05em;font-weight:900;color:#e2c47d}.nb-equipment-picker .nb-picked{font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:#cfd7df}.nb-equipment-state{position:absolute;right:7px;top:7px;width:23px;height:23px;border-radius:999px;display:grid;place-items:center;background:rgba(0,0,0,.65);color:#f0c96c;border:1px solid rgba(240,201,108,.28);font-weight:900}
+      @media(max-width:1280px){.nb-character-layout{grid-template-columns:minmax(145px,165px) minmax(0,1fr) minmax(215px,250px)}.nb-equipment-grid{grid-template-columns:repeat(4,minmax(92px,1fr));gap:8px;padding:11px}}
+      @media(max-width:1050px){.nb-character-layout{grid-template-columns:1fr 1fr;grid-template-areas:'attributes values' 'equipment equipment'}.nb-attribute-panel{grid-area:attributes;position:static}.nb-stats-panel{grid-area:values;position:static}.nb-equipment-window{grid-area:equipment}.nb-equipment-window-head{align-items:flex-start;flex-direction:column}.nb-equipment-window-head p{text-align:left}}
+      @media(max-width:620px){.nb-character-layout{grid-template-columns:1fr;grid-template-areas:'attributes' 'equipment' 'values'}.nb-equipment-window{padding:11px;border-radius:18px}.nb-equipment-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:7px;padding:9px}.nb-equipment-grid-upper{grid-template-areas:'head head' 'weapon1 chest' 'weapon2 legs' 'hands cloak' 'feet belt'}.nb-equipment-grid-lower{grid-template-areas:'core1 core1' 'core2 ring1' 'ring2 neck' 'bracelet brooch' 'ear ear'}.nb-equipment-gap{height:18px}.nb-equipment-picker{min-height:112px;grid-template-rows:58px auto auto;padding:6px}.nb-equipment-art{height:58px}}
     </style>
     """
 
@@ -9778,8 +9827,15 @@ def _render_need_builder_dashboard(
             <button class="btn danger" type="submit" formaction="/needs/builds/delete" onclick="return confirm('Build wirklich löschen?')">🗑 Löschen</button>
             <button class="btn gold" type="submit" formaction="/needs/builds/save-main">⬆ Übertragen</button>
           </div>
-          <div class="nb-build-layout">
-            <div>{''.join(group_html)}</div>
+          <div class="nb-character-layout">
+            <aside class="nb-attribute-panel">
+              <div><span class="eyebrow">Charakter</span><h3>Attribute</h3></div>
+              <div class="nb-attribute-summary"><span>Verteilte Punkte</span><strong id="nbSpentPoints">0</strong></div>
+              <div class="nb-manual-attrs">{builder_attr_rows}</div>
+              <button type="button" class="btn ghost nb-attr-reset" id="nbAttrReset">Attribute zurücksetzen</button>
+              <p class="muted">Die Attributplanung wird pro Build in diesem Browser gespeichert und live in die Werte eingerechnet.</p>
+            </aside>
+            {builder_equipment_html}
             <aside class="nb-stats-panel">
               <h3>📊 Werte</h3>
               <div class="nb-power"><span>Kampfkraft<br><small class="muted">Stufe-1 Vorschau</small></span><strong id="nbPower">250</strong></div>
@@ -9788,7 +9844,7 @@ def _render_need_builder_dashboard(
               <div id="nbValuesBox" class="nb-stat-groups"></div>
               <div id="nbTraitsBox" class="nb-trait-list" style="display:none"></div>
               <div id="nbBreaksBox" class="nb-breakpoints" style="display:none"></div>
-              <p class="nb-stats-note">Addiert Grundwerte + Item-Hauptwerte + Zusatzwerte. Runen, Mastery, Skills und echte Questlog-Kampfkraft sind noch nicht enthalten. Waffenwerte wie Schildgesundheit werden angezeigt, sobald sie im Item-Katalog vorhanden sind.</p>
+              <p class="nb-stats-note">Addiert Grundwerte, manuell verteilte Attribute und die Werte deiner ausgewählten Items.</p>
             </aside>
           </div>
         </form>
@@ -9840,6 +9896,11 @@ def _render_need_builder_dashboard(
         'Melee Endurance':'Nahkampfausdauer','Ranged Endurance':'Fernkampfausdauer','Magic Endurance':'Magieausdauer'
       }};
       const NB_PERCENT_KEYS = ['tempo','dauer','speed','rate','%'];
+      const NB_ATTR_NAMES = ['Stärke','Geschicklichkeit','Weisheit','Wahrnehmung','Standhaftigkeit'];
+      const NB_ATTR_MIN = 1;
+      const NB_ATTR_MAX = 100;
+      const NB_ATTR_STORAGE = 'bb_character_editor_attributes_{int(user_id)}_{_e(active_build_id)}';
+      let NB_ATTR_VALUES = Object.fromEntries(NB_ATTR_NAMES.map(name => [name, 11]));
       let nbCurrentSlot = null;
       let nbPop = null;
       let nbTip = null;
@@ -9892,8 +9953,12 @@ def _render_need_builder_dashboard(
         if (!item || !nbCurrentSlot) return;
         nbCurrentSlot.querySelector('input[type="hidden"]').value = item.id;
         nbCurrentSlot.querySelector('.nb-picked').textContent = item.name;
+        nbCurrentSlot.classList.remove('empty');
+        nbCurrentSlot.classList.add('filled');
+        const state = nbCurrentSlot.querySelector('.nb-equipment-state');
+        if (state) state.textContent = '✓';
         const thumb = nbCurrentSlot.querySelector('.nb-thumb');
-        thumb.innerHTML = item.image ? `<img src="${{nbEsc(item.image)}}" alt="">` : '<span>＋</span>';
+        thumb.innerHTML = item.image ? `<img src="${{nbEsc(item.image)}}" alt="">` : '<span class="nb-equipment-placeholder">🧩</span>';
         nbClosePicker(); nbHideTip(); nbRecalc();
       }}
       function nbSlotTip(btn, ev) {{
@@ -9940,6 +10005,40 @@ def _render_need_builder_dashboard(
         const traits = Array.isArray(d.traits) ? d.traits.slice(0,8).map(t => `<div class="nb-tip-trait"><b>${{nbEsc(nbNormLabel(t.name || ''))}}</b><span>${{nbEsc(Array.isArray(t.values) ? t.values.join(' | ') : (t.values || ''))}}</span></div>`).join('') : '';
         const passive = d.passive && (d.passive.name || d.passive.text) ? `<div class="nb-tip-sec"><h5>Passiv / Effekt</h5><div class="nb-tip-trait"><b>${{nbEsc(d.passive.name || 'Effekt')}}</b><span>${{nbEsc(d.passive.text || '')}}</span></div></div>` : '';
         return `<div class="nb-tip-head"><img src="${{nbEsc(item.image || '')}}" onerror="this.style.visibility='hidden'" alt=""><div><strong>${{nbEsc(item.name)}}</strong><small>${{nbEsc(item.rarity || '—')}} · ${{nbEsc(item.sub || item.category)}} · Lv. ${{nbEsc(item.level || '—')}}</small></div></div>${{primary ? `<div class="nb-tip-sec"><h5>Hauptwerte</h5>${{primary}}</div>` : ''}}${{bonus || statsRows ? `<div class="nb-tip-sec"><h5>Zusatzwerte</h5>${{bonus || statsRows}}</div>` : ''}}${{traits ? `<div class="nb-tip-sec"><h5>Eigenschaften</h5>${{traits}}</div>` : ''}}${{passive}}`;
+      }}
+      function nbLoadAttributes() {{
+        try {{
+          const raw = JSON.parse(localStorage.getItem(NB_ATTR_STORAGE) || '{{}}');
+          NB_ATTR_NAMES.forEach(function(name) {{
+            const value = Number(raw[name]);
+            if (Number.isFinite(value)) NB_ATTR_VALUES[name] = Math.max(NB_ATTR_MIN, Math.min(NB_ATTR_MAX, Math.round(value)));
+          }});
+        }} catch (_) {{}}
+        nbRenderAttributes();
+      }}
+      function nbSaveAttributes() {{
+        try {{ localStorage.setItem(NB_ATTR_STORAGE, JSON.stringify(NB_ATTR_VALUES)); }} catch (_) {{}}
+      }}
+      function nbRenderAttributes() {{
+        let spent = 0;
+        NB_ATTR_NAMES.forEach(function(name) {{
+          const box = document.querySelector('[data-nb-attr-value="' + name + '"]');
+          if (box) box.textContent = String(NB_ATTR_VALUES[name] || 11);
+          spent += Math.max(0, Number(NB_ATTR_VALUES[name] || 11) - 11);
+        }});
+        const spentBox = document.getElementById('nbSpentPoints');
+        if (spentBox) spentBox.textContent = String(spent);
+      }}
+      function nbChangeAttribute(name, delta) {{
+        if (!NB_ATTR_NAMES.includes(name)) return;
+        NB_ATTR_VALUES[name] = Math.max(NB_ATTR_MIN, Math.min(NB_ATTR_MAX, Number(NB_ATTR_VALUES[name] || 11) + delta));
+        nbSaveAttributes(); nbRenderAttributes(); nbRecalc();
+      }}
+      function nbBindAttributeControls() {{
+        document.querySelectorAll('[data-nb-attr-plus]').forEach(function(btn) {{ btn.addEventListener('click', function() {{ nbChangeAttribute(btn.dataset.nbAttrPlus, 1); }}); }});
+        document.querySelectorAll('[data-nb-attr-minus]').forEach(function(btn) {{ btn.addEventListener('click', function() {{ nbChangeAttribute(btn.dataset.nbAttrMinus, -1); }}); }});
+        const reset = document.getElementById('nbAttrReset');
+        if (reset) reset.addEventListener('click', function() {{ NB_ATTR_VALUES = Object.fromEntries(NB_ATTR_NAMES.map(name => [name, 11])); nbSaveAttributes(); nbRenderAttributes(); nbRecalc(); }});
       }}
       function nbNum(v) {{
         if (v === null || v === undefined) return 0;
@@ -9988,6 +10087,10 @@ def _render_need_builder_dashboard(
             traits[name] = vals.length ? vals.join(' | ') : (t.values || '');
           }});
           if (d.passive && (d.passive.name || d.passive.text)) passive.push(d.passive.name || d.passive.text);
+        }});
+        NB_ATTR_NAMES.forEach(function(name) {{
+          const manual = Number(NB_ATTR_VALUES[name] || 11) - 11;
+          if (manual) stats[name] = Number(stats[name] || NB_BASE[name] || 0) + manual;
         }});
         return {{stats, traits, passive, items}};
       }}
@@ -10055,7 +10158,7 @@ def _render_need_builder_dashboard(
       document.addEventListener('click', e => {{ if (nbPop && !nbPop.contains(e.target) && !e.target.closest('.nb-picker')) nbClosePicker(); }});
       document.addEventListener('keydown', e => {{ if (e.key === 'Escape') {{ nbClosePicker(); nbHideTip(); }} }});
       window.addEventListener('resize', () => {{ if (nbPop && !nbIsMobileLayout()) nbClosePicker(); nbHideTip(); }});
-      document.addEventListener('DOMContentLoaded', nbRecalc);
+      document.addEventListener('DOMContentLoaded', function() {{ nbLoadAttributes(); nbBindAttributeControls(); nbRecalc(); }});
     </script>
     """
     return body if embedded else _html_shell("Charakter-Builder · Beer and Buffs Dashboard", body)
@@ -10920,34 +11023,15 @@ def _render_need_editor_panel(
                 else:
                     lower_cards.append(card)
                 editors.append(editor_html(tab, slot, slot_map.get(slot), idx))
-        attr_rows = "".join(
-            f'<div class="ne-attr-row" data-ne-attr-row="{_e(attr)}"><span>{_e(attr)}</span><div class="ne-attr-controls"><button type="button" data-ne-attr-minus="{_e(attr)}" aria-label="{_e(attr)} verringern">−</button><strong data-ne-attr-value="{_e(attr)}">11</strong><button type="button" data-ne-attr-plus="{_e(attr)}" aria-label="{_e(attr)} erhöhen">＋</button></div></div>'
-            for attr in ("Stärke", "Geschicklichkeit", "Weisheit", "Wahrnehmung", "Standhaftigkeit")
-        )
         return f"""
         <section class="equipment-tab" data-equipment-tab="{_e(tab.lower())}"{('' if tab == 'Main' else ' hidden')}>
-          <div class="need-planner-layout">
-            <aside class="ne-side-panel ne-attributes-panel" data-ne-attributes-panel="{_e(tab.lower())}">
-              <div class="ne-side-head"><span class="eyebrow">Charakter</span><h3>Attribute</h3></div>
-              <div class="ne-attr-points"><span>Verteilte Punkte</span><strong data-ne-spent-points="{_e(tab.lower())}">0</strong></div>
-              <div class="ne-attr-list">{attr_rows}</div>
-              <button type="button" class="btn ghost ne-attr-reset" data-ne-attr-reset="{_e(tab.lower())}">Attribute zurücksetzen</button>
-              <p class="muted">Planungswerte werden für diesen Browser gespeichert und fließen live in die Wertetabelle ein.</p>
-            </aside>
-            <div class="equipment-window">
-              <div class="equipment-window-head"><div><span class="eyebrow">Need-Bereich</span><h3>{_e(tab)}</h3></div><p>Slot anklicken und anschließend ausschließlich passende Items auswählen.</p></div>
-              <div class="equipment-grid equipment-grid-upper">{''.join(upper_cards)}</div>
-              <div class="equipment-section-gap" aria-hidden="true"></div>
-              <div class="equipment-grid equipment-grid-lower">{''.join(lower_cards)}</div>
-              <div class="equipment-editor-empty" data-editor-empty="{_e(tab.lower())}">⬆️ Klicke auf einen Equipment-Slot, um ihn zu bearbeiten.</div>
-              <div class="equipment-editors">{''.join(editors)}</div>
-            </div>
-            <aside class="ne-side-panel ne-values-panel" data-ne-values-panel="{_e(tab.lower())}">
-              <div class="ne-side-head"><span class="eyebrow">Live-Berechnung</span><h3>Wertetabelle</h3></div>
-              <div class="ne-value-summary"><span>Ausgewählte Items</span><strong data-ne-item-count="{_e(tab.lower())}">0</strong></div>
-              <input type="search" class="ne-values-search" data-ne-values-search="{_e(tab.lower())}" placeholder="Wert suchen …">
-              <div class="ne-values-list" data-ne-values-list="{_e(tab.lower())}"><p class="muted">Noch keine Werte berechnet.</p></div>
-            </aside>
+          <div class="equipment-window">
+            <div class="equipment-window-head"><div><span class="eyebrow">Need-Bereich</span><h3>{_e(tab)}</h3></div><p>Slot anklicken und anschließend ausschließlich passende Items auswählen.</p></div>
+            <div class="equipment-grid equipment-grid-upper">{''.join(upper_cards)}</div>
+            <div class="equipment-section-gap" aria-hidden="true"></div>
+            <div class="equipment-grid equipment-grid-lower">{''.join(lower_cards)}</div>
+            <div class="equipment-editor-empty" data-editor-empty="{_e(tab.lower())}">⬆️ Klicke auf einen Equipment-Slot, um ihn zu bearbeiten.</div>
+            <div class="equipment-editors">{''.join(editors)}</div>
           </div>
         </section>"""
 
@@ -10970,7 +11054,7 @@ def _render_need_editor_panel(
         .equipment-tabs{{display:flex;gap:8px;padding:5px;border-radius:15px;background:rgba(0,0,0,.28);border:1px solid rgba(214,168,79,.18)}}
         .equipment-tab-button{{border:0;border-radius:11px;padding:11px 17px;background:transparent;color:#c8c8c8;font-weight:900;cursor:pointer}}
         .equipment-tab-button.active{{background:linear-gradient(135deg,#b47a20,#e1b754);color:#171009;box-shadow:0 8px 20px rgba(0,0,0,.28)}}
-        .need-planner-layout{{display:grid;grid-template-columns:minmax(145px,175px) minmax(0,1fr) minmax(205px,245px);gap:12px;align-items:stretch}}
+        .need-planner-layout{{display:block}}
         .ne-side-panel{{min-width:0;border:1px solid rgba(214,168,79,.22);border-radius:20px;padding:13px;background:linear-gradient(160deg,rgba(20,17,14,.97),rgba(7,8,10,.96));box-shadow:0 18px 45px rgba(0,0,0,.28);display:flex;flex-direction:column}}
         .ne-side-head{{margin-bottom:10px}}.ne-side-head h3{{margin:2px 0 0;color:#f1d28a;font-size:20px}}
         .ne-attr-points,.ne-value-summary{{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:9px 10px;border-radius:12px;background:rgba(214,168,79,.07);border:1px solid rgba(214,168,79,.14);margin-bottom:10px;font-size:12px}}
@@ -10990,7 +11074,7 @@ def _render_need_editor_panel(
         .ne-value-group h4{{margin:0;padding:7px 9px;background:rgba(214,168,79,.055);color:#e3c983;font-size:12px}}
         .ne-value-row{{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:7px;padding:6px 9px;border-top:1px solid rgba(255,255,255,.05);font-size:12px}}
         .ne-value-row span{{overflow-wrap:anywhere}}.ne-value-row b{{color:#e8edf2;text-align:right}}.ne-value-row small{{color:#81d58a;margin-left:5px}}
-        .equipment-window{{min-width:0;width:100%;margin:0;border:1px solid rgba(214,168,79,.24);border-radius:24px;padding:18px;background:linear-gradient(160deg,rgba(30,22,14,.98),rgba(8,8,9,.96));box-shadow:0 22px 55px rgba(0,0,0,.38)}}
+        .equipment-window{{min-width:0;width:100%;max-width:1180px;margin:0 auto;border:1px solid rgba(214,168,79,.24);border-radius:24px;padding:18px;background:linear-gradient(160deg,rgba(30,22,14,.98),rgba(8,8,9,.96));box-shadow:0 22px 55px rgba(0,0,0,.38)}}
         .equipment-window-head{{display:flex;justify-content:space-between;align-items:end;gap:18px;margin-bottom:16px}}
         .equipment-window-head h3{{margin:2px 0 0;color:#f2d083;font-size:28px}}
         .equipment-window-head p{{margin:0;color:var(--muted);max-width:520px;text-align:right}}
@@ -11083,12 +11167,6 @@ def _render_need_editor_panel(
           let neTip = null;
           let neCurrentEditor = null;
           let neCurrentButton = null;
-          const NE_ATTR_NAMES = ['Stärke','Geschicklichkeit','Weisheit','Wahrnehmung','Standhaftigkeit'];
-          const NE_ATTR_BASE = 11;
-          const NE_ATTR_MIN = 1;
-          const NE_ATTR_MAX = 100;
-          const NE_ATTR_STORAGE = 'bb_need_attributes_{int(user_id)}_';
-          const NE_PERCENT_KEYS = ['chance','geschwindigkeit','dauer','reichweite','verringerung','rate','speed','cooldown'];
 
           function neEsc(value) {{
             return String(value ?? '').replace(/[&<>"']/g, function(c) {{
@@ -11203,159 +11281,6 @@ def _render_need_editor_panel(
             neTip.style.display = 'block';
             neMoveTip(ev);
           }}
-          function neNum(value) {{
-            if (value === null || value === undefined) return 0;
-            const raw = String(value).replace(/▲/g,'').replace(/%/g,'').replace(/,/g,'.').replace(/[^0-9.\\-]/g,'');
-            if (!raw || raw === '-' || raw === '.') return 0;
-            const num = parseFloat(raw);
-            return Number.isFinite(num) ? num : 0;
-          }}
-          function neLabel(value) {{ return String(value || '').replace(/:$/,'').trim(); }}
-          function neAddValue(map, label, value) {{
-            const clean = neLabel(label);
-            const num = neNum(value);
-            if (!clean || !num) return;
-            map[clean] = (map[clean] || 0) + num;
-          }}
-          function neAttrKey(tabName) {{ return NE_ATTR_STORAGE + String(tabName || 'main'); }}
-          function neLoadAttrs(tabName) {{
-            const base = Object.fromEntries(NE_ATTR_NAMES.map(function(name) {{ return [name, NE_ATTR_BASE]; }}));
-            try {{
-              const saved = JSON.parse(localStorage.getItem(neAttrKey(tabName)) || '{{}}');
-              NE_ATTR_NAMES.forEach(function(name) {{
-                const value = Number(saved[name]);
-                if (Number.isFinite(value)) base[name] = Math.max(NE_ATTR_MIN, Math.min(NE_ATTR_MAX, Math.round(value)));
-              }});
-            }} catch (_) {{}}
-            return base;
-          }}
-          function neSaveAttrs(tabName, attrs) {{
-            try {{ localStorage.setItem(neAttrKey(tabName), JSON.stringify(attrs)); }} catch (_) {{}}
-          }}
-          function neRenderAttrs(tabName, attrs) {{
-            const panel = root.querySelector('[data-ne-attributes-panel="' + tabName + '"]');
-            if (!panel) return;
-            NE_ATTR_NAMES.forEach(function(name) {{
-              const target = panel.querySelector('[data-ne-attr-value="' + name + '"]');
-              if (target) target.textContent = String(attrs[name] ?? NE_ATTR_BASE);
-            }});
-            const spent = panel.querySelector('[data-ne-spent-points="' + tabName + '"]');
-            if (spent) spent.textContent = String(NE_ATTR_NAMES.reduce(function(sum, name) {{ return sum + Math.max(0, Number(attrs[name] || NE_ATTR_BASE) - NE_ATTR_BASE); }}, 0));
-          }}
-          function neSelectedItemsForTab(tabName) {{
-            const tab = root.querySelector('[data-equipment-tab="' + tabName + '"]');
-            if (!tab) return [];
-            const out = [];
-            const usedSlots = new Set();
-            tab.querySelectorAll('.equipment-slot[data-open-equipment]').forEach(function(card) {{
-              const editorId = card.getAttribute('aria-controls') || '';
-              const editor = editorId ? document.getElementById(editorId) : null;
-              const slotName = editor?.dataset.slotName || card.querySelector('.equipment-slot-label')?.textContent || editorId;
-              if (usedSlots.has(slotName)) return;
-              usedSlots.add(slotName);
-              let itemId = Number(card.dataset.neEquippedItemId || 0);
-              let itemName = card.dataset.neEquippedItemName || '';
-              const field = editor ? editor.querySelector('[data-ne-item-value="1"]') : null;
-              if (field) {{
-                itemId = Number(field.dataset.itemId || 0);
-                itemName = field.value || '';
-              }}
-              const item = neFindItem(itemId, itemName);
-              if (item) out.push(item);
-            }});
-            return out;
-          }}
-          function neBuildPlannerValues(tabName) {{
-            const attrs = neLoadAttrs(tabName);
-            const stats = Object.assign({{}}, attrs);
-            const traits = [];
-            const passives = [];
-            const items = neSelectedItemsForTab(tabName);
-            items.forEach(function(item) {{
-              const detail = item.detail || {{}};
-              if (detail.damage_min || detail.damage_max) {{
-                neAddValue(stats, 'Min. Schaden', detail.damage_min);
-                neAddValue(stats, 'Max. Schaden', detail.damage_max);
-              }}
-              if (detail.defense) neAddValue(stats, 'Verteidigung', detail.defense);
-              (detail.primary || []).forEach(function(row) {{ if (row) neAddValue(stats, row.label || row.name, row.value ?? row.text); }});
-              (detail.bonus || []).forEach(function(row) {{ if (row) neAddValue(stats, row.label || row.name, row.value ?? row.text); }});
-              Object.entries(detail.stats || {{}}).forEach(function(pair) {{ neAddValue(stats, pair[0], pair[1]); }});
-              (detail.traits || []).forEach(function(trait) {{
-                if (!trait || !trait.name) return;
-                const values = Array.isArray(trait.values) ? trait.values.join(' | ') : (trait.values || '');
-                traits.push([String(trait.name), String(values)]);
-              }});
-              if (detail.passive && (detail.passive.name || detail.passive.text)) passives.push([detail.passive.name || 'Effekt', detail.passive.text || 'aktiv']);
-            }});
-            return {{attrs:attrs, stats:stats, traits:traits, passives:passives, items:items}};
-          }}
-          function neValueGroup(label) {{
-            const low = neNorm(label);
-            if (NE_ATTR_NAMES.some(function(name) {{ return neNorm(name) === low; }})) return 'Attribute';
-            if (/(schaden|treffer|krit|angriff|bonusschaden|schwerer)/.test(low)) return 'Angriff';
-            if (/(verteid|gesundheit|ausweich|resist|verringer|endurance)/.test(low)) return 'Verteidigung';
-            if (/(mana|cooldown|dauer|reichweite|bewegung|regeneration)/.test(low)) return 'Ressourcen & Tempo';
-            return 'Weitere Werte';
-          }}
-          function neFmtValue(value, label) {{
-            const number = Number(value || 0);
-            const rounded = Math.abs(number - Math.round(number)) < 0.001 ? String(Math.round(number)) : String(Math.round(number * 10) / 10).replace('.', ',');
-            return NE_PERCENT_KEYS.some(function(key) {{ return neNorm(label).includes(key); }}) ? rounded + ' %' : rounded;
-          }}
-          function neRenderValues(tabName) {{
-            const panel = root.querySelector('[data-ne-values-panel="' + tabName + '"]');
-            if (!panel) return;
-            const planner = neBuildPlannerValues(tabName);
-            neRenderAttrs(tabName, planner.attrs);
-            const count = panel.querySelector('[data-ne-item-count="' + tabName + '"]');
-            if (count) count.textContent = String(planner.items.length);
-            const search = panel.querySelector('[data-ne-values-search="' + tabName + '"]');
-            const query = neNorm(search ? search.value : '');
-            const groups = {{'Attribute':[], 'Angriff':[], 'Verteidigung':[], 'Ressourcen & Tempo':[], 'Weitere Werte':[]}};
-            Object.entries(planner.stats || {{}}).forEach(function(pair) {{
-              const label = String(pair[0] || '');
-              if (query && !neNorm(label).includes(query)) return;
-              groups[neValueGroup(label)].push([label, pair[1]]);
-            }});
-            let html = '';
-            Object.entries(groups).forEach(function(entry) {{
-              const rows = entry[1].sort(function(a,b) {{ return String(a[0]).localeCompare(String(b[0]), 'de'); }});
-              if (!rows.length) return;
-              html += '<section class="ne-value-group"><h4>' + neEsc(entry[0]) + '</h4>' + rows.map(function(row) {{
-                return '<div class="ne-value-row"><span>' + neEsc(row[0]) + '</span><b>' + neEsc(neFmtValue(row[1], row[0])) + '</b></div>';
-              }}).join('') + '</section>';
-            }});
-            const extraRows = planner.traits.concat(planner.passives).filter(function(row) {{ return !query || neNorm(row[0]).includes(query) || neNorm(row[1]).includes(query); }});
-            if (extraRows.length) html += '<section class="ne-value-group"><h4>Eigenschaften & Effekte</h4>' + extraRows.slice(0,20).map(function(row) {{ return '<div class="ne-value-row"><span>' + neEsc(row[0]) + '</span><b>' + neEsc(row[1] || 'aktiv') + '</b></div>'; }}).join('') + '</section>';
-            const target = panel.querySelector('[data-ne-values-list="' + tabName + '"]');
-            if (target) target.innerHTML = html || '<p class="muted">Keine passenden Werte vorhanden.</p>';
-          }}
-          function neAdjustAttr(tabName, attrName, delta) {{
-            const attrs = neLoadAttrs(tabName);
-            attrs[attrName] = Math.max(NE_ATTR_MIN, Math.min(NE_ATTR_MAX, Number(attrs[attrName] || NE_ATTR_BASE) + delta));
-            neSaveAttrs(tabName, attrs);
-            neRenderValues(tabName);
-          }}
-          function neInitPlannerPanels() {{
-            root.querySelectorAll('[data-ne-attributes-panel]').forEach(function(panel) {{
-              const tabName = panel.dataset.neAttributesPanel || 'main';
-              panel.querySelectorAll('[data-ne-attr-minus]').forEach(function(button) {{ button.addEventListener('click', function() {{ neAdjustAttr(tabName, button.dataset.neAttrMinus || '', -1); }}); }});
-              panel.querySelectorAll('[data-ne-attr-plus]').forEach(function(button) {{ button.addEventListener('click', function() {{ neAdjustAttr(tabName, button.dataset.neAttrPlus || '', 1); }}); }});
-              const reset = panel.querySelector('[data-ne-attr-reset]');
-              if (reset) reset.addEventListener('click', function() {{
-                const attrs = Object.fromEntries(NE_ATTR_NAMES.map(function(name) {{ return [name, NE_ATTR_BASE]; }}));
-                neSaveAttrs(tabName, attrs);
-                neRenderValues(tabName);
-              }});
-            }});
-            root.querySelectorAll('[data-ne-values-search]').forEach(function(search) {{
-              search.addEventListener('input', function() {{ neRenderValues(search.dataset.neValuesSearch || 'main'); }});
-            }});
-            neRenderValues('main');
-            neRenderValues('secondary');
-          }}
-
           function neFilteredItems(editor, query) {{
             const slot = editor.dataset.slotName || '';
             const weaponField = editor.querySelector('.ne-weapon-type');
@@ -11440,7 +11365,6 @@ def _render_need_editor_panel(
             if (meta) meta.textContent = [item.rarity, item.sub || item.category, item.level ? 'Lv. ' + item.level : ''].filter(Boolean).join(' · ') || 'Item-Datenbank';
             updatePreview(editor);
             refreshDirty(editor);
-            neRenderValues(editor.dataset.tab || 'main');
             neClosePicker();
           }}
 
@@ -11477,7 +11401,6 @@ def _render_need_editor_panel(
               btn.classList.toggle('active', active);
               btn.setAttribute('aria-selected', active ? 'true' : 'false');
             }});
-            neRenderValues(name);
             return true;
           }}
           function closeEditors(tabName, force){{
@@ -11549,8 +11472,7 @@ def _render_need_editor_panel(
                 }}
                 refreshDirty(editor);
                 updatePreview(editor);
-                neRenderValues(editor.dataset.tab || 'main');
-                neClosePicker();
+                    neClosePicker();
               }});
             }});
             editor.querySelectorAll('[data-ne-open-picker="1"]').forEach(function(button){{
@@ -11604,7 +11526,6 @@ def _render_need_editor_panel(
             ev.returnValue = '';
           }});
 
-          neInitPlannerPanels();
           const requestedTab = (new URLSearchParams(window.location.search).get('need_area') || 'main').toLowerCase();
           activateTab(requestedTab === 'secondary' ? 'secondary' : 'main', true);
         }})();
