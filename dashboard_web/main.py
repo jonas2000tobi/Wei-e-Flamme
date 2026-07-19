@@ -189,6 +189,98 @@ def _set_guild_setting_value(guild_id: int, key: str, value: Any) -> None:
         conn.close()
 
 
+def _ensure_profile_update_request_schema() -> None:
+    if not _database_url():
+        return
+    conn = _pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS dashboard_profile_update_requests (
+                    id BIGSERIAL PRIMARY KEY,
+                    request_id TEXT NOT NULL UNIQUE,
+                    guild_id BIGINT NOT NULL,
+                    user_id BIGINT NOT NULL,
+                    class_name TEXT NOT NULL DEFAULT '',
+                    main_role TEXT NOT NULL DEFAULT '',
+                    gearscore INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    actor_id TEXT NOT NULL DEFAULT '',
+                    actor_name TEXT NOT NULL DEFAULT '',
+                    requested_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    processed_at TIMESTAMPTZ,
+                    error_text TEXT NOT NULL DEFAULT ''
+                )
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_dashboard_profile_update_user
+                ON dashboard_profile_update_requests (guild_id, user_id, requested_at DESC)
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_dashboard_profile_update_status
+                ON dashboard_profile_update_requests (status, requested_at)
+            """)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _create_profile_update_request(
+    guild_id: int,
+    user_id: int,
+    *,
+    class_name: str,
+    main_role: str,
+    gearscore: int,
+    actor: Optional[dict[str, Any]] = None,
+) -> str:
+    if not _database_url():
+        raise RuntimeError("DATABASE_URL fehlt.")
+    _ensure_profile_update_request_schema()
+    request_id = f"profile_{int(time.time() * 1000)}_{secrets.token_hex(4)}"
+    actor = actor or {}
+    actor_id = str(actor.get("user_id") or actor.get("id") or actor.get("sub") or "")
+    actor_name = str(actor.get("display_name") or actor.get("username") or actor.get("name") or actor_id or "Dashboard")
+    conn = _pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO dashboard_profile_update_requests
+                (request_id, guild_id, user_id, class_name, main_role, gearscore, status, actor_id, actor_name)
+                VALUES (%s,%s,%s,%s,%s,%s,'pending',%s,%s)
+            """, (
+                request_id, int(guild_id), int(user_id), str(class_name), str(main_role), int(gearscore), actor_id, actor_name,
+            ))
+        conn.commit()
+    finally:
+        conn.close()
+    return request_id
+
+
+def _latest_profile_update_request(guild_id: int, user_id: int) -> dict[str, Any]:
+    if not _database_url() or not guild_id or not user_id:
+        return {}
+    try:
+        _ensure_profile_update_request_schema()
+        conn = _pg_connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT request_id, class_name, main_role, gearscore, status,
+                           requested_at, processed_at, error_text
+                    FROM dashboard_profile_update_requests
+                    WHERE guild_id=%s AND user_id=%s
+                    ORDER BY requested_at DESC, id DESC
+                    LIMIT 1
+                """, (int(guild_id), int(user_id)))
+                row = cur.fetchone()
+                return dict(row) if row else {}
+        finally:
+            conn.close()
+    except Exception:
+        return {}
+
+
 def _guild_brand(data: Optional[dict[str, Any]] = None) -> dict[str, Any]:
     gid = 0
     if isinstance(data, dict):
@@ -3884,8 +3976,7 @@ def _sidebar_html() -> str:
       <button class="mobile-nav-toggle" type="button" onclick="document.body.classList.toggle('nav-open')">☰ Menü</button>
 
       <nav class="side-nav">
-        <a class="announcement-top-button" href="/announcements"><img class="nav-ico" src="{_asset('nav_announcements.png')}" alt="">Ankündigungen</a>
-        <a class="sidebar-home-button" href="/"><img class="nav-ico" src="{_asset('nav_kommando.png')}" alt="">Startseite</a>
+        <a href="/"><img class="nav-ico" src="{_asset('nav_kommando.png')}" alt="">Startseite</a>
         <a class="admin-back" href="/"><span>←</span> Zur normalen Ansicht</a>
         <a href="/character-editor"><img class="nav-ico" src="{_asset('nav_builds.png')}" alt="">Charakter-Editor</a>
         <details open>
@@ -3899,7 +3990,8 @@ def _sidebar_html() -> str:
         </details>
 
         <details open>
-          <summary>Leader-Werkzeuge</summary>
+          <summary>Gilde</summary>
+          <a href="/announcements"><img class="nav-ico" src="{_asset('nav_announcements.png')}" alt="">Ankündigungen</a>
           <a href="/loot"><img class="nav-ico" src="{_asset('nav_auktionen.png')}" alt="">Loot & Auktionen</a>
           <a href="/events-admin"><img class="nav-ico" src="{_asset('nav_events.png')}" alt="">Event-Verwaltung</a>
           <a href="/attendance"><img class="nav-ico" src="{_asset('nav_anwesenheit.png')}" alt="">Anwesenheit</a>
@@ -3931,8 +4023,7 @@ def _member_sidebar_html() -> str:
       <button class="mobile-nav-toggle" type="button" onclick="document.body.classList.toggle('nav-open')">☰ Menü</button>
 
       <nav class="side-nav">
-        <a class="announcement-top-button" href="/announcements"><img class="nav-ico" src="{_asset('nav_announcements.png')}" alt="">Ankündigungen</a>
-        <a class="sidebar-home-button" href="/"><img class="nav-ico" src="{_asset('nav_kommando.png')}" alt="">Startseite</a>
+        <a href="/"><img class="nav-ico" src="{_asset('nav_kommando.png')}" alt="">Startseite</a>
         <a class="admin-portal-button" href="/admin"><img class="nav-ico" src="{_asset('nav_admin_portal.png')}" alt="">Admin-Portal</a>
 
         <details open>
@@ -3943,6 +4034,7 @@ def _member_sidebar_html() -> str:
 
         <details open>
           <summary>Gilde</summary>
+          <a href="/announcements"><img class="nav-ico" src="{_asset('nav_announcements.png')}" alt="">Ankündigungen</a>
           <a href="/member/members"><img class="nav-ico" src="{_asset('nav_mitglieder.png')}" alt="">Mitglieder</a>
           <a href="/member/auctions"><img class="nav-ico" src="{_asset('nav_auktionen.png')}" alt="">Auktionen</a>
           <a href="/member/events"><img class="nav-ico" src="{_asset('nav_events.png')}" alt="">Events</a>
@@ -4018,10 +4110,6 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "member") -> str:
     .side-nav details a {{ margin-left:8px; padding:9px 11px; font-size:13px; color:#ead9ae; }}
     .sidebar-logo-link {{ display:block; flex:0 0 auto; color:inherit; text-decoration:none; border-radius:14px; }}
     .sidebar-logo-link:focus-visible {{ outline:2px solid var(--gold); outline-offset:3px; }}
-    .side-nav .sidebar-home-button {{ margin:0 0 6px 0; border:1px solid rgba(214,168,79,.42); background:linear-gradient(90deg,rgba(214,168,79,.24),rgba(214,168,79,.08)); color:#f5d891; font-weight:900; box-shadow:inset 0 1px 0 rgba(255,255,255,.05); }}
-    .side-nav .sidebar-home-button:hover {{ background:linear-gradient(90deg,rgba(214,168,79,.34),rgba(214,168,79,.12)); color:#ffe7a8; }}
-    .side-nav .announcement-top-button {{ order:-20; margin:0 0 6px 0; border:1px solid rgba(236,194,101,.50); background:linear-gradient(90deg,rgba(236,194,101,.30),rgba(214,168,79,.08)); color:#ffe3a0; font-weight:950; box-shadow:inset 3px 0 0 rgba(255,210,108,.95),0 8px 20px rgba(0,0,0,.20); }}
-    .side-nav .announcement-top-button:hover {{ background:linear-gradient(90deg,rgba(236,194,101,.40),rgba(214,168,79,.13)); color:#fff0be; }}
     .side-nav .admin-portal-button {{ margin:0 0 6px 0; border:1px solid rgba(214,168,79,.34); background:linear-gradient(90deg,rgba(214,168,79,.18),rgba(65,82,101,.18)); color:var(--gold); font-weight:800; }}
     .side-nav .admin-back {{ margin:0 0 6px 0; border:1px solid rgba(129,199,132,.25); background:rgba(129,199,132,.08); color:#bfe8c1; font-weight:800; }}
 
@@ -11595,6 +11683,20 @@ def _render_member_portal(data: dict[str, Any], user_id: int, request: Request, 
     avatar_url = str(profile_value("avatar_url", "display_avatar_url", "discord_avatar_url") or "").strip()
     class_name = str(profile_value("class_name", "main_class", "character_class", "klasse", "class", "build_class", "weapon_combo") or "—")
     main_role = str(profile_value("main_role", "role_name", "class_role", "role") or "—")
+    gearscore = str(profile_value("gearscore", "gear_score", "gs") or "—")
+
+    latest_profile_update = _latest_profile_update_request(int(guild_id or 0), uid) if guild_id else {}
+    update_status = str(latest_profile_update.get("status") or "").lower()
+    published_at = _dt_obj(data.get("published_at"))
+    requested_at = _dt_obj(latest_profile_update.get("requested_at"))
+    use_profile_overlay = update_status in {"pending", "processing"}
+    if update_status == "done" and requested_at and (not published_at or requested_at > published_at):
+        use_profile_overlay = True
+    if use_profile_overlay:
+        class_name = str(latest_profile_update.get("class_name") or class_name or "—")
+        main_role = str(latest_profile_update.get("main_role") or main_role or "—")
+        gearscore = str(latest_profile_update.get("gearscore") or gearscore or "—")
+
     joined_raw = profile_value("guild_joined_at", "joined_guild_at", "member_since", "joined_since", "joined_at", "created_at")
     joined_text = _guild_membership_duration(joined_raw)
     guild_rank = str(profile_value("guild_rank", "rank_name", "rank", "guild_role", "member_rank") or "").strip()
@@ -11650,14 +11752,29 @@ def _render_member_portal(data: dict[str, Any], user_id: int, request: Request, 
         if avatar_url else
         f'<img src="{_e(_brand_image("logo", "beer_and_buffs_logo.png"))}" alt="Profilbild" loading="eager">'
     )
+    role_choices = ["DPS", "Tank", "Heiler", "Support", "Flex"]
+    role_options: list[str] = []
+    if main_role not in ("", "—") and main_role not in role_choices:
+        role_options.append(f'<option value="{_e(main_role)}" selected>{_e(main_role)}</option>')
+    for role_name in role_choices:
+        selected_attr = " selected" if role_name.casefold() == main_role.casefold() else ""
+        role_options.append(f'<option value="{_e(role_name)}"{selected_attr}>{_e(role_name)}</option>')
+
     profile_rows = "".join([
         f'<div class="portal-profile-row"><span>Name</span><strong>{_e(display)}</strong></div>',
-        f'<div class="portal-profile-row"><span>Klasse</span><strong>{_e(class_name)}</strong></div>',
-        f'<div class="portal-profile-row"><span>Rolle</span><strong>{_e(main_role)}</strong></div>',
+        f'<label class="portal-profile-row editable"><span>Klasse</span><span class="profile-edit-control"><input name="class_name" value="{_e("" if class_name == "—" else class_name)}" maxlength="80" placeholder="z. B. Stab / Langbogen"><b>✎</b></span></label>',
+        f'<label class="portal-profile-row editable"><span>Gearscore</span><span class="profile-edit-control"><input name="gearscore" type="number" min="1" max="99999" value="{_e("" if gearscore == "—" else gearscore)}" placeholder="z. B. 4200"><b>✎</b></span></label>',
+        f'<label class="portal-profile-row editable"><span>Rolle</span><span class="profile-edit-control"><select name="main_role"><option value="">Rolle auswählen</option>{"".join(role_options)}</select><b>✎</b></span></label>',
         f'<div class="portal-profile-row"><span>EC-Kontostand</span><strong>{_e(_fmt_ec(balance) if balance is not None else "—")}</strong></div>',
         f'<div class="portal-profile-row"><span>In der Gilde</span><strong>{_e(joined_text)}</strong></div>',
         f'<div class="portal-profile-row"><span>Rang</span><strong>{_e(guild_rank)}</strong></div>',
     ])
+
+    profile_update_notice = ""
+    if update_status in {"pending", "processing"}:
+        profile_update_notice = '<div class="profile-save-state pending">⏳ Profiländerung wurde an den Bot gesendet und wird verarbeitet.</div>'
+    elif update_status == "error":
+        profile_update_notice = f'<div class="profile-save-state error">❌ Profiländerung fehlgeschlagen: {_e(latest_profile_update.get("error_text") or "Unbekannter Fehler")}</div>'
 
     admin_links = ""
     if _is_portal_admin(request) and _current_user_id(request) != uid:
@@ -11677,6 +11794,15 @@ def _render_member_portal(data: dict[str, Any], user_id: int, request: Request, 
       .portal-profile-row:last-child{{border-bottom:0}}
       .portal-profile-row span{{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.07em;font-weight:900}}
       .portal-profile-row strong{{font-size:16px;overflow-wrap:anywhere}}
+      .portal-profile-row.editable{{cursor:text}}
+      .profile-edit-control{{display:grid;grid-template-columns:minmax(0,1fr) 28px;gap:8px;align-items:center}}
+      .profile-edit-control input,.profile-edit-control select{{width:100%;padding:10px 12px;border-radius:11px;border:1px solid rgba(214,168,79,.18);background:rgba(0,0,0,.24);color:var(--text);font:inherit}}
+      .profile-edit-control input:focus,.profile-edit-control select:focus{{outline:none;border-color:rgba(214,168,79,.55);box-shadow:0 0 0 3px rgba(214,168,79,.09)}}
+      .profile-edit-control b{{display:grid;place-items:center;color:var(--gold);font-size:16px}}
+      .profile-save-bar{{display:flex;justify-content:flex-end;gap:10px;padding-top:16px;border-top:1px solid rgba(214,168,79,.14);margin-top:4px}}
+      .profile-save-state{{margin:0 0 12px 0;padding:11px 13px;border-radius:12px;font-weight:700}}
+      .profile-save-state.pending{{background:rgba(214,168,79,.10);border:1px solid rgba(214,168,79,.24);color:#f0d58f}}
+      .profile-save-state.error{{background:rgba(211,82,82,.10);border:1px solid rgba(211,82,82,.25);color:#ffaaaa}}
       .profile-tabs{{display:grid;gap:12px;margin-top:14px}}
       .profile-tab{{border:1px solid rgba(214,168,79,.28);border-radius:17px;background:linear-gradient(135deg,rgba(35,24,13,.88),rgba(8,7,6,.88));overflow:clip}}
       .profile-tab>summary{{list-style:none;cursor:pointer;display:flex;align-items:center;justify-content:space-between;gap:14px;padding:17px 19px;color:#f2dda8;font-family:Georgia,serif;font-weight:900;font-size:18px}}
@@ -11698,10 +11824,32 @@ def _render_member_portal(data: dict[str, Any], user_id: int, request: Request, 
       <div class="hero-actions">{admin_links}</div>
     </section>
     {msg_html}
-    <section class="panel portal-profile-card">
+    {profile_update_notice}
+    <form class="panel portal-profile-card" method="post" action="/portal/member/{uid}/profile-update" data-profile-edit-form="1">
       <div class="portal-profile-rows">{profile_rows}</div>
-    </section>
-    <script>window.BB_SHARED_ITEM_CATALOG = {shared_item_catalog_json};</script>
+      <div class="profile-save-bar"><button class="btn" type="submit">Profiländerungen speichern</button></div>
+    </form>
+    <script>
+      window.BB_SHARED_ITEM_CATALOG = {shared_item_catalog_json};
+      (function profileEditState(){{
+        const form = document.querySelector('[data-profile-edit-form="1"]');
+        if (!form) return;
+        const button = form.querySelector('button[type="submit"]');
+        const initial = new FormData(form);
+        const signature = function(fd){{ return Array.from(fd.entries()).map(function(x){{ return x[0] + '=' + x[1]; }}).join('&'); }};
+        const start = signature(initial);
+        function refresh(){{
+          const dirty = signature(new FormData(form)) !== start;
+          form.classList.toggle('is-dirty', dirty);
+          if (button) button.textContent = dirty ? 'Änderungen speichern' : 'Profil ist aktuell';
+          if (button) button.disabled = !dirty;
+        }}
+        form.addEventListener('input', refresh);
+        form.addEventListener('change', refresh);
+        form.addEventListener('submit', function(){{ if (button) button.disabled = false; }});
+        refresh();
+      }})();
+    </script>
     <section class="profile-tabs">
       <details class="profile-tab" id="needlist"{need_open}>
         <summary><span>🎯 Needliste</span><small class="muted">Items direkt auswählen</small></summary>
@@ -14938,6 +15086,37 @@ def member_portal_page(user_id: int, request: Request, _: bool = Depends(_auth),
             params["msg"] = msg
         return RedirectResponse(url="/character-editor?" + urllib.parse.urlencode(params), status_code=303)
     return HTMLResponse(_render_member_portal(_snapshot_payload(), int(user_id), request, msg))
+
+
+@app.post("/portal/member/{user_id}/profile-update")
+async def portal_profile_update(user_id: int, request: Request, _: bool = Depends(_auth)):
+    if not _portal_can_view(request, int(user_id)):
+        raise HTTPException(status_code=403, detail="Keine Berechtigung für dieses Profil.")
+    data = _snapshot_payload()
+    guild_id = _safe_guild_id(data)
+    if not guild_id:
+        raise HTTPException(status_code=400, detail="Guild-ID fehlt.")
+    form = _parse_urlencoded_body(await request.body())
+    class_name = re.sub(r"\s+", " ", str(form.get("class_name") or "").strip())[:80]
+    main_role = re.sub(r"\s+", " ", str(form.get("main_role") or "").strip())[:50]
+    gearscore_raw = re.sub(r"[^0-9]", "", str(form.get("gearscore") or ""))
+    gearscore = int(gearscore_raw or 0)
+    if not class_name:
+        raise HTTPException(status_code=400, detail="Klasse fehlt.")
+    if not main_role:
+        raise HTTPException(status_code=400, detail="Rolle fehlt.")
+    if gearscore <= 0 or gearscore > 99999:
+        raise HTTPException(status_code=400, detail="Gearscore muss zwischen 1 und 99999 liegen.")
+    actor = _current_user(request) or {"user_id": "basic-admin", "username": "Basic Admin"}
+    request_id = _create_profile_update_request(
+        int(guild_id), int(user_id),
+        class_name=class_name,
+        main_role=main_role,
+        gearscore=gearscore,
+        actor=actor,
+    )
+    params = urllib.parse.urlencode({"msg": f"Profiländerung an den Bot gesendet: {request_id}"})
+    return RedirectResponse(url=f"/portal/member/{int(user_id)}?{params}", status_code=303)
 
 
 @app.post("/portal/member/{user_id}/need-change")
