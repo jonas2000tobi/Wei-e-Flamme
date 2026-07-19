@@ -7381,20 +7381,27 @@ def _need_slot_select_only_html(
     required: bool = False,
 ) -> str:
     """Katalogauswahl für die persönliche Needliste – bewusst ohne Freitext."""
-    items = _loot_catalog_items(snap)
+    items = _loot_catalog_items(snap, limit=4000)
     filtered = [it for it in items if _need_item_slot_matches(it.get("slot", ""), slot, it.get("name", ""))]
     if not filtered:
         filtered = items
     selected = str(selected_value or "").strip()
     required_attr = " required" if required else ""
 
+    def _image_attr(item: dict[str, Any]) -> str:
+        return _e(str(item.get("image_url") or "").strip())
+
     def option_rows(rows: list[dict[str, Any]], *, weapon_type: str = "") -> str:
         out: list[str] = []
         seen: set[str] = set()
+        selected_item = next((it for it in rows if _loot_key(it.get("name")) == _loot_key(selected)), None)
         if selected:
-            out.append(f'<option value="{_e(selected)}" selected>{_e(selected)} · aktuell</option>')
+            out.append(
+                f'<option value="{_e(selected)}" selected data-label="{_e(selected)}" '
+                f'data-image="{_image_attr(selected_item or {})}">{_e(selected)} · aktuell</option>'
+            )
             seen.add(selected.casefold())
-        for item in rows[:800]:
+        for item in rows[:1600]:
             item_name = str(item.get("name") or "").strip()
             if not item_name or item_name.casefold() in seen:
                 continue
@@ -7403,33 +7410,44 @@ def _need_slot_select_only_html(
                 if detected and detected != weapon_type:
                     continue
             seen.add(item_name.casefold())
-            out.append(f'<option value="{_e(item_name)}">{_e(item_name)}</option>')
+            out.append(
+                f'<option value="{_e(item_name)}" data-label="{_e(item_name)}" '
+                f'data-image="{_image_attr(item)}">{_e(item_name)}</option>'
+            )
         return "".join(out)
 
     if _need_slot_kind(slot) == "weapon":
         weapon_opts = ''.join(f'<option value="{_e(w)}">{_e(w)}</option>' for w in _WEAPON_TYPES)
         item_opts: list[str] = []
+        selected_weapon = _weapon_type_from_text(selected)
+        selected_item = next((it for it in filtered if _loot_key(it.get("name")) == _loot_key(selected)), None)
         if selected:
-            item_opts.append(f'<option value="{_e(selected)}" selected data-weapon="{_e(_weapon_type_from_text(selected))}">{_e(selected)} · aktuell</option>')
+            item_opts.append(
+                f'<option value="{_e(selected)}" selected data-weapon="{_e(selected_weapon)}" '
+                f'data-label="{_e(selected)}" data-image="{_image_attr(selected_item or {})}">{_e(selected)} · aktuell</option>'
+            )
         seen = {selected.casefold()} if selected else set()
-        for item in filtered[:800]:
+        for item in filtered[:1600]:
             item_name = str(item.get("name") or "").strip()
             if not item_name or item_name.casefold() in seen:
                 continue
             seen.add(item_name.casefold())
-            item_opts.append(f'<option value="{_e(item_name)}" data-weapon="{_e(_weapon_type_from_text(item_name))}">{_e(item_name)}</option>')
+            item_opts.append(
+                f'<option value="{_e(item_name)}" data-weapon="{_e(_weapon_type_from_text(item_name))}" '
+                f'data-label="{_e(item_name)}" data-image="{_image_attr(item)}">{_e(item_name)}</option>'
+            )
         return (
             f'<div class="need-two-step-picker need-selection-only" data-need-picker="weapon">'
-            f'<select class="weapon-type-picker" name="weapon_type" onchange="this.dataset.changed=\'1\';refreshNeedWeaponPicker(this)">'
+            f'<select class="weapon-type-picker" name="weapon_type" onchange="this.dataset.changed=&#39;1&#39;;refreshNeedWeaponPicker(this)">'
             f'<option value="">1. Waffenart wählen</option>{weapon_opts}</select>'
-            f'<select id="{_e(input_id)}" class="item-picker-select weapon-item-picker" name="{_e(name)}"{required_attr}>'
+            f'<select id="{_e(input_id)}" class="item-picker-select weapon-item-picker" name="{_e(name)}"{required_attr} data-preview-input="1">'
             f'<option value="">2. Item auswählen</option>{"".join(item_opts)}</select>'
             f'<small class="muted">Nur Items aus der Item-Datenbank auswählbar.</small>'
             f'</div>'
         )
 
     return (
-        f'<select id="{_e(input_id)}" class="item-picker-select need-selection-only" name="{_e(name)}"{required_attr}>'
+        f'<select id="{_e(input_id)}" class="item-picker-select need-selection-only" name="{_e(name)}"{required_attr} data-preview-input="1">'
         f'<option value="">Item für {_e(slot)} auswählen</option>{option_rows(filtered)}</select>'
         f'<small class="muted">{len(filtered)} passende Katalogeinträge · kein Freitext</small>'
     )
@@ -10711,33 +10729,75 @@ def _render_need_editor_panel(user_id: int, current_user: Optional[dict[str, Any
     need_info = _needs_by_user(snap).get(int(user_id), {})
     main_map = _need_slot_map((need_info or {}).get("main") or (need_info or {}).get("main_needs") or []) if isinstance(need_info, dict) else {}
     sec_map = _need_slot_map((need_info or {}).get("secondary") or (need_info or {}).get("secondary_needs") or (need_info or {}).get("second") or []) if isinstance(need_info, dict) else {}
+    catalog_items = _loot_catalog_items(snap, limit=4000)
+    catalog_by_name = {_loot_key(it.get("name")): it for it in catalog_items if _loot_key(it.get("name"))}
+
+    slot_icons = {
+        "Waffe 1": "⚔️", "Waffe 2": "🗡️", "Fähigkeitskern 1": "✨", "Fähigkeitskern 2": "✨",
+        "Helm": "🪖", "Brust": "🦺", "Hose": "👖", "Handschuhe": "🧤", "Schuhe": "🥾",
+        "Umhang": "🧥", "Kette": "📿", "Armband": "🫳", "Brosche": "🎖️", "Ring": "💍",
+        "Gürtel": "🪢", "Ohrringe": "🪙",
+    }
+
+    def _item_preview_model(entry: Any) -> tuple[str, str, str]:
+        current = _need_item_display(entry) if entry else ""
+        item = catalog_by_name.get(_loot_key(current), {}) if current else {}
+        image_url = str(item.get("image_url") or "").strip() if isinstance(item, dict) else ""
+        rarity = str((item or {}).get("rarity") or "").strip() if isinstance(item, dict) else ""
+        return current, image_url, rarity
+
+    def _character_slots(tab: str, slot_map: dict[str, Any]) -> str:
+        cards: list[str] = []
+        idx = 0
+        for _, slots in _NEED_SLOT_GROUPS:
+            for slot in slots:
+                idx += 1
+                current, image_url, _ = _item_preview_model(slot_map.get(slot))
+                icon = slot_icons.get(slot, "🧩")
+                img_html = f'<img src="{_e(image_url)}" alt="{_e(current or slot)}" loading="lazy">' if image_url else f'<div class="need-slot-placeholder">{_e(icon)}</div>'
+                state = current or 'leer'
+                cards.append(
+                    f'<a class="need-gear-card" href="#need-row-{_e(tab.lower())}-{idx}" data-target-row="need-row-{_e(tab.lower())}-{idx}">'
+                    f'<div class="need-gear-thumb">{img_html}</div>'
+                    f'<div class="need-gear-copy"><strong>{_e(slot)}</strong><small>{_e(_short(state, 42))}</small></div>'
+                    f'</a>'
+                )
+        return ''.join(cards)
 
     def row_html(tab: str, slot: str, entry: Any, idx: int) -> str:
         locked = bool(entry and _need_is_received(entry))
-        current = _need_item_display(entry) if entry else ""
+        current, image_url, rarity = _item_preview_model(entry)
         input_id = f"need-inline-{int(user_id)}-{tab.lower()}-{idx}"
         slot_id = f"need-slot-fixed-{int(user_id)}-{tab.lower()}-{idx}"
-        weapon_html = ""
-        if slot.startswith("Waffe"):
-            weapon_html = f'<select name="weapon_type" class="mini-input"><option value="">Waffenart</option>{_weapon_type_options_html()}</select>'
+        row_id = f"need-row-{tab.lower()}-{idx}"
         hidden_slot = f'<select id="{_e(slot_id)}" class="need-slot-select" name="slot" style="display:none"><option selected value="{_e(slot)}">{_e(slot)}</option></select>'
+        preview_html = f'<img src="{_e(image_url)}" alt="{_e(current or slot)}" loading="lazy">' if image_url else f'<div class="need-slot-placeholder large">{_e(slot_icons.get(slot, "🧩"))}</div>'
+        state_badge = '<span class="need-state locked">erhalten</span>' if locked else ('<span class="need-state filled">gesetzt</span>' if current else '<span class="need-state empty">leer</span>')
         if locked:
             return f"""
-            <div class="need-inline-row locked">
-              <div class="need-inline-slot">🔒 {_e(slot)}</div>
-              <div class="need-inline-current">{_e(current or '—')}</div>
-              <div class="muted">erhalten · gesperrt</div>
+            <div class="need-inline-row locked" id="{_e(row_id)}" data-empty-icon="{_e(slot_icons.get(slot, "🧩"))}">
+              <div class="need-inline-preview">{preview_html}</div>
+              <div class="need-inline-content">
+                <div class="need-inline-head"><div><div class="need-inline-slot">{_e(slot)}</div><div class="need-inline-current">{_e(current or '—')}</div></div>{state_badge}</div>
+                <div class="muted">Dieses Item ist bereits erhalten und deshalb gesperrt.</div>
+              </div>
             </div>"""
         picker = _need_slot_select_only_html(snap, input_id=input_id, slot=slot, name="item_text", selected_value=current, required=False)
         return f"""
-        <form class="need-inline-row" method="post" action="/portal/member/{int(user_id)}/need-change">
+        <form class="need-inline-row" method="post" action="/portal/member/{int(user_id)}/need-change" id="{_e(row_id)}" data-live-preview="1" data-empty-icon="{_e(slot_icons.get(slot, "🧩"))}">
           <input type="hidden" name="action_type" value="set">
           <input type="hidden" name="tab" value="{_e(tab)}">
           {hidden_slot}
-          <div class="need-inline-slot">{_e(slot)}</div>
-          <div class="need-inline-picker">{picker}</div>
-          <button class="btn mini-btn" type="submit">Speichern</button>
-          <button class="btn mini-btn ghost" type="submit" name="action_type" value="clear" onclick="return confirm('Need für {_e(slot)} entfernen?')">Leeren</button>
+          <div class="need-inline-preview" data-preview-box="1">{preview_html}</div>
+          <div class="need-inline-content">
+            <div class="need-inline-head"><div><div class="need-inline-slot">{_e(slot)}</div><div class="need-inline-current" data-preview-label="1">{_e(current or 'Noch nichts ausgewählt')}</div></div>{state_badge}</div>
+            <div class="need-inline-picker">{picker}</div>
+            <div class="need-inline-actions">
+              <button class="btn mini-btn" type="submit">Speichern</button>
+              <button class="btn mini-btn ghost" type="submit" name="action_type" value="clear" onclick="return confirm('Need für {_e(slot)} entfernen?')">Leeren</button>
+            </div>
+            <div class="need-inline-meta">{_e(rarity or 'Katalogeintrag')} · Slot: {_e(slot)}</div>
+          </div>
         </form>"""
 
     def board_html(tab: str, slot_map: dict[str, Any]) -> str:
@@ -10748,30 +10808,113 @@ def _render_need_editor_panel(user_id: int, current_user: Optional[dict[str, Any
             for slot in slots:
                 idx += 1
                 rows.append(row_html(tab, slot, slot_map.get(slot), idx))
-            blocks.append(f'<div class="need-slot-group"><h3>{_e(title)}</h3>{"".join(rows)}</div>')
-        return f'<div class="need-board edit-board"><h3>{_e(tab)}</h3><p class="muted">Nur aus der Item-Datenbank auswählen. Waffen-Slots beginnen mit der Waffenart.</p>{"".join(blocks)}</div>'
+            blocks.append(f'<div class="need-slot-group"><h3>{_e(title)}</h3><div class="need-slot-group-body">{"".join(rows)}</div></div>')
+        return (
+            f'<div class="need-board edit-board">'
+            f'<div class="need-board-header"><h3>{_e(tab)}</h3><p class="muted">Charakterübersicht oben, darunter die direkte Auswahl. Nur Katalog-Items, kein Freitext.</p></div>'
+            f'<div class="need-gear-grid">{_character_slots(tab, slot_map)}</div>'
+            f'{"".join(blocks)}'
+            f'</div>'
+        )
 
     actor_hint = "Du bearbeitest deine eigene Needliste." if current_user else "Leitungsbearbeitung für dieses Mitglied."
     history_html = "" if compact else f"<h3>Änderungslog</h3>{_table(['Zeit','Status','Aktion','Bereich','Slot','Ergebnis'], req_rows, placeholder='Need-Änderungen durchsuchen…')}"
     return f"""
-    <section class="panel" id="need-editor">
+    <section class="panel need-editor-panel" id="need-editor">
       <h2>🎯 Needliste auswählen</h2>
-      <p class="muted">{_e(actor_hint)} Jede Zeile speichert nur diesen Slot. Es sind ausschließlich Items aus der Item-Datenbank auswählbar.</p>
+      <p class="muted">{_e(actor_hint)} Oben siehst du pro Bereich ein kompaktes Charakterfenster. Darunter wählst du die Items direkt aus und speicherst sie slotweise.</p>
       <style>
-        .need-inline-row{{display:grid;grid-template-columns:160px minmax(260px,1fr) auto auto;gap:10px;align-items:end;padding:10px 0;border-bottom:1px solid rgba(255,255,255,.08)}}
-        .need-inline-slot{{font-weight:800;color:var(--gold)}}
-        .need-inline-current{{font-weight:800}}
-        .need-inline-picker input,.need-inline-picker select,.mini-input{{width:100%;padding:9px;border-radius:10px;background:#08090d;color:var(--text);border:1px solid var(--line)}}
-        .mini-btn{{padding:9px 11px;border:0;cursor:pointer;white-space:nowrap}}
+        .need-editor-panel{{overflow:hidden}}
+        .need-editor-layout{{display:grid;grid-template-columns:repeat(auto-fit,minmax(460px,1fr));gap:18px;align-items:start}}
+        .need-board{{border:1px solid rgba(214,168,79,.22);border-radius:22px;background:linear-gradient(180deg,rgba(29,19,11,.95),rgba(9,8,7,.92));padding:18px;box-shadow:0 14px 34px rgba(0,0,0,.28)}}
+        .need-board-header{{margin-bottom:14px}}
+        .need-board h3{{margin:0 0 6px 0;color:#f3d48c}}
+        .need-gear-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin:0 0 16px 0}}
+        .need-gear-card{{display:grid;grid-template-columns:56px minmax(0,1fr);gap:10px;align-items:center;padding:10px 12px;border-radius:16px;text-decoration:none;color:inherit;background:rgba(255,255,255,.03);border:1px solid rgba(214,168,79,.16);transition:transform .12s ease,border-color .12s ease,background .12s ease}}
+        .need-gear-card:hover{{transform:translateY(-1px);border-color:rgba(214,168,79,.36);background:rgba(214,168,79,.06)}}
+        .need-gear-thumb{{width:56px;height:56px;border-radius:14px;overflow:hidden;display:grid;place-items:center;background:radial-gradient(circle at 30% 30%,rgba(255,219,120,.16),rgba(0,0,0,.22));border:1px solid rgba(214,168,79,.2)}}
+        .need-gear-thumb img,.need-inline-preview img{{width:100%;height:100%;object-fit:contain;display:block}}
+        .need-slot-placeholder{{display:grid;place-items:center;width:100%;height:100%;font-size:26px;color:#e3bf73}}
+        .need-slot-placeholder.large{{font-size:40px}}
+        .need-gear-copy{{display:grid;gap:2px;min-width:0}}
+        .need-gear-copy strong{{font-size:14px;color:#f1d79a}}
+        .need-gear-copy small{{font-size:12px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
+        .need-slot-group{{margin-top:14px;border-top:1px solid rgba(214,168,79,.12);padding-top:14px}}
+        .need-slot-group:first-of-type{{margin-top:0;padding-top:0;border-top:0}}
+        .need-slot-group h3{{display:flex;align-items:center;gap:8px;font-size:21px}}
+        .need-slot-group-body{{display:grid;gap:10px}}
+        .need-inline-row{{display:grid;grid-template-columns:94px minmax(0,1fr);gap:14px;align-items:start;padding:14px;border-radius:18px;border:1px solid rgba(214,168,79,.14);background:linear-gradient(180deg,rgba(255,255,255,.03),rgba(0,0,0,.14))}}
+        .need-inline-row.locked{{opacity:.92}}
+        .need-inline-preview{{width:94px;height:94px;border-radius:18px;overflow:hidden;display:grid;place-items:center;background:rgba(0,0,0,.24);border:1px solid rgba(214,168,79,.18)}}
+        .need-inline-content{{display:grid;gap:10px;min-width:0}}
+        .need-inline-head{{display:flex;justify-content:space-between;align-items:start;gap:12px}}
+        .need-inline-slot{{font-weight:900;color:var(--gold);font-size:18px}}
+        .need-inline-current{{font-weight:700;font-size:14px;line-height:1.35;overflow-wrap:anywhere}}
+        .need-state{{display:inline-flex;align-items:center;gap:6px;padding:5px 10px;border-radius:999px;font-size:12px;font-weight:800;text-transform:uppercase;letter-spacing:.05em}}
+        .need-state.filled{{background:rgba(214,168,79,.12);color:#f3d48c;border:1px solid rgba(214,168,79,.24)}}
+        .need-state.empty{{background:rgba(255,255,255,.06);color:#d7d7d7;border:1px solid rgba(255,255,255,.1)}}
+        .need-state.locked{{background:rgba(127,213,132,.12);color:#97e39e;border:1px solid rgba(127,213,132,.22)}}
+        .need-inline-picker{{display:grid;gap:8px}}
+        .need-inline-picker select,.need-inline-picker input,.mini-input{{width:100%;padding:10px 12px;border-radius:12px;background:#0b0b0d;color:var(--text);border:1px solid rgba(214,168,79,.18);min-width:0}}
+        .need-two-step-picker{{display:grid;grid-template-columns:minmax(170px,220px) minmax(0,1fr);gap:8px;align-items:start}}
+        .need-two-step-picker small{{grid-column:1 / -1}}
+        .need-inline-actions{{display:flex;gap:8px;flex-wrap:wrap}}
+        .mini-btn{{padding:10px 14px;border:0;cursor:pointer;white-space:nowrap}}
         .ghost{{background:#303442;color:var(--text)}}
-        .edit-board .need-slot-group{{margin-top:12px}}
-        @media(max-width:760px){{.need-inline-row{{grid-template-columns:1fr;align-items:stretch}}.need-inline-row .btn{{width:100%}}}}
+        .need-inline-meta{{font-size:12px;color:var(--muted)}}
+        @media(max-width:1360px){{.need-editor-layout{{grid-template-columns:1fr}}}}
+        @media(max-width:860px){{.need-gear-grid{{grid-template-columns:repeat(2,minmax(0,1fr))}}.need-inline-row{{grid-template-columns:80px minmax(0,1fr);padding:12px}}.need-inline-preview{{width:80px;height:80px}}.need-two-step-picker{{grid-template-columns:1fr}}}}
+        @media(max-width:620px){{.need-editor-layout{{gap:12px}}.need-board{{padding:14px}}.need-gear-grid{{grid-template-columns:1fr 1fr}}.need-inline-row{{grid-template-columns:1fr}}.need-inline-preview{{width:100%;max-width:94px;height:94px}}.need-inline-head{{flex-direction:column;align-items:flex-start}}.need-inline-actions .btn{{flex:1 1 100%}}}}
       </style>
-      <div class="split">
+      <div class="need-editor-layout">
         {board_html('Main', main_map)}
         {board_html('Secondary', sec_map)}
       </div>
       {history_html}
+      <script>
+        (function needPreviewEnhancer(){{
+          function updateRowPreview(row){{
+            if (!row) return;
+            const select = row.querySelector('select[data-preview-input="1"]');
+            const label = row.querySelector('[data-preview-label="1"]');
+            const box = row.querySelector('[data-preview-box="1"]');
+            if (!select || !label || !box) return;
+            const option = select.options[select.selectedIndex];
+            const itemLabel = option && option.value ? (option.dataset.label || option.value) : 'Noch nichts ausgewählt';
+            const image = option && option.value ? (option.dataset.image || '') : '';
+            label.textContent = itemLabel;
+            if (image) {{
+              box.innerHTML = '<img src="' + image.replace(/"/g, '&quot;') + '" alt="' + itemLabel.replace(/"/g, '&quot;') + '" loading="lazy">';
+            }} else {{
+              const icon = row.getAttribute('data-empty-icon') || '🧩';
+              box.innerHTML = '<div class="need-slot-placeholder large">' + icon + '</div>';
+            }}
+          }}
+          function bindRow(row){{
+            if (!row || row.dataset.previewBound === '1') return;
+            row.dataset.previewBound = '1';
+            row.querySelectorAll('select[data-preview-input="1"]').forEach(function(sel){{
+              sel.addEventListener('change', function(){{ updateRowPreview(row); }});
+            }});
+            row.querySelectorAll('select.weapon-type-picker').forEach(function(sel){{
+              sel.addEventListener('change', function(){{ setTimeout(function(){{ updateRowPreview(row); }}, 0); }});
+            }});
+            updateRowPreview(row);
+          }}
+          document.querySelectorAll('[data-live-preview="1"]').forEach(bindRow);
+          document.addEventListener('click', function(ev){{
+            const card = ev.target.closest('[data-target-row]');
+            if (!card) return;
+            const row = document.getElementById(card.getAttribute('data-target-row'));
+            if (row) {{
+              setTimeout(function(){{
+                const input = row.querySelector('select, input');
+                if (input) input.focus();
+              }}, 10);
+            }}
+          }});
+        }})();
+      </script>
     </section>
     """
 
@@ -10896,6 +11039,7 @@ def _render_member_portal(data: dict[str, Any], user_id: int, request: Request, 
         f'<div class="portal-profile-row"><span>Name</span><strong>{_e(display)}</strong></div>',
         f'<div class="portal-profile-row"><span>Klasse</span><strong>{_e(class_name)}</strong></div>',
         f'<div class="portal-profile-row"><span>Rolle</span><strong>{_e(main_role)}</strong></div>',
+        f'<div class="portal-profile-row"><span>EC-Kontostand</span><strong>{_e(_fmt_ec(balance) if balance is not None else "—")}</strong></div>',
         f'<div class="portal-profile-row"><span>In der Gilde</span><strong>{_e(joined_text)}</strong></div>',
         f'<div class="portal-profile-row"><span>Rang</span><strong>{_e(guild_rank)}</strong></div>',
     ])
