@@ -611,6 +611,7 @@ PORTAL_OLD_DM_CLEANUP_ON_START = str(os.getenv("PORTAL_OLD_DM_CLEANUP_ON_START",
 NEW_MEMBER_LOOT_LOCK_DAYS = 7
 _portal_repair_task: Optional[asyncio.Task] = None
 _portal_old_cleanup_task: Optional[asyncio.Task] = None
+_profile_update_task: Optional[asyncio.Task] = None
 _PORTAL_PERSISTENT_COMPONENT_IDS: set[str] = set()
 
 # DM-Komponenten müssen den zugehörigen Discord-Server sehr häufig auflösen.
@@ -795,6 +796,176 @@ def save_sent() -> None:
     _save_json(SENT_FILE, sent_state)
 
 
+def _profile_update_ensure_table_sync() -> None:
+    if not _phase3_profile_database_url():
+        return
+    conn = _phase3_profile_pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS dashboard_profile_update_requests (
+                    id BIGSERIAL PRIMARY KEY,
+                    request_id TEXT NOT NULL UNIQUE,
+                    guild_id BIGINT NOT NULL,
+                    user_id BIGINT NOT NULL,
+                    class_name TEXT NOT NULL DEFAULT '',
+                    main_role TEXT NOT NULL DEFAULT '',
+                    gearscore INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    actor_id TEXT NOT NULL DEFAULT '',
+                    actor_name TEXT NOT NULL DEFAULT '',
+                    requested_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    processed_at TIMESTAMPTZ,
+                    error_text TEXT NOT NULL DEFAULT ''
+                )
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_dashboard_profile_update_status
+                ON dashboard_profile_update_requests (status, requested_at)
+            """)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _profile_update_claim_sync(limit: int = 20) -> list[dict[str, Any]]:
+    if not _phase3_profile_database_url():
+        return []
+    _profile_update_ensure_table_sync()
+    conn = _phase3_profile_pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id, request_id, guild_id, user_id, class_name, main_role, gearscore,
+                       actor_id, actor_name, requested_at
+                FROM dashboard_profile_update_requests
+                WHERE status='pending'
+                ORDER BY requested_at ASC, id ASC
+                FOR UPDATE SKIP LOCKED
+                LIMIT %s
+            """, (int(limit),))
+            rows = [dict(row) for row in (cur.fetchall() or [])]
+            if rows:
+                cur.execute("""
+                    UPDATE dashboard_profile_update_requests
+                    SET status='processing', error_text=''
+                    WHERE id = ANY(%s)
+                """, ([int(row["id"]) for row in rows],))
+        conn.commit()
+        return rows
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def _profile_update_finish_sync(request_ids: list[int], *, status: str, error_text: str = "") -> None:
+    if not request_ids or not _phase3_profile_database_url():
+        return
+    conn = _phase3_profile_pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE dashboard_profile_update_requests
+                SET status=%s, processed_at=now(), error_text=%s
+                WHERE id = ANY(%s)
+            """, (str(status), str(error_text or "")[:1000], [int(x) for x in request_ids]))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+async def _process_profile_update_requests_once(client: discord.Client) -> dict[str, int]:
+    summary = {"claimed": 0, "done": 0, "failed": 0}
+    try:
+        rows = await asyncio.to_thread(_profile_update_claim_sync, 25)
+    except Exception as exc:
+        print(f"[member_portal] Profil-Queue konnte nicht gelesen werden: {exc!r}", flush=True)
+        return summary
+    if not rows:
+        return summary
+    summary["claimed"] = len(rows)
+    good_ids: list[int] = []
+    bad: list[tuple[int, str]] = []
+    for row in rows:
+        try:
+            guild_id = int(row.get("guild_id") or 0)
+            user_id = int(row.get("user_id") or 0)
+            class_name = re.sub(r"\s+", " ", str(row.get("class_name") or "").strip())[:80]
+            main_role = re.sub(r"\s+", " ", str(row.get("main_role") or "").strip())[:50]
+            gearscore = _parse_gearscore(row.get("gearscore"))
+            if not guild_id or not user_id:
+                raise ValueError("Guild-ID oder User-ID fehlt")
+            if not class_name:
+                raise ValueError("Klasse fehlt")
+            if not main_role:
+                raise ValueError("Rolle fehlt")
+            if gearscore <= 0 or gearscore > 99999:
+                raise ValueError("Gearscore ungültig")
+            profile = _user_profile(guild_id, user_id)
+            profile["class_name"] = class_name
+            profile["main_role"] = main_role
+            profile["gearscore"] = str(gearscore)
+            profile["updated_at"] = datetime.now(TZ).isoformat()
+            good_ids.append(int(row["id"]))
+        except Exception as exc:
+            bad.append((int(row.get("id") or 0), f"{type(exc).__name__}: {exc}"))
+
+    if good_ids:
+        try:
+            await asyncio.to_thread(save_profiles)
+            await asyncio.to_thread(_profile_update_finish_sync, good_ids, status="done", error_text="")
+            summary["done"] += len(good_ids)
+        except Exception as exc:
+            await asyncio.to_thread(_profile_update_finish_sync, good_ids, status="error", error_text=f"{type(exc).__name__}: {exc}")
+            summary["failed"] += len(good_ids)
+    for request_id, error in bad:
+        if request_id:
+            try:
+                await asyncio.to_thread(_profile_update_finish_sync, [request_id], status="error", error_text=error)
+            except Exception:
+                pass
+        summary["failed"] += 1
+    return summary
+
+
+async def _profile_update_loop(client: discord.Client) -> None:
+    await client.wait_until_ready()
+    await asyncio.sleep(2.0)
+    while not client.is_closed():
+        try:
+            summary = await _process_profile_update_requests_once(client)
+            if summary.get("claimed"):
+                print(
+                    "[member_portal] Profil-Queue: "
+                    f"geholt={summary.get('claimed', 0)} "
+                    f"fertig={summary.get('done', 0)} "
+                    f"fehler={summary.get('failed', 0)}",
+                    flush=True,
+                )
+        except Exception as exc:
+            print(f"[member_portal] Profil-Queue Loop Fehler: {exc!r}", flush=True)
+        await asyncio.sleep(3.0)
+
+
+def _start_profile_update_loop(client: discord.Client) -> None:
+    global _profile_update_task
+    if _profile_update_task is not None and not _profile_update_task.done():
+        return
+    if not _phase3_profile_database_url():
+        print("[member_portal] Profil-Queue deaktiviert: DATABASE_URL fehlt.", flush=True)
+        return
+    try:
+        _profile_update_task = asyncio.create_task(_profile_update_loop(client))
+        print("✅ Member-Portal Profil-Queue gestartet.", flush=True)
+    except Exception as exc:
+        print(f"[member_portal] Profil-Queue Start Fehler: {exc!r}", flush=True)
+
+
 def _is_admin(inter: discord.Interaction) -> bool:
     perms = getattr(inter.user, "guild_permissions", None)
     return bool(perms and (perms.administrator or perms.manage_guild))
@@ -890,6 +1061,7 @@ def _user_profile(guild_id: int, user_id: int) -> dict:
     g = _gdata(guild_id)
     u = g["users"].get(str(user_id)) or {}
     u.setdefault("ingame_name", "")
+    u.setdefault("class_name", "")
     u.setdefault("main_role", "")
     u.setdefault("gearscore", "")
     u.setdefault("created_at", datetime.now(TZ).isoformat())
@@ -1481,6 +1653,7 @@ def _profile_embed(guild: discord.Guild, member: discord.Member) -> discord.Embe
     p = _user_profile(guild.id, member.id)
 
     ingame = p.get("ingame_name") or _display_name(member)
+    class_name = p.get("class_name") or "Nicht gesetzt"
     main_role = p.get("main_role") or "Nicht gesetzt"
     gearscore = p.get("gearscore") or "Nicht gesetzt"
 
@@ -1491,6 +1664,7 @@ def _profile_embed(guild: discord.Guild, member: discord.Member) -> discord.Embe
     )
 
     emb.add_field(name="🎮 Ingame-Name", value=str(ingame), inline=False)
+    emb.add_field(name="🧩 Klasse", value=str(class_name), inline=True)
     emb.add_field(name="⚔️ Main-Rolle", value=str(main_role), inline=True)
     emb.add_field(name="💠 Gearscore", value=str(gearscore), inline=True)
     emb.add_field(name="🏰 Rang", value=_member_position(guild, member), inline=True)
@@ -1501,7 +1675,7 @@ def _profile_embed(guild: discord.Guild, member: discord.Member) -> discord.Embe
     )
     emb.add_field(name="🟢 Status", value=_status_for_user(guild.id, member.id), inline=False)
 
-    emb.set_footer(text="Bearbeitbar: Ingame-Name, Main-Rolle, Gearscore")
+    emb.set_footer(text="Bearbeitbar: Ingame-Name, Klasse, Main-Rolle, Gearscore")
 
     return emb
 
@@ -2795,6 +2969,14 @@ class ProfileEditModal(PortalSafeModal):
             default=str(p.get("ingame_name") or "")
         )
 
+        self.class_name = TextInput(
+            label="Klasse",
+            placeholder="z. B. Stab / Langbogen",
+            required=True,
+            max_length=80,
+            default=str(p.get("class_name") or "")
+        )
+
         self.main_role = TextInput(
             label="Main-Rolle",
             placeholder="z. B. Heiler, Tank, DPS",
@@ -2812,6 +2994,7 @@ class ProfileEditModal(PortalSafeModal):
         )
 
         self.add_item(self.ingame_name)
+        self.add_item(self.class_name)
         self.add_item(self.main_role)
         self.add_item(self.gearscore)
 
@@ -2825,6 +3008,7 @@ class ProfileEditModal(PortalSafeModal):
 
         p = _user_profile(self.guild_id, self.user_id)
         p["ingame_name"] = str(self.ingame_name.value).strip()
+        p["class_name"] = str(self.class_name.value).strip()
         p["main_role"] = str(self.main_role.value).strip()
         p["gearscore"] = str(gs)
 
@@ -6947,6 +7131,7 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
             print(f"[member_portal] Listener-Setup Fehler: {e!r}")
 
     _start_portal_repair_loop(client)
+    _start_profile_update_loop(client)
 
     @tree.command(name="portal_set_absence_channel", description="(Admin) Abwesenheitskanal setzen")
     async def portal_set_absence_channel(inter: discord.Interaction):
