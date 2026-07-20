@@ -1710,13 +1710,63 @@ def _phase3_events_pg_payload(guild_id: Any, snap: dict[str, Any]) -> Optional[d
             yes_groups.append({"role": role, "participants": people})
             yes_counts[role] = len(people)
             yes_dict[role] = people
-        ev["participants"] = {"yes": yes_groups, "maybe": g.get("maybe") or [], "no": g.get("no") or []}
-        ev["yes"] = yes_dict
-        ev["yes_counts"] = yes_counts
-        ev["participant_count"] = int(g.get("yes_count") or 0)
-        ev["maybe_count"] = int(g.get("maybe_count") or 0)
-        ev["no_count"] = int(g.get("no_count") or 0)
-        ev["rsvp_count"] = int(g.get("yes_count") or 0) + int(g.get("maybe_count") or 0) + int(g.get("no_count") or 0)
+
+        pg_yes_count = int(g.get("yes_count") or 0)
+        pg_maybe_count = int(g.get("maybe_count") or 0)
+        pg_no_count = int(g.get("no_count") or 0)
+        pg_total = pg_yes_count + pg_maybe_count + pg_no_count
+
+        # Der Event-Rohdatensatz enthält die produktive Discord-Abstimmung. Die
+        # separate RSVP-Tabelle konnte in älteren Versionen durch einen veralteten
+        # Member-Mirror unvollständig sein. Deshalb gewinnt immer die reichere
+        # Quelle statt Postgres blind über den Discord-Snapshot zu legen.
+        raw_yes = ev.get("yes") if isinstance(ev.get("yes"), dict) else {}
+        raw_maybe = ev.get("maybe")
+        raw_no = ev.get("no")
+        raw_yes_count = sum(len(v or []) for v in raw_yes.values() if isinstance(v, list))
+        raw_maybe_people = list(raw_maybe.values()) if isinstance(raw_maybe, dict) else (list(raw_maybe) if isinstance(raw_maybe, list) else [])
+        raw_no_people = list(raw_no.values()) if isinstance(raw_no, dict) else (list(raw_no) if isinstance(raw_no, list) else [])
+        raw_total = raw_yes_count + len(raw_maybe_people) + len(raw_no_people)
+
+        existing_parts = ev.get("participants") if isinstance(ev.get("participants"), dict) else {}
+        existing_yes_groups = [x for x in (existing_parts.get("yes") or []) if isinstance(x, dict)]
+        existing_yes_count = sum(len(x.get("participants") or []) for x in existing_yes_groups)
+        existing_maybe = [x for x in (existing_parts.get("maybe") or []) if isinstance(x, dict)]
+        existing_no = [x for x in (existing_parts.get("no") or []) if isinstance(x, dict)]
+        existing_total = existing_yes_count + len(existing_maybe) + len(existing_no)
+
+        if max(raw_total, existing_total) > pg_total:
+            if raw_total >= existing_total and raw_total:
+                rich_yes_groups = []
+                rich_counts = {}
+                for role, people in sorted(raw_yes.items(), key=lambda kv: str(kv[0]).lower()):
+                    clean_people = [x for x in (people or []) if isinstance(x, dict)]
+                    rich_yes_groups.append({"role": str(role), "participants": clean_people})
+                    rich_counts[str(role)] = len(clean_people)
+                ev["participants"] = {"yes": rich_yes_groups, "maybe": raw_maybe_people, "no": raw_no_people}
+                ev["yes_counts"] = rich_counts
+                ev["participant_count"] = raw_yes_count
+                ev["maybe_count"] = len(raw_maybe_people)
+                ev["no_count"] = len(raw_no_people)
+                ev["rsvp_count"] = raw_total
+                ev["rsvp_source"] = "event_raw_json_richer_than_rsvp_table"
+            else:
+                ev["participants"] = {"yes": existing_yes_groups, "maybe": existing_maybe, "no": existing_no}
+                ev["yes_counts"] = {str(x.get("role") or "Zusage"): len(x.get("participants") or []) for x in existing_yes_groups}
+                ev["participant_count"] = existing_yes_count
+                ev["maybe_count"] = len(existing_maybe)
+                ev["no_count"] = len(existing_no)
+                ev["rsvp_count"] = existing_total
+                ev["rsvp_source"] = "snapshot_richer_than_rsvp_table"
+        else:
+            ev["participants"] = {"yes": yes_groups, "maybe": g.get("maybe") or [], "no": g.get("no") or []}
+            ev["yes"] = yes_dict
+            ev["yes_counts"] = yes_counts
+            ev["participant_count"] = pg_yes_count
+            ev["maybe_count"] = pg_maybe_count
+            ev["no_count"] = pg_no_count
+            ev["rsvp_count"] = pg_total
+            ev["rsvp_source"] = "postgres_phase3_rsvp_table"
         ev["source"] = "postgres_phase3"
         event_by_id[eid] = ev
 
@@ -3179,6 +3229,138 @@ def _participant_rows(people: Any) -> list[list[Any]]:
             continue
         rows.append([_member_link(p.get("user_id"), p.get("display_name")), "ja" if p.get("is_dashboard_member") else "nein"])
     return rows
+
+
+def _event_yes_groups(event: dict[str, Any]) -> list[dict[str, Any]]:
+    participants = event.get("participants") if isinstance(event.get("participants"), dict) else {}
+    groups = [x for x in (participants.get("yes") or []) if isinstance(x, dict)]
+    if groups:
+        return groups
+    raw_yes = event.get("yes")
+    out: list[dict[str, Any]] = []
+    if isinstance(raw_yes, dict):
+        for role, people in raw_yes.items():
+            out.append({"role": str(role or "Zusage"), "participants": [x for x in (people or []) if isinstance(x, dict)]})
+    elif isinstance(raw_yes, list):
+        for row in raw_yes:
+            if not isinstance(row, dict):
+                continue
+            if "participants" in row:
+                out.append(row)
+            else:
+                role = str(row.get("role_name") or row.get("role") or "Zusage")
+                found = next((g for g in out if str(g.get("role")) == role), None)
+                if found is None:
+                    found = {"role": role, "participants": []}
+                    out.append(found)
+                found["participants"].append(row)
+    return out
+
+
+def _event_current_member_map(snap: dict[str, Any]) -> dict[int, str]:
+    """Aktuelle Gildenmitglieder aus Postgres und Snapshot-Fallback vereinigen."""
+    out: dict[int, str] = {}
+    sources = [
+        snap.get("profiles"), snap.get("members"),
+        snap.get("profiles_snapshot_fallback"), snap.get("members_snapshot_fallback"),
+    ]
+    for obj in sources:
+        if not isinstance(obj, dict):
+            continue
+        rows = obj.get("items") or obj.get("profiles") or []
+        if isinstance(rows, dict):
+            rows = list(rows.values())
+        for row in rows or []:
+            if not isinstance(row, dict):
+                continue
+            uid = _user_id(row.get("user_id") or row.get("member_id") or row.get("discord_id") or row.get("id"))
+            if not uid:
+                continue
+            name = str(row.get("display_name") or row.get("server_name") or row.get("discord_name") or row.get("ingame_name") or f"User {uid}").strip()
+            if uid not in out or str(out[uid]).startswith("User "):
+                out[uid] = name or f"User {uid}"
+    return out
+
+
+def _event_response_summary(snap: dict[str, Any], event: dict[str, Any]) -> dict[str, Any]:
+    groups = _event_yes_groups(event)
+    yes_people: list[dict[str, Any]] = []
+    yes_ids: set[int] = set()
+    for group in groups:
+        for person in group.get("participants") or []:
+            if not isinstance(person, dict):
+                continue
+            yes_people.append(person)
+            uid = _user_id(person.get("user_id") or person.get("id"))
+            if uid:
+                yes_ids.add(uid)
+
+    participants = event.get("participants") if isinstance(event.get("participants"), dict) else {}
+    maybe_people = [x for x in (participants.get("maybe") or event.get("maybe") or []) if isinstance(x, dict)]
+    no_people = [x for x in (participants.get("no") or event.get("no") or []) if isinstance(x, dict)]
+    maybe_ids = {_user_id(x.get("user_id") or x.get("id")) for x in maybe_people}
+    no_ids = {_user_id(x.get("user_id") or x.get("id")) for x in no_people}
+    maybe_ids.discard(0)
+    no_ids.discard(0)
+    response_ids = yes_ids | maybe_ids | no_ids
+
+    yes_count = sum(len(g.get("participants") or []) for g in groups)
+    maybe_count = len(maybe_people)
+    no_count = len(no_people)
+    response_count = yes_count + maybe_count + no_count
+
+    members = _event_current_member_map(snap)
+    member_filter = (snap.get("guild") or {}).get("member_filter") if isinstance(snap.get("guild"), dict) else {}
+    configured_total = int(_num((member_filter or {}).get("eligible_count"), 0)) if isinstance(member_filter, dict) else 0
+    member_total = max(configured_total, len(members), response_count)
+    no_response_ids = sorted(set(members) - response_ids, key=lambda uid: members.get(uid, f"User {uid}").casefold())
+    no_response_count = max(0, member_total - response_count)
+    vote_percent = round((response_count / member_total) * 100, 1) if member_total else 0.0
+    return {
+        "groups": groups,
+        "yes_people": yes_people,
+        "maybe_people": maybe_people,
+        "no_people": no_people,
+        "yes_count": yes_count,
+        "maybe_count": maybe_count,
+        "no_count": no_count,
+        "response_count": response_count,
+        "member_total": member_total,
+        "vote_percent": vote_percent,
+        "member_names": members,
+        "no_response_ids": no_response_ids,
+        "no_response_count": no_response_count,
+    }
+
+
+def _event_person_name(person: dict[str, Any]) -> str:
+    uid = _user_id(person.get("user_id") or person.get("id"))
+    return str(person.get("display_name") or person.get("name") or person.get("server_name") or (f"User {uid}" if uid else "Unbekannt"))
+
+
+def _event_name_chips(items: list[tuple[str, str]], *, empty: str = "Keine") -> str:
+    if not items:
+        return f'<div class="empty">{_e(empty)}</div>'
+    return '<div class="event-name-chips">' + ''.join(
+        f'<span class="event-name-chip {(_e(kind))}"><b>{_e(name)}</b><small>{_e(label)}</small></span>'
+        for name, kind, label in [(name, kind, {"maybe":"Vielleicht", "declined":"Abgemeldet", "missing":"Keine Rückmeldung"}.get(kind, kind)) for name, kind in items]
+    ) + '</div>'
+
+
+def _event_role_overview_html(event: dict[str, Any]) -> str:
+    groups = _event_yes_groups(event)
+    if not groups:
+        return '<div class="empty">Keine Zusagen vorhanden.</div>'
+    order = {"TANK": 0, "HEAL": 1, "HEALER": 1, "DPS": 2, "BANK": 3, "RESERVE": 3}
+    groups = sorted(groups, key=lambda g: (order.get(str(g.get("role") or "").upper(), 20), str(g.get("role") or "").casefold()))
+    blocks: list[str] = []
+    for group in groups:
+        role = str(group.get("role") or "Zusage")
+        people = [x for x in (group.get("participants") or []) if isinstance(x, dict)]
+        names = sorted([_event_person_name(x) for x in people], key=str.casefold)
+        chips = ''.join(f'<span class="event-role-name">{_e(name)}</span>' for name in names) or '<span class="muted">Niemand</span>'
+        blocks.append(f'<div class="event-role-card"><div class="event-role-head"><h3>{_e(role)}</h3><span class="pill">{len(people)}</span></div><div class="event-role-names">{chips}</div></div>')
+    return '<div class="event-role-grid">' + ''.join(blocks) + '</div>'
 
 
 def _role_signup_html(event: dict[str, Any]) -> str:
@@ -8736,55 +8918,65 @@ def _render_event_detail(data: dict[str, Any], event_id: str) -> str:
             "<section class='panel'><h1>❌ Event nicht gefunden</h1><p class='muted'>Dieses Event ist nicht im aktuellen Dashboard-Snapshot und hat keinen Review-Fallback.</p><p><a class='btn' href='/attendance'>Zur Anwesenheit</a></p></section>",
         )
 
-    participants = event.get("participants") or {}
-    maybe_rows = _participant_rows(participants.get("maybe") or [])
-    no_rows = _participant_rows(participants.get("no") or [])
-    yes_counts = event.get("yes_counts") or {}
-    role_items = sorted([(str(k), int(_num(v))) for k, v in yes_counts.items()], key=lambda x: x[0].lower())
-    names = _profile_name_map(snap)
-    voice = _voice_event_analysis(snap, event)
-    voice_rows = [[_member_link(r.get("user_id"), r.get("display_name")), r.get("minutes"), r.get("sessions"), "ja" if r.get("registered") else "nein", "ja" if r.get("signed_yes") else "nein"] for r in voice.get("voice_by_user") or []]
-    missing_voice_rows = _name_rows_from_ids(voice.get("yes_not_voice") or [], names)
-    extra_voice_rows = _name_rows_from_ids(voice.get("voice_not_registered") or [], names)
+    summary = _event_response_summary(snap, event)
+    role_items = [(str(g.get("role") or "Zusage"), len(g.get("participants") or [])) for g in summary.get("groups") or []]
+    role_items.sort(key=lambda row: row[0].casefold())
+
+    not_joined: list[tuple[str, str]] = []
+    for person in sorted(summary.get("maybe_people") or [], key=lambda p: _event_person_name(p).casefold()):
+        not_joined.append((_event_person_name(person), "maybe"))
+    for person in sorted(summary.get("no_people") or [], key=lambda p: _event_person_name(p).casefold()):
+        not_joined.append((_event_person_name(person), "declined"))
+    member_names = summary.get("member_names") or {}
+    for uid in summary.get("no_response_ids") or []:
+        not_joined.append((member_names.get(uid, f"User {uid}"), "missing"))
+    known_missing = len(summary.get("no_response_ids") or [])
+    unnamed_missing = max(0, int(summary.get("no_response_count") or 0) - known_missing)
+    if unnamed_missing:
+        not_joined.append((f"{unnamed_missing} weitere Mitglieder", "missing"))
 
     cards = "".join([
-        _card("Teilnehmer", event.get("participant_count", 0), "alle Rückmeldungen"),
-        _card("Zusagen", voice.get("yes_count", 0), "für Voice-Abgleich"),
-        _card("im Voice erkannt", voice.get("voice_user_count", 0), "gleicher Event-Voice"),
-        _card("angemeldet ohne Voice", len(voice.get("yes_not_voice") or []), "zu prüfen"),
-        _card("Voice ohne Anmeldung", len(voice.get("voice_not_registered") or []), "zu prüfen"),
-        _card("Voice", "ja" if event.get("voice_enabled") else "nein", event.get("voice_channel_id") or event.get("voice_last_channel_id") or "kein Voice"),
+        _card("Zusagen", summary.get("yes_count", 0), "Tank · Heal · DPS · Bank"),
+        _card("Gesamtabstimmung", f"{summary.get('response_count', 0)}/{summary.get('member_total', 0)}", f"{summary.get('vote_percent', 0):.1f} % der Gilde"),
+        _card("Vielleicht", summary.get("maybe_count", 0), "noch unentschieden"),
+        _card("Nicht abgestimmt", summary.get("no_response_count", 0), "noch keine Rückmeldung"),
     ])
 
+    css = """
+    <style>
+      .event-role-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px}
+      .event-role-card{border:1px solid rgba(214,168,79,.18);border-radius:16px;padding:15px;background:rgba(0,0,0,.18)}
+      .event-role-head{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:11px}
+      .event-role-head h3{margin:0;color:#efd594}
+      .event-role-names{display:flex;gap:7px;flex-wrap:wrap}
+      .event-role-name{display:inline-flex;padding:7px 10px;border-radius:999px;background:rgba(214,168,79,.08);border:1px solid rgba(214,168,79,.15);font-size:13px}
+      .event-name-chips{display:flex;flex-wrap:wrap;gap:8px}
+      .event-name-chip{display:inline-flex;align-items:center;gap:7px;padding:7px 10px;border-radius:999px;border:1px solid rgba(255,255,255,.11);background:rgba(255,255,255,.04);font-size:13px}
+      .event-name-chip small{font-size:10px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted)}
+      .event-name-chip.maybe{border-color:rgba(225,178,62,.38);background:rgba(225,178,62,.09)}
+      .event-name-chip.declined{border-color:rgba(205,91,91,.3);background:rgba(205,91,91,.07)}
+      .event-name-chip.missing{opacity:.82}
+    </style>
+    """
+
     body = f"""
-    <nav class="topnav"><a href="/planning">← Planung</a><a href="#signups">Zusagen</a><a href="#voicecheck">Voice-Abgleich</a><a href="#maybe">Vielleicht</a><a href="#no">Abgemeldet</a></nav>
+    {css}
+    <nav class="topnav"><a href="/planning">← Planung</a><a href="#roles">Zusagen</a><a href="#open">Noch nicht zugesagt</a><a href="/attendance">Anwesenheit nach dem Event</a></nav>
     <section class="hero">
       <div>
-        <div class="eyebrow">Event · Voice-/Teilnahme-Abgleich</div>
+        <div class="eyebrow">Event · Abstimmungsübersicht</div>
         <h1>📅 {_e(event.get('title') or event_id)}</h1>
-        <p class="muted">Event-ID: {_e(event_id)} · Zeit: {_e(_dt(event.get('when_iso')))} · Snapshot: {_e(_dt(data.get('published_at')))}</p>
+        <p class="muted">Zeit: {_e(_dt(event.get('when_iso') or event.get('start_at')))} · Stand: {_e(_dt(data.get('published_at')))}</p>
         {f"<p>{_e(event.get('description'))}</p>" if event.get('description') else ""}
       </div>
       <a class="btn" href="/planning">Zurück</a>
     </section>
     <section class="grid">{cards}</section>
-    <section class="panel"><h2>📊 Rollenverteilung</h2>{_bars(role_items, max_items=12)}</section>
-    <section class="panel" id="voicecheck">
-      <h2>🎙️ Voice-Abgleich</h2>
-      <div class="split">
-        <div><h3>Angemeldet/Zusage, aber nicht im Voice erkannt</h3>{_table(['Spieler'], missing_voice_rows, placeholder='fehlende Voice durchsuchen…')}</div>
-        <div><h3>Im Voice, aber nicht angemeldet</h3>{_table(['Spieler'], extra_voice_rows, placeholder='Extra Voice durchsuchen…')}</div>
-      </div>
-      <h3>Erkannte Voice-Zeiten</h3>
-      {_table(['Spieler','Minuten','Sessions','angemeldet','Zusage'], voice_rows, placeholder='Voice-Zeiten durchsuchen…')}
-      <p class="muted">Hinweis: Der Abgleich ist read-only und nutzt den gespeicherten Event-Voice bzw. letzten Event-Voice. EC wird dadurch nicht automatisch vergeben.</p>
-    </section>
-    <section class="panel" id="signups"><h2>✅ Zusagen nach Rolle</h2>{_role_signup_html(event)}</section>
-    <section class="panel" id="maybe"><h2>🟡 Vielleicht</h2>{_table(['Spieler','Gildenrolle'], maybe_rows, placeholder='Vielleicht durchsuchen…')}</section>
-    <section class="panel" id="no"><h2>❌ Abgemeldet</h2>{_table(['Spieler','Gildenrolle'], no_rows, placeholder='Abmeldungen durchsuchen…')}</section>
+    <section class="panel" id="roles"><h2>📊 Rollenverteilung</h2>{_bars(role_items, max_items=12)}</section>
+    <section class="panel"><h2>✅ Wer ist dabei?</h2><p class="muted">Zusagen sind ausschließlich Tank, Heal, DPS und Bank/Reserve.</p>{_event_role_overview_html(event)}</section>
+    <section class="panel" id="open"><h2>🕒 Noch nicht zugesagt</h2><p class="muted">Vielleicht steht zuerst, danach Abmeldungen und Mitglieder ohne Rückmeldung.</p>{_event_name_chips(not_joined, empty='Alle Mitglieder haben zugesagt.')}</section>
     """
     return _html_shell(f"{event.get('title') or 'Event'} · Beer and Buffs Dashboard", body)
-
 
 def _render_voice_dashboard(data: dict[str, Any]) -> str:
     if not data.get("ok"):
@@ -16514,7 +16706,9 @@ def _attendance_candidate_map(snap: dict[str, Any], event: dict[str, Any]) -> di
         role = str(group.get("role") or "Zusage")
         for p in group.get("participants") or []:
             if isinstance(p, dict):
-                add(_user_id(p.get("user_id") or p.get("id")), str(p.get("display_name") or p.get("name") or ""), role, "present", "Zusage")
+                # Eine Zusage bedeutet nur: sollte dabei sein. Die tatsächliche
+                # Anwesenheit wird erst im Review über Voice und Leitung gesetzt.
+                add(_user_id(p.get("user_id") or p.get("id")), str(p.get("display_name") or p.get("name") or ""), role, "open", "Zusage")
     for key, label, status in (("maybe", "Vielleicht", "partial"), ("no", "Abgemeldet", "absent")):
         for p in parts.get(key) or []:
             if isinstance(p, dict):
@@ -16910,49 +17104,64 @@ def _render_attendance_stats_dashboard(data: dict[str, Any]) -> str:
     return _html_shell("Anwesenheit-Stats · Beer and Buffs Dashboard", body)
 
 
+def _event_ready_for_attendance(event: dict[str, Any]) -> bool:
+    if event.get("_pending_ec_check") or event.get("_attendance_review_only"):
+        return True
+    status = str(event.get("status") or event.get("state") or "").strip().lower()
+    if status in {"ended", "finished", "completed", "done", "closed", "past"}:
+        return True
+    start = _dt_obj(event.get("when_iso") or event.get("start_at") or event.get("created_at"))
+    if not start:
+        return False
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=timezone.utc)
+    return start <= datetime.now(timezone.utc)
+
+
 def _render_attendance_list(data: dict[str, Any]) -> str:
     if not data.get("ok"):
         return _html_shell("Anwesenheit · Beer and Buffs Dashboard", f"<section class='panel'><h1>📝 Anwesenheit</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
     snap: dict[str, Any] = data.get("snapshot") or {}
     guild_id = _safe_guild_id(data)
-    events = _attendance_events_with_review_fallbacks(snap, guild_id)
+    events = [ev for ev in _attendance_events_with_review_fallbacks(snap, guild_id) if _event_ready_for_attendance(ev)]
+    events.sort(key=lambda ev: str(ev.get("when_iso") or ev.get("start_at") or ev.get("created_at") or ""), reverse=True)
     rows = []
     for ev in events:
         eid = str(ev.get("event_id") or ev.get("id") or "")
         voice = _voice_event_analysis(snap, ev)
+        summary = _event_response_summary(snap, ev)
         review = _attendance_review_load(guild_id, eid) if eid else {}
         payload = review.get("payload") or {}
         items = payload.get("items") or []
+        open_rows = sum(1 for item in items if isinstance(item, dict) and str(item.get("status") or "open") not in {"present", "partial", "absent", "ignore"})
         queue_badge = _event_ec_queue_badge(guild_id, eid) if eid else _raw("<span class='pill'>—</span>")
         rows.append([
             _raw(f'<a class="link" href="/attendance/{_e(eid)}">{_e(ev.get("title") or eid)}</a>' + (" <span class='pill'>aus Review</span>" if ev.get("_attendance_review_only") else "")),
-            _dt(ev.get("when_iso")),
-            ev.get("participant_count", 0),
-            "ja" if ev.get("voice_enabled") else "nein",
+            _dt(ev.get("when_iso") or ev.get("start_at")),
+            summary.get("yes_count", 0),
             voice.get("voice_user_count", 0),
             _attendance_status_label(review.get("status") or ("reviewed" if items else "open")),
-            len(items),
+            open_rows if items else summary.get("yes_count", 0),
             queue_badge,
             _pending_ec_check_label(ev),
         ])
     body = f"""
-    <nav class="topnav"><a href="/">Kommando</a><a href="/planning">Planung</a><a href="/attendance-stats">Anwesenheit-Stats</a><a href="/attendance-archive">Archiv</a><a href="/voice">Voice</a><a href="/ec-queue">EC-Queue</a><a href="/admin">Leitung</a></nav>
+    <nav class="topnav"><a href="/">Kommando</a><a href="/planning">Planung</a><a href="/attendance-stats">Anwesenheit-Stats</a><a href="/attendance-archive">Archiv</a><a href="/ec-queue">EC-Queue</a><a href="/admin">Leitung</a></nav>
     <section class="hero">
       <div>
-        <div class="eyebrow">Ebene 3 · sichere Admin-Aktion</div>
-        <h1>📝 Anwesenheits-Review</h1>
-        <p>Hier kann die Leitung Anmeldung und Voice-Zeit vergleichen und einen Review speichern. Es wird noch kein EC gebucht.</p>
-        <p class="muted">Snapshot: {_e(_dt(data.get('published_at')))} · Alte Events mit gespeichertem Review bleiben sichtbar, solange EC noch nicht als erledigt erkannt wurde.</p>
+        <div class="eyebrow">Nach dem Event · Anwesenheitsabgleich</div>
+        <h1>📝 Anwesenheit</h1>
+        <p>Hier erscheinen gestartete und abgeschlossene Events. Du vergleichst die ursprünglichen Zusagen mit dem vom Bot erkannten Event-Voice und setzt danach die tatsächliche Anwesenheit.</p>
+        <p class="muted">Zukünftige Events bleiben in der normalen Eventplanung und tauchen hier noch nicht auf.</p>
       </div>
       <a class="btn" href="/planning">Planung</a>
     </section>
     <section class="panel">
-      <h2>📅 Events</h2>
-      {_table(['Event','Zeit','Anmeldungen','Voice','Voice-User','Review','Review-Zeilen','EC-Queue','EC-Check'], rows, placeholder='Events durchsuchen…')}
+      <h2>📅 Events zur Prüfung</h2>
+      {_table(['Event','Zeit','Sollte dabei sein','Bot-Voice erkannt','Review','Noch offen','EC-Queue','EC-Check'], rows, placeholder='Events durchsuchen…')}
     </section>
     """
     return _html_shell("Anwesenheit · Beer and Buffs Dashboard", body)
-
 
 def _attendance_review_control_panel(guild_id: int, event_id: str, review: dict[str, Any]) -> str:
     status = str((review or {}).get("status") or "draft").strip().lower()
@@ -17000,16 +17209,20 @@ def _render_attendance_event(data: dict[str, Any], event_id: str, saved: bool = 
     if not valid_items:
         payload = _attendance_review_payload_from_event(snap, event, mode="voice")
     items = [x for x in ((payload.get("items") if isinstance(payload, dict) else []) or []) if isinstance(x, dict)]
+    signup_order = {"TANK": 0, "HEAL": 1, "HEALER": 1, "DPS": 2, "BANK": 3, "RESERVE": 3, "VIELLEICHT": 4, "ABGEMELDET": 5, "—": 6}
+    items.sort(key=lambda i: (signup_order.get(str(i.get("signup") or "—").upper(), 20), str(i.get("display_name") or "").casefold()))
+    voice_summary = _voice_event_analysis(snap, event)
+    response_summary = _event_response_summary(snap, event)
     present = sum(1 for i in items if str(i.get("status")) == "present")
     partial = sum(1 for i in items if str(i.get("status")) == "partial")
     absent = sum(1 for i in items if str(i.get("status")) == "absent")
     ignored = sum(1 for i in items if str(i.get("status")) == "ignore")
     open_count = sum(1 for i in items if str(i.get("status") or "open") not in {"present", "partial", "absent", "ignore"})
     cards = "".join([
-        _card("War da", present, "Review-Status"),
-        _card("Teilweise", partial, "prüfen/korrigieren"),
-        _card("Nicht da", absent, "Review-Status"),
-        _card("Ignoriert", ignored, "nicht EC-relevant"),
+        _card("Sollte dabei sein", response_summary.get("yes_count", 0), "ursprüngliche Zusagen"),
+        _card("Bot-Voice erkannt", voice_summary.get("voice_user_count", 0), "im Event-Voice"),
+        _card("Zusage ohne Voice", len(voice_summary.get("yes_not_voice") or []), "manuell prüfen"),
+        _card("Voice ohne Zusage", len(voice_summary.get("voice_not_registered") or []), "manuell prüfen"),
         _card("Offen", open_count, "noch nicht bewertet"),
     ])
     rows_html = []
@@ -17025,7 +17238,7 @@ def _render_attendance_event(data: dict[str, Any], event_id: str, saved: bool = 
         <tr>
           <td>{_member_link(uid, i.get('display_name')).get('__html__')}</td>
           <td>{_e(i.get('signup') or '—')}</td>
-          <td>{_e(i.get('voice_minutes') or 0)} min · {_e(i.get('voice_sessions') or 0)}x</td>
+          <td>{('✅ erkannt · ' + _e(i.get('voice_minutes') or 0) + ' min · ' + _e(i.get('voice_sessions') or 0) + 'x') if _num(i.get('voice_minutes'), 0) > 0 else '— nicht erkannt'}</td>
           <td>{_e(i.get('source') or '—')}</td>
           <td>
             <input type="hidden" name="user_id" value="{uid}">
@@ -17073,7 +17286,7 @@ def _render_attendance_event(data: dict[str, Any], event_id: str, saved: bool = 
       <div>
         <div class="eyebrow">{hero_label}</div>
         <h1>📝 {_e(event.get('title') or event_id)}</h1>
-        <p class="muted">Event-ID: {_e(event_id)} · Zeit: {_e(_dt(event.get('when_iso')))} · Voice: {_e(event.get('voice_channel_id') or event.get('voice_last_channel_id') or 'kein Voice')}</p>
+        <p class="muted">Event-ID: {_e(event_id)} · Zeit: {_e(_dt(event.get('when_iso') or event.get('start_at')))} · ursprüngliche Zusagen: {_e(response_summary.get('yes_count', 0))} · Bot-Voice erkannt: {_e(voice_summary.get('voice_user_count', 0))}</p>
         {updated}
       </div>
       <div style="display:flex;gap:8px;flex-wrap:wrap">{hero_actions}</div>
@@ -17107,10 +17320,10 @@ def _render_attendance_event(data: dict[str, Any], event_id: str, saved: bool = 
       </div>
     </section>
     <section class="panel">
-      <h2>👥 Review-Liste</h2>
-      <p class="muted">Diese Speicherung ist ein Dashboard-Review für die Leitung. Sie verändert noch keine EC-Konten und nicht die Discord-Anwesenheitskarte.</p>
+      <h2>👥 Anwesenheit einstellen</h2>
+      <p class="muted">Zusage/Rolle zeigt, wer laut Abstimmung dabei sein sollte. Bot-Voice zeigt, wen der Bot im Event-Sprachkanal erkannt hat. Den tatsächlichen Status stellst du anschließend manuell ein.</p>
       <form id="review-save" method="post" action="/admin/attendance/{_e(event_id)}/save">
-        <div class='table-wrap'><table><thead><tr><th>Spieler</th><th>Anmeldung</th><th>Voice</th><th>Quelle</th><th>Status</th><th>Notiz</th></tr></thead><tbody>{''.join(rows_html)}</tbody></table></div>
+        <div class='table-wrap'><table><thead><tr><th>Spieler</th><th>Zusage / Rolle</th><th>Bot-Voice erkannt</th><th>Quelle</th><th>Tatsächliche Anwesenheit</th><th>Notiz</th></tr></thead><tbody>{''.join(rows_html)}</tbody></table></div>
         <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:14px;align-items:center">
           <button class="btn" type="submit" name="next" value="preview">✅ 1. Überprüfen</button>
           <button class="btn" type="submit" name="next" value="save">Review nur speichern</button>
