@@ -357,14 +357,88 @@ SESSION_COOKIE = "ebo_dashboard_session"
 STATE_COOKIE = "ebo_dashboard_state"
 DISCORD_API_BASE = "https://discord.com/api/v10"
 DISCORD_OAUTH_TOKEN_URL = "https://discord.com/api/oauth2/token"
+_DISCORD_CLIENT_ID_CACHE: dict[str, Any] = {"loaded_at": 0.0, "info": {}}
 
 
 def _env(name: str, default: str = "") -> str:
     return str(os.getenv(name) or default).strip()
 
 
+def _valid_discord_snowflake(value: Any) -> str:
+    raw = str(value or "").strip().strip('"').strip("'")
+    return raw if re.fullmatch(r"[0-9]{16,22}", raw) else ""
+
+
+def _snapshot_oauth_application_id() -> str:
+    """Application-ID des tatsächlich laufenden Bots aus dem Snapshot.
+
+    Bei Discord-Bot-Anwendungen entspricht die Bot-/Application-ID der ID, die
+    in der OAuth-Authorize-URL als client_id verwendet werden muss. Der Snapshot
+    ist deshalb die verlässlichste Quelle, wenn in Railway noch eine alte oder
+    versehentlich falsche Client-ID steht.
+    """
+    try:
+        payload = _snapshot_payload()
+        snap = payload.get("snapshot") or {}
+        auth = snap.get("auth") or {}
+        guild = snap.get("guild") or {}
+        for value in (
+            auth.get("oauth_application_id") if isinstance(auth, dict) else "",
+            guild.get("bot_application_id") if isinstance(guild, dict) else "",
+            guild.get("bot_user_id") if isinstance(guild, dict) else "",
+        ):
+            valid = _valid_discord_snowflake(value)
+            if valid:
+                return valid
+    except Exception:
+        pass
+    return ""
+
+
+def _discord_client_id_info(*, force: bool = False) -> dict[str, Any]:
+    now = time.time()
+    cached = _DISCORD_CLIENT_ID_CACHE.get("info") or {}
+    if not force and cached and now - float(_DISCORD_CLIENT_ID_CACHE.get("loaded_at") or 0) < 60:
+        return dict(cached)
+
+    configured_raw = (
+        _env("DASHBOARD_DISCORD_CLIENT_ID")
+        or _env("DISCORD_CLIENT_ID")
+        or _env("BOT_CLIENT_ID")
+        or _env("APPLICATION_ID")
+    )
+    configured = _valid_discord_snowflake(configured_raw)
+    snapshot = _snapshot_oauth_application_id()
+    allow_separate = _env("DASHBOARD_OAUTH_ALLOW_SEPARATE_APP", "0").lower() in {"1", "true", "yes", "ja"}
+
+    mismatch = bool(configured and snapshot and configured != snapshot)
+    if snapshot and (not configured or (mismatch and not allow_separate)):
+        resolved = snapshot
+        source = "bot_snapshot"
+    else:
+        resolved = configured
+        source = "railway" if configured else "missing"
+
+    info = {
+        "resolved": resolved,
+        "source": source,
+        "configured_raw": configured_raw,
+        "configured": configured,
+        "snapshot": snapshot,
+        "mismatch": mismatch,
+        "allow_separate": allow_separate,
+    }
+    _DISCORD_CLIENT_ID_CACHE["loaded_at"] = now
+    _DISCORD_CLIENT_ID_CACHE["info"] = dict(info)
+    return info
+
+
+def _discord_client_id() -> str:
+    return str(_discord_client_id_info().get("resolved") or "")
+
+
 def _discord_oauth_enabled() -> bool:
-    return bool(_env("DASHBOARD_DISCORD_CLIENT_ID") and _env("DASHBOARD_DISCORD_CLIENT_SECRET"))
+    return bool(_discord_client_id() and _env("DASHBOARD_DISCORD_CLIENT_SECRET"))
 
 
 def _auth_mode() -> str:
@@ -14639,23 +14713,32 @@ def api_leadership(_: bool = Depends(_auth)):
 
 @app.get("/login", response_class=HTMLResponse)
 def login_page(request: Request, next: str = "/"):
-    discord_ready = _discord_oauth_enabled()
+    oauth_info = _discord_client_id_info(force=True)
+    discord_ready = bool(oauth_info.get("resolved") and _env("DASHBOARD_DISCORD_CLIENT_SECRET"))
     basic_ready = bool(_env("DASHBOARD_PASSWORD"))
     role_id = _env("DASHBOARD_MEMBER_ROLE_ID") or _configured_member_role_id_from_snapshot()
     role_name = _configured_member_role_name_from_snapshot() or "gesetzte Gildenrolle"
     discord_block = ""
+    oauth_notice = ""
+    if oauth_info.get("mismatch") and not oauth_info.get("allow_separate"):
+        oauth_notice = (
+            '<div class="warn"><strong>Discord-Client-ID wurde automatisch korrigiert.</strong> '
+            'Die Railway-ID passt nicht zum aktuell laufenden Bot. Für den Login wird die Application-ID aus dem Bot-Snapshot verwendet.</div>'
+        )
     if discord_ready:
         discord_block = f"""
+        {oauth_notice}
         <div class="panel">
           <h2>Discord Login</h2>
           <p class="muted">Zugriff wird über die Discord-Mitgliedschaft und Rollen geprüft.</p>
           <p>Erlaubte Rolle: <strong>{_e(role_name)}</strong> <span class="muted">{_e(role_id or 'keine Rollen-ID erkannt')}</span></p>
+          <p class="muted">OAuth-Anwendung: <code>{_e(oauth_info.get('resolved') or '—')}</code> · Quelle: {_e(oauth_info.get('source') or '—')}</p>
           <a class="btn" href="/auth/discord/start?next={_e(next or '/')}">Mit Discord einloggen</a>
         </div>
         """
     else:
         discord_block = """
-        <div class="warn">Discord Login ist noch nicht eingerichtet. Setze DASHBOARD_DISCORD_CLIENT_ID und DASHBOARD_DISCORD_CLIENT_SECRET beim Dashboard-Service.</div>
+        <div class="warn">Discord Login ist nicht vollständig eingerichtet. Der Dashboard-Service benötigt ein Client Secret; die Client-ID wird bevorzugt aus dem aktuellen Bot-Snapshot übernommen.</div>
         """
     basic_block = ""
     if basic_ready:
@@ -14678,8 +14761,9 @@ def login_page(request: Request, next: str = "/"):
 def discord_debug(request: Request):
     redirect_uri = _redirect_uri(request)
     base_url = _base_url(request)
+    oauth_info = _discord_client_id_info(force=True)
     authorize_params = {
-        "client_id": _env("DASHBOARD_DISCORD_CLIENT_ID"),
+        "client_id": str(oauth_info.get("resolved") or ""),
         "redirect_uri": redirect_uri,
         "response_type": "code",
         "scope": "identify",
@@ -14696,7 +14780,11 @@ def discord_debug(request: Request):
         <tr><td>Redirect URI, die diese Website an Discord sendet</td><td><code>{_e(redirect_uri)}</code></td></tr>
         <tr><td>Discord Developer Portal → Redirects</td><td><code>{_e(redirect_uri)}</code></td></tr>
         <tr><td>Railway Variable DASHBOARD_DISCORD_REDIRECT_URI</td><td><code>{_e(_env('DASHBOARD_DISCORD_REDIRECT_URI') or 'nicht gesetzt')}</code></td></tr>
-        <tr><td>Client ID gesetzt</td><td><code>{_e('ja' if _env('DASHBOARD_DISCORD_CLIENT_ID') else 'nein')}</code></td></tr>
+        <tr><td>Railway Client ID</td><td><code>{_e(oauth_info.get('configured_raw') or 'nicht gesetzt')}</code></td></tr>
+        <tr><td>Bot-Snapshot Application ID</td><td><code>{_e(oauth_info.get('snapshot') or 'noch nicht im Snapshot')}</code></td></tr>
+        <tr><td>Tatsächlich verwendete Client ID</td><td><code>{_e(oauth_info.get('resolved') or 'ungültig/fehlt')}</code></td></tr>
+        <tr><td>Quelle</td><td><code>{_e(oauth_info.get('source') or '—')}</code></td></tr>
+        <tr><td>ID-Konflikt</td><td><code>{_e('ja – automatisch Bot-Snapshot verwendet' if oauth_info.get('mismatch') and not oauth_info.get('allow_separate') else ('ja – getrennte OAuth-App ausdrücklich erlaubt' if oauth_info.get('mismatch') else 'nein'))}</code></td></tr>
         <tr><td>Client Secret gesetzt</td><td><code>{_e('ja · Länge ' + str(len(_env('DASHBOARD_DISCORD_CLIENT_SECRET'))) if _env('DASHBOARD_DISCORD_CLIENT_SECRET') else 'nein')}</code></td></tr>
         <tr><td>Token Endpoint</td><td><code>{_e(DISCORD_OAUTH_TOKEN_URL)}</code></td></tr>
         <tr><td>Scope</td><td><code>identify</code></td></tr>
@@ -14709,12 +14797,20 @@ def discord_debug(request: Request):
 
 @app.get("/auth/discord/start")
 def discord_start(request: Request, next: str = "/"):
-    if not _discord_oauth_enabled():
-        return RedirectResponse("/login", status_code=303)
-    state_payload = {"nonce": secrets.token_urlsafe(24), "next": next or "/", "exp": int(time.time()) + 600}
+    oauth_info = _discord_client_id_info(force=True)
+    client_id = str(oauth_info.get("resolved") or "")
+    if not client_id or not _env("DASHBOARD_DISCORD_CLIENT_SECRET"):
+        return HTMLResponse(
+            _html_shell(
+                "Discord Login nicht eingerichtet",
+                "<section class='panel'><h1>❌ Discord OAuth ist nicht vollständig eingerichtet</h1><p class='muted'>Es fehlt eine gültige Application-ID oder das Client Secret.</p><p><a class='btn' href='/auth/discord/debug'>OAuth-Diagnose öffnen</a></p></section>",
+            ),
+            status_code=503,
+        )
+    state_payload = {"nonce": secrets.token_urlsafe(24), "next": next or "/", "client_id": client_id, "exp": int(time.time()) + 600}
     state = _make_token(state_payload)
     params = {
-        "client_id": _env("DASHBOARD_DISCORD_CLIENT_ID"),
+        "client_id": client_id,
         "redirect_uri": _redirect_uri(request),
         "response_type": "code",
         "scope": "identify",
@@ -14740,7 +14836,7 @@ def discord_callback(request: Request, code: str = "", state: str = "", error: s
             DISCORD_OAUTH_TOKEN_URL,
             method="POST",
             data={
-                "client_id": _env("DASHBOARD_DISCORD_CLIENT_ID"),
+                "client_id": _valid_discord_snowflake(state_data.get("client_id")) or _discord_client_id(),
                 "client_secret": _env("DASHBOARD_DISCORD_CLIENT_SECRET"),
                 "grant_type": "authorization_code",
                 "code": code,
