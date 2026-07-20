@@ -7251,7 +7251,9 @@ def _dashboard_catalog_slot(item: dict[str, Any]) -> str:
     aliases = {
         "necklace": "Kette", "bracelet": "Armband", "brooch": "Brosche", "ring": "Ring",
         "belt": "Gürtel", "earring": "Ohrringe", "helmet": "Helm", "chest": "Brust",
-        "pants": "Hose", "gloves": "Handschuhe", "boots": "Schuhe", "cloak": "Umhang",
+        "pants": "Hose", "legs": "Hose", "beinschutz": "Hose", "beinpanzer": "Hose",
+        "gloves": "Handschuhe", "hands": "Handschuhe", "boots": "Schuhe", "feet": "Schuhe",
+        "cloak": "Umhang", "cape": "Umhang", "mantel": "Umhang", "head": "Helm", "body": "Brust",
     }
     for key, slot in aliases.items():
         if key in low:
@@ -7519,7 +7521,7 @@ def _need_slot_picker_html(snap: dict[str, Any], *, input_id: str, slot: str, na
     Waffen: zuerst Waffenart wählen, danach werden rechts nur passende Waffen angezeigt.
     Andere Slots: direkt passende Items für den Slot anzeigen.
     """
-    items = _loot_catalog_items(snap)
+    items = _loot_catalog_items(snap, limit=10000)
     slot_kind = _need_slot_kind(slot)
     required_attr = " required" if required else ""
     datalist_id = f"{input_id}-list"
@@ -7527,12 +7529,12 @@ def _need_slot_picker_html(snap: dict[str, Any], *, input_id: str, slot: str, na
     filtered = [it for it in items if _need_item_slot_matches(it.get("slot", ""), slot, it.get("name", ""))]
     if not filtered:
         filtered = items
-    options = "".join(f'<option value="{_e(it.get("name"))}"></option>' for it in filtered[:650])
+    options = "".join(f'<option value="{_e(it.get("name"))}"></option>' for it in filtered)
     if slot_kind == "weapon":
         # Waffenarten sind der erste Klick. Die Itemliste rechts wird per JS gefiltert.
         weapon_opts = ''.join(f'<option value="{_e(w)}">{_e(w)}</option>' for w in _WEAPON_TYPES)
         select_options = []
-        for it in filtered[:650]:
+        for it in filtered:
             name_val = it.get("name") or ""
             wt = _weapon_type_from_text(name_val)
             if not wt and it.get("slot") and str(it.get("slot")).lower().startswith("waffe"):
@@ -7549,7 +7551,7 @@ def _need_slot_picker_html(snap: dict[str, Any], *, input_id: str, slot: str, na
             f'<small class="muted">Erst Waffenart, dann passendes Item. Freitext bleibt möglich.</small>'
             f'</div>'
         )
-    select_options = ''.join(f'<option value="{_e(it.get("name"))}">{_e(it.get("name"))}</option>' for it in filtered[:650])
+    select_options = ''.join(f'<option value="{_e(it.get("name"))}">{_e(it.get("name"))}</option>' for it in filtered)
     return (
         f'<select class="item-picker-select" onchange="var el=document.getElementById(\'{_e(input_id)}\'); if(el && this.value) el.value=this.value; this.selectedIndex=0;">'
         f'<option value="">Passendes Item für {_e(slot)} auswählen ... ({len(filtered)})</option>{select_options}</select>'
@@ -7587,7 +7589,7 @@ def _need_slot_select_only_html(
                 f'data-image="{_image_attr(selected_item or {})}">{_e(selected)} · aktuell</option>'
             )
             seen.add(selected.casefold())
-        for item in rows[:1600]:
+        for item in rows:
             item_name = str(item.get("name") or "").strip()
             if not item_name or item_name.casefold() in seen:
                 continue
@@ -7613,7 +7615,7 @@ def _need_slot_select_only_html(
                 f'data-label="{_e(selected)}" data-image="{_image_attr(selected_item or {})}">{_e(selected)} · aktuell</option>'
             )
         seen = {selected.casefold()} if selected else set()
-        for item in filtered[:1600]:
+        for item in filtered:
             item_name = str(item.get("name") or "").strip()
             if not item_name or item_name.casefold() in seen:
                 continue
@@ -9306,34 +9308,29 @@ _NEED_BUILDER_SLOTS = [slot for _title, slots in _NEED_BUILDER_SLOT_GROUPS for s
 
 
 def _need_builder_slot_filter(slot: str) -> dict[str, Any]:
-    """Mappt Dashboard-Slots auf Questlog item_catalog Kategorien."""
+    """Mappt Dashboard-Slots auf alle bekannten Questlog-Kategorievarianten."""
     slot = str(slot or "").strip()
     if slot in {"Waffe 1", "Waffe 2"}:
-        return {"category": "weapon", "subs": [], "special": ""}
+        return {"canonical": "Waffe", "category": "weapon", "subs": [], "special": ""}
     if slot in {"Fähigkeitskern 1", "Fähigkeitskern 2", "Fähigkeitskern"}:
-        return {"category": "", "subs": [], "special": "core"}
-    armor = {
-        "Helm": "Helm",
-        "Brust": "Brust",
-        "Handschuhe": "Handschuhe",
-        "Hose": "Hose",
-        "Schuhe": "Schuhe",
-        "Umhang": "Umhang",
+        return {"canonical": "Fähigkeitskern", "category": "", "subs": [], "special": "core"}
+    filters = {
+        "Helm": ("Helm", "armor", ["Helm", "Helmet", "Head", "Kopf"]),
+        "Brust": ("Brust", "armor", ["Brust", "Chest", "Body", "Rüstung", "Ruestung", "Armor"]),
+        "Handschuhe": ("Handschuhe", "armor", ["Handschuhe", "Gloves", "Hands", "Stulpen"]),
+        "Hose": ("Hose", "armor", ["Hose", "Pants", "Legs", "Beine", "Beinschutz", "Leg Armor"]),
+        "Schuhe": ("Schuhe", "armor", ["Schuhe", "Boots", "Feet", "Stiefel"]),
+        "Umhang": ("Umhang", "armor", ["Umhang", "Cloak", "Cape", "Mantel"]),
+        "Kette": ("Kette", "accessory", ["Kette", "Necklace", "Neck", "Halskette"]),
+        "Armband": ("Armband", "accessory", ["Armband", "Bracelet", "Armreif"]),
+        "Brosche": ("Brosche", "accessory", ["Brosche", "Brooch"]),
+        "Ohrringe": ("Ohrringe", "accessory", ["Ohrringe", "Ohrring", "Earring", "Earrings"]),
+        "Ring 1": ("Ring", "accessory", ["Ring", "Rings"]),
+        "Ring 2": ("Ring", "accessory", ["Ring", "Rings"]),
+        "Gürtel": ("Gürtel", "accessory", ["Gürtel", "Guertel", "Belt", "Schärpe", "Schaerpe"]),
     }
-    if slot in armor:
-        return {"category": "armor", "subs": [armor[slot]]}
-    accessory = {
-        "Kette": "Kette",
-        "Armband": "Armband",
-        "Brosche": "Brosche",
-        "Ohrringe": "Ohrringe",
-        "Ring 1": "Ring",
-        "Ring 2": "Ring",
-        "Gürtel": "Gürtel",
-    }
-    if slot in accessory:
-        return {"category": "accessory", "subs": [accessory[slot]]}
-    return {"category": "", "subs": []}
+    canonical, category, subs = filters.get(slot, ("", "", []))
+    return {"canonical": canonical, "category": category, "subs": subs, "special": ""}
 
 
 def _ensure_need_builder_tables() -> None:
@@ -9564,6 +9561,7 @@ def _need_builder_items() -> list[dict[str, Any]]:
                 "name": name,
                 "category": str(item.get("main_category") or ""),
                 "sub": sub,
+                "slot": _dashboard_catalog_slot(item),
                 "rarity": str(item.get("rarity") or ""),
                 "level": item.get("item_level") or "",
                 "image": str(item.get("manual_image_url") or item.get("image_url") or item.get("icon_url") or ""),
@@ -11339,10 +11337,12 @@ def _render_need_editor_panel(
             return String(value || '').trim().toLocaleLowerCase('de-DE');
           }}
           function neMatchesSlot(item, slot) {{
-            const filter = NE_FILTERS[slot] || {{category:'',subs:[],special:''}};
+            const filter = NE_FILTERS[slot] || {{canonical:'',category:'',subs:[],special:''}};
+            if (filter.special === 'core') return !!item.is_core;
+            const canonical = neNorm(item.slot || '');
+            if (filter.canonical && canonical) return canonical === neNorm(filter.canonical);
             if (filter.category && neNorm(item.category) !== neNorm(filter.category)) return false;
             if (filter.subs && filter.subs.length && !filter.subs.some(function(sub) {{ return neNorm(sub) === neNorm(item.sub); }})) return false;
-            if (filter.special === 'core' && !item.is_core) return false;
             return true;
           }}
           function neMatchesWeapon(item, weaponType) {{
@@ -11453,12 +11453,14 @@ def _render_need_editor_panel(
               if (slot.startsWith('Waffe') && !neMatchesWeapon(item, weaponType)) return false;
               if (needle && !neNorm(item.name).includes(needle)) return false;
               return true;
-            }}).slice(0, 160);
+            }}).sort(function(a, b) {{ return String(a.name || '').localeCompare(String(b.name || ''), 'de'); }});
           }}
           function neRenderOptions(query) {{
             if (!nePop || !neCurrentEditor) return;
             const list = nePop.querySelector('.ne-picker-list');
+            const count = nePop.querySelector('[data-ne-result-count]');
             const items = neFilteredItems(neCurrentEditor, query || '');
+            if (count) count.textContent = items.length + (items.length === 1 ? ' passendes Item' : ' passende Items') + ' – vollständig geladen';
             if (!items.length) {{
               list.innerHTML = '<div class="ne-picker-empty">Keine passenden Items für diesen Slot gefunden.</div>';
               return;
@@ -11501,7 +11503,7 @@ def _render_need_editor_panel(
               nePop.style.left = Math.max(12, Math.min(rect.left, window.innerWidth - 540)) + 'px';
               nePop.style.top = Math.max(12, Math.min(rect.bottom + 8, window.innerHeight - 680)) + 'px';
             }}
-            nePop.innerHTML = '<input class="ne-picker-search" type="search" placeholder="Items durchsuchen …"><div class="ne-picker-list"></div><div class="ne-mobile-hint">Auf Mobilgeräten antippen, um das Item auszuwählen.</div>';
+            nePop.innerHTML = '<input class="ne-picker-search" type="search" placeholder="Optional filtern …"><div class="ne-picker-count" data-ne-result-count aria-live="polite"></div><div class="ne-picker-list"></div><div class="ne-mobile-hint">Die Liste enthält alle passenden Items. Auf Mobilgeräten antippen, um auszuwählen.</div>';
             document.body.appendChild(nePop);
             const search = nePop.querySelector('.ne-picker-search');
             search.addEventListener('input', function() {{ neRenderOptions(search.value); }});
@@ -15975,121 +15977,111 @@ def _discord_feed_escape_content(text: Any) -> str:
     return _e(text).replace("\n", "<br>")
 
 
-def _discord_news_parts(msg: dict[str, Any]) -> dict[str, Any]:
-    """Bereitet eine Discord-Nachricht als redaktionellen News-Beitrag auf."""
+def _discord_feed_parts(msg: dict[str, Any]) -> dict[str, Any]:
+    """Bereitet Feed-Nachrichten als ruhige Beiträge statt als Chat auf.
+
+    Es wird kein künstlicher Titel aus der ersten Zeile erzeugt. Der tatsächliche
+    Nachrichteninhalt bleibt vollständig erhalten; vorhandene Discord-Embed-Titel
+    werden lediglich als Teil des Beitrags dargestellt.
+    """
     content = str(msg.get("content") or "").strip()
     embeds = [x for x in (msg.get("embeds") or []) if isinstance(x, dict)]
     attachments = [x for x in (msg.get("attachments") or []) if isinstance(x, dict)]
 
-    embed_title = next((str(x.get("title") or "").strip() for x in embeds if str(x.get("title") or "").strip()), "")
-    embed_desc = next((str(x.get("description") or "").strip() for x in embeds if str(x.get("description") or "").strip()), "")
+    blocks: list[dict[str, str]] = []
+    if content:
+        blocks.append({"heading": "", "text": content})
+    for embed in embeds:
+        heading = str(embed.get("title") or "").strip()
+        description = str(embed.get("description") or "").strip()
+        if heading or description:
+            blocks.append({"heading": heading, "text": description})
+    if not blocks:
+        blocks.append({"heading": "", "text": "Dieser Beitrag enthält nur einen Anhang."})
 
-    lines = [line.strip() for line in content.splitlines() if line.strip()]
-    first_line = lines[0] if lines else ""
-    clean_first = re.sub(r"^[#>*\-\s📣📰📌❗⚠️]+", "", first_line).strip()
-    title = embed_title or clean_first
-    if not title:
-        title = "Gilden-Neuigkeit"
-    if len(title) > 105:
-        title = title[:102].rstrip() + "…"
-
-    body_lines = lines[1:] if first_line and not embed_title else lines
-    body = "\n".join(body_lines).strip() or embed_desc
-    if not body and content != first_line:
-        body = content
-    if not body:
-        body = "Weitere Informationen findest du direkt im Beitrag."
-
-    cover = ""
+    images: list[str] = []
+    files: list[dict[str, str]] = []
     for item in attachments:
         url = str(item.get("url") or "").strip()
         ctype = str(item.get("content_type") or "").lower()
-        filename = str(item.get("filename") or "").lower()
-        if url and (ctype.startswith("image") or filename.endswith((".png", ".jpg", ".jpeg", ".webp", ".gif"))):
-            cover = url
-            break
-    if not cover:
-        for item in embeds:
-            cover = str(item.get("image_url") or item.get("thumbnail_url") or "").strip()
-            if cover:
-                break
+        filename = str(item.get("filename") or "Anhang").strip()
+        is_image = ctype.startswith("image") or filename.lower().endswith((".png", ".jpg", ".jpeg", ".webp", ".gif"))
+        if url and is_image:
+            images.append(url)
+        elif url:
+            files.append({"url": url, "name": filename})
+    for embed in embeds:
+        for value in (embed.get("image_url"), embed.get("thumbnail_url")):
+            url = str(value or "").strip()
+            if url and url not in images:
+                images.append(url)
 
-    search_text = f"{title} {body}".casefold()
-    pinned = bool(msg.get("pinned")) or any(x in search_text for x in ("wichtig", "achtung", "dringend", "pflicht", "📌", "❗"))
-    if any(x in search_text for x in ("wartung", "update", "patch", "server")):
-        category = "Update"
-        category_icon = "🛠️"
-    elif any(x in search_text for x in ("event", "raid", "gildenboss", "termin", "anmeldung")):
-        category = "Event"
-        category_icon = "📅"
-    elif any(x in search_text for x in ("loot", "need", "auktion", "ec", "dkp")):
-        category = "Gildensystem"
-        category_icon = "🎁"
-    elif any(x in search_text for x in ("regel", "leitung", "gilde", "mitglied")):
-        category = "Gilde"
-        category_icon = "🛡️"
+    combined = " ".join([content] + [f"{b.get('heading')} {b.get('text')}" for b in blocks]).casefold()
+    pinned = bool(msg.get("pinned")) or any(x in combined for x in ("wichtig", "achtung", "dringend", "pflicht", "📌", "❗"))
+    if any(x in combined for x in ("wartung", "update", "patch", "server")):
+        category, icon = "Update", "🛠️"
+    elif any(x in combined for x in ("event", "raid", "gildenboss", "termin", "anmeldung")):
+        category, icon = "Event", "📅"
+    elif any(x in combined for x in ("loot", "need", "auktion", "ec", "dkp")):
+        category, icon = "Gildensystem", "🎁"
+    elif any(x in combined for x in ("regel", "leitung", "gilde", "mitglied")):
+        category, icon = "Gilde", "🛡️"
     else:
-        category = "Neuigkeit"
-        category_icon = "📰"
+        category, icon = "Beitrag", "📌"
 
     return {
-        "title": title,
-        "body": body,
-        "cover": cover,
+        "blocks": blocks,
+        "images": images,
+        "files": files,
         "category": category,
-        "category_icon": category_icon,
+        "category_icon": icon,
         "pinned": pinned,
         "author": msg.get("author_name") or msg.get("author") or "Beer and Buffs",
-        "avatar": str(msg.get("author_avatar_url") or "").strip(),
         "created": _dt(msg.get("created_at")) if msg.get("created_at") else "—",
         "jump": str(msg.get("jump_url") or "").strip(),
-        "attachments": attachments,
-        "embeds": embeds,
     }
 
 
-def _discord_news_article(msg: dict[str, Any], *, featured: bool = False) -> str:
-    data = _discord_news_parts(msg)
-    cover = str(data.get("cover") or "")
-    cover_html = (
-        f'<div class="news-cover"><img src="{_e(cover)}" alt="" loading="lazy"></div>'
-        if cover else
-        '<div class="news-cover news-cover-placeholder"><span>🍺</span></div>'
-    )
-    avatar = str(data.get("avatar") or "")
-    avatar_html = f'<img src="{_e(avatar)}" alt="" loading="lazy">' if avatar else '<span>🍻</span>'
-    pinned = '<span class="news-priority">📌 Wichtig</span>' if data.get("pinned") else ""
+def _discord_feed_post(msg: dict[str, Any]) -> str:
+    data = _discord_feed_parts(msg)
+    block_html: list[str] = []
+    for block in data.get("blocks") or []:
+        heading = str(block.get("heading") or "").strip()
+        body = str(block.get("text") or "").strip()
+        heading_html = f'<div class="feed-embed-heading">{_e(heading)}</div>' if heading else ""
+        body_html = f'<div class="feed-post-copy">{_discord_feed_escape_content(body)}</div>' if body else ""
+        block_html.append(f'<div class="feed-content-block">{heading_html}{body_html}</div>')
+
+    image_html = ""
+    images = [str(x or "") for x in (data.get("images") or []) if str(x or "")]
+    if images:
+        image_html = '<div class="feed-post-images">' + ''.join(
+            f'<a href="{_e(url)}" target="_blank" rel="noopener"><img src="{_e(url)}" alt="Beitragsbild" loading="lazy"></a>'
+            for url in images[:4]
+        ) + '</div>'
+
+    file_html = ""
+    files = data.get("files") or []
+    if files:
+        file_html = '<div class="feed-post-files">' + ''.join(
+            f'<a href="{_e(item.get("url"))}" target="_blank" rel="noopener">📎 {_e(item.get("name") or "Anhang")}</a>'
+            for item in files[:8]
+        ) + '</div>'
+
+    pinned_html = '<span class="feed-badge important">📌 Angepinnt</span>' if data.get("pinned") else ""
     jump = str(data.get("jump") or "")
-    jump_html = f'<a class="btn small" href="{_e(jump)}" target="_blank" rel="noopener">Vollständig in Discord lesen</a>' if jump else ""
+    jump_html = f'<a class="feed-discord-link" href="{_e(jump)}" target="_blank" rel="noopener">In Discord öffnen ↗</a>' if jump else ""
 
-    extra_links: list[str] = []
-    for att in (data.get("attachments") or [])[:5]:
-        if not isinstance(att, dict):
-            continue
-        url = str(att.get("url") or "").strip()
-        name = str(att.get("filename") or "Anhang").strip()
-        ctype = str(att.get("content_type") or "").lower()
-        if url and not ctype.startswith("image"):
-            extra_links.append(f'<a class="news-file" href="{_e(url)}" target="_blank" rel="noopener">📎 {_e(name)}</a>')
-    file_html = '<div class="news-files">' + ''.join(extra_links) + '</div>' if extra_links else ""
-
-    article_class = "news-article featured" if featured else "news-article"
     return f"""
-    <article class="{article_class}">
-      {cover_html}
-      <div class="news-article-body">
-        <div class="news-label-row">
-          <span class="news-category">{_e(data.get('category_icon'))} {_e(data.get('category'))}</span>
-          {pinned}
-        </div>
-        <h2>{_e(data.get('title'))}</h2>
-        <div class="news-copy">{_discord_feed_escape_content(data.get('body'))}</div>
-        {file_html}
-        <div class="news-footer">
-          <div class="news-author"><span class="news-author-avatar">{avatar_html}</span><span><strong>{_e(data.get('author'))}</strong><small>{_e(data.get('created'))}</small></span></div>
-          {jump_html}
-        </div>
+    <article class="feed-post{(' pinned' if data.get('pinned') else '')}">
+      <div class="feed-post-meta">
+        <div class="feed-post-badges"><span class="feed-badge">{_e(data.get('category_icon'))} {_e(data.get('category'))}</span>{pinned_html}</div>
+        <time>{_e(data.get('created'))}</time>
       </div>
+      <div class="feed-post-content">{''.join(block_html)}</div>
+      {image_html}
+      {file_html}
+      <footer class="feed-post-footer"><span>Veröffentlicht von <strong>{_e(data.get('author'))}</strong></span>{jump_html}</footer>
     </article>
     """
 
@@ -16103,77 +16095,65 @@ def _render_discord_feed_page(data: dict[str, Any], *, key: str, title: str, sub
     channel_name = feed.get("channel_name") or feed.get("channel_id") or "nicht gesetzt"
     status = "Aktuell" if messages else ("Kanal verbunden" if feed.get("channel_id") else "Noch nicht verbunden")
 
-    featured_html = ""
-    article_grid = ""
-    if messages:
-        priority_index = next((idx for idx, message in enumerate(messages) if _discord_news_parts(message).get("pinned")), 0)
-        featured_message = messages[priority_index]
-        remaining = [m for idx, m in enumerate(messages) if idx != priority_index]
-        featured_html = _discord_news_article(featured_message, featured=True)
-        article_grid = ''.join(_discord_news_article(message) for message in remaining)
-    else:
-        featured_html = f"""
-        <div class="news-empty">
-          <div class="news-empty-icon">📭</div>
-          <h2>Noch keine Beiträge</h2>
-          <p>Im aktuellen Bot-Snapshot wurden keine Meldungen gefunden.</p>
-          <small>Prüfe den konfigurierten Discord-Kanal und veröffentliche danach einen neuen Dashboard-Snapshot. Technischer Hinweis: <code>{_e(env_hint)}</code></small>
+    posts_html = ''.join(_discord_feed_post(message) for message in messages)
+    if not posts_html:
+        posts_html = f"""
+        <div class="feed-empty">
+          <div>📭</div>
+          <strong>Noch keine Beiträge vorhanden</strong>
+          <span>Im aktuellen Bot-Snapshot wurden keine Meldungen aus dem verbundenen Kanal gefunden.</span>
+          <small>Technischer Hinweis: <code>{_e(env_hint)}</code></small>
         </div>
         """
 
     css = """
     <style>
-      .news-page-head{display:flex;justify-content:space-between;gap:22px;align-items:end;margin-bottom:18px}
-      .news-page-head h1{margin:.25rem 0 .35rem;font-size:clamp(30px,4vw,52px)}
-      .news-page-head p{max-width:760px;margin:0;color:var(--muted);font-size:16px;line-height:1.6}
-      .news-overview{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin:16px 0 22px}
-      .news-overview-card{padding:14px 16px;border:1px solid rgba(214,168,79,.18);border-radius:16px;background:rgba(7,7,8,.62)}
-      .news-overview-card span{display:block;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.09em;font-weight:900}
-      .news-overview-card strong{display:block;margin-top:5px;color:#f0d490;font-size:16px;overflow-wrap:anywhere}
-      .news-article{display:grid;grid-template-rows:210px minmax(0,1fr);overflow:hidden;border:1px solid rgba(214,168,79,.18);border-radius:22px;background:linear-gradient(160deg,rgba(25,18,11,.96),rgba(8,8,9,.96));box-shadow:0 18px 42px rgba(0,0,0,.25)}
-      .news-article.featured{grid-template-columns:minmax(280px,42%) minmax(0,1fr);grid-template-rows:none;min-height:360px;border-color:rgba(230,186,88,.38);margin-bottom:22px}
-      .news-cover{position:relative;min-height:210px;overflow:hidden;background:radial-gradient(circle at 30% 25%,rgba(222,177,78,.22),rgba(0,0,0,.34))}
-      .news-cover img{width:100%;height:100%;object-fit:cover;display:block;transition:transform .3s ease}
-      .news-article:hover .news-cover img{transform:scale(1.025)}
-      .news-cover-placeholder{display:grid;place-items:center;font-size:72px;color:#e1b75e}
-      .news-article-body{display:flex;flex-direction:column;padding:20px;min-width:0}
-      .news-article.featured .news-article-body{padding:28px}
-      .news-label-row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:11px}
-      .news-category,.news-priority{display:inline-flex;align-items:center;padding:6px 10px;border-radius:999px;font-size:11px;font-weight:950;text-transform:uppercase;letter-spacing:.07em}
-      .news-category{background:rgba(214,168,79,.12);color:#f0d18b;border:1px solid rgba(214,168,79,.24)}
-      .news-priority{background:rgba(186,58,49,.16);color:#ffaaa2;border:1px solid rgba(255,104,92,.24)}
-      .news-article h2{margin:0 0 10px;color:#f5e3b5;font-size:clamp(21px,2.1vw,31px);line-height:1.15}
-      .news-copy{color:#d7d8dc;line-height:1.65;display:-webkit-box;-webkit-line-clamp:7;-webkit-box-orient:vertical;overflow:hidden}
-      .news-article:not(.featured) .news-copy{-webkit-line-clamp:5}
-      .news-footer{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-top:auto;padding-top:18px}
-      .news-author{display:flex;align-items:center;gap:10px;min-width:0}
-      .news-author-avatar{width:38px;height:38px;border-radius:50%;display:grid;place-items:center;overflow:hidden;background:#17120c;border:1px solid rgba(214,168,79,.24)}
-      .news-author-avatar img{width:100%;height:100%;object-fit:cover}
-      .news-author>span:last-child{display:grid;min-width:0}.news-author strong{font-size:13px}.news-author small{font-size:11px;color:var(--muted)}
-      .news-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}
-      .news-files{display:flex;flex-wrap:wrap;gap:7px;margin-top:13px}.news-file{font-size:12px;color:#e2c276;text-decoration:none;padding:6px 9px;border-radius:9px;background:rgba(214,168,79,.08)}
-      .news-empty{display:grid;place-items:center;text-align:center;padding:54px 24px;border:1px dashed rgba(214,168,79,.26);border-radius:22px;background:rgba(0,0,0,.20)}
-      .news-empty-icon{font-size:54px}.news-empty h2{margin:10px 0 5px}.news-empty p{margin:0 0 8px;color:var(--muted)}
-      .btn.small{padding:8px 11px;font-size:12px}
-      @media(max-width:980px){.news-article.featured{grid-template-columns:1fr;grid-template-rows:260px auto}.news-grid{grid-template-columns:1fr}.news-overview{grid-template-columns:1fr 1fr}.news-page-head{align-items:start;flex-direction:column}}
-      @media(max-width:620px){.news-overview{grid-template-columns:1fr}.news-article.featured{grid-template-rows:210px auto}.news-article-body,.news-article.featured .news-article-body{padding:17px}.news-footer{align-items:stretch}.news-footer .btn{width:100%;text-align:center}}
+      .feed-page-head{display:flex;justify-content:space-between;gap:18px;align-items:end;margin-bottom:16px}
+      .feed-page-head h1{margin:.2rem 0 .35rem;font-size:clamp(29px,4vw,48px)}
+      .feed-page-head p{max-width:780px;margin:0;color:var(--muted);line-height:1.6}
+      .feed-source-line{display:flex;gap:9px;flex-wrap:wrap;margin:14px 0 20px}
+      .feed-source-chip{display:inline-flex;align-items:center;gap:6px;padding:7px 10px;border:1px solid rgba(214,168,79,.17);border-radius:999px;background:rgba(0,0,0,.2);font-size:12px;color:var(--muted)}
+      .feed-source-chip strong{color:#ead29b}
+      .feed-post-list{display:grid;gap:15px}
+      .feed-post{position:relative;padding:20px 22px;border:1px solid rgba(214,168,79,.17);border-left:4px solid rgba(214,168,79,.52);border-radius:17px;background:linear-gradient(145deg,rgba(24,18,12,.92),rgba(9,9,10,.94));box-shadow:0 12px 32px rgba(0,0,0,.18)}
+      .feed-post.pinned{border-left-color:#e3b552;background:linear-gradient(145deg,rgba(38,26,12,.95),rgba(10,9,8,.95))}
+      .feed-post-meta{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:14px;color:var(--muted);font-size:12px}
+      .feed-post-badges{display:flex;gap:7px;align-items:center;flex-wrap:wrap}
+      .feed-badge{display:inline-flex;align-items:center;padding:5px 9px;border-radius:999px;border:1px solid rgba(214,168,79,.2);background:rgba(214,168,79,.08);color:#e7c97f;font-size:11px;font-weight:850;text-transform:uppercase;letter-spacing:.055em}
+      .feed-badge.important{border-color:rgba(234,105,79,.24);background:rgba(180,57,39,.12);color:#ffb09e}
+      .feed-post-content{display:grid;gap:13px}
+      .feed-content-block{display:grid;gap:6px}
+      .feed-embed-heading{font-size:16px;font-weight:900;color:#f0d898}
+      .feed-post-copy{white-space:normal;color:#dedfe3;line-height:1.68;font-size:15px;overflow-wrap:anywhere}
+      .feed-post-images{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px;margin-top:15px}
+      .feed-post-images a{display:block;border-radius:13px;overflow:hidden;border:1px solid rgba(214,168,79,.15);background:rgba(0,0,0,.25)}
+      .feed-post-images img{display:block;width:100%;max-height:420px;object-fit:contain;background:rgba(0,0,0,.22)}
+      .feed-post-files{display:flex;gap:8px;flex-wrap:wrap;margin-top:13px}
+      .feed-post-files a{padding:7px 10px;border-radius:9px;background:rgba(214,168,79,.07);border:1px solid rgba(214,168,79,.14);color:#e4c779;text-decoration:none;font-size:12px}
+      .feed-post-footer{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-top:17px;padding-top:13px;border-top:1px solid rgba(255,255,255,.065);color:var(--muted);font-size:12px}
+      .feed-post-footer strong{color:#ded6c4}
+      .feed-discord-link{color:#e5c675;text-decoration:none;font-weight:800}
+      .feed-discord-link:hover{text-decoration:underline}
+      .feed-empty{display:grid;place-items:center;text-align:center;gap:8px;padding:48px 22px;border:1px dashed rgba(214,168,79,.24);border-radius:18px;background:rgba(0,0,0,.18)}
+      .feed-empty>div{font-size:46px}.feed-empty span,.feed-empty small{color:var(--muted)}
+      @media(max-width:720px){.feed-page-head{align-items:flex-start;flex-direction:column}.feed-post{padding:16px}.feed-post-meta,.feed-post-footer{align-items:flex-start;flex-direction:column}.feed-post-images{grid-template-columns:1fr}}
     </style>
     """
     body = f"""
     {css}
-    <section class="news-page-head">
-      <div><div class="eyebrow">Schwarzes Brett</div><h1>{_e(title)}</h1><p>{_e(subtitle)}</p></div>
+    <section class="feed-page-head">
+      <div><div class="eyebrow">Discord-Feed</div><h1>{_e(title)}</h1><p>{_e(subtitle)}</p></div>
       <a class="btn" href="/">Zur Startseite</a>
     </section>
-    <section class="news-overview">
-      <div class="news-overview-card"><span>Status</span><strong>{_e(status)}</strong></div>
-      <div class="news-overview-card"><span>Quelle</span><strong># {_e(channel_name)}</strong></div>
-      <div class="news-overview-card"><span>Letzte Aktualisierung</span><strong>{_e(_dt(feed.get('fetched_at')) if feed.get('fetched_at') else '—')}</strong></div>
-    </section>
-    <section class="news-featured">{featured_html}</section>
-    {f'<section class="news-grid">{article_grid}</section>' if article_grid else ''}
+    <div class="feed-source-line">
+      <span class="feed-source-chip">Status: <strong>{_e(status)}</strong></span>
+      <span class="feed-source-chip">Quelle: <strong># {_e(channel_name)}</strong></span>
+      <span class="feed-source-chip">Aktualisiert: <strong>{_e(_dt(feed.get('fetched_at')) if feed.get('fetched_at') else '—')}</strong></span>
+    </div>
+    <section class="feed-post-list">{posts_html}</section>
     """
     return _html_shell(f"{title} · Beer and Buffs Dashboard", body)
+
 
 @app.get("/admin-portal", response_class=HTMLResponse)
 def admin_portal_alias() -> RedirectResponse:
@@ -16196,7 +16176,7 @@ def announcements_page(_: bool = Depends(_auth)) -> HTMLResponse:
         _snapshot_payload(),
         key="announcements",
         title="📣 Ankündigungen",
-        subtitle="Wichtige Gildenmeldungen als übersichtliches schwarzes Brett – nicht als Chatverlauf.",
+        subtitle="Wichtige Gildenmeldungen vollständig und übersichtlich dargestellt.",
         env_hint="DASHBOARD_ANNOUNCEMENTS_CHANNEL_ID",
     ))
 
@@ -16207,7 +16187,7 @@ def tnl_news_page(_: bool = Depends(_auth)) -> HTMLResponse:
         _snapshot_payload(),
         key="news",
         title="📰 TnL News",
-        subtitle="Aktuelle Spielmeldungen als redaktionelle Übersicht mit Titelbild, Kategorie und hervorgehobenem Hauptbeitrag.",
+        subtitle="Aktuelle Spielmeldungen aus dem verbundenen Discord-Kanal, ohne künstliche Überschriften.",
         env_hint="DASHBOARD_NEWS_CHANNEL_ID",
     ))
 
@@ -16230,7 +16210,7 @@ def tnl_guides_page(_: bool = Depends(_auth)) -> HTMLResponse:
         _snapshot_payload(),
         key="guides",
         title="📚 TnL Guides",
-        subtitle="Jede Nachricht aus dem gesetzten Discord-Guides-Kanal wird hier als eigener Guide-Beitrag angezeigt.",
+        subtitle="Beiträge aus dem Guides-Kanal in einer ruhigen, gut lesbaren Übersicht.",
         env_hint="DASHBOARD_GUIDES_CHANNEL_ID",
     ))
 
