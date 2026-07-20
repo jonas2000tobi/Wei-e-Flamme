@@ -5,6 +5,7 @@ import re
 import asyncio
 import os
 import secrets
+import time
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, Any
@@ -656,7 +657,7 @@ def _items_for_need_slot(guild_id: int, need_slot: str, weapon_type: str | None 
     return out
 
 
-CATALOG_PAGE_SIZE = 24
+CATALOG_PAGE_SIZE = 25
 
 
 def _catalog_row_slot(row: dict[str, Any], fallback_slot: str = "") -> str:
@@ -676,8 +677,10 @@ def _catalog_row_slot(row: dict[str, Any], fallback_slot: str = "") -> str:
     aliases = {
         "necklace": "Kette", "bracelet": "Armband", "brooch": "Brosche",
         "ring": "Ring", "belt": "Gürtel", "earring": "Ohrringe",
-        "helmet": "Helm", "chest": "Brust", "pants": "Hose",
-        "gloves": "Handschuhe", "boots": "Schuhe", "cloak": "Umhang",
+        "helmet": "Helm", "head": "Helm", "chest": "Brust", "body": "Brust",
+        "pants": "Hose", "legs": "Hose", "beinschutz": "Hose", "beinpanzer": "Hose",
+        "gloves": "Handschuhe", "hands": "Handschuhe", "boots": "Schuhe", "feet": "Schuhe",
+        "cloak": "Umhang", "cape": "Umhang", "mantel": "Umhang",
     }
     for key, slot in aliases.items():
         if key in low:
@@ -694,53 +697,118 @@ def _catalog_row_weapon_type(row: dict[str, Any]) -> str:
 
 
 def _catalog_query_filter(slot: str, weapon_type: str | None = None) -> tuple[str, str, str]:
+    """Grobe Datenbankfilterung; die exakte Slotprüfung erfolgt anschließend.
+
+    Früher wurde z. B. ``sub_category = Hose`` direkt in SQL verlangt. Einige
+    Importer liefern jedoch Varianten wie ``Pants``, ``Legs`` oder
+    ``Beinschutz``. Diese Items waren über die Namenssuche auffindbar, fehlten
+    aber in der normalen Slotliste. Deshalb laden wir die komplette Obergruppe
+    und normalisieren danach zuverlässig auf den Need-Slot.
+    """
     catalog_slot = _normalize_catalog_slot(slot) or _catalog_slot_for_need_slot(slot)
     if catalog_slot == "Waffe":
-        return "weapon", _normalize_weapon_type(weapon_type), ""
+        return "weapon", "", ""
     if catalog_slot in {"Helm", "Brust", "Hose", "Handschuhe", "Schuhe", "Umhang"}:
-        return "armor", catalog_slot, ""
+        return "armor", "", ""
     if catalog_slot in {"Kette", "Armband", "Brosche", "Ring", "Gürtel", "Ohrringe"}:
-        return "accessory", catalog_slot, ""
+        return "accessory", "", ""
     if catalog_slot == "Fähigkeitskern":
         return "", "", "kern"
     return "", "", ""
 
 
-def _catalog_rows_sync(slot: str, weapon_type: str | None = None, query: str = "", page: int = 0) -> tuple[list[dict[str, Any]], bool]:
-    category, sub, default_query = _catalog_query_filter(slot, weapon_type)
+_CATALOG_BROWSER_CACHE: dict[tuple[str, str, str], tuple[float, list[dict[str, Any]]]] = {}
+_CATALOG_BROWSER_CACHE_SECONDS = 60.0
+
+
+def _catalog_fetch_all_sync(slot: str, weapon_type: str | None = None, query: str = "") -> list[dict[str, Any]]:
+    """Lädt wirklich alle aktiven Katalogitems für einen Need-Slot.
+
+    Discord erlaubt höchstens 25 Einträge pro Select. Deshalb wird der komplette
+    Trefferbestand serverseitig geladen und anschließend in 25er-Seiten
+    angeboten. Eine Namenseingabe ist dadurch nur noch optional.
+    """
     catalog_slot = _normalize_catalog_slot(slot) or _catalog_slot_for_need_slot(slot)
-    page = max(0, int(page or 0))
+    normalized_weapon = _normalize_weapon_type(weapon_type)
+    normalized_query = str(query or "").strip()
+    cache_key = (str(catalog_slot), str(normalized_weapon), normalized_query.casefold())
+    now = time.monotonic()
+    cached = _CATALOG_BROWSER_CACHE.get(cache_key)
+    if cached and now - cached[0] <= _CATALOG_BROWSER_CACHE_SECONDS:
+        return [dict(row) for row in cached[1]]
+
+    category, sub, default_query = _catalog_query_filter(slot, weapon_type)
+    merged: dict[int, dict[str, Any]] = {}
+
+    def load_term(term: str) -> None:
+        offset = 0
+        while True:
+            batch = runtime_db.search_catalog_items(
+                term,
+                limit=50,
+                offset=offset,
+                main_category=category,
+                sub_category=sub,
+            )
+            current = [dict(row) for row in (batch or [])]
+            for row in current:
+                try:
+                    row_id = int(row.get("id") or 0)
+                except Exception:
+                    row_id = 0
+                if row_id:
+                    merged[row_id] = row
+            if len(current) < 50:
+                break
+            offset += 50
+
     try:
         if catalog_slot == "Fähigkeitskern":
-            terms = [str(query or "").strip()] if str(query or "").strip() else ["kern", "core"]
-            merged: dict[int, dict[str, Any]] = {}
+            terms = [normalized_query] if normalized_query else ["kern", "core"]
             for term in terms:
-                for row in runtime_db.search_catalog_items(term, limit=50, offset=0):
-                    if _catalog_row_slot(row) != "Fähigkeitskern":
-                        continue
-                    try:
-                        merged[int(row.get("id") or 0)] = dict(row)
-                    except Exception:
-                        continue
-            all_rows = sorted(merged.values(), key=lambda x: str(x.get("name") or "").lower())
-            start_at = page * CATALOG_PAGE_SIZE
-            selected = all_rows[start_at:start_at + CATALOG_PAGE_SIZE + 1]
-            return selected[:CATALOG_PAGE_SIZE], len(selected) > CATALOG_PAGE_SIZE
-
-        text = str(query or "").strip() or default_query
-        offset = page * CATALOG_PAGE_SIZE
-        rows = runtime_db.search_catalog_items(
-            text, limit=CATALOG_PAGE_SIZE + 1, offset=offset,
-            main_category=category, sub_category=sub,
-        )
+                load_term(term)
+        else:
+            load_term(normalized_query or default_query)
     except Exception as exc:
         print(f"[loot_needs] Katalogsuche fehlgeschlagen: {type(exc).__name__}: {exc}")
-        rows = []
-    has_more = len(rows) > CATALOG_PAGE_SIZE
-    return [dict(r) for r in rows[:CATALOG_PAGE_SIZE]], has_more
+        return []
+
+    rows: list[dict[str, Any]] = []
+    for row in merged.values():
+        row_slot = _catalog_row_slot(row)
+        if row_slot != catalog_slot:
+            continue
+        if catalog_slot == "Waffe" and normalized_weapon:
+            row_weapon = _catalog_row_weapon_type(row)
+            if row_weapon != normalized_weapon:
+                continue
+        rows.append(dict(row))
+
+    rows.sort(key=lambda value: str(value.get("name") or "").casefold())
+    _CATALOG_BROWSER_CACHE[cache_key] = (now, [dict(row) for row in rows])
+    return rows
 
 
-async def _catalog_rows(slot: str, weapon_type: str | None = None, query: str = "", page: int = 0) -> tuple[list[dict[str, Any]], bool]:
+def _catalog_rows_sync(
+    slot: str,
+    weapon_type: str | None = None,
+    query: str = "",
+    page: int = 0,
+) -> tuple[list[dict[str, Any]], bool, int]:
+    all_rows = _catalog_fetch_all_sync(slot, weapon_type, query)
+    total = len(all_rows)
+    page = max(0, int(page or 0))
+    start_at = page * CATALOG_PAGE_SIZE
+    selected = all_rows[start_at:start_at + CATALOG_PAGE_SIZE]
+    return selected, start_at + len(selected) < total, total
+
+
+async def _catalog_rows(
+    slot: str,
+    weapon_type: str | None = None,
+    query: str = "",
+    page: int = 0,
+) -> tuple[list[dict[str, Any]], bool, int]:
     return await asyncio.to_thread(_catalog_rows_sync, slot, weapon_type, query, page)
 
 
@@ -776,13 +844,27 @@ def _catalog_option(row: dict[str, Any]) -> discord.SelectOption:
     return discord.SelectOption(label=name[:100], value=str(int(row.get("id") or 0)), description=desc[:100])
 
 
-def _catalog_browser_embed(title: str, slot: str, weapon_type: str | None, query: str, page: int, count: int) -> discord.Embed:
+def _catalog_browser_embed(
+    title: str,
+    slot: str,
+    weapon_type: str | None,
+    query: str,
+    page: int,
+    count: int,
+    total: int,
+) -> discord.Embed:
+    total_pages = max(1, (int(total or 0) + CATALOG_PAGE_SIZE - 1) // CATALOG_PAGE_SIZE)
+    first_number = page * CATALOG_PAGE_SIZE + 1 if count else 0
+    last_number = page * CATALOG_PAGE_SIZE + count if count else 0
     parts = [f"Slot: **{slot}**"]
     if weapon_type:
         parts.append(f"Waffentyp: **{weapon_type}**")
-    parts.append(f"Suche: **{query or 'alle'}**")
-    parts.append(f"Seite: **{page + 1}** · Treffer auf dieser Seite: **{count}**")
-    parts.append("Nutze **Suchen**, wenn das Item nicht direkt sichtbar ist.")
+    if query:
+        parts.append(f"Filter: **{query}**")
+    parts.append(f"Gefunden: **{total}** · Seite **{page + 1}/{total_pages}**")
+    if count:
+        parts.append(f"Angezeigt werden Item **{first_number}–{last_number}**.")
+    parts.append("Mit **25 weiter ▶** und **◀ 25 zurück** kannst du ohne Namenseingabe durch alle passenden Items blättern.")
     return discord.Embed(title=title, description="\n".join(parts), color=discord.Color.gold())
 
 
@@ -1702,13 +1784,13 @@ async def _show_need_catalog_browser(
 ) -> None:
     if not inter.response.is_done():
         await _portal_defer(inter, thinking=False)
-    rows, has_more = await _catalog_rows(need_slot, weapon_type, query, page)
-    emb = _catalog_browser_embed("🎁 Needliste – Item aus Datenbank wählen", need_slot, weapon_type, query, page, len(rows))
+    rows, has_more, total = await _catalog_rows(need_slot, weapon_type, query, page)
+    emb = _catalog_browser_embed("🎁 Needliste – alle passenden Items", need_slot, weapon_type, query, page, len(rows), total)
     if not rows:
         emb.add_field(name="Keine Treffer", value="Ändere den Suchbegriff oder gehe zurück.", inline=False)
     await _portal_edit(inter, 
         embed=emb,
-        view=NeedCatalogBrowserView(guild_id, user_id, tab, need_slot, weapon_type, query, page, rows, has_more),
+        view=NeedCatalogBrowserView(guild_id, user_id, tab, need_slot, weapon_type, query, page, rows, has_more, total),
     )
 
 
@@ -1735,7 +1817,7 @@ class NeedCatalogItemSelect(Select):
         self.view_ref = view_ref
         options = [_catalog_option(row) for row in rows if int(row.get("id") or 0)]
         super().__init__(
-            placeholder="Item aus der Datenbank wählen", min_values=1, max_values=1,
+            placeholder=f"{len(options)} passende Items auf dieser Seite", min_values=1, max_values=1,
             options=options, custom_id="need_catalog_item_select",
         )
 
@@ -1788,7 +1870,7 @@ class NeedCatalogItemSelect(Select):
 class NeedCatalogBrowserView(PortalSafeView):
     def __init__(
         self, guild_id: int, user_id: int, tab: str, need_slot: str, weapon_type: str | None,
-        query: str, page: int, rows: list[dict[str, Any]], has_more: bool,
+        query: str, page: int, rows: list[dict[str, Any]], has_more: bool, total: int = 0,
     ):
         super().__init__(timeout=None)
         self.guild_id = int(guild_id)
@@ -1799,6 +1881,7 @@ class NeedCatalogBrowserView(PortalSafeView):
         self.query = str(query or "")
         self.page = max(0, int(page or 0))
         self.has_more = bool(has_more)
+        self.total = max(0, int(total or 0))
         if rows:
             self.add_item(NeedCatalogItemSelect(self, rows))
         for child in self.children:
@@ -1807,16 +1890,18 @@ class NeedCatalogBrowserView(PortalSafeView):
                 child.disabled = self.page <= 0
             elif cid == "need_catalog_next":
                 child.disabled = not self.has_more
+        total_pages = max(1, (self.total + CATALOG_PAGE_SIZE - 1) // CATALOG_PAGE_SIZE)
+        self.add_item(discord.ui.Button(label=f"Seite {self.page + 1}/{total_pages}", style=ButtonStyle.secondary, disabled=True, custom_id="need_catalog_page_info", row=2))
 
     @button(label="🔎 Suchen", style=ButtonStyle.primary, custom_id="need_catalog_search", row=1)
     async def btn_search(self, inter: discord.Interaction, _):
         await inter.response.send_modal(NeedCatalogSearchModal(self.guild_id, self.user_id, self.tab, self.need_slot, self.weapon_type, self.query))
 
-    @button(label="◀", style=ButtonStyle.secondary, custom_id="need_catalog_prev", row=1)
+    @button(label="◀ 25 zurück", style=ButtonStyle.secondary, custom_id="need_catalog_prev", row=1)
     async def btn_prev(self, inter: discord.Interaction, _):
         await _show_need_catalog_browser(inter, self.guild_id, self.user_id, self.tab, self.need_slot, weapon_type=self.weapon_type, query=self.query, page=max(0, self.page - 1))
 
-    @button(label="▶", style=ButtonStyle.secondary, custom_id="need_catalog_next", row=1)
+    @button(label="25 weiter ▶", style=ButtonStyle.secondary, custom_id="need_catalog_next", row=1)
     async def btn_next(self, inter: discord.Interaction, _):
         await _show_need_catalog_browser(inter, self.guild_id, self.user_id, self.tab, self.need_slot, weapon_type=self.weapon_type, query=self.query, page=self.page + 1)
 
@@ -3847,14 +3932,14 @@ async def _show_admin_catalog_browser(
 ) -> None:
     if not inter.response.is_done():
         await _portal_defer(inter, thinking=False)
-    rows, has_more = await _catalog_rows(slot, weapon_type, query, page)
+    rows, has_more, total = await _catalog_rows(slot, weapon_type, query, page)
     title = "📦 Loot gedroppt – Item aus Datenbank wählen" if action == "drop" else "🎁 Item aus Datenbank wählen"
-    emb = _catalog_browser_embed(title, slot, weapon_type, query, page, len(rows))
+    emb = _catalog_browser_embed(title, slot, weapon_type, query, page, len(rows), total)
     if not rows:
         emb.add_field(name="Keine Treffer", value="Ändere den Suchbegriff oder gehe zurück.", inline=False)
     await _portal_edit(inter, 
         embed=emb,
-        view=AdminCatalogBrowserView(guild_id, user_id, action, slot, weapon_type, query, page, rows, has_more),
+        view=AdminCatalogBrowserView(guild_id, user_id, action, slot, weapon_type, query, page, rows, has_more, total),
     )
 
 
@@ -3935,7 +4020,7 @@ class AdminCatalogItemSelect(Select):
             image = str(row.get("image_url") or row.get("icon_url") or "")
             if image:
                 emb.set_thumbnail(url=image)
-            await _portal_edit(inter, embed=emb, view=AdminCatalogBrowserView(view.guild_id, view.user_id, view.action, view.slot, view.weapon_type, view.query, view.page, [], view.has_more))
+            await _portal_edit(inter, embed=emb, view=AdminCatalogBrowserView(view.guild_id, view.user_id, view.action, view.slot, view.weapon_type, view.query, view.page, [], view.has_more, view.total))
         except Exception as exc:
             error_id = await _portal_log_event(
                 inter, event_type="Admin-Katalogfehler", error=exc, notify_user=False
@@ -3951,7 +4036,7 @@ class AdminCatalogItemSelect(Select):
 class AdminCatalogBrowserView(PortalSafeView):
     def __init__(
         self, guild_id: int, user_id: int, action: str, slot: str, weapon_type: str | None,
-        query: str, page: int, rows: list[dict[str, Any]], has_more: bool,
+        query: str, page: int, rows: list[dict[str, Any]], has_more: bool, total: int = 0,
     ):
         super().__init__(timeout=None)
         self.guild_id = int(guild_id)
@@ -3962,6 +4047,7 @@ class AdminCatalogBrowserView(PortalSafeView):
         self.query = str(query or "")
         self.page = max(0, int(page or 0))
         self.has_more = bool(has_more)
+        self.total = max(0, int(total or 0))
         if rows:
             self.add_item(AdminCatalogItemSelect(self, rows))
         for child in self.children:
@@ -3970,16 +4056,18 @@ class AdminCatalogBrowserView(PortalSafeView):
                 child.disabled = self.page <= 0
             elif cid == "admin_catalog_next":
                 child.disabled = not self.has_more
+        total_pages = max(1, (self.total + CATALOG_PAGE_SIZE - 1) // CATALOG_PAGE_SIZE)
+        self.add_item(discord.ui.Button(label=f"Seite {self.page + 1}/{total_pages}", style=ButtonStyle.secondary, disabled=True, custom_id="admin_catalog_page_info", row=2))
 
     @button(label="🔎 Suchen", style=ButtonStyle.primary, custom_id="admin_catalog_search", row=1)
     async def btn_search(self, inter: discord.Interaction, _):
         await inter.response.send_modal(AdminCatalogSearchModal(self.guild_id, self.user_id, self.action, self.slot, self.weapon_type, self.query))
 
-    @button(label="◀", style=ButtonStyle.secondary, custom_id="admin_catalog_prev", row=1)
+    @button(label="◀ 25 zurück", style=ButtonStyle.secondary, custom_id="admin_catalog_prev", row=1)
     async def btn_prev(self, inter: discord.Interaction, _):
         await _show_admin_catalog_browser(inter, self.guild_id, self.user_id, self.action, self.slot, weapon_type=self.weapon_type, query=self.query, page=max(0, self.page - 1))
 
-    @button(label="▶", style=ButtonStyle.secondary, custom_id="admin_catalog_next", row=1)
+    @button(label="25 weiter ▶", style=ButtonStyle.secondary, custom_id="admin_catalog_next", row=1)
     async def btn_next(self, inter: discord.Interaction, _):
         await _show_admin_catalog_browser(inter, self.guild_id, self.user_id, self.action, self.slot, weapon_type=self.weapon_type, query=self.query, page=self.page + 1)
 
