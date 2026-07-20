@@ -1478,6 +1478,12 @@ async def _maybe_create_event_voice_for_obj(client: discord.Client, obj: dict) -
                     channel,
                     reason="Event-Voice für Gilde, Allianz und Freunde absichern",
                 )
+                if hasattr(central_voice_creator, "track_managed_voice_channel"):
+                    central_voice_creator.track_managed_voice_channel(
+                        channel,
+                        source_type="event",
+                        creator_id=int(obj.get("created_by", 0) or obj.get("creator_id", 0) or 0),
+                    )
             except Exception as exc:
                 print(f"[event_rsvp_dm] Event-Voice Rechte konnten nicht abgesichert werden: {exc!r}")
         await _position_event_voice(channel, anchor)

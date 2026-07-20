@@ -30,6 +30,8 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 LEADER_CONTACT_CFG_FILE = DATA_DIR / "leader_contact_cfg.json"
 VOICE_TRACK_FILE = DATA_DIR / "voice_creator_channels.json"
 VOICE_EMPTY_DELETE_DELAY_SECONDS = 60
+VOICE_PERMISSION_REPAIR_INTERVAL_SECONDS = 300
+_voice_permission_repair_task: Optional[asyncio.Task] = None
 
 VOICE_ALLOWED_ROLE_NAMES = ("Beer and Buffs", "Ebolus", "Allianz", "Alliance", "Freunde", "Friends")
 VOICE_PARTNER_ROLE_NAMES = ("Allianz", "Alliance", "Freunde", "Friends")
@@ -38,6 +40,21 @@ VOICE_BLOCKED_ROLE_NAMES = ("Raider", "Bewerber")
 
 def _norm_role_name(name: str) -> str:
     return str(name or "").strip().casefold()
+
+
+def _is_partner_role_name(name: str) -> bool:
+    normalized = _norm_role_name(name)
+    compact = re.sub(r"[^a-z0-9äöüß]+", " ", normalized).strip()
+    tokens = set(compact.split())
+    if normalized in {_norm_role_name(x) for x in VOICE_PARTNER_ROLE_NAMES}:
+        return True
+    return bool(
+        {"allianz", "alliance", "alli", "freunde", "freund", "friends", "friend"} & tokens
+        or "allianz" in normalized
+        or "alliance" in normalized
+        or "freund" in normalized
+        or "friend" in normalized
+    )
 
 
 def _find_role_by_name(guild: discord.Guild, role_name: str) -> Optional[discord.Role]:
@@ -91,9 +108,8 @@ def _voice_access_roles(guild: discord.Guild) -> tuple[list[discord.Role], list[
     # Allianz- und Freunde-Rollen sollen unabhängig davon zusätzlich Zugriff
     # erhalten, ob bereits zentrale Mitgliederrollen konfiguriert sind.
     # Weitere Rollen können weiterhin über voice_allowed gesetzt werden.
-    for role_name in VOICE_PARTNER_ROLE_NAMES:
-        role = _find_role_by_name(guild, role_name)
-        if role is not None:
+    for role in getattr(guild, "roles", []) or []:
+        if _is_partner_role_name(getattr(role, "name", "")):
             allowed_roles.append(role)
 
     # Übergangs-Fallback für alte Installationen ohne zentrale Konfiguration.
@@ -150,6 +166,7 @@ def _voice_channel_overwrites(
             view_channel=True,
             connect=True,
             speak=True,
+            stream=True,
             use_voice_activation=True,
         )
 
@@ -230,17 +247,38 @@ def _save_tracked_voice_channels(data: dict) -> None:
     _save_json(VOICE_TRACK_FILE, data)
 
 
-def _track_voice_channel(voice: discord.VoiceChannel, *, source_channel_id: int, creator_id: int, user_limit: int) -> None:
+def track_managed_voice_channel(
+    voice: discord.VoiceChannel,
+    *,
+    source_type: str = "panel",
+    source_channel_id: int = 0,
+    creator_id: int = 0,
+    user_limit: int = 0,
+) -> None:
+    """Registriert jeden vom Bot erzeugten Voice für spätere Rechte-Reparaturen."""
     data = _load_tracked_voice_channels()
+    existing = data.get(str(voice.id)) if isinstance(data.get(str(voice.id)), dict) else {}
     data[str(voice.id)] = {
+        **existing,
         "guild_id": int(voice.guild.id),
         "channel_id": int(voice.id),
-        "source_channel_id": int(source_channel_id),
-        "creator_id": int(creator_id),
-        "user_limit": int(user_limit),
+        "source_type": str(source_type or existing.get("source_type") or "bot"),
+        "source_channel_id": int(source_channel_id or existing.get("source_channel_id") or 0),
+        "creator_id": int(creator_id or existing.get("creator_id") or 0),
+        "user_limit": int(user_limit or existing.get("user_limit") or getattr(voice, "user_limit", 0) or 0),
         "name": str(voice.name),
     }
     _save_tracked_voice_channels(data)
+
+
+def _track_voice_channel(voice: discord.VoiceChannel, *, source_channel_id: int, creator_id: int, user_limit: int) -> None:
+    track_managed_voice_channel(
+        voice,
+        source_type="voice_panel",
+        source_channel_id=source_channel_id,
+        creator_id=creator_id,
+        user_limit=user_limit,
+    )
 
 
 def _untrack_voice_channel(channel_id: int) -> None:
@@ -251,10 +289,15 @@ def _untrack_voice_channel(channel_id: int) -> None:
 
 
 def _is_tracked_voice_channel(channel_id: Optional[int]) -> bool:
+    """Nur temporäre Voice-Panel-Kanäle werden automatisch leer gelöscht."""
     if not channel_id:
         return False
     data = _load_tracked_voice_channels()
-    return str(channel_id) in data
+    row = data.get(str(channel_id))
+    if not isinstance(row, dict):
+        return False
+    source_type = str(row.get("source_type") or "voice_panel").strip().lower()
+    return source_type in {"panel", "voice_panel", "temporary"}
 
 
 def _is_admin(inter: discord.Interaction) -> bool:
@@ -323,6 +366,124 @@ async def _delete_tracked_voice_if_empty(channel: discord.abc.GuildChannel | Non
             f"[VOICE-PANEL] auto_delete_failed guild={guild_id} channel={channel_id} name={channel_name} error={e!r}",
             flush=True,
         )
+
+
+def _event_voice_references() -> list[dict]:
+    """Liest aktive/gespeicherte Event-Voice-IDs ohne harte Modulabhängigkeit."""
+    try:
+        try:
+            from bot import event_rsvp_dm as rsvp  # type: ignore
+        except Exception:
+            import event_rsvp_dm as rsvp  # type: ignore
+        event_store = getattr(rsvp, "store", {}) or {}
+    except Exception:
+        return []
+
+    refs: list[dict] = []
+    for event_id, obj in list(event_store.items()):
+        if not isinstance(obj, dict):
+            continue
+        channel_id = int(obj.get("voice_channel_id", 0) or 0)
+        guild_id = int(obj.get("guild_id", 0) or 0)
+        if channel_id and guild_id:
+            refs.append({
+                "guild_id": guild_id,
+                "channel_id": channel_id,
+                "creator_id": int(obj.get("created_by", 0) or obj.get("creator_id", 0) or 0),
+                "source_type": "event",
+                "event_id": str(event_id),
+            })
+    return refs
+
+
+def _managed_voice_references() -> list[dict]:
+    refs: list[dict] = []
+    tracked = _load_tracked_voice_channels()
+    for channel_id, row in list(tracked.items()):
+        if not isinstance(row, dict):
+            continue
+        try:
+            cid = int(row.get("channel_id") or channel_id)
+            gid = int(row.get("guild_id") or 0)
+        except Exception:
+            continue
+        if cid and gid:
+            refs.append({**row, "channel_id": cid, "guild_id": gid})
+    refs.extend(_event_voice_references())
+
+    unique: dict[tuple[int, int], dict] = {}
+    for row in refs:
+        key = (int(row.get("guild_id") or 0), int(row.get("channel_id") or 0))
+        if key[0] and key[1]:
+            unique[key] = {**unique.get(key, {}), **row}
+    return list(unique.values())
+
+
+async def repair_managed_voice_permissions_once(client: discord.Client) -> dict[str, int]:
+    """Repariert wirklich alle bekannten, vom Bot erzeugten Voice-Kanäle."""
+    checked = repaired = missing = failed = 0
+    tracked = _load_tracked_voice_channels()
+    tracked_changed = False
+
+    for row in _managed_voice_references():
+        guild_id = int(row.get("guild_id") or 0)
+        channel_id = int(row.get("channel_id") or 0)
+        guild = client.get_guild(guild_id) if guild_id else None
+        channel = guild.get_channel(channel_id) if guild is not None else None
+        if not isinstance(channel, discord.VoiceChannel):
+            missing += 1
+            if str(channel_id) in tracked:
+                tracked.pop(str(channel_id), None)
+                tracked_changed = True
+            continue
+
+        checked += 1
+        creator_id = int(row.get("creator_id") or 0)
+        creator = guild.get_member(creator_id) if creator_id else None
+        try:
+            before = dict(channel.overwrites)
+            await ensure_voice_channel_permissions(
+                channel,
+                creator=creator,
+                reason="Bot-Voice für Gilde, Allianz und Freunde freigeben",
+            )
+            if before != dict(channel.overwrites):
+                repaired += 1
+            source_type = str(row.get("source_type") or "bot")
+            if source_type == "event" and str(channel_id) not in tracked:
+                track_managed_voice_channel(channel, source_type="event", creator_id=creator_id)
+        except Exception as exc:
+            failed += 1
+            print(
+                f"[VOICE-PANEL] permission_repair_failed guild={guild_id} channel={channel_id} error={exc!r}",
+                flush=True,
+            )
+
+    if tracked_changed:
+        _save_tracked_voice_channels(tracked)
+    return {"checked": checked, "repaired": repaired, "missing": missing, "failed": failed}
+
+
+async def _voice_permission_repair_loop(client: discord.Client) -> None:
+    await client.wait_until_ready()
+    while not client.is_closed():
+        try:
+            summary = await repair_managed_voice_permissions_once(client)
+            if summary.get("repaired") or summary.get("failed"):
+                print(f"[VOICE-PANEL] permission_repair {summary}", flush=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print(f"[VOICE-PANEL] permission_repair_loop error={exc!r}", flush=True)
+        await asyncio.sleep(VOICE_PERMISSION_REPAIR_INTERVAL_SECONDS)
+
+
+def _start_voice_permission_repair_loop(client: discord.Client) -> None:
+    global _voice_permission_repair_task
+    if _voice_permission_repair_task is not None and not _voice_permission_repair_task.done():
+        return
+    _voice_permission_repair_task = asyncio.create_task(_voice_permission_repair_loop(client))
+    print("✅ Bot-Voice Rechteprüfung für Gilde, Allianz und Freunde gestartet.", flush=True)
 
 
 class VoiceCreateModal(Modal, title="Sprachkanal erstellen"):
@@ -463,6 +624,7 @@ class VoiceCreatePanel(View):
 
 async def setup_voice_creator(client: discord.Client, tree: app_commands.CommandTree):
     client.add_view(VoiceCreatePanel())
+    _start_voice_permission_repair_loop(client)
 
     if not getattr(client, "_ebolus_voice_autodelete_listener", False):
         async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):

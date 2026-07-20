@@ -4232,6 +4232,8 @@ async def _admin_create_event_voice(
                     channel,
                     reason="Event-Voice für Gilde, Allianz und Freunde absichern",
                 )
+                if hasattr(voice_creator, "track_managed_voice_channel"):
+                    voice_creator.track_managed_voice_channel(channel, source_type="event")
             except Exception as exc:
                 print(f"[member_portal] Event-Voice Rechte konnten nicht abgesichert werden: {exc!r}")
         return channel

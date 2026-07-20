@@ -2138,6 +2138,11 @@ def build_dashboard_snapshot(bot: commands.Bot, guild: discord.Guild) -> dict[st
             "cached_members_loaded": len(_active_member_ids(guild)),
             "member_filter": _dashboard_member_filter_info(guild),
             "bot_user_id": int(getattr(getattr(bot, "user", None), "id", 0) or 0),
+            "bot_application_id": int(
+                getattr(bot, "application_id", 0)
+                or getattr(getattr(bot, "user", None), "id", 0)
+                or 0
+            ),
         },
         "storage": {
             "runtime_backend": status.get("backend"),
@@ -2166,6 +2171,12 @@ def build_dashboard_snapshot(bot: commands.Bot, guild: discord.Guild) -> dict[st
         "voice": _voice_summary(guild_id),
         "audit": _audit_summary(guild_id),
     }
+    application_id = str(
+        int(getattr(bot, "application_id", 0) or getattr(getattr(bot, "user", None), "id", 0) or 0)
+        or ""
+    )
+    if isinstance(snapshot.get("auth"), dict):
+        snapshot["auth"]["oauth_application_id"] = application_id
     snapshot["insights"] = _dashboard_insights(guild, snapshot)
     return snapshot
 
