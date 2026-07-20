@@ -31,7 +31,8 @@ LEADER_CONTACT_CFG_FILE = DATA_DIR / "leader_contact_cfg.json"
 VOICE_TRACK_FILE = DATA_DIR / "voice_creator_channels.json"
 VOICE_EMPTY_DELETE_DELAY_SECONDS = 60
 
-VOICE_ALLOWED_ROLE_NAMES = ("Ebolus", "Allianz", "Freunde")
+VOICE_ALLOWED_ROLE_NAMES = ("Beer and Buffs", "Ebolus", "Allianz", "Alliance", "Freunde", "Friends")
+VOICE_PARTNER_ROLE_NAMES = ("Allianz", "Alliance", "Freunde", "Friends")
 VOICE_BLOCKED_ROLE_NAMES = ("Raider", "Bewerber")
 
 
@@ -86,6 +87,14 @@ def _voice_access_roles(guild: discord.Guild) -> tuple[list[discord.Role], list[
                 f"[VOICE-PANEL] zentrale Rollenauflösung fehlgeschlagen guild={guild.id}: {exc!r}",
                 flush=True,
             )
+
+    # Allianz- und Freunde-Rollen sollen unabhängig davon zusätzlich Zugriff
+    # erhalten, ob bereits zentrale Mitgliederrollen konfiguriert sind.
+    # Weitere Rollen können weiterhin über voice_allowed gesetzt werden.
+    for role_name in VOICE_PARTNER_ROLE_NAMES:
+        role = _find_role_by_name(guild, role_name)
+        if role is not None:
+            allowed_roles.append(role)
 
     # Übergangs-Fallback für alte Installationen ohne zentrale Konfiguration.
     if not allowed_roles:
@@ -159,6 +168,39 @@ def _voice_channel_overwrites(
         )
 
     return overwrites, allowed_roles, blocked_roles
+
+
+async def ensure_voice_channel_permissions(
+    channel: discord.VoiceChannel,
+    *,
+    creator: Optional[discord.Member] = None,
+    reason: str = "Voice-Zugriffsrechte für Gilde, Allianz und Freunde absichern",
+) -> tuple[list[discord.Role], list[discord.Role]]:
+    """Ergänzt die zentralen Voice-Rechte auf einem vorhandenen Kanal.
+
+    Vorhandene spezielle Overwrites bleiben erhalten. Die Standardrolle,
+    erlaubten Rollen, gesperrten Rollen und optional der Ersteller werden
+    jedoch konsistent gesetzt.
+    """
+    required, allowed_roles, blocked_roles = _voice_channel_overwrites(
+        channel.guild,
+        creator=creator,
+    )
+    needs_update = False
+    for target, wanted in required.items():
+        current = channel.overwrites_for(target)
+        for permission_name, wanted_value in wanted:
+            if getattr(current, permission_name, None) is not wanted_value:
+                needs_update = True
+                break
+        if needs_update:
+            break
+
+    if needs_update:
+        merged = dict(channel.overwrites)
+        merged.update(required)
+        await channel.edit(overwrites=merged, reason=reason)
+    return allowed_roles, blocked_roles
 
 
 def _load_json(path: Path, default):

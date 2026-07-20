@@ -46,6 +46,14 @@ except Exception:
     except Exception:
         central_guild_config = None  # type: ignore
 
+try:
+    from bot import voice_creator as central_voice_creator  # type: ignore
+except Exception:
+    try:
+        import voice_creator as central_voice_creator  # type: ignore
+    except Exception:
+        central_voice_creator = None  # type: ignore
+
 
 def _guild_brand_name(guild_or_id: Any, fallback: str = "Gilde") -> str:
     try:
@@ -1437,17 +1445,41 @@ async def _maybe_create_event_voice_for_obj(client: discord.Client, obj: dict) -
         if existing_id:
             existing = guild.get_channel(existing_id)
             if isinstance(existing, discord.VoiceChannel):
+                if central_voice_creator is not None:
+                    try:
+                        await central_voice_creator.ensure_voice_channel_permissions(
+                            existing,
+                            reason="Bestehenden Event-Voice für Gilde, Allianz und Freunde freigeben",
+                        )
+                    except Exception as exc:
+                        print(f"[event_rsvp_dm] Event-Voice Rechte konnten nicht nachgezogen werden: {exc!r}")
                 return False
             obj["voice_channel_id"] = 0
 
         category, anchor = _event_voice_category_and_anchor(guild, obj)
         name = str(obj.get("voice_name", "") or "").strip() or _event_voice_name(str(obj.get("title", "Event")))
 
+        overwrites = None
+        if central_voice_creator is not None:
+            try:
+                overwrites, _, _ = central_voice_creator._voice_channel_overwrites(guild)
+            except Exception as exc:
+                print(f"[event_rsvp_dm] Event-Voice Rollenauflösung fehlgeschlagen: {exc!r}")
+
         channel = await guild.create_voice_channel(
             name=name,
             category=category,
+            overwrites=overwrites,
             reason="Event-Voice automatisch 1 Stunde vor Event erstellt",
         )
+        if central_voice_creator is not None:
+            try:
+                await central_voice_creator.ensure_voice_channel_permissions(
+                    channel,
+                    reason="Event-Voice für Gilde, Allianz und Freunde absichern",
+                )
+            except Exception as exc:
+                print(f"[event_rsvp_dm] Event-Voice Rechte konnten nicht abgesichert werden: {exc!r}")
         await _position_event_voice(channel, anchor)
 
         obj["voice_channel_id"] = int(channel.id)

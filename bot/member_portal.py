@@ -1087,8 +1087,20 @@ def _portal_user_state(guild_id: int, user_id: int) -> dict:
     return u
 
 
-def _mark_portal_sent(guild_id: int, user_id: int, message_id: int | None = None) -> None:
-    """Remember the active portal message without writing the volume on every click."""
+def _mark_portal_sent(
+    guild_id: int,
+    user_id: int,
+    message_id: int | None = None,
+    *,
+    allow_older: bool = False,
+) -> None:
+    """Remember the active portal message without allowing stale races.
+
+    Discord snowflake IDs in one DM channel increase over time. A slow repair
+    task that fetched an older message before a newly created portal must not
+    overwrite the newer active ID afterwards. ``allow_older`` is reserved for
+    recovery after the stored message was proven missing/invalid.
+    """
     g = _sent_guild(guild_id)
     arr = set(str(x) for x in g.get("sent_users", []))
     changed = str(user_id) not in arr
@@ -1098,6 +1110,15 @@ def _mark_portal_sent(guild_id: int, user_id: int, message_id: int | None = None
     u = _portal_user_state(guild_id, user_id)
     old_mid = int(u.get("menu_message_id", 0) or 0)
     new_mid = int(message_id or old_mid or 0)
+
+    if new_mid and old_mid and new_mid < old_mid and not allow_older:
+        print(
+            f"[member_portal] Ältere Portal-ID ignoriert guild={guild_id} "
+            f"user={user_id} old={old_mid} candidate={new_mid}",
+            flush=True,
+        )
+        new_mid = old_mid
+
     if new_mid and new_mid != old_mid:
         u["menu_message_id"] = new_mid
         changed = True
@@ -2112,6 +2133,84 @@ def _message_component_ids(message: discord.Message | None) -> set[str]:
     return out
 
 
+def _message_is_ephemeral(message: discord.Message | None) -> bool:
+    """Return whether Discord marks this interaction message as ephemeral."""
+    if message is None:
+        return False
+    try:
+        flags = getattr(message, "flags", None)
+        return bool(flags is not None and getattr(flags, "ephemeral", False))
+    except Exception:
+        return False
+
+
+def _message_embed_title(message: discord.Message | None) -> str:
+    if message is None:
+        return ""
+    try:
+        embeds = list(getattr(message, "embeds", []) or [])
+        if embeds:
+            return str(getattr(embeds[0], "title", "") or "").strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _looks_like_primary_portal_surface(message: discord.Message | None) -> bool:
+    """Identify the one durable Gildenzentrale message, not helper responses.
+
+    Event/channel/role pickers are often sent as separate ephemeral interaction
+    responses. They intentionally have a different message ID and must never be
+    compared with the stored portal root ID.
+    """
+    if message is None or _message_is_ephemeral(message):
+        return False
+
+    title = _message_embed_title(message).casefold()
+    ids = _message_component_ids(message)
+
+    if "portal_main_select" in ids:
+        return True
+
+    durable_title_tokens = (
+        "gildenzentrale",
+        "dein gildenprofil",
+        "gildenkalender",
+        "mitglieder",
+        "abwesenheitskalender",
+        "raid-/event-dms",
+        "regeln & lootsystem",
+        "kontakt & hilfe",
+        "needliste",
+        "auktionen",
+        "admin – event",
+        "admin – loot",
+        "admin – anwesenheit",
+    )
+    if any(token in title for token in durable_title_tokens):
+        return True
+
+    # Root submenus are edited into the stored portal message. Temporary wizard
+    # responses use admin_event_*/admin_alliance_* and are deliberately excluded.
+    durable_prefixes = (
+        "portal_personal_",
+        "portal_dm_",
+        "portal_loot_",
+        "portal_guild_",
+        "portal_absence_calendar_",
+        "portal_support_",
+        "portal_profile_",
+        "portal_events_",
+        "rules_",
+        "help_",
+        "need_",
+        "portalauc:",
+        "portalsale:",
+        "portal_auc_",
+    )
+    return any(cid.startswith(durable_prefixes) for cid in ids)
+
+
 def _portal_component_ids_from_view(view: discord.ui.View) -> set[str]:
     out: set[str] = set()
     for child in list(getattr(view, "children", []) or []):
@@ -2172,7 +2271,7 @@ async def _deactivate_old_portal_messages(
                 continue
             if int(msg.id) == int(active_message_id or 0):
                 continue
-            if not getattr(msg, "components", None) or not _looks_like_portal_message(msg):
+            if not getattr(msg, "components", None) or not _looks_like_primary_portal_surface(msg):
                 continue
             try:
                 await msg.edit(view=None)
@@ -2190,14 +2289,22 @@ async def _fetch_or_find_active_portal_message(
     guild_id: int,
     user_id: int,
 ) -> Optional[discord.Message]:
-    """Fetch the stored portal message or recover its ID from recent DMs.
+    """Fetch the stored root portal or recover it from recent durable DMs.
 
-    Older installations only stored ``sent_users`` and had no message ID. That
-    made a restart repair impossible even though the portal DM still existed.
+    A temporary ephemeral wizard response must never become the saved portal ID.
+    Older versions could accidentally store such a response when the root ID was
+    empty, causing a freshly updated menu to be declared stale immediately.
     """
+    stored_id = _portal_message_id(guild_id, user_id)
     message = await _fetch_portal_message(client, guild_id, user_id)
-    if message is not None:
+    if message is not None and _looks_like_primary_portal_surface(message):
         return message
+    if message is not None:
+        print(
+            f"[member_portal] Gespeicherte Portal-ID ist keine dauerhafte "
+            f"Gildenzentrale guild={guild_id} user={user_id} message={message.id}",
+            flush=True,
+        )
 
     user = client.get_user(int(user_id))
     if user is None:
@@ -2212,9 +2319,15 @@ async def _fetch_or_find_active_portal_message(
                 continue
             if not getattr(candidate, "components", None):
                 continue
-            if not _looks_like_portal_message(candidate):
+            if not _looks_like_primary_portal_surface(candidate):
                 continue
-            _mark_portal_sent(guild_id, user_id, candidate.id)
+            _mark_portal_sent(guild_id, user_id, candidate.id, allow_older=True)
+            if stored_id and int(candidate.id) != int(stored_id):
+                print(
+                    f"[member_portal] Portal-ID korrigiert guild={guild_id} user={user_id} "
+                    f"old={stored_id} new={candidate.id}",
+                    flush=True,
+                )
             return candidate
     except Exception as exc:
         print(f"[member_portal] Portal-ID-Recovery fehlgeschlagen user={user_id}: {exc!r}", flush=True)
@@ -3238,10 +3351,10 @@ async def _auto_reset_portal_after_view_error(inter: discord.Interaction, error:
 
     try:
         msg = (
-            "⚠️ Dieses Menü war veraltet und wurde automatisch auf die Startseite zurückgesetzt. "
-            "Bitte im Privatchat nochmal klicken."
+            "⚠️ Diese Menüaktion konnte technisch nicht abgeschlossen werden. "
+            "Die Gildenzentrale wurde sicher auf die Startseite zurückgesetzt. Bitte nochmal klicken."
             if repaired
-            else "⚠️ Dieses Menü war veraltet. Ich konnte es nicht automatisch reparieren. Prüfe bitte deine Discord-DM-Einstellungen."
+            else "⚠️ Diese Menüaktion ist technisch fehlgeschlagen. Ich konnte die Gildenzentrale nicht automatisch reparieren. Prüfe bitte deine Discord-DM-Einstellungen."
         )
 
         if not inter.response.is_done():
@@ -3360,11 +3473,12 @@ class PortalSafeView(View):
             self._wrap_child_callback(child)
 
     async def interaction_check(self, inter: discord.Interaction) -> bool:
-        """Reject clicks on obsolete duplicate portal DMs.
+        """Reject only genuine obsolete root portals, never helper responses.
 
-        Server-channel panels (for example the public portal opener) are not
-        restricted. In a DM, however, only the currently stored portal message
-        may remain interactive.
+        A modal can send an ephemeral channel/role/item picker in the same DM.
+        Its message ID is supposed to differ from the durable Gildenzentrale ID.
+        The previous blanket comparison falsely marked those fresh picker messages
+        as stale and reset the menu while the user was in the middle of a workflow.
         """
         component_id = _portal_component_id(inter)
         # ACK every normal button/select immediately, before guild resolution,
@@ -3383,25 +3497,72 @@ class PortalSafeView(View):
 
         if inter.guild is not None or inter.message is None:
             return True
+
         guild, member = await _resolve_guild_member_from_inter(inter)
         if not guild or not member:
             await _portal_send(inter, "❌ Ich konnte deinen Server nicht zuordnen.", ephemeral=True)
             return False
+
+        current_id = int(getattr(inter.message, "id", 0) or 0)
         active_id = _portal_message_id(guild.id, member.id)
-        if active_id and int(inter.message.id) != int(active_id):
+        is_ephemeral = _message_is_ephemeral(inter.message)
+        is_primary_surface = _looks_like_primary_portal_surface(inter.message)
+
+        # Separate ephemeral wizard responses (channel picker, role picker,
+        # confirmations etc.) are part of the current workflow. They are not the
+        # saved root portal and therefore must never trigger duplicate detection.
+        if is_ephemeral:
+            return True
+
+        if active_id and current_id != int(active_id):
+            # Non-root helper responses may also exist as normal DM messages.
+            if not is_primary_surface:
+                return True
+
+            # A newer durable root message wins. This self-heals a race where a
+            # slow old repair task saved an older message ID after a fresh portal
+            # had already been created.
+            if current_id > int(active_id):
+                _mark_portal_sent(guild.id, member.id, current_id)
+                print(
+                    f"[member_portal] Neuere Gildenzentrale übernommen guild={guild.id} "
+                    f"user={member.id} old={active_id} new={current_id}",
+                    flush=True,
+                )
+                return True
+
+            # If the stored target is missing or was itself only a helper response,
+            # recover by adopting the clicked durable root even when its snowflake
+            # is numerically older.
+            stored_message = await _fetch_portal_message(inter.client, guild.id, member.id)
+            if stored_message is None or not _looks_like_primary_portal_surface(stored_message):
+                _mark_portal_sent(guild.id, member.id, current_id, allow_older=True)
+                print(
+                    f"[member_portal] Ungültige Portal-ID beim Klick repariert guild={guild.id} "
+                    f"user={member.id} old={active_id} new={current_id}",
+                    flush=True,
+                )
+                return True
+
+            # Only now do we know that the member clicked an actually older
+            # duplicate root portal while a valid newer root exists.
             try:
                 await inter.message.edit(view=None)
             except Exception:
                 pass
             await _portal_send(
                 inter,
-                "ℹ️ Diese Gildenzentrale ist veraltet. Ich habe die aktuelle Gildenzentrale in diesem Privatchat erneuert.",
+                "ℹ️ Du hast eine ältere Gildenzentrale geöffnet. Die neuere Version bleibt in diesem Privatchat aktiv.",
                 ephemeral=True,
             )
-            await ensure_portal_menu_for_user(inter.client, guild.id, member.id, force_view="main")
             return False
+
         if not active_id:
-            _mark_portal_sent(guild.id, member.id, inter.message.id)
+            # Never store an ephemeral/helper message as the durable portal root.
+            if is_primary_surface and current_id:
+                _mark_portal_sent(guild.id, member.id, current_id)
+            return True
+
         return True
 
     async def on_error(self, inter: discord.Interaction, error: Exception, item) -> None:
@@ -4045,11 +4206,35 @@ async def _admin_create_event_voice(
         category = None
 
     try:
-        return await guild.create_voice_channel(
+        overwrites = None
+        voice_creator = None
+        try:
+            from bot import voice_creator as voice_creator  # type: ignore
+        except Exception:
+            try:
+                import voice_creator as voice_creator  # type: ignore
+            except Exception:
+                voice_creator = None
+        if voice_creator is not None:
+            try:
+                overwrites, _, _ = voice_creator._voice_channel_overwrites(guild)
+            except Exception as exc:
+                print(f"[member_portal] Event-Voice Rollenauflösung fehlgeschlagen: {exc!r}")
+        channel = await guild.create_voice_channel(
             name=_admin_clean_voice_name(title),
             category=category,
+            overwrites=overwrites,
             reason="Event-Voice automatisch über Gildenzentrale erstellt",
         )
+        if voice_creator is not None:
+            try:
+                await voice_creator.ensure_voice_channel_permissions(
+                    channel,
+                    reason="Event-Voice für Gilde, Allianz und Freunde absichern",
+                )
+            except Exception as exc:
+                print(f"[member_portal] Event-Voice Rechte konnten nicht abgesichert werden: {exc!r}")
+        return channel
     except Exception as e:
         print(f"[member_portal] Event-Voice konnte nicht erstellt werden: {e!r}")
         return None
