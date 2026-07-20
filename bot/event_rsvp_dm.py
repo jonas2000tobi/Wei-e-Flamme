@@ -46,14 +46,6 @@ except Exception:
     except Exception:
         central_guild_config = None  # type: ignore
 
-try:
-    from bot import voice_creator as central_voice_creator  # type: ignore
-except Exception:
-    try:
-        import voice_creator as central_voice_creator  # type: ignore
-    except Exception:
-        central_voice_creator = None  # type: ignore
-
 
 def _guild_brand_name(guild_or_id: Any, fallback: str = "Gilde") -> str:
     try:
@@ -1445,47 +1437,17 @@ async def _maybe_create_event_voice_for_obj(client: discord.Client, obj: dict) -
         if existing_id:
             existing = guild.get_channel(existing_id)
             if isinstance(existing, discord.VoiceChannel):
-                if central_voice_creator is not None:
-                    try:
-                        await central_voice_creator.ensure_voice_channel_permissions(
-                            existing,
-                            reason="Bestehenden Event-Voice für Gilde, Allianz und Freunde freigeben",
-                        )
-                    except Exception as exc:
-                        print(f"[event_rsvp_dm] Event-Voice Rechte konnten nicht nachgezogen werden: {exc!r}")
                 return False
             obj["voice_channel_id"] = 0
 
         category, anchor = _event_voice_category_and_anchor(guild, obj)
         name = str(obj.get("voice_name", "") or "").strip() or _event_voice_name(str(obj.get("title", "Event")))
 
-        overwrites = None
-        if central_voice_creator is not None:
-            try:
-                overwrites, _, _ = central_voice_creator._voice_channel_overwrites(guild)
-            except Exception as exc:
-                print(f"[event_rsvp_dm] Event-Voice Rollenauflösung fehlgeschlagen: {exc!r}")
-
         channel = await guild.create_voice_channel(
             name=name,
             category=category,
-            overwrites=overwrites,
             reason="Event-Voice automatisch 1 Stunde vor Event erstellt",
         )
-        if central_voice_creator is not None:
-            try:
-                await central_voice_creator.ensure_voice_channel_permissions(
-                    channel,
-                    reason="Event-Voice für Gilde, Allianz und Freunde absichern",
-                )
-                if hasattr(central_voice_creator, "track_managed_voice_channel"):
-                    central_voice_creator.track_managed_voice_channel(
-                        channel,
-                        source_type="event",
-                        creator_id=int(obj.get("created_by", 0) or obj.get("creator_id", 0) or 0),
-                    )
-            except Exception as exc:
-                print(f"[event_rsvp_dm] Event-Voice Rechte konnten nicht abgesichert werden: {exc!r}")
         await _position_event_voice(channel, anchor)
 
         obj["voice_channel_id"] = int(channel.id)
@@ -2662,13 +2624,17 @@ def _phase3_mirror_events_from_store(guild_id: int | None = None) -> dict[str, A
                     continue
                 gid_s = str(gid)
                 ev_id = str(event_id)
-                active_ids = _phase3_event_active_member_ids(gid_s)
+                # Alle aktuellen Antworten aus dem produktiven Event-Store spiegeln.
+                #
+                # Frühere Versionen haben hier gegen ``phase3_members`` gefiltert.
+                # Diese Tabelle kann zwischen zwei Member-Snapshots kurzzeitig
+                # unvollständig sein. Dann zeigte Discord z. B. 30 Zusagen, während
+                # im Dashboard nur 17 RSVP-Zeilen ankamen. Die Mitgliedsprüfung
+                # gehört in die Darstellung/Auswertung, nicht in den verlustbehafteten
+                # Event-Mirror.
                 skipped_inactive = 0
                 for row in _phase3_event_rsvp_rows_from_store(obj, ev_id):
                     uid = str(row.get("user_id") or "").strip()
-                    if active_ids and (not uid or uid not in active_ids):
-                        skipped_inactive += 1
-                        continue
                     display = str(row.get("display_name") or "").strip()
                     response = str(row.get("response") or "").strip()
                     role_name = str(row.get("role_name") or "").strip()
@@ -2687,7 +2653,7 @@ def _phase3_mirror_events_from_store(guild_id: int | None = None) -> dict[str, A
             cur.execute("""
                 INSERT INTO phase3_migration_runs (run_id, guild_id, mode, status, counts_json, notes, created_at)
                 VALUES (%s,%s,'event_rsvp_parallel_mirror','done',%s,%s,now())
-            """, (run_id, str(guild_id or ""), _phase3_event_jsonb({"events": events_count, "event_rsvps": rsvp_count, "inactive_rsvps_skipped": locals().get("skipped_inactive", 0)}), "Bot hat Events/RSVPs direkt aus event_rsvp.json nach Postgres gespiegelt; ehemalige Mitglieder wurden aus Phase-3-RSVPs ausgelassen."))
+            """, (run_id, str(guild_id or ""), _phase3_event_jsonb({"events": events_count, "event_rsvps": rsvp_count, "inactive_rsvps_skipped": locals().get("skipped_inactive", 0)}), "Bot hat Events/RSVPs vollständig aus event_rsvp.json nach Postgres gespiegelt. Mitgliedsfilter werden erst bei der Dashboard-Auswertung angewendet."))
         conn.commit()
         return {"ok": True, "events": events_count, "event_rsvps": rsvp_count}
     finally:
