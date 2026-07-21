@@ -16905,20 +16905,48 @@ def _discord_feed_escape_content(text: Any) -> str:
     return _e(text).replace("\n", "<br>")
 
 
+def _discord_feed_message_block(content: Any) -> dict[str, str] | None:
+    """Teilt einen normalen Discord-Beitrag in Überschrift und Text.
+
+    Schreibweise im Discord-Kanal:
+        Erste Zeile = Überschrift
+        Ab der nächsten Zeile = Beitragstext
+
+    Eine einzelne Zeile bleibt normaler Text. Dadurch werden kurze Hinweise oder
+    reine Links nicht versehentlich als Überschrift ohne Inhalt dargestellt.
+    Leerzeilen im eigentlichen Text bleiben erhalten.
+    """
+    normalized = str(content or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not normalized:
+        return None
+
+    lines = normalized.split("\n")
+    first_index = next((idx for idx, line in enumerate(lines) if line.strip()), None)
+    if first_index is None:
+        return None
+
+    heading = lines[first_index].strip()
+    body = "\n".join(lines[first_index + 1:]).strip()
+    if not body:
+        return {"heading": "", "text": heading}
+    return {"heading": heading, "text": body}
+
+
 def _discord_feed_parts(msg: dict[str, Any]) -> dict[str, Any]:
     """Bereitet Feed-Nachrichten als ruhige Beiträge statt als Chat auf.
 
-    Es wird kein künstlicher Titel aus der ersten Zeile erzeugt. Der tatsächliche
-    Nachrichteninhalt bleibt vollständig erhalten; vorhandene Discord-Embed-Titel
-    werden lediglich als Teil des Beitrags dargestellt.
+    Bei normalen Discord-Nachrichten wird die erste nicht-leere Zeile als echte
+    Überschrift verwendet, sobald danach weiterer Text folgt. Embed-Titel bleiben
+    unverändert erhalten. Es werden keine zusätzlichen Titel erfunden.
     """
     content = str(msg.get("content") or "").strip()
     embeds = [x for x in (msg.get("embeds") or []) if isinstance(x, dict)]
     attachments = [x for x in (msg.get("attachments") or []) if isinstance(x, dict)]
 
     blocks: list[dict[str, str]] = []
-    if content:
-        blocks.append({"heading": "", "text": content})
+    message_block = _discord_feed_message_block(content)
+    if message_block:
+        blocks.append(message_block)
     for embed in embeds:
         heading = str(embed.get("title") or "").strip()
         description = str(embed.get("description") or "").strip()
@@ -17051,7 +17079,7 @@ def _render_discord_feed_page(data: dict[str, Any], *, key: str, title: str, sub
       .feed-badge.important{border-color:rgba(234,105,79,.24);background:rgba(180,57,39,.12);color:#ffb09e}
       .feed-post-content{display:grid;gap:13px}
       .feed-content-block{display:grid;gap:6px}
-      .feed-embed-heading{font-size:16px;font-weight:900;color:#f0d898}
+      .feed-embed-heading{font-size:clamp(19px,2.2vw,25px);line-height:1.2;font-weight:900;color:#f0d898;letter-spacing:.01em;margin-bottom:3px}
       .feed-post-copy{white-space:normal;color:#dedfe3;line-height:1.68;font-size:15px;overflow-wrap:anywhere}
       .feed-post-images{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px;margin-top:15px}
       .feed-post-images a{display:block;border-radius:13px;overflow:hidden;border:1px solid rgba(214,168,79,.15);background:rgba(0,0,0,.25)}
@@ -17115,7 +17143,7 @@ def tnl_news_page(_: bool = Depends(_auth)) -> HTMLResponse:
         _snapshot_payload(),
         key="news",
         title="📰 TnL News",
-        subtitle="Aktuelle Spielmeldungen aus dem verbundenen Discord-Kanal, ohne künstliche Überschriften.",
+        subtitle="Aktuelle Spielmeldungen aus dem verbundenen Discord-Kanal, klar als Beiträge gegliedert.",
         env_hint="DASHBOARD_NEWS_CHANNEL_ID",
     ))
 
