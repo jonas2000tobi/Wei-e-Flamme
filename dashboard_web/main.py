@@ -12757,29 +12757,304 @@ def _render_member_events_page(data: dict[str, Any], request: Request) -> str:
 
 def _render_member_auctions_page(data: dict[str, Any], request: Request) -> str:
     if not data.get("ok"):
-        return _html_shell("Auktionen · Mitgliederbereich", f"<section class='panel'><h1>🏆 Auktionen</h1><p class='muted'>{_e(data.get('error'))}</p></section>", nav_mode="member")
-    snap: dict[str, Any] = data.get("snapshot") or {}
-    auctions = _portal_active_auctions(snap)
-    rows = []
-    for a in auctions:
-        aid = str(a.get("auction_id") or "")
-        count_title, count_value, _ = _auction_count_label(a)
-        rows.append([
-            _auction_link(aid, a.get("item_name") or a.get("item") or aid),
-            _phase_label(a),
-            _loot_effective_status_label(a),
-            f"{count_value} {count_title}",
-            _auction_leader_or_roll_text(a, snap),
-            _auction_timer_text(a),
-            _raw(f'<a class="btn" href="/auction/{_e(aid)}">Öffnen</a>') if aid else "—",
-        ])
-    body = f"""
-    <nav class="topnav"><a href="/member">Start</a><a href="/member/events">Events</a><a href="/member/auctions">Auktionen</a><a href="/portal">Eigenes Profil</a></nav>
-    <section class="hero"><div><div class="eyebrow">Mitgliederbereich</div><h1>🏆 Laufende Auktionen</h1><p class="muted">Alle aktuell offenen Auktionen, Würfelitems und Sales mit Timer.</p></div></section>
-    <section class="panel">{_table(['Item','Bereich','Status','Gebote/Würfe','Führung/Wurf','Timer','Aktion'], rows, placeholder='Auktionen durchsuchen…')}</section>
-    """
-    return _html_shell("Auktionen · Mitgliederbereich", body, nav_mode="member")
+        return _html_shell(
+            "Auktionen · Mitgliederbereich",
+            f"<section class='panel'><h1>🏆 Auktionen</h1><p class='muted'>{_e(data.get('error'))}</p></section>",
+            nav_mode="member",
+        )
 
+    snap: dict[str, Any] = data.get("snapshot") or {}
+    uid = int(_current_user_id(request) or 0)
+    center = _loot_center_payload_from_snapshot(snap)
+    active = [dict(a) for a in (center.get("active") or []) if isinstance(a, dict)]
+    history = [dict(a) for a in (center.get("history") or []) if isinstance(a, dict)]
+    catalog = {
+        _loot_key(row.get("name")): row
+        for row in _loot_catalog_items(snap, limit=10000)
+        if isinstance(row, dict) and _loot_key(row.get("name"))
+    }
+
+    def raw_auction(entry: dict[str, Any]) -> dict[str, Any]:
+        raw = entry.get("raw")
+        return raw if isinstance(raw, dict) else entry
+
+    def auction_id(entry: dict[str, Any]) -> str:
+        raw = raw_auction(entry)
+        return str(entry.get("auction_id") or raw.get("auction_id") or raw.get("id") or "").strip()
+
+    def item_name(entry: dict[str, Any]) -> str:
+        raw = raw_auction(entry)
+        return _loot_text(entry.get("item") or raw.get("item_name") or raw.get("item") or auction_id(entry) or "Auktion")
+
+    def category_key(entry: dict[str, Any]) -> str:
+        raw = raw_auction(entry)
+        mode = str(entry.get("mode") or _loot_mode_bucket(raw) or "").casefold()
+        phase = str(raw.get("phase") or "").casefold()
+        eligibility = str(raw.get("eligibility_mode") or "").casefold()
+        all_text = f"{mode} {phase} {eligibility}"
+        if raw.get("junk_drop") or "müll" in all_text or "muell" in all_text or "sale" in all_text:
+            return "junk"
+        if "main" in all_text:
+            return "main"
+        if "secondary" in all_text or "second" in all_text:
+            return "secondary"
+        if "free" in all_text or "freie" in all_text or eligibility == "all":
+            return "free"
+        return "other"
+
+    def category_label(entry: dict[str, Any]) -> str:
+        return {
+            "main": "Main Need",
+            "secondary": "Second Need",
+            "free": "Freie Auktion",
+            "junk": "Müll-Item",
+            "other": _phase_label(raw_auction(entry)),
+        }.get(category_key(entry), "Auktion")
+
+    def category_icon(entry: dict[str, Any]) -> str:
+        return {"main": "🛡️", "secondary": "🔰", "free": "⚒️", "junk": "🗑️", "other": "📦"}.get(category_key(entry), "📦")
+
+    def image_url(entry: dict[str, Any]) -> str:
+        raw = raw_auction(entry)
+        for key in ("image_url", "item_image_url", "icon_url", "thumbnail_url", "manual_image_url"):
+            value = str(raw.get(key) or entry.get(key) or "").strip()
+            if value.startswith(("https://", "http://", "/static/")):
+                return value
+        row = catalog.get(_loot_key(item_name(entry))) or {}
+        return str(row.get("image_url") or "").strip()
+
+    def item_meta(entry: dict[str, Any]) -> str:
+        raw = raw_auction(entry)
+        row = catalog.get(_loot_key(item_name(entry))) or {}
+        parts = []
+        for value in (
+            raw.get("sub_category") or row.get("slot"),
+            raw.get("rarity") or row.get("rarity"),
+        ):
+            text = str(value or "").strip()
+            if text and text not in parts:
+                parts.append(text)
+        return " · ".join(parts[:2]) or category_label(entry)
+
+    def user_bid_info(entry: dict[str, Any]) -> tuple[bool, str]:
+        raw = raw_auction(entry)
+        amounts: list[int] = []
+        for bid in raw.get("bids") or []:
+            if isinstance(bid, dict) and _user_id(bid.get("user_id") or bid.get("bidder_user_id")) == uid:
+                amounts.append(int(_num(bid.get("amount"), 0)))
+        if amounts:
+            return True, f"{_fmt_ec(max(amounts))} EC"
+        rolls = _junk_roll_entries_dashboard(raw)
+        own_rolls = [int(_num(r.get("roll"), 0)) for r in rolls if _user_id(r.get("user_id")) == uid]
+        if own_rolls:
+            return True, f"Wurf {max(own_rolls)}"
+        if _user_id(raw.get("top_bid_user_id")) == uid and raw.get("top_bid_amount") is not None:
+            return True, f"{_fmt_ec(raw.get('top_bid_amount'))} EC"
+        return False, "—"
+
+    def current_value(entry: dict[str, Any]) -> str:
+        raw = raw_auction(entry)
+        if category_key(entry) == "junk":
+            best = _best_junk_roll_text(raw, snap)
+            return best if best != "—" else "Noch kein Wurf"
+        price = _loot_current_price(raw)
+        return f"{_fmt_ec(price)} EC" if price > 0 else "Noch kein Gebot"
+
+    def activity_count(entry: dict[str, Any]) -> int:
+        raw = raw_auction(entry)
+        return _auction_roll_count(raw) if category_key(entry) == "junk" else _loot_bid_count(raw)
+
+    def status_text(entry: dict[str, Any]) -> str:
+        raw = raw_auction(entry)
+        return _loot_effective_status_label(raw)
+
+    def item_image(entry: dict[str, Any], *, small: bool = False) -> str:
+        src = image_url(entry)
+        cls = "auction-item-image small" if small else "auction-item-image"
+        if src:
+            return f'<div class="{cls}"><img src="{_e(src)}" alt="{_e(item_name(entry))}" loading="lazy"></div>'
+        return f'<div class="{cls} fallback">{category_icon(entry)}</div>'
+
+    my_active = [a for a in active if user_bid_info(a)[0]]
+    my_wins = [a for a in history if _user_id(raw_auction(a).get("winner_user_id") or a.get("winner_user_id")) == uid]
+    junk_active = [a for a in active if category_key(a) == "junk"]
+
+    category_counts = {
+        key: len([a for a in active if category_key(a) == key])
+        for key in ("main", "secondary", "free", "junk")
+    }
+
+    def metric_card(title: str, icon: str, value: int, subtitle: str, cls: str = "") -> str:
+        return f'''
+        <article class="auction-metric {cls}">
+          <div class="auction-metric-icon">{icon}</div>
+          <div><small>{_e(title)}</small><strong>{_e(value)}</strong><span>{_e(subtitle)}</span></div>
+        </article>'''
+
+    def auction_row(entry: dict[str, Any]) -> str:
+        aid = auction_id(entry)
+        category = category_key(entry)
+        has_own, own_value = user_bid_info(entry)
+        count = activity_count(entry)
+        timer = _auction_timer_text(raw_auction(entry))
+        current = current_value(entry)
+        button_label = "Details" if has_own else ("Würfeln" if category == "junk" else "Bieten")
+        return f'''
+        <article class="auction-list-row" data-auction-category="{_e(category)}">
+          <div class="auction-item-cell">
+            {item_image(entry)}
+            <div><h3>{_e(item_name(entry))}</h3><p>{_e(item_meta(entry))}</p>{f'<small>Dein Stand: <strong>{_e(own_value)}</strong></small>' if has_own else ''}</div>
+          </div>
+          <div><span class="auction-category {category}">{_e(category_label(entry))}</span></div>
+          <div class="auction-value"><strong>{_e(current)}</strong><small>{_e(count)} {'Würfe' if category == 'junk' else 'Gebote'}</small></div>
+          <div class="auction-timer"><strong>⌛ {_e(timer)}</strong><small>{_e(status_text(entry))}</small></div>
+          <a class="auction-row-action" href="/auction/{_e(aid)}">{_e(button_label)}</a>
+        </article>'''
+
+    active_html = "".join(auction_row(a) for a in active) or '<div class="auction-empty">Keine laufenden Auktionen.</div>'
+
+    def compact_bid(entry: dict[str, Any]) -> str:
+        aid = auction_id(entry)
+        _has, own = user_bid_info(entry)
+        return f'''
+        <a class="auction-compact-row" href="/auction/{_e(aid)}">
+          {item_image(entry, small=True)}
+          <div><strong>{_e(item_name(entry))}</strong><small>{_e(category_label(entry))}</small></div>
+          <span>{_e(own)}</span>
+          <time>⌛ {_e(_auction_timer_text(raw_auction(entry)))}</time>
+        </a>'''
+
+    my_bids_html = "".join(compact_bid(a) for a in my_active[:8]) or '<div class="auction-empty compact">Du hast aktuell kein Gebot und keinen Müll-Wurf offen.</div>'
+
+    def history_row(entry: dict[str, Any]) -> str:
+        raw = raw_auction(entry)
+        aid = auction_id(entry)
+        winner_uid = _user_id(raw.get("winner_user_id") or entry.get("winner_user_id"))
+        winner = _snapshot_display_name(snap, winner_uid, raw.get("winner_name") or entry.get("winner_name")) if winner_uid else "Nicht vergeben"
+        amount = raw.get("top_bid_amount") or raw.get("current_bid") or raw.get("fixed_price")
+        result = "Gewonnen" if winner_uid == uid else winner
+        return f'''
+        <a class="auction-history-row" href="/auction/{_e(aid)}">
+          {item_image(entry, small=True)}
+          <div><strong>{_e(item_name(entry))}</strong><small>{_e(category_label(entry))}</small></div>
+          <span>{_e((_fmt_ec(amount) + ' EC') if amount not in (None, '') else '—')}</span>
+          <em class="{'won' if winner_uid == uid else ''}">{_e(result)}</em>
+        </a>'''
+
+    history_html = "".join(history_row(a) for a in history[:8]) or '<div class="auction-empty compact">Noch keine abgeschlossenen Auktionen vorhanden.</div>'
+
+    admin_action = (
+        '<a class="auction-side-action primary" href="/loot">⚒️ Auktionsverwaltung</a>'
+        if _is_dashboard_admin(request)
+        else '<a class="auction-side-action primary" href="/member/ec">🪙 EC-Konto öffnen</a>'
+    )
+
+    body = f'''
+    <style>
+      .auctions-page{{display:grid;gap:16px}}
+      .auctions-heading h1{{font:700 42px Georgia,serif;color:#e3b95f;margin-bottom:4px}}
+      .auction-metrics{{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:16px}}
+      .auction-metric{{min-height:138px;display:grid;grid-template-columns:78px minmax(0,1fr);gap:15px;align-items:center;padding:20px;border:1px solid rgba(214,168,79,.32);background:linear-gradient(135deg,rgba(16,15,13,.95),rgba(5,6,6,.93));box-shadow:inset 0 0 0 1px rgba(255,255,255,.02)}}
+      .auction-metric-icon{{width:68px;height:68px;border-radius:50%;display:grid;place-items:center;border:1px solid rgba(214,168,79,.48);font-size:31px;background:rgba(214,168,79,.05)}}
+      .auction-metric small{{display:block;color:#d9b45d;font:700 14px Georgia,serif;text-transform:uppercase;letter-spacing:.04em}}
+      .auction-metric strong{{display:block;font:700 31px Georgia,serif;margin:7px 0 2px}}
+      .auction-metric span{{color:#74cf68;font-size:14px}}
+      .auction-main-grid{{display:grid;grid-template-columns:minmax(0,1fr) 285px;gap:16px;align-items:start}}
+      .auction-section{{border:1px solid rgba(214,168,79,.30);background:linear-gradient(135deg,rgba(13,13,12,.96),rgba(4,5,5,.94));overflow:hidden}}
+      .auction-section-title{{padding:15px 18px;border-bottom:1px solid rgba(214,168,79,.22);color:#e3b95f;font:700 19px Georgia,serif;text-transform:uppercase;letter-spacing:.04em}}
+      .auction-list-head{{display:grid;grid-template-columns:minmax(280px,1.65fr) minmax(130px,.65fr) minmax(150px,.72fr) minmax(145px,.72fr) 112px;gap:14px;padding:11px 17px;color:#cfae67;font:700 11px Georgia,serif;text-transform:uppercase;border-bottom:1px solid rgba(214,168,79,.18)}}
+      .auction-list-row{{display:grid;grid-template-columns:minmax(280px,1.65fr) minmax(130px,.65fr) minmax(150px,.72fr) minmax(145px,.72fr) 112px;gap:14px;align-items:center;padding:15px 17px;border-bottom:1px solid rgba(214,168,79,.16)}}
+      .auction-list-row:last-child{{border-bottom:0}}
+      .auction-list-row:hover{{background:rgba(214,168,79,.035)}}
+      .auction-item-cell{{display:grid;grid-template-columns:74px minmax(0,1fr);gap:13px;align-items:center}}
+      .auction-item-cell h3{{margin:0 0 5px;font-size:17px;color:#e3d1aa}}.auction-item-cell p{{margin:0 0 4px;font-size:12px;color:#bda980}}.auction-item-cell small{{color:#9f9072}}
+      .auction-item-image{{width:72px;height:72px;border:1px solid rgba(214,168,79,.38);background:#090a09;display:grid;place-items:center;overflow:hidden;font-size:28px}}
+      .auction-item-image img{{width:100%;height:100%;object-fit:cover}}.auction-item-image.small{{width:42px;height:42px;font-size:19px}}
+      .auction-category{{display:inline-flex;justify-content:center;min-width:112px;padding:8px 10px;border:1px solid rgba(214,168,79,.38);font:700 11px Georgia,serif;text-transform:uppercase;color:#e7c67d;background:rgba(214,168,79,.06)}}
+      .auction-category.main{{border-color:rgba(174,61,42,.65);background:rgba(128,29,22,.30)}}.auction-category.secondary{{border-color:rgba(183,130,38,.55)}}.auction-category.free{{border-color:rgba(94,145,50,.58);background:rgba(52,90,28,.25)}}.auction-category.junk{{border-color:rgba(154,105,37,.6);background:rgba(92,57,18,.26)}}
+      .auction-value,.auction-timer{{display:grid;gap:4px}}.auction-value strong{{color:#70ca62}}.auction-value small,.auction-timer small{{color:#a99a7d;font-size:12px}}.auction-timer strong{{color:#e3d1aa;font-size:13px}}
+      .auction-row-action{{display:flex;justify-content:center;padding:10px 12px;border:1px solid rgba(214,168,79,.50);background:rgba(133,31,22,.30);color:#efd18d;text-transform:uppercase;font:700 12px Georgia,serif}}
+      .auction-row-action:hover{{background:rgba(167,44,31,.48)}}
+      .auction-list-footer{{padding:13px;text-align:center;border-top:1px solid rgba(214,168,79,.18)}}.auction-list-footer a{{color:#e0b65f;font:700 14px Georgia,serif;text-transform:uppercase}}
+      .auction-side-stack{{display:grid;gap:16px}}
+      .auction-filter-list,.auction-action-list{{display:grid;gap:9px;padding:14px}}
+      .auction-filter{{width:100%;display:flex;justify-content:space-between;align-items:center;gap:9px;padding:12px 13px;border:1px solid rgba(214,168,79,.34);background:rgba(214,168,79,.04);color:#e3cfaa;text-align:left;cursor:pointer;font:700 13px Georgia,serif;text-transform:uppercase}}
+      .auction-filter span:last-child{{min-width:24px;padding:3px 7px;border:1px solid rgba(214,168,79,.32);border-radius:999px;text-align:center;font-size:11px}}
+      .auction-filter.active{{background:rgba(128,29,22,.40);border-color:rgba(188,63,45,.66)}}
+      .auction-side-action{{display:flex;justify-content:center;padding:12px;border:1px solid rgba(214,168,79,.38);background:rgba(214,168,79,.05);color:#efd18d;text-transform:uppercase;font:700 13px Georgia,serif}}
+      .auction-side-action.primary{{background:rgba(128,29,22,.38);border-color:rgba(188,63,45,.62)}}
+      .auction-bottom-grid{{display:grid;grid-template-columns:1fr 1fr;gap:16px}}
+      .auction-compact-list{{padding:8px 14px}}
+      .auction-compact-row,.auction-history-row{{display:grid;grid-template-columns:42px minmax(0,1fr) 105px 100px;gap:11px;align-items:center;padding:10px 0;border-bottom:1px solid rgba(214,168,79,.15);color:inherit}}
+      .auction-compact-row:last-child,.auction-history-row:last-child{{border-bottom:0}}
+      .auction-compact-row strong,.auction-history-row strong{{display:block;color:#e0cda7}}.auction-compact-row small,.auction-history-row small{{display:block;color:#9e9075;margin-top:3px}}
+      .auction-compact-row>span,.auction-history-row>span{{color:#73ca67;text-align:right}}.auction-compact-row time{{font-size:12px;color:#d5c29c;text-align:right}}
+      .auction-history-row{{grid-template-columns:42px minmax(0,1fr) 95px 110px}}.auction-history-row em{{font-style:normal;color:#c9a95f;text-align:right}}.auction-history-row em.won{{color:#70cb65}}
+      .auction-empty{{padding:28px;color:var(--muted);text-align:center}}.auction-empty.compact{{padding:20px}}
+      @media(max-width:1120px){{.auction-metrics{{grid-template-columns:repeat(2,1fr)}}.auction-main-grid{{grid-template-columns:1fr}}.auction-side-stack{{grid-template-columns:1fr 1fr}}}}
+      @media(max-width:820px){{.auction-list-head{{display:none}}.auction-list-row{{grid-template-columns:1fr 1fr;gap:12px}}.auction-item-cell{{grid-column:1/-1}}.auction-row-action{{align-self:stretch}}.auction-bottom-grid{{grid-template-columns:1fr}}}}
+      @media(max-width:620px){{.auction-metrics{{grid-template-columns:1fr}}.auction-metric{{min-height:105px}}.auction-side-stack{{grid-template-columns:1fr}}.auction-list-row{{grid-template-columns:1fr}}.auction-item-cell{{grid-column:auto}}.auction-compact-row,.auction-history-row{{grid-template-columns:42px minmax(0,1fr) auto}}.auction-compact-row time,.auction-history-row em{{grid-column:2/-1;text-align:left}}}}
+    </style>
+    <nav class="topnav"><a href="/member">Startseite</a><a href="/member/auctions">Auktionen</a><a href="/member/ec">Meine EC</a><a href="/portal">Mein Profil</a></nav>
+    <main class="auctions-page">
+      <header class="auctions-heading"><h1>Auktionen</h1><p class="muted">Übersicht über laufende Gebote, Müll-Items und Verteilungen</p></header>
+
+      <section class="auction-metrics">
+        {metric_card('Aktive Auktionen', '⚒️', len(active), 'laufend')}
+        {metric_card('Meine Gebote', '👥', len(my_active), 'aktiv')}
+        {metric_card('Müll-Items', '🗑️', len(junk_active), 'offen')}
+        {metric_card('Meine Gewinne', '🏆', len(my_wins), 'insgesamt')}
+      </section>
+
+      <section class="auction-main-grid">
+        <section class="auction-section" id="active-auctions">
+          <h2 class="auction-section-title">⚒️ Laufende Auktionen</h2>
+          <div class="auction-list-head"><span>Item</span><span>Kategorie</span><span>Höchstgebot / Wurf</span><span>Restzeit</span><span>Aktion</span></div>
+          <div id="auction-list">{active_html}</div>
+          <div class="auction-list-footer"><a href="#active-auctions" data-auction-filter-link="all">Alle Auktionen anzeigen »</a></div>
+        </section>
+
+        <aside class="auction-side-stack">
+          <section class="auction-section"><h2 class="auction-section-title">⌛ Kategorien</h2><div class="auction-filter-list">
+            <button type="button" class="auction-filter active" data-auction-filter="all"><span>Alle Auktionen</span><span>{len(active)}</span></button>
+            <button type="button" class="auction-filter" data-auction-filter="main"><span>🛡️ Main Need</span><span>{category_counts['main']}</span></button>
+            <button type="button" class="auction-filter" data-auction-filter="secondary"><span>🔰 Second Need</span><span>{category_counts['secondary']}</span></button>
+            <button type="button" class="auction-filter" data-auction-filter="free"><span>⚒️ Freie Auktion</span><span>{category_counts['free']}</span></button>
+            <button type="button" class="auction-filter" data-auction-filter="junk"><span>🗑️ Müll-Items</span><span>{category_counts['junk']}</span></button>
+          </div></section>
+          <section class="auction-section"><h2 class="auction-section-title">⚒️ Auktionsaktionen</h2><div class="auction-action-list">
+            {admin_action}
+            <a class="auction-side-action" href="#my-bids">☷ Meine Gebote</a>
+            <a class="auction-side-action" href="#active-auctions" data-auction-filter-link="junk">🗑️ Müll-Items öffnen</a>
+            <a class="auction-side-action" href="#auction-history">⌛ Verlauf öffnen</a>
+          </div></section>
+        </aside>
+      </section>
+
+      <section class="auction-bottom-grid">
+        <section class="auction-section" id="my-bids"><h2 class="auction-section-title">👥 Meine Gebote</h2><div class="auction-compact-list">{my_bids_html}</div></section>
+        <section class="auction-section" id="auction-history"><h2 class="auction-section-title">⌛ Zuletzt beendet</h2><div class="auction-compact-list">{history_html}</div></section>
+      </section>
+    </main>
+    <script>
+      (function auctionFilters(){{
+        const buttons = Array.from(document.querySelectorAll('[data-auction-filter]'));
+        const links = Array.from(document.querySelectorAll('[data-auction-filter-link]'));
+        const rows = Array.from(document.querySelectorAll('[data-auction-category]'));
+        function apply(filter){{
+          rows.forEach(function(row){{
+            row.hidden = filter !== 'all' && row.dataset.auctionCategory !== filter;
+          }});
+          buttons.forEach(function(button){{
+            button.classList.toggle('active', button.dataset.auctionFilter === filter);
+          }});
+        }}
+        buttons.forEach(function(button){{ button.addEventListener('click', function(){{ apply(button.dataset.auctionFilter || 'all'); }}); }});
+        links.forEach(function(link){{ link.addEventListener('click', function(){{ apply(link.dataset.auctionFilterLink || 'all'); }}); }});
+      }})();
+    </script>
+    '''
+    return _html_shell("Auktionen · Mitgliederbereich", body, nav_mode="member")
 
 def _render_member_members_page(data: dict[str, Any], request: Request) -> str:
     if not data.get("ok"):
