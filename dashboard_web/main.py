@@ -9353,137 +9353,436 @@ def _item_card_html(item: dict[str, Any], request: Optional[Request] = None) -> 
       </article>
     """
 
+def _item_db_group(main_category: Any, sub_category: Any = "", name: Any = "") -> str:
+    text = f"{main_category or ''} {sub_category or ''} {name or ''}".casefold()
+    if any(token in text for token in ("weapon", "waffe", "sword", "bow", "staff", "wand", "dagger", "crossbow", "spear", "greatsword", "orb")):
+        return "weapon"
+    if any(token in text for token in ("armor", "rüstung", "ruestung", "helmet", "helm", "chest", "glove", "pants", "boot", "cloak", "cape", "mantel")):
+        return "armor"
+    if any(token in text for token in ("accessory", "schmuck", "ring", "necklace", "kette", "brooch", "brosche", "bracelet", "armband", "earring", "ohrring", "belt", "gürtel", "guertel")):
+        return "accessory"
+    return "other"
+
+
+def _item_db_group_label(item: dict[str, Any]) -> str:
+    group = _item_db_group(item.get("main_category"), item.get("sub_category"), item.get("name"))
+    return {"weapon": "Waffe", "armor": "Rüstung", "accessory": "Schmuck"}.get(group, "Sonstiges")
+
+
+def _item_db_rarity_class(value: Any) -> str:
+    text = str(value or "").casefold()
+    if any(x in text for x in ("legend", "legendär", "legendaer", "orange", "myth")):
+        return "legendary"
+    if any(x in text for x in ("epic", "episch", "purple", "lila")):
+        return "epic"
+    if any(x in text for x in ("rare", "selten", "blue", "blau")):
+        return "rare"
+    if any(x in text for x in ("uncommon", "ungewöhn", "ungewoehn", "green", "grün", "gruen")):
+        return "uncommon"
+    return "common"
+
+
+def _item_db_image_url(item: dict[str, Any]) -> str:
+    detail = _item_detail_model(item)
+    return str(
+        item.get("manual_image_url")
+        or item.get("image_url")
+        or (detail.get("image_url") if isinstance(detail, dict) else "")
+        or item.get("icon_url")
+        or ""
+    ).strip()
+
+
+def _item_db_value_label(item: dict[str, Any]) -> str:
+    detail = _item_detail_model(item)
+    primary = detail.get("primary") if isinstance(detail, dict) else []
+    if isinstance(primary, list):
+        for row in primary:
+            if isinstance(row, dict) and row.get("value") not in (None, ""):
+                label = str(row.get("label") or "Wert").strip()
+                return f"{label}: {row.get('value')}"
+    if item.get("damage_min") is not None or item.get("damage_max") is not None:
+        return f"Schaden {item.get('damage_min') or '—'}–{item.get('damage_max') or '—'}"
+    if item.get("defense") is not None:
+        return f"DEF {item.get('defense')}"
+    level = item.get("item_level") or (detail.get("item_level") if isinstance(detail, dict) else None)
+    if level not in (None, ""):
+        return f"Itemlevel {level}"
+    return "—"
+
+
+def _item_db_sort_value(item: dict[str, Any]) -> float:
+    detail = _item_detail_model(item)
+    candidates: list[Any] = [item.get("damage_max"), item.get("defense"), item.get("item_level")]
+    if isinstance(detail, dict):
+        candidates.extend([detail.get("item_level")])
+        primary = detail.get("primary")
+        if isinstance(primary, list):
+            for row in primary:
+                if isinstance(row, dict):
+                    candidates.append(row.get("value"))
+    for value in candidates:
+        if value in (None, ""):
+            continue
+        match = re.search(r"-?\d+(?:[.,]\d+)?", str(value).replace(".", ""))
+        if match:
+            try:
+                return float(match.group(0).replace(",", "."))
+            except Exception:
+                pass
+    return 0.0
+
+
+def _item_db_source_label(item: dict[str, Any]) -> str:
+    detail = _item_detail_model(item)
+    candidates: list[Any] = []
+    if isinstance(detail, dict):
+        for key in ("drop_source", "source", "obtained_from", "location", "boss"):
+            candidates.append(detail.get(key))
+    for key in ("source_name", "drop_source", "boss_name", "location"):
+        candidates.append(item.get(key))
+    for value in candidates:
+        if isinstance(value, dict):
+            value = value.get("name") or value.get("label") or value.get("title")
+        if isinstance(value, list):
+            value = ", ".join(str(x.get("name") if isinstance(x, dict) else x) for x in value[:2])
+        text = str(value or "").strip()
+        if text:
+            return _short(text, 48)
+    return "Questlog" if str(item.get("source_url") or "").strip() else "—"
+
+
+def _item_db_need_info(item: dict[str, Any], need_index: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    key = _loot_key(item.get("name"))
+    exact = need_index.get(key)
+    if exact:
+        return exact
+    return {"item": item.get("name") or "", "main": [], "secondary": []}
+
+
+def _item_db_need_count(item: dict[str, Any], need_index: dict[str, dict[str, Any]]) -> int:
+    info = _item_db_need_info(item, need_index)
+    return len(info.get("main") or []) + len(info.get("secondary") or [])
+
+
+def _item_db_query_url(params: dict[str, Any], **updates: Any) -> str:
+    merged = dict(params)
+    merged.update(updates)
+    clean: dict[str, str] = {}
+    for key, value in merged.items():
+        if value in (None, "", 0, "0") and key not in {"page"}:
+            continue
+        clean[str(key)] = str(value)
+    query = urllib.parse.urlencode(clean)
+    return "/items" + (f"?{query}" if query else "")
+
+
+def _item_db_people_html(info: dict[str, Any]) -> str:
+    rows: list[str] = []
+    for label, kind in (("Main Need", "main"), ("Second Need", "secondary")):
+        for person in info.get(kind) or []:
+            if not isinstance(person, dict):
+                continue
+            uid = _user_id(person.get("user_id"))
+            name = str(person.get("display_name") or f"User {uid}" if uid else "Unbekannt")
+            name_html = f'<a href="/member/{uid}">{_e(name)}</a>' if uid else _e(name)
+            rows.append(f'<div class="idb-needer"><span class="idb-needer-icon">◆</span><div><strong>{name_html}</strong><small>{_e(label)}</small></div></div>')
+    return "".join(rows) if rows else '<div class="idb-empty-small">Aktuell hat niemand dieses Item offen auf der Needliste.</div>'
+
+
+def _item_db_mini_card(item: dict[str, Any], need_index: dict[str, dict[str, Any]]) -> str:
+    name = str(item.get("name") or "—")
+    image_url = _item_db_image_url(item)
+    art = f'<img src="{_e(image_url)}" alt="" loading="lazy">' if image_url else '<span>?</span>'
+    rarity = str(item.get("rarity") or "—")
+    count = _item_db_need_count(item, need_index)
+    link = _item_db_query_url({}, q=name)
+    return f'''
+      <a class="idb-mini-item" href="{_e(link)}">
+        <span class="idb-mini-art">{art}</span>
+        <span><strong>{_e(name)}</strong><small>{_e(rarity)} · {count} Need{'' if count == 1 else 's'}</small></span>
+      </a>
+    '''
+
+
 def _render_item_catalog(request: Optional[Request] = None) -> str:
     q = str((request.query_params.get("q") if request else "") or "").strip()
     category = str((request.query_params.get("category") if request else "") or "").strip()
     sub_category = str((request.query_params.get("sub_category") if request else "") or "").strip()
     rarity = str((request.query_params.get("rarity") if request else "") or "").strip()
     confidence = str((request.query_params.get("confidence") if request else "") or "").strip()
-    payload = _item_catalog_payload(q=q, category=category, sub_category=sub_category, rarity=rarity, confidence=confidence, limit=250)
+    sort_mode = str((request.query_params.get("sort") if request else "name") or "name").strip().lower()
+    selected_id = str((request.query_params.get("selected") if request else "") or "").strip()
+    try:
+        page = max(1, int((request.query_params.get("page") if request else "1") or 1))
+    except Exception:
+        page = 1
+
+    page_size = 24
+    offset = (page - 1) * page_size
+    payload = _item_catalog_payload(
+        q=q,
+        category=category,
+        sub_category=sub_category,
+        rarity=rarity,
+        confidence=confidence,
+        limit=page_size + 1,
+        offset=offset,
+    )
     if not payload.get("ok"):
-        body = f"""
+        body = f'''
         <nav class="topnav"><a href="/">← Übersicht</a><a href="/loot">Loot</a><a href="/loot-check">Truhencheck</a><a href="/api/items">API</a></nav>
         <section class="hero"><div><div class="eyebrow">Questlog Item-Katalog</div><h1>📚 Item-Datenbank</h1><p class="muted">Noch keine Item-Daten verfügbar oder Postgres/Schema fehlt.</p></div></section>
         <section class="panel"><h2>Fehler</h2><p class="muted">{_e(payload.get('error'))}</p><p>Importer starten:</p><pre>python questlog_item_importer.py --category-url https://questlog.gg/throne-and-liberty/de/db/items/weapons?grade=41 --only weapon</pre></section>
-        """
+        '''
         return _html_shell("Item-Datenbank · Beer and Buffs Dashboard", body)
 
-    items: list[dict[str, Any]] = payload.get("items") or []
+    raw_items: list[dict[str, Any]] = [x for x in (payload.get("items") or []) if isinstance(x, dict)]
+    has_next = len(raw_items) > page_size
+    items = raw_items[:page_size]
     stats: dict[str, Any] = payload.get("stats") or {}
-    total = int(stats.get("total") or 0)
-    low_conf = int(stats.get("low_confidence") or 0)
-    last_update = _dt(stats.get("last_update")) if stats.get("last_update") else "—"
-    cards = "".join([
-        _card("Items", total, "aktive Einträge in Postgres"),
-        _card("Treffer", len(items), "aktuelle Filterung"),
-        _card("Prüfen", low_conf, "niedrige Erkennungssicherheit"),
-        _card("Letztes Update", last_update, "Questlog Importer"),
-    ])
-    cat_rows = []
+
+    snap_payload = _snapshot_payload()
+    snap: dict[str, Any] = snap_payload.get("snapshot") or {} if snap_payload.get("ok") else {}
+    need_index = _loot_need_index(snap) if snap else {}
+
+    rarity_rank = {"legendary": 5, "epic": 4, "rare": 3, "uncommon": 2, "common": 1}
+    if sort_mode == "value":
+        items.sort(key=_item_db_sort_value, reverse=True)
+    elif sort_mode == "need":
+        items.sort(key=lambda item: (_item_db_need_count(item, need_index), str(item.get("name") or "").casefold()), reverse=True)
+    elif sort_mode == "rarity":
+        items.sort(key=lambda item: (rarity_rank.get(_item_db_rarity_class(item.get("rarity")), 0), str(item.get("name") or "").casefold()), reverse=True)
+    else:
+        sort_mode = "name"
+        items.sort(key=lambda item: str(item.get("name") or "").casefold())
+
+    selected_item: Optional[dict[str, Any]] = None
+    if selected_id:
+        selected_item = next((item for item in items if str(item.get("id") or "") == selected_id), None)
+    if selected_item is None and items:
+        selected_item = items[0]
+        selected_id = str(selected_item.get("id") or "")
+
+    params = {
+        "q": q,
+        "category": category,
+        "sub_category": sub_category,
+        "rarity": rarity,
+        "confidence": confidence,
+        "sort": sort_mode,
+        "page": page,
+    }
+
+    category_counts = Counter()
+    sub_options: set[str] = set()
     for row in stats.get("by_category") or []:
-        cat = str(row.get("main_category") or "misc")
-        sub = str(row.get("sub_category") or "—")
-        cat_rows.append([
-            _raw(f'<a class="link" href="/items?category={urllib.parse.quote(cat)}">{_e(cat)}</a>'),
-            _raw(f'<a class="link" href="/items?category={urllib.parse.quote(cat)}&sub_category={urllib.parse.quote(sub if sub != "—" else "")}">{_e(sub)}</a>'),
-            row.get("count"),
-        ])
-    rows = []
+        if not isinstance(row, dict):
+            continue
+        group = _item_db_group(row.get("main_category"), row.get("sub_category"))
+        category_counts[group] += int(_num(row.get("count"), 0))
+        sub = str(row.get("sub_category") or "").strip()
+        if sub:
+            sub_options.add(sub)
+
+    total = int(stats.get("total") or 0)
+    total_needs = sum(len(info.get("main") or []) + len(info.get("secondary") or []) for info in need_index.values())
+    total_label = f"{total:,}".replace(",", ".")
+    weapon_label = f"{category_counts.get('weapon', 0):,}".replace(",", ".")
+    armor_label = f"{category_counts.get('armor', 0):,}".replace(",", ".")
+    accessory_label = f"{category_counts.get('accessory', 0):,}".replace(",", ".")
+
+    def option(value: str, label: str, current: str) -> str:
+        return f'<option value="{_e(value)}"{" selected" if value == current else ""}>{_e(label)}</option>'
+
+    category_options = "".join([
+        option("", "Alle", category),
+        option("weapon", "Waffen", category),
+        option("armor", "Rüstungen", category),
+        option("accessory", "Schmuck", category),
+        option("material", "Material", category),
+        option("misc", "Sonstiges", category),
+    ])
+    sub_select_options = option("", "Alle Typen", sub_category)
+    if sub_category and sub_category not in sub_options:
+        sub_select_options += option(sub_category, sub_category, sub_category)
+    sub_select_options += "".join(option(value, value, sub_category) for value in sorted(sub_options, key=str.casefold)[:120])
+
+    rarity_values = ["Legendary", "Epic", "Rare", "Uncommon", "Common", "Legendär", "Episch", "Selten"]
+    rarity_select_options = option("", "Alle", rarity)
+    if rarity and rarity not in rarity_values:
+        rarity_select_options += option(rarity, rarity, rarity)
+    rarity_select_options += "".join(option(value, value, rarity) for value in rarity_values)
+
+    sort_options = "".join([
+        option("name", "Name A–Z", sort_mode),
+        option("value", "Höchster Wert", sort_mode),
+        option("rarity", "Seltenheit", sort_mode),
+        option("need", "Meiste Needs", sort_mode),
+    ])
+
+    summary_cards = f'''
+      <div class="idb-summary-card"><span class="idb-summary-icon">▣</span><div><small>ITEMS GESAMT</small><strong>{total_label}</strong><em>{total_needs} offene Gilden-Needs</em></div></div>
+      <div class="idb-summary-card weapon"><span class="idb-summary-icon">⚔</span><div><small>WAFFEN</small><strong>{weapon_label}</strong><em>im zentralen Katalog</em></div></div>
+      <div class="idb-summary-card armor"><span class="idb-summary-icon">🛡</span><div><small>RÜSTUNGEN</small><strong>{armor_label}</strong><em>im zentralen Katalog</em></div></div>
+      <div class="idb-summary-card accessory"><span class="idb-summary-icon">◉</span><div><small>SCHMUCK</small><strong>{accessory_label}</strong><em>im zentralen Katalog</em></div></div>
+    '''
+
+    row_html: list[str] = []
     for item in items:
-        dmg = "—"
-        if item.get("damage_min") is not None or item.get("damage_max") is not None:
-            dmg = f"{item.get('damage_min') or '—'} - {item.get('damage_max') or '—'}"
-        elif item.get("defense") is not None:
-            dmg = f"DEF {item.get('defense')}"
-        rows.append([
-            _item_image_cell(item),
-            item.get("name"),
-            item.get("main_category"),
-            item.get("sub_category") or "—",
-            item.get("rarity") or "—",
-            dmg,
-            _item_stat_preview(item),
-            _item_ability_preview(item),
-            item.get("classification_confidence") or "—",
-            _item_source_link(item),
-        ])
-    item_cards = "".join(_item_card_html(item, request) for item in items) or '<p class="muted">Keine Items für diese Filterung gefunden.</p>'
-    item_card_css = """
+        item_id = str(item.get("id") or "")
+        item_name = str(item.get("name") or "—")
+        image_url = _item_db_image_url(item)
+        image = f'<img src="{_e(image_url)}" alt="" loading="lazy">' if image_url else '<span>?</span>'
+        rarity_text = str(item.get("rarity") or "—")
+        rarity_class = _item_db_rarity_class(rarity_text)
+        need_count = _item_db_need_count(item, need_index)
+        details_url = _item_db_query_url(params, selected=item_id)
+        selected_class = " selected" if selected_item is item else ""
+        source_url = str(item.get("source_url") or "").strip()
+        source_label = _item_db_source_label(item)
+        source_html = f'<a href="{_e(source_url)}" target="_blank" rel="noopener">{_e(source_label)}</a>' if source_url else _e(source_label)
+        row_html.append(f'''
+          <tr class="idb-item-row{selected_class}">
+            <td><a class="idb-item-main" href="{_e(details_url)}"><span class="idb-list-art">{image}</span><strong>{_e(item_name)}</strong></a></td>
+            <td>{_e(_item_db_group_label(item))}<small>{_e(item.get('sub_category') or '—')}</small></td>
+            <td><span class="idb-rarity {rarity_class}">{_e(rarity_text)}</span></td>
+            <td>{_e(_item_db_value_label(item))}</td>
+            <td>{source_html}</td>
+            <td><span class="idb-need-count">{need_count}</span><small>{'Spieler braucht es' if need_count == 1 else 'Spieler brauchen es'}</small></td>
+            <td><a class="idb-details-btn" href="{_e(details_url)}">Details</a></td>
+          </tr>
+        ''')
+    table_rows = "".join(row_html) if row_html else '<tr><td colspan="7"><div class="idb-empty-small">Keine Items für diese Filterung gefunden.</div></td></tr>'
+
+    pagination_parts: list[str] = []
+    if page > 1:
+        pagination_parts.append(f'<a href="{_e(_item_db_query_url(params, page=page - 1, selected=""))}">‹ Zurück</a>')
+    pagination_parts.append(f'<span>Seite {page}</span>')
+    if has_next:
+        pagination_parts.append(f'<a href="{_e(_item_db_query_url(params, page=page + 1, selected=""))}">Weiter ›</a>')
+    pagination = "".join(pagination_parts)
+
+    detail_html = '<div class="idb-empty-detail">Wähle links ein Item aus.</div>'
+    recent_seed: dict[str, Any] = {}
+    if selected_item:
+        detail = _item_detail_model(selected_item)
+        image_url = _item_db_image_url(selected_item)
+        image = f'<img src="{_e(image_url)}" alt="" loading="lazy">' if image_url else '<span>?</span>'
+        name = str(selected_item.get("name") or "—")
+        rarity_text = str((detail.get("rarity") if isinstance(detail, dict) else "") or selected_item.get("rarity") or "—")
+        rarity_class = _item_db_rarity_class(rarity_text)
+        sub = str((detail.get("type") if isinstance(detail, dict) else "") or selected_item.get("sub_category") or "—")
+        source_url = str(selected_item.get("source_url") or "").strip()
+        source_label = _item_db_source_label(selected_item)
+        source_line = f'<a href="{_e(source_url)}" target="_blank" rel="noopener">{_e(source_label)}</a>' if source_url else _e(source_label)
+        traits_html = _trait_table_html(selected_item, detail)
+        need_info = _item_db_need_info(selected_item, need_index)
+        need_total = len(need_info.get("main") or []) + len(need_info.get("secondary") or [])
+        loot_link = f'/loot-check?item={urllib.parse.quote(name)}'
+        detail_html = f'''
+          <div class="idb-detail-title"><span>AUSGEWÄHLTES ITEM</span><b>☆</b></div>
+          <div class="idb-detail-head">
+            <div class="idb-detail-art">{image}</div>
+            <div><h2>{_e(name)}</h2><span class="idb-rarity {rarity_class}">{_e(rarity_text)}</span><p>{_e(_item_db_group_label(selected_item))} · {_e(sub)}</p><small>Quelle: {source_line}</small></div>
+          </div>
+          <div class="idb-detail-section"><h3>WERTE</h3><div class="idb-detail-stats">{_questlog_stats_html(selected_item, detail)}{_bonus_stats_html(selected_item, detail)}</div></div>
+          <div class="idb-detail-section"><h3>EIGENSCHAFT / FERTIGKEIT</h3>{_passive_html(selected_item, detail)}</div>
+          {f'<div class="idb-detail-section"><h3>EIGENSCHAFTEN</h3>{traits_html}</div>' if traits_html else ''}
+          <div class="idb-detail-section"><h3>WER BRAUCHT ES? <span>{need_total}</span></h3><div class="idb-needer-list">{_item_db_people_html(need_info)}</div></div>
+          <div class="idb-detail-actions"><a class="idb-primary-action" href="/character-editor">Zum Need-Builder</a><a class="idb-secondary-action" href="{_e(loot_link)}">Im Loot prüfen</a></div>
+          {_item_admin_image_form(selected_item, request)}
+        '''
+        recent_seed = {
+            "id": selected_item.get("id"),
+            "name": name,
+            "image": image_url,
+            "rarity": rarity_text,
+            "value": _item_db_value_label(selected_item),
+        }
+
+    popular = sorted(items, key=lambda item: (_item_db_need_count(item, need_index), _item_db_sort_value(item)), reverse=True)[:4]
+    if popular and all(_item_db_need_count(item, need_index) == 0 for item in popular):
+        popular = items[:4]
+    popular_html = "".join(_item_db_mini_card(item, need_index) for item in popular) or '<div class="idb-empty-small">Keine Items geladen.</div>'
+
+    often_rows: list[str] = []
+    for _key, info in sorted(need_index.items(), key=lambda pair: len(pair[1].get("main") or []) + len(pair[1].get("secondary") or []), reverse=True)[:5]:
+        item_name = str(info.get("item") or "—")
+        count = len(info.get("main") or []) + len(info.get("secondary") or [])
+        often_rows.append(f'<a class="idb-often-row" href="{_e(_item_db_query_url({}, q=item_name))}"><span>{_e(item_name)}</span><strong>{count} Need{'' if count == 1 else 's'}</strong></a>')
+    often_html = "".join(often_rows) or '<div class="idb-empty-small">Noch keine Need-Daten vorhanden.</div>'
+
+    item_db_css = '''
     <style>
-      .item-card-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(520px,1fr));gap:16px;margin-top:12px}
-      .item-card{display:grid;grid-template-columns:112px minmax(0,1fr);gap:16px;padding:16px;border:1px solid rgba(212,164,74,.28);border-radius:18px;background:linear-gradient(135deg,rgba(20,13,8,.88),rgba(0,0,0,.56));box-shadow:0 14px 36px rgba(0,0,0,.22)}
-      .item-art{width:112px;height:112px;border-radius:18px;border:1px solid rgba(212,164,74,.34);background:radial-gradient(circle at 50% 35%,rgba(212,164,74,.18),rgba(0,0,0,.42));display:flex;align-items:center;justify-content:center;overflow:hidden}
-      .item-art img{max-width:100%;max-height:100%;object-fit:contain;padding:8px;filter:drop-shadow(0 10px 18px rgba(0,0,0,.55))}
-      .item-no-img{color:#c3d0dd;font-size:34px;opacity:.6}
-      .item-head{display:flex;gap:12px;justify-content:space-between;align-items:flex-start;margin-bottom:10px}
-      .item-head h3{margin:0;color:#fff;font-size:18px;line-height:1.2}
-      .item-badges{display:flex;flex-wrap:wrap;gap:6px;justify-content:flex-end}
-      .item-badges span,.item-chip{border:1px solid rgba(212,164,74,.28);background:rgba(212,164,74,.10);color:#f1cf82;border-radius:999px;padding:4px 8px;font-size:12px;line-height:1.2}
-      .item-meta{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin:8px 0 12px}
-      .item-meta div{border:1px solid rgba(255,255,255,.08);background:rgba(0,0,0,.22);border-radius:12px;padding:8px;min-width:0}
-      .item-meta small,.item-block small{display:block;color:#a8b3bf;text-transform:uppercase;letter-spacing:.04em;font-size:11px;margin-bottom:3px}
-      .item-meta strong{font-size:13px;word-break:break-word}
-      .item-block{margin-top:10px}
-      .item-chips{display:flex;flex-wrap:wrap;gap:6px}
-      .item-chip b{color:#fff;margin-right:4px}
-      .item-chip.trait{background:rgba(120,88,180,.12)}
-      .item-ability{margin:4px 0 0;line-height:1.45;color:#eee}
-      .ql-card{grid-template-columns:148px minmax(0,1fr);padding:20px;border-radius:20px;background:linear-gradient(135deg,rgba(24,16,10,.94),rgba(2,2,2,.72));}
-      .ql-art{width:148px;height:148px;border-radius:20px;background:linear-gradient(135deg,rgba(88,45,120,.24),rgba(0,0,0,.42));}
-      .ql-art img{padding:10px;max-width:100%;max-height:100%;object-fit:contain;}
-      .ql-subline{display:flex;gap:8px;align-items:center;color:#c7d2de;font-weight:700;margin-top:6px}
-      .ql-subline i{opacity:.45;font-style:normal}.ql-level{margin-top:8px;color:#a8b3bf;font-weight:700}
-      .ql-section{margin-top:14px;padding-top:12px;border-top:1px solid rgba(212,164,74,.18)}
-      .ql-section>small{display:block;color:#c3d0dd;text-transform:uppercase;letter-spacing:.05em;font-size:11px;margin-bottom:8px;font-weight:800}
-      .ql-stat-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px}
-      .ql-stat{border:1px solid rgba(255,255,255,.08);background:rgba(0,0,0,.26);border-radius:14px;padding:10px;min-height:58px}
-      .ql-stat span{display:block;color:#a8b3bf;font-size:12px;margin-bottom:4px}.ql-stat strong{display:block;color:#fff;font-size:17px;line-height:1.15}.ql-stat em{display:inline-block;color:#75d47a;font-style:normal;font-size:12px;margin-top:3px}
-      .passive-box{border:1px solid rgba(120,88,180,.26);background:rgba(120,88,180,.10);border-radius:14px;padding:12px}.passive-box h4{margin:0 0 6px;color:#e6ccff}.passive-box p{margin:0;line-height:1.5}
-      .trait-table{display:grid;gap:7px}.trait-row{display:grid;grid-template-columns:minmax(160px,240px) 1fr;gap:10px;align-items:center;border:1px solid rgba(255,255,255,.07);background:rgba(0,0,0,.2);border-radius:12px;padding:8px 10px}.trait-row>span{color:#c7d2de;font-weight:700}.trait-values{display:flex;flex-wrap:wrap;gap:7px;align-items:center}.trait-values b{color:#fff}.trait-values i{opacity:.35;font-style:normal}
-
-      .admin-img-box{margin-top:8px;border:1px solid rgba(212,164,74,.22);border-radius:12px;background:rgba(0,0,0,.22);padding:8px;font-size:12px}
-      .admin-img-box summary{cursor:pointer;color:#f1cf82;font-weight:800}
-      .admin-img-form{display:grid;grid-template-columns:1fr auto;gap:6px;margin-top:8px}
-      .admin-img-form input{min-width:0;padding:8px;border-radius:9px;border:1px solid rgba(255,255,255,.14);background:rgba(0,0,0,.32);color:inherit}
-      .btn.small{padding:7px 10px;font-size:12px}
-      .btn.danger{border-color:rgba(255,110,110,.32);color:#ffb0b0;background:rgba(160,30,30,.14)}
-      .manual-badge{display:inline-block;margin-left:6px;color:#75d47a;font-size:11px}
-      @media(max-width:760px){.item-card-grid{grid-template-columns:1fr}.item-card{grid-template-columns:84px minmax(0,1fr);padding:12px}.item-art{width:84px;height:84px}.item-meta{grid-template-columns:repeat(2,minmax(0,1fr))}.item-head{display:block}.item-badges{justify-content:flex-start;margin-top:8px}.ql-card{grid-template-columns:1fr}.ql-art{width:120px;height:120px}.trait-row{grid-template-columns:1fr}}
+      .idb-page-head{display:flex;justify-content:space-between;gap:18px;align-items:flex-end;margin:0 0 16px}.idb-page-head h1{font-size:35px;margin:0 0 5px}.idb-page-head p{margin:0}.idb-page-mark{font-size:46px;color:var(--gold);line-height:1}
+      .idb-filter{border:1px solid rgba(214,168,79,.34);background:linear-gradient(180deg,rgba(20,20,24,.92),rgba(9,10,14,.9));border-radius:16px;padding:14px;margin-bottom:16px;box-shadow:inset 0 0 0 1px rgba(255,220,150,.04)}
+      .idb-filter form{display:grid;grid-template-columns:minmax(220px,1.5fr) repeat(4,minmax(135px,.8fr)) auto;gap:9px;align-items:end}.idb-filter label{display:grid;gap:5px}.idb-filter label span{font-size:11px;color:#c8ad72;text-transform:uppercase;letter-spacing:.06em;font-weight:800}.idb-filter input,.idb-filter select{width:100%;min-width:0;padding:11px 12px;border-radius:9px;border:1px solid rgba(214,168,79,.28);background:#101217;color:#eee}.idb-filter-actions{display:flex;gap:7px}.idb-filter button,.idb-reset{padding:11px 13px;border-radius:9px;border:1px solid rgba(214,168,79,.42);background:linear-gradient(180deg,#7b351f,#4b1f16);color:#f8d994;font-weight:900;text-decoration:none;white-space:nowrap}.idb-reset{background:#12151b;color:#d7c9aa}
+      .idb-summary{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:16px}.idb-summary-card{display:grid;grid-template-columns:56px 1fr;gap:12px;align-items:center;padding:14px;border:1px solid rgba(214,168,79,.28);background:linear-gradient(180deg,rgba(24,23,25,.94),rgba(10,11,15,.92));border-radius:13px}.idb-summary-card.weapon{border-color:rgba(196,75,75,.38)}.idb-summary-card.armor{border-color:rgba(67,126,184,.38)}.idb-summary-card.accessory{border-color:rgba(135,87,177,.42)}.idb-summary-icon{width:54px;height:54px;border-radius:50%;display:grid;place-items:center;border:1px solid rgba(214,168,79,.42);background:rgba(214,168,79,.08);font-size:25px}.idb-summary-card small{display:block;color:#d7bd84;font-weight:900;letter-spacing:.05em}.idb-summary-card strong{display:block;font-size:27px;color:#f3ddad;line-height:1.05;margin:3px 0}.idb-summary-card em{display:block;color:#9ccf71;font-style:normal;font-size:12px}
+      .idb-main-grid{display:grid;grid-template-columns:minmax(0,1.8fr) minmax(330px,.72fr);gap:14px;align-items:start}.idb-list-panel,.idb-detail-panel,.idb-bottom-panel{border:1px solid rgba(214,168,79,.28);background:linear-gradient(180deg,rgba(17,18,22,.95),rgba(8,9,12,.94));border-radius:13px;overflow:hidden}.idb-table-wrap{overflow:auto}.idb-table{width:100%;border-collapse:collapse;min-width:860px}.idb-table th{padding:10px 11px;text-align:left;color:#b8a173;font-size:11px;letter-spacing:.045em;border-bottom:1px solid rgba(214,168,79,.24);background:rgba(0,0,0,.22)}.idb-table td{padding:8px 11px;border-bottom:1px solid rgba(255,255,255,.065);vertical-align:middle;font-size:13px}.idb-table td small{display:block;color:#a1a6ae;font-size:11px;margin-top:2px}.idb-item-row:hover,.idb-item-row.selected{background:linear-gradient(90deg,rgba(111,46,27,.36),rgba(214,168,79,.045))}.idb-item-row.selected td:first-child{box-shadow:inset 3px 0 0 #c18432}.idb-item-main{display:flex;align-items:center;gap:9px;text-decoration:none;color:#e8c7ff}.idb-list-art{width:39px;height:39px;flex:0 0 39px;display:grid;place-items:center;border:1px solid rgba(214,168,79,.26);background:rgba(0,0,0,.34);border-radius:5px;overflow:hidden}.idb-list-art img{width:100%;height:100%;object-fit:contain}.idb-rarity{display:inline-flex;padding:4px 7px;border-radius:4px;font-size:10px;font-weight:900;text-transform:uppercase;border:1px solid rgba(255,255,255,.14)}.idb-rarity.legendary{color:#ffb75e;background:#5c2c0d;border-color:#a95d1d}.idb-rarity.epic{color:#e5b3ff;background:#3d1d48;border-color:#754080}.idb-rarity.rare{color:#8dcbff;background:#122d50;border-color:#245c92}.idb-rarity.uncommon{color:#9bdd89;background:#153a1e;border-color:#2d7040}.idb-rarity.common{color:#d0d3d7;background:#2b2e33}.idb-need-count{display:inline-block;color:#e7aa38;font-weight:900}.idb-details-btn{display:inline-flex;padding:7px 10px;border:1px solid rgba(214,168,79,.42);border-radius:6px;color:#e8d2a1;text-decoration:none;background:rgba(214,168,79,.06)}.idb-details-btn:hover{background:rgba(214,168,79,.15)}.idb-pagination{display:flex;justify-content:center;align-items:center;gap:8px;padding:12px}.idb-pagination a,.idb-pagination span{padding:7px 10px;border:1px solid rgba(214,168,79,.24);border-radius:7px;color:#dfc99a;text-decoration:none;background:rgba(255,255,255,.025)}
+      .idb-detail-panel{position:sticky;top:14px;padding:13px}.idb-detail-title{display:flex;justify-content:space-between;align-items:center;color:#d8b86e;font-size:12px;font-weight:900;letter-spacing:.06em;padding:1px 2px 10px;border-bottom:1px solid rgba(214,168,79,.24)}.idb-detail-head{display:grid;grid-template-columns:112px 1fr;gap:14px;padding:12px 0}.idb-detail-art{width:112px;height:112px;display:grid;place-items:center;overflow:hidden;border:1px solid rgba(214,168,79,.38);background:radial-gradient(circle,rgba(87,51,130,.28),rgba(0,0,0,.42));border-radius:5px}.idb-detail-art img{width:100%;height:100%;object-fit:contain;padding:7px}.idb-detail-head h2{margin:1px 0 8px;color:#d7a0f5;font-size:21px;line-height:1.15}.idb-detail-head p{margin:9px 0 3px;color:#d4d7db}.idb-detail-head small{color:#aeb2b8}.idb-detail-head a{color:#e1b95d}.idb-detail-section{padding:11px 0;border-top:1px solid rgba(214,168,79,.22)}.idb-detail-section h3{font-size:11px;color:#d7ae55;letter-spacing:.055em;margin:0 0 8px}.idb-detail-section h3 span{float:right;color:#f0d8a2}.idb-detail-stats{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px}.idb-detail-stats .ql-stat{min-height:0;padding:7px 8px;border-radius:5px}.idb-detail-stats .ql-stat span{font-size:11px}.idb-detail-stats .ql-stat strong{font-size:14px}.idb-detail-panel .passive-box{border-radius:6px;padding:9px}.idb-detail-panel .trait-row{grid-template-columns:1fr;border-radius:5px;padding:7px}.idb-needer-list{display:grid;gap:5px}.idb-needer{display:grid;grid-template-columns:28px 1fr;gap:7px;align-items:center;padding:7px;background:rgba(0,0,0,.22);border:1px solid rgba(255,255,255,.06);border-radius:5px}.idb-needer-icon{width:26px;height:26px;display:grid;place-items:center;border-radius:50%;background:rgba(129,79,174,.18);color:#cf9aff}.idb-needer strong{display:block}.idb-needer a{color:#e8c7ff;text-decoration:none}.idb-needer small{display:block;color:#b7a16f}.idb-detail-actions{display:grid;gap:8px;margin-top:10px}.idb-primary-action,.idb-secondary-action{display:flex;justify-content:center;padding:11px;border-radius:6px;text-decoration:none;font-weight:900;text-transform:uppercase;letter-spacing:.035em}.idb-primary-action{background:linear-gradient(180deg,#7a2d1d,#4d1c13);border:1px solid #a55735;color:#f1d69b}.idb-secondary-action{background:#11141a;border:1px solid rgba(214,168,79,.35);color:#dac9a4}
+      .idb-bottom-grid{display:grid;grid-template-columns:1.25fr 1fr 1fr;gap:12px;margin-top:14px}.idb-bottom-panel{padding:11px}.idb-bottom-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}.idb-bottom-head h3{margin:0;color:#d7b868;font-size:12px;letter-spacing:.05em}.idb-bottom-head a{font-size:11px;color:#e2c271;text-decoration:none}.idb-mini-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px}.idb-mini-item{display:grid;grid-template-columns:48px 1fr;gap:8px;align-items:center;padding:7px;border:1px solid rgba(214,168,79,.18);background:rgba(0,0,0,.2);border-radius:6px;text-decoration:none}.idb-mini-art{width:48px;height:48px;display:grid;place-items:center;background:rgba(0,0,0,.35);border:1px solid rgba(214,168,79,.22);overflow:hidden}.idb-mini-art img{width:100%;height:100%;object-fit:contain}.idb-mini-item strong{display:block;color:#dec2ee;font-size:12px;line-height:1.2}.idb-mini-item small{display:block;color:#a7aab0;font-size:10px;margin-top:4px}.idb-often-list{display:grid;gap:5px}.idb-often-row{display:flex;justify-content:space-between;gap:10px;padding:8px;border-bottom:1px solid rgba(255,255,255,.055);color:#d7c6e0;text-decoration:none;font-size:12px}.idb-often-row strong{color:#d6a84f;white-space:nowrap}.idb-empty-small,.idb-empty-detail{padding:14px;color:#9fa6af;text-align:center}.idb-recent-placeholder{color:#9fa6af;font-size:12px;padding:12px;text-align:center}
+      .idb-detail-panel .admin-img-box{margin-top:10px}.idb-detail-panel .admin-img-form{grid-template-columns:minmax(0,1fr) auto}
+      @media(max-width:1250px){.idb-filter form{grid-template-columns:repeat(3,minmax(0,1fr))}.idb-main-grid{grid-template-columns:1fr}.idb-detail-panel{position:static}.idb-summary{grid-template-columns:repeat(2,minmax(0,1fr))}}
+      @media(max-width:760px){.idb-page-head{align-items:flex-start}.idb-page-head h1{font-size:29px}.idb-filter form{grid-template-columns:1fr}.idb-filter-actions{display:grid;grid-template-columns:1fr 1fr}.idb-summary{grid-template-columns:1fr}.idb-summary-card{grid-template-columns:48px 1fr}.idb-summary-icon{width:46px;height:46px}.idb-bottom-grid{grid-template-columns:1fr}.idb-mini-grid{grid-template-columns:1fr}.idb-detail-head{grid-template-columns:84px 1fr}.idb-detail-art{width:84px;height:84px}.idb-detail-stats{grid-template-columns:1fr}.idb-main-grid{display:flex;flex-direction:column}.idb-list-panel,.idb-detail-panel{width:100%}}
     </style>
-    """
+    '''
 
-    def selected(value: str, current: str) -> str:
-        return ' selected' if value == current else ''
-    body = f"""
+    seed_json = json.dumps(recent_seed, ensure_ascii=False).replace("</", "<\\/")
+    item_db_js = '''
+    <script>
+      (() => {
+        const seed = __SEED__;
+        const key = 'beer_and_buffs_item_recent_v1';
+        let recent = [];
+        try { recent = JSON.parse(localStorage.getItem(key) || '[]'); } catch (_) { recent = []; }
+        if (seed && seed.name) {
+          recent = [seed, ...recent.filter(x => String(x.id || x.name) !== String(seed.id || seed.name))].slice(0, 5);
+          try { localStorage.setItem(key, JSON.stringify(recent)); } catch (_) {}
+        }
+        const root = document.getElementById('idbRecent');
+        if (!root) return;
+        const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+        if (!recent.length) { root.innerHTML = '<div class="idb-recent-placeholder">Noch keine Items angesehen.</div>'; return; }
+        root.innerHTML = recent.slice(0, 4).map(item => {
+          const art = item.image ? '<img src="' + esc(item.image) + '" alt="">' : '<span>?</span>';
+          const href = '/items?q=' + encodeURIComponent(item.name || '');
+          return '<a class="idb-mini-item" href="' + href + '"><span class="idb-mini-art">' + art + '</span><span><strong>' + esc(item.name || '—') + '</strong><small>' + esc(item.rarity || '—') + ' · ' + esc(item.value || '—') + '</small></span></a>';
+        }).join('');
+      })();
+    </script>
+    '''.replace('__SEED__', seed_json)
+
+    body = f'''
     <nav class="topnav"><a href="/">← Übersicht</a><a href="/loot">Loot</a><a href="/loot-check">Truhencheck</a><a href="/character-editor">Needs</a><a href="/api/items">API</a></nav>
-    <section class="hero">
-      <div>
-        <div class="eyebrow">Questlog → Postgres</div>
-        <h1>📚 Item-Datenbank</h1>
-        <p class="muted">Lokaler Katalog aus Questlog. Bot und Dashboard sollen später nur noch diese Tabelle nutzen, nicht Questlog live.</p>
-      </div>
-      <a class="btn" href="/api/items?category={_e(urllib.parse.quote(category))}&q={_e(urllib.parse.quote(q))}">JSON öffnen</a>
-    </section>
-    <section class="grid">{cards}</section>
-    <section class="panel">
-      <h2>Filter</h2>
-      <form method="get" action="/items" style="display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:10px;align-items:end">
-        <label><span class="muted">Suche</span><input name="q" value="{_e(q)}" placeholder="Aridus, Tevent, Bow..." style="width:100%;padding:12px;border-radius:12px;border:1px solid rgba(255,255,255,.16);background:rgba(0,0,0,.22);color:inherit"></label>
-        <label><span class="muted">Kategorie</span><select name="category" style="width:100%;padding:12px;border-radius:12px;border:1px solid rgba(255,255,255,.16);background:rgba(0,0,0,.22);color:inherit"><option value="">alle</option><option value="weapon"{selected('weapon', category)}>weapon</option><option value="armor"{selected('armor', category)}>armor</option><option value="material"{selected('material', category)}>material</option><option value="currency"{selected('currency', category)}>currency</option><option value="misc"{selected('misc', category)}>misc</option></select></label>
-        <label><span class="muted">Unterkategorie</span><input name="sub_category" value="{_e(sub_category)}" placeholder="Langbogen, Helm..." style="width:100%;padding:12px;border-radius:12px;border:1px solid rgba(255,255,255,.16);background:rgba(0,0,0,.22);color:inherit"></label>
-        <label><span class="muted">Seltenheit</span><input name="rarity" value="{_e(rarity)}" placeholder="Epic..." style="width:100%;padding:12px;border-radius:12px;border:1px solid rgba(255,255,255,.16);background:rgba(0,0,0,.22);color:inherit"></label>
-        <label><span class="muted">Sicherheit</span><select name="confidence" style="width:100%;padding:12px;border-radius:12px;border:1px solid rgba(255,255,255,.16);background:rgba(0,0,0,.22);color:inherit"><option value="">alle</option><option value="high"{selected('high', confidence)}>high</option><option value="medium"{selected('medium', confidence)}>medium</option><option value="low"{selected('low', confidence)}>low</option></select></label>
-        <button class="btn" type="submit">Anzeigen</button>
+    <section class="idb-page-head"><div><div class="eyebrow">Questlog → Postgres → Gildenbedarf</div><h1>Item-Datenbank</h1><p class="muted">Suche, filtere und prüfe Ausrüstung samt Werten, Fähigkeiten und offenen Needs.</p></div><div class="idb-page-mark">↧</div></section>
+    <section class="idb-filter">
+      <form method="get" action="/items">
+        <label><span>Item suchen</span><input name="q" value="{_e(q)}" placeholder="Aridus, Tevent, Brosche …"></label>
+        <label><span>Kategorie</span><select name="category">{category_options}</select></label>
+        <label><span>Typ</span><select name="sub_category">{sub_select_options}</select></label>
+        <label><span>Seltenheit</span><select name="rarity">{rarity_select_options}</select></label>
+        <label><span>Sortierung</span><select name="sort">{sort_options}</select></label>
+        <div class="idb-filter-actions"><button type="submit">Filtern</button><a class="idb-reset" href="/items">Reset</a></div>
       </form>
-      <p class="muted">Importer-Befehl für Waffen: <code>python questlog_item_importer.py --category-url https://questlog.gg/throne-and-liberty/de/db/items/weapons?grade=41 --only weapon</code></p>
     </section>
-    {item_card_css}
-    <section class="panel"><h2>Kategorien</h2>{_table(['Kategorie','Unterkategorie','Items'], cat_rows, placeholder='Kategorien durchsuchen…')}</section>
-    <section class="panel"><h2>Items</h2><div class="item-card-grid">{item_cards}</div></section>
-    """
+    <section class="idb-summary">{summary_cards}</section>
+    {item_db_css}
+    <section class="idb-main-grid">
+      <div class="idb-list-panel">
+        <div class="idb-table-wrap"><table class="idb-table"><thead><tr><th>ITEM</th><th>KATEGORIE</th><th>SELTENHEIT</th><th>WERT</th><th>QUELLE</th><th>NEED</th><th>AKTION</th></tr></thead><tbody>{table_rows}</tbody></table></div>
+        <div class="idb-pagination">{pagination}</div>
+      </div>
+      <aside class="idb-detail-panel">{detail_html}</aside>
+    </section>
+    <section class="idb-bottom-grid">
+      <div class="idb-bottom-panel"><div class="idb-bottom-head"><h3>★ BELIEBTE ITEMS</h3><a href="{_e(_item_db_query_url(params, sort='need', page=1, selected=''))}">Alle anzeigen</a></div><div class="idb-mini-grid">{popular_html}</div></div>
+      <div class="idb-bottom-panel"><div class="idb-bottom-head"><h3>ZULETZT ANGESEHEN</h3></div><div class="idb-mini-grid" id="idbRecent"></div></div>
+      <div class="idb-bottom-panel"><div class="idb-bottom-head"><h3>OFT GEBRAUCHT</h3><a href="/need-analytics">Need-Analytics</a></div><div class="idb-often-list">{often_html}</div></div>
+    </section>
+    {item_db_js}
+    '''
     return _html_shell("Item-Datenbank · Beer and Buffs Dashboard", body)
-
-
 
 
 # ---------------------------------------------------------------------------
