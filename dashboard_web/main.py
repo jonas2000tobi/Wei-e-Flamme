@@ -28,6 +28,7 @@ try:
     from item_catalog_db import (
         catalog_stats,
         ensure_item_catalog_schema,
+        get_item_by_id,
         item_source_url_by_id,
         query_items,
         set_item_image_override,
@@ -35,6 +36,7 @@ try:
 except Exception:  # Dashboard soll auch ohne Item-Modul starten
     catalog_stats = None  # type: ignore
     ensure_item_catalog_schema = None  # type: ignore
+    get_item_by_id = None  # type: ignore
     item_source_url_by_id = None  # type: ignore
     query_items = None  # type: ignore
     set_item_image_override = None  # type: ignore
@@ -46,8 +48,8 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
-ASSET_VER = "beer-and-buffs-kastleton-header-v2-20260721"
-DASHBOARD_RELEASE_VERSION = "2.0.0 · Konfigurierbare Gildenplattform"
+ASSET_VER = "beer-and-buffs-items-mobile-need-fix-v1-20260721"
+DASHBOARD_RELEASE_VERSION = "2.0.1 · Item-Aufrufe & Mobile-Need-Picker"
 
 
 def _database_url() -> str:
@@ -9093,6 +9095,162 @@ def _jsonable(value: Any) -> Any:
     return value
 
 
+
+def _ensure_item_view_schema() -> None:
+    """Kleine Dashboard-Tabelle für echte Item-Aufrufe.
+
+    Ein Datensatz pro Besucher und Item verhindert, dass die Tabelle durch
+    jeden Seitenaufruf ungebremst wächst. view_count wird nur bei einem
+    ausdrücklichen Klick auf Details erhöht.
+    """
+    if not _database_url():
+        return
+    conn = _pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS dashboard_item_views (
+                    guild_id BIGINT NOT NULL DEFAULT 0,
+                    item_id BIGINT NOT NULL,
+                    viewer_key TEXT NOT NULL,
+                    view_count BIGINT NOT NULL DEFAULT 1,
+                    first_viewed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    last_viewed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    PRIMARY KEY (guild_id, item_id, viewer_key)
+                )
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_dashboard_item_views_popular
+                ON dashboard_item_views (guild_id, view_count DESC, last_viewed_at DESC)
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_dashboard_item_views_recent
+                ON dashboard_item_views (guild_id, viewer_key, last_viewed_at DESC)
+            """)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _item_viewer_key(request: Optional[Request]) -> str:
+    if request is None:
+        return ""
+    uid = _current_user_id(request)
+    if uid:
+        return f"user:{uid}"
+    session_token = str(request.cookies.get(SESSION_COOKIE, "") or "").strip()
+    if session_token:
+        digest = hashlib.sha256(session_token.encode("utf-8", errors="ignore")).hexdigest()[:32]
+        return f"session:{digest}"
+    client_host = str(getattr(getattr(request, "client", None), "host", "") or "")
+    user_agent = str(request.headers.get("user-agent") or "")
+    raw = f"{client_host}|{user_agent}".strip("|")
+    if not raw:
+        return ""
+    return "anon:" + hashlib.sha256(raw.encode("utf-8", errors="ignore")).hexdigest()[:32]
+
+
+def _record_item_view(request: Optional[Request], item_id: int) -> None:
+    if request is None or not _database_url() or not int(item_id or 0):
+        return
+    viewer_key = _item_viewer_key(request)
+    if not viewer_key:
+        return
+    try:
+        _ensure_item_view_schema()
+        conn = _pg_connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO dashboard_item_views
+                        (guild_id, item_id, viewer_key, view_count, first_viewed_at, last_viewed_at)
+                    VALUES (%s, %s, %s, 1, now(), now())
+                    ON CONFLICT (guild_id, item_id, viewer_key) DO UPDATE SET
+                        view_count = dashboard_item_views.view_count +
+                            CASE WHEN dashboard_item_views.last_viewed_at < now() - interval '45 seconds' THEN 1 ELSE 0 END,
+                        last_viewed_at = now()
+                """, (int(_active_guild_id() or 0), int(item_id), viewer_key))
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as exc:
+        print(f"[dashboard] Item-Aufruf konnte nicht gespeichert werden: {type(exc).__name__}: {exc}")
+
+
+def _item_view_items(request: Optional[Request], *, mode: str, limit: int = 4) -> list[dict[str, Any]]:
+    """Lädt echte beliebte bzw. zuletzt angesehene Items aus Postgres."""
+    if not _database_url():
+        return []
+    viewer_key = _item_viewer_key(request)
+    if mode == "recent" and not viewer_key:
+        return []
+    try:
+        _ensure_item_view_schema()
+        conn = _pg_connect()
+        try:
+            with conn.cursor() as cur:
+                if mode == "recent":
+                    cur.execute("""
+                        SELECT
+                            ic.id, ic.source, ic.source_url, ic.source_item_id, ic.locale, ic.name, ic.slug,
+                            ic.main_category, ic.sub_category, ic.rarity, ic.item_level, ic.required_level,
+                            ic.damage_min, ic.damage_max, ic.defense, ic.stats, ic.abilities, ic.traits,
+                            ic.image_url, ic.icon_url, ov.image_url AS manual_image_url,
+                            ic.classification_confidence, ic.raw_data, ic.is_active,
+                            ic.first_seen_at, ic.last_seen_at, ic.updated_at,
+                            v.view_count AS dashboard_view_count, v.last_viewed_at AS dashboard_last_viewed_at
+                        FROM dashboard_item_views v
+                        JOIN item_catalog ic ON ic.id = v.item_id AND ic.is_active = TRUE
+                        LEFT JOIN item_catalog_image_overrides ov ON ov.source_url = ic.source_url
+                        WHERE v.guild_id = %s AND v.viewer_key = %s
+                        ORDER BY v.last_viewed_at DESC
+                        LIMIT %s
+                    """, (int(_active_guild_id() or 0), viewer_key, max(1, min(int(limit), 20))))
+                else:
+                    cur.execute("""
+                        WITH popular AS (
+                            SELECT item_id, SUM(view_count)::BIGINT AS total_views, MAX(last_viewed_at) AS last_viewed_at
+                            FROM dashboard_item_views
+                            WHERE guild_id = %s
+                              AND last_viewed_at >= now() - interval '90 days'
+                            GROUP BY item_id
+                            ORDER BY total_views DESC, last_viewed_at DESC
+                            LIMIT %s
+                        )
+                        SELECT
+                            ic.id, ic.source, ic.source_url, ic.source_item_id, ic.locale, ic.name, ic.slug,
+                            ic.main_category, ic.sub_category, ic.rarity, ic.item_level, ic.required_level,
+                            ic.damage_min, ic.damage_max, ic.defense, ic.stats, ic.abilities, ic.traits,
+                            ic.image_url, ic.icon_url, ov.image_url AS manual_image_url,
+                            ic.classification_confidence, ic.raw_data, ic.is_active,
+                            ic.first_seen_at, ic.last_seen_at, ic.updated_at,
+                            p.total_views AS dashboard_view_count, p.last_viewed_at AS dashboard_last_viewed_at
+                        FROM popular p
+                        JOIN item_catalog ic ON ic.id = p.item_id AND ic.is_active = TRUE
+                        LEFT JOIN item_catalog_image_overrides ov ON ov.source_url = ic.source_url
+                        ORDER BY p.total_views DESC, p.last_viewed_at DESC
+                    """, (int(_active_guild_id() or 0), max(1, min(int(limit), 20))))
+                return [dict(row) for row in (cur.fetchall() or [])]
+        finally:
+            conn.close()
+    except Exception as exc:
+        print(f"[dashboard] Item-Aufrufsliste konnte nicht geladen werden: {type(exc).__name__}: {exc}")
+        return []
+
+
+def _item_lookup_exact(name: str) -> dict[str, Any]:
+    """Findet einen Need-Namen im Katalog, ohne einen unpassenden Teiltreffer zu nehmen."""
+    if not query_items or not str(name or "").strip():
+        return {}
+    try:
+        rows = query_items(q=str(name).strip(), limit=40, offset=0)  # type: ignore[misc]
+        wanted = _loot_key(name)
+        exact = next((dict(row) for row in rows if _loot_key((row or {}).get("name")) == wanted), None)
+        return exact or (dict(rows[0]) if len(rows) == 1 else {})
+    except Exception:
+        return {}
+
+
 def _item_catalog_payload(q: str = "", category: str = "", sub_category: str = "", rarity: str = "", confidence: str = "", limit: int = 200, offset: int = 0) -> dict[str, Any]:
     if not _item_catalog_available():
         return {"ok": False, "error": "Item-Katalog-Modul nicht geladen."}
@@ -9490,17 +9648,25 @@ def _item_db_people_html(info: dict[str, Any]) -> str:
     return "".join(rows) if rows else '<div class="idb-empty-small">Aktuell hat niemand dieses Item offen auf der Needliste.</div>'
 
 
-def _item_db_mini_card(item: dict[str, Any], need_index: dict[str, dict[str, Any]]) -> str:
+def _item_db_mini_card(item: dict[str, Any], need_index: dict[str, dict[str, Any]], *, context: str = "popular") -> str:
     name = str(item.get("name") or "—")
     image_url = _item_db_image_url(item)
     art = f'<img src="{_e(image_url)}" alt="" loading="lazy">' if image_url else '<span>?</span>'
     rarity = str(item.get("rarity") or "—")
     count = _item_db_need_count(item, need_index)
-    link = _item_db_query_url({}, q=name)
+    views = int(_num(item.get("dashboard_view_count"), 0))
+    if context == "recent":
+        metric = _dt(item.get("dashboard_last_viewed_at")) if item.get("dashboard_last_viewed_at") else "zuletzt geöffnet"
+    elif views:
+        metric = f"{views} Aufruf" + ("" if views == 1 else "e")
+    else:
+        metric = f"{count} Need" + ("" if count == 1 else "s")
+    item_id = str(item.get("id") or "")
+    link = _item_db_query_url({}, q=name, selected=item_id, view=1)
     return f'''
       <a class="idb-mini-item" href="{_e(link)}">
         <span class="idb-mini-art">{art}</span>
-        <span><strong>{_e(name)}</strong><small>{_e(rarity)} · {count} Need{'' if count == 1 else 's'}</small></span>
+        <span><strong>{_e(name)}</strong><small>{_e(rarity)} · {_e(metric)}</small></span>
       </a>
     '''
 
@@ -9560,9 +9726,18 @@ def _render_item_catalog(request: Optional[Request] = None) -> str:
     selected_item: Optional[dict[str, Any]] = None
     if selected_id:
         selected_item = next((item for item in items if str(item.get("id") or "") == selected_id), None)
+        if selected_item is None and get_item_by_id and selected_id.isdigit():
+            try:
+                selected_item = get_item_by_id(int(selected_id))  # type: ignore[misc]
+            except Exception:
+                selected_item = None
     if selected_item is None and items:
         selected_item = items[0]
         selected_id = str(selected_item.get("id") or "")
+
+    explicit_view = bool(request and str(request.query_params.get("view") or "") == "1")
+    if explicit_view and selected_item and int(_num(selected_item.get("id"), 0)):
+        _record_item_view(request, int(selected_item.get("id")))
 
     params = {
         "q": q,
@@ -9637,7 +9812,7 @@ def _render_item_catalog(request: Optional[Request] = None) -> str:
         rarity_text = str(item.get("rarity") or "—")
         rarity_class = _item_db_rarity_class(rarity_text)
         need_count = _item_db_need_count(item, need_index)
-        details_url = _item_db_query_url(params, selected=item_id)
+        details_url = _item_db_query_url(params, selected=item_id, view=1)
         selected_class = " selected" if selected_item is item else ""
         source_url = str(item.get("source_url") or "").strip()
         source_label = _item_db_source_label(item)
@@ -9693,18 +9868,34 @@ def _render_item_catalog(request: Optional[Request] = None) -> str:
           <div class="idb-detail-actions"><a class="idb-primary-action" href="/character-editor">Zum Need-Builder</a><a class="idb-secondary-action" href="{_e(loot_link)}">Im Loot prüfen</a></div>
           {_item_admin_image_form(selected_item, request)}
         '''
-        recent_seed = {
-            "id": selected_item.get("id"),
-            "name": name,
-            "image": image_url,
-            "rarity": rarity_text,
-            "value": _item_db_value_label(selected_item),
-        }
+        if explicit_view:
+            recent_seed = {
+                "id": selected_item.get("id"),
+                "name": name,
+                "image": image_url,
+                "rarity": rarity_text,
+                "value": _item_db_value_label(selected_item),
+            }
 
-    popular = sorted(items, key=lambda item: (_item_db_need_count(item, need_index), _item_db_sort_value(item)), reverse=True)[:4]
-    if popular and all(_item_db_need_count(item, need_index) == 0 for item in popular):
-        popular = items[:4]
-    popular_html = "".join(_item_db_mini_card(item, need_index) for item in popular) or '<div class="idb-empty-small">Keine Items geladen.</div>'
+    popular = _item_view_items(request, mode="popular", limit=4)
+    if not popular:
+        # Solange noch keine Aufrufstatistik existiert, global nach echten Gilden-Needs auffüllen.
+        for _need_key, info in sorted(
+            need_index.items(),
+            key=lambda pair: len(pair[1].get("main") or []) + len(pair[1].get("secondary") or []),
+            reverse=True,
+        ):
+            found = _item_lookup_exact(str(info.get("item") or ""))
+            if found and all(str(row.get("id")) != str(found.get("id")) for row in popular):
+                popular.append(found)
+            if len(popular) >= 4:
+                break
+    if not popular:
+        popular = sorted(items, key=lambda item: (_item_db_need_count(item, need_index), _item_db_sort_value(item)), reverse=True)[:4]
+    popular_html = "".join(_item_db_mini_card(item, need_index, context="popular") for item in popular) or '<div class="idb-empty-small">Noch keine Aufrufe oder Need-Daten vorhanden.</div>'
+
+    recent_items = _item_view_items(request, mode="recent", limit=4)
+    recent_html = "".join(_item_db_mini_card(item, need_index, context="recent") for item in recent_items)
 
     often_rows: list[str] = []
     for _key, info in sorted(need_index.items(), key=lambda pair: len(pair[1].get("main") or []) + len(pair[1].get("secondary") or []), reverse=True)[:5]:
@@ -9741,12 +9932,12 @@ def _render_item_catalog(request: Optional[Request] = None) -> str:
           try { localStorage.setItem(key, JSON.stringify(recent)); } catch (_) {}
         }
         const root = document.getElementById('idbRecent');
-        if (!root) return;
+        if (!root || root.querySelector('.idb-mini-item')) return;
         const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-        if (!recent.length) { root.innerHTML = '<div class="idb-recent-placeholder">Noch keine Items angesehen.</div>'; return; }
+        if (!recent.length) { root.innerHTML = '<div class="idb-recent-placeholder">Noch keine Items bewusst über Details geöffnet.</div>'; return; }
         root.innerHTML = recent.slice(0, 4).map(item => {
           const art = item.image ? '<img src="' + esc(item.image) + '" alt="">' : '<span>?</span>';
-          const href = '/items?q=' + encodeURIComponent(item.name || '');
+          const href = '/items?q=' + encodeURIComponent(item.name || '') + '&selected=' + encodeURIComponent(item.id || '') + '&view=1';
           return '<a class="idb-mini-item" href="' + href + '"><span class="idb-mini-art">' + art + '</span><span><strong>' + esc(item.name || '—') + '</strong><small>' + esc(item.rarity || '—') + ' · ' + esc(item.value || '—') + '</small></span></a>';
         }).join('');
       })();
@@ -9776,8 +9967,8 @@ def _render_item_catalog(request: Optional[Request] = None) -> str:
       <aside class="idb-detail-panel">{detail_html}</aside>
     </section>
     <section class="idb-bottom-grid">
-      <div class="idb-bottom-panel"><div class="idb-bottom-head"><h3>★ BELIEBTE ITEMS</h3><a href="{_e(_item_db_query_url(params, sort='need', page=1, selected=''))}">Alle anzeigen</a></div><div class="idb-mini-grid">{popular_html}</div></div>
-      <div class="idb-bottom-panel"><div class="idb-bottom-head"><h3>ZULETZT ANGESEHEN</h3></div><div class="idb-mini-grid" id="idbRecent"></div></div>
+      <div class="idb-bottom-panel"><div class="idb-bottom-head"><h3>★ BELIEBTE ITEMS</h3><a href="{_e(_item_db_query_url(params, sort='need', page=1, selected=''))}">Meiste Needs</a></div><div class="idb-mini-grid">{popular_html}</div></div>
+      <div class="idb-bottom-panel"><div class="idb-bottom-head"><h3>ZULETZT ANGESEHEN</h3></div><div class="idb-mini-grid" id="idbRecent">{recent_html}</div></div>
       <div class="idb-bottom-panel"><div class="idb-bottom-head"><h3>OFT GEBRAUCHT</h3><a href="/need-analytics">Need-Analytics</a></div><div class="idb-often-list">{often_html}</div></div>
     </section>
     {item_db_js}
@@ -11772,7 +11963,7 @@ def _render_need_editor_panel(
         .ne-picker-pop.mobile{{left:12px!important;right:12px!important;bottom:calc(12px + env(safe-area-inset-bottom));top:auto!important;width:auto!important;max-height:min(78vh,720px)}}
         .ne-picker-search{{width:100%;box-sizing:border-box;padding:12px 13px;border-radius:12px;border:1px solid rgba(214,168,79,.34);background:rgba(0,0,0,.46);color:inherit;margin-bottom:9px}}
         .ne-picker-list{{max-height:520px;overflow:auto;display:grid;grid-template-columns:1fr;gap:7px;padding-right:2px}}
-        .ne-item-option{{display:grid;grid-template-columns:62px minmax(0,1fr) auto;gap:11px;align-items:center;border:1px solid rgba(255,255,255,.075);background:rgba(255,255,255,.035);border-radius:14px;padding:9px;cursor:pointer;text-align:left;color:inherit}}
+        .ne-item-option{{display:grid;grid-template-columns:62px minmax(0,1fr) auto;gap:11px;align-items:center;border:1px solid rgba(255,255,255,.075);background:rgba(255,255,255,.035);border-radius:14px;padding:9px;cursor:pointer;text-align:left;color:inherit;touch-action:manipulation;-webkit-tap-highlight-color:transparent;min-height:78px}}
         .ne-item-option:hover{{border-color:rgba(214,168,79,.52);background:rgba(214,168,79,.09)}}
         .ne-item-option img{{width:60px;height:60px;object-fit:contain;border-radius:11px;background:rgba(0,0,0,.34);border:1px solid rgba(150,115,220,.28);padding:4px}}
         .ne-item-option-copy{{display:grid;gap:3px;min-width:0}}
@@ -11791,7 +11982,7 @@ def _render_need_editor_panel(
         .ne-tip-row b{{color:#f0f3f7;text-align:right}}
         .ne-tip-trait{{font-size:12px;border:1px solid rgba(255,255,255,.065);border-radius:9px;padding:6px;margin-top:5px;background:rgba(255,255,255,.025)}}
         .ne-tip-trait b{{display:block;color:#dce5ef}}
-        .ne-mobile-hint{{display:none;color:#aeb7c4;font-size:11px;margin-top:4px}}
+        .ne-mobile-hint{{display:none;color:#aeb7c4;font-size:11px;margin-top:4px}}.ne-picker-close{{display:none;width:100%;margin-top:8px;padding:11px;border-radius:11px;border:1px solid rgba(214,168,79,.34);background:#1b1e25;color:#f0d392;font-weight:900;touch-action:manipulation}}
         .equipment-editor-actions{{display:flex;gap:9px;flex-wrap:wrap}}
         .equipment-unsaved{{padding:10px 12px;border-radius:11px;background:rgba(222,157,39,.12);border:1px solid rgba(222,157,39,.35);color:#f4cf78;font-weight:800;font-size:13px}}
         .equipment-editor.is-dirty{{border-color:rgba(222,157,39,.58);box-shadow:0 0 0 2px rgba(222,157,39,.1)}}
@@ -11802,7 +11993,7 @@ def _render_need_editor_panel(
         .need-state.locked{{color:#94e49c;background:rgba(65,170,80,.14);border:1px solid rgba(65,170,80,.24)}}
         @media(max-width:1280px){{.need-planner-layout{{grid-template-columns:minmax(140px,165px) minmax(0,1fr) minmax(185px,220px);gap:9px}}.ne-side-panel{{padding:10px}}.equipment-window{{padding:13px}}.equipment-grid{{grid-template-columns:repeat(4,minmax(95px,1fr));gap:8px;padding:11px}}}}
         @media(max-width:1050px){{.need-planner-layout{{grid-template-columns:1fr 1fr;grid-template-areas:'attributes values' 'equipment equipment'}}.ne-attributes-panel{{grid-area:attributes}}.ne-values-panel{{grid-area:values}}.equipment-window{{grid-area:equipment}}.ne-values-list{{max-height:360px}}.equipment-grid{{grid-template-columns:repeat(4,minmax(100px,1fr))}}.equipment-grid-upper{{grid-template-areas:'. head head .' 'weapon1 chest hands cloak' 'weapon2 legs feet belt'}}.equipment-grid-lower{{grid-template-areas:'core1 . . .' 'core2 ring1 neck brooch' '. ring2 bracelet ear'}}.equipment-need-heading,.equipment-window-head{{align-items:flex-start;flex-direction:column}}.equipment-window-head p{{text-align:left}}}}
-        @media(max-width:620px){{.need-planner-layout{{grid-template-columns:1fr;grid-template-areas:'attributes' 'equipment' 'values'}}.equipment-tabs{{width:100%}}.equipment-tab-button{{flex:1}}.equipment-window{{padding:11px;border-radius:18px}}.equipment-grid{{grid-template-columns:repeat(2,minmax(0,1fr));gap:7px;padding:9px}}.equipment-grid-upper{{grid-template-areas:'head head' 'weapon1 chest' 'weapon2 legs' 'hands cloak' 'feet belt'}}.equipment-grid-lower{{grid-template-areas:'core1 core1' 'core2 ring1' 'ring2 neck' 'bracelet brooch' 'ear ear'}}.equipment-section-gap{{height:18px}}.equipment-slot{{min-height:112px;grid-template-rows:58px auto auto;padding:6px}}.equipment-slot-art{{height:58px}}.equipment-placeholder{{font-size:28px}}.equipment-slot-label{{font-size:10px}}.equipment-slot-item{{font-size:9px}}.equipment-editor{{grid-template-columns:1fr}}.equipment-editor-preview{{width:110px;height:110px}}.equipment-editor-actions .btn{{flex:1 1 100%}}.ne-picker-button{{grid-template-columns:50px minmax(0,1fr) auto}}.ne-picker-thumb{{width:48px;height:48px}}.ne-item-tooltip{{display:none!important}}.ne-mobile-hint{{display:block}}body.ne-picker-open{{overflow:hidden}}.ne-values-list{{max-height:none}}}}
+        @media(max-width:620px){{.need-planner-layout{{grid-template-columns:1fr;grid-template-areas:'attributes' 'equipment' 'values'}}.equipment-tabs{{width:100%}}.equipment-tab-button{{flex:1}}.equipment-window{{padding:11px;border-radius:18px}}.equipment-grid{{grid-template-columns:repeat(2,minmax(0,1fr));gap:7px;padding:9px}}.equipment-grid-upper{{grid-template-areas:'head head' 'weapon1 chest' 'weapon2 legs' 'hands cloak' 'feet belt'}}.equipment-grid-lower{{grid-template-areas:'core1 core1' 'core2 ring1' 'ring2 neck' 'bracelet brooch' 'ear ear'}}.equipment-section-gap{{height:18px}}.equipment-slot{{min-height:112px;grid-template-rows:58px auto auto;padding:6px}}.equipment-slot-art{{height:58px}}.equipment-placeholder{{font-size:28px}}.equipment-slot-label{{font-size:10px}}.equipment-slot-item{{font-size:9px}}.equipment-editor{{grid-template-columns:1fr}}.equipment-editor-preview{{width:110px;height:110px}}.equipment-editor-actions .btn{{flex:1 1 100%}}.ne-picker-button{{grid-template-columns:50px minmax(0,1fr) auto}}.ne-picker-thumb{{width:48px;height:48px}}.ne-item-tooltip{{display:none!important}}.ne-mobile-hint{{display:block}}body.ne-picker-open{{overflow:hidden}}.ne-values-list{{max-height:none}}.ne-picker-close{{display:block}}.ne-picker-pop.mobile{{z-index:30000!important}}}}
       </style>
       {board_html('Main', main_map)}
       {board_html('Secondary', sec_map)}
@@ -11994,12 +12185,14 @@ def _render_need_editor_panel(
               nePop.style.left = Math.max(12, Math.min(rect.left, window.innerWidth - 540)) + 'px';
               nePop.style.top = Math.max(12, Math.min(rect.bottom + 8, window.innerHeight - 680)) + 'px';
             }}
-            nePop.innerHTML = '<input class="ne-picker-search" type="search" placeholder="Optional filtern …"><div class="ne-picker-count" data-ne-result-count aria-live="polite"></div><div class="ne-picker-list"></div><div class="ne-mobile-hint">Die Liste enthält alle passenden Items. Auf Mobilgeräten antippen, um auszuwählen.</div>';
+            nePop.innerHTML = '<input class="ne-picker-search" type="search" placeholder="Optional filtern …"><div class="ne-picker-count" data-ne-result-count aria-live="polite"></div><div class="ne-picker-list"></div><div class="ne-mobile-hint">Item antippen, um es direkt auszuwählen.</div><button type="button" class="ne-picker-close">Schließen</button>';
             document.body.appendChild(nePop);
             const search = nePop.querySelector('.ne-picker-search');
             search.addEventListener('input', function() {{ neRenderOptions(search.value); }});
+            const closeButton = nePop.querySelector('.ne-picker-close');
+            if (closeButton) closeButton.addEventListener('click', neClosePicker);
             neRenderOptions('');
-            search.focus();
+            if (!neIsMobile()) search.focus();
           }}
           function neChooseItem(itemId) {{
             const item = NE_ITEMS.find(function(row) {{ return Number(row.id) === Number(itemId); }});
@@ -12281,7 +12474,7 @@ def _render_member_portal(data: dict[str, Any], user_id: int, request: Request, 
     requests = _need_change_requests(int(guild_id), user_id=uid, limit=40) if guild_id else []
     need_editor_actor = current_user if _current_user_id(request) == uid else None
     shared_item_catalog = _need_builder_items()
-    shared_item_catalog_json = json.dumps(shared_item_catalog, ensure_ascii=False)
+    shared_item_catalog_json = json.dumps(shared_item_catalog, ensure_ascii=False).replace("</", "<\\/")
     need_editor = _render_need_editor_panel(
         uid,
         need_editor_actor,
@@ -12558,6 +12751,7 @@ def _render_member_portal(data: dict[str, Any], user_id: int, request: Request, 
       </div>
     </details>
 
+    <script>window.BB_SHARED_ITEM_CATALOG = {shared_item_catalog_json};</script>
     <details class="profile-details" id="needlist-editor">
       <summary>Needliste bearbeiten</summary>
       <div class="profile-details-body">{need_editor}</div>
@@ -12571,7 +12765,6 @@ def _render_member_portal(data: dict[str, Any], user_id: int, request: Request, 
     </details>
 
     <script>
-      window.BB_SHARED_ITEM_CATALOG = {shared_item_catalog_json};
       (function profileEditState(){{
         const form = document.querySelector('[data-profile-edit-form="1"]');
         if (!form) return;
