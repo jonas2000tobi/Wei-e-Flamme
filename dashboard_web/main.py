@@ -12269,30 +12269,351 @@ def _member_event_role_summary_text(ev: dict[str, Any]) -> str:
 
 def _render_member_events_page(data: dict[str, Any], request: Request) -> str:
     if not data.get("ok"):
-        return _html_shell("Events · Mitgliederbereich", f"<section class='panel'><h1>📅 Events</h1><p class='muted'>{_e(data.get('error'))}</p></section>", nav_mode="member")
-    uid = _current_user_id(request)
-    snap: dict[str, Any] = data.get("snapshot") or {}
-    events = _portal_active_events(snap, int(uid or 0))
-    rows = []
-    for ev in events:
-        eid = str(ev.get("event_id") or ev.get("id") or "")
-        rows.append([
-            _event_link(eid, ev.get("title") or ev.get("name") or eid),
-            _dt(ev.get("when_iso") or ev.get("start_at") or ev.get("created_at")),
-            _event_status_text(ev),
-            _member_event_role_summary_text(ev),
-            _portal_event_status_for_user(ev, int(uid or 0)),
-            _raw(f'<a class="btn" href="/event/{_e(eid)}">Details</a>') if eid else "—",
-        ])
-    history_rows = _member_event_rows(snap, int(uid or 0)) if uid else []
-    body = f"""
-    <nav class="topnav"><a href="/member">Start</a><a href="/member/events">Events</a><a href="/member/auctions">Auktionen</a><a href="/portal">Eigenes Profil</a></nav>
-    <section class="hero"><div><div class="eyebrow">Mitgliederbereich</div><h1>📅 Events</h1><p class="muted">Eigene Eventseite mit mehr Infos als die Startseite.</p></div></section>
-    <section class="panel"><h2>📆 Laufende & kommende Events</h2>{_table(['Event','Zeit','Status','Rollen','Deine Anmeldung','Aktion'], rows, placeholder='Events durchsuchen…')}</section>
-    <section class="panel"><h2>🧾 Deine Event-Historie</h2>{_table(['Event','Zeit','Deine Anmeldung'], history_rows, placeholder='Historie durchsuchen…')}</section>
-    """
-    return _html_shell("Events · Mitgliederbereich", body, nav_mode="member")
+        return _html_shell(
+            "Events · Mitgliederbereich",
+            f"<section class='panel'><h1>📅 Events</h1><p class='muted'>{_e(data.get('error'))}</p></section>",
+            nav_mode="member",
+        )
 
+    uid = int(_current_user_id(request) or 0)
+    snap: dict[str, Any] = data.get("snapshot") or {}
+    guild_id = int(_safe_guild_id(data) or 0)
+    now = datetime.now(timezone.utc)
+
+    active_events = [dict(ev) for ev in _portal_active_events(snap, uid) if isinstance(ev, dict)]
+    active_events.sort(
+        key=lambda ev: _dt_obj(ev.get("when_iso") or ev.get("start_at") or ev.get("created_at"))
+        or datetime.max.replace(tzinfo=timezone.utc)
+    )
+
+    all_events = [dict(ev) for ev in _events_items(snap) if isinstance(ev, dict)]
+    past_events = []
+    for ev in all_events:
+        dt = _dt_obj(ev.get("when_iso") or ev.get("start_at") or ev.get("created_at"))
+        if dt and dt < now and not _is_running_event(ev):
+            past_events.append(ev)
+    past_events.sort(
+        key=lambda ev: _dt_obj(ev.get("when_iso") or ev.get("start_at") or ev.get("created_at"))
+        or datetime.min.replace(tzinfo=timezone.utc),
+        reverse=True,
+    )
+
+    def event_id(ev: dict[str, Any]) -> str:
+        return str(ev.get("event_id") or ev.get("id") or ev.get("message_id") or "").strip()
+
+    def event_title(ev: dict[str, Any]) -> str:
+        return str(ev.get("title") or ev.get("name") or event_id(ev) or "Gildenevent").strip()
+
+    def event_dt(ev: dict[str, Any]) -> Optional[datetime]:
+        return _dt_obj(ev.get("when_iso") or ev.get("start_at") or ev.get("created_at"))
+
+    def event_image(ev: dict[str, Any]) -> str:
+        for key in ("image_url", "banner_url", "thumbnail_url", "media_url", "event_image_url"):
+            value = str(ev.get(key) or "").strip()
+            if value.startswith(("https://", "http://", "/static/")):
+                return value
+        embed = ev.get("embed") if isinstance(ev.get("embed"), dict) else {}
+        for key in ("image_url", "thumbnail_url", "image", "thumbnail"):
+            value = embed.get(key)
+            if isinstance(value, dict):
+                value = value.get("url")
+            value = str(value or "").strip()
+            if value.startswith(("https://", "http://", "/static/")):
+                return value
+        return ""
+
+    def discord_event_url(ev: dict[str, Any]) -> str:
+        for key in ("jump_url", "discord_url", "message_url", "scheduled_event_url"):
+            value = str(ev.get(key) or "").strip()
+            if value.startswith("https://"):
+                return value
+        channel_id = str(ev.get("channel_id") or "").strip()
+        message_id = str(ev.get("message_id") or event_id(ev) or "").strip()
+        if guild_id and channel_id.isdigit() and message_id.isdigit():
+            return f"https://discord.com/channels/{guild_id}/{channel_id}/{message_id}"
+        return ""
+
+    def capacity_text(ev: dict[str, Any]) -> str:
+        for key in ("max_participants", "max_players", "capacity", "participant_limit", "limit", "slots"):
+            value = int(_num(ev.get(key), 0))
+            if value > 0:
+                return str(value)
+        return "unbegrenzt"
+
+    def event_type_text(ev: dict[str, Any]) -> str:
+        return str(ev.get("event_type") or ev.get("dkp_event_type") or "Gildenevent").strip() or "Gildenevent"
+
+    def role_counts(summary: dict[str, Any]) -> dict[str, int]:
+        out = {"Tank": 0, "Heiler": 0, "DPS": 0, "Reserve": 0, "Andere": 0}
+        for group in summary.get("groups") or []:
+            if not isinstance(group, dict):
+                continue
+            bucket = _role_bucket(group.get("role"))
+            if bucket not in out:
+                bucket = "Andere"
+            out[bucket] += len([p for p in (group.get("participants") or []) if isinstance(p, dict)])
+        return out
+
+    def start_status(ev: dict[str, Any]) -> tuple[str, str]:
+        dt = event_dt(ev)
+        if _is_running_event(ev):
+            return "EVENT LÄUFT", "running"
+        if dt and dt >= now:
+            return "ANMELDUNG OFFEN", "open"
+        return "ABGESCHLOSSEN", "closed"
+
+    def until_text(ev: dict[str, Any]) -> str:
+        dt = event_dt(ev)
+        if not dt:
+            return "Zeit unbekannt"
+        seconds = int((dt - now).total_seconds())
+        if seconds <= 0:
+            return "Event läuft bereits"
+        minutes = max(1, seconds // 60)
+        if minutes < 60:
+            return f"Startet in {minutes} Minuten"
+        hours = minutes // 60
+        if hours < 24:
+            return f"Startet in {hours} Stunden"
+        days = hours // 24
+        return f"Startet in {days} Tagen"
+
+    def image_block(ev: dict[str, Any], *, compact: bool = False) -> str:
+        src = event_image(ev)
+        cls = "event-mini-image" if compact else "event-feature-image"
+        if src:
+            return f'<div class="{cls}"><img src="{_e(src)}" alt="{_e(event_title(ev))}" loading="lazy"></div>'
+        icon = "⚔️" if "boss" in event_type_text(ev).casefold() or "raid" in event_type_text(ev).casefold() else "📅"
+        return f'<div class="{cls} event-image-placeholder"><span>{icon}</span><small>{_e(event_type_text(ev))}</small></div>'
+
+    def role_strip(summary: dict[str, Any], *, compact: bool = False) -> str:
+        counts = role_counts(summary)
+        items = [
+            ("🛡️", "Tanks", counts.get("Tank", 0), "tank"),
+            ("✚", "Heiler", counts.get("Heiler", 0), "heal"),
+            ("⚔️", "DDs", counts.get("DPS", 0), "dps"),
+            ("🔖", "Reserve", counts.get("Reserve", 0), "reserve"),
+        ]
+        if not compact:
+            items.extend([
+                ("❔", "Vielleicht", int(summary.get("maybe_count") or 0), "maybe"),
+                ("✖", "Abgemeldet", int(summary.get("no_count") or 0), "no"),
+            ])
+        return '<div class="event-role-strip ' + ('compact' if compact else '') + '">' + ''.join(
+            f'<div class="event-role-stat {kind}"><span>{icon}</span><small>{_e(label)}</small><strong>{_e(value)}</strong></div>'
+            for icon, label, value, kind in items
+        ) + '</div>'
+
+    def status_class(status: str) -> str:
+        value = status.casefold()
+        if "tank" in value:
+            return "tank"
+        if "heal" in value:
+            return "heal"
+        if "dps" in value or "dd" in value:
+            return "dps"
+        if "reserve" in value or "bank" in value:
+            return "reserve"
+        if "vielleicht" in value:
+            return "maybe"
+        if "abgemeldet" in value:
+            return "no"
+        return "missing"
+
+    def action_href(ev: dict[str, Any]) -> tuple[str, str]:
+        direct = discord_event_url(ev)
+        if direct:
+            return direct, ' target="_blank" rel="noopener"'
+        eid = event_id(ev)
+        return (f"/event/{urllib.parse.quote(eid)}" if eid else "/member/events"), ""
+
+    def featured_event(ev: dict[str, Any]) -> str:
+        eid = event_id(ev)
+        summary = _event_response_summary(snap, ev)
+        state_label, state_class = start_status(ev)
+        user_status = _portal_event_status_for_user(ev, uid)
+        href, target = action_href(ev)
+        response_text = f"{int(summary.get('response_count') or 0)}/{int(summary.get('member_total') or 0)} · {float(summary.get('vote_percent') or 0):.1f} %"
+        return f'''
+        <article class="event-feature-card">
+          <div class="event-section-title">Nächstes Gildenevent</div>
+          <div class="event-feature-main">
+            {image_block(ev)}
+            <div class="event-feature-copy">
+              <div class="event-type-label">{_e(event_type_text(ev))}</div>
+              <h2>{_e(event_title(ev))}</h2>
+              <div class="event-time-line"><span>▣</span><strong>{_e(_dt(ev.get('when_iso') or ev.get('start_at') or ev.get('created_at')))}</strong></div>
+              <span class="event-state-badge {state_class}">{_e(state_label)}</span>
+              <div class="event-feature-numbers">
+                <span>👥 <strong>{_e(summary.get('yes_count', 0))}</strong> / {_e(capacity_text(ev))}</span>
+                <span>🗳️ <strong>{_e(response_text)}</strong> abgestimmt</span>
+              </div>
+              <a class="event-detail-link" href="/event/{_e(eid)}">Teilnehmer & Details öffnen →</a>
+            </div>
+          </div>
+          {role_strip(summary)}
+          <div class="event-own-status"><span>👤 Dein Status:</span><strong class="{status_class(user_status)}">{_e(user_status if user_status != '—' else 'Noch nicht abgestimmt')}</strong></div>
+          <div class="event-feature-actions">
+            <a class="event-choice participate" href="{_e(href)}"{target}>✓ <span>Teilnehmen</span></a>
+            <a class="event-choice maybe" href="{_e(href)}"{target}>? <span>Vielleicht</span></a>
+            <a class="event-choice reserve" href="{_e(href)}"{target}>🔖 <span>Reserve</span></a>
+            <a class="event-choice decline" href="{_e(href)}"{target}>✕ <span>Abmelden</span></a>
+          </div>
+          <p class="event-action-note">Die Auswahl öffnet den Eventpost in Discord, dort wird die Rolle bzw. Rückmeldung gesetzt.</p>
+        </article>
+        '''
+
+    def small_event_card(ev: dict[str, Any]) -> str:
+        eid = event_id(ev)
+        summary = _event_response_summary(snap, ev)
+        user_status = _portal_event_status_for_user(ev, uid)
+        href, target = action_href(ev)
+        return f'''
+        <article class="event-mini-card">
+          {image_block(ev, compact=True)}
+          <div class="event-mini-copy">
+            <div class="event-mini-heading">
+              <div><span class="event-mini-type">{_e(event_type_text(ev))}</span><h3>{_e(event_title(ev))}</h3></div>
+              <span class="event-mini-open">{_e(start_status(ev)[0])}</span>
+            </div>
+            <div class="event-mini-time">▣ {_e(_dt(ev.get('when_iso') or ev.get('start_at') or ev.get('created_at')))}</div>
+            <div class="event-mini-count">👥 <strong>{_e(summary.get('yes_count', 0))}</strong> / {_e(capacity_text(ev))} zugesagt · Abstimmung {_e(summary.get('response_count', 0))}/{_e(summary.get('member_total', 0))}</div>
+            {role_strip(summary, compact=True)}
+            <div class="event-mini-status">Dein Status: <strong class="{status_class(user_status)}">{_e(user_status if user_status != '—' else 'Noch nicht abgestimmt')}</strong></div>
+            <div class="event-mini-actions">
+              <a class="event-secondary-button primary" href="/event/{_e(eid)}">Details öffnen</a>
+              <a class="event-secondary-button" href="{_e(href)}"{target}>Status ändern</a>
+            </div>
+          </div>
+        </article>
+        '''
+
+    featured = active_events[0] if active_events else None
+    other_events = active_events[1:] if len(active_events) > 1 else []
+
+    summaries = [_event_response_summary(snap, ev) for ev in active_events]
+    current_week = now.isocalendar()[:2]
+    this_week = sum(1 for ev in active_events if event_dt(ev) and event_dt(ev).isocalendar()[:2] == current_week)
+    total_responses = sum(int(s.get("response_count") or 0) for s in summaries)
+    total_missing = sum(int(s.get("no_response_count") or 0) for s in summaries)
+
+    attention_items: list[str] = []
+    if featured:
+        feature_summary = _event_response_summary(snap, featured)
+        feature_roles = role_counts(feature_summary)
+        if feature_roles.get("Tank", 0) <= 0:
+            attention_items.append("Noch kein Tank zugesagt")
+        if feature_roles.get("Heiler", 0) <= 0:
+            attention_items.append("Noch kein Heiler zugesagt")
+        if int(feature_summary.get("no_response_count") or 0) > 0:
+            attention_items.append(f"{int(feature_summary.get('no_response_count') or 0)} Mitglieder ohne Rückmeldung")
+        attention_items.append(until_text(featured))
+    if not attention_items:
+        attention_items.append("Aktuell keine dringenden Hinweise")
+
+    status_panel = f'''
+    <aside class="event-status-panel">
+      <div class="event-section-title">▥ Event-Status</div>
+      <div class="event-status-list">
+        <div><span>👥 Aktive Events</span><strong>{len(active_events)}</strong></div>
+        <div><span>▣ Diese Woche</span><strong>{this_week}</strong></div>
+        <div><span>▤ Rückmeldungen</span><strong class="positive">{total_responses}</strong></div>
+        <div><span>◷ Nicht reagiert</span><strong class="warning">{total_missing}</strong></div>
+      </div>
+      <div class="event-attention-box">
+        <h3>⚠ Aufmerksamkeit</h3>
+        <ul>{''.join(f'<li>{_e(item)}</li>' for item in attention_items)}</ul>
+      </div>
+    </aside>
+    '''
+
+    history_rows = []
+    for ev in past_events[:80]:
+        eid = event_id(ev)
+        history_rows.append([
+            _event_link(eid, event_title(ev)),
+            _dt(ev.get("when_iso") or ev.get("start_at") or ev.get("created_at")),
+            _portal_event_status_for_user(ev, uid),
+        ])
+    if not history_rows:
+        history_rows = _member_event_rows(snap, uid) if uid else []
+
+    featured_html = featured_event(featured) if featured else '<article class="event-feature-card"><div class="empty">Derzeit ist kein laufendes oder kommendes Event eingetragen.</div></article>'
+    other_html = ''.join(small_event_card(ev) for ev in other_events) or '<div class="empty">Keine weiteren geplanten Events.</div>'
+
+    body = f'''
+    <style>
+      .events-page-heading{{margin:4px 0 18px;padding:0 4px}}
+      .events-page-heading h1{{margin:0;color:#e5c276;font-size:42px;font-family:Georgia,serif;letter-spacing:.02em}}
+      .events-page-heading p{{margin:6px 0 0}}
+      .events-top-layout{{display:grid;grid-template-columns:minmax(0,2.35fr) minmax(280px,.85fr);gap:18px;align-items:stretch}}
+      .event-feature-card,.event-status-panel,.events-more-panel,.events-history{{border:1px solid rgba(214,168,79,.36);background:linear-gradient(145deg,rgba(12,16,18,.94),rgba(5,7,8,.88));box-shadow:0 18px 48px rgba(0,0,0,.25)}}
+      .event-feature-card{{padding:18px 20px}}
+      .event-section-title{{color:#d9b76d;text-transform:uppercase;letter-spacing:.08em;font-family:Georgia,serif;font-weight:800;font-size:16px;padding-bottom:11px;margin-bottom:14px;border-bottom:1px solid rgba(214,168,79,.26)}}
+      .event-feature-main{{display:grid;grid-template-columns:minmax(190px,30%) minmax(0,1fr);gap:22px;align-items:center}}
+      .event-feature-image{{height:168px;border:1px solid rgba(214,168,79,.25);background:rgba(0,0,0,.34);overflow:hidden}}
+      .event-feature-image img,.event-mini-image img{{width:100%;height:100%;object-fit:cover}}
+      .event-image-placeholder{{display:grid;place-items:center;text-align:center;background:radial-gradient(circle at 50% 40%,rgba(150,87,34,.28),rgba(5,7,8,.92))}}
+      .event-image-placeholder span{{font-size:52px}}.event-image-placeholder small{{color:#d9b76d;text-transform:uppercase;letter-spacing:.08em}}
+      .event-feature-copy h2{{font-family:Georgia,serif;font-size:34px;margin:3px 0 8px;color:#f2eadb}}
+      .event-type-label,.event-mini-type{{color:#a99b86;text-transform:uppercase;font-size:11px;letter-spacing:.1em}}
+      .event-time-line{{display:flex;align-items:center;gap:9px;color:#e0b95f;margin-bottom:9px}}
+      .event-state-badge{{display:inline-flex;padding:7px 15px;border:1px solid;border-radius:4px;font-size:12px;font-weight:900;letter-spacing:.06em}}
+      .event-state-badge.open{{color:#b8dd8d;border-color:#56863d;background:rgba(65,117,37,.28)}}
+      .event-state-badge.running{{color:#f2cf72;border-color:#9b7124;background:rgba(132,88,18,.28)}}
+      .event-state-badge.closed{{color:#aab1b7;border-color:#596067;background:rgba(65,70,75,.25)}}
+      .event-feature-numbers{{display:flex;gap:18px;flex-wrap:wrap;margin:13px 0;color:#c9bda8}}
+      .event-detail-link{{color:#d9b76d;text-decoration:none;font-weight:800}}
+      .event-role-strip{{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));margin:17px 0 0;border-top:1px solid rgba(214,168,79,.22);border-bottom:1px solid rgba(214,168,79,.18)}}
+      .event-role-strip.compact{{grid-template-columns:repeat(4,minmax(0,1fr));margin:10px 0;border-top:1px solid rgba(214,168,79,.16)}}
+      .event-role-stat{{display:grid;grid-template-columns:auto 1fr;column-gap:7px;align-items:center;padding:12px 10px;border-right:1px dotted rgba(214,168,79,.28)}}
+      .event-role-stat:last-child{{border-right:0}}.event-role-stat>span{{grid-row:1/3;font-size:22px}}.event-role-stat small{{color:#c9bda8}}.event-role-stat strong{{font-size:19px;color:#f2eadb}}
+      .event-role-stat.tank>span{{color:#6ea4e8}}.event-role-stat.heal>span{{color:#83d45f}}.event-role-stat.dps>span{{color:#dc5548}}.event-role-stat.reserve>span{{color:#e2bd52}}.event-role-stat.maybe>span{{color:#b77ce4}}
+      .event-own-status{{display:flex;gap:8px;align-items:center;padding:13px 4px;color:#c9bda8}}
+      .event-own-status strong,.event-mini-status strong{{color:#f2eadb}}.event-own-status strong.tank,.event-mini-status strong.tank{{color:#78aeea}}.event-own-status strong.heal,.event-mini-status strong.heal{{color:#8ddf6a}}.event-own-status strong.dps,.event-mini-status strong.dps{{color:#ef6d5c}}.event-own-status strong.reserve,.event-mini-status strong.reserve{{color:#e7c55f}}.event-own-status strong.maybe,.event-mini-status strong.maybe{{color:#c28aef}}.event-own-status strong.no,.event-mini-status strong.no{{color:#c28f87}}
+      .event-feature-actions{{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}}
+      .event-choice{{display:flex;gap:9px;align-items:center;justify-content:center;padding:13px 9px;border:1px solid rgba(214,168,79,.42);background:linear-gradient(180deg,rgba(44,37,30,.88),rgba(15,15,14,.9));color:#e5d3b0;text-decoration:none;text-transform:uppercase;font-family:Georgia,serif;font-weight:800;letter-spacing:.03em}}
+      .event-choice:hover{{filter:brightness(1.18)}}.event-choice.participate{{border-color:#8c4c2b;background:linear-gradient(180deg,rgba(105,29,20,.75),rgba(42,13,10,.88))}}.event-choice.maybe{{border-color:#745a91;background:linear-gradient(180deg,rgba(65,38,82,.78),rgba(28,18,36,.9))}}.event-choice.reserve{{border-color:#9b722d;background:linear-gradient(180deg,rgba(106,70,18,.72),rgba(45,31,12,.9))}}
+      .event-action-note{{margin:9px 0 0;text-align:right;color:var(--muted);font-size:11px}}
+      .event-status-panel{{padding:18px}}
+      .event-status-list{{display:grid;border:1px solid rgba(214,168,79,.18)}}
+      .event-status-list>div{{display:flex;justify-content:space-between;gap:12px;align-items:center;padding:15px;border-bottom:1px solid rgba(214,168,79,.16);color:#cabda6}}
+      .event-status-list>div:last-child{{border-bottom:0}}.event-status-list strong{{font-size:22px;color:#f1e8d8}}.event-status-list strong.positive{{color:#77c95b}}.event-status-list strong.warning{{color:#e8953f}}
+      .event-attention-box{{margin-top:16px;padding:15px;border:1px solid rgba(190,67,45,.58);background:linear-gradient(135deg,rgba(94,27,20,.48),rgba(37,13,11,.68))}}
+      .event-attention-box h3{{margin:0 0 9px;color:#e2bd68;text-transform:uppercase;font-family:Georgia,serif}}.event-attention-box ul{{margin:0;padding-left:20px;color:#d7c7b7}}.event-attention-box li{{margin:7px 0}}
+      .events-more-panel{{margin-top:18px;padding:16px}}
+      .events-more-grid{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}}
+      .event-mini-card{{display:grid;grid-template-columns:145px minmax(0,1fr);border:1px solid rgba(214,168,79,.28);background:rgba(6,9,10,.7);min-height:220px}}
+      .event-mini-image{{min-height:220px;border-right:1px solid rgba(214,168,79,.22);overflow:hidden}}
+      .event-mini-copy{{padding:14px 15px;display:flex;flex-direction:column}}
+      .event-mini-heading{{display:flex;justify-content:space-between;gap:10px;align-items:flex-start}}.event-mini-heading h3{{margin:3px 0 4px;color:#f0e7d7;font-family:Georgia,serif;font-size:22px}}
+      .event-mini-open{{font-size:9px;color:#a5cf7a;border:1px solid rgba(89,131,55,.5);padding:5px 7px;white-space:nowrap}}
+      .event-mini-time{{color:#d8b563;font-weight:800;margin-bottom:7px}}.event-mini-count{{color:#c9bda8;font-size:13px}}
+      .event-mini-card .event-role-stat{{padding:8px 5px}}.event-mini-card .event-role-stat>span{{font-size:15px}}.event-mini-card .event-role-stat small{{font-size:9px}}.event-mini-card .event-role-stat strong{{font-size:14px}}
+      .event-mini-status{{margin:3px 0 10px;color:#b8ad9d;font-size:13px}}
+      .event-mini-actions{{margin-top:auto;display:grid;grid-template-columns:1fr 1fr;gap:10px}}
+      .event-secondary-button{{display:flex;align-items:center;justify-content:center;padding:10px;border:1px solid rgba(214,168,79,.38);color:#d8c8aa;text-decoration:none;text-transform:uppercase;font-family:Georgia,serif;font-size:12px}}.event-secondary-button.primary{{border-color:#8e452b;background:rgba(102,28,18,.5)}}
+      .events-history{{margin-top:18px;padding:0}}.events-history>summary{{cursor:pointer;list-style:none;padding:16px 20px;color:#d9b76d;font-family:Georgia,serif;font-size:18px;text-transform:uppercase;letter-spacing:.04em}}.events-history>summary::-webkit-details-marker{{display:none}}.events-history>summary::after{{content:'⌄';float:right}}.events-history[open]>summary{{border-bottom:1px solid rgba(214,168,79,.22)}}.events-history-content{{padding:14px}}
+      @media(max-width:1100px){{.events-top-layout{{grid-template-columns:1fr}}.events-more-grid{{grid-template-columns:1fr}}}}
+      @media(max-width:720px){{.events-page-heading h1{{font-size:34px}}.event-feature-main{{grid-template-columns:1fr}}.event-feature-image{{height:190px}}.event-role-strip{{grid-template-columns:repeat(3,minmax(0,1fr))}}.event-feature-actions{{grid-template-columns:1fr 1fr}}.event-mini-card{{grid-template-columns:105px minmax(0,1fr)}}.event-mini-image{{min-height:235px}}}}
+      @media(max-width:480px){{.event-feature-card,.event-status-panel,.events-more-panel{{padding:13px}}.event-feature-copy h2{{font-size:27px}}.event-role-strip{{grid-template-columns:1fr 1fr}}.event-feature-actions{{grid-template-columns:1fr}}.event-mini-card{{grid-template-columns:1fr}}.event-mini-image{{height:150px;min-height:150px;border-right:0;border-bottom:1px solid rgba(214,168,79,.22)}}.event-mini-heading{{display:block}}.event-mini-open{{display:inline-flex;margin-bottom:6px}}}}
+    </style>
+    <nav class="topnav"><a href="/member">Start</a><a href="/member/events">Events</a><a href="/member/auctions">Auktionen</a><a href="/portal">Eigenes Profil</a></nav>
+    <header class="events-page-heading"><h1>Events</h1><p class="muted">Deine kommenden Gildeneinsätze</p></header>
+    <section class="events-top-layout">
+      {featured_html}
+      {status_panel}
+    </section>
+    <section class="events-more-panel">
+      <div class="event-section-title">Weitere geplante Events</div>
+      <div class="events-more-grid">{other_html}</div>
+    </section>
+    <details class="events-history">
+      <summary>◷ Vergangene Events / Verlauf</summary>
+      <div class="events-history-content">{_table(['Event','Zeit','Deine Anmeldung'], history_rows, placeholder='Vergangene Events durchsuchen…')}</div>
+    </details>
+    '''
+    return _html_shell("Events · Mitgliederbereich", body, nav_mode="member")
 
 def _render_member_auctions_page(data: dict[str, Any], request: Request) -> str:
     if not data.get("ok"):
