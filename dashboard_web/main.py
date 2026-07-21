@@ -11915,7 +11915,11 @@ def _guild_membership_duration(value: Any) -> str:
 
 def _render_member_portal(data: dict[str, Any], user_id: int, request: Request, msg: str = "") -> str:
     if not data.get("ok"):
-        return _html_shell("Profil · Beer and Buffs Dashboard", f"<section class='panel'><h1>👤 Mein Profil</h1><p class='muted'>{_e(data.get('error'))}</p></section>", nav_mode="member")
+        return _html_shell(
+            "Profil · Beer and Buffs Dashboard",
+            f"<section class='panel'><h1>👤 Mein Profil</h1><p class='muted'>{_e(data.get('error'))}</p></section>",
+            nav_mode="member",
+        )
     if not _portal_can_view(request, int(user_id)):
         raise HTTPException(status_code=403, detail="Du darfst nur dein eigenes Profil sehen. Leitung/Admins sehen alle Mitglieder.")
 
@@ -11924,6 +11928,8 @@ def _render_member_portal(data: dict[str, Any], user_id: int, request: Request, 
     names = _profile_name_map(snap)
     uid = int(user_id)
     current_user = _current_user(request)
+    now = datetime.now(timezone.utc)
+    brand = _guild_brand(data)
 
     profiles = ((snap.get("profiles") or {}).get("items") or [])
     profile: dict[str, Any] = {}
@@ -11973,11 +11979,6 @@ def _render_member_portal(data: dict[str, Any], user_id: int, request: Request, 
         preferred = next((name for name in role_names if any(term in name.casefold() for term in ("anführer", "gildenmeister", "leader", "berater", "wächter", "guardian"))), "")
         guild_rank = preferred or "Mitglied"
 
-    active_tab = str(request.query_params.get("profile_tab") or "").strip().lower()
-    need_open = " open" if active_tab == "needlist" else ""
-    ec_open = " open" if active_tab == "ec" else ""
-    events_open = " open" if active_tab in {"events", "attendance"} else ""
-
     requests = _need_change_requests(int(guild_id), user_id=uid, limit=40) if guild_id else []
     need_editor_actor = current_user if _current_user_id(request) == uid else None
     shared_item_catalog = _need_builder_items()
@@ -11990,23 +11991,12 @@ def _render_member_portal(data: dict[str, Any], user_id: int, request: Request, 
         compact=True,
         item_catalog=shared_item_catalog,
     )
+
+    need_info = _needs_by_user(snap).get(uid, {})
+    main_needs = need_info.get("main") if isinstance(need_info, dict) and isinstance(need_info.get("main"), list) else []
+    secondary_needs = need_info.get("secondary") if isinstance(need_info, dict) and isinstance(need_info.get("secondary"), list) else []
+    need_count = len(main_needs) + len(secondary_needs)
     balance = _balance_map(snap).get(uid)
-    ec_rows = [
-        [_dt(tx.get("created_at")), _fmt_ec(tx.get("amount")), tx.get("raw_type") or tx.get("type") or "—", _short(tx.get("reason"), 180)]
-        for tx in _tx_for_user(snap, uid, limit=140)
-    ]
-    event_rows = _member_event_rows(snap, uid)
-    upcoming_rows: list[list[Any]] = []
-    for ev in _portal_active_events(snap, uid):
-        status = _portal_event_status_for_user(ev, uid)
-        if status == "—":
-            continue
-        eid = str(ev.get("event_id") or ev.get("id") or "")
-        upcoming_rows.append([
-            _event_link(eid, ev.get("title") or ev.get("name") or eid),
-            _dt(ev.get("when_iso") or ev.get("start_at")),
-            status,
-        ])
 
     attendance_player: dict[str, Any] = {}
     try:
@@ -12015,11 +12005,133 @@ def _render_member_portal(data: dict[str, Any], user_id: int, request: Request, 
     except Exception:
         attendance_player = {}
 
+    def event_dt(ev: dict[str, Any]) -> Optional[datetime]:
+        return _dt_obj(ev.get("when_iso") or ev.get("start_at") or ev.get("created_at"))
+
+    def event_image(ev: dict[str, Any]) -> str:
+        for key in ("image_url", "banner_url", "thumbnail_url", "media_url", "event_image_url"):
+            value = str(ev.get(key) or "").strip()
+            if value.startswith(("https://", "http://", "/static/")):
+                return value
+        embed = ev.get("embed") if isinstance(ev.get("embed"), dict) else {}
+        for key in ("image_url", "thumbnail_url", "image", "thumbnail"):
+            value = embed.get(key)
+            if isinstance(value, dict):
+                value = value.get("url")
+            value = str(value or "").strip()
+            if value.startswith(("https://", "http://", "/static/")):
+                return value
+        return ""
+
+    active_events = [ev for ev in _portal_active_events(snap, uid) if isinstance(ev, dict)]
+    active_events.sort(key=lambda ev: event_dt(ev) or datetime.max.replace(tzinfo=timezone.utc))
+
+    week_start = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+    week_end = week_start + timedelta(days=7)
+    all_events = [ev for ev in _events_items(snap) if isinstance(ev, dict)]
+    week_events = [ev for ev in all_events if (event_dt(ev) and week_start <= event_dt(ev) < week_end)]
+    week_yes = 0
+    week_open = 0
+    week_missed = 0
+    for ev in week_events:
+        status = _portal_event_status_for_user(ev, uid)
+        dt = event_dt(ev)
+        if status.startswith("✅"):
+            week_yes += 1
+        elif dt and dt < now and not _is_running_event(ev):
+            week_missed += 1
+        else:
+            week_open += 1
+    week_total = len(week_events)
+    week_percent = round((week_yes / week_total) * 100) if week_total else 0
+
+    auctions = [a for a in (((snap.get("loot") or {}).get("auctions") or {}).get("items") or []) if isinstance(a, dict)]
+    won_auctions = sum(1 for a in auctions if _user_id(a.get("winner_user_id")) == uid)
+
+    def user_in_auction(a: dict[str, Any]) -> bool:
+        if _user_id(a.get("top_bid_user_id")) == uid or _user_id(a.get("winner_user_id")) == uid:
+            return True
+        for bid in a.get("bids") or []:
+            if isinstance(bid, dict) and _user_id(bid.get("user_id") or bid.get("bidder_id") or bid.get("member_id")) == uid:
+                return True
+        return False
+
+    user_active_auctions = [a for a in _portal_active_auctions(snap) if isinstance(a, dict) and user_in_auction(a)]
+    user_active_auctions = user_active_auctions[:3]
+
+    absence_text = "Keine Abwesenheit"
+    absence_state = "available"
+    for absence in ((snap.get("absences") or {}).get("items") or []):
+        if not isinstance(absence, dict) or _user_id(absence.get("user_id") or absence.get("member_id")) != uid:
+            continue
+        status_text = str(absence.get("status") or "").casefold()
+        if any(term in status_text for term in ("abgelehnt", "rejected", "storniert", "cancelled", "gelöscht", "deleted")):
+            continue
+        start = _dt_obj(absence.get("start_at") or absence.get("start_at_text") or absence.get("from"))
+        end = _dt_obj(absence.get("end_at") or absence.get("end_at_text") or absence.get("until"))
+        if end and end < now:
+            continue
+        if start and start > now:
+            absence_text = f"Geplant ab {_dt(start)}"
+            absence_state = "planned"
+        else:
+            absence_text = "Aktuell abwesend"
+            absence_state = "away"
+        break
+
+    def event_row(ev: dict[str, Any]) -> str:
+        eid = str(ev.get("event_id") or ev.get("id") or "")
+        title = str(ev.get("title") or ev.get("name") or eid or "Gildenevent")
+        status = _portal_event_status_for_user(ev, uid)
+        image = event_image(ev)
+        image_html = f'<img src="{_e(image)}" alt="{_e(title)}" loading="lazy">' if image else '<span class="profile-event-fallback">⚔️</span>'
+        status_cls = "yes" if status.startswith("✅") else "maybe" if "Vielleicht" in status else "no" if "Abgemeldet" in status else "open"
+        summary = _event_response_summary(snap, ev)
+        yes_count = int(summary.get("yes_count") or 0)
+        return f'''
+        <article class="profile-event-row">
+          <div class="profile-event-image">{image_html}</div>
+          <div class="profile-event-copy">
+            <h3>{_e(title)}</h3>
+            <p>📅 {_e(_dt(ev.get("when_iso") or ev.get("start_at")))}</p>
+            <small>Dein Status: <strong>{_e(status)}</strong></small>
+          </div>
+          <div class="profile-event-side"><span class="profile-status {status_cls}">{_e("Zugesagt" if status.startswith("✅") else status.replace("🟡 ", "").replace("❌ ", ""))}</span><small>👥 {yes_count} Zusagen</small></div>
+        </article>'''
+
+    upcoming_html = "".join(event_row(ev) for ev in active_events[:2]) or '<div class="profile-empty">Keine kommenden Events.</div>'
+
+    def auction_row(a: dict[str, Any]) -> str:
+        aid = str(a.get("auction_id") or a.get("id") or "")
+        item = _loot_text(a.get("item_name") or a.get("item") or aid or "Auktion")
+        phase = _phase_label(a)
+        bid = a.get("top_bid_amount")
+        bid_text = _fmt_ec(bid) if bid is not None else "noch kein Gebot"
+        return f'''
+        <article class="profile-auction-row">
+          <div class="profile-auction-icon">⚒️</div>
+          <div><h3>{_e(item)}</h3><p>{_e(phase)} · {_e(bid_text)}</p></div>
+          <a class="profile-mini-link" href="/auction/{_e(aid)}">Öffnen</a>
+        </article>'''
+
+    auctions_html = "".join(auction_row(a) for a in user_active_auctions) or '<div class="profile-empty">Du bist aktuell an keiner laufenden Auktion beteiligt.</div>'
+
+    txs = _tx_for_user(snap, uid, limit=5)
+    activity_rows: list[str] = []
+    for tx in txs:
+        amount = int(_num(tx.get("amount"), 0))
+        sign_cls = "plus" if amount >= 0 else "minus"
+        activity_rows.append(
+            f'<div class="profile-activity-row"><span class="profile-activity-icon">🪙</span><strong class="{sign_cls}">{_e(_fmt_ec(amount))}</strong><span>{_e(_short(tx.get("reason") or tx.get("raw_type") or "EC-Buchung", 90))}</span><small>{_e(_dt(tx.get("created_at")))}</small></div>'
+        )
+    activities_html = "".join(activity_rows) or '<div class="profile-empty">Noch keine Aktivitäten vorhanden.</div>'
+
     avatar_html = (
         f'<img src="{_e(avatar_url)}" alt="Discord-Profilbild von {_e(display)}" loading="eager">'
-        if avatar_url else
-        f'<img src="{_e(_brand_image("logo", "beer_and_buffs_logo.png"))}" alt="Profilbild" loading="eager">'
+        if avatar_url
+        else f'<img src="{_e(_brand_image("logo", "beer_and_buffs_logo.png"))}" alt="Profilbild" loading="eager">'
     )
+
     role_choices = ["DPS", "Tank", "Heiler", "Support", "Flex"]
     role_options: list[str] = []
     if main_role not in ("", "—") and main_role not in role_choices:
@@ -12027,16 +12139,6 @@ def _render_member_portal(data: dict[str, Any], user_id: int, request: Request, 
     for role_name in role_choices:
         selected_attr = " selected" if role_name.casefold() == main_role.casefold() else ""
         role_options.append(f'<option value="{_e(role_name)}"{selected_attr}>{_e(role_name)}</option>')
-
-    profile_rows = "".join([
-        f'<div class="portal-profile-row"><span>Name</span><strong>{_e(display)}</strong></div>',
-        f'<label class="portal-profile-row editable"><span>Klasse</span><span class="profile-edit-control"><input name="class_name" value="{_e("" if class_name == "—" else class_name)}" maxlength="80" placeholder="z. B. Stab / Langbogen"><b>✎</b></span></label>',
-        f'<label class="portal-profile-row editable"><span>Gearscore</span><span class="profile-edit-control"><input name="gearscore" type="number" min="1" max="99999" value="{_e("" if gearscore == "—" else gearscore)}" placeholder="z. B. 4200"><b>✎</b></span></label>',
-        f'<label class="portal-profile-row editable"><span>Rolle</span><span class="profile-edit-control"><select name="main_role"><option value="">Rolle auswählen</option>{"".join(role_options)}</select><b>✎</b></span></label>',
-        f'<div class="portal-profile-row"><span>EC-Kontostand</span><strong>{_e(_fmt_ec(balance) if balance is not None else "—")}</strong></div>',
-        f'<div class="portal-profile-row"><span>In der Gilde</span><strong>{_e(joined_text)}</strong></div>',
-        f'<div class="portal-profile-row"><span>Rang</span><strong>{_e(guild_rank)}</strong></div>',
-    ])
 
     profile_update_notice = ""
     if update_status in {"pending", "processing"}:
@@ -12051,64 +12153,134 @@ def _render_member_portal(data: dict[str, Any], user_id: int, request: Request, 
 
     body = f"""
     <style>
-      .profile-hero{{display:grid;grid-template-columns:126px minmax(0,1fr) auto;gap:22px;align-items:center;min-height:0;padding:22px}}
-      .profile-avatar{{width:118px;height:118px;border-radius:28px;overflow:hidden;border:2px solid rgba(226,181,81,.72);background:rgba(0,0,0,.35);box-shadow:0 15px 38px rgba(0,0,0,.42),0 0 0 5px rgba(214,168,79,.08)}}
-      .profile-avatar img{{width:100%;height:100%;object-fit:cover}}
-      .profile-main{{display:grid;gap:12px}}
-      .profile-main h1{{margin:0}}
-      .portal-profile-card{{display:block}}
-      .portal-profile-rows{{display:grid;gap:0}}
-      .portal-profile-row{{display:grid;grid-template-columns:150px minmax(0,1fr);gap:12px;align-items:center;padding:12px 0;border-bottom:1px solid rgba(214,168,79,.14)}}
-      .portal-profile-row:last-child{{border-bottom:0}}
-      .portal-profile-row span{{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.07em;font-weight:900}}
-      .portal-profile-row strong{{font-size:16px;overflow-wrap:anywhere}}
-      .portal-profile-row.editable{{cursor:text}}
-      .profile-edit-control{{display:grid;grid-template-columns:minmax(0,1fr) 28px;gap:8px;align-items:center}}
-      .profile-edit-control input,.profile-edit-control select{{width:100%;padding:10px 12px;border-radius:11px;border:1px solid rgba(214,168,79,.18);background:rgba(0,0,0,.24);color:var(--text);font:inherit}}
-      .profile-edit-control input:focus,.profile-edit-control select:focus{{outline:none;border-color:rgba(214,168,79,.55);box-shadow:0 0 0 3px rgba(214,168,79,.09)}}
-      .profile-edit-control b{{display:grid;place-items:center;color:var(--gold);font-size:16px}}
-      .profile-save-bar{{display:flex;justify-content:flex-end;gap:10px;padding-top:16px;border-top:1px solid rgba(214,168,79,.14);margin-top:4px}}
-      .profile-save-state{{margin:0 0 12px 0;padding:11px 13px;border-radius:12px;font-weight:700}}
-      .profile-save-state.pending{{background:rgba(214,168,79,.10);border:1px solid rgba(214,168,79,.24);color:#f0d58f}}
-      .profile-save-state.error{{background:rgba(211,82,82,.10);border:1px solid rgba(211,82,82,.25);color:#ffaaaa}}
-      .profile-tabs{{display:grid;gap:12px;margin-top:14px}}
-      .profile-tab{{border:1px solid rgba(214,168,79,.28);border-radius:17px;background:linear-gradient(135deg,rgba(35,24,13,.88),rgba(8,7,6,.88));overflow:clip}}
-      .profile-tab>summary{{list-style:none;cursor:pointer;display:flex;align-items:center;justify-content:space-between;gap:14px;padding:17px 19px;color:#f2dda8;font-family:Georgia,serif;font-weight:900;font-size:18px}}
-      .profile-tab>summary::-webkit-details-marker{{display:none}}
-      .profile-tab>summary::after{{content:"＋";font-family:Inter,sans-serif;color:var(--gold);font-size:22px}}
-      .profile-tab[open]>summary::after{{content:"−"}}
-      .profile-tab[open]>summary{{border-bottom:1px solid rgba(214,168,79,.18);background:rgba(214,168,79,.06)}}
-      .profile-tab-content{{padding:16px}}
-      .profile-tab-content>.panel:first-child{{margin-top:0}}
-      .profile-tab-kpis{{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:10px;margin-bottom:14px}}
-      .profile-tab-kpis .card{{min-width:0}}
-      @media(max-width:900px){{.profile-hero{{grid-template-columns:90px minmax(0,1fr)}}.profile-hero .hero-actions{{grid-column:1/-1}}.profile-avatar{{width:84px;height:84px;border-radius:22px}}.portal-profile-card{{display:block}}.profile-tab-kpis{{grid-template-columns:repeat(2,minmax(0,1fr))}}}}
-      @media(max-width:620px){{.profile-hero{{grid-template-columns:70px minmax(0,1fr);padding:16px;gap:13px}}.profile-avatar{{width:66px;height:66px;border-radius:18px}}.portal-profile-row{{grid-template-columns:1fr;gap:4px}}.profile-tab>summary{{padding:15px;font-size:16px}}.profile-tab-content{{padding:10px}}.profile-tab-kpis{{grid-template-columns:1fr 1fr}}}}
+      .member-profile-dashboard{{display:grid;gap:16px}}
+      .profile-section{{border:1px solid rgba(214,168,79,.30);background:linear-gradient(135deg,rgba(16,15,13,.95),rgba(5,6,6,.93));box-shadow:inset 0 0 0 1px rgba(255,255,255,.02);overflow:hidden}}
+      .profile-section-title{{margin:0;padding:13px 17px;border-bottom:1px solid rgba(214,168,79,.22);color:#e7c477;font:700 18px Georgia,serif;text-transform:uppercase;letter-spacing:.04em}}
+      .profile-top-grid{{display:grid;grid-template-columns:minmax(320px,.95fr) minmax(480px,1.35fr);gap:16px}}
+      .profile-identity{{display:grid;grid-template-columns:170px minmax(0,1fr);gap:22px;align-items:center;padding:24px}}
+      .profile-avatar-wrap{{display:grid;justify-items:center;gap:9px}}
+      .profile-avatar-large{{width:150px;height:150px;padding:5px;border-radius:50%;border:2px solid #c89435;background:radial-gradient(circle,rgba(158,37,28,.55),rgba(0,0,0,.94));box-shadow:0 0 0 5px rgba(214,168,79,.08)}}
+      .profile-avatar-large img{{width:100%;height:100%;object-fit:cover;border-radius:50%}}
+      .profile-level{{margin-top:-28px;position:relative;display:grid;place-items:center;width:48px;height:48px;border-radius:50%;background:#17130d;border:2px solid #c89435;color:#f1d28a;font:700 17px Georgia,serif}}
+      .profile-identity h1{{margin:0 0 5px;font-size:35px}}
+      .profile-guild-line{{color:#d7b66c;font-family:Georgia,serif;margin-bottom:16px}}
+      .profile-role-pills{{display:flex;flex-wrap:wrap;gap:8px;margin:13px 0}}
+      .profile-role-pill{{padding:7px 11px;border:1px solid rgba(214,168,79,.35);background:rgba(214,168,79,.08);font-weight:800;text-transform:uppercase;font-size:12px}}
+      .profile-role-pill.primary{{background:rgba(132,29,21,.42);border-color:rgba(204,76,54,.65)}}
+      .profile-identity-meta{{display:grid;gap:7px;color:#d9c9aa}}
+      .profile-stat-grid{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr))}}
+      .profile-stat{{min-height:132px;padding:18px;display:grid;align-content:center;justify-items:center;text-align:center;border-right:1px solid rgba(214,168,79,.20);border-bottom:1px solid rgba(214,168,79,.20)}}
+      .profile-stat:nth-child(3n){{border-right:0}}.profile-stat:nth-child(n+4){{border-bottom:0}}
+      .profile-stat small{{color:#d5ad58;font:700 13px Georgia,serif;text-transform:uppercase;letter-spacing:.05em}}
+      .profile-stat strong{{font:700 28px Georgia,serif;margin:10px 0 4px}}
+      .profile-stat span{{color:#7dd067;font-size:13px}}
+      .profile-middle-grid{{display:grid;grid-template-columns:1.05fr 1fr;gap:16px}}
+      .profile-event-list,.profile-auction-list,.profile-activity-list{{padding:12px}}
+      .profile-event-row{{display:grid;grid-template-columns:94px minmax(0,1fr) auto;gap:13px;align-items:center;padding:8px;border-bottom:1px solid rgba(214,168,79,.16)}}
+      .profile-event-row:last-child{{border-bottom:0}}
+      .profile-event-image{{height:76px;overflow:hidden;border:1px solid rgba(214,168,79,.28);background:#0d0d0c;display:grid;place-items:center}}
+      .profile-event-image img{{width:100%;height:100%;object-fit:cover}}.profile-event-fallback{{font-size:32px}}
+      .profile-event-copy h3,.profile-auction-row h3{{margin:0 0 5px;font-size:18px}}.profile-event-copy p,.profile-auction-row p{{margin:0 0 5px;color:#d2bd94;font-size:13px}}
+      .profile-event-side{{display:grid;justify-items:end;gap:8px}}.profile-event-side small{{color:#c9b996}}
+      .profile-status{{padding:6px 11px;border:1px solid rgba(214,168,79,.38);font:700 12px Georgia,serif;text-transform:uppercase}}
+      .profile-status.yes{{background:rgba(46,105,31,.40);border-color:rgba(93,169,61,.58)}}.profile-status.maybe{{background:rgba(97,62,130,.34)}}.profile-status.no{{background:rgba(116,35,28,.38)}}
+      .profile-panel-footer{{display:flex;justify-content:center;padding:10px;border-top:1px solid rgba(214,168,79,.20);background:rgba(122,28,20,.20)}}
+      .profile-panel-footer a{{color:#efd18d;text-transform:uppercase;font:700 14px Georgia,serif}}
+      .profile-auction-row{{display:grid;grid-template-columns:48px minmax(0,1fr) auto;gap:12px;align-items:center;padding:14px 8px;border-bottom:1px solid rgba(214,168,79,.16)}}
+      .profile-auction-row:last-child{{border-bottom:0}}.profile-auction-icon{{font-size:28px;text-align:center}}.profile-mini-link{{color:#efd18d;font-weight:800}}
+      .profile-bottom-grid{{display:grid;grid-template-columns:1.25fr .8fr .8fr;gap:16px}}
+      .profile-activity-row{{display:grid;grid-template-columns:28px 90px minmax(0,1fr) auto;gap:10px;align-items:center;padding:10px 6px;border-bottom:1px solid rgba(214,168,79,.14);font-size:13px}}
+      .profile-activity-row:last-child{{border-bottom:0}}.profile-activity-row .plus{{color:#69d56f}}.profile-activity-row .minus{{color:#ff6d67}}.profile-activity-row small{{color:#a99575}}
+      .profile-week{{display:grid;justify-items:center;gap:14px;padding:22px}}
+      .profile-donut{{--p:{week_percent};width:150px;height:150px;border-radius:50%;display:grid;place-items:center;background:conic-gradient(#d6a84f calc(var(--p)*1%),rgba(214,168,79,.12) 0);position:relative}}
+      .profile-donut::after{{content:"";position:absolute;inset:14px;border-radius:50%;background:#0a0b0a;border:1px solid rgba(214,168,79,.25)}}
+      .profile-donut-text{{position:relative;z-index:1;text-align:center}}.profile-donut-text strong{{display:block;font:700 30px Georgia,serif;color:#e4bc66}}.profile-donut-text span{{font-size:13px}}
+      .profile-week-legend{{display:grid;gap:8px;width:100%}}.profile-week-legend div{{display:flex;justify-content:space-between;gap:12px}}
+      .profile-actions{{display:grid;gap:10px;padding:16px}}.profile-action{{display:flex;justify-content:center;padding:13px;border:1px solid rgba(214,168,79,.38);background:rgba(214,168,79,.05);color:#efd18d;text-transform:uppercase;font:700 14px Georgia,serif}}
+      .profile-action.primary{{background:rgba(127,30,22,.38);border-color:rgba(188,63,45,.6)}}
+      .profile-details{{margin-top:16px;border:1px solid rgba(214,168,79,.30);background:rgba(8,8,7,.92)}}
+      .profile-details>summary{{list-style:none;cursor:pointer;padding:15px 18px;color:#efd18d;font:700 16px Georgia,serif;text-transform:uppercase}}.profile-details>summary::-webkit-details-marker{{display:none}}.profile-details[open]>summary{{border-bottom:1px solid rgba(214,168,79,.18)}}
+      .profile-details-body{{padding:16px}}
+      .profile-edit-grid{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}}.profile-edit-grid label{{display:grid;gap:6px;color:#c9b894;font-size:12px;text-transform:uppercase;font-weight:800}}
+      .profile-edit-grid input,.profile-edit-grid select{{width:100%;padding:11px 12px;border:1px solid rgba(214,168,79,.25);background:rgba(0,0,0,.35);color:var(--text)}}
+      .profile-save-bar{{display:flex;justify-content:flex-end;padding-top:14px}}.profile-save-state{{margin-bottom:12px;padding:11px 13px;border-radius:8px}}.profile-save-state.pending{{background:rgba(214,168,79,.10);color:#f0d58f}}.profile-save-state.error{{background:rgba(211,82,82,.10);color:#ffaaaa}}
+      .profile-empty{{padding:24px;color:var(--muted);text-align:center}}
+      @media(max-width:1100px){{.profile-top-grid,.profile-middle-grid,.profile-bottom-grid{{grid-template-columns:1fr}}.profile-stat-grid{{grid-template-columns:repeat(3,1fr)}}}}
+      @media(max-width:700px){{.profile-identity{{grid-template-columns:1fr;text-align:center}}.profile-role-pills{{justify-content:center}}.profile-stat-grid{{grid-template-columns:repeat(2,1fr)}}.profile-stat:nth-child(3n){{border-right:1px solid rgba(214,168,79,.20)}}.profile-stat:nth-child(2n){{border-right:0}}.profile-stat:nth-child(n+4){{border-bottom:1px solid rgba(214,168,79,.20)}}.profile-stat:nth-child(n+5){{border-bottom:0}}.profile-event-row{{grid-template-columns:76px minmax(0,1fr)}}.profile-event-side{{grid-column:1/-1;display:flex;justify-content:space-between}}.profile-activity-row{{grid-template-columns:24px 80px minmax(0,1fr)}}.profile-activity-row small{{grid-column:2/-1}}.profile-edit-grid{{grid-template-columns:1fr}}}}
     </style>
-    <nav class="topnav"><a href="/">Startseite</a><a href="#needlist">Needliste</a><a href="/character-editor">Charakter-Editor</a><a href="#ec-history">EC-Verlauf</a><a href="#event-history">Eventanmeldungen</a></nav>
-    <section class="hero profile-hero">
-      <div class="profile-avatar">{avatar_html}</div>
-      <div class="profile-main"><div class="eyebrow">Mein Profil</div><h1>{_e(display)}</h1><p class="muted">Deine persönlichen Gildendaten und einklappbaren Bereiche.</p></div>
-      <div class="hero-actions">{admin_links}</div>
-    </section>
+    <nav class="topnav"><a href="/member">Startseite</a><a href="/member/events">Events</a><a href="/member/auctions">Auktionen</a><a href="#profile-edit">Profil bearbeiten</a><a href="#needlist-editor">Needliste bearbeiten</a></nav>
+    <section class="hero"><div><div class="eyebrow">Mein Profil</div><h1>Mein Profil</h1><p class="muted">Deine persönliche Gildenübersicht</p></div>{admin_links}</section>
     {msg_html}
     {profile_update_notice}
-    <form class="panel portal-profile-card" method="post" action="/portal/member/{uid}/profile-update" data-profile-edit-form="1">
-      <div class="portal-profile-rows">{profile_rows}</div>
-      <div class="profile-save-bar"><button class="btn" type="submit">Profiländerungen speichern</button></div>
-    </form>
+    <main class="member-profile-dashboard">
+      <div class="profile-top-grid">
+        <section class="profile-section profile-identity">
+          <div class="profile-avatar-wrap"><div class="profile-avatar-large">{avatar_html}</div><div class="profile-level">{_e(gearscore if gearscore != '—' else 'GS')}</div></div>
+          <div>
+            <h1>{_e(display)}</h1>
+            <div class="profile-guild-line">🛡️ {_e(brand.get('display_name') or 'Beer and Buffs')} · {_e(guild_rank)}</div>
+            <div class="profile-role-pills"><span class="profile-role-pill primary">{_e(main_role)}</span><span class="profile-role-pill">{_e(class_name)}</span></div>
+            <div class="profile-identity-meta"><span>⚙️ Gearscore: <strong>{_e(gearscore)}</strong></span><span>📅 Aktiv { _e(joined_text) }</span></div>
+          </div>
+        </section>
+        <section class="profile-section profile-stat-grid">
+          <div class="profile-stat"><small>Ebolus Coins (EC)</small><strong>🪙 {_e(_fmt_ec(balance) if balance is not None else '—')}</strong><span>Verfügbar</span></div>
+          <div class="profile-stat"><small>Deine Rolle</small><strong>{_e(main_role)}</strong><span>{_e(class_name)}</span></div>
+          <div class="profile-stat"><small>Teilnahmen diese Woche</small><strong>{week_yes} / {week_total}</strong><span>Events</span></div>
+          <div class="profile-stat"><small>Auktionen gewonnen</small><strong>⚒️ {won_auctions}</strong><span>Insgesamt</span></div>
+          <div class="profile-stat"><small>Needlisteneinträge</small><strong>📋 {need_count}</strong><span>Offen</span></div>
+          <div class="profile-stat"><small>Abwesenheitsstatus</small><strong>{'🌙' if absence_state != 'available' else '✓'}</strong><span>{_e(absence_text)}</span></div>
+        </section>
+      </div>
+
+      <div class="profile-middle-grid">
+        <section class="profile-section"><h2 class="profile-section-title">Deine kommenden Events</h2><div class="profile-event-list">{upcoming_html}</div><div class="profile-panel-footer"><a href="/member/events">Zu meinen Events</a></div></section>
+        <section class="profile-section"><h2 class="profile-section-title">Deine aktiven Auktionen</h2><div class="profile-auction-list">{auctions_html}</div><div class="profile-panel-footer"><a href="/member/auctions">Auktionen öffnen</a></div></section>
+      </div>
+
+      <div class="profile-bottom-grid">
+        <section class="profile-section"><h2 class="profile-section-title">Letzte Aktivitäten</h2><div class="profile-activity-list">{activities_html}</div><div class="profile-panel-footer"><a href="/member/ec">Zur Aktivitäten-Historie</a></div></section>
+        <section class="profile-section"><h2 class="profile-section-title">Eventbeteiligung · Diese Woche</h2><div class="profile-week"><div class="profile-donut"><div class="profile-donut-text"><strong>{week_percent}%</strong><span>{week_yes} / {week_total}<br>Events</span></div></div><div class="profile-week-legend"><div><span>🟢 Zugesagt</span><strong>{week_yes}</strong></div><div><span>🟡 Offen</span><strong>{week_open}</strong></div><div><span>🔴 Verpasst</span><strong>{week_missed}</strong></div></div></div></section>
+        <section class="profile-section"><h2 class="profile-section-title">Profilaktionen</h2><div class="profile-actions"><a class="profile-action primary" href="#profile-edit">Profil bearbeiten</a><a class="profile-action" href="#needlist-editor">Needliste öffnen</a><a class="profile-action" href="/character-editor">Charakter-Editor</a><a class="profile-action" href="/member/auctions">Meine Auktionen</a></div></section>
+      </div>
+    </main>
+
+    <details class="profile-details" id="profile-edit">
+      <summary>Profil bearbeiten</summary>
+      <div class="profile-details-body">
+        <form method="post" action="/portal/member/{uid}/profile-update" data-profile-edit-form="1">
+          <div class="profile-edit-grid">
+            <label>Klasse<input name="class_name" value="{_e('' if class_name == '—' else class_name)}" maxlength="80" placeholder="z. B. Stab / Langbogen"></label>
+            <label>Gearscore<input name="gearscore" type="number" min="1" max="99999" value="{_e('' if gearscore == '—' else gearscore)}" placeholder="z. B. 4200"></label>
+            <label>Rolle<select name="main_role"><option value="">Rolle auswählen</option>{''.join(role_options)}</select></label>
+          </div>
+          <div class="profile-save-bar"><button class="btn" type="submit">Profiländerungen speichern</button></div>
+        </form>
+      </div>
+    </details>
+
+    <details class="profile-details" id="needlist-editor">
+      <summary>Needliste bearbeiten</summary>
+      <div class="profile-details-body">{need_editor}</div>
+    </details>
+
+    <details class="profile-details" id="profile-history">
+      <summary>EC- und Eventhistorie</summary>
+      <div class="profile-details-body">
+        <section class="grid">{_card('Reviews', attendance_player.get('reviews', 0), 'gewertete Events')}{_card('War da', attendance_player.get('present', 0), 'anwesend')}{_card('Teilweise', attendance_player.get('partial', 0), 'teilweise')}{_card('Nicht da', attendance_player.get('absent', 0), 'abwesend')}{_card('Quote', attendance_player.get('rate') or '—', 'Anwesenheit')}</section>
+      </div>
+    </details>
+
     <script>
       window.BB_SHARED_ITEM_CATALOG = {shared_item_catalog_json};
       (function profileEditState(){{
         const form = document.querySelector('[data-profile-edit-form="1"]');
         if (!form) return;
         const button = form.querySelector('button[type="submit"]');
-        const initial = new FormData(form);
         const signature = function(fd){{ return Array.from(fd.entries()).map(function(x){{ return x[0] + '=' + x[1]; }}).join('&'); }};
-        const start = signature(initial);
+        const start = signature(new FormData(form));
         function refresh(){{
           const dirty = signature(new FormData(form)) !== start;
-          form.classList.toggle('is-dirty', dirty);
           if (button) button.textContent = dirty ? 'Änderungen speichern' : 'Profil ist aktuell';
           if (button) button.disabled = !dirty;
         }}
@@ -12117,40 +12289,11 @@ def _render_member_portal(data: dict[str, Any], user_id: int, request: Request, 
         form.addEventListener('submit', function(){{ if (button) button.disabled = false; }});
         refresh();
       }})();
-    </script>
-    <section class="profile-tabs">
-      <details class="profile-tab" id="needlist"{need_open}>
-        <summary><span>🎯 Needliste</span><small class="muted">Items direkt auswählen</small></summary>
-        <div class="profile-tab-content">{need_editor}</div>
-      </details>
-      <details class="profile-tab" id="ec-history"{ec_open}>
-        <summary><span>🪙 Eigener EC-Verlauf</span><small class="muted">Kontostand und Buchungen</small></summary>
-        <div class="profile-tab-content">
-          <section class="grid">{_card('EC-Kontostand', _fmt_ec(balance) if balance is not None else '—', 'aktueller Stand')}</section>
-          <section class="panel"><h2>Deine EC-Buchungen</h2>{_table(['Zeit','Betrag','Typ','Grund'], ec_rows, placeholder='EC-Verlauf durchsuchen…')}</section>
-        </div>
-      </details>
-      <details class="profile-tab" id="event-history"{events_open}>
-        <summary><span>📅 Eventanmeldungen & Anwesenheiten</span><small class="muted">Eigene Historie</small></summary>
-        <div class="profile-tab-content">
-          <section class="profile-tab-kpis">
-            {_card('Reviews', attendance_player.get('reviews', 0), 'gewertete Events')}
-            {_card('War da', attendance_player.get('present', 0), 'anwesend')}
-            {_card('Teilweise', attendance_player.get('partial', 0), 'teilweise')}
-            {_card('Nicht da', attendance_player.get('absent', 0), 'abwesend')}
-            {_card('Quote', attendance_player.get('rate') or '—', 'Anwesenheit')}
-          </section>
-          <section class="panel"><h2>Laufende und kommende Anmeldungen</h2>{_table(['Event','Zeit','Deine Anmeldung'], upcoming_rows, placeholder='Anmeldungen durchsuchen…')}</section>
-          <section class="panel"><h2>Eigene Event-Historie</h2>{_table(['Event','Zeit','Deine Anmeldung'], event_rows, placeholder='Event-Historie durchsuchen…')}</section>
-        </div>
-      </details>
-    </section>
-    <script>
-      (function profileTabs(){{
-        function openHashTab(){{
-          const hash = (window.location.hash || '').slice(1);
-          if (!hash) return;
-          const target = document.getElementById(hash);
+      (function openProfileHash(){{
+        function openTarget(){{
+          const id = (window.location.hash || '').slice(1);
+          if (!id) return;
+          const target = document.getElementById(id);
           if (target && target.tagName === 'DETAILS') target.open = true;
         }}
         document.addEventListener('click', function(ev){{
@@ -12159,15 +12302,12 @@ def _render_member_portal(data: dict[str, Any], user_id: int, request: Request, 
           const target = document.querySelector(link.getAttribute('href'));
           if (target && target.tagName === 'DETAILS') target.open = true;
         }});
-        window.addEventListener('hashchange', openHashTab);
-        openHashTab();
+        window.addEventListener('hashchange', openTarget);
+        openTarget();
       }})();
     </script>
     """
     return _html_shell(f"{display} · Mein Profil", body, nav_mode="member")
-
-
-
 
 def _member_home_event_rows(events: list[dict[str, Any]], user_id: int) -> str:
     if not events:
