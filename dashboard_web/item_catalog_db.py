@@ -268,6 +268,7 @@ def query_items(
     sub_category: str = "",
     rarity: str = "",
     confidence: str = "",
+    sort: str = "",
     active_only: bool = True,
     limit: int = 200,
     offset: int = 0,
@@ -293,6 +294,13 @@ def query_items(
         where.append("ic.classification_confidence = %(confidence)s")
         params["confidence"] = confidence.strip()
     sql_where = "WHERE " + " AND ".join(where) if where else ""
+    sort_key = str(sort or "").strip().lower()
+    order_by = {
+        "level_desc": "COALESCE(ic.item_level, ic.required_level, -1) DESC, ic.name ASC",
+        "level_asc": "CASE WHEN COALESCE(ic.item_level, ic.required_level) IS NULL THEN 1 ELSE 0 END, COALESCE(ic.item_level, ic.required_level) ASC, ic.name ASC",
+        "name": "ic.name ASC",
+        "rarity": "CASE lower(COALESCE(ic.rarity, '')) WHEN 'legendary' THEN 5 WHEN 'legendär' THEN 5 WHEN 'epic' THEN 4 WHEN 'episch' THEN 4 WHEN 'rare' THEN 3 WHEN 'selten' THEN 3 WHEN 'uncommon' THEN 2 WHEN 'common' THEN 1 ELSE 0 END DESC, ic.name ASC",
+    }.get(sort_key, "CASE ic.main_category WHEN 'weapon' THEN 1 WHEN 'armor' THEN 2 WHEN 'material' THEN 3 WHEN 'currency' THEN 4 ELSE 9 END, COALESCE(ic.sub_category, ''), ic.name")
     sql = f"""
         SELECT
             ic.id, ic.source, ic.source_url, ic.source_item_id, ic.locale, ic.name, ic.slug,
@@ -304,16 +312,7 @@ def query_items(
         FROM item_catalog ic
         LEFT JOIN item_catalog_image_overrides ov ON ov.source_url = ic.source_url
         {sql_where}
-        ORDER BY
-            CASE ic.main_category
-                WHEN 'weapon' THEN 1
-                WHEN 'armor' THEN 2
-                WHEN 'material' THEN 3
-                WHEN 'currency' THEN 4
-                ELSE 9
-            END,
-            COALESCE(ic.sub_category, ''),
-            ic.name
+        ORDER BY {order_by}
         LIMIT %(limit)s OFFSET %(offset)s
     """
     with connect() as conn:

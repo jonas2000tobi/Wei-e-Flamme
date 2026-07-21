@@ -48,8 +48,8 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
-ASSET_VER = "beer-and-buffs-items-mobile-need-fix-v1-20260721"
-DASHBOARD_RELEASE_VERSION = "2.0.1 · Item-Aufrufe & Mobile-Need-Picker"
+ASSET_VER = "beer-and-buffs-item-level-type-filter-v2-20260721"
+DASHBOARD_RELEASE_VERSION = "2.0.2 · Item-Level & abhängige Typfilter"
 
 
 def _database_url() -> str:
@@ -9251,20 +9251,33 @@ def _item_lookup_exact(name: str) -> dict[str, Any]:
         return {}
 
 
-def _item_catalog_payload(q: str = "", category: str = "", sub_category: str = "", rarity: str = "", confidence: str = "", limit: int = 200, offset: int = 0) -> dict[str, Any]:
+def _item_catalog_payload(q: str = "", category: str = "", sub_category: str = "", rarity: str = "", confidence: str = "", sort: str = "", limit: int = 200, offset: int = 0) -> dict[str, Any]:
     if not _item_catalog_available():
         return {"ok": False, "error": "Item-Katalog-Modul nicht geladen."}
     try:
         ensure_item_catalog_schema()  # type: ignore[misc]
-        items = query_items(  # type: ignore[misc]
-            q=q,
-            category=category,
-            sub_category=sub_category,
-            rarity=rarity,
-            confidence=confidence,
-            limit=limit,
-            offset=offset,
-        )
+        try:
+            items = query_items(  # type: ignore[misc]
+                q=q,
+                category=category,
+                sub_category=sub_category,
+                rarity=rarity,
+                confidence=confidence,
+                sort=sort,
+                limit=limit,
+                offset=offset,
+            )
+        except TypeError:
+            # Fallback für ältere item_catalog_db.py-Versionen.
+            items = query_items(  # type: ignore[misc]
+                q=q,
+                category=category,
+                sub_category=sub_category,
+                rarity=rarity,
+                confidence=confidence,
+                limit=limit,
+                offset=offset,
+            )
         stats = catalog_stats()  # type: ignore[misc]
         return {"ok": True, "items": _jsonable(items), "stats": _jsonable(stats)}
     except Exception as exc:
@@ -9569,6 +9582,27 @@ def _item_db_value_label(item: dict[str, Any]) -> str:
     return "—"
 
 
+def _item_db_level_value(item: dict[str, Any]) -> int:
+    """Liefert das sichtbare Item-Level für stabile Datenbank-Sortierung."""
+    detail = _item_detail_model(item)
+    candidates: list[Any] = [
+        item.get("item_level"),
+        detail.get("item_level") if isinstance(detail, dict) else None,
+        item.get("required_level"),
+        detail.get("required_level") if isinstance(detail, dict) else None,
+    ]
+    for value in candidates:
+        if value in (None, ""):
+            continue
+        match = re.search(r"-?\d+", str(value))
+        if match:
+            try:
+                return int(match.group(0))
+            except Exception:
+                pass
+    return -1
+
+
 def _item_db_sort_value(item: dict[str, Any]) -> float:
     detail = _item_detail_model(item)
     candidates: list[Any] = [item.get("damage_max"), item.get("defense"), item.get("item_level")]
@@ -9677,7 +9711,7 @@ def _render_item_catalog(request: Optional[Request] = None) -> str:
     sub_category = str((request.query_params.get("sub_category") if request else "") or "").strip()
     rarity = str((request.query_params.get("rarity") if request else "") or "").strip()
     confidence = str((request.query_params.get("confidence") if request else "") or "").strip()
-    sort_mode = str((request.query_params.get("sort") if request else "name") or "name").strip().lower()
+    sort_mode = str((request.query_params.get("sort") if request else "level_desc") or "level_desc").strip().lower()
     selected_id = str((request.query_params.get("selected") if request else "") or "").strip()
     try:
         page = max(1, int((request.query_params.get("page") if request else "1") or 1))
@@ -9692,6 +9726,7 @@ def _render_item_catalog(request: Optional[Request] = None) -> str:
         sub_category=sub_category,
         rarity=rarity,
         confidence=confidence,
+        sort=sort_mode,
         limit=page_size + 1,
         offset=offset,
     )
@@ -9713,7 +9748,11 @@ def _render_item_catalog(request: Optional[Request] = None) -> str:
     need_index = _loot_need_index(snap) if snap else {}
 
     rarity_rank = {"legendary": 5, "epic": 4, "rare": 3, "uncommon": 2, "common": 1}
-    if sort_mode == "value":
+    if sort_mode == "level_desc":
+        items.sort(key=lambda item: (_item_db_level_value(item), str(item.get("name") or "").casefold()), reverse=True)
+    elif sort_mode == "level_asc":
+        items.sort(key=lambda item: (_item_db_level_value(item) < 0, _item_db_level_value(item), str(item.get("name") or "").casefold()))
+    elif sort_mode == "value":
         items.sort(key=_item_db_sort_value, reverse=True)
     elif sort_mode == "need":
         items.sort(key=lambda item: (_item_db_need_count(item, need_index), str(item.get("name") or "").casefold()), reverse=True)
@@ -9750,15 +9789,53 @@ def _render_item_catalog(request: Optional[Request] = None) -> str:
     }
 
     category_counts = Counter()
-    sub_options: set[str] = set()
+    sub_options_by_category: dict[str, set[str]] = {"": set()}
     for row in stats.get("by_category") or []:
         if not isinstance(row, dict):
             continue
+        raw_category = str(row.get("main_category") or "").strip().casefold()
         group = _item_db_group(row.get("main_category"), row.get("sub_category"))
+        filter_category = group if group != "other" else (raw_category or "misc")
         category_counts[group] += int(_num(row.get("count"), 0))
         sub = str(row.get("sub_category") or "").strip()
         if sub:
-            sub_options.add(sub)
+            sub_options_by_category.setdefault("", set()).add(sub)
+            sub_options_by_category.setdefault(filter_category, set()).add(sub)
+            if raw_category:
+                sub_options_by_category.setdefault(raw_category, set()).add(sub)
+
+    sub_options = sub_options_by_category.get(category, set()) if category else sub_options_by_category.get("", set())
+    # Beim Kategorienwechsel darf ein unpassender alter Typ nicht weiterfiltern.
+    if category and sub_category and sub_category not in sub_options:
+        sub_category = ""
+        payload = _item_catalog_payload(
+            q=q,
+            category=category,
+            sub_category="",
+            rarity=rarity,
+            confidence=confidence,
+            sort=sort_mode,
+            limit=page_size + 1,
+            offset=offset,
+        )
+        raw_items = [x for x in (payload.get("items") or []) if isinstance(x, dict)] if payload.get("ok") else []
+        has_next = len(raw_items) > page_size
+        items = raw_items[:page_size]
+        if sort_mode == "level_desc":
+            items.sort(key=lambda item: (_item_db_level_value(item), str(item.get("name") or "").casefold()), reverse=True)
+        elif sort_mode == "level_asc":
+            items.sort(key=lambda item: (_item_db_level_value(item) < 0, _item_db_level_value(item), str(item.get("name") or "").casefold()))
+        elif sort_mode == "value":
+            items.sort(key=_item_db_sort_value, reverse=True)
+        elif sort_mode == "need":
+            items.sort(key=lambda item: (_item_db_need_count(item, need_index), str(item.get("name") or "").casefold()), reverse=True)
+        elif sort_mode == "rarity":
+            items.sort(key=lambda item: (rarity_rank.get(_item_db_rarity_class(item.get("rarity")), 0), str(item.get("name") or "").casefold()), reverse=True)
+        else:
+            items.sort(key=lambda item: str(item.get("name") or "").casefold())
+        selected_item = items[0] if items else None
+        selected_id = str(selected_item.get("id") or "") if selected_item else ""
+        params["sub_category"] = ""
 
     total = int(stats.get("total") or 0)
     total_needs = sum(len(info.get("main") or []) + len(info.get("secondary") or []) for info in need_index.values())
@@ -9779,7 +9856,7 @@ def _render_item_catalog(request: Optional[Request] = None) -> str:
         option("misc", "Sonstiges", category),
     ])
     sub_select_options = option("", "Alle Typen", sub_category)
-    if sub_category and sub_category not in sub_options:
+    if not category and sub_category and sub_category not in sub_options:
         sub_select_options += option(sub_category, sub_category, sub_category)
     sub_select_options += "".join(option(value, value, sub_category) for value in sorted(sub_options, key=str.casefold)[:120])
 
@@ -9790,6 +9867,8 @@ def _render_item_catalog(request: Optional[Request] = None) -> str:
     rarity_select_options += "".join(option(value, value, rarity) for value in rarity_values)
 
     sort_options = "".join([
+        option("level_desc", "Item-Level: hoch → niedrig", sort_mode),
+        option("level_asc", "Item-Level: niedrig → hoch", sort_mode),
         option("name", "Name A–Z", sort_mode),
         option("value", "Höchster Wert", sort_mode),
         option("rarity", "Seltenheit", sort_mode),
@@ -9812,6 +9891,8 @@ def _render_item_catalog(request: Optional[Request] = None) -> str:
         rarity_text = str(item.get("rarity") or "—")
         rarity_class = _item_db_rarity_class(rarity_text)
         need_count = _item_db_need_count(item, need_index)
+        item_level = _item_db_level_value(item)
+        level_html = f"Lv. {item_level}" if item_level >= 0 else "—"
         details_url = _item_db_query_url(params, selected=item_id, view=1)
         selected_class = " selected" if selected_item is item else ""
         source_url = str(item.get("source_url") or "").strip()
@@ -9822,13 +9903,14 @@ def _render_item_catalog(request: Optional[Request] = None) -> str:
             <td><a class="idb-item-main" href="{_e(details_url)}"><span class="idb-list-art">{image}</span><strong>{_e(item_name)}</strong></a></td>
             <td>{_e(_item_db_group_label(item))}<small>{_e(item.get('sub_category') or '—')}</small></td>
             <td><span class="idb-rarity {rarity_class}">{_e(rarity_text)}</span></td>
+            <td><strong class="idb-level">{_e(level_html)}</strong></td>
             <td>{_e(_item_db_value_label(item))}</td>
             <td>{source_html}</td>
             <td><span class="idb-need-count">{need_count}</span><small>{'Spieler braucht es' if need_count == 1 else 'Spieler brauchen es'}</small></td>
             <td><a class="idb-details-btn" href="{_e(details_url)}">Details</a></td>
           </tr>
         ''')
-    table_rows = "".join(row_html) if row_html else '<tr><td colspan="7"><div class="idb-empty-small">Keine Items für diese Filterung gefunden.</div></td></tr>'
+    table_rows = "".join(row_html) if row_html else '<tr><td colspan="8"><div class="idb-empty-small">Keine Items für diese Filterung gefunden.</div></td></tr>'
 
     pagination_parts: list[str] = []
     if page > 1:
@@ -9920,10 +10002,29 @@ def _render_item_catalog(request: Optional[Request] = None) -> str:
     '''
 
     seed_json = json.dumps(recent_seed, ensure_ascii=False).replace("</", "<\\/")
+    subcategory_map_json = json.dumps(
+        {key: sorted(values, key=str.casefold) for key, values in sub_options_by_category.items()},
+        ensure_ascii=False,
+    ).replace("</", "<\\/")
     item_db_js = '''
     <script>
       (() => {
         const seed = __SEED__;
+        const subcategoryMap = __SUBCATEGORY_MAP__;
+        const categorySelect = document.getElementById('idbCategory');
+        const typeSelect = document.getElementById('idbSubCategory');
+        const escOption = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+        const syncTypeOptions = () => {
+          if (!categorySelect || !typeSelect) return;
+          const current = typeSelect.value || '';
+          const values = subcategoryMap[categorySelect.value || ''] || [];
+          typeSelect.innerHTML = '<option value="">Alle Typen</option>' + values.map(value => '<option value="' + escOption(value) + '">' + escOption(value) + '</option>').join('');
+          typeSelect.value = values.includes(current) ? current : '';
+        };
+        if (categorySelect && typeSelect) {
+          categorySelect.addEventListener('change', syncTypeOptions);
+          syncTypeOptions();
+        }
         const key = 'beer_and_buffs_item_recent_v1';
         let recent = [];
         try { recent = JSON.parse(localStorage.getItem(key) || '[]'); } catch (_) { recent = []; }
@@ -9942,7 +10043,7 @@ def _render_item_catalog(request: Optional[Request] = None) -> str:
         }).join('');
       })();
     </script>
-    '''.replace('__SEED__', seed_json)
+    '''.replace('__SEED__', seed_json).replace('__SUBCATEGORY_MAP__', subcategory_map_json)
 
     body = f'''
     <nav class="topnav"><a href="/">← Übersicht</a><a href="/loot">Loot</a><a href="/loot-check">Truhencheck</a><a href="/character-editor">Needs</a><a href="/api/items">API</a></nav>
@@ -9950,8 +10051,8 @@ def _render_item_catalog(request: Optional[Request] = None) -> str:
     <section class="idb-filter">
       <form method="get" action="/items">
         <label><span>Item suchen</span><input name="q" value="{_e(q)}" placeholder="Aridus, Tevent, Brosche …"></label>
-        <label><span>Kategorie</span><select name="category">{category_options}</select></label>
-        <label><span>Typ</span><select name="sub_category">{sub_select_options}</select></label>
+        <label><span>Kategorie</span><select id="idbCategory" name="category">{category_options}</select></label>
+        <label><span>Typ</span><select id="idbSubCategory" name="sub_category">{sub_select_options}</select></label>
         <label><span>Seltenheit</span><select name="rarity">{rarity_select_options}</select></label>
         <label><span>Sortierung</span><select name="sort">{sort_options}</select></label>
         <div class="idb-filter-actions"><button type="submit">Filtern</button><a class="idb-reset" href="/items">Reset</a></div>
@@ -9961,7 +10062,7 @@ def _render_item_catalog(request: Optional[Request] = None) -> str:
     {item_db_css}
     <section class="idb-main-grid">
       <div class="idb-list-panel">
-        <div class="idb-table-wrap"><table class="idb-table"><thead><tr><th>ITEM</th><th>KATEGORIE</th><th>SELTENHEIT</th><th>WERT</th><th>QUELLE</th><th>NEED</th><th>AKTION</th></tr></thead><tbody>{table_rows}</tbody></table></div>
+        <div class="idb-table-wrap"><table class="idb-table"><thead><tr><th>ITEM</th><th>KATEGORIE</th><th>SELTENHEIT</th><th>LEVEL</th><th>WERT</th><th>QUELLE</th><th>NEED</th><th>AKTION</th></tr></thead><tbody>{table_rows}</tbody></table></div>
         <div class="idb-pagination">{pagination}</div>
       </div>
       <aside class="idb-detail-panel">{detail_html}</aside>
@@ -11040,10 +11141,11 @@ def api_items(
     sub_category: str = "",
     rarity: str = "",
     confidence: str = "",
+    sort: str = "",
     limit: int = 200,
     offset: int = 0,
 ):
-    payload = _item_catalog_payload(q=q, category=category, sub_category=sub_category, rarity=rarity, confidence=confidence, limit=limit, offset=offset)
+    payload = _item_catalog_payload(q=q, category=category, sub_category=sub_category, rarity=rarity, confidence=confidence, sort=sort, limit=limit, offset=offset)
     return JSONResponse(payload)
 
 
