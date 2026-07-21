@@ -46,7 +46,7 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
-ASSET_VER = "beer-and-buffs-logo-v3"
+ASSET_VER = "beer-and-buffs-kastleton-header-v2-20260721"
 DASHBOARD_RELEASE_VERSION = "2.0.0 · Konfigurierbare Gildenplattform"
 
 
@@ -4320,8 +4320,8 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "member") -> str:
     brand = _guild_brand()
     brand_name = str(brand.get("display_name") or "Gilde")
     # Separate responsive header assets: wide desktop artwork and portrait mobile artwork.
-    hero_banner = _css_url(_asset("beer_and_buffs_header_desktop.png"))
-    hero_banner_mobile = _css_url(_asset("beer_and_buffs_header_mobile.png"))
+    hero_banner = _css_url(_asset("beer_and_buffs_header_desktop_kastleton_v2.png"))
+    hero_banner_mobile = _css_url(_asset("beer_and_buffs_header_mobile_kastleton_v2.png"))
     brand_logo = _css_url(_brand_image("logo", "beer_and_buffs_logo.png"))
     for old_name in ("Weisse Flamme", "Weiße Flamme", "Ebolus", "ebolus"):
         title = str(title).replace(old_name, brand_name)
@@ -15872,7 +15872,7 @@ def _render_status_dashboard(data: dict[str, Any], request: Optional[Request] = 
         .status-topnav-shell{{border:1px solid rgba(218,166,74,.34);border-radius:20px;padding:10px;margin:0 0 18px;background:linear-gradient(180deg,rgba(218,166,74,.09),rgba(11,14,22,.38));box-shadow:0 16px 40px rgba(0,0,0,.22), inset 0 0 0 1px rgba(255,232,174,.04);}}
         .status-topnav{{margin:0;}}
         .status-topnav a{{border-color:rgba(218,166,74,.34);}}
-        .status-main-hero{{min-height:520px;padding:30px 32px;background-image:linear-gradient(180deg,rgba(6,8,12,.10) 0%,rgba(7,9,14,.24) 48%,rgba(7,9,14,.86) 100%),url("{_asset('beer_and_buffs_header_desktop.png')}");background-position:center center;background-size:cover;background-repeat:no-repeat;border:1px solid rgba(218,166,74,.38);box-shadow:0 22px 56px rgba(0,0,0,.48), inset 0 0 0 1px rgba(255,220,150,.05);}}
+        .status-main-hero{{min-height:520px;padding:30px 32px;background-image:linear-gradient(180deg,rgba(6,8,12,.10) 0%,rgba(7,9,14,.24) 48%,rgba(7,9,14,.86) 100%),url("{_asset('beer_and_buffs_header_desktop_kastleton_v2.png')}");background-position:center center;background-size:cover;background-repeat:no-repeat;border:1px solid rgba(218,166,74,.38);box-shadow:0 22px 56px rgba(0,0,0,.48), inset 0 0 0 1px rgba(255,220,150,.05);}}
         .status-hero-inner{{width:100%;display:flex;flex-direction:column;align-items:center;gap:18px;}}
         .status-hero-head{{display:flex;flex-direction:column;align-items:center;text-align:center;gap:12px;width:100%;}}
         .status-hero-brand-wrap{{display:flex;flex-direction:column;align-items:center;gap:10px;width:100%;}}
@@ -15892,7 +15892,7 @@ def _render_status_dashboard(data: dict[str, Any], request: Optional[Request] = 
           .status-topnav-shell{{padding:0;border-radius:14px;margin-bottom:10px;}}
           .status-topnav{{display:grid !important;grid-template-columns:repeat(3,minmax(0,1fr));height:auto !important;min-height:0 !important;overflow:visible !important;padding:6px !important;gap:6px !important;}}
           .status-topnav a{{width:100%;min-width:0;min-height:38px !important;padding:8px 6px !important;justify-content:center;text-align:center;font-size:12px !important;white-space:normal !important;line-height:1.1 !important;}}
-          .status-main-hero{{min-height:0;padding:16px 14px 20px;background-image:linear-gradient(180deg,rgba(6,8,12,.04) 0%,rgba(7,9,14,.08) 42%,rgba(7,9,14,.72) 68%,rgba(7,9,14,.96) 100%),url("{_asset('beer_and_buffs_header_mobile.png')}");background-position:center top;background-size:100% auto;background-repeat:no-repeat;background-color:#07080b;}}
+          .status-main-hero{{min-height:0;padding:16px 14px 20px;background-image:linear-gradient(180deg,rgba(6,8,12,.04) 0%,rgba(7,9,14,.08) 42%,rgba(7,9,14,.72) 68%,rgba(7,9,14,.96) 100%),url("{_asset('beer_and_buffs_header_mobile_kastleton_v2.png')}");background-position:center top;background-size:100% auto;background-repeat:no-repeat;background-color:#07080b;}}
           .status-hero-inner{{gap:12px;}}
           .status-hero-head{{min-height:clamp(300px,92vw,420px);justify-content:flex-start;}}
           .status-hero-brand-wrap{{gap:4px;}}
