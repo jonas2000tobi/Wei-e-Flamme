@@ -13355,30 +13355,478 @@ def _render_member_auctions_page(data: dict[str, Any], request: Request) -> str:
     '''
     return _html_shell("Auktionen · Mitgliederbereich", body, nav_mode="member")
 
+def _member_roster_role_names(row: dict[str, Any]) -> list[str]:
+    names: list[str] = []
+    raw_roles = row.get("roles") or row.get("role_names") or []
+    if isinstance(raw_roles, dict):
+        raw_roles = list(raw_roles.values())
+    if not isinstance(raw_roles, list):
+        raw_roles = [raw_roles]
+    for role in raw_roles:
+        if isinstance(role, dict):
+            value = role.get("role_name") or role.get("name") or role.get("label") or role.get("role")
+        else:
+            value = role
+        text = re.sub(r"\s+", " ", str(value or "")).strip()
+        if text and text not in names:
+            names.append(text)
+    for key in ("guild_rank", "rank_name", "member_rank", "guild_role"):
+        text = re.sub(r"\s+", " ", str(row.get(key) or "")).strip()
+        if text and text not in names:
+            names.append(text)
+    return names
+
+
+def _member_roster_rank(row: dict[str, Any]) -> tuple[str, str]:
+    roles = _member_roster_role_names(row)
+    joined = " ".join(roles).casefold()
+    if any(term in joined for term in ("gildenmeister", "anführer", "anfuehrer", "guild master", "guildmaster", "leader")):
+        return "Anführer", "leader"
+    if any(term in joined for term in ("berater", "advisor", "offizier", "officer")):
+        return "Berater", "advisor"
+    if any(term in joined for term in ("gildenwächter", "gildenwaechter", "guardian", "wächter", "waechter")):
+        return "Wächter", "guardian"
+    if any(term in joined for term in ("rekrut", "recruit", "trial", "probe")):
+        return "Rekrut", "recruit"
+    return "Mitglied", "member"
+
+
+def _member_roster_date(value: Any) -> Optional[datetime]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except Exception:
+        pass
+    for fmt in ("%d.%m.%Y", "%d-%m-%Y", "%d/%m/%Y", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(text[:10], fmt).replace(tzinfo=timezone.utc)
+        except Exception:
+            continue
+    return None
+
+
+def _member_absence_window(absence: dict[str, Any], today: Any) -> Optional[tuple[Any, Any]]:
+    start_raw = absence.get("start_at") or absence.get("start_at_text") or absence.get("from") or absence.get("start") or absence.get("date_from")
+    end_raw = absence.get("end_at") or absence.get("end_at_text") or absence.get("to") or absence.get("until") or absence.get("end") or absence.get("date_to")
+    start_text = str(start_raw or "").strip()
+    end_text = str(end_raw or "").strip()
+    if not start_text and not end_text:
+        return None
+
+    def full_date(text: str) -> Optional[Any]:
+        dt = _member_roster_date(text)
+        return dt.date() if dt else None
+
+    start_full = full_date(start_text)
+    end_full = full_date(end_text)
+    if start_full or end_full:
+        start_date = start_full or end_full
+        end_date = end_full or start_full
+        if start_date and end_date and end_date < start_date:
+            start_date, end_date = end_date, start_date
+        return (start_date, end_date) if start_date and end_date else None
+
+    ddmm = re.compile(r"^(\d{1,2})[.\-/](\d{1,2})$")
+    start_match = ddmm.match(start_text)
+    end_match = ddmm.match(end_text)
+    if not start_match and not end_match:
+        return None
+    if not start_match:
+        start_match = end_match
+    if not end_match:
+        end_match = start_match
+    try:
+        start_day, start_month = int(start_match.group(1)), int(start_match.group(2))
+        end_day, end_month = int(end_match.group(1)), int(end_match.group(2))
+        start_md = (start_month, start_day)
+        end_md = (end_month, end_day)
+        if end_md < start_md:
+            previous_start = datetime(today.year - 1, start_month, start_day, tzinfo=timezone.utc).date()
+            current_end = datetime(today.year, end_month, end_day, tzinfo=timezone.utc).date()
+            if previous_start <= today <= current_end:
+                return previous_start, current_end
+            start_date = datetime(today.year, start_month, start_day, tzinfo=timezone.utc).date()
+            end_date = datetime(today.year + 1, end_month, end_day, tzinfo=timezone.utc).date()
+            return start_date, end_date
+        start_date = datetime(today.year, start_month, start_day, tzinfo=timezone.utc).date()
+        end_date = datetime(today.year, end_month, end_day, tzinfo=timezone.utc).date()
+        return start_date, end_date
+    except Exception:
+        return None
+
+
+def _member_absence_state(absences: list[dict[str, Any]], user_id: int, today: Any) -> dict[str, Any]:
+    active: list[dict[str, Any]] = []
+    upcoming: list[dict[str, Any]] = []
+    rejected_words = ("abgelehnt", "rejected", "storniert", "cancelled", "canceled", "gelöscht", "geloescht", "deleted", "beendet", "expired")
+    for absence in absences:
+        if not isinstance(absence, dict):
+            continue
+        uid = _user_id(absence.get("user_id") or absence.get("member_id") or absence.get("discord_id") or absence.get("id"))
+        if uid != int(user_id or 0):
+            continue
+        status_text = str(absence.get("status") or absence.get("state") or "").casefold()
+        if any(term in status_text for term in rejected_words):
+            continue
+        window = _member_absence_window(absence, today)
+        reason = str(absence.get("reason") or absence.get("note") or absence.get("description") or "").strip()
+        if window:
+            start_date, end_date = window
+            item = {"row": absence, "start": start_date, "end": end_date, "reason": reason}
+            if start_date <= today <= end_date:
+                active.append(item)
+            elif start_date > today:
+                upcoming.append(item)
+        elif any(term in status_text for term in ("abwesend", "away", "active", "laufend")):
+            active.append({"row": absence, "start": None, "end": None, "reason": reason})
+
+    if active:
+        active.sort(key=lambda item: item.get("end") or today)
+        item = active[0]
+        end_date = item.get("end")
+        detail = f"bis {end_date.strftime('%d.%m.%Y')}" if end_date else "laut Abwesenheiten-Planer"
+        if item.get("reason"):
+            detail += f" · {item['reason']}"
+        return {"state": "away", "label": "Abwesend", "detail": detail, "start": item.get("start"), "end": end_date}
+    if upcoming:
+        upcoming.sort(key=lambda item: item.get("start") or today)
+        item = upcoming[0]
+        start_date = item.get("start")
+        detail = f"ab {start_date.strftime('%d.%m.%Y')}" if start_date else "geplant"
+        if item.get("reason"):
+            detail += f" · {item['reason']}"
+        return {"state": "online", "label": "Online", "detail": detail, "planned": True, "start": start_date, "end": item.get("end")}
+    return {"state": "online", "label": "Online", "detail": "nicht aktuell abwesend", "planned": False}
+
+
+def _member_roster_relative(value: Any) -> str:
+    dt = _member_roster_date(value)
+    if not dt:
+        return "—"
+    diff = datetime.now(timezone.utc) - dt
+    seconds = max(0, int(diff.total_seconds()))
+    if seconds < 3600:
+        return f"vor {max(1, seconds // 60)} Min."
+    if seconds < 86400:
+        return f"vor {seconds // 3600} Std."
+    days = seconds // 86400
+    return f"vor {days} Tag" if days == 1 else f"vor {days} Tagen"
+
+
 def _render_member_members_page(data: dict[str, Any], request: Request) -> str:
     if not data.get("ok"):
         return _html_shell("Mitglieder · Mitgliederbereich", f"<section class='panel'><h1>👥 Mitglieder</h1><p class='muted'>{_e(data.get('error'))}</p></section>", nav_mode="member")
-    snap: dict[str, Any] = data.get("snapshot") or {}
-    profiles = ((snap.get("profiles") or {}).get("items") or [])
-    rows = []
-    for p in profiles:
-        if not isinstance(p, dict):
-            continue
-        uid = _user_id(p.get("user_id") or p.get("id"))
-        rows.append([
-            _member_link(uid, p.get("display_name") or p.get("discord_name") or p.get("ingame_name") or f"User {uid}"),
-            p.get("ingame_name") or "—",
-            p.get("main_role") or "—",
-            p.get("gearscore") or "—",
-            "ja" if p.get("has_needs") else "nein",
-        ])
-    body = f"""
-    <nav class="topnav"><a href="/member">Start</a><a href="/member/members">Mitglieder</a><a href="/member/events">Events</a><a href="/member/auctions">Auktionen</a></nav>
-    <section class="hero"><div><div class="eyebrow">Mitgliederbereich</div><h1>👥 Mitglieder</h1><p class="muted">Reduzierte Mitgliederliste ohne Leitungs-Prüfliste.</p></div></section>
-    <section class="panel">{_table(['Name','Ingame','Rolle','GS','Needliste'], rows, placeholder='Mitglieder durchsuchen…')}</section>
-    """
-    return _html_shell("Mitglieder · Mitgliederbereich", body, nav_mode="member")
 
+    snap: dict[str, Any] = data.get("snapshot") or {}
+    profile_items = [row for row in ((snap.get("profiles") or {}).get("items") or []) if isinstance(row, dict)]
+    profile_map = {
+        _user_id(row.get("user_id") or row.get("member_id") or row.get("discord_id") or row.get("id")): row
+        for row in profile_items
+        if _user_id(row.get("user_id") or row.get("member_id") or row.get("discord_id") or row.get("id"))
+    }
+    source_members = [row for row in _insight_members(snap) if isinstance(row, dict)]
+    member_map: dict[int, dict[str, Any]] = {}
+    for row in source_members + profile_items:
+        uid = _user_id(row.get("user_id") or row.get("member_id") or row.get("discord_id") or row.get("id"))
+        if not uid:
+            continue
+        merged = dict(member_map.get(uid) or {})
+        merged.update(row)
+        if uid in profile_map:
+            profile_overlay = dict(profile_map[uid])
+            profile_overlay.update(merged)
+            merged = profile_overlay
+        member_map[uid] = merged
+
+    balances = _balance_map(snap)
+    absences = [row for row in ((snap.get("absences") or {}).get("items") or []) if isinstance(row, dict)]
+    now = datetime.now(timezone.utc)
+    today = now.date()
+    week_start = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+    week_end = week_start + timedelta(days=7)
+    week_events = []
+    for event in _events_items(snap):
+        if not isinstance(event, dict):
+            continue
+        event_dt = _dt_obj(event.get("when_iso") or event.get("start_at") or event.get("created_at"))
+        if event_dt and week_start <= event_dt < week_end:
+            week_events.append(event)
+
+    members: list[dict[str, Any]] = []
+    role_counts: Counter = Counter()
+    for uid, row in member_map.items():
+        profile = profile_map.get(uid, {})
+        display_name = str(row.get("display_name") or row.get("discord_name") or row.get("username") or profile.get("display_name") or profile.get("ingame_name") or f"User {uid}")
+        ingame_name = str(row.get("ingame_name") or profile.get("ingame_name") or "")
+        avatar_url = str(row.get("avatar_url") or row.get("display_avatar_url") or row.get("discord_avatar_url") or profile.get("avatar_url") or "").strip()
+        rank_label, rank_key = _member_roster_rank({**profile, **row})
+        role_counts[rank_label] += 1
+        class_name = str(row.get("class_name") or row.get("main_class") or row.get("character_class") or profile.get("class_name") or "").strip()
+        combat_role = str(row.get("main_role") or profile.get("main_role") or "").strip()
+        class_type = " · ".join(value for value in (class_name, combat_role) if value) or "—"
+        absence = _member_absence_state(absences, uid, today)
+        event_yes = 0
+        for event in week_events:
+            try:
+                if _portal_event_status_for_user(event, uid).startswith("✅"):
+                    event_yes += 1
+            except Exception:
+                continue
+        joined_at = row.get("guild_joined_at") or row.get("joined_guild_at") or row.get("member_since") or row.get("joined_at") or profile.get("joined_at") or ""
+        last_active = row.get("last_active") or row.get("last_seen") or row.get("updated_at") or profile.get("updated_at") or joined_at
+        members.append({
+            "user_id": uid,
+            "display_name": display_name,
+            "ingame_name": ingame_name,
+            "avatar_url": avatar_url,
+            "rank_label": rank_label,
+            "rank_key": rank_key,
+            "class_type": class_type,
+            "absence": absence,
+            "event_yes": event_yes,
+            "event_total": len(week_events),
+            "ec": row.get("ec_balance") if row.get("ec_balance") is not None else balances.get(uid),
+            "joined_at": joined_at,
+            "joined_dt": _member_roster_date(joined_at),
+            "last_active": last_active,
+            "last_active_dt": _member_roster_date(last_active),
+        })
+
+    rank_order = {"leader": 0, "advisor": 1, "guardian": 2, "member": 3, "recruit": 4}
+    members.sort(key=lambda item: (rank_order.get(str(item.get("rank_key")), 9), str(item.get("display_name") or "").casefold()))
+    total_members = len(members)
+    away_count = sum(1 for item in members if (item.get("absence") or {}).get("state") == "away")
+    online_count = max(0, total_members - away_count)
+    leadership_count = sum(1 for item in members if item.get("rank_key") in {"leader", "advisor", "guardian"})
+    planned_count = sum(1 for item in members if bool((item.get("absence") or {}).get("planned")))
+
+    def initials(name: str) -> str:
+        parts = [part for part in re.split(r"\s+", str(name or "").strip()) if part]
+        return "".join(part[0].upper() for part in parts[:2]) or "?"
+
+    def avatar_html(item: dict[str, Any]) -> str:
+        url = str(item.get("avatar_url") or "")
+        if url.startswith(("https://", "http://", "/static/")):
+            return f'<span class="members-avatar"><img src="{_e(url)}" alt="" loading="lazy" onerror="this.parentElement.textContent=\'{_e(initials(item.get("display_name") or ""))}\'"></span>'
+        return f'<span class="members-avatar">{_e(initials(item.get("display_name") or ""))}</span>'
+
+    member_rows: list[str] = []
+    for item in members:
+        absence = item.get("absence") or {}
+        status_state = str(absence.get("state") or "online")
+        status_detail = str(absence.get("detail") or "")
+        if absence.get("planned"):
+            status_detail = "Geplant " + status_detail
+        ec_value = item.get("ec")
+        ec_text = _fmt_ec(ec_value) if ec_value is not None else "—"
+        searchable = " ".join([
+            str(item.get("display_name") or ""), str(item.get("ingame_name") or ""), str(item.get("rank_label") or ""),
+            str(item.get("class_type") or ""), "abwesend" if status_state == "away" else "online",
+        ]).casefold()
+        member_rows.append(f'''
+          <div class="members-row" role="row" tabindex="0" data-member-row data-member-name="{_e(str(item.get('display_name') or '').casefold())}" data-member-ec="{_e(_num(ec_value, -1))}" data-member-status="{_e(status_state)}" data-member-search="{_e(searchable)}" data-member-href="/portal/member/{int(item['user_id'])}">
+            <div class="members-person" role="cell">{avatar_html(item)}<span><strong>{_e(item.get('display_name'))}</strong><small>{_e(item.get('ingame_name') or 'Kein Ingame-Name')}</small></span></div>
+            <div role="cell"><span class="members-rank {item.get('rank_key')}">{_e(item.get('rank_label'))}</span></div>
+            <div class="members-class" role="cell">{_e(item.get('class_type'))}</div>
+            <div role="cell"><span class="members-status {status_state}"><i></i>{_e(absence.get('label') or 'Online')}</span><small class="members-status-detail">{_e(status_detail)}</small></div>
+            <div class="members-events" role="cell"><strong>{int(item.get('event_yes') or 0)} / {int(item.get('event_total') or 0)}</strong><small>zugesagt</small></div>
+            <div class="members-ec" role="cell"><span>◈</span><strong>{_e(ec_text)}</strong></div>
+          </div>
+        ''')
+    rows_html = "".join(member_rows) or '<div class="members-empty">Keine Mitglieder im aktuellen Snapshot.</div>'
+
+    max_role = max(role_counts.values(), default=1)
+    role_class = {"Anführer": "leader", "Berater": "advisor", "Wächter": "guardian", "Mitglied": "member", "Rekrut": "recruit"}
+    role_rows_html = "".join(
+        f'<div class="members-role-row"><span>{_e(label)}</span><div><i class="{role_class.get(label, "member")}" style="width:{max(5, round((count / max_role) * 100))}%"></i></div><strong>{count}</strong></div>'
+        for label, count in ((label, role_counts.get(label, 0)) for label in ("Anführer", "Berater", "Wächter", "Mitglied", "Rekrut"))
+        if count
+    ) or '<div class="members-empty compact">Keine Rollendaten.</div>'
+
+    joined_members = sorted([item for item in members if item.get("joined_dt")], key=lambda item: item.get("joined_dt"), reverse=True)[:4]
+    joined_html = "".join(
+        f'<a class="members-mini-row" href="/portal/member/{int(item["user_id"])}">{avatar_html(item)}<span><strong>{_e(item.get("display_name"))}</strong><small>{_e(item.get("rank_label"))}</small></span><time>{_e(_member_roster_relative(item.get("joined_at")))}</time></a>'
+        for item in joined_members
+    ) or '<div class="members-empty compact">Keine Beitrittsdaten im Snapshot.</div>'
+
+    upcoming = [item for item in members if bool((item.get("absence") or {}).get("planned"))]
+    upcoming.sort(key=lambda item: (item.get("absence") or {}).get("start") or today)
+    upcoming_html = "".join(
+        f'<a class="members-mini-row" href="/portal/member/{int(item["user_id"])}">{avatar_html(item)}<span><strong>{_e(item.get("display_name"))}</strong><small>{_e((item.get("absence") or {}).get("detail") or "geplant")}</small></span><time>⌛</time></a>'
+        for item in upcoming[:4]
+    ) or '<div class="members-empty compact">Keine kommenden Abwesenheiten eingetragen.</div>'
+
+    online_pct = round((online_count / total_members) * 100) if total_members else 0
+    away_pct = 100 - online_pct if total_members else 0
+    admin_action = '<a class="members-action" href="/admin">♛ Admin-Portal öffnen</a>' if _is_portal_admin(request) else ''
+
+    body = f'''
+    <style>
+      .members-page{{display:grid;gap:16px}}
+      .members-page-header{{display:flex;justify-content:space-between;align-items:end;gap:20px;padding:8px 2px 2px}}
+      .members-page-header h1{{font:700 clamp(34px,4vw,54px) Georgia,serif;color:#e8c87d;letter-spacing:.03em;margin:0}}
+      .members-page-header p{{margin:6px 0 0}}
+      .members-source-note{{display:inline-flex;align-items:center;gap:8px;padding:9px 12px;border:1px solid rgba(214,168,79,.24);background:rgba(214,168,79,.06);border-radius:10px;color:#c9b98f;font-size:12px}}
+      .members-metrics{{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}}
+      .members-metric,.members-section{{background:linear-gradient(180deg,rgba(21,23,29,.97),rgba(11,13,18,.97));border:1px solid rgba(214,168,79,.28);box-shadow:0 16px 32px rgba(0,0,0,.25),inset 0 1px rgba(255,255,255,.025)}}
+      .members-metric{{min-height:128px;padding:18px 20px;display:grid;grid-template-columns:52px 1fr;gap:14px;align-items:center}}
+      .members-metric-icon{{width:50px;height:50px;border:1px solid rgba(214,168,79,.26);display:grid;place-items:center;font-size:25px;color:#d7b367;background:rgba(214,168,79,.06)}}
+      .members-metric small{{display:block;color:#bda46b;text-transform:uppercase;letter-spacing:.08em;font:700 12px Georgia,serif}}
+      .members-metric strong{{display:block;color:#ead7ac;font:400 31px Georgia,serif;margin:4px 0}}
+      .members-metric span{{display:block;color:#938a78;font-size:12px;line-height:1.4}}
+      .members-layout{{display:grid;grid-template-columns:minmax(0,1fr) 285px;gap:16px;align-items:start}}
+      .members-section{{overflow:hidden}}
+      .members-section-title{{margin:0;padding:14px 17px;border-bottom:1px solid rgba(214,168,79,.22);color:#d9b86d;text-transform:uppercase;letter-spacing:.06em;font:700 16px Georgia,serif}}
+      .members-toolbar{{display:grid;grid-template-columns:minmax(220px,1fr) 180px;gap:12px;padding:13px;border-bottom:1px solid rgba(214,168,79,.18)}}
+      .members-toolbar input,.members-toolbar select{{width:100%;padding:11px 12px;border:1px solid rgba(214,168,79,.25);background:#0a0c10;color:#d8cfba;outline:none}}
+      .members-toolbar input:focus,.members-toolbar select:focus{{border-color:#c79b47}}
+      .members-table-head,.members-row{{display:grid;grid-template-columns:minmax(230px,1.35fr) 120px minmax(150px,.85fr) minmax(185px,1fr) 105px 120px;align-items:center}}
+      .members-table-head{{padding:11px 14px;color:#bca66f;text-transform:uppercase;letter-spacing:.045em;font:700 11px Georgia,serif;border-bottom:1px solid rgba(214,168,79,.19)}}
+      .members-row{{min-height:64px;padding:7px 14px;border-bottom:1px solid rgba(214,168,79,.12);cursor:pointer;transition:.15s ease}}
+      .members-row:hover,.members-row.selected{{background:linear-gradient(90deg,rgba(126,30,23,.22),rgba(214,168,79,.035));box-shadow:inset 3px 0 #9d392c}}
+      .members-row[hidden]{{display:none}}
+      .members-person{{display:flex;align-items:center;gap:11px;min-width:0}}
+      .members-avatar{{width:39px;height:39px;flex:0 0 39px;border-radius:50%;display:grid;place-items:center;overflow:hidden;border:1px solid rgba(214,168,79,.43);background:radial-gradient(circle at 35% 25%,#6a5230,#17171a 68%);color:#f2d99e;font:700 12px Georgia,serif}}
+      .members-avatar img{{width:100%;height:100%;object-fit:cover}}
+      .members-person strong,.members-mini-row strong{{display:block;color:#e3d2aa;font:700 14px Georgia,serif;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
+      .members-person small,.members-mini-row small{{display:block;color:#8f887a;font-size:11px;margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
+      .members-rank{{display:inline-flex;padding:5px 9px;border:1px solid;border-radius:2px;text-transform:uppercase;font:700 10px Georgia,serif}}
+      .members-rank.leader{{color:#f0aa8d;border-color:#87362b;background:#4f1915}}.members-rank.advisor{{color:#d5aae5;border-color:#633975;background:#301d38}}.members-rank.guardian{{color:#e4bd70;border-color:#76602e;background:#352c18}}.members-rank.member{{color:#b4c9e4;border-color:#35536e;background:#17293a}}.members-rank.recruit{{color:#b9dba7;border-color:#446a34;background:#1b3319}}
+      .members-class{{color:#aea89c;font-size:12px}}
+      .members-status{{display:inline-flex;align-items:center;gap:7px;text-transform:uppercase;font:700 11px Georgia,serif}}.members-status i{{width:9px;height:9px;border-radius:50%;box-shadow:0 0 9px currentColor}}
+      .members-status.online{{color:#75ca57}}.members-status.online i{{background:#66bd48}}.members-status.away{{color:#df982e}}.members-status.away i{{background:#d78319}}
+      .members-status-detail{{display:block;color:#817b70;font-size:10px;margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:180px}}
+      .members-events strong,.members-events small{{display:block;text-align:center}}.members-events strong{{color:#d4c7a7;font:700 13px Georgia,serif}}.members-events small{{color:#777267;font-size:9px;margin-top:2px}}
+      .members-ec{{display:flex;justify-content:flex-end;align-items:center;gap:7px;color:#e1bd62}}.members-ec strong{{font:700 13px Georgia,serif}}
+      .members-table-footer{{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:12px 14px;color:#8f8775;font-size:12px}}
+      .members-pagination{{display:flex;gap:6px}}.members-pagination button{{min-width:31px;height:31px;border:1px solid rgba(214,168,79,.24);background:#0b0d11;color:#bfb49c;cursor:pointer}}.members-pagination button.active{{border-color:#a6652f;background:#3b1714;color:#f0cc83}}
+      .members-side{{display:grid;gap:14px}}
+      .members-role-list,.members-action-list,.members-status-panel{{padding:14px}}
+      .members-role-row{{display:grid;grid-template-columns:78px 1fr 26px;gap:9px;align-items:center;margin:10px 0;color:#b8ad96;font-size:12px}}.members-role-row>div{{height:7px;background:#08090c;border:1px solid #292820}}.members-role-row i{{display:block;height:100%}}.members-role-row i.leader{{background:#b33b31}}.members-role-row i.advisor{{background:#7e408e}}.members-role-row i.guardian{{background:#b08938}}.members-role-row i.member{{background:#3e78a9}}.members-role-row i.recruit{{background:#57943f}}
+      .members-action-list{{display:grid;gap:8px}}.members-action{{display:flex;justify-content:center;align-items:center;gap:8px;padding:11px;border:1px solid rgba(214,168,79,.28);background:rgba(214,168,79,.035);color:#d6bd82;text-decoration:none;text-transform:uppercase;font:700 11px Georgia,serif;cursor:pointer}}.members-action.primary{{background:#571916;border-color:#9c3328;color:#efd194}}
+      .members-donut-wrap{{display:grid;grid-template-columns:90px 1fr;gap:14px;align-items:center}}.members-donut{{width:86px;height:86px;border-radius:50%;background:conic-gradient(#69bd4d 0 {online_pct}%,#d4871e {online_pct}% 100%);position:relative}}.members-donut:after{{content:"";position:absolute;inset:15px;border-radius:50%;background:#111318;border:1px solid #4b4539}}
+      .members-legend{{display:grid;gap:8px;color:#b7ad99;font-size:12px}}.members-legend span{{display:flex;align-items:center;justify-content:space-between;gap:8px}}.members-legend i{{width:8px;height:8px;border-radius:50%;display:inline-block;margin-right:6px}}.members-legend .on i{{background:#69bd4d}}.members-legend .away i{{background:#d4871e}}
+      .members-planner-note{{margin-top:13px;padding-top:12px;border-top:1px solid rgba(214,168,79,.15);color:#8d8678;font-size:11px;line-height:1.45}}
+      .members-bottom{{display:grid;grid-template-columns:1fr 1fr;gap:16px}}
+      .members-mini-list{{padding:4px 14px 10px}}.members-mini-row{{display:grid;grid-template-columns:39px minmax(0,1fr) auto;gap:10px;align-items:center;padding:10px 0;border-bottom:1px solid rgba(214,168,79,.12);text-decoration:none}}.members-mini-row:last-child{{border-bottom:0}}.members-mini-row time{{color:#a59a84;font-size:11px}}
+      .members-empty{{padding:25px;color:#8c8475;text-align:center}}.members-empty.compact{{padding:15px}}
+      @media(max-width:1180px){{.members-metrics{{grid-template-columns:repeat(2,1fr)}}.members-layout{{grid-template-columns:1fr}}.members-side{{grid-template-columns:repeat(3,1fr)}}}}
+      @media(max-width:900px){{.members-table-head{{display:none}}.members-row{{grid-template-columns:1fr 1fr;gap:10px;padding:13px}}.members-person{{grid-column:1/-1}}.members-ec{{justify-content:flex-start}}.members-side{{grid-template-columns:1fr}}}}
+      @media(max-width:650px){{.members-page-header{{align-items:start;flex-direction:column}}.members-metrics{{grid-template-columns:1fr}}.members-toolbar{{grid-template-columns:1fr}}.members-row{{grid-template-columns:1fr}}.members-person{{grid-column:auto}}.members-bottom{{grid-template-columns:1fr}}}}
+    </style>
+    <nav class="topnav"><a href="/member">Start</a><a href="/member/members">Mitglieder</a><a href="/member/events">Events</a><a href="/member/auctions">Auktionen</a><a href="/portal">Mein Profil</a></nav>
+    <main class="members-page">
+      <header class="members-page-header"><div><h1>Mitglieder</h1><p>Übersicht über alle Gildenmitglieder, Rollen und Aktivität</p></div><div class="members-source-note">ⓘ Online und Abwesend werden ausschließlich aus dem Abwesenheiten-Planer berechnet.</div></header>
+
+      <section class="members-metrics">
+        <article class="members-metric"><div class="members-metric-icon">👥</div><div><small>Mitglieder gesamt</small><strong>{total_members}</strong><span>aktuelle Mitglieder im Snapshot</span></div></article>
+        <article class="members-metric"><div class="members-metric-icon">●</div><div><small>Online</small><strong>{online_count}</strong><span>aktuell nicht als abwesend eingetragen</span></div></article>
+        <article class="members-metric"><div class="members-metric-icon">♛</div><div><small>Leitung</small><strong>{leadership_count}</strong><span>Anführer, Berater und Wächter</span></div></article>
+        <article class="members-metric"><div class="members-metric-icon">⌛</div><div><small>Abwesend</small><strong>{away_count}</strong><span>aktuell laufende Abwesenheiten · {planned_count} geplant</span></div></article>
+      </section>
+
+      <section class="members-layout">
+        <section class="members-section">
+          <div class="members-toolbar"><input id="members-search" type="search" placeholder="Mitglied suchen..."><select id="members-sort"><option value="rank">Nach Rolle</option><option value="name">Nach Name</option><option value="ec">Nach EC</option></select></div>
+          <div class="members-table-head" role="row"><span>Name</span><span>Rolle</span><span>Klasse / Typ</span><span>Status</span><span>Events diese Woche</span><span>EC / Punkte</span></div>
+          <div id="members-rows">{rows_html}</div>
+          <div class="members-table-footer"><div class="members-pagination" id="members-pages"></div><span id="members-range">0 Mitglieder</span></div>
+        </section>
+
+        <aside class="members-side">
+          <section class="members-section"><h2 class="members-section-title">Rollenverteilung</h2><div class="members-role-list">{role_rows_html}</div></section>
+          <section class="members-section"><h2 class="members-section-title">Aktionen</h2><div class="members-action-list"><button class="members-action primary" type="button" id="member-open">👤 Mitglied ansehen</button><button class="members-action" type="button" data-member-filter="online">● Online anzeigen</button><button class="members-action" type="button" data-member-filter="away">⌛ Abwesende anzeigen</button><a class="members-action" href="/export/members.csv">⇩ Export</a>{admin_action}</div></section>
+          <section class="members-section"><h2 class="members-section-title">Mitgliederstatus</h2><div class="members-status-panel"><div class="members-donut-wrap"><div class="members-donut"></div><div class="members-legend"><span class="on"><b><i></i>Online</b><strong>{online_count} ({online_pct}%)</strong></span><span class="away"><b><i></i>Abwesend</b><strong>{away_count} ({away_pct}%)</strong></span></div></div><div class="members-planner-note">„Online“ bedeutet hier: im Abwesenheiten-Planer derzeit nicht abwesend. Discord-Presence wird bewusst nicht behauptet.</div></div></section>
+        </aside>
+      </section>
+
+      <section class="members-bottom">
+        <section class="members-section"><h2 class="members-section-title">Neu beigetreten</h2><div class="members-mini-list">{joined_html}</div></section>
+        <section class="members-section"><h2 class="members-section-title">Kommende Abwesenheiten</h2><div class="members-mini-list">{upcoming_html}</div></section>
+      </section>
+    </main>
+    <script>
+      (function membersPage(){{
+        const allRows = Array.from(document.querySelectorAll('[data-member-row]'));
+        const search = document.getElementById('members-search');
+        const sort = document.getElementById('members-sort');
+        const pages = document.getElementById('members-pages');
+        const range = document.getElementById('members-range');
+        const open = document.getElementById('member-open');
+        const pageSize = 10;
+        let currentPage = 1;
+        let statusFilter = 'all';
+        let selected = null;
+
+        function visibleRows(){{
+          const q = String(search && search.value || '').trim().toLocaleLowerCase('de');
+          let rows = allRows.filter(function(row){{
+            const statusOk = statusFilter === 'all' || row.dataset.memberStatus === statusFilter;
+            const searchOk = !q || String(row.dataset.memberSearch || '').includes(q);
+            return statusOk && searchOk;
+          }});
+          const mode = sort ? sort.value : 'rank';
+          if (mode === 'name') rows.sort(function(a,b){{ return String(a.dataset.memberName || '').localeCompare(String(b.dataset.memberName || ''), 'de'); }});
+          if (mode === 'ec') rows.sort(function(a,b){{ return Number(b.dataset.memberEc || -1) - Number(a.dataset.memberEc || -1); }});
+          return rows;
+        }}
+
+        function choose(row){{
+          allRows.forEach(function(item){{ item.classList.toggle('selected', item === row); }});
+          selected = row || null;
+        }}
+
+        function render(){{
+          const filtered = visibleRows();
+          const pageCount = Math.max(1, Math.ceil(filtered.length / pageSize));
+          currentPage = Math.min(currentPage, pageCount);
+          const start = (currentPage - 1) * pageSize;
+          const end = Math.min(filtered.length, start + pageSize);
+          const pageRows = new Set(filtered.slice(start, end));
+          allRows.forEach(function(row){{ row.hidden = !pageRows.has(row); }});
+          pages.innerHTML = '';
+          for (let page = 1; page <= pageCount; page += 1){{
+            const button = document.createElement('button');
+            button.type = 'button';
+            button.textContent = String(page);
+            button.classList.toggle('active', page === currentPage);
+            button.addEventListener('click', function(){{ currentPage = page; render(); }});
+            pages.appendChild(button);
+          }}
+          range.textContent = filtered.length ? (start + 1) + '–' + end + ' von ' + filtered.length + ' Mitgliedern' : 'Keine Mitglieder gefunden';
+          if (!selected || selected.hidden) choose(filtered[start] || null);
+        }}
+
+        allRows.forEach(function(row){{
+          row.addEventListener('click', function(event){{
+            choose(row);
+            if (event.detail >= 2) window.location.href = row.dataset.memberHref;
+          }});
+          row.addEventListener('keydown', function(event){{
+            if (event.key === 'Enter') window.location.href = row.dataset.memberHref;
+            if (event.key === ' '){{ event.preventDefault(); choose(row); }}
+          }});
+        }});
+        document.querySelectorAll('[data-member-filter]').forEach(function(button){{
+          button.addEventListener('click', function(){{
+            statusFilter = statusFilter === button.dataset.memberFilter ? 'all' : button.dataset.memberFilter;
+            currentPage = 1;
+            render();
+          }});
+        }});
+        if (search) search.addEventListener('input', function(){{ currentPage = 1; render(); }});
+        if (sort) sort.addEventListener('change', function(){{ currentPage = 1; render(); }});
+        if (open) open.addEventListener('click', function(){{ if (selected && selected.dataset.memberHref) window.location.href = selected.dataset.memberHref; }});
+        render();
+      }})();
+    </script>
+    '''
+    return _html_shell("Mitglieder · Beer and Buffs Dashboard", body, nav_mode="member")
 
 def _render_member_ec_page(data: dict[str, Any], request: Request) -> str:
     if not data.get("ok"):
