@@ -3085,6 +3085,93 @@ async def setup_dkp_system(client: discord.Client, tree: app_commands.CommandTre
             result += f"\n⚠️ Fehlgeschlagen: **{len(failed)}** ({failed_names})"
         await inter.followup.send(result[:1900], ephemeral=True)
 
+    @dkp.command(name="role", description="Leader: Jedem Mitglied einer Rolle EC/DKP geben oder abziehen")
+    @app_commands.describe(
+        role="Discord-Rolle, deren Mitglieder gebucht werden",
+        amount="EC/DKP je Mitglied; negativ zum Abziehen",
+        reason="Pflichtgrund für die Rollenbuchung",
+    )
+    async def dkp_role(
+        inter: discord.Interaction,
+        role: discord.Role,
+        amount: int,
+        reason: str,
+    ):
+        if inter.guild is None:
+            await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
+            return
+        if not _is_leader_or_admin(inter):
+            await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
+            return
+        if role.is_default():
+            await inter.response.send_message("❌ Die @everyone-Rolle ist aus Sicherheitsgründen nicht erlaubt.", ephemeral=True)
+            return
+        if amount == 0:
+            await inter.response.send_message("❌ Betrag darf nicht 0 sein.", ephemeral=True)
+            return
+        reason = str(reason or "").strip()
+        if not reason:
+            await inter.response.send_message("❌ Grund ist Pflicht.", ephemeral=True)
+            return
+        home_id = _home_guild_id(default=inter.guild.id)
+        if int(inter.guild.id) != int(home_id):
+            await inter.response.send_message("❌ DKP wird nur auf dem Home-Gildenserver verwaltet.", ephemeral=True)
+            return
+
+        targets = [member for member in inter.guild.members if not member.bot and role in member.roles]
+        if not targets:
+            await inter.response.send_message(f"❌ In {role.mention} wurden keine Mitglieder gefunden.", ephemeral=True)
+            return
+
+        await inter.response.defer(ephemeral=True, thinking=True)
+
+        def _apply_role() -> tuple[list[tuple[discord.Member, dict[str, Any]]], list[tuple[discord.Member, str]]]:
+            applied: list[tuple[discord.Member, dict[str, Any]]] = []
+            failed: list[tuple[discord.Member, str]] = []
+            for member in targets:
+                try:
+                    tx = _add_transaction(
+                        inter.guild.id,
+                        member.id,
+                        int(amount),
+                        reason,
+                        inter.user.id,
+                        "manual_role_adjust",
+                    )
+                    applied.append((member, tx))
+                except Exception as exc:
+                    failed.append((member, f"{type(exc).__name__}: {exc}"))
+            return applied, failed
+
+        applied, failed = await asyncio.to_thread(_apply_role)
+        if not applied:
+            detail = "\n".join(f"• {m.display_name}: {err}" for m, err in failed[:8]) or "Unbekannter Fehler"
+            await inter.followup.send(f"❌ Keine Rollenbuchung durchgeführt.\n{detail[:1500]}", ephemeral=True)
+            return
+
+        emb = discord.Embed(title="🪙 EC-Rollenbuchung", color=discord.Color.gold())
+        emb.add_field(name="Rolle", value=role.mention, inline=True)
+        emb.add_field(name="Gebucht", value=str(len(applied)), inline=True)
+        emb.add_field(name="Je Mitglied", value=f"**{_format_amount(amount)} EC**", inline=True)
+        emb.add_field(name="Grund", value=_safe_text(reason)[:1000], inline=False)
+        names = ", ".join(member.mention for member, _tx in applied[:12])
+        if len(applied) > 12:
+            names += f" … +{len(applied) - 12} weitere"
+        emb.add_field(name="Betroffene Spieler", value=names[:1000], inline=False)
+        if failed:
+            emb.add_field(name="Fehlgeschlagen", value=str(len(failed)), inline=True)
+        emb.set_footer(text=f"Ausgeführt von {inter.user} • {datetime.now(TZ).strftime('%d.%m.%Y %H:%M')}")
+        await _log_to_channel(client, inter.guild.id, emb)
+
+        text = (
+            f"✅ **{len(applied)}** Mitglieder aus {role.mention} erhielten je "
+            f"**{_format_amount(amount)} EC**."
+        )
+        if failed:
+            failed_names = ", ".join(member.display_name for member, _err in failed[:8])
+            text += f"\n⚠️ Fehlgeschlagen: **{len(failed)}** ({failed_names})"
+        await inter.followup.send(text[:1900], ephemeral=True)
+
     @dkp.command(name="config", description="Zeigt die EC-/DKP-Konfiguration")
     async def dkp_config_show(inter: discord.Interaction):
         if inter.guild is None:

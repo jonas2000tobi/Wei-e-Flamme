@@ -624,6 +624,18 @@ def _item_weapon_type(guild_id: int, item_id: str) -> str:
     return str(item.get("weapon_type", "") or "").strip()
 
 
+def _item_level_value(item: dict[str, Any]) -> int:
+    """Einheitlicher Sortierwert: Item-Level, ersatzweise benötigtes Level."""
+    for key in ("item_level", "required_level", "level"):
+        try:
+            value = item.get(key)
+            if value is not None and str(value).strip() != "":
+                return int(float(str(value).replace(",", ".")))
+        except Exception:
+            continue
+    return -1
+
+
 def _items_for_need_slot(guild_id: int, need_slot: str, weapon_type: str | None = None) -> list[dict]:
     catalog_slot = _catalog_slot_for_need_slot(need_slot)
     items = _all_items(guild_id)
@@ -653,7 +665,7 @@ def _items_for_need_slot(guild_id: int, need_slot: str, weapon_type: str | None 
         i["id"] = item_id
         out.append(i)
 
-    out.sort(key=lambda x: str(x.get("name", "")).lower())
+    out.sort(key=lambda x: (-_item_level_value(x), str(x.get("name", "")).casefold()))
     return out
 
 
@@ -784,7 +796,7 @@ def _catalog_fetch_all_sync(slot: str, weapon_type: str | None = None, query: st
                 continue
         rows.append(dict(row))
 
-    rows.sort(key=lambda value: str(value.get("name") or "").casefold())
+    rows.sort(key=lambda value: (-_item_level_value(value), str(value.get("name") or "").casefold()))
     _CATALOG_BROWSER_CACHE[cache_key] = (now, [dict(row) for row in rows])
     return rows
 
@@ -829,6 +841,8 @@ def _ensure_local_catalog_item(guild_id: int, catalog_item_id: int, fallback_slo
         "source_url": str(row.get("source_url") or ""),
         "image_url": str(row.get("image_url") or row.get("icon_url") or ""),
         "rarity": str(row.get("rarity") or ""),
+        "item_level": row.get("item_level"),
+        "required_level": row.get("required_level"),
         "updated_at": _now_iso(),
     }
     _all_items(int(guild_id))[local_id] = obj
@@ -840,7 +854,9 @@ def _catalog_option(row: dict[str, Any]) -> discord.SelectOption:
     name = str(row.get("name") or f"Item {row.get('id')}")
     sub = str(row.get("sub_category") or row.get("main_category") or "Item")
     rarity = str(row.get("rarity") or "")
-    desc = " · ".join(x for x in (sub, rarity) if x)
+    level = _item_level_value(row)
+    level_text = f"Level {level}" if level >= 0 else ""
+    desc = " · ".join(x for x in (level_text, sub, rarity) if x)
     return discord.SelectOption(label=name[:100], value=str(int(row.get("id") or 0)), description=desc[:100])
 
 
@@ -3061,7 +3077,7 @@ async def setup_loot_needs(client: discord.Client, tree: app_commands.CommandTre
             x["id"] = item_id
             items.append(x)
 
-        items.sort(key=lambda x: (str(x.get("slot", "")), str(x.get("weapon_type", "")), str(x.get("name", "")).lower()))
+        items.sort(key=lambda x: (-_item_level_value(x), str(x.get("slot", "")), str(x.get("weapon_type", "")), str(x.get("name", "")).casefold()))
 
         if catalog_slot and wt:
             title = f"🎁 Item-Katalog – {catalog_slot} / {wt}"
@@ -3080,7 +3096,9 @@ async def setup_loot_needs(client: discord.Client, tree: app_commands.CommandTre
             slot_txt = str(item.get("slot", ""))
             wt_txt = str(item.get("weapon_type", "") or "")
             extra = f" / {wt_txt}" if wt_txt else ""
-            lines.append(f"• **{item.get('name')}** — {slot_txt}{extra}")
+            level = _item_level_value(item)
+            level_txt = f"Level {level} · " if level >= 0 else ""
+            lines.append(f"• **{item.get('name')}** — {level_txt}{slot_txt}{extra}")
 
         desc = "\n".join(lines)
 

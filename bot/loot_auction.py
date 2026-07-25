@@ -426,6 +426,17 @@ def _all_items(guild_id: int) -> dict:
     return g.get("items") if isinstance(g.get("items"), dict) else {}
 
 
+def _item_level_value(item: dict[str, Any]) -> int:
+    for key in ("item_level", "required_level", "level"):
+        try:
+            value = item.get(key)
+            if value is not None and str(value).strip() != "":
+                return int(float(str(value).replace(",", ".")))
+        except Exception:
+            continue
+    return -1
+
+
 def _item_display(guild_id: int, item_id: str, fallback: str = "") -> str:
     item = _all_items(guild_id).get(str(item_id)) or {}
     if not item:
@@ -449,6 +460,9 @@ def _find_item(guild_id: int, query: str) -> tuple[str, str, list[tuple[str, str
             exact.append((str(item_id), display))
         elif q and (q in name.lower() or q in display.lower() or q in str(item_id).lower()):
             matches.append((str(item_id), display))
+    item_map = _all_items(guild_id)
+    exact.sort(key=lambda pair: (-_item_level_value(item_map.get(pair[0]) or {}), pair[1].casefold()))
+    matches.sort(key=lambda pair: (-_item_level_value(item_map.get(pair[0]) or {}), pair[1].casefold()))
     if exact:
         return exact[0][0], exact[0][1], exact + matches
     if len(matches) == 1:
@@ -539,6 +553,8 @@ def _ensure_local_catalog_item(
         "image_url": str(linked.get("manual_image_url") or linked.get("image_url") or linked.get("icon_url") or ""),
         "main_category": str(linked.get("main_category") or ""),
         "sub_category": str(linked.get("sub_category") or ""),
+        "item_level": linked.get("item_level"),
+        "required_level": linked.get("required_level"),
         "catalog_linked_at": _now_iso(),
     })
     items[stable_local_id] = merged
@@ -602,7 +618,13 @@ async def _catalog_item_autocomplete(inter: discord.Interaction, current: str) -
             continue
         name = str(row.get("name") or f"Item {cid}")
         sub = str(row.get("sub_category") or row.get("main_category") or "")
-        label = f"{name} · {sub}" if sub else name
+        level = _item_level_value(row)
+        parts = [name]
+        if level >= 0:
+            parts.append(f"Level {level}")
+        if sub:
+            parts.append(sub)
+        label = " · ".join(parts)
         choices.append(app_commands.Choice(name=label[:100], value=f"db:{cid}"))
     return choices
 

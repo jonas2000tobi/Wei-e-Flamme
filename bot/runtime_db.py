@@ -1968,14 +1968,14 @@ def search_catalog_items(
             cur.execute(
                 f"""
                 SELECT ic.id, ic.source, ic.source_url, ic.source_item_id, ic.name,
-                       ic.main_category, ic.sub_category, ic.rarity, ic.item_level,
+                       ic.main_category, ic.sub_category, ic.rarity, ic.item_level, ic.required_level,
                        ic.stats, ic.abilities, ic.traits, ic.raw_data,
                        COALESCE(ov.image_url, ic.image_url, ic.icon_url, '') AS image_url,
                        ic.icon_url
                 FROM item_catalog ic
                 LEFT JOIN item_catalog_image_overrides ov ON ov.source_url = ic.source_url
                 WHERE {where}
-                ORDER BY {order_sql} COALESCE(ic.sub_category, ''), ic.name ASC
+                ORDER BY {order_sql} COALESCE(ic.item_level, ic.required_level, -1) DESC, COALESCE(ic.sub_category, ''), ic.name ASC
                 LIMIT %s OFFSET %s
                 """,
                 tuple(params + [safe_limit, safe_offset]),
@@ -2003,7 +2003,7 @@ def get_catalog_item(catalog_item_id: int) -> Optional[dict[str, Any]]:
             cur.execute(
                 """
                 SELECT ic.id, ic.source, ic.source_url, ic.source_item_id, ic.name,
-                       ic.main_category, ic.sub_category, ic.rarity, ic.item_level,
+                       ic.main_category, ic.sub_category, ic.rarity, ic.item_level, ic.required_level,
                        ic.stats, ic.abilities, ic.traits, ic.raw_data,
                        COALESCE(ov.image_url, ic.image_url, ic.icon_url, '') AS image_url,
                        ic.icon_url
@@ -2046,7 +2046,7 @@ def resolve_catalog_item_reference(*, guild_id: int, local_item_id: str = "", it
                 cur.execute(
                     f"""
                     SELECT ic.id, ic.source, ic.source_url, ic.source_item_id, ic.name,
-                           ic.main_category, ic.sub_category, ic.rarity, ic.stats,
+                           ic.main_category, ic.sub_category, ic.rarity, ic.item_level, ic.required_level, ic.stats,
                            ic.abilities, ic.traits, ic.image_url, ic.icon_url,
                            ov.image_url AS manual_image_url
                     FROM item_catalog ic
@@ -2112,7 +2112,7 @@ def resolve_catalog_item_reference(*, guild_id: int, local_item_id: str = "", it
                 cur.execute(
                     """
                     SELECT ic.id, ic.source, ic.source_url, ic.source_item_id, ic.name,
-                           ic.main_category, ic.sub_category, ic.rarity, ic.stats,
+                           ic.main_category, ic.sub_category, ic.rarity, ic.item_level, ic.required_level, ic.stats,
                            ic.abilities, ic.traits, ic.image_url, ic.icon_url,
                            ov.image_url AS manual_image_url
                     FROM item_catalog ic

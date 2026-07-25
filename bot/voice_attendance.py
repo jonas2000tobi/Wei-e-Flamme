@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
@@ -35,6 +36,8 @@ except Exception:
         audit_log = None  # type: ignore
 
 TZ = ZoneInfo("Europe/Berlin")
+VOICE_RECONCILE_INTERVAL_SECONDS = 30
+_voice_reconcile_task: Optional[asyncio.Task] = None
 
 
 def _is_admin(inter: discord.Interaction) -> bool:
@@ -254,27 +257,115 @@ def _pick_default_event(guild_id: int) -> tuple[Optional[str], Optional[dict]]:
     return events[0]
 
 
-async def _bootstrap_current_voice_members(client: discord.Client) -> int:
-    count = 0
-    now_meta = {"bootstrap": True}
-    for guild in list(client.guilds):
+def _current_voice_members(guild: discord.Guild) -> dict[int, tuple[int, str, str]]:
+    """Liefert den aktuellen Voice-Zustand aus dem Discord-Gateway-Cache.
+
+    Der Polling-Abgleich ergänzt den normalen Voice-State-Listener. Dadurch gehen
+    Anwesenheiten auch nach Reconnects, Railway-Restarts oder einzelnen verpassten
+    Gateway-Events nicht verloren.
+    """
+    current: dict[int, tuple[int, str, str]] = {}
+    for channel in list(getattr(guild, "voice_channels", []) or []):
+        for member in list(getattr(channel, "members", []) or []):
+            if getattr(member, "bot", False):
+                continue
+            current[int(member.id)] = (int(channel.id), str(member.display_name), str(channel.name))
+    return current
+
+
+async def _reconcile_voice_sessions_once(client: discord.Client) -> dict[str, int]:
+    stats = {"guilds": 0, "current": 0, "started": 0, "closed": 0, "errors": 0}
+    until_iso = _iso_utc(_now_utc() + timedelta(minutes=2))
+    for guild in list(getattr(client, "guilds", []) or []):
+        stats["guilds"] += 1
         try:
-            for ch in guild.voice_channels:
-                for member in ch.members:
-                    if member.bot:
+            current = _current_voice_members(guild)
+            stats["current"] += len(current)
+            rows = await asyncio.to_thread(
+                fetch_voice_sessions,
+                int(guild.id),
+                since_iso="1970-01-01T00:00:00+00:00",
+                until_iso=until_iso,
+                limit=5000,
+            )
+            open_rows = [r for r in (rows or []) if isinstance(r, dict) and not r.get("left_at")]
+            open_by_user: dict[int, list[dict[str, Any]]] = {}
+            for row in open_rows:
+                try:
+                    open_by_user.setdefault(int(row.get("user_id") or 0), []).append(row)
+                except Exception:
+                    continue
+
+            # Stale oder auf dem falschen Kanal offene Sessions schließen.
+            for uid, sessions in open_by_user.items():
+                expected = current.get(uid)
+                matching_channel = int(expected[0]) if expected else 0
+                for row in sessions:
+                    row_channel = int(row.get("channel_id") or 0)
+                    if expected is not None and row_channel == matching_channel:
                         continue
-                    start_voice_session(
-                        guild_id=int(guild.id),
-                        user_id=int(member.id),
-                        channel_id=int(ch.id),
-                        member_name=member.display_name,
-                        channel_name=ch.name,
-                        metadata=now_meta,
+                    stats["closed"] += await asyncio.to_thread(
+                        close_open_voice_sessions_for_user,
+                        int(guild.id),
+                        int(uid),
+                        channel_id=row_channel or None,
                     )
-                    count += 1
-        except Exception as e:
-            print(f"[voice_attendance] Bootstrap Fehler in Guild {getattr(guild, 'id', '?')}: {e!r}")
-    return count
+
+            # Fehlende Sessions für aktuell verbundene Nutzer nachtragen.
+            for uid, (channel_id, member_name, channel_name) in current.items():
+                matching = any(
+                    int(row.get("channel_id") or 0) == int(channel_id)
+                    for row in open_by_user.get(uid, [])
+                    if isinstance(row, dict)
+                )
+                if matching:
+                    continue
+                await asyncio.to_thread(
+                    start_voice_session,
+                    guild_id=int(guild.id),
+                    user_id=int(uid),
+                    channel_id=int(channel_id),
+                    member_name=member_name,
+                    channel_name=channel_name,
+                    metadata={"reconciled": True},
+                )
+                stats["started"] += 1
+        except Exception as exc:
+            stats["errors"] += 1
+            print(f"[voice_attendance] Reconcile Fehler guild={getattr(guild, 'id', '?')}: {exc!r}", flush=True)
+    return stats
+
+
+async def _voice_reconcile_loop(client: discord.Client) -> None:
+    await client.wait_until_ready()
+    while not client.is_closed():
+        try:
+            stats = await _reconcile_voice_sessions_once(client)
+            if stats["started"] or stats["closed"] or stats["errors"]:
+                print(
+                    "[voice_attendance] Voice-Abgleich: "
+                    f"current={stats['current']} started={stats['started']} "
+                    f"closed={stats['closed']} errors={stats['errors']}",
+                    flush=True,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print(f"[voice_attendance] Reconcile-Loop Fehler: {exc!r}", flush=True)
+        await asyncio.sleep(VOICE_RECONCILE_INTERVAL_SECONDS)
+
+
+def _start_voice_reconcile_loop(client: discord.Client) -> None:
+    global _voice_reconcile_task
+    if _voice_reconcile_task is not None and not _voice_reconcile_task.done():
+        return
+    _voice_reconcile_task = asyncio.create_task(_voice_reconcile_loop(client))
+    print(f"🎙️ Voice-Abgleich gestartet: alle {VOICE_RECONCILE_INTERVAL_SECONDS}s.", flush=True)
+
+
+async def _bootstrap_current_voice_members(client: discord.Client) -> int:
+    stats = await _reconcile_voice_sessions_once(client)
+    return int(stats.get("current", 0))
 
 
 async def setup_voice_attendance(client: discord.Client, tree: app_commands.CommandTree):
@@ -289,19 +380,22 @@ async def setup_voice_attendance(client: discord.Client, tree: app_commands.Comm
                     return
 
                 if before_ch is not None:
-                    close_open_voice_sessions_for_user(
+                    await asyncio.to_thread(
+                        close_open_voice_sessions_for_user,
                         int(member.guild.id),
                         int(member.id),
                         channel_id=int(before_ch.id),
                     )
 
                 if after_ch is not None:
-                    start_voice_session(
+                    await asyncio.to_thread(
+                        start_voice_session,
                         guild_id=int(member.guild.id),
                         user_id=int(member.id),
                         channel_id=int(after_ch.id),
                         member_name=member.display_name,
                         channel_name=getattr(after_ch, "name", ""),
+                        metadata={"listener": True},
                     )
             except Exception as e:
                 print(f"[voice_attendance] Voice-State-Fehler: {e!r}")
@@ -309,6 +403,8 @@ async def setup_voice_attendance(client: discord.Client, tree: app_commands.Comm
         client.add_listener(_voice_attendance_state_update, "on_voice_state_update")
         setattr(client, "_ebolus_voice_attendance_listener_added", True)
         print("🎙️ Voice-Attendance Listener gestartet.")
+
+    _start_voice_reconcile_loop(client)
 
     try:
         boot_count = await _bootstrap_current_voice_members(client)

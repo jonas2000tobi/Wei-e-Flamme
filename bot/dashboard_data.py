@@ -1496,6 +1496,19 @@ def _voice_summary(guild_id: int) -> dict[str, Any]:
                 dur = int(float(sess.get("duration_seconds") or sess.get("duration") or 0))
             except Exception:
                 dur = 0
+            # Offene Sessions haben noch kein left_at und in der DB häufig noch
+            # duration_seconds=0. Für die Live-Anzeige die bisherige Dauer aus
+            # joined_at berechnen, ohne die gespeicherten Daten zu verändern.
+            if dur <= 0 and not str(sess.get("left_at") or "").strip():
+                try:
+                    joined_dt = datetime.fromisoformat(str(sess.get("joined_at") or "").replace("Z", "+00:00"))
+                    if joined_dt.tzinfo is None:
+                        joined_dt = joined_dt.replace(tzinfo=timezone.utc)
+                    dur = max(0, int((datetime.now(timezone.utc) - joined_dt.astimezone(timezone.utc)).total_seconds()))
+                    sess["duration_seconds"] = dur
+                    sess["is_open"] = True
+                except Exception:
+                    dur = 0
             bucket = by_user.setdefault(uid, {
                 "user_id": uid,
                 "sessions": 0,
@@ -1518,7 +1531,7 @@ def _voice_summary(guild_id: int) -> dict[str, Any]:
         return {
             "sessions_total": runtime_db.count_voice_sessions(guild_id),
             "sessions_open": runtime_db.count_voice_sessions(guild_id, open_only=True),
-            "recent_sessions": sessions[:250],
+            "recent_sessions": sessions[:1000],
             "loaded_sessions": len(sessions or []),
             "total_seconds_loaded": total_seconds,
             "total_hours_loaded": round(total_seconds / 3600, 2),
