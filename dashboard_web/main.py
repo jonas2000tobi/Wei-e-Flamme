@@ -48,8 +48,8 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
-ASSET_VER = "beer-and-buffs-item-level-type-filter-v2-20260721"
-DASHBOARD_RELEASE_VERSION = "2.0.2 · Item-Level & abhängige Typfilter"
+ASSET_VER = "beer-and-buffs-combined-items-voice-dkp-v1-20260724"
+DASHBOARD_RELEASE_VERSION = "2.0.3 · Gesamtpatch Items, Voice-Anwesenheit & Rollen-DKP"
 
 
 def _database_url() -> str:
@@ -9251,7 +9251,7 @@ def _item_lookup_exact(name: str) -> dict[str, Any]:
         return {}
 
 
-def _item_catalog_payload(q: str = "", category: str = "", sub_category: str = "", rarity: str = "", confidence: str = "", sort: str = "", limit: int = 200, offset: int = 0) -> dict[str, Any]:
+def _item_catalog_payload(q: str = "", category: str = "", sub_category: str = "", rarity: str = "", confidence: str = "", sort: str = "level_desc", limit: int = 200, offset: int = 0) -> dict[str, Any]:
     if not _item_catalog_available():
         return {"ok": False, "error": "Item-Katalog-Modul nicht geladen."}
     try:
@@ -9712,6 +9712,8 @@ def _render_item_catalog(request: Optional[Request] = None) -> str:
     rarity = str((request.query_params.get("rarity") if request else "") or "").strip()
     confidence = str((request.query_params.get("confidence") if request else "") or "").strip()
     sort_mode = str((request.query_params.get("sort") if request else "level_desc") or "level_desc").strip().lower()
+    if sort_mode not in {"level_desc", "level_asc", "name", "value", "need", "rarity"}:
+        sort_mode = "level_desc"
     selected_id = str((request.query_params.get("selected") if request else "") or "").strip()
     try:
         page = max(1, int((request.query_params.get("page") if request else "1") or 1))
@@ -9749,7 +9751,7 @@ def _render_item_catalog(request: Optional[Request] = None) -> str:
 
     rarity_rank = {"legendary": 5, "epic": 4, "rare": 3, "uncommon": 2, "common": 1}
     if sort_mode == "level_desc":
-        items.sort(key=lambda item: (_item_db_level_value(item), str(item.get("name") or "").casefold()), reverse=True)
+        items.sort(key=lambda item: (-_item_db_level_value(item), str(item.get("name") or "").casefold()))
     elif sort_mode == "level_asc":
         items.sort(key=lambda item: (_item_db_level_value(item) < 0, _item_db_level_value(item), str(item.get("name") or "").casefold()))
     elif sort_mode == "value":
@@ -9822,7 +9824,7 @@ def _render_item_catalog(request: Optional[Request] = None) -> str:
         has_next = len(raw_items) > page_size
         items = raw_items[:page_size]
         if sort_mode == "level_desc":
-            items.sort(key=lambda item: (_item_db_level_value(item), str(item.get("name") or "").casefold()), reverse=True)
+            items.sort(key=lambda item: (-_item_db_level_value(item), str(item.get("name") or "").casefold()))
         elif sort_mode == "level_asc":
             items.sort(key=lambda item: (_item_db_level_value(item) < 0, _item_db_level_value(item), str(item.get("name") or "").casefold()))
         elif sort_mode == "value":
@@ -11141,7 +11143,7 @@ def api_items(
     sub_category: str = "",
     rarity: str = "",
     confidence: str = "",
-    sort: str = "",
+    sort: str = "level_desc",
     limit: int = 200,
     offset: int = 0,
 ):
@@ -12237,7 +12239,16 @@ def _render_need_editor_panel(
               if (slot.startsWith('Waffe') && !neMatchesWeapon(item, weaponType)) return false;
               if (needle && !neNorm(item.name).includes(needle)) return false;
               return true;
-            }}).sort(function(a, b) {{ return String(a.name || '').localeCompare(String(b.name || ''), 'de'); }});
+            }}).sort(function(a, b) {{
+              const parseLevel = function(item) {{
+                const raw = item && (item.level ?? item.item_level ?? item.required_level);
+                const value = Number.parseFloat(String(raw ?? '').replace(',', '.'));
+                return Number.isFinite(value) ? value : -1;
+              }};
+              const levelDiff = parseLevel(b) - parseLevel(a);
+              if (levelDiff) return levelDiff;
+              return String(a.name || '').localeCompare(String(b.name || ''), 'de');
+            }});
           }}
           function neRenderOptions(query) {{
             if (!nePop || !neCurrentEditor) return;
