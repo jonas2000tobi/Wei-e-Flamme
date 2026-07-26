@@ -345,6 +345,9 @@ def _blank_slot() -> dict:
         "item_id": "",
         "catalog_item_id": 0,
         "catalog_source_item_id": "",
+        # Serverseitig gesetzter Zeitstempel. Er zeigt nachvollziehbar, seit wann
+        # genau dieses Item in diesem Slot als Need eingetragen ist.
+        "need_since": "",
         "received": False,
         "locked": False,
         "received_at": "",
@@ -358,6 +361,9 @@ def _slot_obj(value: Any) -> dict:
         obj.setdefault("item_id", "")
         obj.setdefault("catalog_item_id", 0)
         obj.setdefault("catalog_source_item_id", "")
+        # Kompatibilität mit möglichen älteren Bezeichnungen. Alte Einträge ohne
+        # Zeitstempel bleiben absichtlich leer, statt ein falsches Datum zu erfinden.
+        obj.setdefault("need_since", str(obj.get("selected_at") or obj.get("need_created_at") or ""))
         obj.setdefault("received", False)
         obj.setdefault("locked", bool(obj.get("received", False)))
         obj.setdefault("received_at", "")
@@ -374,6 +380,9 @@ def _slot_obj(value: Any) -> dict:
 
         return {
             "item_id": value,
+            "catalog_item_id": 0,
+            "catalog_source_item_id": "",
+            "need_since": "",
             "received": False,
             "locked": False,
             "received_at": "",
@@ -401,10 +410,17 @@ def _set_slot_item(
     catalog_source_item_id: str = "",
 ) -> None:
     data.setdefault(tab, {})
+    new_item_id = str(item_id)
+    previous = _slot_obj(data[tab].get(slot))
+    # Derselbe Need behält sein ursprüngliches Datum. Bei einem Itemwechsel beginnt
+    # die Frist neu. Der Browser kann diesen Wert nicht vorgeben oder manipulieren.
+    previous_since = str(previous.get("need_since") or "")
+    need_since = previous_since if str(previous.get("item_id") or "") == new_item_id and previous_since else _now_iso()
     data[tab][slot] = {
-        "item_id": str(item_id),
+        "item_id": new_item_id,
         "catalog_item_id": int(catalog_item_id or 0),
         "catalog_source_item_id": str(catalog_source_item_id or ""),
+        "need_since": need_since,
         "received": False,
         "locked": False,
         "received_at": "",
@@ -1029,6 +1045,19 @@ def _guild_name(guild: discord.Guild) -> str:
     return str(getattr(guild, "name", "Gilde") or "Gilde")
 
 
+def _need_since_discord(value: Any) -> str:
+    raw = str(_slot_obj(value).get("need_since") or "").strip()
+    if not raw:
+        return ""
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=TZ)
+        return f" · 🕒 <t:{int(dt.timestamp())}:f>"
+    except Exception:
+        return ""
+
+
 def _need_embed(guild: discord.Guild, user_id: int, tab: str = "Main") -> discord.Embed:
     tab = _normalize_tab(tab) or "Main"
     data = _user_needs(guild.id, user_id)
@@ -1064,6 +1093,8 @@ def _need_embed(guild: discord.Guild, user_id: int, tab: str = "Main") -> discor
             item_name = "—"
 
         line = f"**{slot}:** {item_name}"
+        if item_id:
+            line += _need_since_discord(slot_data)
 
         if slot in ("Waffe 1", "Waffe 2"):
             weapon_lines.append(line)

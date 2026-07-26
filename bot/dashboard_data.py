@@ -1225,7 +1225,7 @@ def _simplify_need_value(value: Any, catalog: Optional[dict[str, Any]] = None, *
             out.append(f"{_safe_text(slot_name, 80)}: {label}" if slot_name else label)
             return out
 
-        meta_keys = {"updated_at", "created_at", "user_id", "display_name", "received", "locked", "received_at", "received_by", "obtained", "done"}
+        meta_keys = {"updated_at", "created_at", "need_since", "selected_at", "need_created_at", "user_id", "display_name", "received", "locked", "received_at", "received_by", "obtained", "done"}
         for key, val in value.items():
             key_s = str(key)
             if key_s.lower() in meta_keys or val in (None, "", False):
@@ -1289,6 +1289,9 @@ def _extract_need_items(raw: dict[str, Any], tab_names: set[str], catalog: dict[
                     "catalog_item_name": str((linked or {}).get("name") or obj.get("catalog_item_name") or ""),
                     "catalog_source_url": str((linked or {}).get("source_url") or obj.get("catalog_source_url") or ""),
                     "catalog_image_url": str((linked or {}).get("manual_image_url") or (linked or {}).get("image_url") or (linked or {}).get("icon_url") or obj.get("catalog_image_url") or ""),
+                    # Wird im Mitgliederprofil klein angezeigt. Der Wert stammt direkt
+                    # aus dem produktiven Bot-Slot und nicht aus dem Dashboard.
+                    "need_since": str(obj.get("need_since") or obj.get("selected_at") or obj.get("need_created_at") or ""),
                     "received": False,
                 })
             return out
