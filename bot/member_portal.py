@@ -5848,10 +5848,10 @@ def _admin_attendance_embed(guild: discord.Guild, event: dict) -> discord.Embed:
     ec_type = _admin_event_ec_type(event, event_id)
     ec_line = ""
     if ec_type:
-        base_ec, reserve_ec = _admin_event_ec_points(guild.id, ec_type)
+        base_ec, _reserve_ec = _admin_event_ec_points(guild.id, ec_type)
         awarded = _admin_event_ec_awarded(guild.id, event_id, event)
         ec_line = (
-            f"🪙 EC-Typ: **{ec_type}** • Wert: **{base_ec} EC** • Reserve: **{reserve_ec} EC**\n"
+            f"🪙 EC-Typ: **{ec_type}** • Wert pro Anwesenheit: **{base_ec} EC**\n"
             f"EC-Status: **{'✅ bereits vergeben' if awarded else 'offen'}**\n"
         )
     else:
@@ -6143,18 +6143,18 @@ class AdminAttendanceMemberSelectView(PortalSafeView):
             await _portal_send(inter, "❌ Für dieses Event wurden bereits EC vergeben. Korrekturen bitte über `/dkp adjust` machen.", ephemeral=True)
             return
 
-        base_ec, reserve_ec = _admin_event_ec_points(self.guild_id, event_type)
+        base_ec, _reserve_ec = _admin_event_ec_points(self.guild_id, event_type)
         present_count, reserve_count, partner_count, open_count = _admin_event_award_preview_lines(inter.client, self.guild_id, self.event_id, event, event_type)
+        full_count = present_count + reserve_count
         title = str(event.get("title", "Event") or "Event")
         emb = discord.Embed(
             title="💰 EC vergeben – Bestätigung",
             description=(
                 f"Event: **{title}**\n"
                 f"EC-Typ: **{event_type}**\n"
-                f"Wert: **{base_ec} EC** • Reserve: **{reserve_ec} EC**\n\n"
+                f"Wert pro anwesendem Gildenspieler: **{base_ec} EC**\n\n"
                 f"Würde vergeben an:\n"
-                f"✅ Volle Wertung: **{present_count}** Spieler\n"
-                f"🏦 Reserve: **{reserve_count}** Spieler\n"
+                f"✅ Volle Wertung: **{full_count}** Spieler\n"
                 f"🤝 Allianz/Partner ohne EC: **{partner_count}**\n"
                 f"⚪ Offen/nicht gewertet: **{open_count}**\n\n"
                 "Das schreibt echte EC-Transaktionen und kann nicht einfach nochmal gedrückt werden."

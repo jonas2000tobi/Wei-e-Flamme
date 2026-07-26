@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-"""Stabile Eventbild-URLs für Discord-Bot und Dashboard.
+"""Dauerhafte Eventbilder für Bot und Dashboard.
 
-Discord-Anhangslinks mit ``ex/is/hm`` sind signiert und laufen ab. Deshalb liegen
-unsere Standardbilder im Dashboard unter ``/static/event_images``. Der Bot nutzt
-absolute URLs auf dieselben Dateien, damit Discord-Embeds ebenfalls dauerhaft
-funktionieren.
+Standardbilder werden über eine feste Dashboard-Route ausgeliefert. Bei den
+fünf bekannten Gildenevents hat die lokale Bildzuordnung Vorrang vor alten oder
+abgelaufenen Discord-/Extern-Links. Nur ausdrücklich als ``custom`` markierte
+Bilder bleiben externe URLs.
 """
 
 import os
@@ -13,13 +13,12 @@ from typing import Any, Mapping
 from urllib.parse import urlparse
 
 DEFAULT_DASHBOARD_PUBLIC_BASE_URL = "https://dashboardweb-production-2933.up.railway.app"
-EVENT_IMAGE_ASSET_VERSION = "2.2.2"
+EVENT_IMAGE_ASSET_VERSION = "2.2.4"
 
 EVENT_IMAGE_ASSETS: dict[str, str] = {
     "normal_raid": "normal_raid.webp",
     "hard_raid": "hard_raid.webp",
     "trials": "trials.webp",
-    "nightmare": "nightmare.webp",
     "pvp": "pvp.webp",
     "guild_boss": "guild_boss.webp",
 }
@@ -32,15 +31,44 @@ DISPLAY_PRESET_KEYS: dict[str, str] = {
     "Segensstein": "pvp",
 }
 
-# Alte, bereits gespeicherte Discord-Anhangslinks werden anhand stabiler Teile
-# erkannt. Die Query-Parameter selbst dürfen nicht weiterverwendet werden.
+_PRESET_ALIASES: dict[str, str] = {
+    "normal": "normal_raid",
+    "normal raid": "normal_raid",
+    "normal mode": "normal_raid",
+    "normal mode raid": "normal_raid",
+    "normal_raid": "normal_raid",
+    "nm raid": "normal_raid",
+    "hard": "hard_raid",
+    "hard raid": "hard_raid",
+    "hard mode": "hard_raid",
+    "hard mode raid": "hard_raid",
+    "hardmode raid": "hard_raid",
+    "hard_raid": "hard_raid",
+    "hm raid": "hard_raid",
+    "trial": "trials",
+    "trials": "trials",
+    "dimensionsprüfung": "trials",
+    "dimensionspruefung": "trials",
+    "pvp": "pvp",
+    "segensstein": "pvp",
+    "segensstein pvp": "pvp",
+    "boss": "guild_boss",
+    "gildenboss": "guild_boss",
+    "gildenbosse": "guild_boss",
+    "guild boss": "guild_boss",
+    "guild_boss": "guild_boss",
+}
+
+_NO_IMAGE_KEYS = {"none", "kein bild", "no image", "off", "disabled"}
+_CUSTOM_IMAGE_KEYS = {"custom", "eigene url", "external", "extern"}
+
+# Alte, bereits gespeicherte Discord-Anhangslinks werden zusätzlich anhand
+# stabiler URL-Bestandteile erkannt.
 LEGACY_URL_MARKERS: dict[str, str] = {
     "1516086614957494312": "normal_raid",
     "282b2b20-5a8f-4251-b038-15fde2ac723d": "normal_raid",
     "1513816935832228033": "hard_raid",
     "7225f274-cc4f-4eda-ba74-ca401f4e572b": "hard_raid",
-    "1513816992358858842": "nightmare",
-    "d6ee8bc1-432a-4d28-914d-31be80adf835": "nightmare",
     "1491660359952502825": "trials",
     "file_000000007dcc7246bb6e57ae41860769": "trials",
     "1513202292302811186": "pvp",
@@ -57,8 +85,10 @@ def dashboard_public_base_url() -> str:
 
 
 def event_image_asset_path(preset_key: str) -> str:
-    filename = EVENT_IMAGE_ASSETS.get(str(preset_key or "").strip().lower(), "")
-    return f"/static/event_images/{filename}?v={EVENT_IMAGE_ASSET_VERSION}" if filename else ""
+    key = str(preset_key or "").strip().lower()
+    if key not in EVENT_IMAGE_ASSETS:
+        return ""
+    return f"/event-image/{key}?v={EVENT_IMAGE_ASSET_VERSION}"
 
 
 def event_image_asset_url(preset_key: str) -> str:
@@ -74,6 +104,7 @@ def is_discord_attachment_url(url: str) -> bool:
     value = str(url or "").strip()
     try:
         host = (urlparse(value).hostname or "").lower()
+        path = (urlparse(value).path or "").lower()
     except Exception:
         return False
     return host in {
@@ -81,7 +112,7 @@ def is_discord_attachment_url(url: str) -> bool:
         "media.discordapp.net",
         "images-ext-1.discordapp.net",
         "images-ext-2.discordapp.net",
-    } and "/attachments/" in value
+    } and ("/attachments/" in path or "/ephemeral-attachments/" in path)
 
 
 def legacy_preset_key(url: str) -> str:
@@ -92,18 +123,23 @@ def legacy_preset_key(url: str) -> str:
     return ""
 
 
+def _selected_image_mode(event: Mapping[str, Any]) -> str:
+    return str(event.get("image_type") or event.get("image_preset") or "").strip().casefold()
+
+
+def _selected_preset_key(event: Mapping[str, Any]) -> str:
+    mode = _selected_image_mode(event)
+    return _PRESET_ALIASES.get(mode, mode if mode in EVENT_IMAGE_ASSETS else "")
+
+
 def infer_preset_key(event: Mapping[str, Any] | None) -> str:
     event = event or {}
+    selected = _selected_preset_key(event)
+    if selected:
+        return selected
+
     values: list[str] = []
-    for key in (
-        "image_preset",
-        "image_type",
-        "dkp_event_type",
-        "event_type",
-        "title",
-        "name",
-        "description",
-    ):
+    for key in ("dkp_event_type", "event_type", "title", "name", "description"):
         value = event.get(key)
         if value is not None:
             values.append(str(value))
@@ -111,9 +147,7 @@ def infer_preset_key(event: Mapping[str, Any] | None) -> str:
 
     if any(term in text for term in ("segensstein", "boonstone", "pvp")):
         return "pvp"
-    if any(term in text for term in ("nightmare", "albtraum")):
-        return "nightmare"
-    if any(term in text for term in ("trial", "prüfung", "pruefung")):
+    if any(term in text for term in ("trial", "dimensionsprüfung", "dimensionspruefung", "prüfung", "pruefung")):
         return "trials"
     if any(term in text for term in ("hardmode", "hard mode", "hard raid", "hm raid")):
         return "hard_raid"
@@ -131,11 +165,11 @@ def normalize_event_image_url(
     absolute: bool = True,
     infer_when_missing: bool = False,
 ) -> str:
-    """Gibt eine dauerhafte Eventbild-URL zurück.
+    """Gibt eine dauerhafte Bild-URL zurück.
 
-    Eigene externe URLs bleiben unverändert. Alte/signierte Discord-Anhangslinks
-    werden auf ein lokales Standardbild abgebildet. Bei leerer URL kann das
-    Dashboard optional aus Eventtyp/Titel ein passendes Bild ableiten.
+    Für bekannte Eventtypen wird immer das feste lokale Bild verwendet. Damit
+    werden auch bereits laufende Events repariert, deren alte Bild-URL zwar noch
+    gespeichert ist, aber inzwischen nicht mehr geladen werden kann.
     """
     event = event or {}
     raw = str(raw_url or "").strip()
@@ -146,33 +180,49 @@ def normalize_event_image_url(
                 raw = candidate
                 break
 
-    if raw.startswith("/static/"):
-        path, _, _query = raw.partition("?")
-        if path.startswith("/static/event_images/"):
-            raw = f"{path}?v={EVENT_IMAGE_ASSET_VERSION}"
-        return f"{dashboard_public_base_url()}{raw}" if absolute else raw
+    mode = _selected_image_mode(event)
+    if mode in _NO_IMAGE_KEYS:
+        return ""
 
-    inferred = infer_preset_key(event)
-    legacy = legacy_preset_key(raw)
-    if raw and is_discord_attachment_url(raw):
-        preset_key = inferred or legacy
-        if preset_key:
-            return event_image_asset_url(preset_key) if absolute else event_image_asset_path(preset_key)
-        # Nicht bekannte Discord-Anhangslinks mit Signatur sind nicht dauerhaft.
-        if any(token in raw for token in ("?ex=", "&ex=", "&hm=", "?hm=")):
-            return ""
-        return raw
+    # Eine ausdrücklich gewählte eigene URL darf die Standardzuordnung ersetzen.
+    if mode in _CUSTOM_IMAGE_KEYS:
+        if raw.startswith(("https://", "http://")):
+            return raw
+        return ""
+
+    preset_key = infer_preset_key(event) or legacy_preset_key(raw)
+    if preset_key:
+        return event_image_asset_url(preset_key) if absolute else event_image_asset_path(preset_key)
+
+    if raw.startswith("/event-image/"):
+        path = raw.split("?", 1)[0]
+        stable = f"{path}?v={EVENT_IMAGE_ASSET_VERSION}"
+        return f"{dashboard_public_base_url()}{stable}" if absolute else stable
+
+    if raw.startswith("/static/event_images/"):
+        filename = raw.split("?", 1)[0].rsplit("/", 1)[-1]
+        key = next((k for k, v in EVENT_IMAGE_ASSETS.items() if v == filename), "")
+        if key:
+            return event_image_asset_url(key) if absolute else event_image_asset_path(key)
 
     if raw.startswith(("https://", "http://")):
         try:
             parsed = urlparse(raw)
+            if str(parsed.path or "").startswith("/event-image/"):
+                path = str(parsed.path)
+                stable = f"{path}?v={EVENT_IMAGE_ASSET_VERSION}"
+                return f"{dashboard_public_base_url()}{stable}" if absolute else stable
             if str(parsed.path or "").startswith("/static/event_images/"):
-                stable_path = f"{parsed.path}?v={EVENT_IMAGE_ASSET_VERSION}"
-                return f"{dashboard_public_base_url()}{stable_path}" if absolute else stable_path
+                filename = str(parsed.path).rsplit("/", 1)[-1]
+                key = next((k for k, v in EVENT_IMAGE_ASSETS.items() if v == filename), "")
+                if key:
+                    return event_image_asset_url(key) if absolute else event_image_asset_path(key)
         except Exception:
             pass
+        if is_discord_attachment_url(raw) and any(token in raw for token in ("?ex=", "&ex=", "&hm=", "?hm=")):
+            return ""
         return raw
 
-    if infer_when_missing and inferred:
-        return event_image_asset_url(inferred) if absolute else event_image_asset_path(inferred)
+    if infer_when_missing and preset_key:
+        return event_image_asset_url(preset_key) if absolute else event_image_asset_path(preset_key)
     return ""

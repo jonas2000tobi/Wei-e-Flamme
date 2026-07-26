@@ -1037,16 +1037,15 @@ def _attendance_check_embed(client: discord.Client, home_guild_id: int, event: d
     counts = _attendance_status_counts(event)
     title, when = _event_title_and_time(event)
     base = _event_points(home_guild_id, event_type)
-    res = _reserve_points(home_guild_id, event_type)
     emb = discord.Embed(title="📋 EC-Anwesenheit bestätigen", color=discord.Color.blurple())
     emb.description = (
         f"**{title}**\n"
         f"Zeit: **{when}**\n"
         f"Event-ID: `{event_id}`\n"
         f"EC-Typ: **{event_type}**\n"
-        f"Wert: **{base} EC** • Reserve: **{res} EC**\n\n"
+        f"Wert pro anwesendem Gildenspieler: **{base} EC**\n\n"
         "Beim Klick auf **EC vergeben** werden alle noch offenen Teilnehmer automatisch auf **War da** gesetzt.\n"
-        "Manuell gesetzte Status wie Reserve, Vielleicht, Abwesend oder Entschuldigt bleiben unverändert. "
+        "Vielleicht, Abwesend und Entschuldigt bleiben unverändert. "
         "Nachgetragene Spieler gelten nur für diese EC-Anwesenheit und ändern keine Event-Anmeldung."
     )
 
@@ -1075,13 +1074,12 @@ def _attendance_check_embed(client: discord.Client, home_guild_id: int, event: d
     emb.add_field(
         name="Aktueller Status",
         value=(
-            f"✅ War da: **{counts.get('present', 0)}**\n"
-            f"🪑 Reserve: **{counts.get('reserve', 0)}**\n"
+            f"✅ War da: **{counts.get('present', 0) + counts.get('reserve', 0)}**\n"
             f"❔ Vielleicht: **{counts.get('maybe', 0)}**\n"
             f"❌ Nicht da / 🟡 Entschuldigt: **{counts.get('absent', 0) + counts.get('excused', 0)}**\n"
             f"🤝 Partner ohne EC: **{len(skipped_partner)}**\n"
             f"⚪ Noch offen → bei Vergabe automatisch War da: **{counts.get('open', 0)}**\n\n"
-            f"Aktuell bestätigt: **{len(present)}** volle Wertung, **{len(reserve)}** Reserve"
+            f"Aktuell bestätigt: **{len(present) + len(reserve)}** volle Wertung"
         ),
         inline=False,
     )
@@ -3421,6 +3419,13 @@ def _resolve_event_type(choice: Optional[app_commands.Choice[str]], event: dict 
 
 
 def _attendance_summary_for_award(client: discord.Client, home_guild_id: int, event: dict, event_type: str) -> tuple[list[dict], list[dict], list[dict], list[dict]]:
+    """Ermittelt die EC-Empfänger anhand der tatsächlichen Anwesenheit.
+
+    Die frühere RSVP-Rolle (einschließlich BANK/Reserve) beeinflusst die EC-Höhe
+    nicht mehr. Wer als ``present`` oder ``reserve`` bestätigt wurde, gilt bei
+    der EC-Vergabe als anwesend und erhält den normalen Eventwert. Die zweite
+    Rückgabeliste bleibt aus Kompatibilitätsgründen bestehen, ist aber leer.
+    """
     participants = _attendance_unique_participants(event)
     attendance = event.get("attendance") or {}
     present: list[dict] = []
@@ -3429,7 +3434,6 @@ def _attendance_summary_for_award(client: discord.Client, home_guild_id: int, ev
     skipped_not_present: list[dict] = []
 
     base_points = _event_points(home_guild_id, event_type)
-    reserve_points = _reserve_points(home_guild_id, event_type)
 
     for p in participants:
         try:
@@ -3440,7 +3444,6 @@ def _attendance_summary_for_award(client: discord.Client, home_guild_id: int, ev
             continue
         status = str((attendance.get(str(uid)) or {}).get("status", "") or "")
         signup = str(p.get("signup", "") or "")
-        is_reserve = status == "reserve" or (status == "present" and signup == "BANK")
         row = {
             "user_id": uid,
             "name": _participant_display_name(client, int(home_guild_id), p),
@@ -3453,16 +3456,13 @@ def _attendance_summary_for_award(client: discord.Client, home_guild_id: int, ev
         if not _is_ebolus_member(client, home_guild_id, uid):
             skipped_not_ebolus.append(row)
             continue
-        requested = reserve_points if is_reserve else base_points
+        requested = base_points
         remaining = weekly_event_remaining(home_guild_id, uid)
         row["requested_points"] = requested
         row["points"] = min(requested, remaining)
         row["weekly_remaining_before"] = remaining
         row["weekly_limited"] = row["points"] < requested
-        if is_reserve:
-            reserve.append(row)
-        else:
-            present.append(row)
+        present.append(row)
 
     return present, reserve, skipped_not_ebolus, skipped_not_present
 
@@ -4263,22 +4263,15 @@ def _award_preview_embed(event: dict, event_type: str, present: list[dict], rese
     emb.description = f"**{title}**\nZeit: {when}\nTyp: **{event_type}**"
     if duplicate:
         emb.add_field(name="⚠️ Hinweis", value="Für dieses Event und diesen Typ wurden bereits DKP vergeben.", inline=False)
+    awarded = list(present) + list(reserve)
     lines = [
         (
             f"• **{discord.utils.escape_markdown(str(x.get('name') or 'Unbekannter Spieler'))}**: **+{x['points']} EC**"
             + (f" (Limit: statt {x.get('requested_points')} EC)" if x.get("weekly_limited") else "")
         )
-        for x in present
+        for x in awarded
     ]
-    emb.add_field(name="✅ Gilde – Teilnahme", value="\n".join(lines)[:1000] if lines else "—", inline=False)
-    lines = [
-        (
-            f"• **{discord.utils.escape_markdown(str(x.get('name') or 'Unbekannter Spieler'))}**: **+{x['points']} EC**"
-            + (f" (Limit: statt {x.get('requested_points')} EC)" if x.get("weekly_limited") else "")
-        )
-        for x in reserve
-    ]
-    emb.add_field(name="🏦 Gilde – Reserve", value="\n".join(lines)[:1000] if lines else "—", inline=False)
+    emb.add_field(name="✅ Gilde – volle Teilnahme", value="\n".join(lines)[:1000] if lines else "—", inline=False)
     lines = [f"• {x.get('name') or ('User ' + str(x['user_id']))}" for x in skipped_partner]
     emb.add_field(name="🤝 Allianz/Partner – keine DKP", value="\n".join(lines)[:1000] if lines else "—", inline=False)
     open_count = len(skipped_open)
