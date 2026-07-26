@@ -1848,7 +1848,8 @@ async def _push_overview(client: discord.Client, msg_id: str, obj: dict):
 
                 msg = await ch.fetch_message(int(mirror.get("message_id", 0) or 0))
                 emb = build_embed(guild, obj)
-                await msg.edit(embed=emb, view=ServerRaidView(master_id))
+                closed = str(obj.get("status") or obj.get("state") or "").strip().lower() in {"closed", "ended", "finished", "beendet", "archived", "done", "completed"}
+                await msg.edit(embed=emb, view=None if closed else ServerRaidView(master_id))
 
             except Exception:
                 continue
@@ -1873,7 +1874,8 @@ async def _push_overview(client: discord.Client, msg_id: str, obj: dict):
     emb = build_embed(guild, obj)
 
     try:
-        await msg.edit(embed=emb, view=ServerRaidView(int(msg_id)))
+        closed = str(obj.get("status") or obj.get("state") or "").strip().lower() in {"closed", "ended", "finished", "beendet", "archived", "done", "completed"}
+        await msg.edit(embed=emb, view=None if closed else ServerRaidView(int(msg_id)))
     except Exception:
         pass
 
@@ -3139,15 +3141,21 @@ _DASHBOARD_EVENT_IMAGE_ALIASES = {
 
 
 def _dashboard_event_image_url_from_payload(payload: dict[str, Any]) -> str | None:
+    image_type = str(payload.get("image_type") or payload.get("image_preset") or "auto").strip().lower()
     direct = str(payload.get("image_url") or "").strip()
-    if direct:
-        stable = normalize_event_image_url(payload, direct, absolute=True)
-        return stable or None
-    image_type = str(payload.get("image_type") or payload.get("image_preset") or "").strip().lower()
-    if image_type in {"", "none", "custom"}:
+    if image_type in {"none", "kein bild", "off", "disabled"}:
         return None
+    if image_type in {"custom", "eigene url", "external", "extern"}:
+        return normalize_event_image_url({"image_type": "custom"}, direct, absolute=True) or None
+    if image_type in {"", "auto", "standard", "default"}:
+        return normalize_event_image_url(payload, direct, absolute=True, infer_when_missing=True) or None
     key = _DASHBOARD_EVENT_IMAGE_ALIASES.get(image_type, image_type)
-    return _DASHBOARD_EVENT_IMAGE_PRESETS.get(key)
+    preset = _DASHBOARD_EVENT_IMAGE_PRESETS.get(key)
+    if preset:
+        return preset
+    if direct:
+        return normalize_event_image_url({"image_type": "custom"}, direct, absolute=True) or None
+    return normalize_event_image_url(payload, "", absolute=True, infer_when_missing=True) or None
 
 
 def _dashboard_event_duration_minutes(payload: dict[str, Any], fallback: int = 120) -> int:
@@ -3335,7 +3343,9 @@ async def _dashboard_event_create(client: discord.Client, guild_id: int, payload
         "duration_minutes": _dashboard_event_duration_minutes(payload),
         "location": str(payload.get("location") or (_guild_brand_name(guild) + " Discord")).strip(),
         "sync_discord_event": bool(payload.get("sync_discord_event", False)),
+        "image_type": str(payload.get("image_type") or "auto").strip().lower(),
         "image_url": _dashboard_event_image_url_from_payload(payload),
+        "status": "active",
         "yes": {"TANK": [], "HEAL": [], "DPS": [], "BANK": []},
         "maybe": {},
         "no": [],
@@ -3404,40 +3414,95 @@ async def _dashboard_event_edit(client: discord.Client, guild_id: int, payload: 
     _init_event_shape(obj)
     if int(obj.get("guild_id", 0) or 0) != int(guild_id):
         raise RuntimeError("Event gehört nicht zu diesem Server")
+
+    before = {
+        "title": obj.get("title"), "description": obj.get("description"),
+        "event_type": obj.get("event_type"), "dkp_event_type": obj.get("dkp_event_type"),
+        "when_iso": obj.get("when_iso"), "image_type": obj.get("image_type"),
+        "image_url": obj.get("image_url"), "duration_minutes": obj.get("duration_minutes"),
+        "location": obj.get("location"), "target_role_id": obj.get("target_role_id"),
+        "status": obj.get("status"),
+    }
     changed: list[str] = []
+
     title = str(payload.get("title") or "").strip()
-    if title:
-        obj["title"] = title
+    if title and title != str(obj.get("title") or ""):
+        obj["title"] = title[:180]
         changed.append("Titel")
-    # Beschreibung darf bewusst auf leer gesetzt werden, wenn Feld mitgesendet wurde.
-    if "description" in payload and str(payload.get("description") or "").strip():
-        obj["description"] = str(payload.get("description") or "").strip()
-        changed.append("Beschreibung")
-    image_url = _dashboard_event_image_url_from_payload(payload)
-    if image_url:
-        obj["image_url"] = image_url
-        changed.append("Bild")
-    dkp_event_type = _dashboard_event_dkp_type_from_payload(payload)
-    if dkp_event_type:
-        obj["dkp_enabled"] = True
+
+    if bool(payload.get("description_present")):
+        description = str(payload.get("description") or "").strip()
+        if description != str(obj.get("description") or ""):
+            obj["description"] = description
+            changed.append("Beschreibung")
+
+    if bool(payload.get("event_type_present")):
+        event_type = str(payload.get("event_type") or "").strip()
+        if event_type != str(obj.get("event_type") or ""):
+            obj["event_type"] = event_type
+            changed.append("Eventtyp")
+
+    if bool(payload.get("dkp_event_type_present")):
+        raw_dkp = str(payload.get("dkp_event_type") or "").strip()
+        dkp_event_type = "" if raw_dkp == "Nicht DKP-relevant" else raw_dkp
+        obj["dkp_enabled"] = bool(dkp_event_type)
         obj["dkp_event_type"] = dkp_event_type
-        changed.append("EC-Typ")
+        changed.append("EC-Regel")
+
+    if bool(payload.get("image_present")):
+        image_type = str(payload.get("image_type") or "auto").strip().lower()
+        obj["image_type"] = image_type
+        if image_type in {"none", "kein bild", "off", "disabled"}:
+            if obj.pop("image_url", None) is not None:
+                changed.append("Bild entfernt")
+        else:
+            image_url = _dashboard_event_image_url_from_payload(payload)
+            if image_type == "custom" and not image_url:
+                raise RuntimeError("Eigene Bild-URL fehlt oder ist ungültig")
+            if image_url != obj.get("image_url"):
+                if image_url:
+                    obj["image_url"] = image_url
+                else:
+                    obj.pop("image_url", None)
+                changed.append("Bild")
+
     if str(payload.get("date") or "").strip() or str(payload.get("time") or "").strip() or str(payload.get("when_iso") or "").strip():
-        obj["when_iso"] = _dashboard_event_parse_when(payload, str(obj.get("when_iso") or "")).isoformat()
-        changed.append("Zeit")
-    if str(payload.get("target_role_id") or "").strip():
-        obj["target_role_id"] = _dashboard_event_int(payload.get("target_role_id"))
-        changed.append("Zielrolle")
-    if str(payload.get("duration_minutes") or "").strip():
-        obj["duration_minutes"] = _dashboard_event_duration_minutes(payload, int(obj.get("duration_minutes") or 120))
-        start_dt = _dashboard_event_parse_when(payload, str(obj.get("when_iso") or ""))
-        obj["end_at"] = _dashboard_event_end_time(start_dt, payload, int(obj.get("duration_minutes") or 120)).isoformat()
-        changed.append("Dauer")
-    if str(payload.get("location") or "").strip():
-        obj["location"] = str(payload.get("location") or "").strip()
-        changed.append("Ort")
+        new_when = _dashboard_event_parse_when(payload, str(obj.get("when_iso") or "")).isoformat()
+        if new_when != str(obj.get("when_iso") or ""):
+            obj["when_iso"] = new_when
+            changed.append("Zeitpunkt")
+
+    if bool(payload.get("target_role_present")):
+        target_role_id = _dashboard_event_int(payload.get("target_role_id"))
+        if target_role_id != int(obj.get("target_role_id", 0) or 0):
+            obj["target_role_id"] = target_role_id
+            changed.append("Zielrolle")
+
+    if bool(payload.get("duration_present")):
+        duration = _dashboard_event_duration_minutes(payload, int(obj.get("duration_minutes") or 120))
+        if duration != int(obj.get("duration_minutes") or 120):
+            obj["duration_minutes"] = duration
+            changed.append("Dauer")
+
+    start_dt = _dashboard_event_parse_when(payload, str(obj.get("when_iso") or ""))
+    obj["end_at"] = _dashboard_event_end_time(start_dt, payload, int(obj.get("duration_minutes") or 120)).isoformat()
+
+    if bool(payload.get("location_present")):
+        location = str(payload.get("location") or "").strip()
+        if location != str(obj.get("location") or ""):
+            obj["location"] = location
+            changed.append("Ort")
+
+    if bool(payload.get("status_present")):
+        requested_status = str(payload.get("status") or "active").strip().lower()
+        new_status = "closed" if requested_status in {"closed", "ended", "finished", "beendet", "archived"} else "active"
+        if new_status != str(obj.get("status") or "active").strip().lower():
+            obj["status"] = new_status
+            changed.append("Status")
+
     if "sync_discord_event" in payload:
         obj["sync_discord_event"] = bool(payload.get("sync_discord_event")) or bool(obj.get("scheduled_event_id"))
+
     guild = client.get_guild(int(guild_id))
     scheduled_result: dict[str, Any] = {}
     if guild is not None and (obj.get("scheduled_event_id") or payload.get("sync_discord_event")):
@@ -3449,13 +3514,44 @@ async def _dashboard_event_edit(client: discord.Client, guild_id: int, payload: 
         except Exception as exc:
             obj["scheduled_event_error"] = f"{type(exc).__name__}: {exc}"
             scheduled_result = {"error": obj["scheduled_event_error"]}
+
+    obj["last_dashboard_edit_at"] = datetime.now(TZ).isoformat()
+    obj["last_dashboard_edit_by"] = dict(payload.get("requested_by") or {})
     store[event_id] = obj
-    save_store()
-    await _push_overview(client, event_id, obj)
+    save_store(str(event_id))
+
+    discord_updated = False
+    if bool(payload.get("update_discord", True)):
+        await _push_overview(client, event_id, obj)
+        discord_updated = True
+
+    try:
+        ensure_attendance_snapshot(client, event_id, obj)
+    except Exception:
+        pass
+    try:
+        _phase3_upsert_event_from_store(event_id)
+    except Exception:
+        pass
     if guild is not None:
         _schedule_portal_refresh_for_event(client, guild, obj)
-    await _log(client, int(guild_id), f"Dashboard-Event bearbeitet: {obj.get('title')} ({event_id})")
-    return {"event_id": event_id, "changed": changed or ["keine sichtbaren Felder"], "scheduled_event": scheduled_result}
+    await _log(client, int(guild_id), f"Dashboard-Event bearbeitet: {obj.get('title')} ({event_id}) · {', '.join(changed) if changed else 'keine sichtbaren Änderungen'}")
+    return {
+        "event_id": event_id,
+        "changed": changed or ["keine sichtbaren Felder"],
+        "discord_updated": discord_updated,
+        "force_refresh": bool(payload.get("force_refresh")),
+        "scheduled_event": scheduled_result,
+        "before": before,
+        "after": {
+            "title": obj.get("title"), "description": obj.get("description"),
+            "event_type": obj.get("event_type"), "dkp_event_type": obj.get("dkp_event_type"),
+            "when_iso": obj.get("when_iso"), "image_type": obj.get("image_type"),
+            "image_url": obj.get("image_url"), "duration_minutes": obj.get("duration_minutes"),
+            "location": obj.get("location"), "target_role_id": obj.get("target_role_id"),
+            "status": obj.get("status"),
+        },
+    }
 
 
 async def _dashboard_event_delete(client: discord.Client, guild_id: int, payload: dict[str, Any]) -> dict[str, Any]:

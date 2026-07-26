@@ -12,7 +12,7 @@ from typing import Any, Mapping
 from urllib.parse import urlparse
 
 DEFAULT_DASHBOARD_PUBLIC_BASE_URL = "https://dashboardweb-production-2933.up.railway.app"
-EVENT_IMAGE_ASSET_VERSION = "2.2.6"
+EVENT_IMAGE_ASSET_VERSION = "2.3.0"
 
 EVENT_IMAGE_ASSETS: dict[str, str] = {
     "normal_raid": "normal_raid.webp",
@@ -24,11 +24,11 @@ EVENT_IMAGE_ASSETS: dict[str, str] = {
 
 # Stabile Discord-Attachment-URLs ohne zeitlich begrenzte Signaturparameter.
 EVENT_IMAGE_URLS: dict[str, str] = {
-    "guild_boss": "https://cdn.discordapp.com/attachments/1528469765860098171/1528469820738375882/Gildenbosse.png",
-    "normal_raid": "https://cdn.discordapp.com/attachments/1528469765860098171/1528469819865956352/0d9886d3-f6f5-4f3e-b926-1f86151dc84d.png",
-    "hard_raid": "https://cdn.discordapp.com/attachments/1528469765860098171/1529804865679786085/7225f274-cc4f-4eda-ba74-ca401f4e572b.png",
-    "trials": "https://cdn.discordapp.com/attachments/1528469765860098171/1530963146020356246/8b34c404-89eb-4259-9e6e-acbcc1def2b2.png",
-    "pvp": "https://cdn.discordapp.com/attachments/1528469765860098171/1528469820310290493/4a00e277-c3b6-48b0-ac7e-ad3e3722aaf1.png",
+    "guild_boss": "https://media.discordapp.net/attachments/1528469765860098171/1528469820738375882/Gildenbosse.png?ex=6a66fbb2&is=6a65aa32&hm=68dd55e6c4471bfafac7fbe6f397e338df96be2a7d5ed09e5670beaabd2b1306&=&format=webp&quality=lossless&width=1521&height=856",
+    "normal_raid": "https://media.discordapp.net/attachments/1528469765860098171/1528469819865956352/0d9886d3-f6f5-4f3e-b926-1f86151dc84d.png?ex=6a66fbb2&is=6a65aa32&hm=8e97e8d1fbc2f0360281da525ed91428de983d09053bb1b3ee7725b5fe826de2&=&format=webp&quality=lossless&width=1521&height=856",
+    "hard_raid": "https://cdn.discordapp.com/attachments/1528469765860098171/1529804865679786085/7225f274-cc4f-4eda-ba74-ca401f4e572b.png?ex=6a6739ce&is=6a65e84e&hm=e7c2682271f30cf9eb6ef9938fe814cdbb02c6303ebb08e6d3be591f97102da6&",
+    "trials": "https://cdn.discordapp.com/attachments/1528469765860098171/1530963146020356246/8b34c404-89eb-4259-9e6e-acbcc1def2b2.png?ex=6a677c09&is=6a662a89&hm=336425c5a5bb6e814cf55d2126ad2f24ce4a55112e2b8ab5733a06d056afd80d&",
+    "pvp": "https://media.discordapp.net/attachments/1528469765860098171/1528469820310290493/4a00e277-c3b6-48b0-ac7e-ad3e3722aaf1.png?ex=6a66fbb2&is=6a65aa32&hm=a33dd39d4312e0785b0d00df131b12e5b0a563c1d9c4c6999e8c69339961a5b8&=&format=webp&quality=lossless&width=1521&height=856",
 }
 
 DISPLAY_PRESET_KEYS: dict[str, str] = {
@@ -135,18 +135,15 @@ def is_discord_attachment_url(url: str) -> bool:
 
 
 def stable_external_image_url(url: str) -> str:
-    """Entfernt nur bei Discord-Anhängen die ablaufende Query-Signatur."""
+    """Behält eine gültige externe Bild-URL exakt bei.
+
+    Discord-Anhangslinks können signierte Query-Parameter benötigen. Deshalb
+    werden eigene und vorkonfigurierte URLs nicht mehr automatisch gekürzt.
+    """
     value = str(url or "").strip()
     if not value.startswith(("https://", "http://")):
         return ""
-    if not is_discord_attachment_url(value):
-        return value
-    try:
-        parsed = urlparse(value)
-        host = "cdn.discordapp.com" if (parsed.hostname or "").lower() == "media.discordapp.net" else (parsed.hostname or "")
-        return parsed._replace(scheme="https", netloc=host, query="", fragment="").geturl()
-    except Exception:
-        return value.split("?", 1)[0]
+    return value
 
 
 def legacy_preset_key(url: str) -> str:
@@ -220,6 +217,11 @@ def normalize_event_image_url(
 
     # Eine ausdrücklich gewählte eigene URL darf die Standardzuordnung ersetzen.
     if mode in _CUSTOM_IMAGE_KEYS:
+        return stable_external_image_url(raw)
+
+    # Ältere Events mit eigener URL hatten noch kein image_type-Feld. Solange
+    # die URL nicht zu einem bekannten Standardbild gehört, bleibt sie erhalten.
+    if not mode and raw and not legacy_preset_key(raw):
         return stable_external_image_url(raw)
 
     preset_key = infer_preset_key(event) or legacy_preset_key(raw)
