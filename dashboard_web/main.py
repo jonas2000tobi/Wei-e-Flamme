@@ -49,22 +49,22 @@ async def _dashboard_lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Guild Platform Dashboard", version="2.2.4", lifespan=_dashboard_lifespan)
+app = FastAPI(title="Guild Platform Dashboard", version="2.2.6", lifespan=_dashboard_lifespan)
 security = HTTPBasic(auto_error=False)
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
-ASSET_VER = "beer-and-buffs-v2-2-4-running-event-images"
-DASHBOARD_RELEASE_VERSION = "2.2.4 · Laufende Eventbilder + volle Anwesenheitswertung"
+ASSET_VER = "beer-and-buffs-v2-2-6-discord-cdn-event-images"
+DASHBOARD_RELEASE_VERSION = "2.2.6 · Discord-CDN-Eventbilder + volle Anwesenheitswertung"
 
 _EVENT_IMAGE_ASSETS: dict[str, str] = {
-    "normal_raid": f"/event-image/normal_raid?v={ASSET_VER}",
-    "hard_raid": f"/event-image/hard_raid?v={ASSET_VER}",
-    "trials": f"/event-image/trials?v={ASSET_VER}",
-    "pvp": f"/event-image/pvp?v={ASSET_VER}",
-    "guild_boss": f"/event-image/guild_boss?v={ASSET_VER}",
+    "guild_boss": "https://cdn.discordapp.com/attachments/1528469765860098171/1528469820738375882/Gildenbosse.png",
+    "normal_raid": "https://cdn.discordapp.com/attachments/1528469765860098171/1528469819865956352/0d9886d3-f6f5-4f3e-b926-1f86151dc84d.png",
+    "hard_raid": "https://cdn.discordapp.com/attachments/1528469765860098171/1529804865679786085/7225f274-cc4f-4eda-ba74-ca401f4e572b.png",
+    "trials": "https://cdn.discordapp.com/attachments/1528469765860098171/1530963146020356246/8b34c404-89eb-4259-9e6e-acbcc1def2b2.png",
+    "pvp": "https://cdn.discordapp.com/attachments/1528469765860098171/1528469820310290493/4a00e277-c3b6-48b0-ac7e-ad3e3722aaf1.png",
 }
 
 _EVENT_IMAGE_FILES: dict[str, str] = {
@@ -108,10 +108,19 @@ _EVENT_IMAGE_CUSTOM_KEYS = {"custom", "eigene url", "external", "extern"}
 
 
 _EVENT_IMAGE_LEGACY_MARKERS: dict[str, str] = {
+    "1528469820738375882": "guild_boss",
+    "Gildenbosse.png": "guild_boss",
+    "1528469819865956352": "normal_raid",
+    "0d9886d3-f6f5-4f3e-b926-1f86151dc84d": "normal_raid",
+    "1529804865679786085": "hard_raid",
+    "7225f274-cc4f-4eda-ba74-ca401f4e572b": "hard_raid",
+    "1530963146020356246": "trials",
+    "8b34c404-89eb-4259-9e6e-acbcc1def2b2": "trials",
+    "1528469820310290493": "pvp",
+    "4a00e277-c3b6-48b0-ac7e-ad3e3722aaf1": "pvp",
     "1516086614957494312": "normal_raid",
     "282b2b20-5a8f-4251-b038-15fde2ac723d": "normal_raid",
     "1513816935832228033": "hard_raid",
-    "7225f274-cc4f-4eda-ba74-ca401f4e572b": "hard_raid",
     "1491660359952502825": "trials",
     "file_000000007dcc7246bb6e57ae41860769": "trials",
     "1513202292302811186": "pvp",
@@ -133,6 +142,20 @@ def _event_image_is_discord_attachment(url: str) -> bool:
         "images-ext-1.discordapp.net",
         "images-ext-2.discordapp.net",
     } and ("/attachments/" in path or "/ephemeral-attachments/" in path)
+
+
+def _stable_event_external_url(url: str) -> str:
+    value = str(url or "").strip()
+    if not value.startswith(("https://", "http://")):
+        return ""
+    if not _event_image_is_discord_attachment(value):
+        return value
+    try:
+        parsed = urllib.parse.urlsplit(value)
+        host = "cdn.discordapp.com" if (parsed.hostname or "").lower() == "media.discordapp.net" else (parsed.hostname or "")
+        return urllib.parse.urlunsplit(("https", host, parsed.path, "", ""))
+    except Exception:
+        return value.split("?", 1)[0]
 
 
 def _event_image_mode(ev: dict[str, Any]) -> str:
@@ -209,7 +232,7 @@ def _dashboard_event_image_url(ev: dict[str, Any]) -> str:
     if mode in _EVENT_IMAGE_NO_IMAGE_KEYS:
         return ""
     if mode in _EVENT_IMAGE_CUSTOM_KEYS:
-        return raw if raw.startswith(("https://", "http://")) else ""
+        return _stable_event_external_url(raw)
 
     inferred = _event_image_preset_key(ev)
     legacy = ""
@@ -242,9 +265,7 @@ def _dashboard_event_image_url(ev: dict[str, Any]) -> str:
                 return _EVENT_IMAGE_ASSETS.get(key, "")
         except Exception:
             pass
-        if _event_image_is_discord_attachment(raw) and any(token in raw for token in ("?ex=", "&ex=", "?hm=", "&hm=")):
-            return ""
-        return raw
+        return _stable_event_external_url(raw)
     return ""
 
 
