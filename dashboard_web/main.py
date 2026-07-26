@@ -49,22 +49,22 @@ async def _dashboard_lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Guild Platform Dashboard", version="2.2.6", lifespan=_dashboard_lifespan)
+app = FastAPI(title="Guild Platform Dashboard", version="2.3.0", lifespan=_dashboard_lifespan)
 security = HTTPBasic(auto_error=False)
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
-ASSET_VER = "beer-and-buffs-v2-2-6-discord-cdn-event-images"
-DASHBOARD_RELEASE_VERSION = "2.2.6 · Discord-CDN-Eventbilder + volle Anwesenheitswertung"
+ASSET_VER = "beer-and-buffs-v2-3-0-admin-event-editor"
+DASHBOARD_RELEASE_VERSION = "2.3.0 · Adminportal & laufende Events bearbeiten"
 
 _EVENT_IMAGE_ASSETS: dict[str, str] = {
-    "guild_boss": "https://cdn.discordapp.com/attachments/1528469765860098171/1528469820738375882/Gildenbosse.png",
-    "normal_raid": "https://cdn.discordapp.com/attachments/1528469765860098171/1528469819865956352/0d9886d3-f6f5-4f3e-b926-1f86151dc84d.png",
-    "hard_raid": "https://cdn.discordapp.com/attachments/1528469765860098171/1529804865679786085/7225f274-cc4f-4eda-ba74-ca401f4e572b.png",
-    "trials": "https://cdn.discordapp.com/attachments/1528469765860098171/1530963146020356246/8b34c404-89eb-4259-9e6e-acbcc1def2b2.png",
-    "pvp": "https://cdn.discordapp.com/attachments/1528469765860098171/1528469820310290493/4a00e277-c3b6-48b0-ac7e-ad3e3722aaf1.png",
+    "guild_boss": "https://media.discordapp.net/attachments/1528469765860098171/1528469820738375882/Gildenbosse.png?ex=6a66fbb2&is=6a65aa32&hm=68dd55e6c4471bfafac7fbe6f397e338df96be2a7d5ed09e5670beaabd2b1306&=&format=webp&quality=lossless&width=1521&height=856",
+    "normal_raid": "https://media.discordapp.net/attachments/1528469765860098171/1528469819865956352/0d9886d3-f6f5-4f3e-b926-1f86151dc84d.png?ex=6a66fbb2&is=6a65aa32&hm=8e97e8d1fbc2f0360281da525ed91428de983d09053bb1b3ee7725b5fe826de2&=&format=webp&quality=lossless&width=1521&height=856",
+    "hard_raid": "https://cdn.discordapp.com/attachments/1528469765860098171/1529804865679786085/7225f274-cc4f-4eda-ba74-ca401f4e572b.png?ex=6a6739ce&is=6a65e84e&hm=e7c2682271f30cf9eb6ef9938fe814cdbb02c6303ebb08e6d3be591f97102da6&",
+    "trials": "https://cdn.discordapp.com/attachments/1528469765860098171/1530963146020356246/8b34c404-89eb-4259-9e6e-acbcc1def2b2.png?ex=6a677c09&is=6a662a89&hm=336425c5a5bb6e814cf55d2126ad2f24ce4a55112e2b8ab5733a06d056afd80d&",
+    "pvp": "https://media.discordapp.net/attachments/1528469765860098171/1528469820310290493/4a00e277-c3b6-48b0-ac7e-ad3e3722aaf1.png?ex=6a66fbb2&is=6a65aa32&hm=a33dd39d4312e0785b0d00df131b12e5b0a563c1d9c4c6999e8c69339961a5b8&=&format=webp&quality=lossless&width=1521&height=856",
 }
 
 _EVENT_IMAGE_FILES: dict[str, str] = {
@@ -148,14 +148,9 @@ def _stable_event_external_url(url: str) -> str:
     value = str(url or "").strip()
     if not value.startswith(("https://", "http://")):
         return ""
-    if not _event_image_is_discord_attachment(value):
-        return value
-    try:
-        parsed = urllib.parse.urlsplit(value)
-        host = "cdn.discordapp.com" if (parsed.hostname or "").lower() == "media.discordapp.net" else (parsed.hostname or "")
-        return urllib.parse.urlunsplit(("https", host, parsed.path, "", ""))
-    except Exception:
-        return value.split("?", 1)[0]
+    # Discord-Anhangslinks können die signierten Query-Parameter benötigen.
+    # Eigene URLs bleiben deshalb unverändert.
+    return value
 
 
 def _event_image_mode(ev: dict[str, Any]) -> str:
@@ -234,12 +229,18 @@ def _dashboard_event_image_url(ev: dict[str, Any]) -> str:
     if mode in _EVENT_IMAGE_CUSTOM_KEYS:
         return _stable_event_external_url(raw)
 
-    inferred = _event_image_preset_key(ev)
     legacy = ""
     for marker, preset_key in _EVENT_IMAGE_LEGACY_MARKERS.items():
         if marker in raw:
             legacy = preset_key
             break
+    # Eigene URLs aus älteren Eventständen hatten noch kein image_type-Feld.
+    # Sie dürfen nicht allein wegen des Eventtitels durch ein Standardbild
+    # überschrieben werden.
+    if not mode and raw and not legacy:
+        return _stable_event_external_url(raw)
+
+    inferred = _event_image_preset_key(ev)
     preset_key = inferred or legacy
     if preset_key:
         return _EVENT_IMAGE_ASSETS.get(preset_key, "")
@@ -2821,11 +2822,21 @@ def _admin_center_payload(data: dict[str, Any]) -> dict[str, Any]:
     ec_requests = _ec_award_requests_for_dashboard(guild_id, limit=120) if guild_id else []
     loot_requests = _loot_action_requests_for_dashboard(guild_id, limit=120) if guild_id else []
     settings_requests = _settings_change_requests_for_dashboard(guild_id, limit=80) if guild_id else []
+    event_requests = _dashboard_event_action_requests(guild_id, limit=80) if guild_id else []
     ec_counts = _queue_status_counts(ec_requests)
     loot_counts = _queue_status_counts(loot_requests)
     settings_counts = _queue_status_counts(settings_requests)
+    event_counts = _queue_status_counts(event_requests)
     admin_states = _all_member_admin_states(guild_id) if guild_id else []
     admin_log = _admin_action_log(guild_id, limit=160) if guild_id else []
+    event_items = [dict(ev) for ev in _events_items(snap)]
+    now = datetime.now(timezone.utc)
+    closed_states = {"closed", "ended", "finished", "beendet", "archived", "done", "completed"}
+    running_events = [ev for ev in event_items if str(ev.get("status") or ev.get("state") or "").strip().lower() not in closed_states and _is_running_event(ev)]
+    upcoming_events = [ev for ev in event_items if str(ev.get("status") or ev.get("state") or "").strip().lower() not in closed_states and not _is_running_event(ev) and (_event_admin_datetime(ev) or datetime.min.replace(tzinfo=timezone.utc)) >= now]
+    running_events.sort(key=lambda ev: _event_admin_datetime(ev) or datetime.max.replace(tzinfo=timezone.utc))
+    upcoming_events.sort(key=lambda ev: _event_admin_datetime(ev) or datetime.max.replace(tzinfo=timezone.utc))
+    attendance_open = _open_attendance_review_events_for_homepage(snap, guild_id, limit=120) if guild_id else []
 
     member_filter = settings.get("member_filter") or ((guild.get("member_filter") or {}))
     if isinstance(member_filter, dict) and member_filter.get("mode") == "discord_role":
@@ -2849,6 +2860,10 @@ def _admin_center_payload(data: dict[str, Any]) -> dict[str, Any]:
         next_steps.append("EC-Queue hat offene Anfragen. Bot-Verarbeitung prüfen.")
     if loot_counts.get("pending", 0):
         next_steps.append("Loot-Queue hat offene Dashboard-Aktionen. Bot-Verarbeitung prüfen.")
+    if event_counts.get("pending", 0) or event_counts.get("processing", 0):
+        next_steps.append("Event-Queue verarbeitet noch Änderungen.")
+    if attendance_open:
+        next_steps.append(f"{len(attendance_open)} Event(s) warten auf Anwesenheitsprüfung.")
     if source_bad:
         next_steps.append("Mindestens eine Datenquelle fehlt oder hat Fehler.")
     if not _discord_oauth_enabled():
@@ -2875,6 +2890,11 @@ def _admin_center_payload(data: dict[str, Any]) -> dict[str, Any]:
         "loot_counts": dict(loot_counts),
         "settings_requests": settings_requests,
         "settings_counts": dict(settings_counts),
+        "event_requests": event_requests,
+        "event_counts": dict(event_counts),
+        "running_events": running_events,
+        "upcoming_events": upcoming_events,
+        "attendance_open": attendance_open,
         "admin_states": admin_states,
         "admin_log": admin_log,
         "next_steps": next_steps,
@@ -2884,87 +2904,72 @@ def _admin_center_payload(data: dict[str, Any]) -> dict[str, Any]:
 
 def _render_admin_center_dashboard(data: dict[str, Any]) -> str:
     if not data.get("ok"):
-        return _html_shell("Admin · Beer and Buffs Dashboard", f"<section class='panel'><h1>🛡️ Admin-Zentrale</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
-    snap: dict[str, Any] = data.get("snapshot") or {}
-    names = _profile_name_map(snap)
+        return _html_shell("Admin · Beer and Buffs Dashboard", f"<section class='panel'><h1>🛡️ Admin-Zentrale</h1><p class='muted'>{_e(data.get('error'))}</p></section>", nav_mode="admin")
     p = _admin_center_payload(data)
+    snap: dict[str, Any] = data.get("snapshot") or {}
     guild_id = p.get("guild_id")
     ec_counts = Counter(p.get("ec_counts") or {})
     loot_counts = Counter(p.get("loot_counts") or {})
     settings_counts = Counter(p.get("settings_counts") or {})
+    event_counts = Counter(p.get("event_counts") or {})
+    running_events = list(p.get("running_events") or [])
+    upcoming_events = list(p.get("upcoming_events") or [])
+    attendance_open = list(p.get("attendance_open") or [])
 
-    overview_cards = "".join([
-        _card("Guild-ID", guild_id or "—", "Dashboard-Kontext"),
-        _card("Snapshot", p.get("snapshot_id") or "—", _dt(p.get("published_at"))),
-        _card("Backend", p.get("backend") or "—", p.get("database_url_kind") or "—"),
-        _card("Quellen OK", p.get("source_ok", 0), f"Fehler/fehlen: {p.get('source_bad', 0)}"),
-        _card("Admin-Markierungen", len(p.get("admin_states") or []), "interne Leitungsnotizen"),
-        _card("Admin-Log", len(p.get("admin_log") or []), "letzte Web-Aktionen"),
-        _card("Settings offen", settings_counts.get("pending", 0), f"erledigt: {settings_counts.get('done', 0)}"),
-    ])
-    queue_cards = _queue_status_cards("EC", ec_counts) + _queue_status_cards("Loot", loot_counts) + _queue_status_cards("Settings", settings_counts)
+    def _home_event_card(ev: dict[str, Any]) -> str:
+        eid = _event_admin_id(ev)
+        title = _event_admin_title(ev)
+        state = "LÄUFT" if _is_running_event(ev) else "GEPLANT"
+        state_class = "ok" if _is_running_event(ev) else "warn"
+        return f"""
+        <article class="admin-home-event">
+          {_event_admin_image_preview(ev, css_class='admin-home-event-image')}
+          <div class="admin-home-event-body"><span class="pill {state_class}">{state}</span><h3>{_e(title)}</h3><p class="muted">{_dt(ev.get('when_iso') or ev.get('start_at') or ev.get('created_at'))}</p><div class="admin-home-actions"><a class="btn compact" href="/admin/events/{_e(eid)}">Bearbeiten</a><a class="btn compact secondary" href="/attendance/{_e(eid)}">Anwesenheit</a><a class="btn compact secondary" href="/attendance/{_e(eid)}/ec-preview">EC</a></div></div>
+        </article>
+        """
+
+    focus_events = (running_events + upcoming_events)[:4]
+    event_html = "".join(_home_event_card(ev) for ev in focus_events) or '<div class="empty">Keine laufenden oder kommenden Events.</div>'
+
+    task_rows: list[list[Any]] = []
+    if attendance_open:
+        task_rows.append(["Anwesenheit", f"{len(attendance_open)} Event(s) warten auf Prüfung", _raw('<a class="link" href="/attendance">Öffnen</a>')])
+    if event_counts.get("pending", 0) or event_counts.get("processing", 0):
+        task_rows.append(["Events", f"{event_counts.get('pending',0)} offen · {event_counts.get('processing',0)} in Arbeit", _raw('<a class="link" href="/events-admin#event-queue">Queue</a>')])
+    if ec_counts.get("pending", 0) or ec_counts.get("processing", 0):
+        task_rows.append(["EC", f"{ec_counts.get('pending',0)} offen · {ec_counts.get('processing',0)} in Arbeit", _raw('<a class="link" href="/ec-queue">Queue</a>')])
+    if loot_counts.get("pending", 0) or loot_counts.get("processing", 0):
+        task_rows.append(["Loot", f"{loot_counts.get('pending',0)} offen · {loot_counts.get('processing',0)} in Arbeit", _raw('<a class="link" href="/loot">Öffnen</a>')])
+    if settings_counts.get("pending", 0) or settings_counts.get("processing", 0):
+        task_rows.append(["Einstellungen", f"{settings_counts.get('pending',0)} offen · {settings_counts.get('processing',0)} in Arbeit", _raw('<a class="link" href="/admin-settings">Queue</a>')])
+    if not task_rows:
+        task_rows.append(["Status", "Keine offenen Admin-Aufgaben erkannt", "✓"])
+
+    recent_rows: list[list[Any]] = []
+    for row in (p.get("event_requests") or [])[:8]:
+        recent_rows.append([_dt(row.get("requested_at")), "Event " + str(row.get("action_type") or ""), row.get("event_id") or "neu", row.get("actor_name") or row.get("actor_id") or "Dashboard", _ec_award_status_label(row.get("status")).replace("EC", "")])
+    for row in (p.get("admin_log") or [])[:8]:
+        recent_rows.append([_dt(row.get("created_at")), row.get("action_type"), row.get("target_id") or "—", row.get("actor_name") or row.get("actor_id") or "Dashboard", "protokolliert"])
+    recent_rows = sorted(recent_rows, key=lambda r: str(r[0]), reverse=True)[:12]
 
     auth_rows = [[r.get("setting"), r.get("value"), r.get("hint")] for r in p.get("auth_rows") or []]
-    rule_rows = p.get("rule_rows") or []
     source_rows = p.get("source_rows") or []
-
-    ec_rows = []
-    for r in p.get("ec_requests") or []:
-        result = r.get("result") if isinstance(r.get("result"), dict) else {}
-        payload = r.get("payload") if isinstance(r.get("payload"), dict) else {}
-        title = payload.get("event_title") or r.get("event_id")
-        ec_rows.append([_dt(r.get("requested_at")), _ec_award_status_label(r.get("status")), _event_link(r.get("event_id"), title), _fmt_ec(result.get("total_ec") if result.get("total_ec") is not None else payload.get("total_ec")), r.get("actor_name") or r.get("actor_id") or "—", _short(result.get("error") or r.get("request_id"), 100)])
-
-    loot_rows = []
-    for r in p.get("loot_requests") or []:
-        payload = r.get("payload") if isinstance(r.get("payload"), dict) else {}
-        result = r.get("result") if isinstance(r.get("result"), dict) else {}
-        item = payload.get("item_name") or payload.get("item") or r.get("auction_id")
-        status = _ec_award_status_label(r.get("status")).replace("EC", "")
-        loot_rows.append([_dt(r.get("requested_at")), status, _auction_link(r.get("auction_id"), item), r.get("action_type"), _fmt_ec(r.get("amount")), r.get("actor_name") or r.get("actor_id") or "—", _short(result.get("error") or result.get("message") or r.get("request_id"), 100)])
-
-    setting_req_rows = []
-    for r in p.get("settings_requests") or []:
-        payload = r.get("payload") if isinstance(r.get("payload"), dict) else {}
-        result = r.get("result") if isinstance(r.get("result"), dict) else {}
-        detail = result.get("message") or result.get("error") or payload.get("event_type") or payload.get("weekly_event_limit") or payload.get("decay_percent") or r.get("request_id")
-        setting_req_rows.append([_dt(r.get("requested_at")), _ec_award_status_label(r.get("status")).replace("EC", ""), r.get("action_type"), _short(detail, 140), r.get("actor_name") or r.get("actor_id") or "—"])
-
-    state_rows = []
-    for st in p.get("admin_states") or []:
-        uid = _user_id(st.get("member_user_id"))
-        state_rows.append([_member_link(uid, names.get(uid, f"User {uid}")), _status_label(st.get("status")), _short(st.get("note"), 160) or "—", st.get("updated_by_name") or st.get("updated_by_id") or "—", _dt(st.get("updated_at"))])
-
-    log_rows = []
-    for lg in p.get("admin_log") or []:
-        uid = _user_id(lg.get("target_id"))
-        log_rows.append([_dt(lg.get("created_at")), lg.get("action_type"), _member_link(uid, names.get(uid, f"User {uid}")) if uid else lg.get("target_id"), lg.get("actor_name") or lg.get("actor_id") or "—"])
-
-    next_rows = [[x] for x in p.get("next_steps") or []]
     body = f"""
-    <nav class="topnav"><a href="/">Kommando</a><a href="/members">Mitglieder</a><a href="/loot">Loot</a><a href="/ec">EC</a><a href="/ec-queue">EC-Queue</a><a href="/admin-settings">EC-Regeln bearbeiten</a><a href="/settings">Setup</a><a href="/system">System</a><a href="/audit">Audit</a><a href="/api/admin-center">API</a></nav>
-    <section class="hero">
-      <div>
-        <div class="eyebrow">Schritt 4 · Admin & Einstellungen</div>
-        <h1>🛡️ Admin-Zentrale</h1>
-        <p class="muted">Ein Ort für Rechte, Bot-Setup, Quellenstatus, Dashboard-Queues und Leitungsnotizen. Keine Bot-JSON-Schreiberei.</p>
-      </div>
-      <a class="btn" href="/export/admin_center.csv">CSV</a>
-    </section>
-    <section class="grid">{overview_cards}</section>
-    <section class="grid mini-grid">{queue_cards}</section>
-    <section class="panel"><h2>🚦 Nächste Prüfpunkte</h2>{_table(['Hinweis'], next_rows, placeholder='Hinweise durchsuchen…')}</section>
-    <section class="panel"><h2>🔐 Login & Rollen</h2><p class="muted">Diese Werte kommen aus Railway-Variablen bzw. dem Snapshot. Änderungen weiter über Railway/Discord, nicht direkt über diese Seite.</p>{_table(['Setting','Wert','Hinweis'], auth_rows, placeholder='Login durchsuchen…')}</section>
-    <section class="panel"><h2>🧾 Erkannte EC-/Loot-/Event-Regeln</h2><p class="muted">Gefilterte Snapshot-Settings. Wenn hier eine Regel fehlt, exportiert der Bot sie aktuell nicht ins Dashboard.</p>{_table(['Quelle','Key','Wert'], rule_rows, placeholder='Regeln durchsuchen…')}</section>
-    <section class="panel"><h2>⚙️ EC-Regeln bearbeiten</h2><p class="muted">EC-Werte, Wochenlimit und Verfall laufen sicher über eine Bot-Queue. Das Dashboard ändert keine Bot-JSON direkt.</p><a class="btn" href="/admin-settings">Zur Einstellungsseite</a></section>
-    <section class="panel"><h2>🪙 EC-Queue zuletzt</h2>{_table(['Zeit','Status','Event','EC','Akteur','Resultat'], ec_rows, placeholder='EC-Queue durchsuchen…')}</section>
-    <section class="panel"><h2>⚙️ Settings-Queue zuletzt</h2>{_table(['Zeit','Status','Aktion','Details','Akteur'], setting_req_rows, placeholder='Settings-Queue durchsuchen…')}</section>
-    <section class="panel"><h2>🎁 Loot-Dashboard-Aktionen zuletzt</h2>{_table(['Zeit','Status','Auktion/Item','Aktion','EC','Akteur','Resultat'], loot_rows, placeholder='Loot-Aktionen durchsuchen…')}</section>
-    <section class="panel"><h2>👥 Markierte Mitglieder</h2>{_table(['Mitglied','Status','Notiz','Geändert von','Geändert am'], state_rows, placeholder='Mitglieder durchsuchen…')}</section>
-    <section class="panel"><h2>🧩 Datenquellen</h2>{_table(['Key','Datei','vorhanden','Status','Bytes','Geändert'], source_rows, placeholder='Quellen durchsuchen…')}</section>
-    <section class="panel"><h2>🧾 Web-Admin-Aktionslog</h2>{_table(['Zeit','Aktion','Ziel','Akteur'], log_rows, placeholder='Adminlog durchsuchen…')}</section>
+    <style>
+      .admin-tabs{{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px}}.admin-tabs a{{padding:9px 13px;border:1px solid var(--line);border-radius:10px;text-decoration:none;background:rgba(255,255,255,.025)}}.admin-tabs a.active{{border-color:#d6a84f;background:rgba(214,168,79,.12);color:#f3d68c}}
+      .admin-quick-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px}}.admin-quick{{display:flex;gap:12px;align-items:center;padding:15px;border:1px solid rgba(214,168,79,.24);border-radius:14px;text-decoration:none;background:rgba(10,9,9,.72)}}.admin-quick:hover{{border-color:#d6a84f;background:rgba(214,168,79,.08)}}.admin-quick span{{font-size:1.7rem}}.admin-quick strong{{display:block}}.admin-quick small{{display:block;color:var(--muted);margin-top:3px}}
+      .admin-home-event-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:14px}}.admin-home-event{{display:grid;grid-template-columns:135px minmax(0,1fr);border:1px solid rgba(214,168,79,.22);border-radius:15px;overflow:hidden;background:rgba(9,8,9,.82)}}.admin-home-event-image{{min-height:145px;background:#0a0909;overflow:hidden}}.admin-home-event-image img{{width:100%;height:100%;object-fit:cover}}.admin-home-event-body{{padding:14px}}.admin-home-event-body h3{{margin:.45rem 0 .15rem}}.admin-home-actions{{display:flex;gap:7px;flex-wrap:wrap;margin-top:12px}}.btn.compact{{padding:7px 10px;font-size:.86rem}}.btn.secondary{{background:rgba(255,255,255,.035);border-color:var(--line)}}.admin-event-image-error,.admin-event-thumb-empty{{height:100%;display:flex;align-items:center;justify-content:center;flex-direction:column;color:#d6a84f}}
+      details.admin-details>summary{{cursor:pointer;font-weight:700;color:#e5c477;padding:8px 0}}@media(max-width:620px){{.admin-home-event{{grid-template-columns:1fr}}.admin-home-event-image{{aspect-ratio:16/7}}}}
+    </style>
+    <nav class="admin-tabs"><a class="active" href="/admin">Übersicht</a><a href="/events-admin">Events</a><a href="/attendance">Anwesenheit & EC</a><a href="/loot">Loot</a><a href="/members">Mitglieder</a><a href="/admin/guild-config">Einstellungen</a><a href="/system">System & Logs</a></nav>
+    <section class="hero"><div><div class="eyebrow">Admin-Portal</div><h1>🛡️ Verwaltung</h1><p class="muted">Schnellzugriff auf laufende Events, Anwesenheit, EC, Loot und Gildeneinstellungen.</p></div><a class="btn" href="/events-admin#event-create">+ Event erstellen</a></section>
+    <section class="admin-quick-grid"><a class="admin-quick" href="/events-admin"><span>📅</span><div><strong>Events verwalten</strong><small>Laufende Events bearbeiten</small></div></a><a class="admin-quick" href="/attendance"><span>✅</span><div><strong>Anwesenheit & EC</strong><small>Prüfen und vergeben</small></div></a><a class="admin-quick" href="/loot"><span>🎁</span><div><strong>Loot & Auktionen</strong><small>Offene Aktionen</small></div></a><a class="admin-quick" href="/members"><span>👥</span><div><strong>Mitglieder</strong><small>Profile und Notizen</small></div></a><a class="admin-quick" href="/admin/guild-config"><span>⚙️</span><div><strong>Gildeneinstellungen</strong><small>Rollen, Kanäle, Branding</small></div></a><a class="admin-quick" href="/system"><span>🧩</span><div><strong>System & Logs</strong><small>Bot, DB und Quellen</small></div></a></section>
+    <section class="grid">{_card('Laufende Events',len(running_events),'direkt bearbeitbar')}{_card('Kommende Events',len(upcoming_events),'geplant')}{_card('Anwesenheit offen',len(attendance_open),'wartet auf Prüfung')}{_card('Event-Queue',event_counts.get('pending',0)+event_counts.get('processing',0),f"Fehler: {event_counts.get('failed',0)+event_counts.get('rejected',0)}")}</section>
+    <section class="panel"><h2>🔥 Laufende und nächste Events</h2><div class="admin-home-event-grid">{event_html}</div><p style="margin-top:14px"><a class="btn secondary" href="/events-admin">Alle Events öffnen</a></p></section>
+    <section class="split"><section class="panel"><h2>🚦 Offene Aufgaben</h2>{_table(['Bereich','Status','Aktion'],task_rows,searchable=False)}</section><section class="panel"><h2>🧾 Letzte Admin-Aktionen</h2>{_table(['Zeit','Aktion','Ziel','Von','Status'],recent_rows,searchable=False)}</section></section>
+    <section class="panel"><details class="admin-details"><summary>Technische Details anzeigen</summary><div class="grid">{_card('Guild-ID',guild_id or '—','Dashboard-Kontext')}{_card('Snapshot',p.get('snapshot_id') or '—',_dt(p.get('published_at')))}{_card('Backend',p.get('backend') or '—',p.get('database_url_kind') or '—')}{_card('Quellen OK',p.get('source_ok',0),f"Fehler/fehlen: {p.get('source_bad',0)}")}</div><h3>Login & Rollen</h3>{_table(['Setting','Wert','Hinweis'],auth_rows,placeholder='Login durchsuchen…')}<h3>Datenquellen</h3>{_table(['Key','Datei','vorhanden','Status','Bytes','Geändert'],source_rows,placeholder='Quellen durchsuchen…')}</details></section>
     """
-    return _html_shell("Admin-Zentrale · Beer and Buffs Dashboard", body, nav_mode="admin")
+    return _html_shell("Admin-Portal · Beer and Buffs Dashboard", body, nav_mode="admin")
 
 
 def _card(title: str, value: Any, sub: str = "") -> str:
@@ -14869,280 +14874,413 @@ def _dashboard_select_options_from_settings(snap: dict[str, Any], kind: str) -> 
     return out
 
 
-def _dashboard_channel_select_html(snap: dict[str, Any], *, required: bool = True) -> str:
+def _dashboard_channel_select_html(snap: dict[str, Any], *, required: bool = True, selected: Any = "", name: str = "channel_id") -> str:
     opts = _dashboard_select_options_from_settings(snap, "channels")
     req = " required" if required else ""
+    selected_s = str(selected or "").strip()
     if not opts:
-        return f'<input name="channel_id"{req} placeholder="Kanal-ID, falls keine Kanäle im Snapshot sind">'
-    html = '<select name="channel_id"' + req + '><option value="">Kanal auswählen</option>'
-    for value, name in opts:
-        html += f'<option value="{_e(value)}">#{_e(name)} · {_e(value)}</option>'
-    html += '</select>'
-    return html
+        value = f' value="{_e(selected_s)}"' if selected_s else ""
+        return f'<input name="{_e(name)}"{req}{value} placeholder="Kanal-ID, falls keine Kanäle im Snapshot sind">'
+    html_value = f'<select name="{_e(name)}"{req}><option value="">Kanal auswählen</option>'
+    for value, label in opts:
+        sel = " selected" if value == selected_s else ""
+        html_value += f'<option value="{_e(value)}"{sel}>#{_e(label)} · {_e(value)}</option>'
+    html_value += '</select>'
+    return html_value
 
 
-def _dashboard_role_select_html(snap: dict[str, Any]) -> str:
+def _dashboard_role_select_html(snap: dict[str, Any], *, selected: Any = "", name: str = "target_role_id") -> str:
     opts = _dashboard_select_options_from_settings(snap, "roles")
+    selected_s = str(selected or "").strip()
     if not opts:
-        return '<input name="target_role_id" placeholder="optional: Rollen-ID, falls keine Rollen im Snapshot sind">'
-    html = '<select name="target_role_id"><option value="">Keine Zielrolle / alle erlaubten Mitglieder</option>'
-    for value, name in opts:
-        html += f'<option value="{_e(value)}">@{_e(name)} · {_e(value)}</option>'
-    html += '</select>'
-    return html
+        value = f' value="{_e(selected_s)}"' if selected_s else ""
+        return f'<input name="{_e(name)}"{value} placeholder="optional: Rollen-ID, falls keine Rollen im Snapshot sind">'
+    html_value = f'<select name="{_e(name)}"><option value="">Keine Zielrolle / alle erlaubten Mitglieder</option>'
+    for value, label in opts:
+        sel = " selected" if value == selected_s else ""
+        html_value += f'<option value="{_e(value)}"{sel}>@{_e(label)} · {_e(value)}</option>'
+    html_value += '</select>'
+    return html_value
 
 
-def _dashboard_event_type_select_html() -> str:
-    values = ["Nicht DKP-relevant", "Gildenboss", "Normal Raid", "HM Raid", "NM Raid", "Übungsrun HM Raid", "Übungsrun Trials", "Segensstein PvP"]
-    return '<select name="dkp_event_type">' + ''.join(f'<option value="{_e(v)}">{_e(v)}</option>' for v in values) + '</select>'
+_EVENT_VISIBLE_TYPES: tuple[str, ...] = (
+    "Normal Mode Raid",
+    "Hardmode Raid",
+    "Dimensionsprüfung",
+    "Gildenbosse",
+    "Segensstein",
+    "Benutzerdefiniertes Event",
+)
 
-def _render_events_center(data: dict[str, Any], current_user: Optional[dict[str, Any]] = None, msg: str = "", *, nav_mode: str = "member") -> str:
+_EVENT_DKP_TYPES: tuple[str, ...] = (
+    "Nicht DKP-relevant",
+    "Gildenboss",
+    "NM Raid",
+    "HM Raid",
+    "Übungsrun HM Raid",
+    "Übungsrun Trials",
+    "Segensstein PvP",
+)
+
+_EVENT_IMAGE_CHOICES: tuple[tuple[str, str], ...] = (
+    ("auto", "Standardbild des Eventtyps"),
+    ("boss", "Gildenbosse"),
+    ("normal", "Normal Mode Raid"),
+    ("hard", "Hardmode Raid"),
+    ("trials", "Dimensionsprüfung"),
+    ("pvp", "Segensstein"),
+    ("custom", "Eigene Bild-URL"),
+    ("none", "Kein Bild"),
+)
+
+
+def _dashboard_select_html(name: str, values: tuple[str, ...], selected: Any = "", *, blank_label: str = "") -> str:
+    selected_s = str(selected or "").strip()
+    out = [f'<select name="{_e(name)}">']
+    if blank_label:
+        out.append(f'<option value="">{_e(blank_label)}</option>')
+    for value in values:
+        sel = " selected" if value == selected_s else ""
+        out.append(f'<option value="{_e(value)}"{sel}>{_e(value)}</option>')
+    out.append('</select>')
+    return "".join(out)
+
+
+def _dashboard_event_type_select_html(selected: Any = "", *, name: str = "dkp_event_type") -> str:
+    return _dashboard_select_html(name, _EVENT_DKP_TYPES, selected)
+
+
+def _dashboard_visible_event_type_select_html(selected: Any = "", *, name: str = "event_type") -> str:
+    return _dashboard_select_html(name, _EVENT_VISIBLE_TYPES, selected, blank_label="Eventtyp auswählen")
+
+
+def _dashboard_image_type_select_html(selected: Any = "auto", *, name: str = "image_type", element_id: str = "event-image-type") -> str:
+    selected_s = str(selected or "auto").strip().lower()
+    options = []
+    for value, label in _EVENT_IMAGE_CHOICES:
+        sel = " selected" if value == selected_s else ""
+        options.append(f'<option value="{_e(value)}"{sel}>{_e(label)}</option>')
+    return f'<select id="{_e(element_id)}" name="{_e(name)}">{"".join(options)}</select>'
+
+
+def _event_admin_id(ev: dict[str, Any]) -> str:
+    return str(ev.get("event_id") or ev.get("id") or ev.get("message_id") or "").strip()
+
+
+def _event_admin_title(ev: dict[str, Any]) -> str:
+    return str(ev.get("title") or ev.get("name") or _event_admin_id(ev) or "Event").strip()
+
+
+def _event_admin_datetime(ev: dict[str, Any]) -> Optional[datetime]:
+    return _dt_obj(ev.get("when_iso") or ev.get("start_at") or ev.get("created_at"))
+
+
+def _event_admin_input_date_time(ev: dict[str, Any]) -> tuple[str, str]:
+    dt = _event_admin_datetime(ev)
+    if not dt:
+        return "", ""
+    try:
+        local = dt.astimezone()
+    except Exception:
+        local = dt
+    return local.strftime("%Y-%m-%d"), local.strftime("%H:%M")
+
+
+def _event_admin_image_mode(ev: dict[str, Any]) -> str:
+    explicit = str(ev.get("image_type") or ev.get("image_preset") or "").strip().lower()
+    aliases = {
+        "guild_boss": "boss", "gildenboss": "boss", "gildenbosse": "boss",
+        "normal_raid": "normal", "normal mode raid": "normal", "nm raid": "normal",
+        "hard_raid": "hard", "hardmode raid": "hard", "hm raid": "hard",
+        "dimensionsprüfung": "trials", "dimensionspruefung": "trials", "trial": "trials",
+        "segensstein": "pvp", "segensstein pvp": "pvp",
+    }
+    if explicit in {x[0] for x in _EVENT_IMAGE_CHOICES}:
+        return explicit
+    if explicit in aliases:
+        return aliases[explicit]
+    raw = _event_image_raw_url(ev)
+    for marker, preset in _EVENT_IMAGE_LEGACY_MARKERS.items():
+        if marker in raw:
+            return {"guild_boss": "boss", "normal_raid": "normal", "hard_raid": "hard", "trials": "trials", "pvp": "pvp"}.get(preset, "auto")
+    if raw:
+        return "custom"
+    return "auto"
+
+
+def _event_admin_discord_url(ev: dict[str, Any]) -> str:
+    for key in ("jump_url", "message_url", "discord_url", "post_url"):
+        value = str(ev.get(key) or "").strip()
+        if value.startswith("https://"):
+            return value
+    guild_id = str(ev.get("guild_id") or "").strip()
+    channel_id = str(ev.get("channel_id") or "").strip()
+    message_id = str(ev.get("message_id") or ev.get("event_id") or ev.get("id") or "").strip()
+    if guild_id.isdigit() and channel_id.isdigit() and message_id.isdigit():
+        return f"https://discord.com/channels/{guild_id}/{channel_id}/{message_id}"
+    return ""
+
+
+def _event_admin_find(data: dict[str, Any], event_id: str) -> dict[str, Any]:
+    snap = data.get("snapshot") or {}
+    wanted = str(event_id or "").strip()
+    for ev in _events_items(snap):
+        if _event_admin_id(ev) == wanted:
+            return dict(ev)
+    for ev in _events_with_pending_ec_checks(snap):
+        if _event_admin_id(ev) == wanted:
+            return dict(ev)
+    guild_id = _safe_guild_id(data)
+    if guild_id:
+        for ev in _open_attendance_review_events_for_homepage(snap, guild_id, limit=120):
+            if _event_admin_id(ev) == wanted:
+                return dict(ev)
+    return {}
+
+
+def _event_admin_image_preview(ev: dict[str, Any], *, css_class: str = "admin-event-thumb") -> str:
+    url = _dashboard_event_image_url(ev)
+    if not url:
+        return f'<div class="{_e(css_class)} admin-event-thumb-empty"><span>⚔️</span><small>Kein Bild</small></div>'
+    return (
+        f'<div class="{_e(css_class)}">'
+        f'<img src="{_e(url)}" alt="{_e(_event_admin_title(ev))}" loading="lazy" '
+        'onerror="this.style.display=\'none\';this.nextElementSibling.style.display=\'flex\'">'
+        '<div class="admin-event-image-error" style="display:none"><span>⚠️</span><small>Bild nicht erreichbar</small></div>'
+        '</div>'
+    )
+
+
+def _event_admin_queue_state(action_rows: list[dict[str, Any]], event_id: str) -> tuple[str, str]:
+    for row in action_rows:
+        if str(row.get("event_id") or "") != str(event_id):
+            continue
+        status = str(row.get("status") or "").lower()
+        if status in {"pending", "processing"}:
+            return ("Änderung wartet" if status == "pending" else "Bot verarbeitet", "warn")
+        if status in {"failed", "rejected"}:
+            return ("Änderung fehlgeschlagen", "danger")
+        if status == "done":
+            return ("Synchronisiert", "ok")
+    return ("Synchron", "ok")
+
+
+def _render_event_editor(data: dict[str, Any], event_id: str, current_user: Optional[dict[str, Any]] = None, msg: str = "") -> str:
     if not data.get("ok"):
-        return _html_shell("Events · Beer and Buffs Dashboard", f"<section class='panel'><h1>📅 Events</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+        return _html_shell("Event bearbeiten · Beer and Buffs Dashboard", f"<section class='panel'><h1>Event bearbeiten</h1><p>{_e(data.get('error'))}</p></section>", nav_mode="admin")
+    ev = _event_admin_find(data, event_id)
+    if not ev:
+        return _html_shell("Event nicht gefunden · Beer and Buffs Dashboard", "<section class='panel'><h1>❌ Event nicht gefunden</h1><p class='muted'>Der Eventdatensatz ist im aktuellen Snapshot nicht vorhanden.</p><a class='btn' href='/events-admin'>Zur Eventverwaltung</a></section>", nav_mode="admin")
+    snap = data.get("snapshot") or {}
+    guild_id = _safe_guild_id(data)
+    eid = _event_admin_id(ev)
+    title = _event_admin_title(ev)
+    date_value, time_value = _event_admin_input_date_time(ev)
+    visible_type = str(ev.get("event_type") or "").strip()
+    dkp_type = str(ev.get("dkp_event_type") or "").strip() or "Nicht DKP-relevant"
+    description = str(ev.get("description") or "")
+    image_mode = _event_admin_image_mode(ev)
+    image_url = _event_image_raw_url(ev)
+    duration = int(_num(ev.get("duration_minutes"), 120) or 120)
+    target_role_id = str(ev.get("target_role_id") or "")
+    channel_id = str(ev.get("channel_id") or "")
+    location = str(ev.get("location") or "")
+    current_status = str(ev.get("status") or ev.get("state") or "active").strip().lower()
+    running = _is_running_event(ev)
+    action_rows = _dashboard_event_action_requests(guild_id, limit=20, event_id=eid) if guild_id else []
+    queue_label, queue_class = _event_admin_queue_state(action_rows, eid)
+    discord_url = _event_admin_discord_url(ev)
+    image_presets_json = json.dumps({
+        "boss": _EVENT_IMAGE_ASSETS["guild_boss"],
+        "normal": _EVENT_IMAGE_ASSETS["normal_raid"],
+        "hard": _EVENT_IMAGE_ASSETS["hard_raid"],
+        "trials": _EVENT_IMAGE_ASSETS["trials"],
+        "pvp": _EVENT_IMAGE_ASSETS["pvp"],
+    }, ensure_ascii=False)
+    msg_panel = f"<section class='panel admin-flash'><p>{_e(msg)}</p></section>" if msg else ""
+    running_warning = """
+      <div class="admin-running-warning"><strong>⚠ Dieses Event läuft bereits.</strong><span>Titel, Beschreibung, Zeitpunkt und Bild können trotzdem geändert werden. Teilnehmer, Rückmeldungen und Anwesenheit bleiben erhalten.</span></div>
+    """ if running else ""
+    discord_button = f'<a class="btn secondary" href="{_e(discord_url)}" target="_blank" rel="noopener">Discord-Post öffnen</a>' if discord_url else ""
+    body = f"""
+    <style>
+      .admin-tabs{{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px}}.admin-tabs a{{padding:9px 13px;border:1px solid var(--line);border-radius:10px;text-decoration:none;background:rgba(255,255,255,.025)}}.admin-tabs a.active{{border-color:#d6a84f;background:rgba(214,168,79,.12);color:#f3d68c}}
+      .event-editor-layout{{display:grid;grid-template-columns:minmax(0,1.35fr) minmax(300px,.65fr);gap:16px;align-items:start}}.event-editor-form{{display:grid;gap:14px}}.editor-grid{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}}.editor-grid .wide{{grid-column:1/-1}}.event-editor-form input,.event-editor-form select,.event-editor-form textarea{{width:100%}}
+      .event-live-preview{{position:sticky;top:16px}}.event-live-preview .preview-card{{border:1px solid rgba(214,168,79,.34);border-radius:16px;overflow:hidden;background:rgba(8,8,10,.88)}}.event-live-preview img{{display:block;width:100%;aspect-ratio:16/9;object-fit:cover}}.preview-body{{padding:16px}}.preview-body h2{{margin:.2rem 0 .35rem}}.preview-meta{{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0}}.preview-meta span{{border:1px solid var(--line);border-radius:999px;padding:5px 8px;font-size:.82rem}}
+      .admin-running-warning{{display:grid;gap:4px;padding:12px 14px;border:1px solid #a86d20;background:rgba(168,109,32,.13);border-radius:12px;color:#f2d09a}}.editor-actions{{display:flex;gap:10px;flex-wrap:wrap;align-items:center}}.editor-danger{{margin-top:16px;border-color:rgba(220,70,70,.45)}}.admin-event-image-error,.admin-event-thumb-empty{{aspect-ratio:16/9;align-items:center;justify-content:center;flex-direction:column;gap:6px;background:linear-gradient(135deg,#1a120d,#09090b);color:#d6a84f}}
+      @media(max-width:900px){{.event-editor-layout{{grid-template-columns:1fr}}.event-live-preview{{position:static}}}}@media(max-width:620px){{.editor-grid{{grid-template-columns:1fr}}.editor-grid .wide{{grid-column:auto}}}}
+    </style>
+    <nav class="admin-tabs"><a href="/admin">Übersicht</a><a class="active" href="/events-admin">Events</a><a href="/attendance">Anwesenheit & EC</a><a href="/loot">Loot</a><a href="/members">Mitglieder</a><a href="/admin/guild-config">Einstellungen</a><a href="/system">System & Logs</a></nav>
+    <section class="hero"><div><div class="eyebrow">Admin · Eventverwaltung</div><h1>✏️ {_e(title)}</h1><p class="muted">Event-ID {_e(eid)} · <span class="pill {_e(queue_class)}">{_e(queue_label)}</span></p></div><div class="editor-actions"><a class="btn secondary" href="/events-admin">← Eventliste</a>{discord_button}</div></section>
+    {msg_panel}{running_warning}
+    <div class="event-editor-layout">
+      <section class="panel">
+        <form class="event-editor-form" method="post" action="/admin/events/action" id="event-editor-form">
+          <input type="hidden" name="action_type" value="edit"><input type="hidden" name="event_id" value="{_e(eid)}"><input type="hidden" name="description_present" value="1"><input type="hidden" name="image_present" value="1"><input type="hidden" name="force_refresh" id="force-refresh" value="0">
+          <div class="editor-grid">
+            <label class="wide">Titel<br><input id="editor-title" name="title" value="{_e(title)}" required maxlength="180"></label>
+            <label>Eventtyp<br>{_dashboard_visible_event_type_select_html(visible_type)}</label>
+            <label>EC-Regel<br>{_dashboard_event_type_select_html(dkp_type)}</label>
+            <label>Datum<br><input id="editor-date" name="date" type="date" value="{_e(date_value)}" required></label>
+            <label>Uhrzeit<br><input id="editor-time" name="time" type="time" value="{_e(time_value)}" required></label>
+            <label>Dauer in Minuten<br><input name="duration_minutes" type="number" min="30" max="720" step="15" value="{_e(duration)}"></label>
+            <label>Status<br><select name="status"><option value="active"{" selected" if current_status not in {"closed","ended","finished","beendet","archived"} else ""}>Aktiv / geplant</option><option value="closed"{" selected" if current_status in {"closed","ended","finished","beendet","archived"} else ""}>Beendet</option></select></label>
+            <label>Ort / Hinweis<br><input name="location" value="{_e(location)}" placeholder="Beer and Buffs Discord"></label>
+            <label>Zielrolle<br>{_dashboard_role_select_html(snap, selected=target_role_id)}</label>
+            <label>Aktueller Discord-Kanal<br><input value="{_e(channel_id or '—')}" disabled><small class="muted">Ein laufender Post wird nicht in einen anderen Kanal verschoben.</small></label>
+            <label class="wide">Beschreibung<br><textarea id="editor-description" name="description" rows="6">{_e(description)}</textarea></label>
+          </div>
+          <section class="panel" style="margin:0">
+            <h2>🖼️ Eventbild</h2>
+            <div class="editor-grid">
+              <label>Bildauswahl<br>{_dashboard_image_type_select_html(image_mode)}</label>
+              <label>Eigene Bild-URL<br><input id="event-image-url" name="image_url" value="{_e(image_url)}" placeholder="https://..."></label>
+            </div>
+            <p class="muted">Bei „Eigene Bild-URL“ wird der Link unverändert übernommen. Standardbilder kommen aus der festen Zuordnung des Bots.</p>
+          </section>
+          <div class="editor-actions"><button class="btn" type="submit" onclick="document.getElementById('force-refresh').value='0'">Speichern + Discord aktualisieren</button><button class="btn secondary" type="submit" onclick="document.getElementById('force-refresh').value='1'">Discord-Post neu aufbauen</button><a class="btn secondary" href="/events-admin">Abbrechen</a></div>
+        </form>
+      </section>
+      <aside class="event-live-preview">
+        <section class="panel"><h2>Live-Vorschau</h2><div class="preview-card"><img id="event-preview-image" src="{_e(_dashboard_event_image_url(ev))}" alt="Eventbild"><div id="event-preview-image-error" class="admin-event-image-error" style="display:none"><span>⚠️</span><small>Bild nicht erreichbar</small></div><div class="preview-body"><div class="eyebrow">{_e(visible_type or 'Gildenevent')}</div><h2 id="event-preview-title">{_e(title)}</h2><p id="event-preview-description" class="muted">{_e(description or 'Keine Beschreibung')}</p><div class="preview-meta"><span id="event-preview-date">{_e(date_value)} {_e(time_value)}</span><span>{_e(_event_status_text(ev))}</span><span>{_e(_event_role_counts(ev))}</span></div></div></div></section>
+      </aside>
+    </div>
+    <section class="panel editor-danger"><h2>🗑️ Event löschen</h2><p class="muted">Der Eventpost und die Bot-Daten werden gelöscht. Diese Aktion kann nicht rückgängig gemacht werden.</p><form method="post" action="/admin/events/action" style="display:flex;gap:10px;flex-wrap:wrap;align-items:end"><input type="hidden" name="action_type" value="delete"><input type="hidden" name="event_id" value="{_e(eid)}"><label>Sicherheitswort<br><input name="confirm" placeholder="LÖSCHEN" required></label><button class="btn danger" type="submit" onclick="return confirm('Event wirklich endgültig löschen?')">Endgültig löschen</button></form></section>
+    <script>
+      const eventPresetUrls = {image_presets_json};
+      const imageType = document.getElementById('event-image-type'); const imageUrl = document.getElementById('event-image-url'); const previewImage = document.getElementById('event-preview-image'); const previewError = document.getElementById('event-preview-image-error');
+      function eventPreviewUrl(){{ const mode=imageType.value; if(mode==='none') return ''; if(mode==='custom') return imageUrl.value.trim(); if(mode==='auto'){{ const t=(document.querySelector('[name=event_type]').value||'').toLowerCase(); if(t.includes('gildenboss')) return eventPresetUrls.boss; if(t.includes('hard')) return eventPresetUrls.hard; if(t.includes('dimension')) return eventPresetUrls.trials; if(t.includes('segen')) return eventPresetUrls.pvp; if(t.includes('normal')) return eventPresetUrls.normal; return imageUrl.value.trim(); }} return eventPresetUrls[mode]||imageUrl.value.trim(); }}
+      function updateEventPreview(){{ document.getElementById('event-preview-title').textContent=document.getElementById('editor-title').value||'Event'; document.getElementById('event-preview-description').textContent=document.getElementById('editor-description').value||'Keine Beschreibung'; document.getElementById('event-preview-date').textContent=(document.getElementById('editor-date').value+' '+document.getElementById('editor-time').value).trim(); const url=eventPreviewUrl(); previewError.style.display='none'; if(!url){{previewImage.style.display='none';previewError.style.display='flex';previewError.querySelector('small').textContent='Kein Bild';}}else{{previewImage.style.display='block';previewImage.src=url;}} }}
+      previewImage.onerror=()=>{{previewImage.style.display='none';previewError.style.display='flex';previewError.querySelector('small').textContent='Bild nicht erreichbar';}}; previewImage.onload=()=>{{previewError.style.display='none';previewImage.style.display='block';}};
+      ['editor-title','editor-description','editor-date','editor-time','event-image-url','event-image-type'].forEach(id=>{{const el=document.getElementById(id);if(el){{el.addEventListener('input',updateEventPreview);el.addEventListener('change',updateEventPreview);}}}}); const eventTypeSelect=document.querySelector('[name=event_type]'); if(eventTypeSelect) eventTypeSelect.addEventListener('change',updateEventPreview); updateEventPreview();
+    </script>
+    """
+    return _html_shell(f"{title} bearbeiten · Beer and Buffs Dashboard", body, nav_mode="admin")
+
+
+def _render_events_center(data: dict[str, Any], current_user: Optional[dict[str, Any]] = None, msg: str = "", *, nav_mode: str = "admin") -> str:
+    if not data.get("ok"):
+        return _html_shell("Events · Beer and Buffs Dashboard", f"<section class='panel'><h1>📅 Events</h1><p class='muted'>{_e(data.get('error'))}</p></section>", nav_mode=nav_mode)
 
     snap: dict[str, Any] = data.get("snapshot") or {}
     guild_id = _safe_guild_id(data)
     now = datetime.now(timezone.utc)
-
-    raw_events = [dict(e) for e in ((snap.get("events") or {}).get("items") or []) if isinstance(e, dict)]
     by_id: dict[str, dict[str, Any]] = {}
-    for ev in raw_events:
-        eid = str(ev.get("event_id") or ev.get("id") or "").strip()
+    for ev in _events_items(snap):
+        eid = _event_admin_id(ev)
         if eid:
-            by_id[eid] = ev
-
-    # Events mit offenem DKP-/EC-Check und gespeicherte Reviews werden bewusst ergänzt.
-    for ev in _events_with_pending_ec_checks(snap):
-        eid = str(ev.get("event_id") or ev.get("id") or "").strip()
-        if eid and eid not in by_id:
             by_id[eid] = dict(ev)
-        elif eid:
-            by_id[eid].update({k: v for k, v in ev.items() if str(k).startswith("_")})
+    for ev in _events_with_pending_ec_checks(snap):
+        eid = _event_admin_id(ev)
+        if eid:
+            by_id.setdefault(eid, {}).update(dict(ev))
     if guild_id:
-        for ev in _open_attendance_review_events_for_homepage(snap, guild_id, limit=80):
-            eid = str(ev.get("event_id") or ev.get("id") or "").strip()
-            if eid and eid not in by_id:
-                by_id[eid] = dict(ev)
+        for ev in _open_attendance_review_events_for_homepage(snap, guild_id, limit=120):
+            eid = _event_admin_id(ev)
+            if eid:
+                by_id.setdefault(eid, {}).update(dict(ev))
 
     events = list(by_id.values())
-
-    def _when(ev: dict[str, Any]) -> Optional[datetime]:
-        return _dt_obj(ev.get("when_iso") or ev.get("start_at") or ev.get("created_at"))
-
-    def _sort_key_future(ev: dict[str, Any]):
-        return _when(ev) or datetime.max.replace(tzinfo=timezone.utc)
-
-    def _sort_key_past(ev: dict[str, Any]):
-        dt = _when(ev) or datetime.min.replace(tzinfo=timezone.utc)
-        return -dt.timestamp()
-
     running: list[dict[str, Any]] = []
     upcoming: list[dict[str, Any]] = []
     past: list[dict[str, Any]] = []
+    closed_states = {"closed", "ended", "finished", "beendet", "archived", "done", "completed"}
     for ev in events:
-        dt = _when(ev)
-        if _is_running_event(ev) or ev.get("_pending_ec_check") or ev.get("_attendance_review_only"):
+        dt = _event_admin_datetime(ev)
+        state = str(ev.get("status") or ev.get("state") or "").strip().lower()
+        if state in closed_states:
+            past.append(ev)
+        elif _is_running_event(ev) or ev.get("_pending_ec_check") or ev.get("_attendance_review_only"):
             running.append(ev)
         elif dt and dt >= now:
             upcoming.append(ev)
         else:
             past.append(ev)
+    running.sort(key=lambda ev: _event_admin_datetime(ev) or datetime.max.replace(tzinfo=timezone.utc))
+    upcoming.sort(key=lambda ev: _event_admin_datetime(ev) or datetime.max.replace(tzinfo=timezone.utc))
+    past.sort(key=lambda ev: -((_event_admin_datetime(ev) or datetime.min.replace(tzinfo=timezone.utc)).timestamp()))
 
-    running.sort(key=_sort_key_future)
-    upcoming.sort(key=_sort_key_future)
-    past.sort(key=_sort_key_past)
+    action_rows = _dashboard_event_action_requests(guild_id, limit=100) if guild_id else []
+    action_counts = _event_action_counts(action_rows)
 
-    action_rows = _dashboard_event_action_requests(guild_id, limit=50) if guild_id else []
-    ac = _event_action_counts(action_rows)
+    def _status_bucket(ev: dict[str, Any]) -> str:
+        if ev in running:
+            return "running"
+        if ev in upcoming:
+            return "upcoming"
+        return "past"
 
-    def _event_buttons(eid: str) -> str:
-        if not eid:
-            return "—"
-        return (
-            f"<div class='actions-inline'>"
-            f"<a class='link' href='/event/{_e(eid)}'>Details</a>"
-            f"<a class='link' href='/attendance/{_e(eid)}'>Review</a>"
-            f"<a class='link' href='/attendance/{_e(eid)}/report'>Bericht</a>"
-            f"<a class='link' href='/attendance/{_e(eid)}/ec-preview'>EC</a>"
-            f"</div>"
-        )
-
-    def _role_bar(ev: dict[str, Any]) -> str:
+    def _event_card(ev: dict[str, Any]) -> str:
+        eid = _event_admin_id(ev)
+        title = _event_admin_title(ev)
+        bucket = _status_bucket(ev)
+        bucket_label = {"running": "LÄUFT", "upcoming": "GEPLANT", "past": "BEENDET"}[bucket]
+        status_class = {"running": "ok", "upcoming": "warn", "past": "muted"}[bucket]
+        queue_label, queue_class = _event_admin_queue_state(action_rows, eid)
         summary = _event_role_summary(ev)
-        parts = []
-        for label, icon in (("Tank", "🛡️"), ("Heiler", "✚"), ("DPS", "⚔️"), ("Reserve", "🪑")):
-            parts.append(f"<span class='pill'>{icon} {_e(label)}: {_e(summary.get(label, 0))}</span>")
-        maybe = int(_num(ev.get("maybe_count"), 0))
-        no = int(_num(ev.get("no_count"), 0))
-        if maybe:
-            parts.append(f"<span class='pill'>Vielleicht: {_e(maybe)}</span>")
-        if no:
-            parts.append(f"<span class='pill muted'>Abgemeldet: {_e(no)}</span>")
-        return " ".join(parts)
-
-    def _participant_preview(ev: dict[str, Any]) -> str:
-        parts = ev.get("participants") or {}
-        names: list[str] = []
-        yes = parts.get("yes") or []
-        if isinstance(yes, list):
-            for group in yes:
-                if not isinstance(group, dict):
-                    continue
-                for p in (group.get("participants") or [])[:3]:
-                    if isinstance(p, dict):
-                        names.append(str(p.get("display_name") or p.get("name") or p.get("user_id") or ""))
-                    elif p:
-                        names.append(str(p))
-                    if len(names) >= 6:
-                        break
-                if len(names) >= 6:
-                    break
-        if not names:
-            return "<span class='muted'>Noch keine Zusagen im Snapshot.</span>"
-        more = int(_num(ev.get("participant_count"), 0)) - len(names)
-        suffix = f" <span class='muted'>+{_e(more)} weitere</span>" if more > 0 else ""
-        return ", ".join(_e(n) for n in names if n) + suffix
-
-    def _event_card(ev: dict[str, Any], label: str) -> str:
-        eid = str(ev.get("event_id") or ev.get("id") or "")
-        title = str(ev.get("title") or ev.get("name") or eid or "Event")
-        status = _event_status_text(ev)
-        status_class = "ok" if label == "kommend" else "warn" if label == "offen" else "muted"
-        queue_badge = _event_ec_queue_badge(guild_id, eid) if guild_id and eid else {"label": "—", "class": "muted"}
+        discord_url = _event_admin_discord_url(ev)
+        discord_action = f'<a class="btn compact secondary" href="{_e(discord_url)}" target="_blank" rel="noopener">Discord</a>' if discord_url else ""
+        image = _event_admin_image_preview(ev)
+        search_text = " ".join([title, str(ev.get("event_type") or ""), str(ev.get("dkp_event_type") or ""), _event_status_text(ev)]).casefold()
         return f"""
-        <article class="event-card">
-          <div class="event-card-head">
-            <div>
-              <div class="eyebrow">{_e(label.upper())}</div>
-              <h3><a class="link" href="/event/{_e(eid)}">{_e(title)}</a></h3>
-              <p class="muted">{_dt(ev.get('when_iso') or ev.get('start_at') or ev.get('created_at'))}</p>
-            </div>
-            <div style="text-align:right"><span class="pill {status_class}">{_e(status)}</span><br><span class="pill {_e(queue_badge.get('class'))}">{_e(queue_badge.get('label'))}</span></div>
+        <article class="admin-event-card" data-event-status="{_e(bucket)}" data-search="{_e(search_text)}">
+          {image}
+          <div class="admin-event-card-body">
+            <div class="admin-event-card-head"><div><span class="pill {status_class}">{_e(bucket_label)}</span><span class="pill {_e(queue_class)}">{_e(queue_label)}</span><h3>{_e(title)}</h3><p class="muted">{_dt(ev.get('when_iso') or ev.get('start_at') or ev.get('created_at'))}</p></div></div>
+            <div class="admin-event-stats"><span>🛡️ {_e(summary.get('Tank',0))}</span><span>✚ {_e(summary.get('Heiler',0))}</span><span>⚔️ {_e(summary.get('DPS',0))}</span><span>🪑 {_e(summary.get('Reserve',0))}</span><span>👥 {_e(summary.get('yes_count', ev.get('participant_count',0)))}</span></div>
+            <div class="admin-event-actions"><a class="btn compact" href="/admin/events/{_e(eid)}">Bearbeiten</a><a class="btn compact secondary" href="/attendance/{_e(eid)}">Anwesenheit</a><a class="btn compact secondary" href="/attendance/{_e(eid)}/ec-preview">EC</a><a class="btn compact secondary" href="/event/{_e(eid)}">Details</a>{discord_action}</div>
           </div>
-          <div class="role-strip">{_role_bar(ev)}</div>
-          <p class="muted"><strong>Teilnehmer:</strong> {_participant_preview(ev)}</p>
-          {_raw(_event_buttons(eid)).get('__html__')}
         </article>
         """
 
-    def _section(title: str, items: list[dict[str, Any]], label: str, empty: str) -> str:
-        cards_html = "".join(_event_card(ev, label) for ev in items[:30])
-        if not cards_html:
-            cards_html = f"<div class='empty'>{_e(empty)}</div>"
-        return f"<section class='panel'><h2>{_e(title)}</h2><div class='event-card-grid'>{cards_html}</div></section>"
+    all_cards = "".join(_event_card(ev) for ev in (running + upcoming + past[:40])) or '<div class="empty">Keine Events im Snapshot.</div>'
 
-    action_table_rows = []
-    for r in action_rows[:40]:
+    action_table_rows: list[list[Any]] = []
+    for row in action_rows[:60]:
         result = ""
         try:
-            result_obj = json.loads(str(r.get("result_json") or "{}"))
-            result = result_obj.get("message") or result_obj.get("error") or ""
+            parsed = json.loads(str(row.get("result_json") or "{}"))
+            result = parsed.get("message") or parsed.get("error") or ""
         except Exception:
-            result = str(r.get("result_json") or "")[:160]
+            result = str(row.get("result_json") or "")[:160]
+        eid = str(row.get("event_id") or "")
         action_table_rows.append([
-            r.get("requested_at"),
-            r.get("action_type"),
-            r.get("event_id") or "neu",
-            r.get("status"),
-            r.get("actor_name"),
-            result,
+            _dt(row.get("requested_at")),
+            row.get("action_type"),
+            _raw(f'<a class="link" href="/admin/events/{_e(eid)}">{_e(eid)}</a>') if eid else "neu",
+            _ec_award_status_label(row.get("status")).replace("EC", ""),
+            row.get("actor_name") or row.get("actor_id") or "—",
+            _short(result or row.get("request_id"), 160),
         ])
 
-    event_cut = data.get("phase3_events_read_cutover") or {}
-    event_source_label = "Postgres Phase 3" if event_cut.get("active") else "Snapshot/Fallback"
-    cards = "".join([
-        _card("Event-Quelle", event_source_label, "Read-Cutover aktiv" if event_cut.get("active") else "Fallback aktiv"),
-        _card("Laufend/offen", len(running), "inkl. offener Review/EC"),
-        _card("Kommend", len(upcoming), "geplante Events"),
-        _card("Vergangen", len(past), "letzte Events im Snapshot"),
-        _card("Queue offen", ac.get("pending", 0) + ac.get("processing", 0), f"erledigt: {ac.get('done', 0)}"),
-    ])
-
-    event_table_rows = []
-    for ev in (running + upcoming + past)[:120]:
-        eid = str(ev.get("event_id") or ev.get("id") or "")
-        event_table_rows.append([
-            _raw(f"<a class='link' href='/event/{_e(eid)}'>{_e(ev.get('title') or ev.get('name') or eid)}</a>"),
-            _dt(ev.get("when_iso") or ev.get("start_at") or ev.get("created_at")),
-            _event_status_text(ev),
-            _raw(_role_bar(ev)),
-            ev.get("participant_count", ev.get("participants", "—")),
-            _raw(_event_buttons(eid)),
-        ])
-
-    msg_panel = f"<section class='panel'><p>{_e(msg)}</p></section>" if msg else ""
+    msg_panel = f"<section class='panel admin-flash'><p>{_e(msg)}</p></section>" if msg else ""
     body = f"""
     <style>
-      .event-card-grid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(280px,1fr)); gap:14px; }}
-      .event-card {{ border:1px solid rgba(255,255,255,.10); border-radius:18px; padding:16px; background:rgba(16,12,10,.55); box-shadow:0 12px 34px rgba(0,0,0,.22); }}
-      .event-card-head {{ display:flex; justify-content:space-between; gap:14px; align-items:flex-start; }}
-      .event-card h3 {{ margin:.15rem 0 .1rem; }}
-      .role-strip {{ display:flex; flex-wrap:wrap; gap:6px; margin:12px 0; }}
-      .actions-inline {{ display:flex; flex-wrap:wrap; gap:8px; margin-top:12px; }}
-      .actions-inline .link {{ border:1px solid rgba(255,255,255,.12); border-radius:999px; padding:7px 10px; background:rgba(255,255,255,.04); text-decoration:none; }}
-      .actions-inline .link:hover {{ background:rgba(234,179,8,.12); }}
-      .event-form-grid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:10px; }}
-      .event-form-grid label {{ display:block; }}
-      .event-form-grid input, .event-form-grid textarea, .event-form-grid select {{ width:100%; }}
-      @media(max-width:720px) {{ .event-card-head {{ flex-direction:column; }} .actions-inline .link {{ flex:1 1 auto; text-align:center; }} }}
+      .admin-tabs{{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px}}.admin-tabs a{{padding:9px 13px;border:1px solid var(--line);border-radius:10px;text-decoration:none;background:rgba(255,255,255,.025)}}.admin-tabs a.active{{border-color:#d6a84f;background:rgba(214,168,79,.12);color:#f3d68c}}
+      .event-toolbar{{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:14px}}.event-toolbar input{{flex:1 1 260px}}.event-filter{{border:1px solid var(--line);background:rgba(255,255,255,.03);color:var(--text);border-radius:999px;padding:8px 12px;cursor:pointer}}.event-filter.active{{border-color:#d6a84f;background:rgba(214,168,79,.14);color:#f4d78e}}
+      .admin-event-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(330px,1fr));gap:15px}}.admin-event-card{{border:1px solid rgba(214,168,79,.24);border-radius:16px;overflow:hidden;background:rgba(8,8,10,.82);box-shadow:0 14px 38px rgba(0,0,0,.24)}}.admin-event-thumb{{position:relative;aspect-ratio:16/7;background:#0b0908;overflow:hidden}}.admin-event-thumb img{{width:100%;height:100%;object-fit:cover;display:block}}.admin-event-thumb-empty,.admin-event-image-error{{height:100%;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:5px;color:#d6a84f;background:linear-gradient(135deg,#21150d,#09090b)}}.admin-event-card-body{{padding:15px}}.admin-event-card-head h3{{margin:.55rem 0 .15rem;font-size:1.25rem}}.admin-event-card-head .pill{{margin-right:5px}}.admin-event-stats{{display:flex;gap:7px;flex-wrap:wrap;margin:12px 0}}.admin-event-stats span{{border:1px solid var(--line);border-radius:999px;padding:5px 8px;font-size:.84rem}}.admin-event-actions{{display:flex;gap:7px;flex-wrap:wrap}}.btn.compact{{padding:7px 10px;font-size:.86rem}}.btn.secondary{{background:rgba(255,255,255,.035);border-color:var(--line)}}
+      .create-event-form{{display:grid;gap:13px}}.event-form-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:11px}}.event-form-grid input,.event-form-grid select,.event-form-grid textarea{{width:100%}}@media(max-width:620px){{.admin-event-grid{{grid-template-columns:1fr}}}}
     </style>
-    <nav class="topnav"><a href="/">← Kommando</a><a href="/attendance">Anwesenheit</a><a href="/ec">EC</a><a href="/overview">Gesamtübersicht</a><a href="/api/events-center">API</a><a href="/export/events_center.csv">CSV</a></nav>
-    <section class="hero">
-      <div><div class="eyebrow">Event-Zentrale</div><h1>📅 Events & Planung</h1><p class="muted">Kommende Events, laufende Events, Eventstatus, Rollenverteilung, Teilnehmerübersicht und direkte Links zu Attendance, Review und EC.</p></div>
-      <div class="hero-actions"><a class="hero-action attendance" href="#create"><span>➕</span><strong>Event erstellen</strong><small>Bot-Queue</small></a><a class="hero-action loot" href="#overview"><span>📋</span><strong>Events prüfen</strong><small>Status & Rollen</small></a><a class="hero-action members" href="#actions"><span>🧾</span><strong>Queue</strong><small>Erstellen/Bearbeiten/Löschen</small></a></div>
-    </section>
+    <nav class="admin-tabs"><a href="/admin">Übersicht</a><a class="active" href="/events-admin">Events</a><a href="/attendance">Anwesenheit & EC</a><a href="/loot">Loot</a><a href="/members">Mitglieder</a><a href="/admin/guild-config">Einstellungen</a><a href="/system">System & Logs</a></nav>
+    <section class="hero"><div><div class="eyebrow">Admin · Eventverwaltung</div><h1>📅 Events verwalten</h1><p class="muted">Geplante, laufende und vergangene Events direkt öffnen. Änderungen werden über die Bot-Queue in den bestehenden Discord-Post übernommen.</p></div><a class="btn" href="#event-create">+ Event erstellen</a></section>
     {msg_panel}
-    <section class="grid">{cards}</section>
-    <div id="overview"></div>
-    {_section('🔥 Laufende / offene Events', running, 'offen', 'Keine laufenden oder offenen Events.')}
-    {_section('📆 Kommende Events', upcoming, 'kommend', 'Keine kommenden Events im Snapshot.')}
-    {_section('🕰️ Vergangene / abgeschlossene Events', past[:20], 'vergangen', 'Keine alten Events im Snapshot.')}
-    <section class="panel"><h2>📋 Komplette Eventliste</h2><p class="muted">Suchbar. Enthält Snapshot-Events plus offene Review-/EC-Fallbacks.</p>{_table(['Event','Zeit','Status','Rollen','Teilnehmer','Links'], event_table_rows, placeholder='Event suchen…')}</section>
-    <section class="panel" id="create"><h2>➕ Event erstellen</h2><p class="muted">Das Dashboard schreibt nicht direkt in Discord. Es legt einen Antrag an, den der Bot verarbeitet.</p>
-      <form method="post" action="/admin/events/action" style="display:grid; gap:12px;">
-        <input type="hidden" name="action_type" value="create">
-        <div class="event-form-grid">
-          <label>Titel<br><input name="title" required placeholder="z. B. Gildenbosse Sonntag"></label>
-          <label>Datum<br><input name="date" type="date" required></label>
-          <label>Uhrzeit<br><input name="time" type="time" required></label>
-          <label>Eventtyp / EC-Regel<br>{_dashboard_event_type_select_html()}</label>
-          <label>Sichtbarer Eventbereich<br><select name="event_type"><option value="">Standard</option><option value="Normal Mode Raid">Normal Mode Raid</option><option value="Hardmode Raid">Hardmode Raid</option><option value="Dimensionsprüfung">Dimensionsprüfung</option><option value="Gildenbosse">Gildenbosse</option><option value="Segensstein">Segensstein</option></select></label>
-          <label>Zielkanal<br>{_dashboard_channel_select_html(snap, required=True)}</label>
-          <label>Zielrolle optional<br>{_dashboard_role_select_html(snap)}</label>
-        </div>
+    <section class="grid">{_card('Laufend',len(running),'direkt bearbeitbar')}{_card('Geplant',len(upcoming),'kommende Termine')}{_card('Vergangen',len(past),'im Snapshot')}{_card('Queue offen',action_counts.get('pending',0)+action_counts.get('processing',0),f"Fehler: {action_counts.get('failed',0)+action_counts.get('rejected',0)}")}</section>
+    <section class="panel"><div class="event-toolbar"><input id="admin-event-search" type="search" placeholder="Event suchen…"><button class="event-filter active" data-filter="all">Alle</button><button class="event-filter" data-filter="running">Laufend</button><button class="event-filter" data-filter="upcoming">Geplant</button><button class="event-filter" data-filter="past">Beendet</button></div><div id="admin-event-grid" class="admin-event-grid">{all_cards}</div></section>
+    <section class="panel" id="event-create"><h2>➕ Event erstellen</h2><p class="muted">Das Dashboard legt einen Auftrag an. Der Bot erstellt den Discord-Post und übernimmt die Rückmeldungen.</p>
+      <form method="post" action="/admin/events/action" class="create-event-form">
+        <input type="hidden" name="action_type" value="create"><input type="hidden" name="description_present" value="1"><input type="hidden" name="image_present" value="1">
+        <div class="event-form-grid"><label>Titel<br><input name="title" required maxlength="180" placeholder="z. B. Gildenbosse Sonntag"></label><label>Eventtyp<br>{_dashboard_visible_event_type_select_html()}</label><label>EC-Regel<br>{_dashboard_event_type_select_html()}</label><label>Datum<br><input name="date" type="date" required></label><label>Uhrzeit<br><input name="time" type="time" required></label><label>Dauer in Minuten<br><input name="duration_minutes" type="number" min="30" max="720" step="15" value="120"></label><label>Zielkanal<br>{_dashboard_channel_select_html(snap, required=True)}</label><label>Zielrolle optional<br>{_dashboard_role_select_html(snap)}</label><label>Ort / Hinweis<br><input name="location" placeholder="Beer and Buffs Discord"></label></div>
         <label>Beschreibung<br><textarea name="description" rows="4" placeholder="Kurzbeschreibung"></textarea></label>
-        <div class="event-form-grid">
-          <label>Bildtyp<br><select name="image_type" style="width:100%; padding:10px; border-radius:10px; background:#08090d; color:var(--text); border:1px solid var(--line);"><option value="none">Kein Bild</option><option value="custom">Eigene URL</option><option value="normal">Normal Mode Raid</option><option value="hard">Hardmode Raid</option><option value="trials">Dimensionsprüfung</option><option value="boss">Gildenbosse</option><option value="pvp">Segensstein</option></select></label>
-          <label>Bild-URL bei Eigene URL<br><input name="image_url" placeholder="https://..."></label>
-          <label style="display:flex; gap:8px; align-items:center; padding-top:22px;"><input type="checkbox" name="send_dms" value="1" checked> DMs an Zielgruppe senden</label>
-        </div>
-        <button class="btn" type="submit" onclick="return confirm('Event-Erstellung als Bot-Antrag senden?')">Event-Erstellung an Bot senden</button>
+        <div class="event-form-grid"><label>Bild<br>{_dashboard_image_type_select_html('auto', element_id='create-image-type')}</label><label>Eigene Bild-URL<br><input name="image_url" placeholder="https://..."></label><label style="display:flex;gap:8px;align-items:center;padding-top:22px"><input type="checkbox" name="send_dms" value="1" checked> DMs an Zielgruppe senden</label></div>
+        <button class="btn" type="submit" onclick="return confirm('Event erstellen und an den Bot senden?')">Event erstellen</button>
       </form>
     </section>
-    <section class="split">
-      <section class="panel"><h2>✏️ Event bearbeiten</h2><p class="muted">Nur ausgefüllte Felder werden geändert. Event-ID ist normalerweise die Discord-Message-ID des Eventposts.</p>
-        <form method="post" action="/admin/events/action" style="display:grid; gap:10px;">
-          <input type="hidden" name="action_type" value="edit">
-          <label>Event-ID<br><input name="event_id" required placeholder="Message-ID"></label>
-          <label>Neuer Titel optional<br><input name="title"></label>
-          <div class="event-form-grid"><label>Neues Datum optional<br><input name="date" type="date"></label><label>Neue Uhrzeit optional<br><input name="time" type="time"></label></div>
-          <label>Neue Beschreibung optional<br><textarea name="description" rows="3"></textarea></label>
-          <label>Neue Bild-URL optional<br><input name="image_url"></label>
-          <button class="btn" type="submit" onclick="return confirm('Änderung als Bot-Antrag senden?')">Bearbeitung an Bot senden</button>
-        </form>
-      </section>
-      <section class="panel"><h2>🗑️ Event löschen</h2><p class="muted">Löscht nicht blind im Dashboard, sondern sendet einen sicheren Antrag an den Bot.</p>
-        <form method="post" action="/admin/events/action" style="display:grid; gap:10px;">
-          <input type="hidden" name="action_type" value="delete">
-          <label>Event-ID<br><input name="event_id" required placeholder="Message-ID"></label>
-          <label>Zur Sicherheit LÖSCHEN schreiben<br><input name="confirm" required placeholder="LÖSCHEN"></label>
-          <button class="btn danger" type="submit" onclick="return confirm('Event wirklich löschen? Der Bot entfernt den Eventpost.')">Löschen an Bot senden</button>
-        </form>
-      </section>
-    </section>
-    <section class="panel" id="actions"><h2>🧾 Event-Aktionsqueue</h2><p class="muted">Zeigt Erstellen/Bearbeiten/Löschen aus dem Dashboard und den Bot-Status.</p>{_table(['Zeit','Aktion','Event','Status','Von','Ergebnis'], action_table_rows, placeholder='Queue durchsuchen…')}</section>
+    <section class="panel" id="event-queue"><h2>🧾 Event-Aktionsqueue</h2><p class="muted">Erstellen, Bearbeiten und Löschen mit Bot-Status.</p>{_table(['Zeit','Aktion','Event','Status','Von','Ergebnis'], action_table_rows, placeholder='Queue durchsuchen…')}</section>
+    <script>
+      let adminEventFilter='all'; const eventSearch=document.getElementById('admin-event-search'); const eventCards=[...document.querySelectorAll('.admin-event-card')]; function applyAdminEventFilter(){{const q=(eventSearch.value||'').toLowerCase().trim();eventCards.forEach(card=>{{const status=card.dataset.eventStatus;const text=card.dataset.search||'';card.style.display=((adminEventFilter==='all'||status===adminEventFilter)&&(!q||text.includes(q)))?'':'none';}});}} document.querySelectorAll('.event-filter').forEach(btn=>btn.addEventListener('click',()=>{{document.querySelectorAll('.event-filter').forEach(x=>x.classList.remove('active'));btn.classList.add('active');adminEventFilter=btn.dataset.filter;applyAdminEventFilter();}})); eventSearch.addEventListener('input',applyAdminEventFilter);
+    </script>
     """
-    return _html_shell("Events · Beer and Buffs Dashboard", body, nav_mode=nav_mode)
+    return _html_shell("Events verwalten · Beer and Buffs Dashboard", body, nav_mode=nav_mode)
 
 
 @app.get("/events", response_class=HTMLResponse)
@@ -15162,6 +15300,21 @@ def events_admin_page(request: Request, _: bool = Depends(_admin_auth), msg: str
         return HTMLResponse(_render_events_center(_snapshot_payload(), _current_user(request), msg, nav_mode="admin"))
     except Exception as exc:
         return HTMLResponse(_html_shell("Beer and Buffs Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>", nav_mode="admin"), status_code=500)
+
+
+@app.get("/admin/events", response_class=HTMLResponse)
+def admin_events_alias(_: bool = Depends(_admin_auth)):
+    return RedirectResponse("/events-admin", status_code=302)
+
+
+@app.get("/admin/events/{event_id}", response_class=HTMLResponse)
+def admin_event_editor_page(event_id: str, request: Request, _: bool = Depends(_admin_auth), msg: str = ""):
+    try:
+        return HTMLResponse(_render_event_editor(_snapshot_payload(), event_id, _current_user(request), msg))
+    except Exception as exc:
+        return HTMLResponse(_html_shell("Beer and Buffs Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>", nav_mode="admin"), status_code=500)
+
+
 @app.get("/api/events-center")
 def api_events_center(_: bool = Depends(_auth)):
     payload = _snapshot_payload()
@@ -15221,30 +15374,90 @@ def export_events_center_csv(_: bool = Depends(_admin_auth)):
 
 @app.post("/admin/events/action")
 async def admin_events_action(request: Request, _: bool = Depends(_admin_auth)):
-    payload = _snapshot_payload()
-    guild_id = _safe_guild_id(payload)
+    data = _snapshot_payload()
+    guild_id = _safe_guild_id(data)
     actor = _current_user(request) or {"username": "Dashboard"}
     form = _parse_urlencoded_body(await request.body())
     action = str(form.get("action_type") or "").strip().lower()
+    event_id = str(form.get("event_id") or "").strip()
+
+    if action not in {"create", "edit", "delete"}:
+        return RedirectResponse("/events-admin?msg=" + urllib.parse.quote("Unbekannte Event-Aktion."), status_code=303)
     if action == "delete" and str(form.get("confirm") or "").strip().upper() != "LÖSCHEN":
-        return RedirectResponse("/events?msg=" + urllib.parse.quote("Löschen abgebrochen: Sicherheitswort fehlt."), status_code=303)
-    clean_payload = {
-        "event_id": str(form.get("event_id") or "").strip(),
+        target = f"/admin/events/{urllib.parse.quote(event_id)}" if event_id else "/events-admin"
+        return RedirectResponse(target + "?msg=" + urllib.parse.quote("Löschen abgebrochen: Sicherheitswort fehlt."), status_code=303)
+
+    image_type = str(form.get("image_type") or "").strip().lower()
+    image_url = str(form.get("image_url") or "").strip()
+    if image_type == "custom" and image_url and not image_url.startswith(("https://", "http://")):
+        target = f"/admin/events/{urllib.parse.quote(event_id)}" if event_id else "/events-admin"
+        return RedirectResponse(target + "?msg=" + urllib.parse.quote("Eigene Bild-URL muss mit http:// oder https:// beginnen."), status_code=303)
+
+    event_type = str(form.get("event_type") or "").strip()
+    if event_type and event_type not in _EVENT_VISIBLE_TYPES:
+        target = f"/admin/events/{urllib.parse.quote(event_id)}" if event_id else "/events-admin"
+        return RedirectResponse(target + "?msg=" + urllib.parse.quote("Unbekannter Eventtyp."), status_code=303)
+
+    clean_payload: dict[str, Any] = {
+        "event_id": event_id,
         "title": str(form.get("title") or "").strip(),
         "date": str(form.get("date") or "").strip(),
         "time": str(form.get("time") or "").strip(),
-        "event_type": str(form.get("event_type") or "").strip(),
+        "event_type": event_type,
+        "event_type_present": "event_type" in form,
         "dkp_event_type": str(form.get("dkp_event_type") or "").strip(),
+        "dkp_event_type_present": "dkp_event_type" in form,
         "channel_id": str(form.get("channel_id") or "").strip(),
         "target_role_id": str(form.get("target_role_id") or "").strip(),
-        "description": str(form.get("description") or "").strip(),
-        "image_type": str(form.get("image_type") or "").strip(),
-        "image_url": str(form.get("image_url") or "").strip(),
+        "target_role_present": "target_role_id" in form,
+        "description": str(form.get("description") or ""),
+        "description_present": str(form.get("description_present") or "") == "1" or "description" in form,
+        "image_type": image_type,
+        "image_url": image_url,
+        "image_present": str(form.get("image_present") or "") == "1" or "image_type" in form or "image_url" in form,
+        "duration_minutes": str(form.get("duration_minutes") or "").strip(),
+        "duration_present": "duration_minutes" in form,
+        "location": str(form.get("location") or ""),
+        "location_present": "location" in form,
+        "status": str(form.get("status") or "").strip().lower(),
+        "status_present": "status" in form,
         "send_dms": str(form.get("send_dms") or "") == "1",
+        "force_refresh": str(form.get("force_refresh") or "") == "1",
+        "update_discord": True,
     }
-    res = _enqueue_event_action_request(guild_id, action, clean_payload, actor)
-    msg = "Event-Aktion wurde an den Bot gesendet." if res.get("ok") else f"Fehler: {res.get('error')}"
-    return RedirectResponse("/events?msg=" + urllib.parse.quote(msg), status_code=303)
+
+    before = _event_admin_find(data, event_id) if event_id else {}
+    if before:
+        clean_payload["before_event"] = {
+            "event_id": _event_admin_id(before),
+            "title": _event_admin_title(before),
+            "when_iso": before.get("when_iso") or before.get("start_at"),
+            "event_type": before.get("event_type"),
+            "dkp_event_type": before.get("dkp_event_type"),
+            "description": before.get("description"),
+            "image_url": _event_image_raw_url(before),
+            "image_type": before.get("image_type"),
+            "duration_minutes": before.get("duration_minutes"),
+            "location": before.get("location"),
+            "target_role_id": before.get("target_role_id"),
+            "status": before.get("status") or before.get("state"),
+        }
+
+    result = _enqueue_event_action_request(guild_id, action, clean_payload, actor)
+    if result.get("ok"):
+        message = {
+            "create": "Event-Erstellung wurde an den Bot gesendet.",
+            "edit": "Event-Änderung wurde an den Bot gesendet. Teilnehmer und Anwesenheit bleiben erhalten.",
+            "delete": "Event-Löschung wurde an den Bot gesendet.",
+        }.get(action, "Event-Aktion wurde an den Bot gesendet.")
+    else:
+        message = f"Fehler: {result.get('error')}"
+
+    if action == "edit" and event_id:
+        target = f"/admin/events/{urllib.parse.quote(event_id)}"
+    else:
+        target = "/events-admin"
+    return RedirectResponse(target + "?msg=" + urllib.parse.quote(message), status_code=303)
 
 
 @app.get("/planning", response_class=HTMLResponse)
