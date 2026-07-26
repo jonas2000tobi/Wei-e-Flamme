@@ -13,6 +13,7 @@ from typing import Any, Mapping
 from urllib.parse import urlparse
 
 DEFAULT_DASHBOARD_PUBLIC_BASE_URL = "https://dashboardweb-production-2933.up.railway.app"
+EVENT_IMAGE_ASSET_VERSION = "2.2.2"
 
 EVENT_IMAGE_ASSETS: dict[str, str] = {
     "normal_raid": "normal_raid.webp",
@@ -24,12 +25,11 @@ EVENT_IMAGE_ASSETS: dict[str, str] = {
 }
 
 DISPLAY_PRESET_KEYS: dict[str, str] = {
-    "Normal Raid": "normal_raid",
-    "Hard Raid": "hard_raid",
-    "Trials": "trials",
-    "Nightmare": "nightmare",
-    "PvP": "pvp",
+    "Normal Mode Raid": "normal_raid",
+    "Hardmode Raid": "hard_raid",
+    "Dimensionsprüfung": "trials",
     "Gildenbosse": "guild_boss",
+    "Segensstein": "pvp",
 }
 
 # Alte, bereits gespeicherte Discord-Anhangslinks werden anhand stabiler Teile
@@ -58,7 +58,7 @@ def dashboard_public_base_url() -> str:
 
 def event_image_asset_path(preset_key: str) -> str:
     filename = EVENT_IMAGE_ASSETS.get(str(preset_key or "").strip().lower(), "")
-    return f"/static/event_images/{filename}" if filename else ""
+    return f"/static/event_images/{filename}?v={EVENT_IMAGE_ASSET_VERSION}" if filename else ""
 
 
 def event_image_asset_url(preset_key: str) -> str:
@@ -147,6 +147,9 @@ def normalize_event_image_url(
                 break
 
     if raw.startswith("/static/"):
+        path, _, _query = raw.partition("?")
+        if path.startswith("/static/event_images/"):
+            raw = f"{path}?v={EVENT_IMAGE_ASSET_VERSION}"
         return f"{dashboard_public_base_url()}{raw}" if absolute else raw
 
     inferred = infer_preset_key(event)
@@ -161,6 +164,13 @@ def normalize_event_image_url(
         return raw
 
     if raw.startswith(("https://", "http://")):
+        try:
+            parsed = urlparse(raw)
+            if str(parsed.path or "").startswith("/static/event_images/"):
+                stable_path = f"{parsed.path}?v={EVENT_IMAGE_ASSET_VERSION}"
+                return f"{dashboard_public_base_url()}{stable_path}" if absolute else stable_path
+        except Exception:
+            pass
         return raw
 
     if infer_when_missing and inferred:

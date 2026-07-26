@@ -3110,23 +3110,29 @@ def _dashboard_event_parse_when(payload: dict[str, Any], fallback_iso: str = "")
 
 
 _DASHBOARD_EVENT_IMAGE_PRESETS = {
-    "normal raid": event_image_asset_url("normal_raid"),
-    "hard raid": event_image_asset_url("hard_raid"),
-    "nightmare": event_image_asset_url("nightmare"),
-    "trials": event_image_asset_url("trials"),
-    "pvp": event_image_asset_url("pvp"),
+    "normal mode raid": event_image_asset_url("normal_raid"),
+    "hardmode raid": event_image_asset_url("hard_raid"),
+    "dimensionsprüfung": event_image_asset_url("trials"),
     "gildenbosse": event_image_asset_url("guild_boss"),
+    "segensstein": event_image_asset_url("pvp"),
 }
 
 _DASHBOARD_EVENT_IMAGE_ALIASES = {
-    "normal": "normal raid",
-    "hard": "hard raid",
-    "hm raid": "hard raid",
-    "nightmare": "nightmare",
-    "nm raid": "normal raid",
-    "trial": "trials",
-    "trials": "trials",
-    "pvp": "pvp",
+    "normal": "normal mode raid",
+    "normal raid": "normal mode raid",
+    "normal mode": "normal mode raid",
+    "nm raid": "normal mode raid",
+    "hard": "hardmode raid",
+    "hard raid": "hardmode raid",
+    "hard mode raid": "hardmode raid",
+    "hm raid": "hardmode raid",
+    "trial": "dimensionsprüfung",
+    "trials": "dimensionsprüfung",
+    "dimensionspruefung": "dimensionsprüfung",
+    "dimensionsprüfung": "dimensionsprüfung",
+    "pvp": "segensstein",
+    "segensstein pvp": "segensstein",
+    "segensstein": "segensstein",
     "gildenboss": "gildenbosse",
     "gildenbosse": "gildenbosse",
 }

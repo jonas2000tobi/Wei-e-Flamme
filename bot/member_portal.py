@@ -5434,12 +5434,11 @@ class AdminEventImageSelect(Select):
         options = [
             discord.SelectOption(label="Kein Bild", value="none", description="Event ohne Bild erstellen"),
             discord.SelectOption(label="Eigene URL", value="custom", description="Eigenen Bildlink eingeben"),
-            discord.SelectOption(label="Normal Raid", value="Normal Raid"),
-            discord.SelectOption(label="Hard Raid", value="Hard Raid"),
-            discord.SelectOption(label="Trials", value="Trials"),
-            discord.SelectOption(label="Nightmare", value="Nightmare"),
-            discord.SelectOption(label="PvP", value="PvP"),
+            discord.SelectOption(label="Normal Mode Raid", value="Normal Mode Raid"),
+            discord.SelectOption(label="Hardmode Raid", value="Hardmode Raid"),
+            discord.SelectOption(label="Dimensionsprüfung", value="Dimensionsprüfung"),
             discord.SelectOption(label="Gildenbosse", value="Gildenbosse"),
+            discord.SelectOption(label="Segensstein", value="Segensstein"),
         ]
         super().__init__(
             placeholder="Bildtyp wählen",
