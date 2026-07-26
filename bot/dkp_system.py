@@ -1045,8 +1045,9 @@ def _attendance_check_embed(client: discord.Client, home_guild_id: int, event: d
         f"Event-ID: `{event_id}`\n"
         f"EC-Typ: **{event_type}**\n"
         f"Wert: **{base} EC** • Reserve: **{res} EC**\n\n"
-        "Die Anmeldung ist nur ein Vorschlag. Bitte bestätige die echte Anwesenheit, bevor EC vergeben werden.\n"
-        "Nachgetragene Spieler werden **nur für diese EC-Anwesenheit** gespeichert und ändern keine Event-Anmeldung."
+        "Beim Klick auf **EC vergeben** werden alle noch offenen Teilnehmer automatisch auf **War da** gesetzt.\n"
+        "Manuell gesetzte Status wie Reserve, Vielleicht, Abwesend oder Entschuldigt bleiben unverändert. "
+        "Nachgetragene Spieler gelten nur für diese EC-Anwesenheit und ändern keine Event-Anmeldung."
     )
 
     participants = _attendance_sorted_participants(event)
@@ -1079,8 +1080,8 @@ def _attendance_check_embed(client: discord.Client, home_guild_id: int, event: d
             f"❔ Vielleicht: **{counts.get('maybe', 0)}**\n"
             f"❌ Nicht da / 🟡 Entschuldigt: **{counts.get('absent', 0) + counts.get('excused', 0)}**\n"
             f"🤝 Partner ohne EC: **{len(skipped_partner)}**\n"
-            f"⚪ Noch offen / nicht bestätigt: **{counts.get('open', 0)}**\n\n"
-            f"EC bei Vergabe: **{len(present)}** volle Wertung, **{len(reserve)}** Reserve"
+            f"⚪ Noch offen → bei Vergabe automatisch War da: **{counts.get('open', 0)}**\n\n"
+            f"Aktuell bestätigt: **{len(present)}** volle Wertung, **{len(reserve)}** Reserve"
         ),
         inline=False,
     )
@@ -1336,6 +1337,43 @@ async def _apply_voice_attendance_suggestion(
     return True, msg, emb
 
 
+def _confirm_open_attendance_for_award(
+    rsvp: Any,
+    guild_id: int,
+    event_id: str,
+    actor_id: int,
+) -> tuple[Optional[dict], int, str]:
+    """Setzt unmittelbar vor der EC-Vergabe alle offenen Teilnehmer auf War da.
+
+    Bereits manuell gesetzte Status wie Reserve, Abwesend, Entschuldigt oder
+    Vielleicht bleiben unverändert. Die Massenänderung wird mit genau einem
+    Schreibvorgang gespeichert.
+    """
+    apply_updates = getattr(rsvp, "apply_attendance_updates", None)
+    if not callable(apply_updates):
+        return None, 0, "RSVP-System unterstützt die automatische Anwesenheitsbestätigung nicht."
+    try:
+        result = apply_updates(
+            int(guild_id),
+            str(event_id),
+            marked_by=int(actor_id or 0),
+            confirm_open=True,
+        )
+    except Exception as exc:
+        return None, 0, f"Offene Anwesenheiten konnten nicht bestätigt werden: {exc}"
+    if not isinstance(result, dict) or not bool(result.get("ok", False)):
+        error = ""
+        if isinstance(result, dict):
+            failures = result.get("failed") or []
+            if failures:
+                error = str(failures[0].get("error") if isinstance(failures[0], dict) else failures[0])
+        return None, 0, error or "Offene Anwesenheiten konnten nicht bestätigt werden."
+    event = rsvp.get_attendance_event(int(guild_id), str(event_id))
+    if not event:
+        return None, 0, "Event war nach der Anwesenheitsaktualisierung nicht mehr verfügbar."
+    return event, int(result.get("applied", 0) or 0), ""
+
+
 async def _award_event_now(
     client: discord.Client,
     guild_id: int,
@@ -1354,10 +1392,16 @@ async def _award_event_now(
     if _event_has_dkp_already(int(guild_id), str(event_id), event_type):
         return False, "Für dieses Event wurden bereits EC vergeben. Nutze bei Fehlern `/dkp adjust`.", None
 
+    event, auto_confirmed, confirm_error = _confirm_open_attendance_for_award(
+        rsvp, int(guild_id), str(event_id), int(getattr(actor, "id", 0) or 0)
+    )
+    if confirm_error or not event:
+        return False, f"Automatische Anwesenheitsbestätigung fehlgeschlagen: {confirm_error}", None
+
     present, reserve, skipped_partner, skipped_open = _attendance_summary_for_award(client, int(guild_id), event, event_type)
     awarded = present + reserve
     if not awarded:
-        return False, "Keine bestätigten Gildenteilnehmer mit Status 'War da' gefunden.", None
+        return False, "Keine EC-berechtigten Gildenteilnehmer für dieses Event gefunden.", None
 
     for row in awarded:
         tx = _add_transaction(
@@ -1379,8 +1423,16 @@ async def _award_event_now(
     save_event_checks()
 
     emb = _award_log_embed(event, event_type, present, reserve, skipped_partner, skipped_open, actor)
+    if auto_confirmed:
+        emb.add_field(
+            name="✅ Automatisch bestätigt",
+            value=f"**{auto_confirmed}** offene Teilnehmer wurden vor der EC-Vergabe auf **War da** gesetzt.",
+            inline=False,
+        )
     await _log_to_channel(client, int(guild_id), emb)
-    return True, f"EC vergeben: {len(awarded)} Gildenspieler.", emb
+    await _publish_dashboard_snapshot_now(client, int(guild_id))
+    suffix = f" Davon wurden {auto_confirmed} offene Teilnehmer automatisch als anwesend bestätigt." if auto_confirmed else ""
+    return True, f"EC vergeben: {len(awarded)} Gildenspieler.{suffix}", emb
 
 
 class ECAttendanceParticipantSelect(Select):
@@ -1673,25 +1725,19 @@ class ECEventCheckView(View):
             await inter.edit_original_response(content="❌ Event nicht gefunden.", embed=None, view=None)
             return
 
-        attendance = event.get("attendance") if isinstance(event.get("attendance"), dict) else {}
-        changed = 0
-        kept = 0
-        failed = 0
-        for p in _attendance_unique_participants(event):
-            try:
-                uid = int(p.get("id", 0) or 0)
-            except Exception:
-                uid = 0
-            if not uid:
-                continue
-            current = str((attendance.get(str(uid)) or {}).get("status", "") or "")
-            if current:
-                kept += 1
-                continue
-            if rsvp.set_attendance_status(self.guild_id, self.event_id, uid, "present", int(inter.user.id)):
-                changed += 1
-            else:
-                failed += 1
+        total_participants = len(_attendance_unique_participants(event))
+        result = rsvp.apply_attendance_updates(
+            self.guild_id,
+            self.event_id,
+            marked_by=int(inter.user.id),
+            confirm_open=True,
+        )
+        if not bool((result or {}).get("ok", False)):
+            await inter.edit_original_response(content="❌ Offene Anwesenheiten konnten nicht gespeichert werden.", embed=None, view=None)
+            return
+        changed = int((result or {}).get("applied", 0) or 0)
+        kept = max(0, total_participants - changed)
+        failed = len((result or {}).get("failed") or [])
 
         event = rsvp.get_attendance_event(self.guild_id, self.event_id) or event
         event_type = _dkp_type_from_event(event, self.event_id)
@@ -3575,28 +3621,23 @@ async def setup_dkp_system(client: discord.Client, tree: app_commands.CommandTre
         if not event:
             await inter.edit_original_response(content=f"❌ Anwesenheitsevent `{selected_id}` nicht gefunden.")
             return
-        attendance = event.get("attendance") if isinstance(event.get("attendance"), dict) else {}
-        changed = 0
-        kept = 0
-        for participant in _attendance_unique_participants(event):
-            try:
-                uid = int(participant.get("id", 0) or 0)
-            except Exception:
-                uid = 0
-            if not uid:
-                continue
-            current = str((attendance.get(str(uid)) or {}).get("status", "") or "")
-            if current:
-                kept += 1
-                continue
-            if rsvp.set_attendance_status(int(inter.guild.id), selected_id, uid, "present", int(inter.user.id)):
-                changed += 1
+        total_participants = len(_attendance_unique_participants(event))
+        result = rsvp.apply_attendance_updates(
+            int(inter.guild.id),
+            selected_id,
+            marked_by=int(inter.user.id),
+            confirm_open=True,
+        )
+        if not bool((result or {}).get("ok", False)):
+            await inter.edit_original_response(content="❌ Offene Anwesenheiten konnten nicht gespeichert werden.")
+            return
+        changed = int((result or {}).get("applied", 0) or 0)
+        kept = max(0, total_participants - changed)
         st = _event_check_state(int(inter.guild.id), selected_id)
         await _refresh_attendance_check_message(
             inter.client, int(inter.guild.id), selected_id,
             int(st.get("channel_id", 0) or 0), int(st.get("message_id", 0) or 0),
         )
-        await _publish_dashboard_snapshot_now(inter.client, int(inter.guild.id))
         await inter.edit_original_response(content=f"✅ **{changed} offene Spieler** auf **War da** gesetzt. **{kept} gesetzte Status** blieben unverändert. Event-ID: `{selected_id}`")
 
     @dkp.command(name="balance", description="Zeigt deinen EC-/DKP-Stand privat")
@@ -3921,10 +3962,17 @@ async def setup_dkp_system(client: discord.Client, tree: app_commands.CommandTre
             await inter.followup.send("❌ Für dieses Event und diesen Eventtyp wurden bereits EC vergeben. Nutze bei Fehlern `/dkp adjust`.", ephemeral=True)
             return
 
+        event, auto_confirmed, confirm_error = _confirm_open_attendance_for_award(
+            rsvp, int(home_id), str(event_id), int(inter.user.id)
+        )
+        if confirm_error or not event:
+            await inter.followup.send(f"❌ Automatische Anwesenheitsbestätigung fehlgeschlagen: {confirm_error}", ephemeral=True)
+            return
+
         present, reserve, skipped_partner, skipped_open = _attendance_summary_for_award(client, int(home_id), event, resolved_event_type)
         awarded = present + reserve
         if not awarded:
-            await inter.followup.send("❌ Keine bestätigten Gildenteilnehmer mit Status 'War da' gefunden.", ephemeral=True)
+            await inter.followup.send("❌ Keine EC-berechtigten Gildenteilnehmer für dieses Event gefunden.", ephemeral=True)
             return
 
         for row in awarded:
@@ -3941,9 +3989,22 @@ async def setup_dkp_system(client: discord.Client, tree: app_commands.CommandTre
             row["points"] = int(tx.get("amount", 0) or 0)
             row["weekly_limited"] = row["points"] < int(row.get("requested_points", row["points"]) or 0)
 
+        st = _event_check_state(int(home_id), str(event_id))
+        st["awarded"] = True
+        st["awarded_at"] = _now_iso()
+        save_event_checks()
+
         emb = _award_log_embed(event, resolved_event_type, present, reserve, skipped_partner, skipped_open, inter.user)
+        if auto_confirmed:
+            emb.add_field(
+                name="✅ Automatisch bestätigt",
+                value=f"**{auto_confirmed}** offene Teilnehmer wurden vor der EC-Vergabe auf **War da** gesetzt.",
+                inline=False,
+            )
         await _log_to_channel(client, int(home_id), emb)
-        await inter.followup.send(f"✅ EC vergeben: **{len(awarded)}** Gildenspieler. Log wurde gepostet.", ephemeral=True)
+        await _publish_dashboard_snapshot_now(client, int(home_id))
+        auto_text = f" **{auto_confirmed} offene Teilnehmer** wurden automatisch als anwesend bestätigt." if auto_confirmed else ""
+        await inter.followup.send(f"✅ EC vergeben: **{len(awarded)}** Gildenspieler.{auto_text} Log wurde gepostet.", ephemeral=True)
 
     @dkp.command(name="post_event_check", description="Leader: EC-Anwesenheitscheck sofort in den Log-Kanal posten")
     async def dkp_post_event_check(inter: discord.Interaction, event_id: str):
@@ -4221,7 +4282,7 @@ def _award_preview_embed(event: dict, event_type: str, present: list[dict], rese
     lines = [f"• {x.get('name') or ('User ' + str(x['user_id']))}" for x in skipped_partner]
     emb.add_field(name="🤝 Allianz/Partner – keine DKP", value="\n".join(lines)[:1000] if lines else "—", inline=False)
     open_count = len(skipped_open)
-    emb.add_field(name="⚪ Nicht als 'War da' bestätigt", value=str(open_count), inline=True)
+    emb.add_field(name="⚪ Bei Vergabe automatisch 'War da'", value=str(open_count), inline=True)
     return emb
 
 

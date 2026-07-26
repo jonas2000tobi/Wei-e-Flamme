@@ -16,6 +16,11 @@ from discord.ui import View, button, Modal, TextInput, Select, ChannelSelect, Ro
 from discord.enums import ButtonStyle
 
 try:
+    from bot.event_images import preset_urls_by_display_name  # type: ignore
+except Exception:
+    from event_images import preset_urls_by_display_name  # type: ignore
+
+try:
     from bot.channel_picker import send_text_channel_picker, send_voice_channel_picker  # type: ignore
 except Exception:
     from channel_picker import send_text_channel_picker, send_voice_channel_picker  # type: ignore
@@ -4334,13 +4339,7 @@ async def _admin_create_event_voice(
         return None
 
 
-EVENT_IMAGE_PRESETS = {
-    "Normal Raid": "https://media.discordapp.net/attachments/1488142284812714085/1516086614957494312/282b2b20-5a8f-4251-b038-15fde2ac723d.png?ex=6a315d30&is=6a300bb0&hm=767b9ad51564019a71be77906c480350e29137f24e08b6abd99f67a9c9edad33&=&format=webp&quality=lossless",
-    "Hard Raid": "https://media.discordapp.net/attachments/1488142284812714085/1513816935832228033/7225f274-cc4f-4eda-ba74-ca401f4e572b.png?ex=6a310462&is=6a2fb2e2&hm=9aa88c9c5b45f6eea14ec33541344421b7d467b3b5969f2c8d7faeebb3b30df2&=&format=webp&quality=lossless",
-    "Nightmare": "https://media.discordapp.net/attachments/1488142284812714085/1513816992358858842/d6ee8bc1-432a-4d28-914d-31be80adf835.png?ex=6a310470&is=6a2fb2f0&hm=77fbec16dae3b00858a4dd20000eec86150d99de8823aab5acc7a3189f39092c&=&format=webp&quality=lossless",
-    "Trials": "https://media.discordapp.net/attachments/1488142284812714085/1491660359952502825/file_000000007dcc7246bb6e57ae41860769.png?ex=6a30d4f7&is=6a2f8377&hm=40ae17883015fa630db3155e0d922cdfbf8fea9ca88a43a0b20a51d6852a9e64&=&format=webp&quality=lossless&width=1440&height=960",
-    "PvP": "https://media.discordapp.net/attachments/1488142284812714085/1513202292302811186/1780845919107.png?ex=6a30c234&is=6a2f70b4&hm=eb19a0dbc88e29a962ba726adc39f397f6240652dfd5b377a87c74b311f680b5&=&format=webp&quality=lossless",
-}
+EVENT_IMAGE_PRESETS = preset_urls_by_display_name()
 
 
 DKP_EVENT_TYPES = [
@@ -5440,6 +5439,7 @@ class AdminEventImageSelect(Select):
             discord.SelectOption(label="Trials", value="Trials"),
             discord.SelectOption(label="Nightmare", value="Nightmare"),
             discord.SelectOption(label="PvP", value="PvP"),
+            discord.SelectOption(label="Gildenbosse", value="Gildenbosse"),
         ]
         super().__init__(
             placeholder="Bildtyp wählen",
@@ -5458,6 +5458,7 @@ class AdminEventImageSelect(Select):
 
         image_url = None if value == "none" else EVENT_IMAGE_PRESETS.get(value)
         self.data["image_url"] = image_url or ""
+        self.data["image_preset"] = value
 
         if str(self.data.get("scope", "")) == "alliance":
             await _portal_defer(inter, ephemeral=True, thinking=True)

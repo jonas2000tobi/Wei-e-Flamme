@@ -24,6 +24,11 @@ from discord.ui import View, button
 from discord.enums import ButtonStyle
 
 try:
+    from bot.event_images import event_image_asset_url, normalize_event_image_url  # type: ignore
+except Exception:
+    from event_images import event_image_asset_url, normalize_event_image_url  # type: ignore
+
+try:
     from bot.channel_picker import send_text_channel_picker, send_voice_channel_picker  # type: ignore
 except Exception:
     from channel_picker import send_text_channel_picker, send_voice_channel_picker  # type: ignore
@@ -819,8 +824,9 @@ def build_embed(guild: discord.Guild, obj: dict) -> discord.Embed:
             inline=False,
         )
 
-    if obj.get("image_url"):
-        emb.set_image(url=obj["image_url"])
+    stable_image_url = normalize_event_image_url(obj, str(obj.get("image_url") or ""), absolute=True)
+    if stable_image_url:
+        emb.set_image(url=stable_image_url)
 
     emb.set_footer(text="DM-Buttons und Server-Buttons schreiben beide in dieselbe Anmeldung.")
 
@@ -3104,11 +3110,12 @@ def _dashboard_event_parse_when(payload: dict[str, Any], fallback_iso: str = "")
 
 
 _DASHBOARD_EVENT_IMAGE_PRESETS = {
-    "normal raid": "https://media.discordapp.net/attachments/1488142284812714085/1516086614957494312/282b2b20-5a8f-4251-b038-15fde2ac723d.png?ex=6a315d30&is=6a300bb0&hm=767b9ad51564019a71be77906c480350e29137f24e08b6abd99f67a9c9edad33&=&format=webp&quality=lossless",
-    "hard raid": "https://media.discordapp.net/attachments/1488142284812714085/1513816935832228033/7225f274-cc4f-4eda-ba74-ca401f4e572b.png?ex=6a310462&is=6a2fb2e2&hm=9aa88c9c5b45f6eea14ec33541344421b7d467b3b5969f2c8d7faeebb3b30df2&=&format=webp&quality=lossless",
-    "nightmare": "https://media.discordapp.net/attachments/1488142284812714085/1513816992358858842/d6ee8bc1-432a-4d28-914d-31be80adf835.png?ex=6a310470&is=6a2fb2f0&hm=77fbec16dae3b00858a4dd20000eec86150d99de8823aab5acc7a3189f39092c&=&format=webp&quality=lossless",
-    "trials": "https://media.discordapp.net/attachments/1488142284812714085/1491660359952502825/file_000000007dcc7246bb6e57ae41860769.png?ex=6a30d4f7&is=6a2f8377&hm=40ae17883015fa630db3155e0d922cdfbf8fea9ca88a43a0b20a51d6852a9e64&=&format=webp&quality=lossless&width=1440&height=960",
-    "pvp": "https://media.discordapp.net/attachments/1488142284812714085/1513202292302811186/1780845919107.png?ex=6a30c234&is=6a2f70b4&hm=eb19a0dbc88e29a962ba726adc39f397f6240652dfd5b377a87c74b311f680b5&=&format=webp&quality=lossless",
+    "normal raid": event_image_asset_url("normal_raid"),
+    "hard raid": event_image_asset_url("hard_raid"),
+    "nightmare": event_image_asset_url("nightmare"),
+    "trials": event_image_asset_url("trials"),
+    "pvp": event_image_asset_url("pvp"),
+    "gildenbosse": event_image_asset_url("guild_boss"),
 }
 
 _DASHBOARD_EVENT_IMAGE_ALIASES = {
@@ -3116,18 +3123,21 @@ _DASHBOARD_EVENT_IMAGE_ALIASES = {
     "hard": "hard raid",
     "hm raid": "hard raid",
     "nightmare": "nightmare",
-    "nm raid": "nightmare",
+    "nm raid": "normal raid",
     "trial": "trials",
     "trials": "trials",
     "pvp": "pvp",
+    "gildenboss": "gildenbosse",
+    "gildenbosse": "gildenbosse",
 }
 
 
 def _dashboard_event_image_url_from_payload(payload: dict[str, Any]) -> str | None:
     direct = str(payload.get("image_url") or "").strip()
     if direct:
-        return direct
-    image_type = str(payload.get("image_type") or "").strip().lower()
+        stable = normalize_event_image_url(payload, direct, absolute=True)
+        return stable or None
+    image_type = str(payload.get("image_type") or payload.get("image_preset") or "").strip().lower()
     if image_type in {"", "none", "custom"}:
         return None
     key = _DASHBOARD_EVENT_IMAGE_ALIASES.get(image_type, image_type)
@@ -3575,6 +3585,12 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
 
     for msg_id, obj in list(store.items()):
         try:
+            raw_image_url = str(obj.get("image_url") or "").strip()
+            stable_image_url = normalize_event_image_url(obj, raw_image_url, absolute=True)
+            if stable_image_url and stable_image_url != raw_image_url:
+                obj["image_url"] = stable_image_url
+            elif raw_image_url and not stable_image_url:
+                obj.pop("image_url", None)
             srv_count, dm_count = _register_persistent_views_for_event(client, str(msg_id), obj)
             restored_server_views += srv_count
             restored_dm_views += dm_count
