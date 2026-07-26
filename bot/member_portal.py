@@ -2966,30 +2966,49 @@ async def _delete_old_bot_dms_for_member(
     member: discord.Member,
     limit: int = 300
 ) -> int:
-    if member.bot:
-        return 0
+    """Delete obsolete bot DMs while keeping the one active guild portal.
 
-    if client.user is None:
+    Older versions deliberately protected every message that looked like a
+    portal page and skipped all messages with components. That left stale
+    attendance/admin menus permanently visible after the real portal had
+    already moved on. The stored active portal message is now the only portal
+    surface that is protected. Other interactive messages are removed only
+    when their component IDs or embed title identify them as portal/admin
+    menus. Unrelated interactive DMs such as event RSVP messages stay intact.
+    """
+    if member.bot or client.user is None:
         return 0
 
     active_menu_id = _portal_message_id(member.guild.id, member.id)
 
-    protected_titles = {
+    # The command calls ensure_portal_menu_for_user before this helper, but
+    # recover the active root once more if the saved ID was missing or stale.
+    if not active_menu_id:
+        try:
+            active_message = await _fetch_or_find_active_portal_message(
+                client,
+                member.guild.id,
+                member.id,
+            )
+            if active_message is not None:
+                active_menu_id = int(active_message.id)
+                _mark_portal_sent(member.guild.id, member.id, active_menu_id)
+        except Exception:
+            active_menu_id = 0
+
+    portal_titles = {
         "⚜️ Gildenzentrale",
         f"{EMOJI_EBOLUS} Gildenzentrale",
         "🏰 Gildenzentrale",
         "👤 Dein Gildenprofil",
         f"{EMOJI_PERSONAL} Dein Gildenprofil",
         "📅 Gildenkalender",
-        "📅 Gildenkalender",
         "📅 Gilden-Events",
         "🏖️ Abwesenheitskalender",
         "📬 Raid-/Event-DMs",
         "❓ Hilfe – Gildenbot",
-        "❓ Hilfe – Gildenbot",
         "👥 Gildenmitglieder",
         "👥 Mitgliederliste",
-        "📜 Regeln & Lootsystem",
         "📜 Regeln & Lootsystem",
         "🎁 Needliste",
         "👤 Persönlich",
@@ -3010,6 +3029,7 @@ async def _delete_old_bot_dms_for_member(
         f"{EMOJI_LOOT} Admin – Loot",
         "✅ Admin – Anwesenheit",
         "✅ Anwesenheit prüfen",
+        "💰 EC vergeben – Bestätigung",
     }
 
     deleted = 0
@@ -3019,29 +3039,33 @@ async def _delete_old_bot_dms_for_member(
 
         async for msg in dm.history(limit=limit):
             try:
-                if msg.author.id != client.user.id:
+                if int(getattr(msg.author, "id", 0) or 0) != int(client.user.id):
                     continue
 
-                if active_menu_id and msg.id == active_menu_id:
+                # Exactly one message is the active, editable Gildenzentrale.
+                if active_menu_id and int(msg.id) == int(active_menu_id):
                     continue
 
-                title = ""
-                if msg.embeds:
-                    title = msg.embeds[0].title or ""
+                title = _message_embed_title(msg)
+                component_ids = _message_component_ids(msg)
 
-                if title in protected_titles:
-                    if not active_menu_id:
-                        _mark_portal_sent(member.guild.id, member.id, msg.id)
-                        active_menu_id = msg.id
+                is_stale_portal_surface = (
+                    bool(component_ids)
+                    and any(_is_portal_component_id(cid) for cid in component_ids)
+                ) or title in portal_titles or _looks_like_primary_portal_surface(msg)
+
+                if is_stale_portal_surface:
+                    await msg.delete()
+                    deleted += 1
+                    await asyncio.sleep(0.08)
                     continue
 
-                # Safety: the Gildenzentrale is one saved DM that can temporarily
-                # show many admin/loot/auction wizard pages. Those pages have
-                # buttons/selects, so manual cleanup must not delete interactive
-                # bot messages unless a feature deletes its own tracked message.
+                # Preserve unrelated interactive bot DMs, especially event RSVP
+                # messages whose custom IDs do not belong to the portal system.
                 if getattr(msg, "components", None):
                     continue
 
+                # Keep the historic cleanup behaviour for plain bot replies.
                 await msg.delete()
                 deleted += 1
                 await asyncio.sleep(0.08)
