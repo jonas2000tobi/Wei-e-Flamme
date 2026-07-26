@@ -1314,7 +1314,11 @@ def get_attendance_events_for_guild(guild_id: int) -> list[dict]:
 def get_attendance_event(guild_id: int, event_id: str) -> dict | None:
     g = _attendance_guild_bucket(int(guild_id))
     ev = (g.get("events") or {}).get(str(event_id))
-    return ev if isinstance(ev, dict) else None
+    if not isinstance(ev, dict):
+        return None
+    if _dedupe_attendance_participants(ev):
+        save_attendance()
+    return ev
 
 
 def _attendance_find_participant(ev: dict, user_id: int) -> dict | None:
@@ -1326,6 +1330,48 @@ def _attendance_find_participant(ev: dict, user_id: int) -> dict | None:
         except Exception:
             continue
     return None
+
+
+def _dedupe_attendance_participants(ev: dict) -> bool:
+    """Repariert alte Snapshots mit mehrfach vorhandenen Discord-Nutzer-IDs."""
+    raw = ev.get("participants") if isinstance(ev.get("participants"), list) else []
+    unique: list[dict] = []
+    by_id: dict[int, dict] = {}
+    changed = False
+
+    for p in raw:
+        if not isinstance(p, dict):
+            changed = True
+            continue
+        try:
+            uid = int(p.get("id", 0) or 0)
+        except Exception:
+            uid = 0
+        if not uid:
+            changed = True
+            continue
+        existing = by_id.get(uid)
+        if existing is None:
+            copy = dict(p)
+            copy["id"] = uid
+            by_id[uid] = copy
+            unique.append(copy)
+            continue
+
+        changed = True
+        # Fehlende Daten aus der doppelten Zeile übernehmen, ohne eine echte
+        # RSVP-Anmeldung durch einen späteren manuellen Nachtrag umzuschreiben.
+        if not str(existing.get("name", "") or "") and str(p.get("name", "") or ""):
+            existing["name"] = p.get("name")
+        if not str(existing.get("signup", "") or "") and str(p.get("signup", "") or ""):
+            existing["signup"] = p.get("signup")
+        if bool(p.get("manual")) or str(p.get("source", "") or "") == "manual":
+            existing.setdefault("manual_duplicate_repaired", True)
+
+    if changed or len(unique) != len(raw):
+        ev["participants"] = unique
+        return True
+    return False
 
 
 def add_attendance_participant(guild_id: int, event_id: str, user_id: int, name: str, signup: str = "DPS", status: str = "present", marked_by: int = 0) -> bool:
@@ -1353,9 +1399,12 @@ def add_attendance_participant(guild_id: int, event_id: str, user_id: int, name:
         })
     else:
         p["name"] = str(name or p.get("name") or f"User {user_id}")
-        p["signup"] = signup
-        p["manual"] = bool(p.get("manual", False)) or True
-        p["source"] = str(p.get("source", "") or "manual")
+        was_manual = bool(p.get("manual")) or str(p.get("source", "") or "") == "manual"
+        if was_manual or not str(p.get("signup", "") or ""):
+            p["signup"] = signup
+        # Ein bereits angemeldeter Spieler bleibt eine echte RSVP-Anmeldung.
+        # Nur der Anwesenheitsstatus wurde manuell ergänzt.
+        p["attendance_added_manually"] = True
         p["updated_by"] = int(marked_by or 0)
         p["updated_at"] = datetime.now(TZ).isoformat()
     return set_attendance_status(guild_id, event_id, user_id, status, marked_by)
@@ -1398,7 +1447,7 @@ def set_attendance_status(guild_id: int, event_id: str, user_id: int, status: st
     if not ev:
         return False
 
-    valid = {"present", "absent", "excused", "maybe"}
+    valid = {"present", "reserve", "absent", "excused", "maybe"}
     attendance = ev.setdefault("attendance", {})
 
     if status == "clear":

@@ -791,11 +791,59 @@ def _participant_display_name(client: discord.Client, guild_id: int, participant
     return discord.utils.escape_markdown(stored or "Unbekannter Spieler")
 
 
+def _attendance_unique_participants(event: dict) -> list[dict]:
+    """Liefert jede Discord-Nutzer-ID genau einmal.
+
+    Alte Snapshots konnten durch Nachträge oder frühere Merge-Versionen doppelte
+    Teilnehmerzeilen enthalten. Anzeige, Zähler und EC-Vergabe müssen deshalb
+    dieselbe deduplizierte Grundlage verwenden.
+    """
+    unique: list[dict] = []
+    seen: set[int] = set()
+    for p in event.get("participants") or []:
+        if not isinstance(p, dict):
+            continue
+        try:
+            uid = int(p.get("id", 0) or 0)
+        except Exception:
+            uid = 0
+        if not uid or uid in seen:
+            continue
+        seen.add(uid)
+        unique.append(p)
+    return unique
+
+
+def _attendance_sorted_participants(event: dict) -> list[dict]:
+    """Sortiert gesetzte Anwesenheiten nach vorne, damit Summen sichtbar prüfbar sind."""
+    attendance = event.get("attendance") if isinstance(event.get("attendance"), dict) else {}
+    status_rank = {
+        "present": 0,
+        "reserve": 1,
+        "maybe": 2,
+        "absent": 3,
+        "excused": 4,
+        "": 5,
+        "open": 5,
+    }
+
+    def _key(p: dict) -> tuple[int, int, str, int]:
+        try:
+            uid = int(p.get("id", 0) or 0)
+        except Exception:
+            uid = 0
+        status = str((attendance.get(str(uid)) or {}).get("status", "") or "")
+        manual = bool(p.get("manual")) or str(p.get("source", "") or "") == "manual" or str(p.get("signup", "") or "") == "MANUAL"
+        name = str(p.get("name", "") or p.get("display_name", "") or f"User {uid}").casefold()
+        return (status_rank.get(status, 5), 0 if manual else 1, name, uid)
+
+    return sorted(_attendance_unique_participants(event), key=_key)
+
+
 def _attendance_status_counts(event: dict) -> dict[str, int]:
-    participants = event.get("participants") or []
     attendance = event.get("attendance") or {}
     counts = {"present": 0, "reserve": 0, "maybe": 0, "absent": 0, "excused": 0, "open": 0}
-    for p in participants:
+    for p in _attendance_unique_participants(event):
         try:
             uid = int(p.get("id", 0) or 0)
         except Exception:
@@ -860,7 +908,7 @@ def _attendance_check_embed(client: discord.Client, home_guild_id: int, event: d
         "Nachgetragene Spieler werden **nur für diese EC-Anwesenheit** gespeichert und ändern keine Event-Anmeldung."
     )
 
-    participants = event.get("participants") or []
+    participants = _attendance_sorted_participants(event)
     attendance = event.get("attendance") or {}
     lines = []
     for p in participants[:25]:
@@ -1195,12 +1243,14 @@ async def _award_event_now(
 
 
 class ECAttendanceParticipantSelect(Select):
-    def __init__(self, guild_id: int, event_id: str, participants: list[dict], page: int, source_channel_id: int, source_message_id: int):
+    def __init__(self, guild_id: int, event_id: str, event: dict, page: int, source_channel_id: int, source_message_id: int):
         self.guild_id = int(guild_id)
         self.event_id = str(event_id)
         self.page = int(page)
         self.source_channel_id = int(source_channel_id)
         self.source_message_id = int(source_message_id)
+        participants = _attendance_sorted_participants(event)
+        attendance = event.get("attendance") if isinstance(event.get("attendance"), dict) else {}
         start = self.page * 25
         chunk = participants[start:start + 25]
         options: list[discord.SelectOption] = []
@@ -1215,10 +1265,13 @@ class ECAttendanceParticipantSelect(Select):
             label = raw_name[:90]
             signup = _signup_label(str(p.get("signup", "") or ""))
             manual = " • nachgetragen" if bool(p.get("manual")) or str(p.get("source", "") or "") == "manual" or str(p.get("signup", "") or "") == "MANUAL" else ""
-            options.append(discord.SelectOption(label=label, value=str(uid), description=(signup + manual)[:100]))
+            status = str((attendance.get(str(uid)) or {}).get("status", "") or "")
+            description = f"{signup}{manual} • {_attendance_status_label(status)}"
+            options.append(discord.SelectOption(label=label, value=str(uid), description=description[:100]))
         if not options:
             options = [discord.SelectOption(label="Keine Spieler gefunden", value="0", description="Dieses Event hat keine Anwesenheitsliste")]
-        super().__init__(placeholder=f"Spieler wählen – Seite {self.page + 1}", min_values=1, max_values=1, options=options, custom_id="dkp_attendance_participant_select")
+        max_page = max(0, (len(participants) - 1) // 25)
+        super().__init__(placeholder=f"Spieler wählen – Seite {self.page + 1}/{max_page + 1}", min_values=1, max_values=1, options=options, custom_id="dkp_attendance_participant_select")
 
     async def callback(self, inter: discord.Interaction):
         if inter.guild is None or not _is_leader_or_admin(inter):
@@ -1247,8 +1300,8 @@ class ECAttendanceParticipantView(View):
         self.page = int(page)
         self.source_channel_id = int(source_channel_id)
         self.source_message_id = int(source_message_id)
-        self.participants = list(event.get("participants") or [])
-        self.add_item(ECAttendanceParticipantSelect(self.guild_id, self.event_id, self.participants, self.page, self.source_channel_id, self.source_message_id))
+        self.participants = _attendance_sorted_participants(event)
+        self.add_item(ECAttendanceParticipantSelect(self.guild_id, self.event_id, event, self.page, self.source_channel_id, self.source_message_id))
 
     async def _show_page(self, inter: discord.Interaction, page: int):
         rsvp = _import_rsvp()
@@ -1256,8 +1309,14 @@ class ECAttendanceParticipantView(View):
         if not event:
             await inter.response.send_message("❌ Event nicht gefunden.", ephemeral=True)
             return
+        participants = _attendance_sorted_participants(event)
+        max_page = max(0, (len(participants) - 1) // 25)
+        page = max(0, min(int(page), max_page))
         await inter.response.edit_message(
-            content="Wähle einen Spieler aus der EC-Anwesenheitsliste. Das ändert keine Event-Anmeldung.",
+            content=(
+                f"Wähle einen Spieler aus der EC-Anwesenheitsliste – Seite **{page + 1}/{max_page + 1}**. "
+                "Gesetzte Status und nachgetragene Spieler stehen zuerst."
+            ),
             embed=None,
             view=ECAttendanceParticipantView(self.guild_id, self.event_id, event, page, self.source_channel_id, self.source_message_id),
         )
@@ -1276,6 +1335,13 @@ class ECAttendanceParticipantView(View):
             return
         max_page = max(0, (len(self.participants) - 1) // 25)
         await self._show_page(inter, min(max_page, self.page + 1))
+
+    @button(label="🔄 Aktualisieren", style=ButtonStyle.secondary, custom_id="dkp_attendance_page_refresh", row=1)
+    async def refresh_page(self, inter: discord.Interaction, _btn: discord.ui.Button):
+        if inter.guild is None or not _is_leader_or_admin(inter):
+            await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
+            return
+        await self._show_page(inter, self.page)
 
 
 class ECAttendanceStatusView(View):
@@ -1447,7 +1513,7 @@ class ECEventCheckView(View):
             return False
         return True
 
-    @button(label="Alle Anmeldungen bestätigen", style=ButtonStyle.success, custom_id="dkp_check_confirm_all", row=0)
+    @button(label="Alle offenen → War da", style=ButtonStyle.success, custom_id="dkp_check_confirm_all", row=0)
     async def confirm_all(self, inter: discord.Interaction, btn: discord.ui.Button):
         if not await self._guard(inter):
             return
@@ -1465,16 +1531,27 @@ class ECEventCheckView(View):
         if not event:
             await inter.edit_original_response(content="❌ Event nicht gefunden.", embed=None, view=None)
             return
-        count = 0
-        for p in event.get("participants", []) or []:
+
+        attendance = event.get("attendance") if isinstance(event.get("attendance"), dict) else {}
+        changed = 0
+        kept = 0
+        failed = 0
+        for p in _attendance_unique_participants(event):
             try:
                 uid = int(p.get("id", 0) or 0)
             except Exception:
                 uid = 0
             if not uid:
                 continue
+            current = str((attendance.get(str(uid)) or {}).get("status", "") or "")
+            if current:
+                kept += 1
+                continue
             if rsvp.set_attendance_status(self.guild_id, self.event_id, uid, "present", int(inter.user.id)):
-                count += 1
+                changed += 1
+            else:
+                failed += 1
+
         event = rsvp.get_attendance_event(self.guild_id, self.event_id) or event
         event_type = _dkp_type_from_event(event, self.event_id)
         emb = _attendance_check_embed(inter.client, self.guild_id, event, self.event_id, event_type or "Unbekannt")
@@ -1482,7 +1559,12 @@ class ECEventCheckView(View):
             await inter.message.edit(embed=emb, view=self)
         except Exception as e:
             print(f"[dkp_system] EC-Check confirm_all Message-Update fehlgeschlagen: {e!r}")
-        await inter.edit_original_response(content=f"✅ {count} angemeldete Spieler wurden als 'War da' bestätigt. Nutze bei Bedarf „Einzel bearbeiten“ oder „Spieler nachtragen“.", embed=None, view=None)
+
+        text = f"✅ **{changed} offene Spieler** wurden auf **War da** gesetzt. **{kept} bereits gesetzte Status** blieben unverändert."
+        if failed:
+            text += f" ⚠️ {failed} konnten nicht gespeichert werden."
+        text += " Einzelbearbeitung und Nachtragen bleiben weiterhin verfügbar."
+        await inter.edit_original_response(content=text, embed=None, view=None)
 
     @button(label="Einzel bearbeiten", style=ButtonStyle.secondary, custom_id="dkp_check_edit_one", row=0)
     async def edit_one(self, inter: discord.Interaction, btn: discord.ui.Button):
@@ -1495,8 +1577,13 @@ class ECEventCheckView(View):
             return
         source_channel_id = int(getattr(inter.channel, "id", 0) or 0)
         source_message_id = int(getattr(inter.message, "id", 0) or 0) if inter.message else 0
+        participants = _attendance_sorted_participants(event)
+        max_page = max(0, (len(participants) - 1) // 25)
         await inter.response.send_message(
-            "Wähle einen Spieler aus der EC-Anwesenheitsliste. Das ändert keine Event-Anmeldung.",
+            (
+                f"Wähle einen Spieler aus der EC-Anwesenheitsliste – Seite **1/{max_page + 1}**. "
+                "Gesetzte Status und nachgetragene Spieler stehen zuerst."
+            ),
             view=ECAttendanceParticipantView(self.guild_id, self.event_id, event, 0, source_channel_id, source_message_id),
             ephemeral=True,
         )
@@ -2837,7 +2924,7 @@ def _resolve_event_type(choice: Optional[app_commands.Choice[str]], event: dict 
 
 
 def _attendance_summary_for_award(client: discord.Client, home_guild_id: int, event: dict, event_type: str) -> tuple[list[dict], list[dict], list[dict], list[dict]]:
-    participants = event.get("participants") or []
+    participants = _attendance_unique_participants(event)
     attendance = event.get("attendance") or {}
     present: list[dict] = []
     reserve: list[dict] = []
@@ -2915,6 +3002,36 @@ def _register_persistent_event_check_views(client: discord.Client) -> int:
     return count
 
 
+async def _refresh_registered_event_check_messages(client: discord.Client) -> None:
+    """Aktualisiert offene Check-Nachrichten nach Deploy inklusive neuer Buttontexte."""
+    await asyncio.sleep(2)
+    refreshed = 0
+    for gid_str, g in list((dkp_event_checks or {}).items()):
+        try:
+            gid = int(gid_str)
+        except Exception:
+            continue
+        events = g.get("events") if isinstance(g, dict) else {}
+        if not isinstance(events, dict):
+            continue
+        for event_id, st in list(events.items()):
+            if not isinstance(st, dict):
+                continue
+            if not bool(st.get("posted", False)) or bool(st.get("ignored", False)) or bool(st.get("awarded", False)):
+                continue
+            channel_id = int(st.get("channel_id", 0) or 0)
+            message_id = int(st.get("message_id", 0) or 0)
+            if not channel_id or not message_id:
+                continue
+            try:
+                await _refresh_attendance_check_message(client, gid, str(event_id), channel_id, message_id)
+                refreshed += 1
+                await asyncio.sleep(0.15)
+            except Exception as e:
+                print(f"[dkp_system] EC-Check Start-Refresh fehlgeschlagen {gid}/{event_id}/{message_id}: {e!r}")
+    print(f"💰 EC-Anwesenheitschecks nach Deploy aktualisiert: {refreshed}")
+
+
 async def setup_dkp_system(client: discord.Client, tree: app_commands.CommandTree):
     # Initialisiert Defaults für alle aktuell bekannten Guilds.
     for guild in getattr(client, "guilds", []) or []:
@@ -2927,6 +3044,7 @@ async def setup_dkp_system(client: discord.Client, tree: app_commands.CommandTre
     try:
         registered_checks = _register_persistent_event_check_views(client)
         print(f"💰 EC-Anwesenheitscheck Persistent Views registriert: {registered_checks}")
+        asyncio.create_task(_refresh_registered_event_check_messages(client))
     except Exception as e:
         print(f"[dkp_system] EC-Anwesenheitscheck Persistent Views Fehler: {e!r}")
 
