@@ -49,7 +49,7 @@ async def _dashboard_lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Guild Platform Dashboard", version="2.3.0", lifespan=_dashboard_lifespan)
+app = FastAPI(title="Guild Platform Dashboard", version="2.3.1", lifespan=_dashboard_lifespan)
 security = HTTPBasic(auto_error=False)
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -57,7 +57,7 @@ if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 ASSET_VER = "beer-and-buffs-v2-3-0-admin-event-editor"
-DASHBOARD_RELEASE_VERSION = "2.3.0 · Adminportal & laufende Events bearbeiten"
+DASHBOARD_RELEASE_VERSION = "2.3.1 · Vereinfachte Anwesenheitsprüfung"
 
 _EVENT_IMAGE_ASSETS: dict[str, str] = {
     "guild_boss": "https://media.discordapp.net/attachments/1528469765860098171/1528469820738375882/Gildenbosse.png?ex=6a66fbb2&is=6a65aa32&hm=68dd55e6c4471bfafac7fbe6f397e338df96be2a7d5ed09e5670beaabd2b1306&=&format=webp&quality=lossless&width=1521&height=856",
@@ -19788,20 +19788,30 @@ def _render_attendance_event(data: dict[str, Any], event_id: str, saved: bool = 
     items = [x for x in ((payload.get("items") if isinstance(payload, dict) else []) or []) if isinstance(x, dict)]
     signup_order = {"TANK": 0, "HEAL": 1, "HEALER": 1, "DPS": 2, "BANK": 3, "RESERVE": 3, "VIELLEICHT": 4, "ABGEMELDET": 5, "—": 6}
     items.sort(key=lambda i: (signup_order.get(str(i.get("signup") or "—").upper(), 20), str(i.get("display_name") or "").casefold()))
-    voice_summary = _voice_event_analysis(snap, event)
-    response_summary = _event_response_summary(snap, event)
+    bot_suggested_present = sum(
+        1
+        for item in (live_payload.get("items") or [])
+        if isinstance(item, dict) and str(item.get("status") or "open") == "present"
+    )
     present = sum(1 for i in items if str(i.get("status")) == "present")
-    partial = sum(1 for i in items if str(i.get("status")) == "partial")
     absent = sum(1 for i in items if str(i.get("status")) == "absent")
-    ignored = sum(1 for i in items if str(i.get("status")) == "ignore")
-    open_count = sum(1 for i in items if str(i.get("status") or "open") not in {"present", "partial", "absent", "ignore"})
-    cards = "".join([
-        _card("Sollte dabei sein", response_summary.get("yes_count", 0), "ursprüngliche Zusagen"),
-        _card("Bot-Voice erkannt", voice_summary.get("voice_user_count", 0), "im Event-Voice"),
-        _card("Zusage ohne Voice", len(voice_summary.get("yes_not_voice") or []), "manuell prüfen"),
-        _card("Voice ohne Zusage", len(voice_summary.get("voice_not_registered") or []), "manuell prüfen"),
-        _card("Offen", open_count, "noch nicht bewertet"),
-    ])
+    cards = f"""
+    <div class="card">
+      <div class="card-title">Bot-Vorschlag</div>
+      <div class="card-value">{_e(bot_suggested_present)}</div>
+      <div class="card-sub">vom Bot als „War da“ vorgeschlagen</div>
+    </div>
+    <div class="card">
+      <div class="card-title">Aktuell „War da“</div>
+      <div class="card-value" id="attendance-present-count">{_e(present)}</div>
+      <div class="card-sub">derzeit ausgewählt</div>
+    </div>
+    <div class="card">
+      <div class="card-title">Aktuell „Nicht da“</div>
+      <div class="card-value" id="attendance-absent-count">{_e(absent)}</div>
+      <div class="card-sub">derzeit ausgewählt</div>
+    </div>
+    """
     rows_html = []
     for i in items:
         uid = _user_id(i.get("user_id"))
@@ -19885,7 +19895,7 @@ def _render_attendance_event(data: dict[str, Any], event_id: str, saved: bool = 
       <div>
         <div class="eyebrow">{hero_label}</div>
         <h1>📝 {_e(event.get('title') or event_id)}</h1>
-        <p class="muted">Event-ID: {_e(event_id)} · Zeit: {_e(_dt(event.get('when_iso') or event.get('start_at')))} · ursprüngliche Zusagen: {_e(response_summary.get('yes_count', 0))} · Bot-Voice erkannt: {_e(voice_summary.get('voice_user_count', 0))}</p>
+        <p class="muted">Event-ID: {_e(event_id)} · Zeit: {_e(_dt(event.get('when_iso') or event.get('start_at')))}</p>
         {updated}
       </div>
       <div style="display:flex;gap:8px;flex-wrap:wrap">{hero_actions}</div>
@@ -19893,21 +19903,21 @@ def _render_attendance_event(data: dict[str, Any], event_id: str, saved: bool = 
     {saved_note}
     {queue_notice}
     {award_notice}
-    {_attendance_review_control_panel(guild_id, str(event_id), review)}
     <section class="grid">{cards}</section>
     <section class="panel">
-      <h2>➕ Spieler hinzufügen</h2>
-      <p class="muted">Der Spieler wird über die Postgres-Queue direkt in die echte Bot-Anwesenheitsliste übernommen.</p>
-      <form method="post" action="/admin/attendance/{_e(event_id)}/add-player" style="display:flex;gap:8px;flex-wrap:wrap;align-items:end">
-        <label>Spieler<br><select name="user_id" required><option value="">Spieler wählen …</option>{add_player_options}</select></label>
-        <label>Rolle<br><select name="signup"><option value="DPS">DPS</option><option value="TANK">Tank</option><option value="HEAL">Heal</option><option value="BANK">Reserve</option></select></label>
-        <label>Status<br><select name="status"><option value="present">War da</option><option value="partial">Teilweise</option><option value="absent">Nicht da</option><option value="open">Offen</option></select></label>
-        <button class="btn" type="submit" {'disabled' if not add_player_options else ''}>➕ Spieler hinzufügen</button>
+      <h2>👥 Anwesenheit nach Ingame-Nachweis einstellen</h2>
+      <p class="muted">Vergleiche deinen Ingame-Screenshot mit dieser Liste. Setze jede Person auf „War da“ oder „Nicht da“. Die beiden Zähler oben ändern sich sofort mit deiner Auswahl.</p>
+      <form id="review-save" method="post" action="/admin/attendance/{_e(event_id)}/save">
+        <div class='table-wrap'><table><thead><tr><th>Spieler</th><th>Zusage / Rolle</th><th>Bot-Voice erkannt</th><th>Quelle</th><th>Tatsächliche Anwesenheit</th><th>Notiz</th></tr></thead><tbody>{''.join(rows_html)}</tbody></table></div>
+        <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:14px;align-items:center">
+          <button class="btn" type="submit" name="next" value="preview">✅ Überprüfen und EC-Vorschau öffnen</button>
+          <button class="btn" type="submit" name="next" value="save">Nur speichern</button>
+        </div>
       </form>
     </section>
     <section class="panel">
       <h2>⚙️ Schnellaktionen</h2>
-      <p class="muted">Diese Aktionen speichern den Review und werden zusätzlich an den Discord-Bot übertragen. EC wird dadurch noch nicht gebucht.</p>
+      <p class="muted">Nur verwenden, wenn die Aktion wirklich auf alle betroffenen Spieler passt. EC wird hier noch nicht gebucht.</p>
       <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
         <form method="post" action="/admin/attendance/{_e(event_id)}/bulk" onsubmit="return confirm('Alle Review-Zeilen auf War da setzen?');">
           <input type="hidden" name="action" value="confirm_all">
@@ -19930,18 +19940,36 @@ def _render_attendance_event(data: dict[str, Any], event_id: str, saved: bool = 
       </div>
     </section>
     <section class="panel">
-      <h2>👥 Anwesenheit einstellen</h2>
-      <p class="muted">Zusage/Rolle zeigt, wer laut Abstimmung dabei sein sollte. Bot-Voice zeigt, wen der Bot im Event-Sprachkanal erkannt hat. Den tatsächlichen Status stellst du anschließend manuell ein.</p>
-      <form id="review-save" method="post" action="/admin/attendance/{_e(event_id)}/save">
-        <div class='table-wrap'><table><thead><tr><th>Spieler</th><th>Zusage / Rolle</th><th>Bot-Voice erkannt</th><th>Quelle</th><th>Tatsächliche Anwesenheit</th><th>Notiz</th></tr></thead><tbody>{''.join(rows_html)}</tbody></table></div>
-        <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:14px;align-items:center">
-          <button class="btn" type="submit" name="next" value="preview">✅ 1. Überprüfen</button>
-          <button class="btn" type="submit" name="next" value="save">Review nur speichern</button>
-          <span class="muted">Überprüfen speichert den Review und öffnet direkt die EC-Vorschau. Danach ist nur noch „EC wirklich buchen“ nötig.</span>
-        </div>
+      <h2>➕ Spieler hinzufügen</h2>
+      <p class="muted">Nur verwenden, wenn eine Person im Ingame-Screenshot auftaucht, aber in der Liste fehlt.</p>
+      <form method="post" action="/admin/attendance/{_e(event_id)}/add-player" style="display:flex;gap:8px;flex-wrap:wrap;align-items:end">
+        <label>Spieler<br><select name="user_id" required><option value="">Spieler wählen …</option>{add_player_options}</select></label>
+        <label>Rolle<br><select name="signup"><option value="DPS">DPS</option><option value="TANK">Tank</option><option value="HEAL">Heal</option><option value="BANK">Reserve</option></select></label>
+        <label>Status<br><select name="status"><option value="present">War da</option><option value="partial">Teilweise</option><option value="absent">Nicht da</option><option value="open">Offen</option></select></label>
+        <button class="btn" type="submit" {'disabled' if not add_player_options else ''}>➕ Spieler hinzufügen</button>
       </form>
     </section>
+    {_attendance_review_control_panel(guild_id, str(event_id), review)}
     {_event_ec_queue_panel(guild_id, str(event_id))}
+    <script>
+    (() => {{
+      const presentCount = document.getElementById('attendance-present-count');
+      const absentCount = document.getElementById('attendance-absent-count');
+      const selects = Array.from(document.querySelectorAll('select[name^="status_"]'));
+      const refreshCounts = () => {{
+        let present = 0;
+        let absent = 0;
+        for (const select of selects) {{
+          if (select.value === 'present') present += 1;
+          if (select.value === 'absent') absent += 1;
+        }}
+        if (presentCount) presentCount.textContent = String(present);
+        if (absentCount) absentCount.textContent = String(absent);
+      }};
+      for (const select of selects) select.addEventListener('change', refreshCounts);
+      refreshCounts();
+    }})();
+    </script>
     """
     return _html_shell(f"Anwesenheit · {event.get('title') or event_id}", body)
 
