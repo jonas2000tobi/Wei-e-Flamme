@@ -287,6 +287,11 @@ class LeaderContactView(View):
 
 
 async def setup_leader_contact(client: discord.Client, tree: app_commands.CommandTree):
+    leader_group = app_commands.Group(
+        name="leader",
+        description="Kontakt zur Gildenleitung verwalten",
+    )
+    tree.add_command(leader_group)
     try:
         client.add_view(LeaderContactView())
     except Exception:
@@ -297,7 +302,7 @@ async def setup_leader_contact(client: discord.Client, tree: app_commands.Comman
     except Exception:
         pass
 
-    @tree.command(name="leadercontact_public", description="(Admin) Öffentlichen Kontakt-Channel setzen")
+    @leader_group.command(name="public_channel", description="(Admin) Öffentlichen Kontakt-Channel setzen")
     async def leadercontact_public(inter: discord.Interaction):
         if not _is_admin(inter):
             await inter.response.send_message("❌ Nur Admins.", ephemeral=True)
@@ -312,7 +317,7 @@ async def setup_leader_contact(client: discord.Client, tree: app_commands.Comman
 
         await send_text_channel_picker(inter, "📣 Öffentlichen Kontakt-Channel auswählen", _picked)
 
-    @tree.command(name="leadercontact_internal", description="(Admin) Internen Leader-Channel setzen")
+    @leader_group.command(name="internal_channel", description="(Admin) Internen Leader-Channel setzen")
     async def leadercontact_internal(inter: discord.Interaction):
         if not _is_admin(inter):
             await inter.response.send_message("❌ Nur Admins.", ephemeral=True)
@@ -327,7 +332,7 @@ async def setup_leader_contact(client: discord.Client, tree: app_commands.Comman
 
         await send_text_channel_picker(inter, "🔒 Internen Leader-Channel auswählen", _picked)
 
-    @tree.command(name="leadercontact_role", description="(Admin) Leader-Rolle setzen")
+    @leader_group.command(name="role", description="(Admin) Leader-Rolle setzen")
     async def leadercontact_role(inter: discord.Interaction, role: discord.Role):
         if not _is_admin(inter):
             await inter.response.send_message("❌ Nur Admins.", ephemeral=True)
@@ -340,7 +345,7 @@ async def setup_leader_contact(client: discord.Client, tree: app_commands.Comman
 
         await inter.response.send_message(f"✅ Leader-Rolle gesetzt: {role.mention}", ephemeral=True)
 
-    @tree.command(name="leadercontact_status", description="(Admin) Zeigt die aktuelle Leader-Kontakt-Konfiguration")
+    @leader_group.command(name="status", description="(Admin) Zeigt die aktuelle Leader-Kontakt-Konfiguration")
     async def leadercontact_status(inter: discord.Interaction):
         if not _is_admin(inter):
             await inter.response.send_message("❌ Nur Admins.", ephemeral=True)
@@ -363,7 +368,7 @@ async def setup_leader_contact(client: discord.Client, tree: app_commands.Comman
         )
         await inter.response.send_message(text, ephemeral=True)
 
-    @tree.command(name="leadercontact_post", description="(Admin) Postet die Kontakt-Nachricht im öffentlichen Kontakt-Channel")
+    @leader_group.command(name="post", description="(Admin) Postet die Kontakt-Nachricht im öffentlichen Kontakt-Channel")
     async def leadercontact_post(inter: discord.Interaction):
         if not _is_admin(inter):
             await inter.response.send_message("❌ Nur Admins.", ephemeral=True)
@@ -405,7 +410,7 @@ async def setup_leader_contact(client: discord.Client, tree: app_commands.Comman
 
         await inter.response.send_message(f"✅ Kontakt-Post erstellt: {msg.jump_url}", ephemeral=True)
 
-    @tree.command(name="leadercontact_repost", description="(Admin) Erstellt einen neuen Kontakt-Post")
+    @leader_group.command(name="repost", description="(Admin) Erstellt einen neuen Kontakt-Post")
     async def leadercontact_repost(inter: discord.Interaction):
         if not _is_admin(inter):
             await inter.response.send_message("❌ Nur Admins.", ephemeral=True)

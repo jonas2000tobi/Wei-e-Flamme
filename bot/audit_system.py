@@ -56,10 +56,15 @@ def _format_dt(value: str) -> str:
 
 
 async def setup_audit_system(client: discord.Client, tree: app_commands.CommandTree):
+    audit_group = app_commands.Group(
+        name="audit",
+        description="Audit- und Laufzeitdiagnose",
+    )
+    tree.add_command(audit_group)
     info = init_runtime_db()
     print(f"✅ Runtime-DB initialisiert: {info.get('backend')} {info.get('path')}")
 
-    @tree.command(name="audit_status", description="Admin: Status der neuen Runtime-/Audit-Datenbank")
+    @audit_group.command(name="status", description="Admin: Status der neuen Runtime-/Audit-Datenbank")
     async def audit_status(inter: discord.Interaction):
         if inter.guild is None or not _is_admin(inter):
             await inter.response.send_message("❌ Nur Admins.", ephemeral=True)
@@ -83,7 +88,7 @@ async def setup_audit_system(client: discord.Client, tree: app_commands.CommandT
             emb.add_field(name="Postgres-Fehler", value=f"```{str(st.get('postgres_error'))[:900]}```", inline=False)
         await inter.response.send_message(embed=emb, ephemeral=True)
 
-    @tree.command(name="audit_last", description="Admin: Letzte Audit-Einträge anzeigen")
+    @audit_group.command(name="last", description="Admin: Letzte Audit-Einträge anzeigen")
     @app_commands.describe(limit="Anzahl Einträge, maximal 20")
     async def audit_last(inter: discord.Interaction, limit: int = 10):
         if inter.guild is None or not _is_admin(inter):

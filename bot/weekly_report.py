@@ -460,9 +460,14 @@ _report_task_started = False
 
 
 async def setup_weekly_report(client: discord.Client, tree: app_commands.CommandTree):
+    report_group = app_commands.Group(
+        name="report",
+        description="Wöchentliche Gildenberichte verwalten",
+    )
+    tree.add_command(report_group)
     global _report_task_started
 
-    @tree.command(name="weekly_report_set_channel", description="(Admin) Channel für Wochenbericht setzen")
+    @report_group.command(name="set_channel", description="(Admin) Channel für Wochenbericht setzen")
     async def weekly_report_set_channel(inter: discord.Interaction):
         if not _is_admin(inter):
             await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True)
@@ -477,7 +482,7 @@ async def setup_weekly_report(client: discord.Client, tree: app_commands.Command
 
         await send_text_channel_picker(inter, "📊 Wochenbericht-Channel auswählen", _picked)
 
-    @tree.command(name="weekly_report_toggle", description="(Admin) Wochenbericht aktivieren/deaktivieren")
+    @report_group.command(name="toggle", description="(Admin) Wochenbericht aktivieren/deaktivieren")
     async def weekly_report_toggle(inter: discord.Interaction, enabled: bool):
         if not _is_admin(inter):
             await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True)
@@ -493,7 +498,7 @@ async def setup_weekly_report(client: discord.Client, tree: app_commands.Command
             ephemeral=True
         )
 
-    @tree.command(name="weekly_report_time", description="(Admin) Zeit für Wochenbericht setzen")
+    @report_group.command(name="time", description="(Admin) Zeit für Wochenbericht setzen")
     @app_commands.describe(
         weekday="0=Montag, 1=Dienstag, ..., 6=Sonntag",
         hour="Stunde 0-23",
@@ -520,7 +525,7 @@ async def setup_weekly_report(client: discord.Client, tree: app_commands.Command
             ephemeral=True
         )
 
-    @tree.command(name="weekly_report_status", description="(Admin) Zeigt Wochenbericht-Konfiguration")
+    @report_group.command(name="status", description="(Admin) Zeigt Wochenbericht-Konfiguration")
     async def weekly_report_status(inter: discord.Interaction):
         if not _is_admin(inter):
             await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True)
@@ -539,7 +544,7 @@ async def setup_weekly_report(client: discord.Client, tree: app_commands.Command
 
         await inter.response.send_message(text, ephemeral=True)
 
-    @tree.command(name="weekly_report_now", description="(Admin) Erstellt den Wochenbericht sofort")
+    @report_group.command(name="now", description="(Admin) Erstellt den Wochenbericht sofort")
     async def weekly_report_now(inter: discord.Interaction):
         await inter.response.defer(ephemeral=True, thinking=True)
 

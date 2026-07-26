@@ -719,6 +719,84 @@ def _phase3_profile_ensure_tables() -> None:
         conn.close()
 
 
+def _phase3_upsert_profile_targets_to_pg(targets: list[tuple[int, int]] | set[tuple[int, int]]) -> dict[str, Any]:
+    """Spiegelt nur konkret geänderte Profile und Abwesenheiten."""
+    unique_targets = sorted({(int(gid), int(uid)) for gid, uid in targets if int(gid) and int(uid)})
+    if not unique_targets:
+        return {"ok": True, "counts": {"members": 0, "absences": 0}}
+    if not _phase3_profile_database_url():
+        return {"ok": False, "error": "DATABASE_URL fehlt"}
+    _phase3_profile_ensure_tables()
+    counts = {"members": 0, "absences": 0}
+    conn = _phase3_profile_pg_connect()
+    try:
+        with conn.cursor() as cur:
+            for guild_id, user_id in unique_targets:
+                guild_data = profiles.get(str(guild_id)) if isinstance(profiles.get(str(guild_id)), dict) else {}
+                users = guild_data.get("users") if isinstance(guild_data.get("users"), dict) else {}
+                absences = guild_data.get("absences") if isinstance(guild_data.get("absences"), dict) else {}
+                profile = users.get(str(user_id))
+                if isinstance(profile, dict):
+                    raw = dict(profile)
+                    raw["user_id"] = str(user_id)
+                    cur.execute("""
+                        INSERT INTO phase3_members (guild_id, user_id, discord_name, ingame_name, roles_json, raw_json, source, updated_at)
+                        VALUES (%s,%s,%s,%s,%s,%s,'member_portal',now())
+                        ON CONFLICT (guild_id, user_id) DO UPDATE SET
+                          discord_name=COALESCE(NULLIF(EXCLUDED.discord_name,''), phase3_members.discord_name),
+                          ingame_name=COALESCE(NULLIF(EXCLUDED.ingame_name,''), phase3_members.ingame_name),
+                          roles_json=EXCLUDED.roles_json,
+                          raw_json=EXCLUDED.raw_json,
+                          source='member_portal',
+                          updated_at=now()
+                    """, (
+                        str(guild_id), str(user_id), str(profile.get("discord_name") or profile.get("display_name") or ""),
+                        str(profile.get("ingame_name") or ""), _phase3_profile_jsonb(profile.get("roles") or []),
+                        _phase3_profile_jsonb(raw),
+                    ))
+                    counts["members"] += 1
+                else:
+                    cur.execute(
+                        "DELETE FROM phase3_members WHERE guild_id=%s AND user_id=%s AND source='member_portal'",
+                        (str(guild_id), str(user_id)),
+                    )
+
+                absence = absences.get(str(user_id))
+                absence_id = f"absence:{user_id}"
+                if absence is not None:
+                    raw_absence = absence if isinstance(absence, dict) else {"value": absence}
+                    cur.execute("""
+                        INSERT INTO phase3_absences (guild_id, absence_id, user_id, status, start_at_text, end_at_text, raw_json, source, updated_at)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,'member_portal',now())
+                        ON CONFLICT (guild_id, absence_id) DO UPDATE SET
+                          user_id=EXCLUDED.user_id,
+                          status=EXCLUDED.status,
+                          start_at_text=EXCLUDED.start_at_text,
+                          end_at_text=EXCLUDED.end_at_text,
+                          raw_json=EXCLUDED.raw_json,
+                          source='member_portal',
+                          updated_at=now()
+                    """, (
+                        str(guild_id), absence_id, str(user_id), str(raw_absence.get("status") or "active"),
+                        str(raw_absence.get("from") or raw_absence.get("start") or ""),
+                        str(raw_absence.get("to") or raw_absence.get("end") or ""),
+                        _phase3_profile_jsonb(raw_absence),
+                    ))
+                    counts["absences"] += 1
+                else:
+                    cur.execute(
+                        "DELETE FROM phase3_absences WHERE guild_id=%s AND absence_id=%s AND source='member_portal'",
+                        (str(guild_id), absence_id),
+                    )
+        conn.commit()
+        return {"ok": True, "counts": counts, "targets": len(unique_targets)}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def _phase3_mirror_profiles_to_pg(guild_id: Optional[int] = None) -> dict[str, Any]:
     if not _phase3_profile_database_url():
         return {"ok": False, "error": "DATABASE_URL fehlt"}
@@ -745,6 +823,7 @@ def _phase3_mirror_profiles_to_pg(guild_id: Optional[int] = None) -> dict[str, A
                         ON CONFLICT (guild_id, user_id) DO UPDATE SET
                           discord_name=COALESCE(NULLIF(EXCLUDED.discord_name,''), phase3_members.discord_name),
                           ingame_name=COALESCE(NULLIF(EXCLUDED.ingame_name,''), phase3_members.ingame_name),
+                          roles_json=EXCLUDED.roles_json,
                           raw_json=EXCLUDED.raw_json,
                           source='member_portal',
                           updated_at=now()
@@ -782,14 +861,26 @@ def _phase3_mirror_profiles_to_pg(guild_id: Optional[int] = None) -> dict[str, A
         conn.close()
 
 
-def save_profiles() -> None:
+def save_profiles(
+    guild_id: int | None = None,
+    user_id: int | None = None,
+    *,
+    targets: list[tuple[int, int]] | set[tuple[int, int]] | None = None,
+) -> None:
     _save_json(PROFILE_FILE, profiles)
     try:
-        _phase3_mirror_profiles_to_pg()
+        if targets:
+            _phase3_upsert_profile_targets_to_pg(targets)
+        elif guild_id is not None and user_id is not None:
+            _phase3_upsert_profile_targets_to_pg({(int(guild_id), int(user_id))})
+        elif guild_id is not None:
+            _phase3_mirror_profiles_to_pg(int(guild_id))
+        else:
+            _phase3_mirror_profiles_to_pg()
     except NameError:
         pass
-    except Exception as e:
-        print(f"[phase3-members] Profil-Spiegelung übersprungen: {e!r}", flush=True)
+    except Exception as exc:
+        print(f"[phase3-members] Profil-Upsert übersprungen: {exc!r}", flush=True)
 
 
 def save_sent() -> None:
@@ -890,6 +981,7 @@ async def _process_profile_update_requests_once(client: discord.Client) -> dict[
         return summary
     summary["claimed"] = len(rows)
     good_ids: list[int] = []
+    changed_targets: set[tuple[int, int]] = set()
     bad: list[tuple[int, str]] = []
     for row in rows:
         try:
@@ -912,12 +1004,13 @@ async def _process_profile_update_requests_once(client: discord.Client) -> dict[
             profile["gearscore"] = str(gearscore)
             profile["updated_at"] = datetime.now(TZ).isoformat()
             good_ids.append(int(row["id"]))
+            changed_targets.add((guild_id, user_id))
         except Exception as exc:
             bad.append((int(row.get("id") or 0), f"{type(exc).__name__}: {exc}"))
 
     if good_ids:
         try:
-            await asyncio.to_thread(save_profiles)
+            await asyncio.to_thread(save_profiles, targets=changed_targets)
             await asyncio.to_thread(_profile_update_finish_sync, good_ids, status="done", error_text="")
             summary["done"] += len(good_ids)
         except Exception as exc:
@@ -3125,12 +3218,11 @@ class ProfileEditModal(PortalSafeModal):
         p["main_role"] = str(self.main_role.value).strip()
         p["gearscore"] = str(gs)
 
-        save_profiles()
-
         try:
             await _portal_defer(inter, )
         except Exception:
             pass
+        await asyncio.to_thread(save_profiles, self.guild_id, self.user_id)
 
         await ensure_portal_menu_for_user(inter.client, self.guild_id, self.user_id, force_view="profile")
 
@@ -3194,6 +3286,11 @@ class AbsenceModal(PortalSafeModal):
             await _portal_send(inter, "❌ Mitglied nicht gefunden.")
             return
 
+        try:
+            await _portal_defer(inter, )
+        except Exception:
+            pass
+
         g = _gdata(self.guild_id)
         g["absences"][str(self.user_id)] = {
             "from": from_s,
@@ -3202,7 +3299,7 @@ class AbsenceModal(PortalSafeModal):
             "created_at": datetime.now(TZ).isoformat()
         }
 
-        save_profiles()
+        await asyncio.to_thread(save_profiles, self.guild_id, self.user_id)
 
         p = _user_profile(self.guild_id, self.user_id)
         ingame = p.get("ingame_name") or _display_name(member)
@@ -3228,11 +3325,6 @@ class AbsenceModal(PortalSafeModal):
                 await ch.send(embed=emb)
             except Exception:
                 pass
-
-        try:
-            await _portal_defer(inter, )
-        except Exception:
-            pass
 
         await ensure_portal_menu_for_user(inter.client, self.guild_id, self.user_id, force_view="main")
 
@@ -5672,8 +5764,58 @@ async def _admin_attendance_events(guild: Optional[discord.Guild]) -> list[dict]
         return []
 
 
+def _admin_attendance_unique_participants(event: dict) -> list[dict]:
+    """Eine sichtbare Zeile pro Discord-Nutzer, auch bei alten doppelten Snapshots."""
+    unique: list[dict] = []
+    seen: set[int] = set()
+    for raw in event.get("participants") or []:
+        if not isinstance(raw, dict):
+            continue
+        try:
+            uid = int(raw.get("id", 0) or 0)
+        except Exception:
+            uid = 0
+        if not uid or uid in seen:
+            continue
+        seen.add(uid)
+        unique.append(raw)
+    return unique
+
+
+def _admin_attendance_sorted_participants(event: dict) -> list[dict]:
+    attendance = event.get("attendance") if isinstance(event.get("attendance"), dict) else {}
+    rank = {"present": 0, "reserve": 1, "maybe": 2, "absent": 3, "excused": 4, "": 5}
+    def key(row: dict):
+        try:
+            uid = int(row.get("id", 0) or 0)
+        except Exception:
+            uid = 0
+        status = str((attendance.get(str(uid)) or {}).get("status", "") or "")
+        manual = bool(row.get("manual")) or str(row.get("source", "") or "") == "manual"
+        name = str(row.get("name", "") or f"User {uid}").casefold()
+        return (rank.get(status, 5), 0 if manual else 1, name, uid)
+    return sorted(_admin_attendance_unique_participants(event), key=key)
+
+
+async def _admin_publish_attendance_dashboard(client: discord.Client, guild_id: int) -> None:
+    """Nach Bot-Änderungen den Web-Snapshot sofort aktualisieren."""
+    try:
+        guild = client.get_guild(int(guild_id))
+        if guild is None:
+            return
+        try:
+            from bot import dashboard_data as dashboard_data_module  # type: ignore
+        except Exception:
+            import dashboard_data as dashboard_data_module  # type: ignore
+        publish = getattr(dashboard_data_module, "publish_dashboard_snapshot", None)
+        if callable(publish):
+            await asyncio.to_thread(publish, client, guild)
+    except Exception as exc:
+        print(f"[member_portal] Sofortiger Anwesenheits-Snapshot fehlgeschlagen: {exc!r}", flush=True)
+
+
 def _admin_attendance_embed(guild: discord.Guild, event: dict) -> discord.Embed:
-    participants = event.get("participants") or []
+    participants = _admin_attendance_unique_participants(event)
     attendance = event.get("attendance") or {}
 
     counts = {"present": 0, "absent": 0, "excused": 0, "maybe": 0, "open": 0}
@@ -5860,7 +6002,7 @@ class AdminAttendanceMemberSelectView(PortalSafeView):
         self.user_id = int(user_id)
         self.event_id = str(event_id)
         self.page = max(0, int(page))
-        participants = event.get("participants") or []
+        participants = _admin_attendance_sorted_participants(event)
         max_page = max(0, (len(participants) - 1) // 25)
         if self.page > max_page:
             self.page = max_page
@@ -5891,9 +6033,50 @@ class AdminAttendanceMemberSelectView(PortalSafeView):
         if not guild or not event:
             await _portal_send(inter, "❌ Event nicht gefunden.", ephemeral=True)
             return
-        participants = event.get("participants") or []
+        participants = _admin_attendance_sorted_participants(event)
         max_page = max(0, (len(participants) - 1) // 25)
         await _portal_edit(inter, embed=_admin_attendance_embed(guild, event), view=AdminAttendanceMemberSelectView(self.guild_id, self.user_id, self.event_id, event, min(max_page, self.page + 1)))
+
+    @button(label="✅ Alle offenen → War da", style=ButtonStyle.success, custom_id="admin_attendance_all_open_present", row=3)
+    async def btn_all_open_present(self, inter: discord.Interaction, _):
+        resolved_guild, member = await _resolve_guild_member_from_inter(inter)
+        if not _is_portal_admin(resolved_guild, member):
+            await _portal_send(inter, "❌ Dieser Bereich ist nur für Gildenleitung, Berater oder Wächter.", ephemeral=True)
+            return
+        await _portal_defer(inter, ephemeral=True, thinking=True)
+        rsvp = _admin_event_module()
+        guild = inter.client.get_guild(self.guild_id) or resolved_guild
+        event = rsvp.get_attendance_event(self.guild_id, self.event_id)
+        if not guild or not event:
+            await inter.followup.send("❌ Event nicht gefunden.", ephemeral=True)
+            return
+        attendance = event.get("attendance") if isinstance(event.get("attendance"), dict) else {}
+        changed = 0
+        kept = 0
+        for participant in _admin_attendance_unique_participants(event):
+            try:
+                uid = int(participant.get("id", 0) or 0)
+            except Exception:
+                uid = 0
+            if not uid:
+                continue
+            current = str((attendance.get(str(uid)) or {}).get("status", "") or "")
+            if current:
+                kept += 1
+                continue
+            if rsvp.set_attendance_status(self.guild_id, self.event_id, uid, "present", int(inter.user.id)):
+                changed += 1
+        event = rsvp.get_attendance_event(self.guild_id, self.event_id)
+        asyncio.create_task(_admin_publish_attendance_dashboard(inter.client, self.guild_id))
+        if event and inter.message:
+            await inter.message.edit(
+                embed=_admin_attendance_embed(guild, event),
+                view=AdminAttendanceMemberSelectView(self.guild_id, self.user_id, self.event_id, event, self.page),
+            )
+        await inter.followup.send(
+            f"✅ **{changed} offene Spieler** auf **War da** gesetzt. **{kept} bereits gesetzte Status** blieben unverändert.",
+            ephemeral=True,
+        )
 
     @button(label="➕ Spieler hinzufügen", style=ButtonStyle.success, custom_id="admin_attendance_add_player", row=2)
     async def btn_add_player(self, inter: discord.Interaction, _):
@@ -6125,6 +6308,7 @@ class AdminAttendanceAddModal(Modal, title="Spieler zur Anwesenheit hinzufügen"
         if not ok or not event:
             await _portal_send(inter, "❌ Spieler konnte nicht hinzugefügt werden.", ephemeral=True)
             return
+        asyncio.create_task(_admin_publish_attendance_dashboard(inter.client, self.guild_id))
         await _portal_edit(inter, embed=_admin_attendance_embed(guild, event), view=AdminAttendanceMemberSelectView(self.guild_id, self.user_id, self.event_id, event, self.page))
 
 
@@ -6134,7 +6318,7 @@ class AdminAttendanceMemberSelect(Select):
         self.user_id = int(user_id)
         self.event_id = str(event_id)
         self.page = max(0, int(page))
-        participants = event.get("participants") or []
+        participants = _admin_attendance_sorted_participants(event)
         attendance = event.get("attendance") or {}
         start_i = self.page * 25
         page_participants = participants[start_i:start_i + 25]
@@ -6195,6 +6379,7 @@ class AdminAttendanceMarkView(PortalSafeView):
         if not ok or not guild or not event:
             await _portal_send(inter, "❌ Anwesenheit konnte nicht gespeichert werden.", ephemeral=True)
             return
+        asyncio.create_task(_admin_publish_attendance_dashboard(inter.client, self.guild_id))
         await _portal_edit(inter, embed=_admin_attendance_embed(guild, event), view=AdminAttendanceMemberSelectView(self.guild_id, self.user_id, self.event_id, event, self.page))
 
     async def _remove(self, inter: discord.Interaction):
@@ -6205,6 +6390,7 @@ class AdminAttendanceMarkView(PortalSafeView):
         if not ok or not guild or not event:
             await _portal_send(inter, "❌ Spieler konnte nicht entfernt werden.", ephemeral=True)
             return
+        asyncio.create_task(_admin_publish_attendance_dashboard(inter.client, self.guild_id))
         await _portal_edit(inter, embed=_admin_attendance_embed(guild, event), view=AdminAttendanceMemberSelectView(self.guild_id, self.user_id, self.event_id, event, self.page))
 
     @button(label="✅ War da", style=ButtonStyle.success, custom_id="admin_attendance_mark_present", row=0)
@@ -6383,11 +6569,11 @@ class AdminMenuView(PortalSafeView):
             description=(
                 "Event-Verwaltung im Menü.\n\n"
                 "Aktuell sind die bestehenden Slash-Commands weiterhin die sicherste Eingabeform:\n"
-                "• `/raid_create_dm` – normalen Raid erstellen\n"
-                "• `/alliance_raid_create` – Allianz-Raid erstellen\n"
-                "• `/raid_delete` – Event löschen\n"
-                "• `/alliance_raid_delete` – Allianz-Event löschen\n"
-                "• `/raid_resend_missing` – fehlende Abstimmungen erneut senden\n\n"
+                "• `/event create` – normalen Raid erstellen\n"
+                "• `/event alliance_create` – Allianz-Raid erstellen\n"
+                "• `/event delete` – Event löschen\n"
+                "• `/event alliance_delete` – Allianz-Event löschen\n"
+                "• `/event resend_missing` – fehlende Abstimmungen erneut senden\n\n"
                 "Die vollständige Formular-Version bauen wir als nächsten Schritt, ohne die bestehenden Eventdaten anzufassen."
             ),
             color=discord.Color.gold()
@@ -7219,6 +7405,11 @@ async def refresh_portals_for_guild(
 
 
 async def setup_member_portal(client: discord.Client, tree: app_commands.CommandTree):
+    portal_group = app_commands.Group(
+        name="portal",
+        description="Private Gildenzentrale verwalten",
+    )
+    tree.add_command(portal_group)
     # Beim Serverwechsel haben Custom-Emojis neue IDs. Der Bot übernimmt sie
     # automatisch anhand der Emoji-Namen, bevor persistente Views registriert werden.
     for guild in list(getattr(client, "guilds", []) or []):
@@ -7320,7 +7511,7 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
     _start_portal_repair_loop(client)
     _start_profile_update_loop(client)
 
-    @tree.command(name="portal_set_absence_channel", description="(Admin) Abwesenheitskanal setzen")
+    @portal_group.command(name="set_absence_channel", description="(Admin) Abwesenheitskanal setzen")
     async def portal_set_absence_channel(inter: discord.Interaction):
         if not _is_admin(inter):
             await _portal_send(inter, "❌ Nur Admin/Manage Server.", ephemeral=True)
@@ -7335,7 +7526,7 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
 
         await send_text_channel_picker(inter, "📅 Abwesenheitskanal auswählen", _picked)
 
-    @tree.command(name="portal_set_member_role", description="(Admin) Rolle setzen, deren Mitglieder automatisch die Gildenzentrale bekommen")
+    @portal_group.command(name="set_member_role", description="(Admin) Rolle setzen, deren Mitglieder automatisch die Gildenzentrale bekommen")
     async def portal_set_member_role(inter: discord.Interaction, role: discord.Role):
         if not _is_admin(inter):
             await _portal_send(inter, "❌ Nur Admin/Manage Server.", ephemeral=True)
@@ -7352,7 +7543,7 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
             ephemeral=True
         )
 
-    @tree.command(name="portal_set_guild_info", description="(Admin) Mitteilung in der Gildenzentrale setzen oder leeren")
+    @portal_group.command(name="set_guild_info", description="(Admin) Mitteilung in der Gildenzentrale setzen oder leeren")
     async def portal_set_guild_info(inter: discord.Interaction, text: str = ""):
         if not _is_admin(inter):
             await _portal_send(inter, "❌ Nur Admins/Manage Guild.", ephemeral=True)
@@ -7377,8 +7568,8 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
         else:
             await _portal_send(inter, "✅ Gildeninfo geleert. Nutze `/guild portal_refresh_all neu_erstellen:false`, um bestehende Menüs zu aktualisieren.", ephemeral=True)
 
-    @tree.command(
-        name="portal_rundnachricht",
+    @portal_group.command(
+        name="broadcast",
         description="(Admin) Sendet eine private Rundnachricht an alle Gildenmitglieder",
     )
     async def portal_rundnachricht(inter: discord.Interaction):
@@ -7395,7 +7586,7 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
 
         if not member_role_id:
             await _portal_send(inter, 
-                "❌ Keine Gildenmitglied-Rolle gesetzt. Nutze zuerst `/portal_set_member_role`.",
+                "❌ Keine Gildenmitglied-Rolle gesetzt. Nutze zuerst `/portal set_member_role`.",
                 ephemeral=True,
             )
             return
@@ -7421,7 +7612,7 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
             )
         )
 
-    @tree.command(name="portal_force_new_user", description="(Admin) Erzwingt eine komplett neue Gildenzentrale per DM")
+    @portal_group.command(name="force_user", description="(Admin) Erzwingt eine komplett neue Gildenzentrale per DM")
     async def portal_force_new_user(inter: discord.Interaction, member: discord.Member):
         await _portal_defer(inter, ephemeral=True, thinking=True)
 
@@ -7454,7 +7645,7 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
                 ephemeral=True,
             )
 
-    @tree.command(name="portal_force_new_all", description="(Admin) Erzwingt eine komplett neue Gildenzentrale bei allen Gildenmitgliedern")
+    @portal_group.command(name="force_all", description="(Admin) Erzwingt eine komplett neue Gildenzentrale bei allen Gildenmitgliedern")
     async def portal_force_new_all(inter: discord.Interaction):
         await _portal_defer(inter, ephemeral=True, thinking=True)
 
@@ -7467,7 +7658,7 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
 
         if not member_role_id:
             await inter.followup.send(
-                "❌ Keine Gildenmitglied-Rolle gesetzt. Nutze zuerst `/portal_set_member_role`.",
+                "❌ Keine Gildenmitglied-Rolle gesetzt. Nutze zuerst `/portal set_member_role`.",
                 ephemeral=True
             )
             return
@@ -7514,7 +7705,7 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
             ephemeral=True
         )
 
-    @tree.command(name="portal_dm_cleanup_user", description="(Admin) Löscht alte Bot-DMs bei einem Mitglied, schützt aktive Gildenzentrale")
+    @portal_group.command(name="cleanup_user", description="(Admin) Löscht alte Bot-DMs bei einem Mitglied, schützt aktive Gildenzentrale")
     async def portal_dm_cleanup_user(
         inter: discord.Interaction,
         member: discord.Member,
@@ -7539,7 +7730,7 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
             ephemeral=True
         )
 
-    @tree.command(name="portal_dm_cleanup_all", description="(Admin) Löscht alte Bot-DMs bei allen Gildenmitgliedern, schützt aktive Gildenzentrale")
+    @portal_group.command(name="cleanup_all", description="(Admin) Löscht alte Bot-DMs bei allen Gildenmitgliedern, schützt aktive Gildenzentrale")
     async def portal_dm_cleanup_all(
         inter: discord.Interaction,
         limit: int = 300
@@ -7557,7 +7748,7 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
 
         if not member_role_id:
             await inter.followup.send(
-                "❌ Keine Gildenmitglied-Rolle gesetzt. Nutze zuerst `/portal_set_member_role`.",
+                "❌ Keine Gildenmitglied-Rolle gesetzt. Nutze zuerst `/portal set_member_role`.",
                 ephemeral=True
             )
             return
@@ -7596,7 +7787,7 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
             ephemeral=True
         )
 
-    @tree.command(name="portal_set_position_roles", description="(Admin) Rollen für Anführer/Gildenberater/Wächter setzen")
+    @portal_group.command(name="set_position_roles", description="(Admin) Rollen für Anführer/Gildenberater/Wächter setzen")
     async def portal_set_position_roles(
         inter: discord.Interaction,
         anfuehrer: discord.Role,
@@ -7625,7 +7816,7 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
             ephemeral=True
         )
 
-    @tree.command(name="portal_event_add", description="(Admin) Festes Event für die Gildenzentrale hinzufügen")
+    @portal_group.command(name="event_add", description="(Admin) Festes Event für die Gildenzentrale hinzufügen")
     async def portal_event_add(
         inter: discord.Interaction,
         weekday: str,
@@ -7654,7 +7845,7 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
             ephemeral=True
         )
 
-    @tree.command(name="portal_events_clear", description="(Admin) Alle festen Gildenzentrale-Events löschen")
+    @portal_group.command(name="events_clear", description="(Admin) Alle festen Gildenzentrale-Events löschen")
     async def portal_events_clear(inter: discord.Interaction):
         if not _is_admin(inter):
             await _portal_send(inter, "❌ Nur Admin/Manage Server.", ephemeral=True)
@@ -7667,7 +7858,7 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
 
         await _portal_send(inter, "✅ Alle Gildenzentrale-Events gelöscht.", ephemeral=True)
 
-    @tree.command(name="portal_events_list", description="(Admin) Zeigt gespeicherte Gildenzentrale-Events")
+    @portal_group.command(name="events_list", description="(Admin) Zeigt gespeicherte Gildenzentrale-Events")
     async def portal_events_list(inter: discord.Interaction):
         if not _is_admin(inter):
             await _portal_send(inter, "❌ Nur Admin/Manage Server.", ephemeral=True)
@@ -7687,7 +7878,7 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
 
         await _portal_send(inter, "\n".join(lines), ephemeral=True)
 
-    @tree.command(name="portal_post", description="(Admin) Postet den Button zum Öffnen der privaten Gildenzentrale")
+    @portal_group.command(name="post", description="(Admin) Postet den Button zum Öffnen der privaten Gildenzentrale")
     async def portal_post(inter: discord.Interaction):
         if not _is_admin(inter):
             await _portal_send(inter, "❌ Nur Admin/Manage Server.", ephemeral=True)
@@ -7727,7 +7918,7 @@ async def setup_member_portal(client: discord.Client, tree: app_commands.Command
 
         await send_text_channel_picker(inter, "⚜️ Kanal für Gildenzentrale-Post auswählen", _picked)
 
-    @tree.command(name="portal_status", description="(Admin) Zeigt Portal-Konfiguration")
+    @portal_group.command(name="status", description="(Admin) Zeigt Portal-Konfiguration")
     async def portal_status(inter: discord.Interaction):
         if not _is_admin(inter):
             await _portal_send(inter, "❌ Nur Admin/Manage Server.", ephemeral=True)

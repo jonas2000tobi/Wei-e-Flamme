@@ -268,14 +268,26 @@ def _save(p: Path, obj):
 store: Dict[str, dict] = _load(RSVP_FILE, {})
 cfg: Dict[str, dict] = _load(DM_CFG_FILE, {})
 attendance_store: Dict[str, dict] = _load(ATTENDANCE_FILE, {})
+_RSVP_LOCKS: dict[str, asyncio.Lock] = {}
 
 
-def save_store():
+def _rsvp_lock(event_id: str) -> asyncio.Lock:
+    key = str(event_id)
+    lock = _RSVP_LOCKS.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _RSVP_LOCKS[key] = lock
+    return lock
+
+
+def save_store(event_id: str | None = None):
     _save(RSVP_FILE, store)
     try:
-        _phase3_mirror_events_from_store()
+        if event_id:
+            _phase3_upsert_event_from_store(str(event_id))
+        else:
+            _phase3_mirror_events_from_store()
     except NameError:
-        # Während des Modulimports ist die Spiegel-Funktion noch nicht definiert.
         pass
     except Exception as e:
         print(f"[phase3-events] Event-Spiegelung übersprungen: {e!r}", flush=True)
@@ -1465,6 +1477,124 @@ def set_attendance_status(guild_id: int, event_id: str, user_id: int, status: st
     return True
 
 
+def apply_attendance_updates(
+    guild_id: int,
+    event_id: str,
+    items: list[dict[str, Any]] | None = None,
+    *,
+    marked_by: int = 0,
+    confirm_open: bool = False,
+) -> dict[str, Any]:
+    """Wendet mehrere Anwesenheitsänderungen mit genau einem Dateischreibvorgang an.
+
+    Diese Funktion wird von der Dashboard-Queue verwendet. Sie verhindert, dass
+    ein Massenabgleich pro Spieler die komplette event_attendance.json neu schreibt.
+    """
+    ev = get_attendance_event(int(guild_id), str(event_id))
+    if not ev:
+        return {"ok": False, "applied": 0, "added": 0, "failed": [{"error": "Event nicht gefunden"}]}
+
+    participants = ev.setdefault("participants", [])
+    attendance = ev.setdefault("attendance", {})
+    now_iso = datetime.now(TZ).isoformat()
+    valid_statuses = {"present", "reserve", "absent", "excused", "maybe"}
+    applied = 0
+    added = 0
+    failed: list[dict[str, Any]] = []
+    changed = False
+
+    if confirm_open:
+        for participant in list(participants):
+            try:
+                uid = int(participant.get("id", 0) or 0)
+            except Exception:
+                uid = 0
+            if not uid or str((attendance.get(str(uid)) or {}).get("status") or ""):
+                continue
+            attendance[str(uid)] = {
+                "status": "present",
+                "marked_by": int(marked_by or 0),
+                "marked_at": now_iso,
+            }
+            applied += 1
+            changed = True
+    else:
+        for item in list(items or []):
+            if not isinstance(item, dict):
+                continue
+            try:
+                uid = int(item.get("user_id") or item.get("id") or 0)
+            except Exception:
+                uid = 0
+            if not uid:
+                failed.append({"user_id": 0, "error": "Ungültige User-ID"})
+                continue
+
+            display_name = str(item.get("display_name") or item.get("name") or f"User {uid}")
+            signup = str(item.get("signup") or "DPS").upper().strip()
+            if signup not in {"TANK", "HEAL", "DPS", "BANK"}:
+                signup = "DPS"
+            target_status = str(item.get("status") or "clear").strip().lower()
+            if target_status not in valid_statuses and target_status != "clear":
+                target_status = "clear"
+
+            participant = _attendance_find_participant(ev, uid)
+            if participant is None:
+                participant = {
+                    "id": uid,
+                    "name": display_name,
+                    "signup": signup,
+                    "manual": True,
+                    "source": "manual",
+                    "added_by": int(marked_by or 0),
+                    "added_at": now_iso,
+                }
+                participants.append(participant)
+                added += 1
+                changed = True
+            else:
+                if str(participant.get("name") or "") != display_name:
+                    participant["name"] = display_name
+                    changed = True
+                was_manual = (
+                    bool(participant.get("manual"))
+                    or str(participant.get("source") or "").lower() == "manual"
+                    or str(participant.get("signup") or "").upper() == "MANUAL"
+                )
+                # Eine echte RSVP-Rolle bleibt die Quelle der Wahrheit. Nur
+                # manuelle/rollenlose Nachträge dürfen über das Dashboard eine
+                # neue Signup-Rolle erhalten.
+                if (was_manual or not str(participant.get("signup") or "")) and str(participant.get("signup") or "").upper() != signup:
+                    participant["signup"] = signup
+                    changed = True
+                participant["attendance_added_manually"] = True
+                participant["updated_by"] = int(marked_by or 0)
+                participant["updated_at"] = now_iso
+
+            previous = attendance.get(str(uid))
+            if target_status == "clear":
+                if str(uid) in attendance:
+                    attendance.pop(str(uid), None)
+                    changed = True
+            else:
+                new_value = {
+                    "status": target_status,
+                    "marked_by": int(marked_by or 0),
+                    "marked_at": now_iso,
+                }
+                if previous != new_value:
+                    attendance[str(uid)] = new_value
+                    changed = True
+            applied += 1
+
+    if _dedupe_attendance_participants(ev):
+        changed = True
+    if changed:
+        ev["updated_at"] = now_iso
+        save_attendance()
+    return {"ok": True, "applied": applied, "added": added, "failed": failed, "changed": changed}
+
+
 def _event_voice_name(title: str) -> str:
     raw = str(title or "Event").strip() or "Event"
     raw = re.sub(r"[#@`*_~|<>\n\r]+", "", raw).strip()
@@ -2141,7 +2271,7 @@ async def apply_rsvp(inter: discord.Interaction, msg_id: str, group: str) -> tup
     else:
         return False, "Ungültige Auswahl."
 
-    save_store()
+    save_store(str(msg_id))
     record_response(int(obj["guild_id"]), uid, str(msg_id), response_key)
     await _push_overview(inter.client, str(msg_id), obj)
 
@@ -2184,7 +2314,10 @@ class BaseRaidView(View):
 
     async def _handle(self, inter: discord.Interaction, group: str):
         try:
-            ok, text = await apply_rsvp(inter, self.msg_id, group)
+            if not inter.response.is_done():
+                await inter.response.defer(ephemeral=True, thinking=True)
+            async with _rsvp_lock(self.msg_id):
+                ok, text = await apply_rsvp(inter, self.msg_id, group)
             await self._send_feedback(inter, text)
 
             if ok:
@@ -2731,6 +2864,64 @@ def _phase3_event_rsvp_rows_from_store(obj: dict, event_id: str) -> list[dict[st
         key = (str(row.get("event_id") or ""), str(row.get("user_id") or row.get("display_name") or ""))
         dedup[key] = row
     return list(dedup.values())
+
+
+def _phase3_upsert_event_from_store(event_id: str) -> dict[str, Any]:
+    """Spiegelt genau ein Event und seine aktuellen RSVPs."""
+    if not _dashboard_event_queue_available():
+        return {"ok": False, "error": "DATABASE_URL fehlt"}
+    _phase3_event_ensure_tables()
+    ev_id = str(event_id)
+    obj = store.get(ev_id)
+    conn = _dashboard_pg_connect()
+    try:
+        with conn.cursor() as cur:
+            if not isinstance(obj, dict):
+                # Event kann bereits aus dem JSON entfernt sein: anhand event_id in allen Gilden löschen.
+                cur.execute("DELETE FROM phase3_event_rsvps WHERE event_id=%s", (ev_id,))
+                cur.execute("DELETE FROM phase3_events WHERE event_id=%s", (ev_id,))
+                conn.commit()
+                return {"ok": True, "deleted": True, "event_id": ev_id}
+            _init_event_shape(obj)
+            gid = int(obj.get("guild_id", 0) or 0)
+            if not gid:
+                return {"ok": False, "error": "guild_id fehlt"}
+            gid_s = str(gid)
+            title = str(obj.get("title") or "Event")
+            status = str(obj.get("status") or obj.get("state") or ("deleted" if obj.get("deleted") else "active"))
+            start_at = str(obj.get("when_iso") or obj.get("start_at") or obj.get("date") or "")
+            end_at = str(obj.get("end_at") or "")
+            cur.execute("""
+                INSERT INTO phase3_events (guild_id, event_id, title, status, start_at_text, end_at_text, raw_json, source, updated_at)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,'bot_event_store',now())
+                ON CONFLICT (guild_id, event_id) DO UPDATE SET
+                  title=EXCLUDED.title, status=EXCLUDED.status,
+                  start_at_text=EXCLUDED.start_at_text, end_at_text=EXCLUDED.end_at_text,
+                  raw_json=EXCLUDED.raw_json, source='bot_event_store', updated_at=now()
+            """, (gid_s, ev_id, title, status, start_at, end_at, _phase3_event_jsonb(obj)))
+            cur.execute("DELETE FROM phase3_event_rsvps WHERE guild_id=%s AND event_id=%s", (gid_s, ev_id))
+            count = 0
+            for row in _phase3_event_rsvp_rows_from_store(obj, ev_id):
+                uid = str(row.get("user_id") or "").strip()
+                display = str(row.get("display_name") or "").strip()
+                response = str(row.get("response") or "").strip()
+                role_name = str(row.get("role_name") or "").strip()
+                rsvp_id = f"{ev_id}:{uid or display}:{response}:{role_name}"
+                cur.execute("""
+                    INSERT INTO phase3_event_rsvps
+                      (guild_id, rsvp_id, event_id, user_id, response, role_name, display_name, raw_json, source, updated_at)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,'bot_event_store',now())
+                    ON CONFLICT (guild_id, rsvp_id) DO UPDATE SET
+                      event_id=EXCLUDED.event_id, user_id=EXCLUDED.user_id,
+                      response=EXCLUDED.response, role_name=EXCLUDED.role_name,
+                      display_name=EXCLUDED.display_name, raw_json=EXCLUDED.raw_json,
+                      source='bot_event_store', updated_at=now()
+                """, (gid_s, rsvp_id, ev_id, uid, response, role_name, display, _phase3_event_jsonb(row.get("raw_json") or row)))
+                count += 1
+        conn.commit()
+        return {"ok": True, "event_id": ev_id, "event_rsvps": count}
+    finally:
+        conn.close()
 
 
 def _phase3_mirror_events_from_store(guild_id: int | None = None) -> dict[str, Any]:
@@ -3369,6 +3560,11 @@ async def dashboard_event_action_loop():
 
 
 async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
+    event_group = app_commands.Group(
+        name="event",
+        description="Events, RSVP und Allianz-Raids",
+    )
+    tree.add_command(event_group)
     # Neue Server-IDs automatisch anhand der Emoji-Namen übernehmen.
     for guild in list(getattr(client, "guilds", []) or []):
         _refresh_rsvp_emojis(guild)
@@ -3425,7 +3621,7 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
     except Exception as e:
         print(f"[event_rsvp_dm] Voice-State-Listener Startfehler: {e!r}")
 
-    @tree.command(name="events_phase3_mirror", description="Leader: Events/RSVPs direkt aus dem Bot-Store nach Postgres spiegeln")
+    @event_group.command(name="phase3_mirror", description="Leader: Events/RSVPs direkt aus dem Bot-Store nach Postgres spiegeln")
     async def events_phase3_mirror_cmd(inter: discord.Interaction):
         await inter.response.defer(ephemeral=True, thinking=True)
         if not _is_admin(inter):
@@ -3440,7 +3636,7 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
         except Exception as e:
             await inter.followup.send(f"❌ Phase 3 Event-Spiegelung Fehler: {type(e).__name__}: {e}", ephemeral=True)
 
-    @tree.command(name="events_phase3_status", description="Leader: Phase-3 Events/RSVP Postgres-Status anzeigen")
+    @event_group.command(name="phase3_status", description="Leader: Phase-3 Events/RSVP Postgres-Status anzeigen")
     async def events_phase3_status_cmd(inter: discord.Interaction):
         await inter.response.defer(ephemeral=True, thinking=True)
         if not _is_admin(inter):
@@ -3455,7 +3651,7 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
         except Exception as e:
             await inter.followup.send(f"❌ Phase 3 Event-Status Fehler: {type(e).__name__}: {e}", ephemeral=True)
 
-    @tree.command(name="raid_set_roles_dm", description="(Admin) Primärrollen (Tank/Heal/DPS) für Maybe-Label setzen")
+    @event_group.command(name="set_roles_dm", description="(Admin) Primärrollen (Tank/Heal/DPS) für Maybe-Label setzen")
     @app_commands.describe(tank_role="Rolle: Tank", heal_role="Rolle: Heal", dps_role="Rolle: DPS")
     async def raid_set_roles_dm(
         inter: discord.Interaction,
@@ -3481,7 +3677,7 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
             ephemeral=True
         )
 
-    @tree.command(name="raid_set_log_channel", description="(Admin) Log-Kanal für RSVP-DM (optional)")
+    @event_group.command(name="set_log_channel", description="(Admin) Log-Kanal für RSVP-DM (optional)")
     async def raid_set_log_channel(inter: discord.Interaction):
         if not _is_admin(inter):
             await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True)
@@ -3496,7 +3692,7 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
 
         await send_text_channel_picker(inter, "🧾 RSVP-Log-Kanal auswählen", _picked)
 
-    @tree.command(name="raid_create_dm", description="(Admin) Raid/Anmeldung erzeugen + Übersicht posten")
+    @event_group.command(name="create", description="(Admin) Raid/Anmeldung erzeugen + Übersicht posten")
     @app_commands.describe(
         title="Titel",
         date="Datum YYYY-MM-DD",
@@ -3548,7 +3744,7 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
             msg = await ch.send(embed=emb)
 
             store[str(msg.id)] = obj
-            save_store()
+            save_store(str(msg.id))
 
             try:
                 await msg.edit(view=ServerRaidView(int(msg.id)))
@@ -3581,7 +3777,7 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
                 except Exception:
                     pass
 
-            save_store()
+            save_store(str(msg.id))
 
             ziel = role_obj.mention if role_obj else "alle Mitglieder (ohne Bots)"
 
@@ -3710,7 +3906,7 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
         })
 
         store[str(master_id)] = obj
-        save_store()
+        save_store(str(master_id))
 
         try:
             await home_msg.edit(view=ServerRaidView(master_id))
@@ -3775,7 +3971,7 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
             )
 
         store[str(master_id)] = obj
-        save_store()
+        save_store(str(master_id))
         await _push_overview(inter.client, str(master_id), obj)
 
         result = (
@@ -3799,7 +3995,7 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
         # Home-Gildenzentralen aktualisieren, ohne neue Portal-DMs zu senden.
         _schedule_portal_refresh_for_event(inter.client, inter.guild, obj)
 
-    @tree.command(name="alliance_raid_create", description="(Leader) Allianz-Raid auf alle Server einer Allianz-Gruppe posten")
+    @event_group.command(name="alliance_create", description="(Leader) Allianz-Raid auf alle Server einer Allianz-Gruppe posten")
     @app_commands.describe(
         group="Name der Allianz-Gruppe",
         event_type="NM Raid / HM Raid / PvP Schlacht / Dimensionsprüfung",
@@ -3824,7 +4020,7 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
         await inter.response.defer(ephemeral=True, thinking=True)
         await _create_alliance_raid_impl(inter, group, event_type, title, date, time, description, target_role, image_url)
 
-    @tree.command(name="alliance_raid_from_template", description="(Leader) Allianz-Raid aus gespeichertem Template erstellen")
+    @event_group.command(name="alliance_from_template", description="(Leader) Allianz-Raid aus gespeichertem Template erstellen")
     @app_commands.describe(
         name="Name des Templates",
         date="Datum YYYY-MM-DD",
@@ -3876,7 +4072,7 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
             image_url=image_url,
         )
 
-    @tree.command(name="alliance_raid_template", description="(Leader) Zeigt Copy-Paste-Vorlagen für Allianz-Raids")
+    @event_group.command(name="alliance_template", description="(Leader) Zeigt Copy-Paste-Vorlagen für Allianz-Raids")
     async def alliance_raid_template(inter: discord.Interaction):
         await inter.response.defer(ephemeral=True, thinking=False)
 
@@ -3889,20 +4085,20 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
         text = (
             "**🤝 Allianz-Raid Vorlagen**\n\n"
             "**HM Raid:**\n"
-            "`/alliance_raid_create group:HM Raid Allianz title:HM Raid date:2026-05-30 time:21:00 description:HM Raid – bitte Rolle wählen`\n\n"
+            "`/event alliance_create group:HM Raid Allianz title:HM Raid date:2026-05-30 time:21:00 description:HM Raid – bitte Rolle wählen`\n\n"
             "**Gildenbosse:**\n"
-            "`/alliance_raid_create group:Gildenboss Allianz title:Gildenbosse date:2026-05-30 time:20:00 description:Gildenbosse – Anmeldung für Loot-/Needübersicht`\n\n"
+            "`/event alliance_create group:Gildenboss Allianz title:Gildenbosse date:2026-05-30 time:20:00 description:Gildenbosse – Anmeldung für Loot-/Needübersicht`\n\n"
             "**PvP Event:**\n"
-            "`/alliance_raid_create group:PvP Allianz title:Allianz PvP date:2026-05-30 time:20:30 description:Allianz-PvP – bitte anmelden`\n\n"
+            "`/event alliance_create group:PvP Allianz title:Allianz PvP date:2026-05-30 time:20:30 description:Allianz-PvP – bitte anmelden`\n\n"
             "**Mit Zielrolle für Home-DMs:**\n"
-            "`/alliance_raid_create group:HM Raid Allianz title:HM Raid date:2026-05-30 time:21:00 description:HM Raid target_role:@Raid`\n\n"
+            "`/event alliance_create group:HM Raid Allianz title:HM Raid date:2026-05-30 time:21:00 description:HM Raid target_role:@Raid`\n\n"
             "**Hinweis:**\n"
             "Partner-Server bekommen keine DMs. Dort läuft nur der Channel-Post mit Buttons."
         )
 
         await inter.followup.send(text, ephemeral=True)
 
-    @tree.command(name="raid_resend_missing", description="(Admin) DMs an alle, die noch nicht abgestimmt haben")
+    @event_group.command(name="resend_missing", description="(Admin) DMs an alle, die noch nicht abgestimmt haben")
     async def raid_resend_missing(inter: discord.Interaction, message_id: str):
         await inter.response.defer(ephemeral=True, thinking=True)
 
@@ -3967,7 +4163,7 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
             ephemeral=True
         )
 
-    @tree.command(name="raid_resend_to", description="(Admin) DMs gezielt an Rolle oder User für ein Event senden")
+    @event_group.command(name="resend_to", description="(Admin) DMs gezielt an Rolle oder User für ein Event senden")
     async def raid_resend_to(
         inter: discord.Interaction,
         message_id: str,
@@ -4036,7 +4232,7 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
             ephemeral=True
         )
 
-    @tree.command(name="raid_delete", description="(Admin) Löscht ein Raid-/Event inkl. Serverpost und DMs")
+    @event_group.command(name="delete", description="(Admin) Löscht ein Raid-/Event inkl. Serverpost und DMs")
     async def raid_delete(inter: discord.Interaction, message_id: str):
         await inter.response.defer(ephemeral=True, thinking=True)
 
@@ -4165,7 +4361,7 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
                 pass
 
 
-    @tree.command(name="alliance_raid_delete", description="(Leader) Löscht einen Allianz-Raid inkl. aller Mirror-Posts")
+    @event_group.command(name="alliance_delete", description="(Leader) Löscht einen Allianz-Raid inkl. aller Mirror-Posts")
     async def alliance_raid_delete(inter: discord.Interaction, message_id: str):
         await inter.response.defer(ephemeral=True, thinking=True)
 
@@ -4185,7 +4381,7 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
 
         if not _is_alliance_event(obj):
             await inter.followup.send(
-                "❌ Das ist kein Allianz-Raid. Normale Raids bitte mit `/raid_delete` löschen.",
+                "❌ Das ist kein Allianz-Raid. Normale Raids bitte mit `/event delete` löschen.",
                 ephemeral=True
             )
             return

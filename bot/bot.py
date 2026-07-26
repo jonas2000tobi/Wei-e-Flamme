@@ -53,6 +53,7 @@ setup_dashboard_data = None
 setup_guild_config = None
 store = {}
 _modules_initialized = False
+_startup_failure: str | None = None
 
 
 def _import_modules():
@@ -267,7 +268,7 @@ def _get_token() -> str | None:
 
 @bot.event
 async def on_ready():
-    global _modules_initialized
+    global _modules_initialized, _startup_failure
     print(f"✅ Eingeloggt als {bot.user} (ID: {bot.user.id})")
 
     # on_ready can fire again after a gateway reconnect. Registering commands,
@@ -309,11 +310,24 @@ async def on_ready():
         for module_name, setup_func in setup_steps:
             results.append(await _safe_setup(module_name, setup_func))
 
+        join_hook_ok = True
         try:
+            if register_join_hook is None:
+                raise RuntimeError("Join-Hook-Modul nicht geladen")
             register_join_hook(bot, send_onboarding_dm, auto_resend_for_new_member)
             print("✅ Join-Hook registriert.")
         except Exception as e:
+            join_hook_ok = False
             print(f"❌ Join-Hook Setup-Fehler: {e!r}")
+
+        failed_modules = [name for (name, _), ok in zip(setup_steps, results) if not ok]
+        if not join_hook_ok:
+            failed_modules.append("join_hook")
+        if failed_modules:
+            _startup_failure = "Modul-Setup fehlgeschlagen: " + ", ".join(failed_modules)
+            print(f"🛑 {_startup_failure}. Bot beendet sich kontrolliert, statt teilweise aktiv zu bleiben.", flush=True)
+            await bot.close()
+            return
 
         # Commands werden absichtlich serverbezogen synchronisiert. Globale und
         # serverbezogene Kopien mit identischem Namen führen im Discord-Client zu
@@ -576,12 +590,19 @@ async def cleanup_expired_events():
         print(f"[cleanup_expired_events] Fehler: {e}")
 
 
+raid_group = app_commands.Group(
+    name="raid",
+    description="Persönliche Raid-Einstellungen und Statistiken",
+)
+tree.add_command(raid_group)
+
+
 @tree.command(name="ping", description="Lebenszeichen.")
 async def ping(inter: discord.Interaction):
     await inter.response.send_message("🏓 Pong!", ephemeral=True)
 
 
-@tree.command(name="raid_dm", description="Eigene Raid-DM Einstellungen")
+@raid_group.command(name="dm", description="Eigene Raid-DM Einstellungen")
 @app_commands.describe(mode="on / off / status")
 async def raid_dm(inter: discord.Interaction, mode: str):
     if inter.guild_id is None:
@@ -618,7 +639,7 @@ async def raid_dm(inter: discord.Interaction, mode: str):
     await inter.response.send_message("Nutze: `on`, `off` oder `status`.", ephemeral=True)
 
 
-@tree.command(name="raid_calendar", description="Zeigt kommende Raid-/Event-Termine")
+@raid_group.command(name="calendar", description="Zeigt kommende Raid-/Event-Termine")
 async def raid_calendar(inter: discord.Interaction):
     if inter.guild_id is None:
         await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
@@ -666,7 +687,7 @@ async def raid_calendar(inter: discord.Interaction):
     await inter.response.send_message(embed=emb, ephemeral=True)
 
 
-@tree.command(name="raid_stats", description="Zeigt Mitglieder, die bei Raid-/Events nicht abgestimmt haben")
+@raid_group.command(name="stats", description="Zeigt Mitglieder, die bei Raid-/Events nicht abgestimmt haben")
 async def raid_stats_cmd(inter: discord.Interaction):
     if inter.guild_id is None or inter.guild is None:
         await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
@@ -700,7 +721,7 @@ async def raid_stats_cmd(inter: discord.Interaction):
     await inter.response.send_message(embed=emb, ephemeral=True)
 
 
-@tree.command(name="raid_stats_top", description="Top 10 Mitglieder, die am häufigsten nicht abgestimmt haben")
+@raid_group.command(name="stats_top", description="Top 10 Mitglieder, die am häufigsten nicht abgestimmt haben")
 async def raid_stats_top_cmd(inter: discord.Interaction):
     if inter.guild_id is None or inter.guild is None:
         await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
@@ -740,6 +761,8 @@ def main():
         return
 
     bot.run(token)
+    if _startup_failure:
+        raise RuntimeError(_startup_failure)
 
 
 if __name__ == "__main__":

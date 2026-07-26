@@ -4,6 +4,7 @@ import asyncio
 import json
 import math
 import os
+from threading import RLock
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Any
@@ -65,6 +66,10 @@ DKP_TX_FILE = DATA_DIR / "dkp_transactions.json"
 DKP_CHECK_FILE = DATA_DIR / "dkp_event_checks.json"
 MEMBER_PORTAL_CFG_FILE = DATA_DIR / "member_portal_cfg.json"
 LEADER_CONTACT_CFG_FILE = DATA_DIR / "leader_contact_cfg.json"
+DKP_PENDING_TX_FILE = DATA_DIR / "dkp_pending_transaction.json"
+
+# Ein gemeinsamer re-entrant Lock schützt Saldo und Journal als logische Einheit.
+_EC_TRANSACTION_LOCK = RLock()
 
 EVENT_TYPE_CHOICES = [
     "Gildenboss",
@@ -335,6 +340,49 @@ def _gtx(guild_id: int) -> list:
     return arr
 
 
+def _ec_request_id(meta: Optional[dict]) -> str:
+    raw = meta if isinstance(meta, dict) else {}
+    return str(raw.get("request_id") or raw.get("dashboard_request_id") or "").strip()
+
+
+def _find_transaction_by_request_id(guild_id: int, request_id: str) -> Optional[dict]:
+    if not request_id:
+        return None
+    for tx in reversed(_gtx(int(guild_id))):
+        if not isinstance(tx, dict):
+            continue
+        meta = tx.get("meta") if isinstance(tx.get("meta"), dict) else {}
+        if str(meta.get("request_id") or meta.get("dashboard_request_id") or "").strip() == request_id:
+            return tx
+    return None
+
+
+def _recover_pending_ec_transaction() -> None:
+    """Repariert einen Prozessabbruch zwischen Saldo- und Journaldatei.
+
+    Das Pending-Journal wird vor beiden Dateien geschrieben. Existiert die
+    Transaktion bereits, wird der Saldo auf balance_after gesetzt; andernfalls
+    wird auf balance_before zurückgerollt.
+    """
+    pending = _load_json(DKP_PENDING_TX_FILE, {})
+    if not isinstance(pending, dict) or not pending.get("tx"):
+        return
+    tx = pending.get("tx") if isinstance(pending.get("tx"), dict) else {}
+    try:
+        guild_id = int(tx.get("guild_id") or 0)
+        user_id = int(tx.get("user_id") or 0)
+        tx_id = str(tx.get("id") or "")
+        exists = any(isinstance(row, dict) and str(row.get("id") or "") == tx_id for row in _gtx(guild_id))
+        target = int(tx.get("balance_after") if exists else tx.get("balance_before") or 0)
+        _gbal(guild_id).setdefault("users", {})[str(user_id)] = target
+        _save_json(DKP_BALANCES_FILE, dkp_balances)
+        _save_json(DKP_TX_FILE, dkp_transactions)
+        _save_json(DKP_PENDING_TX_FILE, {})
+        print(f"[dkp_system] Pending-EC-Transaktion wiederhergestellt: {tx_id} -> {target}", flush=True)
+    except Exception as exc:
+        print(f"[dkp_system] Pending-EC-Wiederherstellung fehlgeschlagen: {exc!r}", flush=True)
+
+
 def _weekly_period_start(now: Optional[datetime] = None) -> datetime:
     """Aktuelle EC-Woche: Donnerstag 10:00 bis Donnerstag 09:59:59."""
     now = (now or datetime.now(TZ)).astimezone(TZ)
@@ -390,6 +438,9 @@ def weekly_event_remaining(guild_id: int, user_id: int, now: Optional[datetime] 
     return max(0, limit - weekly_event_earned(guild_id, user_id, now))
 
 
+_recover_pending_ec_transaction()
+
+
 def _railway_log_transaction(tx: dict) -> None:
     """Einzeiliger Railway-Log für jede einzelne EC-Buchung/Korrektur."""
     try:
@@ -417,8 +468,8 @@ def _railway_log_transaction(tx: dict) -> None:
         print(f"[dkp_system] EC-Railway-Log Fehler: {e!r}", flush=True)
 
 
-def _append_starting_balance_transaction(guild_id: int, user_id: int, amount: int) -> None:
-    tx = {
+def _starting_balance_transaction(guild_id: int, user_id: int, amount: int) -> dict:
+    return {
         "id": f"{datetime.now(TZ).strftime('%Y%m%d%H%M%S%f')}-{int(user_id)}-start",
         "created_at": _now_iso(),
         "guild_id": int(guild_id),
@@ -430,29 +481,64 @@ def _append_starting_balance_transaction(guild_id: int, user_id: int, amount: in
         "actor_id": 0,
         "type": "starting_balance",
         "event_id": "",
-        "meta": {"automatic": True},
+        "meta": {"automatic": True, "request_id": f"starting-balance:{int(guild_id)}:{int(user_id)}"},
     }
-    _gtx(guild_id).append(tx)
-    save_transactions()
 
 
 def _ensure_start_balance(guild_id: int, user_id: int) -> int:
-    users = _gbal(guild_id).setdefault("users", {})
-    key = str(int(user_id))
-    if key in users:
-        try:
-            return int(users.get(key, 0) or 0)
-        except Exception:
+    # Reentrant, weil _add_transaction bereits denselben Lock hält.
+    with _EC_TRANSACTION_LOCK:
+        users = _gbal(guild_id).setdefault("users", {})
+        key = str(int(user_id))
+        if key in users:
+            try:
+                return int(users.get(key, 0) or 0)
+            except Exception:
+                users[key] = 0
+                _save_json(DKP_BALANCES_FILE, dkp_balances)
+                return 0
+
+        amount = int(_gcfg(guild_id).get("start_balance", DEFAULT_START_BALANCE) or 0)
+        request_id = f"starting-balance:{int(guild_id)}:{int(user_id)}"
+        existing = _find_transaction_by_request_id(int(guild_id), request_id)
+        if existing is not None:
+            recovered = int(existing.get("balance_after", amount) or 0)
+            users[key] = recovered
+            _save_json(DKP_BALANCES_FILE, dkp_balances)
+            return recovered
+
+        if amount == 0:
             users[key] = 0
-            save_balances()
+            _save_json(DKP_BALANCES_FILE, dkp_balances)
             return 0
 
-    amount = int(_gcfg(guild_id).get("start_balance", DEFAULT_START_BALANCE) or 0)
-    users[key] = amount
-    save_balances()
-    if amount:
-        _append_starting_balance_transaction(guild_id, user_id, amount)
-    return amount
+        tx = _starting_balance_transaction(guild_id, user_id, amount)
+        tx_list = _gtx(guild_id)
+        old_len = len(tx_list)
+        _save_json(DKP_PENDING_TX_FILE, {"tx": tx, "created_at": _now_iso()})
+        try:
+            users[key] = amount
+            tx_list.append(tx)
+            _save_json(DKP_BALANCES_FILE, dkp_balances)
+            _save_json(DKP_TX_FILE, dkp_transactions)
+            _save_json(DKP_PENDING_TX_FILE, {})
+        except Exception:
+            users.pop(key, None)
+            del tx_list[old_len:]
+            try:
+                _save_json(DKP_BALANCES_FILE, dkp_balances)
+                _save_json(DKP_TX_FILE, dkp_transactions)
+                _save_json(DKP_PENDING_TX_FILE, {})
+            finally:
+                pass
+            raise
+
+        try:
+            _phase3_upsert_ec_change(tx)
+        except Exception as exc:
+            print(f"[phase3-ec] Startguthaben-Spiegelung fehlgeschlagen: {exc!r}", flush=True)
+        _railway_log_transaction(tx)
+        return amount
 
 
 def get_balance(guild_id: int, user_id: int) -> int:
@@ -475,50 +561,78 @@ def _add_transaction(
     event_id: str = "",
     meta: Optional[dict] = None,
 ) -> dict:
-    requested_amount = int(amount)
-    actual_amount = requested_amount
-    tx_meta = dict(meta or {})
+    with _EC_TRANSACTION_LOCK:
+        requested_amount = int(amount)
+        actual_amount = requested_amount
+        tx_meta = dict(meta or {})
+        request_id = _ec_request_id(tx_meta)
+        existing = _find_transaction_by_request_id(int(guild_id), request_id)
+        if existing is not None:
+            return existing
 
-    # Nur echte Eventgutschriften zählen in das Wochenlimit.
-    # Leader-/Admin-Gutschriften (manual_adjust) bleiben vollständig außerhalb.
-    if str(tx_type) == "event_award" and requested_amount > 0:
-        remaining = weekly_event_remaining(guild_id, user_id)
-        actual_amount = min(requested_amount, remaining)
-        tx_meta.update({
-            "requested_amount": requested_amount,
-            "weekly_limit": int(_gcfg(guild_id).get("weekly_event_limit", DEFAULT_WEEKLY_EVENT_LIMIT) or 0),
-            "weekly_earned_before": weekly_event_earned(guild_id, user_id),
-            "weekly_remaining_before": remaining,
-            "weekly_period_start": _weekly_period_start().isoformat(),
-            "limited": actual_amount < requested_amount,
-        })
+        # Nur echte Eventgutschriften zählen in das Wochenlimit.
+        if str(tx_type) == "event_award" and requested_amount > 0:
+            remaining = weekly_event_remaining(guild_id, user_id)
+            actual_amount = min(requested_amount, remaining)
+            tx_meta.update({
+                "requested_amount": requested_amount,
+                "weekly_limit": int(_gcfg(guild_id).get("weekly_event_limit", DEFAULT_WEEKLY_EVENT_LIMIT) or 0),
+                "weekly_earned_before": weekly_event_earned(guild_id, user_id),
+                "weekly_remaining_before": remaining,
+                "weekly_period_start": _weekly_period_start().isoformat(),
+                "limited": actual_amount < requested_amount,
+            })
 
-    before = get_balance(guild_id, user_id)
-    after = before + actual_amount
-    set_balance(guild_id, user_id, after)
+        before = get_balance(guild_id, user_id)
+        after = before + actual_amount
+        tx = {
+            "id": f"{datetime.now(TZ).strftime('%Y%m%d%H%M%S%f')}-{int(user_id)}",
+            "created_at": _now_iso(),
+            "guild_id": int(guild_id),
+            "user_id": int(user_id),
+            "amount": int(actual_amount),
+            "balance_before": int(before),
+            "balance_after": int(after),
+            "reason": _safe_text(reason),
+            "actor_id": int(actor_id),
+            "type": str(tx_type),
+            "event_id": str(event_id or ""),
+            "meta": tx_meta,
+        }
 
-    tx = {
-        "id": f"{datetime.now(TZ).strftime('%Y%m%d%H%M%S%f')}-{int(user_id)}",
-        "created_at": _now_iso(),
-        "guild_id": int(guild_id),
-        "user_id": int(user_id),
-        "amount": int(actual_amount),
-        "balance_before": int(before),
-        "balance_after": int(after),
-        "reason": _safe_text(reason),
-        "actor_id": int(actor_id),
-        "type": str(tx_type),
-        "event_id": str(event_id or ""),
-        "meta": tx_meta,
-    }
-    _gtx(guild_id).append(tx)
-    save_transactions()
+        users = _gbal(guild_id).setdefault("users", {})
+        key = str(int(user_id))
+        old_balance = int(users.get(key, before) or 0)
+        tx_list = _gtx(guild_id)
+        old_len = len(tx_list)
+        _save_json(DKP_PENDING_TX_FILE, {"tx": tx, "created_at": _now_iso()})
+        try:
+            users[key] = int(after)
+            tx_list.append(tx)
+            # Beide JSON-Dateien werden innerhalb desselben Prozess-Locks geschrieben.
+            _save_json(DKP_BALANCES_FILE, dkp_balances)
+            _save_json(DKP_TX_FILE, dkp_transactions)
+            _save_json(DKP_PENDING_TX_FILE, {})
+        except Exception:
+            users[key] = old_balance
+            del tx_list[old_len:]
+            try:
+                _save_json(DKP_BALANCES_FILE, dkp_balances)
+                _save_json(DKP_TX_FILE, dkp_transactions)
+                _save_json(DKP_PENDING_TX_FILE, {})
+            finally:
+                pass
+            raise
 
-    # Railway-Konsole: jede relevante EC-Buchung einzeln sichtbar machen.
-    if str(tx_type) in {"event_award", "manual_adjust", "starting_balance", "loot_auction", "loot_sale", "weekly_decay"} or int(actual_amount) != 0:
-        _railway_log_transaction(tx)
+        try:
+            _phase3_upsert_ec_change(tx)
+        except Exception as exc:
+            # JSON bleibt produktive Quelle; der nächste Vollabgleich repariert die Spiegelung.
+            print(f"[phase3-ec] Inkrementelle EC-Spiegelung fehlgeschlagen: {exc!r}", flush=True)
 
-    return tx
+        if str(tx_type) in {"event_award", "manual_adjust", "starting_balance", "loot_auction", "loot_sale", "weekly_decay"} or int(actual_amount) != 0:
+            _railway_log_transaction(tx)
+        return tx
 
 
 def _apply_weekly_decay(guild_id: int, actor_id: int = 0) -> list[tuple[int, int]]:
@@ -865,6 +979,8 @@ async def _refresh_attendance_check_message(
     event_id: str,
     channel_id: int,
     message_id: int,
+    *,
+    publish_snapshot: bool = True,
 ) -> None:
     if not channel_id or not message_id:
         return
@@ -889,6 +1005,31 @@ async def _refresh_attendance_check_message(
         await msg.edit(embed=emb, view=ECEventCheckView(int(guild_id), str(event_id)))
     except Exception as e:
         print(f"[dkp_system] EC-Anwesenheitscheck konnte nicht aktualisiert werden: {e!r}")
+
+    if publish_snapshot:
+        await _publish_dashboard_snapshot_now(client, int(guild_id))
+
+
+async def _publish_dashboard_snapshot_now(client: discord.Client, guild_id: int) -> None:
+    """Veröffentlicht nach einer Anwesenheitsänderung sofort einen neuen Snapshot.
+
+    Der normale Dashboard-Loop läuft nur periodisch. Ohne diesen Push erscheinen
+    manuell im Discord-Bot nachgetragene Spieler im Web erst sehr spät oder – bei
+    alten Snapshot-Strukturen – gar nicht.
+    """
+    try:
+        guild = client.get_guild(int(guild_id))
+        if guild is None:
+            return
+        try:
+            from bot import dashboard_data as _dashboard_data  # type: ignore
+        except Exception:
+            import dashboard_data as _dashboard_data  # type: ignore
+        publish = getattr(_dashboard_data, "publish_dashboard_snapshot", None)
+        if callable(publish):
+            await asyncio.to_thread(publish, client, guild)
+    except Exception as exc:
+        print(f"[dkp_system] Sofortiger Dashboard-Snapshot fehlgeschlagen guild={guild_id}: {exc!r}")
 
 
 def _attendance_check_embed(client: discord.Client, home_guild_id: int, event: dict, event_id: str, event_type: str) -> discord.Embed:
@@ -1559,6 +1700,7 @@ class ECEventCheckView(View):
             await inter.message.edit(embed=emb, view=self)
         except Exception as e:
             print(f"[dkp_system] EC-Check confirm_all Message-Update fehlgeschlagen: {e!r}")
+        await _publish_dashboard_snapshot_now(inter.client, self.guild_id)
 
         text = f"✅ **{changed} offene Spieler** wurden auf **War da** gesetzt. **{kept} bereits gesetzte Status** blieben unverändert."
         if failed:
@@ -1935,6 +2077,48 @@ def _phase3_prune_inactive_members_from_pg(guild_id: int | str) -> dict:
         for uid in sorted(candidates):
             results.append(_phase3_prune_member_from_pg(gid, uid, "inactive_member_audit_cleanup"))
         return {"ok": True, "users_pruned": len(results), "user_ids": sorted(candidates), "results": results}
+    finally:
+        conn.close()
+
+
+def _phase3_upsert_ec_change(tx: dict) -> dict:
+    """Saldo und Transaktion in genau einer PostgreSQL-Transaktion spiegeln."""
+    if not _phase3_ec_enabled():
+        return {"ok": False, "error": "DATABASE_URL fehlt"}
+    _ensure_phase3_ec_schema()
+    gid = str(tx.get("guild_id") or "")
+    uid = str(tx.get("user_id") or "")
+    tx_id = str(tx.get("id") or "")
+    if not gid or not uid or not tx_id:
+        return {"ok": False, "error": "unvollständige EC-Transaktion"}
+    conn = _dash_pg_connect()
+    try:
+        with conn.cursor() as cur:
+            balance = int(tx.get("balance_after", 0) or 0)
+            cur.execute("""
+                INSERT INTO phase3_ec_balances (guild_id, user_id, balance, raw_json, source, updated_at)
+                VALUES (%s,%s,%s,%s,'bot_incremental',now())
+                ON CONFLICT (guild_id, user_id) DO UPDATE SET
+                  balance=EXCLUDED.balance, raw_json=EXCLUDED.raw_json,
+                  source='bot_incremental', updated_at=now()
+            """, (gid, uid, balance, _phase3_jsonb({"guild_id": gid, "user_id": uid, "balance": balance})))
+            cur.execute("""
+                INSERT INTO phase3_ec_transactions
+                  (guild_id, transaction_id, user_id, amount, reason, event_id, created_at_text, raw_json, source, mirrored_at)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,'bot_incremental',now())
+                ON CONFLICT (guild_id, transaction_id) DO UPDATE SET
+                  user_id=EXCLUDED.user_id, amount=EXCLUDED.amount,
+                  reason=EXCLUDED.reason, event_id=EXCLUDED.event_id,
+                  created_at_text=EXCLUDED.created_at_text,
+                  raw_json=EXCLUDED.raw_json, source='bot_incremental', mirrored_at=now()
+            """, (
+                gid, tx_id, uid, int(tx.get("amount", 0) or 0),
+                str(tx.get("reason") or tx.get("type") or ""),
+                str(tx.get("event_id") or ""), str(tx.get("created_at") or ""),
+                _phase3_jsonb(tx),
+            ))
+        conn.commit()
+        return {"ok": True, "transaction_id": tx_id, "balance": int(tx.get("balance_after", 0) or 0)}
     finally:
         conn.close()
 
@@ -2402,7 +2586,8 @@ async def _process_dashboard_ec_award_request(client: discord.Client, row: dict)
                     "signup": str(item.get("signup") or ""),
                     "review_status": str(item.get("status") or ""),
                     "voice_minutes": item.get("voice_minutes"),
-                    "dashboard_request_id": request_id,
+                    "dashboard_request_id": f"{request_id}:{uid}",
+                    "request_id": f"dashboard-ec-award:{request_id}:{uid}",
                     "source": "dashboard_attendance_review",
                 },
             )
@@ -2465,6 +2650,272 @@ async def dashboard_ec_award_request_loop():
         return
     for row in rows:
         await _process_dashboard_ec_award_request(client, row)
+
+
+# ---------------------------------------------------------------------------
+# Dashboard → Bot Anwesenheitsqueue
+# ---------------------------------------------------------------------------
+
+
+def _ensure_dashboard_attendance_action_table() -> None:
+    if not _dashboard_queue_enabled():
+        return
+    conn = _dash_pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS dashboard_attendance_action_requests (
+                    id BIGSERIAL PRIMARY KEY,
+                    request_id TEXT NOT NULL UNIQUE,
+                    guild_id BIGINT NOT NULL,
+                    event_id TEXT NOT NULL,
+                    action_type TEXT NOT NULL DEFAULT 'sync_review',
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    payload_json TEXT NOT NULL DEFAULT '{}',
+                    actor_id TEXT,
+                    actor_name TEXT,
+                    requested_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    claimed_at TIMESTAMPTZ,
+                    processed_at TIMESTAMPTZ,
+                    result_json TEXT,
+                    attempt_count INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT
+                )
+                """
+            )
+            cur.execute("ALTER TABLE dashboard_attendance_action_requests ADD COLUMN IF NOT EXISTS attempt_count INTEGER NOT NULL DEFAULT 0")
+            cur.execute("ALTER TABLE dashboard_attendance_action_requests ADD COLUMN IF NOT EXISTS last_error TEXT")
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_dashboard_attendance_action_pending
+                ON dashboard_attendance_action_requests (status, requested_at, id)
+                """
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _claim_dashboard_attendance_actions(limit: int = 10) -> list[dict]:
+    if not _dashboard_queue_enabled():
+        return []
+    _ensure_dashboard_attendance_action_table()
+    conn = _dash_pg_connect()
+    try:
+        with conn.cursor() as cur:
+            # Nach einem Bot-/Railway-Absturz dürfen processing-Einträge nicht
+            # dauerhaft hängen bleiben. Alte Claims werden bis zu fünfmal neu
+            # freigegeben und danach sichtbar als fehlgeschlagen markiert.
+            cur.execute(
+                """
+                UPDATE dashboard_attendance_action_requests
+                SET status = 'failed', processed_at = NOW(),
+                    last_error = 'Maximale Wiederholungen nach abgelaufenem Claim erreicht',
+                    result_json = '{"ok":false,"error":"stale_processing_max_retries"}'
+                WHERE status = 'processing'
+                  AND claimed_at < NOW() - INTERVAL '5 minutes'
+                  AND COALESCE(attempt_count, 0) >= 5
+                """
+            )
+            cur.execute(
+                """
+                UPDATE dashboard_attendance_action_requests
+                SET status = 'pending', claimed_at = NULL,
+                    last_error = 'Abgelaufener processing-Claim wurde erneut eingereiht'
+                WHERE status = 'processing'
+                  AND claimed_at < NOW() - INTERVAL '5 minutes'
+                  AND COALESCE(attempt_count, 0) < 5
+                """
+            )
+            cur.execute(
+                """
+                UPDATE dashboard_attendance_action_requests
+                SET status = 'processing', claimed_at = NOW(),
+                    attempt_count = COALESCE(attempt_count, 0) + 1
+                WHERE id IN (
+                    SELECT id
+                    FROM dashboard_attendance_action_requests
+                    WHERE status = 'pending'
+                    ORDER BY requested_at ASC, id ASC
+                    LIMIT %s
+                    FOR UPDATE SKIP LOCKED
+                )
+                RETURNING *
+                """,
+                (int(limit),),
+            )
+            rows = [dict(row) for row in (cur.fetchall() or [])]
+        conn.commit()
+        return rows
+    finally:
+        conn.close()
+
+
+def _finish_dashboard_attendance_action(request_id: str, status: str, result: dict) -> None:
+    if not _dashboard_queue_enabled() or not request_id:
+        return
+    _ensure_dashboard_attendance_action_table()
+    conn = _dash_pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE dashboard_attendance_action_requests
+                SET status = %s, processed_at = NOW(), result_json = %s
+                WHERE request_id = %s
+                """,
+                (str(status), json.dumps(result or {}, ensure_ascii=False, separators=(",", ":")), str(request_id)),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _dashboard_status_to_bot(value: object) -> str:
+    status = str(value or "open").strip().lower()
+    return {
+        "present": "present",
+        "partial": "maybe",
+        "absent": "absent",
+        "ignore": "excused",
+        "reserve": "reserve",
+        "open": "clear",
+        "": "clear",
+    }.get(status, "clear")
+
+
+def _dashboard_signup_to_bot(value: object) -> str:
+    signup = str(value or "DPS").strip().upper()
+    aliases = {
+        "HEALER": "HEAL",
+        "RESERVE": "BANK",
+        "BANK": "BANK",
+        "TANK": "TANK",
+        "HEAL": "HEAL",
+        "DPS": "DPS",
+    }
+    return aliases.get(signup, "DPS")
+
+
+async def _process_dashboard_attendance_action(client: discord.Client, row: dict) -> None:
+    request_id = str(row.get("request_id") or "")
+    try:
+        guild_id = int(row.get("guild_id") or 0)
+        event_id = str(row.get("event_id") or "")
+        action_type = str(row.get("action_type") or "sync_review").strip().lower()
+        try:
+            payload = json.loads(row.get("payload_json") or "{}")
+        except Exception:
+            payload = {}
+        if not guild_id or not event_id:
+            raise RuntimeError("Guild-ID oder Event-ID fehlt")
+        rsvp = _import_rsvp()
+        if not rsvp:
+            raise RuntimeError("RSVP-System nicht geladen")
+        event = rsvp.get_attendance_event(guild_id, event_id)
+        if not event:
+            obj = (getattr(rsvp, "store", {}) or {}).get(event_id)
+            if isinstance(obj, dict):
+                event = rsvp.ensure_attendance_snapshot(client, event_id, obj)
+        if not event:
+            raise RuntimeError("Anwesenheitsevent nicht gefunden")
+
+        actor_id = int(row.get("actor_id") or 0) if str(row.get("actor_id") or "").isdigit() else 0
+        items = payload.get("items") if isinstance(payload.get("items"), list) else []
+        if action_type == "add_player":
+            items = [payload]
+        if action_type not in {"sync_review", "add_player", "confirm_open"}:
+            raise RuntimeError(f"Unbekannte Aktion: {action_type}")
+
+        normalized_items: list[dict[str, Any]] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            normalized = dict(item)
+            normalized["signup"] = _dashboard_signup_to_bot(item.get("signup"))
+            normalized["status"] = _dashboard_status_to_bot(item.get("status"))
+            normalized_items.append(normalized)
+
+        bulk_apply = getattr(rsvp, "apply_attendance_updates", None)
+        if callable(bulk_apply):
+            result = bulk_apply(
+                guild_id,
+                event_id,
+                normalized_items,
+                marked_by=actor_id,
+                confirm_open=(action_type == "confirm_open"),
+            )
+            if not result.get("ok"):
+                raise RuntimeError(str(result.get("failed") or "Anwesenheitsabgleich fehlgeschlagen"))
+            applied = int(result.get("applied", 0) or 0)
+            added = int(result.get("added", 0) or 0)
+            failed = list(result.get("failed") or [])
+        else:
+            # Kompatibilitätsfallback für ältere RSVP-Module.
+            applied = 0
+            added = 0
+            failed: list[dict] = []
+            if action_type == "confirm_open":
+                attendance = event.get("attendance") if isinstance(event.get("attendance"), dict) else {}
+                for participant in _attendance_unique_participants(event):
+                    uid = int(participant.get("id", 0) or 0)
+                    if uid and not str((attendance.get(str(uid)) or {}).get("status") or ""):
+                        applied += int(bool(rsvp.set_attendance_status(guild_id, event_id, uid, "present", actor_id)))
+            else:
+                for item in normalized_items:
+                    uid = int(item.get("user_id") or item.get("id") or 0)
+                    if not uid:
+                        continue
+                    existing = any(int(p.get("id", 0) or 0) == uid for p in _attendance_unique_participants(event))
+                    if not existing:
+                        ok = rsvp.add_attendance_participant(
+                            guild_id, event_id, uid,
+                            str(item.get("display_name") or item.get("name") or f"User {uid}"),
+                            signup=str(item.get("signup") or "DPS"),
+                            status=str(item.get("status") or "clear"),
+                            marked_by=actor_id,
+                        )
+                        applied += int(bool(ok))
+                        added += int(bool(ok))
+                    else:
+                        rsvp.set_attendance_signup(guild_id, event_id, uid, str(item.get("signup") or "DPS"), actor_id)
+                        applied += int(bool(rsvp.set_attendance_status(guild_id, event_id, uid, str(item.get("status") or "clear"), actor_id)))
+
+        st = _event_check_state(guild_id, event_id)
+        await _refresh_attendance_check_message(
+            client, guild_id, event_id,
+            int(st.get("channel_id", 0) or 0), int(st.get("message_id", 0) or 0),
+            publish_snapshot=False,
+        )
+        # Genau ein Snapshot pro Queue-Aktion – unabhängig davon, ob eine
+        # Discord-Prüfnachricht existiert oder aktualisiert werden konnte.
+        await _publish_dashboard_snapshot_now(client, guild_id)
+        _finish_dashboard_attendance_action(request_id, "done", {
+            "ok": True,
+            "action_type": action_type,
+            "event_id": event_id,
+            "applied": applied,
+            "added": added,
+            "failed": failed,
+        })
+    except Exception as exc:
+        print(f"[dkp_system] Dashboard-Anwesenheitsaktion fehlgeschlagen {request_id}: {exc!r}")
+        _finish_dashboard_attendance_action(request_id, "failed", {"ok": False, "error": repr(exc)})
+
+
+@tasks.loop(seconds=10)
+async def dashboard_attendance_action_loop():
+    client = getattr(dashboard_attendance_action_loop, "_client", None)
+    if client is None or not _dashboard_queue_enabled():
+        return
+    try:
+        rows = _claim_dashboard_attendance_actions(limit=10)
+    except Exception as exc:
+        print(f"[dkp_system] Dashboard-Anwesenheitsqueue konnte nicht gelesen werden: {exc!r}")
+        return
+    for row in rows:
+        await _process_dashboard_attendance_action(client, row)
 
 
 # ---------------------------------------------------------------------------
@@ -2707,7 +3158,7 @@ def _apply_dashboard_settings_change(row: dict) -> dict:
 
         return {
             "ok": True,
-            "message": "Rollen/Kanal übernommen. Danach /dashboard_status ausführen und neu einloggen, falls Dashboard-Zugriff betroffen ist.",
+            "message": "Rollen/Kanal übernommen. Danach /dashboard status ausführen und neu einloggen, falls Dashboard-Zugriff betroffen ist.",
             "changed": {
                 "log_channel_id_old": old_log,
                 "log_channel_id_new": log_channel_id or old_log,
@@ -3091,6 +3542,62 @@ async def setup_dkp_system(client: discord.Client, tree: app_commands.CommandTre
             await pick_inter.response.edit_message(content=f"✅ DKP-/Loot-Log-Kanal gesetzt: {channel.mention}", view=None)
 
         await send_text_channel_picker(inter, "🧾 DKP-/Loot-Log-Kanal auswählen", _picked)
+
+    @dkp.command(name="attendance_all_present", description="Leader: Alle offenen Spieler eines EC-Checks auf War da setzen")
+    async def dkp_attendance_all_present(inter: discord.Interaction, event_id: str = ""):
+        if inter.guild is None:
+            await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
+            return
+        if not _is_leader_or_admin(inter):
+            await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
+            return
+        await inter.response.defer(ephemeral=True, thinking=True)
+        rsvp = _import_rsvp()
+        if not rsvp:
+            await inter.edit_original_response(content="❌ RSVP-System nicht geladen.")
+            return
+        selected_id = str(event_id or "").strip()
+        if not selected_id:
+            candidates = []
+            for event in rsvp.get_attendance_events_for_guild(int(inter.guild.id)) or []:
+                eid = str(event.get("event_id") or event.get("message_id") or "")
+                if not eid:
+                    continue
+                if _event_has_dkp_already(int(inter.guild.id), eid, _dkp_type_from_event(event, eid)):
+                    continue
+                candidates.append((event, eid))
+            if not candidates:
+                await inter.edit_original_response(content="❌ Kein offener EC-Anwesenheitscheck gefunden.")
+                return
+            event, selected_id = candidates[0]
+        else:
+            event = rsvp.get_attendance_event(int(inter.guild.id), selected_id)
+        if not event:
+            await inter.edit_original_response(content=f"❌ Anwesenheitsevent `{selected_id}` nicht gefunden.")
+            return
+        attendance = event.get("attendance") if isinstance(event.get("attendance"), dict) else {}
+        changed = 0
+        kept = 0
+        for participant in _attendance_unique_participants(event):
+            try:
+                uid = int(participant.get("id", 0) or 0)
+            except Exception:
+                uid = 0
+            if not uid:
+                continue
+            current = str((attendance.get(str(uid)) or {}).get("status", "") or "")
+            if current:
+                kept += 1
+                continue
+            if rsvp.set_attendance_status(int(inter.guild.id), selected_id, uid, "present", int(inter.user.id)):
+                changed += 1
+        st = _event_check_state(int(inter.guild.id), selected_id)
+        await _refresh_attendance_check_message(
+            inter.client, int(inter.guild.id), selected_id,
+            int(st.get("channel_id", 0) or 0), int(st.get("message_id", 0) or 0),
+        )
+        await _publish_dashboard_snapshot_now(inter.client, int(inter.guild.id))
+        await inter.edit_original_response(content=f"✅ **{changed} offene Spieler** auf **War da** gesetzt. **{kept} gesetzte Status** blieben unverändert. Event-ID: `{selected_id}`")
 
     @dkp.command(name="balance", description="Zeigt deinen EC-/DKP-Stand privat")
     async def dkp_balance(inter: discord.Interaction, user: Optional[discord.Member] = None):
@@ -3667,6 +4174,11 @@ async def setup_dkp_system(client: discord.Client, tree: app_commands.CommandTre
         dashboard_settings_change_request_loop._client = client  # type: ignore[attr-defined]
         dashboard_settings_change_request_loop.start()
         print("⚙️ Dashboard-Settings-Queue gestartet.")
+
+    if not dashboard_attendance_action_loop.is_running():
+        dashboard_attendance_action_loop._client = client  # type: ignore[attr-defined]
+        dashboard_attendance_action_loop.start()
+        print("📋 Dashboard-Anwesenheitsqueue gestartet.")
 
     try:
         _phase3_refresh_active_member_cache(client)

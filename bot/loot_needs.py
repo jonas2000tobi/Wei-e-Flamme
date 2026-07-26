@@ -6,6 +6,7 @@ import asyncio
 import os
 import secrets
 import time
+import threading
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, Any
@@ -176,46 +177,66 @@ def save_items() -> None:
 
 
 _phase3_need_mirror_task: Optional[asyncio.Task] = None
+_phase3_need_pending_scopes: set[tuple[int, int | None]] = set()
+_phase3_need_scope_lock = threading.RLock()
+_PHASE3_NEED_FULL_SCOPE = (0, None)
 
 
 async def _phase3_need_mirror_debounced() -> None:
     global _phase3_need_mirror_task
     try:
-        # Mehrere schnelle Slot-Aenderungen werden zu einer Spiegelung gebuendelt.
-        await asyncio.sleep(0.75)
-        await asyncio.to_thread(_phase3_mirror_all_needs)
+        await asyncio.sleep(0.35)
+        while True:
+            with _phase3_need_scope_lock:
+                if not _phase3_need_pending_scopes:
+                    break
+                scopes = set(_phase3_need_pending_scopes)
+                _phase3_need_pending_scopes.clear()
+            if _PHASE3_NEED_FULL_SCOPE in scopes:
+                await asyncio.to_thread(_phase3_mirror_all_needs)
+                continue
+            for guild_id, user_id in sorted(scopes, key=lambda item: (item[0], item[1] or 0)):
+                await asyncio.to_thread(_phase3_upsert_needs_scope, guild_id, user_id)
     except asyncio.CancelledError:
         raise
-    except Exception as e:
-        print(f"[phase3] Need-Spiegelung fehlgeschlagen: {e!r}")
+    except Exception as exc:
+        print(f"[phase3-needs] Hintergrund-Upsert fehlgeschlagen: {exc!r}", flush=True)
     finally:
         _phase3_need_mirror_task = None
+        with _phase3_need_scope_lock:
+            pending = bool(_phase3_need_pending_scopes)
+        if pending:
+            _phase3_need_mirror_task = asyncio.get_running_loop().create_task(_phase3_need_mirror_debounced())
 
 
-def _schedule_phase3_need_mirror() -> None:
+def _schedule_phase3_need_mirror(guild_id: int | None = None, user_id: int | None = None) -> None:
     global _phase3_need_mirror_task
+    scope = _PHASE3_NEED_FULL_SCOPE if guild_id is None else (int(guild_id), int(user_id) if user_id is not None else None)
+    with _phase3_need_scope_lock:
+        if scope == _PHASE3_NEED_FULL_SCOPE:
+            _phase3_need_pending_scopes.clear()
+        if _PHASE3_NEED_FULL_SCOPE not in _phase3_need_pending_scopes:
+            _phase3_need_pending_scopes.add(scope)
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
         loop = getattr(_client_ref, "loop", None) if _client_ref is not None else None
         if loop is not None and getattr(loop, "is_running", lambda: False)():
             try:
-                loop.call_soon_threadsafe(_schedule_phase3_need_mirror)
+                loop.call_soon_threadsafe(_schedule_phase3_need_mirror, guild_id, user_id)
             except Exception:
                 pass
         return
-    if _phase3_need_mirror_task is not None and not _phase3_need_mirror_task.done():
-        _phase3_need_mirror_task.cancel()
-    _phase3_need_mirror_task = loop.create_task(_phase3_need_mirror_debounced())
+    if _phase3_need_mirror_task is None or _phase3_need_mirror_task.done():
+        _phase3_need_mirror_task = loop.create_task(_phase3_need_mirror_debounced())
 
 
-def save_needs() -> None:
-    # JSON bleibt die unmittelbare produktive Quelle. Die komplette Postgres-
-    # Spiegelung darf keine Discord-Interaktion blockieren und laeuft deshalb
-    # entkoppelt/debounced im Hintergrund.
+def save_needs(guild_id: int | None = None, user_id: int | None = None) -> None:
+    # JSON bleibt die unmittelbare produktive Quelle. In Postgres wird nur der
+    # geänderte Spieler bzw. die geänderte Gilde ersetzt; ein Full-Mirror bleibt
+    # ausschließlich der expliziten Reparatur-/Migrationsfunktion vorbehalten.
     _save_json(NEEDS_FILE, loot_needs)
-    _schedule_phase3_need_mirror()
-
+    _schedule_phase3_need_mirror(guild_id, user_id)
 
 def save_cfg() -> None:
     _save_json(CFG_FILE, loot_cfg)
@@ -971,7 +992,7 @@ def _cleanup_needs_without_guild_role(guild: discord.Guild) -> int:
         users.pop(uid_str, None)
 
     if remove:
-        save_needs()
+        save_needs(guild.id)
 
     return len(remove)
 
@@ -1283,7 +1304,7 @@ async def _send_received_request(
                 description=(
                     "Es ist kein Leader-/Loot-Kanal gesetzt.\n\n"
                     "Die Gildenleitung muss zuerst einen Kanal setzen:\n"
-                    "`/loot_set_leader_channel`"
+                    "`/loot set_leader_channel`"
                 ),
                 color=discord.Color.red()
             ),
@@ -1422,7 +1443,7 @@ async def open_need_menu(inter: discord.Interaction, guild_id: int, user_id: int
     # Bearbeitungsziel, selbst wenn JSON/Volume kurz langsam sind.
     await _portal_defer(inter, thinking=False)
     _user_needs(int(guild_id), int(user_id))
-    await asyncio.to_thread(save_needs)
+    await asyncio.to_thread(save_needs, int(guild_id), int(user_id))
 
     await _portal_edit(
         inter,
@@ -1678,7 +1699,7 @@ class NeedSlotSelect(Select):
 
         if self.action == "clear":
             _clear_slot_item(data, self.tab, need_slot)
-            save_needs()
+            save_needs(self.guild_id, self.user_id)
 
             guild = inter.client.get_guild(self.guild_id)
 
@@ -1860,7 +1881,7 @@ class NeedCatalogItemSelect(Select):
                 catalog_item_id=int(item.get("catalog_item_id") or catalog_id),
                 catalog_source_item_id=str(item.get("catalog_source_item_id") or ""),
             )
-            await asyncio.to_thread(save_needs)
+            await asyncio.to_thread(save_needs, view.guild_id, view.user_id)
             guild = inter.client.get_guild(view.guild_id)
             if guild:
                 await _portal_edit(inter, embed=_need_embed(guild, view.user_id, view.tab), view=NeedMainView(view.guild_id, view.user_id, view.tab))
@@ -1979,7 +2000,7 @@ class ReceivedReportReviewView(PortalSafeView):
             return
 
         _mark_slot_received(needs, tab, slot, inter.user.id)
-        save_needs()
+        save_needs(guild.id, user_id)
 
         member = guild.get_member(user_id)
         player_name = _profile_name(guild, user_id, member.display_name if member else "Unbekannt")
@@ -2343,6 +2364,59 @@ def _phase3_need_rows_for_guild(guild_id: int) -> list[dict]:
     return rows
 
 
+def _phase3_upsert_needs_scope(guild_id: int, user_id: int | None = None) -> dict:
+    """Ersetzt nur die Needs eines Spielers oder einer einzelnen Gilde."""
+    if not _phase3_pg_ready():
+        return {"ok": False, "error": "DATABASE_URL fehlt", "needs": 0}
+    _phase3_ensure_need_tables()
+    guild_id = int(guild_id)
+    user_id_s = str(int(user_id)) if user_id is not None else ""
+    rows = _phase3_need_rows_for_guild(guild_id)
+    active_ids = _phase3_need_active_member_ids(guild_id)
+    if active_ids:
+        rows = [row for row in rows if str(row.get("user_id") or "").strip() in active_ids]
+    if user_id_s:
+        rows = [row for row in rows if str(row.get("user_id") or "").strip() == user_id_s]
+
+    conn = _dash_pg_connect()
+    try:
+        with conn.cursor() as cur:
+            if user_id_s:
+                cur.execute(
+                    "DELETE FROM phase3_loot_needs WHERE guild_id=%s AND user_id=%s AND source='bot'",
+                    (str(guild_id), user_id_s),
+                )
+            else:
+                cur.execute(
+                    "DELETE FROM phase3_loot_needs WHERE guild_id=%s AND source='bot'",
+                    (str(guild_id),),
+                )
+            for row in rows:
+                cur.execute("""
+                    INSERT INTO phase3_loot_needs (guild_id, need_id, user_id, item_name, need_type, slot_name, status, raw_json, source, updated_at)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,'bot',now())
+                    ON CONFLICT (guild_id, need_id) DO UPDATE SET
+                      user_id=EXCLUDED.user_id,
+                      item_name=EXCLUDED.item_name,
+                      need_type=EXCLUDED.need_type,
+                      slot_name=EXCLUDED.slot_name,
+                      status=EXCLUDED.status,
+                      raw_json=EXCLUDED.raw_json,
+                      source='bot',
+                      updated_at=now()
+                """, (
+                    str(guild_id), row["need_id"], row["user_id"], row["item_name"],
+                    row["need_type"], row["slot_name"], row["status"], _phase3_jsonb(row["raw"]),
+                ))
+        conn.commit()
+        return {"ok": True, "needs": len(rows), "guild_id": guild_id, "user_id": int(user_id) if user_id is not None else None}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def _phase3_mirror_all_needs() -> dict:
     if not _phase3_pg_ready():
         return {"ok": False, "error": "DATABASE_URL fehlt", "needs": 0}
@@ -2701,7 +2775,7 @@ def _process_dashboard_need_request(row: dict) -> tuple[str, dict]:
         return "rejected", {"ok": False, "error": "Dieser Slot ist als erhalten gesperrt. Nur die Leitung kann ihn ändern."}
     if action == "clear":
         _clear_slot_item(data, tab, slot)
-        save_needs()
+        save_needs(guild_id, target_user_id)
         result = {"ok": True, "message": f"{tab} – {slot} entfernt.", "old_item": old_name, "new_item": "—"}
         _phase3_log_need_change(guild_id, request_id, str(row.get("actor_id") or ""), target_user_id, action, result, payload)
         return "done", result
@@ -2723,7 +2797,7 @@ def _process_dashboard_need_request(row: dict) -> tuple[str, dict]:
             catalog_item_id=catalog_item_id,
             catalog_source_item_id=str(payload.get("catalog_source_item_id") or local_item.get("catalog_source_item_id") or ""),
         )
-        save_needs()
+        save_needs(guild_id, target_user_id)
         new_name = _item_name(guild_id, item_id, with_type=True)
         result = {"ok": True, "message": f"{tab} – {slot}: {new_name} gespeichert.", "old_item": old_name, "new_item": new_name, "item_id": item_id}
         _phase3_log_need_change(guild_id, request_id, str(row.get("actor_id") or ""), target_user_id, action, result, payload)
@@ -2822,6 +2896,11 @@ async def auto_loot_need_eventstart():
 
 
 async def setup_loot_needs(client: discord.Client, tree: app_commands.CommandTree):
+    loot_group = app_commands.Group(
+        name="loot",
+        description="Loot-Katalog und Needlisten",
+    )
+    tree.add_command(loot_group)
     global _client_ref
     _client_ref = client
 
@@ -2838,7 +2917,7 @@ async def setup_loot_needs(client: discord.Client, tree: app_commands.CommandTre
         dashboard_need_change_queue_loop.start()
         print("🎁 Dashboard-Need-Queue gestartet.")
 
-    @tree.command(name="loot_dashboard_needs_status", description="(Leader) Dashboard-Need-Queue Status anzeigen")
+    @loot_group.command(name="dashboard_status", description="(Leader) Dashboard-Need-Queue Status anzeigen")
     async def loot_dashboard_needs_status(inter: discord.Interaction):
         if inter.guild is None:
             await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
@@ -2859,7 +2938,7 @@ async def setup_loot_needs(client: discord.Client, tree: app_commands.CommandTre
             lines.append(f"`{r.get('status')}` {r.get('action_type')} → <@{r.get('target_user_id')}> · {r.get('request_id')}")
         await inter.response.send_message("\n".join(lines)[:1900], ephemeral=True)
 
-    @tree.command(name="loot_dashboard_needs_run", description="(Leader) Dashboard-Need-Queue sofort verarbeiten")
+    @loot_group.command(name="dashboard_run", description="(Leader) Dashboard-Need-Queue sofort verarbeiten")
     async def loot_dashboard_needs_run(inter: discord.Interaction):
         if inter.guild is None:
             await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
@@ -2876,7 +2955,7 @@ async def setup_loot_needs(client: discord.Client, tree: app_commands.CommandTre
             ephemeral=True,
         )
 
-    @tree.command(name="loot_phase3_needs_status", description="(Leader) Phase 3.3 Need-DB Status anzeigen")
+    @loot_group.command(name="phase3_status", description="(Leader) Phase 3.3 Need-DB Status anzeigen")
     async def loot_phase3_needs_status(inter: discord.Interaction):
         if inter.guild is None or not _is_leader_or_admin(inter):
             await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
@@ -2895,7 +2974,7 @@ async def setup_loot_needs(client: discord.Client, tree: app_commands.CommandTre
         except Exception as exc:
             await inter.followup.send(f"❌ Fehler: {type(exc).__name__}: {exc}", ephemeral=True)
 
-    @tree.command(name="loot_phase3_needs_mirror", description="(Leader) Needlisten sofort nach Postgres spiegeln")
+    @loot_group.command(name="phase3_mirror", description="(Leader) Needlisten sofort nach Postgres spiegeln")
     async def loot_phase3_needs_mirror(inter: discord.Interaction):
         if inter.guild is None or not _is_leader_or_admin(inter):
             await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
@@ -2914,7 +2993,7 @@ async def setup_loot_needs(client: discord.Client, tree: app_commands.CommandTre
         except Exception as exc:
             await inter.followup.send(f"❌ Fehler: {type(exc).__name__}: {exc}", ephemeral=True)
 
-    @tree.command(name="loot_set_leader_channel", description="(Leader) Kanal für automatische Loot-/Need-Übersichten setzen")
+    @loot_group.command(name="set_leader_channel", description="(Leader) Kanal für automatische Loot-/Need-Übersichten setzen")
     async def loot_set_leader_channel(inter: discord.Interaction):
         if inter.guild is None:
             await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
@@ -2933,7 +3012,7 @@ async def setup_loot_needs(client: discord.Client, tree: app_commands.CommandTre
 
         await send_text_channel_picker(inter, "🎁 Loot-/Need-Channel auswählen", _picked)
 
-    @tree.command(name="loot_item_add", description="(Leader) Item zum Need-Katalog hinzufügen")
+    @loot_group.command(name="item_add", description="(Leader) Item zum Need-Katalog hinzufügen")
     @app_commands.choices(slot=_catalog_slot_choices(), weapon_type=_weapon_type_choices())
     async def loot_item_add(
         inter: discord.Interaction,
@@ -3009,7 +3088,7 @@ async def setup_loot_needs(client: discord.Client, tree: app_commands.CommandTre
             ephemeral=True
         )
 
-    @tree.command(name="loot_item_set_weapon_type", description="(Leader) Waffentyp bei bestehender Waffe nachtragen/ändern")
+    @loot_group.command(name="item_weapon_type", description="(Leader) Waffentyp bei bestehender Waffe nachtragen/ändern")
     @app_commands.choices(weapon_type=_weapon_type_choices())
     async def loot_item_set_weapon_type(
         inter: discord.Interaction,
@@ -3050,7 +3129,7 @@ async def setup_loot_needs(client: discord.Client, tree: app_commands.CommandTre
             ephemeral=True
         )
 
-    @tree.command(name="loot_item_list", description="Zeigt Items aus dem Need-Katalog")
+    @loot_group.command(name="item_list", description="Zeigt Items aus dem Need-Katalog")
     @app_commands.choices(slot=_catalog_slot_choices(), weapon_type=_weapon_type_choices())
     async def loot_item_list(
         inter: discord.Interaction,
@@ -3115,7 +3194,7 @@ async def setup_loot_needs(client: discord.Client, tree: app_commands.CommandTre
 
         await inter.response.send_message(embed=emb, ephemeral=True)
 
-    @tree.command(name="loot_item_remove", description="(Leader) Item aus dem Need-Katalog entfernen")
+    @loot_group.command(name="item_remove", description="(Leader) Item aus dem Need-Katalog entfernen")
     @app_commands.choices(slot=_catalog_slot_choices())
     async def loot_item_remove(inter: discord.Interaction, slot: app_commands.Choice[str], name: str):
         if inter.guild is None:
@@ -3158,7 +3237,7 @@ async def setup_loot_needs(client: discord.Client, tree: app_commands.CommandTre
                 changed_users += 1
 
         save_items()
-        save_needs()
+        save_needs(inter.guild.id)
 
         await inter.response.send_message(
             f"✅ Item entfernt: **{item.get('name')}**\n"
@@ -3166,7 +3245,7 @@ async def setup_loot_needs(client: discord.Client, tree: app_commands.CommandTre
             ephemeral=True
         )
 
-    @tree.command(name="loot_mark_received", description="(Leader) Markiert einen Need-Slot als erhalten und sperrt ihn")
+    @loot_group.command(name="mark_received", description="(Leader) Markiert einen Need-Slot als erhalten und sperrt ihn")
     @app_commands.choices(tab=_tab_choices(), slot=_need_slot_choices())
     async def loot_mark_received(
         inter: discord.Interaction,
@@ -3209,7 +3288,7 @@ async def setup_loot_needs(client: discord.Client, tree: app_commands.CommandTre
             return
 
         _mark_slot_received(data, tab_name, slot_name, inter.user.id)
-        save_needs()
+        save_needs(inter.guild.id, member.id)
 
         item_name = _item_name(inter.guild.id, item_id, with_type=True)
 
@@ -3229,7 +3308,7 @@ async def setup_loot_needs(client: discord.Client, tree: app_commands.CommandTre
             ephemeral=True
         )
 
-    @tree.command(name="loot_unmark_received", description="(Leader) Gibt einen erhaltenen Need-Slot wieder frei")
+    @loot_group.command(name="unmark_received", description="(Leader) Gibt einen erhaltenen Need-Slot wieder frei")
     @app_commands.choices(tab=_tab_choices(), slot=_need_slot_choices())
     async def loot_unmark_received(
         inter: discord.Interaction,
@@ -3268,7 +3347,7 @@ async def setup_loot_needs(client: discord.Client, tree: app_commands.CommandTre
             return
 
         _unmark_slot_received(data, tab_name, slot_name)
-        save_needs()
+        save_needs(inter.guild.id, member.id)
 
         item_name = _item_name(inter.guild.id, item_id, with_type=True)
 
@@ -3279,7 +3358,7 @@ async def setup_loot_needs(client: discord.Client, tree: app_commands.CommandTre
             ephemeral=True
         )
 
-    @tree.command(name="loot_reset_all_needs", description="(Leader) Setzt alle Needlisten zurück, z.B. für T4")
+    @loot_group.command(name="reset_all", description="(Leader) Setzt alle Needlisten zurück, z.B. für T4")
     async def loot_reset_all_needs(
         inter: discord.Interaction,
         confirm: str,
@@ -3296,7 +3375,7 @@ async def setup_loot_needs(client: discord.Client, tree: app_commands.CommandTre
         if confirm != "RESET":
             await inter.response.send_message(
                 "❌ Sicherheitswort falsch.\n"
-                "Nutze: `/loot_reset_all_needs confirm:RESET`",
+                "Nutze: `/loot reset_all confirm:RESET`",
                 ephemeral=True
             )
             return
@@ -3329,7 +3408,7 @@ async def setup_loot_needs(client: discord.Client, tree: app_commands.CommandTre
             if changed:
                 affected += 1
 
-        save_needs()
+        save_needs(inter.guild.id)
 
         await inter.response.send_message(
             f"✅ Alle Needlisten wurden zurückgesetzt.\n"
@@ -3338,7 +3417,7 @@ async def setup_loot_needs(client: discord.Client, tree: app_commands.CommandTre
             ephemeral=True
         )
 
-    @tree.command(name="loot_cleanup", description="(Leader) Entfernt Needlisten von Leuten ohne Gildenmitglied-Rolle")
+    @loot_group.command(name="cleanup", description="(Leader) Entfernt Needlisten von Leuten ohne Gildenmitglied-Rolle")
     async def loot_cleanup(inter: discord.Interaction):
         if inter.guild is None:
             await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
@@ -3355,7 +3434,7 @@ async def setup_loot_needs(client: discord.Client, tree: app_commands.CommandTre
             ephemeral=True
         )
 
-    @tree.command(name="loot_need_all", description="(Leader) Gesamte Needliste aller aktuellen Gildenmitglieder anzeigen")
+    @loot_group.command(name="need_all", description="(Leader) Gesamte Needliste aller aktuellen Gildenmitglieder anzeigen")
     async def loot_need_all(inter: discord.Interaction, public: bool = False):
         if inter.guild is None:
             await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
@@ -3394,7 +3473,7 @@ async def setup_loot_needs(client: discord.Client, tree: app_commands.CommandTre
                 ephemeral=True
             )
 
-    @tree.command(name="loot_weapon_all", description="(Leader) Waffenbedarf aller aktuellen Gildenmitglieder zusammenfassen")
+    @loot_group.command(name="weapon_all", description="(Leader) Waffenbedarf aller aktuellen Gildenmitglieder zusammenfassen")
     async def loot_weapon_all(inter: discord.Interaction, public: bool = False):
         if inter.guild is None:
             await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
@@ -3423,7 +3502,7 @@ async def setup_loot_needs(client: discord.Client, tree: app_commands.CommandTre
                 ephemeral=True
             )
 
-    @tree.command(name="loot_need_event", description="(Leader) Waffenbedarf aus Raid-/Event-Anmeldung anzeigen")
+    @loot_group.command(name="need_event", description="(Leader) Waffenbedarf aus Raid-/Event-Anmeldung anzeigen")
     async def loot_need_event(inter: discord.Interaction, message_id: str, public: bool = False):
         if inter.guild is None:
             await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
@@ -3463,7 +3542,7 @@ async def setup_loot_needs(client: discord.Client, tree: app_commands.CommandTre
 
         await _send_embed_response(inter, emb, public=public)
 
-    @tree.command(name="loot_auto_status", description="(Leader) Zeigt Auto-Loot-Need-Status")
+    @loot_group.command(name="auto_status", description="(Leader) Zeigt Auto-Loot-Need-Status")
     async def loot_auto_status(inter: discord.Interaction):
         if inter.guild is None:
             await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
@@ -3491,7 +3570,7 @@ async def setup_loot_needs(client: discord.Client, tree: app_commands.CommandTre
 
         await inter.response.send_message(embed=emb, ephemeral=True)
 
-    @tree.command(name="loot_auto_toggle", description="(Leader) Automatische Waffenübersicht bei Gildenboss-Eventstart an/aus")
+    @loot_group.command(name="auto_toggle", description="(Leader) Automatische Waffenübersicht bei Gildenboss-Eventstart an/aus")
     async def loot_auto_toggle(inter: discord.Interaction, enabled: bool):
         if inter.guild is None:
             await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
@@ -4290,7 +4369,7 @@ class AdminLootUserSelect(Select):
                 await _portal_send(inter, "ℹ️ Dieser Slot ist bereits als erhalten markiert.", ephemeral=True)
                 return
             _mark_slot_received(data, tab, slot, inter.user.id)
-            save_needs()
+            save_needs(guild.id, uid)
             try:
                 if member:
                     await member.send(f"✅ Dein Need **{item_name}** wurde von der Gildenleitung als **erhalten** markiert.\nSlot: **{tab} – {slot}**")
@@ -4304,7 +4383,7 @@ class AdminLootUserSelect(Select):
                 await _portal_send(inter, "ℹ️ Dieser Slot ist nicht als erhalten markiert.", ephemeral=True)
                 return
             _unmark_slot_received(data, tab, slot)
-            save_needs()
+            save_needs(guild.id, uid)
             emb = discord.Embed(title="✅ Erhalten-Markierung entfernt", description=f"**{name}**\n**{tab} – {slot}:** {item_name}", color=discord.Color.green())
             await _portal_edit(inter, embed=emb, view=AdminLootBackView())
             return

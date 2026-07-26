@@ -21,6 +21,7 @@ except Exception:
 DATA_DIR = Path(__file__).resolve().parent / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 CFG_FILE = DATA_DIR / "onboarding_cfg.json"
+SESSIONS_FILE = DATA_DIR / "onboarding_sessions.json"
 
 # cfg[guild_id] = {
 #   "enabled": bool,
@@ -99,14 +100,97 @@ def _review_channel(guild: discord.Guild) -> Optional[discord.abc.Messageable]:
     return ch if isinstance(ch, (discord.TextChannel, discord.Thread)) else None
 
 class StepContext:
-    def __init__(self, member_id: int, guild_id: int):
-        self.member_id = member_id
-        self.guild_id = guild_id
-        self.category: str | None = None
-        self.primary: str | None = None
-        self.experienced: bool | None = None
+    def __init__(
+        self,
+        member_id: int,
+        guild_id: int,
+        *,
+        message_id: int = 0,
+        stage: str = "category",
+        category: str | None = None,
+        primary: str | None = None,
+        experienced: bool | None = None,
+    ):
+        self.member_id = int(member_id)
+        self.guild_id = int(guild_id)
+        self.message_id = int(message_id or 0)
+        self.stage = str(stage or "category")
+        self.category = category
+        self.primary = primary
+        self.experienced = experienced
 
+    def to_dict(self) -> dict:
+        return {
+            "member_id": self.member_id,
+            "guild_id": self.guild_id,
+            "message_id": self.message_id,
+            "stage": self.stage,
+            "category": self.category,
+            "primary": self.primary,
+            "experienced": self.experienced,
+        }
+
+    @classmethod
+    def from_dict(cls, raw: dict) -> "StepContext":
+        return cls(
+            int(raw.get("member_id", 0) or 0),
+            int(raw.get("guild_id", 0) or 0),
+            message_id=int(raw.get("message_id", 0) or 0),
+            stage=str(raw.get("stage") or "category"),
+            category=raw.get("category"),
+            primary=raw.get("primary"),
+            experienced=raw.get("experienced"),
+        )
+
+
+def _load_sessions() -> dict[str, dict]:
+    raw = load_json_file(SESSIONS_FILE, {}, context=__name__)
+    return raw if isinstance(raw, dict) else {}
+
+
+def _save_sessions() -> None:
+    save_json_atomic(SESSIONS_FILE, _session_records, context=__name__)
+
+
+def _remember_ctx(ctx: StepContext) -> None:
+    if ctx.message_id <= 0:
+        return
+    _sessions[ctx.member_id] = ctx
+    _session_records[str(ctx.message_id)] = ctx.to_dict()
+    _save_sessions()
+
+
+def _forget_message(message_id: int) -> None:
+    raw = _session_records.pop(str(int(message_id or 0)), None)
+    if isinstance(raw, dict):
+        member_id = int(raw.get("member_id", 0) or 0)
+        current = _sessions.get(member_id)
+        if current and current.message_id == int(message_id or 0):
+            _sessions.pop(member_id, None)
+    _save_sessions()
+
+
+def _forget_member_sessions(member_id: int) -> None:
+    member_id = int(member_id)
+    changed = False
+    for message_id, raw in list(_session_records.items()):
+        if isinstance(raw, dict) and int(raw.get("member_id", 0) or 0) == member_id:
+            _session_records.pop(message_id, None)
+            changed = True
+    _sessions.pop(member_id, None)
+    if changed:
+        _save_sessions()
+
+
+_session_records: dict[str, dict] = _load_sessions()
 _sessions: dict[int, StepContext] = {}
+for _raw_ctx in list(_session_records.values()):
+    try:
+        _ctx = StepContext.from_dict(_raw_ctx)
+        if _ctx.member_id and _ctx.guild_id and _ctx.message_id:
+            _sessions[_ctx.member_id] = _ctx
+    except Exception:
+        continue
 
 class CategoryView(View):
     def __init__(self, ctx: StepContext):
@@ -115,6 +199,10 @@ class CategoryView(View):
 
     async def _next(self, inter: discord.Interaction, cat: str):
         self.ctx.category = cat
+        self.ctx.stage = "primary"
+        if inter.message:
+            self.ctx.message_id = int(inter.message.id)
+        _remember_ctx(self.ctx)
         await inter.response.edit_message(
             content="Welche **Spielrolle** spielst du?",
             view=PrimaryView(self.ctx)
@@ -143,6 +231,10 @@ class PrimaryView(View):
 
     async def _next(self, inter: discord.Interaction, primary: str):
         self.ctx.primary = primary
+        self.ctx.stage = "experience"
+        if inter.message:
+            self.ctx.message_id = int(inter.message.id)
+        _remember_ctx(self.ctx)
         await inter.response.edit_message(
             content="Bist du **erfahren** oder **unerfahren**?",
             view=ExperienceView(self.ctx)
@@ -161,12 +253,14 @@ class PrimaryView(View):
         await self._next(inter, "DPS")
 
 class ReviewView(View):
-    def __init__(self, member_id: int, category: str, primary: str, experienced: bool):
+    def __init__(self, member_id: int, category: str, primary: str, experienced: bool, *, message_id: int = 0, guild_id: int = 0):
         super().__init__(timeout=None)
-        self.member_id = member_id
+        self.member_id = int(member_id)
         self.category = category
         self.primary = primary
         self.experienced = experienced
+        self.message_id = int(message_id or 0)
+        self.guild_id = int(guild_id or 0)
 
     def _is_admin(self, inter: discord.Interaction) -> bool:
         p = getattr(inter.user, "guild_permissions", None)
@@ -187,16 +281,18 @@ class ReviewView(View):
             await inter.response.send_message("Nur Admins.", ephemeral=True)
             return
 
+        await inter.response.defer()
         member = await self._get_member(inter.guild)
         if not member:
-            await inter.response.send_message("Mitglied nicht gefunden.", ephemeral=True)
+            await inter.followup.send("Mitglied nicht gefunden.", ephemeral=True)
             return
 
         roles = await _assign_roles(member, self.category, self.primary, self.experienced)
-        await inter.response.edit_message(
+        await inter.edit_original_response(
             content=f"✅ **Akzeptiert** – Rollen: {', '.join(r.mention for r in roles) if roles else '—'}",
             view=None
         )
+        _forget_message(self.message_id or (inter.message.id if inter.message else 0))
 
         try:
             await member.send("✅ Deine Anfrage wurde **akzeptiert**. Willkommen!")
@@ -209,8 +305,10 @@ class ReviewView(View):
             await inter.response.send_message("Nur Admins.", ephemeral=True)
             return
 
+        await inter.response.defer()
         member = await self._get_member(inter.guild)
-        await inter.response.edit_message(content="❌ **Abgelehnt**.", view=None)
+        await inter.edit_original_response(content="❌ **Abgelehnt**.", view=None)
+        _forget_message(self.message_id or (inter.message.id if inter.message else 0))
 
         if member:
             try:
@@ -225,11 +323,15 @@ class ExperienceView(View):
 
     async def _finish(self, inter: discord.Interaction, experienced: bool):
         try:
+            if not inter.response.is_done():
+                await inter.response.defer()
             self.ctx.experienced = experienced
+            if inter.message:
+                self.ctx.message_id = int(inter.message.id)
             guild = inter.client.get_guild(self.ctx.guild_id)
 
             if not guild:
-                await inter.response.edit_message(content="⚠️ Server nicht gefunden.", view=None)
+                await inter.edit_original_response(content="⚠️ Server nicht gefunden.", view=None)
                 return
 
             c = _gcfg(guild)
@@ -260,7 +362,7 @@ class ExperienceView(View):
 
             if require:
                 if not review_ch:
-                    await inter.response.edit_message(
+                    await inter.edit_original_response(
                         content="❌ Review ist aktiviert, aber kein Review-Kanal gesetzt.",
                         view=None
                     )
@@ -273,12 +375,28 @@ class ExperienceView(View):
                     f"**Erfahrung:** {exp_txt}"
                 )
 
-                await review_ch.send(
-                    desc,
-                    view=ReviewView(self.ctx.member_id, self.ctx.category, self.ctx.primary, experienced)
+                review_view = ReviewView(
+                    self.ctx.member_id,
+                    self.ctx.category,
+                    self.ctx.primary,
+                    experienced,
+                    guild_id=self.ctx.guild_id,
                 )
+                review_message = await review_ch.send(desc, view=review_view)
+                review_view.message_id = int(review_message.id)
+                review_ctx = StepContext(
+                    self.ctx.member_id,
+                    self.ctx.guild_id,
+                    message_id=int(review_message.id),
+                    stage="review",
+                    category=self.ctx.category,
+                    primary=self.ctx.primary,
+                    experienced=experienced,
+                )
+                _session_records[str(review_message.id)] = review_ctx.to_dict()
+                _save_sessions()
 
-                await inter.response.edit_message(
+                await inter.edit_original_response(
                     content="✅ Danke! Deine Angaben wurden zur **Prüfung** an die Gildenleitung gesendet.",
                     view=None
                 )
@@ -292,9 +410,9 @@ class ExperienceView(View):
                             f"Rollen: {', '.join(r.mention for r in roles) if roles else '—'}"
                         )
 
-                await inter.response.edit_message(content="✅ Danke! Deine Rollen wurden vergeben.", view=None)
+                await inter.edit_original_response(content="✅ Danke! Deine Rollen wurden vergeben.", view=None)
 
-            _sessions.pop(self.ctx.member_id, None)
+            _forget_message(self.ctx.message_id or (inter.message.id if inter.message else 0))
 
         except Exception as e:
             try:
@@ -315,30 +433,70 @@ class ExperienceView(View):
     async def btn_new(self, inter: discord.Interaction, _):
         await self._finish(inter, False)
 
-async def send_onboarding_dm(member: discord.Member) -> None:
+async def send_onboarding_dm(member: discord.Member) -> tuple[bool, str]:
     try:
         if member.bot:
-            return
+            return False, "Botkonten werden nicht onboardet."
 
         c = _gcfg(member.guild)
         if not c.get("enabled", True):
-            return
+            return False, "Onboarding ist für diesen Server deaktiviert."
 
+        _forget_member_sessions(member.id)
         ctx = StepContext(member.id, member.guild.id)
-        _sessions[member.id] = ctx
 
         text = (
             f"👋 **Willkommen {member.display_name}!**\n\n"
             f"Wähle bitte zuerst deine **Kategorie**."
         )
 
-        await member.send(text, view=CategoryView(ctx))
+        message = await member.send(text, view=CategoryView(ctx))
+        ctx.message_id = int(message.id)
+        ctx.stage = "category"
+        _remember_ctx(ctx)
+        return True, "Onboarding-DM gesendet."
 
-    except Exception:
-        pass
+    except discord.Forbidden:
+        return False, "DM konnte nicht zugestellt werden. Das Mitglied hat Direktnachrichten vermutlich deaktiviert."
+    except Exception as exc:
+        print(f"[onboarding] DM an {getattr(member, 'id', 0)} fehlgeschlagen: {exc!r}", flush=True)
+        return False, f"{type(exc).__name__}: {str(exc)[:240]}"
+
 
 async def setup_onboarding(client: discord.Client, tree: app_commands.CommandTree) -> None:
-    @tree.command(name="onboarding_toggle", description="(Admin) Onboarding ein-/ausschalten")
+    onboarding_group = app_commands.Group(
+        name="onboarding",
+        description="Mitglieder-Onboarding verwalten",
+    )
+    tree.add_command(onboarding_group)
+
+    # Persistente Onboarding- und Review-Buttons nach einem Neustart wieder anbinden.
+    for message_id, raw_ctx in list(_session_records.items()):
+        try:
+            ctx = StepContext.from_dict(raw_ctx)
+            mid = int(message_id)
+            if ctx.stage == "category":
+                client.add_view(CategoryView(ctx), message_id=mid)
+            elif ctx.stage == "primary":
+                client.add_view(PrimaryView(ctx), message_id=mid)
+            elif ctx.stage == "experience":
+                client.add_view(ExperienceView(ctx), message_id=mid)
+            elif ctx.stage == "review":
+                client.add_view(
+                    ReviewView(
+                        ctx.member_id,
+                        str(ctx.category or ""),
+                        str(ctx.primary or ""),
+                        bool(ctx.experienced),
+                        message_id=mid,
+                        guild_id=ctx.guild_id,
+                    ),
+                    message_id=mid,
+                )
+        except Exception as exc:
+            print(f"[onboarding] Persistente View {message_id} konnte nicht geladen werden: {exc!r}")
+
+    @onboarding_group.command(name="toggle", description="(Admin) Onboarding ein-/ausschalten")
     @app_commands.describe(enabled="true = an, false = aus")
     async def onboarding_toggle(inter: discord.Interaction, enabled: bool):
         if not _is_admin(inter):
@@ -352,7 +510,7 @@ async def setup_onboarding(client: discord.Client, tree: app_commands.CommandTre
 
         await inter.response.send_message(f"✅ Onboarding {'aktiviert' if enabled else 'deaktiviert'}.", ephemeral=True)
 
-    @tree.command(name="onboarding_set_categories", description="(Admin) Rollen für Kategorien setzen")
+    @onboarding_group.command(name="set_categories", description="(Admin) Rollen für Kategorien setzen")
     async def onboarding_set_categories(
         inter: discord.Interaction,
         gildenmitglied: discord.Role,
@@ -384,7 +542,7 @@ async def setup_onboarding(client: discord.Client, tree: app_commands.CommandTre
             ephemeral=True
         )
 
-    @tree.command(name="onboarding_set_primaries", description="(Admin) Primärrollen für Tank/Heal/DPS setzen")
+    @onboarding_group.command(name="set_primaries", description="(Admin) Primärrollen für Tank/Heal/DPS setzen")
     async def onboarding_set_primaries(
         inter: discord.Interaction,
         tank: discord.Role,
@@ -405,7 +563,7 @@ async def setup_onboarding(client: discord.Client, tree: app_commands.CommandTre
             ephemeral=True
         )
 
-    @tree.command(name="onboarding_set_experience", description="(Admin) Rollen für Erfahren/Unerfahren setzen")
+    @onboarding_group.command(name="set_experience", description="(Admin) Rollen für Erfahren/Unerfahren setzen")
     async def onboarding_set_experience(
         inter: discord.Interaction,
         experienced_role: Optional[discord.Role] = None,
@@ -431,7 +589,7 @@ async def setup_onboarding(client: discord.Client, tree: app_commands.CommandTre
             ephemeral=True
         )
 
-    @tree.command(name="onboarding_set_review_channel", description="(Admin) Kanal für Review/Logs setzen")
+    @onboarding_group.command(name="set_review_channel", description="(Admin) Kanal für Review/Logs setzen")
     async def onboarding_set_review_channel(inter: discord.Interaction):
         if not _is_admin(inter):
             await inter.response.send_message("Nur Admins.", ephemeral=True)
@@ -449,7 +607,7 @@ async def setup_onboarding(client: discord.Client, tree: app_commands.CommandTre
 
         await send_text_channel_picker(inter, "📝 Onboarding-Review-Kanal auswählen", _picked)
 
-    @tree.command(name="onboarding_require_review", description="(Admin) Review durch Staff erzwingen")
+    @onboarding_group.command(name="require_review", description="(Admin) Review durch Staff erzwingen")
     async def onboarding_require_review(inter: discord.Interaction, require: bool):
         if not _is_admin(inter):
             await inter.response.send_message("Nur Admins.", ephemeral=True)
@@ -462,16 +620,20 @@ async def setup_onboarding(client: discord.Client, tree: app_commands.CommandTre
 
         await inter.response.send_message(f"✅ Review erforderlich: {'Ja' if require else 'Nein'}", ephemeral=True)
 
-    @tree.command(name="onboarding_send", description="(Admin) Onboarding-DM manuell an ein Mitglied senden")
+    @onboarding_group.command(name="send", description="(Admin) Onboarding-DM manuell an ein Mitglied senden")
     async def onboarding_send(inter: discord.Interaction, member: discord.Member):
         if not _is_admin(inter):
             await inter.response.send_message("Nur Admins.", ephemeral=True)
             return
 
-        await send_onboarding_dm(member)
-        await inter.response.send_message(f"✉️ DM an {member.mention} geschickt (falls DMs offen).", ephemeral=True)
+        await inter.response.defer(ephemeral=True, thinking=True)
+        ok, reason = await send_onboarding_dm(member)
+        if ok:
+            await inter.followup.send(f"✅ Onboarding-DM an {member.mention} geschickt.", ephemeral=True)
+        else:
+            await inter.followup.send(f"❌ Onboarding-DM an {member.mention} fehlgeschlagen: {reason}", ephemeral=True)
 
-    @tree.command(name="onboarding_status", description="(Admin) Zeigt aktuelle Onboarding-Konfiguration")
+    @onboarding_group.command(name="status", description="(Admin) Zeigt aktuelle Onboarding-Konfiguration")
     async def onboarding_status(inter: discord.Interaction):
         if not _is_admin(inter):
             await inter.response.send_message("Nur Admins.", ephemeral=True)

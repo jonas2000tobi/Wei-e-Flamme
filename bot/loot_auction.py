@@ -130,6 +130,20 @@ ELIGIBILITY_CHOICES = [
 
 _client_ref: Optional[discord.Client] = None
 
+# Pro Auktion genau ein schreibender Ablauf gleichzeitig. Das verhindert, dass
+# zwei Buttons/Dashboard-Requests denselben alten Stand prüfen und anschließend
+# beide Gebot/Kauf/Abschluss anwenden.
+_AUCTION_LOCKS: dict[tuple[int, str], asyncio.Lock] = {}
+
+
+def _auction_lock(guild_id: int, auction_id: str) -> asyncio.Lock:
+    key = (int(guild_id), str(auction_id))
+    lock = _AUCTION_LOCKS.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _AUCTION_LOCKS[key] = lock
+    return lock
+
 
 def _load_json(path: Path, default):
     return load_json_file(path, default, context=__name__)
@@ -144,10 +158,13 @@ auction_cfg: dict = _load_json(AUCTION_CFG_FILE, {})
 guild_chest: dict = _load_json(GUILD_CHEST_FILE, {})
 
 
-def save_auctions() -> None:
+def save_auctions(guild_id: int | None = None, auction_id: str | None = None) -> None:
     _save_json(AUCTION_FILE, auction_state)
     try:
-        _phase3_mirror_all_auctions()
+        if guild_id is not None and auction_id:
+            _phase3_upsert_auction(int(guild_id), str(auction_id))
+        else:
+            _phase3_mirror_all_auctions()
     except Exception as e:
         print(f"[phase3] Auktions-Spiegelung fehlgeschlagen: {e!r}")
 
@@ -942,6 +959,21 @@ def _add_ec_transaction(guild_id: int, user_id: int, amount: int, reason: str, a
     return False
 
 
+def _refund_sale_charge(guild_id: int, user_id: int, price: int, auction_id: str, *, reason: str) -> bool:
+    if int(price) <= 0:
+        return True
+    return _add_ec_transaction(
+        int(guild_id), int(user_id), int(price),
+        f"Rückbuchung Sale-Kauf: {reason}", int(user_id), str(auction_id),
+        meta={
+            "auction_id": str(auction_id),
+            "kind": "sale_refund",
+            "rollback": True,
+            "request_id": f"sale-refund:{int(guild_id)}:{str(auction_id)}",
+        },
+    )
+
+
 def _configured_text_channel(client: discord.Client, guild_id: int, channel_id: int):
     guild = client.get_guild(int(guild_id))
     if guild and channel_id:
@@ -1674,45 +1706,45 @@ async def _place_bid(inter: discord.Interaction, guild_id: int, auction_id: str,
     if guild is None:
         await _portal_send(inter, "❌ Server konnte nicht zugeordnet werden.", ephemeral=True)
         return
-    auction = _auction(guild_id, auction_id)
-    if not auction:
-        await _portal_send(inter, "❌ Auktion nicht gefunden.", ephemeral=True)
-        return
     user_id = int(inter.user.id)
     if not _is_ebolus_member(guild, user_id):
         await _portal_send(inter, "❌ Nur Gildenmitglieder dürfen mit EC bieten.", ephemeral=True)
         return
     if not await _require_loot_unlocked(inter, guild, user_id):
         return
-    reason = _bid_rejection_reason(guild, auction, user_id, int(amount))
-    if reason:
-        await _portal_send(inter, f"❌ {reason}", ephemeral=True)
-        return
 
-    # Öffentliche Nachrichten, Marktpost und Logs können mehrere Sekunden dauern.
-    # Die Interaktion wird deshalb vor der eigentlichen Verarbeitung bestätigt.
     await _portal_defer(inter, ephemeral=True, thinking=True)
+    async with _auction_lock(int(guild_id), str(auction_id)):
+        auction = _auction(guild_id, auction_id)
+        if not auction:
+            await _portal_send(inter, "❌ Auktion nicht gefunden.", ephemeral=True)
+            return
+        # Unter dem Lock erneut prüfen; der Stand vor dem defer kann bereits veraltet sein.
+        reason = _bid_rejection_reason(guild, auction, user_id, int(amount))
+        if reason:
+            await _portal_send(inter, f"❌ {reason}", ephemeral=True)
+            return
+        bids = auction.setdefault("bids", [])
+        bids.append({
+            "user_id": user_id,
+            "amount": int(amount),
+            "created_at": _now_iso(),
+            "name": getattr(inter.user, "display_name", str(user_id)),
+        })
+        auction["updated_at"] = _now_iso()
+        save_auctions(int(guild_id), str(auction_id))
 
-    bids = auction.setdefault("bids", [])
-    bids.append({"user_id": user_id, "amount": int(amount), "created_at": _now_iso(), "name": getattr(inter.user, "display_name", str(user_id))})
-    auction["updated_at"] = _now_iso()
-    save_auctions()
-
+    # Externe Discord-Nachrichten werden nach dem atomaren Zustandswechsel aktualisiert.
     await _refresh_auction_message(inter.client, guild_id, auction)
     await _post_or_refresh_active_auction_message(inter.client, guild_id, auction)
     await _post_or_refresh_market_message(inter.client, guild_id, auction)
     await _announce_bid_log(inter.client, guild_id, auction, user_id, int(amount))
-    # Die ursprünglichen Need-DMs werden im Hintergrund aktualisiert, damit die Button-Reaktion nicht timeoutet.
-    # Falls diese Auktion noch aus einer älteren Version stammt und keine DM-Message-IDs gespeichert hat,
-    # wird einmalig eine neue Live-Tracking-DM gesendet und ab dann aktualisiert/bei Übergabe gelöscht.
+
     async def _repair_and_refresh_tracking_dm():
         await _ensure_auction_tracking_dms(inter.client, guild_id, auction)
         await _refresh_auction_tracking_dms(inter.client, guild_id, auction)
     asyncio.create_task(_repair_and_refresh_tracking_dm())
 
-    # Wenn das Gebot aus der Gildenzentrale/DM kommt, muss auch diese aktuelle DM-Nachricht
-    # aktualisiert werden. Die normale Refresh-Funktion aktualisiert nur die öffentliche
-    # Auktionsnachricht im Auktionskanal.
     if portal_user_id is not None:
         try:
             if inter.message:
@@ -2230,7 +2262,7 @@ async def _transition_to_sale(client: discord.Client, guild_id: int, auction_id:
     return True
 
 
-async def _close_auction(client: discord.Client, guild_id: int, auction_id: str, reason: str = "time") -> bool:
+async def _close_auction_unlocked(client: discord.Client, guild_id: int, auction_id: str, reason: str = "time") -> bool:
     guild = client.get_guild(int(guild_id))
     auction = _auction(guild_id, auction_id)
     if not guild or not auction or str(auction.get("status", "")) != "active":
@@ -2252,7 +2284,7 @@ async def _close_auction(client: discord.Client, guild_id: int, auction_id: str,
             _mark_chest_item_status(guild_id, auction, "expired")
             await _edit_market_message_final(client, guild_id, auction, final="expired")
             await _delete_active_auction_message(client, auction)
-            save_auctions()
+            save_auctions(int(guild_id), str(auction_id))
             await _refresh_auction_message(client, guild_id, auction)
             await _announce_log(
                 client, guild_id,
@@ -2267,7 +2299,7 @@ async def _close_auction(client: discord.Client, guild_id: int, auction_id: str,
     auction["closed_at"] = _now_iso()
     auction["close_reason"] = reason
     _mark_chest_item_status(guild_id, auction, "waiting_delivery")
-    save_auctions()
+    save_auctions(int(guild_id), str(auction_id))
     await _refresh_auction_message(client, guild_id, auction)
     await _delete_active_auction_message(client, auction)
     # Im Auktionshaus keine Abschluss-/Gewinnerdetails posten.
@@ -2306,9 +2338,19 @@ async def _close_auction(client: discord.Client, guild_id: int, auction_id: str,
         msg = await ch.send(embed=emb, view=AuctionDeliveryView(guild_id, auction_id))
         auction["delivery_message_id"] = int(msg.id)
         auction["delivery_channel_id"] = int(getattr(ch, "id", 0) or 0)
-        save_auctions()
+        save_auctions(int(guild_id), str(auction_id))
     return True
 
+
+
+async def _close_auction(client: discord.Client, guild_id: int, auction_id: str, reason: str = "time") -> bool:
+    """Schließt oder verschiebt eine Auktion genau einmal.
+
+    Derselbe Lock wird auch von Geboten und Sofortkäufen verwendet. Damit kann ein
+    Timer nicht gleichzeitig mit einem Kauf oder Gebot denselben alten Status verarbeiten.
+    """
+    async with _auction_lock(int(guild_id), str(auction_id)):
+        return await _close_auction_unlocked(client, int(guild_id), str(auction_id), reason=reason)
 
 
 
@@ -2417,6 +2459,65 @@ def _phase3_auction_rows_for_guild(guild_id: int) -> tuple[list[dict], list[dict
             entry_id = str(auc.get("history_id") or f"auction:{auction_id}")
             history_out.append({"entry_id": entry_id, "user_id": winner, "item_name": item_name, "amount": current_bid, "raw": auc})
     return auctions_out, bids_out, history_out
+
+
+def _phase3_upsert_auction(guild_id: int, auction_id: str) -> dict:
+    """Spiegelt nur die geänderte Auktion statt bei jedem Klick alle Tabellen zu leeren."""
+    if not _phase3_pg_ready():
+        return {"ok": False, "error": "DATABASE_URL fehlt"}
+    _phase3_ensure_auction_tables()
+    auc = _auction(int(guild_id), str(auction_id))
+    conn = _dashboard_pg_connect()
+    try:
+        with conn.cursor() as cur:
+            if not auc:
+                cur.execute("DELETE FROM phase3_loot_auctions WHERE guild_id=%s AND auction_id=%s", (str(guild_id), str(auction_id)))
+                cur.execute("DELETE FROM phase3_loot_bids WHERE guild_id=%s AND auction_id=%s", (str(guild_id), str(auction_id)))
+                cur.execute("DELETE FROM phase3_loot_history WHERE guild_id=%s AND entry_id=%s", (str(guild_id), f"auction:{auction_id}"))
+                conn.commit()
+                return {"ok": True, "deleted": True}
+            top = _highest_bid(auc)
+            winner = str(auc.get("winner_user_id") or auc.get("winner_id") or (top or {}).get("user_id") or "")
+            current_bid = int((top or {}).get("amount") or auc.get("current_bid") or auc.get("fixed_price") or 0)
+            item_name = str(auc.get("item_name") or auc.get("item") or auc.get("name") or auction_id)
+            status = str(auc.get("status") or "")
+            cur.execute("""
+                INSERT INTO phase3_loot_auctions (guild_id, auction_id, item_name, status, winner_user_id, current_bid, raw_json, source, updated_at)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,'bot',now())
+                ON CONFLICT (guild_id, auction_id) DO UPDATE SET
+                  item_name=EXCLUDED.item_name, status=EXCLUDED.status,
+                  winner_user_id=EXCLUDED.winner_user_id, current_bid=EXCLUDED.current_bid,
+                  raw_json=EXCLUDED.raw_json, source='bot', updated_at=now()
+            """, (str(guild_id), str(auction_id), item_name, status, winner, current_bid, _phase3_jsonb(auc)))
+            cur.execute("DELETE FROM phase3_loot_bids WHERE guild_id=%s AND auction_id=%s", (str(guild_id), str(auction_id)))
+            for idx, bid in enumerate(auc.get("bids") if isinstance(auc.get("bids"), list) else []):
+                if not isinstance(bid, dict):
+                    continue
+                bid_id = str(bid.get("id") or bid.get("bid_id") or f"{auction_id}:{bid.get('user_id','0')}:{bid.get('amount','0')}:{idx}")
+                cur.execute("""
+                    INSERT INTO phase3_loot_bids (guild_id, bid_id, auction_id, user_id, amount, raw_json, source, mirrored_at)
+                    VALUES (%s,%s,%s,%s,%s,%s,'bot',now())
+                    ON CONFLICT (guild_id, bid_id) DO UPDATE SET
+                      auction_id=EXCLUDED.auction_id, user_id=EXCLUDED.user_id,
+                      amount=EXCLUDED.amount, raw_json=EXCLUDED.raw_json,
+                      source='bot', mirrored_at=now()
+                """, (str(guild_id), bid_id, str(auction_id), str(bid.get("user_id") or bid.get("bidder_id") or ""), int(bid.get("amount") or bid.get("bid") or 0), _phase3_jsonb(bid)))
+            entry_id = f"auction:{auction_id}"
+            if status in {"closed", "delivered", "finished", "done", "expired", "cancelled", "deleted"} or winner:
+                cur.execute("""
+                    INSERT INTO phase3_loot_history (guild_id, entry_id, user_id, item_name, amount, raw_json, source, mirrored_at)
+                    VALUES (%s,%s,%s,%s,%s,%s,'bot',now())
+                    ON CONFLICT (guild_id, entry_id) DO UPDATE SET
+                      user_id=EXCLUDED.user_id, item_name=EXCLUDED.item_name,
+                      amount=EXCLUDED.amount, raw_json=EXCLUDED.raw_json,
+                      source='bot', mirrored_at=now()
+                """, (str(guild_id), entry_id, winner, item_name, current_bid, _phase3_jsonb(auc)))
+            else:
+                cur.execute("DELETE FROM phase3_loot_history WHERE guild_id=%s AND entry_id=%s", (str(guild_id), entry_id))
+        conn.commit()
+        return {"ok": True, "auction_id": str(auction_id)}
+    finally:
+        conn.close()
 
 
 def _phase3_mirror_all_auctions() -> dict:
@@ -2716,7 +2817,7 @@ async def _dashboard_apply_bid(client: discord.Client, guild: discord.Guild, row
         "dashboard_request_id": str(row.get("request_id") or ""),
     })
     auc["updated_at"] = _now_iso()
-    save_auctions()
+    save_auctions(int(guild.id), auction_id)
     await _refresh_auction_message(client, int(guild.id), auc)
     await _post_or_refresh_active_auction_message(client, int(guild.id), auc)
     await _post_or_refresh_market_message(client, int(guild.id), auc)
@@ -2785,16 +2886,40 @@ async def _dashboard_apply_sale_or_junk(client: discord.Client, guild: discord.G
         bal = _ec_balance(int(guild.id), int(user_id))
         if bal < price:
             return {"ok": False, "status": "rejected", "error": f"Spieler hat nur {bal} EC, benötigt aber {price} EC."}
-        ok = _add_ec_transaction(
-            int(guild.id), int(user_id), -price,
-            f"Sale-Kauf: {auc.get('item_name','Item')}",
-            int(user_id), auction_id,
-            meta={"auction_id": auction_id, "item_id": auc.get("item_id", ""), "item_name": auc.get("item_name", ""), "kind": "sale", "source": "dashboard"},
-        )
-        if not ok:
-            return {"ok": False, "status": "failed", "error": "DKP/EC-System konnte nicht geladen werden. Keine EC abgebucht."}
 
-    emb = await _finalize_sale_delivery(client, guild, int(guild.id), auc, auction_id, int(user_id), price, actor_id=int(user_id), source="dashboard_sale_buy")
+    auc["status"] = "processing"
+    auc["processing_by"] = int(user_id)
+    auc["processing_at"] = _now_iso()
+    save_auctions(int(guild.id), auction_id)
+    charged = False
+    try:
+        if price > 0:
+            charged = _add_ec_transaction(
+                int(guild.id), int(user_id), -price,
+                f"Sale-Kauf: {auc.get('item_name','Item')}",
+                int(user_id), auction_id,
+                meta={
+                    "auction_id": auction_id,
+                    "item_id": auc.get("item_id", ""),
+                    "item_name": auc.get("item_name", ""),
+                    "kind": "sale",
+                    "source": "dashboard",
+                    "request_id": f"sale-charge:{int(guild.id)}:{auction_id}",
+                    "dashboard_request_id": str(row.get("request_id") or ""),
+                },
+            )
+            if not charged:
+                raise RuntimeError("DKP/EC-System konnte nicht geladen werden")
+        emb = await _finalize_sale_delivery(client, guild, int(guild.id), auc, auction_id, int(user_id), price, actor_id=int(user_id), source="dashboard_sale_buy")
+    except Exception as exc:
+        if charged:
+            _refund_sale_charge(int(guild.id), int(user_id), price, auction_id, reason="Dashboard-Auslieferung fehlgeschlagen")
+        auc["status"] = "active"
+        auc.pop("processing_by", None)
+        auc.pop("processing_at", None)
+        auc["last_error"] = f"{type(exc).__name__}: {exc}"[:500]
+        save_auctions(int(guild.id), auction_id)
+        return {"ok": False, "status": "failed", "error": "Kauf fehlgeschlagen; EC wurden zurückgebucht."}
     return {"ok": True, "status": "done", "message": f"Sale-Kauf erledigt ({price} EC).", "auction_id": auction_id, "price": int(price), "embed_title": getattr(emb, "title", "")}
 
 
@@ -2884,10 +3009,14 @@ async def _process_dashboard_loot_action(client: discord.Client, row: dict) -> d
     if str(auc.get("status", "")) != "active":
         return {"ok": False, "status": "rejected", "error": "Auktion ist nicht mehr aktiv."}
 
-    if action_type == "bid":
-        return await _dashboard_apply_bid(client, guild, row, auc, actor_id, actor_name, amount)
-    if action_type in {"sale_buy", "junk_roll"}:
-        return await _dashboard_apply_sale_or_junk(client, guild, row, auc, actor_id, action_type)
+    if action_type in {"bid", "sale_buy", "junk_roll"}:
+        async with _auction_lock(int(guild_id), str(auction_id)):
+            auc = _auction(guild_id, auction_id)
+            if not auc or str(auc.get("status", "")) != "active":
+                return {"ok": False, "status": "rejected", "error": "Auktion ist nicht mehr aktiv."}
+            if action_type == "bid":
+                return await _dashboard_apply_bid(client, guild, row, auc, actor_id, actor_name, amount)
+            return await _dashboard_apply_sale_or_junk(client, guild, row, auc, actor_id, action_type)
     return {"ok": False, "status": "rejected", "error": f"Unbekannte Aktion: {action_type}"}
 
 
@@ -2996,8 +3125,7 @@ def _is_junk_interest_sale(auction: dict) -> bool:
     return bool(auction.get("junk_drop", False)) and _auction_phase(auction) == "sale" and int(auction.get("fixed_price", auction.get("start_bid", 0)) or 0) <= 0
 
 
-def _junk_interest_until(auction: dict) -> Optional[datetime]:
-    return _parse_dt(str(auction.get("junk_interest_until", "") or ""))
+# Entfernte überschriebene Altdefinition: _junk_interest_until
 
 
 def _junk_roll_until(auction: dict) -> Optional[datetime]:
@@ -3207,6 +3335,11 @@ async def _finalize_sale_delivery(
     auction["sold_to"] = int(user_id)
     auction["charged_amount"] = int(price)
     auction["delivery_source"] = str(source)
+    auction.pop("processing_by", None)
+    auction.pop("processing_at", None)
+    # Der endgültige Zustand wird vor allen Discord-Netzwerkaufrufen gespeichert.
+    # Ein Prozessabsturz kann dadurch keine zweite Vergabe desselben Items öffnen.
+    save_auctions(int(guild_id), str(auction_id))
     _mark_chest_item_status(int(guild_id), auction, "delivered", {"delivered_to": int(user_id), "delivered_by": actor, "delivered_at": auction["sold_at"]})
     locked_need = _mark_need_received_for_winner(
         int(guild_id),
@@ -3223,7 +3356,7 @@ async def _finalize_sale_delivery(
     else:
         await _delete_market_message(client, auction)
     await _delete_active_auction_message(client, auction)
-    save_auctions()
+    save_auctions(int(guild_id), str(auction_id))
     try:
         await _refresh_auction_message(client, int(guild_id), auction)
     except Exception:
@@ -3719,14 +3852,6 @@ async def _buy_sale_item(inter: discord.Interaction, guild_id: int, auction_id: 
     if guild is None:
         await _portal_send(inter, "❌ Server konnte nicht zugeordnet werden.", ephemeral=True)
         return
-    auc = _auction(guild_id, auction_id)
-    if not auc or str(auc.get("status", "")) != "active" or _auction_phase(auc) != "sale":
-        await _portal_send(inter, "❌ Sale-Kauf nicht gefunden oder nicht mehr aktiv.", ephemeral=True)
-        return
-    end_dt = _parse_dt(str(auc.get("ends_at", "") or ""))
-    if end_dt and _now() >= end_dt:
-        await _portal_send(inter, "❌ Dieses Sale-Item ist bereits abgelaufen.", ephemeral=True)
-        return
     user_id = int(inter.user.id)
     if not _is_ebolus_member(guild, user_id):
         await _portal_send(inter, "❌ Nur Gildenmitglieder können mit EC kaufen.", ephemeral=True)
@@ -3734,31 +3859,70 @@ async def _buy_sale_item(inter: discord.Interaction, guild_id: int, auction_id: 
     if not await _require_loot_unlocked(inter, guild, user_id):
         return
 
-    # Sale-Abrechnung, EC-Buchung und Nachrichtenupdates dürfen die 3-Sekunden-
-    # Frist von Discord nicht blockieren.
     await _portal_defer(inter, ephemeral=True, thinking=True)
-
-    price = int(auc.get("fixed_price", auc.get("start_bid", 0)) or 0)
-    if _is_junk_interest_sale(auc) and price <= 0:
-        await _handle_junk_sale_click(inter, int(guild_id), str(auction_id), guild, auc, user_id)
-        return
-
-    if price > 0:
-        bal = _ec_balance(guild_id, user_id)
-        if bal < price:
-            await _portal_send(inter, f"❌ Du hast aktuell nur **{bal} EC**, benötigst aber **{price} EC**.", ephemeral=True)
+    async with _auction_lock(int(guild_id), str(auction_id)):
+        auc = _auction(guild_id, auction_id)
+        if not auc or str(auc.get("status", "")) != "active" or _auction_phase(auc) != "sale":
+            await _portal_send(inter, "❌ Sale-Kauf nicht gefunden oder nicht mehr aktiv.", ephemeral=True)
             return
-        ok = _add_ec_transaction(
-            int(guild_id), user_id, -price,
-            f"Sale-Kauf: {auc.get('item_name','Item')}",
-            user_id, str(auction_id),
-            meta={"auction_id": str(auction_id), "item_id": auc.get("item_id", ""), "item_name": auc.get("item_name", ""), "kind": "sale"},
-        )
-        if not ok:
-            await _portal_send(inter, "❌ DKP/EC-System konnte nicht geladen werden. Keine EC abgebucht.", ephemeral=True)
+        end_dt = _parse_dt(str(auc.get("ends_at", "") or ""))
+        if end_dt and _now() >= end_dt and not _is_junk_interest_sale(auc):
+            await _portal_send(inter, "❌ Dieses Sale-Item ist bereits abgelaufen.", ephemeral=True)
             return
 
-    emb = await _finalize_sale_delivery(inter.client, guild, int(guild_id), auc, str(auction_id), user_id, price, actor_id=user_id, source="sale_direct_buy")
+        price = int(auc.get("fixed_price", auc.get("start_bid", 0)) or 0)
+        if _is_junk_interest_sale(auc) and price <= 0:
+            await _handle_junk_sale_click(inter, int(guild_id), str(auction_id), guild, auc, user_id)
+            return
+
+        if price > 0:
+            bal = _ec_balance(guild_id, user_id)
+            if bal < price:
+                await _portal_send(inter, f"❌ Du hast aktuell nur **{bal} EC**, benötigst aber **{price} EC**.", ephemeral=True)
+                return
+
+        # Erst exklusiv reservieren, dann abbuchen. Jeder weitere Klick sieht
+        # sofort status=processing und kann nicht parallel weiterlaufen.
+        auc["status"] = "processing"
+        auc["processing_by"] = int(user_id)
+        auc["processing_at"] = _now_iso()
+        save_auctions(int(guild_id), str(auction_id))
+
+        charged = False
+        try:
+            if price > 0:
+                charged = _add_ec_transaction(
+                    int(guild_id), user_id, -price,
+                    f"Sale-Kauf: {auc.get('item_name','Item')}",
+                    user_id, str(auction_id),
+                    meta={
+                        "auction_id": str(auction_id),
+                        "item_id": auc.get("item_id", ""),
+                        "item_name": auc.get("item_name", ""),
+                        "kind": "sale",
+                        "request_id": f"sale-charge:{int(guild_id)}:{str(auction_id)}",
+                    },
+                )
+                if not charged:
+                    raise RuntimeError("DKP/EC-System konnte nicht geladen werden")
+            emb = await _finalize_sale_delivery(
+                inter.client, guild, int(guild_id), auc, str(auction_id), user_id, price,
+                actor_id=user_id, source="sale_direct_buy",
+            )
+        except Exception as exc:
+            if charged:
+                try:
+                    _refund_sale_charge(int(guild_id), user_id, price, str(auction_id), reason="Auslieferung fehlgeschlagen")
+                except Exception as refund_exc:
+                    print(f"[loot_auction] KRITISCH: Sale-Rückbuchung fehlgeschlagen {guild_id}/{auction_id}: {refund_exc!r}")
+            auc["status"] = "active"
+            auc.pop("processing_by", None)
+            auc.pop("processing_at", None)
+            auc["last_error"] = f"{type(exc).__name__}: {exc}"[:500]
+            save_auctions(int(guild_id), str(auction_id))
+            await _portal_send(inter, "❌ Kauf konnte nicht vollständig abgeschlossen werden. Bereits abgebuchte EC wurden zurückgebucht.", ephemeral=True)
+            return
+
     try:
         if inter.message:
             await inter.message.edit(embed=emb, view=None)
@@ -3914,7 +4078,18 @@ async def start_loot_drop_auction(inter: discord.Interaction, guild: discord.Gui
 
     ch = _auction_channel(inter.client, guild.id, inter.channel)
     if ch:
-        msg = await ch.send(embed=_auction_embed(guild, auc), view=AuctionBidView(guild.id, aid))
+        try:
+            msg = await ch.send(embed=_auction_embed(guild, auc), view=AuctionBidView(guild.id, aid))
+        except Exception as exc:
+            auc["status"] = "cancelled"
+            auc["close_reason"] = "initial_post_failed"
+            auc["closed_at"] = _now_iso()
+            save_auctions(int(guild.id), aid)
+            await inter.followup.send(
+                f"❌ Auktion konnte nicht gepostet werden: `{type(exc).__name__}: {str(exc)[:300]}`",
+                ephemeral=True,
+            )
+            return
         auc["message_id"] = int(msg.id)
         auc["channel_id"] = int(getattr(ch, "id", 0) or 0)
         save_auctions()
@@ -4170,28 +4345,33 @@ async def setup_loot_auction(client: discord.Client, tree: app_commands.CommandT
         if start_bid < 0 or min_increment < 0 or duration_hours < 0 or duration_hours > 240:
             await inter.response.send_message("❌ Ungültige Werte. 0 = Regelwert. Dauer: 0 oder 1–240 Stunden.", ephemeral=True)
             return
+        await inter.response.defer(ephemeral=True, thinking=True)
         guild = inter.guild
         item_id, item_name, matches, linked_item = _resolve_item_request(guild.id, item)
         if not item_id and len(matches) > 1:
             lines = "\n".join(f"• `{mid}` – {name}" for mid, name in matches[:10])
-            await inter.response.send_message(
+            await inter.followup.send(
                 "❌ Mehrere Items gefunden. Bitte genauer schreiben oder die Item-ID nutzen:\n" + lines,
                 ephemeral=True,
             )
             return
         if not item_id:
-            await inter.response.send_message("❌ Item nicht gefunden. Nutze die Autovervollständigung aus der Item-Datenbank.", ephemeral=True)
+            await inter.followup.send("❌ Item nicht gefunden. Nutze die Autovervollständigung aus der Item-Datenbank.", ephemeral=True)
             return
         mode, eligible_ids = _eligible_user_ids(guild, item_id, eligibility)
         if eligibility in {"main_need", "secondary_need"} and not eligible_ids:
-            await inter.response.send_message("❌ Für dieses Item gibt es aktuell keinen passenden offenen Need. Nutze eligibility = Alle Gildenmitglieder.", ephemeral=True)
+            await inter.followup.send("❌ Für dieses Item gibt es aktuell keinen passenden offenen Need. Nutze eligibility = Alle Gildenmitglieder.", ephemeral=True)
             return
         phase, rule_hours, rule_start_bid, rule_min_increment = _auction_rule_defaults(guild.id, mode)
         final_hours = int(duration_hours or rule_hours)
         final_start_bid = int(start_bid or rule_start_bid)
         final_min_increment = int(min_increment or rule_min_increment)
         if final_hours < 1 or final_hours > 240 or final_start_bid < 1 or final_min_increment < 1:
-            await inter.response.send_message("❌ Ungültige Regel-/Eingabewerte. Auktionen brauchen Dauer 1–240h, Startgebot ≥1, Mindestschritt ≥1.", ephemeral=True)
+            await inter.followup.send("❌ Ungültige Regel-/Eingabewerte. Auktionen brauchen Dauer 1–240h, Startgebot ≥1, Mindestschritt ≥1.", ephemeral=True)
+            return
+        ch = _auction_channel(client, guild.id, inter.channel)
+        if not ch:
+            await inter.followup.send("❌ Kein Auktionskanal gefunden. Nutze `/auction set_channel`.", ephemeral=True)
             return
         aid = _new_auction_id()
         ends = _now() + timedelta(hours=final_hours)
@@ -4220,19 +4400,15 @@ async def setup_loot_auction(client: discord.Client, tree: app_commands.CommandT
             catalog_item_id=int((linked_item or {}).get("id") or 0),
         ))
         _gauctions(guild.id).setdefault("auctions", {})[aid] = auc
-        save_auctions()
+        save_auctions(int(guild.id), aid)
 
-        ch = _auction_channel(client, guild.id, inter.channel)
-        if not ch:
-            await inter.response.send_message("❌ Kein Auktionskanal gefunden. Nutze `/auction set_channel`.", ephemeral=True)
-            return
         msg = await ch.send(embed=_auction_embed(guild, auc), view=AuctionBidView(guild.id, aid))
         auc["message_id"] = int(msg.id)
         auc["channel_id"] = int(getattr(ch, "id", 0) or 0)
-        save_auctions()
+        save_auctions(int(guild.id), aid)
         await _post_or_refresh_active_auction_message(client, guild.id, auc)
         await _post_or_refresh_market_message(client, guild.id, auc)
-        await inter.response.send_message(
+        await inter.followup.send(
             f"✅ Auktion gestartet: `{aid}` in {ch.mention} · {_need_mode_label(mode)} · "
             f"{final_hours}h · Start {final_start_bid} EC",
             ephemeral=True,
@@ -4256,17 +4432,22 @@ async def setup_loot_auction(client: discord.Client, tree: app_commands.CommandT
         if price < 1 or duration_hours < 1 or duration_hours > 720:
             await inter.response.send_message("❌ Ungültige Werte. Preis mindestens 1 EC, Dauer 1–720 Stunden.", ephemeral=True)
             return
+        await inter.response.defer(ephemeral=True, thinking=True)
         guild = inter.guild
         item_id, item_name, matches, linked_item = _resolve_item_request(guild.id, item)
         if not item_id and len(matches) > 1:
             lines = "\n".join(f"• `{mid}` – {name}" for mid, name in matches[:10])
-            await inter.response.send_message(
+            await inter.followup.send(
                 "❌ Mehrere Items gefunden. Bitte genauer schreiben oder die Item-ID nutzen:\n" + lines,
                 ephemeral=True,
             )
             return
         if not item_id:
-            await inter.response.send_message("❌ Item nicht gefunden. Nutze die Autovervollständigung aus der Item-Datenbank.", ephemeral=True)
+            await inter.followup.send("❌ Item nicht gefunden. Nutze die Autovervollständigung aus der Item-Datenbank.", ephemeral=True)
+            return
+        ch = _auction_channel(client, guild.id, inter.channel)
+        if not ch:
+            await inter.followup.send("❌ Kein Auktionskanal gefunden. Nutze `/auction set_channel`.", ephemeral=True)
             return
         aid = _new_auction_id()
         ends = _now() + timedelta(hours=int(duration_hours))
@@ -4294,18 +4475,25 @@ async def setup_loot_auction(client: discord.Client, tree: app_commands.CommandT
             catalog_item_id=int((linked_item or {}).get("id") or 0),
         ))
         _gauctions(guild.id).setdefault("auctions", {})[aid] = auc
-        save_auctions()
-        ch = _auction_channel(client, guild.id, inter.channel)
-        if not ch:
-            await inter.response.send_message("❌ Kein Auktionskanal gefunden. Nutze `/auction set_channel`.", ephemeral=True)
+        save_auctions(int(guild.id), aid)
+        try:
+            msg = await ch.send(embed=_sale_embed(guild, auc), view=SaleBuyView(guild.id, aid))
+        except Exception as exc:
+            auc["status"] = "cancelled"
+            auc["close_reason"] = "initial_post_failed"
+            auc["closed_at"] = _now_iso()
+            save_auctions(int(guild.id), aid)
+            await inter.followup.send(
+                f"❌ Sale-Kauf konnte nicht gepostet werden: `{type(exc).__name__}: {str(exc)[:300]}`",
+                ephemeral=True,
+            )
             return
-        msg = await ch.send(embed=_sale_embed(guild, auc), view=SaleBuyView(guild.id, aid))
         auc["message_id"] = int(msg.id)
         auc["channel_id"] = int(getattr(ch, "id", 0) or 0)
-        save_auctions()
+        save_auctions(int(guild.id), aid)
         await _post_or_refresh_active_auction_message(client, guild.id, auc)
         await _post_or_refresh_market_message(client, guild.id, auc)
-        await inter.response.send_message(f"✅ Sale-Kauf gestartet: `{aid}` in {ch.mention}", ephemeral=True)
+        await inter.followup.send(f"✅ Sale-Kauf gestartet: `{aid}` in {ch.mention}", ephemeral=True)
 
     @auction_sale_start.autocomplete("item")
     async def auction_sale_start_item_autocomplete(inter: discord.Interaction, current: str):

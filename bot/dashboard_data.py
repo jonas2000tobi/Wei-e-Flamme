@@ -154,7 +154,7 @@ def _dashboard_member_role(guild: discord.Guild) -> Optional[discord.Role]:
     Für Vermietung/Multi-Guild gibt es keinen festen Default wie `Ebolus`.
     Jede Gilde setzt ihre Mitgliederrolle aktiv über:
 
-        /dashboard_set_member_role role:<Rolle>
+        /dashboard set_member_role role:<Rolle>
 
     Optionaler Notfall-Fallback per Railway:
     - DASHBOARD_MEMBER_ROLE_ID=123...
@@ -413,7 +413,7 @@ def _dashboard_member_filter_info(guild: discord.Guild) -> dict[str, Any]:
         "eligible_count": 0,
         "configured": False,
         "setting_value": str(configured or ""),
-        "hint": "Mit /dashboard_set_member_role role:<Rolle> eine Gildenrolle setzen.",
+        "hint": "Mit /dashboard set_member_role role:<Rolle> eine Gildenrolle setzen.",
     }
 
 
@@ -572,9 +572,13 @@ def _event_participants(guild: discord.Guild, event: dict[str, Any]) -> dict[str
     return {"yes": yes_detail, "maybe": maybe_people, "no": no_people}
 
 
-def _summarize_events(data: Any, guild: discord.Guild, *, limit: int = 200) -> dict[str, Any]:
+def _summarize_events(data: Any, guild: discord.Guild, attendance_data: Any = None, *, limit: int = 200) -> dict[str, Any]:
     guild_id = int(guild.id)
     events: list[dict[str, Any]] = []
+    attendance_bucket = _guild_dict(attendance_data, guild_id)
+    attendance_events = attendance_bucket.get("events") if isinstance(attendance_bucket.get("events"), dict) else {}
+    if not isinstance(attendance_events, dict):
+        attendance_events = {}
     if isinstance(data, dict):
         for message_id, ev in data.items():
             if not isinstance(ev, dict):
@@ -598,6 +602,59 @@ def _summarize_events(data: Any, guild: discord.Guild, *, limit: int = 200) -> d
             yes = ev.get("yes") if isinstance(ev.get("yes"), dict) else {}
             role_counts = {str(k): len(v) for k, v in yes.items() if isinstance(v, list)}
             participant_detail = _event_participants(guild, ev)
+
+            # Echte EC-Anwesenheit aus event_attendance.json in den Dashboard-Snapshot
+            # aufnehmen. Dadurch erscheinen manuell im Bot nachgetragene Spieler und
+            # Statusänderungen auch im Web-Dashboard.
+            attendance_event = attendance_events.get(str(message_id)) if isinstance(attendance_events, dict) else None
+            if not isinstance(attendance_event, dict):
+                attendance_event = {}
+            raw_attendance = attendance_event.get("attendance") if isinstance(attendance_event.get("attendance"), dict) else {}
+            attendance_statuses: dict[str, dict[str, Any]] = {}
+            for uid, raw_status in raw_attendance.items():
+                if not str(uid).isdigit() or not isinstance(raw_status, dict):
+                    continue
+                attendance_statuses[str(int(uid))] = {
+                    "status": _safe_text(raw_status.get("status") or "", 40),
+                    "marked_by": int(raw_status.get("marked_by", 0) or 0),
+                    "marked_at": str(raw_status.get("marked_at") or ""),
+                }
+            attendance_participants: list[dict[str, Any]] = []
+            seen_attendance_ids: set[int] = set()
+            for raw_participant in attendance_event.get("participants") or []:
+                if not isinstance(raw_participant, dict):
+                    continue
+                try:
+                    uid = int(raw_participant.get("id", 0) or 0)
+                except Exception:
+                    uid = 0
+                if not uid or uid in seen_attendance_ids:
+                    continue
+                seen_attendance_ids.add(uid)
+                member = guild.get_member(uid)
+                status_obj = attendance_statuses.get(str(uid)) or {}
+                attendance_participants.append({
+                    "user_id": uid,
+                    "display_name": _safe_text(
+                        raw_participant.get("name")
+                        or getattr(member, "display_name", "")
+                        or f"User {uid}",
+                        120,
+                    ),
+                    "signup": _safe_text(raw_participant.get("signup") or "", 40),
+                    "manual": bool(raw_participant.get("manual")) or str(raw_participant.get("source") or "") == "manual",
+                    "source": _safe_text(raw_participant.get("source") or ("manual" if raw_participant.get("manual") else "rsvp"), 40),
+                    "status": _safe_text(status_obj.get("status") or "", 40),
+                    "marked_by": int(status_obj.get("marked_by", 0) or 0),
+                    "marked_at": str(status_obj.get("marked_at") or ""),
+                })
+            attendance_counts = {"present": 0, "reserve": 0, "maybe": 0, "absent": 0, "excused": 0, "open": 0}
+            for row in attendance_participants:
+                status = str(row.get("status") or "open")
+                if status not in attendance_counts:
+                    status = "open"
+                attendance_counts[status] += 1
+
             events.append({
                 "event_id": str(message_id),
                 "guild_id": int(guild_id),
@@ -623,6 +680,10 @@ def _summarize_events(data: Any, guild: discord.Guild, *, limit: int = 200) -> d
                 "no_count": len(participant_detail.get("no") or []),
                 "participant_count": _event_user_count(ev),
                 "participants": participant_detail,
+                "attendance_participants": attendance_participants,
+                "attendance_statuses": attendance_statuses,
+                "attendance_counts": attendance_counts,
+                "attendance_updated_at": str(attendance_event.get("updated_at") or attendance_event.get("last_updated_at") or ""),
                 "description": _safe_text(ev.get("description") or ev.get("desc") or "", 600),
                 "image_url": _event_image_url_from_raw(ev),
             })
@@ -714,7 +775,7 @@ def _sync_member_directory(guild: discord.Guild, profile_summary: dict[str, Any]
         return {
             "ok": False,
             "skipped": True,
-            "error": "Keine Dashboard-Gildenrolle gesetzt. Nutze /dashboard_set_member_role.",
+            "error": "Keine Dashboard-Gildenrolle gesetzt. Nutze /dashboard set_member_role.",
             "active": 0,
             "deactivated": 0,
         }
@@ -2169,7 +2230,7 @@ def build_dashboard_snapshot(bot: commands.Bot, guild: discord.Guild) -> dict[st
         "profiles": profile_summary,
         "members": profile_summary,
         "member_directory": member_sync,
-        "events": _summarize_events(sources.get("events"), guild),
+        "events": _summarize_events(sources.get("events"), guild, sources.get("event_attendance")),
         "event_checks": _summarize_event_checks(sources.get("dkp_event_checks"), guild_id),
         "ec": {
             "balances": _summarize_balances(sources.get("dkp_balances"), guild),
@@ -2270,8 +2331,13 @@ def start_dashboard_publisher(bot: commands.Bot) -> None:
 
 
 async def setup_dashboard_data(bot: commands.Bot, tree: app_commands.CommandTree):
+    dashboard_group = app_commands.Group(
+        name="dashboard",
+        description="Dashboard-Konfiguration und Datenexport",
+    )
+    tree.add_command(dashboard_group)
     start_dashboard_publisher(bot)
-    @tree.command(name="dashboard_set_member_role", description="Legt die Gildenrolle fest, die im Dashboard als Mitglied zählt.")
+    @dashboard_group.command(name="set_member_role", description="Legt die Gildenrolle fest, die im Dashboard als Mitglied zählt.")
     @app_commands.describe(role="Rolle, die echte Gildenmitglieder haben müssen")
     async def dashboard_set_member_role(inter: discord.Interaction, role: discord.Role):
         if inter.guild is None:
@@ -2313,7 +2379,7 @@ async def setup_dashboard_data(bot: commands.Bot, tree: app_commands.CommandTree
 
 
 
-    @tree.command(name="dashboard_set_admin_role", description="Legt die Dashboard-Adminrolle fest.")
+    @dashboard_group.command(name="set_admin_role", description="Legt die Dashboard-Adminrolle fest.")
     @app_commands.describe(role="Rolle, die im Dashboard als Admin/Leitung zählt")
     async def dashboard_set_admin_role(inter: discord.Interaction, role: discord.Role):
         if inter.guild is None:
@@ -2354,7 +2420,7 @@ async def setup_dashboard_data(bot: commands.Bot, tree: app_commands.CommandTree
         except Exception as exc:
             await inter.followup.send(f"❌ Konnte Adminrolle nicht speichern: `{type(exc).__name__}: {exc}`", ephemeral=True)
 
-    @tree.command(name="dashboard_set_feed_channel", description="Setzt den Discord-Kanal für News, Guides oder Ankündigungen im Dashboard.")
+    @dashboard_group.command(name="set_feed_channel", description="Setzt den Discord-Kanal für News, Guides oder Ankündigungen im Dashboard.")
     @app_commands.describe(feed="News, Guides oder Ankündigungen", channel_name="Kanalname ohne ID, z. B. news, guides oder ankündigungen")
     @app_commands.choices(feed=[
         app_commands.Choice(name="News", value="news"),
@@ -2416,7 +2482,7 @@ async def setup_dashboard_data(bot: commands.Bot, tree: app_commands.CommandTree
         except Exception as exc:
             await inter.followup.send(f"❌ Konnte Feed-Kanal nicht speichern: `{type(exc).__name__}: {exc}`", ephemeral=True)
 
-    @tree.command(name="dashboard_status", description="Zeigt den Status der read-only Dashboard-Datenbasis.")
+    @dashboard_group.command(name="status", description="Zeigt den Status der read-only Dashboard-Datenbasis.")
     async def dashboard_status(inter: discord.Interaction):
         if inter.guild is None:
             await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
@@ -2475,7 +2541,7 @@ async def setup_dashboard_data(bot: commands.Bot, tree: app_commands.CommandTree
         emb.set_footer(text="Dashboard ist read-only. Alte JSON-Daten werden nur gefiltert, nicht gelöscht.")
         await inter.followup.send(embed=emb, ephemeral=True)
 
-    @tree.command(name="dashboard_export", description="Erstellt einen read-only JSON-Export für das spätere Dashboard.")
+    @dashboard_group.command(name="export", description="Erstellt einen read-only JSON-Export für das spätere Dashboard.")
     async def dashboard_export(inter: discord.Interaction):
         if inter.guild is None:
             await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
@@ -2495,7 +2561,7 @@ async def setup_dashboard_data(bot: commands.Bot, tree: app_commands.CommandTree
         except Exception as exc:
             await inter.followup.send(f"❌ Dashboard-Export fehlgeschlagen: `{type(exc).__name__}: {exc}`", ephemeral=True)
 
-    @tree.command(name="dashboard_sources", description="Zeigt, welche JSON-Quellen fürs Dashboard gefunden werden.")
+    @dashboard_group.command(name="sources", description="Zeigt, welche JSON-Quellen fürs Dashboard gefunden werden.")
     async def dashboard_sources(inter: discord.Interaction):
         if inter.guild is None:
             await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)

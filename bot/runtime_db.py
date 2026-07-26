@@ -148,6 +148,9 @@ def _init_sqlite() -> dict[str, Any]:
                 ON voice_sessions (guild_id, channel_id, joined_at DESC);
             CREATE INDEX IF NOT EXISTS idx_voice_sessions_event
                 ON voice_sessions (guild_id, event_id);
+            CREATE INDEX IF NOT EXISTS idx_voice_sessions_guild_open
+                ON voice_sessions (guild_id, user_id, channel_id)
+                WHERE left_at IS NULL;
             
             CREATE TABLE IF NOT EXISTS dashboard_snapshots (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -349,6 +352,13 @@ def _init_postgres() -> dict[str, Any]:
                 """
                 CREATE INDEX IF NOT EXISTS idx_voice_sessions_event
                     ON voice_sessions (guild_id, event_id)
+                """
+            )
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_voice_sessions_guild_open
+                    ON voice_sessions (guild_id, user_id, channel_id)
+                    WHERE left_at IS NULL
                 """
             )
             cur.execute(
@@ -1225,6 +1235,7 @@ def fetch_voice_sessions(
     until_iso: Optional[str] = None,
     channel_ids: Optional[list[int]] = None,
     user_ids: Optional[list[int]] = None,
+    open_only: bool = False,
     limit: int = 500,
 ) -> list[dict[str, Any]]:
     """Liest Voice-Sessions, die ein Zeitfenster überlappen.
@@ -1238,6 +1249,7 @@ def fetch_voice_sessions(
     until = str(until_iso or _now_iso())
     channel_ids = [int(x) for x in (channel_ids or []) if int(x or 0)]
     user_ids = [int(x) for x in (user_ids or []) if int(x or 0)]
+    open_clause = " AND left_at IS NULL" if bool(open_only) else ""
 
     def _filter_py(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         out = []
@@ -1260,11 +1272,12 @@ def fetch_voice_sessions(
             try:
                 with conn.cursor() as cur:
                     cur.execute(
-                        """
+                        f"""
                         SELECT * FROM voice_sessions
                         WHERE guild_id = %s
                           AND joined_at < %s
                           AND (left_at IS NULL OR left_at > %s)
+                          {open_clause}
                         ORDER BY joined_at DESC, id DESC
                         LIMIT %s
                         """,
@@ -1277,11 +1290,12 @@ def fetch_voice_sessions(
         conn = _sqlite_connect()
         try:
             rows = conn.execute(
-                """
+                f"""
                 SELECT * FROM voice_sessions
                 WHERE guild_id = ?
                   AND joined_at < ?
                   AND (left_at IS NULL OR left_at > ?)
+                  {open_clause}
                 ORDER BY joined_at DESC, id DESC
                 LIMIT ?
                 """,

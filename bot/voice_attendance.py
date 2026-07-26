@@ -286,9 +286,10 @@ async def _reconcile_voice_sessions_once(client: discord.Client) -> dict[str, in
                 int(guild.id),
                 since_iso="1970-01-01T00:00:00+00:00",
                 until_iso=until_iso,
-                limit=5000,
+                open_only=True,
+                limit=1000,
             )
-            open_rows = [r for r in (rows or []) if isinstance(r, dict) and not r.get("left_at")]
+            open_rows = [r for r in (rows or []) if isinstance(r, dict)]
             open_by_user: dict[int, list[dict[str, Any]]] = {}
             for row in open_rows:
                 try:
@@ -369,6 +370,11 @@ async def _bootstrap_current_voice_members(client: discord.Client) -> int:
 
 
 async def setup_voice_attendance(client: discord.Client, tree: app_commands.CommandTree):
+    attendance_group = app_commands.Group(
+        name="attendance",
+        description="Voice-Anwesenheit auswerten",
+    )
+    tree.add_command(attendance_group)
     if not getattr(client, "_ebolus_voice_attendance_listener_added", False):
         async def _voice_attendance_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
             try:
@@ -412,7 +418,7 @@ async def setup_voice_attendance(client: discord.Client, tree: app_commands.Comm
     except Exception as e:
         print(f"[voice_attendance] Bootstrap Startfehler: {e!r}")
 
-    @tree.command(name="voice_attendance_status", description="(Admin) Status vom Voice-Attendance-Tracking")
+    @attendance_group.command(name="status", description="(Admin) Status vom Voice-Attendance-Tracking")
     async def voice_attendance_status(inter: discord.Interaction):
         if inter.guild_id is None:
             await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
@@ -439,7 +445,7 @@ async def setup_voice_attendance(client: discord.Client, tree: app_commands.Comm
         emb.set_footer(text="Es wird nur gemessen. EC wird nicht automatisch vergeben.")
         await inter.response.send_message(embed=emb, ephemeral=True)
 
-    @tree.command(name="voice_attendance_events", description="(Admin) Zeigt Event-IDs für Voice-Anwesenheitsvorschläge")
+    @attendance_group.command(name="events", description="(Admin) Zeigt Event-IDs für Voice-Anwesenheitsvorschläge")
     async def voice_attendance_events(inter: discord.Interaction):
         if inter.guild_id is None:
             await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
@@ -467,10 +473,10 @@ async def setup_voice_attendance(client: discord.Client, tree: app_commands.Comm
             description="\n".join(lines),
             color=discord.Color.blurple(),
         )
-        emb.set_footer(text="Nutze die ID mit /voice_attendance_suggest event_id:...")
+        emb.set_footer(text="Nutze die ID mit /attendance suggest event_id:...")
         await inter.response.send_message(embed=emb, ephemeral=True)
 
-    @tree.command(name="voice_attendance_recent", description="(Admin) Letzte gemessene Voice-Sessions")
+    @attendance_group.command(name="recent", description="(Admin) Letzte gemessene Voice-Sessions")
     @app_commands.describe(member="Optional: nur ein Mitglied", limit="Anzahl 1-15")
     async def voice_attendance_recent(inter: discord.Interaction, member: Optional[discord.Member] = None, limit: Optional[int] = 8):
         if inter.guild_id is None:
@@ -514,9 +520,9 @@ async def setup_voice_attendance(client: discord.Client, tree: app_commands.Comm
         )
         await inter.response.send_message(embed=emb, ephemeral=True)
 
-    @tree.command(name="voice_attendance_suggest", description="(Admin) Voice-Zeiten als Anwesenheitsvorschlag für ein Event")
+    @attendance_group.command(name="suggest", description="(Admin) Voice-Zeiten als Anwesenheitsvorschlag für ein Event")
     @app_commands.describe(
-        event_id="Optional: Event-ID aus /voice_attendance_events. Leer = passendstes aktuelles Event",
+        event_id="Optional: Event-ID aus /attendance events. Leer = passendstes aktuelles Event",
         dauer_minuten="Geplante Eventdauer. Standard 120",
         vorlauf_minuten="Voice-Zeit vor Start mitzählen. Standard 15",
         voll_ab_prozent="Ab wie viel % Eventdauer: voll dabei. Standard 70",
@@ -543,7 +549,7 @@ async def setup_voice_attendance(client: discord.Client, tree: app_commands.Comm
 
         eid, ev = _get_event(inter.guild_id, event_id or "") if event_id else _pick_default_event(inter.guild_id)
         if not eid or not ev:
-            await inter.followup.send("❌ Kein Event gefunden. Nutze erst `/voice_attendance_events` und kopiere die Event-ID.", ephemeral=True)
+            await inter.followup.send("❌ Kein Event gefunden. Nutze erst `/attendance events` und kopiere die Event-ID.", ephemeral=True)
             return
 
         when = _parse_dt(str(ev.get("when_iso", "") or ""))

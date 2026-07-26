@@ -428,6 +428,11 @@ async def raid_template_auto_loop():
 
 
 async def setup_raid_templates(client: discord.Client, tree: app_commands.CommandTree):
+    template_group = app_commands.Group(
+        name="template",
+        description="Raid- und Eventvorlagen verwalten",
+    )
+    tree.add_command(template_group)
     global _client_ref
     _client_ref = client
 
@@ -435,7 +440,7 @@ async def setup_raid_templates(client: discord.Client, tree: app_commands.Comman
         raid_template_auto_loop.start()
         print("📋 Raid-Template Auto-Task gestartet.")
 
-    @tree.command(name="raid_template_create", description="(Admin) Erstellt eine Raid-/Event-Vorlage")
+    @template_group.command(name="create", description="(Admin) Erstellt eine Raid-/Event-Vorlage")
     @app_commands.describe(
         name="Interner Vorlagenname, z.B. gildenraid",
         title="Titel des Events",
@@ -517,7 +522,7 @@ async def setup_raid_templates(client: discord.Client, tree: app_commands.Comman
 
         await send_text_channel_picker(inter, "📢 Zielchannel für Vorlage auswählen", _picked)
 
-    @tree.command(name="raid_template_set_media", description="(Admin) Speichert Mediennachricht/Bild für eine Vorlage")
+    @template_group.command(name="set_media", description="(Admin) Speichert Mediennachricht/Bild für eine Vorlage")
     async def raid_template_set_media(
         inter: discord.Interaction,
         name: str,
@@ -563,7 +568,7 @@ async def setup_raid_templates(client: discord.Client, tree: app_commands.Comman
 
         await send_text_channel_picker(inter, "🖼️ Kanal der Mediennachricht auswählen", _picked)
 
-    @tree.command(name="raid_template_set_description", description="(Admin) Ändert Beschreibung einer Vorlage")
+    @template_group.command(name="set_description", description="(Admin) Ändert Beschreibung einer Vorlage")
     async def raid_template_set_description(inter: discord.Interaction, name: str, description: str):
         await inter.response.defer(ephemeral=True, thinking=False)
 
@@ -584,7 +589,7 @@ async def setup_raid_templates(client: discord.Client, tree: app_commands.Comman
 
         await inter.followup.send(f"✅ Beschreibung für `{key}` geändert.", ephemeral=True)
 
-    @tree.command(name="raid_template_set_target", description="(Admin) Setzt Zielrolle einer Vorlage")
+    @template_group.command(name="set_target", description="(Admin) Setzt Zielrolle einer Vorlage")
     async def raid_template_set_target(inter: discord.Interaction, name: str, target_role: Optional[discord.Role] = None):
         await inter.response.defer(ephemeral=True, thinking=False)
 
@@ -608,7 +613,7 @@ async def setup_raid_templates(client: discord.Client, tree: app_commands.Comman
             ephemeral=True
         )
 
-    @tree.command(name="raid_template_set_channel", description="(Admin) Setzt Zielchannel einer Vorlage")
+    @template_group.command(name="set_channel", description="(Admin) Setzt Zielchannel einer Vorlage")
     async def raid_template_set_channel(inter: discord.Interaction, name: str):
         if not _is_admin(inter):
             await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True)
@@ -629,7 +634,7 @@ async def setup_raid_templates(client: discord.Client, tree: app_commands.Comman
 
         await send_text_channel_picker(inter, "📢 Zielchannel für Vorlage auswählen", _picked)
 
-    @tree.command(name="raid_template_set_reminders", description="(Admin) Setzt Reminder-Minuten, z.B. 1440,180,60")
+    @template_group.command(name="set_reminders", description="(Admin) Setzt Reminder-Minuten, z.B. 1440,180,60")
     async def raid_template_set_reminders(inter: discord.Interaction, name: str, minutes: str):
         await inter.response.defer(ephemeral=True, thinking=False)
 
@@ -653,7 +658,7 @@ async def setup_raid_templates(client: discord.Client, tree: app_commands.Comman
             ephemeral=True
         )
 
-    @tree.command(name="raid_template_auto_set", description="(Admin) Aktiviert/deaktiviert wöchentliches Auto-Posting für eine Vorlage")
+    @template_group.command(name="auto_set", description="(Admin) Aktiviert/deaktiviert wöchentliches Auto-Posting für eine Vorlage")
     async def raid_template_auto_set(
         inter: discord.Interaction,
         name: str,
@@ -688,7 +693,7 @@ async def setup_raid_templates(client: discord.Client, tree: app_commands.Comman
             ephemeral=True
         )
 
-    @tree.command(name="raid_template_auto_status", description="Zeigt Auto-Posting-Status aller Vorlagen")
+    @template_group.command(name="auto_status", description="Zeigt Auto-Posting-Status aller Vorlagen")
     async def raid_template_auto_status(inter: discord.Interaction):
         g = _gcfg(inter.guild_id)
         all_tpl = g.get("templates") or {}
@@ -717,7 +722,7 @@ async def setup_raid_templates(client: discord.Client, tree: app_commands.Comman
 
         await inter.response.send_message("\n\n".join(lines), ephemeral=True)
 
-    @tree.command(name="raid_template_auto_reset", description="(Admin) Löscht Auto-Post-Merker einer Vorlage für ein Datum")
+    @template_group.command(name="auto_reset", description="(Admin) Löscht Auto-Post-Merker einer Vorlage für ein Datum")
     async def raid_template_auto_reset(
         inter: discord.Interaction,
         name: str,
@@ -749,7 +754,7 @@ async def setup_raid_templates(client: discord.Client, tree: app_commands.Comman
         else:
             await inter.followup.send(f"ℹ️ Kein Auto-Merker für `{marker}` gefunden.", ephemeral=True)
 
-    @tree.command(name="raid_template_run", description="(Admin) Erstellt ein Event aus Vorlage")
+    @template_group.command(name="run", description="(Admin) Erstellt ein Event aus Vorlage")
     @app_commands.describe(
         name="Vorlagenname",
         date_override="Optional: YYYY-MM-DD"
@@ -797,7 +802,7 @@ async def setup_raid_templates(client: discord.Client, tree: app_commands.Comman
 
         await send_text_channel_picker(inter, "📢 Zielchannel für Event aus Vorlage auswählen", _picked)
 
-    @tree.command(name="raid_template_list", description="Zeigt alle Raid-/Event-Vorlagen")
+    @template_group.command(name="list", description="Zeigt alle Raid-/Event-Vorlagen")
     async def raid_template_list(inter: discord.Interaction):
         g = _gcfg(inter.guild_id)
         all_tpl = g.get("templates") or {}
@@ -824,7 +829,7 @@ async def setup_raid_templates(client: discord.Client, tree: app_commands.Comman
 
         await inter.response.send_message("\n".join(lines), ephemeral=True)
 
-    @tree.command(name="raid_template_show", description="Zeigt Details einer Vorlage")
+    @template_group.command(name="show", description="Zeigt Details einer Vorlage")
     async def raid_template_show(inter: discord.Interaction, name: str):
         key = _normalize_name(name)
         g = _gcfg(inter.guild_id)
@@ -859,7 +864,7 @@ async def setup_raid_templates(client: discord.Client, tree: app_commands.Comman
 
         await inter.response.send_message(text, ephemeral=True)
 
-    @tree.command(name="raid_template_delete", description="(Admin) Löscht eine Vorlage")
+    @template_group.command(name="delete", description="(Admin) Löscht eine Vorlage")
     async def raid_template_delete(inter: discord.Interaction, name: str):
         await inter.response.defer(ephemeral=True, thinking=False)
 
