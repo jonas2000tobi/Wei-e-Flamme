@@ -49,23 +49,23 @@ async def _dashboard_lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Guild Platform Dashboard", version="2.2.1", lifespan=_dashboard_lifespan)
+app = FastAPI(title="Guild Platform Dashboard", version="2.2.2", lifespan=_dashboard_lifespan)
 security = HTTPBasic(auto_error=False)
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
-ASSET_VER = "beer-and-buffs-v2-2-1-event-images"
-DASHBOARD_RELEASE_VERSION = "2.2.1 · EC-Autoanwesenheit + stabile Eventbilder"
+ASSET_VER = "beer-and-buffs-v2-2-2-event-images"
+DASHBOARD_RELEASE_VERSION = "2.2.2 · Origin-Fix + fünf feste Eventbilder"
 
 _EVENT_IMAGE_ASSETS: dict[str, str] = {
-    "normal_raid": "/static/event_images/normal_raid.webp",
-    "hard_raid": "/static/event_images/hard_raid.webp",
-    "trials": "/static/event_images/trials.webp",
-    "nightmare": "/static/event_images/nightmare.webp",
-    "pvp": "/static/event_images/pvp.webp",
-    "guild_boss": "/static/event_images/guild_boss.webp",
+    "normal_raid": f"/static/event_images/normal_raid.webp?v={ASSET_VER}",
+    "hard_raid": f"/static/event_images/hard_raid.webp?v={ASSET_VER}",
+    "trials": f"/static/event_images/trials.webp?v={ASSET_VER}",
+    "nightmare": f"/static/event_images/nightmare.webp?v={ASSET_VER}",
+    "pvp": f"/static/event_images/pvp.webp?v={ASSET_VER}",
+    "guild_boss": f"/static/event_images/guild_boss.webp?v={ASSET_VER}",
 }
 
 _EVENT_IMAGE_LEGACY_MARKERS: dict[str, str] = {
@@ -138,8 +138,18 @@ def _event_image_raw_url(ev: dict[str, Any]) -> str:
 def _dashboard_event_image_url(ev: dict[str, Any]) -> str:
     """Liefert eine dauerhafte Bildquelle und ersetzt alte Discord-Signaturlinks."""
     raw = _event_image_raw_url(ev)
+    if raw.startswith("/static/event_images/"):
+        path = raw.split("?", 1)[0]
+        return f"{path}?v={ASSET_VER}"
     if raw.startswith("/static/"):
         return raw
+    if raw.startswith(("https://", "http://")):
+        try:
+            parsed = urllib.parse.urlsplit(raw)
+            if parsed.path.startswith("/static/event_images/"):
+                return f"{parsed.path}?v={ASSET_VER}"
+        except Exception:
+            pass
     inferred = _event_image_preset_key(ev)
     legacy = ""
     for marker, preset_key in _EVENT_IMAGE_LEGACY_MARKERS.items():
@@ -784,8 +794,63 @@ def _safe_local_path(value: Any, default: str = "/") -> str:
     return path or default
 
 
+def _normalize_origin(value: Any) -> str:
+    raw = str(value or "").strip().rstrip("/")
+    if not raw:
+        return ""
+    try:
+        parsed = urllib.parse.urlsplit(raw)
+    except Exception:
+        return ""
+    scheme = str(parsed.scheme or "").lower()
+    netloc = str(parsed.netloc or "").lower()
+    if scheme not in {"http", "https"} or not netloc:
+        return ""
+    return f"{scheme}://{netloc}"
+
+
+def _first_forwarded_value(value: Any) -> str:
+    return str(value or "").split(",", 1)[0].strip()
+
+
+def _allowed_request_origins(request: Request) -> set[str]:
+    """Gültige Browser-Origins auch hinter dem Railway-HTTPS-Proxy."""
+    candidates: set[str] = set()
+
+    def add(value: Any) -> None:
+        origin = _normalize_origin(value)
+        if origin:
+            candidates.add(origin)
+
+    add(f"{request.url.scheme}://{request.url.netloc}")
+
+    host = _first_forwarded_value(request.headers.get("host") or request.url.netloc)
+    forwarded_host = _first_forwarded_value(request.headers.get("x-forwarded-host")) or host
+    forwarded_proto = _first_forwarded_value(request.headers.get("x-forwarded-proto")) or str(request.url.scheme or "http")
+    if forwarded_host:
+        add(f"{forwarded_proto}://{forwarded_host}")
+
+    for env_name in (
+        "DASHBOARD_PUBLIC_BASE_URL",
+        "DASHBOARD_BASE_URL",
+        "DASHBOARD_URL",
+        "RAILWAY_STATIC_URL",
+    ):
+        add(os.getenv(env_name))
+
+    railway_domain = str(os.getenv("RAILWAY_PUBLIC_DOMAIN") or "").strip()
+    if railway_domain:
+        add(f"https://{railway_domain}")
+
+    return candidates
+
+
 def _request_origin(request: Request) -> str:
-    return f"{request.url.scheme}://{request.url.netloc}".rstrip("/")
+    allowed = _allowed_request_origins(request)
+    forwarded_proto = _first_forwarded_value(request.headers.get("x-forwarded-proto"))
+    forwarded_host = _first_forwarded_value(request.headers.get("x-forwarded-host") or request.headers.get("host"))
+    preferred = _normalize_origin(f"{forwarded_proto}://{forwarded_host}") if forwarded_proto and forwarded_host else ""
+    return preferred or _normalize_origin(f"{request.url.scheme}://{request.url.netloc}") or next(iter(allowed), "")
 
 
 @app.middleware("http")
@@ -796,12 +861,14 @@ async def _security_middleware(request: Request, call_next):
         fetch_site = str(request.headers.get("sec-fetch-site") or "").lower()
         if fetch_site not in {"", "same-origin", "same-site", "none"}:
             return JSONResponse({"ok": False, "error": "Cross-Site-Request blockiert"}, status_code=403)
-        expected = _request_origin(request)
-        origin = str(request.headers.get("origin") or "").rstrip("/")
-        referer = str(request.headers.get("referer") or "")
+        allowed_origins = _allowed_request_origins(request)
+        origin = str(request.headers.get("origin") or "").strip()
+        referer = str(request.headers.get("referer") or "").strip()
         explicit_api_signal = str(request.headers.get("x-dashboard-request") or "") == "1"
-        valid_origin = bool(origin and origin == expected)
-        valid_referer = bool(referer and referer.startswith(expected + "/"))
+        normalized_origin = _normalize_origin(origin)
+        normalized_referer = _normalize_origin(referer)
+        valid_origin = bool(normalized_origin and normalized_origin in allowed_origins)
+        valid_referer = bool(normalized_referer and normalized_referer in allowed_origins)
         valid_fetch_metadata = fetch_site in {"same-origin", "same-site", "none"}
         if origin and not valid_origin:
             return JSONResponse({"ok": False, "error": "Ungültige Request-Origin"}, status_code=403)
