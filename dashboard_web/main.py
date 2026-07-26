@@ -22,7 +22,7 @@ from typing import Any, Optional
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse, Response, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response, RedirectResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
@@ -49,32 +49,69 @@ async def _dashboard_lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Guild Platform Dashboard", version="2.2.2", lifespan=_dashboard_lifespan)
+app = FastAPI(title="Guild Platform Dashboard", version="2.2.4", lifespan=_dashboard_lifespan)
 security = HTTPBasic(auto_error=False)
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
-ASSET_VER = "beer-and-buffs-v2-2-2-event-images"
-DASHBOARD_RELEASE_VERSION = "2.2.2 · Origin-Fix + fünf feste Eventbilder"
+ASSET_VER = "beer-and-buffs-v2-2-4-running-event-images"
+DASHBOARD_RELEASE_VERSION = "2.2.4 · Laufende Eventbilder + volle Anwesenheitswertung"
 
 _EVENT_IMAGE_ASSETS: dict[str, str] = {
-    "normal_raid": f"/static/event_images/normal_raid.webp?v={ASSET_VER}",
-    "hard_raid": f"/static/event_images/hard_raid.webp?v={ASSET_VER}",
-    "trials": f"/static/event_images/trials.webp?v={ASSET_VER}",
-    "nightmare": f"/static/event_images/nightmare.webp?v={ASSET_VER}",
-    "pvp": f"/static/event_images/pvp.webp?v={ASSET_VER}",
-    "guild_boss": f"/static/event_images/guild_boss.webp?v={ASSET_VER}",
+    "normal_raid": f"/event-image/normal_raid?v={ASSET_VER}",
+    "hard_raid": f"/event-image/hard_raid?v={ASSET_VER}",
+    "trials": f"/event-image/trials?v={ASSET_VER}",
+    "pvp": f"/event-image/pvp?v={ASSET_VER}",
+    "guild_boss": f"/event-image/guild_boss?v={ASSET_VER}",
 }
+
+_EVENT_IMAGE_FILES: dict[str, str] = {
+    "normal_raid": "normal_raid.webp",
+    "hard_raid": "hard_raid.webp",
+    "trials": "trials.webp",
+    "pvp": "pvp.webp",
+    "guild_boss": "guild_boss.webp",
+}
+
+_EVENT_IMAGE_PRESET_ALIASES: dict[str, str] = {
+    "normal": "normal_raid",
+    "normal raid": "normal_raid",
+    "normal mode": "normal_raid",
+    "normal mode raid": "normal_raid",
+    "normal_raid": "normal_raid",
+    "nm raid": "normal_raid",
+    "hard": "hard_raid",
+    "hard raid": "hard_raid",
+    "hard mode": "hard_raid",
+    "hard mode raid": "hard_raid",
+    "hardmode raid": "hard_raid",
+    "hard_raid": "hard_raid",
+    "hm raid": "hard_raid",
+    "trial": "trials",
+    "trials": "trials",
+    "dimensionsprüfung": "trials",
+    "dimensionspruefung": "trials",
+    "pvp": "pvp",
+    "segensstein": "pvp",
+    "segensstein pvp": "pvp",
+    "boss": "guild_boss",
+    "gildenboss": "guild_boss",
+    "gildenbosse": "guild_boss",
+    "guild boss": "guild_boss",
+    "guild_boss": "guild_boss",
+}
+
+_EVENT_IMAGE_NO_IMAGE_KEYS = {"none", "kein bild", "no image", "off", "disabled"}
+_EVENT_IMAGE_CUSTOM_KEYS = {"custom", "eigene url", "external", "extern"}
+
 
 _EVENT_IMAGE_LEGACY_MARKERS: dict[str, str] = {
     "1516086614957494312": "normal_raid",
     "282b2b20-5a8f-4251-b038-15fde2ac723d": "normal_raid",
     "1513816935832228033": "hard_raid",
     "7225f274-cc4f-4eda-ba74-ca401f4e572b": "hard_raid",
-    "1513816992358858842": "nightmare",
-    "d6ee8bc1-432a-4d28-914d-31be80adf835": "nightmare",
     "1491660359952502825": "trials",
     "file_000000007dcc7246bb6e57ae41860769": "trials",
     "1513202292302811186": "pvp",
@@ -87,6 +124,7 @@ def _event_image_is_discord_attachment(url: str) -> bool:
     try:
         parsed = urllib.parse.urlparse(value)
         host = (parsed.hostname or "").lower()
+        path = (parsed.path or "").lower()
     except Exception:
         return False
     return host in {
@@ -94,21 +132,28 @@ def _event_image_is_discord_attachment(url: str) -> bool:
         "media.discordapp.net",
         "images-ext-1.discordapp.net",
         "images-ext-2.discordapp.net",
-    } and "/attachments/" in value
+    } and ("/attachments/" in path or "/ephemeral-attachments/" in path)
+
+
+def _event_image_mode(ev: dict[str, Any]) -> str:
+    return str(ev.get("image_type") or ev.get("image_preset") or "").strip().casefold()
 
 
 def _event_image_preset_key(ev: dict[str, Any]) -> str:
+    mode = _event_image_mode(ev)
+    selected = _EVENT_IMAGE_PRESET_ALIASES.get(mode, mode if mode in _EVENT_IMAGE_ASSETS else "")
+    if selected:
+        return selected
+
     values = []
-    for key in ("image_preset", "image_type", "dkp_event_type", "event_type", "title", "name", "description"):
+    for key in ("dkp_event_type", "event_type", "title", "name", "description"):
         value = ev.get(key)
         if value is not None:
             values.append(str(value))
     text = " ".join(values).casefold().replace("-", " ").replace("_", " ")
     if any(term in text for term in ("segensstein", "boonstone", "pvp")):
         return "pvp"
-    if any(term in text for term in ("nightmare", "albtraum")):
-        return "nightmare"
-    if any(term in text for term in ("trial", "prüfung", "pruefung")):
+    if any(term in text for term in ("trial", "dimensionsprüfung", "dimensionspruefung", "prüfung", "pruefung")):
         return "trials"
     if any(term in text for term in ("hardmode", "hard mode", "hard raid", "hm raid")):
         return "hard_raid"
@@ -135,33 +180,72 @@ def _event_image_raw_url(ev: dict[str, Any]) -> str:
     return ""
 
 
+@app.get("/event-image/{preset_key}", include_in_schema=False)
+def event_image_asset(preset_key: str):
+    key = _EVENT_IMAGE_PRESET_ALIASES.get(str(preset_key or "").strip().casefold(), str(preset_key or "").strip().casefold())
+    filename = _EVENT_IMAGE_FILES.get(key)
+    if not filename:
+        raise HTTPException(status_code=404, detail="Unbekanntes Eventbild")
+    path = STATIC_DIR / "event_images" / filename
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Eventbild fehlt im Deployment")
+    return FileResponse(
+        str(path),
+        media_type="image/webp",
+        headers={"Cache-Control": "public, max-age=86400, immutable"},
+    )
+
+
 def _dashboard_event_image_url(ev: dict[str, Any]) -> str:
-    """Liefert eine dauerhafte Bildquelle und ersetzt alte Discord-Signaturlinks."""
+    """Liefert für bekannte Eventtypen immer das feste lokale Bild.
+
+    Das repariert auch bereits laufende Events, deren alte externe Bild-URL noch
+    im Snapshot steht, aber inzwischen abgelaufen oder nicht mehr erreichbar ist.
+    Nur ausdrücklich als eigene URL markierte Bilder bleiben extern.
+    """
     raw = _event_image_raw_url(ev)
-    if raw.startswith("/static/event_images/"):
-        path = raw.split("?", 1)[0]
-        return f"{path}?v={ASSET_VER}"
-    if raw.startswith("/static/"):
-        return raw
-    if raw.startswith(("https://", "http://")):
-        try:
-            parsed = urllib.parse.urlsplit(raw)
-            if parsed.path.startswith("/static/event_images/"):
-                return f"{parsed.path}?v={ASSET_VER}"
-        except Exception:
-            pass
+    mode = _event_image_mode(ev)
+
+    if mode in _EVENT_IMAGE_NO_IMAGE_KEYS:
+        return ""
+    if mode in _EVENT_IMAGE_CUSTOM_KEYS:
+        return raw if raw.startswith(("https://", "http://")) else ""
+
     inferred = _event_image_preset_key(ev)
     legacy = ""
     for marker, preset_key in _EVENT_IMAGE_LEGACY_MARKERS.items():
         if marker in raw:
             legacy = preset_key
             break
-    if raw and _event_image_is_discord_attachment(raw):
-        preset_key = inferred or legacy
+    preset_key = inferred or legacy
+    if preset_key:
         return _EVENT_IMAGE_ASSETS.get(preset_key, "")
-    if raw.startswith(("https://", "http://")):
+
+    if raw.startswith("/event-image/"):
+        path = raw.split("?", 1)[0]
+        return f"{path}?v={ASSET_VER}"
+    if raw.startswith("/static/event_images/"):
+        filename = raw.split("?", 1)[0].rsplit("/", 1)[-1]
+        key = next((k for k, v in _EVENT_IMAGE_FILES.items() if v == filename), "")
+        return _EVENT_IMAGE_ASSETS.get(key, "")
+    if raw.startswith("/static/"):
         return raw
-    return _EVENT_IMAGE_ASSETS.get(inferred, "")
+
+    if raw.startswith(("https://", "http://")):
+        try:
+            parsed = urllib.parse.urlsplit(raw)
+            if parsed.path.startswith("/event-image/"):
+                return f"{parsed.path}?v={ASSET_VER}"
+            if parsed.path.startswith("/static/event_images/"):
+                filename = parsed.path.rsplit("/", 1)[-1]
+                key = next((k for k, v in _EVENT_IMAGE_FILES.items() if v == filename), "")
+                return _EVENT_IMAGE_ASSETS.get(key, "")
+        except Exception:
+            pass
+        if _event_image_is_discord_attachment(raw) and any(token in raw for token in ("?ex=", "&ex=", "?hm=", "&hm=")):
+            return ""
+        return raw
+    return ""
 
 
 def _database_url() -> str:
@@ -14952,13 +15036,13 @@ def _render_events_center(data: dict[str, Any], current_user: Optional[dict[str,
           <label>Datum<br><input name="date" type="date" required></label>
           <label>Uhrzeit<br><input name="time" type="time" required></label>
           <label>Eventtyp / EC-Regel<br>{_dashboard_event_type_select_html()}</label>
-          <label>Sichtbarer Eventbereich<br><select name="event_type"><option value="">Standard</option><option value="Normal Raid">Normal Raid</option><option value="Hard Raid">Hard Raid</option><option value="Nightmare">Nightmare</option><option value="Trials">Trials</option><option value="PvP">PvP</option><option value="Gildenbosse">Gildenbosse</option></select></label>
+          <label>Sichtbarer Eventbereich<br><select name="event_type"><option value="">Standard</option><option value="Normal Mode Raid">Normal Mode Raid</option><option value="Hardmode Raid">Hardmode Raid</option><option value="Dimensionsprüfung">Dimensionsprüfung</option><option value="Gildenbosse">Gildenbosse</option><option value="Segensstein">Segensstein</option></select></label>
           <label>Zielkanal<br>{_dashboard_channel_select_html(snap, required=True)}</label>
           <label>Zielrolle optional<br>{_dashboard_role_select_html(snap)}</label>
         </div>
         <label>Beschreibung<br><textarea name="description" rows="4" placeholder="Kurzbeschreibung"></textarea></label>
         <div class="event-form-grid">
-          <label>Bildtyp<br><select name="image_type" style="width:100%; padding:10px; border-radius:10px; background:#08090d; color:var(--text); border:1px solid var(--line);"><option value="none">Kein Bild</option><option value="custom">Eigene URL</option><option value="normal">Normal Raid</option><option value="hard">Hard Raid</option><option value="nightmare">Nightmare</option><option value="trials">Trials</option><option value="pvp">PvP</option><option value="boss">Gildenbosse</option></select></label>
+          <label>Bildtyp<br><select name="image_type" style="width:100%; padding:10px; border-radius:10px; background:#08090d; color:var(--text); border:1px solid var(--line);"><option value="none">Kein Bild</option><option value="custom">Eigene URL</option><option value="normal">Normal Mode Raid</option><option value="hard">Hardmode Raid</option><option value="trials">Dimensionsprüfung</option><option value="boss">Gildenbosse</option><option value="pvp">Segensstein</option></select></label>
           <label>Bild-URL bei Eigene URL<br><input name="image_url" placeholder="https://..."></label>
           <label style="display:flex; gap:8px; align-items:center; padding-top:22px;"><input type="checkbox" name="send_dms" value="1" checked> DMs an Zielgruppe senden</label>
         </div>
