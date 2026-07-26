@@ -20,6 +20,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
 from typing import Any, Optional
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, RedirectResponse, FileResponse
@@ -49,7 +50,7 @@ async def _dashboard_lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Guild Platform Dashboard", version="2.3.1", lifespan=_dashboard_lifespan)
+app = FastAPI(title="Guild Platform Dashboard", version="2.3.2", lifespan=_dashboard_lifespan)
 security = HTTPBasic(auto_error=False)
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -57,7 +58,7 @@ if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 ASSET_VER = "beer-and-buffs-v2-3-0-admin-event-editor"
-DASHBOARD_RELEASE_VERSION = "2.3.1 · Vereinfachte Anwesenheitsprüfung"
+DASHBOARD_RELEASE_VERSION = "2.3.2 · Needliste: Slot leeren & Zeitstempel"
 
 _EVENT_IMAGE_ASSETS: dict[str, str] = {
     "guild_boss": "https://media.discordapp.net/attachments/1528469765860098171/1528469820738375882/Gildenbosse.png?ex=6a66fbb2&is=6a65aa32&hm=68dd55e6c4471bfafac7fbe6f397e338df96be2a7d5ed09e5670beaabd2b1306&=&format=webp&quality=lossless&width=1521&height=856",
@@ -1615,6 +1616,7 @@ def _phase3_loot_pg_payload(guild_id: Any, snap: dict[str, Any]) -> Optional[dic
             "slot_name": slot,
             "label": _phase3_need_label(slot, item),
             "status": row.get("status") or raw.get("status") or "",
+            "need_since": str(raw.get("need_since") or raw.get("selected_at") or raw.get("need_created_at") or ""),
             "source": "postgres_phase3",
         }
         # _loot_text bevorzugt item_name. Damit die Loot-Zentrale weiterhin Slot+Item gruppiert,
@@ -3200,6 +3202,31 @@ def _need_is_received(entry: Any) -> bool:
     status = str(entry.get("status") or entry.get("state") or "").lower()
     raw = json.dumps(entry, ensure_ascii=False).lower()
     return status in {"received", "erhalten", "done", "locked", "complete", "completed"} or "✅" in raw or "erhalten" in raw
+
+def _need_since_raw(entry: Any) -> str:
+    if not isinstance(entry, dict):
+        return ""
+    raw = entry.get("need_since") or entry.get("selected_at") or entry.get("need_created_at")
+    if not raw and isinstance(entry.get("raw_json"), dict):
+        nested = entry.get("raw_json") or {}
+        raw = nested.get("need_since") or nested.get("selected_at") or nested.get("need_created_at")
+    return str(raw or "").strip()
+
+
+def _need_since_html(entry: Any) -> str:
+    raw = _need_since_raw(entry)
+    if not raw:
+        return '<span class="need-since unknown" title="Dieser Need stammt aus dem Altbestand ohne gespeicherten Zeitstempel.">🕒 seit unbekannt (Altbestand)</span>'
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        local_dt = dt.astimezone(ZoneInfo("Europe/Berlin"))
+        label = local_dt.strftime("%d.%m.%Y, %H:%M Uhr")
+        return f'<span class="need-since" title="Serverseitig gespeichert: {_e(raw)}">🕒 Need seit {_e(label)}</span>'
+    except Exception:
+        return '<span class="need-since unknown">🕒 Zeitpunkt nicht lesbar</span>'
+
 
 def _need_slot_map(items: Any) -> dict[str, dict[str, Any]]:
     out: dict[str, dict[str, Any]] = {}
@@ -12157,6 +12184,7 @@ def _render_need_editor_panel(
     def editor_html(tab: str, slot: str, entry: Any, idx: int) -> str:
         locked = bool(entry and _need_is_received(entry))
         current, image_url, rarity = item_model(entry)
+        since_html = _need_since_html(entry) if current else ""
         input_id = f"need-equipment-{int(user_id)}-{tab.lower()}-{idx}"
         slot_id = f"need-equipment-slot-{int(user_id)}-{tab.lower()}-{idx}"
         editor_id = f"need-equipment-editor-{tab.lower()}-{idx}"
@@ -12167,7 +12195,7 @@ def _render_need_editor_panel(
             <section class="equipment-editor" id="{_e(editor_id)}" data-tab="{_e(tab.lower())}" data-slot-name="{_e(slot)}" hidden>
               <div class="equipment-editor-preview">{image}</div>
               <div class="equipment-editor-main">
-                <div class="equipment-editor-title"><div><span>{_e(slot)}</span><strong>{_e(current or '—')}</strong></div><span class="need-state locked">Erhalten</span></div>
+                <div class="equipment-editor-title"><div><span>{_e(slot)}</span><strong>{_e(current or '—')}</strong>{since_html}</div><span class="need-state locked">Erhalten</span></div>
                 <p class="muted">Dieser Slot ist als erhalten markiert und bleibt gesperrt. Nur die Gildenleitung kann ihn wieder freigeben.</p>
               </div>
             </section>"""
@@ -12202,17 +12230,16 @@ def _render_need_editor_panel(
         """
         return f"""
         <form class="equipment-editor" id="{_e(editor_id)}" data-tab="{_e(tab.lower())}" data-live-preview="1" data-empty-icon="{_e(slot_icons.get(slot, '🧩'))}" data-slot-name="{_e(slot)}" hidden method="post" action="/portal/member/{int(user_id)}/need-change">
-          <input type="hidden" name="action_type" value="set">
           <input type="hidden" name="tab" value="{_e(tab)}">
           {hidden_slot}
           <div class="equipment-editor-preview" data-preview-box="1">{image}</div>
           <div class="equipment-editor-main">
-            <div class="equipment-editor-title"><div><span>{_e(slot)}</span><strong data-preview-label="1">{_e(current or 'Noch kein Item gewählt')}</strong></div><span class="need-state {('filled' if current else 'empty')}">{('Gesetzt' if current else 'Leer')}</span></div>
+            <div class="equipment-editor-title"><div><span>{_e(slot)}</span><strong data-preview-label="1">{_e(current or 'Noch kein Item gewählt')}</strong>{since_html}</div><span class="need-state {('filled' if current else 'empty')}">{('Gesetzt' if current else 'Leer')}</span></div>
             <div class="equipment-editor-picker">{picker}</div>
             <div class="equipment-unsaved" data-unsaved-warning="1" hidden>⚠️ Ungespeicherte Änderung – bitte speichern oder bewusst verwerfen.</div>
             <div class="equipment-editor-actions">
-              <button class="btn" type="submit">Speichern &amp; an Bot senden</button>
-              <button class="btn ghost" type="submit" name="action_type" value="clear" onclick="return confirm('Need für {_e(slot)} entfernen?')">Slot leeren</button>
+              <button class="btn" type="submit" name="action_type" value="set">Speichern &amp; an Bot senden</button>
+              <button class="btn ghost" type="submit" name="action_type" value="clear" formnovalidate onclick="return confirm('Need für {_e(slot)} wirklich entfernen?')">Slot leeren</button>
             </div>
             <small class="muted">{_e(rarity or 'Item-Datenbank')} · Bilder und Werte stammen aus derselben Item-Datenbank wie im Charakter-Builder.</small>
           </div>
@@ -12232,11 +12259,13 @@ def _render_need_editor_panel(
                 current_item_id = int((current_item or {}).get("id") or 0)
                 editor_id = f"need-equipment-editor-{tab.lower()}-{idx}"
                 area = slot_areas.get(slot, "auto")
-                locked = bool(slot_map.get(slot) and _need_is_received(slot_map.get(slot)))
+                slot_entry = slot_map.get(slot)
+                locked = bool(slot_entry and _need_is_received(slot_entry))
+                need_since_title = re.sub(r"<[^>]+>", "", _need_since_html(slot_entry)) if current else ""
                 state_cls = "locked" if locked else ("filled" if current else "empty")
                 state_txt = "🔒" if locked else ("✓" if current else "+")
                 card = f"""
-                <button type="button" class="equipment-slot {state_cls}" style="grid-area:{_e(area)}" data-open-equipment="{_e(editor_id)}" data-tab="{_e(tab.lower())}" data-ne-equipped-item-id="{current_item_id}" data-ne-equipped-item-name="{_e(current)}" aria-controls="{_e(editor_id)}">
+                <button type="button" class="equipment-slot {state_cls}" style="grid-area:{_e(area)}" data-open-equipment="{_e(editor_id)}" data-tab="{_e(tab.lower())}" data-ne-equipped-item-id="{current_item_id}" data-ne-equipped-item-name="{_e(current)}" title="{_e(need_since_title)}" aria-controls="{_e(editor_id)}">
                   <span class="equipment-slot-art">{preview_html(slot, current, image_url)}</span>
                   <span class="equipment-slot-label">{_e(slot)}</span>
                   <span class="equipment-slot-item">{_e(_short(current or 'Leer', 33))}</span>
@@ -12329,6 +12358,8 @@ def _render_need_editor_panel(
         .equipment-editor-title div{{display:grid;gap:4px}}
         .equipment-editor-title span:first-child{{color:#e8bd65;font-weight:900;text-transform:uppercase;letter-spacing:.05em;font-size:13px}}
         .equipment-editor-title strong{{font-size:20px;overflow-wrap:anywhere}}
+        .need-since{{display:block;margin-top:5px;color:#a9b0b8;font-size:11px;font-weight:600;letter-spacing:.01em}}
+        .need-since.unknown{{color:#8c8f94}}
         .equipment-editor-picker select{{width:100%;min-width:0;padding:11px 12px;border-radius:11px;background:#08090c;color:var(--text);border:1px solid rgba(214,168,79,.2)}}
         .ne-picker-wrap{{display:grid;gap:10px}}
         .ne-weapon-label,.ne-item-label{{display:grid;gap:6px}}
@@ -17792,9 +17823,9 @@ async def portal_need_change(user_id: int, request: Request, _: bool = Depends(_
     if not guild_id:
         raise HTTPException(status_code=400, detail="Guild-ID fehlt.")
     form = _parse_urlencoded_body(await request.body())
-    action_type = str(form.get("action_type") or "set").strip().lower()
+    action_type = str(form.get("action_type") or request.query_params.get("action_type") or "").strip().lower()
     if action_type not in {"set", "clear"}:
-        action_type = "set"
+        raise HTTPException(status_code=400, detail="Need-Aktion fehlt oder ist ungültig.")
     tab = str(form.get("tab") or "Main").strip()
     slot = str(form.get("slot") or "").strip()
     if slot == "Fähigkeitskern":
