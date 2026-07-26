@@ -2710,6 +2710,55 @@ def _loot_action_requests_for_dashboard(guild_id: int, limit: int = 120) -> list
         conn.close()
 
 
+def _settings_change_requests_for_dashboard(guild_id: int, limit: int = 80) -> list[dict[str, Any]]:
+    """Letzte Einstellungsänderungen aus der Dashboard-Queue.
+
+    Die Admin-Zentrale nutzt diese Daten nur zur Anzeige und Diagnose. Fehlt
+    PostgreSQL oder ist keine Guild-ID bekannt, bleibt die Seite trotzdem
+    erreichbar und zeigt eine leere Liste.
+    """
+    if not _database_url() or not guild_id:
+        return []
+    try:
+        _ensure_admin_tables()
+    except Exception:
+        return []
+    conn = _pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, request_id, guild_id, scope, action_type, status,
+                       actor_id, actor_name, requested_at, claimed_at, processed_at,
+                       payload_json, result_json
+                FROM dashboard_settings_change_requests
+                WHERE guild_id = %s
+                ORDER BY requested_at DESC, id DESC
+                LIMIT %s
+                """,
+                (int(guild_id), max(1, min(int(limit), 500))),
+            )
+            rows: list[dict[str, Any]] = []
+            for row in cur.fetchall() or []:
+                out = dict(row)
+                try:
+                    out["payload"] = json.loads(out.get("payload_json") or "{}")
+                except Exception:
+                    out["payload"] = {}
+                try:
+                    out["result"] = json.loads(out.get("result_json") or "{}")
+                except Exception:
+                    out["result"] = {}
+                rows.append(out)
+            return rows
+    except Exception:
+        # Die Admin-Seite darf bei einem kurzzeitigen DB-/Schemafehler nicht
+        # komplett ausfallen. Schreibaktionen bleiben davon unberührt.
+        return []
+    finally:
+        conn.close()
+
+
 def _admin_flat_settings(snap: dict[str, Any]) -> list[dict[str, Any]]:
     settings = snap.get("settings") or {}
     out: list[dict[str, Any]] = []
