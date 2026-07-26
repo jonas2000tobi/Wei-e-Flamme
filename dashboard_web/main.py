@@ -49,15 +49,109 @@ async def _dashboard_lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Guild Platform Dashboard", version="2.2.0", lifespan=_dashboard_lifespan)
+app = FastAPI(title="Guild Platform Dashboard", version="2.2.1", lifespan=_dashboard_lifespan)
 security = HTTPBasic(auto_error=False)
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
-ASSET_VER = "beer-and-buffs-v2-2-0-combined"
-DASHBOARD_RELEASE_VERSION = "2.2.0 · Stabilität + Anwesenheitssynchronisierung"
+ASSET_VER = "beer-and-buffs-v2-2-1-event-images"
+DASHBOARD_RELEASE_VERSION = "2.2.1 · EC-Autoanwesenheit + stabile Eventbilder"
+
+_EVENT_IMAGE_ASSETS: dict[str, str] = {
+    "normal_raid": "/static/event_images/normal_raid.webp",
+    "hard_raid": "/static/event_images/hard_raid.webp",
+    "trials": "/static/event_images/trials.webp",
+    "nightmare": "/static/event_images/nightmare.webp",
+    "pvp": "/static/event_images/pvp.webp",
+    "guild_boss": "/static/event_images/guild_boss.webp",
+}
+
+_EVENT_IMAGE_LEGACY_MARKERS: dict[str, str] = {
+    "1516086614957494312": "normal_raid",
+    "282b2b20-5a8f-4251-b038-15fde2ac723d": "normal_raid",
+    "1513816935832228033": "hard_raid",
+    "7225f274-cc4f-4eda-ba74-ca401f4e572b": "hard_raid",
+    "1513816992358858842": "nightmare",
+    "d6ee8bc1-432a-4d28-914d-31be80adf835": "nightmare",
+    "1491660359952502825": "trials",
+    "file_000000007dcc7246bb6e57ae41860769": "trials",
+    "1513202292302811186": "pvp",
+    "1780845919107": "pvp",
+}
+
+
+def _event_image_is_discord_attachment(url: str) -> bool:
+    value = str(url or "").strip()
+    try:
+        parsed = urllib.parse.urlparse(value)
+        host = (parsed.hostname or "").lower()
+    except Exception:
+        return False
+    return host in {
+        "cdn.discordapp.com",
+        "media.discordapp.net",
+        "images-ext-1.discordapp.net",
+        "images-ext-2.discordapp.net",
+    } and "/attachments/" in value
+
+
+def _event_image_preset_key(ev: dict[str, Any]) -> str:
+    values = []
+    for key in ("image_preset", "image_type", "dkp_event_type", "event_type", "title", "name", "description"):
+        value = ev.get(key)
+        if value is not None:
+            values.append(str(value))
+    text = " ".join(values).casefold().replace("-", " ").replace("_", " ")
+    if any(term in text for term in ("segensstein", "boonstone", "pvp")):
+        return "pvp"
+    if any(term in text for term in ("nightmare", "albtraum")):
+        return "nightmare"
+    if any(term in text for term in ("trial", "prüfung", "pruefung")):
+        return "trials"
+    if any(term in text for term in ("hardmode", "hard mode", "hard raid", "hm raid")):
+        return "hard_raid"
+    if any(term in text for term in ("gildenboss", "gildenbosse", "guild boss", "guildboss")):
+        return "guild_boss"
+    if any(term in text for term in ("normalmodus", "normal mode", "normal raid", "nm raid")):
+        return "normal_raid"
+    return ""
+
+
+def _event_image_raw_url(ev: dict[str, Any]) -> str:
+    for key in ("image_url", "banner_url", "thumbnail_url", "media_url", "event_image_url"):
+        value = str(ev.get(key) or "").strip()
+        if value:
+            return value
+    embed = ev.get("embed") if isinstance(ev.get("embed"), dict) else {}
+    for key in ("image_url", "thumbnail_url", "image", "thumbnail"):
+        value = embed.get(key)
+        if isinstance(value, dict):
+            value = value.get("url")
+        value = str(value or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _dashboard_event_image_url(ev: dict[str, Any]) -> str:
+    """Liefert eine dauerhafte Bildquelle und ersetzt alte Discord-Signaturlinks."""
+    raw = _event_image_raw_url(ev)
+    if raw.startswith("/static/"):
+        return raw
+    inferred = _event_image_preset_key(ev)
+    legacy = ""
+    for marker, preset_key in _EVENT_IMAGE_LEGACY_MARKERS.items():
+        if marker in raw:
+            legacy = preset_key
+            break
+    if raw and _event_image_is_discord_attachment(raw):
+        preset_key = inferred or legacy
+        return _EVENT_IMAGE_ASSETS.get(preset_key, "")
+    if raw.startswith(("https://", "http://")):
+        return raw
+    return _EVENT_IMAGE_ASSETS.get(inferred, "")
 
 
 def _database_url() -> str:
@@ -12572,19 +12666,7 @@ def _render_member_portal(data: dict[str, Any], user_id: int, request: Request, 
         return _dt_obj(ev.get("when_iso") or ev.get("start_at") or ev.get("created_at"))
 
     def event_image(ev: dict[str, Any]) -> str:
-        for key in ("image_url", "banner_url", "thumbnail_url", "media_url", "event_image_url"):
-            value = str(ev.get(key) or "").strip()
-            if value.startswith(("https://", "http://", "/static/")):
-                return value
-        embed = ev.get("embed") if isinstance(ev.get("embed"), dict) else {}
-        for key in ("image_url", "thumbnail_url", "image", "thumbnail"):
-            value = embed.get(key)
-            if isinstance(value, dict):
-                value = value.get("url")
-            value = str(value or "").strip()
-            if value.startswith(("https://", "http://", "/static/")):
-                return value
-        return ""
+        return _dashboard_event_image_url(ev)
 
     active_events = [ev for ev in _portal_active_events(snap, uid) if isinstance(ev, dict)]
     active_events.sort(key=lambda ev: event_dt(ev) or datetime.max.replace(tzinfo=timezone.utc))
@@ -12647,7 +12729,7 @@ def _render_member_portal(data: dict[str, Any], user_id: int, request: Request, 
         title = str(ev.get("title") or ev.get("name") or eid or "Gildenevent")
         status = _portal_event_status_for_user(ev, uid)
         image = event_image(ev)
-        image_html = f'<img src="{_e(image)}" alt="{_e(title)}" loading="lazy">' if image else '<span class="profile-event-fallback">⚔️</span>'
+        image_html = f'<img src="{_e(image)}" alt="{_e(title)}" loading="lazy" onerror="this.style.display=\'none\';this.parentElement.dataset.failed=\'1\'">' if image else '<span class="profile-event-fallback">⚔️</span>'
         status_cls = "yes" if status.startswith("✅") else "maybe" if "Vielleicht" in status else "no" if "Abgemeldet" in status else "open"
         summary = _event_response_summary(snap, ev)
         yes_count = int(summary.get("yes_count") or 0)
@@ -12742,6 +12824,7 @@ def _render_member_portal(data: dict[str, Any], user_id: int, request: Request, 
       .profile-event-row{{display:grid;grid-template-columns:94px minmax(0,1fr) auto;gap:13px;align-items:center;padding:8px;border-bottom:1px solid rgba(214,168,79,.16)}}
       .profile-event-row:last-child{{border-bottom:0}}
       .profile-event-image{{height:76px;overflow:hidden;border:1px solid rgba(214,168,79,.28);background:#0d0d0c;display:grid;place-items:center}}
+      .profile-event-image[data-failed="1"]::after{{content:"⚔️";font-size:32px}}
       .profile-event-image img{{width:100%;height:100%;object-fit:cover}}.profile-event-fallback{{font-size:32px}}
       .profile-event-copy h3,.profile-auction-row h3{{margin:0 0 5px;font-size:18px}}.profile-event-copy p,.profile-auction-row p{{margin:0 0 5px;color:#d2bd94;font-size:13px}}
       .profile-event-side{{display:grid;justify-items:end;gap:8px}}.profile-event-side small{{color:#c9b996}}
@@ -13011,19 +13094,7 @@ def _render_member_events_page(data: dict[str, Any], request: Request) -> str:
         return _dt_obj(ev.get("when_iso") or ev.get("start_at") or ev.get("created_at"))
 
     def event_image(ev: dict[str, Any]) -> str:
-        for key in ("image_url", "banner_url", "thumbnail_url", "media_url", "event_image_url"):
-            value = str(ev.get(key) or "").strip()
-            if value.startswith(("https://", "http://", "/static/")):
-                return value
-        embed = ev.get("embed") if isinstance(ev.get("embed"), dict) else {}
-        for key in ("image_url", "thumbnail_url", "image", "thumbnail"):
-            value = embed.get(key)
-            if isinstance(value, dict):
-                value = value.get("url")
-            value = str(value or "").strip()
-            if value.startswith(("https://", "http://", "/static/")):
-                return value
-        return ""
+        return _dashboard_event_image_url(ev)
 
     def discord_event_url(ev: dict[str, Any]) -> str:
         for key in ("jump_url", "discord_url", "message_url", "scheduled_event_url"):
@@ -13085,7 +13156,7 @@ def _render_member_events_page(data: dict[str, Any], request: Request) -> str:
         src = event_image(ev)
         cls = "event-mini-image" if compact else "event-feature-image"
         if src:
-            return f'<div class="{cls}"><img src="{_e(src)}" alt="{_e(event_title(ev))}" loading="lazy"></div>'
+            return f'<div class="{cls}"><img src="{_e(src)}" alt="{_e(event_title(ev))}" loading="lazy" onerror="this.style.display=\'none\';this.parentElement.dataset.failed=\'1\'"></div>'
         icon = "⚔️" if "boss" in event_type_text(ev).casefold() or "raid" in event_type_text(ev).casefold() else "📅"
         return f'<div class="{cls} event-image-placeholder"><span>{icon}</span><small>{_e(event_type_text(ev))}</small></div>'
 
@@ -13257,6 +13328,7 @@ def _render_member_events_page(data: dict[str, Any], request: Request) -> str:
       .event-feature-image{{height:168px;border:1px solid rgba(214,168,79,.25);background:rgba(0,0,0,.34);overflow:hidden}}
       .event-feature-image img,.event-mini-image img{{width:100%;height:100%;object-fit:cover}}
       .event-image-placeholder{{display:grid;place-items:center;text-align:center;background:radial-gradient(circle at 50% 40%,rgba(150,87,34,.28),rgba(5,7,8,.92))}}
+      .event-feature-image[data-failed="1"]::after,.event-mini-image[data-failed="1"]::after{{content:"⚔️";font-size:52px;display:grid;place-items:center;width:100%;height:100%;background:radial-gradient(circle at 50% 40%,rgba(150,87,34,.28),rgba(5,7,8,.92))}}
       .event-image-placeholder span{{font-size:52px}}.event-image-placeholder small{{color:#d9b76d;text-transform:uppercase;letter-spacing:.08em}}
       .event-feature-copy h2{{font-family:Georgia,serif;font-size:34px;margin:3px 0 8px;color:#f2eadb}}
       .event-type-label,.event-mini-type{{color:#a99b86;text-transform:uppercase;font-size:11px;letter-spacing:.1em}}
