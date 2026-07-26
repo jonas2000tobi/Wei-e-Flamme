@@ -14,7 +14,9 @@ import time
 import urllib.parse
 import urllib.request
 import urllib.error
+import uuid
 from collections import Counter
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
 from typing import Any, Optional
 from pathlib import Path
@@ -41,15 +43,21 @@ except Exception:  # Dashboard soll auch ohne Item-Modul starten
     query_items = None  # type: ignore
     set_item_image_override = None  # type: ignore
 
-app = FastAPI(title="Guild Platform Dashboard", version="2.0.0")
+@asynccontextmanager
+async def _dashboard_lifespan(_: FastAPI):
+    _validate_dashboard_security_config()
+    yield
+
+
+app = FastAPI(title="Guild Platform Dashboard", version="2.2.0", lifespan=_dashboard_lifespan)
 security = HTTPBasic(auto_error=False)
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
-ASSET_VER = "beer-and-buffs-combined-items-voice-dkp-v1-20260724"
-DASHBOARD_RELEASE_VERSION = "2.0.3 · Gesamtpatch Items, Voice-Anwesenheit & Rollen-DKP"
+ASSET_VER = "beer-and-buffs-v2-2-0-combined"
+DASHBOARD_RELEASE_VERSION = "2.2.0 · Stabilität + Anwesenheitssynchronisierung"
 
 
 def _database_url() -> str:
@@ -349,8 +357,8 @@ def _guild_rule_value(guild_id: int, kind: str) -> int:
 # Auth
 # ---------------------------------------------------------------------------
 # Das Dashboard unterstützt jetzt zwei Modi:
-# 1) Basic Auth über DASHBOARD_USERNAME / DASHBOARD_PASSWORD (Fallback/Test)
-# 2) Discord OAuth über DASHBOARD_DISCORD_CLIENT_ID / DASHBOARD_DISCORD_CLIENT_SECRET
+# 1) Discord OAuth über DASHBOARD_DISCORD_CLIENT_ID / DASHBOARD_DISCORD_CLIENT_SECRET
+# 2) Optionaler, ausdrücklich aktivierter Basic-Auth-Notfallzugang
 #
 # Discord OAuth ist bewusst optional. Wenn es nicht konfiguriert ist, bleibt dein
 # bisheriger Passwort-Login unverändert.
@@ -444,21 +452,40 @@ def _discord_oauth_enabled() -> bool:
 
 
 def _auth_mode() -> str:
-    mode = _env("DASHBOARD_AUTH_MODE", "hybrid").lower()
+    mode = _env("DASHBOARD_AUTH_MODE", "discord").lower()
     if mode not in {"basic", "discord", "hybrid"}:
-        return "hybrid"
+        return "discord"
     return mode
 
 
+def _basic_auth_allowed() -> bool:
+    # Basic Auth ist nur noch ein bewusst aktivierter Notfallmodus. Ein gesetztes
+    # Passwort allein öffnet keinen zweiten Loginpfad mehr.
+    return _auth_mode() == "basic" or _env("DASHBOARD_ALLOW_BASIC_AUTH", "0").lower() in {"1", "true", "yes", "ja"}
+
+
 def _session_secret() -> str:
-    configured = _env("DASHBOARD_SESSION_SECRET") or _env("DASHBOARD_PASSWORD")
-    if configured:
-        return configured
-    # Kein öffentlicher Default mehr. DATABASE_URL ist ein technisches Secret und
-    # liefert einen stabilen, deploy-spezifischen Notfallwert. Besser trotzdem
-    # DASHBOARD_SESSION_SECRET in Railway setzen.
-    seed = _database_url() or "dashboard-session-not-configured"
-    return hashlib.sha256(("guild-dashboard:" + seed).encode("utf-8")).hexdigest()
+    configured = _env("DASHBOARD_SESSION_SECRET")
+    if len(configured) < 32:
+        raise RuntimeError(
+            "DASHBOARD_SESSION_SECRET fehlt oder ist kürzer als 32 Zeichen. "
+            "Setze in Railway einen zufälligen Secret-Wert; Passwort und DATABASE_URL werden nicht mehr als Cookie-Schlüssel verwendet."
+        )
+    return configured
+
+
+def _validate_dashboard_security_config() -> None:
+    # Fail closed: Das Dashboard darf mit vorhersagbaren oder fehlenden
+    # Cookie-Schlüsseln gar nicht erst produktiv starten.
+    _session_secret()
+    if _basic_auth_allowed() and not _env("DASHBOARD_PASSWORD"):
+        raise RuntimeError(
+            "Basic Auth wurde aktiviert, aber DASHBOARD_PASSWORD fehlt. Der Notfallzugang bleibt ohne starkes Passwort geschlossen."
+        )
+    if _auth_mode() in {"discord", "hybrid"} and not _discord_oauth_enabled() and not _basic_auth_allowed():
+        raise RuntimeError(
+            "Discord OAuth ist nicht vollständig konfiguriert. Setze Client Secret oder aktiviere Basic Auth bewusst mit DASHBOARD_ALLOW_BASIC_AUTH=1."
+        )
 
 
 def _b64e(raw: bytes) -> str:
@@ -626,15 +653,79 @@ def _auth(request: Request, credentials: Optional[HTTPBasicCredentials] = Depend
     if mode in {"discord", "hybrid"} and _discord_oauth_enabled():
         user = _current_user(request)
         if user:
-            return True
-        if mode == "discord":
-            raise HTTPException(status_code=303, detail="Login required", headers={"Location": f"/login?next={urllib.parse.quote(str(request.url.path))}"})
+            uid = str(user.get("user_id") or user.get("id") or "").strip()
+            auth_lists = _snapshot_auth_lists()
+            allowed_ids = set(auth_lists.get("allowed_member_ids") or set())
+            admin_ids = set(auth_lists.get("admin_member_ids") or set())
+            # Rollenentzug und Gildenaustritt wirken bei jedem Request sofort.
+            if uid and uid in (allowed_ids | admin_ids):
+                return True
+            raise HTTPException(status_code=403, detail="Dashboard-Zugriff wurde entzogen. Bitte neu anmelden.")
+        if not _basic_auth_allowed():
+            target = _safe_local_path(str(request.url.path), "/")
+            raise HTTPException(status_code=303, detail="Login required", headers={"Location": f"/login?next={urllib.parse.quote(target)}"})
 
-    # Hybrid/Basic-Fallback bleibt absichtlich erhalten, damit du dich nicht aussperrst.
-    if mode in {"basic", "hybrid"}:
+    if _basic_auth_allowed():
         return _basic_auth(credentials)
 
-    raise HTTPException(status_code=303, detail="Login required", headers={"Location": "/login"})
+    raise HTTPException(status_code=503, detail="Kein sicherer Dashboard-Login ist konfiguriert.")
+
+
+def _safe_local_path(value: Any, default: str = "/") -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return default
+    try:
+        parsed = urllib.parse.urlsplit(raw)
+    except Exception:
+        return default
+    # Nur lokale absolute Pfade; keine //host-URLs, Schemes, Steuerzeichen oder Backslashes.
+    if parsed.scheme or parsed.netloc or not parsed.path.startswith("/") or parsed.path.startswith("//"):
+        return default
+    if "\\" in raw or any(ord(ch) < 32 for ch in raw):
+        return default
+    path = parsed.path
+    if parsed.query:
+        path += "?" + parsed.query
+    return path or default
+
+
+def _request_origin(request: Request) -> str:
+    return f"{request.url.scheme}://{request.url.netloc}".rstrip("/")
+
+
+@app.middleware("http")
+async def _security_middleware(request: Request, call_next):
+    # SameSite=Lax schützt viel, aber nicht alle Browser-/Proxy-Konstellationen.
+    # Zustandsändernde Requests aus fremden Origins werden zusätzlich blockiert.
+    if request.method.upper() in {"POST", "PUT", "PATCH", "DELETE"}:
+        fetch_site = str(request.headers.get("sec-fetch-site") or "").lower()
+        if fetch_site not in {"", "same-origin", "same-site", "none"}:
+            return JSONResponse({"ok": False, "error": "Cross-Site-Request blockiert"}, status_code=403)
+        expected = _request_origin(request)
+        origin = str(request.headers.get("origin") or "").rstrip("/")
+        referer = str(request.headers.get("referer") or "")
+        explicit_api_signal = str(request.headers.get("x-dashboard-request") or "") == "1"
+        valid_origin = bool(origin and origin == expected)
+        valid_referer = bool(referer and referer.startswith(expected + "/"))
+        valid_fetch_metadata = fetch_site in {"same-origin", "same-site", "none"}
+        if origin and not valid_origin:
+            return JSONResponse({"ok": False, "error": "Ungültige Request-Origin"}, status_code=403)
+        if referer and not valid_referer:
+            return JSONResponse({"ok": False, "error": "Ungültiger Request-Referer"}, status_code=403)
+        # Keine zustandsändernde Anfrage ohne mindestens ein nicht fälschbares
+        # Browser-/Same-Origin-Signal. API-Clients können den Custom-Header setzen;
+        # Cross-Origin-JavaScript löst dafür einen CORS-Preflight aus.
+        if not (valid_origin or valid_referer or valid_fetch_metadata or explicit_api_signal):
+            return JSONResponse({"ok": False, "error": "CSRF-Schutz: Herkunft nicht nachweisbar"}, status_code=403)
+
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "same-origin")
+    response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+    response.headers.setdefault("Content-Security-Policy", "frame-ancestors 'none'; base-uri 'self'; form-action 'self'")
+    return response
 
 
 def _request_json(url: str, *, method: str = "GET", data: Optional[dict[str, Any]] = None, token: str = "") -> dict[str, Any]:
@@ -1846,44 +1937,31 @@ def _apply_phase3_events_read_cutover(payload: dict[str, Any]) -> dict[str, Any]
 # ---------------------------------------------------------------------------
 
 def _is_dashboard_admin(request: Request) -> bool:
-    """Admin-Erkennung robust halten.
+    """Adminrechte ausschließlich aus dem aktuellen Bot-Snapshot ableiten.
 
-    Admins sehen standardmäßig die normale Mitgliederansicht. Der Admin-Portal-Button
-    muss trotzdem funktionieren – auch wenn die Session noch als member gespeichert
-    ist. Darum wird zusätzlich der aktuelle Snapshot geprüft.
+    Die im Cookie gespeicherte Rolle ist nur Anzeigeinformation und niemals mehr
+    Berechtigungsquelle. Damit wirkt ein Discord-Rollenentzug sofort.
     """
     user = _current_user(request) or {}
-    if str(user.get("role") or "").lower() == "admin":
-        return True
-    if bool(user.get("is_admin") or user.get("admin")):
-        return True
     uid = str(user.get("user_id") or user.get("id") or "").strip()
-    if uid:
-        try:
-            auth_lists = _snapshot_auth_lists()
-            if uid in set(auth_lists.get("admin_member_ids") or set()):
-                return True
-        except Exception:
-            pass
+    if not uid:
+        return False
     try:
-        session_roles = {str(x) for x in (user.get("roles") or []) if str(x).strip()}
-        if session_roles & _admin_role_ids():
-            return True
-        if "snapshot_admin" in session_roles:
-            return True
+        auth_lists = _snapshot_auth_lists()
+        return uid in set(auth_lists.get("admin_member_ids") or set())
     except Exception:
-        pass
-    return False
+        return False
 
 
 def _admin_auth(request: Request, credentials: Optional[HTTPBasicCredentials] = Depends(security)) -> bool:
     _auth(request, credentials)
     if _is_dashboard_admin(request):
         return True
-    # Nur für lokalen Notfall, wenn Discord OAuth komplett deaktiviert ist.
-    if _auth_mode() in {"basic", "hybrid"} and not _discord_oauth_enabled():
-        return True
-    raise HTTPException(status_code=403, detail="Dashboard-Adminrolle erforderlich")
+    # Sobald Basic Auth ausdrücklich aktiviert wurde, sind gültige Basic-
+    # Zugangsdaten der klar definierte Notfall-Adminpfad – auch im Hybridmodus.
+    if _basic_auth_allowed() and credentials is not None:
+        return _basic_auth(credentials)
+    raise HTTPException(status_code=403, detail="Aktuelle Dashboard-Adminrolle erforderlich")
 
 
 def _safe_guild_id(data: Optional[dict[str, Any]] = None) -> int:
@@ -1953,6 +2031,35 @@ def _ensure_admin_tables() -> None:
                 """
                 CREATE INDEX IF NOT EXISTS idx_dashboard_ec_award_requests_lookup
                 ON dashboard_ec_award_requests (guild_id, event_id, status, requested_at DESC)
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS dashboard_attendance_action_requests (
+                    id BIGSERIAL PRIMARY KEY,
+                    request_id TEXT NOT NULL UNIQUE,
+                    guild_id BIGINT NOT NULL,
+                    event_id TEXT NOT NULL,
+                    action_type TEXT NOT NULL DEFAULT 'sync_review',
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    payload_json TEXT NOT NULL DEFAULT '{}',
+                    actor_id TEXT,
+                    actor_name TEXT,
+                    requested_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    claimed_at TIMESTAMPTZ,
+                    processed_at TIMESTAMPTZ,
+                    result_json TEXT,
+                    attempt_count INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT
+                )
+                """
+            )
+            cur.execute("ALTER TABLE dashboard_attendance_action_requests ADD COLUMN IF NOT EXISTS attempt_count INTEGER NOT NULL DEFAULT 0")
+            cur.execute("ALTER TABLE dashboard_attendance_action_requests ADD COLUMN IF NOT EXISTS last_error TEXT")
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_dashboard_attendance_action_pending
+                ON dashboard_attendance_action_requests (status, requested_at, id)
                 """
             )
             cur.execute(
@@ -2419,7 +2526,7 @@ def _admin_center_payload(data: dict[str, Any]) -> dict[str, Any]:
         {"setting": "Admin Role IDs", "value": ", ".join(sorted(_admin_role_ids())) or "—", "hint": "Adminrechte"},
         {"setting": "Public Base URL", "value": _env("DASHBOARD_PUBLIC_BASE_URL") or "auto", "hint": "Railway/Domain"},
         {"setting": "Redirect URI", "value": _env("DASHBOARD_DISCORD_REDIRECT_URI") or "auto: /auth/discord/callback", "hint": "Discord Developer Portal"},
-        {"setting": "Session Secret", "value": "gesetzt" if _env("DASHBOARD_SESSION_SECRET") else "Fallback", "hint": "Cookie-Signatur"},
+        {"setting": "Session Secret", "value": "gesetzt" if _env("DASHBOARD_SESSION_SECRET") else "FEHLT", "hint": "Cookie-Signatur (Pflicht)"},
     ]
 
     next_steps = []
@@ -2943,7 +3050,7 @@ def _render_dashboard(data: dict[str, Any]) -> str:
             <section class="panel">
               <h1>📊 Beer and Buffs Dashboard</h1>
               <p class="muted">{_e(data.get('error'))}</p>
-              <p>Starte den Bot mit der aktuellen Version und warte bis zu 5 Minuten. Oder nutze im Discord <code>/dashboard_status</code>, damit direkt ein Snapshot veröffentlicht wird.</p>
+              <p>Starte den Bot mit der aktuellen Version und warte bis zu 5 Minuten. Oder nutze im Discord <code>/dashboard status</code>, damit direkt ein Snapshot veröffentlicht wird.</p>
             </section>
             """,
         )
@@ -3101,75 +3208,7 @@ def _render_dashboard(data: dict[str, Any]) -> str:
     return _html_shell("Beer and Buffs Dashboard", body)
 
 
-def _render_member_detail(data: dict[str, Any], user_id: int, current_user: Optional[dict[str, Any]] = None) -> str:
-    if not data.get("ok"):
-        return _html_shell("Beer and Buffs Dashboard", f"<section class='panel'><h1>📊 Beer and Buffs Dashboard</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
-    snap: dict[str, Any] = data.get("snapshot") or {}
-    profiles = ((snap.get("profiles") or {}).get("items") or [])
-    balances = _balance_map(snap)
-    needs_by_user = _needs_by_user(snap)
-    profile = None
-    for p in profiles:
-        if isinstance(p, dict) and _user_id(p.get("user_id")) == int(user_id):
-            profile = p
-            break
-    if not profile:
-        return _html_shell(
-            "Mitglied nicht gefunden",
-            "<section class='panel'><h1>❌ Mitglied nicht gefunden</h1><p class='muted'>Dieses Mitglied ist nicht im aktuellen Dashboard-Snapshot oder hat nicht die gesetzte Gildenrolle.</p><p><a class='btn' href='/'>Zurück</a></p></section>",
-        )
-
-    display = profile.get("display_name") or profile.get("ingame_name") or f"User {user_id}"
-    ec_value = balances.get(int(user_id))
-    need_info = needs_by_user.get(int(user_id), {})
-    main_needs = need_info.get("main") if isinstance(need_info, dict) else []
-    secondary_needs = need_info.get("secondary") if isinstance(need_info, dict) else []
-
-    tx_rows = []
-    for tx in _tx_for_user(snap, user_id):
-        tx_rows.append([_dt(tx.get("created_at")), _fmt_ec(tx.get("amount")), tx.get("raw_type"), _short(tx.get("reason"), 140)])
-
-    voice_rows = []
-    for v in _voice_for_user(snap, user_id):
-        seconds = int(_num(v.get("duration_seconds"), 0))
-        minutes = round(seconds / 60, 1) if seconds else "—"
-        voice_rows.append([v.get("channel_name") or v.get("channel_id"), _dt(v.get("joined_at")), _dt(v.get("left_at")), minutes])
-
-    auction_rows = []
-    for a in _auctions_for_user(snap, user_id):
-        auction_rows.append([a.get("item_name"), a.get("status"), a.get("phase"), _fmt_ec(a.get("top_bid_amount")) if a.get("top_bid_amount") is not None else "—", _dt(a.get("ends_at"))])
-
-    cards = "".join([
-        _card("Ingame", profile.get("ingame_name") or "—", "Profil"),
-        _card("Rolle", profile.get("main_role") or "—", "Main-Rolle"),
-        _card("Gearscore", profile.get("gearscore") or "—", "Profilwert"),
-        _card("EC", _fmt_ec(ec_value) if ec_value is not None else "—", "aktueller Kontostand"),
-    ])
-
-    body = f"""
-    <nav class="topnav"><a href="/">← Übersicht</a><a href="/ec">EC-Verlauf</a><a href="/member/{_e(user_id)}/loot">Loot-Verlauf</a><a href="#needs">Needs</a><a href="#ec">EC</a><a href="#voice">Voice</a><a href="/api/snapshot">JSON</a></nav>
-    <section class="hero">
-      <div>
-        <div class="eyebrow">Mitglied</div>
-        <h1>👤 {_e(display)}</h1>
-        <p class="muted">User-ID: {_e(user_id)} · Snapshot: {_e(_dt(data.get('published_at')))}</p>
-      </div>
-      <a class="btn" href="/">Zurück</a>
-    </section>
-    <section class="grid">{cards}</section>
-    {_admin_member_panel(data, int(user_id), current_user)}
-    <section class="panel" id="needs">
-      <h2>🎁 Needliste</h2>
-      <div class="split">
-        <div>{_need_list_html('Main-Needs', main_needs)}</div>
-        <div>{_need_list_html('Secondary-Needs', secondary_needs)}</div>
-      </div>
-    </section>
-    <section class="panel" id="ec"><h2>🪙 Letzte EC-Buchungen</h2>{_table(['Zeit','Betrag','Typ','Grund'], tx_rows, placeholder='Buchungen durchsuchen…')}</section>
-    <section class="panel"><h2>🎁 Auktionen mit aktueller Führung/Gewinn</h2>{_table(['Item','Status','Phase','Gebot','Ende'], auction_rows, placeholder='Auktionen durchsuchen…')}</section>
-    <section class="panel" id="voice"><h2>🎙️ Voice-Sessions</h2>{_table(['Kanal','Rein','Raus','Minuten'], voice_rows, placeholder='Voice durchsuchen…')}</section>
-    """
-    return _html_shell(f"{display} · Beer and Buffs Dashboard", body)
+# Entfernte überschriebene Altdefinition: _render_member_detail
 
 
 def _event_by_id(snap: dict[str, Any], event_id: str) -> Optional[dict[str, Any]]:
@@ -3384,50 +3423,7 @@ def _role_signup_html(event: dict[str, Any]) -> str:
     return "".join(blocks)
 
 
-def _render_event_detail(data: dict[str, Any], event_id: str) -> str:
-    if not data.get("ok"):
-        return _html_shell("Beer and Buffs Dashboard", f"<section class='panel'><h1>📊 Beer and Buffs Dashboard</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
-    snap: dict[str, Any] = data.get("snapshot") or {}
-    guild_id = _safe_guild_id(data)
-    event = _event_by_id(snap, event_id) or _event_stub_from_attendance_review(guild_id, event_id)
-    if not event:
-        return _html_shell(
-            "Event nicht gefunden",
-            "<section class='panel'><h1>❌ Event nicht gefunden</h1><p class='muted'>Dieses Event ist nicht im aktuellen Dashboard-Snapshot und hat keinen Review-Fallback.</p><p><a class='btn' href='/attendance'>Zur Anwesenheit</a></p></section>",
-        )
-
-    participants = event.get("participants") or {}
-    maybe_rows = _participant_rows(participants.get("maybe") or [])
-    no_rows = _participant_rows(participants.get("no") or [])
-    yes_counts = event.get("yes_counts") or {}
-    role_items = sorted([(str(k), int(_num(v))) for k, v in yes_counts.items()], key=lambda x: x[0].lower())
-
-    cards = "".join([
-        _card("Teilnehmer", event.get("participant_count", 0), "alle Rückmeldungen"),
-        _card("Vielleicht", event.get("maybe_count", 0), "unsicher"),
-        _card("Abgemeldet", event.get("no_count", 0), "Nein/abgemeldet"),
-        _card("Voice", "ja" if event.get("voice_enabled") else "nein", event.get("voice_channel_id") or event.get("voice_last_channel_id") or "kein Voice"),
-    ])
-
-    body = f"""
-    <nav class="topnav"><a href="/">← Übersicht</a><a href="#signups">Zusagen</a><a href="#maybe">Vielleicht</a><a href="#no">Abgemeldet</a><a href="/api/snapshot">JSON</a></nav>
-    <section class="hero">
-      <div>
-        <div class="eyebrow">Event</div>
-        <h1>📅 {_e(event.get('title') or event_id)}</h1>
-        <p class="muted">Event-ID: {_e(event_id)} · Zeit: {_e(_dt(event.get('when_iso')))} · Snapshot: {_e(_dt(data.get('published_at')))}</p>
-        {f"<p>{_e(event.get('description'))}</p>" if event.get('description') else ""}
-      </div>
-      <a class="btn" href="/#events">Zurück</a>
-    </section>
-    <section class="grid">{cards}</section>
-    <section class="panel"><h2>📊 Rollenverteilung</h2>{_bars(role_items, max_items=12)}</section>
-    <section class="panel" id="signups"><h2>✅ Zusagen nach Rolle</h2>{_role_signup_html(event)}</section>
-    <section class="panel" id="maybe"><h2>🟡 Vielleicht</h2>{_table(['Spieler','Gildenrolle'], maybe_rows, placeholder='Vielleicht durchsuchen…')}</section>
-    <section class="panel" id="no"><h2>❌ Abgemeldet</h2>{_table(['Spieler','Gildenrolle'], no_rows, placeholder='Abmeldungen durchsuchen…')}</section>
-    {_event_ec_queue_panel(_safe_guild_id(data), str(event_id))}
-    """
-    return _html_shell(f"{event.get('title') or 'Event'} · Beer and Buffs Dashboard", body)
+# Entfernte überschriebene Altdefinition: _render_event_detail
 
 
 def _auction_by_id(snap: dict[str, Any], auction_id: str) -> Optional[dict[str, Any]]:
@@ -5854,17 +5850,7 @@ def _ec_award_request_by_request_id(guild_id: int, request_id: str) -> dict[str,
         conn.close()
 
 
-def _dt_obj(value: Any) -> Optional[datetime]:
-    if isinstance(value, datetime):
-        dt = value
-    else:
-        try:
-            dt = datetime.fromisoformat(str(value or "").replace("Z", "+00:00"))
-        except Exception:
-            return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
+# Entfernte überschriebene Altdefinition: _dt_obj
 
 
 def _ec_award_request_is_stale(row: dict[str, Any], minutes: int = 15) -> bool:
@@ -6441,7 +6427,7 @@ def _render_settings_dashboard(data: dict[str, Any]) -> str:
         ["Admin Role IDs", admin_roles, "DASHBOARD_ADMIN_ROLE_IDS"],
         ["Public Base URL", _env("DASHBOARD_PUBLIC_BASE_URL") or "auto", "für Redirect URI / Custom Domain"],
         ["Redirect URI", _env("DASHBOARD_DISCORD_REDIRECT_URI") or "auto: /auth/discord/callback", "muss im Discord Developer Portal stehen"],
-        ["Session Secret", "gesetzt" if _env("DASHBOARD_SESSION_SECRET") else "Fallback", "für signiertes Dashboard-Cookie"],
+        ["Session Secret", "gesetzt" if _env("DASHBOARD_SESSION_SECRET") else "FEHLT", "für signiertes Dashboard-Cookie (Pflicht)"],
     ]
 
     body = f"""
@@ -6464,35 +6450,7 @@ def _render_settings_dashboard(data: dict[str, Any]) -> str:
     return _html_shell("Einstellungen · Beer and Buffs Dashboard", body, nav_mode="admin")
 
 
-def _render_audit_dashboard(data: dict[str, Any]) -> str:
-    if not data.get("ok"):
-        return _html_shell("Beer and Buffs Dashboard", f"<section class='panel'><h1>🧾 Audit</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
-    snap: dict[str, Any] = data.get("snapshot") or {}
-    audit = snap.get("audit") or {}
-    logs = [x for x in (audit.get("recent_logs") or []) if isinstance(x, dict)]
-    by_action = Counter(str(x.get("action") or "Unbekannt") for x in logs)
-    by_actor = Counter(str(x.get("actor_id") or "Unbekannt") for x in logs)
-    cards = "".join([
-        _card("Audit gesamt", audit.get("logs_total", 0), "in Runtime-DB"),
-        _card("geladen", len(logs), "im Snapshot"),
-        _card("Aktionen", len(by_action), "unterschiedliche Typen"),
-        _card("Akteure", len(by_actor), "unterschiedliche IDs"),
-    ])
-    log_rows = []
-    for a in logs:
-        log_rows.append([_dt(a.get("created_at")), a.get("action"), a.get("actor_id"), _short(a.get("summary"), 180)])
-    action_rows = [[k, v] for k, v in by_action.most_common(80)]
-    actor_rows = [[k, v] for k, v in by_actor.most_common(80)]
-    body = f"""
-    <nav class="topnav"><a href="/">← Übersicht</a><a href="/settings">Einstellungen</a><a href="/system">System</a><a href="#logs">Logs</a><a href="/api/audit">API</a></nav>
-    <section class="hero"><div><div class="eyebrow">Audit Trail</div><h1>🧾 Audit-Log</h1><p class="muted">Read-only Protokoll der wichtigsten Bot-Aktionen. Snapshot: {_e(_dt(data.get('published_at')))}</p></div><a class="btn" href="/">Zurück</a></section>
-    <section class="grid">{cards}</section>
-    <section class="split"><div class="panel"><h2>Aktionen</h2>{_bars(by_action.most_common(12), max_items=12)}</div><div class="panel"><h2>Akteure</h2>{_bars(by_actor.most_common(12), max_items=12)}</div></section>
-    <section class="panel"><h2>Aktionen als Tabelle</h2>{_table(['Aktion','Anzahl'], action_rows, placeholder='Aktionen durchsuchen…')}</section>
-    <section class="panel"><h2>Akteure als Tabelle</h2>{_table(['Actor ID','Anzahl'], actor_rows, placeholder='Akteure durchsuchen…')}</section>
-    <section class="panel" id="logs"><h2>Letzte Audit-Einträge</h2>{_table(['Zeit','Aktion','Actor','Zusammenfassung'], log_rows, placeholder='Audit durchsuchen…')}</section>
-    """
-    return _html_shell("Audit · Beer and Buffs Dashboard", body, nav_mode="admin")
+# Entfernte überschriebene Altdefinition: _render_audit_dashboard
 
 
 def _render_system_dashboard(data: dict[str, Any]) -> str:
@@ -10783,13 +10741,13 @@ def _render_need_builder_dashboard(
             {builder_equipment_html}
             <aside class="nb-stats-panel">
               <h3>📊 Werte</h3>
-              <div class="nb-power"><span>Kampfkraft<br><small class="muted">Stufe-1 Vorschau</small></span><strong id="nbPower">250</strong></div>
+              <div class="nb-power"><span>Build-Score<br><small class="muted">grober Vergleichswert</small></span><strong id="nbPower">250</strong></div>
               <input id="nbValueSearch" class="nb-values-search" type="search" placeholder="Nach Werten suchen..." oninput="nbRenderValues()">
               <div class="nb-panel-subtabs"><button type="button" class="active" onclick="nbPanelTab('werte', this)">Werte</button><button type="button" onclick="nbPanelTab('traits', this)">Eigenschaften</button><button type="button" onclick="nbPanelTab('breaks', this)">Breakpoints</button></div>
               <div id="nbValuesBox" class="nb-stat-groups"></div>
               <div id="nbTraitsBox" class="nb-trait-list" style="display:none"></div>
               <div id="nbBreaksBox" class="nb-breakpoints" style="display:none"></div>
-              <p class="nb-stats-note">Addiert Grundwerte, manuell verteilte Attribute und die Werte deiner ausgewählten Items.</p>
+              <p class="nb-stats-note">Addiert importierte Itemwerte und manuelle Attribute. Der Build-Score ist keine offizielle Kampfkraft und nur zum groben Vergleich gedacht.</p>
             </aside>
           </div>
         </form>
@@ -11077,7 +11035,7 @@ def _render_need_builder_dashboard(
           'Weisheit': ['30: Max. Mana +750','40: Debuff-Dauer -5%','50: Cooldown Speed +5%','60: Max. Mana +900'],
           'Wahrnehmung': ['30: Treffer +100','40: Buff-Dauer +5%','50: Reichweite +7,5%','60: Treffer +120']
         }};
-        box.innerHTML = Object.entries(defs).map(([attr, lines]) => `<div class="nb-bp"><b>${{attr}} ${{nbFmt(nbNum(s[attr]||0))}}</b><span>${{lines.join('<br>')}}</span></div>`).join('') + '<p class="muted">Breakpoints nach öffentlich verfügbaren Guides; Standhaftigkeit/weitere Formeln später exakt ergänzen.</p>';
+        box.innerHTML = Object.entries(defs).map(([attr, lines]) => `<div class="nb-bp"><b>${{attr}} ${{nbFmt(nbNum(s[attr]||0))}}</b><span>${{lines.join('<br>')}}</span></div>`).join('') + '<p class="muted">Breakpoints sind eine unverbindliche Vorschau und müssen mit aktuellen Spielwerten geprüft werden; Standhaftigkeit ist noch nicht abgebildet.</p>';
       }}
       function nbRecalc() {{
         nbLastValues = nbBuildValues();
@@ -11161,7 +11119,7 @@ def api_items_stats():
 
 
 @app.get("/voice", response_class=HTMLResponse)
-def voice_page(_: bool = Depends(_auth)):
+def voice_page(_: bool = Depends(_admin_auth)):
     try:
         return HTMLResponse(_render_voice_dashboard(_snapshot_payload()))
     except Exception as exc:
@@ -11172,7 +11130,7 @@ def voice_page(_: bool = Depends(_auth)):
 
 
 @app.get("/api/voice")
-def api_voice(_: bool = Depends(_auth)):
+def api_voice(_: bool = Depends(_admin_auth)):
     payload = _snapshot_payload()
     if not payload.get("ok"):
         return JSONResponse(payload, status_code=404)
@@ -11344,14 +11302,14 @@ async def admin_loot_drop_dashboard(request: Request, _: bool = Depends(_admin_a
 
 
 @app.get("/loot-check", response_class=HTMLResponse)
-def loot_check_page(item: str = "", _: bool = Depends(_auth)):
+def loot_check_page(item: str = "", _: bool = Depends(_admin_auth)):
     try:
         return HTMLResponse(_render_loot_check(_snapshot_payload(), item))
     except Exception as exc:
         return HTMLResponse(_html_shell("Beer and Buffs Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"), status_code=500)
 
 @app.get("/exports", response_class=HTMLResponse)
-def exports_page(_: bool = Depends(_auth)):
+def exports_page(_: bool = Depends(_admin_auth)):
     try:
         return HTMLResponse(_render_exports_dashboard(_snapshot_payload()))
     except Exception as exc:
@@ -11378,7 +11336,7 @@ def api_member_center(_: bool = Depends(_auth)):
 
 
 @app.get("/export/member_center.csv")
-def export_member_center_csv(_: bool = Depends(_auth)):
+def export_member_center_csv(_: bool = Depends(_admin_auth)):
     payload = _snapshot_payload()
     if not payload.get("ok"):
         return _csv_response("member_center.csv", ["error"], [[payload.get("error")]])
@@ -11428,7 +11386,7 @@ def api_loot(_: bool = Depends(_auth)):
 
 
 @app.get("/export/members.csv")
-def export_members_csv(_: bool = Depends(_auth)):
+def export_members_csv(_: bool = Depends(_admin_auth)):
     payload = _snapshot_payload(); snap = payload.get("snapshot") or {}
     rows = []
     for m in _insight_members(snap):
@@ -11437,7 +11395,7 @@ def export_members_csv(_: bool = Depends(_auth)):
 
 
 @app.get("/export/ec.csv")
-def export_ec_csv(_: bool = Depends(_auth)):
+def export_ec_csv(_: bool = Depends(_admin_auth)):
     payload = _snapshot_payload(); snap = payload.get("snapshot") or {}
     rows = []
     for b in ((((snap.get("ec") or {}).get("balances") or {}).get("top") or [])):
@@ -11447,7 +11405,7 @@ def export_ec_csv(_: bool = Depends(_auth)):
 
 
 @app.get("/export/needs.csv")
-def export_needs_csv(_: bool = Depends(_auth)):
+def export_needs_csv(_: bool = Depends(_admin_auth)):
     payload = _snapshot_payload(); snap = payload.get("snapshot") or {}
     rows = []
     for n in ((((snap.get("loot") or {}).get("needs") or {}).get("items") or [])):
@@ -11457,7 +11415,7 @@ def export_needs_csv(_: bool = Depends(_auth)):
 
 
 @app.get("/export/auctions.csv")
-def export_auctions_csv(_: bool = Depends(_auth)):
+def export_auctions_csv(_: bool = Depends(_admin_auth)):
     payload = _snapshot_payload(); snap = payload.get("snapshot") or {}
     rows = []
     for a in ((((snap.get("loot") or {}).get("auctions") or {}).get("items") or [])):
@@ -11469,7 +11427,7 @@ def export_auctions_csv(_: bool = Depends(_auth)):
 
 
 @app.get("/api/loot-check")
-def api_loot_check(item: str = "", _: bool = Depends(_auth)):
+def api_loot_check(item: str = "", _: bool = Depends(_admin_auth)):
     payload = _snapshot_payload()
     if not payload.get("ok"):
         return JSONResponse(payload, status_code=404)
@@ -11526,7 +11484,7 @@ def api_loot_history(_: bool = Depends(_auth)):
 
 
 @app.get("/export/loot_history.csv")
-def export_loot_history_csv(_: bool = Depends(_auth)):
+def export_loot_history_csv(_: bool = Depends(_admin_auth)):
     payload = _snapshot_payload()
     snap = payload.get("snapshot") or {}
     guild_id = _safe_guild_id(payload)
@@ -11583,7 +11541,7 @@ def export_loot_history_csv(_: bool = Depends(_auth)):
 
 
 @app.get("/export/loot_check.csv")
-def export_loot_check_csv(item: str = "", _: bool = Depends(_auth)):
+def export_loot_check_csv(item: str = "", _: bool = Depends(_admin_auth)):
     payload = _snapshot_payload()
     snap = payload.get("snapshot") or {}
     check = _loot_check_payload_from_snapshot(snap, item)
@@ -11603,7 +11561,7 @@ def export_loot_check_csv(item: str = "", _: bool = Depends(_auth)):
     return _csv_response("loot_check.csv", ["suche","item","match","main_count","main_spieler","secondary_count","secondary_spieler","ergebnis","naechster_schritt"], rows)
 
 @app.get("/export/loot_center.csv")
-def export_loot_center_csv(_: bool = Depends(_auth)):
+def export_loot_center_csv(_: bool = Depends(_admin_auth)):
     payload = _snapshot_payload()
     snap = payload.get("snapshot") or {}
     center = _loot_center_payload_from_snapshot(snap)
@@ -14944,7 +14902,7 @@ def api_events_center(_: bool = Depends(_auth)):
 
 
 @app.get("/export/events_center.csv")
-def export_events_center_csv(_: bool = Depends(_auth)):
+def export_events_center_csv(_: bool = Depends(_admin_auth)):
     payload = _snapshot_payload()
     if not payload.get("ok"):
         return _csv_response("events_center.csv", ["error"], [[payload.get("error")]])
@@ -15035,7 +14993,7 @@ def api_fairness(_: bool = Depends(_auth)):
 
 
 @app.get("/export/fairness.csv")
-def export_fairness_csv(_: bool = Depends(_auth)):
+def export_fairness_csv(_: bool = Depends(_admin_auth)):
     payload = _snapshot_payload(); snap = payload.get("snapshot") or {}
     fair = _fairness_analytics(snap)
     rows = []
@@ -16417,7 +16375,7 @@ def _render_leadership_dashboard(data: dict[str, Any]) -> str:
             <section class="panel">
               <h1>🏰 Gildenleitung</h1>
               <p class="muted">{_e(data.get('error'))}</p>
-              <p>Starte den Bot mit der aktuellen Version und warte bis zu 5 Minuten. Oder nutze im Discord <code>/dashboard_status</code>, damit direkt ein Snapshot veröffentlicht wird.</p>
+              <p>Starte den Bot mit der aktuellen Version und warte bis zu 5 Minuten. Oder nutze im Discord <code>/dashboard status</code>, damit direkt ein Snapshot veröffentlicht wird.</p>
             </section>
             """,
         )
@@ -16685,7 +16643,7 @@ def _render_leadership_dashboard(data: dict[str, Any]) -> str:
 
 
 @app.get("/api/leadership")
-def api_leadership(_: bool = Depends(_auth)):
+def api_leadership(_: bool = Depends(_admin_auth)):
     payload = _snapshot_payload()
     if not payload.get("ok"):
         return JSONResponse(payload, status_code=404)
@@ -16696,9 +16654,10 @@ def api_leadership(_: bool = Depends(_auth)):
 
 @app.get("/login", response_class=HTMLResponse)
 def login_page(request: Request, next: str = "/"):
+    next = _safe_local_path(next, "/")
     oauth_info = _discord_client_id_info(force=True)
     discord_ready = bool(oauth_info.get("resolved") and _env("DASHBOARD_DISCORD_CLIENT_SECRET"))
-    basic_ready = bool(_env("DASHBOARD_PASSWORD"))
+    basic_ready = bool(_env("DASHBOARD_PASSWORD")) and _basic_auth_allowed()
     role_id = _env("DASHBOARD_MEMBER_ROLE_ID") or _configured_member_role_id_from_snapshot()
     role_name = _configured_member_role_name_from_snapshot() or "gesetzte Gildenrolle"
     discord_block = ""
@@ -16728,7 +16687,7 @@ def login_page(request: Request, next: str = "/"):
         basic_block = """
         <div class="panel">
           <h2>Passwort-Fallback</h2>
-          <p class="muted">Der alte Basic-Auth Login bleibt als Fallback aktiv, solange DASHBOARD_AUTH_MODE nicht auf <code>discord</code> steht.</p>
+          <p class="muted">Basic Auth ist als bewusst aktivierter Notfallzugang freigeschaltet. Ohne <code>DASHBOARD_ALLOW_BASIC_AUTH=1</code> oder den Modus <code>basic</code> bleibt dieser Zugang geschlossen.</p>
           <p>Wenn der Browser nach Benutzer/Passwort fragt: <code>DASHBOARD_USERNAME</code> und <code>DASHBOARD_PASSWORD</code> nutzen.</p>
         </div>
         """
@@ -16790,7 +16749,7 @@ def discord_start(request: Request, next: str = "/"):
             ),
             status_code=503,
         )
-    state_payload = {"nonce": secrets.token_urlsafe(24), "next": next or "/", "client_id": client_id, "exp": int(time.time()) + 600}
+    state_payload = {"nonce": secrets.token_urlsafe(24), "next": _safe_local_path(next, "/"), "client_id": client_id, "exp": int(time.time()) + 600}
     state = _make_token(state_payload)
     params = {
         "client_id": client_id,
@@ -16851,7 +16810,7 @@ def discord_callback(request: Request, code: str = "", state: str = "", error: s
             auth = auth_lists.get("auth") or {}
             member_role = (auth.get("member_role") or {}) if isinstance(auth, dict) else {}
             role_hint = member_role.get("role_name") or member_role.get("role_id") or "keine Gildenrolle im Snapshot"
-            return HTMLResponse(_html_shell("Kein Zugriff", f"<section class='panel'><h1>⛔ Kein Zugriff</h1><p class='muted'>Deine Discord-ID ist im aktuellen Dashboard-Snapshot nicht als Gildenmitglied/Admin enthalten.</p><p>Erlaubte Gildenrolle laut Snapshot: <code>{_e(role_hint)}</code></p><p class='muted'>Falls du die Rolle gerade erst gesetzt hast: im Discord <code>/dashboard_status</code> ausführen und dann erneut einloggen.</p><p><a class='btn' href='/logout'>Logout</a></p></section>"), status_code=403)
+            return HTMLResponse(_html_shell("Kein Zugriff", f"<section class='panel'><h1>⛔ Kein Zugriff</h1><p class='muted'>Deine Discord-ID ist im aktuellen Dashboard-Snapshot nicht als Gildenmitglied/Admin enthalten.</p><p>Erlaubte Gildenrolle laut Snapshot: <code>{_e(role_hint)}</code></p><p class='muted'>Falls du die Rolle gerade erst gesetzt hast: im Discord <code>/dashboard status</code> ausführen und dann erneut einloggen.</p><p><a class='btn' href='/logout'>Logout</a></p></section>"), status_code=403)
 
         session = {
             "user_id": uid,
@@ -16862,7 +16821,7 @@ def discord_callback(request: Request, code: str = "", state: str = "", error: s
             "iat": int(time.time()),
             "exp": int(time.time()) + 7 * 24 * 3600,
         }
-        target = str(state_data.get("next") or "/")
+        target = _safe_local_path(state_data.get("next"), "/")
         # Normale Mitglieder landen nach dem Login automatisch im reduzierten Mitgliederbereich.
         # Admins behalten den vollen Dashboard-Einstieg.
         if not is_admin and target in {"", "/", "/overview", "/admin", "/settings", "/system", "/audit", "/ec", "/ec-queue", "/attendance", "/analytics", "/voice", "/exports"}:
@@ -16902,13 +16861,133 @@ def healthz():
     }
 
 
+def _member_snapshot_payload(request: Request) -> dict[str, Any]:
+    payload = _snapshot_payload()
+    if not payload.get("ok"):
+        return payload
+    snap = payload.get("snapshot") if isinstance(payload.get("snapshot"), dict) else {}
+    user = _current_user(request) or {}
+    uid = str(user.get("user_id") or user.get("id") or "").strip()
+
+    def own_rows(section: Any, keys: tuple[str, ...] = ("items", "top", "sample")) -> dict[str, Any]:
+        if not isinstance(section, dict):
+            return {}
+        out: dict[str, Any] = {}
+        for key in keys:
+            rows = section.get(key)
+            if isinstance(rows, list):
+                filtered = [
+                    row for row in rows
+                    if isinstance(row, dict)
+                    and str(row.get("user_id") or row.get("member_user_id") or "") == uid
+                ]
+                if filtered:
+                    out[key] = filtered
+        return out
+
+    profiles = own_rows(snap.get("profiles"), ("items",))
+    balances = own_rows(((snap.get("ec") or {}).get("balances") or {}), ("top", "items"))
+    transactions = own_rows(((snap.get("ec") or {}).get("transactions") or {}), ("items",))
+    needs = own_rows(((snap.get("loot") or {}).get("needs") or {}), ("items", "sample"))
+
+    # Nur öffentliche Eventfelder plus der eigene RSVP-Status. Discord-/Mirror-IDs,
+    # Staff-Fehlertexte und vollständige Teilnehmerlisten bleiben im Admin-Snapshot.
+    event_fields = {
+        "event_id", "title", "when_iso", "end_at", "duration_minutes", "location",
+        "scheduled_event_url", "scope", "is_mirror_for_this_guild", "voice_enabled",
+        "dkp_enabled", "dkp_event_type", "yes_counts", "maybe_count", "no_count",
+        "participant_count", "description", "image_url",
+    }
+    public_events: list[dict[str, Any]] = []
+    for event in (((snap.get("events") or {}).get("items") or [])):
+        if not isinstance(event, dict):
+            continue
+        row = {k: event.get(k) for k in event_fields if k in event}
+        participants = event.get("participants") if isinstance(event.get("participants"), dict) else {}
+        own_status = ""
+        yes_groups = participants.get("yes") if isinstance(participants.get("yes"), list) else []
+        for group in yes_groups:
+            if not isinstance(group, dict):
+                continue
+            entries = group.get("participants") if isinstance(group.get("participants"), list) else []
+            if any(str((x or {}).get("user_id") if isinstance(x, dict) else x) == uid for x in entries):
+                own_status = str(group.get("role") or "yes")
+                break
+        if not own_status:
+            for status in ("maybe", "no"):
+                entries = participants.get(status) if isinstance(participants.get(status), list) else []
+                if any(str((x or {}).get("user_id") if isinstance(x, dict) else x) == uid for x in entries):
+                    own_status = status
+                    break
+        row["my_status"] = own_status
+        public_events.append(row)
+
+    # Auktionsdaten ohne berechtigte Mitglieder, fremde Gebotshistorie, Discord-IDs
+    # oder interne Liefer-/Moderationsfelder. Eigene Gebote bleiben sichtbar.
+    public_auctions: list[dict[str, Any]] = []
+    auction_source = ((snap.get("loot") or {}).get("auctions") or {})
+    auction_items = auction_source.get("items") if isinstance(auction_source, dict) else []
+    for auction in auction_items or []:
+        if not isinstance(auction, dict):
+            continue
+        row = {
+            key: auction.get(key)
+            for key in {
+                "auction_id", "item_id", "item_name", "catalog_item_id",
+                "catalog_source_item_id", "catalog_item_name", "catalog_source_url",
+                "catalog_image_url", "status", "kind", "phase", "eligibility_mode",
+                "created_at", "ends_at", "start_bid", "min_increment", "fixed_price",
+                "bid_count", "top_bid_amount", "winner_name", "delivered_at",
+                "eligible_count", "junk_drop", "junk_roll_until", "junk_roll_winner_roll",
+            }
+            if key in auction
+        }
+        own_bids = []
+        for bid in auction.get("bids") or []:
+            if isinstance(bid, dict) and str(bid.get("user_id") or "") == uid:
+                own_bids.append({
+                    "amount": bid.get("amount"),
+                    "created_at": bid.get("created_at"),
+                })
+        row["my_bids"] = own_bids
+        row["i_am_winner"] = str(auction.get("winner_user_id") or "") == uid
+        public_auctions.append(row)
+
+    safe_snapshot = {
+        "schema_version": snap.get("schema_version"),
+        "generated_at": snap.get("generated_at"),
+        "guild": {
+            k: v for k, v in (snap.get("guild") or {}).items()
+            if k in {"id", "name", "discord_name", "profile", "member_count_cache"}
+        },
+        "me": {
+            "user_id": uid,
+            "username": user.get("username") or "",
+            "profile": profiles,
+            "ec": {"balances": balances, "transactions": transactions},
+            "needs": needs,
+        },
+        "events": {"count": len(public_events), "items": public_events},
+        "loot": {"auctions": {"count": len(public_auctions), "items": public_auctions}},
+        "discord_feeds": snap.get("discord_feeds") or {},
+    }
+    return {"ok": True, "guild_id": payload.get("guild_id"), "snapshot": safe_snapshot, "scope": "member"}
+
+
 @app.get("/api/snapshot")
-def api_snapshot(_: bool = Depends(_auth)):
+def api_snapshot(request: Request, _: bool = Depends(_auth)):
+    if _is_dashboard_admin(request):
+        return JSONResponse(_snapshot_payload())
+    return JSONResponse(_member_snapshot_payload(request))
+
+
+@app.get("/api/admin/snapshot")
+def api_admin_snapshot(_: bool = Depends(_admin_auth)):
     return JSONResponse(_snapshot_payload())
 
 
 @app.get("/api/analytics")
-def api_analytics(_: bool = Depends(_auth)):
+def api_analytics(_: bool = Depends(_admin_auth)):
     payload = _snapshot_payload()
     if not payload.get("ok"):
         return JSONResponse(payload, status_code=404)
@@ -16917,7 +16996,7 @@ def api_analytics(_: bool = Depends(_auth)):
 
 
 @app.get("/analytics", response_class=HTMLResponse)
-def analytics_page(_: bool = Depends(_auth)):
+def analytics_page(_: bool = Depends(_admin_auth)):
     try:
         return HTMLResponse(_render_activity_analytics(_snapshot_payload()))
     except Exception as exc:
@@ -16929,7 +17008,7 @@ def analytics_page(_: bool = Depends(_auth)):
 
 
 @app.get("/ec", response_class=HTMLResponse)
-def ec_dashboard(_: bool = Depends(_auth)):
+def ec_dashboard(_: bool = Depends(_admin_auth)):
     try:
         return HTMLResponse(_render_ec_dashboard(_snapshot_payload()))
     except Exception as exc:
@@ -16941,7 +17020,7 @@ def ec_dashboard(_: bool = Depends(_auth)):
 
 
 @app.get("/api/ec-award-requests")
-def api_ec_award_requests(_: bool = Depends(_auth)):
+def api_ec_award_requests(_: bool = Depends(_admin_auth)):
     payload = _snapshot_payload()
     guild_id = _safe_guild_id(payload)
     rows = _ec_award_requests_for_dashboard(guild_id, limit=120) if guild_id else []
@@ -16969,7 +17048,7 @@ def api_ec_award_requests(_: bool = Depends(_auth)):
 
 
 @app.get("/api/ec")
-def api_ec(_: bool = Depends(_auth)):
+def api_ec(_: bool = Depends(_admin_auth)):
     payload = _snapshot_payload()
     if not payload.get("ok"):
         return JSONResponse(payload, status_code=404)
@@ -16978,7 +17057,7 @@ def api_ec(_: bool = Depends(_auth)):
 
 
 @app.get("/api/quality")
-def api_quality(_: bool = Depends(_auth)):
+def api_quality(_: bool = Depends(_admin_auth)):
     payload = _snapshot_payload()
     if not payload.get("ok"):
         return JSONResponse(payload, status_code=404)
@@ -17374,7 +17453,7 @@ def export_admin_center_csv(_: bool = Depends(_admin_auth)):
 
 
 @app.get("/ec-queue", response_class=HTMLResponse)
-def ec_queue_dashboard(request: Request, _: bool = Depends(_auth)):
+def ec_queue_dashboard(request: Request, _: bool = Depends(_admin_auth)):
     try:
         return HTMLResponse(_render_ec_queue_dashboard(_snapshot_payload(), _current_user(request), str(request.query_params.get("msg") or "")))
     except Exception as exc:
@@ -17449,7 +17528,7 @@ async def admin_member_save(user_id: int, request: Request, _: bool = Depends(_a
 
 
 @app.post("/admin/member/{user_id}/clear")
-async def admin_member_clear(user_id: int, request: Request, _: bool = Depends(_admin_auth)):
+def admin_member_clear(user_id: int, request: Request, _: bool = Depends(_admin_auth)):
     payload = _snapshot_payload()
     guild_id = _safe_guild_id(payload)
     _delete_member_admin_state(guild_id, int(user_id), _current_user(request) or {})
@@ -17657,7 +17736,7 @@ def _render_guild_config_dashboard(data: dict[str, Any], msg: str = "") -> str:
       <section class='panel'><h2>🎁 Loot- und Auktionsregeln</h2><p class='muted'>Diese Werte gelten sofort für neu gestartete Auktionen. Bereits laufende Auktionen behalten ihre gespeicherten Zeiten und Preise.</p><div class='grid'>
         {''.join(f"<label>{_e(spec['label'])}<br><input type='number' name='rule_{_e(kind)}' value='{loot_rules[kind]}' min='{int(spec['min'])}' max='{int(spec['max'])}'></label>" for kind, spec in GUILD_LOOT_RULES.items())}
       </div><p class='muted'>EC-Punkte, Wochenlimit und Verfall bleiben im Bereich <a href='/admin-settings'>EC & Regeln</a> einstellbar. Dieselben Lootwerte gehen auch per <code>/guild set_rule</code>.</p></section>
-      <section class='panel'><button class='btn' type='submit'>Konfiguration speichern</button><p class='muted'>Der Bot übernimmt diese Werte direkt aus Postgres. Für neue Zugriffsrollen danach einmal <code>/dashboard_status</code> ausführen und neu einloggen.</p></section>
+      <section class='panel'><button class='btn' type='submit'>Konfiguration speichern</button><p class='muted'>Der Bot übernimmt diese Werte direkt aus Postgres. Für neue Zugriffsrollen danach einmal <code>/dashboard status</code> ausführen und neu einloggen.</p></section>
     </form>
     <section class='panel'><h2>🚚 Serverwechsel</h2><p>Auf dem neuen Discord-Server: <code>/guild setup</code>, Rollen/Kanäle auswählen und danach <code>/guild rehome source_guild_id:ALTE_ID</code>. Es werden nur mitgekommene Mitglieder und sichere Historie übernommen.</p></section>
     <section class='panel'><h2>🗃️ Bekannte Gilden</h2>{_table(['Name','Guild-ID','Status','Vorherige Guild','Aktualisiert'], profile_rows, placeholder='Gilden durchsuchen…')}</section>
@@ -17831,7 +17910,7 @@ async def admin_settings_change(request: Request, _: bool = Depends(_admin_auth)
 
 
 @app.post("/admin/settings-request/{request_id}/{queue_action}")
-async def admin_settings_request_action(request: Request, request_id: str, queue_action: str, _: bool = Depends(_admin_auth)):
+def admin_settings_request_action(request: Request, request_id: str, queue_action: str, _: bool = Depends(_admin_auth)):
     payload = _snapshot_payload()
     guild_id = _safe_guild_id(payload)
     actor = _current_user(request) or {"username": "Dashboard"}
@@ -17863,7 +17942,7 @@ def _release_status_payload(data: dict[str, Any]) -> dict[str, Any]:
     if not _database_url():
         warnings.append("DATABASE_URL fehlt oder ist leer")
     if not _discord_oauth_enabled():
-        warnings.append("Discord OAuth ist nicht aktiv, Fallback-Login wird genutzt")
+        warnings.append("Discord OAuth ist nicht aktiv")
     return {
         "ok": bool(data.get("ok")),
         "version": DASHBOARD_RELEASE_VERSION,
@@ -18260,7 +18339,7 @@ def system_page(_: bool = Depends(_admin_auth)):
 
 
 @app.get("/api/settings")
-def api_settings(_: bool = Depends(_auth)):
+def api_settings(_: bool = Depends(_admin_auth)):
     payload = _snapshot_payload()
     if not payload.get("ok"):
         return JSONResponse(payload, status_code=404)
@@ -18269,7 +18348,7 @@ def api_settings(_: bool = Depends(_auth)):
 
 
 @app.get("/api/audit")
-def api_audit(_: bool = Depends(_auth)):
+def api_audit(_: bool = Depends(_admin_auth)):
     payload = _snapshot_payload()
     if not payload.get("ok"):
         return JSONResponse(payload, status_code=404)
@@ -18278,7 +18357,7 @@ def api_audit(_: bool = Depends(_auth)):
 
 
 @app.get("/api/system")
-def api_system(_: bool = Depends(_auth)):
+def api_system(_: bool = Depends(_admin_auth)):
     payload = _snapshot_payload()
     if not payload.get("ok"):
         return JSONResponse(payload, status_code=404)
@@ -18462,6 +18541,130 @@ def _attendance_review_save(guild_id: int, event_id: str, payload: dict[str, Any
         conn.close()
 
 
+def _attendance_action_enqueue(
+    guild_id: int,
+    event_id: str,
+    action_type: str,
+    payload: dict[str, Any],
+    actor: dict[str, Any],
+) -> str:
+    if not _database_url() or not guild_id or not event_id:
+        raise RuntimeError("DATABASE_URL/Guild/Event fehlt")
+    _ensure_attendance_review_tables()
+    request_id = f"attendance_{int(guild_id)}_{str(event_id)}_{uuid.uuid4().hex[:12]}"
+    actor_id = str(actor.get("user_id") or "")
+    actor_name = str(actor.get("username") or actor.get("user_id") or "")
+    conn = _pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO dashboard_attendance_action_requests
+                    (request_id, guild_id, event_id, action_type, status, payload_json, actor_id, actor_name, requested_at)
+                VALUES (%s, %s, %s, %s, 'pending', %s, %s, %s, NOW())
+                """,
+                (
+                    request_id,
+                    int(guild_id),
+                    str(event_id),
+                    str(action_type or "sync_review"),
+                    json.dumps(payload or {}, ensure_ascii=False, separators=(",", ":")),
+                    actor_id,
+                    actor_name,
+                ),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    return request_id
+
+
+def _attendance_review_save_and_enqueue(
+    guild_id: int,
+    event_id: str,
+    payload: dict[str, Any],
+    actor: dict[str, Any],
+    *,
+    status: str = "reviewed",
+    action_type: str = "sync_review",
+    action_payload: Optional[dict[str, Any]] = None,
+) -> str:
+    """Speichert Review und Bot-Auftrag atomar in derselben PG-Transaktion."""
+    if not _database_url() or not guild_id or not event_id:
+        raise RuntimeError("DATABASE_URL/Guild/Event fehlt")
+    status = str(status or "reviewed").strip().lower()
+    if status not in {"draft", "reviewed", "locked", "closed", "archived"}:
+        status = "reviewed"
+    _ensure_attendance_review_tables()
+    request_id = f"attendance_{int(guild_id)}_{str(event_id)}_{uuid.uuid4().hex[:12]}"
+    actor_id = str(actor.get("user_id") or "")
+    actor_name = str(actor.get("username") or actor.get("user_id") or "")
+    review_raw = json.dumps(payload or {}, ensure_ascii=False, separators=(",", ":"))
+    queue_raw = json.dumps(action_payload if action_payload is not None else (payload or {}), ensure_ascii=False, separators=(",", ":"))
+    conn = _pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO dashboard_event_attendance_review
+                    (guild_id, event_id, status, payload_json, updated_by_id, updated_by_name, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, NOW())
+                ON CONFLICT (guild_id, event_id) DO UPDATE SET
+                    status = EXCLUDED.status,
+                    payload_json = EXCLUDED.payload_json,
+                    updated_by_id = EXCLUDED.updated_by_id,
+                    updated_by_name = EXCLUDED.updated_by_name,
+                    updated_at = NOW()
+                """,
+                (int(guild_id), str(event_id), status, review_raw, actor_id, actor_name),
+            )
+            cur.execute(
+                """
+                INSERT INTO dashboard_admin_action_log
+                    (guild_id, action_type, target_type, target_id, actor_id, actor_name, payload_json)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    int(guild_id), "attendance_review_save", "event", str(event_id), actor_id, actor_name,
+                    json.dumps({"status": status, "items": len((payload or {}).get("items") or [])}, ensure_ascii=False),
+                ),
+            )
+            cur.execute(
+                """
+                INSERT INTO dashboard_attendance_action_requests
+                    (request_id, guild_id, event_id, action_type, status, payload_json, actor_id, actor_name, requested_at)
+                VALUES (%s, %s, %s, %s, 'pending', %s, %s, %s, NOW())
+                """,
+                (request_id, int(guild_id), str(event_id), str(action_type or "sync_review"), queue_raw, actor_id, actor_name),
+            )
+        conn.commit()
+        return request_id
+    finally:
+        conn.close()
+
+
+def _attendance_action_status(guild_id: int, event_id: str, limit: int = 8) -> list[dict[str, Any]]:
+    if not _database_url() or not guild_id or not event_id:
+        return []
+    _ensure_attendance_review_tables()
+    conn = _pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT request_id, action_type, status, actor_name, requested_at, processed_at, result_json
+                FROM dashboard_attendance_action_requests
+                WHERE guild_id = %s AND event_id = %s
+                ORDER BY requested_at DESC, id DESC
+                LIMIT %s
+                """,
+                (int(guild_id), str(event_id), int(limit)),
+            )
+            return [dict(row) for row in (cur.fetchall() or [])]
+    finally:
+        conn.close()
+
+
 def _attendance_status_label(value: Any) -> str:
     v = str(value or "open").strip().lower()
     return {
@@ -18592,6 +18795,31 @@ def _attendance_candidate_map(snap: dict[str, Any], event: dict[str, Any]) -> di
                     conn.close()
             except Exception:
                 pass
+
+    # Echte Bot-Anwesenheit hat Vorrang vor RSVP-/Voice-Vorschlägen.
+    for row in event.get("attendance_participants") or []:
+        if not isinstance(row, dict):
+            continue
+        uid = _user_id(row.get("user_id") or row.get("id"))
+        if not uid:
+            continue
+        raw_signup = str(row.get("signup") or "")
+        signup_label = {"TANK": "Tank", "HEAL": "Heal", "DPS": "DPS", "BANK": "Reserve"}.get(raw_signup.upper(), raw_signup or "Zusage")
+        bot_status = str(row.get("status") or "").lower()
+        dashboard_status = {
+            "present": "present",
+            "reserve": "partial",
+            "maybe": "partial",
+            "absent": "absent",
+            "excused": "ignore",
+            "": "open",
+        }.get(bot_status, "open")
+        add(uid, str(row.get("display_name") or ""), signup_label, dashboard_status, "Bot-Anwesenheit")
+        entry = candidates.get(uid)
+        if entry is not None:
+            entry["suggested_status"] = dashboard_status
+            if bool(row.get("manual")):
+                entry["source"].add("Bot-Nachtrag")
 
     for r in voice.get("voice_by_user") or []:
         if not isinstance(r, dict):
@@ -19023,8 +19251,34 @@ def _render_attendance_event(data: dict[str, Any], event_id: str, saved: bool = 
     payload = review.get("payload") or {}
     raw_items = payload.get("items") if isinstance(payload, dict) else None
     valid_items = [x for x in (raw_items or []) if isinstance(x, dict) and _user_id(x.get("user_id"))] if isinstance(raw_items, list) else []
+    live_payload = _attendance_review_payload_from_event(snap, event, mode="voice")
     if not valid_items:
-        payload = _attendance_review_payload_from_event(snap, event, mode="voice")
+        payload = live_payload
+    else:
+        # Gespeicherte Dashboard-Notizen behalten, aber neue/aktualisierte echte
+        # Bot-Anwesenheit immer einmischen. So erscheinen Discord-Nachträge auch
+        # dann, wenn bereits ein älterer Dashboard-Review existiert.
+        saved_map = {_user_id(x.get("user_id")): dict(x) for x in valid_items if _user_id(x.get("user_id"))}
+        for live in (live_payload.get("items") or []):
+            if not isinstance(live, dict):
+                continue
+            uid = _user_id(live.get("user_id"))
+            if not uid:
+                continue
+            existing = saved_map.get(uid)
+            if existing is None:
+                saved_map[uid] = dict(live)
+                continue
+            source = str(live.get("source") or "")
+            if "Bot-Anwesenheit" in source or "Bot-Nachtrag" in source:
+                note = existing.get("note", "")
+                existing.update(live)
+                existing["note"] = note
+            else:
+                existing["voice_minutes"] = live.get("voice_minutes", existing.get("voice_minutes", 0))
+                existing["voice_sessions"] = live.get("voice_sessions", existing.get("voice_sessions", 0))
+        payload = dict(payload)
+        payload["items"] = list(saved_map.values())
     items = [x for x in ((payload.get("items") if isinstance(payload, dict) else []) or []) if isinstance(x, dict)]
     signup_order = {"TANK": 0, "HEAL": 1, "HEALER": 1, "DPS": 2, "BANK": 3, "RESERVE": 3, "VIELLEICHT": 4, "ABGEMELDET": 5, "—": 6}
     items.sort(key=lambda i: (signup_order.get(str(i.get("signup") or "—").upper(), 20), str(i.get("display_name") or "").casefold()))
@@ -19073,6 +19327,28 @@ def _render_attendance_event(data: dict[str, Any], event_id: str, saved: bool = 
     updated = ""
     if review:
         updated = f"<p class='muted'>Letzte Speicherung: {_e(_dt(review.get('updated_at')))} durch {_e(review.get('updated_by_name') or '—')} · Status: {_e(review.get('status') or 'draft')}</p>"
+    attendance_queue_rows = _attendance_action_status(guild_id, str(event_id), limit=8)
+    queue_latest = attendance_queue_rows[0] if attendance_queue_rows else {}
+    queue_status = str(queue_latest.get("status") or "")
+    queue_notice = ""
+    if queue_status in {"pending", "processing"}:
+        queue_notice = f"<div class='warn'>⏳ Anwesenheitsänderung wartet auf den Bot: {_e(queue_status)}. Die Seite aktualisiert sich nach der Verarbeitung.</div>"
+    elif queue_status == "failed":
+        queue_notice = f"<div class='warn'>❌ Letzte Bot-Synchronisierung fehlgeschlagen. {_e(queue_latest.get('result_json') or '')}</div>"
+
+    current_ids = {_user_id(i.get("user_id")) for i in items}
+    member_options = []
+    for member in ((snap.get("members") or snap.get("profiles") or {}).get("items") or []):
+        if not isinstance(member, dict):
+            continue
+        uid = _user_id(member.get("user_id"))
+        if not uid or uid in current_ids:
+            continue
+        name = str(member.get("display_name") or member.get("server_name") or f"User {uid}")
+        member_options.append((name.casefold(), uid, name))
+    member_options.sort()
+    add_player_options = "".join(f'<option value="{uid}">{_e(name)}</option>' for _, uid, name in member_options)
+
     award_state = _event_award_state(snap, str(event_id))
     award_rows = _event_award_transaction_rows(snap, str(event_id)) if award_state.get("awarded") else []
     if award_state.get("awarded"):
@@ -19109,12 +19385,23 @@ def _render_attendance_event(data: dict[str, Any], event_id: str, saved: bool = 
       <div style="display:flex;gap:8px;flex-wrap:wrap">{hero_actions}</div>
     </section>
     {saved_note}
+    {queue_notice}
     {award_notice}
     {_attendance_review_control_panel(guild_id, str(event_id), review)}
     <section class="grid">{cards}</section>
     <section class="panel">
+      <h2>➕ Spieler hinzufügen</h2>
+      <p class="muted">Der Spieler wird über die Postgres-Queue direkt in die echte Bot-Anwesenheitsliste übernommen.</p>
+      <form method="post" action="/admin/attendance/{_e(event_id)}/add-player" style="display:flex;gap:8px;flex-wrap:wrap;align-items:end">
+        <label>Spieler<br><select name="user_id" required><option value="">Spieler wählen …</option>{add_player_options}</select></label>
+        <label>Rolle<br><select name="signup"><option value="DPS">DPS</option><option value="TANK">Tank</option><option value="HEAL">Heal</option><option value="BANK">Reserve</option></select></label>
+        <label>Status<br><select name="status"><option value="present">War da</option><option value="partial">Teilweise</option><option value="absent">Nicht da</option><option value="open">Offen</option></select></label>
+        <button class="btn" type="submit" {'disabled' if not add_player_options else ''}>➕ Spieler hinzufügen</button>
+      </form>
+    </section>
+    <section class="panel">
       <h2>⚙️ Schnellaktionen</h2>
-      <p class="muted">Diese Aktionen ändern nur den gespeicherten Dashboard-Review. Es wird dadurch noch kein EC gebucht.</p>
+      <p class="muted">Diese Aktionen speichern den Review und werden zusätzlich an den Discord-Bot übertragen. EC wird dadurch noch nicht gebucht.</p>
       <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
         <form method="post" action="/admin/attendance/{_e(event_id)}/bulk" onsubmit="return confirm('Alle Review-Zeilen auf War da setzen?');">
           <input type="hidden" name="action" value="confirm_all">
@@ -19232,7 +19519,7 @@ def _render_attendance_archive(data: dict[str, Any]) -> str:
 
 
 @app.get("/attendance-archive", response_class=HTMLResponse)
-def attendance_archive_page(_: bool = Depends(_auth)):
+def attendance_archive_page(_: bool = Depends(_admin_auth)):
     try:
         return HTMLResponse(_render_attendance_archive(_snapshot_payload()))
     except Exception as exc:
@@ -19275,12 +19562,12 @@ def admin_attendance_reopen(event_id: str, request: Request, _: bool = Depends(_
 
 
 @app.get("/attendance-stats", response_class=HTMLResponse)
-def attendance_stats_dashboard(_: bool = Depends(_auth)):
+def attendance_stats_dashboard(_: bool = Depends(_admin_auth)):
     return _render_attendance_stats_dashboard(_snapshot_payload())
 
 
 @app.get("/api/attendance-stats")
-def api_attendance_stats(_: bool = Depends(_auth)):
+def api_attendance_stats(_: bool = Depends(_admin_auth)):
     data = _snapshot_payload()
     if not data.get("ok"):
         return JSONResponse(data, status_code=404)
@@ -19288,7 +19575,7 @@ def api_attendance_stats(_: bool = Depends(_auth)):
 
 
 @app.get("/export/attendance_stats.csv")
-def export_attendance_stats_csv(_: bool = Depends(_auth)):
+def export_attendance_stats_csv(_: bool = Depends(_admin_auth)):
     data = _snapshot_payload()
     payload = _attendance_stats_payload(data) if data.get("ok") else {"player_rows": [], "event_rows": []}
     out = io.StringIO()
@@ -19331,7 +19618,7 @@ def export_attendance_stats_csv(_: bool = Depends(_auth)):
 
 
 @app.get("/attendance", response_class=HTMLResponse)
-def attendance_dashboard(_: bool = Depends(_auth)):
+def attendance_dashboard(_: bool = Depends(_admin_auth)):
     try:
         return HTMLResponse(_render_attendance_list(_snapshot_payload()))
     except Exception as exc:
@@ -19339,7 +19626,7 @@ def attendance_dashboard(_: bool = Depends(_auth)):
 
 
 @app.get("/attendance/{event_id}", response_class=HTMLResponse)
-def attendance_event_page(event_id: str, saved: int = 0, _: bool = Depends(_auth)):
+def attendance_event_page(event_id: str, saved: int = 0, _: bool = Depends(_admin_auth)):
     try:
         return HTMLResponse(_render_attendance_event(_snapshot_payload(), str(event_id), saved=bool(saved)))
     except Exception as exc:
@@ -19347,7 +19634,7 @@ def attendance_event_page(event_id: str, saved: int = 0, _: bool = Depends(_auth
 
 
 @app.post("/admin/attendance/{event_id}/voice-suggest")
-async def admin_attendance_voice_suggest(event_id: str, request: Request, _: bool = Depends(_admin_auth)):
+def admin_attendance_voice_suggest(event_id: str, request: Request, _: bool = Depends(_admin_auth)):
     payload = _snapshot_payload()
     snap: dict[str, Any] = payload.get("snapshot") or {}
     event = _event_by_id(snap, str(event_id))
@@ -19395,7 +19682,11 @@ async def admin_attendance_save(event_id: str, request: Request, _: bool = Depen
         "items": items,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
-    _attendance_review_save(guild_id, str(event_id), review_payload, _current_user(request) or {}, status="reviewed")
+    actor = _current_user(request) or {}
+    _attendance_review_save_and_enqueue(
+        guild_id, str(event_id), review_payload, actor,
+        status="reviewed", action_type="sync_review",
+    )
     next_action = str((form.get("next") or [""])[0] or "").strip().lower()
     if next_action == "preview":
         return RedirectResponse(f"/attendance/{urllib.parse.quote(str(event_id))}/ec-preview?saved=1", status_code=303)
@@ -19433,7 +19724,8 @@ async def admin_attendance_bulk(event_id: str, request: Request, _: bool = Depen
         old_status = str(item.get("status") or "open")
         new_status = old_status
         if action == "confirm_all":
-            new_status = "present"
+            if old_status in {"", "open"}:
+                new_status = "present"
         elif action == "no_voice_absent":
             if _num(item.get("voice_minutes"), 0) <= 0:
                 new_status = "absent"
@@ -19465,12 +19757,75 @@ async def admin_attendance_bulk(event_id: str, request: Request, _: bool = Depen
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
     review_payload["updated_at"] = datetime.now(timezone.utc).isoformat()
-    _attendance_review_save(guild_id, str(event_id), review_payload, _current_user(request) or {}, status="reviewed")
+    actor = _current_user(request) or {}
+    _attendance_review_save_and_enqueue(
+        guild_id, str(event_id), review_payload, actor,
+        status="reviewed", action_type="sync_review",
+    )
+    return RedirectResponse(f"/attendance/{urllib.parse.quote(str(event_id))}?saved=1", status_code=303)
+
+
+@app.post("/admin/attendance/{event_id}/add-player")
+async def admin_attendance_add_player(event_id: str, request: Request, _: bool = Depends(_admin_auth)):
+    raw = (await request.body()).decode("utf-8", errors="replace")
+    form = urllib.parse.parse_qs(raw, keep_blank_values=True)
+    uid = _user_id((form.get("user_id") or [0])[0])
+    signup = str((form.get("signup") or ["DPS"])[0] or "DPS").upper()
+    status = str((form.get("status") or ["present"])[0] or "present").lower()
+    if not uid:
+        raise HTTPException(status_code=400, detail="Spieler fehlt")
+    if signup not in {"TANK", "HEAL", "DPS", "BANK"}:
+        signup = "DPS"
+    if status not in {"present", "partial", "absent", "open"}:
+        status = "present"
+
+    data = _snapshot_payload()
+    snap: dict[str, Any] = data.get("snapshot") or {}
+    guild_id = _safe_guild_id(data)
+    event = _event_by_id(snap, str(event_id)) or _event_stub_from_attendance_review(guild_id, str(event_id))
+    if not event:
+        raise HTTPException(status_code=404, detail="Event nicht gefunden")
+    member = next((m for m in ((snap.get("members") or snap.get("profiles") or {}).get("items") or []) if _user_id((m or {}).get("user_id")) == uid), {})
+    display_name = str((member or {}).get("display_name") or (member or {}).get("server_name") or f"User {uid}")
+
+    review = _attendance_review_load(guild_id, str(event_id))
+    review_payload = review.get("payload") if isinstance(review.get("payload"), dict) else {}
+    if not review_payload.get("items"):
+        review_payload = _attendance_review_payload_from_event(snap, event, mode="voice")
+    items = [dict(x) for x in (review_payload.get("items") or []) if isinstance(x, dict)]
+    existing = next((x for x in items if _user_id(x.get("user_id")) == uid), None)
+    row = {
+        "user_id": uid,
+        "display_name": display_name,
+        "signup": signup,
+        "voice_minutes": 0,
+        "voice_sessions": 0,
+        "source": "Dashboard-Nachtrag",
+        "status": status,
+        "note": "",
+    }
+    if existing is None:
+        items.append(row)
+    else:
+        existing.update(row)
+    review_payload.update({
+        "event_id": str(event_id),
+        "event_title": event.get("title") or review_payload.get("event_title") or str(event_id),
+        "event_when": event.get("when_iso") or review_payload.get("event_when"),
+        "mode": "dashboard_add_player",
+        "items": items,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    })
+    actor = _current_user(request) or {}
+    _attendance_review_save_and_enqueue(
+        guild_id, str(event_id), review_payload, actor,
+        status="reviewed", action_type="add_player", action_payload=row,
+    )
     return RedirectResponse(f"/attendance/{urllib.parse.quote(str(event_id))}?saved=1", status_code=303)
 
 
 @app.get("/api/attendance/{event_id}")
-def api_attendance_review(event_id: str, _: bool = Depends(_auth)):
+def api_attendance_review(event_id: str, _: bool = Depends(_admin_auth)):
     payload = _snapshot_payload()
     if not payload.get("ok"):
         return JSONResponse(payload, status_code=404)
@@ -20176,7 +20531,7 @@ def _render_attendance_report(data: dict[str, Any], event_id: str, full_ec: Opti
 
 
 @app.get("/attendance/{event_id}/report", response_class=HTMLResponse)
-def attendance_report_page(event_id: str, full_ec: Optional[float] = None, partial_ec: Optional[float] = None, _: bool = Depends(_auth)):
+def attendance_report_page(event_id: str, full_ec: Optional[float] = None, partial_ec: Optional[float] = None, _: bool = Depends(_admin_auth)):
     try:
         return HTMLResponse(_render_attendance_report(_snapshot_payload(), str(event_id), full_ec=full_ec, partial_ec=partial_ec))
     except Exception as exc:
@@ -20184,14 +20539,14 @@ def attendance_report_page(event_id: str, full_ec: Optional[float] = None, parti
 
 
 @app.get("/api/attendance/{event_id}/report")
-def api_attendance_report(event_id: str, full_ec: Optional[float] = None, partial_ec: Optional[float] = None, _: bool = Depends(_auth)):
+def api_attendance_report(event_id: str, full_ec: Optional[float] = None, partial_ec: Optional[float] = None, _: bool = Depends(_admin_auth)):
     payload = _attendance_report_payload(_snapshot_payload(), str(event_id), full_ec=full_ec, partial_ec=partial_ec)
     status = 200 if payload.get("ok") else 404
     return JSONResponse(payload, status_code=status)
 
 
 @app.get("/export/attendance/{event_id}_report.csv")
-def export_attendance_report_csv(event_id: str, full_ec: Optional[float] = None, partial_ec: Optional[float] = None, _: bool = Depends(_auth)):
+def export_attendance_report_csv(event_id: str, full_ec: Optional[float] = None, partial_ec: Optional[float] = None, _: bool = Depends(_admin_auth)):
     payload = _attendance_report_payload(_snapshot_payload(), str(event_id), full_ec=full_ec, partial_ec=partial_ec)
     if not payload.get("ok"):
         return Response("error\n" + str(payload.get("error") or "unknown"), media_type="text/csv", status_code=404)
@@ -20220,7 +20575,7 @@ def export_attendance_report_csv(event_id: str, full_ec: Optional[float] = None,
     return Response(output.getvalue(), media_type="text/csv; charset=utf-8", headers={"Content-Disposition": f"attachment; filename=attendance_report_{event_id}.csv"})
 
 @app.get("/attendance/{event_id}/ec-preview", response_class=HTMLResponse)
-def attendance_ec_preview_page(event_id: str, full_ec: Optional[float] = None, partial_ec: Optional[float] = None, saved: int = 0, _: bool = Depends(_auth)):
+def attendance_ec_preview_page(event_id: str, full_ec: Optional[float] = None, partial_ec: Optional[float] = None, saved: int = 0, _: bool = Depends(_admin_auth)):
     try:
         return HTMLResponse(_render_attendance_ec_preview(_snapshot_payload(), str(event_id), full_ec=full_ec, partial_ec=partial_ec, saved=bool(saved)))
     except Exception as exc:
@@ -20285,14 +20640,14 @@ async def admin_attendance_ec_award(event_id: str, request: Request, _: bool = D
     return RedirectResponse(f"/attendance/{urllib.parse.quote(str(event_id))}/ec-preview?full_ec={urllib.parse.quote(str(full_ec))}&partial_ec={urllib.parse.quote(str(partial_ec))}&saved=1", status_code=303)
 
 @app.get("/api/attendance/{event_id}/ec-preview")
-def api_attendance_ec_preview(event_id: str, full_ec: Optional[float] = None, partial_ec: Optional[float] = None, _: bool = Depends(_auth)):
+def api_attendance_ec_preview(event_id: str, full_ec: Optional[float] = None, partial_ec: Optional[float] = None, _: bool = Depends(_admin_auth)):
     payload = _attendance_ec_preview_payload(_snapshot_payload(), str(event_id), full_ec=full_ec, partial_ec=partial_ec)
     status = 200 if payload.get("ok") else 404
     return JSONResponse(payload, status_code=status)
 
 
 @app.get("/export/attendance/{event_id}.csv")
-def export_attendance_ec_preview_csv(event_id: str, full_ec: Optional[float] = None, partial_ec: Optional[float] = None, _: bool = Depends(_auth)):
+def export_attendance_ec_preview_csv(event_id: str, full_ec: Optional[float] = None, partial_ec: Optional[float] = None, _: bool = Depends(_admin_auth)):
     payload = _attendance_ec_preview_payload(_snapshot_payload(), str(event_id), full_ec=full_ec, partial_ec=partial_ec)
     if not payload.get("ok"):
         return Response("error\n" + str(payload.get("error") or "unknown"), media_type="text/csv", status_code=404)
@@ -21553,7 +21908,7 @@ def _render_phase3_database_page(payload: dict[str, Any]) -> str:
     cut_warn_html = "" if not cut_warn else "<div class='notice'><b>Cutover-Hinweise</b><ul>" + "".join(f"<li>{_e(w)}</li>" for w in cut_warn) + "</ul></div>"
     return _html_shell("Phase 3 · Datenbank · Beer and Buffs Dashboard", f"""
     <nav class='topnav'><a href='/'>← Kommando</a><a href='/release'>Release</a><a href='/admin'>Admin</a><a href='/database-audit'>Cutover-Prüfung</a><a href='/api/database-cutover-status'>Cutover API</a><a href='/api/database-status'>Status API</a><a href='/api/database-live-status'>Live API</a></nav>
-    <section class='hero'><div><h1>Phase 3.9 · Online-Datenbank</h1><p>{_e(status_text)} · Dashboard liest Postgres-first. Bot schreibt sicher weiter lokal JSON und spiegelt direkt nach Postgres, damit JSON als Backup/Fallback erhalten bleibt.</p></div><div class='page-actions'><a class='btn' href='/database/init'>Tabellen vorbereiten</a><a class='btn' href='/database/mirror-snapshot'>Snapshot nachspiegeln</a></div></section>
+    <section class='hero'><div><h1>Phase 3.9 · Online-Datenbank</h1><p>{_e(status_text)} · Dashboard liest Postgres-first. Bot schreibt sicher weiter lokal JSON und spiegelt direkt nach Postgres, damit JSON als Backup/Fallback erhalten bleibt.</p></div><div class='page-actions'><form method='post' action='/database/init' style='display:inline'><button class='btn' type='submit'>Tabellen vorbereiten</button></form><form method='post' action='/database/mirror-snapshot' style='display:inline'><button class='btn' type='submit'>Snapshot nachspiegeln</button></form></div></section>
     <section class='panel'><h2>Cutover-Stand</h2><p>Das ist der relevante Zustand: Nicht ob JSON-Dateien noch existieren, sondern ob das Dashboard die Live-Bereiche aus Postgres liest.</p>{_table(['Bereich','Status','Quelle','Zeilen/Einträge'], cut_rows, searchable=False)}{cut_warn_html}</section>
     <section class='panel'><h2>Jetzt gültige Architektur</h2><div class='grid'>
       <div class='card'><b>Dashboard</b><p>Liest EC, Loot, Events und Profile bevorzugt aus Postgres.</p></div>
@@ -21581,44 +21936,44 @@ def database_page(_: bool = Depends(_admin_auth)):
 
 
 @app.get("/api/database-status")
-def api_database_status(_: bool = Depends(_auth)):
+def api_database_status(_: bool = Depends(_admin_auth)):
     payload = _snapshot_payload()
     return JSONResponse(_json_safe({"ok": True, "snapshot_counts": _phase3_extract_snapshot_counts(payload), "cutover": _phase3_cutover_summary(payload), "database": _phase3_status_payload()}))
 
 
 @app.get("/api/database-cutover-status")
-def api_database_cutover_status(_: bool = Depends(_auth)):
+def api_database_cutover_status(_: bool = Depends(_admin_auth)):
     payload = _snapshot_payload()
     return JSONResponse(_json_safe(_phase3_cutover_summary(payload)))
 
 
 @app.get("/api/database-ec-status")
-def api_database_ec_status(_: bool = Depends(_auth)):
+def api_database_ec_status(_: bool = Depends(_admin_auth)):
     payload = _snapshot_payload()
     return JSONResponse(_json_safe(_phase3_ec_status_payload(payload)))
 
 
 @app.get("/api/database-loot-status")
-def api_database_loot_status(_: bool = Depends(_auth)):
+def api_database_loot_status(_: bool = Depends(_admin_auth)):
     payload = _snapshot_payload()
     return JSONResponse(_json_safe(_phase3_loot_status_payload(payload)))
 
 
 @app.get("/api/database-live-status")
-def api_database_live_status(_: bool = Depends(_auth)):
+def api_database_live_status(_: bool = Depends(_admin_auth)):
     payload = _snapshot_payload()
     return JSONResponse(_json_safe(_phase3_live_status_payload(payload)))
 
 
-@app.get("/database/init")
-def database_init(_: bool = Depends(_auth)):
+@app.post("/database/init")
+def database_init(_: bool = Depends(_admin_auth)):
     res = _phase3_ensure_schema()
     msg = "Phase-3-Tabellen vorbereitet." if res.get("ok") else f"Fehler: {res.get('error')}"
     return RedirectResponse("/database?msg=" + urllib.parse.quote(msg), status_code=303)
 
 
-@app.get("/database/mirror-snapshot")
-def database_mirror_snapshot(_: bool = Depends(_auth)):
+@app.post("/database/mirror-snapshot")
+def database_mirror_snapshot(_: bool = Depends(_admin_auth)):
     res = _phase3_mirror_snapshot(_snapshot_payload())
     if res.get("ok"):
         msg = "Snapshot gespiegelt: " + ", ".join(f"{k}={v}" for k, v in (res.get("counts") or {}).items())
@@ -21855,7 +22210,7 @@ def _render_phase3_audit_page() -> str:
 
 
 @app.get("/database-audit", response_class=HTMLResponse)
-def database_audit_page(_: bool = Depends(_auth)):
+def database_audit_page(_: bool = Depends(_admin_auth)):
     try:
         return HTMLResponse(_render_phase3_audit_page())
     except Exception as exc:
@@ -21863,5 +22218,5 @@ def database_audit_page(_: bool = Depends(_auth)):
 
 
 @app.get("/api/database-audit")
-def api_database_audit(_: bool = Depends(_auth)):
+def api_database_audit(_: bool = Depends(_admin_auth)):
     return JSONResponse(_phase3_audit_payload())

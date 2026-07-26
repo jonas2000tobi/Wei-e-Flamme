@@ -1232,210 +1232,12 @@ def _canon_armor_trait_label(label: str) -> str:
     return clean_text(label).rstrip(":")
 
 
-def _parse_armor_traits_from_text_sequence(tokens: list[str], expected: int) -> list[dict[str, Any]]:
-    """Liest Questlog-Eigenschaften aus einer echten Text-Reihenfolge.
-
-    Der Punkt, der vorher kaputt war: wir dürfen nicht versuchen, aus dem kompletten
-    Body einzelne Regex-Funde zu raten. Questlog rendert den linken Itemkasten aber
-    immer in der gleichen Reihenfolge:
-
-        Eigenschaften:
-        Label
-        150 | 300 | 450 | 600
-        Label
-        40 | 80 | 120 | 160
-
-    Manchmal stehen Label und Werte in einer Zeile. Diese Funktion kann beides.
-    """
-    if expected <= 0:
-        return []
-
-    # Labels lang -> kurz, damit "Krit. Trefferchance" vor "Trefferchance" gewinnt.
-    labels = sorted(set(ARMOR_TRAIT_LABELS_DE), key=len, reverse=True)
-    label_lows = [(x.lower().strip(" :"), x) for x in labels]
-
-    def find_label(text: str) -> tuple[str, str] | None:
-        t = clean_text(text).strip()
-        low = t.lower().strip(" :")
-        if not t:
-            return None
-        for low_label, label in label_lows:
-            if low == low_label:
-                return _canon_armor_trait_label(label), ""
-            if low.startswith(low_label + ":"):
-                return _canon_armor_trait_label(label), t[len(label):].lstrip(" :")
-            if low.startswith(low_label + " "):
-                rest = t[len(label):].strip()
-                # Nur als Inline werten, wenn danach wirklich Zahlen kommen.
-                if re.search(r"\d", rest):
-                    return _canon_armor_trait_label(label), rest
-        return None
-
-    def nums(text: str) -> list[str]:
-        # Traits haben Werte wie 150, 300 oder -1,5 %, 3 %, 12 %.
-        return [clean_text(x) for x in re.findall(r"[+\-]?\d+(?:[.,]\d+)?\s*%?", str(text or ""))]
-
-    def is_stop(text: str) -> bool:
-        low = clean_text(text).lower().strip(" :")
-        return any(x in low for x in (
-            "dieser gegenstand hat", "this item has", "ausrüstungseffekt", "ausruestungseffekt",
-            "ausrüstungsset", "ausruestungsset", "set des", "verkaufspreis", "sales price",
-            "kommentare", "comments", "von npcs erbeutet", "dropped from", "in lithographen",
-            "lithograph", "remove ads", "auction house", "auktionshaus", "preisverlauf", "bestandsverlauf",
-            "karte", "map", "stats", "enchanting", "teilen", "share",
-        ))
-
-    clean_tokens = [clean_text(t).strip() for t in tokens if clean_text(t).strip()]
-
-    # Start exakt nach Eigenschaften suchen. Wenn nicht da, erster bekannter Trait.
-    start = -1
-    for i, t in enumerate(clean_tokens):
-        if clean_text(t).lower().strip(" :") in {"eigenschaften", "traits"}:
-            start = i + 1
-            break
-    if start < 0:
-        for i, t in enumerate(clean_tokens):
-            if find_label(t):
-                start = i
-                break
-    if start < 0:
-        return []
-
-    out: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    i = start
-    while i < len(clean_tokens) and len(out) < expected:
-        t = clean_tokens[i]
-        if is_stop(t):
-            break
-        found = find_label(t)
-        if not found:
-            i += 1
-            continue
-
-        label, inline = found
-        key = label.lower().strip(" :")
-        if key in seen:
-            i += 1
-            continue
-
-        values: list[str] = []
-        if inline:
-            values.extend(nums(inline))
-
-        j = i + 1
-        while j < len(clean_tokens) and len(values) < 4:
-            nxt = clean_tokens[j]
-            if is_stop(nxt):
-                break
-            if find_label(nxt):
-                break
-            # Separators/empty dots ignorieren, Zahlen einsammeln.
-            values.extend(nums(nxt))
-            j += 1
-
-        # Jede Questlog-Eigenschaft hat faktisch 4 Stufen. Wenn ein Layout nur 2 liefert,
-        # nehmen wir sie trotzdem, aber nur aus dem echten Eigenschaften-Block.
-        if len(values) >= 2:
-            out.append({"name": label, "values": values[:4]})
-            seen.add(key)
-            i = max(j, i + 1)
-            continue
-        i += 1
-
-    return out[:expected]
+# Entfernte überschriebene Altdefinition: _parse_armor_traits_from_text_sequence
 
 
 
 
-def _parse_armor_traits_by_label_windows(raw_text: str, expected: int) -> list[dict[str, Any]]:
-    """Letzter robuster Fallback für Questlog-Rüstungs-Eigenschaften.
-
-    Arbeitet wie der Waffenparser: erst den echten Abschnitt ab "Eigenschaften" isolieren,
-    dann bekannte Trait-Labels nach ihrer tatsächlichen Reihenfolge im Abschnitt finden.
-    Pro Label werden die Zahlen bis zum nächsten bekannten Label gelesen. Dadurch ist es egal,
-    ob Questlog die Zeile als "Label: 1 | 2 | 3 | 4" oder als mehrere DOM-Textnodes rendert.
-    """
-    if expected <= 0:
-        return []
-    raw = normalize_raw_text(raw_text)
-    low = raw.lower()
-    start = low.find("eigenschaften")
-    if start < 0:
-        start = low.find("traits")
-    if start < 0:
-        return []
-
-    segment = raw[start:]
-    seg_low = segment.lower()
-    stop_markers = [
-        "dieser gegenstand hat", "this item has", "ausrüstungseffekte", "ausruestungseffekte",
-        "ausrüstungseffekt", "ausruestungseffekt", "ausrüstungsset", "ausruestungsset",
-        "verkaufspreis", "sales price", "kommentare", "comments", "von npcs erbeutet",
-        "dropped from", "in lithographen", "lithograph", "auktion", "auction house",
-        "preisverlauf", "bestandsverlauf", "remove ads",
-    ]
-    cut = len(segment)
-    for marker in stop_markers:
-        idx = seg_low.find(marker)
-        if idx > 0:
-            cut = min(cut, idx)
-    segment = segment[:cut]
-
-    # Varianten/Schreibweisen. Kanonische Namen bleiben deutsch fürs Dashboard.
-    labels = [
-        "Max. Gesundheit", "Max. Leben", "Max. Mana",
-        "Gesundheitsregeneration", "Manaregeneration", "Mana-Regeneration",
-        "Mana-Kosteneffizienz", "Manakosteneffizienz", "Manakosten-Effizienz",
-        "Trefferchance", "Krit. Trefferchance", "Kritische Trefferchance",
-        "Chance auf starken Angriff", "Chance auf Fesseln", "Schwächungschance", "Schwaechungschance",
-        "Nahkampfausweichen", "Fernkampfausweichen", "Magieausweichen",
-        "Nahkampfausdauer", "Fernkampfausdauer", "Magieausdauer",
-        "Buff-Dauer", "Debuff-Dauer", "Angriffstempo",
-        "Untote-Zusatzschaden", "Humanoide-Zusatzschaden", "Konstrukt-Zusatzschaden",
-        "Wildkin-Bonusschaden", "Wildkin Bonus Damage",
-    ]
-    # längere Labels zuerst verhindert, dass "Trefferchance" in "Krit. Trefferchance" matcht.
-    labels_sorted = sorted(set(labels), key=len, reverse=True)
-
-    matches: list[tuple[int, int, str]] = []
-    for label in labels_sorted:
-        pattern = re.compile(r"(?<![A-Za-zÄÖÜäöüß])" + re.escape(label) + r"\s*:?")
-        for m in pattern.finditer(segment):
-            canon = _canon_armor_trait_label(label)
-            matches.append((m.start(), m.end(), canon))
-
-    if not matches:
-        return []
-
-    # Doppelte/überlappende Matches entfernen. Wenn zwei an gleicher Position starten,
-    # gewinnt das längere Label, weil labels_sorted nach Länge sortiert ist.
-    matches.sort(key=lambda x: (x[0], -(x[1] - x[0])))
-    cleaned: list[tuple[int, int, str]] = []
-    occupied_until = -1
-    for m in matches:
-        if m[0] < occupied_until:
-            continue
-        cleaned.append(m)
-        occupied_until = m[1]
-    matches = cleaned
-
-    out: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for idx, (start_pos, end_pos, label) in enumerate(matches):
-        key = label.lower().strip(" :")
-        if key in seen:
-            continue
-        next_pos = matches[idx + 1][0] if idx + 1 < len(matches) else len(segment)
-        value_text = segment[end_pos:next_pos]
-        nums = [clean_text(x) for x in re.findall(r"[+\-]?\d+(?:[.,]\d+)?\s*%?", value_text)]
-        # Jede Eigenschaft hat 4 Stufen. Falls Questlog Prozentwerte mit Komma rendert, bleibt das als Text erhalten.
-        if len(nums) >= 4:
-            out.append({"name": label, "values": nums[:4]})
-            seen.add(key)
-        if len(out) >= expected:
-            break
-    return out[:expected]
+# Entfernte überschriebene Altdefinition: _parse_armor_traits_by_label_windows
 
 
 def extract_armor_traits_from_dom_textnodes(page, *, sub_category: str | None, item_level: Any, item_name: str) -> list[dict[str, Any]]:
@@ -3409,34 +3211,7 @@ def armor_expected_trait_count_from_level_public(level_value: Any) -> int:
     return 0
 
 
-def _extract_bonus_stats_from_parsed(parsed: dict[str, Any], row: dict[str, Any]) -> tuple[list[dict[str, Any]], int]:
-    detail = ((parsed.get("raw_data") or {}).get("detail") or {}) if isinstance(parsed.get("raw_data"), dict) else {}
-    level = parsed.get("item_level") or detail.get("item_level") or row.get("item_level")
-    expected = armor_expected_bonus_count_from_level(level)
-    bonus = detail.get("bonus_stats") or []
-    if not isinstance(bonus, list):
-        bonus = []
-    clean_bonus: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for item in bonus:
-        if not isinstance(item, dict):
-            continue
-        label = clean_text(item.get("label") or item.get("name") or "").rstrip(":")
-        value = clean_text(item.get("value") or "")
-        delta = clean_text(item.get("delta") or "")
-        if not label or not value:
-            continue
-        key = label.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        out: dict[str, Any] = {"label": label, "value": value}
-        if delta:
-            out["delta"] = delta
-        clean_bonus.append(out)
-        if expected and len(clean_bonus) >= expected:
-            break
-    return clean_bonus, expected
+# Entfernte überschriebene Altdefinition: _extract_bonus_stats_from_parsed
 
 
 def update_armor_stats_only(conn, row: dict[str, Any], parsed: dict[str, Any]) -> bool:
@@ -4752,25 +4527,7 @@ def _parse_armor_bonus_stats_generic(raw_text: str, expected: int) -> list[dict[
     return out[:expected]
 
 
-def _extract_bonus_stats_from_parsed(parsed: dict[str, Any], row: dict[str, Any]) -> tuple[list[dict[str, Any]], int]:  # type: ignore[override]
-    detail = ((parsed.get("raw_data") or {}).get("detail") or {}) if isinstance(parsed.get("raw_data"), dict) else {}
-    level = parsed.get("item_level") or detail.get("item_level") or row.get("item_level")
-    expected = armor_expected_bonus_count_from_level(level)
-
-    raw_text = str(parsed.get("raw_text") or "")
-    generic = _parse_armor_bonus_stats_generic(raw_text, expected)
-    if expected > 0 and len(generic) >= expected:
-        return generic[:expected], expected
-
-    # Fallback auf den bisherigen Detailparser, falls generisch bei Sonderseiten
-    # nichts findet. Aber wenn generisch mehr findet, nehmen wir generisch.
-    try:
-        old_bonus, _ = _old_extract_bonus_stats_from_parsed(parsed, row)
-    except Exception:
-        old_bonus = []
-    if len(generic) >= len(old_bonus or []):
-        return generic[:expected] if expected else generic, expected
-    return (old_bonus or [])[:expected] if expected else (old_bonus or []), expected
+# Entfernte überschriebene Altdefinition: _extract_bonus_stats_from_parsed
 
 
 

@@ -1,1 +1,6 @@
-worker: python questlog_item_importer.py --only weapon,armor,material,currency,misc
+{
+  "$schema": "https://schema.railpack.com",
+  "deploy": {
+    "startCommand": "bash start.sh"
+  }
+}

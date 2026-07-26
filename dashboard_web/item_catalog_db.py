@@ -268,7 +268,7 @@ def query_items(
     sub_category: str = "",
     rarity: str = "",
     confidence: str = "",
-    sort: str = "",
+    sort: str = "level_desc",
     active_only: bool = True,
     limit: int = 200,
     offset: int = 0,
@@ -300,7 +300,7 @@ def query_items(
         "level_asc": "CASE WHEN COALESCE(ic.item_level, ic.required_level) IS NULL THEN 1 ELSE 0 END, COALESCE(ic.item_level, ic.required_level) ASC, ic.name ASC",
         "name": "ic.name ASC",
         "rarity": "CASE lower(COALESCE(ic.rarity, '')) WHEN 'legendary' THEN 5 WHEN 'legendär' THEN 5 WHEN 'epic' THEN 4 WHEN 'episch' THEN 4 WHEN 'rare' THEN 3 WHEN 'selten' THEN 3 WHEN 'uncommon' THEN 2 WHEN 'common' THEN 1 ELSE 0 END DESC, ic.name ASC",
-    }.get(sort_key, "CASE ic.main_category WHEN 'weapon' THEN 1 WHEN 'armor' THEN 2 WHEN 'material' THEN 3 WHEN 'currency' THEN 4 ELSE 9 END, COALESCE(ic.sub_category, ''), ic.name")
+    }.get(sort_key, "COALESCE(ic.item_level, ic.required_level, -1) DESC, ic.name ASC")
     sql = f"""
         SELECT
             ic.id, ic.source, ic.source_url, ic.source_item_id, ic.locale, ic.name, ic.slug,
