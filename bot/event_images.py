@@ -2,10 +2,9 @@ from __future__ import annotations
 
 """Dauerhafte Eventbilder für Bot und Dashboard.
 
-Standardbilder werden über eine feste Dashboard-Route ausgeliefert. Bei den
-fünf bekannten Gildenevents hat die lokale Bildzuordnung Vorrang vor alten oder
-abgelaufenen Discord-/Extern-Links. Nur ausdrücklich als ``custom`` markierte
-Bilder bleiben externe URLs.
+Die fünf Standardbilder liegen als normale Discord-CDN-Anhänge vor. Gespeichert
+werden nur die stabilen Attachment-URLs ohne die zeitlich begrenzten Parameter
+``ex``, ``is`` und ``hm``. Eigene externe URLs bleiben weiterhin möglich.
 """
 
 import os
@@ -13,7 +12,7 @@ from typing import Any, Mapping
 from urllib.parse import urlparse
 
 DEFAULT_DASHBOARD_PUBLIC_BASE_URL = "https://dashboardweb-production-2933.up.railway.app"
-EVENT_IMAGE_ASSET_VERSION = "2.2.4"
+EVENT_IMAGE_ASSET_VERSION = "2.2.6"
 
 EVENT_IMAGE_ASSETS: dict[str, str] = {
     "normal_raid": "normal_raid.webp",
@@ -21,6 +20,15 @@ EVENT_IMAGE_ASSETS: dict[str, str] = {
     "trials": "trials.webp",
     "pvp": "pvp.webp",
     "guild_boss": "guild_boss.webp",
+}
+
+# Stabile Discord-Attachment-URLs ohne zeitlich begrenzte Signaturparameter.
+EVENT_IMAGE_URLS: dict[str, str] = {
+    "guild_boss": "https://cdn.discordapp.com/attachments/1528469765860098171/1528469820738375882/Gildenbosse.png",
+    "normal_raid": "https://cdn.discordapp.com/attachments/1528469765860098171/1528469819865956352/0d9886d3-f6f5-4f3e-b926-1f86151dc84d.png",
+    "hard_raid": "https://cdn.discordapp.com/attachments/1528469765860098171/1529804865679786085/7225f274-cc4f-4eda-ba74-ca401f4e572b.png",
+    "trials": "https://cdn.discordapp.com/attachments/1528469765860098171/1530963146020356246/8b34c404-89eb-4259-9e6e-acbcc1def2b2.png",
+    "pvp": "https://cdn.discordapp.com/attachments/1528469765860098171/1528469820310290493/4a00e277-c3b6-48b0-ac7e-ad3e3722aaf1.png",
 }
 
 DISPLAY_PRESET_KEYS: dict[str, str] = {
@@ -65,10 +73,21 @@ _CUSTOM_IMAGE_KEYS = {"custom", "eigene url", "external", "extern"}
 # Alte, bereits gespeicherte Discord-Anhangslinks werden zusätzlich anhand
 # stabiler URL-Bestandteile erkannt.
 LEGACY_URL_MARKERS: dict[str, str] = {
+    # Aktuelle Discord-Nachrichten / Dateinamen
+    "1528469820738375882": "guild_boss",
+    "Gildenbosse.png": "guild_boss",
+    "1528469819865956352": "normal_raid",
+    "0d9886d3-f6f5-4f3e-b926-1f86151dc84d": "normal_raid",
+    "1529804865679786085": "hard_raid",
+    "7225f274-cc4f-4eda-ba74-ca401f4e572b": "hard_raid",
+    "1530963146020356246": "trials",
+    "8b34c404-89eb-4259-9e6e-acbcc1def2b2": "trials",
+    "1528469820310290493": "pvp",
+    "4a00e277-c3b6-48b0-ac7e-ad3e3722aaf1": "pvp",
+    # Ältere gespeicherte Links
     "1516086614957494312": "normal_raid",
     "282b2b20-5a8f-4251-b038-15fde2ac723d": "normal_raid",
     "1513816935832228033": "hard_raid",
-    "7225f274-cc4f-4eda-ba74-ca401f4e572b": "hard_raid",
     "1491660359952502825": "trials",
     "file_000000007dcc7246bb6e57ae41860769": "trials",
     "1513202292302811186": "pvp",
@@ -92,8 +111,8 @@ def event_image_asset_path(preset_key: str) -> str:
 
 
 def event_image_asset_url(preset_key: str) -> str:
-    path = event_image_asset_path(preset_key)
-    return f"{dashboard_public_base_url()}{path}" if path else ""
+    key = str(preset_key or "").strip().lower()
+    return EVENT_IMAGE_URLS.get(key, "")
 
 
 def preset_urls_by_display_name() -> dict[str, str]:
@@ -113,6 +132,21 @@ def is_discord_attachment_url(url: str) -> bool:
         "images-ext-1.discordapp.net",
         "images-ext-2.discordapp.net",
     } and ("/attachments/" in path or "/ephemeral-attachments/" in path)
+
+
+def stable_external_image_url(url: str) -> str:
+    """Entfernt nur bei Discord-Anhängen die ablaufende Query-Signatur."""
+    value = str(url or "").strip()
+    if not value.startswith(("https://", "http://")):
+        return ""
+    if not is_discord_attachment_url(value):
+        return value
+    try:
+        parsed = urlparse(value)
+        host = "cdn.discordapp.com" if (parsed.hostname or "").lower() == "media.discordapp.net" else (parsed.hostname or "")
+        return parsed._replace(scheme="https", netloc=host, query="", fragment="").geturl()
+    except Exception:
+        return value.split("?", 1)[0]
 
 
 def legacy_preset_key(url: str) -> str:
@@ -186,9 +220,7 @@ def normalize_event_image_url(
 
     # Eine ausdrücklich gewählte eigene URL darf die Standardzuordnung ersetzen.
     if mode in _CUSTOM_IMAGE_KEYS:
-        if raw.startswith(("https://", "http://")):
-            return raw
-        return ""
+        return stable_external_image_url(raw)
 
     preset_key = infer_preset_key(event) or legacy_preset_key(raw)
     if preset_key:
@@ -219,9 +251,7 @@ def normalize_event_image_url(
                     return event_image_asset_url(key) if absolute else event_image_asset_path(key)
         except Exception:
             pass
-        if is_discord_attachment_url(raw) and any(token in raw for token in ("?ex=", "&ex=", "&hm=", "?hm=")):
-            return ""
-        return raw
+        return stable_external_image_url(raw)
 
     if infer_when_missing and preset_key:
         return event_image_asset_url(preset_key) if absolute else event_image_asset_path(preset_key)
