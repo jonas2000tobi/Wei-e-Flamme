@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.sqlite3-shm
+*.sqlite3-wal
+.pytest_cache/
+.ruff_cache/
+.pyright/
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+.DS_Store
+*.log
+bot/data/dkp_pending_transaction.json

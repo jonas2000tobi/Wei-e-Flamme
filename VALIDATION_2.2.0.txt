@@ -1,0 +1,19 @@
+BEER AND BUFFS 2.2.0 – KOMPLETTUPDATE
+
+Dieses Paket ist ein vollständiges Projekt und ersetzt die getrennten ZIPs.
+Nicht zuerst V4 und danach 2.1.0 kopieren. Nur dieses Paket verwenden.
+
+Vorher:
+1. Railway-Deployment sichern.
+2. PostgreSQL sichern.
+3. Persistentes Bot-Volume sichern.
+4. DASHBOARD_SESSION_SECRET mit mindestens 32 zufälligen Zeichen setzen.
+
+Deployment:
+1. Bot-Service deployen.
+2. Erfolgreichen Command-Sync und alle Modul-Setups im Log prüfen.
+3. Dashboard-Service deployen.
+4. Anwesenheit, EC und eine Testauktion prüfen.
+
+Keine Dateien unter bot/data/ wurden gegenüber dem ursprünglichen Upload verändert.
+Ausführliche Informationen: RELEASE_NOTES_2.2.0.md

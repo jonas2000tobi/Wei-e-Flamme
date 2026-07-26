@@ -1,0 +1,34 @@
+Beer and Buffs Gesamtpatch V4 – Anwesenheit Bot ↔ Dashboard
+
+Wichtige Korrektur:
+Die im Screenshot gezeigte Anwesenheitsoberfläche liegt in bot/member_portal.py.
+Der vorherige Patch hatte hauptsächlich bot/dkp_system.py geändert und deshalb
+war der gewünschte Button in dieser Oberfläche nicht sichtbar.
+
+Behoben:
+1. Discord-Bot-Nachträge werden sofort in einen neuen Dashboard-Snapshot geschrieben.
+2. In der tatsächlichen Gildenzentrale gibt es den Button:
+   "Alle offenen → War da"
+3. Zähler und Auswahl zeigen jeden Discord-Nutzer nur einmal.
+4. War-da-Spieler und manuelle Nachträge werden in der Auswahl zuerst angezeigt.
+5. Dashboard-Review und Bot-Anwesenheit werden über Postgres synchronisiert.
+6. Im Dashboard können Spieler zur Anwesenheit hinzugefügt werden.
+7. Dashboard-Statusänderungen und Schnellaktionen werden vom Bot übernommen.
+8. Zusätzlicher Sicherheitsbefehl:
+   /dkp attendance_all_present
+
+Installation:
+- Inhalt dieses ZIPs über das Projekt kopieren.
+- Bot-Service neu deployen.
+- Dashboard-Web-Service neu deployen.
+- Keine Daten-/JSON-Dateien löschen.
+
+Geänderte Kern-Dateien:
+- bot/member_portal.py
+- bot/event_rsvp_dm.py
+- bot/dkp_system.py
+- bot/dashboard_data.py
+- dashboard_web/main.py
+
+Der Gesamtpatch enthält außerdem die Dateien des vorherigen Gesamtpatches,
+damit die bisherigen Item-, Needlisten-, Emoji-, Voice-Anwesenheits- und Header-Fixes erhalten bleiben.
