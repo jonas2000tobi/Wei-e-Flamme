@@ -99,6 +99,24 @@ _RSVP_EMOJI_FALLBACKS: dict[str, str] = {
     "maybe": "❔",
     "no": "❌",
 }
+
+# Schnelle serverfeste Zuordnung für die Beer-and-Buffs-Eventposts.
+# Der Bot nimmt zuerst das gleichnamige Server-Emoji und fällt nur dann auf
+# ein normales Unicode-Emoji zurück.
+_EVENT_EMOJI_ALIASES: dict[str, tuple[str, ...]] = {
+    "calendar": ("kalender", "calendar"),
+    "time": ("time", "zeit", "uhr"),
+    "voted": ("voted", "abgestimmt", "abstimmung"),
+    "target": ("target", "zielgruppe", "gilde"),
+    "absence": ("abwesenheit", "nichtda"),
+}
+_EVENT_EMOJI_FALLBACKS: dict[str, str] = {
+    "calendar": "📅",
+    "time": "🕒",
+    "voted": "🗳️",
+    "target": "🎯",
+    "absence": "🚪",
+}
 _RSVP_LEGACY_TO_KEY: dict[str, str] = {
     "tank": "tank",
     "heal": "heal",
@@ -140,6 +158,14 @@ def _rsvp_server_emoji(key: str) -> Optional[discord.Emoji]:
     return None
 
 
+def _event_server_emoji(key: str) -> Optional[discord.Emoji]:
+    for alias in _EVENT_EMOJI_ALIASES.get(key, (key,)):
+        emoji = _RSVP_SERVER_EMOJIS.get(alias.lower())
+        if emoji is not None:
+            return emoji
+    return None
+
+
 def _rsvp_component_emoji(value: object):
     key = _rsvp_key(value)
     emoji = _rsvp_server_emoji(key)
@@ -151,9 +177,10 @@ def _rsvp_component_emoji(value: object):
     return _RSVP_EMOJI_FALLBACKS.get(key, "•")
 
 
-def _refresh_rsvp_emojis(guild: Optional[discord.Guild]) -> None:
+def _refresh_rsvp_emojis(guild: Optional[discord.Guild], *, log: bool = True) -> None:
     if guild is None:
         return
+
     _RSVP_SERVER_EMOJIS.clear()
     for emoji in list(getattr(guild, "emojis", []) or []):
         name = str(getattr(emoji, "name", "") or "").strip().lower()
@@ -161,6 +188,8 @@ def _refresh_rsvp_emojis(guild: Optional[discord.Guild]) -> None:
             _RSVP_SERVER_EMOJIS[name] = emoji
 
     global EMOJI_TANK, EMOJI_HEAL, EMOJI_DPS, EMOJI_BANK, EMOJI_MAYBE, EMOJI_NO
+    global EMOJI_CALENDAR, EMOJI_TIME, EMOJI_VOTED, EMOJI_TARGET, EMOJI_ABSENCE
+
     EMOJI_TANK = str(_rsvp_server_emoji("tank") or _RSVP_EMOJI_FALLBACKS["tank"])
     EMOJI_HEAL = str(_rsvp_server_emoji("heal") or _RSVP_EMOJI_FALLBACKS["heal"])
     EMOJI_DPS = str(_rsvp_server_emoji("dps") or _RSVP_EMOJI_FALLBACKS["dps"])
@@ -168,12 +197,21 @@ def _refresh_rsvp_emojis(guild: Optional[discord.Guild]) -> None:
     EMOJI_MAYBE = str(_rsvp_server_emoji("maybe") or _RSVP_EMOJI_FALLBACKS["maybe"])
     EMOJI_NO = str(_rsvp_server_emoji("no") or _RSVP_EMOJI_FALLBACKS["no"])
 
-    print(
-        f"[event_rsvp_dm] RSVP-Emojis geladen für {guild.name}: "
-        f"Tank={EMOJI_TANK}, Heal={EMOJI_HEAL}, DPS={EMOJI_DPS}, "
-        f"Reserve={EMOJI_BANK}, Vielleicht={EMOJI_MAYBE}, Abmelden={EMOJI_NO}",
-        flush=True,
-    )
+    EMOJI_CALENDAR = str(_event_server_emoji("calendar") or _EVENT_EMOJI_FALLBACKS["calendar"])
+    EMOJI_TIME = str(_event_server_emoji("time") or _EVENT_EMOJI_FALLBACKS["time"])
+    EMOJI_VOTED = str(_event_server_emoji("voted") or _EVENT_EMOJI_FALLBACKS["voted"])
+    EMOJI_TARGET = str(_event_server_emoji("target") or _EVENT_EMOJI_FALLBACKS["target"])
+    EMOJI_ABSENCE = str(_event_server_emoji("absence") or _EVENT_EMOJI_FALLBACKS["absence"])
+
+    if log:
+        print(
+            f"[event_rsvp_dm] Server-Emojis geladen für {guild.name}: "
+            f"Tank={EMOJI_TANK}, Heal={EMOJI_HEAL}, DPS={EMOJI_DPS}, "
+            f"Reserve={EMOJI_BANK}, Vielleicht={EMOJI_MAYBE}, Abmelden={EMOJI_NO}, "
+            f"Kalender={EMOJI_CALENDAR}, Zeit={EMOJI_TIME}, "
+            f"Abgestimmt={EMOJI_VOTED}, Zielgruppe={EMOJI_TARGET}",
+            flush=True,
+        )
 
 
 def _button_emoji(value: str):
@@ -181,11 +219,30 @@ def _button_emoji(value: str):
 
 
 def _rebind_rsvp_view_emojis(view: discord.ui.View) -> None:
+    # Die Decorator-Emojis werden bereits beim Python-Import festgeschrieben.
+    # Darum darf hier NICHT vom bisherigen (oft Unicode-)Emoji abgeleitet werden.
+    # Stattdessen ordnen wir jeden RSVP-Button über seine feste custom_id zu.
+    key_by_custom_id = {
+        "dm_rsvp_tank": "tank",
+        "dm_rsvp_heal": "heal",
+        "dm_rsvp_dps": "dps",
+        "dm_rsvp_bank": "reserve",
+        "dm_rsvp_maybe": "maybe",
+        "dm_rsvp_no": "no",
+        "srv_rsvp_tank": "tank",
+        "srv_rsvp_heal": "heal",
+        "srv_rsvp_dps": "dps",
+        "srv_rsvp_bank": "reserve",
+        "srv_rsvp_maybe": "maybe",
+        "srv_rsvp_no": "no",
+    }
+
     for child in list(getattr(view, "children", []) or []):
         try:
-            current = getattr(child, "emoji", None)
-            if current is not None:
-                child.emoji = _rsvp_component_emoji(current)
+            key = key_by_custom_id.get(str(getattr(child, "custom_id", "") or ""))
+            if not key:
+                continue
+            child.emoji = _rsvp_server_emoji(key) or _RSVP_EMOJI_FALLBACKS[key]
         except Exception:
             pass
 
@@ -665,6 +722,9 @@ def _eligible_members(guild: discord.Guild, obj: dict) -> List[discord.Member]:
 
 
 def build_embed(guild: discord.Guild, obj: dict) -> discord.Embed:
+    # Auch nach einem Emoji-Wechsel oder Bot-Neustart immer die aktuellen
+    # Server-Emojis verwenden.
+    _refresh_rsvp_emojis(guild, log=False)
     _init_event_shape(obj)
 
     when = datetime.fromisoformat(obj["when_iso"])
@@ -2386,6 +2446,53 @@ def _register_persistent_views_for_event(client: discord.Client, msg_id: str, ob
     return registered_server, registered_dm
 
 
+async def _refresh_existing_server_event_message(
+    client: discord.Client,
+    msg_id: str,
+    obj: dict,
+) -> bool:
+    """Aktualisiert bestehende Serverposts beim Start mit den richtigen Emojis."""
+    try:
+        _init_event_shape(obj)
+        # Nur aktuelle und kommende Posts anfassen; alte Eventarchive bleiben in Ruhe.
+        try:
+            when = datetime.fromisoformat(str(obj.get("when_iso", "") or ""))
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=TZ)
+            if when < datetime.now(TZ) - timedelta(hours=12):
+                return False
+        except Exception:
+            pass
+
+        guild_id = int(obj.get("guild_id", 0) or 0)
+        channel_id = int(obj.get("channel_id", 0) or 0)
+        message_id = int(obj.get("message_id", msg_id) or msg_id)
+        guild = client.get_guild(guild_id)
+        if guild is None or not channel_id or not message_id:
+            return False
+
+        channel = guild.get_channel(channel_id)
+        if channel is None:
+            try:
+                channel = await client.fetch_channel(channel_id)
+            except Exception:
+                return False
+        if not hasattr(channel, "fetch_message"):
+            return False
+
+        message = await channel.fetch_message(message_id)
+        await message.edit(
+            embed=build_embed(guild, obj),
+            view=ServerRaidView(message_id),
+        )
+        return True
+    except Exception as exc:
+        print(
+            f"[event_rsvp_dm] Bestehender Eventpost konnte nicht aktualisiert werden "
+            f"msg_id={msg_id}: {exc!r}",
+            flush=True,
+        )
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -3219,19 +3326,23 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
 
     restored_server_views = 0
     restored_dm_views = 0
+    refreshed_server_posts = 0
 
     for msg_id, obj in list(store.items()):
         try:
             srv_count, dm_count = _register_persistent_views_for_event(client, str(msg_id), obj)
             restored_server_views += srv_count
             restored_dm_views += dm_count
+            if await _refresh_existing_server_event_message(client, str(msg_id), obj):
+                refreshed_server_posts += 1
         except Exception as e:
             print(f"[event_rsvp_dm] Event-View Restore Fehler msg_id={msg_id}: {e!r}")
 
     save_store()
     print(
         "✅ RSVP Persistent Views registriert: "
-        f"Server={restored_server_views}, DM={restored_dm_views}"
+        f"Server={restored_server_views}, DM={restored_dm_views}; "
+        f"Serverposts aktualisiert={refreshed_server_posts}"
     )
 
     try:
