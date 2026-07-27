@@ -2902,6 +2902,55 @@ def _admin_center_payload(data: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _admin_tabs_style() -> str:
+    return """
+    <style>
+      .admin-tabs{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:16px;padding:10px 0 4px}
+      .admin-tabs a,.admin-tabs a:visited{padding:10px 14px;border:1px solid rgba(214,168,79,.28);border-radius:12px;text-decoration:none;background:rgba(255,255,255,.025);color:#e8d6b0;font-weight:700;line-height:1.1;transition:all .15s ease}
+      .admin-tabs a:hover{border-color:#d6a84f;background:rgba(214,168,79,.08);color:#f6df9e;transform:translateY(-1px)}
+      .admin-tabs a.active,.admin-tabs a.active:visited{border-color:#d6a84f;background:linear-gradient(180deg,rgba(214,168,79,.22),rgba(214,168,79,.10));box-shadow:0 0 0 1px rgba(214,168,79,.16) inset;color:#f6df9e}
+      .btn.secondary,.btn.secondary:visited{color:#f0d58f;border-color:rgba(214,168,79,.35);background:rgba(214,168,79,.06)}
+      .btn.secondary:hover{background:rgba(214,168,79,.12);border-color:#d6a84f;color:#f8e6b5}
+      .btn.disabled,.btn.disabled:visited{display:inline-flex;align-items:center;justify-content:center;opacity:.55;cursor:not-allowed;pointer-events:none;color:#b49a66;border-color:rgba(214,168,79,.16);background:rgba(255,255,255,.03)}
+    </style>
+    """
+
+
+def _admin_tabs(active: str) -> str:
+    items = [
+        ("overview", "/admin", "Übersicht"),
+        ("events", "/events-admin", "Events"),
+        ("attendance", "/attendance", "Anwesenheit & EC"),
+        ("loot", "/loot", "Loot"),
+        ("members", "/members", "Mitglieder"),
+        ("settings", "/admin-settings", "Einstellungen"),
+        ("system", "/system", "System & Logs"),
+    ]
+    links = []
+    for key, href, label in items:
+        cls = "active" if active == key else ""
+        links.append(f"<a class='{cls}' href='{_e(href)}'>{_e(label)}</a>")
+    return "<nav class='admin-tabs'>" + "".join(links) + "</nav>"
+
+
+def _admin_card_action_buttons(event_id: str, discord_url: str = "", compact: bool = True, include_discord: bool = True) -> str:
+    compact_cls = " compact" if compact else ""
+    cls_primary = f"btn{compact_cls}"
+    cls_secondary = f"btn{compact_cls} secondary"
+    buttons = [
+        f"<a class='{cls_primary}' href='/admin/events/{_e(event_id)}'>Bearbeiten</a>",
+        f"<a class='{cls_secondary}' href='/attendance/{_e(event_id)}'>Anwesenheit</a>",
+        f"<a class='{cls_secondary}' href='/attendance/{_e(event_id)}/ec-preview'>EC</a>",
+        f"<a class='{cls_secondary}' href='/event/{_e(event_id)}'>Details</a>",
+    ]
+    if include_discord:
+        if discord_url:
+            buttons.append(f"<a class='{cls_secondary}' href='{_e(discord_url)}' target='_blank' rel='noopener'>Discord</a>")
+        else:
+            buttons.append(f"<span class='{cls_secondary} disabled' title='Kein Discord-Post verknüpft'>Discord</span>")
+    return "".join(buttons)
+
+
 def _render_admin_center_dashboard(data: dict[str, Any]) -> str:
     if not data.get("ok"):
         return _html_shell("Admin · Beer and Buffs Dashboard", f"<section class='panel'><h1>🛡️ Admin-Zentrale</h1><p class='muted'>{_e(data.get('error'))}</p></section>", nav_mode="admin")
@@ -2921,10 +2970,12 @@ def _render_admin_center_dashboard(data: dict[str, Any]) -> str:
         title = _event_admin_title(ev)
         state = "LÄUFT" if _is_running_event(ev) else "GEPLANT"
         state_class = "ok" if _is_running_event(ev) else "warn"
+        discord_url = _event_admin_discord_url(ev)
+        buttons = _admin_card_action_buttons(eid, discord_url=discord_url, compact=True, include_discord=True)
         return f"""
         <article class="admin-home-event">
           {_event_admin_image_preview(ev, css_class='admin-home-event-image')}
-          <div class="admin-home-event-body"><span class="pill {state_class}">{state}</span><h3>{_e(title)}</h3><p class="muted">{_dt(ev.get('when_iso') or ev.get('start_at') or ev.get('created_at'))}</p><div class="admin-home-actions"><a class="btn compact" href="/admin/events/{_e(eid)}">Bearbeiten</a><a class="btn compact secondary" href="/attendance/{_e(eid)}">Anwesenheit</a><a class="btn compact secondary" href="/attendance/{_e(eid)}/ec-preview">EC</a></div></div>
+          <div class="admin-home-event-body"><span class="pill {state_class}">{state}</span><h3>{_e(title)}</h3><p class="muted">{_dt(ev.get('when_iso') or ev.get('start_at') or ev.get('created_at'))}</p><div class="admin-home-actions">{buttons}</div></div>
         </article>
         """
 
@@ -2956,14 +3007,14 @@ def _render_admin_center_dashboard(data: dict[str, Any]) -> str:
     source_rows = p.get("source_rows") or []
     body = f"""
     <style>
-      .admin-tabs{{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px}}.admin-tabs a{{padding:9px 13px;border:1px solid var(--line);border-radius:10px;text-decoration:none;background:rgba(255,255,255,.025)}}.admin-tabs a.active{{border-color:#d6a84f;background:rgba(214,168,79,.12);color:#f3d68c}}
-      .admin-quick-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px}}.admin-quick{{display:flex;gap:12px;align-items:center;padding:15px;border:1px solid rgba(214,168,79,.24);border-radius:14px;text-decoration:none;background:rgba(10,9,9,.72)}}.admin-quick:hover{{border-color:#d6a84f;background:rgba(214,168,79,.08)}}.admin-quick span{{font-size:1.7rem}}.admin-quick strong{{display:block}}.admin-quick small{{display:block;color:var(--muted);margin-top:3px}}
-      .admin-home-event-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:14px}}.admin-home-event{{display:grid;grid-template-columns:135px minmax(0,1fr);border:1px solid rgba(214,168,79,.22);border-radius:15px;overflow:hidden;background:rgba(9,8,9,.82)}}.admin-home-event-image{{min-height:145px;background:#0a0909;overflow:hidden}}.admin-home-event-image img{{width:100%;height:100%;object-fit:cover}}.admin-home-event-body{{padding:14px}}.admin-home-event-body h3{{margin:.45rem 0 .15rem}}.admin-home-actions{{display:flex;gap:7px;flex-wrap:wrap;margin-top:12px}}.btn.compact{{padding:7px 10px;font-size:.86rem}}.btn.secondary{{background:rgba(255,255,255,.035);border-color:var(--line)}}.admin-event-image-error,.admin-event-thumb-empty{{height:100%;display:flex;align-items:center;justify-content:center;flex-direction:column;color:#d6a84f}}
+      .admin-quick-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px}}.admin-quick{{display:flex;gap:12px;align-items:center;padding:15px;border:1px solid rgba(214,168,79,.24);border-radius:14px;text-decoration:none;background:rgba(10,9,9,.72);color:#ead9b2}}.admin-quick:visited{{color:#ead9b2}}.admin-quick:hover{{border-color:#d6a84f;background:rgba(214,168,79,.08)}}.admin-quick span{{font-size:1.7rem}}.admin-quick strong{{display:block}}.admin-quick small{{display:block;color:var(--muted);margin-top:3px}}
+      .admin-home-event-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:14px}}.admin-home-event{{display:grid;grid-template-columns:135px minmax(0,1fr);border:1px solid rgba(214,168,79,.22);border-radius:15px;overflow:hidden;background:rgba(9,8,9,.82)}}.admin-home-event-image{{min-height:145px;background:#0a0909;overflow:hidden}}.admin-home-event-image img{{width:100%;height:100%;object-fit:cover}}.admin-home-event-body{{padding:14px}}.admin-home-event-body h3{{margin:.45rem 0 .15rem}}.admin-home-actions{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px;margin-top:12px}}.btn.compact{{padding:7px 10px;font-size:.86rem;text-align:center;justify-content:center}}.admin-event-image-error,.admin-event-thumb-empty{{height:100%;display:flex;align-items:center;justify-content:center;flex-direction:column;color:#d6a84f}}
       details.admin-details>summary{{cursor:pointer;font-weight:700;color:#e5c477;padding:8px 0}}@media(max-width:620px){{.admin-home-event{{grid-template-columns:1fr}}.admin-home-event-image{{aspect-ratio:16/7}}}}
     </style>
-    <nav class="admin-tabs"><a class="active" href="/admin">Übersicht</a><a href="/events-admin">Events</a><a href="/attendance">Anwesenheit & EC</a><a href="/loot">Loot</a><a href="/members">Mitglieder</a><a href="/admin/guild-config">Einstellungen</a><a href="/system">System & Logs</a></nav>
+    {_admin_tabs_style()}
+    {_admin_tabs('overview')}
     <section class="hero"><div><div class="eyebrow">Admin-Portal</div><h1>🛡️ Verwaltung</h1><p class="muted">Schnellzugriff auf laufende Events, Anwesenheit, EC, Loot und Gildeneinstellungen.</p></div><a class="btn" href="/events-admin#event-create">+ Event erstellen</a></section>
-    <section class="admin-quick-grid"><a class="admin-quick" href="/events-admin"><span>📅</span><div><strong>Events verwalten</strong><small>Laufende Events bearbeiten</small></div></a><a class="admin-quick" href="/attendance"><span>✅</span><div><strong>Anwesenheit & EC</strong><small>Prüfen und vergeben</small></div></a><a class="admin-quick" href="/loot"><span>🎁</span><div><strong>Loot & Auktionen</strong><small>Offene Aktionen</small></div></a><a class="admin-quick" href="/members"><span>👥</span><div><strong>Mitglieder</strong><small>Profile und Notizen</small></div></a><a class="admin-quick" href="/admin/guild-config"><span>⚙️</span><div><strong>Gildeneinstellungen</strong><small>Rollen, Kanäle, Branding</small></div></a><a class="admin-quick" href="/system"><span>🧩</span><div><strong>System & Logs</strong><small>Bot, DB und Quellen</small></div></a></section>
+    <section class="admin-quick-grid"><a class="admin-quick" href="/events-admin"><span>📅</span><div><strong>Events verwalten</strong><small>Laufende Events bearbeiten</small></div></a><a class="admin-quick" href="/attendance"><span>✅</span><div><strong>Anwesenheit & EC</strong><small>Prüfen und vergeben</small></div></a><a class="admin-quick" href="/loot"><span>🎁</span><div><strong>Loot & Auktionen</strong><small>Offene Aktionen</small></div></a><a class="admin-quick" href="/members"><span>👥</span><div><strong>Mitglieder</strong><small>Profile und Notizen</small></div></a><a class="admin-quick" href="/admin-settings"><span>⚙️</span><div><strong>Einstellungen</strong><small>Regeln, Rollen und Gilden-Setup</small></div></a><a class="admin-quick" href="/system"><span>🧩</span><div><strong>System & Logs</strong><small>Bot, DB und Quellen</small></div></a></section>
     <section class="grid">{_card('Laufende Events',len(running_events),'direkt bearbeitbar')}{_card('Kommende Events',len(upcoming_events),'geplant')}{_card('Anwesenheit offen',len(attendance_open),'wartet auf Prüfung')}{_card('Event-Queue',event_counts.get('pending',0)+event_counts.get('processing',0),f"Fehler: {event_counts.get('failed',0)+event_counts.get('rejected',0)}")}</section>
     <section class="panel"><h2>🔥 Laufende und nächste Events</h2><div class="admin-home-event-grid">{event_html}</div><p style="margin-top:14px"><a class="btn secondary" href="/events-admin">Alle Events öffnen</a></p></section>
     <section class="split"><section class="panel"><h2>🚦 Offene Aufgaben</h2>{_table(['Bereich','Status','Aktion'],task_rows,searchable=False)}</section><section class="panel"><h2>🧾 Letzte Admin-Aktionen</h2>{_table(['Zeit','Aktion','Ziel','Von','Status'],recent_rows,searchable=False)}</section></section>
@@ -14943,7 +14994,7 @@ def _render_admin_settings_editor(data: dict[str, Any], msg: str = "", section: 
         </section>
         """
 
-    style = """
+    style = _admin_tabs_style() + """
     <style>
       .settings-shell{display:grid;gap:18px}
       .settings-header{display:flex;justify-content:space-between;gap:16px;align-items:flex-start;flex-wrap:wrap}
@@ -14991,7 +15042,7 @@ def _render_admin_settings_editor(data: dict[str, Any], msg: str = "", section: 
     body = f"""
     {style}
     <div class='settings-shell'>
-      <nav class='admin-tabs'><a href='/admin'>Übersicht</a><a href='/events-admin'>Events</a><a href='/attendance'>Anwesenheit & EC</a><a href='/loot'>Loot</a><a href='/members'>Mitglieder</a><a class='active' href='/admin-settings'>Einstellungen</a><a href='/system'>System & Logs</a></nav>
+      {_admin_tabs('settings')}
       <section class='panel'>
         <div class='settings-header'>
           <div>
@@ -15377,13 +15428,13 @@ def _render_event_editor(data: dict[str, Any], event_id: str, current_user: Opti
     discord_button = f'<a class="btn secondary" href="{_e(discord_url)}" target="_blank" rel="noopener">Discord-Post öffnen</a>' if discord_url else ""
     body = f"""
     <style>
-      .admin-tabs{{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px}}.admin-tabs a{{padding:9px 13px;border:1px solid var(--line);border-radius:10px;text-decoration:none;background:rgba(255,255,255,.025)}}.admin-tabs a.active{{border-color:#d6a84f;background:rgba(214,168,79,.12);color:#f3d68c}}
       .event-editor-layout{{display:grid;grid-template-columns:minmax(0,1.35fr) minmax(300px,.65fr);gap:16px;align-items:start}}.event-editor-form{{display:grid;gap:14px}}.editor-grid{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}}.editor-grid .wide{{grid-column:1/-1}}.event-editor-form input,.event-editor-form select,.event-editor-form textarea{{width:100%}}
       .event-live-preview{{position:sticky;top:16px}}.event-live-preview .preview-card{{border:1px solid rgba(214,168,79,.34);border-radius:16px;overflow:hidden;background:rgba(8,8,10,.88)}}.event-live-preview img{{display:block;width:100%;aspect-ratio:16/9;object-fit:cover}}.preview-body{{padding:16px}}.preview-body h2{{margin:.2rem 0 .35rem}}.preview-meta{{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0}}.preview-meta span{{border:1px solid var(--line);border-radius:999px;padding:5px 8px;font-size:.82rem}}
       .admin-running-warning{{display:grid;gap:4px;padding:12px 14px;border:1px solid #a86d20;background:rgba(168,109,32,.13);border-radius:12px;color:#f2d09a}}.editor-actions{{display:flex;gap:10px;flex-wrap:wrap;align-items:center}}.editor-danger{{margin-top:16px;border-color:rgba(220,70,70,.45)}}.admin-event-image-error,.admin-event-thumb-empty{{aspect-ratio:16/9;align-items:center;justify-content:center;flex-direction:column;gap:6px;background:linear-gradient(135deg,#1a120d,#09090b);color:#d6a84f}}
       @media(max-width:900px){{.event-editor-layout{{grid-template-columns:1fr}}.event-live-preview{{position:static}}}}@media(max-width:620px){{.editor-grid{{grid-template-columns:1fr}}.editor-grid .wide{{grid-column:auto}}}}
     </style>
-    <nav class="admin-tabs"><a href="/admin">Übersicht</a><a class="active" href="/events-admin">Events</a><a href="/attendance">Anwesenheit & EC</a><a href="/loot">Loot</a><a href="/members">Mitglieder</a><a href="/admin/guild-config">Einstellungen</a><a href="/system">System & Logs</a></nav>
+    {_admin_tabs_style()}
+    {_admin_tabs('events')}
     <section class="hero"><div><div class="eyebrow">Admin · Eventverwaltung</div><h1>✏️ {_e(title)}</h1><p class="muted">Event-ID {_e(eid)} · <span class="pill {_e(queue_class)}">{_e(queue_label)}</span></p></div><div class="editor-actions"><a class="btn secondary" href="/events-admin">← Eventliste</a>{discord_button}</div></section>
     {msg_panel}{running_warning}
     <div class="event-editor-layout">
@@ -15492,7 +15543,7 @@ def _render_events_center(data: dict[str, Any], current_user: Optional[dict[str,
         queue_label, queue_class = _event_admin_queue_state(action_rows, eid)
         summary = _event_role_summary(ev)
         discord_url = _event_admin_discord_url(ev)
-        discord_action = f'<a class="btn compact secondary" href="{_e(discord_url)}" target="_blank" rel="noopener">Discord</a>' if discord_url else ""
+        buttons = _admin_card_action_buttons(eid, discord_url=discord_url, compact=True, include_discord=True)
         image = _event_admin_image_preview(ev)
         search_text = " ".join([title, str(ev.get("event_type") or ""), str(ev.get("dkp_event_type") or ""), _event_status_text(ev)]).casefold()
         return f"""
@@ -15501,7 +15552,7 @@ def _render_events_center(data: dict[str, Any], current_user: Optional[dict[str,
           <div class="admin-event-card-body">
             <div class="admin-event-card-head"><div><span class="pill {status_class}">{_e(bucket_label)}</span><span class="pill {_e(queue_class)}">{_e(queue_label)}</span><h3>{_e(title)}</h3><p class="muted">{_dt(ev.get('when_iso') or ev.get('start_at') or ev.get('created_at'))}</p></div></div>
             <div class="admin-event-stats"><span>🛡️ {_e(summary.get('Tank',0))}</span><span>✚ {_e(summary.get('Heiler',0))}</span><span>⚔️ {_e(summary.get('DPS',0))}</span><span>🪑 {_e(summary.get('Reserve',0))}</span><span>👥 {_e(summary.get('yes_count', ev.get('participant_count',0)))}</span></div>
-            <div class="admin-event-actions"><a class="btn compact" href="/admin/events/{_e(eid)}">Bearbeiten</a><a class="btn compact secondary" href="/attendance/{_e(eid)}">Anwesenheit</a><a class="btn compact secondary" href="/attendance/{_e(eid)}/ec-preview">EC</a><a class="btn compact secondary" href="/event/{_e(eid)}">Details</a>{discord_action}</div>
+            <div class="admin-event-actions">{buttons}</div>
           </div>
         </article>
         """
@@ -15529,12 +15580,12 @@ def _render_events_center(data: dict[str, Any], current_user: Optional[dict[str,
     msg_panel = f"<section class='panel admin-flash'><p>{_e(msg)}</p></section>" if msg else ""
     body = f"""
     <style>
-      .admin-tabs{{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px}}.admin-tabs a{{padding:9px 13px;border:1px solid var(--line);border-radius:10px;text-decoration:none;background:rgba(255,255,255,.025)}}.admin-tabs a.active{{border-color:#d6a84f;background:rgba(214,168,79,.12);color:#f3d68c}}
       .event-toolbar{{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:14px}}.event-toolbar input{{flex:1 1 260px}}.event-filter{{border:1px solid var(--line);background:rgba(255,255,255,.03);color:var(--text);border-radius:999px;padding:8px 12px;cursor:pointer}}.event-filter.active{{border-color:#d6a84f;background:rgba(214,168,79,.14);color:#f4d78e}}
-      .admin-event-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(330px,1fr));gap:15px}}.admin-event-card{{border:1px solid rgba(214,168,79,.24);border-radius:16px;overflow:hidden;background:rgba(8,8,10,.82);box-shadow:0 14px 38px rgba(0,0,0,.24)}}.admin-event-thumb{{position:relative;aspect-ratio:16/7;background:#0b0908;overflow:hidden}}.admin-event-thumb img{{width:100%;height:100%;object-fit:cover;display:block}}.admin-event-thumb-empty,.admin-event-image-error{{height:100%;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:5px;color:#d6a84f;background:linear-gradient(135deg,#21150d,#09090b)}}.admin-event-card-body{{padding:15px}}.admin-event-card-head h3{{margin:.55rem 0 .15rem;font-size:1.25rem}}.admin-event-card-head .pill{{margin-right:5px}}.admin-event-stats{{display:flex;gap:7px;flex-wrap:wrap;margin:12px 0}}.admin-event-stats span{{border:1px solid var(--line);border-radius:999px;padding:5px 8px;font-size:.84rem}}.admin-event-actions{{display:flex;gap:7px;flex-wrap:wrap}}.btn.compact{{padding:7px 10px;font-size:.86rem}}.btn.secondary{{background:rgba(255,255,255,.035);border-color:var(--line)}}
+      .admin-event-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(330px,1fr));gap:15px}}.admin-event-card{{border:1px solid rgba(214,168,79,.24);border-radius:16px;overflow:hidden;background:rgba(8,8,10,.82);box-shadow:0 14px 38px rgba(0,0,0,.24)}}.admin-event-thumb{{position:relative;aspect-ratio:16/7;background:#0b0908;overflow:hidden}}.admin-event-thumb img{{width:100%;height:100%;object-fit:cover;display:block}}.admin-event-thumb-empty,.admin-event-image-error{{height:100%;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:5px;color:#d6a84f;background:linear-gradient(135deg,#21150d,#09090b)}}.admin-event-card-body{{padding:15px}}.admin-event-card-head h3{{margin:.55rem 0 .15rem;font-size:1.25rem}}.admin-event-card-head .pill{{margin-right:5px}}.admin-event-stats{{display:flex;gap:7px;flex-wrap:wrap;margin:12px 0}}.admin-event-stats span{{border:1px solid var(--line);border-radius:999px;padding:5px 8px;font-size:.84rem}}.admin-event-actions{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px}}.btn.compact{{padding:7px 10px;font-size:.86rem;text-align:center;justify-content:center}}
       .create-event-form{{display:grid;gap:13px}}.event-form-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:11px}}.event-form-grid input,.event-form-grid select,.event-form-grid textarea{{width:100%}}@media(max-width:620px){{.admin-event-grid{{grid-template-columns:1fr}}}}
     </style>
-    <nav class="admin-tabs"><a href="/admin">Übersicht</a><a class="active" href="/events-admin">Events</a><a href="/attendance">Anwesenheit & EC</a><a href="/loot">Loot</a><a href="/members">Mitglieder</a><a href="/admin/guild-config">Einstellungen</a><a href="/system">System & Logs</a></nav>
+    {_admin_tabs_style()}
+    {_admin_tabs('events')}
     <section class="hero"><div><div class="eyebrow">Admin · Eventverwaltung</div><h1>📅 Events verwalten</h1><p class="muted">Geplante, laufende und vergangene Events direkt öffnen. Änderungen werden über die Bot-Queue in den bestehenden Discord-Post übernommen.</p></div><a class="btn" href="#event-create">+ Event erstellen</a></section>
     {msg_panel}
     <section class="grid">{_card('Laufend',len(running),'direkt bearbeitbar')}{_card('Geplant',len(upcoming),'kommende Termine')}{_card('Vergangen',len(past),'im Snapshot')}{_card('Queue offen',action_counts.get('pending',0)+action_counts.get('processing',0),f"Fehler: {action_counts.get('failed',0)+action_counts.get('rejected',0)}")}</section>
@@ -18465,7 +18516,8 @@ def _render_guild_config_dashboard(data: dict[str, Any], msg: str = "") -> str:
     profile_rows = [[r.get("display_name") or r.get("discord_name"), r.get("guild_id"), r.get("status"), r.get("previous_guild_id") or "—", _dt(r.get("updated_at"))] for r in profiles]
     msg_panel = f"<section class='panel'><p>{_e(msg)}</p></section>" if msg else ""
     body = f"""
-    <nav class='topnav'><a href='/admin'>← Admin</a><a href='/admin-settings'>EC & Regeln</a><a href='/settings'>System-Setup</a></nav>
+    {_admin_tabs_style()}
+    {_admin_tabs('settings')}
     <section class='hero'><div><div class='eyebrow'>Mandantenfähige Konfiguration</div><h1>⚙️ Gilde & Discord</h1><p class='muted'>Gildenname, Branding, Rollen und Kanäle liegen in Postgres. Railway bleibt bei Tokens, OAuth-Secrets, DATABASE_URL und Session-Secret.</p></div></section>
     {msg_panel}
     <section class='grid'>{_card('Aktive Guild-ID', gid, 'automatisch aus Bot-Snapshot')}{_card('Discord-Server', profile.get('discord_name') or guild_row.get('discord_name') or '—', 'technischer Servername')}{_card('Gildenname', profile.get('display_name') or '—', 'frei änderbar')}{_card('Rollen im Snapshot', len(roles), 'Auswahl ohne IDs kopieren')}</section>
