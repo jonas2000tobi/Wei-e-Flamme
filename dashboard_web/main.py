@@ -2905,32 +2905,40 @@ def _admin_center_payload(data: dict[str, Any]) -> dict[str, Any]:
 def _admin_tabs_style() -> str:
     return """
     <style>
-      .admin-tabs{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:16px;padding:10px 0 4px}
-      .admin-tabs a,.admin-tabs a:visited{padding:10px 14px;border:1px solid rgba(214,168,79,.28);border-radius:12px;text-decoration:none;background:rgba(255,255,255,.025);color:#e8d6b0;font-weight:700;line-height:1.1;transition:all .15s ease}
-      .admin-tabs a:hover{border-color:#d6a84f;background:rgba(214,168,79,.08);color:#f6df9e;transform:translateY(-1px)}
-      .admin-tabs a.active,.admin-tabs a.active:visited{border-color:#d6a84f;background:linear-gradient(180deg,rgba(214,168,79,.22),rgba(214,168,79,.10));box-shadow:0 0 0 1px rgba(214,168,79,.16) inset;color:#f6df9e}
+      .admin-quick-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px;margin:16px 0 18px}
+      .admin-quick,.admin-quick:visited{display:flex;gap:12px;align-items:center;padding:15px;border:1px solid rgba(214,168,79,.24);border-radius:14px;text-decoration:none;background:rgba(10,9,9,.72);color:#ead9b2;transition:all .15s ease}
+      .admin-quick:hover{border-color:#d6a84f;background:rgba(214,168,79,.08);transform:translateY(-1px)}
+      .admin-quick.active,.admin-quick.active:visited{border-color:#d6a84f;background:linear-gradient(180deg,rgba(214,168,79,.20),rgba(214,168,79,.08));box-shadow:0 0 0 1px rgba(214,168,79,.18) inset;color:#f6df9e}
+      .admin-quick span{font-size:1.7rem}
+      .admin-quick strong{display:block}
+      .admin-quick small{display:block;color:var(--muted);margin-top:3px}
       .btn.secondary,.btn.secondary:visited{color:#f0d58f;border-color:rgba(214,168,79,.35);background:rgba(214,168,79,.06)}
       .btn.secondary:hover{background:rgba(214,168,79,.12);border-color:#d6a84f;color:#f8e6b5}
       .btn.disabled,.btn.disabled:visited{display:inline-flex;align-items:center;justify-content:center;opacity:.55;cursor:not-allowed;pointer-events:none;color:#b49a66;border-color:rgba(214,168,79,.16);background:rgba(255,255,255,.03)}
+      @media(max-width:620px){.admin-quick-grid{grid-template-columns:1fr 1fr}}
+      @media(max-width:420px){.admin-quick-grid{grid-template-columns:1fr}}
     </style>
     """
 
 
 def _admin_tabs(active: str) -> str:
+    return ""
+
+
+def _admin_quick_links(active: str = "") -> str:
     items = [
-        ("overview", "/admin", "Übersicht"),
-        ("events", "/events-admin", "Events"),
-        ("attendance", "/attendance", "Anwesenheit & EC"),
-        ("loot", "/loot", "Loot"),
-        ("members", "/members", "Mitglieder"),
-        ("settings", "/admin-settings", "Einstellungen"),
-        ("system", "/system", "System & Logs"),
+        ("events", "/events-admin", "📅", "Events verwalten", "Laufende Events bearbeiten"),
+        ("attendance", "/attendance", "✅", "Anwesenheit & EC", "Prüfen und vergeben"),
+        ("loot", "/loot", "🎁", "Loot & Auktionen", "Offene Aktionen"),
+        ("members", "/members", "👥", "Mitglieder", "Profile und Notizen"),
+        ("settings", "/admin-settings", "⚙️", "Einstellungen", "Regeln, Rollen und Gilden-Setup"),
+        ("system", "/system", "🧩", "System & Logs", "Bot, DB und Quellen"),
     ]
-    links = []
-    for key, href, label in items:
-        cls = "active" if active == key else ""
-        links.append(f"<a class='{cls}' href='{_e(href)}'>{_e(label)}</a>")
-    return "<nav class='admin-tabs'>" + "".join(links) + "</nav>"
+    cards = []
+    for key, href, icon, title, subtitle in items:
+        cls = 'admin-quick active' if key == active else 'admin-quick'
+        cards.append(f"<a class='{cls}' href='{_e(href)}'><span>{icon}</span><div><strong>{_e(title)}</strong><small>{_e(subtitle)}</small></div></a>")
+    return "<section class='admin-quick-grid'>" + "".join(cards) + "</section>"
 
 
 def _admin_card_action_buttons(event_id: str, discord_url: str = "", compact: bool = True, include_discord: bool = True) -> str:
@@ -3014,7 +3022,7 @@ def _render_admin_center_dashboard(data: dict[str, Any]) -> str:
     {_admin_tabs_style()}
     {_admin_tabs('overview')}
     <section class="hero"><div><div class="eyebrow">Admin-Portal</div><h1>🛡️ Verwaltung</h1><p class="muted">Schnellzugriff auf laufende Events, Anwesenheit, EC, Loot und Gildeneinstellungen.</p></div><a class="btn" href="/events-admin#event-create">+ Event erstellen</a></section>
-    <section class="admin-quick-grid"><a class="admin-quick" href="/events-admin"><span>📅</span><div><strong>Events verwalten</strong><small>Laufende Events bearbeiten</small></div></a><a class="admin-quick" href="/attendance"><span>✅</span><div><strong>Anwesenheit & EC</strong><small>Prüfen und vergeben</small></div></a><a class="admin-quick" href="/loot"><span>🎁</span><div><strong>Loot & Auktionen</strong><small>Offene Aktionen</small></div></a><a class="admin-quick" href="/members"><span>👥</span><div><strong>Mitglieder</strong><small>Profile und Notizen</small></div></a><a class="admin-quick" href="/admin-settings"><span>⚙️</span><div><strong>Einstellungen</strong><small>Regeln, Rollen und Gilden-Setup</small></div></a><a class="admin-quick" href="/system"><span>🧩</span><div><strong>System & Logs</strong><small>Bot, DB und Quellen</small></div></a></section>
+    {_admin_quick_links('overview')}
     <section class="grid">{_card('Laufende Events',len(running_events),'direkt bearbeitbar')}{_card('Kommende Events',len(upcoming_events),'geplant')}{_card('Anwesenheit offen',len(attendance_open),'wartet auf Prüfung')}{_card('Event-Queue',event_counts.get('pending',0)+event_counts.get('processing',0),f"Fehler: {event_counts.get('failed',0)+event_counts.get('rejected',0)}")}</section>
     <section class="panel"><h2>🔥 Laufende und nächste Events</h2><div class="admin-home-event-grid">{event_html}</div><p style="margin-top:14px"><a class="btn secondary" href="/events-admin">Alle Events öffnen</a></p></section>
     <section class="split"><section class="panel"><h2>🚦 Offene Aufgaben</h2>{_table(['Bereich','Status','Aktion'],task_rows,searchable=False)}</section><section class="panel"><h2>🧾 Letzte Admin-Aktionen</h2>{_table(['Zeit','Aktion','Ziel','Von','Status'],recent_rows,searchable=False)}</section></section>
@@ -7206,6 +7214,7 @@ def _render_loot_dashboard(data: dict[str, Any]) -> str:
     body = f"""
     <nav class="topnav"><a href="/">← Übersicht</a><a href="/members">Mitglieder</a><a href="/character-editor">Needs</a><a href="/analytics">Analytics</a><a href="/voice">Voice</a><a href="/exports">Exports</a><a href="/api/loot">API</a></nav>
     <section class="hero"><div><div class="eyebrow">Loot & Auktionen</div><h1>🎁 Loot-Dashboard</h1><p class="muted">Aktive Auktionen, Gewinnerverteilung und Auktionshistorie. Read-only.</p></div><a class="btn" href="/export/auctions.csv">CSV herunterladen</a></section>
+    {_admin_quick_links('loot')}
     <section class="grid">{cards}</section>
     <section class="split"><div class="panel"><h2>🏆 Loot-Gewinner</h2>{_table(['Spieler','Items'], winner_rows, placeholder='Gewinner durchsuchen…')}</div><div class="panel"><h2>📈 Aktuell führend</h2>{_table(['Spieler','Führungen'], leader_rows, placeholder='Führungen durchsuchen…')}</div></section>
     <section class="panel"><h2>🟢 Aktive Auktionen</h2>{_table(['Item','Bereich','Status','Gebote/Würfe','Führung/Wurf','Gewinner','Timer'], active_rows, placeholder='Aktive Auktionen durchsuchen…')}</section>
@@ -15056,6 +15065,7 @@ def _render_admin_settings_editor(data: dict[str, Any], msg: str = "", section: 
           </div>
         </div>
       </section>
+      {_admin_quick_links('settings')}
       {msg_panel}
       <section class='panel'><div class='settings-metrics'>{top_status}</div></section>
       <section class='panel'><div class='settings-tabs'>{_settings_nav('ec','EC & Regeln')}{_settings_nav('events','Events')}{_settings_nav('roles','Rollen')}{_settings_nav('loot','Loot')}{_settings_nav('dashboard','Dashboard')}{_settings_nav('system','Bot / System')}</div></section>
@@ -15436,6 +15446,7 @@ def _render_event_editor(data: dict[str, Any], event_id: str, current_user: Opti
     {_admin_tabs_style()}
     {_admin_tabs('events')}
     <section class="hero"><div><div class="eyebrow">Admin · Eventverwaltung</div><h1>✏️ {_e(title)}</h1><p class="muted">Event-ID {_e(eid)} · <span class="pill {_e(queue_class)}">{_e(queue_label)}</span></p></div><div class="editor-actions"><a class="btn secondary" href="/events-admin">← Eventliste</a>{discord_button}</div></section>
+    {_admin_quick_links('events')}
     {msg_panel}{running_warning}
     <div class="event-editor-layout">
       <section class="panel">
@@ -15587,6 +15598,7 @@ def _render_events_center(data: dict[str, Any], current_user: Optional[dict[str,
     {_admin_tabs_style()}
     {_admin_tabs('events')}
     <section class="hero"><div><div class="eyebrow">Admin · Eventverwaltung</div><h1>📅 Events verwalten</h1><p class="muted">Geplante, laufende und vergangene Events direkt öffnen. Änderungen werden über die Bot-Queue in den bestehenden Discord-Post übernommen.</p></div><a class="btn" href="#event-create">+ Event erstellen</a></section>
+    {_admin_quick_links('events')}
     {msg_panel}
     <section class="grid">{_card('Laufend',len(running),'direkt bearbeitbar')}{_card('Geplant',len(upcoming),'kommende Termine')}{_card('Vergangen',len(past),'im Snapshot')}{_card('Queue offen',action_counts.get('pending',0)+action_counts.get('processing',0),f"Fehler: {action_counts.get('failed',0)+action_counts.get('rejected',0)}")}</section>
     <section class="panel"><div class="event-toolbar"><input id="admin-event-search" type="search" placeholder="Event suchen…"><button class="event-filter active" data-filter="all">Alle</button><button class="event-filter" data-filter="running">Laufend</button><button class="event-filter" data-filter="upcoming">Geplant</button><button class="event-filter" data-filter="past">Beendet</button></div><div id="admin-event-grid" class="admin-event-grid">{all_cards}</div></section>
@@ -18519,6 +18531,7 @@ def _render_guild_config_dashboard(data: dict[str, Any], msg: str = "") -> str:
     {_admin_tabs_style()}
     {_admin_tabs('settings')}
     <section class='hero'><div><div class='eyebrow'>Mandantenfähige Konfiguration</div><h1>⚙️ Gilde & Discord</h1><p class='muted'>Gildenname, Branding, Rollen und Kanäle liegen in Postgres. Railway bleibt bei Tokens, OAuth-Secrets, DATABASE_URL und Session-Secret.</p></div></section>
+    {_admin_quick_links('settings')}
     {msg_panel}
     <section class='grid'>{_card('Aktive Guild-ID', gid, 'automatisch aus Bot-Snapshot')}{_card('Discord-Server', profile.get('discord_name') or guild_row.get('discord_name') or '—', 'technischer Servername')}{_card('Gildenname', profile.get('display_name') or '—', 'frei änderbar')}{_card('Rollen im Snapshot', len(roles), 'Auswahl ohne IDs kopieren')}</section>
     <form method='post' action='/admin/guild-config' style='display:grid;gap:18px;'>
