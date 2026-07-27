@@ -20,7 +20,6 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
 from typing import Any, Optional
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, RedirectResponse, FileResponse
@@ -50,7 +49,7 @@ async def _dashboard_lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Guild Platform Dashboard", version="2.3.2", lifespan=_dashboard_lifespan)
+app = FastAPI(title="Guild Platform Dashboard", version="2.3.1", lifespan=_dashboard_lifespan)
 security = HTTPBasic(auto_error=False)
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -58,7 +57,7 @@ if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 ASSET_VER = "beer-and-buffs-v2-3-0-admin-event-editor"
-DASHBOARD_RELEASE_VERSION = "2.3.2 · Needliste: Slot leeren & Zeitstempel"
+DASHBOARD_RELEASE_VERSION = "2.3.1 · Vereinfachte Anwesenheitsprüfung"
 
 _EVENT_IMAGE_ASSETS: dict[str, str] = {
     "guild_boss": "https://media.discordapp.net/attachments/1528469765860098171/1528469820738375882/Gildenbosse.png?ex=6a66fbb2&is=6a65aa32&hm=68dd55e6c4471bfafac7fbe6f397e338df96be2a7d5ed09e5670beaabd2b1306&=&format=webp&quality=lossless&width=1521&height=856",
@@ -1616,7 +1615,6 @@ def _phase3_loot_pg_payload(guild_id: Any, snap: dict[str, Any]) -> Optional[dic
             "slot_name": slot,
             "label": _phase3_need_label(slot, item),
             "status": row.get("status") or raw.get("status") or "",
-            "need_since": str(raw.get("need_since") or raw.get("selected_at") or raw.get("need_created_at") or ""),
             "source": "postgres_phase3",
         }
         # _loot_text bevorzugt item_name. Damit die Loot-Zentrale weiterhin Slot+Item gruppiert,
@@ -3202,31 +3200,6 @@ def _need_is_received(entry: Any) -> bool:
     status = str(entry.get("status") or entry.get("state") or "").lower()
     raw = json.dumps(entry, ensure_ascii=False).lower()
     return status in {"received", "erhalten", "done", "locked", "complete", "completed"} or "✅" in raw or "erhalten" in raw
-
-def _need_since_raw(entry: Any) -> str:
-    if not isinstance(entry, dict):
-        return ""
-    raw = entry.get("need_since") or entry.get("selected_at") or entry.get("need_created_at")
-    if not raw and isinstance(entry.get("raw_json"), dict):
-        nested = entry.get("raw_json") or {}
-        raw = nested.get("need_since") or nested.get("selected_at") or nested.get("need_created_at")
-    return str(raw or "").strip()
-
-
-def _need_since_html(entry: Any) -> str:
-    raw = _need_since_raw(entry)
-    if not raw:
-        return '<span class="need-since unknown" title="Dieser Need stammt aus dem Altbestand ohne gespeicherten Zeitstempel.">🕒 seit unbekannt (Altbestand)</span>'
-    try:
-        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        local_dt = dt.astimezone(ZoneInfo("Europe/Berlin"))
-        label = local_dt.strftime("%d.%m.%Y, %H:%M Uhr")
-        return f'<span class="need-since" title="Serverseitig gespeichert: {_e(raw)}">🕒 Need seit {_e(label)}</span>'
-    except Exception:
-        return '<span class="need-since unknown">🕒 Zeitpunkt nicht lesbar</span>'
-
 
 def _need_slot_map(items: Any) -> dict[str, dict[str, Any]]:
     out: dict[str, dict[str, Any]] = {}
@@ -12184,7 +12157,6 @@ def _render_need_editor_panel(
     def editor_html(tab: str, slot: str, entry: Any, idx: int) -> str:
         locked = bool(entry and _need_is_received(entry))
         current, image_url, rarity = item_model(entry)
-        since_html = _need_since_html(entry) if current else ""
         input_id = f"need-equipment-{int(user_id)}-{tab.lower()}-{idx}"
         slot_id = f"need-equipment-slot-{int(user_id)}-{tab.lower()}-{idx}"
         editor_id = f"need-equipment-editor-{tab.lower()}-{idx}"
@@ -12195,7 +12167,7 @@ def _render_need_editor_panel(
             <section class="equipment-editor" id="{_e(editor_id)}" data-tab="{_e(tab.lower())}" data-slot-name="{_e(slot)}" hidden>
               <div class="equipment-editor-preview">{image}</div>
               <div class="equipment-editor-main">
-                <div class="equipment-editor-title"><div><span>{_e(slot)}</span><strong>{_e(current or '—')}</strong>{since_html}</div><span class="need-state locked">Erhalten</span></div>
+                <div class="equipment-editor-title"><div><span>{_e(slot)}</span><strong>{_e(current or '—')}</strong></div><span class="need-state locked">Erhalten</span></div>
                 <p class="muted">Dieser Slot ist als erhalten markiert und bleibt gesperrt. Nur die Gildenleitung kann ihn wieder freigeben.</p>
               </div>
             </section>"""
@@ -12230,16 +12202,17 @@ def _render_need_editor_panel(
         """
         return f"""
         <form class="equipment-editor" id="{_e(editor_id)}" data-tab="{_e(tab.lower())}" data-live-preview="1" data-empty-icon="{_e(slot_icons.get(slot, '🧩'))}" data-slot-name="{_e(slot)}" hidden method="post" action="/portal/member/{int(user_id)}/need-change">
+          <input type="hidden" name="action_type" value="set">
           <input type="hidden" name="tab" value="{_e(tab)}">
           {hidden_slot}
           <div class="equipment-editor-preview" data-preview-box="1">{image}</div>
           <div class="equipment-editor-main">
-            <div class="equipment-editor-title"><div><span>{_e(slot)}</span><strong data-preview-label="1">{_e(current or 'Noch kein Item gewählt')}</strong>{since_html}</div><span class="need-state {('filled' if current else 'empty')}">{('Gesetzt' if current else 'Leer')}</span></div>
+            <div class="equipment-editor-title"><div><span>{_e(slot)}</span><strong data-preview-label="1">{_e(current or 'Noch kein Item gewählt')}</strong></div><span class="need-state {('filled' if current else 'empty')}">{('Gesetzt' if current else 'Leer')}</span></div>
             <div class="equipment-editor-picker">{picker}</div>
             <div class="equipment-unsaved" data-unsaved-warning="1" hidden>⚠️ Ungespeicherte Änderung – bitte speichern oder bewusst verwerfen.</div>
             <div class="equipment-editor-actions">
-              <button class="btn" type="submit" name="action_type" value="set">Speichern &amp; an Bot senden</button>
-              <button class="btn ghost" type="submit" name="action_type" value="clear" formnovalidate onclick="return confirm('Need für {_e(slot)} wirklich entfernen?')">Slot leeren</button>
+              <button class="btn" type="submit">Speichern &amp; an Bot senden</button>
+              <button class="btn ghost" type="submit" name="action_type" value="clear" onclick="return confirm('Need für {_e(slot)} entfernen?')">Slot leeren</button>
             </div>
             <small class="muted">{_e(rarity or 'Item-Datenbank')} · Bilder und Werte stammen aus derselben Item-Datenbank wie im Charakter-Builder.</small>
           </div>
@@ -12259,13 +12232,11 @@ def _render_need_editor_panel(
                 current_item_id = int((current_item or {}).get("id") or 0)
                 editor_id = f"need-equipment-editor-{tab.lower()}-{idx}"
                 area = slot_areas.get(slot, "auto")
-                slot_entry = slot_map.get(slot)
-                locked = bool(slot_entry and _need_is_received(slot_entry))
-                need_since_title = re.sub(r"<[^>]+>", "", _need_since_html(slot_entry)) if current else ""
+                locked = bool(slot_map.get(slot) and _need_is_received(slot_map.get(slot)))
                 state_cls = "locked" if locked else ("filled" if current else "empty")
                 state_txt = "🔒" if locked else ("✓" if current else "+")
                 card = f"""
-                <button type="button" class="equipment-slot {state_cls}" style="grid-area:{_e(area)}" data-open-equipment="{_e(editor_id)}" data-tab="{_e(tab.lower())}" data-ne-equipped-item-id="{current_item_id}" data-ne-equipped-item-name="{_e(current)}" title="{_e(need_since_title)}" aria-controls="{_e(editor_id)}">
+                <button type="button" class="equipment-slot {state_cls}" style="grid-area:{_e(area)}" data-open-equipment="{_e(editor_id)}" data-tab="{_e(tab.lower())}" data-ne-equipped-item-id="{current_item_id}" data-ne-equipped-item-name="{_e(current)}" aria-controls="{_e(editor_id)}">
                   <span class="equipment-slot-art">{preview_html(slot, current, image_url)}</span>
                   <span class="equipment-slot-label">{_e(slot)}</span>
                   <span class="equipment-slot-item">{_e(_short(current or 'Leer', 33))}</span>
@@ -12358,8 +12329,6 @@ def _render_need_editor_panel(
         .equipment-editor-title div{{display:grid;gap:4px}}
         .equipment-editor-title span:first-child{{color:#e8bd65;font-weight:900;text-transform:uppercase;letter-spacing:.05em;font-size:13px}}
         .equipment-editor-title strong{{font-size:20px;overflow-wrap:anywhere}}
-        .need-since{{display:block;margin-top:5px;color:#a9b0b8;font-size:11px;font-weight:600;letter-spacing:.01em}}
-        .need-since.unknown{{color:#8c8f94}}
         .equipment-editor-picker select{{width:100%;min-width:0;padding:11px 12px;border-radius:11px;background:#08090c;color:var(--text);border:1px solid rgba(214,168,79,.2)}}
         .ne-picker-wrap{{display:grid;gap:10px}}
         .ne-weapon-label,.ne-item-label{{display:grid;gap:6px}}
@@ -14674,102 +14643,375 @@ def _settings_request_admin_action(guild_id: int, request_id: str, action: str, 
     finally:
         conn.close()
 
-def _render_admin_settings_editor(data: dict[str, Any], msg: str = "") -> str:
+def _render_admin_settings_editor(data: dict[str, Any], msg: str = "", section: str = "ec") -> str:
     if not data.get("ok"):
-        return _html_shell("Admin-Einstellungen · Beer and Buffs Dashboard", f"<section class='panel'><h1>⚙️ Admin-Einstellungen</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+        return _html_shell("Admin-Einstellungen · Beer and Buffs Dashboard", f"<section class='panel'><h1>⚙️ Einstellungen</h1><p class='muted'>{_e(data.get('error'))}</p></section>", nav_mode="admin")
+
     snap: dict[str, Any] = data.get("snapshot") or {}
     guild_id = _safe_guild_id(data)
     cfg = _current_dkp_settings_from_snapshot(snap)
     requests = _settings_change_requests_for_dashboard(guild_id, 100) if guild_id else []
     counts = _queue_status_counts(requests)
-    cards = "".join([
-        _card("Offen", counts.get("pending", 0), "wartet auf Bot"),
-        _card("In Arbeit", counts.get("processing", 0), "Bot verarbeitet"),
-        _card("Erledigt", counts.get("done", 0), "übernommen"),
-        _card("Problem", counts.get("failed", 0) + counts.get("rejected", 0) + counts.get("cancelled", 0), "failed/rejected/cancelled"),
-    ])
+    selected = str(section or "ec").strip().lower()
+    allowed_sections = {"ec", "events", "roles", "loot", "dashboard", "system"}
+    if selected not in allowed_sections:
+        selected = "ec"
 
-    point_rows = []
+    settings_rows = ((snap.get("settings") or {}).get("settings") or []) if isinstance((snap.get("settings") or {}), dict) else []
+    def _find_setting(names: list[str], default: Any = "") -> Any:
+        wanted = [str(n).lower() for n in names]
+        for row in settings_rows:
+            if not isinstance(row, dict):
+                continue
+            key = str(row.get("key") or "").lower()
+            src = str(row.get("source") or "").lower()
+            for needle in wanted:
+                if key == needle or key.endswith("." + needle) or needle in key or needle in src:
+                    return row.get("value")
+        return default
+
+    def _clean_num(value: Any, fallback: Any = 0) -> str:
+        try:
+            if value in {None, "", "—"}:
+                return str(fallback)
+            num = float(str(value).replace(",", "."))
+            return str(int(num)) if num.is_integer() else str(num)
+        except Exception:
+            return str(fallback)
+
+    def _split_ids(value: Any) -> list[str]:
+        if isinstance(value, list):
+            out = []
+            for item in value:
+                s = str(item).strip()
+                if s:
+                    out.append(s)
+            return out
+        return [x.strip() for x in str(value or "").split(",") if x.strip()]
+
+    reset_day = _find_setting(["weekly_reset_day", "reset_day", "reset_weekday"], "Donnerstag")
+    reset_time = _find_setting(["weekly_reset_time", "reset_time", "reset_hour"], "10:00")
+    new_member_start = _find_setting(["new_member_start_points", "new_member_ec", "member_start_points"], 0)
+    former_member_start = _find_setting(["returning_member_start_points", "former_member_start_points", "legacy_member_start_points"], 40)
+    decay_active = float(str(cfg.get("decay_percent") or 0).replace(",", ".") or 0) > 0
+    member_role_ids = _split_ids(cfg.get("member_role_id"))
+    admin_role_ids = _split_ids(cfg.get("dashboard_admin_role_ids"))
+    allowed_role_ids = _split_ids(cfg.get("dashboard_allowed_role_ids"))
+    leader_role_ids = _split_ids(cfg.get("leader_role_id"))
+    log_channel_id = str(cfg.get("log_channel_id") or "—")
+
+    event_value_rows = []
     for et in cfg.get("event_types") or []:
-        val = (cfg.get("event_points") or {}).get(et, "")
-        form = f"""
-        <form method='post' action='/admin/settings-change' style='display:flex; gap:8px; align-items:center; flex-wrap:wrap;'>
-          <input type='hidden' name='action_type' value='set_event_points'>
-          <input type='hidden' name='event_type' value='{_e(et)}'>
-          <input name='points' value='{_e(val)}' inputmode='numeric' style='max-width:110px;'>
-          <button class='btn compact' type='submit'>ändern</button>
-        </form>
-        """
-        point_rows.append([et, val, _raw(form)])
+        event_value_rows.append(f"<tr><td>{_e(et)}</td><td><strong>{_e(cfg.get('event_points', {}).get(et, 0))} EC</strong></td></tr>")
+    event_value_table = "".join(event_value_rows) or "<tr><td colspan='2' class='muted'>Keine Eventtypen im Snapshot.</td></tr>"
 
-    req_rows = []
-    for r in requests:
+    queue_rows = []
+    for r in requests[:10]:
         payload = r.get("payload") if isinstance(r.get("payload"), dict) else {}
         result = r.get("result") if isinstance(r.get("result"), dict) else {}
         detail = result.get("message") or result.get("error") or payload.get("event_type") or payload.get("weekly_event_limit") or payload.get("decay_percent") or payload.get("leader_role_id") or payload.get("member_role_id") or r.get("request_id")
-        rid = _e(r.get("request_id") or "")
-        status = str(r.get("status") or "").lower()
-        actions = []
-        if status == "pending":
-            actions.append(f"<form method='post' action='/admin/settings-request/{rid}/cancel' style='display:inline'><button class='btn compact danger' type='submit' onclick=\"return confirm('Offenen Antrag abbrechen?')\">abbrechen</button></form>")
-        if status in {"failed", "rejected", "cancelled"}:
-            actions.append(f"<form method='post' action='/admin/settings-request/{rid}/retry' style='display:inline'><button class='btn compact' type='submit'>neu öffnen</button></form>")
-        req_rows.append([_dt(r.get("requested_at")), _ec_award_status_label(r.get("status")).replace("EC", ""), r.get("action_type"), _short(detail, 180), r.get("actor_name") or r.get("actor_id") or "—", _raw(" ".join(actions) or "—")])
+        queue_rows.append([_dt(r.get("requested_at")), _ec_award_status_label(r.get("status")).replace("EC", ""), r.get("action_type"), _short(detail, 160), r.get("actor_name") or r.get("actor_id") or "—"])
+
+    queue_panel = _table(["Zeit", "Status", "Aktion", "Details", "Akteur"], queue_rows, searchable=False) if queue_rows else "<div class='empty-state'>Keine offenen oder letzten Einstellungsaufträge.</div>"
 
     msg_panel = f"<section class='panel'><p>{_e(msg)}</p></section>" if msg else ""
-    role_hint = "Dashboard-Adminrollen brauchen zusätzlich einen frischen Snapshot und erneuten Login. Falls eure aktuelle Snapshot-Logik diese Rolle nicht exportiert, bleibt Railway-ENV weiterhin maßgeblich."
-    body = f"""
-    <nav class="topnav"><a href="/admin">← Admin</a><a href="/settings">Setup</a><a href="/ec">EC-Verlauf</a><a href="/api/admin-settings">API</a></nav>
-    <section class="hero">
-      <div><div class="eyebrow">Admin · Änderbar über Bot-Queue</div><h1>⚙️ Admin-Einstellungen</h1><p class="muted">Das Dashboard legt nur Änderungsanträge an. Der Bot übernimmt sie und schreibt das Ergebnis zurück.</p></div>
-      <a class="btn" href="/admin">Admin-Zentrale</a>
-    </section>
-    {msg_panel}
-    <section class="grid">{cards}</section>
 
-    <section class="panel"><h2>🪙 EC-Werte pro Eventtyp</h2><p class="muted">Änderungen gelten erst, wenn der Bot den Antrag verarbeitet hat.</p>{_table(['Eventtyp','Aktuell','Ändern'], point_rows, placeholder='Eventtyp suchen…')}</section>
+    def _settings_metric(icon: str, title: str, value: str, meta: str = "") -> str:
+        return f"<div class='settings-metric'><div class='settings-metric-icon'>{icon}</div><div><div class='settings-metric-title'>{_e(title)}</div><div class='settings-metric-value'>{_e(value)}</div><div class='settings-metric-meta'>{_e(meta)}</div></div></div>"
 
-    <section class="split">
-      <section class="panel"><h2>📅 Wochenlimit</h2><p class="muted">Aktuell: <strong>{_e(cfg.get('weekly_event_limit'))} EC</strong> aus Event-Buchungen pro Woche.</p>
-        <form method="post" action="/admin/settings-change" style="display:grid; gap:10px; max-width:520px;">
-          <input type="hidden" name="action_type" value="set_weekly_limit">
-          <label>Neues Wochenlimit<br><input name="weekly_event_limit" value="{_e(cfg.get('weekly_event_limit'))}" inputmode="numeric"></label>
-          <button class="btn" type="submit" onclick="return confirm('Wochenlimit als Bot-Antrag senden?')">Wochenlimit ändern</button>
-        </form>
-      </section>
-      <section class="panel"><h2>📉 Wöchentlicher Verfall</h2><p class="muted">Aktuell: <strong>{_e(cfg.get('decay_percent'))}%</strong> nur über <strong>{_e(cfg.get('decay_protected_balance'))} EC</strong>.</p>
-        <form method="post" action="/admin/settings-change" style="display:grid; gap:10px; max-width:520px;">
-          <input type="hidden" name="action_type" value="set_decay">
-          <label>Verfall in %<br><input name="decay_percent" value="{_e(cfg.get('decay_percent'))}" inputmode="decimal"></label>
-          <label>Schutzbetrag<br><input name="decay_protected_balance" value="{_e(cfg.get('decay_protected_balance'))}" inputmode="numeric"></label>
-          <button class="btn" type="submit" onclick="return confirm('Verfall-Regel als Bot-Antrag senden?')">Verfall ändern</button>
-        </form>
-      </section>
-    </section>
+    def _settings_nav(slug: str, label: str) -> str:
+        cls = "settings-tab active" if slug == selected else "settings-tab"
+        return f"<a class='{cls}' href='/admin-settings?section={_e(slug)}'>{_e(label)}</a>"
 
-    <section class="split">
-      <section class="panel"><h2>🛡️ Rollen & Kanäle</h2><p class="muted">Leitungsrolle, Gildenrolle und EC-/Loot-Logkanal zentral als Bot-Antrag setzen.</p>
-        <form method="post" action="/admin/settings-change" style="display:grid; gap:10px; max-width:620px;">
-          <input type="hidden" name="action_type" value="set_roles">
-          <label>Leitungsrolle / Adminrolle ID<br><input name="leader_role_id" value="{_e(cfg.get('leader_role_id'))}" placeholder="z. B. 123456789012345678"></label>
-          <label>Gildenrolle / Memberrolle ID<br><input name="member_role_id" value="{_e(cfg.get('member_role_id'))}" placeholder="z. B. 123456789012345678"></label>
-          <label>EC-/Loot-Logkanal ID<br><input name="log_channel_id" value="{_e(cfg.get('log_channel_id'))}" placeholder="z. B. 123456789012345678"></label>
-          <button class="btn" type="submit" onclick="return confirm('Rollen/Kanal als Bot-Antrag senden?')">Rollen & Kanal ändern</button>
-        </form>
-      </section>
-      <section class="panel"><h2>🔐 Dashboard-Zugriff</h2><p class="muted">{_e(role_hint)}</p>
-        <form method="post" action="/admin/settings-change" style="display:grid; gap:10px; max-width:620px;">
-          <input type="hidden" name="action_type" value="set_access_roles">
-          <label>Dashboard-Adminrollen IDs, kommagetrennt<br><input name="dashboard_admin_role_ids" value="{_e(cfg.get('dashboard_admin_role_ids'))}" placeholder="ID,ID,ID"></label>
-          <label>Dashboard-Zugriffsrollen IDs, kommagetrennt<br><input name="dashboard_allowed_role_ids" value="{_e(cfg.get('dashboard_allowed_role_ids'))}" placeholder="ID,ID,ID"></label>
-          <button class="btn" type="submit" onclick="return confirm('Dashboard-Zugriffsrollen als Bot-Antrag senden?')">Zugriffsrollen speichern</button>
-        </form>
-      </section>
-    </section>
+    top_status = "".join([
+        _settings_metric("🕒", "Letzte Speicherung", _dt(data.get("published_at") or data.get("generated_at")), "Snapshot-Stand"),
+        _settings_metric("📬", "Queue", f"{counts.get('pending', 0)} offen", f"{counts.get('processing', 0)} in Arbeit · {counts.get('done', 0)} erledigt"),
+        _settings_metric("🤖", "Bot", "Online" if data.get("ok") else "Prüfen", "Snapshot verbunden" if data.get("ok") else "Kein Snapshot"),
+        _settings_metric("🗄️", "Datenbank", "Verbunden" if _database_url() else "Fehlt", "Postgres" if _database_url() else "DATABASE_URL prüfen"),
+    ])
 
-    <section class="panel"><h2>🧾 Änderungsqueue</h2><p class="muted">Offene Anträge können abgebrochen werden. Fehlgeschlagene/blockierte/abgebrochene Anträge können neu geöffnet werden.</p>{_table(['Zeit','Status','Aktion','Details','Akteur','Aktion'], req_rows, placeholder='Änderungen durchsuchen…')}</section>
+    section_html = ""
+    if selected == "ec":
+        point_forms = []
+        for et in cfg.get("event_types") or []:
+            val = cfg.get("event_points", {}).get(et, 0)
+            point_forms.append(f"""
+            <form method='post' action='/admin/settings-change' class='settings-inline-form'>
+              <input type='hidden' name='action_type' value='set_event_points'>
+              <input type='hidden' name='event_type' value='{_e(et)}'>
+              <div class='settings-inline-name'>{_e(et)}</div>
+              <input name='points' value='{_e(val)}' inputmode='numeric'>
+              <span class='unit'>EC</span>
+              <button class='btn compact' type='submit'>Speichern</button>
+            </form>
+            """)
+        point_forms_html = "".join(point_forms) or "<div class='empty-state'>Keine Eventtypen gefunden.</div>"
+        section_html = f"""
+        <section class='settings-card'>
+          <div class='settings-card-head'><div><div class='eyebrow'>1. Wochenlimit</div><h2>EC & Regeln</h2><p class='muted'>Alles für Wochenlimit, Verfall und EC-Grundregeln kompakt auf einer Seite.</p></div></div>
+          <div class='settings-split'>
+            <div class='settings-subcard'>
+              <h3>📅 Wochenlimit</h3>
+              <form method='post' action='/admin/settings-change' class='settings-form'>
+                <input type='hidden' name='action_type' value='set_weekly_limit'>
+                <label>Wochenlimit aktiv
+                  <div class='toggle-hint'>{'Aktiv – Event-EC werden gegen das Wochenlimit geprüft.' if int(float(str(cfg.get('weekly_event_limit') or 0).replace(',', '.') or 0)) > 0 else 'Deaktiviert – aktuell werden keine Event-EC vergeben.'}</div>
+                </label>
+                <label>Wochenlimit (EC)
+                  <input name='weekly_event_limit' value='{_e(_clean_num(cfg.get('weekly_event_limit'), 40))}' inputmode='numeric'>
+                </label>
+                <p class='muted'>1000 EC entsprechen praktisch unbegrenzt. 0 EC blockiert Eventvergaben.</p>
+                <button class='btn' type='submit'>Wochenlimit speichern</button>
+              </form>
+            </div>
+            <div class='settings-subcard'>
+              <h3>♻️ Reset & Verfall</h3>
+              <div class='settings-readonly-grid'>
+                <div><span>Reset-Tag</span><strong>{_e(reset_day)}</strong></div>
+                <div><span>Reset-Zeit</span><strong>{_e(reset_time)} UTC</strong></div>
+              </div>
+              <form method='post' action='/admin/settings-change' class='settings-form'>
+                <input type='hidden' name='action_type' value='set_decay'>
+                <label>Verfall aktiv
+                  <div class='toggle-hint'>{'Aktiv – wöchentlicher EC-Verfall ist eingeschaltet.' if decay_active else 'Deaktiviert – kein automatischer Verfall aktiv.'}</div>
+                </label>
+                <div class='settings-two'>
+                  <label>Verfall (%) pro Woche
+                    <input name='decay_percent' value='{_e(_clean_num(cfg.get('decay_percent'), 15))}' inputmode='decimal'>
+                  </label>
+                  <label>Geschützter Betrag
+                    <input name='decay_protected_balance' value='{_e(_clean_num(cfg.get('decay_protected_balance'), 50))}' inputmode='numeric'>
+                  </label>
+                </div>
+                <button class='btn' type='submit'>Verfall speichern</button>
+              </form>
+            </div>
+            <div class='settings-subcard'>
+              <h3>⭐ Startpunkte</h3>
+              <div class='settings-readonly-grid'>
+                <div><span>Neue Mitglieder</span><strong>{_e(_clean_num(new_member_start, 0))} EC</strong></div>
+                <div><span>Ehemalige Mitglieder</span><strong>{_e(_clean_num(former_member_start, 40))} EC</strong></div>
+              </div>
+              <p class='muted'>Diese Startwerte kommen aktuell aus dem Bot-/Guild-Setup. Für EC-Startpunkte gibt es hier noch keinen direkten Speichern-Button.</p>
+              <a class='btn secondary' href='/admin/guild-config'>Gildenkonfiguration öffnen</a>
+            </div>
+          </div>
+        </section>
+        <section class='settings-card'>
+          <div class='settings-card-head'><div><div class='eyebrow'>2. Event-EC Kategorien</div><h2>Werte pro Eventtyp</h2><p class='muted'>Jede Änderung erzeugt einen Bot-Antrag und wird erst nach Verarbeitung wirksam.</p></div></div>
+          <div class='settings-list-card'>{point_forms_html}</div>
+        </section>
+        <section class='settings-card'>
+          <div class='settings-card-head'><div><div class='eyebrow'>3. Weitere Regeln</div><h2>Wichtige Hinweise</h2></div></div>
+          <ul class='settings-bullets'>
+            <li>EC werden nur nach bestätigter Anwesenheit vergeben.</li>
+            <li>Manuelle EC-Buchungen zählen nicht ins Wochenlimit.</li>
+            <li>Änderungen werden nicht direkt vom Dashboard geschrieben, sondern über die Bot-Queue verarbeitet.</li>
+            <li>Reserve-Wertung wird separat im Anwesenheits-/EC-Bereich behandelt.</li>
+          </ul>
+        </section>
+        """
+    elif selected == "events":
+        section_html = f"""
+        <section class='settings-card'>
+          <div class='settings-card-head'><div><div class='eyebrow'>Events</div><h2>Event-Standards & Verwaltung</h2><p class='muted'>Die eigentliche Bearbeitung laufender und geplanter Events läuft in der Eventverwaltung. Hier siehst du die wichtigsten Standardwerte kompakt.</p></div><a class='btn' href='/events-admin'>Eventverwaltung öffnen</a></div>
+          <div class='settings-split'>
+            <div class='settings-subcard'>
+              <h3>Verfügbare Eventtypen</h3>
+              <table class='mini-table'><thead><tr><th>Eventtyp</th><th>Aktueller EC-Wert</th></tr></thead><tbody>{event_value_table}</tbody></table>
+            </div>
+            <div class='settings-subcard'>
+              <h3>Standardbilder</h3>
+              <ul class='settings-bullets'>
+                <li>Normal Mode Raid</li>
+                <li>Hardmode Raid</li>
+                <li>Dimensionsprüfung</li>
+                <li>Gildenbosse</li>
+                <li>Segensstein</li>
+              </ul>
+              <p class='muted'>Standardbilder und eigene Bildlinks bearbeitest du direkt am Event. So bleiben auch laufende Events sauber synchronisiert.</p>
+            </div>
+            <div class='settings-subcard'>
+              <h3>Eventverhalten</h3>
+              <ul class='settings-bullets'>
+                <li>RSVP-DMs und Dashboard-Status bleiben am Event erhalten.</li>
+                <li>Discord-Posts können beim Bearbeiten direkt aktualisiert oder neu aufgebaut werden.</li>
+                <li>Laufende Events bleiben im Dashboard sichtbar, bis sie abgeschlossen werden.</li>
+              </ul>
+            </div>
+          </div>
+        </section>
+        """
+    elif selected == "roles":
+        section_html = f"""
+        <section class='settings-card'>
+          <div class='settings-card-head'><div><div class='eyebrow'>Rollen</div><h2>Rechte & Zugriff</h2><p class='muted'>Leitungsrolle, Memberrolle und Dashboard-Zugriff sauber getrennt.</p></div><a class='btn secondary' href='/admin/guild-config'>Rollen & Kanäle öffnen</a></div>
+          <div class='settings-split'>
+            <div class='settings-subcard'>
+              <h3>🛡️ Rollen & Kanal</h3>
+              <form method='post' action='/admin/settings-change' class='settings-form'>
+                <input type='hidden' name='action_type' value='set_roles'>
+                <label>Leitungsrolle / Adminrolle ID<input name='leader_role_id' value='{_e((leader_role_ids or [""])[0])}' placeholder='123456789012345678'></label>
+                <label>Gildenrolle / Memberrolle ID<input name='member_role_id' value='{_e((member_role_ids or [""])[0])}' placeholder='123456789012345678'></label>
+                <label>EC-/Loot-Logkanal ID<input name='log_channel_id' value='{_e(log_channel_id)}' placeholder='123456789012345678'></label>
+                <button class='btn' type='submit'>Rollen & Kanal speichern</button>
+              </form>
+            </div>
+            <div class='settings-subcard'>
+              <h3>🔐 Dashboard-Zugriff</h3>
+              <form method='post' action='/admin/settings-change' class='settings-form'>
+                <input type='hidden' name='action_type' value='set_access_roles'>
+                <label>Dashboard-Adminrollen IDs, kommagetrennt<input name='dashboard_admin_role_ids' value='{_e(",".join(admin_role_ids))}' placeholder='ID,ID,ID'></label>
+                <label>Zusätzliche Zugriffsrollen IDs, kommagetrennt<input name='dashboard_allowed_role_ids' value='{_e(",".join(allowed_role_ids))}' placeholder='ID,ID,ID'></label>
+                <button class='btn' type='submit'>Zugriffsrollen speichern</button>
+              </form>
+              <p class='muted'>Nach Änderungen an den Zugriffsrollen Bot-Snapshot neu bauen und einmal neu einloggen.</p>
+            </div>
+          </div>
+        </section>
+        """
+    elif selected == "loot":
+        section_html = f"""
+        <section class='settings-card'>
+          <div class='settings-card-head'><div><div class='eyebrow'>Loot</div><h2>Loot-Regeln & Needlisten</h2><p class='muted'>Needlisten, Auktionen und Gilden-Loot liegen in der Gildenkonfiguration, nicht im EC-Bereich.</p></div><a class='btn' href='/admin/guild-config'>Loot-Konfiguration öffnen</a></div>
+          <div class='settings-split'>
+            <div class='settings-subcard'>
+              <h3>Needliste</h3>
+              <ul class='settings-bullets'>
+                <li>Need-Slots und Items werden im Bot gespeichert.</li>
+                <li>"Need seit" wird pro Item protokolliert, damit Nachträge nach Drops sichtbar bleiben.</li>
+                <li>Slot-Leeren und Änderungen laufen über die Bot-Queue.</li>
+              </ul>
+            </div>
+            <div class='settings-subcard'>
+              <h3>Auktionen</h3>
+              <ul class='settings-bullets'>
+                <li>Aktive Auktionen behalten ihre gespeicherten Werte.</li>
+                <li>Neue Default-Regeln gelten für neu gestartete Loot-/Sale-Auktionen.</li>
+                <li>Für Müll- und Sale-Abläufe bleibt die Gildenkonfiguration der zentrale Ort.</li>
+              </ul>
+            </div>
+          </div>
+        </section>
+        """
+    elif selected == "dashboard":
+        login_mode = "Discord OAuth" if _discord_oauth_enabled() else "Passwort-Fallback"
+        section_html = f"""
+        <section class='settings-card'>
+          <div class='settings-card-head'><div><div class='eyebrow'>Dashboard</div><h2>Branding & Oberfläche</h2><p class='muted'>Die Optik bleibt im Beer-and-Buffs-Stil, während Inhalte und Module sauber getrennt bleiben.</p></div></div>
+          <div class='settings-split'>
+            <div class='settings-subcard'>
+              <h3>Darstellung</h3>
+              <div class='settings-readonly-grid'>
+                <div><span>Gildenname</span><strong>{_e(data.get('guild_name') or 'Beer and Buffs')}</strong></div>
+                <div><span>Login-Modus</span><strong>{_e(login_mode)}</strong></div>
+                <div><span>Favicon/Branding</span><strong>Beer and Buffs</strong></div>
+                <div><span>Headerbild</span><strong>über Static-Assets</strong></div>
+              </div>
+              <p class='muted'>Header, Hintergrund und visuelle Assets werden direkt im Dashboard-Code bzw. Static-Ordner gepflegt.</p>
+            </div>
+            <div class='settings-subcard'>
+              <h3>Empfohlene Struktur</h3>
+              <ul class='settings-bullets'>
+                <li>Admin-Portal klar getrennt von Mitgliederansicht.</li>
+                <li>Einstellungen in Bereiche EC & Regeln, Events, Rollen, Loot, Dashboard und Bot/System teilen.</li>
+                <li>Komplexe Änderungen immer über eigene Fachseiten statt über eine endlose Sammelseite.</li>
+              </ul>
+            </div>
+          </div>
+        </section>
+        """
+    else:
+        section_html = f"""
+        <section class='settings-card'>
+          <div class='settings-card-head'><div><div class='eyebrow'>Bot / System</div><h2>Technik & Synchronisierung</h2><p class='muted'>Alles, was für Livebetrieb, Queue und Fehlerprüfung wichtig ist.</p></div><div class='page-actions'><a class='btn' href='/system'>System & Logs</a><a class='btn secondary' href='/release-status'>Release</a></div></div>
+          <div class='settings-split'>
+            <div class='settings-subcard'>
+              <h3>Status</h3>
+              <div class='settings-readonly-grid'>
+                <div><span>Bot</span><strong>{'Online' if data.get('ok') else 'Prüfen'}</strong></div>
+                <div><span>Datenbank</span><strong>{'Verbunden' if _database_url() else 'Fehlt'}</strong></div>
+                <div><span>Offene Anträge</span><strong>{counts.get('pending', 0)}</strong></div>
+                <div><span>In Arbeit</span><strong>{counts.get('processing', 0)}</strong></div>
+              </div>
+            </div>
+            <div class='settings-subcard'>
+              <h3>Queue & letzte Änderungen</h3>
+              {queue_panel}
+            </div>
+          </div>
+        </section>
+        """
+
+    style = """
+    <style>
+      .settings-shell{display:grid;gap:18px}
+      .settings-header{display:flex;justify-content:space-between;gap:16px;align-items:flex-start;flex-wrap:wrap}
+      .settings-save-note{display:flex;align-items:center;gap:10px;padding:12px 16px;border:1px solid var(--line);border-radius:16px;background:linear-gradient(180deg,rgba(214,168,79,.20),rgba(214,168,79,.10));box-shadow:0 0 0 1px rgba(214,168,79,.12) inset}
+      .settings-save-note b{display:block}
+      .settings-metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}
+      .settings-metric{display:flex;gap:12px;align-items:flex-start;padding:14px 16px;border:1px solid var(--line);border-radius:16px;background:rgba(0,0,0,.24)}
+      .settings-metric-icon{font-size:22px;line-height:1}
+      .settings-metric-title{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em}
+      .settings-metric-value{font-size:18px;font-weight:700;margin-top:2px}
+      .settings-metric-meta{font-size:12px;color:var(--muted);margin-top:3px}
+      .settings-tabs{display:flex;gap:10px;flex-wrap:wrap}
+      .settings-tab{padding:10px 14px;border:1px solid var(--line);border-radius:999px;background:rgba(0,0,0,.22);text-decoration:none;color:inherit;font-weight:700}
+      .settings-tab.active{background:linear-gradient(180deg,rgba(214,168,79,.32),rgba(214,168,79,.16));box-shadow:0 0 0 1px rgba(214,168,79,.28) inset;color:var(--text)}
+      .settings-card{padding:18px;border:1px solid var(--line);border-radius:18px;background:rgba(0,0,0,.20);display:grid;gap:16px}
+      .settings-card-head{display:flex;justify-content:space-between;gap:16px;align-items:flex-start;flex-wrap:wrap}
+      .settings-card-head h2{margin:4px 0 0}
+      .settings-split{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:16px}
+      .settings-subcard{padding:16px;border:1px solid rgba(214,168,79,.18);border-radius:16px;background:rgba(255,255,255,.03);display:grid;gap:12px}
+      .settings-subcard h3{margin:0}
+      .settings-form{display:grid;gap:10px}
+      .settings-form label,.settings-subcard label{display:grid;gap:6px;font-weight:600}
+      .settings-two{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+      .settings-readonly-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+      .settings-readonly-grid div{padding:10px 12px;border:1px solid rgba(214,168,79,.14);border-radius:14px;background:rgba(0,0,0,.18)}
+      .settings-readonly-grid span{display:block;font-size:12px;color:var(--muted);margin-bottom:4px}
+      .settings-readonly-grid strong{font-size:16px}
+      .toggle-hint{font-size:12px;color:var(--muted);font-weight:500}
+      .settings-list-card{display:grid;gap:10px}
+      .settings-inline-form{display:grid;grid-template-columns:minmax(220px,1fr) 90px auto auto;gap:10px;align-items:center;padding:12px;border:1px solid rgba(214,168,79,.14);border-radius:14px;background:rgba(0,0,0,.15)}
+      .settings-inline-name{font-weight:700}
+      .settings-inline-form .unit{font-size:13px;color:var(--muted)}
+      .settings-bullets{margin:0;padding-left:18px;display:grid;gap:8px}
+      .settings-bullets li{line-height:1.45}
+      .mini-table{width:100%;border-collapse:collapse}
+      .mini-table th,.mini-table td{padding:10px 12px;border-bottom:1px solid rgba(214,168,79,.12);text-align:left}
+      .empty-state{padding:14px;border:1px dashed rgba(214,168,79,.18);border-radius:14px;color:var(--muted)}
+      @media (max-width: 780px){
+        .settings-two,.settings-readonly-grid{grid-template-columns:1fr}
+        .settings-inline-form{grid-template-columns:1fr}
+      }
+    </style>
     """
-    return _html_shell("Admin-Einstellungen · Beer and Buffs Dashboard", body, nav_mode="admin")
+
+    body = f"""
+    {style}
+    <div class='settings-shell'>
+      <nav class='admin-tabs'><a href='/admin'>Übersicht</a><a href='/events-admin'>Events</a><a href='/attendance'>Anwesenheit & EC</a><a href='/loot'>Loot</a><a href='/members'>Mitglieder</a><a class='active' href='/admin-settings'>Einstellungen</a><a href='/system'>System & Logs</a></nav>
+      <section class='panel'>
+        <div class='settings-header'>
+          <div>
+            <div class='eyebrow'>Admin · Einstellungen</div>
+            <h1>⚙️ Einstellungen</h1>
+            <p class='muted'>Verwalte Regeln, Events, Rechte und Systemverhalten übersichtlich nach Bereichen. Änderungen im EC-/Rollenbereich werden als Bot-Anträge verarbeitet.</p>
+          </div>
+          <div class='settings-save-note'>
+            <div>🛡️</div>
+            <div><b>Änderungen speichern</b><span class='muted'>Je Bereich direkt mit dem jeweiligen Speichern-Button. So bleibt die Queue sauber und nachvollziehbar.</span></div>
+          </div>
+        </div>
+      </section>
+      {msg_panel}
+      <section class='panel'><div class='settings-metrics'>{top_status}</div></section>
+      <section class='panel'><div class='settings-tabs'>{_settings_nav('ec','EC & Regeln')}{_settings_nav('events','Events')}{_settings_nav('roles','Rollen')}{_settings_nav('loot','Loot')}{_settings_nav('dashboard','Dashboard')}{_settings_nav('system','Bot / System')}</div></section>
+      {section_html}
+    </div>
+    """
+    return _html_shell("Einstellungen · Beer and Buffs Dashboard", body, nav_mode="admin")
 
 def _dashboard_event_action_requests(guild_id: int, limit: int = 80, event_id: str = "") -> list[dict[str, Any]]:
     if not _database_url() or not guild_id:
@@ -17823,9 +18065,9 @@ async def portal_need_change(user_id: int, request: Request, _: bool = Depends(_
     if not guild_id:
         raise HTTPException(status_code=400, detail="Guild-ID fehlt.")
     form = _parse_urlencoded_body(await request.body())
-    action_type = str(form.get("action_type") or request.query_params.get("action_type") or "").strip().lower()
+    action_type = str(form.get("action_type") or "set").strip().lower()
     if action_type not in {"set", "clear"}:
-        raise HTTPException(status_code=400, detail="Need-Aktion fehlt oder ist ungültig.")
+        action_type = "set"
     tab = str(form.get("tab") or "Main").strip()
     slot = str(form.get("slot") or "").strip()
     if slot == "Fähigkeitskern":
@@ -18397,9 +18639,9 @@ def settings_page(_: bool = Depends(_admin_auth)):
 
 
 @app.get("/admin-settings", response_class=HTMLResponse)
-def admin_settings_page(_: bool = Depends(_admin_auth), msg: str = ""):
+def admin_settings_page(_: bool = Depends(_admin_auth), msg: str = "", section: str = "ec"):
     try:
-        return HTMLResponse(_render_admin_settings_editor(_snapshot_payload(), msg=msg))
+        return HTMLResponse(_render_admin_settings_editor(_snapshot_payload(), msg=msg, section=section))
     except Exception as exc:
         return HTMLResponse(
             _html_shell("Beer and Buffs Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
