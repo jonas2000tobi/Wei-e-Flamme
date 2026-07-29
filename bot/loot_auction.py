@@ -1163,16 +1163,24 @@ def _auction_user_name(guild: discord.Guild | None, user_id: int, row: dict | No
     return "Unbekannter Spieler"
 
 
-def _auction_embed(guild: discord.Guild, auction: dict, compact: bool = False) -> discord.Embed:
+def _auction_embed(
+    guild: discord.Guild,
+    auction: dict,
+    compact: bool = False,
+    viewer_user_id: int = 0,
+) -> discord.Embed:
+    """Schlanke Auktionskarte.
+
+    Sichtbar bleiben nur aktuelles Gebot, eigener EC-Kontostand in privaten
+    Ansichten und die drei letzten Gebote. Technische Regeln wie Startgebot und
+    Mindestschritt gehören nicht in die laufende Hauptkarte.
+    """
     status = str(auction.get("status", "active") or "active")
     item_name = str(auction.get("item_name", "Item") or "Item")
-    auction_id = str(auction.get("id", "") or "")
     end_dt = _parse_dt(str(auction.get("ends_at", "") or ""))
     top = _highest_bid(auction)
     current = int(top.get("amount", 0) or 0) if top else 0
-    min_next = _min_next_bid(auction)
     color = discord.Color.gold() if status == "active" else discord.Color.dark_gold()
-    kind = str(auction.get("kind", "auction") or "auction")
     phase = _auction_phase(auction)
     mode = str(auction.get("eligibility_mode", "all") or "all")
     if phase == "sale":
@@ -1181,31 +1189,36 @@ def _auction_embed(guild: discord.Guild, auction: dict, compact: bool = False) -
         title_prefix = "🎯 Main-Need-Auktion" if mode == "main_need" else "🔁 Second-Need-Auktion"
     else:
         title_prefix = "⚖️ Freie Auktion"
-    emb = discord.Embed(title=f"{title_prefix}: {item_name}", color=color, timestamp=_now())
-    # Nutzeransicht bewusst schlank halten:
-    # Status, Auktions-ID und Berechtigung sind intern/logisch relevant,
-    # aber in der Gildenzentrale und in der Auktionskarte unnötig unübersichtlich.
-    desc = []
-    if end_dt:
-        desc.append(f"Ende: **{end_dt.strftime('%d.%m.%Y %H:%M')}**")
-    desc.append(f"Startgebot: **{int(auction.get('start_bid', DEFAULT_START_BID) or DEFAULT_START_BID)} EC**")
-    desc.append(f"Mindestschritt: **{int(auction.get('min_increment', DEFAULT_MIN_INCREMENT) or DEFAULT_MIN_INCREMENT)} EC**")
-    if top:
-        desc.append(f"Höchstgebot: **{current} EC** von **{_auction_user_name(guild, int(top.get('user_id', 0) or 0), top)}**")
-        desc.append(f"Nächstes Mindestgebot: **{min_next} EC**")
-    else:
-        desc.append("Höchstgebot: **noch keines**")
-        desc.append(f"Nächstes Mindestgebot: **{min_next} EC**")
-    emb.description = "\n".join(desc)
 
-    if not compact:
-        bids = auction.get("bids") if isinstance(auction.get("bids"), list) else []
-        if bids:
-            # Übersicht: nur die 3 letzten Gebote anzeigen.
-            last = sorted(bids, key=lambda b: str(b.get("created_at", "")), reverse=True)[:3]
-            lines = [f"• **{_auction_user_name(guild, int(b.get('user_id', 0) or 0), b)}** – **{int(b.get('amount', 0) or 0)} EC**" for b in last]
-            emb.add_field(name="Letzte Gebote", value="\n".join(lines), inline=False)
-    emb.set_footer(text="Gebote prüfen beim Bieten deinen aktuellen EC-Kontostand. Abgebucht wird erst bei Übergabe-Bestätigung.")
+    emb = discord.Embed(title=f"{title_prefix}: {item_name}", color=color, timestamp=_now())
+    if top:
+        leader = _auction_user_name(guild, int(top.get("user_id", 0) or 0), top)
+        emb.add_field(name="🏆 Aktuelles Gebot", value=f"**{current} EC** · {leader}", inline=False)
+    else:
+        emb.add_field(name="🏆 Aktuelles Gebot", value="**Noch kein Gebot**", inline=False)
+
+    if int(viewer_user_id or 0):
+        emb.add_field(
+            name="🪙 Dein Kontostand",
+            value=f"**{_ec_balance(guild.id, int(viewer_user_id))} EC**",
+            inline=False,
+        )
+
+    bids = auction.get("bids") if isinstance(auction.get("bids"), list) else []
+    if bids:
+        last = sorted(bids, key=lambda b: str(b.get("created_at", "")), reverse=True)[:3]
+        lines = [
+            f"• **{int(b.get('amount', 0) or 0)} EC** · {_auction_user_name(guild, int(b.get('user_id', 0) or 0), b)}"
+            for b in last
+        ]
+        emb.add_field(name="📜 Letzte 3 Gebote", value="\n".join(lines), inline=False)
+    else:
+        emb.add_field(name="📜 Letzte 3 Gebote", value="Noch keine Gebote.", inline=False)
+
+    footer = "EC werden erst bei bestätigter Übergabe abgebucht."
+    if end_dt:
+        footer = f"Ende: {end_dt.strftime('%d.%m.%Y %H:%M')} Uhr · " + footer
+    emb.set_footer(text=footer)
     return emb
 
 
@@ -1748,7 +1761,7 @@ async def _place_bid(inter: discord.Interaction, guild_id: int, auction_id: str,
     if portal_user_id is not None:
         try:
             if inter.message:
-                await inter.message.edit(embed=_auction_embed(guild, auction), view=PortalAuctionBidView(int(guild_id), int(portal_user_id), str(auction_id)))
+                await inter.message.edit(embed=_auction_embed(guild, auction, viewer_user_id=int(portal_user_id)), view=PortalAuctionBidView(int(guild_id), int(portal_user_id), str(auction_id)))
         except Exception as e:
             print(f"[loot_auction] portal bid message refresh failed: {e!r}")
 
@@ -2007,11 +2020,7 @@ def _auction_dm_content(auction: dict, *, ended: bool = False, winner_id: int = 
             f"**Item:** {item_name}\n"
             f"**Auktion:** {phase_name}\n"
         )
-    return (
-        f"🎁 **Dein {phase_name}-Item ist gedroppt!**\n\n"
-        "Diese Nachricht wird bei jedem Gebot aktualisiert, damit du den Stand direkt hier sehen kannst.\n"
-        "Bieten kannst du über **Gildenzentrale → Auktion → Need-Auktion**."
-    )
+    return f"🎁 **{item_name}** · {phase_name}"
 
 
 async def _send_auction_tracking_dm(guild: discord.Guild, user_id: int, auction: dict) -> Optional[dict]:
@@ -2020,7 +2029,7 @@ async def _send_auction_tracking_dm(guild: discord.Guild, user_id: int, auction:
     if not member or member.bot:
         return None
     try:
-        msg = await member.send(content=_auction_dm_content(auction), embed=_auction_embed(guild, auction))
+        msg = await member.send(content=_auction_dm_content(auction), embed=_auction_embed(guild, auction, viewer_user_id=int(user_id)))
         return {
             "user_id": int(user_id),
             "channel_id": int(getattr(msg.channel, "id", 0) or 0),
@@ -2039,10 +2048,10 @@ async def _refresh_auction_tracking_dms(client: discord.Client, guild_id: int, a
     if not guild:
         return
     content = _auction_dm_content(auction, ended=ended, winner_id=int(winner_id or 0))
-    embed = _auction_embed(guild, auction)
     for ref in list(refs):
         try:
             uid = int(ref.get("user_id", 0) or 0)
+            embed = _auction_embed(guild, auction, viewer_user_id=uid)
             cid = int(ref.get("channel_id", 0) or 0)
             mid = int(ref.get("message_id", 0) or 0)
             if not uid or not mid:
@@ -3691,7 +3700,7 @@ class AuctionSelect(discord.ui.Select):
         if self.mode in {"sale", "junk_sale"}:
             await _portal_edit(inter, embed=_sale_embed(guild, auc), view=PortalSaleBuyView(self.guild_id, self.user_id, aid))
         else:
-            await _portal_edit(inter, embed=_auction_embed(guild, auc), view=PortalAuctionBidView(self.guild_id, self.user_id, aid))
+            await _portal_edit(inter, embed=_auction_embed(guild, auc, viewer_user_id=self.user_id), view=PortalAuctionBidView(self.guild_id, self.user_id, aid))
 
 
 class AuctionSelectView(PortalSafeView):
@@ -4526,7 +4535,7 @@ async def setup_loot_auction(client: discord.Client, tree: app_commands.CommandT
         if not auc:
             await inter.response.send_message("❌ Auktion nicht gefunden.", ephemeral=True)
             return
-        await inter.response.send_message(embed=_auction_embed(inter.guild, auc), ephemeral=True)
+        await inter.response.send_message(embed=_auction_embed(inter.guild, auc, viewer_user_id=int(inter.user.id)), ephemeral=True)
 
     @group.command(name="end", description="Beendet eine Auktion sofort")
     async def auction_end(inter: discord.Interaction, auction_id: str):
