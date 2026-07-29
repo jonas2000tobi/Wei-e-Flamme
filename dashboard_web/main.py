@@ -20,6 +20,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
 from typing import Any, Optional
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, RedirectResponse, FileResponse
@@ -49,22 +50,22 @@ async def _dashboard_lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Guild Platform Dashboard", version="2.3.1", lifespan=_dashboard_lifespan)
+app = FastAPI(title="Guild Platform Dashboard", version="2.3.6", lifespan=_dashboard_lifespan)
 security = HTTPBasic(auto_error=False)
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
-ASSET_VER = "beer-and-buffs-v2-3-0-admin-event-editor"
-DASHBOARD_RELEASE_VERSION = "2.3.1 · Vereinfachte Anwesenheitsprüfung"
+ASSET_VER = "beer-and-buffs-v2-3-6-dashboard-fixes"
+DASHBOARD_RELEASE_VERSION = "2.3.6 · Eventzeit, Bilder, Admin-Navigation und Auktionen"
 
 _EVENT_IMAGE_ASSETS: dict[str, str] = {
-    "guild_boss": "https://media.discordapp.net/attachments/1528469765860098171/1528469820738375882/Gildenbosse.png?ex=6a66fbb2&is=6a65aa32&hm=68dd55e6c4471bfafac7fbe6f397e338df96be2a7d5ed09e5670beaabd2b1306&=&format=webp&quality=lossless&width=1521&height=856",
-    "normal_raid": "https://media.discordapp.net/attachments/1528469765860098171/1528469819865956352/0d9886d3-f6f5-4f3e-b926-1f86151dc84d.png?ex=6a66fbb2&is=6a65aa32&hm=8e97e8d1fbc2f0360281da525ed91428de983d09053bb1b3ee7725b5fe826de2&=&format=webp&quality=lossless&width=1521&height=856",
-    "hard_raid": "https://cdn.discordapp.com/attachments/1528469765860098171/1529804865679786085/7225f274-cc4f-4eda-ba74-ca401f4e572b.png?ex=6a6739ce&is=6a65e84e&hm=e7c2682271f30cf9eb6ef9938fe814cdbb02c6303ebb08e6d3be591f97102da6&",
-    "trials": "https://cdn.discordapp.com/attachments/1528469765860098171/1530963146020356246/8b34c404-89eb-4259-9e6e-acbcc1def2b2.png?ex=6a677c09&is=6a662a89&hm=336425c5a5bb6e814cf55d2126ad2f24ce4a55112e2b8ab5733a06d056afd80d&",
-    "pvp": "https://media.discordapp.net/attachments/1528469765860098171/1528469820310290493/4a00e277-c3b6-48b0-ac7e-ad3e3722aaf1.png?ex=6a66fbb2&is=6a65aa32&hm=a33dd39d4312e0785b0d00df131b12e5b0a563c1d9c4c6999e8c69339961a5b8&=&format=webp&quality=lossless&width=1521&height=856",
+    "guild_boss": f"/static/event_images/guild_boss.webp?v={ASSET_VER}",
+    "normal_raid": f"/static/event_images/normal_raid.webp?v={ASSET_VER}",
+    "hard_raid": f"/static/event_images/hard_raid.webp?v={ASSET_VER}",
+    "trials": f"/static/event_images/trials.webp?v={ASSET_VER}",
+    "pvp": f"/static/event_images/pvp.webp?v={ASSET_VER}",
 }
 
 _EVENT_IMAGE_FILES: dict[str, str] = {
@@ -226,24 +227,28 @@ def _dashboard_event_image_url(ev: dict[str, Any]) -> str:
 
     if mode in _EVENT_IMAGE_NO_IMAGE_KEYS:
         return ""
-    if mode in _EVENT_IMAGE_CUSTOM_KEYS:
-        return _stable_event_external_url(raw)
 
     legacy = ""
     for marker, preset_key in _EVENT_IMAGE_LEGACY_MARKERS.items():
         if marker in raw:
             legacy = preset_key
             break
-    # Eigene URLs aus älteren Eventständen hatten noch kein image_type-Feld.
-    # Sie dürfen nicht allein wegen des Eventtitels durch ein Standardbild
-    # überschrieben werden.
-    if not mode and raw and not legacy:
+
+    # Früher wurden auch die fünf Standardbilder als "custom" gespeichert.
+    # Solche bekannten alten Discord-Links werden auf das lokale Bild repariert.
+    if mode in _EVENT_IMAGE_CUSTOM_KEYS and not legacy:
         return _stable_event_external_url(raw)
 
+    # Bekannte Eventtypen verwenden immer das lokale, mitdeployte Standardbild.
+    # Nur eine ausdrücklich gewählte eigene URL darf diese Zuordnung ersetzen.
     inferred = _event_image_preset_key(ev)
     preset_key = inferred or legacy
     if preset_key:
         return _EVENT_IMAGE_ASSETS.get(preset_key, "")
+
+    # Unbekannte/benutzerdefinierte Alt-Events dürfen ihre externe URL behalten.
+    if not mode and raw:
+        return _stable_event_external_url(raw)
 
     if raw.startswith("/event-image/"):
         path = raw.split("?", 1)[0]
@@ -2830,12 +2835,12 @@ def _admin_center_payload(data: dict[str, Any]) -> dict[str, Any]:
     admin_states = _all_member_admin_states(guild_id) if guild_id else []
     admin_log = _admin_action_log(guild_id, limit=160) if guild_id else []
     event_items = [dict(ev) for ev in _events_items(snap)]
-    now = datetime.now(timezone.utc)
+    now = datetime.now(BERLIN_TZ)
     closed_states = {"closed", "ended", "finished", "beendet", "archived", "done", "completed"}
     running_events = [ev for ev in event_items if str(ev.get("status") or ev.get("state") or "").strip().lower() not in closed_states and _is_running_event(ev)]
-    upcoming_events = [ev for ev in event_items if str(ev.get("status") or ev.get("state") or "").strip().lower() not in closed_states and not _is_running_event(ev) and (_event_admin_datetime(ev) or datetime.min.replace(tzinfo=timezone.utc)) >= now]
-    running_events.sort(key=lambda ev: _event_admin_datetime(ev) or datetime.max.replace(tzinfo=timezone.utc))
-    upcoming_events.sort(key=lambda ev: _event_admin_datetime(ev) or datetime.max.replace(tzinfo=timezone.utc))
+    upcoming_events = [ev for ev in event_items if str(ev.get("status") or ev.get("state") or "").strip().lower() not in closed_states and not _is_running_event(ev) and (_event_admin_datetime(ev) or datetime.min.replace(tzinfo=BERLIN_TZ)) >= now]
+    running_events.sort(key=lambda ev: _event_admin_datetime(ev) or datetime.max.replace(tzinfo=BERLIN_TZ))
+    upcoming_events.sort(key=lambda ev: _event_admin_datetime(ev) or datetime.max.replace(tzinfo=BERLIN_TZ))
     attendance_open = _open_attendance_review_events_for_homepage(snap, guild_id, limit=120) if guild_id else []
 
     member_filter = settings.get("member_filter") or ((guild.get("member_filter") or {}))
@@ -2983,7 +2988,7 @@ def _render_admin_center_dashboard(data: dict[str, Any]) -> str:
         return f"""
         <article class="admin-home-event">
           {_event_admin_image_preview(ev, css_class='admin-home-event-image')}
-          <div class="admin-home-event-body"><span class="pill {state_class}">{state}</span><h3>{_e(title)}</h3><p class="muted">{_dt(ev.get('when_iso') or ev.get('start_at') or ev.get('created_at'))}</p><div class="admin-home-actions">{buttons}</div></div>
+          <div class="admin-home-event-body"><span class="pill {state_class}">{state}</span><h3>{_e(title)}</h3><p class="muted">{_event_dt(ev.get('when_iso') or ev.get('start_at') or ev.get('created_at'))}</p><div class="admin-home-actions">{buttons}</div></div>
         </article>
         """
 
@@ -4502,97 +4507,98 @@ def _render_auction_detail(data: dict[str, Any], auction_id: str, current_user: 
     if not auction:
         return _html_shell(
             "Auktion nicht gefunden",
-            "<section class='panel'><h1>❌ Auktion nicht gefunden</h1><p class='muted'>Diese Auktion ist nicht im aktuellen Dashboard-Snapshot.</p><p><a class='btn' href='/#loot'>Zurück</a></p></section>",
+            "<section class='panel'><h1>❌ Auktion nicht gefunden</h1><p class='muted'>Diese Auktion ist nicht im aktuellen Dashboard-Snapshot.</p><p><a class='btn' href='/loot'>Zurück</a></p></section>",
         )
 
-    count_title, count_value, count_sub = _auction_count_label(auction)
+    guild_id = _safe_guild_id(data)
+    user_id = _user_id((current_user or {}).get("user_id") or (current_user or {}).get("id"))
+    balances = _balance_map(snap)
+    own_balance = balances.get(user_id)
+    own_balance_text = f"{_fmt_ec(own_balance)} EC" if own_balance is not None else "nicht geladen"
+
+    current_bid = _loot_current_price(auction)
+    min_next = _loot_min_next_bid(auction)
     leader = _auction_leader_or_roll_text(auction, snap)
-    leader_label = "Bester Wurf" if auction.get("junk_drop") else "Führend"
-    winner = "—"
-    if auction.get("winner_user_id"):
-        winner = _snapshot_display_name(snap, auction.get("winner_user_id"), auction.get("winner_name"))
-    elif auction.get("winner_name"):
-        winner = str(auction.get("winner_name"))
-    eligible_value, eligible_sub = _auction_eligible_card_value(auction)
+    is_sale = _loot_is_sale_like(auction)
+    price_label = "Festpreis" if is_sale else "Aktuelles Gebot"
+    price_value = _fmt_ec(auction.get("fixed_price") if is_sale else current_bid) + " EC"
+    price_sub = "Sofortkauf" if is_sale else (f"{leader} führt" if leader and leader != "—" else "noch kein Bieter")
 
-    cards = "".join([
-        _card("Status", _loot_effective_status_key(auction), _phase_label(auction)),
-        _card(count_title, count_value, f"{leader_label}: {leader}"),
-        _card("Gewinner", winner, _dt(auction.get("delivered_at")) if auction.get("delivered_at") else "noch offen"),
-        _card("Timer", _auction_timer_text(auction), _auction_timer_subtext(auction)),
-        _card("Regel", _loot_phase_window_text(auction), "Soll-Laufzeit"),
-        _card("Startgebot", _fmt_ec(auction.get("start_bid")), "EC"),
-        _card("Mindestschritt", _fmt_ec(auction.get("min_increment")), "EC"),
-        _card("Festpreis", _fmt_ec(auction.get("fixed_price")), "Sale"),
-        _card("Berechtigt", eligible_value, eligible_sub),
-    ])
+    bids = [b for b in (auction.get("bids") or []) if isinstance(b, dict)]
+    bids.sort(key=lambda b: str(b.get("created_at") or ""), reverse=True)
+    last_three_rows = [
+        [
+            _member_link(b.get("user_id"), b.get("display_name") or b.get("name")),
+            f"{_fmt_ec(b.get('amount'))} EC",
+            _dt(b.get("created_at")),
+        ]
+        for b in bids[:3]
+    ]
+    last_three = _table(["Spieler", "Gebot", "Zeit"], last_three_rows, searchable=False) if last_three_rows else "<div class='empty'>Noch keine Gebote.</div>"
 
-    bid_rows = _bid_rows(auction)
+    action_panel = _loot_dashboard_action_panel(int(guild_id), auction, current_user, snap) if guild_id else ""
+    queue_panel = _loot_action_queue_panel(int(guild_id), auction_id) if guild_id else ""
     eligible_rows = _eligible_rows(auction)
-    roll_rows = _junk_roll_rows(auction, snap)
+    full_bid_rows = _bid_rows(auction)
     channel_info = [
         ["Auktions-/Log-Nachricht", auction.get("channel_id") or "—", auction.get("message_id") or "—"],
         ["Auktionshaus-Nachricht", "—", auction.get("market_message_id") or auction.get("active_message_id") or "—"],
     ]
 
-    extra_roll_section = ""
-    if auction.get("junk_drop") or roll_rows:
-        extra_roll_section = f"""
-        <section class="panel" id="rolls">
-          <h2>🎲 Müll-Würfe</h2>
-          <p class="muted">Würfelphase bis: {_e(_dt(auction.get('junk_roll_until')))} · Gewinnerwurf: {_e(auction.get('junk_roll_winner_roll') or '—')}</p>
-          {_table(['Spieler','Wurf','Zeit'], roll_rows, placeholder='Würfe durchsuchen…')}
-        </section>
-        """
-
-    guild_id = _safe_guild_id(data)
-    action_panel = _loot_dashboard_action_panel(int(guild_id), auction, current_user, snap) if guild_id else ""
-    queue_panel = _loot_action_queue_panel(int(guild_id), auction_id) if guild_id else ""
-    recent_actions = _loot_action_requests_for_auction(int(guild_id), auction_id, limit=10) if guild_id else []
-    queue_counts = Counter(str(r.get("status") or "").lower() for r in recent_actions)
-    auto_refresh = bool(_loot_is_active(auction) or queue_counts.get("pending") or queue_counts.get("processing"))
-    refresh_panel = ""
-    if auto_refresh:
-        refresh_panel = """
-        <section class='panel'>
-          <h2>🔄 Live-Aktualisierung</h2>
-          <p class='muted'>Diese Seite lädt sich alle 15 Sekunden neu, solange die Auktion aktiv ist oder Dashboard-Aktionen offen sind.</p>
-          <script>setTimeout(function(){ if(!document.hidden){ window.location.reload(); } }, 15000);</script>
-        </section>
-        """
+    auto_refresh = bool(_loot_is_active(auction))
+    refresh_script = "<script>setTimeout(function(){if(!document.hidden){window.location.reload();}},15000);</script>" if auto_refresh else ""
     msg_panel = f"<section class='panel'><p>{_e(msg)}</p></section>" if msg else ""
-    state_panel = ""
-    if _loot_effective_status_key(auction) == "expired_waiting":
-        state_panel = """
-        <section class='panel'>
-          <h2>⚠️ Abgelaufen, wartet auf Bot</h2>
-          <p class='muted'>Diese Auktion hat laut Enddatum die Laufzeit überschritten, steht in Postgres/Snapshot aber noch auf aktiv. Der Bot sollte sie im nächsten Auktions-Loop schließen oder in die nächste Phase schieben.</p>
-        </section>
-        """
+
+    details_cards = "".join([
+        _card("Status", _loot_effective_status_key(auction), _phase_label(auction)),
+        _card("Nächstes Mindestgebot", f"{_fmt_ec(min_next)} EC", "nur bei Auktionen"),
+        _card("Startgebot", f"{_fmt_ec(auction.get('start_bid'))} EC", "Startwert"),
+        _card("Mindestschritt", f"{_fmt_ec(auction.get('min_increment'))} EC", "Gebotsschritt"),
+    ])
 
     body = f"""
-    <nav class="topnav"><a href="/">← Übersicht</a><a href="/loot">Loot</a><a href="#bid">Bieten/Kaufen</a><a href="#loot-actions">Queue</a><a href="#bids">Gebote</a><a href="#eligible">Berechtigte</a><a href="#tech">Technik</a><a href="/api/snapshot">JSON</a></nav>
+    <style>
+      .auction-summary-grid{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}}
+      .auction-summary-card{{padding:18px;border:1px solid rgba(214,168,79,.25);border-radius:16px;background:rgba(7,7,8,.74)}}
+      .auction-summary-card span{{display:block;color:var(--muted);font-size:.82rem;text-transform:uppercase;letter-spacing:.06em}}
+      .auction-summary-card strong{{display:block;margin-top:6px;font-size:1.65rem;color:#f0d18a}}
+      .auction-summary-card small{{display:block;margin-top:5px;color:var(--muted)}}
+      .auction-detail-actions .panel{{margin:0}}
+      details.auction-more>summary{{cursor:pointer;font-weight:800;color:#e7c472;padding:10px 0}}
+      @media(max-width:760px){{.auction-summary-grid{{grid-template-columns:1fr}}}}
+    </style>
     <section class="hero">
       <div>
-        <div class="eyebrow">Auktion</div>
+        <div class="eyebrow">{_e(_phase_label(auction))}</div>
         <h1>🎁 {_e(_loot_text(auction.get('item_name') or auction_id))}</h1>
-        <p class="muted">Auktions-ID: {_e(auction_id)} · {_e(_phase_label(auction))} · Snapshot: {_e(_dt(data.get('published_at')))}</p>
+        <p class="muted">Ende: {_e(_dt(auction.get('ends_at')))} · Aktualisiert automatisch</p>
       </div>
-      <a class="btn" href="/#loot">Zurück</a>
+      <a class="btn" href="/loot">Zurück</a>
     </section>
     {msg_panel}
-    {state_panel}
-    {refresh_panel}
-    <section class="grid">{cards}</section>
-    {action_panel}
-    {queue_panel}
-    <section class="panel" id="bids"><h2>💰 Gebotshistorie</h2>{_table(['Spieler','Gebot','Zeit'], bid_rows, placeholder='Gebote durchsuchen…')}</section>
-    {extra_roll_section}
-    <section class="panel" id="eligible"><h2>✅ Berechtigte Spieler</h2><p class="muted">Bei freien Auktionen/Sale kann die Liste leer sein, weil dann alle berechtigt sind.</p>{_table(['Spieler'], eligible_rows, placeholder='Berechtigte durchsuchen…')}</section>
-    <section class="panel" id="tech"><h2>🧾 Technische Infos</h2>{_table(['Bereich','Kanal-ID','Nachricht-ID'], channel_info, searchable=False)}</section>
+    <section class="auction-summary-grid">
+      <div class="auction-summary-card"><span>{_e(price_label)}</span><strong>{_e(price_value)}</strong><small>{_e(price_sub)}</small></div>
+      <div class="auction-summary-card"><span>Dein Kontostand</span><strong>{_e(own_balance_text)}</strong><small>{_e((current_user or {}).get('username') or 'Discord-Login')}</small></div>
+      <div class="auction-summary-card"><span>Letzte Gebote</span><strong>{len(bids[:3])}</strong><small>die drei neuesten Einträge</small></div>
+    </section>
+    <section class="panel"><h2>💰 Letzte 3 Gebote</h2>{last_three}</section>
+    <div class="auction-detail-actions">{action_panel}</div>
+    <section class="panel">
+      <details class="auction-more">
+        <summary>Weitere Details und Technik anzeigen</summary>
+        <section class="grid">{details_cards}</section>
+        <h3>Gesamte Gebotshistorie</h3>
+        {_table(['Spieler','Gebot','Zeit'], full_bid_rows, searchable=False)}
+        <h3>Berechtigte Spieler</h3>
+        {_table(['Spieler'], eligible_rows, searchable=False)}
+        {queue_panel}
+        <h3>Technische IDs</h3>
+        {_table(['Bereich','Kanal-ID','Nachricht-ID'], channel_info, searchable=False)}
+      </details>
+    </section>
+    {refresh_script}
     """
     return _html_shell(f"{_loot_text(auction.get('item_name') or 'Auktion')} · Beer and Buffs Dashboard", body)
-
 
 def _sidebar_html() -> str:
     """Admin-/Leader-Sidebar. Diese Ansicht erscheint nur im Admin-Modus."""
@@ -6465,7 +6471,7 @@ def _render_ec_dashboard(data: dict[str, Any]) -> str:
         balance_rows.append([_member_link(b.get("user_id"), b.get("display_name")), _fmt_ec(b.get("balance"))])
 
     body = f"""
-    <nav class="topnav"><a href="/">← Übersicht</a><a href="/attendance">Anwesenheit</a><a href="/analytics">Analytics</a><a href="/voice">Voice</a><a href="#queue">Dashboard-Buchungen</a><a href="#recent">Buchungen</a><a href="#top">Toplisten</a><a href="#balances">Konten</a><a href="/api/ec">API</a></nav>
+    {_admin_tabs_style()}
     <section class="hero">
       <div>
         <div class="eyebrow">Analytics</div>
@@ -6474,6 +6480,7 @@ def _render_ec_dashboard(data: dict[str, Any]) -> str:
       </div>
       <a class="btn" href="/">Zurück</a>
     </section>
+    {_admin_quick_links('attendance')}
     <section class="grid">{cards}</section>
     <section class="panel" id="queue">
       <h2>🌐 Dashboard-EC-Buchungen</h2>
@@ -6492,7 +6499,7 @@ def _render_ec_dashboard(data: dict[str, Any]) -> str:
     <section class="panel" id="recent"><h2>🧾 Letzte EC-Buchungen</h2>{_table(['Zeit','Spieler','Betrag','Typ','Grund','Quelle'], recent_rows, placeholder='Buchungen durchsuchen…')}</section>
     <section class="panel" id="balances"><h2>🪙 Alle EC-Konten</h2>{_table(['Spieler','EC'], balance_rows, placeholder='EC-Konten durchsuchen…')}</section>
     """
-    return _html_shell("EC-Verlauf · Beer and Buffs Dashboard", body)
+    return _html_shell("EC-Verlauf · Beer and Buffs Dashboard", body, nav_mode="admin")
 
 
 
@@ -6852,8 +6859,9 @@ def _render_system_dashboard(data: dict[str, Any]) -> str:
     storage_rows = [[k, v] for k, v in storage.items()]
     guild_rows = [[k, v] for k, v in guild.items() if k != "member_filter"]
     body = f"""
-    <nav class="topnav"><a href="/">← Übersicht</a><a href="/admin">Admin-Zentrale</a><a href="/settings">Einstellungen</a><a href="/audit">Audit</a><a href="/api/system">API</a></nav>
-    <section class="hero"><div><div class="eyebrow">System</div><h1>🛠️ System & Datenquellen</h1><p class="muted">Nur Diagnose. Keine Schreibzugriffe.</p></div><a class="btn" href="/">Zurück</a></section>
+    {_admin_tabs_style()}
+    <section class="hero"><div><div class="eyebrow">System</div><h1>🛠️ System & Datenquellen</h1><p class="muted">Nur Diagnose. Keine Schreibzugriffe.</p></div><a class="btn" href="/admin">Zur Verwaltung</a></section>
+    {_admin_quick_links('system')}
     <section class="grid">{cards}</section>
     <section class="panel"><h2>Speicher</h2>{_table(['Key','Wert'], storage_rows, placeholder='Speicher durchsuchen…')}</section>
     <section class="panel"><h2>Guild</h2>{_table(['Key','Wert'], guild_rows, placeholder='Guild durchsuchen…')}</section>
@@ -7125,14 +7133,15 @@ def _render_members_dashboard(data: dict[str, Any]) -> str:
     ])
 
     body = f"""
-    <nav class="topnav"><a href="/">← Übersicht</a><a href="/attendance-stats">Anwesenheit-Stats</a><a href="/loot-history">Loot-Verlauf</a><a href="/ec">EC</a><a href="/admin">Leitung</a><a href="/export/member_center.csv">CSV</a><a href="/api/member-center">API</a></nav>
+    {_admin_tabs_style()}
     <section class="hero"><div><div class="eyebrow">Mitgliederzentrale</div><h1>👥 Mitglieder</h1><p class="muted">Kombiniert Profil, EC, Needliste, Attendance-Reviews, Loot-Verlauf und Leitungsmarkierungen. Read-only – hier wird nichts am Bot verändert.</p></div><a class="btn" href="/export/member_center.csv">CSV herunterladen</a></section>
+    {_admin_quick_links('members')}
     <section class="grid">{cards}</section>
     <section class="split"><div class="panel"><h2>Rollenverteilung</h2>{_bars(role_rows, max_items=8)}</div><div class="panel"><h2>Top EC</h2>{_table(['Spieler','EC','Rolle','Anwesenheit','Hinweis'], ec_rows, placeholder='Top EC durchsuchen…')}</div></section>
     <section class="panel"><details class="soft-details"><summary><strong>⚠️ Prüfliste optional anzeigen</strong> <span class="muted">({len(problem_rows)} Einträge)</span></summary><p class="muted">Auffällige Mitglieder aus Profil-/EC-/Need-Daten, Attendance-Historie, Loot-Verlauf und internen Leitungsnotizen.</p>{_table(['Spieler','Leitung','Attendance','EC','Hinweis','Letzte Aktivität'], problem_rows, placeholder='Prüfliste durchsuchen…')}</details></section>
     <section class="panel"><h2>👥 Alle Mitglieder</h2>{_table(['Name','Ingame','Rolle','GS','EC','Needs M/S','Anwesenheit','Review-Zähler','Voice','Loot/EC','Leitung','Hinweise','Loot'], member_rows, placeholder='Mitglieder durchsuchen…')}</section>
     """
-    return _html_shell("Mitgliederzentrale · Beer and Buffs Dashboard", body)
+    return _html_shell("Mitgliederzentrale · Beer and Buffs Dashboard", body, nav_mode="admin")
 
 def _render_needs_dashboard(data: dict[str, Any]) -> str:
     if not data.get("ok"):
@@ -7212,7 +7221,7 @@ def _render_loot_dashboard(data: dict[str, Any]) -> str:
         _card("Gewinner", len(winner_rows), "Spieler mit Loot"),
     ])
     body = f"""
-    <nav class="topnav"><a href="/">← Übersicht</a><a href="/members">Mitglieder</a><a href="/character-editor">Needs</a><a href="/analytics">Analytics</a><a href="/voice">Voice</a><a href="/exports">Exports</a><a href="/api/loot">API</a></nav>
+    {_admin_tabs_style()}
     <section class="hero"><div><div class="eyebrow">Loot & Auktionen</div><h1>🎁 Loot-Dashboard</h1><p class="muted">Aktive Auktionen, Gewinnerverteilung und Auktionshistorie. Read-only.</p></div><a class="btn" href="/export/auctions.csv">CSV herunterladen</a></section>
     {_admin_quick_links('loot')}
     <section class="grid">{cards}</section>
@@ -7220,7 +7229,7 @@ def _render_loot_dashboard(data: dict[str, Any]) -> str:
     <section class="panel"><h2>🟢 Aktive Auktionen</h2>{_table(['Item','Bereich','Status','Gebote/Würfe','Führung/Wurf','Gewinner','Timer'], active_rows, placeholder='Aktive Auktionen durchsuchen…')}</section>
     <section class="panel"><h2>📜 Auktionshistorie</h2>{_table(['Item','Bereich','Status','Gebote/Würfe','Führung/Wurf','Gewinner','Timer'], closed_rows[:250], placeholder='Auktionshistorie durchsuchen…')}</section>
     """
-    return _html_shell("Loot · Beer and Buffs Dashboard", body)
+    return _html_shell("Loot · Beer and Buffs Dashboard", body, nav_mode="admin")
 
 
 
@@ -9306,7 +9315,7 @@ def _render_event_detail(data: dict[str, Any], event_id: str) -> str:
       <div>
         <div class="eyebrow">Event · Abstimmungsübersicht</div>
         <h1>📅 {_e(event.get('title') or event_id)}</h1>
-        <p class="muted">Zeit: {_e(_dt(event.get('when_iso') or event.get('start_at')))} · Stand: {_e(_dt(data.get('published_at')))}</p>
+        <p class="muted">Zeit: {_e(_event_dt(event.get('when_iso') or event.get('start_at')))} · Stand: {_e(_dt(data.get('published_at')))}</p>
         {f"<p>{_e(event.get('description'))}</p>" if event.get('description') else ""}
       </div>
       <a class="btn" href="/planning">Zurück</a>
@@ -12102,10 +12111,10 @@ def _portal_active_events(snap: dict[str, Any], user_id: int = 0) -> list[dict[s
     for ev in ((snap.get("events") or {}).get("items") or []):
         if not isinstance(ev, dict):
             continue
-        dt = _dt_obj(ev.get("when_iso") or ev.get("start_at"))
+        dt = _event_dt_obj(ev.get("when_iso") or ev.get("start_at"))
         if _is_running_event(ev) or (dt and dt >= now):
             events.append(ev)
-    events.sort(key=lambda ev: _dt_obj(ev.get("when_iso") or ev.get("start_at")) or datetime.max.replace(tzinfo=timezone.utc))
+    events.sort(key=lambda ev: _event_dt_obj(ev.get("when_iso") or ev.get("start_at")) or datetime.max.replace(tzinfo=BERLIN_TZ))
     return events[:40]
 
 
@@ -12949,13 +12958,13 @@ def _render_member_portal(data: dict[str, Any], user_id: int, request: Request, 
         attendance_player = {}
 
     def event_dt(ev: dict[str, Any]) -> Optional[datetime]:
-        return _dt_obj(ev.get("when_iso") or ev.get("start_at") or ev.get("created_at"))
+        return _event_dt_obj(ev.get("when_iso") or ev.get("start_at") or ev.get("created_at"))
 
     def event_image(ev: dict[str, Any]) -> str:
         return _dashboard_event_image_url(ev)
 
     active_events = [ev for ev in _portal_active_events(snap, uid) if isinstance(ev, dict)]
-    active_events.sort(key=lambda ev: event_dt(ev) or datetime.max.replace(tzinfo=timezone.utc))
+    active_events.sort(key=lambda ev: event_dt(ev) or datetime.max.replace(tzinfo=BERLIN_TZ))
 
     week_start = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
     week_end = week_start + timedelta(days=7)
@@ -13024,7 +13033,7 @@ def _render_member_portal(data: dict[str, Any], user_id: int, request: Request, 
           <div class="profile-event-image">{image_html}</div>
           <div class="profile-event-copy">
             <h3>{_e(title)}</h3>
-            <p>📅 {_e(_dt(ev.get("when_iso") or ev.get("start_at")))}</p>
+            <p>📅 {_e(_event_dt(ev.get("when_iso") or ev.get("start_at")))}</p>
             <small>Dein Status: <strong>{_e(status)}</strong></small>
           </div>
           <div class="profile-event-side"><span class="profile-status {status_cls}">{_e("Zugesagt" if status.startswith("✅") else status.replace("🟡 ", "").replace("❌ ", ""))}</span><small>👥 {yes_count} Zusagen</small></div>
@@ -13248,7 +13257,7 @@ def _member_home_event_rows(events: list[dict[str, Any]], user_id: int) -> str:
     for ev in events[:2]:
         eid = str(ev.get("event_id") or ev.get("id") or "")
         title = ev.get("title") or ev.get("name") or eid or "Event"
-        meta = f"{_dt(ev.get('when_iso') or ev.get('start_at') or ev.get('created_at'))} · {_event_status_text(ev)} · Deine Anmeldung: {_portal_event_status_for_user(ev, user_id)}"
+        meta = f"{_event_dt(ev.get('when_iso') or ev.get('start_at') or ev.get('created_at'))} · {_event_status_text(ev)} · Deine Anmeldung: {_portal_event_status_for_user(ev, user_id)}"
         items.append(f'<div class="member-summary-item"><div><div class="member-summary-title">{_cell(_event_link(eid, title))}</div><div class="member-summary-meta">{_e(meta)}</div></div></div>')
     return '<div class="member-summary-list">' + ''.join(items) + '</div>'
 
@@ -13273,10 +13282,10 @@ def _render_member_home(data: dict[str, Any], request: Request) -> str:
     names = _profile_name_map(snap)
     display = names.get(int(uid), str(user.get("username") or "Mitglied")) if uid else str(user.get("username") or "Mitglied")
     running_events = [ev for ev in _events_items(snap) if isinstance(ev, dict) and _is_running_event(ev)]
-    running_events.sort(key=lambda ev: _dt_obj(ev.get("when_iso") or ev.get("start_at") or ev.get("created_at")) or datetime.max.replace(tzinfo=timezone.utc))
+    running_events.sort(key=lambda ev: _event_dt_obj(ev.get("when_iso") or ev.get("start_at") or ev.get("created_at")) or datetime.max.replace(tzinfo=BERLIN_TZ))
     auctions = (((snap.get("loot") or {}).get("auctions") or {}).get("items") or [])
     active_auctions = [a for a in auctions if isinstance(a, dict) and _loot_is_active(a)]
-    active_auctions.sort(key=lambda a: _auction_timer_dt(a) or datetime.max.replace(tzinfo=timezone.utc))
+    active_auctions.sort(key=lambda a: _auction_timer_dt(a) or datetime.max.replace(tzinfo=BERLIN_TZ))
     my_ec_balance = _balance_map(snap).get(int(uid or 0)) if uid else None
     now_text = datetime.now().strftime("%d.%m.%Y %H:%M")
     cards = "".join([_card("Meine EC", _fmt_ec(my_ec_balance) if my_ec_balance is not None else "—", "aktueller Stand"), _card("Uhrzeit", now_text, "lokale Dashboard-Zeit"), _card("Events", len(running_events), "max. 2 auf Startseite"), _card("Auktionen", len(active_auctions), "max. 4 auf Startseite")])
@@ -13350,23 +13359,23 @@ def _render_member_events_page(data: dict[str, Any], request: Request) -> str:
     uid = int(_current_user_id(request) or 0)
     snap: dict[str, Any] = data.get("snapshot") or {}
     guild_id = int(_safe_guild_id(data) or 0)
-    now = datetime.now(timezone.utc)
+    now = datetime.now(BERLIN_TZ)
 
     active_events = [dict(ev) for ev in _portal_active_events(snap, uid) if isinstance(ev, dict)]
     active_events.sort(
-        key=lambda ev: _dt_obj(ev.get("when_iso") or ev.get("start_at") or ev.get("created_at"))
-        or datetime.max.replace(tzinfo=timezone.utc)
+        key=lambda ev: _event_dt_obj(ev.get("when_iso") or ev.get("start_at") or ev.get("created_at"))
+        or datetime.max.replace(tzinfo=BERLIN_TZ)
     )
 
     all_events = [dict(ev) for ev in _events_items(snap) if isinstance(ev, dict)]
     past_events = []
     for ev in all_events:
-        dt = _dt_obj(ev.get("when_iso") or ev.get("start_at") or ev.get("created_at"))
-        if dt and dt < now and not _is_running_event(ev):
+        dt = _event_dt_obj(ev.get("when_iso") or ev.get("start_at") or ev.get("created_at"))
+        if dt and dt < datetime.now(BERLIN_TZ) and not _is_running_event(ev):
             past_events.append(ev)
     past_events.sort(
-        key=lambda ev: _dt_obj(ev.get("when_iso") or ev.get("start_at") or ev.get("created_at"))
-        or datetime.min.replace(tzinfo=timezone.utc),
+        key=lambda ev: _event_dt_obj(ev.get("when_iso") or ev.get("start_at") or ev.get("created_at"))
+        or datetime.min.replace(tzinfo=BERLIN_TZ),
         reverse=True,
     )
 
@@ -13377,7 +13386,7 @@ def _render_member_events_page(data: dict[str, Any], request: Request) -> str:
         return str(ev.get("title") or ev.get("name") or event_id(ev) or "Gildenevent").strip()
 
     def event_dt(ev: dict[str, Any]) -> Optional[datetime]:
-        return _dt_obj(ev.get("when_iso") or ev.get("start_at") or ev.get("created_at"))
+        return _event_dt_obj(ev.get("when_iso") or ev.get("start_at") or ev.get("created_at"))
 
     def event_image(ev: dict[str, Any]) -> str:
         return _dashboard_event_image_url(ev)
@@ -13426,9 +13435,17 @@ def _render_member_events_page(data: dict[str, Any], request: Request) -> str:
         dt = event_dt(ev)
         if not dt:
             return "Zeit unbekannt"
+        end = _event_end_dt(ev, dt)
+        if _is_running_event(ev):
+            minutes = max(1, int((now - dt).total_seconds()) // 60)
+            if minutes < 60:
+                return f"Läuft seit {minutes} Minuten"
+            return f"Läuft seit {minutes // 60} Stunden"
+        if end and now >= end:
+            return "Event beendet"
         seconds = int((dt - now).total_seconds())
         if seconds <= 0:
-            return "Event läuft bereits"
+            return "Event beendet"
         minutes = max(1, seconds // 60)
         if minutes < 60:
             return f"Startet in {minutes} Minuten"
@@ -13502,7 +13519,7 @@ def _render_member_events_page(data: dict[str, Any], request: Request) -> str:
             <div class="event-feature-copy">
               <div class="event-type-label">{_e(event_type_text(ev))}</div>
               <h2>{_e(event_title(ev))}</h2>
-              <div class="event-time-line"><span>▣</span><strong>{_e(_dt(ev.get('when_iso') or ev.get('start_at') or ev.get('created_at')))}</strong></div>
+              <div class="event-time-line"><span>▣</span><strong>{_e(_event_dt(ev.get('when_iso') or ev.get('start_at') or ev.get('created_at')))}</strong></div>
               <span class="event-state-badge {state_class}">{_e(state_label)}</span>
               <div class="event-feature-numbers">
                 <span>👥 <strong>{_e(summary.get('yes_count', 0))}</strong> / {_e(capacity_text(ev))}</span>
@@ -13536,7 +13553,7 @@ def _render_member_events_page(data: dict[str, Any], request: Request) -> str:
               <div><span class="event-mini-type">{_e(event_type_text(ev))}</span><h3>{_e(event_title(ev))}</h3></div>
               <span class="event-mini-open">{_e(start_status(ev)[0])}</span>
             </div>
-            <div class="event-mini-time">▣ {_e(_dt(ev.get('when_iso') or ev.get('start_at') or ev.get('created_at')))}</div>
+            <div class="event-mini-time">▣ {_e(_event_dt(ev.get('when_iso') or ev.get('start_at') or ev.get('created_at')))}</div>
             <div class="event-mini-count">👥 <strong>{_e(summary.get('yes_count', 0))}</strong> / {_e(capacity_text(ev))} zugesagt · Abstimmung {_e(summary.get('response_count', 0))}/{_e(summary.get('member_total', 0))}</div>
             {role_strip(summary, compact=True)}
             <div class="event-mini-status">Dein Status: <strong class="{status_class(user_status)}">{_e(user_status if user_status != '—' else 'Noch nicht abgestimmt')}</strong></div>
@@ -13592,7 +13609,7 @@ def _render_member_events_page(data: dict[str, Any], request: Request) -> str:
         eid = event_id(ev)
         history_rows.append([
             _event_link(eid, event_title(ev)),
-            _dt(ev.get("when_iso") or ev.get("start_at") or ev.get("created_at")),
+            _event_dt(ev.get("when_iso") or ev.get("start_at") or ev.get("created_at")),
             _portal_event_status_for_user(ev, uid),
         ])
     if not history_rows:
@@ -15306,7 +15323,7 @@ def _event_admin_title(ev: dict[str, Any]) -> str:
 
 
 def _event_admin_datetime(ev: dict[str, Any]) -> Optional[datetime]:
-    return _dt_obj(ev.get("when_iso") or ev.get("start_at") or ev.get("created_at"))
+    return _event_dt_obj(ev.get("when_iso") or ev.get("start_at") or ev.get("created_at"))
 
 
 def _event_admin_input_date_time(ev: dict[str, Any]) -> tuple[str, str]:
@@ -15314,7 +15331,7 @@ def _event_admin_input_date_time(ev: dict[str, Any]) -> tuple[str, str]:
     if not dt:
         return "", ""
     try:
-        local = dt.astimezone()
+        local = dt.astimezone(BERLIN_TZ)
     except Exception:
         local = dt
     return local.strftime("%Y-%m-%d"), local.strftime("%H:%M")
@@ -15499,7 +15516,7 @@ def _render_events_center(data: dict[str, Any], current_user: Optional[dict[str,
 
     snap: dict[str, Any] = data.get("snapshot") or {}
     guild_id = _safe_guild_id(data)
-    now = datetime.now(timezone.utc)
+    now = datetime.now(BERLIN_TZ)
     by_id: dict[str, dict[str, Any]] = {}
     for ev in _events_items(snap):
         eid = _event_admin_id(ev)
@@ -15525,15 +15542,15 @@ def _render_events_center(data: dict[str, Any], current_user: Optional[dict[str,
         state = str(ev.get("status") or ev.get("state") or "").strip().lower()
         if state in closed_states:
             past.append(ev)
-        elif _is_running_event(ev) or ev.get("_pending_ec_check") or ev.get("_attendance_review_only"):
+        elif _is_running_event(ev):
             running.append(ev)
         elif dt and dt >= now:
             upcoming.append(ev)
         else:
             past.append(ev)
-    running.sort(key=lambda ev: _event_admin_datetime(ev) or datetime.max.replace(tzinfo=timezone.utc))
-    upcoming.sort(key=lambda ev: _event_admin_datetime(ev) or datetime.max.replace(tzinfo=timezone.utc))
-    past.sort(key=lambda ev: -((_event_admin_datetime(ev) or datetime.min.replace(tzinfo=timezone.utc)).timestamp()))
+    running.sort(key=lambda ev: _event_admin_datetime(ev) or datetime.max.replace(tzinfo=BERLIN_TZ))
+    upcoming.sort(key=lambda ev: _event_admin_datetime(ev) or datetime.max.replace(tzinfo=BERLIN_TZ))
+    past.sort(key=lambda ev: -((_event_admin_datetime(ev) or datetime.min.replace(tzinfo=BERLIN_TZ)).timestamp()))
 
     action_rows = _dashboard_event_action_requests(guild_id, limit=100) if guild_id else []
     action_counts = _event_action_counts(action_rows)
@@ -15561,7 +15578,7 @@ def _render_events_center(data: dict[str, Any], current_user: Optional[dict[str,
         <article class="admin-event-card" data-event-status="{_e(bucket)}" data-search="{_e(search_text)}">
           {image}
           <div class="admin-event-card-body">
-            <div class="admin-event-card-head"><div><span class="pill {status_class}">{_e(bucket_label)}</span><span class="pill {_e(queue_class)}">{_e(queue_label)}</span><h3>{_e(title)}</h3><p class="muted">{_dt(ev.get('when_iso') or ev.get('start_at') or ev.get('created_at'))}</p></div></div>
+            <div class="admin-event-card-head"><div><span class="pill {status_class}">{_e(bucket_label)}</span><span class="pill {_e(queue_class)}">{_e(queue_label)}</span><h3>{_e(title)}</h3><p class="muted">{_event_dt(ev.get('when_iso') or ev.get('start_at') or ev.get('created_at'))}</p></div></div>
             <div class="admin-event-stats"><span>🛡️ {_e(summary.get('Tank',0))}</span><span>✚ {_e(summary.get('Heiler',0))}</span><span>⚔️ {_e(summary.get('DPS',0))}</span><span>🪑 {_e(summary.get('Reserve',0))}</span><span>👥 {_e(summary.get('yes_count', ev.get('participant_count',0)))}</span></div>
             <div class="admin-event-actions">{buttons}</div>
           </div>
@@ -15697,7 +15714,7 @@ def export_events_center_csv(_: bool = Depends(_admin_auth)):
         rows.append([
             eid,
             ev.get("title") or ev.get("name") or "",
-            _dt(ev.get("when_iso") or ev.get("start_at") or ev.get("created_at")),
+            _event_dt(ev.get("when_iso") or ev.get("start_at") or ev.get("created_at")),
             _event_status_text(ev),
             _event_role_counts(ev),
             ev.get("participant_count", ""),
@@ -15864,6 +15881,52 @@ def _dt_obj(value: Any) -> Optional[datetime]:
         return None
 
 
+BERLIN_TZ = ZoneInfo("Europe/Berlin")
+
+def _event_dt_obj(value: Any) -> Optional[datetime]:
+    """Eventzeiten sind in diesem Projekt als Berliner Wandzeit gemeint.
+
+    Ältere Datensätze wurden teilweise mit UTC-Kennzeichnung gespeichert, obwohl
+    der eingegebene Wert bereits Ortszeit war. Deshalb bleibt für Events die
+    sichtbare Uhrzeit erhalten und wird konsequent Europe/Berlin zugeordnet.
+    """
+    s = str(value or "").strip()
+    if not s:
+        return None
+    try:
+        parsed = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return parsed.replace(tzinfo=None).replace(tzinfo=BERLIN_TZ)
+    except Exception:
+        return None
+
+
+def _event_dt(value: Any) -> str:
+    dt = _event_dt_obj(value)
+    if not dt:
+        return "—"
+    return dt.strftime("%d.%m.%Y %H:%M Uhr")
+
+
+def _event_end_dt(event: dict[str, Any], start: Optional[datetime] = None) -> Optional[datetime]:
+    if not isinstance(event, dict):
+        return None
+    explicit = _event_dt_obj(event.get("end_at") or event.get("ends_at") or event.get("end_time"))
+    if explicit:
+        return explicit
+    start = start or _event_dt_obj(
+        event.get("when_iso") or event.get("start_at") or event.get("start_time")
+        or event.get("starts_at") or event.get("datetime") or event.get("date")
+    )
+    if not start:
+        return None
+    try:
+        duration = int(float(event.get("duration_minutes") or event.get("duration") or 120))
+    except Exception:
+        duration = 120
+    duration = min(720, max(30, duration))
+    return start + timedelta(minutes=duration)
+
+
 def _is_active_auction(auction: dict[str, Any]) -> bool:
     status = str(auction.get("status") or "").strip().lower()
     phase = str(auction.get("phase") or "").strip().lower()
@@ -15894,24 +15957,20 @@ def _is_active_auction(auction: dict[str, Any]) -> bool:
 
 
 def _is_running_event(event: dict[str, Any]) -> bool:
-    """Laufend = erstellt, nicht manuell geschlossen und noch nicht 1h nach Start.
+    """Ein Event läuft nur zwischen Start- und Endzeit.
 
-    Jonas-Definition:
-    - Sobald ein Event erstellt ist, zählt es als laufend/aktiv.
-    - Automatisch abgeschlossen ist es 60 Minuten nach Eventbeginn.
-    - Manuell gelöschte/abgebrochene/geschlossene Events bleiben draußen.
+    Endzeit kommt bevorzugt aus ``end_at``. Fehlt sie, wird die gespeicherte
+    Dauer verwendet; bei Altbestand gelten 120 Minuten. Damit landen Events nach
+    Ende automatisch im Verlauf und zukünftige Events werden nicht mehr als
+    laufend markiert.
     """
     if not isinstance(event, dict):
         return False
 
     status = str(
-        event.get("status")
-        or event.get("state")
-        or event.get("phase")
-        or event.get("event_status")
-        or ""
+        event.get("status") or event.get("state") or event.get("phase")
+        or event.get("event_status") or ""
     ).strip().lower()
-
     closed_statuses = {
         "done", "ended", "finished", "closed", "cancelled", "canceled",
         "deleted", "archived", "completed", "aborted", "expired",
@@ -15919,34 +15978,26 @@ def _is_running_event(event: dict[str, Any]) -> bool:
     }
     if status in closed_statuses:
         return False
-
     for key in (
         "is_done", "done", "ended", "is_ended", "closed", "is_closed",
         "cancelled", "canceled", "deleted", "archived", "aborted",
     ):
         if bool(event.get(key)):
             return False
-
     if event.get("ended_at") or event.get("deleted_at") or event.get("cancelled_at") or event.get("canceled_at"):
         return False
 
-    start = _dt_obj(
-        event.get("when_iso")
-        or event.get("start_at")
-        or event.get("start_time")
-        or event.get("starts_at")
-        or event.get("datetime")
-        or event.get("date")
+    start = _event_dt_obj(
+        event.get("when_iso") or event.get("start_at") or event.get("start_time")
+        or event.get("starts_at") or event.get("datetime") or event.get("date")
     )
-
-    # Ohne lesbare Startzeit lieber anzeigen statt verstecken. Sonst verschwinden
-    # manuell erstellte Alt-Events nur wegen alter Datenstruktur.
     if not start:
-        return True
-
-    now = datetime.now(timezone.utc)
-    return now < (start + timedelta(hours=1))
-
+        return False
+    end = _event_end_dt(event, start)
+    if not end:
+        return False
+    now = datetime.now(BERLIN_TZ)
+    return start <= now < end
 
 def _event_check_items(snap: dict[str, Any]) -> list[dict[str, Any]]:
     """Robust geladene EC-/DKP-Anwesenheitschecks aus dem Snapshot.
@@ -16184,7 +16235,7 @@ def _open_attendance_review_events_for_homepage(snap: dict[str, Any], guild_id: 
         stub = _event_stub_from_attendance_review(guild_id, eid)
         if stub:
             out.append({**stub, "_dt": _dt_obj(stub.get("when_iso") or stub.get("created_at"))})
-    out.sort(key=lambda x: (x.get("_dt") is None, x.get("_dt") or datetime.max.replace(tzinfo=timezone.utc)))
+    out.sort(key=lambda x: (x.get("_dt") is None, x.get("_dt") or datetime.max.replace(tzinfo=BERLIN_TZ)))
     return out[:limit]
 
 
@@ -16196,7 +16247,7 @@ def _running_events_from_snapshot(snap: dict[str, Any], *, limit: int = 12) -> l
         if not _is_running_event(ev) and not ev.get("_pending_ec_check"):
             continue
         out.append({**ev, "_dt": _dt_obj(ev.get("when_iso") or ev.get("start_at") or ev.get("created_at"))})
-    out.sort(key=lambda x: (x.get("_dt") is None, x.get("_dt") or datetime.max.replace(tzinfo=timezone.utc)))
+    out.sort(key=lambda x: (x.get("_dt") is None, x.get("_dt") or datetime.max.replace(tzinfo=BERLIN_TZ)))
     return out[:limit]
 
 
@@ -16229,7 +16280,7 @@ def _leadership_insights(snap: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(a, dict) or not _is_active_auction(a):
             continue
         active_auctions.append({**a, "_dt": _dt_obj(a.get("ends_at") or a.get("end_at") or a.get("expires_at"))})
-    active_auctions.sort(key=lambda x: (x.get("_dt") is None, x.get("_dt") or datetime.max.replace(tzinfo=timezone.utc)))
+    active_auctions.sort(key=lambda x: (x.get("_dt") is None, x.get("_dt") or datetime.max.replace(tzinfo=BERLIN_TZ)))
 
     quality = (_insights(snap).get("quality") if isinstance(_insights(snap).get("quality"), dict) else {})
     missing_profile = int(_num(quality.get("missing_profile"), analytics.get("missing_profiles", 0)))
@@ -16935,7 +16986,7 @@ def _render_status_dashboard(data: dict[str, Any], request: Optional[Request] = 
 
     auctions = (((snap.get("loot") or {}).get("auctions") or {}).get("items") or [])
     active_auctions = [a for a in auctions if isinstance(a, dict) and _loot_is_active(a)]
-    active_auctions.sort(key=lambda a: _auction_timer_dt(a) or datetime.max.replace(tzinfo=timezone.utc))
+    active_auctions.sort(key=lambda a: _auction_timer_dt(a) or datetime.max.replace(tzinfo=BERLIN_TZ))
 
     game = _game_status_from_snapshot(snap)
     def _mini_status_value(kind: str, value: Any) -> str:
@@ -17283,7 +17334,7 @@ def _render_leadership_dashboard(data: dict[str, Any]) -> str:
             title_cell = _event_link(eid, ev.get("title") or ev.get("name"))
         event_rows.append([
             title_cell,
-            _dt(ev.get("when_iso") or ev.get("start_at") or ev.get("created_at")),
+            _event_dt(ev.get("when_iso") or ev.get("start_at") or ev.get("created_at")),
             ev.get("participant_count", ev.get("participants", "—")),
             ev.get("maybe_count", ev.get("maybe", "—")),
             ev.get("no_count", ev.get("no", "—")),
@@ -17355,7 +17406,7 @@ def _render_leadership_dashboard(data: dict[str, Any]) -> str:
         _home_item(
             "📅",
             ev.get("title") or ev.get("name") or ev.get("event_id") or "Event",
-            f"{_dt(ev.get('when_iso') or ev.get('start_at') or ev.get('created_at'))} · Teilnehmer: {ev.get('participant_count', ev.get('participants', '—'))} · {'EC offen' if ev.get('_pending_ec_check') else ('Review offen' if ev.get('_attendance_review_only') else 'EC: —')}",
+            f"{_event_dt(ev.get('when_iso') or ev.get('start_at') or ev.get('created_at'))} · Teilnehmer: {ev.get('participant_count', ev.get('participants', '—'))} · {'EC offen' if ev.get('_pending_ec_check') else ('Review offen' if ev.get('_attendance_review_only') else 'EC: —')}",
             f"/attendance/{_e(str(ev.get('event_id') or ev.get('id') or ''))}" if ev.get("_attendance_review_only") else f"/event/{_e(str(ev.get('event_id') or ev.get('id') or ''))}",
             "Review offen" if ev.get("_attendance_review_only") else "läuft",
         )
@@ -19975,7 +20026,7 @@ def _render_attendance_stats_dashboard(data: dict[str, Any]) -> str:
         ])
 
     body = f"""
-    <nav class="topnav"><a href="/">Kommando</a><a href="/attendance">Anwesenheit</a><a href="/attendance-archive">Archiv</a><a href="/ec-queue">EC-Queue</a><a href="/planning">Planung</a><a href="/voice">Voice</a><a href="/export/attendance_stats.csv">CSV</a><a href="/api/attendance-stats">API</a></nav>
+    {_admin_tabs_style()}
     <section class="hero">
       <div>
         <div class="eyebrow">Read-only · gespeicherte Attendance Reviews</div>
@@ -19990,7 +20041,7 @@ def _render_attendance_stats_dashboard(data: dict[str, Any]) -> str:
     <section class="panel"><h2>👥 Spieler-Statistik</h2>{_table(['Spieler','Reviews','War da','Teilweise','Nicht da','Ignoriert','Offen','Quote','Voice','Letzter Status','Letztes Event'], player_table, placeholder='Spieler durchsuchen…')}</section>
     <section class="panel"><h2>📅 Event-Reviews</h2>{_table(['Event','Zeit','Review','Zeilen','War da','Teilweise','Nicht da','Offen','Quote','Queue','Geändert'], event_table, placeholder='Events durchsuchen…')}</section>
     """
-    return _html_shell("Anwesenheit-Stats · Beer and Buffs Dashboard", body)
+    return _html_shell("Anwesenheit-Stats · Beer and Buffs Dashboard", body, nav_mode="admin")
 
 
 def _event_ready_for_attendance(event: dict[str, Any]) -> bool:
@@ -19999,12 +20050,12 @@ def _event_ready_for_attendance(event: dict[str, Any]) -> bool:
     status = str(event.get("status") or event.get("state") or "").strip().lower()
     if status in {"ended", "finished", "completed", "done", "closed", "past"}:
         return True
-    start = _dt_obj(event.get("when_iso") or event.get("start_at") or event.get("created_at"))
+    start = _event_dt_obj(event.get("when_iso") or event.get("start_at") or event.get("created_at"))
     if not start:
         return False
     if start.tzinfo is None:
         start = start.replace(tzinfo=timezone.utc)
-    return start <= datetime.now(timezone.utc)
+    return start <= datetime.now(BERLIN_TZ)
 
 
 def _render_attendance_list(data: dict[str, Any]) -> str:
@@ -20026,7 +20077,7 @@ def _render_attendance_list(data: dict[str, Any]) -> str:
         queue_badge = _event_ec_queue_badge(guild_id, eid) if eid else _raw("<span class='pill'>—</span>")
         rows.append([
             _raw(f'<a class="link" href="/attendance/{_e(eid)}">{_e(ev.get("title") or eid)}</a>' + (" <span class='pill'>aus Review</span>" if ev.get("_attendance_review_only") else "")),
-            _dt(ev.get("when_iso") or ev.get("start_at")),
+            _event_dt(ev.get("when_iso") or ev.get("start_at")),
             summary.get("yes_count", 0),
             voice.get("voice_user_count", 0),
             _attendance_status_label(review.get("status") or ("reviewed" if items else "open")),
@@ -20035,7 +20086,7 @@ def _render_attendance_list(data: dict[str, Any]) -> str:
             _pending_ec_check_label(ev),
         ])
     body = f"""
-    <nav class="topnav"><a href="/">Kommando</a><a href="/planning">Planung</a><a href="/attendance-stats">Anwesenheit-Stats</a><a href="/attendance-archive">Archiv</a><a href="/ec-queue">EC-Queue</a><a href="/admin">Leitung</a></nav>
+    {_admin_tabs_style()}
     <section class="hero">
       <div>
         <div class="eyebrow">Nach dem Event · Anwesenheitsabgleich</div>
@@ -20045,12 +20096,13 @@ def _render_attendance_list(data: dict[str, Any]) -> str:
       </div>
       <a class="btn" href="/planning">Planung</a>
     </section>
+    {_admin_quick_links('attendance')}
     <section class="panel">
       <h2>📅 Events zur Prüfung</h2>
       {_table(['Event','Zeit','Sollte dabei sein','Bot-Voice erkannt','Review','Noch offen','EC-Queue','EC-Check'], rows, placeholder='Events durchsuchen…')}
     </section>
     """
-    return _html_shell("Anwesenheit · Beer and Buffs Dashboard", body)
+    return _html_shell("Anwesenheit · Beer and Buffs Dashboard", body, nav_mode="admin")
 
 def _attendance_review_control_panel(guild_id: int, event_id: str, review: dict[str, Any]) -> str:
     status = str((review or {}).get("status") or "draft").strip().lower()
@@ -20228,16 +20280,17 @@ def _render_attendance_event(data: dict[str, Any], event_id: str, saved: bool = 
         hero_label = "Anwesenheits-Review · keine EC-Buchung"
         hero_actions = f'<form method="post" action="/admin/attendance/{_e(event_id)}/voice-suggest"><button class="btn" type="submit">🎙️ Voice-Vorschlag neu laden</button></form><a class="btn" href="#review-save">✅ 1. Überprüfen</a><a class="btn" href="/attendance/{_e(event_id)}/report">📋 Abschlussbericht</a>'
     body = f"""
-    <nav class="topnav"><a href="/attendance">← Anwesenheit</a><a href="/attendance-stats">Stats</a><a href="/attendance-archive">Archiv</a><a href="/event/{_e(event_id)}">Eventdetails</a><a href="/attendance/{_e(event_id)}/ec-preview">EC-Vorschau</a><a href="/attendance/{_e(event_id)}/report">Abschlussbericht</a><a href="#event-ec-queue">EC-Queue</a><a href="/voice">Voice</a><a href="/ec">EC</a></nav>
+    {_admin_tabs_style()}
     <section class="hero">
       <div>
         <div class="eyebrow">{hero_label}</div>
         <h1>📝 {_e(event.get('title') or event_id)}</h1>
-        <p class="muted">Event-ID: {_e(event_id)} · Zeit: {_e(_dt(event.get('when_iso') or event.get('start_at')))}</p>
+        <p class="muted">Event-ID: {_e(event_id)} · Zeit: {_e(_event_dt(event.get('when_iso') or event.get('start_at')))}</p>
         {updated}
       </div>
       <div style="display:flex;gap:8px;flex-wrap:wrap">{hero_actions}</div>
     </section>
+    {_admin_quick_links('attendance')}
     {saved_note}
     {queue_notice}
     {award_notice}
@@ -20309,7 +20362,7 @@ def _render_attendance_event(data: dict[str, Any], event_id: str, saved: bool = 
     }})();
     </script>
     """
-    return _html_shell(f"Anwesenheit · {event.get('title') or event_id}", body)
+    return _html_shell(f"Anwesenheit · {event.get('title') or event_id}", body, nav_mode="admin")
 
 
 
@@ -20371,7 +20424,7 @@ def _render_attendance_archive(data: dict[str, Any]) -> str:
         _card("Queue offen", queue_pending, "pending/processing"),
     ])
     body = f"""
-    <nav class="topnav"><a href="/">Kommando</a><a href="/attendance">Anwesenheit</a><a href="/attendance-stats">Stats</a><a href="/ec-queue">EC-Queue</a><a href="/audit">Audit</a></nav>
+    {_admin_tabs_style()}
     <section class="hero">
       <div>
         <div class="eyebrow">Attendance-Archiv · Steuerung</div>
@@ -20381,13 +20434,14 @@ def _render_attendance_archive(data: dict[str, Any]) -> str:
       </div>
       <a class="btn" href="/attendance">Offene Anwesenheit</a>
     </section>
+    {_admin_quick_links('attendance')}
     <section class="grid">{cards}</section>
     <section class="panel">
       <h2>📋 Alle gespeicherten Reviews</h2>
       {_table(['Event','Zeit','Review','Queue','Zeilen','War da','Teilweise','Nicht da','Offen','Geändert','Aktion'], rows, placeholder='Archiv durchsuchen…')}
     </section>
     """
-    return _html_shell("Attendance-Archiv · Beer and Buffs Dashboard", body)
+    return _html_shell("Attendance-Archiv · Beer and Buffs Dashboard", body, nav_mode="admin")
 
 
 @app.get("/attendance-archive", response_class=HTMLResponse)
@@ -21193,12 +21247,12 @@ def _render_attendance_ec_preview(data: dict[str, Any], event_id: str, full_ec: 
     if latest_request:
         notice += f"<div class='warn'>📌 Letzte Dashboard-EC-Anfrage: <strong>{_e(latest_request.get('status'))}</strong> · Request <code>{_e(latest_request.get('request_id'))}</code> · {_e(_dt(latest_request.get('requested_at')))}</div>"
     body = f"""
-    <nav class="topnav"><a href="/attendance/{_e(event_id)}">← Review</a><a href="/attendance/{_e(event_id)}/report">Abschlussbericht</a><a href="/attendance">Anwesenheit</a><a href="/attendance-archive">Archiv</a><a href="/ec">EC-Verlauf</a><a href="/ec-queue">EC-Queue</a><a href="/event/{_e(event_id)}">Eventdetails</a></nav>
+    {_admin_tabs_style()}
     <section class="hero">
       <div>
         <div class="eyebrow">EC-Vorschau + Bot-Buchung über sichere Queue</div>
         <h1>🪙 {_e(event.get('title') or event_id)}</h1>
-        <p class="muted">Review-Status: {_e(review_status)} · Event: {_e(_dt(event.get('when_iso')))} · Typ: {_e(event_type)} · Erkennung: {_e((preview.get('defaults') or {}).get('detected_from') or 'manuell')}</p>
+        <p class="muted">Review-Status: {_e(review_status)} · Event: {_e(_event_dt(event.get('when_iso')))} · Typ: {_e(event_type)} · Erkennung: {_e((preview.get('defaults') or {}).get('detected_from') or 'manuell')}</p>
       </div>
       <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
         <form method="post" action="/admin/attendance/{_e(event_id)}/ec-award" onsubmit="return confirm('EC wirklich buchen? Der Bot verarbeitet diese Anfrage und schreibt danach in die echten EC-Daten.');">
@@ -21208,6 +21262,7 @@ def _render_attendance_ec_preview(data: dict[str, Any], event_id: str, full_ec: 
         <a class="btn" href="/export/attendance/{_e(event_id)}.csv?full_ec={_e(fe)}&partial_ec={_e(pe)}">CSV herunterladen</a>
       </div>
     </section>
+    {_admin_quick_links('attendance')}
     {notice}
     {_event_ec_queue_panel(guild_id, str(event_id))}
     <section class="grid">
@@ -21246,7 +21301,7 @@ def _render_attendance_ec_preview(data: dict[str, Any], event_id: str, full_ec: 
       <p class="muted">Doppelbuchungs-Schutz: Dashboard blockt bereits bekannte/pending Buchungen. Der Bot prüft vor dem Schreiben zusätzlich nochmal seine echten EC-Transaktionen.</p>
     </section>
     """
-    return _html_shell(f"EC-Vorschau · {event.get('title') or event_id}", body)
+    return _html_shell(f"EC-Vorschau · {event.get('title') or event_id}", body, nav_mode="admin")
 
 
 
@@ -21363,15 +21418,16 @@ def _render_attendance_report(data: dict[str, Any], event_id: str, full_ec: Opti
             copy_lines.append(f"- {r.get('display_name')}: {r.get('warning')}")
     copy_text = "\n".join(copy_lines)
     body = f"""
-    <nav class="topnav"><a href="/attendance/{_e(event_id)}">← Review</a><a href="/attendance/{_e(event_id)}/ec-preview">EC-Vorschau</a><a href="/attendance">Anwesenheit</a><a href="/attendance-archive">Archiv</a><a href="/ec-queue">EC-Queue</a><a href="/event/{_e(event_id)}">Eventdetails</a></nav>
+    {_admin_tabs_style()}
     <section class="hero">
       <div>
         <div class="eyebrow">Attendance-Abschlussbericht · read-only</div>
         <h1>📋 {_e(event.get('title') or event_id)}</h1>
-        <p class="muted">Event-ID: {_e(event_id)} · Zeit: {_e(_dt(event.get('when_iso')))} · Review: {_e(payload.get('review_status') or '—')} · Queue: {_e(latest_status)}</p>
+        <p class="muted">Event-ID: {_e(event_id)} · Zeit: {_e(_event_dt(event.get('when_iso')))} · Review: {_e(payload.get('review_status') or '—')} · Queue: {_e(latest_status)}</p>
       </div>
       <a class="btn" href="/export/attendance/{_e(event_id)}_report.csv?full_ec={_e(fe)}&partial_ec={_e(pe)}">Bericht-CSV</a>
     </section>
+    {_admin_quick_links('attendance')}
     {ready_notice}
     <section class="grid mini-grid">
       {_card('Review-Zeilen', report.get('total_rows', 0), 'alle Kandidaten')}
