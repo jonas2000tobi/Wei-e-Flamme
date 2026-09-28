@@ -2290,6 +2290,7 @@ async def apply_rsvp(inter: discord.Interaction, msg_id: str, group: str) -> tup
     save_store(str(msg_id))
     record_response(int(obj["guild_id"]), uid, str(msg_id), response_key)
     await _push_overview(inter.client, str(msg_id), obj)
+    await _sync_event_lineup_discord(inter.client, str(msg_id), obj)
 
     # Gildenzentrale-Startseite aktualisieren, aber nur vorhandene Portal-DM bearbeiten.
     # Es wird keine neue Portal-DM gesendet.
@@ -2754,6 +2755,23 @@ def _dashboard_event_ensure_tables() -> None:
                 """
                 CREATE INDEX IF NOT EXISTS idx_dashboard_event_action_requests_lookup
                 ON dashboard_event_action_requests (guild_id, event_id, status, requested_at DESC)
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS dashboard_event_lineups (
+                    guild_id BIGINT NOT NULL,
+                    event_id TEXT NOT NULL,
+                    lineup_json TEXT NOT NULL DEFAULT '{}',
+                    published BOOLEAN NOT NULL DEFAULT FALSE,
+                    discord_channel_id BIGINT NOT NULL DEFAULT 0,
+                    discord_message_id BIGINT NOT NULL DEFAULT 0,
+                    updated_by_id TEXT,
+                    updated_by_name TEXT,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    last_synced_at TIMESTAMPTZ,
+                    PRIMARY KEY (guild_id, event_id)
+                )
                 """
             )
         conn.commit()
@@ -3631,6 +3649,250 @@ async def _dashboard_event_delete(client: discord.Client, guild_id: int, payload
     return {"event_id": event_id, "deleted_posts": deleted_posts, "deleted_dms": deleted_dms, "failed_posts": failed_posts[:10], "scheduled_event": scheduled_result}
 
 
+
+def _dashboard_lineup_record(guild_id: int, event_id: str) -> dict[str, Any]:
+    if not _dashboard_event_queue_available() or not guild_id or not event_id:
+        return {}
+    _dashboard_event_ensure_tables()
+    conn = _dashboard_pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT lineup_json, published, discord_channel_id, discord_message_id,
+                       updated_by_id, updated_by_name, updated_at, last_synced_at
+                FROM dashboard_event_lineups
+                WHERE guild_id = %s AND event_id = %s
+                """,
+                (int(guild_id), str(event_id)),
+            )
+            row = dict(cur.fetchone() or {})
+    finally:
+        conn.close()
+    if not row:
+        return {}
+    try:
+        lineup = json.loads(row.get("lineup_json") or "{}")
+    except Exception:
+        lineup = {}
+    if not isinstance(lineup, dict):
+        lineup = {}
+    lineup["published"] = bool(row.get("published"))
+    lineup["discord_channel_id"] = int(row.get("discord_channel_id") or 0)
+    lineup["discord_message_id"] = int(row.get("discord_message_id") or 0)
+    lineup["updated_by_id"] = str(row.get("updated_by_id") or "")
+    lineup["updated_by_name"] = str(row.get("updated_by_name") or "")
+    return lineup
+
+
+def _dashboard_lineup_candidates(obj: dict[str, Any]) -> dict[int, dict[str, Any]]:
+    _init_event_shape(obj)
+    out: dict[int, dict[str, Any]] = {}
+    role_labels = {"TANK": "Tank", "HEAL": "Heal", "DPS": "DPS", "BANK": "Reserve"}
+    for role_key in ("TANK", "HEAL", "DPS", "BANK"):
+        for entry in obj.get("yes", {}).get(role_key, []) or []:
+            uid = _entry_user_id(entry)
+            if not uid:
+                continue
+            out[int(uid)] = {
+                "user_id": int(uid),
+                "display_name": _entry_name(entry) or f"User {uid}",
+                "role": role_labels.get(role_key, role_key),
+            }
+    return out
+
+
+def _dashboard_lineup_clean(obj: dict[str, Any], raw: Any) -> dict[str, Any]:
+    data = raw if isinstance(raw, dict) else {}
+    candidates = _dashboard_lineup_candidates(obj)
+    try:
+        group_size = max(1, min(24, int(data.get("group_size") or 6)))
+    except Exception:
+        group_size = 6
+    raw_groups = data.get("groups") if isinstance(data.get("groups"), list) else []
+    try:
+        group_count = max(1, min(20, int(data.get("group_count") or len(raw_groups) or 1)))
+    except Exception:
+        group_count = max(1, len(raw_groups) or 1)
+    group_count = max(group_count, len(raw_groups), 1)
+    used: set[int] = set()
+    groups: list[dict[str, Any]] = []
+    for idx in range(group_count):
+        src = raw_groups[idx] if idx < len(raw_groups) and isinstance(raw_groups[idx], dict) else {}
+        name = re.sub(r"\s+", " ", str(src.get("name") or f"Gruppe {idx + 1}").strip())[:60] or f"Gruppe {idx + 1}"
+        members: list[dict[str, Any]] = []
+        for item in src.get("members") or []:
+            try:
+                uid = int((item or {}).get("user_id") if isinstance(item, dict) else item)
+            except Exception:
+                uid = 0
+            if not uid or uid in used or uid not in candidates or len(members) >= group_size:
+                continue
+            used.add(uid)
+            members.append(dict(candidates[uid]))
+        groups.append({"name": name, "members": members})
+    bench: list[dict[str, Any]] = []
+    for item in data.get("bench") or []:
+        try:
+            uid = int((item or {}).get("user_id") if isinstance(item, dict) else item)
+        except Exception:
+            uid = 0
+        if not uid or uid in used or uid not in candidates:
+            continue
+        used.add(uid)
+        bench.append(dict(candidates[uid]))
+    return {
+        "group_size": group_size,
+        "group_count": len(groups),
+        "groups": groups,
+        "bench": bench,
+        "published": bool(data.get("published", True)),
+        "candidate_count": len(candidates),
+    }
+
+
+def _dashboard_lineup_member_line(member: dict[str, Any]) -> str:
+    uid = int(member.get("user_id") or 0)
+    role = str(member.get("role") or "").strip()
+    role_icon = {"Tank": "🛡️", "Heal": "💚", "DPS": "⚔️", "Reserve": "🪑"}.get(role, "•")
+    who = f"<@{uid}>" if uid else _safe_name(member.get("display_name") or "Unbekannt")
+    return f"{role_icon} {who}" + (f" · {role}" if role else "")
+
+
+def _dashboard_lineup_embed(guild: discord.Guild, obj: dict[str, Any], lineup: dict[str, Any]) -> discord.Embed:
+    title = str(obj.get("title") or "Event")
+    emb = discord.Embed(
+        title=f"🧩 Aufstellung · {title}",
+        description="Live-Aufstellung aus dem Gilden-Dashboard. Änderungen werden automatisch hierher synchronisiert.",
+        color=discord.Color.gold(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    when = str(obj.get("when_iso") or obj.get("start_at") or "").strip()
+    if when:
+        try:
+            dt = datetime.fromisoformat(when.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=TZ)
+            dt = dt.astimezone(TZ)
+            emb.add_field(name="Zeit", value=dt.strftime("%d.%m.%Y · %H:%M"), inline=False)
+        except Exception:
+            pass
+    used: set[int] = set()
+    for idx, group in enumerate(lineup.get("groups") or []):
+        if idx >= 20 or not isinstance(group, dict):
+            break
+        members = [m for m in (group.get("members") or []) if isinstance(m, dict)]
+        for m in members:
+            try:
+                used.add(int(m.get("user_id") or 0))
+            except Exception:
+                pass
+        text = "\n".join(_dashboard_lineup_member_line(m) for m in members) or "— noch leer —"
+        emb.add_field(name=f"{group.get('name') or f'Gruppe {idx + 1}'} · {len(members)}/{int(lineup.get('group_size') or 6)}", value=text[:1024], inline=True)
+    bench = [m for m in (lineup.get("bench") or []) if isinstance(m, dict)]
+    for m in bench:
+        try:
+            used.add(int(m.get("user_id") or 0))
+        except Exception:
+            pass
+    if bench:
+        emb.add_field(name=f"🪑 Reserve · {len(bench)}", value="\n".join(_dashboard_lineup_member_line(m) for m in bench)[:1024], inline=False)
+    candidates = _dashboard_lineup_candidates(obj)
+    unassigned = [m for uid, m in candidates.items() if uid not in used]
+    if unassigned:
+        emb.add_field(name=f"⏳ Noch nicht eingeteilt · {len(unassigned)}", value="\n".join(_dashboard_lineup_member_line(m) for m in unassigned)[:1024], inline=False)
+    actor = str(lineup.get("updated_by_name") or "Dashboard").strip()
+    emb.set_footer(text=f"Live-Sync · zuletzt geändert von {actor}")
+    return emb
+
+
+def _dashboard_lineup_store_sync(guild_id: int, event_id: str, lineup: dict[str, Any], channel_id: int, message_id: int) -> None:
+    if not _dashboard_event_queue_available():
+        return
+    _dashboard_event_ensure_tables()
+    conn = _dashboard_pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO dashboard_event_lineups
+                    (guild_id, event_id, lineup_json, published, discord_channel_id, discord_message_id, updated_at, last_synced_at)
+                VALUES (%s, %s, %s, TRUE, %s, %s, NOW(), NOW())
+                ON CONFLICT (guild_id, event_id) DO UPDATE SET
+                    lineup_json = EXCLUDED.lineup_json,
+                    published = TRUE,
+                    discord_channel_id = EXCLUDED.discord_channel_id,
+                    discord_message_id = EXCLUDED.discord_message_id,
+                    last_synced_at = NOW()
+                """,
+                (int(guild_id), str(event_id), json.dumps(lineup, ensure_ascii=False, separators=(",", ":")), int(channel_id), int(message_id)),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+async def _dashboard_event_lineup(client: discord.Client, guild_id: int, payload: dict[str, Any]) -> dict[str, Any]:
+    event_id = str(payload.get("event_id") or "").strip()
+    if not event_id or event_id not in store:
+        raise RuntimeError("Event nicht gefunden")
+    obj = store[event_id]
+    _init_event_shape(obj)
+    if int(obj.get("guild_id", 0) or 0) != int(guild_id):
+        raise RuntimeError("Event gehört nicht zu diesem Server")
+    guild = client.get_guild(int(guild_id))
+    if guild is None:
+        raise RuntimeError("Bot sieht den Server nicht")
+
+    record = _dashboard_lineup_record(guild_id, event_id)
+    raw = payload.get("lineup") if isinstance(payload.get("lineup"), dict) else record
+    clean = _dashboard_lineup_clean(obj, raw)
+    clean["published"] = True
+    requested_by = payload.get("requested_by") if isinstance(payload.get("requested_by"), dict) else {}
+    clean["updated_by_name"] = str(requested_by.get("name") or record.get("updated_by_name") or "Dashboard")
+
+    channel_id = int(record.get("discord_channel_id") or obj.get("channel_id", 0) or 0)
+    channel = guild.get_channel(channel_id)
+    if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+        channel_id = int(obj.get("channel_id", 0) or 0)
+        channel = guild.get_channel(channel_id)
+    if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+        raise RuntimeError("Eventkanal für die Aufstellung wurde nicht gefunden")
+
+    embed = _dashboard_lineup_embed(guild, obj, clean)
+    msg: Optional[discord.Message] = None
+    old_message_id = int(record.get("discord_message_id") or 0)
+    if old_message_id:
+        try:
+            msg = await channel.fetch_message(old_message_id)
+            await msg.edit(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+        except Exception:
+            msg = None
+    if msg is None:
+        msg = await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+
+    _dashboard_lineup_store_sync(guild_id, event_id, clean, int(channel.id), int(msg.id))
+    return {
+        "event_id": event_id,
+        "discord_channel_id": int(channel.id),
+        "discord_message_id": int(msg.id),
+        "groups": int(clean.get("group_count") or 0),
+        "players": sum(len(g.get("members") or []) for g in clean.get("groups") or []),
+        "bench": len(clean.get("bench") or []),
+    }
+
+
+async def _sync_event_lineup_discord(client: discord.Client, event_id: str, obj: dict[str, Any]) -> None:
+    """Bei RSVP-Änderungen eine bereits veröffentlichte Aufstellung nachziehen."""
+    try:
+        guild_id = int(obj.get("guild_id", 0) or 0)
+        record = _dashboard_lineup_record(guild_id, str(event_id))
+        if not record or not bool(record.get("published")):
+            return
+        await _dashboard_event_lineup(client, guild_id, {"event_id": str(event_id), "lineup": record, "requested_by": {"name": "RSVP-Sync"}})
+    except Exception as exc:
+        print(f"[event_rsvp_dm] Aufstellungs-Sync Fehler event={event_id}: {exc!r}")
+
 def _dashboard_event_rsvp_open(obj: dict[str, Any]) -> bool:
     status = str(obj.get("status") or obj.get("state") or "").strip().lower()
     if status in {"closed", "ended", "finished", "beendet", "archived", "done", "completed", "deleted"}:
@@ -3742,6 +4004,7 @@ async def _dashboard_event_rsvp(client: discord.Client, guild_id: int, payload: 
         record_response(int(obj["guild_id"]), user_id, event_id, response_key)
 
         await _push_overview(client, event_id, obj)
+        await _sync_event_lineup_discord(client, event_id, obj)
         try:
             ensure_attendance_snapshot(client, event_id, obj)
         except Exception:
@@ -3781,6 +4044,9 @@ async def _dashboard_event_process_request(client: discord.Client, row: dict[str
     if action == "rsvp":
         result = await _dashboard_event_rsvp(client, guild_id, payload)
         return True, f"RSVP aktualisiert: {result.get('display_name')} → {result.get('label')}", result
+    if action == "lineup":
+        result = await _dashboard_event_lineup(client, guild_id, payload)
+        return True, f"Aufstellung synchronisiert: {result.get('event_id')}", result
     raise RuntimeError("Unbekannte Event-Aktion")
 
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+import re
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
@@ -181,9 +182,145 @@ async def _archive_ticket(inter: discord.Interaction, embed: discord.Embed, acto
     return True
 
 
+
+def _embed_field_value(embed: discord.Embed, field_name: str) -> str:
+    wanted = str(field_name or "").strip().casefold()
+    for field in list(embed.fields):
+        if str(field.name or "").strip().casefold() == wanted:
+            return str(field.value or "").strip()
+    return ""
+
+
+def _replace_or_add_field(embed: discord.Embed, name: str, value: str, *, inline: bool = False) -> discord.Embed:
+    try:
+        new_embed = discord.Embed.from_dict(embed.to_dict())
+    except Exception:
+        new_embed = discord.Embed(title=embed.title, description=embed.description, color=embed.color)
+    kept: list[tuple[str, str, bool]] = []
+    wanted = str(name or "").strip().casefold()
+    for field in list(new_embed.fields):
+        if str(field.name or "").strip().casefold() != wanted:
+            kept.append((field.name, field.value, field.inline))
+    new_embed.clear_fields()
+    for field_name, field_value, field_inline in kept:
+        new_embed.add_field(name=field_name, value=field_value, inline=field_inline)
+    new_embed.add_field(name=name, value=value, inline=inline)
+    return new_embed
+
+
+def _ticket_member_from_embed(guild: discord.Guild, embed: discord.Embed) -> Optional[discord.Member]:
+    raw = _embed_field_value(embed, "User-ID")
+    try:
+        uid = int(raw)
+    except Exception:
+        uid = 0
+    if not uid:
+        return None
+    member = guild.get_member(uid)
+    return member if isinstance(member, discord.Member) else None
+
+
+def _ticket_channel_slug(member: discord.Member, source_message_id: int) -> str:
+    raw = str(member.display_name or member.name or member.id).casefold()
+    slug = re.sub(r"[^a-z0-9äöüß_-]+", "-", raw, flags=re.IGNORECASE)
+    slug = re.sub(r"-+", "-", slug).strip("-_") or str(member.id)
+    suffix = str(int(source_message_id))[-4:]
+    return (f"ticket-{slug}-{suffix}")[:95]
+
+
+def _existing_ticket_channel(guild: discord.Guild, source_message_id: int) -> Optional[discord.TextChannel]:
+    marker = f"Leader-Ticket Message-ID {int(source_message_id)}"
+    for channel in guild.text_channels:
+        if marker in str(channel.topic or ""):
+            return channel
+    return None
+
+
+async def _ensure_private_ticket_channel(inter: discord.Interaction) -> tuple[Optional[discord.TextChannel], str]:
+    if inter.guild is None or inter.message is None or not inter.message.embeds:
+        return None, "Ticket-Nachricht nicht gefunden."
+    embed = inter.message.embeds[0]
+    member = _ticket_member_from_embed(inter.guild, embed)
+    if member is None:
+        return None, "Für anonyme Meldungen kann kein privater Ticket-Chat geöffnet werden."
+
+    existing = _existing_ticket_channel(inter.guild, int(inter.message.id))
+    if existing is not None:
+        return existing, "Vorhandener Ticket-Chat verwendet."
+
+    leader_role = _leader_role(inter.guild)
+    if not isinstance(leader_role, discord.Role):
+        return None, "Keine Leader-Rolle konfiguriert."
+    internal = _internal_channel(inter.guild)
+    category = internal.category if isinstance(internal, discord.TextChannel) else None
+    me = inter.guild.me
+
+    overwrites: dict[discord.abc.Snowflake, discord.PermissionOverwrite] = {
+        inter.guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        member: discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=True,
+            read_message_history=True,
+            attach_files=True,
+            embed_links=True,
+        ),
+        leader_role: discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=True,
+            read_message_history=True,
+            attach_files=True,
+            embed_links=True,
+        ),
+    }
+    if me is not None:
+        overwrites[me] = discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=True,
+            read_message_history=True,
+            manage_channels=True,
+            manage_messages=True,
+        )
+
+    try:
+        channel = await inter.guild.create_text_channel(
+            _ticket_channel_slug(member, int(inter.message.id)),
+            category=category,
+            overwrites=overwrites,
+            topic=f"Privater Leader-Contact-Chat mit {member} · Leader-Ticket Message-ID {inter.message.id}",
+            reason=f"Leader-Contact Ticket für {member} ({member.id})",
+        )
+    except discord.Forbidden:
+        return None, "Dem Bot fehlen Rechte zum Erstellen eines privaten Ticket-Channels."
+    except Exception as exc:
+        return None, f"Ticket-Channel konnte nicht erstellt werden: {type(exc).__name__}: {exc}"
+
+    summary = discord.Embed(
+        title=f"📨 Leader-Ticket · {member.display_name}",
+        description="Privater Gesprächskanal zwischen Mitglied und Gildenleitung.",
+        color=discord.Color.blurple(),
+        timestamp=datetime.now(TZ),
+    )
+    topic = _embed_field_value(embed, "Thema") or "—"
+    message = _embed_field_value(embed, "Nachricht") or "—"
+    summary.add_field(name="Mitglied", value=member.mention, inline=False)
+    summary.add_field(name="Thema", value=topic[:1024], inline=False)
+    summary.add_field(name="Ursprüngliche Nachricht", value=message[:1024], inline=False)
+    summary.add_field(name="Leader-Ticket", value=inter.message.jump_url, inline=False)
+    try:
+        summary.set_thumbnail(url=member.display_avatar.url)
+    except Exception:
+        pass
+    await channel.send(content=member.mention, embed=summary, allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False))
+    return channel, "Ticket-Chat erstellt."
+
 class LeaderStatusView(View):
-    def __init__(self):
+    def __init__(self, anonymous: bool = False):
         super().__init__(timeout=None)
+        self.anonymous = bool(anonymous)
+        if self.anonymous:
+            for child in list(self.children):
+                if getattr(child, "custom_id", None) == "leader_status_open_chat":
+                    self.remove_item(child)
 
     async def interaction_check(self, inter: discord.Interaction) -> bool:
         if inter.guild is None or not is_module_enabled(inter.guild.id, "leader_contact"):
@@ -220,6 +357,26 @@ class LeaderStatusView(View):
         name = inter.user.display_name if hasattr(inter.user, "display_name") else inter.user.name
         await self._edit_status(inter, f"👀 Übernommen von **{_safe_text(name)}**")
 
+    @button(label="💬 Ticket öffnen", style=ButtonStyle.secondary, custom_id="leader_status_open_chat")
+    async def btn_open_chat(self, inter: discord.Interaction, _):
+        if not _is_leader_or_admin(inter):
+            await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
+            return
+        if not inter.message or not inter.message.embeds:
+            await inter.response.send_message("❌ Ticket-Nachricht nicht gefunden.", ephemeral=True)
+            return
+        await inter.response.defer(ephemeral=True)
+        channel, info = await _ensure_private_ticket_channel(inter)
+        if channel is None:
+            await inter.followup.send(f"❌ {info}", ephemeral=True)
+            return
+        try:
+            updated = _replace_or_add_field(inter.message.embeds[0], "Ticket-Chat", channel.mention, inline=False)
+            await inter.message.edit(embed=updated, view=self)
+        except Exception:
+            pass
+        await inter.followup.send(f"✅ {info} {channel.mention}", ephemeral=True)
+
     @button(label="✅ Erledigt", style=ButtonStyle.success, custom_id="leader_status_done")
     async def btn_done(self, inter: discord.Interaction, _):
         if not _is_leader_or_admin(inter):
@@ -232,6 +389,12 @@ class LeaderStatusView(View):
         await inter.response.defer(ephemeral=True)
         name = inter.user.display_name if hasattr(inter.user, "display_name") else inter.user.name
         new_embed = _replace_status_field(inter.message.embeds[0], f"✅ Erledigt von **{_safe_text(name)}**")
+        ticket_ch = _existing_ticket_channel(inter.guild, int(inter.message.id)) if inter.guild else None
+        if ticket_ch is not None:
+            try:
+                await ticket_ch.send(f"✅ Dieses Leader-Ticket wurde von {inter.user.mention} als **erledigt** markiert.", allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False))
+            except Exception:
+                pass
         archive_ch = _archive_channel(inter.guild) if inter.guild else None
 
         if archive_ch is None:
@@ -346,7 +509,7 @@ class ContactModal(Modal):
             await internal_ch.send(
                 content=ping_txt,
                 embed=emb,
-                view=LeaderStatusView()
+                view=LeaderStatusView(anonymous=self.anonymous)
             )
         except Exception as e:
             await inter.response.send_message(f"❌ Konnte Anfrage nicht senden: {e}", ephemeral=True)
