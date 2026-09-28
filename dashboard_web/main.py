@@ -67,7 +67,7 @@ async def _dashboard_lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Guild Platform Dashboard", version="2.5.1", lifespan=_dashboard_lifespan)
+app = FastAPI(title="Guild Platform Dashboard", version="2.5.2", lifespan=_dashboard_lifespan)
 security = HTTPBasic(auto_error=False)
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -75,7 +75,7 @@ if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 ASSET_VER = "guild-platform-v2-5-0-welcome"
-DASHBOARD_RELEASE_VERSION = "2.5.1 · Guild Binding Fix"
+DASHBOARD_RELEASE_VERSION = "2.5.2 · Welcome Channel Fix"
 
 _EVENT_IMAGE_ASSETS: dict[str, str] = {
     "guild_boss": f"/static/event_images/guild_boss.webp?v={ASSET_VER}",
@@ -18869,7 +18869,14 @@ def _dashboard_upsert_guild_profile(guild_id: int, values: dict[str, Any]) -> No
 
 
 def _catalog_from_snapshot(data: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    snap = data.get("snapshot") or {}
+    # Akzeptiert sowohl den äußeren Dashboard-Datensatz {snapshot: ...}
+    # als auch direkt den Snapshot selbst. Einige Admin-Ansichten arbeiten
+    # bereits mit dem entpackten Snapshot; ohne diesen Fallback wurde dort
+    # fälschlich ein leerer Discord-Kanalkatalog angezeigt.
+    if isinstance(data.get("snapshot"), dict):
+        snap = data.get("snapshot") or {}
+    else:
+        snap = data
     guild = snap.get("guild") or {}
     catalog = guild.get("discord_catalog") or {}
     roles = [x for x in (catalog.get("roles") or []) if isinstance(x, dict)]
