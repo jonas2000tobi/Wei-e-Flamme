@@ -11,6 +11,22 @@ from dataclasses import dataclass
 from typing import Iterable
 
 
+DEFAULT_ONBOARDING_WELCOME_SLOGANS: tuple[str, ...] = (
+    "Ein neuer Held betritt das Schlachtfeld.",
+    "Verstärkung ist eingetroffen. Ob sie was taugt, sehen wir später.",
+    "Willkommen! Die Raidleitung übernimmt keinerlei Haftung.",
+    "Ein wildes {user} ist erschienen!",
+    "Da ist ja unser nächstes Opfer für die Mechaniken.",
+    "Möge dein Loot besser sein als dein Würfelglück.",
+    "Die Gilde ist wieder um eine fragwürdige Entscheidung reicher.",
+    "{user} hat den Server gefunden. Jetzt gibt es kein Zurück mehr.",
+    "Noch ein Name mehr auf der Anwesenheitsliste. Willkommen, {user}!",
+    "Die Gruppe wächst. Die Ausreden bei Wipes vermutlich auch.",
+    "Willkommen bei {guild} – bitte Mechaniken erst ignorieren, wenn sie erklärt wurden.",
+    "Mitglied #{member_count} ist angekommen. Das kann ja heiter werden.",
+)
+
+
 @dataclass(frozen=True)
 class ModuleDefinition:
     key: str
@@ -89,7 +105,7 @@ MODULES: tuple[ModuleDefinition, ...] = (
     ModuleDefinition(
         "onboarding",
         "Onboarding & Recruitment",
-        "Automatisches Onboarding, Bewerber und Staff-Review.",
+        "Automatisches Onboarding, Welcome Cards, Bewerber und Staff-Review.",
         "🚪",
     ),
     ModuleDefinition(

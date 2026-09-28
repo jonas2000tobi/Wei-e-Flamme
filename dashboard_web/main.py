@@ -35,6 +35,7 @@ from guild_modules import (
     resolved_enable_set,
     resolved_disable_set,
     required_modules_for_dashboard_path,
+    DEFAULT_ONBOARDING_WELCOME_SLOGANS,
 )
 from zoneinfo import ZoneInfo
 
@@ -66,15 +67,15 @@ async def _dashboard_lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Guild Platform Dashboard", version="2.4.0", lifespan=_dashboard_lifespan)
+app = FastAPI(title="Guild Platform Dashboard", version="2.5.0", lifespan=_dashboard_lifespan)
 security = HTTPBasic(auto_error=False)
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
-ASSET_VER = "guild-platform-v2-4-0-modules"
-DASHBOARD_RELEASE_VERSION = "2.4.0 · Modular Guild Core"
+ASSET_VER = "guild-platform-v2-5-0-welcome"
+DASHBOARD_RELEASE_VERSION = "2.5.0 · Welcome & Onboarding"
 
 _EVENT_IMAGE_ASSETS: dict[str, str] = {
     "guild_boss": f"/static/event_images/guild_boss.webp?v={ASSET_VER}",
@@ -435,6 +436,53 @@ def _set_guild_setting_value(guild_id: int, key: str, value: Any) -> None:
                 VALUES (%s,%s,%s,%s)
                 ON CONFLICT(guild_id,key) DO UPDATE SET value_json=EXCLUDED.value_json, updated_at=EXCLUDED.updated_at
             """, (int(guild_id), str(key), json.dumps(value, ensure_ascii=False, separators=(",", ":")), datetime.now(timezone.utc).isoformat()))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _dashboard_module_setting_value(guild_id: int, module: str, key: str, default: Any = None) -> Any:
+    if not _database_url() or not guild_id:
+        return default
+    try:
+        _ensure_guild_profile_schema()
+        conn = _pg_connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT value_json FROM module_settings WHERE guild_id=%s AND module=%s AND key=%s",
+                    (int(guild_id), str(module), str(key)),
+                )
+                row = cur.fetchone()
+            if not row:
+                return default
+            return json.loads(row.get("value_json") or "null")
+        finally:
+            conn.close()
+    except Exception:
+        return default
+
+
+def _set_dashboard_module_setting_value(guild_id: int, module: str, key: str, value: Any) -> None:
+    _ensure_guild_profile_schema()
+    conn = _pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO module_settings(guild_id,module,key,value_json,updated_at)
+                VALUES (%s,%s,%s,%s,%s)
+                ON CONFLICT(guild_id,module,key)
+                DO UPDATE SET value_json=EXCLUDED.value_json, updated_at=EXCLUDED.updated_at
+                """,
+                (
+                    int(guild_id),
+                    str(module),
+                    str(key),
+                    json.dumps(value, ensure_ascii=False, separators=(",", ":")),
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
         conn.commit()
     finally:
         conn.close()
@@ -15064,6 +15112,60 @@ def _render_admin_settings_editor(data: dict[str, Any], msg: str = "", section: 
                 </article>
                 """)
         active_optional = sum(1 for key in OPTIONAL_MODULE_KEYS if module_states.get(key, False))
+        onboarding_config_html = ""
+        if module_states.get("onboarding", False):
+            _, onboarding_channels = _catalog_from_snapshot(snap)
+            welcome_enabled = bool(_dashboard_module_setting_value(guild_id, "onboarding", "welcome_enabled", True))
+            welcome_update_on_leave = bool(_dashboard_module_setting_value(guild_id, "onboarding", "welcome_update_on_leave", True))
+            welcome_channel_id = int(_guild_setting_value(guild_id, "guild_channel_welcome_id", 0) or 0)
+            raw_slogans = _dashboard_module_setting_value(
+                guild_id,
+                "onboarding",
+                "welcome_slogans",
+                list(DEFAULT_ONBOARDING_WELCOME_SLOGANS),
+            )
+            if isinstance(raw_slogans, str):
+                raw_slogans = [line.strip() for line in raw_slogans.splitlines() if line.strip()]
+            welcome_slogans = [str(line).strip() for line in (raw_slogans or []) if str(line).strip()]
+            if not welcome_slogans:
+                welcome_slogans = list(DEFAULT_ONBOARDING_WELCOME_SLOGANS)
+            slogans_text = "\n".join(welcome_slogans)
+            onboarding_config_html = f"""
+            <section class='settings-card'>
+              <div class='settings-card-head'>
+                <div><div class='eyebrow'>Onboarding & Recruitment</div><h2>👋 Welcome Card</h2><p class='muted'>Beim Serverbeitritt erscheint eine Nachricht mit Avatar, Name und Zufallsspruch. Dieselbe Nachricht wird während des Onboardings automatisch aktualisiert.</p></div>
+                <span class='pill {'ok' if welcome_enabled else ''}'>{'Aktiv' if welcome_enabled else 'Aus'}</span>
+              </div>
+              <form method='post' action='/admin/onboarding-welcome-settings' class='settings-form'>
+                <div class='settings-two'>
+                  <label>Welcome Card aktiv
+                    <select name='welcome_enabled'>
+                      <option value='1' {'selected' if welcome_enabled else ''}>Ja</option>
+                      <option value='0' {'selected' if not welcome_enabled else ''}>Nein</option>
+                    </select>
+                  </label>
+                  <label>Bei Serveraustritt aktualisieren
+                    <select name='welcome_update_on_leave'>
+                      <option value='1' {'selected' if welcome_update_on_leave else ''}>Ja</option>
+                      <option value='0' {'selected' if not welcome_update_on_leave else ''}>Nein</option>
+                    </select>
+                  </label>
+                </div>
+                <label>Welcome-Kanal<br>{_channel_select('welcome_channel_id', onboarding_channels, welcome_channel_id, kinds={'text'})}</label>
+                <label>Fancy Sprüche – einer pro Zeile
+                  <textarea name='welcome_slogans' rows='10' maxlength='12000' placeholder='Ein neuer Held betritt das Schlachtfeld.'>{_e(slogans_text)}</textarea>
+                </label>
+                <p class='muted'>Platzhalter: <code>{{user}}</code> = Anzeigename · <code>{{guild}}</code> = Gildenname · <code>{{member_count}}</code> = aktuelle Mitgliederzahl. Maximal 50 Sprüche werden gespeichert.</p>
+                <div class='settings-readonly-grid'>
+                  <div><span>Beim Join</span><strong>🟡 Onboarding läuft</strong></div>
+                  <div><span>Staff-Review</span><strong>🟠 Wartet auf Freigabe</strong></div>
+                  <div><span>Abgeschlossen</span><strong>🟢 Onboarding abgeschlossen</strong></div>
+                  <div><span>Server verlassen</span><strong>⚫ Server verlassen</strong></div>
+                </div>
+                <button class='btn' type='submit'>Welcome-System speichern</button>
+              </form>
+            </section>
+            """
         section_html = f"""
         <section class='settings-card'>
           <div class='settings-card-head'><div><div class='eyebrow'>Core</div><h2>Grundsystem</h2><p class='muted'>Diese Bereiche bilden die Gildenplattform und bleiben immer aktiv.</p></div><span class='pill ok'>3 Core-Module</span></div>
@@ -15074,6 +15176,7 @@ def _render_admin_settings_editor(data: dict[str, Any], msg: str = "", section: 
           <div class='module-grid'>{''.join(optional_cards)}</div>
           <p class='muted'>Abhängigkeiten werden beim Aktivieren automatisch mit eingeschaltet. Wenn ein benötigtes Modul deaktiviert wird, werden abhängige Module ebenfalls deaktiviert.</p>
         </section>
+        {onboarding_config_html}
         """
     elif selected == "ec":
         point_forms = []
@@ -19165,6 +19268,48 @@ async def admin_module_toggle(module_key: str, request: Request, _: bool = Depen
         extras = [name for name in changed_labels if name != label]
         if extras:
             msg += " Abhängige Module ebenfalls deaktiviert: " + ", ".join(extras) + "."
+    return RedirectResponse(
+        "/admin-settings?" + urllib.parse.urlencode({"section": "modules", "msg": msg}),
+        status_code=303,
+    )
+
+
+@app.post("/admin/onboarding-welcome-settings")
+async def admin_onboarding_welcome_settings(request: Request, _: bool = Depends(_admin_auth)):
+    payload = _snapshot_payload()
+    guild_id = _safe_guild_id(payload)
+    if not guild_id:
+        raise HTTPException(status_code=400, detail="Guild-ID fehlt")
+    if not _dashboard_module_enabled("onboarding", guild_id):
+        return RedirectResponse(
+            "/admin-settings?" + urllib.parse.urlencode({"section": "modules", "msg": "Onboarding & Recruitment ist deaktiviert."}),
+            status_code=303,
+        )
+    form = _parse_urlencoded_body(await request.body())
+    welcome_enabled = str(form.get("welcome_enabled") or "0").strip().lower() in {"1", "true", "yes", "on"}
+    update_on_leave = str(form.get("welcome_update_on_leave") or "0").strip().lower() in {"1", "true", "yes", "on"}
+    channel_raw = str(form.get("welcome_channel_id") or "").strip()
+    channel_id = int(channel_raw) if channel_raw.isdigit() else 0
+    slogans_raw = str(form.get("welcome_slogans") or "")
+    slogans: list[str] = []
+    for line in slogans_raw.splitlines():
+        clean = re.sub(r"\s+", " ", str(line or "").strip())
+        if not clean:
+            continue
+        slogans.append(clean[:300])
+        if len(slogans) >= 50:
+            break
+    if not slogans:
+        slogans = list(DEFAULT_ONBOARDING_WELCOME_SLOGANS)
+
+    _set_guild_setting_value(guild_id, "guild_channel_welcome_id", channel_id)
+    _set_dashboard_module_setting_value(guild_id, "onboarding", "welcome_enabled", welcome_enabled)
+    _set_dashboard_module_setting_value(guild_id, "onboarding", "welcome_update_on_leave", update_on_leave)
+    _set_dashboard_module_setting_value(guild_id, "onboarding", "welcome_slogans", slogans)
+
+    msg = "Welcome-System gespeichert."
+    if welcome_enabled and not channel_id:
+        msg += " Es ist noch kein Welcome-Kanal ausgewählt; bis dahin wird keine öffentliche Welcome Card gesendet."
     return RedirectResponse(
         "/admin-settings?" + urllib.parse.urlencode({"section": "modules", "msg": msg}),
         status_code=303,
