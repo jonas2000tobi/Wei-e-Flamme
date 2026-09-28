@@ -75,7 +75,7 @@ if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 ASSET_VER = "guild-platform-v2-5-0-welcome"
-DASHBOARD_RELEASE_VERSION = "2.7.0 · Server-Logs, Ticket-Archiv & Rollenfix"
+DASHBOARD_RELEASE_VERSION = "2.8.0 · Dashboard Event-RSVP"
 
 _EVENT_IMAGE_ASSETS: dict[str, str] = {
     "guild_boss": f"/static/event_images/guild_boss.webp?v={ASSET_VER}",
@@ -9454,7 +9454,84 @@ def _render_member_detail(data: dict[str, Any], user_id: int, current_user: Opti
     return _html_shell(f"{display} · Beer and Buffs Dashboard", body)
 
 
-def _render_event_detail(data: dict[str, Any], event_id: str) -> str:
+def _event_rsvp_is_open(event: dict[str, Any]) -> bool:
+    status = str(event.get("status") or event.get("state") or "").strip().lower()
+    if status in {"closed", "ended", "finished", "beendet", "archived", "done", "completed", "deleted"}:
+        return False
+    start = _event_dt_obj(event.get("when_iso") or event.get("start_at") or event.get("created_at"))
+    if _is_running_event(event):
+        return True
+    if start is None:
+        return True
+    return start >= datetime.now(BERLIN_TZ)
+
+
+def _event_rsvp_choice_from_status(status: str) -> str:
+    value = str(status or "").upper()
+    if "TANK" in value:
+        return "TANK"
+    if "HEAL" in value:
+        return "HEAL"
+    if "DPS" in value or "DD" in value:
+        return "DPS"
+    if "BANK" in value or "RESERVE" in value:
+        return "BANK"
+    if "VIELLEICHT" in value or "MAYBE" in value:
+        return "MAYBE"
+    if "ABGEMELDET" in value or "NEIN" in value:
+        return "NO"
+    return ""
+
+
+def _event_rsvp_controls(event_id: str, user_status: str, *, return_to: str, compact: bool = False) -> str:
+    eid = str(event_id or "").strip()
+    if not eid:
+        return ""
+    current = _event_rsvp_choice_from_status(user_status)
+    choices = [
+        ("TANK", "🛡️", "Tank", "tank"),
+        ("HEAL", "✚", "Heal", "heal"),
+        ("DPS", "⚔️", "DPS", "dps"),
+        ("BANK", "🔖", "Reserve", "reserve"),
+        ("MAYBE", "❔", "Vielleicht", "maybe"),
+        ("NO", "✕", "Abmelden", "no"),
+    ]
+    forms = []
+    for choice, icon, label, css in choices:
+        active = " active" if current == choice else ""
+        forms.append(
+            f'<form method="post" action="/event/{_e(eid)}/rsvp" class="event-rsvp-form">'
+            f'<input type="hidden" name="choice" value="{_e(choice)}">'
+            f'<input type="hidden" name="next" value="{_e(return_to)}">'
+            f'<button type="submit" class="event-rsvp-btn {css}{active}" title="{_e(label)}">{icon}<span>{_e(label)}</span></button>'
+            '</form>'
+        )
+    cls = "event-rsvp-controls compact" if compact else "event-rsvp-controls"
+    return f'<div class="{cls}">' + "".join(forms) + '</div>'
+
+
+def _event_rsvp_flash(msg: str) -> str:
+    text = str(msg or "").strip()
+    if not text:
+        return ""
+    css = "ok" if text.startswith("✅") else ("danger" if text.startswith("❌") else "warn")
+    return f'<div class="event-rsvp-flash {css}">{_e(text)}</div>'
+
+
+def _event_rsvp_css() -> str:
+    return """<style>
+      .event-rsvp-controls{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:9px;margin-top:14px}
+      .event-rsvp-controls.compact{grid-template-columns:repeat(3,minmax(0,1fr));gap:6px;margin-top:10px}
+      .event-rsvp-form{margin:0}.event-rsvp-btn{width:100%;min-height:43px;display:flex;gap:7px;align-items:center;justify-content:center;border:1px solid rgba(214,168,79,.28);background:rgba(255,255,255,.035);color:#ded3c2;cursor:pointer;font:inherit;font-weight:750;padding:9px 8px;transition:.15s ease}
+      .event-rsvp-btn:hover{transform:translateY(-1px);border-color:rgba(214,168,79,.68);background:rgba(214,168,79,.10)}
+      .event-rsvp-btn.active{box-shadow:inset 0 0 0 1px #d6a84f;border-color:#d6a84f;background:rgba(214,168,79,.16);color:#f5dda3}
+      .event-rsvp-btn.no{border-color:rgba(190,71,65,.36)}.event-rsvp-btn.no:hover,.event-rsvp-btn.no.active{border-color:#c85f58;background:rgba(160,49,45,.16)}
+      .event-rsvp-btn.maybe{border-color:rgba(225,178,62,.34)}.event-rsvp-flash{margin:0 0 14px;padding:11px 13px;border:1px solid rgba(214,168,79,.35);background:rgba(214,168,79,.09);font-weight:700}.event-rsvp-flash.ok{border-color:rgba(91,171,91,.45);background:rgba(72,145,72,.11)}.event-rsvp-flash.danger{border-color:rgba(205,91,91,.45);background:rgba(180,63,63,.11)}
+      @media(max-width:620px){.event-rsvp-controls,.event-rsvp-controls.compact{grid-template-columns:repeat(2,minmax(0,1fr))}.event-rsvp-btn span{font-size:12px}}
+    </style>"""
+
+
+def _render_event_detail(data: dict[str, Any], event_id: str, request: Optional[Request] = None, msg: str = "") -> str:
     if not data.get("ok"):
         return _html_shell("Beer and Buffs Dashboard", f"<section class='panel'><h1>📊 Beer and Buffs Dashboard</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
     snap: dict[str, Any] = data.get("snapshot") or {}
@@ -9467,6 +9544,9 @@ def _render_event_detail(data: dict[str, Any], event_id: str) -> str:
         )
 
     summary = _event_response_summary(snap, event)
+    current_uid = int(_current_user_id(request) or 0) if request is not None else 0
+    current_status = _portal_event_status_for_user(event, current_uid) if current_uid else "—"
+    rsvp_open = bool(current_uid and _event_rsvp_is_open(event))
     role_items = [(str(g.get("role") or "Zusage"), len(g.get("participants") or [])) for g in summary.get("groups") or []]
     role_items.sort(key=lambda row: row[0].casefold())
 
@@ -9490,7 +9570,7 @@ def _render_event_detail(data: dict[str, Any], event_id: str) -> str:
         _card("Nicht abgestimmt", summary.get("no_response_count", 0), "noch keine Rückmeldung"),
     ])
 
-    css = """
+    css = _event_rsvp_css() + """
     <style>
       .event-role-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px}
       .event-role-card{border:1px solid rgba(214,168,79,.18);border-radius:16px;padding:15px;background:rgba(0,0,0,.18)}
@@ -9520,6 +9600,8 @@ def _render_event_detail(data: dict[str, Any], event_id: str) -> str:
       <a class="btn" href="/planning">Zurück</a>
     </section>
     <section class="grid">{cards}</section>
+    {_event_rsvp_flash(msg)}
+    {f'<section class="panel"><h2>🎮 Deine Rückmeldung</h2><p class="muted">Aktuell: <strong>{_e(current_status if current_status != "—" else "Noch nicht abgestimmt")}</strong>. Änderungen werden an den Bot gesendet und mit dem Discord-Event synchronisiert.</p>{_event_rsvp_controls(str(event_id), current_status, return_to=f"/event/{urllib.parse.quote(str(event_id))}")}</section>' if rsvp_open else ('<section class="panel"><h2>🎮 Deine Rückmeldung</h2><p class="muted">Dieses Event ist für neue Rückmeldungen geschlossen.</p></section>' if current_uid else '')}
     <section class="panel" id="roles"><h2>📊 Rollenverteilung</h2>{_bars(role_items, max_items=12)}</section>
     <section class="panel"><h2>✅ Wer ist dabei?</h2><p class="muted">Zusagen sind ausschließlich Tank, Heal, DPS und Bank/Reserve.</p>{_event_role_overview_html(event)}</section>
     <section class="panel" id="open"><h2>🕒 Noch nicht zugesagt</h2><p class="muted">Vielleicht steht zuerst, danach Abmeldungen und Mitglieder ohne Rückmeldung.</p>{_event_name_chips(not_joined, empty='Alle Mitglieder haben zugesagt.')}</section>
@@ -13630,6 +13712,7 @@ def _render_member_events_page(data: dict[str, Any], request: Request) -> str:
         )
 
     uid = int(_current_user_id(request) or 0)
+    page_msg = str(request.query_params.get("msg") or "").strip()
     snap: dict[str, Any] = data.get("snapshot") or {}
     guild_id = int(_safe_guild_id(data) or 0)
     now = datetime.now(BERLIN_TZ)
@@ -13803,13 +13886,8 @@ def _render_member_events_page(data: dict[str, Any], request: Request) -> str:
           </div>
           {role_strip(summary)}
           <div class="event-own-status"><span>👤 Dein Status:</span><strong class="{status_class(user_status)}">{_e(user_status if user_status != '—' else 'Noch nicht abgestimmt')}</strong></div>
-          <div class="event-feature-actions">
-            <a class="event-choice participate" href="{_e(href)}"{target}>✓ <span>Teilnehmen</span></a>
-            <a class="event-choice maybe" href="{_e(href)}"{target}>? <span>Vielleicht</span></a>
-            <a class="event-choice reserve" href="{_e(href)}"{target}>🔖 <span>Reserve</span></a>
-            <a class="event-choice decline" href="{_e(href)}"{target}>✕ <span>Abmelden</span></a>
-          </div>
-          <p class="event-action-note">Die Auswahl öffnet den Eventpost in Discord, dort wird die Rolle bzw. Rückmeldung gesetzt.</p>
+          {_event_rsvp_controls(eid, user_status, return_to="/member/events") if _event_rsvp_is_open(ev) else '<p class="event-action-note">Dieses Event ist für Rückmeldungen geschlossen.</p>'}
+          <p class="event-action-note">Änderungen werden über den Bot direkt mit dem Discord-Event synchronisiert.</p>
         </article>
         '''
 
@@ -13832,8 +13910,9 @@ def _render_member_events_page(data: dict[str, Any], request: Request) -> str:
             <div class="event-mini-status">Dein Status: <strong class="{status_class(user_status)}">{_e(user_status if user_status != '—' else 'Noch nicht abgestimmt')}</strong></div>
             <div class="event-mini-actions">
               <a class="event-secondary-button primary" href="/event/{_e(eid)}">Details öffnen</a>
-              <a class="event-secondary-button" href="{_e(href)}"{target}>Status ändern</a>
+              {f'<a class="event-secondary-button" href="{_e(href)}"{target}>Discord öffnen</a>' if href.startswith('https://') else ''}
             </div>
+            {_event_rsvp_controls(eid, user_status, return_to="/member/events", compact=True) if _event_rsvp_is_open(ev) else ''}
           </div>
         </article>
         '''
@@ -13949,7 +14028,9 @@ def _render_member_events_page(data: dict[str, Any], request: Request) -> str:
       @media(max-width:720px){{.events-page-heading h1{{font-size:34px}}.event-feature-main{{grid-template-columns:1fr}}.event-feature-image{{height:190px}}.event-role-strip{{grid-template-columns:repeat(3,minmax(0,1fr))}}.event-feature-actions{{grid-template-columns:1fr 1fr}}.event-mini-card{{grid-template-columns:105px minmax(0,1fr)}}.event-mini-image{{min-height:235px}}}}
       @media(max-width:480px){{.event-feature-card,.event-status-panel,.events-more-panel{{padding:13px}}.event-feature-copy h2{{font-size:27px}}.event-role-strip{{grid-template-columns:1fr 1fr}}.event-feature-actions{{grid-template-columns:1fr}}.event-mini-card{{grid-template-columns:1fr}}.event-mini-image{{height:150px;min-height:150px;border-right:0;border-bottom:1px solid rgba(214,168,79,.22)}}.event-mini-heading{{display:block}}.event-mini-open{{display:inline-flex;margin-bottom:6px}}}}
     </style>
+    {_event_rsvp_css()}
     <nav class="topnav"><a href="/member">Start</a><a href="/member/events">Events</a><a href="/member/auctions">Auktionen</a><a href="/portal">Eigenes Profil</a></nav>
+    {_event_rsvp_flash(page_msg)}
     <header class="events-page-heading"><h1>Events</h1><p class="muted">Deine kommenden Gildeneinsätze</p></header>
     <section class="events-top-layout">
       {featured_html}
@@ -15562,13 +15643,19 @@ def _enqueue_event_action_request(guild_id: int, action_type: str, payload: dict
     if not guild_id:
         return {"ok": False, "error": "Guild-ID fehlt."}
     action = str(action_type or "").strip().lower()
-    if action not in {"create", "edit", "delete"}:
+    if action not in {"create", "edit", "delete", "rsvp"}:
         return {"ok": False, "error": "Unbekannte Event-Aktion."}
     actor_id = str(actor.get("user_id") or "").strip()
     actor_name = str(actor.get("username") or actor_id or "Dashboard")
     event_id = str(payload.get("event_id") or "").strip()
-    if action in {"edit", "delete"} and not event_id:
+    if action in {"edit", "delete", "rsvp"} and not event_id:
         return {"ok": False, "error": "Event-ID fehlt."}
+    if action == "rsvp":
+        choice = str(payload.get("choice") or payload.get("response") or "").strip().upper()
+        if choice not in {"TANK", "HEAL", "DPS", "BANK", "MAYBE", "NO"}:
+            return {"ok": False, "error": "Ungültige RSVP-Auswahl."}
+        if not actor_id.isdigit():
+            return {"ok": False, "error": "Discord-Login erforderlich."}
     if action == "create" and not str(payload.get("title") or "").strip():
         return {"ok": False, "error": "Titel fehlt."}
     if action == "create" and not str(payload.get("channel_id") or "").strip():
@@ -15585,6 +15672,16 @@ def _enqueue_event_action_request(guild_id: int, action_type: str, payload: dict
     conn = _pg_connect()
     try:
         with conn.cursor() as cur:
+            if action == "rsvp":
+                cur.execute(
+                    """
+                    UPDATE dashboard_event_action_requests
+                    SET status = 'superseded', processed_at = NOW(), result_json = %s
+                    WHERE guild_id = %s AND event_id = %s AND action_type = 'rsvp'
+                      AND actor_id = %s AND status = 'pending'
+                    """,
+                    (json.dumps({"ok": False, "message": "Durch neuere Dashboard-RSVP ersetzt."}, ensure_ascii=False), int(guild_id), event_id, actor_id),
+                )
             cur.execute(
                 """
                 INSERT INTO dashboard_event_action_requests
@@ -15858,7 +15955,7 @@ def _render_event_editor(data: dict[str, Any], event_id: str, current_user: Opti
     location = str(ev.get("location") or "")
     current_status = str(ev.get("status") or ev.get("state") or "active").strip().lower()
     running = _is_running_event(ev)
-    action_rows = _dashboard_event_action_requests(guild_id, limit=20, event_id=eid) if guild_id else []
+    action_rows = [r for r in (_dashboard_event_action_requests(guild_id, limit=60, event_id=eid) if guild_id else []) if str(r.get("action_type") or "") in {"create","edit","delete"}]
     queue_label, queue_class = _event_admin_queue_state(action_rows, eid)
     discord_url = _event_admin_discord_url(ev)
     image_presets_json = json.dumps({
@@ -15972,7 +16069,7 @@ def _render_events_center(data: dict[str, Any], current_user: Optional[dict[str,
     upcoming.sort(key=lambda ev: _event_admin_datetime(ev) or datetime.max.replace(tzinfo=BERLIN_TZ))
     past.sort(key=lambda ev: -((_event_admin_datetime(ev) or datetime.min.replace(tzinfo=BERLIN_TZ)).timestamp()))
 
-    action_rows = _dashboard_event_action_requests(guild_id, limit=100) if guild_id else []
+    action_rows = [r for r in (_dashboard_event_action_requests(guild_id, limit=180) if guild_id else []) if str(r.get("action_type") or "") in {"create","edit","delete"}]
     action_counts = _event_action_counts(action_rows)
 
     def _status_bucket(ev: dict[str, Any]) -> str:
@@ -18473,15 +18570,53 @@ def api_auction_dashboard_actions(auction_id: str, _: bool = Depends(_auth)):
 
 
 @app.get("/event/{event_id}", response_class=HTMLResponse)
-def event_detail(event_id: str, _: bool = Depends(_auth)):
+def event_detail(event_id: str, request: Request, _: bool = Depends(_auth), msg: str = ""):
     try:
-        return HTMLResponse(_render_event_detail(_snapshot_payload(), str(event_id)))
+        return HTMLResponse(_render_event_detail(_snapshot_payload(), str(event_id), request, msg))
     except Exception as exc:
         return HTMLResponse(
             _html_shell("Beer and Buffs Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
             status_code=500,
         )
 
+
+
+@app.post("/event/{event_id}/rsvp")
+async def event_dashboard_rsvp(event_id: str, request: Request, _: bool = Depends(_auth)):
+    data = _snapshot_payload()
+    guild_id = int(_safe_guild_id(data) or 0)
+    snap = data.get("snapshot") or {}
+    uid = int(_current_user_id(request) or 0)
+    actor = _current_user(request) or {}
+    form = _parse_urlencoded_body(await request.body())
+    choice = str(form.get("choice") or "").strip().upper()
+    next_path = str(form.get("next") or f"/event/{event_id}").strip()
+    allowed_next = {f"/event/{event_id}", "/member/events", "/events"}
+    if next_path not in allowed_next:
+        next_path = f"/event/{event_id}"
+
+    if not uid:
+        message = "❌ Für Event-Rückmeldungen musst du mit Discord eingeloggt sein."
+    elif not guild_id:
+        message = "❌ Guild-ID fehlt."
+    elif choice not in {"TANK", "HEAL", "DPS", "BANK", "MAYBE", "NO"}:
+        message = "❌ Ungültige Rückmeldung."
+    else:
+        event = _event_by_id(snap, str(event_id))
+        if not event:
+            message = "❌ Event wurde nicht gefunden."
+        elif not _event_rsvp_is_open(event):
+            message = "❌ Dieses Event ist für Rückmeldungen geschlossen."
+        else:
+            actor = dict(actor)
+            actor["user_id"] = str(uid)
+            payload = {"event_id": str(event_id), "choice": choice, "source": "dashboard_member_rsvp"}
+            result = _enqueue_event_action_request(guild_id, "rsvp", payload, actor)
+            label = {"TANK":"Tank", "HEAL":"Heal", "DPS":"DPS", "BANK":"Reserve", "MAYBE":"Vielleicht", "NO":"Abgemeldet"}.get(choice, choice)
+            message = (f"✅ {label} wurde an den Bot gesendet. Discord und Dashboard werden synchronisiert." if result.get("ok") else f"❌ {result.get('error') or 'Rückmeldung konnte nicht gesendet werden.'}")
+
+    joiner = "&" if "?" in next_path else "?"
+    return RedirectResponse(next_path + joiner + "msg=" + urllib.parse.quote(message), status_code=303)
 
 
 @app.get("/member", response_class=HTMLResponse)
