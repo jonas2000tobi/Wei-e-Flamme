@@ -75,7 +75,7 @@ if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 ASSET_VER = "guild-platform-v2-5-0-welcome"
-DASHBOARD_RELEASE_VERSION = "2.8.0 · Dashboard Event-RSVP"
+DASHBOARD_RELEASE_VERSION = "2.9.0 · Raid-Aufstellung & Leader-Ticket-Chats"
 
 _EVENT_IMAGE_ASSETS: dict[str, str] = {
     "guild_boss": f"/static/event_images/guild_boss.webp?v={ASSET_VER}",
@@ -2556,6 +2556,29 @@ def _ensure_admin_tables() -> None:
                 """
                 CREATE INDEX IF NOT EXISTS idx_dashboard_event_action_requests_lookup
                 ON dashboard_event_action_requests (guild_id, event_id, status, requested_at DESC)
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS dashboard_event_lineups (
+                    guild_id BIGINT NOT NULL,
+                    event_id TEXT NOT NULL,
+                    lineup_json TEXT NOT NULL DEFAULT '{}',
+                    published BOOLEAN NOT NULL DEFAULT FALSE,
+                    discord_channel_id BIGINT NOT NULL DEFAULT 0,
+                    discord_message_id BIGINT NOT NULL DEFAULT 0,
+                    updated_by_id TEXT,
+                    updated_by_name TEXT,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    last_synced_at TIMESTAMPTZ,
+                    PRIMARY KEY (guild_id, event_id)
+                )
+                """
+            )
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_dashboard_event_lineups_updated
+                ON dashboard_event_lineups (guild_id, updated_at DESC)
                 """
             )
             cur.execute(
@@ -9587,9 +9610,12 @@ def _render_event_detail(data: dict[str, Any], event_id: str, request: Optional[
     </style>
     """
 
+    lineup_panel = _event_lineup_panel(data, event, str(event_id), request)
+    lineup_nav = '<a href="#lineup">Aufstellung</a>' if lineup_panel else ''
+
     body = f"""
     {css}
-    <nav class="topnav"><a href="/planning">← Planung</a><a href="#roles">Zusagen</a><a href="#open">Noch nicht zugesagt</a><a href="/attendance">Anwesenheit nach dem Event</a></nav>
+    <nav class="topnav"><a href="/planning">← Planung</a>{lineup_nav}<a href="#roles">Zusagen</a><a href="#open">Noch nicht zugesagt</a><a href="/attendance">Anwesenheit nach dem Event</a></nav>
     <section class="hero">
       <div>
         <div class="eyebrow">Event · Abstimmungsübersicht</div>
@@ -9602,6 +9628,7 @@ def _render_event_detail(data: dict[str, Any], event_id: str, request: Optional[
     <section class="grid">{cards}</section>
     {_event_rsvp_flash(msg)}
     {f'<section class="panel"><h2>🎮 Deine Rückmeldung</h2><p class="muted">Aktuell: <strong>{_e(current_status if current_status != "—" else "Noch nicht abgestimmt")}</strong>. Änderungen werden an den Bot gesendet und mit dem Discord-Event synchronisiert.</p>{_event_rsvp_controls(str(event_id), current_status, return_to=f"/event/{urllib.parse.quote(str(event_id))}")}</section>' if rsvp_open else ('<section class="panel"><h2>🎮 Deine Rückmeldung</h2><p class="muted">Dieses Event ist für neue Rückmeldungen geschlossen.</p></section>' if current_uid else '')}
+    {lineup_panel}
     <section class="panel" id="roles"><h2>📊 Rollenverteilung</h2>{_bars(role_items, max_items=12)}</section>
     <section class="panel"><h2>✅ Wer ist dabei?</h2><p class="muted">Zusagen sind ausschließlich Tank, Heal, DPS und Bank/Reserve.</p>{_event_role_overview_html(event)}</section>
     <section class="panel" id="open"><h2>🕒 Noch nicht zugesagt</h2><p class="muted">Vielleicht steht zuerst, danach Abmeldungen und Mitglieder ohne Rückmeldung.</p>{_event_name_chips(not_joined, empty='Alle Mitglieder haben zugesagt.')}</section>
@@ -15643,12 +15670,12 @@ def _enqueue_event_action_request(guild_id: int, action_type: str, payload: dict
     if not guild_id:
         return {"ok": False, "error": "Guild-ID fehlt."}
     action = str(action_type or "").strip().lower()
-    if action not in {"create", "edit", "delete", "rsvp"}:
+    if action not in {"create", "edit", "delete", "rsvp", "lineup"}:
         return {"ok": False, "error": "Unbekannte Event-Aktion."}
     actor_id = str(actor.get("user_id") or "").strip()
     actor_name = str(actor.get("username") or actor_id or "Dashboard")
     event_id = str(payload.get("event_id") or "").strip()
-    if action in {"edit", "delete", "rsvp"} and not event_id:
+    if action in {"edit", "delete", "rsvp", "lineup"} and not event_id:
         return {"ok": False, "error": "Event-ID fehlt."}
     if action == "rsvp":
         choice = str(payload.get("choice") or payload.get("response") or "").strip().upper()
@@ -15682,6 +15709,16 @@ def _enqueue_event_action_request(guild_id: int, action_type: str, payload: dict
                     """,
                     (json.dumps({"ok": False, "message": "Durch neuere Dashboard-RSVP ersetzt."}, ensure_ascii=False), int(guild_id), event_id, actor_id),
                 )
+            if action == "lineup":
+                cur.execute(
+                    """
+                    UPDATE dashboard_event_action_requests
+                    SET status = 'superseded', processed_at = NOW(), result_json = %s
+                    WHERE guild_id = %s AND event_id = %s AND action_type = 'lineup'
+                      AND status = 'pending'
+                    """,
+                    (json.dumps({"ok": False, "message": "Durch neuere Aufstellung ersetzt."}, ensure_ascii=False), int(guild_id), event_id),
+                )
             cur.execute(
                 """
                 INSERT INTO dashboard_event_action_requests
@@ -15705,6 +15742,293 @@ def _enqueue_event_action_request(guild_id: int, action_type: str, payload: dict
     finally:
         conn.close()
 
+
+
+def _event_lineup_candidates(event: dict[str, Any]) -> list[dict[str, Any]]:
+    """Aktuelle Zusagen eines Events als eindeutige Drag-&-Drop-Kandidaten."""
+    out: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    role_order = {"TANK": 0, "HEAL": 1, "HEALER": 1, "DPS": 2, "BANK": 3, "RESERVE": 3}
+    groups = sorted(
+        _event_yes_groups(event),
+        key=lambda g: (role_order.get(str(g.get("role") or "").upper(), 20), str(g.get("role") or "").casefold()),
+    )
+    for group in groups:
+        role_raw = str(group.get("role") or "Zusage").strip()
+        role_key = role_raw.upper()
+        role = {"HEALER": "Heal", "HEAL": "Heal", "TANK": "Tank", "DPS": "DPS", "BANK": "Reserve", "RESERVE": "Reserve"}.get(role_key, role_raw or "Zusage")
+        for person in group.get("participants") or []:
+            if not isinstance(person, dict):
+                continue
+            uid = _user_id(person.get("user_id") or person.get("id"))
+            if not uid or uid in seen:
+                continue
+            seen.add(uid)
+            out.append({
+                "user_id": int(uid),
+                "display_name": _event_person_name(person),
+                "role": role,
+            })
+    return out
+
+
+def _event_lineup_default(event: dict[str, Any], *, group_size: int = 6) -> dict[str, Any]:
+    candidates = _event_lineup_candidates(event)
+    size = max(1, min(24, int(group_size or 6)))
+    group_count = max(1, (len(candidates) + size - 1) // size) if candidates else 1
+    return {
+        "group_size": size,
+        "group_count": group_count,
+        "groups": [{"name": f"Gruppe {i}", "members": []} for i in range(1, group_count + 1)],
+        "bench": [],
+        "published": False,
+    }
+
+
+def _load_event_lineup(guild_id: int, event_id: str, event: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    if not guild_id or not event_id or not _database_url():
+        return _event_lineup_default(event or {})
+    _ensure_admin_tables()
+    conn = _pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT lineup_json, published, discord_channel_id, discord_message_id,
+                       updated_by_id, updated_by_name, updated_at, last_synced_at
+                FROM dashboard_event_lineups
+                WHERE guild_id = %s AND event_id = %s
+                """,
+                (int(guild_id), str(event_id)),
+            )
+            row = dict(cur.fetchone() or {})
+    finally:
+        conn.close()
+    if not row:
+        return _event_lineup_default(event or {})
+    try:
+        lineup = json.loads(row.get("lineup_json") or "{}")
+    except Exception:
+        lineup = {}
+    if not isinstance(lineup, dict):
+        lineup = {}
+    lineup.setdefault("group_size", 6)
+    lineup.setdefault("group_count", max(1, len(lineup.get("groups") or [])))
+    lineup.setdefault("groups", [])
+    lineup.setdefault("bench", [])
+    lineup["published"] = bool(row.get("published"))
+    lineup["discord_channel_id"] = int(row.get("discord_channel_id") or 0)
+    lineup["discord_message_id"] = int(row.get("discord_message_id") or 0)
+    lineup["updated_by_id"] = str(row.get("updated_by_id") or "")
+    lineup["updated_by_name"] = str(row.get("updated_by_name") or "")
+    lineup["updated_at"] = row.get("updated_at")
+    lineup["last_synced_at"] = row.get("last_synced_at")
+    return lineup
+
+
+def _normalize_event_lineup(event: dict[str, Any], raw: Any) -> dict[str, Any]:
+    """Lineup gegen aktuelle Event-Zusagen validieren und Dubletten entfernen."""
+    data = raw if isinstance(raw, dict) else {}
+    candidates = _event_lineup_candidates(event)
+    by_uid = {int(x["user_id"]): x for x in candidates}
+    size = max(1, min(24, int(_num(data.get("group_size"), 6) or 6)))
+    requested_count = max(1, min(20, int(_num(data.get("group_count"), 1) or 1)))
+    raw_groups = data.get("groups") if isinstance(data.get("groups"), list) else []
+    requested_count = max(requested_count, len(raw_groups), 1)
+    groups: list[dict[str, Any]] = []
+    used: set[int] = set()
+    for idx in range(requested_count):
+        src = raw_groups[idx] if idx < len(raw_groups) and isinstance(raw_groups[idx], dict) else {}
+        name = re.sub(r"\s+", " ", str(src.get("name") or f"Gruppe {idx + 1}").strip())[:60] or f"Gruppe {idx + 1}"
+        members: list[dict[str, Any]] = []
+        for item in (src.get("members") or []):
+            uid = _user_id(item.get("user_id") if isinstance(item, dict) else item)
+            if not uid or uid in used or uid not in by_uid or len(members) >= size:
+                continue
+            used.add(uid)
+            members.append(dict(by_uid[uid]))
+        groups.append({"name": name, "members": members})
+    bench: list[dict[str, Any]] = []
+    for item in (data.get("bench") or []):
+        uid = _user_id(item.get("user_id") if isinstance(item, dict) else item)
+        if not uid or uid in used or uid not in by_uid:
+            continue
+        used.add(uid)
+        bench.append(dict(by_uid[uid]))
+    return {
+        "group_size": size,
+        "group_count": len(groups),
+        "groups": groups,
+        "bench": bench,
+        "published": bool(data.get("published")),
+        "candidate_count": len(candidates),
+    }
+
+
+def _save_event_lineup(guild_id: int, event_id: str, event: dict[str, Any], lineup: dict[str, Any], actor: dict[str, Any]) -> dict[str, Any]:
+    if not _database_url():
+        raise RuntimeError("DATABASE_URL fehlt.")
+    clean = _normalize_event_lineup(event, lineup)
+    actor_id = str(actor.get("user_id") or actor.get("id") or "")
+    actor_name = str(actor.get("username") or actor.get("global_name") or actor_id or "Dashboard")
+    _ensure_admin_tables()
+    conn = _pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO dashboard_event_lineups
+                    (guild_id, event_id, lineup_json, published, updated_by_id, updated_by_name, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, NOW())
+                ON CONFLICT (guild_id, event_id) DO UPDATE SET
+                    lineup_json = EXCLUDED.lineup_json,
+                    published = EXCLUDED.published,
+                    updated_by_id = EXCLUDED.updated_by_id,
+                    updated_by_name = EXCLUDED.updated_by_name,
+                    updated_at = NOW()
+                """,
+                (int(guild_id), str(event_id), json.dumps(clean, ensure_ascii=False, separators=(",", ":")), bool(clean.get("published")), actor_id, actor_name),
+            )
+            cur.execute(
+                """
+                INSERT INTO dashboard_admin_action_log
+                    (guild_id, action_type, target_type, target_id, actor_id, actor_name, payload_json)
+                VALUES (%s, 'event_lineup_save', 'event', %s, %s, %s, %s)
+                """,
+                (int(guild_id), str(event_id), actor_id, actor_name, json.dumps({"groups": clean.get("group_count"), "group_size": clean.get("group_size"), "published": clean.get("published")}, ensure_ascii=False)),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    return clean
+
+
+def _event_lineup_panel(data: dict[str, Any], event: dict[str, Any], event_id: str, request: Optional[Request]) -> str:
+    if request is None or not _is_dashboard_admin(request):
+        return ""
+    guild_id = int(_safe_guild_id(data) or 0)
+    candidates = _event_lineup_candidates(event)
+    stored = _load_event_lineup(guild_id, str(event_id), event)
+    clean = _normalize_event_lineup(event, stored)
+    clean["published"] = bool(stored.get("published"))
+    clean["discord_channel_id"] = int(stored.get("discord_channel_id") or 0)
+    clean["discord_message_id"] = int(stored.get("discord_message_id") or 0)
+    clean["updated_by_name"] = str(stored.get("updated_by_name") or "")
+    clean["updated_at"] = stored.get("updated_at")
+    clean["last_synced_at"] = stored.get("last_synced_at")
+
+    payload = {
+        "event_id": str(event_id),
+        "group_size": clean.get("group_size", 6),
+        "group_count": clean.get("group_count", 1),
+        "groups": clean.get("groups") or [],
+        "bench": clean.get("bench") or [],
+        "published": bool(clean.get("published")),
+        "candidates": candidates,
+    }
+    js_data = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).replace("</", "<\\/")
+    pub_text = "🟢 Discord-Live-Sync aktiv" if clean.get("published") else "⚪ Noch nicht auf Discord veröffentlicht"
+    discord_link = ""
+    if clean.get("discord_channel_id") and clean.get("discord_message_id"):
+        discord_link = f'<a class="btn ghost" href="https://discord.com/channels/{int(guild_id)}/{int(clean.get("discord_channel_id"))}/{int(clean.get("discord_message_id"))}" target="_blank" rel="noopener">Discord-Aufstellung öffnen</a>'
+
+    return f"""
+    <section class="panel lineup-panel" id="lineup">
+      <div class="lineup-toolbar">
+        <div>
+          <h2>🧩 Raid-/Gruppenaufstellung</h2>
+          <p class="muted">Ziehe angemeldete Spieler per Drag & Drop in die Gruppen. Nach dem Veröffentlichen werden weitere Verschiebungen automatisch mit dem Discord-Post synchronisiert.</p>
+        </div>
+        <span id="lineup-sync-state" class="pill">{_e(pub_text)}</span>
+      </div>
+      <div class="lineup-settings">
+        <label>Gruppengröße <input id="lineup-group-size" type="number" min="1" max="24" value="{int(clean.get('group_size') or 6)}"></label>
+        <label>Gruppen <input id="lineup-group-count" type="number" min="1" max="20" value="{int(clean.get('group_count') or 1)}"></label>
+        <button class="btn ghost" type="button" id="lineup-apply-size">Gruppen anwenden</button>
+        <button class="btn ghost" type="button" id="lineup-auto">⚡ Automatisch verteilen</button>
+        <button class="btn" type="button" id="lineup-publish">📣 Auf Discord veröffentlichen</button>
+        {discord_link}
+      </div>
+      <div id="lineup-save-note" class="muted" style="margin:8px 0 14px">{_e(('Zuletzt geändert von ' + str(clean.get('updated_by_name'))) if clean.get('updated_by_name') else 'Noch keine gespeicherte Aufstellung.')}</div>
+      <div class="lineup-board">
+        <div class="lineup-pool-wrap">
+          <h3>Angemeldet / nicht eingeteilt <span id="lineup-pool-count" class="pill"></span></h3>
+          <div id="lineup-pool" class="lineup-dropzone lineup-pool" data-zone="pool"></div>
+          <h3 style="margin-top:16px">Reserve / Bank</h3>
+          <div id="lineup-bench" class="lineup-dropzone lineup-bench" data-zone="bench"></div>
+        </div>
+        <div id="lineup-groups" class="lineup-groups"></div>
+      </div>
+    </section>
+    <style>
+      .lineup-toolbar{{display:flex;justify-content:space-between;align-items:flex-start;gap:14px;flex-wrap:wrap}}.lineup-toolbar h2{{margin-top:0}}
+      .lineup-settings{{display:flex;gap:10px;align-items:end;flex-wrap:wrap;margin:12px 0}}.lineup-settings label{{display:grid;gap:5px;font-size:12px;color:var(--muted)}}
+      .lineup-settings input{{width:95px;padding:9px;border-radius:10px;border:1px solid rgba(255,255,255,.14);background:rgba(0,0,0,.2);color:inherit}}
+      .lineup-board{{display:grid;grid-template-columns:minmax(240px,.8fr) minmax(0,2fr);gap:14px}}.lineup-pool-wrap{{border:1px solid rgba(255,255,255,.09);border-radius:16px;padding:12px;background:rgba(0,0,0,.12)}}
+      .lineup-groups{{display:grid;grid-template-columns:repeat(auto-fit,minmax(245px,1fr));gap:12px}}.lineup-group{{border:1px solid rgba(214,168,79,.22);border-radius:16px;padding:12px;background:rgba(0,0,0,.15)}}
+      .lineup-group-head{{display:flex;justify-content:space-between;gap:8px;align-items:center;margin-bottom:8px}}.lineup-group-name{{font-weight:800;color:#efd594;background:transparent;border:0;border-bottom:1px dashed rgba(239,213,148,.35);min-width:0;width:150px}}
+      .lineup-dropzone{{min-height:64px;border:1px dashed rgba(255,255,255,.18);border-radius:12px;padding:8px;display:flex;flex-direction:column;gap:7px}}.lineup-dropzone.drag-over{{border-color:#efd594;background:rgba(214,168,79,.08)}}
+      .lineup-player{{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:9px 10px;border-radius:11px;background:rgba(255,255,255,.055);border:1px solid rgba(255,255,255,.08);cursor:grab;user-select:none}}.lineup-player:active{{cursor:grabbing}}.lineup-player b{{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}.lineup-role{{font-size:11px;padding:3px 6px;border-radius:999px;background:rgba(214,168,79,.11);color:#e8cf99;white-space:nowrap}}.lineup-pool .lineup-player{{background:rgba(255,255,255,.035)}}
+      @media(max-width:850px){{.lineup-board{{grid-template-columns:1fr}}.lineup-groups{{grid-template-columns:1fr}}}}
+    </style>
+    <script>
+    (()=>{{
+      const initial={js_data};
+      const byId=new Map((initial.candidates||[]).map(x=>[String(x.user_id),x]));
+      let state={{group_size:Number(initial.group_size||6),group_count:Number(initial.group_count||1),groups:initial.groups||[],bench:initial.bench||[],published:!!initial.published}};
+      let timer=null, saving=false;
+      const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]));
+      function normalize(){{
+        state.group_size=Math.max(1,Math.min(24,Number(state.group_size||6)));
+        state.group_count=Math.max(1,Math.min(20,Number(state.group_count||1)));
+        while(state.groups.length<state.group_count) state.groups.push({{name:`Gruppe ${{state.groups.length+1}}`,members:[]}});
+        if(state.groups.length>state.group_count){{const removed=state.groups.splice(state.group_count);for(const g of removed) state.bench.push(...(g.members||[]));}}
+        state.groups.forEach((g,i)=>{{g.name=g.name||`Gruppe ${{i+1}}`;g.members=(g.members||[]).slice(0,state.group_size)}});
+      }}
+      function placedIds(){{const x=new Set();state.groups.forEach(g=>(g.members||[]).forEach(m=>x.add(String(m.user_id))));(state.bench||[]).forEach(m=>x.add(String(m.user_id)));return x}}
+      function playerHtml(p){{return `<div class="lineup-player" draggable="true" data-user-id="${{esc(p.user_id)}}"><b>${{esc(p.display_name)}}</b><span class="lineup-role">${{esc(p.role||'')}}</span></div>`}}
+      function render(){{
+        normalize();
+        const used=placedIds();
+        const pool=(initial.candidates||[]).filter(p=>!used.has(String(p.user_id)));
+        document.getElementById('lineup-pool').innerHTML=pool.map(playerHtml).join('')||'<span class="muted">Alle eingeteilt.</span>';
+        document.getElementById('lineup-pool-count').textContent=pool.length;
+        document.getElementById('lineup-bench').innerHTML=(state.bench||[]).map(playerHtml).join('')||'<span class="muted">Keine Reserve.</span>';
+        document.getElementById('lineup-groups').innerHTML=state.groups.map((g,i)=>`<div class="lineup-group"><div class="lineup-group-head"><input class="lineup-group-name" data-gi="${{i}}" value="${{esc(g.name)}}"><span class="pill">${{(g.members||[]).length}} / ${{state.group_size}}</span></div><div class="lineup-dropzone" data-zone="group" data-gi="${{i}}">${{(g.members||[]).map(playerHtml).join('')||'<span class="muted">Spieler hierher ziehen</span>'}}</div></div>`).join('');
+        bindDnD();
+        document.querySelectorAll('.lineup-group-name').forEach(el=>el.addEventListener('change',()=>{{state.groups[Number(el.dataset.gi)].name=el.value.trim()||`Gruppe ${{Number(el.dataset.gi)+1}}`;scheduleSave()}}));
+      }}
+      function removeUser(uid){{state.groups.forEach(g=>g.members=(g.members||[]).filter(m=>String(m.user_id)!==uid));state.bench=(state.bench||[]).filter(m=>String(m.user_id)!==uid)}}
+      function move(uid,zone,gi){{const p=byId.get(uid);if(!p)return;removeUser(uid);if(zone==='bench')state.bench.push(p);else if(zone==='group'){{const g=state.groups[gi];if(!g||g.members.length>=state.group_size)return;g.members.push(p)}}render();scheduleSave()}}
+      function bindDnD(){{
+        document.querySelectorAll('.lineup-player').forEach(el=>el.addEventListener('dragstart',e=>{{e.dataTransfer.setData('text/plain',el.dataset.userId);e.dataTransfer.effectAllowed='move'}}));
+        document.querySelectorAll('.lineup-dropzone').forEach(z=>{{z.addEventListener('dragover',e=>{{e.preventDefault();z.classList.add('drag-over')}});z.addEventListener('dragleave',()=>z.classList.remove('drag-over'));z.addEventListener('drop',e=>{{e.preventDefault();z.classList.remove('drag-over');const uid=e.dataTransfer.getData('text/plain');if(z.dataset.zone==='pool'){{removeUser(uid);render();scheduleSave()}}else move(uid,z.dataset.zone,Number(z.dataset.gi||0))}})}});
+      }}
+      async function save(publishOverride=null){{
+        if(saving)return; saving=true;
+        if(publishOverride!==null)state.published=!!publishOverride;
+        const note=document.getElementById('lineup-save-note');note.textContent='Speichere…';
+        try{{
+          const res=await fetch(`/event/${{encodeURIComponent(initial.event_id)}}/lineup`,{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(state)}});
+          const data=await res.json();if(!res.ok||!data.ok)throw new Error(data.error||`HTTP ${{res.status}}`);
+          state=data.lineup||state;note.textContent=data.message||'Gespeichert.';document.getElementById('lineup-sync-state').textContent=state.published?'🟢 Discord-Live-Sync aktiv':'⚪ Noch nicht auf Discord veröffentlicht';render();
+        }}catch(err){{note.textContent='❌ '+err.message}}finally{{saving=false}}
+      }}
+      function scheduleSave(){{clearTimeout(timer);timer=setTimeout(()=>save(null),500)}}
+      document.getElementById('lineup-apply-size').addEventListener('click',()=>{{state.group_size=Number(document.getElementById('lineup-group-size').value||6);state.group_count=Number(document.getElementById('lineup-group-count').value||1);render();scheduleSave()}});
+      document.getElementById('lineup-publish').addEventListener('click',()=>save(true));
+      document.getElementById('lineup-auto').addEventListener('click',()=>{{
+        state.group_size=Number(document.getElementById('lineup-group-size').value||6);state.group_count=Number(document.getElementById('lineup-group-count').value||1);normalize();state.groups.forEach(g=>g.members=[]);state.bench=[];
+        const buckets={{Tank:[],Heal:[],DPS:[],Reserve:[],Other:[]}};(initial.candidates||[]).forEach(p=>(buckets[p.role]||buckets.Other).push(p));
+        for(const key of Object.keys(buckets)) buckets[key].sort((a,b)=>String(a.display_name).localeCompare(String(b.display_name)));
+        const order=[...buckets.Tank,...buckets.Heal,...buckets.DPS,...buckets.Other,...buckets.Reserve];
+        let cursor=0;for(const p of order){{let placed=false;for(let tries=0;tries<state.groups.length;tries++){{const gi=cursor%state.groups.length;cursor++;if(state.groups[gi].members.length<state.group_size){{state.groups[gi].members.push(p);placed=true;break}}}}if(!placed)state.bench.push(p)}}
+        render();scheduleSave();
+      }});
+      render();
+    }})();
+    </script>
+    """
 
 def _event_status_text(ev: dict[str, Any]) -> str:
     if ev.get("_attendance_review_only"):
@@ -18618,6 +18942,38 @@ async def event_dashboard_rsvp(event_id: str, request: Request, _: bool = Depend
     joiner = "&" if "?" in next_path else "?"
     return RedirectResponse(next_path + joiner + "msg=" + urllib.parse.quote(message), status_code=303)
 
+
+
+@app.post("/event/{event_id}/lineup")
+async def event_lineup_save(event_id: str, request: Request, _: bool = Depends(_admin_auth)):
+    data = _snapshot_payload()
+    guild_id = int(_safe_guild_id(data) or 0)
+    snap = data.get("snapshot") or {}
+    event = _event_by_id(snap, str(event_id))
+    if not guild_id:
+        return JSONResponse({"ok": False, "error": "Guild-ID fehlt."}, status_code=400)
+    if not event:
+        return JSONResponse({"ok": False, "error": "Event nicht gefunden."}, status_code=404)
+    try:
+        raw = await request.json()
+    except Exception:
+        return JSONResponse({"ok": False, "error": "Ungültige JSON-Daten."}, status_code=400)
+    if not isinstance(raw, dict):
+        return JSONResponse({"ok": False, "error": "Ungültige Aufstellung."}, status_code=400)
+    actor = _current_user(request) or {"user_id": "basic-admin", "username": "Basic Admin"}
+    try:
+        lineup = _save_event_lineup(guild_id, str(event_id), event, raw, actor)
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": f"Speichern fehlgeschlagen: {type(exc).__name__}: {exc}"}, status_code=500)
+
+    queued = None
+    if bool(lineup.get("published")):
+        payload = {"event_id": str(event_id), "lineup": lineup, "publish": True, "source": "dashboard_lineup"}
+        queued = _enqueue_event_action_request(guild_id, "lineup", payload, actor)
+        if not queued.get("ok"):
+            return JSONResponse({"ok": False, "error": queued.get("error") or "Discord-Sync konnte nicht eingeplant werden.", "lineup": lineup}, status_code=500)
+    message = "✅ Aufstellung gespeichert." + (" Discord-Sync läuft…" if bool(lineup.get("published")) else "")
+    return JSONResponse({"ok": True, "lineup": lineup, "message": message, "queued": queued})
 
 @app.get("/member", response_class=HTMLResponse)
 def member_home(request: Request, _: bool = Depends(_auth)):
