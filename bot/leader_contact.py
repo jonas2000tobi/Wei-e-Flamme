@@ -120,9 +120,28 @@ def _internal_channel(guild: discord.Guild) -> Optional[discord.abc.Messageable]
 
 
 def _archive_channel(guild: discord.Guild) -> Optional[discord.abc.Messageable]:
+    """Schnelle Cache-Auflösung des konfigurierten Archivkanals."""
     ch_id = int((_gcfg(guild.id).get("archive_channel_id") or 0))
     ch = guild.get_channel(ch_id)
     return ch if isinstance(ch, (discord.TextChannel, discord.Thread)) else None
+
+
+async def _resolve_archive_channel(inter: discord.Interaction) -> Optional[discord.abc.Messageable]:
+    """Archivkanal robust auflösen, auch wenn er noch nicht im Guild-Cache steckt."""
+    guild = inter.guild
+    if guild is None:
+        return None
+    ch_id = int((_gcfg(guild.id).get("archive_channel_id") or 0))
+    if not ch_id:
+        return None
+    ch = guild.get_channel(ch_id)
+    if isinstance(ch, (discord.TextChannel, discord.Thread)):
+        return ch
+    try:
+        fetched = await inter.client.fetch_channel(ch_id)
+    except Exception:
+        return None
+    return fetched if isinstance(fetched, (discord.TextChannel, discord.Thread)) else None
 
 
 def _ticket_category(guild: discord.Guild) -> Optional[discord.CategoryChannel]:
@@ -165,13 +184,22 @@ def _replace_status_field(embed: discord.Embed, text: str) -> discord.Embed:
     return new_embed
 
 
-async def _archive_ticket(inter: discord.Interaction, embed: discord.Embed, actor_name: str) -> bool:
+async def _archive_ticket(inter: discord.Interaction, embed: discord.Embed, actor_name: str) -> tuple[bool, Optional[discord.abc.Messageable], str]:
     guild = inter.guild
     if guild is None:
-        return False
-    archive_ch = _archive_channel(guild)
+        return False, None, "Guild nicht verfügbar."
+    archive_ch = await _resolve_archive_channel(inter)
     if archive_ch is None:
-        return False
+        return False, None, "Kein gültiger Archivkanal konfiguriert oder Kanal nicht erreichbar."
+
+    # Rechte vorab verständlich prüfen. Bei Threads entscheidet Discord zusätzlich
+    # über Thread-Rechte; der Send-Versuch unten bleibt die endgültige Wahrheit.
+    if isinstance(archive_ch, discord.TextChannel):
+        me = guild.me
+        if me is not None:
+            perms = archive_ch.permissions_for(me)
+            if not perms.view_channel or not perms.send_messages:
+                return False, archive_ch, "Dem Bot fehlt im Archivkanal `Kanal ansehen` oder `Nachrichten senden`."
 
     try:
         archived = discord.Embed.from_dict(embed.to_dict())
@@ -187,8 +215,11 @@ async def _archive_ticket(inter: discord.Interaction, embed: discord.Embed, acto
     old_footer = str(getattr(getattr(archived, "footer", None), "text", "") or "").strip()
     stamp = datetime.now(TZ).strftime("%d.%m.%Y %H:%M")
     archived.set_footer(text=(old_footer + " · " if old_footer else "") + f"Archiviert {stamp}")
-    await archive_ch.send(embed=archived, allowed_mentions=discord.AllowedMentions.none())
-    return True
+    try:
+        await archive_ch.send(embed=archived, allowed_mentions=discord.AllowedMentions.none())
+    except Exception as exc:
+        return False, archive_ch, f"{type(exc).__name__}: {exc}"
+    return True, archive_ch, ""
 
 
 
@@ -406,26 +437,38 @@ class LeaderStatusView(View):
                 await ticket_ch.send(f"✅ Dieses Leader-Ticket wurde von {inter.user.mention} als **erledigt** markiert.", allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False))
             except Exception:
                 pass
-        archive_ch = _archive_channel(inter.guild) if inter.guild else None
-
-        if archive_ch is None:
-            await inter.message.edit(embed=new_embed, view=self)
-            await inter.followup.send("✅ Status aktualisiert. Kein Archivkanal gesetzt, daher bleibt das Ticket hier stehen.", ephemeral=True)
-            return
-
-        try:
-            await _archive_ticket(inter, new_embed, name)
-            await inter.message.delete()
-            await inter.followup.send(f"✅ Ticket erledigt und nach {getattr(archive_ch, 'mention', '#Archiv')} archiviert.", ephemeral=True)
-        except Exception as e:
+        ok, archive_ch, archive_error = await _archive_ticket(inter, new_embed, name)
+        if not ok:
+            # Niemals das Original löschen, solange die Archivkopie nicht bestätigt ist.
             try:
                 await inter.message.edit(embed=new_embed, view=self)
             except Exception:
                 pass
-            if not inter.response.is_done():
-                await inter.response.send_message(f"❌ Archivieren fehlgeschlagen: {e}", ephemeral=True)
+            if archive_ch is None and "Kein gültiger Archivkanal" in archive_error:
+                await inter.followup.send(
+                    "✅ Status auf erledigt gesetzt, aber **nicht archiviert**. "
+                    "Bitte `/leader archive_channel` bzw. `leader_contact_archive` prüfen. "
+                    f"Details: {archive_error}",
+                    ephemeral=True,
+                )
             else:
-                await inter.followup.send(f"❌ Archivieren fehlgeschlagen: {e}", ephemeral=True)
+                mention = getattr(archive_ch, "mention", "#Archiv") if archive_ch is not None else "#Archiv"
+                await inter.followup.send(
+                    f"❌ Ticket bleibt hier stehen: Kopieren nach {mention} fehlgeschlagen. **{archive_error}**",
+                    ephemeral=True,
+                )
+            return
+
+        try:
+            await inter.message.delete()
+        except Exception as exc:
+            await inter.followup.send(
+                f"✅ Archivkopie wurde in {getattr(archive_ch, 'mention', '#Archiv')} erstellt, "
+                f"aber die aktive Ticket-Nachricht konnte nicht gelöscht werden: {type(exc).__name__}: {exc}",
+                ephemeral=True,
+            )
+            return
+        await inter.followup.send(f"✅ Ticket erledigt und nach {getattr(archive_ch, 'mention', '#Archiv')} archiviert.", ephemeral=True)
 
     @button(label="🗑️ Löschen", style=ButtonStyle.danger, custom_id="leader_status_delete")
     async def btn_delete(self, inter: discord.Interaction, _):

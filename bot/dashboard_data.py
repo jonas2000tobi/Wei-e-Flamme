@@ -2345,37 +2345,88 @@ async def setup_dashboard_data(bot: commands.Bot, tree: app_commands.CommandTree
     )
     tree.add_command(dashboard_group)
     start_dashboard_publisher(bot)
+    async def _store_member_role(guild: discord.Guild, actor_id: int, role: discord.Role) -> tuple[dict[str, Any], int]:
+        runtime_db.set_guild_setting(int(guild.id), DASHBOARD_MEMBER_ROLE_SETTING, int(role.id))
+        try:
+            runtime_db.write_audit_log(
+                guild_id=int(guild.id),
+                actor_id=int(actor_id),
+                action="dashboard_member_role_set",
+                target_type="role",
+                target_id=str(role.id),
+                summary=f"Dashboard-Gildenrolle gesetzt: {role.name}",
+                new_value={"role_id": int(role.id), "role_name": role.name},
+            )
+        except Exception:
+            pass
+        snap = await asyncio.to_thread(build_dashboard_snapshot, bot, guild)
+        try:
+            await asyncio.to_thread(
+                runtime_db.save_dashboard_snapshot,
+                guild_id=int(guild.id),
+                guild_name=str(((snap.get("guild") or {}).get("name") or guild.name)),
+                snapshot=snap,
+            )
+        except Exception:
+            pass
+        count = int((snap.get("guild", {}).get("member_filter") or {}).get("eligible_count", len(getattr(role, "members", []) or [])) or 0)
+        return snap, count
+
+    class _DashboardMemberRolePicker(discord.ui.View):
+        def __init__(self, owner_id: int):
+            super().__init__(timeout=120)
+            self.owner_id = int(owner_id)
+            selector = discord.ui.RoleSelect(placeholder="Gildenmitglieder-Rolle auswählen …", min_values=1, max_values=1)
+            selector.callback = self._picked  # type: ignore[method-assign]
+            self.selector = selector
+            self.add_item(selector)
+
+        async def interaction_check(self, pick_inter: discord.Interaction) -> bool:
+            if int(pick_inter.user.id) != self.owner_id:
+                await pick_inter.response.send_message("❌ Nur derjenige, der den Picker geöffnet hat, kann die Rolle setzen.", ephemeral=True)
+                return False
+            return True
+
+        async def _picked(self, pick_inter: discord.Interaction) -> None:
+            if pick_inter.guild is None or not _is_admin(pick_inter):
+                await pick_inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True)
+                return
+            raw = self.selector.values[0] if self.selector.values else None
+            role = raw if isinstance(raw, discord.Role) else None
+            if role is None:
+                await pick_inter.response.send_message("❌ Discord konnte die ausgewählte Rolle nicht auflösen.", ephemeral=True)
+                return
+            try:
+                _, count = await _store_member_role(pick_inter.guild, pick_inter.user.id, role)
+            except Exception as exc:
+                await pick_inter.response.send_message(f"❌ Konnte Rolle nicht speichern: `{type(exc).__name__}: {exc}`", ephemeral=True)
+                return
+            await pick_inter.response.edit_message(
+                content=f"✅ Dashboard-Gildenrolle gesetzt: {role.mention}\nRollenmitglieder im Dashboard: **{count}**\nDashboard wurde aktualisiert.",
+                view=None,
+            )
+            self.stop()
+
     @dashboard_group.command(name="set_member_role", description="Legt die Gildenrolle fest, die im Dashboard als Mitglied zählt.")
-    @app_commands.describe(role="Rolle, die echte Gildenmitglieder haben müssen")
-    async def dashboard_set_member_role(inter: discord.Interaction, role: discord.Role):
+    @app_commands.describe(role="Rolle (optional; leer lassen öffnet einen Rollenpicker)")
+    async def dashboard_set_member_role(inter: discord.Interaction, role: discord.Role | None = None):
         if inter.guild is None:
             await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
             return
         if not _is_admin(inter):
             await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True)
             return
+        if role is None:
+            await inter.response.send_message(
+                "🎭 **Welche Rolle zählt als Gildenmitglied?**",
+                view=_DashboardMemberRolePicker(inter.user.id),
+                ephemeral=True,
+            )
+            return
 
         await inter.response.defer(ephemeral=True)
         try:
-            runtime_db.set_guild_setting(int(inter.guild.id), DASHBOARD_MEMBER_ROLE_SETTING, int(role.id))
-            try:
-                runtime_db.write_audit_log(
-                    guild_id=int(inter.guild.id),
-                    actor_id=int(inter.user.id),
-                    action="dashboard_member_role_set",
-                    target_type="role",
-                    target_id=str(role.id),
-                    summary=f"Dashboard-Gildenrolle gesetzt: {role.name}",
-                    new_value={"role_id": int(role.id), "role_name": role.name},
-                )
-            except Exception:
-                pass
-            snap = await asyncio.to_thread(build_dashboard_snapshot, bot, inter.guild)
-            try:
-                await asyncio.to_thread(runtime_db.save_dashboard_snapshot, guild_id=int(inter.guild.id), guild_name=str(((snap.get("guild") or {}).get("name") or inter.guild.name)), snapshot=snap)
-            except Exception:
-                pass
-            count = (snap.get("guild", {}).get("member_filter") or {}).get("eligible_count", len(getattr(role, "members", []) or []))
+            _, count = await _store_member_role(inter.guild, inter.user.id, role)
             await inter.followup.send(
                 f"✅ Dashboard-Gildenrolle gesetzt: {role.mention}\n"
                 f"Rollenmitglieder im Dashboard: **{count}**\n"

@@ -606,41 +606,104 @@ async def setup_guild_config(bot: commands.Bot, tree: app_commands.CommandTree) 
         )
         await inter.followup.send(f"✅ Gilde konfiguriert: **{clean}**. Railway musste nicht geändert werden.", ephemeral=True)
 
-    @guild_group.command(name="set_role", description="Ordnet eine Discord-Rolle einer Gildenfunktion zu.")
-    @app_commands.describe(kind="Funktion der Rolle", role="Discord-Rolle")
-    @app_commands.choices(kind=[app_commands.Choice(name=x, value=x) for x in ROLE_KEYS])
-    async def guild_set_role(inter: discord.Interaction, kind: app_commands.Choice[str], role: discord.Role):
-        if inter.guild is None:
-            await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
-            return
-        await inter.response.defer(ephemeral=True, thinking=True)
-        if not await asyncio.to_thread(_is_admin, inter):
-            await inter.followup.send("❌ Nur für Server-Admins/Leitung.", ephemeral=True)
-            return
-        required_module = _optional_role_module(kind.value)
-        if required_module and not await asyncio.to_thread(is_module_enabled, inter.guild.id, required_module):
-            await inter.followup.send("❌ Diese Rolleneinstellung gehört zu einem deaktivierten Modul.", ephemeral=True)
-            return
-        key = ROLE_KEYS[kind.value]
-        if kind.value in MULTI_ROLE_KINDS:
-            value = await asyncio.to_thread(role_ids, inter.guild.id, kind.value)
+    async def _apply_role_mapping(guild: discord.Guild, actor_id: int, kind_value: str, role: discord.Role) -> str:
+        required_module = _optional_role_module(kind_value)
+        if required_module and not await asyncio.to_thread(is_module_enabled, guild.id, required_module):
+            raise RuntimeError("Diese Rolleneinstellung gehört zu einem deaktivierten Modul.")
+        key = ROLE_KEYS[kind_value]
+        if kind_value in MULTI_ROLE_KINDS:
+            value = await asyncio.to_thread(role_ids, guild.id, kind_value)
             if int(role.id) not in value:
                 value.append(int(role.id))
         else:
             value = int(role.id)
-        await asyncio.to_thread(runtime_db.set_guild_setting, inter.guild.id, key, value)
-        await asyncio.to_thread(sync_legacy_compatibility, inter.guild.id)
+        await asyncio.to_thread(runtime_db.set_guild_setting, guild.id, key, value)
+        await asyncio.to_thread(sync_legacy_compatibility, guild.id)
         await asyncio.to_thread(
             runtime_db.write_audit_log,
-            guild_id=inter.guild.id,
-            actor_id=inter.user.id,
+            guild_id=guild.id,
+            actor_id=int(actor_id),
             action="guild_role_map_set",
             target_type="role",
             target_id=str(role.id),
-            summary=f"{kind.value}: {role.name}",
-            new_value={"kind": kind.value, "role_id": role.id},
+            summary=f"{kind_value}: {role.name}",
+            new_value={"kind": kind_value, "role_id": role.id, "role_name": role.name},
         )
-        await inter.followup.send(f"✅ **{kind.value}** → {role.mention}", ephemeral=True)
+        return f"✅ **{kind_value}** → {role.mention}"
+
+    class _GuildRolePicker(discord.ui.View):
+        def __init__(self, *, kind_value: str, owner_id: int):
+            super().__init__(timeout=120)
+            self.kind_value = str(kind_value)
+            self.owner_id = int(owner_id)
+            selector = discord.ui.RoleSelect(
+                placeholder=f"Rolle für {self.kind_value} auswählen …",
+                min_values=1,
+                max_values=1,
+            )
+            selector.callback = self._picked  # type: ignore[method-assign]
+            self.selector = selector
+            self.add_item(selector)
+
+        async def interaction_check(self, pick_inter: discord.Interaction) -> bool:
+            if int(pick_inter.user.id) != self.owner_id:
+                await pick_inter.response.send_message("❌ Nur derjenige, der den Picker geöffnet hat, kann diese Rolle setzen.", ephemeral=True)
+                return False
+            return True
+
+        async def _picked(self, pick_inter: discord.Interaction) -> None:
+            if pick_inter.guild is None:
+                await pick_inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
+                return
+            raw = self.selector.values[0] if self.selector.values else None
+            role = raw if isinstance(raw, discord.Role) else None
+            if role is None:
+                await pick_inter.response.send_message("❌ Discord konnte die ausgewählte Rolle nicht auflösen.", ephemeral=True)
+                return
+            if not await asyncio.to_thread(_is_admin, pick_inter):
+                await pick_inter.response.send_message("❌ Nur für Server-Admins/Leitung.", ephemeral=True)
+                return
+            try:
+                text = await _apply_role_mapping(pick_inter.guild, pick_inter.user.id, self.kind_value, role)
+            except Exception as exc:
+                await pick_inter.response.send_message(f"❌ Rolle konnte nicht gespeichert werden: {exc}", ephemeral=True)
+                return
+            await pick_inter.response.edit_message(content=text, view=None)
+            self.stop()
+
+    @guild_group.command(name="set_role", description="Ordnet eine Discord-Rolle einer Gildenfunktion zu.")
+    @app_commands.describe(kind="Funktion der Rolle", role="Discord-Rolle (optional; leer lassen öffnet einen Rollenpicker)")
+    @app_commands.choices(kind=[app_commands.Choice(name=x, value=x) for x in ROLE_KEYS])
+    async def guild_set_role(inter: discord.Interaction, kind: app_commands.Choice[str], role: discord.Role | None = None):
+        if inter.guild is None:
+            await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
+            return
+        if not await asyncio.to_thread(_is_admin, inter):
+            await inter.response.send_message("❌ Nur für Server-Admins/Leitung.", ephemeral=True)
+            return
+        required_module = _optional_role_module(kind.value)
+        if required_module and not await asyncio.to_thread(is_module_enabled, inter.guild.id, required_module):
+            await inter.response.send_message("❌ Diese Rolleneinstellung gehört zu einem deaktivierten Modul.", ephemeral=True)
+            return
+
+        # Auf einigen Discord-Clients kann der Role-Transformer nach Serverwechseln
+        # mit einer veralteten Command-ID fehlschlagen. Ohne Role-Argument nutzen wir
+        # deshalb einen nativen RoleSelect, der die Rolle direkt aus der Guild auflöst.
+        if role is None:
+            await inter.response.send_message(
+                f"🎭 **Rolle für `{kind.value}` auswählen**",
+                view=_GuildRolePicker(kind_value=kind.value, owner_id=inter.user.id),
+                ephemeral=True,
+            )
+            return
+
+        await inter.response.defer(ephemeral=True, thinking=True)
+        try:
+            text = await _apply_role_mapping(inter.guild, inter.user.id, kind.value, role)
+        except Exception as exc:
+            await inter.followup.send(f"❌ Rolle konnte nicht gespeichert werden: {exc}", ephemeral=True)
+            return
+        await inter.followup.send(text, ephemeral=True)
 
     @guild_group.command(name="set_channel", description="Ordnet einen Discord-Kanal einer Gildenfunktion zu.")
     @app_commands.describe(kind="Funktion des Kanals", channel="Discord-Kanal")
