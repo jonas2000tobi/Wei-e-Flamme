@@ -1728,50 +1728,47 @@ def _loot_lock_block(member: Optional[discord.Member]) -> str:
     )
 
 def _main_menu_embed(guild: discord.Guild, member: Optional[discord.Member] = None) -> discord.Embed:
-    event_block = ""
+    event_block = _event_status_block(guild, member) if member else ""
+    guild_id = int(guild.id)
+    auctions_enabled = is_module_enabled(guild_id, "auctions")
+    points_enabled = is_module_enabled(guild_id, "points")
 
-    if member:
-        event_block = _event_status_block(guild, member)
-
-    available_items = _active_market_item_count(guild.id)
-
-    ec_balance: Optional[int] = None
-    loot_lock_text = ""
-    if member:
-        ec_balance = _get_ec_balance_safe(guild.id, member.id)
-        loot_lock_text = _loot_lock_block(member)
-
-    item_word = "Item" if int(available_items) == 1 else "Items"
     sections: list[str] = [
         _menu_sep(),
         event_block or f"{EMOJI_CALENDAR} {_bold_sans('Nächster Einsatz')}\nKeine aktiven Anmeldungen oder offenen Abstimmungen.",
-        _menu_sep(),
-        f"🎒 {_bold_sans('Gildenhandel')}\n**{available_items} {item_word} verfügbar**",
     ]
 
-    if ec_balance is not None:
+    # Die Gildenzentrale bleibt optisch identisch, zeigt aber nur Module, die
+    # für diese Gilde tatsächlich aktiv sind. Keine 0-EC-/0-Item-Platzhalter.
+    if auctions_enabled:
+        available_items = _active_market_item_count(guild_id)
+        item_word = "Item" if int(available_items) == 1 else "Items"
         sections.extend([
             _menu_sep(),
-            f"🪙 {_bold_sans('EC-Konto')}\n**{ec_balance} EC**",
+            f"🎒 {_bold_sans('Gildenhandel')}\n**{available_items} {item_word} verfügbar**",
         ])
 
-    if loot_lock_text:
-        # Lootsperre bleibt bewusst normaler Discord-Markdown, damit Warnungen klar lesbar bleiben.
-        sections.append(loot_lock_text.strip())
+    if points_enabled and member:
+        ec_balance = _get_ec_balance_safe(guild_id, member.id)
+        if ec_balance is not None:
+            sections.extend([
+                _menu_sep(),
+                f"🪙 {_bold_sans('Punktekonto')}\n**{ec_balance} Punkte**",
+            ])
 
-    sections.extend([
-        _menu_sep(),
-        _bold_sans('Bereich unten auswählen.'),
-    ])
+    if auctions_enabled and member:
+        loot_lock_text = _loot_lock_block(member)
+        if loot_lock_text:
+            sections.append(loot_lock_text.strip())
+
+    sections.extend([_menu_sep(), _bold_sans('Bereich unten auswählen.')])
 
     emb = discord.Embed(
         title=f"{EMOJI_EBOLUS} {_bold_sans(_guild_brand_name(guild) + ' Gildenzentrale')}",
         description="\n".join(sections),
         color=discord.Color.gold(),
     )
-
     emb.set_footer(text=f"Server: {guild.name} • {_guild_bot_name(guild)}")
-
     return emb
 
 
@@ -2466,7 +2463,7 @@ async def _repair_stale_active_portal_for_user(
     if _portal_member_interaction_busy(guild.id, member.id):
         return "busy", 0
     try:
-        await msg.edit(embed=_main_menu_embed(guild, member), view=MemberPortalMainView())
+        await msg.edit(embed=_main_menu_embed(guild, member), view=MemberPortalMainView(guild.id))
         _mark_portal_sent(guild.id, member.id, msg.id)
         return "reset", 0
     except Exception as exc:
@@ -2613,7 +2610,7 @@ async def _send_new_portal_menu(user: discord.abc.User, guild: discord.Guild) ->
     _refresh_portal_emojis(guild)
 
     try:
-        msg = await user.send(embed=_main_menu_embed(guild, member), view=MemberPortalMainView())
+        msg = await user.send(embed=_main_menu_embed(guild, member), view=MemberPortalMainView(guild.id))
         _mark_portal_sent(guild.id, user.id, msg.id)
         _portal_last_dm_errors.pop((int(guild.id), int(user.id)), None)
         try:
@@ -2671,7 +2668,7 @@ async def ensure_portal_menu_for_user(
             elif force_view == "dm_settings":
                 await msg.edit(embed=_dm_settings_embed(guild, member), view=DmSettingsView())
             else:
-                await msg.edit(embed=_main_menu_embed(guild, member), view=MemberPortalMainView())
+                await msg.edit(embed=_main_menu_embed(guild, member), view=MemberPortalMainView(guild.id))
 
             _mark_portal_sent(guild_id, user_id, msg.id)
             return True
@@ -3740,7 +3737,8 @@ class PortalOpenView(PortalSafeView):
 
 
 class PortalMainSelect(Select):
-    def __init__(self):
+    def __init__(self, guild_id: int | None = None):
+        gid = int(guild_id or 0)
         options = [
             discord.SelectOption(
                 label="Persönlich",
@@ -3748,18 +3746,24 @@ class PortalMainSelect(Select):
                 description="Profil, Gearscore, Abwesenheit und Raid-DMs",
                 emoji=_menu_emoji(EMOJI_PERSONAL)
             ),
-            discord.SelectOption(
+        ]
+
+        if not gid or is_module_enabled(gid, "needlists"):
+            options.append(discord.SelectOption(
                 label="Loot & Bedarf",
                 value="loot",
                 description="Main- und Second-Needs verwalten",
                 emoji=_menu_emoji(EMOJI_LOOT)
-            ),
-            discord.SelectOption(
+            ))
+        if not gid or is_module_enabled(gid, "auctions"):
+            options.append(discord.SelectOption(
                 label="Auktion",
                 value="auction",
                 description="Need-Auktionen, freie Auktionen und Sale-Kauf",
                 emoji="🏷️"
-            ),
+            ))
+
+        options.extend([
             discord.SelectOption(
                 label="Gilde",
                 value="guild",
@@ -3769,22 +3773,22 @@ class PortalMainSelect(Select):
             discord.SelectOption(
                 label="Kontakt & Hilfe",
                 value="support",
-                description="Leader kontaktieren oder Hilfe zum Bot öffnen",
+                description="Gildenleitung kontaktieren oder Hilfe zum Bot öffnen",
                 emoji=_menu_emoji(EMOJI_CONTACT)
             ),
             discord.SelectOption(
                 label="Admin",
                 value="admin",
-                description="Event- und Loot-Verwaltung für Leitung",
+                description="Verwaltungsbereich für die Gildenleitung",
                 emoji=_menu_emoji(EMOJI_ADMIN)
             ),
-        ]
+        ])
 
         super().__init__(
             placeholder="Bereich auswählen …",
             min_values=1,
             max_values=1,
-            options=options,
+            options=options[:25],
             custom_id="portal_main_select"
         )
 
@@ -3894,26 +3898,28 @@ class PortalMainSelect(Select):
                 await _portal_send(inter, "❌ Dieser Bereich ist nur für Gildenleitung, Berater oder Wächter.", ephemeral=True)
                 return
 
+            admin_sections = [
+                "Interner Verwaltungsbereich für die Gildenleitung.",
+                "**Event**\nRaids erstellen, Events löschen und fehlende Abstimmungen erneut senden.",
+            ]
+            if is_module_enabled(guild.id, "alliance"):
+                admin_sections.append("**Allianz**\nAllianz-Events erstellen und verwalten.")
+            if any(is_module_enabled(guild.id, key) for key in ("needlists", "loot", "auctions")):
+                admin_sections.append("**Loot**\nLoot-/Need-Funktionen der aktivierten Module verwalten.")
             emb = discord.Embed(
                 title=f"{EMOJI_ADMIN} Admin",
-                description=(
-                    "Interner Verwaltungsbereich für die Gildenleitung.\n\n"
-                    "**Event**\n"
-                    "Raids erstellen, Allianz-Raids erstellen, Events löschen und fehlende Abstimmungen erneut senden.\n\n"
-                    "**Loot**\n"
-                    "Items hinzufügen, Loot-Drops melden, Items als erhalten markieren und Katalog anzeigen."
-                ),
+                description="\n\n".join(admin_sections),
                 color=discord.Color.gold()
             )
 
-            await _portal_edit(inter, embed=emb, view=AdminMenuView())
+            await _portal_edit(inter, embed=emb, view=AdminMenuView(guild.id))
             return
 
 
 class MemberPortalMainView(PortalSafeView):
-    def __init__(self):
+    def __init__(self, guild_id: int | None = None):
         super().__init__(timeout=None)
-        self.add_item(PortalMainSelect())
+        self.add_item(PortalMainSelect(guild_id))
 
 
 class PersonalMenuView(PortalSafeView):
@@ -3966,7 +3972,7 @@ class PersonalMenuView(PortalSafeView):
         if guild and member and inter.message:
             _mark_portal_sent(guild.id, member.id, inter.message.id)
 
-        await _portal_edit(inter, embed=_main_menu_embed(guild, member), view=MemberPortalMainView())
+        await _portal_edit(inter, embed=_main_menu_embed(guild, member), view=MemberPortalMainView(guild.id))
 
 
 class DmSettingsView(PortalSafeView):
@@ -4063,7 +4069,7 @@ class LootMenuView(PortalSafeView):
         if guild and member and inter.message:
             _mark_portal_sent(guild.id, member.id, inter.message.id)
 
-        await _portal_edit(inter, embed=_main_menu_embed(guild, member), view=MemberPortalMainView())
+        await _portal_edit(inter, embed=_main_menu_embed(guild, member), view=MemberPortalMainView(guild.id))
 
 
 class GuildMenuView(PortalSafeView):
@@ -4129,7 +4135,7 @@ class GuildMenuView(PortalSafeView):
             guild, member = await self._begin(inter)
             if guild and member and inter.message:
                 await asyncio.to_thread(_mark_portal_sent, guild.id, member.id, inter.message.id)
-            await _portal_edit(inter, embed=await asyncio.to_thread(_main_menu_embed, guild, member), view=MemberPortalMainView())
+            await _portal_edit(inter, embed=await asyncio.to_thread(_main_menu_embed, guild, member), view=MemberPortalMainView(guild.id))
         except Exception as error:
             await self._show_error(inter, "Gildenzentrale", error)
 
@@ -4468,7 +4474,7 @@ class AdminEventCreatedView(PortalSafeView):
             description="Wähle eine Event-Aktion.",
             color=discord.Color.gold(),
         )
-        await _portal_edit(inter, embed=emb, view=AdminEventMenuView())
+        await _portal_edit(inter, embed=emb, view=AdminEventMenuView(guild.id))
 
     @button(
         label="Gildenzentrale",
@@ -4485,7 +4491,7 @@ class AdminEventCreatedView(PortalSafeView):
             _mark_portal_sent(guild.id, member.id, inter.message.id)
         await _portal_edit(inter, 
             embed=_main_menu_embed(guild, member),
-            view=MemberPortalMainView(),
+            view=MemberPortalMainView(guild.id),
         )
 
 
@@ -5086,7 +5092,7 @@ class AdminAllianceGroupSelectView(PortalSafeView):
     async def btn_cancel(self, inter: discord.Interaction, _):
         await _portal_edit(inter, 
             embed=discord.Embed(title="Abgebrochen", description="Das Allianz-Event wurde nicht erstellt.", color=discord.Color.orange()),
-            view=AdminEventMenuView(),
+            view=AdminEventMenuView(int(self.data.get("guild_id", 0) or 0)),
         )
 
 
@@ -5143,7 +5149,7 @@ class AdminAllianceEventTypeSelectView(PortalSafeView):
 
     @button(label="❌ Abbrechen", style=ButtonStyle.secondary, custom_id="admin_alliance_type_cancel", row=1)
     async def btn_cancel(self, inter: discord.Interaction, _):
-        await _portal_edit(inter, embed=discord.Embed(title="Abgebrochen", description="Das Allianz-Event wurde nicht erstellt.", color=discord.Color.orange()), view=AdminEventMenuView())
+        await _portal_edit(inter, embed=discord.Embed(title="Abgebrochen", description="Das Allianz-Event wurde nicht erstellt.", color=discord.Color.orange()), view=AdminEventMenuView(int(self.data.get("guild_id", 0) or 0)))
 
 
 class AdminAllianceEventTypeSelect(Select):
@@ -5180,7 +5186,7 @@ class AdminAllianceRoleSelectView(PortalSafeView):
 
     @button(label="❌ Abbrechen", style=ButtonStyle.secondary, custom_id="admin_alliance_role_cancel", row=1)
     async def btn_cancel(self, inter: discord.Interaction, _):
-        await _portal_edit(inter, embed=discord.Embed(title="Abgebrochen", description="Das Allianz-Event wurde nicht erstellt.", color=discord.Color.orange()), view=AdminEventMenuView())
+        await _portal_edit(inter, embed=discord.Embed(title="Abgebrochen", description="Das Allianz-Event wurde nicht erstellt.", color=discord.Color.orange()), view=AdminEventMenuView(int(self.data.get("guild_id", 0) or 0)))
 
 
 class AdminAllianceRoleSelect(Select):
@@ -5204,12 +5210,23 @@ class AdminAllianceRoleSelect(Select):
         except Exception:
             role_id = 0
         self.data["target_role_id"] = int(role_id or 0)
+        if guild is not None and not is_module_enabled(guild.id, "points"):
+            self.data["dkp_event_type"] = ""
+            self.data["dkp_enabled"] = False
+            emb = discord.Embed(
+                title="🖼️ Event-Bild wählen",
+                description=(
+                    "Punktesystem ist deaktiviert. Wähle direkt das Bild für das Allianz-Event.\n\n"
+                    "**Kein Bild** erstellt das Event ohne Bild.\n"
+                    "**Eigene URL** öffnet danach ein Eingabefeld für deinen Bildlink."
+                ),
+                color=discord.Color.gold(),
+            )
+            await _portal_edit(inter, embed=emb, view=AdminEventImageSelectView(self.data))
+            return
         emb = discord.Embed(
-            title="🪙 EC-/DKP-Typ wählen",
-            description=(
-                "Wähle, ob und als welcher EC-/DKP-Typ dieses Allianz-Event für die Home-Gilde gewertet werden soll.\n\n"
-                "Partner-/Allianzspieler können teilnehmen, erhalten aber keine EC."
-            ),
+            title="🪙 Punkte-/DKP-Typ wählen",
+            description="Wähle, ob und als welcher Punkte-/DKP-Typ dieses Allianz-Event gewertet werden soll.",
             color=discord.Color.gold(),
         )
         await _portal_edit(inter, embed=emb, view=AdminEventDKPSelectView(self.data))
@@ -5229,7 +5246,7 @@ class AdminEventChannelSelectView(PortalSafeView):
                 description="Das Event wurde nicht erstellt.",
                 color=discord.Color.orange()
             ),
-            view=AdminEventMenuView()
+            view=AdminEventMenuView(int(self.data.get("guild_id", 0) or 0))
         )
 
 
@@ -5345,7 +5362,7 @@ class AdminEventRoleSelectView(PortalSafeView):
                 description="Das Event wurde nicht erstellt.",
                 color=discord.Color.orange()
             ),
-            view=AdminEventMenuView()
+            view=AdminEventMenuView(int(self.data.get("guild_id", 0) or 0))
         )
 
 
@@ -5400,16 +5417,30 @@ class AdminEventRoleSelect(Select):
             if role:
                 role_text = role.mention
 
+        if guild is not None and not is_module_enabled(guild.id, "points"):
+            self.data["dkp_event_type"] = ""
+            self.data["dkp_enabled"] = False
+            emb = discord.Embed(
+                title="🖼️ Event-Bild wählen",
+                description=(
+                    f"Zielrolle: {role_text}\n\n"
+                    "Wähle, welches Bild für dieses Event verwendet werden soll.\n\n"
+                    "**Kein Bild** erstellt den Raid ohne Bild.\n"
+                    "**Eigene URL** öffnet danach ein Eingabefeld für deinen Bildlink."
+                ),
+                color=discord.Color.gold(),
+            )
+            await _portal_edit(inter, embed=emb, view=AdminEventImageSelectView(self.data))
+            return
+
         emb = discord.Embed(
-            title="🪙 EC-/DKP-Typ wählen",
+            title="🪙 Punkte-/DKP-Typ wählen",
             description=(
                 f"Zielrolle: {role_text}\n\n"
-                "Wähle, ob und als welcher EC-/DKP-Typ dieses Event gewertet werden soll.\n"
-                "Der Bot speichert den Typ direkt am Event und erkennt ihn später automatisch."
+                "Wähle, ob und als welcher Punkte-/DKP-Typ dieses Event gewertet werden soll."
             ),
             color=discord.Color.gold()
         )
-
         await _portal_edit(inter, embed=emb, view=AdminEventDKPSelectView(self.data))
 
 
@@ -5427,7 +5458,7 @@ class AdminEventDKPSelectView(PortalSafeView):
                 description="Das Event wurde nicht erstellt.",
                 color=discord.Color.orange(),
             ),
-            view=AdminEventMenuView(),
+            view=AdminEventMenuView(int(self.data.get("guild_id", 0) or 0)),
         )
 
 
@@ -5480,7 +5511,7 @@ class AdminEventImageSelectView(PortalSafeView):
                 description="Das Event wurde nicht erstellt.",
                 color=discord.Color.orange()
             ),
-            view=AdminEventMenuView()
+            view=AdminEventMenuView(int(self.data.get("guild_id", 0) or 0))
         )
 
 
@@ -5586,7 +5617,7 @@ class AdminEventReminderSelectView(PortalSafeView):
                 description="Das Event wurde nicht erstellt.",
                 color=discord.Color.orange(),
             ),
-            view=AdminEventMenuView(),
+            view=AdminEventMenuView(int(self.data.get("guild_id", 0) or 0)),
         )
 
 
@@ -5657,7 +5688,7 @@ class AdminEventVoiceSelectView(PortalSafeView):
     async def btn_cancel(self, inter: discord.Interaction, _):
         await _portal_edit(inter, 
             embed=discord.Embed(title="Abgebrochen", description="Das Event wurde nicht erstellt.", color=discord.Color.orange()),
-            view=AdminEventMenuView(),
+            view=AdminEventMenuView(int(self.data.get("guild_id", 0) or 0)),
         )
 
 
@@ -5901,17 +5932,18 @@ def _admin_attendance_embed(guild: discord.Guild, event: dict) -> discord.Embed:
         when = "Unbekannt"
 
     event_id = str(event.get("event_id", "") or event.get("message_id", "") or "")
-    ec_type = _admin_event_ec_type(event, event_id)
     ec_line = ""
-    if ec_type:
-        base_ec, _reserve_ec = _admin_event_ec_points(guild.id, ec_type)
-        awarded = _admin_event_ec_awarded(guild.id, event_id, event)
-        ec_line = (
-            f"🪙 EC-Typ: **{ec_type}** • Wert pro Anwesenheit: **{base_ec} EC**\n"
-            f"EC-Status: **{'✅ bereits vergeben' if awarded else 'offen'}**\n"
-        )
-    else:
-        ec_line = "🪙 EC-Typ: **nicht EC-relevant / nicht gesetzt**\n"
+    if is_module_enabled(guild.id, "points"):
+        ec_type = _admin_event_ec_type(event, event_id)
+        if ec_type:
+            base_ec, _reserve_ec = _admin_event_ec_points(guild.id, ec_type)
+            awarded = _admin_event_ec_awarded(guild.id, event_id, event)
+            ec_line = (
+                f"🪙 Punkte-Typ: **{ec_type}** • Wert pro Anwesenheit: **{base_ec}**\n"
+                f"Punkte-Status: **{'✅ bereits vergeben' if awarded else 'offen'}**\n"
+            )
+        else:
+            ec_line = "🪙 Punkte-Typ: **nicht relevant / nicht gesetzt**\n"
 
     desc = (
         f"**{title}**\n"
@@ -5937,7 +5969,10 @@ def _admin_attendance_embed(guild: discord.Guild, event: dict) -> discord.Embed:
         description=desc[:3900],
         color=discord.Color.gold(),
     )
-    emb.set_footer(text="Du kannst Anwesenheit ändern, Spieler nachtragen, den EC-Typ setzen und EC direkt vergeben.")
+    if is_module_enabled(guild.id, "points"):
+        emb.set_footer(text="Du kannst Anwesenheit ändern, Spieler nachtragen und Punkte direkt vergeben.")
+    else:
+        emb.set_footer(text="Du kannst Anwesenheit ändern und Spieler nachtragen.")
     return emb
 
 
@@ -5952,7 +5987,7 @@ class AdminEventSelectView(PortalSafeView):
     @button(label="Zurück", emoji=_menu_emoji(EMOJI_BACK), style=ButtonStyle.secondary, custom_id="admin_event_select_back")
     async def btn_back(self, inter: discord.Interaction, _):
         emb = discord.Embed(title=f"{EMOJI_GUILD} Admin – Event", description="Wähle eine Event-Aktion.", color=discord.Color.gold())
-        await _portal_edit(inter, embed=emb, view=AdminEventMenuView())
+        await _portal_edit(inter, embed=emb, view=AdminEventMenuView(self.guild_id))
 
 
 class AdminEventSelect(Select):
@@ -6002,7 +6037,7 @@ class AdminEventDeleteConfirmView(PortalSafeView):
     @button(label="❌ Abbrechen", style=ButtonStyle.secondary, custom_id="admin_event_delete_cancel")
     async def btn_cancel(self, inter: discord.Interaction, _):
         emb = discord.Embed(title="Abgebrochen", description="Das Event wurde nicht gelöscht.", color=discord.Color.orange())
-        await _portal_edit(inter, embed=emb, view=AdminEventMenuView())
+        await _portal_edit(inter, embed=emb, view=AdminEventMenuView(self.guild_id))
 
 
 
@@ -6016,7 +6051,7 @@ class AdminAttendanceEventSelectView(PortalSafeView):
     @button(label="Zurück", emoji=_menu_emoji(EMOJI_BACK), style=ButtonStyle.secondary, custom_id="admin_attendance_event_back")
     async def btn_back(self, inter: discord.Interaction, _):
         emb = discord.Embed(title=f"{EMOJI_GUILD} Admin – Event", description="Wähle eine Event-Aktion.", color=discord.Color.gold())
-        await _portal_edit(inter, embed=emb, view=AdminEventMenuView())
+        await _portal_edit(inter, embed=emb, view=AdminEventMenuView(self.guild_id))
 
 
 class AdminAttendanceEventSelect(Select):
@@ -6063,6 +6098,10 @@ class AdminAttendanceMemberSelectView(PortalSafeView):
         if self.page > max_page:
             self.page = max_page
         self.add_item(AdminAttendanceMemberSelect(guild_id, user_id, event_id, event, self.page))
+        if not is_module_enabled(self.guild_id, "points"):
+            for item in list(self.children):
+                if str(getattr(item, "custom_id", "")) in {"admin_attendance_set_ec_type", "admin_attendance_award_ec"}:
+                    self.remove_item(item)
 
     @button(label="⬅️ Eventliste", style=ButtonStyle.secondary, custom_id="admin_attendance_member_back", row=1)
     async def btn_back(self, inter: discord.Interaction, _):
@@ -6518,7 +6557,7 @@ class AdminVoiceSettingsView(PortalSafeView):
     @button(label="Zurück", emoji=_menu_emoji(EMOJI_BACK), style=ButtonStyle.secondary, custom_id="admin_voice_back", row=1)
     async def btn_back(self, inter: discord.Interaction, _):
         emb = discord.Embed(title=f"{EMOJI_GUILD} Admin – Event", description="Wähle eine Event-Aktion.", color=discord.Color.gold())
-        await _portal_edit(inter, embed=emb, view=AdminEventMenuView())
+        await _portal_edit(inter, embed=emb, view=AdminEventMenuView(self.guild_id))
 
 
 class AdminVoiceCategorySelectView(PortalSafeView):
@@ -6609,8 +6648,13 @@ async def _admin_show_voice_settings(inter: discord.Interaction, guild_id: int):
 
 
 class AdminMenuView(PortalSafeView):
-    def __init__(self):
+    def __init__(self, guild_id: int | None = None):
         super().__init__(timeout=None)
+        gid = int(guild_id or 0)
+        if gid and not any(is_module_enabled(gid, key) for key in ("needlists", "loot", "auctions")):
+            for item in list(self.children):
+                if str(getattr(item, "custom_id", "")) == "portal_admin_loot":
+                    self.remove_item(item)
 
     @button(label="Event", emoji=_menu_emoji(EMOJI_EBOLUS), style=ButtonStyle.secondary, custom_id="portal_admin_event")
     async def btn_event(self, inter: discord.Interaction, _):
@@ -6620,21 +6664,23 @@ class AdminMenuView(PortalSafeView):
             return
         if guild and member and inter.message:
             _mark_portal_sent(guild.id, member.id, inter.message.id)
+        enabled_lines = [
+            "• Event erstellen",
+            "• Event löschen",
+            "• Fehlende Abstimmungen erneut senden",
+        ]
+        if is_module_enabled(guild.id, "alliance"):
+            enabled_lines.append("• Allianz-Event erstellen")
+        if is_module_enabled(guild.id, "attendance"):
+            enabled_lines.append("• Anwesenheit verwalten")
+        if is_module_enabled(guild.id, "voice"):
+            enabled_lines.append("• Event-Voice konfigurieren")
         emb = discord.Embed(
             title=f"{EMOJI_GUILD} Admin – Event",
-            description=(
-                "Event-Verwaltung im Menü.\n\n"
-                "Aktuell sind die bestehenden Slash-Commands weiterhin die sicherste Eingabeform:\n"
-                "• `/event create` – normalen Raid erstellen\n"
-                "• `/event alliance_create` – Allianz-Raid erstellen\n"
-                "• `/event delete` – Event löschen\n"
-                "• `/event alliance_delete` – Allianz-Event löschen\n"
-                "• `/event resend_missing` – fehlende Abstimmungen erneut senden\n\n"
-                "Die vollständige Formular-Version bauen wir als nächsten Schritt, ohne die bestehenden Eventdaten anzufassen."
-            ),
+            description="Event-Verwaltung im Menü.\n\n" + "\n".join(enabled_lines),
             color=discord.Color.gold()
         )
-        await _portal_edit(inter, embed=emb, view=AdminEventMenuView())
+        await _portal_edit(inter, embed=emb, view=AdminEventMenuView(guild.id))
 
     @button(label="Loot", emoji=_menu_emoji(EMOJI_LOOT), style=ButtonStyle.secondary, custom_id="portal_admin_loot")
     async def btn_loot(self, inter: discord.Interaction, _):
@@ -6663,12 +6709,24 @@ class AdminMenuView(PortalSafeView):
         guild, member = await _resolve_guild_member_from_inter(inter)
         if guild and member and inter.message:
             _mark_portal_sent(guild.id, member.id, inter.message.id)
-        await _portal_edit(inter, embed=_main_menu_embed(guild, member), view=MemberPortalMainView())
+        await _portal_edit(inter, embed=_main_menu_embed(guild, member), view=MemberPortalMainView(guild.id))
 
 
 class AdminEventMenuView(PortalSafeView):
-    def __init__(self):
+    def __init__(self, guild_id: int | None = None):
         super().__init__(timeout=None)
+        gid = int(guild_id or 0)
+        disabled_ids: set[str] = set()
+        if gid and not is_module_enabled(gid, "alliance"):
+            disabled_ids.add("portal_admin_event_alliance")
+        if gid and not is_module_enabled(gid, "attendance"):
+            disabled_ids.add("portal_admin_event_attendance")
+        if gid and not is_module_enabled(gid, "voice"):
+            disabled_ids.add("portal_admin_event_voice_settings")
+        if disabled_ids:
+            for item in list(self.children):
+                if str(getattr(item, "custom_id", "")) in disabled_ids:
+                    self.remove_item(item)
 
     @button(label="📅 Event erstellen", style=ButtonStyle.secondary, custom_id="portal_admin_event_create", row=0)
     async def btn_create(self, inter: discord.Interaction, _):
@@ -6746,8 +6804,9 @@ class AdminEventMenuView(PortalSafeView):
 
     @button(label="Zurück", emoji=_menu_emoji(EMOJI_BACK), style=ButtonStyle.secondary, custom_id="portal_admin_event_back", row=4)
     async def btn_back(self, inter: discord.Interaction, _):
+        guild, _member = await _resolve_guild_member_from_inter(inter)
         emb = discord.Embed(title=f"{EMOJI_ADMIN} Admin", description="Wähle einen Bereich.", color=discord.Color.gold())
-        await _portal_edit(inter, embed=emb, view=AdminMenuView())
+        await _portal_edit(inter, embed=emb, view=AdminMenuView(guild.id if guild else None))
 
 
 class AdminJunkDropModal(Modal, title="🧹 Müll gedroppt"):
@@ -6893,8 +6952,9 @@ class AdminLootMenuView(PortalSafeView):
 
     @button(label="Zurück", emoji=_menu_emoji(EMOJI_BACK), style=ButtonStyle.secondary, custom_id="portal_admin_loot_back", row=3)
     async def btn_back(self, inter: discord.Interaction, _):
+        guild, _member = await _resolve_guild_member_from_inter(inter)
         emb = discord.Embed(title=f"{EMOJI_ADMIN} Admin", description="Wähle einen Bereich.", color=discord.Color.gold())
-        await _portal_edit(inter, embed=emb, view=AdminMenuView())
+        await _portal_edit(inter, embed=emb, view=AdminMenuView(guild.id if guild else None))
 
 
 class SupportMenuView(PortalSafeView):
@@ -6954,7 +7014,7 @@ class SupportMenuView(PortalSafeView):
         if guild and member and inter.message:
             _mark_portal_sent(guild.id, member.id, inter.message.id)
 
-        await _portal_edit(inter, embed=_main_menu_embed(guild, member), view=MemberPortalMainView())
+        await _portal_edit(inter, embed=_main_menu_embed(guild, member), view=MemberPortalMainView(guild.id))
 
 
 class ProfileView(PortalSafeView):
@@ -6994,7 +7054,7 @@ class ProfileView(PortalSafeView):
         if guild and member and inter.message:
             _mark_portal_sent(guild.id, member.id, inter.message.id)
 
-        await _portal_edit(inter, embed=_main_menu_embed(guild, member), view=MemberPortalMainView())
+        await _portal_edit(inter, embed=_main_menu_embed(guild, member), view=MemberPortalMainView(guild.id))
 
 
 class EventsInfoView(PortalSafeView):
@@ -7067,7 +7127,7 @@ class RulesLootView(PortalSafeView):
         if guild and member and inter.message:
             _mark_portal_sent(guild.id, member.id, inter.message.id)
 
-        await _portal_edit(inter, embed=_main_menu_embed(guild, member), view=MemberPortalMainView())
+        await _portal_edit(inter, embed=_main_menu_embed(guild, member), view=MemberPortalMainView(guild.id))
 
 
 class HelpView(PortalSafeView):
@@ -7094,7 +7154,7 @@ class HelpView(PortalSafeView):
         if guild and member and inter.message:
             _mark_portal_sent(guild.id, member.id, inter.message.id)
 
-        await _portal_edit(inter, embed=_main_menu_embed(guild, member), view=MemberPortalMainView())
+        await _portal_edit(inter, embed=_main_menu_embed(guild, member), view=MemberPortalMainView(guild.id))
 
 
 class BackOnlyView(PortalSafeView):
@@ -7108,7 +7168,7 @@ class BackOnlyView(PortalSafeView):
         if guild and member and inter.message:
             _mark_portal_sent(guild.id, member.id, inter.message.id)
 
-        await _portal_edit(inter, embed=_main_menu_embed(guild, member), view=MemberPortalMainView())
+        await _portal_edit(inter, embed=_main_menu_embed(guild, member), view=MemberPortalMainView(guild.id))
 
 
 class GuildBroadcastConfirmView(discord.ui.View):

@@ -30,6 +30,7 @@ intents.members = True
 intents.dm_messages = True
 intents.message_content = False
 intents.voice_states = True
+intents.moderation = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
@@ -57,6 +58,7 @@ setup_audit_system = None
 setup_voice_attendance = None
 setup_dashboard_data = None
 setup_guild_config = None
+setup_server_log = None
 store = {}
 _modules_initialized = False
 _startup_failure: str | None = None
@@ -167,6 +169,15 @@ def _import_modules():
     except ModuleNotFoundError:
         from raid_stats import get_user_stats, get_top_yes_stats, get_non_response_stats  # type: ignore
         print("✅ Import: raid_stats (root)")
+
+    global setup_server_log
+
+    try:
+        from bot.server_log import setup_server_log  # type: ignore
+        print("✅ Import: bot.server_log")
+    except ModuleNotFoundError:
+        from server_log import setup_server_log  # type: ignore
+        print("✅ Import: server_log (root)")
 
     global setup_leader_contact
 
@@ -349,6 +360,7 @@ async def on_ready():
         # Alliance/Home-Server first, then the portal and its child modules.
         setup_steps = [
             ("guild_config", setup_guild_config),
+            ("server_log", setup_server_log),
             ("audit_system", setup_audit_system),
             ("voice_attendance", setup_voice_attendance),
             ("dashboard_data", setup_dashboard_data),

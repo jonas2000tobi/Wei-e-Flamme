@@ -539,46 +539,77 @@ async def _set_pending_applicant_role(member: discord.Member, enabled: bool) -> 
             await member.add_roles(role, reason="Onboarding: Bewerberstatus")
         elif not enabled and role in member.roles:
             await member.remove_roles(role, reason="Onboarding: Bewerbung abgelehnt")
-    except Exception:
-        pass
+    except Exception as exc:
+        print(
+            f"[onboarding] Bewerberrolle {role.name} für {member} konnte nicht "
+            f"{'gesetzt' if enabled else 'entfernt'} werden: {exc!r}",
+            flush=True,
+        )
     return role
 
 
-async def _assign_roles(member: discord.Member, category_key: str, primary_key: str, experienced: bool) -> List[discord.Role]:
-    out: List[discord.Role] = []
+async def _assign_roles(member: discord.Member, category_key: str, primary_key: str, experienced: bool) -> tuple[List[discord.Role], List[str]]:
+    """Vergibt Kategorie-, Primär- und Erfahrungsrolle einzeln und meldet Fehler zurück."""
     g = member.guild
     c = _gcfg(g)
+    category_labels = {
+        "guild": "Gildenmitglied",
+        "ally": "Allianzmitglied",
+        "friend": "Freund",
+        "applicant": "Bewerber",
+    }
 
+    wanted: list[tuple[str, int | None]] = []
     cat_map = (c.get("category_roles") or {})
-    cat_rid = {
-        "guild": cat_map.get("guild"),
-        "ally": cat_map.get("ally"),
-        "friend": cat_map.get("friend"),
-        "applicant": cat_map.get("applicant"),
-    }.get(category_key)
-
-    r = _role(g, cat_rid)
-    out += [r] if r else []
+    wanted.append((category_labels.get(category_key, "Kategorie"), cat_map.get(category_key)))
 
     prim_map = (c.get("primary_roles") or {})
-    r = _role(g, prim_map.get(primary_key.upper()))
-    out += [r] if r else []
+    pkey = str(primary_key or "").upper()
+    wanted.append((pkey or "Primärrolle", prim_map.get(pkey)))
 
     exp_map = (c.get("experience_roles") or {})
-    r = _role(g, exp_map.get("experienced" if experienced else "newbie"))
-    out += [r] if r else []
+    exp_key = "experienced" if experienced else "newbie"
+    wanted.append(("Erfahren" if experienced else "Unerfahren", exp_map.get(exp_key)))
 
-    granted = []
-    for role in out:
+    granted: List[discord.Role] = []
+    errors: List[str] = []
+    seen: set[int] = set()
+    bot_member = g.me
+    bot_top = getattr(bot_member, "top_role", None)
+
+    for label, rid in wanted:
+        if not rid:
+            errors.append(f"{label}: keine Rolle konfiguriert")
+            continue
+        role = _role(g, int(rid))
+        if role is None:
+            errors.append(f"{label}: konfigurierte Rolle `{rid}` existiert nicht mehr")
+            continue
+        if role.id in seen:
+            continue
+        seen.add(role.id)
+
+        if role.managed:
+            errors.append(f"{label}: {role.mention} ist eine verwaltete Discord-Rolle")
+            continue
+        if bot_top is not None and role >= bot_top:
+            errors.append(f"{label}: {role.mention} liegt über/gleich der höchsten Bot-Rolle")
+            continue
         try:
-            if role and role not in member.roles:
-                await member.add_roles(role, reason="Onboarding")
-            if role:
-                granted.append(role)
-        except Exception:
-            pass
+            if role not in member.roles:
+                await member.add_roles(role, reason=f"Onboarding: {label}")
+            granted.append(role)
+        except discord.Forbidden:
+            errors.append(f"{label}: keine Berechtigung für {role.mention} (Bot-Rolle/Rechte prüfen)")
+        except discord.HTTPException as exc:
+            errors.append(f"{label}: Discord-Fehler bei {role.mention} ({getattr(exc, 'status', 'HTTP')})")
+        except Exception as exc:
+            errors.append(f"{label}: {role.mention} konnte nicht gesetzt werden ({type(exc).__name__})")
 
-    return granted
+    if errors:
+        print(f"[onboarding] Rollenfehler für {member} ({member.id}): " + " | ".join(errors), flush=True)
+    return granted, errors
+
 
 def _review_channel(guild: discord.Guild) -> Optional[discord.abc.Messageable]:
     ch_id = int((_gcfg(guild).get("review_channel") or 0))
@@ -788,7 +819,7 @@ class ReviewView(OnboardingFeatureView):
             await inter.followup.send("Mitglied nicht gefunden.", ephemeral=True)
             return
 
-        roles = await _assign_roles(member, self.category, self.primary, self.experienced)
+        roles, role_errors = await _assign_roles(member, self.category, self.primary, self.experienced)
         await update_welcome_card(
             member,
             "completed",
@@ -804,10 +835,14 @@ class ReviewView(OnboardingFeatureView):
                 actor=inter.user,
             )
         member_name = discord.utils.escape_markdown(member.display_name or member.name)
+        role_error_text = ""
+        if role_errors:
+            role_error_text = "\n⚠️ **Nicht gesetzt:** " + " · ".join(role_errors)
         await inter.edit_original_response(
             content=(
                 f"✅ **Akzeptiert:** **{member_name}** ({member.mention}) – Rollen: "
                 f"{', '.join(r.mention for r in roles) if roles else '—'}"
+                f"{role_error_text}"
             ),
             view=None
         )
@@ -969,7 +1004,7 @@ class ExperienceView(OnboardingFeatureView):
                 )
             else:
                 if member:
-                    roles = await _assign_roles(member, self.ctx.category, self.ctx.primary, experienced)
+                    roles, role_errors = await _assign_roles(member, self.ctx.category, self.ctx.primary, experienced)
                     await update_welcome_card(
                         member,
                         "completed",
@@ -979,12 +1014,15 @@ class ExperienceView(OnboardingFeatureView):
                     )
 
                     if review_ch:
+                        err_line = ("\n⚠️ Nicht gesetzt: " + " · ".join(role_errors)) if role_errors else ""
                         await review_ch.send(
                             f"📝 **Auto-Onboarding:** {member.mention} – {cat_txt}, {pri_txt}, {exp_txt}\n"
-                            f"Rollen: {', '.join(r.mention for r in roles) if roles else '—'}"
+                            f"Rollen: {', '.join(r.mention for r in roles) if roles else '—'}{err_line}"
                         )
 
                 auto_done_text = "✅ Danke! Deine Rollen wurden vergeben."
+                if member and role_errors:
+                    auto_done_text += "\n⚠️ Einige Rollen konnten nicht gesetzt werden. Die Gildenleitung wurde informiert."
                 if application_channel is not None:
                     auto_done_text += f"\n📝 Dein privater Bewerbungs-Chat wurde erstellt: {application_channel.mention}"
                 await inter.edit_original_response(content=auto_done_text, view=None)

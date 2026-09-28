@@ -23,6 +23,11 @@ except Exception:
 from zoneinfo import ZoneInfo
 
 try:
+    from bot import runtime_db  # type: ignore
+except Exception:
+    import runtime_db  # type: ignore
+
+try:
     from bot import guild_config as central_guild_config  # type: ignore
 except Exception:
     try:
@@ -69,6 +74,7 @@ def _gcfg(guild_id: int) -> dict:
     c = cfg.get(str(guild_id)) or {}
     c.setdefault("public_channel_id", 0)
     c.setdefault("internal_channel_id", 0)
+    c.setdefault("archive_channel_id", 0)
     c.setdefault("leader_role_id", 0)
     c.setdefault("contact_post_channel_id", 0)
     c.setdefault("contact_post_message_id", 0)
@@ -81,6 +87,8 @@ def _gcfg(guild_id: int) -> dict:
                 c["public_channel_id"] = central_guild_config.channel_id(int(guild_id), "leader_contact_public")
             if central_guild_config.channel_mapping_configured(int(guild_id), "leader_contact_internal"):
                 c["internal_channel_id"] = central_guild_config.channel_id(int(guild_id), "leader_contact_internal")
+            if central_guild_config.channel_mapping_configured(int(guild_id), "leader_contact_archive"):
+                c["archive_channel_id"] = central_guild_config.channel_id(int(guild_id), "leader_contact_archive")
     except Exception:
         pass
     cfg[str(guild_id)] = c
@@ -107,6 +115,12 @@ def _internal_channel(guild: discord.Guild) -> Optional[discord.abc.Messageable]
     return ch if isinstance(ch, (discord.TextChannel, discord.Thread)) else None
 
 
+def _archive_channel(guild: discord.Guild) -> Optional[discord.abc.Messageable]:
+    ch_id = int((_gcfg(guild.id).get("archive_channel_id") or 0))
+    ch = guild.get_channel(ch_id)
+    return ch if isinstance(ch, (discord.TextChannel, discord.Thread)) else None
+
+
 def _public_channel(guild: discord.Guild) -> Optional[discord.abc.Messageable]:
     ch_id = int((_gcfg(guild.id).get("public_channel_id") or 0))
     ch = guild.get_channel(ch_id)
@@ -125,22 +139,46 @@ def _is_leader_or_admin(inter: discord.Interaction) -> bool:
 
 
 def _replace_status_field(embed: discord.Embed, text: str) -> discord.Embed:
-    new_embed = discord.Embed(
-        title=embed.title,
-        description=embed.description,
-        color=embed.color
-    )
+    try:
+        new_embed = discord.Embed.from_dict(embed.to_dict())
+    except Exception:
+        new_embed = discord.Embed(title=embed.title, description=embed.description, color=embed.color)
 
-    for field in embed.fields:
+    kept = []
+    for field in list(new_embed.fields):
         if field.name != "Status":
-            new_embed.add_field(name=field.name, value=field.value, inline=field.inline)
-
+            kept.append((field.name, field.value, field.inline))
+    new_embed.clear_fields()
+    for name, value, inline in kept:
+        new_embed.add_field(name=name, value=value, inline=inline)
     new_embed.add_field(name="Status", value=text, inline=False)
-
-    if embed.footer and embed.footer.text:
-        new_embed.set_footer(text=embed.footer.text)
-
     return new_embed
+
+
+async def _archive_ticket(inter: discord.Interaction, embed: discord.Embed, actor_name: str) -> bool:
+    guild = inter.guild
+    if guild is None:
+        return False
+    archive_ch = _archive_channel(guild)
+    if archive_ch is None:
+        return False
+
+    try:
+        archived = discord.Embed.from_dict(embed.to_dict())
+    except Exception:
+        archived = embed
+
+    actor = getattr(inter.user, "mention", None) or f"**{_safe_text(actor_name)}**"
+    source = "—"
+    if inter.message is not None:
+        source = f"<#{inter.message.channel.id}> · Nachricht `{inter.message.id}`"
+    archived.add_field(name="Archiviert von", value=str(actor), inline=False)
+    archived.add_field(name="Ursprung", value=source, inline=False)
+    old_footer = str(getattr(getattr(archived, "footer", None), "text", "") or "").strip()
+    stamp = datetime.now(TZ).strftime("%d.%m.%Y %H:%M")
+    archived.set_footer(text=(old_footer + " · " if old_footer else "") + f"Archiviert {stamp}")
+    await archive_ch.send(embed=archived, allowed_mentions=discord.AllowedMentions.none())
+    return True
 
 
 class LeaderStatusView(View):
@@ -184,8 +222,36 @@ class LeaderStatusView(View):
 
     @button(label="✅ Erledigt", style=ButtonStyle.success, custom_id="leader_status_done")
     async def btn_done(self, inter: discord.Interaction, _):
+        if not _is_leader_or_admin(inter):
+            await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
+            return
+        if not inter.message or not inter.message.embeds:
+            await inter.response.send_message("❌ Nachricht/Embed nicht gefunden.", ephemeral=True)
+            return
+
+        await inter.response.defer(ephemeral=True)
         name = inter.user.display_name if hasattr(inter.user, "display_name") else inter.user.name
-        await self._edit_status(inter, f"✅ Erledigt von **{_safe_text(name)}**")
+        new_embed = _replace_status_field(inter.message.embeds[0], f"✅ Erledigt von **{_safe_text(name)}**")
+        archive_ch = _archive_channel(inter.guild) if inter.guild else None
+
+        if archive_ch is None:
+            await inter.message.edit(embed=new_embed, view=self)
+            await inter.followup.send("✅ Status aktualisiert. Kein Archivkanal gesetzt, daher bleibt das Ticket hier stehen.", ephemeral=True)
+            return
+
+        try:
+            await _archive_ticket(inter, new_embed, name)
+            await inter.message.delete()
+            await inter.followup.send(f"✅ Ticket erledigt und nach {getattr(archive_ch, 'mention', '#Archiv')} archiviert.", ephemeral=True)
+        except Exception as e:
+            try:
+                await inter.message.edit(embed=new_embed, view=self)
+            except Exception:
+                pass
+            if not inter.response.is_done():
+                await inter.response.send_message(f"❌ Archivieren fehlgeschlagen: {e}", ephemeral=True)
+            else:
+                await inter.followup.send(f"❌ Archivieren fehlgeschlagen: {e}", ephemeral=True)
 
     @button(label="🗑️ Löschen", style=ButtonStyle.danger, custom_id="leader_status_delete")
     async def btn_delete(self, inter: discord.Interaction, _):
@@ -359,6 +425,25 @@ async def setup_leader_contact(client: discord.Client, tree: app_commands.Comman
 
         await send_text_channel_picker(inter, "🔒 Internen Leader-Channel auswählen", _picked)
 
+    @leader_group.command(name="archive_channel", description="(Admin) Archivkanal für erledigte Leader-Tickets setzen")
+    async def leadercontact_archive(inter: discord.Interaction):
+        if not _is_admin(inter):
+            await inter.response.send_message("❌ Nur Admins.", ephemeral=True)
+            return
+
+        async def _picked(pick_inter: discord.Interaction, channel: discord.TextChannel):
+            c = _gcfg(pick_inter.guild_id)
+            c["archive_channel_id"] = int(channel.id)
+            cfg[str(pick_inter.guild_id)] = c
+            _save_cfg(cfg)
+            try:
+                runtime_db.set_guild_setting(int(pick_inter.guild_id), "guild_channel_leader_contact_archive_id", int(channel.id))
+            except Exception:
+                pass
+            await pick_inter.response.edit_message(content=f"✅ Leader-Ticket-Archiv gesetzt: {channel.mention}", view=None)
+
+        await send_text_channel_picker(inter, "🗃️ Archivkanal für erledigte Leader-Tickets auswählen", _picked)
+
     @leader_group.command(name="role", description="(Admin) Leader-Rolle setzen")
     async def leadercontact_role(inter: discord.Interaction, role: discord.Role):
         if not _is_admin(inter):
@@ -383,12 +468,14 @@ async def setup_leader_contact(client: discord.Client, tree: app_commands.Comman
 
         public_ch = guild.get_channel(int(c.get("public_channel_id", 0) or 0))
         internal_ch = guild.get_channel(int(c.get("internal_channel_id", 0) or 0))
+        archive_ch = guild.get_channel(int(c.get("archive_channel_id", 0) or 0))
         role = guild.get_role(int(c.get("leader_role_id", 0) or 0))
 
         text = (
             f"**Leader-Kontakt Status**\n"
             f"• Öffentlicher Channel: {public_ch.mention if isinstance(public_ch, discord.TextChannel) else '—'}\n"
             f"• Interner Channel: {internal_ch.mention if isinstance(internal_ch, discord.TextChannel) else '—'}\n"
+            f"• Archiv: {archive_ch.mention if isinstance(archive_ch, discord.TextChannel) else '—'}\n"
             f"• Leader-Rolle: {role.mention if role else '—'}\n"
             f"• Kontakt-Post Channel-ID: `{c.get('contact_post_channel_id', 0)}`\n"
             f"• Kontakt-Post Message-ID: `{c.get('contact_post_message_id', 0)}`"
