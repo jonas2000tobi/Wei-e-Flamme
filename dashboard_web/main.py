@@ -75,7 +75,7 @@ if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 ASSET_VER = "guild-platform-v2-5-0-welcome"
-DASHBOARD_RELEASE_VERSION = "2.5.2 · Welcome Channel Fix"
+DASHBOARD_RELEASE_VERSION = "2.6.0 · Bewerbungen & Voice Setup"
 
 _EVENT_IMAGE_ASSETS: dict[str, str] = {
     "guild_boss": f"/static/event_images/guild_boss.webp?v={ASSET_VER}",
@@ -15120,7 +15120,7 @@ def _render_admin_settings_editor(data: dict[str, Any], msg: str = "", section: 
         active_optional = sum(1 for key in OPTIONAL_MODULE_KEYS if module_states.get(key, False))
         onboarding_config_html = ""
         if module_states.get("onboarding", False):
-            _, onboarding_channels = _catalog_from_snapshot(snap)
+            onboarding_roles, onboarding_channels = _catalog_from_snapshot(snap)
             welcome_enabled = bool(_dashboard_module_setting_value(guild_id, "onboarding", "welcome_enabled", True))
             welcome_update_on_leave = bool(_dashboard_module_setting_value(guild_id, "onboarding", "welcome_update_on_leave", True))
             welcome_channel_id = int(_guild_setting_value(guild_id, "guild_channel_welcome_id", 0) or 0)
@@ -15136,6 +15136,11 @@ def _render_admin_settings_editor(data: dict[str, Any], msg: str = "", section: 
             if not welcome_slogans:
                 welcome_slogans = list(DEFAULT_ONBOARDING_WELCOME_SLOGANS)
             slogans_text = "\n".join(welcome_slogans)
+            application_chat_enabled = bool(_dashboard_module_setting_value(guild_id, "onboarding", "application_chat_enabled", True))
+            application_category_id = int(_dashboard_module_setting_value(guild_id, "onboarding", "application_category_id", 0) or 0)
+            application_lead_role_id = int(_dashboard_module_setting_value(guild_id, "onboarding", "application_lead_role_id", 0) or 0)
+            if not application_lead_role_id:
+                application_lead_role_id = int(_guild_setting_value(guild_id, "guild_role_leader_id", 0) or 0)
             onboarding_config_html = f"""
             <section class='settings-card'>
               <div class='settings-card-head'>
@@ -15169,6 +15174,34 @@ def _render_admin_settings_editor(data: dict[str, Any], msg: str = "", section: 
                   <div><span>Server verlassen</span><strong>⚫ Server verlassen</strong></div>
                 </div>
                 <button class='btn' type='submit'>Welcome-System speichern</button>
+              </form>
+            </section>
+            <section class='settings-card'>
+              <div class='settings-card-head'>
+                <div><div class='eyebrow'>Onboarding & Recruitment</div><h2>📝 Privater Bewerbungs-Chat</h2><p class='muted'>Wählt jemand im Onboarding <strong>Bewerber</strong>, erstellt der Bot nach Abschluss automatisch einen privaten Textkanal für Bewerber und Lead. Der Kanal wird beim Review direkt verlinkt.</p></div>
+                <span class='pill {'ok' if application_chat_enabled else ''}'>{'Aktiv' if application_chat_enabled else 'Aus'}</span>
+              </div>
+              <form method='post' action='/admin/onboarding-application-settings' class='settings-form'>
+                <div class='settings-two'>
+                  <label>Bewerbungs-Chat aktiv
+                    <select name='application_chat_enabled'>
+                      <option value='1' {'selected' if application_chat_enabled else ''}>Ja</option>
+                      <option value='0' {'selected' if not application_chat_enabled else ''}>Nein</option>
+                    </select>
+                  </label>
+                  <label>Lead-Rolle
+                    {_role_select('application_lead_role_id', onboarding_roles, [application_lead_role_id])}
+                  </label>
+                </div>
+                <label>Kategorie für Bewerbungs-Chats<br>{_channel_select('application_category_id', onboarding_channels, application_category_id, kinds={'category'})}</label>
+                <p class='muted'>Erstellte Kanäle heißen <code>bewerbung-name</code>. Sichtbar sind @everyone nicht, sondern nur der Bewerber, die gewählte Lead-Rolle und der Bot. Discord-Administratoren können private Kanalrechte technisch immer umgehen.</p>
+                <div class='settings-readonly-grid'>
+                  <div><span>Auslöser</span><strong>📝 Kategorie Bewerber</strong></div>
+                  <div><span>Zeitpunkt</span><strong>✅ Onboarding ausgefüllt</strong></div>
+                  <div><span>Review</span><strong>🔗 Kanal wird verlinkt</strong></div>
+                  <div><span>Status</span><strong>✅ / ❌ wird im Chat gepostet</strong></div>
+                </div>
+                <button class='btn' type='submit'>Bewerbungs-Chat speichern</button>
               </form>
             </section>
             """
@@ -19323,6 +19356,42 @@ async def admin_onboarding_welcome_settings(request: Request, _: bool = Depends(
     msg = "Welcome-System gespeichert."
     if welcome_enabled and not channel_id:
         msg += " Es ist noch kein Welcome-Kanal ausgewählt; bis dahin wird keine öffentliche Welcome Card gesendet."
+    return RedirectResponse(
+        "/admin-settings?" + urllib.parse.urlencode({"section": "modules", "msg": msg}),
+        status_code=303,
+    )
+
+
+@app.post("/admin/onboarding-application-settings")
+async def admin_onboarding_application_settings(request: Request, _: bool = Depends(_admin_auth)):
+    payload = _snapshot_payload()
+    guild_id = _safe_guild_id(payload)
+    if not guild_id:
+        raise HTTPException(status_code=400, detail="Guild-ID fehlt")
+    if not _dashboard_module_enabled("onboarding", guild_id):
+        return RedirectResponse(
+            "/admin-settings?" + urllib.parse.urlencode({"section": "modules", "msg": "Onboarding & Recruitment ist deaktiviert."}),
+            status_code=303,
+        )
+    form = _parse_urlencoded_body(await request.body())
+    enabled = str(form.get("application_chat_enabled") or "0").strip().lower() in {"1", "true", "yes", "on"}
+    category_raw = str(form.get("application_category_id") or "").strip()
+    lead_raw = str(form.get("application_lead_role_id") or "").strip()
+    category_id = int(category_raw) if category_raw.isdigit() else 0
+    lead_role_id = int(lead_raw) if lead_raw.isdigit() else 0
+
+    _set_dashboard_module_setting_value(guild_id, "onboarding", "application_chat_enabled", enabled)
+    _set_dashboard_module_setting_value(guild_id, "onboarding", "application_category_id", category_id)
+    _set_dashboard_module_setting_value(guild_id, "onboarding", "application_lead_role_id", lead_role_id)
+
+    msg = "Bewerbungs-Chat gespeichert."
+    missing = []
+    if enabled and not category_id:
+        missing.append("Bewerbungs-Kategorie")
+    if enabled and not lead_role_id:
+        missing.append("Lead-Rolle")
+    if missing:
+        msg += " Fehlt noch: " + ", ".join(missing) + "."
     return RedirectResponse(
         "/admin-settings?" + urllib.parse.urlencode({"section": "modules", "msg": msg}),
         status_code=303,
