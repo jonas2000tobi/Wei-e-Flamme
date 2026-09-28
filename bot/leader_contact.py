@@ -76,6 +76,7 @@ def _gcfg(guild_id: int) -> dict:
     c.setdefault("public_channel_id", 0)
     c.setdefault("internal_channel_id", 0)
     c.setdefault("archive_channel_id", 0)
+    c.setdefault("ticket_category_id", 0)
     c.setdefault("leader_role_id", 0)
     c.setdefault("contact_post_channel_id", 0)
     c.setdefault("contact_post_message_id", 0)
@@ -90,6 +91,8 @@ def _gcfg(guild_id: int) -> dict:
                 c["internal_channel_id"] = central_guild_config.channel_id(int(guild_id), "leader_contact_internal")
             if central_guild_config.channel_mapping_configured(int(guild_id), "leader_contact_archive"):
                 c["archive_channel_id"] = central_guild_config.channel_id(int(guild_id), "leader_contact_archive")
+            if central_guild_config.channel_mapping_configured(int(guild_id), "leader_ticket_category"):
+                c["ticket_category_id"] = central_guild_config.channel_id(int(guild_id), "leader_ticket_category")
     except Exception:
         pass
     cfg[str(guild_id)] = c
@@ -120,6 +123,12 @@ def _archive_channel(guild: discord.Guild) -> Optional[discord.abc.Messageable]:
     ch_id = int((_gcfg(guild.id).get("archive_channel_id") or 0))
     ch = guild.get_channel(ch_id)
     return ch if isinstance(ch, (discord.TextChannel, discord.Thread)) else None
+
+
+def _ticket_category(guild: discord.Guild) -> Optional[discord.CategoryChannel]:
+    ch_id = int((_gcfg(guild.id).get("ticket_category_id") or 0))
+    ch = guild.get_channel(ch_id)
+    return ch if isinstance(ch, discord.CategoryChannel) else None
 
 
 def _public_channel(guild: discord.Guild) -> Optional[discord.abc.Messageable]:
@@ -252,7 +261,9 @@ async def _ensure_private_ticket_channel(inter: discord.Interaction) -> tuple[Op
     if not isinstance(leader_role, discord.Role):
         return None, "Keine Leader-Rolle konfiguriert."
     internal = _internal_channel(inter.guild)
-    category = internal.category if isinstance(internal, discord.TextChannel) else None
+    category = _ticket_category(inter.guild)
+    if category is None:
+        category = internal.category if isinstance(internal, discord.TextChannel) else None
     me = inter.guild.me
 
     overwrites: dict[discord.abc.Snowflake, discord.PermissionOverwrite] = {
@@ -607,6 +618,21 @@ async def setup_leader_contact(client: discord.Client, tree: app_commands.Comman
 
         await send_text_channel_picker(inter, "🗃️ Archivkanal für erledigte Leader-Tickets auswählen", _picked)
 
+    @leader_group.command(name="ticket_category", description="(Admin) Kategorie für private Leader-Ticket-Chats setzen")
+    async def leadercontact_ticket_category(inter: discord.Interaction, category: discord.CategoryChannel):
+        if not _is_admin(inter):
+            await inter.response.send_message("❌ Nur Admins.", ephemeral=True)
+            return
+        c = _gcfg(inter.guild_id)
+        c["ticket_category_id"] = int(category.id)
+        cfg[str(inter.guild_id)] = c
+        _save_cfg(cfg)
+        try:
+            runtime_db.set_guild_setting(int(inter.guild_id), "guild_channel_leader_ticket_category_id", int(category.id))
+        except Exception:
+            pass
+        await inter.response.send_message(f"✅ Private Leader-Ticket-Chats werden in **{category.name}** erstellt.", ephemeral=True)
+
     @leader_group.command(name="role", description="(Admin) Leader-Rolle setzen")
     async def leadercontact_role(inter: discord.Interaction, role: discord.Role):
         if not _is_admin(inter):
@@ -632,6 +658,7 @@ async def setup_leader_contact(client: discord.Client, tree: app_commands.Comman
         public_ch = guild.get_channel(int(c.get("public_channel_id", 0) or 0))
         internal_ch = guild.get_channel(int(c.get("internal_channel_id", 0) or 0))
         archive_ch = guild.get_channel(int(c.get("archive_channel_id", 0) or 0))
+        ticket_category = guild.get_channel(int(c.get("ticket_category_id", 0) or 0))
         role = guild.get_role(int(c.get("leader_role_id", 0) or 0))
 
         text = (
@@ -639,6 +666,7 @@ async def setup_leader_contact(client: discord.Client, tree: app_commands.Comman
             f"• Öffentlicher Channel: {public_ch.mention if isinstance(public_ch, discord.TextChannel) else '—'}\n"
             f"• Interner Channel: {internal_ch.mention if isinstance(internal_ch, discord.TextChannel) else '—'}\n"
             f"• Archiv: {archive_ch.mention if isinstance(archive_ch, discord.TextChannel) else '—'}\n"
+            f"• Ticket-Kategorie: {ticket_category.name if isinstance(ticket_category, discord.CategoryChannel) else 'Kategorie des internen Channels'}\n"
             f"• Leader-Rolle: {role.mention if role else '—'}\n"
             f"• Kontakt-Post Channel-ID: `{c.get('contact_post_channel_id', 0)}`\n"
             f"• Kontakt-Post Message-ID: `{c.get('contact_post_message_id', 0)}`"

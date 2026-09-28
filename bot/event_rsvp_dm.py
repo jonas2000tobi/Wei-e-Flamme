@@ -3685,6 +3685,125 @@ def _dashboard_lineup_record(guild_id: int, event_id: str) -> dict[str, Any]:
     return lineup
 
 
+def get_event_lineup_state(guild_id: int, event_id: str) -> dict[str, Any]:
+    """Aktuelle Aufstellung fuer Dashboard/Gildenzentrale lesen.
+
+    Liefert immer eine normalisierte Gruppenstruktur plus Kandidaten und nicht
+    eingeteilte Spieler. Die Daten liegen in derselben Postgres-Tabelle wie
+    der Dashboard-Planer.
+    """
+    eid = str(event_id or "").strip()
+    obj = (store or {}).get(eid)
+    if not isinstance(obj, dict) or int(obj.get("guild_id", 0) or 0) != int(guild_id):
+        return {"ok": False, "error": "Event nicht gefunden."}
+    _init_event_shape(obj)
+    candidates = _dashboard_lineup_candidates(obj)
+    record = _dashboard_lineup_record(int(guild_id), eid)
+    if record:
+        clean = _dashboard_lineup_clean(obj, record)
+    else:
+        size = 6
+        count = max(1, min(20, (len(candidates) + size - 1) // size if candidates else 1))
+        clean = {
+            "group_size": size,
+            "group_count": count,
+            "groups": [{"name": f"Gruppe {i}", "members": []} for i in range(1, count + 1)],
+            "bench": [],
+            "published": False,
+            "candidate_count": len(candidates),
+        }
+    clean["published"] = bool(record.get("published")) if record else bool(clean.get("published"))
+    clean["discord_channel_id"] = int(record.get("discord_channel_id") or 0) if record else 0
+    clean["discord_message_id"] = int(record.get("discord_message_id") or 0) if record else 0
+    clean["updated_by_id"] = str(record.get("updated_by_id") or "") if record else ""
+    clean["updated_by_name"] = str(record.get("updated_by_name") or "") if record else ""
+    used: set[int] = set()
+    for group in clean.get("groups") or []:
+        for member in (group.get("members") or []) if isinstance(group, dict) else []:
+            try:
+                used.add(int(member.get("user_id") or 0))
+            except Exception:
+                pass
+    for member in clean.get("bench") or []:
+        try:
+            used.add(int(member.get("user_id") or 0))
+        except Exception:
+            pass
+    clean["candidates"] = list(candidates.values())
+    clean["unassigned"] = [dict(member) for uid, member in candidates.items() if int(uid) not in used]
+    clean["event_id"] = eid
+    clean["event_title"] = str(obj.get("title") or "Event")
+    clean["ok"] = True
+    return clean
+
+
+def save_event_lineup_state(
+    guild_id: int,
+    event_id: str,
+    lineup: dict[str, Any],
+    *,
+    actor_id: int = 0,
+    actor_name: str = "Gildenzentrale",
+) -> dict[str, Any]:
+    """Aufstellung aus der Gildenzentrale in dieselbe Tabelle wie das Dashboard speichern."""
+    eid = str(event_id or "").strip()
+    obj = (store or {}).get(eid)
+    if not isinstance(obj, dict) or int(obj.get("guild_id", 0) or 0) != int(guild_id):
+        return {"ok": False, "error": "Event nicht gefunden."}
+    if not _dashboard_event_queue_available():
+        return {"ok": False, "error": "DATABASE_URL fehlt."}
+    record = _dashboard_lineup_record(int(guild_id), eid)
+    raw = dict(lineup or {})
+    if "published" not in raw:
+        raw["published"] = bool(record.get("published"))
+    clean = _dashboard_lineup_clean(obj, raw)
+    clean["published"] = bool(raw.get("published"))
+    _dashboard_event_ensure_tables()
+    conn = _dashboard_pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO dashboard_event_lineups
+                    (guild_id, event_id, lineup_json, published, discord_channel_id, discord_message_id,
+                     updated_by_id, updated_by_name, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                ON CONFLICT (guild_id, event_id) DO UPDATE SET
+                    lineup_json = EXCLUDED.lineup_json,
+                    published = EXCLUDED.published,
+                    updated_by_id = EXCLUDED.updated_by_id,
+                    updated_by_name = EXCLUDED.updated_by_name,
+                    updated_at = NOW()
+                """,
+                (
+                    int(guild_id), eid,
+                    json.dumps(clean, ensure_ascii=False, separators=(",", ":")),
+                    bool(clean.get("published")),
+                    int(record.get("discord_channel_id") or 0),
+                    int(record.get("discord_message_id") or 0),
+                    str(actor_id or ""), str(actor_name or "Gildenzentrale"),
+                ),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    return get_event_lineup_state(int(guild_id), eid)
+
+
+async def sync_event_lineup_state(client: discord.Client, guild_id: int, event_id: str, *, publish: bool = False, actor_name: str = "Gildenzentrale") -> dict[str, Any]:
+    """Bestehende Discord-Aufstellung aktualisieren oder auf Wunsch erstmals veroeffentlichen."""
+    state = get_event_lineup_state(int(guild_id), str(event_id))
+    if not state.get("ok"):
+        return state
+    if not publish and not bool(state.get("published")):
+        return {"ok": True, "synced": False, "reason": "Noch nicht veröffentlicht", **state}
+    result = await _dashboard_event_lineup(
+        client, int(guild_id),
+        {"event_id": str(event_id), "lineup": state, "requested_by": {"name": str(actor_name or "Gildenzentrale")}},
+    )
+    return {"ok": True, "synced": True, **result}
+
+
 def _dashboard_lineup_candidates(obj: dict[str, Any]) -> dict[int, dict[str, Any]]:
     _init_event_shape(obj)
     out: dict[int, dict[str, Any]] = {}

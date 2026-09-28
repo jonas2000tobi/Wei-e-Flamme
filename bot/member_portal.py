@@ -1619,20 +1619,48 @@ def _event_status_block(guild: discord.Guild, member: discord.Member) -> str:
                     if event_guild_id != int(guild.id):
                         continue
 
-                when = datetime.fromisoformat(obj.get("when_iso", ""))
+                when = datetime.fromisoformat(str(obj.get("when_iso", "") or "").replace("Z", "+00:00"))
+                if when.tzinfo is None:
+                    when = when.replace(tzinfo=TZ)
+                when = when.astimezone(TZ)
 
-                if now >= when:
+                # Ein Event verschwindet nicht mehr exakt zur Startzeit aus der
+                # Gildenzentrale. Dashboard-Events besitzen end_at/duration_minutes;
+                # für ältere Discord-Events ohne Laufzeit verwenden wir 2 Stunden.
+                end_at = None
+                raw_end = str(obj.get("end_at") or "").strip()
+                if raw_end:
+                    try:
+                        end_at = datetime.fromisoformat(raw_end.replace("Z", "+00:00"))
+                        if end_at.tzinfo is None:
+                            end_at = end_at.replace(tzinfo=TZ)
+                        end_at = end_at.astimezone(TZ)
+                    except Exception:
+                        end_at = None
+                if end_at is None:
+                    try:
+                        duration_minutes = max(30, min(720, int(obj.get("duration_minutes") or 120)))
+                    except Exception:
+                        duration_minutes = 120
+                    end_at = when + timedelta(minutes=duration_minutes)
+
+                if now > end_at:
                     continue
 
                 title = str(obj.get("title", "Event"))
-                line_base = f"{when.strftime('%d.%m. %H:%M')} – {title}"
-
                 status = _rsvp_user_status(obj, member.id)
 
-                if status:
-                    answered.append((when, f"• {line_base} – {status}"))
+                if now >= when:
+                    running_line = f"• 🟢 **Läuft jetzt** – {title}"
+                    if status:
+                        running_line += f" – {status}"
+                    answered.append((when, running_line))
                 else:
-                    open_votes.append((when, f"• {line_base}"))
+                    line_base = f"{when.strftime('%d.%m. %H:%M')} – {title}"
+                    if status:
+                        answered.append((when, f"• {line_base} – {status}"))
+                    else:
+                        open_votes.append((when, f"• {line_base}"))
 
             except Exception:
                 continue
@@ -1648,7 +1676,8 @@ def _event_status_block(guild: discord.Guild, member: discord.Member) -> str:
             lines = [clean_line]
             if len(answered) > 1:
                 lines.append(f"Weitere Events: **{len(answered) - 1}**")
-            parts.append(f"{EMOJI_CALENDAR} {_bold_sans('Nächster Einsatz')}\n" + "\n".join(lines))
+            heading = "Aktueller Einsatz" if "Läuft jetzt" in clean_line else "Nächster Einsatz"
+            parts.append(f"{EMOJI_CALENDAR} {_bold_sans(heading)}\n" + "\n".join(lines))
 
         if open_votes:
             lines = [x[1] for x in open_votes[:3]]
@@ -6666,6 +6695,7 @@ class AdminMenuView(PortalSafeView):
             _mark_portal_sent(guild.id, member.id, inter.message.id)
         enabled_lines = [
             "• Event erstellen",
+            "• 🧩 Raid-/Gruppenaufstellung",
             "• Event löschen",
             "• Fehlende Abstimmungen erneut senden",
         ]
@@ -6749,6 +6779,23 @@ class AdminEventMenuView(PortalSafeView):
             _mark_portal_sent(guild.id, member.id, inter.message.id)
         await inter.response.send_modal(AdminAllianceEventCreateModal(guild.id, member.id))
 
+    @button(label="🧩 Aufstellung", style=ButtonStyle.primary, custom_id="portal_admin_event_lineup", row=0)
+    async def btn_lineup(self, inter: discord.Interaction, _):
+        guild, member = await _resolve_guild_member_from_inter(inter)
+        if not _is_portal_admin(guild, member):
+            await _portal_send(inter, "❌ Dieser Bereich ist nur für die Gildenleitung.", ephemeral=True)
+            return
+        events = _admin_lineup_events(guild)
+        if not events:
+            await _portal_send(inter, f"{EMOJI_CALENDAR} Keine geplanten oder laufenden Events mit Zusagen gefunden.", ephemeral=True)
+            return
+        emb = discord.Embed(
+            title="🧩 Raid-/Gruppenaufstellung",
+            description="Wähle ein Event. Danach kannst du angemeldete Spieler Gruppen oder der Reserve zuweisen. Die gleiche Aufstellung wird im Dashboard verwendet.",
+            color=discord.Color.gold(),
+        )
+        await _portal_edit(inter, embed=emb, view=AdminLineupEventSelectView(guild.id, member.id, events))
+
     @button(label="🗑️ Event löschen", style=ButtonStyle.secondary, custom_id="portal_admin_event_delete", row=1)
     async def btn_delete(self, inter: discord.Interaction, _):
         guild, member = await _resolve_guild_member_from_inter(inter)
@@ -6807,6 +6854,281 @@ class AdminEventMenuView(PortalSafeView):
         guild, _member = await _resolve_guild_member_from_inter(inter)
         emb = discord.Embed(title=f"{EMOJI_ADMIN} Admin", description="Wähle einen Bereich.", color=discord.Color.gold())
         await _portal_edit(inter, embed=emb, view=AdminMenuView(guild.id if guild else None))
+
+
+def _admin_lineup_events(guild: Optional[discord.Guild]) -> list[tuple[str, dict]]:
+    if guild is None:
+        return []
+    try:
+        rsvp = _admin_event_module()
+        now = datetime.now(rsvp.TZ)
+        out: list[tuple[str, dict]] = []
+        for event_id, obj in list((getattr(rsvp, "store", {}) or {}).items()):
+            if not isinstance(obj, dict) or int(obj.get("guild_id", 0) or 0) != int(guild.id):
+                continue
+            try:
+                start = datetime.fromisoformat(str(obj.get("when_iso") or ""))
+                duration = int(obj.get("duration_minutes") or 120)
+                end = start + timedelta(minutes=max(30, duration))
+                if end < now:
+                    continue
+            except Exception:
+                pass
+            try:
+                state = rsvp.get_event_lineup_state(int(guild.id), str(event_id))
+                if not state.get("candidates"):
+                    continue
+            except Exception:
+                continue
+            out.append((str(event_id), obj))
+        out.sort(key=lambda pair: str(pair[1].get("when_iso") or ""))
+        return out[:25]
+    except Exception:
+        return []
+
+
+def _admin_lineup_embed(guild: discord.Guild, event_id: str) -> discord.Embed:
+    rsvp = _admin_event_module()
+    state = rsvp.get_event_lineup_state(int(guild.id), str(event_id))
+    if not state.get("ok"):
+        return discord.Embed(title="🧩 Aufstellung", description=f"❌ {state.get('error') or 'Nicht verfügbar.'}", color=discord.Color.red())
+    emb = discord.Embed(
+        title=f"🧩 Aufstellung · {state.get('event_title') or 'Event'}",
+        description=(
+            "Spieler auswählen und danach Zielgruppe festlegen. Änderungen werden mit dem Dashboard geteilt.\n"
+            + ("🟢 **Discord-Live-Sync aktiv**" if state.get("published") else "⚪ Noch nicht auf Discord veröffentlicht")
+        ),
+        color=discord.Color.gold(),
+    )
+    size = int(state.get("group_size") or 6)
+    for idx, group in enumerate(state.get("groups") or []):
+        if idx >= 20 or not isinstance(group, dict):
+            break
+        members = [m for m in (group.get("members") or []) if isinstance(m, dict)]
+        lines = [f"• <@{int(m.get('user_id') or 0)}> · {m.get('role') or '—'}" for m in members if int(m.get('user_id') or 0)]
+        emb.add_field(
+            name=f"{group.get('name') or f'Gruppe {idx + 1}'} · {len(members)}/{size}",
+            value="\n".join(lines)[:1024] if lines else "— leer —",
+            inline=True,
+        )
+    bench = [m for m in (state.get("bench") or []) if isinstance(m, dict)]
+    if bench:
+        emb.add_field(name=f"🪑 Reserve · {len(bench)}", value="\n".join(f"• <@{int(m.get('user_id') or 0)}> · {m.get('role') or '—'}" for m in bench)[:1024], inline=False)
+    unassigned = [m for m in (state.get("unassigned") or []) if isinstance(m, dict)]
+    emb.add_field(
+        name=f"⏳ Nicht eingeteilt · {len(unassigned)}",
+        value="\n".join(f"• <@{int(m.get('user_id') or 0)}> · {m.get('role') or '—'}" for m in unassigned[:20])[:1024] if unassigned else "Alle eingeteilt.",
+        inline=False,
+    )
+    emb.set_footer(text="Dashboard und Gildenzentrale verwenden dieselbe Aufstellung.")
+    return emb
+
+
+class AdminLineupEventSelectView(PortalSafeView):
+    def __init__(self, guild_id: int, user_id: int, events: list[tuple[str, dict]]):
+        super().__init__(timeout=None)
+        self.guild_id = int(guild_id)
+        self.user_id = int(user_id)
+        self.add_item(AdminLineupEventSelect(guild_id, user_id, events))
+
+    @button(label="Zurück", emoji=_menu_emoji(EMOJI_BACK), style=ButtonStyle.secondary, custom_id="admin_lineup_event_back", row=1)
+    async def btn_back(self, inter: discord.Interaction, _):
+        emb = discord.Embed(title=f"{EMOJI_GUILD} Admin – Event", description="Wähle eine Event-Aktion.", color=discord.Color.gold())
+        await _portal_edit(inter, embed=emb, view=AdminEventMenuView(self.guild_id))
+
+
+class AdminLineupEventSelect(Select):
+    def __init__(self, guild_id: int, user_id: int, events: list[tuple[str, dict]]):
+        self.guild_id = int(guild_id)
+        self.user_id = int(user_id)
+        options: list[discord.SelectOption] = []
+        for event_id, obj in events[:25]:
+            title = str(obj.get("title") or "Event")
+            when = str(obj.get("when_iso") or "")
+            desc = ""
+            try:
+                dt = datetime.fromisoformat(when)
+                desc = dt.strftime("%d.%m. %H:%M")
+            except Exception:
+                pass
+            options.append(discord.SelectOption(label=title[:100], value=str(event_id), description=desc[:100] or None))
+        super().__init__(placeholder="Event für Aufstellung wählen", min_values=1, max_values=1, options=options, custom_id="admin_lineup_event_select")
+
+    async def callback(self, inter: discord.Interaction):
+        guild = inter.client.get_guild(self.guild_id)
+        member = guild.get_member(int(inter.user.id)) if guild else None
+        if not _is_portal_admin(guild, member):
+            await _portal_send(inter, "❌ Nur Gildenleitung.", ephemeral=True)
+            return
+        event_id = str(self.values[0])
+        await _portal_edit(inter, embed=_admin_lineup_embed(guild, event_id), view=AdminLineupManageView(self.guild_id, self.user_id, event_id, 0))
+
+
+class AdminLineupManageView(PortalSafeView):
+    def __init__(self, guild_id: int, user_id: int, event_id: str, page: int = 0):
+        super().__init__(timeout=None)
+        self.guild_id = int(guild_id)
+        self.user_id = int(user_id)
+        self.event_id = str(event_id)
+        self.page = max(0, int(page))
+        rsvp = _admin_event_module()
+        state = rsvp.get_event_lineup_state(self.guild_id, self.event_id)
+        candidates = sorted([m for m in (state.get("candidates") or []) if isinstance(m, dict)], key=lambda m: str(m.get("display_name") or "").casefold())
+        max_page = max(0, (len(candidates) - 1) // 25)
+        self.page = min(self.page, max_page)
+        if candidates:
+            self.add_item(AdminLineupPlayerSelect(self.guild_id, self.user_id, self.event_id, candidates, self.page))
+
+    @button(label="⚡ Automatisch", style=ButtonStyle.secondary, custom_id="admin_lineup_auto", row=1)
+    async def btn_auto(self, inter: discord.Interaction, _):
+        guild = inter.client.get_guild(self.guild_id)
+        member = guild.get_member(int(inter.user.id)) if guild else None
+        if not _is_portal_admin(guild, member):
+            await _portal_send(inter, "❌ Nur Gildenleitung.", ephemeral=True)
+            return
+        rsvp = _admin_event_module()
+        state = rsvp.get_event_lineup_state(self.guild_id, self.event_id)
+        if not state.get("ok"):
+            await _portal_send(inter, f"❌ {state.get('error')}", ephemeral=True)
+            return
+        groups = state.get("groups") or []
+        for group in groups:
+            if isinstance(group, dict):
+                group["members"] = []
+        state["bench"] = []
+        buckets = {"Tank": [], "Heal": [], "DPS": [], "Reserve": [], "Other": []}
+        for p in state.get("candidates") or []:
+            buckets.get(str(p.get("role") or ""), buckets["Other"]).append(p)
+        order = buckets["Tank"] + buckets["Heal"] + buckets["DPS"] + buckets["Other"] + buckets["Reserve"]
+        size = int(state.get("group_size") or 6)
+        cursor = 0
+        for p in order:
+            placed = False
+            for _ in range(max(1, len(groups))):
+                gi = cursor % max(1, len(groups)); cursor += 1
+                if len(groups[gi].get("members") or []) < size:
+                    groups[gi].setdefault("members", []).append(p); placed = True; break
+            if not placed:
+                state.setdefault("bench", []).append(p)
+        saved = rsvp.save_event_lineup_state(self.guild_id, self.event_id, state, actor_id=int(inter.user.id), actor_name=str(inter.user.display_name))
+        if saved.get("published"):
+            await rsvp.sync_event_lineup_state(inter.client, self.guild_id, self.event_id, actor_name=str(inter.user.display_name))
+        await _portal_edit(inter, embed=_admin_lineup_embed(guild, self.event_id), view=AdminLineupManageView(self.guild_id, self.user_id, self.event_id, self.page))
+
+    @button(label="📣 Discord veröffentlichen", style=ButtonStyle.success, custom_id="admin_lineup_publish", row=1)
+    async def btn_publish(self, inter: discord.Interaction, _):
+        guild = inter.client.get_guild(self.guild_id)
+        member = guild.get_member(int(inter.user.id)) if guild else None
+        if not _is_portal_admin(guild, member):
+            await _portal_send(inter, "❌ Nur Gildenleitung.", ephemeral=True)
+            return
+        rsvp = _admin_event_module()
+        state = rsvp.get_event_lineup_state(self.guild_id, self.event_id)
+        state["published"] = True
+        saved = rsvp.save_event_lineup_state(self.guild_id, self.event_id, state, actor_id=int(inter.user.id), actor_name=str(inter.user.display_name))
+        if not saved.get("ok"):
+            await _portal_send(inter, f"❌ {saved.get('error')}", ephemeral=True)
+            return
+        try:
+            await rsvp.sync_event_lineup_state(inter.client, self.guild_id, self.event_id, publish=True, actor_name=str(inter.user.display_name))
+        except Exception as exc:
+            await _portal_send(inter, f"❌ Discord-Sync fehlgeschlagen: `{exc}`", ephemeral=True)
+            return
+        await _portal_edit(inter, embed=_admin_lineup_embed(guild, self.event_id), view=AdminLineupManageView(self.guild_id, self.user_id, self.event_id, self.page))
+
+    @button(label="◀️ Spieler", style=ButtonStyle.secondary, custom_id="admin_lineup_prev", row=2)
+    async def btn_prev(self, inter: discord.Interaction, _):
+        guild = inter.client.get_guild(self.guild_id)
+        await _portal_edit(inter, embed=_admin_lineup_embed(guild, self.event_id), view=AdminLineupManageView(self.guild_id, self.user_id, self.event_id, max(0, self.page - 1)))
+
+    @button(label="Spieler ▶️", style=ButtonStyle.secondary, custom_id="admin_lineup_next", row=2)
+    async def btn_next(self, inter: discord.Interaction, _):
+        guild = inter.client.get_guild(self.guild_id)
+        rsvp = _admin_event_module(); state = rsvp.get_event_lineup_state(self.guild_id, self.event_id)
+        total = len(state.get("candidates") or []); max_page = max(0, (total - 1) // 25)
+        await _portal_edit(inter, embed=_admin_lineup_embed(guild, self.event_id), view=AdminLineupManageView(self.guild_id, self.user_id, self.event_id, min(max_page, self.page + 1)))
+
+    @button(label="↩️ Eventliste", style=ButtonStyle.secondary, custom_id="admin_lineup_back_events", row=3)
+    async def btn_back(self, inter: discord.Interaction, _):
+        guild = inter.client.get_guild(self.guild_id)
+        events = _admin_lineup_events(guild)
+        emb = discord.Embed(title="🧩 Raid-/Gruppenaufstellung", description="Wähle ein Event.", color=discord.Color.gold())
+        await _portal_edit(inter, embed=emb, view=AdminLineupEventSelectView(self.guild_id, self.user_id, events))
+
+
+class AdminLineupPlayerSelect(Select):
+    def __init__(self, guild_id: int, user_id: int, event_id: str, candidates: list[dict], page: int):
+        self.guild_id = int(guild_id); self.user_id = int(user_id); self.event_id = str(event_id); self.page = int(page)
+        chunk = candidates[self.page * 25:(self.page + 1) * 25]
+        options = [discord.SelectOption(label=str(p.get("display_name") or f"User {p.get('user_id')}")[:100], value=str(p.get("user_id")), description=str(p.get("role") or "")[:100] or None) for p in chunk]
+        super().__init__(placeholder=f"Spieler auswählen · Seite {self.page + 1}", min_values=1, max_values=1, options=options, custom_id="admin_lineup_player_select")
+
+    async def callback(self, inter: discord.Interaction):
+        uid = int(self.values[0])
+        guild = inter.client.get_guild(self.guild_id)
+        await _portal_edit(inter, embed=_admin_lineup_embed(guild, self.event_id), view=AdminLineupTargetView(self.guild_id, self.user_id, self.event_id, uid, self.page))
+
+
+class AdminLineupTargetView(PortalSafeView):
+    def __init__(self, guild_id: int, user_id: int, event_id: str, target_user_id: int, page: int = 0):
+        super().__init__(timeout=None)
+        self.guild_id = int(guild_id); self.user_id = int(user_id); self.event_id = str(event_id); self.target_user_id = int(target_user_id); self.page = int(page)
+        self.add_item(AdminLineupTargetSelect(guild_id, user_id, event_id, target_user_id, page))
+
+    @button(label="Zurück", emoji=_menu_emoji(EMOJI_BACK), style=ButtonStyle.secondary, custom_id="admin_lineup_target_back", row=1)
+    async def btn_back(self, inter: discord.Interaction, _):
+        guild = inter.client.get_guild(self.guild_id)
+        await _portal_edit(inter, embed=_admin_lineup_embed(guild, self.event_id), view=AdminLineupManageView(self.guild_id, self.user_id, self.event_id, self.page))
+
+
+class AdminLineupTargetSelect(Select):
+    def __init__(self, guild_id: int, user_id: int, event_id: str, target_user_id: int, page: int):
+        self.guild_id = int(guild_id); self.user_id = int(user_id); self.event_id = str(event_id); self.target_user_id = int(target_user_id); self.page = int(page)
+        rsvp = _admin_event_module(); state = rsvp.get_event_lineup_state(self.guild_id, self.event_id)
+        options = [
+            discord.SelectOption(label="Nicht eingeteilt", value="pool", emoji="⏳"),
+            discord.SelectOption(label="Reserve / Bank", value="bench", emoji="🪑"),
+        ]
+        for idx, group in enumerate(state.get("groups") or []):
+            if idx >= 20: break
+            options.append(discord.SelectOption(label=str(group.get("name") or f"Gruppe {idx + 1}")[:100], value=f"group:{idx}", description=f"{len(group.get('members') or [])}/{int(state.get('group_size') or 6)} Spieler"))
+        super().__init__(placeholder="Ziel für Spieler wählen", min_values=1, max_values=1, options=options[:25], custom_id="admin_lineup_target_select")
+
+    async def callback(self, inter: discord.Interaction):
+        guild = inter.client.get_guild(self.guild_id)
+        member = guild.get_member(int(inter.user.id)) if guild else None
+        if not _is_portal_admin(guild, member):
+            await _portal_send(inter, "❌ Nur Gildenleitung.", ephemeral=True); return
+        rsvp = _admin_event_module(); state = rsvp.get_event_lineup_state(self.guild_id, self.event_id)
+        if not state.get("ok"):
+            await _portal_send(inter, f"❌ {state.get('error')}", ephemeral=True); return
+        uid = int(self.target_user_id)
+        candidate = next((p for p in state.get("candidates") or [] if int(p.get("user_id") or 0) == uid), None)
+        if not candidate:
+            await _portal_send(inter, "❌ Spieler ist nicht mehr für dieses Event angemeldet.", ephemeral=True); return
+        for group in state.get("groups") or []:
+            if isinstance(group, dict): group["members"] = [m for m in (group.get("members") or []) if int(m.get("user_id") or 0) != uid]
+        state["bench"] = [m for m in (state.get("bench") or []) if int(m.get("user_id") or 0) != uid]
+        target = str(self.values[0])
+        if target == "bench":
+            state.setdefault("bench", []).append(candidate)
+        elif target.startswith("group:"):
+            gi = int(target.split(":", 1)[1]); groups = state.get("groups") or []
+            if gi < 0 or gi >= len(groups):
+                await _portal_send(inter, "❌ Gruppe nicht gefunden.", ephemeral=True); return
+            if len(groups[gi].get("members") or []) >= int(state.get("group_size") or 6):
+                await _portal_send(inter, "❌ Diese Gruppe ist voll.", ephemeral=True); return
+            groups[gi].setdefault("members", []).append(candidate)
+        saved = rsvp.save_event_lineup_state(self.guild_id, self.event_id, state, actor_id=int(inter.user.id), actor_name=str(inter.user.display_name))
+        if not saved.get("ok"):
+            await _portal_send(inter, f"❌ {saved.get('error')}", ephemeral=True); return
+        if saved.get("published"):
+            try:
+                await rsvp.sync_event_lineup_state(inter.client, self.guild_id, self.event_id, actor_name=str(inter.user.display_name))
+            except Exception as exc:
+                await _portal_send(inter, f"⚠️ Gespeichert, Discord-Sync fehlgeschlagen: `{exc}`", ephemeral=True)
+        await _portal_edit(inter, embed=_admin_lineup_embed(guild, self.event_id), view=AdminLineupManageView(self.guild_id, self.user_id, self.event_id, self.page))
+
 
 
 class AdminJunkDropModal(Modal, title="🧹 Müll gedroppt"):

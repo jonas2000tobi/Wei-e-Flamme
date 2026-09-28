@@ -67,6 +67,7 @@ CHANNEL_KEYS = {
     "leader_contact_public": "guild_channel_leader_contact_public_id",
     "leader_contact_internal": "guild_channel_leader_contact_internal_id",
     "leader_contact_archive": "guild_channel_leader_contact_archive_id",
+    "leader_ticket_category": "guild_channel_leader_ticket_category_id",
     "weekly_report": "guild_channel_weekly_report_id",
     "auction_active": "guild_channel_auction_active_id",
     "auction_market": "guild_channel_auction_market_id",
@@ -103,7 +104,7 @@ def _optional_channel_modules(kind: str) -> tuple[str, ...]:
         return ("voice",)
     if key == "member_portal":
         return ("member_portal",)
-    if key in {"leader_contact_public", "leader_contact_internal", "leader_contact_archive"}:
+    if key in {"leader_contact_public", "leader_contact_internal", "leader_contact_archive", "leader_ticket_category"}:
         return ("leader_contact",)
     if key == "weekly_report":
         return ("analytics",)
@@ -475,6 +476,7 @@ def sync_legacy_compatibility(guild_id: int) -> dict[str, bool]:
         "leader_contact_public": "public_channel_id",
         "leader_contact_internal": "internal_channel_id",
         "leader_contact_archive": "archive_channel_id",
+        "leader_ticket_category": "ticket_category_id",
     }
     for kind, field in mappings.items():
         cid = channel_id(int(guild_id), kind)
