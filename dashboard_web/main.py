@@ -75,7 +75,7 @@ if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 ASSET_VER = "guild-platform-v2-5-0-welcome"
-DASHBOARD_RELEASE_VERSION = "2.9.0 · Raid-Aufstellung & Leader-Ticket-Chats"
+DASHBOARD_RELEASE_VERSION = "2.10.0 · Live-Raidplanung & Ticket-Kategorie"
 
 _EVENT_IMAGE_ASSETS: dict[str, str] = {
     "guild_boss": f"/static/event_images/guild_boss.webp?v={ASSET_VER}",
@@ -3150,7 +3150,10 @@ def _admin_card_action_buttons(event_id: str, discord_url: str = "", compact: bo
     compact_cls = " compact" if compact else ""
     cls_primary = f"btn{compact_cls}"
     cls_secondary = f"btn{compact_cls} secondary"
-    buttons = [f"<a class='{cls_primary}' href='/admin/events/{_e(event_id)}'>Bearbeiten</a>"]
+    buttons = [
+        f"<a class='{cls_primary} lineup-cta' href='/event/{_e(event_id)}#lineup'>🧩 Aufstellung</a>",
+        f"<a class='{cls_secondary}' href='/admin/events/{_e(event_id)}'>Bearbeiten</a>",
+    ]
     if states.get("attendance", False):
         buttons.append(f"<a class='{cls_secondary}' href='/attendance/{_e(event_id)}'>Anwesenheit</a>")
         if states.get("points", False):
@@ -15772,8 +15775,43 @@ def _event_lineup_candidates(event: dict[str, Any]) -> list[dict[str, Any]]:
     return out
 
 
-def _event_lineup_default(event: dict[str, Any], *, group_size: int = 6) -> dict[str, Any]:
-    candidates = _event_lineup_candidates(event)
+def _event_lineup_candidates_for_snapshot(snap: dict[str, Any], event: dict[str, Any]) -> list[dict[str, Any]]:
+    """Zusagen stabil aus Eventobjekt + RSVP-Mirror zusammenführen.
+
+    Der Event-Snapshot kann während eines Bot-Publishes kurz ohne eingebettete
+    Teilnehmer vorliegen. Für die Drag-&-Drop-Aufstellung darf dadurch eine
+    bereits sichtbare Zuordnung nicht wieder verschwinden.
+    """
+    out = list(_event_lineup_candidates(event))
+    seen = {int(x.get("user_id") or 0) for x in out if isinstance(x, dict)}
+    event_id = str(event.get("event_id") or event.get("id") or "").strip()
+    rows = ((snap.get("event_rsvps") or {}).get("items") or []) if isinstance(snap.get("event_rsvps"), dict) else []
+    for row in rows:
+        if not isinstance(row, dict) or str(row.get("event_id") or "").strip() != event_id:
+            continue
+        uid = _user_id(row.get("user_id") or row.get("id"))
+        if not uid or uid in seen:
+            continue
+        response = str(row.get("response") or row.get("status") or "").strip().lower()
+        role_raw = str(row.get("role_name") or row.get("role") or "Zusage").strip()
+        role_l = role_raw.lower()
+        if response in {"no", "nein", "absent", "abgemeldet", "declined", "deny", "maybe", "vielleicht", "tentative", "unsure"}:
+            continue
+        if role_l in {"no", "nein", "abgemeldet", "maybe", "vielleicht"}:
+            continue
+        role_key = role_raw.upper()
+        role = {"HEALER": "Heal", "HEAL": "Heal", "TANK": "Tank", "DPS": "DPS", "BANK": "Reserve", "RESERVE": "Reserve"}.get(role_key, role_raw or "Zusage")
+        out.append({
+            "user_id": int(uid),
+            "display_name": str(row.get("display_name") or row.get("name") or row.get("server_name") or f"User {uid}"),
+            "role": role,
+        })
+        seen.add(uid)
+    return out
+
+
+def _event_lineup_default(event: dict[str, Any], *, group_size: int = 6, candidates: Optional[list[dict[str, Any]]] = None) -> dict[str, Any]:
+    candidates = list(candidates) if candidates is not None else _event_lineup_candidates(event)
     size = max(1, min(24, int(group_size or 6)))
     group_count = max(1, (len(candidates) + size - 1) // size) if candidates else 1
     return {
@@ -15785,9 +15823,9 @@ def _event_lineup_default(event: dict[str, Any], *, group_size: int = 6) -> dict
     }
 
 
-def _load_event_lineup(guild_id: int, event_id: str, event: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+def _load_event_lineup(guild_id: int, event_id: str, event: Optional[dict[str, Any]] = None, *, candidates: Optional[list[dict[str, Any]]] = None) -> dict[str, Any]:
     if not guild_id or not event_id or not _database_url():
-        return _event_lineup_default(event or {})
+        return _event_lineup_default(event or {}, candidates=candidates)
     _ensure_admin_tables()
     conn = _pg_connect()
     try:
@@ -15805,7 +15843,7 @@ def _load_event_lineup(guild_id: int, event_id: str, event: Optional[dict[str, A
     finally:
         conn.close()
     if not row:
-        return _event_lineup_default(event or {})
+        return _event_lineup_default(event or {}, candidates=candidates)
     try:
         lineup = json.loads(row.get("lineup_json") or "{}")
     except Exception:
@@ -15826,10 +15864,10 @@ def _load_event_lineup(guild_id: int, event_id: str, event: Optional[dict[str, A
     return lineup
 
 
-def _normalize_event_lineup(event: dict[str, Any], raw: Any) -> dict[str, Any]:
+def _normalize_event_lineup(event: dict[str, Any], raw: Any, *, candidates: Optional[list[dict[str, Any]]] = None) -> dict[str, Any]:
     """Lineup gegen aktuelle Event-Zusagen validieren und Dubletten entfernen."""
     data = raw if isinstance(raw, dict) else {}
-    candidates = _event_lineup_candidates(event)
+    candidates = list(candidates) if candidates is not None else _event_lineup_candidates(event)
     by_uid = {int(x["user_id"]): x for x in candidates}
     size = max(1, min(24, int(_num(data.get("group_size"), 6) or 6)))
     requested_count = max(1, min(20, int(_num(data.get("group_count"), 1) or 1)))
@@ -15865,10 +15903,10 @@ def _normalize_event_lineup(event: dict[str, Any], raw: Any) -> dict[str, Any]:
     }
 
 
-def _save_event_lineup(guild_id: int, event_id: str, event: dict[str, Any], lineup: dict[str, Any], actor: dict[str, Any]) -> dict[str, Any]:
+def _save_event_lineup(guild_id: int, event_id: str, event: dict[str, Any], lineup: dict[str, Any], actor: dict[str, Any], *, candidates: Optional[list[dict[str, Any]]] = None) -> dict[str, Any]:
     if not _database_url():
         raise RuntimeError("DATABASE_URL fehlt.")
-    clean = _normalize_event_lineup(event, lineup)
+    clean = _normalize_event_lineup(event, lineup, candidates=candidates)
     actor_id = str(actor.get("user_id") or actor.get("id") or "")
     actor_name = str(actor.get("username") or actor.get("global_name") or actor_id or "Dashboard")
     _ensure_admin_tables()
@@ -15907,9 +15945,10 @@ def _event_lineup_panel(data: dict[str, Any], event: dict[str, Any], event_id: s
     if request is None or not _is_dashboard_admin(request):
         return ""
     guild_id = int(_safe_guild_id(data) or 0)
-    candidates = _event_lineup_candidates(event)
-    stored = _load_event_lineup(guild_id, str(event_id), event)
-    clean = _normalize_event_lineup(event, stored)
+    snap = data.get("snapshot") or {}
+    candidates = _event_lineup_candidates_for_snapshot(snap, event)
+    stored = _load_event_lineup(guild_id, str(event_id), event, candidates=candidates)
+    clean = _normalize_event_lineup(event, stored, candidates=candidates)
     clean["published"] = bool(stored.get("published"))
     clean["discord_channel_id"] = int(stored.get("discord_channel_id") or 0)
     clean["discord_message_id"] = int(stored.get("discord_message_id") or 0)
@@ -15968,15 +16007,15 @@ def _event_lineup_panel(data: dict[str, Any], event: dict[str, Any], event_id: s
       .lineup-groups{{display:grid;grid-template-columns:repeat(auto-fit,minmax(245px,1fr));gap:12px}}.lineup-group{{border:1px solid rgba(214,168,79,.22);border-radius:16px;padding:12px;background:rgba(0,0,0,.15)}}
       .lineup-group-head{{display:flex;justify-content:space-between;gap:8px;align-items:center;margin-bottom:8px}}.lineup-group-name{{font-weight:800;color:#efd594;background:transparent;border:0;border-bottom:1px dashed rgba(239,213,148,.35);min-width:0;width:150px}}
       .lineup-dropzone{{min-height:64px;border:1px dashed rgba(255,255,255,.18);border-radius:12px;padding:8px;display:flex;flex-direction:column;gap:7px}}.lineup-dropzone.drag-over{{border-color:#efd594;background:rgba(214,168,79,.08)}}
-      .lineup-player{{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:9px 10px;border-radius:11px;background:rgba(255,255,255,.055);border:1px solid rgba(255,255,255,.08);cursor:grab;user-select:none}}.lineup-player:active{{cursor:grabbing}}.lineup-player b{{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}.lineup-role{{font-size:11px;padding:3px 6px;border-radius:999px;background:rgba(214,168,79,.11);color:#e8cf99;white-space:nowrap}}.lineup-pool .lineup-player{{background:rgba(255,255,255,.035)}}
+      .lineup-player{{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:9px 10px;border-radius:11px;background:rgba(255,255,255,.055);border:1px solid rgba(255,255,255,.08);cursor:grab;user-select:none}}.lineup-player:active{{cursor:grabbing}}.lineup-player.selected{{outline:2px solid #efd594;background:rgba(214,168,79,.16)}}.lineup-player b{{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}.lineup-role{{font-size:11px;padding:3px 6px;border-radius:999px;background:rgba(214,168,79,.11);color:#e8cf99;white-space:nowrap}}.lineup-pool .lineup-player{{background:rgba(255,255,255,.035)}}
       @media(max-width:850px){{.lineup-board{{grid-template-columns:1fr}}.lineup-groups{{grid-template-columns:1fr}}}}
     </style>
     <script>
     (()=>{{
       const initial={js_data};
       const byId=new Map((initial.candidates||[]).map(x=>[String(x.user_id),x]));
-      let state={{group_size:Number(initial.group_size||6),group_count:Number(initial.group_count||1),groups:initial.groups||[],bench:initial.bench||[],published:!!initial.published}};
-      let timer=null, saving=false;
+      let state={{group_size:Number(initial.group_size||6),group_count:Number(initial.group_count||1),groups:structuredClone(initial.groups||[]),bench:structuredClone(initial.bench||[]),published:!!initial.published}};
+      let timer=null, saving=false, saveAgain=false, revision=0, dragUid='', selectedUid='';
       const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]));
       function normalize(){{
         state.group_size=Math.max(1,Math.min(24,Number(state.group_size||6)));
@@ -15986,7 +16025,7 @@ def _event_lineup_panel(data: dict[str, Any], event: dict[str, Any], event_id: s
         state.groups.forEach((g,i)=>{{g.name=g.name||`Gruppe ${{i+1}}`;g.members=(g.members||[]).slice(0,state.group_size)}});
       }}
       function placedIds(){{const x=new Set();state.groups.forEach(g=>(g.members||[]).forEach(m=>x.add(String(m.user_id))));(state.bench||[]).forEach(m=>x.add(String(m.user_id)));return x}}
-      function playerHtml(p){{return `<div class="lineup-player" draggable="true" data-user-id="${{esc(p.user_id)}}"><b>${{esc(p.display_name)}}</b><span class="lineup-role">${{esc(p.role||'')}}</span></div>`}}
+      function playerHtml(p){{const sel=String(p.user_id)===selectedUid?' selected':'';return `<div class="lineup-player${{sel}}" draggable="true" tabindex="0" data-user-id="${{esc(p.user_id)}}"><b>${{esc(p.display_name)}}</b><span class="lineup-role">${{esc(p.role||'')}}</span></div>`}}
       function render(){{
         normalize();
         const used=placedIds();
@@ -15996,26 +16035,69 @@ def _event_lineup_panel(data: dict[str, Any], event: dict[str, Any], event_id: s
         document.getElementById('lineup-bench').innerHTML=(state.bench||[]).map(playerHtml).join('')||'<span class="muted">Keine Reserve.</span>';
         document.getElementById('lineup-groups').innerHTML=state.groups.map((g,i)=>`<div class="lineup-group"><div class="lineup-group-head"><input class="lineup-group-name" data-gi="${{i}}" value="${{esc(g.name)}}"><span class="pill">${{(g.members||[]).length}} / ${{state.group_size}}</span></div><div class="lineup-dropzone" data-zone="group" data-gi="${{i}}">${{(g.members||[]).map(playerHtml).join('')||'<span class="muted">Spieler hierher ziehen</span>'}}</div></div>`).join('');
         bindDnD();
-        document.querySelectorAll('.lineup-group-name').forEach(el=>el.addEventListener('change',()=>{{state.groups[Number(el.dataset.gi)].name=el.value.trim()||`Gruppe ${{Number(el.dataset.gi)+1}}`;scheduleSave()}}));
+        document.querySelectorAll('.lineup-group-name').forEach(el=>el.addEventListener('change',()=>{{state.groups[Number(el.dataset.gi)].name=el.value.trim()||`Gruppe ${{Number(el.dataset.gi)+1}}`;markDirty()}}));
       }}
       function removeUser(uid){{state.groups.forEach(g=>g.members=(g.members||[]).filter(m=>String(m.user_id)!==uid));state.bench=(state.bench||[]).filter(m=>String(m.user_id)!==uid)}}
-      function move(uid,zone,gi){{const p=byId.get(uid);if(!p)return;removeUser(uid);if(zone==='bench')state.bench.push(p);else if(zone==='group'){{const g=state.groups[gi];if(!g||g.members.length>=state.group_size)return;g.members.push(p)}}render();scheduleSave()}}
-      function bindDnD(){{
-        document.querySelectorAll('.lineup-player').forEach(el=>el.addEventListener('dragstart',e=>{{e.dataTransfer.setData('text/plain',el.dataset.userId);e.dataTransfer.effectAllowed='move'}}));
-        document.querySelectorAll('.lineup-dropzone').forEach(z=>{{z.addEventListener('dragover',e=>{{e.preventDefault();z.classList.add('drag-over')}});z.addEventListener('dragleave',()=>z.classList.remove('drag-over'));z.addEventListener('drop',e=>{{e.preventDefault();z.classList.remove('drag-over');const uid=e.dataTransfer.getData('text/plain');if(z.dataset.zone==='pool'){{removeUser(uid);render();scheduleSave()}}else move(uid,z.dataset.zone,Number(z.dataset.gi||0))}})}});
+      function move(uid,zone,gi){{
+        const p=byId.get(String(uid));if(!p)return false;
+        if(zone==='group'){{const g=state.groups[gi];if(!g)return false;const already=(g.members||[]).some(m=>String(m.user_id)===String(uid));if(!already && g.members.length>=state.group_size){{document.getElementById('lineup-save-note').textContent=`❌ ${{g.name}} ist bereits voll.`;return false;}}}}
+        removeUser(String(uid));
+        if(zone==='bench') state.bench.push(p);
+        else if(zone==='group') state.groups[gi].members.push(p);
+        selectedUid='';
+        render();markDirty();return true;
       }}
+      function bindDnD(){{
+        document.querySelectorAll('.lineup-player').forEach(el=>{{
+          el.addEventListener('dragstart',e=>{{dragUid=el.dataset.userId||'';try{{e.dataTransfer.setData('text/plain',dragUid);e.dataTransfer.effectAllowed='move'}}catch(_e){{}}}});
+          el.addEventListener('dragend',()=>{{dragUid='';document.querySelectorAll('.lineup-dropzone').forEach(z=>z.classList.remove('drag-over'))}});
+          el.addEventListener('click',e=>{{e.stopPropagation();selectedUid=(selectedUid===el.dataset.userId?'':el.dataset.userId);document.querySelectorAll('.lineup-player').forEach(x=>x.classList.toggle('selected',x.dataset.userId===selectedUid))}});
+          el.addEventListener('keydown',e=>{{if(e.key==='Enter'||e.key===' '){{e.preventDefault();el.click()}}}});
+        }});
+        document.querySelectorAll('.lineup-dropzone').forEach(z=>{{
+          z.addEventListener('dragenter',e=>{{e.preventDefault();z.classList.add('drag-over')}});
+          z.addEventListener('dragover',e=>{{e.preventDefault();if(e.dataTransfer)e.dataTransfer.dropEffect='move';z.classList.add('drag-over')}});
+          z.addEventListener('dragleave',e=>{{if(!z.contains(e.relatedTarget))z.classList.remove('drag-over')}});
+          z.addEventListener('drop',e=>{{e.preventDefault();e.stopPropagation();z.classList.remove('drag-over');let uid=dragUid;try{{uid=uid||e.dataTransfer.getData('text/plain')}}catch(_e){{}};dragUid='';if(!uid)return;if(z.dataset.zone==='pool'){{removeUser(String(uid));selectedUid='';render();markDirty()}}else move(String(uid),z.dataset.zone,Number(z.dataset.gi||0))}});
+          z.addEventListener('click',()=>{{if(!selectedUid)return;if(z.dataset.zone==='pool'){{removeUser(selectedUid);selectedUid='';render();markDirty()}}else move(selectedUid,z.dataset.zone,Number(z.dataset.gi||0))}});
+        }});
+      }}
+      function payloadState(){{
+        normalize();
+        return {{
+          group_size:state.group_size,group_count:state.group_count,published:!!state.published,
+          groups:state.groups.map(g=>({{name:g.name,members:(g.members||[]).map(m=>({{user_id:String(m.user_id)}}))}})),
+          bench:(state.bench||[]).map(m=>({{user_id:String(m.user_id)}}))
+        }};
+      }}
+      function layoutSignature(obj){{
+        const groups=(obj.groups||[]).map(g=>({{name:String(g.name||''),members:(g.members||[]).map(m=>String(m.user_id??m))}}));
+        const bench=(obj.bench||[]).map(m=>String(m.user_id??m));
+        return JSON.stringify({{group_size:Number(obj.group_size||6),group_count:Number(obj.group_count||groups.length||1),groups,bench}});
+      }}
+      function assignedIds(obj){{const ids=[];(obj.groups||[]).forEach(g=>(g.members||[]).forEach(m=>ids.push(String(m.user_id??m))));(obj.bench||[]).forEach(m=>ids.push(String(m.user_id??m)));return ids.sort().join(',')}}
+      function markDirty(){{revision++;scheduleSave()}}
       async function save(publishOverride=null){{
-        if(saving)return; saving=true;
-        if(publishOverride!==null)state.published=!!publishOverride;
+        if(publishOverride!==null){{state.published=!!publishOverride;revision++;}}
+        if(saving){{saveAgain=true;return;}}
+        saving=true;saveAgain=false;
+        const requestRevision=revision;
+        const sent=payloadState();
         const note=document.getElementById('lineup-save-note');note.textContent='Speichere…';
         try{{
-          const res=await fetch(`/event/${{encodeURIComponent(initial.event_id)}}/lineup`,{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(state)}});
+          const res=await fetch(`/event/${{encodeURIComponent(initial.event_id)}}/lineup`,{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(sent)}});
           const data=await res.json();if(!res.ok||!data.ok)throw new Error(data.error||`HTTP ${{res.status}}`);
-          state=data.lineup||state;note.textContent=data.message||'Gespeichert.';document.getElementById('lineup-sync-state').textContent=state.published?'🟢 Discord-Live-Sync aktiv':'⚪ Noch nicht auf Discord veröffentlicht';render();
-        }}catch(err){{note.textContent='❌ '+err.message}}finally{{saving=false}}
+          const server=data.lineup||{{}};
+          if(layoutSignature(server)!==layoutSignature(sent))throw new Error('Die gespeicherte Aufstellung stimmt nicht mit deiner Verschiebung überein. Deine lokale Position bleibt sichtbar; bitte prüfe die Fehlermeldung oder lade einmal neu.');
+          state.published=!!server.published;
+          document.getElementById('lineup-sync-state').textContent=state.published?'🟢 Discord-Live-Sync aktiv':'⚪ Noch nicht auf Discord veröffentlicht';
+          const n=assignedIds(sent)?assignedIds(sent).split(',').filter(Boolean).length:0;
+          note.textContent=(data.message||'✅ Aufstellung gespeichert.')+` · ${{n}} eingeteilt`;
+        }}catch(err){{note.textContent='❌ '+err.message}}
+        finally{{saving=false;if(saveAgain||revision>requestRevision){{saveAgain=false;clearTimeout(timer);timer=setTimeout(()=>save(null),80)}}}}
       }}
-      function scheduleSave(){{clearTimeout(timer);timer=setTimeout(()=>save(null),500)}}
-      document.getElementById('lineup-apply-size').addEventListener('click',()=>{{state.group_size=Number(document.getElementById('lineup-group-size').value||6);state.group_count=Number(document.getElementById('lineup-group-count').value||1);render();scheduleSave()}});
+      function scheduleSave(){{clearTimeout(timer);timer=setTimeout(()=>save(null),300)}}
+      document.getElementById('lineup-apply-size').addEventListener('click',()=>{{state.group_size=Number(document.getElementById('lineup-group-size').value||6);state.group_count=Number(document.getElementById('lineup-group-count').value||1);render();markDirty()}});
       document.getElementById('lineup-publish').addEventListener('click',()=>save(true));
       document.getElementById('lineup-auto').addEventListener('click',()=>{{
         state.group_size=Number(document.getElementById('lineup-group-size').value||6);state.group_count=Number(document.getElementById('lineup-group-count').value||1);normalize();state.groups.forEach(g=>g.members=[]);state.bench=[];
@@ -16023,7 +16105,7 @@ def _event_lineup_panel(data: dict[str, Any], event: dict[str, Any], event_id: s
         for(const key of Object.keys(buckets)) buckets[key].sort((a,b)=>String(a.display_name).localeCompare(String(b.display_name)));
         const order=[...buckets.Tank,...buckets.Heal,...buckets.DPS,...buckets.Other,...buckets.Reserve];
         let cursor=0;for(const p of order){{let placed=false;for(let tries=0;tries<state.groups.length;tries++){{const gi=cursor%state.groups.length;cursor++;if(state.groups[gi].members.length<state.group_size){{state.groups[gi].members.push(p);placed=true;break}}}}if(!placed)state.bench.push(p)}}
-        render();scheduleSave();
+        render();markDirty();
       }});
       render();
     }})();
@@ -16450,7 +16532,7 @@ def _render_events_center(data: dict[str, Any], current_user: Optional[dict[str,
     body = f"""
     <style>
       .event-toolbar{{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:14px}}.event-toolbar input{{flex:1 1 260px}}.event-filter{{border:1px solid var(--line);background:rgba(255,255,255,.03);color:var(--text);border-radius:999px;padding:8px 12px;cursor:pointer}}.event-filter.active{{border-color:#d6a84f;background:rgba(214,168,79,.14);color:#f4d78e}}
-      .admin-event-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(330px,1fr));gap:15px}}.admin-event-card{{border:1px solid rgba(214,168,79,.24);border-radius:16px;overflow:hidden;background:rgba(8,8,10,.82);box-shadow:0 14px 38px rgba(0,0,0,.24)}}.admin-event-thumb{{position:relative;aspect-ratio:16/7;background:#0b0908;overflow:hidden}}.admin-event-thumb img{{width:100%;height:100%;object-fit:cover;display:block}}.admin-event-thumb-empty,.admin-event-image-error{{height:100%;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:5px;color:#d6a84f;background:linear-gradient(135deg,#21150d,#09090b)}}.admin-event-card-body{{padding:15px}}.admin-event-card-head h3{{margin:.55rem 0 .15rem;font-size:1.25rem}}.admin-event-card-head .pill{{margin-right:5px}}.admin-event-stats{{display:flex;gap:7px;flex-wrap:wrap;margin:12px 0}}.admin-event-stats span{{border:1px solid var(--line);border-radius:999px;padding:5px 8px;font-size:.84rem}}.admin-event-actions{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px}}.btn.compact{{padding:7px 10px;font-size:.86rem;text-align:center;justify-content:center}}
+      .admin-event-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(330px,1fr));gap:15px}}.admin-event-card{{border:1px solid rgba(214,168,79,.24);border-radius:16px;overflow:hidden;background:rgba(8,8,10,.82);box-shadow:0 14px 38px rgba(0,0,0,.24)}}.admin-event-thumb{{position:relative;aspect-ratio:16/7;background:#0b0908;overflow:hidden}}.admin-event-thumb img{{width:100%;height:100%;object-fit:cover;display:block}}.admin-event-thumb-empty,.admin-event-image-error{{height:100%;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:5px;color:#d6a84f;background:linear-gradient(135deg,#21150d,#09090b)}}.admin-event-card-body{{padding:15px}}.admin-event-card-head h3{{margin:.55rem 0 .15rem;font-size:1.25rem}}.admin-event-card-head .pill{{margin-right:5px}}.admin-event-stats{{display:flex;gap:7px;flex-wrap:wrap;margin:12px 0}}.admin-event-stats span{{border:1px solid var(--line);border-radius:999px;padding:5px 8px;font-size:.84rem}}.admin-event-actions{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px}}.admin-event-actions .lineup-cta{{grid-column:span 2;box-shadow:0 0 0 1px rgba(239,213,148,.22),0 8px 20px rgba(214,168,79,.14)}}.btn.compact{{padding:7px 10px;font-size:.86rem;text-align:center;justify-content:center}}
       .create-event-form{{display:grid;gap:13px}}.event-form-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:11px}}.event-form-grid input,.event-form-grid select,.event-form-grid textarea{{width:100%}}@media(max-width:620px){{.admin-event-grid{{grid-template-columns:1fr}}}}
     </style>
     {_admin_tabs_style()}
@@ -18962,7 +19044,8 @@ async def event_lineup_save(event_id: str, request: Request, _: bool = Depends(_
         return JSONResponse({"ok": False, "error": "Ungültige Aufstellung."}, status_code=400)
     actor = _current_user(request) or {"user_id": "basic-admin", "username": "Basic Admin"}
     try:
-        lineup = _save_event_lineup(guild_id, str(event_id), event, raw, actor)
+        candidates = _event_lineup_candidates_for_snapshot(snap, event)
+        lineup = _save_event_lineup(guild_id, str(event_id), event, raw, actor, candidates=candidates)
     except Exception as exc:
         return JSONResponse({"ok": False, "error": f"Speichern fehlgeschlagen: {type(exc).__name__}: {exc}"}, status_code=500)
 
@@ -19499,6 +19582,7 @@ def _render_guild_config_dashboard(data: dict[str, Any], msg: str = "") -> str:
         "leader_contact_public": "guild_channel_leader_contact_public_id",
         "leader_contact_internal": "guild_channel_leader_contact_internal_id",
         "leader_contact_archive": "guild_channel_leader_contact_archive_id",
+        "leader_ticket_category": "guild_channel_leader_ticket_category_id",
         "weekly_report": "guild_channel_weekly_report_id",
         "auction_active": "guild_channel_auction_active_id",
         "auction_market": "guild_channel_auction_market_id",
@@ -19568,6 +19652,7 @@ def _render_guild_config_dashboard(data: dict[str, Any], msg: str = "") -> str:
             f"<label>Leaderkontakt öffentlich<br>{_channel_select('channel_leader_contact_public', channels, cv['leader_contact_public'], kinds={'text','forum'})}</label>",
             f"<label>Leaderkontakt intern<br>{_channel_select('channel_leader_contact_internal', channels, cv['leader_contact_internal'], kinds={'text','forum'})}</label>",
             f"<label>Leaderkontakt Archiv<br>{_channel_select('channel_leader_contact_archive', channels, cv['leader_contact_archive'], kinds={'text','forum'})}</label>",
+            f"<label>Private Ticket-Kategorie<br>{_channel_select('channel_leader_ticket_category', channels, cv['leader_ticket_category'], kinds={'category'})}</label>",
         ])
     if states.get("analytics"):
         channel_fields.append(f"<label>Wochenbericht<br>{_channel_select('channel_weekly_report', channels, cv['weekly_report'], kinds={'text','forum'})}</label>")
@@ -19718,6 +19803,7 @@ async def guild_config_save(request: Request, _: bool = Depends(_admin_auth)):
         settings["guild_channel_leader_contact_public_id"] = one_int("channel_leader_contact_public")
         settings["guild_channel_leader_contact_internal_id"] = one_int("channel_leader_contact_internal")
         settings["guild_channel_leader_contact_archive_id"] = one_int("channel_leader_contact_archive")
+        settings["guild_channel_leader_ticket_category_id"] = one_int("channel_leader_ticket_category")
     if states.get("analytics", False):
         settings["guild_channel_weekly_report_id"] = one_int("channel_weekly_report")
     if states.get("auctions", False):
