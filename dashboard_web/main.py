@@ -75,7 +75,7 @@ if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 ASSET_VER = "guild-platform-v2-5-0-welcome"
-DASHBOARD_RELEASE_VERSION = "2.6.0 · Bewerbungen & Voice Setup"
+DASHBOARD_RELEASE_VERSION = "2.7.0 · Server-Logs, Ticket-Archiv & Rollenfix"
 
 _EVENT_IMAGE_ASSETS: dict[str, str] = {
     "guild_boss": f"/static/event_images/guild_boss.webp?v={ASSET_VER}",
@@ -18995,6 +18995,7 @@ def _render_guild_config_dashboard(data: dict[str, Any], msg: str = "") -> str:
         "loot": "guild_channel_loot_id",
         "ec_log": "guild_channel_ec_log_id",
         "audit": "guild_channel_audit_id",
+        "server_log": "guild_channel_server_log_id",
         "error_log": "guild_channel_error_log_id",
         "welcome": "guild_channel_welcome_id",
         "announcements": "guild_channel_announcements_id",
@@ -19006,6 +19007,7 @@ def _render_guild_config_dashboard(data: dict[str, Any], msg: str = "") -> str:
         "member_portal": "guild_channel_member_portal_id",
         "leader_contact_public": "guild_channel_leader_contact_public_id",
         "leader_contact_internal": "guild_channel_leader_contact_internal_id",
+        "leader_contact_archive": "guild_channel_leader_contact_archive_id",
         "weekly_report": "guild_channel_weekly_report_id",
         "auction_active": "guild_channel_auction_active_id",
         "auction_market": "guild_channel_auction_market_id",
@@ -19048,6 +19050,7 @@ def _render_guild_config_dashboard(data: dict[str, Any], msg: str = "") -> str:
     channel_fields = [
         f"<label>Events<br>{_channel_select('channel_events', channels, cv['events'], kinds={'text','forum'})}</label>",
         f"<label>Audit / Technik<br>{_channel_select('channel_audit', channels, cv['audit'], kinds={'text'})}</label>",
+        f"<label>Server-Log<br>{_channel_select('channel_server_log', channels, cv['server_log'], kinds={'text'})}</label>",
         f"<label>Bot-Fehlerkanal<br>{_channel_select('channel_error_log', channels, cv['error_log'], kinds={'text'})}</label>",
         f"<label>Willkommen<br>{_channel_select('channel_welcome', channels, cv['welcome'], kinds={'text'})}</label>",
         f"<label>Ankündigungen<br>{_channel_select('channel_announcements', channels, cv['announcements'], kinds={'text','forum'})}</label>",
@@ -19073,6 +19076,7 @@ def _render_guild_config_dashboard(data: dict[str, Any], msg: str = "") -> str:
         channel_fields.extend([
             f"<label>Leaderkontakt öffentlich<br>{_channel_select('channel_leader_contact_public', channels, cv['leader_contact_public'], kinds={'text','forum'})}</label>",
             f"<label>Leaderkontakt intern<br>{_channel_select('channel_leader_contact_internal', channels, cv['leader_contact_internal'], kinds={'text','forum'})}</label>",
+            f"<label>Leaderkontakt Archiv<br>{_channel_select('channel_leader_contact_archive', channels, cv['leader_contact_archive'], kinds={'text','forum'})}</label>",
         ])
     if states.get("analytics"):
         channel_fields.append(f"<label>Wochenbericht<br>{_channel_select('channel_weekly_report', channels, cv['weekly_report'], kinds={'text','forum'})}</label>")
@@ -19197,6 +19201,7 @@ async def guild_config_save(request: Request, _: bool = Depends(_admin_auth)):
         "guild_role_guardian_id": one_int("guardian_role_id"),
         "guild_channel_events_id": one_int("channel_events"),
         "guild_channel_audit_id": one_int("channel_audit"),
+        "guild_channel_server_log_id": one_int("channel_server_log"),
         "guild_channel_error_log_id": one_int("channel_error_log"),
         "guild_channel_welcome_id": one_int("channel_welcome"),
         "guild_channel_announcements_id": one_int("channel_announcements"),
@@ -19221,6 +19226,7 @@ async def guild_config_save(request: Request, _: bool = Depends(_admin_auth)):
     if states.get("leader_contact", False):
         settings["guild_channel_leader_contact_public_id"] = one_int("channel_leader_contact_public")
         settings["guild_channel_leader_contact_internal_id"] = one_int("channel_leader_contact_internal")
+        settings["guild_channel_leader_contact_archive_id"] = one_int("channel_leader_contact_archive")
     if states.get("analytics", False):
         settings["guild_channel_weekly_report_id"] = one_int("channel_weekly_report")
     if states.get("auctions", False):
