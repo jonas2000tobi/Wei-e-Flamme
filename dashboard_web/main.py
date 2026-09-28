@@ -15,11 +15,27 @@ import urllib.parse
 import urllib.request
 import urllib.error
 import uuid
+import sys
 from collections import Counter
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
 from typing import Any, Optional
 from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from guild_modules import (
+    MODULES as GUILD_MODULES,
+    CORE_MODULE_KEYS,
+    OPTIONAL_MODULE_KEYS,
+    module_definition,
+    normalized_states,
+    resolved_enable_set,
+    resolved_disable_set,
+    required_modules_for_dashboard_path,
+)
 from zoneinfo import ZoneInfo
 
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -50,15 +66,15 @@ async def _dashboard_lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Guild Platform Dashboard", version="2.3.6", lifespan=_dashboard_lifespan)
+app = FastAPI(title="Guild Platform Dashboard", version="2.4.0", lifespan=_dashboard_lifespan)
 security = HTTPBasic(auto_error=False)
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
-ASSET_VER = "beer-and-buffs-v2-3-6-dashboard-fixes"
-DASHBOARD_RELEASE_VERSION = "2.3.6 · Eventzeit, Bilder, Admin-Navigation und Auktionen"
+ASSET_VER = "guild-platform-v2-4-0-modules"
+DASHBOARD_RELEASE_VERSION = "2.4.0 · Modular Guild Core"
 
 _EVENT_IMAGE_ASSETS: dict[str, str] = {
     "guild_boss": f"/static/event_images/guild_boss.webp?v={ASSET_VER}",
@@ -326,6 +342,16 @@ def _ensure_guild_profile_schema() -> None:
                     PRIMARY KEY (guild_id, key)
                 )
             """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS module_settings (
+                    guild_id BIGINT NOT NULL,
+                    module TEXT NOT NULL,
+                    key TEXT NOT NULL,
+                    value_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (guild_id, module, key)
+                )
+            """)
             cur.execute("CREATE INDEX IF NOT EXISTS idx_guild_profiles_status ON guild_profiles(status, updated_at DESC)")
         conn.commit()
     finally:
@@ -412,6 +438,99 @@ def _set_guild_setting_value(guild_id: int, key: str, value: Any) -> None:
         conn.commit()
     finally:
         conn.close()
+
+
+def _dashboard_module_states(guild_id: int | None = None) -> dict[str, bool]:
+    gid = int(guild_id or _active_guild_id() or 0)
+    raw: dict[str, object] = {}
+    if not gid or not _database_url():
+        return normalized_states(raw)
+    try:
+        _ensure_guild_profile_schema()
+        conn = _pg_connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT module, value_json FROM module_settings WHERE guild_id=%s AND key='enabled'",
+                    (gid,),
+                )
+                rows = [dict(row) for row in cur.fetchall()]
+        finally:
+            conn.close()
+        for row in rows:
+            key = str(row.get("module") or "").strip().lower()
+            try:
+                raw[key] = bool(json.loads(row.get("value_json") or "false"))
+            except Exception:
+                raw[key] = False
+    except Exception:
+        pass
+    return normalized_states(raw)
+
+
+def _dashboard_module_enabled(module_key: str, guild_id: int | None = None) -> bool:
+    return bool(_dashboard_module_states(guild_id).get(str(module_key or "").strip().lower(), False))
+
+
+def _write_dashboard_module_flag(guild_id: int, module_key: str, enabled: bool) -> None:
+    definition = module_definition(module_key)
+    if not definition or definition.core:
+        raise ValueError("Core-Module können nicht deaktiviert werden.")
+    _ensure_guild_profile_schema()
+    conn = _pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO module_settings(guild_id,module,key,value_json,updated_at)
+                VALUES (%s,%s,'enabled',%s,%s)
+                ON CONFLICT(guild_id,module,key)
+                DO UPDATE SET value_json=EXCLUDED.value_json, updated_at=EXCLUDED.updated_at
+                """,
+                (
+                    int(guild_id),
+                    definition.key,
+                    json.dumps(bool(enabled)),
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _set_dashboard_module_enabled(guild_id: int, module_key: str, enabled: bool) -> dict[str, bool]:
+    definition = module_definition(module_key)
+    if not definition or definition.core:
+        raise ValueError("Unbekanntes oder nicht schaltbares Modul.")
+    changed: dict[str, bool] = {}
+    keys = resolved_enable_set(definition.key) if enabled else resolved_disable_set(definition.key)
+    for key in keys:
+        _write_dashboard_module_flag(int(guild_id), key, bool(enabled))
+        changed[key] = bool(enabled)
+    return changed
+
+
+@app.middleware("http")
+async def _module_access_middleware(request: Request, call_next):
+    """Blockiert direkte Aufrufe deaktivierter optionaler Dashboard-Funktionen."""
+    required = required_modules_for_dashboard_path(request.url.path)
+    if required:
+        states = _dashboard_module_states()
+        missing = [key for key in required if not states.get(key, False)]
+        if missing:
+            labels = [module_definition(key).label if module_definition(key) else key for key in missing]
+            if request.url.path.startswith("/api/"):
+                return JSONResponse({"ok": False, "error": "Modul deaktiviert", "modules": labels}, status_code=404)
+            return HTMLResponse(
+                "<!doctype html><html lang='de'><meta charset='utf-8'><title>Nicht verfügbar</title>"
+                "<body style='font-family:system-ui;background:#0b0e14;color:#eef2f7;padding:40px'>"
+                "<h1>Diese Funktion ist nicht aktiv.</h1>"
+                "<p>Die Gildenleitung kann das entsprechende Modul in den Dashboard-Einstellungen aktivieren.</p>"
+                "<p><a style='color:#d6a84f' href='/'>Zur Startseite</a></p></body></html>",
+                status_code=404,
+            )
+    return await call_next(request)
 
 
 def _ensure_profile_update_request_schema() -> None:
@@ -526,7 +645,7 @@ def _guild_brand(data: Optional[dict[str, Any]] = None) -> dict[str, Any]:
         guild_row = snap.get("guild") or {}
     else:
         guild_row = {}
-    display = str(profile.get("display_name") or guild_row.get("name") or (data or {}).get("guild_name") or "Beer and Buffs")
+    display = str(profile.get("display_name") or guild_row.get("name") or (data or {}).get("guild_name") or "Gilde")
     accent = str(profile.get("accent_color") or "#d6a84f").strip()
     if not re.fullmatch(r"#[0-9a-fA-F]{6}", accent):
         accent = "#d6a84f"
@@ -534,7 +653,7 @@ def _guild_brand(data: Optional[dict[str, Any]] = None) -> dict[str, Any]:
         "guild_id": gid,
         "display_name": display,
         "short_name": str(profile.get("short_name") or display),
-        "bot_display_name": str(profile.get("bot_display_name") or "Beer and Buffs Knecht"),
+        "bot_display_name": str(profile.get("bot_display_name") or "Gildenbot"),
         "timezone": str(profile.get("timezone_name") or profile.get("timezone") or "Europe/Berlin"),
         "logo_url": str(profile.get("logo_url") or ""),
         "banner_url": str(profile.get("banner_url") or ""),
@@ -2931,31 +3050,35 @@ def _admin_tabs(active: str) -> str:
 
 
 def _admin_quick_links(active: str = "") -> str:
+    states = _dashboard_module_states()
     items = [
-        ("events", "/events-admin", "📅", "Events verwalten", "Laufende Events bearbeiten"),
-        ("attendance", "/attendance", "✅", "Anwesenheit & EC", "Prüfen und vergeben"),
-        ("loot", "/loot", "🎁", "Loot & Auktionen", "Offene Aktionen"),
-        ("members", "/members", "👥", "Mitglieder", "Profile und Notizen"),
-        ("settings", "/admin-settings", "⚙️", "Einstellungen", "Regeln, Rollen und Gilden-Setup"),
-        ("system", "/system", "🧩", "System & Logs", "Bot, DB und Quellen"),
+        ("events", "/events-admin", "📅", "Events verwalten", "Laufende Events bearbeiten", True),
+        ("attendance", "/attendance", "✅", "Anwesenheit", "Raid-Reviews und Auswertung", states.get("attendance", False)),
+        ("loot", "/loot", "🎁", "Loot", "Loot-Verwaltung", states.get("loot", False)),
+        ("members", "/members", "👥", "Mitglieder", "Profile und Notizen", True),
+        ("settings", "/admin-settings", "⚙️", "Einstellungen", "Module, Rollen und Gilden-Setup", True),
+        ("system", "/system", "🧩", "System & Logs", "Bot, DB und Quellen", True),
     ]
     cards = []
-    for key, href, icon, title, subtitle in items:
+    for key, href, icon, title, subtitle, visible in items:
+        if not visible:
+            continue
         cls = 'admin-quick active' if key == active else 'admin-quick'
         cards.append(f"<a class='{cls}' href='{_e(href)}'><span>{icon}</span><div><strong>{_e(title)}</strong><small>{_e(subtitle)}</small></div></a>")
     return "<section class='admin-quick-grid'>" + "".join(cards) + "</section>"
 
 
 def _admin_card_action_buttons(event_id: str, discord_url: str = "", compact: bool = True, include_discord: bool = True) -> str:
+    states = _dashboard_module_states()
     compact_cls = " compact" if compact else ""
     cls_primary = f"btn{compact_cls}"
     cls_secondary = f"btn{compact_cls} secondary"
-    buttons = [
-        f"<a class='{cls_primary}' href='/admin/events/{_e(event_id)}'>Bearbeiten</a>",
-        f"<a class='{cls_secondary}' href='/attendance/{_e(event_id)}'>Anwesenheit</a>",
-        f"<a class='{cls_secondary}' href='/attendance/{_e(event_id)}/ec-preview'>EC</a>",
-        f"<a class='{cls_secondary}' href='/event/{_e(event_id)}'>Details</a>",
-    ]
+    buttons = [f"<a class='{cls_primary}' href='/admin/events/{_e(event_id)}'>Bearbeiten</a>"]
+    if states.get("attendance", False):
+        buttons.append(f"<a class='{cls_secondary}' href='/attendance/{_e(event_id)}'>Anwesenheit</a>")
+        if states.get("points", False):
+            buttons.append(f"<a class='{cls_secondary}' href='/attendance/{_e(event_id)}/ec-preview'>Punkte</a>")
+    buttons.append(f"<a class='{cls_secondary}' href='/event/{_e(event_id)}'>Details</a>")
     if include_discord:
         if discord_url:
             buttons.append(f"<a class='{cls_secondary}' href='{_e(discord_url)}' target='_blank' rel='noopener'>Discord</a>")
@@ -2970,13 +3093,14 @@ def _render_admin_center_dashboard(data: dict[str, Any]) -> str:
     p = _admin_center_payload(data)
     snap: dict[str, Any] = data.get("snapshot") or {}
     guild_id = p.get("guild_id")
+    states = _dashboard_module_states(int(guild_id or 0))
     ec_counts = Counter(p.get("ec_counts") or {})
     loot_counts = Counter(p.get("loot_counts") or {})
     settings_counts = Counter(p.get("settings_counts") or {})
     event_counts = Counter(p.get("event_counts") or {})
     running_events = list(p.get("running_events") or [])
     upcoming_events = list(p.get("upcoming_events") or [])
-    attendance_open = list(p.get("attendance_open") or [])
+    attendance_open = list(p.get("attendance_open") or []) if states.get("attendance", False) else []
 
     def _home_event_card(ev: dict[str, Any]) -> str:
         eid = _event_admin_id(ev)
@@ -2996,13 +3120,13 @@ def _render_admin_center_dashboard(data: dict[str, Any]) -> str:
     event_html = "".join(_home_event_card(ev) for ev in focus_events) or '<div class="empty">Keine laufenden oder kommenden Events.</div>'
 
     task_rows: list[list[Any]] = []
-    if attendance_open:
+    if states.get("attendance", False) and attendance_open:
         task_rows.append(["Anwesenheit", f"{len(attendance_open)} Event(s) warten auf Prüfung", _raw('<a class="link" href="/attendance">Öffnen</a>')])
     if event_counts.get("pending", 0) or event_counts.get("processing", 0):
         task_rows.append(["Events", f"{event_counts.get('pending',0)} offen · {event_counts.get('processing',0)} in Arbeit", _raw('<a class="link" href="/events-admin#event-queue">Queue</a>')])
-    if ec_counts.get("pending", 0) or ec_counts.get("processing", 0):
-        task_rows.append(["EC", f"{ec_counts.get('pending',0)} offen · {ec_counts.get('processing',0)} in Arbeit", _raw('<a class="link" href="/ec-queue">Queue</a>')])
-    if loot_counts.get("pending", 0) or loot_counts.get("processing", 0):
+    if states.get("points", False) and (ec_counts.get("pending", 0) or ec_counts.get("processing", 0)):
+        task_rows.append(["Punkte", f"{ec_counts.get('pending',0)} offen · {ec_counts.get('processing',0)} in Arbeit", _raw('<a class="link" href="/ec-queue">Queue</a>')])
+    if (states.get("loot", False) or states.get("needlists", False) or states.get("auctions", False)) and (loot_counts.get("pending", 0) or loot_counts.get("processing", 0)):
         task_rows.append(["Loot", f"{loot_counts.get('pending',0)} offen · {loot_counts.get('processing',0)} in Arbeit", _raw('<a class="link" href="/loot">Öffnen</a>')])
     if settings_counts.get("pending", 0) or settings_counts.get("processing", 0):
         task_rows.append(["Einstellungen", f"{settings_counts.get('pending',0)} offen · {settings_counts.get('processing',0)} in Arbeit", _raw('<a class="link" href="/admin-settings">Queue</a>')])
@@ -3018,6 +3142,15 @@ def _render_admin_center_dashboard(data: dict[str, Any]) -> str:
 
     auth_rows = [[r.get("setting"), r.get("value"), r.get("hint")] for r in p.get("auth_rows") or []]
     source_rows = p.get("source_rows") or []
+    overview_cards = [
+        _card("Laufende Events", len(running_events), "direkt bearbeitbar"),
+        _card("Kommende Events", len(upcoming_events), "geplant"),
+        _card("Event-Queue", event_counts.get("pending", 0) + event_counts.get("processing", 0), f"Fehler: {event_counts.get('failed',0)+event_counts.get('rejected',0)}"),
+        _card("Aktive Module", sum(1 for key in OPTIONAL_MODULE_KEYS if states.get(key, False)), "optionale Systeme"),
+    ]
+    if states.get("attendance", False):
+        overview_cards.append(_card("Attendance offen", len(attendance_open), "wartet auf Prüfung"))
+
     body = f"""
     <style>
       .admin-quick-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px}}.admin-quick{{display:flex;gap:12px;align-items:center;padding:15px;border:1px solid rgba(214,168,79,.24);border-radius:14px;text-decoration:none;background:rgba(10,9,9,.72);color:#ead9b2}}.admin-quick:visited{{color:#ead9b2}}.admin-quick:hover{{border-color:#d6a84f;background:rgba(214,168,79,.08)}}.admin-quick span{{font-size:1.7rem}}.admin-quick strong{{display:block}}.admin-quick small{{display:block;color:var(--muted);margin-top:3px}}
@@ -3026,14 +3159,14 @@ def _render_admin_center_dashboard(data: dict[str, Any]) -> str:
     </style>
     {_admin_tabs_style()}
     {_admin_tabs('overview')}
-    <section class="hero"><div><div class="eyebrow">Admin-Portal</div><h1>🛡️ Verwaltung</h1><p class="muted">Schnellzugriff auf laufende Events, Anwesenheit, EC, Loot und Gildeneinstellungen.</p></div><a class="btn" href="/events-admin#event-create">+ Event erstellen</a></section>
+    <section class="hero"><div><div class="eyebrow">Admin-Portal</div><h1>🛡️ Verwaltung</h1><p class="muted">Gilde, Mitglieder und Events bilden den Core. Weitere Systeme werden unter Einstellungen → Module zugeschaltet.</p></div><a class="btn" href="/events-admin#event-create">+ Event erstellen</a></section>
     {_admin_quick_links('overview')}
-    <section class="grid">{_card('Laufende Events',len(running_events),'direkt bearbeitbar')}{_card('Kommende Events',len(upcoming_events),'geplant')}{_card('Anwesenheit offen',len(attendance_open),'wartet auf Prüfung')}{_card('Event-Queue',event_counts.get('pending',0)+event_counts.get('processing',0),f"Fehler: {event_counts.get('failed',0)+event_counts.get('rejected',0)}")}</section>
+    <section class="grid">{"".join(overview_cards)}</section>
     <section class="panel"><h2>🔥 Laufende und nächste Events</h2><div class="admin-home-event-grid">{event_html}</div><p style="margin-top:14px"><a class="btn secondary" href="/events-admin">Alle Events öffnen</a></p></section>
     <section class="split"><section class="panel"><h2>🚦 Offene Aufgaben</h2>{_table(['Bereich','Status','Aktion'],task_rows,searchable=False)}</section><section class="panel"><h2>🧾 Letzte Admin-Aktionen</h2>{_table(['Zeit','Aktion','Ziel','Von','Status'],recent_rows,searchable=False)}</section></section>
     <section class="panel"><details class="admin-details"><summary>Technische Details anzeigen</summary><div class="grid">{_card('Guild-ID',guild_id or '—','Dashboard-Kontext')}{_card('Snapshot',p.get('snapshot_id') or '—',_dt(p.get('published_at')))}{_card('Backend',p.get('backend') or '—',p.get('database_url_kind') or '—')}{_card('Quellen OK',p.get('source_ok',0),f"Fehler/fehlen: {p.get('source_bad',0)}")}</div><h3>Login & Rollen</h3>{_table(['Setting','Wert','Hinweis'],auth_rows,placeholder='Login durchsuchen…')}<h3>Datenquellen</h3>{_table(['Key','Datei','vorhanden','Status','Bytes','Geändert'],source_rows,placeholder='Quellen durchsuchen…')}</details></section>
     """
-    return _html_shell("Admin-Portal · Beer and Buffs Dashboard", body, nav_mode="admin")
+    return _html_shell("Admin-Portal · Guild Platform", body, nav_mode="admin")
 
 
 def _card(title: str, value: Any, sub: str = "") -> str:
@@ -4601,9 +4734,26 @@ def _render_auction_detail(data: dict[str, Any], auction_id: str, current_user: 
     return _html_shell(f"{_loot_text(auction.get('item_name') or 'Auktion')} · Beer and Buffs Dashboard", body)
 
 def _sidebar_html() -> str:
-    """Admin-/Leader-Sidebar. Diese Ansicht erscheint nur im Admin-Modus."""
+    """Admin-/Leader-Sidebar mit Modulfilter."""
     brand = _guild_brand()
     logo = _brand_image("logo", "beer_and_buffs_logo.png")
+    states = _dashboard_module_states()
+
+    guild_links = [
+        f'<a href="/announcements"><img class="nav-ico" src="{_asset("nav_announcements.png")}" alt="">Ankündigungen</a>',
+        f'<a href="/events-admin"><img class="nav-ico" src="{_asset("nav_events.png")}" alt="">Event-Verwaltung</a>',
+    ]
+    if states.get("attendance"):
+        guild_links.append(f'<a href="/attendance"><img class="nav-ico" src="{_asset("nav_anwesenheit.png")}" alt="">Anwesenheit</a>')
+    if states.get("points"):
+        guild_links.append(f'<a href="/ec-queue"><img class="nav-ico" src="{_asset("nav_ec.png")}" alt="">Punkte-Queue</a>')
+    if states.get("loot"):
+        guild_links.append(f'<a href="/loot"><img class="nav-ico" src="{_asset("nav_loot.png")}" alt="">Loot</a>')
+    if states.get("needlists"):
+        guild_links.append(f'<a href="/needs"><img class="nav-ico" src="{_asset("nav_needs.png")}" alt="">Needlists</a>')
+    if states.get("auctions"):
+        guild_links.append(f'<a href="/auctions"><img class="nav-ico" src="{_asset("nav_auktionen.png")}" alt="">Auktionen</a>')
+
     return f"""
     <aside class="sidebar admin-sidebar">
       <div class="brand">
@@ -4613,44 +4763,64 @@ def _sidebar_html() -> str:
         <div class="brand-subtitle"><strong>{_e(brand['short_name'])}</strong><span>Admin-Portal</span></div>
       </div>
       <button class="mobile-nav-toggle" type="button" onclick="document.body.classList.toggle('nav-open')">☰ Menü</button>
-
       <nav class="side-nav">
         <a href="/"><img class="nav-ico" src="{_asset('nav_kommando.png')}" alt="">Startseite</a>
         <a class="admin-back" href="/"><span>←</span> Zur normalen Ansicht</a>
-        <a href="/character-editor"><img class="nav-ico" src="{_asset('nav_builds.png')}" alt="">Charakter-Editor</a>
-        <details open>
-          <summary>Admin</summary>
+        <details open><summary>Admin</summary>
           <a href="/admin"><img class="nav-ico" src="{_asset('nav_admin_portal.png')}" alt="">Admin-Portal</a>
           <a href="/admin/guild-config"><img class="nav-ico" src="{_asset('nav_einstellungen.png')}" alt="">Gilde & Discord</a>
-          <a href="/settings"><img class="nav-ico" src="{_asset('nav_einstellungen.png')}" alt="">System-Setup</a>
+          <a href="/admin-settings?section=modules"><img class="nav-ico" src="{_asset('nav_einstellungen.png')}" alt="">Module & Einstellungen</a>
           <a href="/audit"><img class="nav-ico" src="{_asset('nav_audit.png')}" alt="">Audit</a>
           <a href="/system"><img class="nav-ico" src="{_asset('nav_system.png')}" alt="">System</a>
           <a href="/database"><img class="nav-ico" src="{_asset('nav_database.png')}" alt="">Datenbank</a>
         </details>
-
-        <details open>
-          <summary>Gilde</summary>
-          <a href="/announcements"><img class="nav-ico" src="{_asset('nav_announcements.png')}" alt="">Ankündigungen</a>
-          <a href="/loot"><img class="nav-ico" src="{_asset('nav_auktionen.png')}" alt="">Loot & Auktionen</a>
-          <a href="/events-admin"><img class="nav-ico" src="{_asset('nav_events.png')}" alt="">Event-Verwaltung</a>
-          <a href="/attendance"><img class="nav-ico" src="{_asset('nav_anwesenheit.png')}" alt="">Anwesenheit</a>
-          <a href="/ec-queue"><img class="nav-ico" src="{_asset('nav_ec.png')}" alt="">EC-Queue</a>
-        </details>
+        <details open><summary>Gilde</summary>{''.join(guild_links)}</details>
       </nav>
-
       <div class="sidebar-footer">
-        <a href="/me">Mein Login</a>
-        <a href="/release">Release</a>
-        <a href="/logout">Logout</a>
+        <a href="/me">Mein Login</a><a href="/release">Release</a><a href="/logout">Logout</a>
         <span class="version-pill">v{_e(DASHBOARD_RELEASE_VERSION)}</span>
       </div>
     </aside>
     """
 
 def _member_sidebar_html() -> str:
-    """Normale Dashboard-Sidebar. Auch Admins sehen standardmäßig diese Ansicht."""
+    """Normale Sidebar: Core immer sichtbar, optionale Bereiche nur bei aktivem Modul."""
     brand = _guild_brand()
     logo = _brand_image("logo", "beer_and_buffs_logo.png")
+    states = _dashboard_module_states()
+
+    portal_links: list[str] = []
+    if states.get("member_portal"):
+        portal_links.append(f'<a href="/portal"><img class="nav-ico" src="{_asset("nav_portal.png")}" alt="">Mein Profil</a>')
+    if states.get("needlists"):
+        portal_links.append(f'<a href="/character-editor"><img class="nav-ico" src="{_asset("nav_builds.png")}" alt="">Charakter & Builds</a>')
+
+    guild_links = [
+        f'<a href="/announcements"><img class="nav-ico" src="{_asset("nav_announcements.png")}" alt="">Ankündigungen</a>',
+        f'<a href="/member/members"><img class="nav-ico" src="{_asset("nav_mitglieder.png")}" alt="">Mitglieder</a>',
+        f'<a href="/member/events"><img class="nav-ico" src="{_asset("nav_events.png")}" alt="">Events</a>',
+    ]
+    if states.get("auctions"):
+        guild_links.append(f'<a href="/member/auctions"><img class="nav-ico" src="{_asset("nav_auktionen.png")}" alt="">Auktionen</a>')
+    if states.get("points"):
+        guild_links.append(f'<a href="/member/ec"><img class="nav-ico" src="{_asset("nav_ec.png")}" alt="">Punkte-Verlauf</a>')
+    if states.get("attendance"):
+        guild_links.append(f'<a href="/attendance"><img class="nav-ico" src="{_asset("nav_anwesenheit.png")}" alt="">Anwesenheit</a>')
+
+    game_links: list[str] = []
+    if states.get("game_information"):
+        game_links.extend([
+            f'<a href="/tnl/news"><img class="nav-ico" src="{_asset("nav_news.png")}" alt="">News</a>',
+            f'<a href="/tnl/guides"><img class="nav-ico" src="{_asset("nav_guides.png")}" alt="">Guides</a>',
+        ])
+    if states.get("game_integration"):
+        game_links.append(f'<a href="/tnl/builds"><img class="nav-ico" src="{_asset("nav_builds.png")}" alt="">Game Builds</a>')
+    if states.get("game_database"):
+        game_links.append(f'<a href="/items"><img class="nav-ico" src="{_asset("nav_item_database.png")}" alt="">Item-Datenbank</a>')
+
+    portal_block = f'<details open><summary>Mein Portal</summary>{"".join(portal_links)}</details>' if portal_links else ''
+    game_block = f'<details open><summary>Spiel</summary>{"".join(game_links)}</details>' if game_links else ''
+
     return f"""
     <aside class="sidebar member-default-sidebar">
       <div class="brand">
@@ -4660,40 +4830,15 @@ def _member_sidebar_html() -> str:
         <div class="brand-subtitle"><strong>{_e(brand['short_name'])}</strong><span>Gilden-Dashboard</span></div>
       </div>
       <button class="mobile-nav-toggle" type="button" onclick="document.body.classList.toggle('nav-open')">☰ Menü</button>
-
       <nav class="side-nav">
         <a href="/"><img class="nav-ico" src="{_asset('nav_kommando.png')}" alt="">Startseite</a>
         <a class="admin-portal-button" href="/admin"><img class="nav-ico" src="{_asset('nav_admin_portal.png')}" alt="">Admin-Portal</a>
-
-        <details open>
-          <summary>Mein Portal</summary>
-          <a href="/portal"><img class="nav-ico" src="{_asset('nav_portal.png')}" alt="">Mein Profil</a>
-          <a href="/character-editor"><img class="nav-ico" src="{_asset('nav_builds.png')}" alt="">Charakter-Editor</a>
-        </details>
-
-        <details open>
-          <summary>Gilde</summary>
-          <a href="/announcements"><img class="nav-ico" src="{_asset('nav_announcements.png')}" alt="">Ankündigungen</a>
-          <a href="/member/members"><img class="nav-ico" src="{_asset('nav_mitglieder.png')}" alt="">Mitglieder</a>
-          <a href="/member/auctions"><img class="nav-ico" src="{_asset('nav_auktionen.png')}" alt="">Auktionen</a>
-          <a href="/member/events"><img class="nav-ico" src="{_asset('nav_events.png')}" alt="">Events</a>
-          <a href="/member/ec"><img class="nav-ico" src="{_asset('nav_ec.png')}" alt="">EC-Verlauf</a>
-          <a href="/attendance"><img class="nav-ico" src="{_asset('nav_anwesenheit.png')}" alt="">Anwesenheit</a>
-        </details>
-
-        <details open>
-          <summary>TnL</summary>
-          <a href="/tnl/news"><img class="nav-ico" src="{_asset('nav_news.png')}" alt="">News</a>
-          <a href="/tnl/builds"><img class="nav-ico" src="{_asset('nav_builds.png')}" alt="">Builds</a>
-          <a href="/tnl/guides"><img class="nav-ico" src="{_asset('nav_guides.png')}" alt="">Guides</a>
-          <a href="/items"><img class="nav-ico" src="{_asset('nav_item_database.png')}" alt="">Item-Datenbank</a>
-        </details>
+        {portal_block}
+        <details open><summary>Gilde</summary>{''.join(guild_links)}</details>
+        {game_block}
       </nav>
-
       <div class="sidebar-footer">
-        <a href="/me">Mein Login</a>
-        <a href="/release">Release</a>
-        <a href="/logout">Logout</a>
+        <a href="/me">Mein Login</a><a href="/release">Release</a><a href="/logout">Logout</a>
         <span class="version-pill">v{_e(DASHBOARD_RELEASE_VERSION)}</span>
       </div>
     </aside>
@@ -4706,7 +4851,7 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "member") -> str:
     hero_banner = _css_url(_asset("beer_and_buffs_header_desktop_kastleton_v2.png"))
     hero_banner_mobile = _css_url(_asset("beer_and_buffs_header_mobile_kastleton_v2.png"))
     brand_logo = _css_url(_brand_image("logo", "beer_and_buffs_logo.png"))
-    for old_name in ("Weisse Flamme", "Weiße Flamme", "Ebolus", "ebolus"):
+    for old_name in ("Beer and Buffs", "Beer & Buffs", "Weisse Flamme", "Weiße Flamme", "Ebolus", "ebolus"):
         title = str(title).replace(old_name, brand_name)
         body = str(body).replace(old_name, brand_name)
     auth_note = ""
@@ -6833,7 +6978,7 @@ def _render_settings_dashboard(data: dict[str, Any]) -> str:
     <section class="panel"><h2>🎭 Rollen</h2>{_table(['Quelle','Setting','Rolle','ID'], role_rows, placeholder='Rollen durchsuchen…')}</section>
     <section class="panel"><h2>🔧 Erkannte Einstellungen</h2>{_table(['Quelle','Key','Wert'], setting_rows, placeholder='Settings durchsuchen…')}</section>
     """
-    return _html_shell("Einstellungen · Beer and Buffs Dashboard", body, nav_mode="admin")
+    return _html_shell("Einstellungen · Guild Platform", body, nav_mode="admin")
 
 
 # Entfernte überschriebene Altdefinition: _render_audit_dashboard
@@ -13275,27 +13420,101 @@ def _member_home_auction_rows(auctions: list[dict[str, Any]], snap: dict[str, An
 
 def _render_member_home(data: dict[str, Any], request: Request) -> str:
     if not data.get("ok"):
-        return _html_shell("Mitgliederbereich · Beer and Buffs Dashboard", f"<section class='panel'><h1>🏠 Mitgliederbereich</h1><p class='muted'>{_e(data.get('error'))}</p></section>", nav_mode="member")
+        return _html_shell(
+            "Mitgliederbereich · Guild Platform",
+            f"<section class='panel'><h1>🏠 Mitgliederbereich</h1><p class='muted'>{_e(data.get('error'))}</p></section>",
+            nav_mode="member",
+        )
+
     user = _current_user(request) or {}
     uid = _current_user_id(request)
     snap: dict[str, Any] = data.get("snapshot") or {}
+    guild_id = int(_safe_guild_id(data) or 0)
+    states = _dashboard_module_states(guild_id)
     names = _profile_name_map(snap)
     display = names.get(int(uid), str(user.get("username") or "Mitglied")) if uid else str(user.get("username") or "Mitglied")
-    running_events = [ev for ev in _events_items(snap) if isinstance(ev, dict) and _is_running_event(ev)]
-    running_events.sort(key=lambda ev: _event_dt_obj(ev.get("when_iso") or ev.get("start_at") or ev.get("created_at")) or datetime.max.replace(tzinfo=BERLIN_TZ))
-    auctions = (((snap.get("loot") or {}).get("auctions") or {}).get("items") or [])
-    active_auctions = [a for a in auctions if isinstance(a, dict) and _loot_is_active(a)]
-    active_auctions.sort(key=lambda a: _auction_timer_dt(a) or datetime.max.replace(tzinfo=BERLIN_TZ))
-    my_ec_balance = _balance_map(snap).get(int(uid or 0)) if uid else None
-    now_text = datetime.now().strftime("%d.%m.%Y %H:%M")
-    cards = "".join([_card("Meine EC", _fmt_ec(my_ec_balance) if my_ec_balance is not None else "—", "aktueller Stand"), _card("Uhrzeit", now_text, "lokale Dashboard-Zeit"), _card("Events", len(running_events), "max. 2 auf Startseite"), _card("Auktionen", len(active_auctions), "max. 4 auf Startseite")])
-    body = f"""
-    <nav class="topnav"><a href="/member">Start</a><a href="/member/events">Events</a><a href="/member/auctions">Auktionen</a><a href="/member/members">Mitglieder</a><a href="/member/ec">Meine EC</a><a href="/portal">Eigenes Profil</a><a href="/portal?profile_tab=needlist#needlist">Meine Needliste</a></nav>
-    <section class="hero member-home-hero"><div style="display:flex;gap:16px;align-items:center;flex-wrap:wrap;"><div class="member-start-logo"><img src="{_e(_brand_image('logo', 'beer_and_buffs_logo.png'))}" alt="{_e(_guild_brand().get('display_name') or 'Gilde')}"></div><div><div class="eyebrow">Mitgliederbereich</div><h1>Willkommen, {_e(display)}</h1><p class="muted">Kurzüberblick. Weitere Bereiche erreichst du links über die Leiste.</p></div></div></section>
-    <section class="grid">{cards}</section>
-    <section class="split"><div class="panel" id="events"><h2>📅 Nächste 2 Events</h2>{_member_home_event_rows(running_events, int(uid or 0))}</div><div class="panel" id="auctions"><h2>🏆 Max. 4 laufende Auktionen</h2>{_member_home_auction_rows(active_auctions, snap)}</div></section>
-    """
-    return _html_shell("Mitgliederbereich · Beer and Buffs Dashboard", body, nav_mode="member")
+    guild = snap.get("guild") or {}
+    member_filter = guild.get("member_filter") if isinstance(guild.get("member_filter"), dict) else {}
+    member_count = int(_num(member_filter.get("eligible_count"), 0))
+
+    now = datetime.now(BERLIN_TZ)
+    all_events = [ev for ev in _events_items(snap) if isinstance(ev, dict)]
+    active_events = []
+    for ev in all_events:
+        dt = _event_dt_obj(ev.get("when_iso") or ev.get("start_at") or ev.get("created_at"))
+        if _is_running_event(ev) or (dt is not None and dt >= now):
+            active_events.append(ev)
+    active_events.sort(key=lambda ev: _event_dt_obj(ev.get("when_iso") or ev.get("start_at") or ev.get("created_at")) or datetime.max.replace(tzinfo=BERLIN_TZ))
+
+    auctions: list[dict[str, Any]] = []
+    if states.get("auctions", False):
+        raw_auctions = (((snap.get("loot") or {}).get("auctions") or {}).get("items") or [])
+        auctions = [a for a in raw_auctions if isinstance(a, dict) and _loot_is_active(a)]
+        auctions.sort(key=lambda a: _auction_timer_dt(a) or datetime.max.replace(tzinfo=BERLIN_TZ))
+
+    cards = [
+        _card("Mitglieder", member_count, "aktuell in der Gilde"),
+        _card("Events", len(active_events), "laufend oder geplant"),
+        _card("Aktive Module", sum(1 for key in OPTIONAL_MODULE_KEYS if states.get(key, False)), "optionale Systeme"),
+    ]
+    if states.get("points", False):
+        my_balance = _balance_map(snap).get(int(uid or 0)) if uid else None
+        cards.append(_card("Meine Punkte", _fmt_ec(my_balance) if my_balance is not None else "—", "Punktesystem aktiv"))
+    if states.get("auctions", False):
+        cards.append(_card("Auktionen", len(auctions), "aktuell aktiv"))
+
+    nav = [
+        '<a href="/member">Start</a>',
+        '<a href="/member/events">Events</a>',
+        '<a href="/member/members">Mitglieder</a>',
+        '<a href="/announcements">Ankündigungen</a>',
+    ]
+    if states.get("member_portal", False):
+        nav.append('<a href="/portal">Mein Portal</a>')
+    if states.get("attendance", False):
+        nav.append('<a href="/attendance">Attendance</a>')
+    if states.get("points", False):
+        nav.append('<a href="/member/ec">Meine Punkte</a>')
+    if states.get("auctions", False):
+        nav.append('<a href="/member/auctions">Auktionen</a>')
+
+    sections = [f'''
+      <section class="panel" id="events">
+        <h2>📅 Nächste Events</h2>
+        {_member_home_event_rows(active_events, int(uid or 0))}
+        <p style="margin-top:14px"><a class="btn secondary" href="/member/events">Alle Events</a></p>
+      </section>
+    ''']
+    if states.get("auctions", False):
+        sections.append(f'''
+          <section class="panel" id="auctions">
+            <h2>🔨 Laufende Auktionen</h2>
+            {_member_home_auction_rows(auctions, snap)}
+            <p style="margin-top:14px"><a class="btn secondary" href="/member/auctions">Alle Auktionen</a></p>
+          </section>
+        ''')
+    else:
+        sections.append('''
+          <section class="panel">
+            <h2>👥 Gilde</h2>
+            <p class="muted">Die Grundfunktionen bleiben bewusst schlank. Weitere Systeme können von der Gildenleitung unter Einstellungen → Module zugeschaltet werden.</p>
+            <p><a class="btn secondary" href="/member/members">Mitgliederliste öffnen</a></p>
+          </section>
+        ''')
+
+    brand = _guild_brand(snap)
+    body = f'''
+    <nav class="topnav">{"".join(nav)}</nav>
+    <section class="hero member-home-hero">
+      <div style="display:flex;gap:16px;align-items:center;flex-wrap:wrap;">
+        <div class="member-start-logo"><img src="{_e(_brand_image('logo', 'logo_512.png'))}" alt="{_e(brand.get('display_name') or 'Gilde')}"></div>
+        <div><div class="eyebrow">Gildenzentrale</div><h1>Willkommen, {_e(display)}</h1><p class="muted">{_e(brand.get('display_name') or 'Gilde')} · Events, Mitglieder und deine aktivierten Gildenmodule.</p></div>
+      </div>
+    </section>
+    <section class="grid">{"".join(cards)}</section>
+    <section class="split">{"".join(sections)}</section>
+    '''
+    return _html_shell("Gildenzentrale · Guild Platform", body, nav_mode="member")
 
 
     """Letzte Dashboard-Einstellungsanträge.
@@ -14720,7 +14939,7 @@ def _settings_request_admin_action(guild_id: int, request_id: str, action: str, 
     finally:
         conn.close()
 
-def _render_admin_settings_editor(data: dict[str, Any], msg: str = "", section: str = "ec") -> str:
+def _render_admin_settings_editor(data: dict[str, Any], msg: str = "", section: str = "modules") -> str:
     if not data.get("ok"):
         return _html_shell("Admin-Einstellungen · Beer and Buffs Dashboard", f"<section class='panel'><h1>⚙️ Einstellungen</h1><p class='muted'>{_e(data.get('error'))}</p></section>", nav_mode="admin")
 
@@ -14729,10 +14948,15 @@ def _render_admin_settings_editor(data: dict[str, Any], msg: str = "", section: 
     cfg = _current_dkp_settings_from_snapshot(snap)
     requests = _settings_change_requests_for_dashboard(guild_id, 100) if guild_id else []
     counts = _queue_status_counts(requests)
-    selected = str(section or "ec").strip().lower()
-    allowed_sections = {"ec", "events", "roles", "loot", "dashboard", "system"}
+    module_states = _dashboard_module_states(guild_id)
+    selected = str(section or "modules").strip().lower()
+    allowed_sections = {"modules", "ec", "events", "roles", "loot", "dashboard", "system"}
     if selected not in allowed_sections:
-        selected = "ec"
+        selected = "modules"
+    if selected == "ec" and not module_states.get("points", False):
+        selected = "modules"
+    if selected == "loot" and not any(module_states.get(k, False) for k in ("loot", "needlists", "auctions")):
+        selected = "modules"
 
     settings_rows = ((snap.get("settings") or {}).get("settings") or []) if isinstance((snap.get("settings") or {}), dict) else []
     def _find_setting(names: list[str], default: Any = "") -> Any:
@@ -14808,7 +15032,50 @@ def _render_admin_settings_editor(data: dict[str, Any], msg: str = "", section: 
     ])
 
     section_html = ""
-    if selected == "ec":
+    if selected == "modules":
+        core_cards = []
+        optional_cards = []
+        for definition in GUILD_MODULES:
+            enabled = bool(module_states.get(definition.key, definition.core))
+            dep_text = ""
+            if definition.dependencies:
+                dep_labels = [module_definition(dep).label if module_definition(dep) else dep for dep in definition.dependencies]
+                dep_text = "<div class='module-deps'>Benötigt: " + _e(", ".join(dep_labels)) + "</div>"
+            if definition.core:
+                core_cards.append(f"""
+                <article class='module-card core'>
+                  <div class='module-card-head'><span class='module-icon'>{definition.icon}</span><div><h3>{_e(definition.label)}</h3><span class='module-state on'>Immer aktiv</span></div></div>
+                  <p>{_e(definition.description)}</p>
+                </article>
+                """)
+            else:
+                action_label = "Deaktivieren" if enabled else "Aktivieren"
+                state_label = "Aktiv" if enabled else "Aus"
+                state_class = "on" if enabled else "off"
+                optional_cards.append(f"""
+                <article class='module-card {'enabled' if enabled else ''}'>
+                  <div class='module-card-head'><span class='module-icon'>{definition.icon}</span><div><h3>{_e(definition.label)}</h3><span class='module-state {state_class}'>{state_label}</span></div></div>
+                  <p>{_e(definition.description)}</p>
+                  {dep_text}
+                  <form method='post' action='/admin/modules/{_e(definition.key)}/toggle'>
+                    <input type='hidden' name='enabled' value='{'0' if enabled else '1'}'>
+                    <button class='btn {'secondary' if enabled else ''}' type='submit'>{action_label}</button>
+                  </form>
+                </article>
+                """)
+        active_optional = sum(1 for key in OPTIONAL_MODULE_KEYS if module_states.get(key, False))
+        section_html = f"""
+        <section class='settings-card'>
+          <div class='settings-card-head'><div><div class='eyebrow'>Core</div><h2>Grundsystem</h2><p class='muted'>Diese Bereiche bilden die Gildenplattform und bleiben immer aktiv.</p></div><span class='pill ok'>3 Core-Module</span></div>
+          <div class='module-grid'>{''.join(core_cards)}</div>
+        </section>
+        <section class='settings-card'>
+          <div class='settings-card-head'><div><div class='eyebrow'>Optionale Module</div><h2>Funktionen ein- und ausschalten</h2><p class='muted'>Neue Gilden starten mit allen optionalen Systemen deaktiviert. Aktivierte Module erscheinen automatisch im Dashboard und bei den Discord-Slash-Commands.</p></div><span class='pill'>{active_optional} aktiv</span></div>
+          <div class='module-grid'>{''.join(optional_cards)}</div>
+          <p class='muted'>Abhängigkeiten werden beim Aktivieren automatisch mit eingeschaltet. Wenn ein benötigtes Modul deaktiviert wird, werden abhängige Module ebenfalls deaktiviert.</p>
+        </section>
+        """
+    elif selected == "ec":
         point_forms = []
         for et in cfg.get("event_types") or []:
             val = cfg.get("event_points", {}).get(et, 0)
@@ -14889,22 +15156,35 @@ def _render_admin_settings_editor(data: dict[str, Any], msg: str = "", section: 
         </section>
         """
     elif selected == "events":
+        points_event_block = ""
+        if module_states.get("points", False):
+            points_event_block = f"""
+            <div class='settings-subcard'>
+              <h3>Event-Punkte</h3>
+              <table class='mini-table'><thead><tr><th>Eventtyp</th><th>Aktueller Punktewert</th></tr></thead><tbody>{event_value_table}</tbody></table>
+            </div>
+            """
+        else:
+            points_event_block = """
+            <div class='settings-subcard'>
+              <h3>Event-Punkte</h3>
+              <p class='muted'>Das optionale DKP-/Punktesystem ist deaktiviert. Events und RSVP funktionieren unabhängig davon vollständig weiter.</p>
+              <a class='btn secondary' href='/admin-settings?section=modules'>Module verwalten</a>
+            </div>
+            """
         section_html = f"""
         <section class='settings-card'>
           <div class='settings-card-head'><div><div class='eyebrow'>Events</div><h2>Event-Standards & Verwaltung</h2><p class='muted'>Die eigentliche Bearbeitung laufender und geplanter Events läuft in der Eventverwaltung. Hier siehst du die wichtigsten Standardwerte kompakt.</p></div><a class='btn' href='/events-admin'>Eventverwaltung öffnen</a></div>
           <div class='settings-split'>
-            <div class='settings-subcard'>
-              <h3>Verfügbare Eventtypen</h3>
-              <table class='mini-table'><thead><tr><th>Eventtyp</th><th>Aktueller EC-Wert</th></tr></thead><tbody>{event_value_table}</tbody></table>
-            </div>
+            {points_event_block}
             <div class='settings-subcard'>
               <h3>Standardbilder</h3>
               <ul class='settings-bullets'>
-                <li>Normal Mode Raid</li>
-                <li>Hardmode Raid</li>
-                <li>Dimensionsprüfung</li>
-                <li>Gildenbosse</li>
-                <li>Segensstein</li>
+                <li>Raid</li>
+                <li>Hardmode / Progress</li>
+                <li>Instanz / Prüfung</li>
+                <li>Gildenboss</li>
+                <li>PvP</li>
               </ul>
               <p class='muted'>Standardbilder und eigene Bildlinks bearbeitest du direkt am Event. So bleiben auch laufende Events sauber synchronisiert.</p>
             </div>
@@ -14922,27 +15202,18 @@ def _render_admin_settings_editor(data: dict[str, Any], msg: str = "", section: 
     elif selected == "roles":
         section_html = f"""
         <section class='settings-card'>
-          <div class='settings-card-head'><div><div class='eyebrow'>Rollen</div><h2>Rechte & Zugriff</h2><p class='muted'>Leitungsrolle, Memberrolle und Dashboard-Zugriff sauber getrennt.</p></div><a class='btn secondary' href='/admin/guild-config'>Rollen & Kanäle öffnen</a></div>
+          <div class='settings-card-head'>
+            <div><div class='eyebrow'>Rollen & Rechte</div><h2>Core-Berechtigungen</h2><p class='muted'>Member-, Admin-, Leader- und Channel-Zuordnungen gehören zum immer aktiven Gilden-Core und sind nicht an das Punktesystem gekoppelt.</p></div>
+            <a class='btn' href='/admin/guild-config'>Rollen & Kanäle öffnen</a>
+          </div>
           <div class='settings-split'>
             <div class='settings-subcard'>
-              <h3>🛡️ Rollen & Kanal</h3>
-              <form method='post' action='/admin/settings-change' class='settings-form'>
-                <input type='hidden' name='action_type' value='set_roles'>
-                <label>Leitungsrolle / Adminrolle ID<input name='leader_role_id' value='{_e((leader_role_ids or [""])[0])}' placeholder='123456789012345678'></label>
-                <label>Gildenrolle / Memberrolle ID<input name='member_role_id' value='{_e((member_role_ids or [""])[0])}' placeholder='123456789012345678'></label>
-                <label>EC-/Loot-Logkanal ID<input name='log_channel_id' value='{_e(log_channel_id)}' placeholder='123456789012345678'></label>
-                <button class='btn' type='submit'>Rollen & Kanal speichern</button>
-              </form>
+              <h3>👥 Gildenrollen</h3>
+              <p class='muted'>Mitgliederrolle, Adminrolle, Leader/Advisor/Guardian und weitere Zugriffsrollen werden zentral in der Gildenkonfiguration gepflegt.</p>
             </div>
             <div class='settings-subcard'>
               <h3>🔐 Dashboard-Zugriff</h3>
-              <form method='post' action='/admin/settings-change' class='settings-form'>
-                <input type='hidden' name='action_type' value='set_access_roles'>
-                <label>Dashboard-Adminrollen IDs, kommagetrennt<input name='dashboard_admin_role_ids' value='{_e(",".join(admin_role_ids))}' placeholder='ID,ID,ID'></label>
-                <label>Zusätzliche Zugriffsrollen IDs, kommagetrennt<input name='dashboard_allowed_role_ids' value='{_e(",".join(allowed_role_ids))}' placeholder='ID,ID,ID'></label>
-                <button class='btn' type='submit'>Zugriffsrollen speichern</button>
-              </form>
-              <p class='muted'>Nach Änderungen an den Zugriffsrollen Bot-Snapshot neu bauen und einmal neu einloggen.</p>
+              <p class='muted'>Dashboard-Berechtigungen verwenden dieselbe zentrale Rollenverwaltung. Dadurch bleiben sie auch bei deaktiviertem DKP-, Loot- oder Auktionsmodul verfügbar.</p>
             </div>
           </div>
         </section>
@@ -14975,14 +15246,14 @@ def _render_admin_settings_editor(data: dict[str, Any], msg: str = "", section: 
         login_mode = "Discord OAuth" if _discord_oauth_enabled() else "Passwort-Fallback"
         section_html = f"""
         <section class='settings-card'>
-          <div class='settings-card-head'><div><div class='eyebrow'>Dashboard</div><h2>Branding & Oberfläche</h2><p class='muted'>Die Optik bleibt im Beer-and-Buffs-Stil, während Inhalte und Module sauber getrennt bleiben.</p></div></div>
+          <div class='settings-card-head'><div><div class='eyebrow'>Dashboard</div><h2>Branding & Oberfläche</h2><p class='muted'>Branding und Oberfläche bleiben gildenbezogen, während optionale Systeme modular zugeschaltet werden.</p></div></div>
           <div class='settings-split'>
             <div class='settings-subcard'>
               <h3>Darstellung</h3>
               <div class='settings-readonly-grid'>
-                <div><span>Gildenname</span><strong>{_e(data.get('guild_name') or 'Beer and Buffs')}</strong></div>
+                <div><span>Gildenname</span><strong>{_e(data.get('guild_name') or 'Gilde')}</strong></div>
                 <div><span>Login-Modus</span><strong>{_e(login_mode)}</strong></div>
-                <div><span>Favicon/Branding</span><strong>Beer and Buffs</strong></div>
+                <div><span>Favicon/Branding</span><strong>Gildenbezogen</strong></div>
                 <div><span>Headerbild</span><strong>über Static-Assets</strong></div>
               </div>
               <p class='muted'>Header, Hintergrund und visuelle Assets werden direkt im Dashboard-Code bzw. Static-Ordner gepflegt.</p>
@@ -15058,6 +15329,13 @@ def _render_admin_settings_editor(data: dict[str, Any], msg: str = "", section: 
       .mini-table{width:100%;border-collapse:collapse}
       .mini-table th,.mini-table td{padding:10px 12px;border-bottom:1px solid rgba(214,168,79,.12);text-align:left}
       .empty-state{padding:14px;border:1px dashed rgba(214,168,79,.18);border-radius:14px;color:var(--muted)}
+      .module-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:14px}
+      .module-card{display:grid;gap:12px;padding:16px;border:1px solid rgba(214,168,79,.15);border-radius:16px;background:rgba(255,255,255,.025)}
+      .module-card.enabled,.module-card.core{border-color:rgba(129,199,132,.35);background:rgba(129,199,132,.055)}
+      .module-card-head{display:flex;gap:12px;align-items:center}.module-card-head h3{margin:0 0 4px}.module-icon{font-size:28px}
+      .module-state{display:inline-flex;padding:3px 8px;border-radius:999px;font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.05em}
+      .module-state.on{background:rgba(129,199,132,.14);color:#bfe8c1}.module-state.off{background:rgba(217,104,104,.12);color:#e8a7a7}
+      .module-card p{margin:0;color:var(--muted);line-height:1.45}.module-deps{font-size:12px;color:#e5c982}
       @media (max-width: 780px){
         .settings-two,.settings-readonly-grid{grid-template-columns:1fr}
         .settings-inline-form{grid-template-columns:1fr}
@@ -15074,7 +15352,7 @@ def _render_admin_settings_editor(data: dict[str, Any], msg: str = "", section: 
           <div>
             <div class='eyebrow'>Admin · Einstellungen</div>
             <h1>⚙️ Einstellungen</h1>
-            <p class='muted'>Verwalte Regeln, Events, Rechte und Systemverhalten übersichtlich nach Bereichen. Änderungen im EC-/Rollenbereich werden als Bot-Anträge verarbeitet.</p>
+            <p class='muted'>Verwalte Core-Funktionen und optionale MMO-Module zentral. Neue optionale Systeme sind standardmäßig deaktiviert und werden erst nach Aktivierung sichtbar.</p>
           </div>
           <div class='settings-save-note'>
             <div>🛡️</div>
@@ -15085,7 +15363,7 @@ def _render_admin_settings_editor(data: dict[str, Any], msg: str = "", section: 
       {_admin_quick_links('settings')}
       {msg_panel}
       <section class='panel'><div class='settings-metrics'>{top_status}</div></section>
-      <section class='panel'><div class='settings-tabs'>{_settings_nav('ec','EC & Regeln')}{_settings_nav('events','Events')}{_settings_nav('roles','Rollen')}{_settings_nav('loot','Loot')}{_settings_nav('dashboard','Dashboard')}{_settings_nav('system','Bot / System')}</div></section>
+      <section class='panel'><div class='settings-tabs'>{_settings_nav('modules','Module')}{_settings_nav('events','Events')}{_settings_nav('roles','Rollen')}{_settings_nav('ec','DKP / Punkte') if module_states.get('points') else ''}{_settings_nav('loot','Loot') if any(module_states.get(k) for k in ('loot','needlists','auctions')) else ''}{_settings_nav('dashboard','Dashboard')}{_settings_nav('system','Bot / System')}</div></section>
       {section_html}
     </div>
     """
@@ -18067,7 +18345,7 @@ def event_detail(event_id: str, _: bool = Depends(_auth)):
 @app.get("/member", response_class=HTMLResponse)
 def member_home(request: Request, _: bool = Depends(_auth)):
     try:
-        return HTMLResponse(_render_status_dashboard(_snapshot_payload(), request, nav_mode="member"))
+        return HTMLResponse(_render_member_home(_snapshot_payload(), request))
     except Exception as exc:
         return HTMLResponse(_html_shell("Mitgliederbereich Fehler", f"<section class='panel'><h1>❌ Mitgliederbereich-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>", nav_mode="member"), status_code=500)
 
@@ -18442,9 +18720,9 @@ def _dashboard_upsert_guild_profile(guild_id: int, values: dict[str, Any]) -> No
     now = datetime.now(timezone.utc).isoformat()
     merged = {
         "discord_name": str(values.get("discord_name") if values.get("discord_name") is not None else current.get("discord_name") or "")[:120],
-        "display_name": str(values.get("display_name") or current.get("display_name") or "Beer and Buffs")[:120],
-        "short_name": str(values.get("short_name") or current.get("short_name") or values.get("display_name") or "Beer and Buffs")[:60],
-        "bot_display_name": str(values.get("bot_display_name") or current.get("bot_display_name") or "Beer and Buffs Knecht")[:120],
+        "display_name": str(values.get("display_name") or current.get("display_name") or "Gilde")[:120],
+        "short_name": str(values.get("short_name") or current.get("short_name") or values.get("display_name") or "Gilde")[:60],
+        "bot_display_name": str(values.get("bot_display_name") or current.get("bot_display_name") or "Gildenbot")[:120],
         "timezone_name": str(values.get("timezone_name") or current.get("timezone_name") or "Europe/Berlin")[:80],
         "logo_url": str(values.get("logo_url") if values.get("logo_url") is not None else current.get("logo_url") or "")[:1200],
         "banner_url": str(values.get("banner_url") if values.get("banner_url") is not None else current.get("banner_url") or "")[:1200],
@@ -18521,49 +18799,71 @@ def _channel_select(name: str, channels: list[dict[str, Any]], selected: int, *,
 
 def _render_guild_config_dashboard(data: dict[str, Any], msg: str = "") -> str:
     if not data.get("ok"):
-        return _html_shell("Gilde & Discord", f"<section class='panel'><h1>⚙️ Gilde & Discord</h1><p class='muted'>{_e(data.get('error'))}</p></section>", nav_mode="admin")
+        return _html_shell(
+            "Gilde & Discord",
+            f"<section class='panel'><h1>⚙️ Gilde & Discord</h1><p class='muted'>{_e(data.get('error'))}</p></section>",
+            nav_mode="admin",
+        )
+
     gid = _safe_guild_id(data)
+    states = _dashboard_module_states(gid)
     profile = _guild_profile_row(gid)
     snap = data.get("snapshot") or {}
     guild_row = snap.get("guild") or {}
     if not profile:
+        discord_name = str(guild_row.get("name") or data.get("guild_name") or "Gilde")
         profile = {
             "guild_id": gid,
-            "discord_name": guild_row.get("discord_name") or guild_row.get("name") or "",
-            "display_name": guild_row.get("name") or data.get("guild_name") or "Beer and Buffs",
-            "short_name": guild_row.get("name") or "Beer and Buffs",
-            "bot_display_name": f"{guild_row.get('name') or 'Beer and Buffs'} Knecht",
+            "discord_name": guild_row.get("discord_name") or discord_name,
+            "display_name": discord_name,
+            "short_name": discord_name,
+            "bot_display_name": f"{discord_name} Bot",
             "timezone_name": "Europe/Berlin",
             "accent_color": "#d6a84f",
             "status": "active",
         }
+
     roles, channels = _catalog_from_snapshot(data)
     member = int(_guild_setting_value(gid, "dashboard_member_role_id", 0) or 0)
     admins = _guild_setting_value(gid, "dashboard_admin_role_ids", []) or []
     allowed = _guild_setting_value(gid, "dashboard_allowed_role_ids", []) or []
-    if not isinstance(admins, list): admins = [admins]
-    if not isinstance(allowed, list): allowed = [allowed]
+    if not isinstance(admins, list):
+        admins = [admins]
+    if not isinstance(allowed, list):
+        allowed = [allowed]
     leader = int(_guild_setting_value(gid, "guild_role_leader_id", 0) or 0)
     advisor = int(_guild_setting_value(gid, "guild_role_advisor_id", 0) or 0)
     guardian = int(_guild_setting_value(gid, "guild_role_guardian_id", 0) or 0)
     voice_allowed = _guild_setting_value(gid, "guild_role_voice_allowed_ids", []) or []
     voice_blocked = _guild_setting_value(gid, "guild_role_voice_blocked_ids", []) or []
-    if not isinstance(voice_allowed, list): voice_allowed = [voice_allowed]
-    if not isinstance(voice_blocked, list): voice_blocked = [voice_blocked]
+    if not isinstance(voice_allowed, list):
+        voice_allowed = [voice_allowed]
+    if not isinstance(voice_blocked, list):
+        voice_blocked = [voice_blocked]
+
     channel_keys = {
-        "events": "guild_channel_events_id", "loot": "guild_channel_loot_id", "ec_log": "guild_channel_ec_log_id",
-        "audit": "guild_channel_audit_id", "error_log": "guild_channel_error_log_id", "welcome": "guild_channel_welcome_id",
-        "announcements": "guild_channel_announcements_id", "news": "guild_channel_news_id",
-        "guides": "guild_channel_guides_id", "voice_category": "guild_channel_voice_category_id",
-        "voice_return": "guild_channel_voice_return_id", "absences": "guild_channel_absences_id",
+        "events": "guild_channel_events_id",
+        "loot": "guild_channel_loot_id",
+        "ec_log": "guild_channel_ec_log_id",
+        "audit": "guild_channel_audit_id",
+        "error_log": "guild_channel_error_log_id",
+        "welcome": "guild_channel_welcome_id",
+        "announcements": "guild_channel_announcements_id",
+        "news": "guild_channel_news_id",
+        "guides": "guild_channel_guides_id",
+        "voice_category": "guild_channel_voice_category_id",
+        "voice_return": "guild_channel_voice_return_id",
+        "absences": "guild_channel_absences_id",
         "member_portal": "guild_channel_member_portal_id",
         "leader_contact_public": "guild_channel_leader_contact_public_id",
         "leader_contact_internal": "guild_channel_leader_contact_internal_id",
         "weekly_report": "guild_channel_weekly_report_id",
-        "auction_active": "guild_channel_auction_active_id", "auction_market": "guild_channel_auction_market_id",
+        "auction_active": "guild_channel_auction_active_id",
+        "auction_market": "guild_channel_auction_market_id",
     }
     cv = {k: int(_guild_setting_value(gid, v, 0) or 0) for k, v in channel_keys.items()}
     loot_rules = {kind: _guild_rule_value(gid, kind) for kind in GUILD_LOOT_RULES}
+
     profiles = []
     try:
         _ensure_guild_profile_schema()
@@ -18576,15 +18876,95 @@ def _render_guild_config_dashboard(data: dict[str, Any], msg: str = "") -> str:
             conn.close()
     except Exception:
         profiles = []
-    profile_rows = [[r.get("display_name") or r.get("discord_name"), r.get("guild_id"), r.get("status"), r.get("previous_guild_id") or "—", _dt(r.get("updated_at"))] for r in profiles]
+    profile_rows = [
+        [r.get("display_name") or r.get("discord_name"), r.get("guild_id"), r.get("status"), r.get("previous_guild_id") or "—", _dt(r.get("updated_at"))]
+        for r in profiles
+    ]
     msg_panel = f"<section class='panel'><p>{_e(msg)}</p></section>" if msg else ""
+
+    role_fields = [
+        f"<label>Mitgliederrolle<br>{_role_select('member_role_id', roles, [member])}</label>",
+        f"<label>Dashboard-Adminrollen<br>{_role_select('admin_role_ids', roles, [int(x) for x in admins if str(x).isdigit()], multiple=True)}</label>",
+        f"<label>Zusätzliche Zugriffsrollen<br>{_role_select('allowed_role_ids', roles, [int(x) for x in allowed if str(x).isdigit()], multiple=True)}</label>",
+        f"<label>Gildenmeister / Leitung<br>{_role_select('leader_role_id', roles, [leader])}</label>",
+        f"<label>Gildenberater<br>{_role_select('advisor_role_id', roles, [advisor])}</label>",
+        f"<label>Gildenwächter<br>{_role_select('guardian_role_id', roles, [guardian])}</label>",
+    ]
+    if states.get("voice", False):
+        role_fields.extend([
+            f"<label>Voice-Zugriffsrollen<br>{_role_select('voice_allowed_role_ids', roles, [int(x) for x in voice_allowed if str(x).isdigit()], multiple=True)}</label>",
+            f"<label>Vom Voice ausgeschlossene Rollen<br>{_role_select('voice_blocked_role_ids', roles, [int(x) for x in voice_blocked if str(x).isdigit()], multiple=True)}</label>",
+        ])
+
+    channel_fields = [
+        f"<label>Events<br>{_channel_select('channel_events', channels, cv['events'], kinds={'text','forum'})}</label>",
+        f"<label>Audit / Technik<br>{_channel_select('channel_audit', channels, cv['audit'], kinds={'text'})}</label>",
+        f"<label>Bot-Fehlerkanal<br>{_channel_select('channel_error_log', channels, cv['error_log'], kinds={'text'})}</label>",
+        f"<label>Willkommen<br>{_channel_select('channel_welcome', channels, cv['welcome'], kinds={'text'})}</label>",
+        f"<label>Ankündigungen<br>{_channel_select('channel_announcements', channels, cv['announcements'], kinds={'text','forum'})}</label>",
+        f"<label>Abwesenheiten<br>{_channel_select('channel_absences', channels, cv['absences'], kinds={'text','forum'})}</label>",
+    ]
+    if states.get("loot") or states.get("needlists") or states.get("auctions"):
+        channel_fields.append(f"<label>Loot<br>{_channel_select('channel_loot', channels, cv['loot'], kinds={'text','forum'})}</label>")
+    if states.get("points") or states.get("loot") or states.get("auctions"):
+        channel_fields.append(f"<label>Punkte-/Loot-Log<br>{_channel_select('channel_ec_log', channels, cv['ec_log'], kinds={'text'})}</label>")
+    if states.get("game_information"):
+        channel_fields.extend([
+            f"<label>News<br>{_channel_select('channel_news', channels, cv['news'], kinds={'text','forum'})}</label>",
+            f"<label>Guides<br>{_channel_select('channel_guides', channels, cv['guides'], kinds={'text','forum'})}</label>",
+        ])
+    if states.get("voice"):
+        channel_fields.extend([
+            f"<label>Voice-Kategorie<br>{_channel_select('channel_voice_category', channels, cv['voice_category'], kinds={'category'})}</label>",
+            f"<label>Voice-Rückkehrkanal<br>{_channel_select('channel_voice_return', channels, cv['voice_return'], kinds={'voice','stage'})}</label>",
+        ])
+    if states.get("member_portal"):
+        channel_fields.append(f"<label>Mitgliederportal-Post<br>{_channel_select('channel_member_portal', channels, cv['member_portal'], kinds={'text'})}</label>")
+    if states.get("leader_contact"):
+        channel_fields.extend([
+            f"<label>Leaderkontakt öffentlich<br>{_channel_select('channel_leader_contact_public', channels, cv['leader_contact_public'], kinds={'text','forum'})}</label>",
+            f"<label>Leaderkontakt intern<br>{_channel_select('channel_leader_contact_internal', channels, cv['leader_contact_internal'], kinds={'text','forum'})}</label>",
+        ])
+    if states.get("analytics"):
+        channel_fields.append(f"<label>Wochenbericht<br>{_channel_select('channel_weekly_report', channels, cv['weekly_report'], kinds={'text','forum'})}</label>")
+    if states.get("auctions"):
+        channel_fields.extend([
+            f"<label>Aktive Auktionen<br>{_channel_select('channel_auction_active', channels, cv['auction_active'], kinds={'text','forum'})}</label>",
+            f"<label>Auktionsmarkt / Sale<br>{_channel_select('channel_auction_market', channels, cv['auction_market'], kinds={'text','forum'})}</label>",
+        ])
+
+    loot_rules_section = ""
+    if states.get("loot") or states.get("auctions"):
+        rule_fields = "".join(
+            f"<label>{_e(spec['label'])}<br><input type='number' name='rule_{_e(kind)}' value='{loot_rules[kind]}' min='{int(spec['min'])}' max='{int(spec['max'])}'></label>"
+            for kind, spec in GUILD_LOOT_RULES.items()
+        )
+        loot_rules_section = f"""
+        <section class='panel'>
+          <h2>🎁 Loot- und Auktionsregeln</h2>
+          <p class='muted'>Dieser Bereich erscheint nur, wenn Loot Management oder Auktionen aktiv sind.</p>
+          <div class='grid'>{rule_fields}</div>
+        </section>
+        """
+
+    active_optional = [module_definition(k).label for k in OPTIONAL_MODULE_KEYS if states.get(k) and module_definition(k)]
+    module_summary = ", ".join(active_optional) if active_optional else "Keine optionalen Module"
+
     body = f"""
     {_admin_tabs_style()}
     {_admin_tabs('settings')}
-    <section class='hero'><div><div class='eyebrow'>Mandantenfähige Konfiguration</div><h1>⚙️ Gilde & Discord</h1><p class='muted'>Gildenname, Branding, Rollen und Kanäle liegen in Postgres. Railway bleibt bei Tokens, OAuth-Secrets, DATABASE_URL und Session-Secret.</p></div></section>
+    <section class='hero'>
+      <div><div class='eyebrow'>Gilden-Core</div><h1>⚙️ Gilde & Discord</h1><p class='muted'>Gildenname, Branding, Core-Rollen und nur die Kanäle der aktuell aktivierten Module.</p></div>
+      <a class='btn secondary' href='/admin-settings?section=modules'>Module verwalten</a>
+    </section>
     {_admin_quick_links('settings')}
     {msg_panel}
-    <section class='grid'>{_card('Aktive Guild-ID', gid, 'automatisch aus Bot-Snapshot')}{_card('Discord-Server', profile.get('discord_name') or guild_row.get('discord_name') or '—', 'technischer Servername')}{_card('Gildenname', profile.get('display_name') or '—', 'frei änderbar')}{_card('Rollen im Snapshot', len(roles), 'Auswahl ohne IDs kopieren')}</section>
+    <section class='grid'>
+      {_card('Aktive Guild-ID', gid, 'automatisch aus Bot-Snapshot')}
+      {_card('Discord-Server', profile.get('discord_name') or guild_row.get('discord_name') or '—', 'technischer Servername')}
+      {_card('Gildenname', profile.get('display_name') or '—', 'frei änderbar')}
+      {_card('Optionale Module', len(active_optional), module_summary)}
+    </section>
     <form method='post' action='/admin/guild-config' style='display:grid;gap:18px;'>
       <section class='split'>
         <section class='panel'><h2>🏰 Name & Branding</h2>
@@ -18597,46 +18977,16 @@ def _render_guild_config_dashboard(data: dict[str, Any], msg: str = "") -> str:
           <label>Akzentfarbe<br><input name='accent_color' value='{_e(profile.get('accent_color') or '#d6a84f')}' placeholder='#d6a84f'></label>
           <label>Discord-Einladungslink<br><input name='invite_url' value='{_e(profile.get('invite_url') or '')}' placeholder='https://discord.gg/…'></label>
         </section>
-        <section class='panel'><h2>🛡️ Rollen</h2>
-          <label>Mitgliederrolle<br>{_role_select('member_role_id', roles, [member])}</label>
-          <label>Dashboard-Adminrollen<br>{_role_select('admin_role_ids', roles, [int(x) for x in admins if str(x).isdigit()], multiple=True)}</label>
-          <label>Zusätzliche Zugriffsrollen<br>{_role_select('allowed_role_ids', roles, [int(x) for x in allowed if str(x).isdigit()], multiple=True)}</label>
-          <label>Gildenmeister/Leitung<br>{_role_select('leader_role_id', roles, [leader])}</label>
-          <label>Gildenberater<br>{_role_select('advisor_role_id', roles, [advisor])}</label>
-          <label>Gildenwächter<br>{_role_select('guardian_role_id', roles, [guardian])}</label>
-          <label>Voice-Zugriffsrollen<br>{_role_select('voice_allowed_role_ids', roles, [int(x) for x in voice_allowed if str(x).isdigit()], multiple=True)}</label>
-          <label>Vom Voice ausgeschlossene Rollen<br>{_role_select('voice_blocked_role_ids', roles, [int(x) for x in voice_blocked if str(x).isdigit()], multiple=True)}</label>
-        </section>
+        <section class='panel'><h2>🛡️ Rollen</h2>{''.join(role_fields)}</section>
       </section>
-      <section class='panel'><h2>💬 Kanäle</h2><div class='grid'>
-        <label>Events<br>{_channel_select('channel_events', channels, cv['events'], kinds={'text','forum'})}</label>
-        <label>Loot/Auktionen<br>{_channel_select('channel_loot', channels, cv['loot'], kinds={'text','forum'})}</label>
-        <label>EC-/Loot-Log<br>{_channel_select('channel_ec_log', channels, cv['ec_log'], kinds={'text'})}</label>
-        <label>Audit/Technik<br>{_channel_select('channel_audit', channels, cv['audit'], kinds={'text'})}</label>
-        <label>Bot-Fehlerkanal<br>{_channel_select('channel_error_log', channels, cv['error_log'], kinds={'text'})}</label>
-        <label>Willkommen<br>{_channel_select('channel_welcome', channels, cv['welcome'], kinds={'text'})}</label>
-        <label>Ankündigungen<br>{_channel_select('channel_announcements', channels, cv['announcements'], kinds={'text','forum'})}</label>
-        <label>News<br>{_channel_select('channel_news', channels, cv['news'], kinds={'text','forum'})}</label>
-        <label>Guides<br>{_channel_select('channel_guides', channels, cv['guides'], kinds={'text','forum'})}</label>
-        <label>Voice-Kategorie<br>{_channel_select('channel_voice_category', channels, cv['voice_category'], kinds={'category'})}</label>
-        <label>Voice-Rückkehrkanal<br>{_channel_select('channel_voice_return', channels, cv['voice_return'], kinds={'voice','stage'})}</label>
-        <label>Abwesenheiten<br>{_channel_select('channel_absences', channels, cv['absences'], kinds={'text','forum'})}</label>
-        <label>Mitgliederportal-Post<br>{_channel_select('channel_member_portal', channels, cv['member_portal'], kinds={'text'})}</label>
-        <label>Leaderkontakt öffentlich<br>{_channel_select('channel_leader_contact_public', channels, cv['leader_contact_public'], kinds={'text','forum'})}</label>
-        <label>Leaderkontakt intern<br>{_channel_select('channel_leader_contact_internal', channels, cv['leader_contact_internal'], kinds={'text','forum'})}</label>
-        <label>Wochenbericht<br>{_channel_select('channel_weekly_report', channels, cv['weekly_report'], kinds={'text','forum'})}</label>
-        <label>Aktive Auktionen<br>{_channel_select('channel_auction_active', channels, cv['auction_active'], kinds={'text','forum'})}</label>
-        <label>Auktionsmarkt/Sale<br>{_channel_select('channel_auction_market', channels, cv['auction_market'], kinds={'text','forum'})}</label>
-      </div></section>
-      <section class='panel'><h2>🎁 Loot- und Auktionsregeln</h2><p class='muted'>Diese Werte gelten sofort für neu gestartete Auktionen. Bereits laufende Auktionen behalten ihre gespeicherten Zeiten und Preise.</p><div class='grid'>
-        {''.join(f"<label>{_e(spec['label'])}<br><input type='number' name='rule_{_e(kind)}' value='{loot_rules[kind]}' min='{int(spec['min'])}' max='{int(spec['max'])}'></label>" for kind, spec in GUILD_LOOT_RULES.items())}
-      </div><p class='muted'>EC-Punkte, Wochenlimit und Verfall bleiben im Bereich <a href='/admin-settings'>EC & Regeln</a> einstellbar. Dieselben Lootwerte gehen auch per <code>/guild set_rule</code>.</p></section>
-      <section class='panel'><button class='btn' type='submit'>Konfiguration speichern</button><p class='muted'>Der Bot übernimmt diese Werte direkt aus Postgres. Für neue Zugriffsrollen danach einmal <code>/dashboard status</code> ausführen und neu einloggen.</p></section>
+      <section class='panel'><h2>💬 Kanäle</h2><div class='grid'>{''.join(channel_fields)}</div></section>
+      {loot_rules_section}
+      <section class='panel'><button class='btn' type='submit'>Konfiguration speichern</button><p class='muted'>Deaktivierte Modulbereiche werden beim Speichern nicht verändert.</p></section>
     </form>
     <section class='panel'><h2>🚚 Serverwechsel</h2><p>Auf dem neuen Discord-Server: <code>/guild setup</code>, Rollen/Kanäle auswählen und danach <code>/guild rehome source_guild_id:ALTE_ID</code>. Es werden nur mitgekommene Mitglieder und sichere Historie übernommen.</p></section>
     <section class='panel'><h2>🗃️ Bekannte Gilden</h2>{_table(['Name','Guild-ID','Status','Vorherige Guild','Aktualisiert'], profile_rows, placeholder='Gilden durchsuchen…')}</section>
     """
-    return _html_shell("Gilde & Discord", body, nav_mode="admin")
+    return _html_shell("Gilde & Discord · Guild Platform", body, nav_mode="admin")
 
 
 @app.get("/admin/guild-config", response_class=HTMLResponse)
@@ -18650,6 +19000,7 @@ async def guild_config_save(request: Request, _: bool = Depends(_admin_auth)):
     gid = _safe_guild_id(data)
     if not gid:
         raise HTTPException(status_code=409, detail="Keine aktive Guild-ID verfügbar.")
+    states = _dashboard_module_states(gid)
     raw_body = (await request.body()).decode("utf-8", errors="replace")
     parsed_form = urllib.parse.parse_qs(raw_body, keep_blank_values=True)
     def form_one(name: str, default: str = "") -> str:
@@ -18670,7 +19021,7 @@ async def guild_config_save(request: Request, _: bool = Depends(_admin_auth)):
         "discord_name": guild_row.get("discord_name") or guild_row.get("name") or before.get("discord_name") or "",
         "display_name": display_name,
         "short_name": form_one("short_name", display_name).strip(),
-        "bot_display_name": form_one("bot_display_name", f"{display_name} Knecht").strip(),
+        "bot_display_name": form_one("bot_display_name", f"{display_name} Bot").strip(),
         "timezone_name": form_one("timezone_name", "Europe/Berlin").strip(),
         "logo_url": form_one("logo_url").strip(),
         "banner_url": form_one("banner_url").strip(),
@@ -18695,34 +19046,45 @@ async def guild_config_save(request: Request, _: bool = Depends(_admin_auth)):
         "guild_role_leader_id": one_int("leader_role_id"),
         "guild_role_advisor_id": one_int("advisor_role_id"),
         "guild_role_guardian_id": one_int("guardian_role_id"),
-        "guild_role_voice_allowed_ids": many_int("voice_allowed_role_ids"),
-        "guild_role_voice_blocked_ids": many_int("voice_blocked_role_ids"),
         "guild_channel_events_id": one_int("channel_events"),
-        "guild_channel_loot_id": one_int("channel_loot"),
-        "guild_channel_ec_log_id": one_int("channel_ec_log"),
         "guild_channel_audit_id": one_int("channel_audit"),
         "guild_channel_error_log_id": one_int("channel_error_log"),
         "guild_channel_welcome_id": one_int("channel_welcome"),
         "guild_channel_announcements_id": one_int("channel_announcements"),
-        "guild_channel_news_id": one_int("channel_news"),
-        "guild_channel_guides_id": one_int("channel_guides"),
-        "guild_channel_voice_category_id": one_int("channel_voice_category"),
-        "guild_channel_voice_return_id": one_int("channel_voice_return"),
         "guild_channel_absences_id": one_int("channel_absences"),
-        "guild_channel_member_portal_id": one_int("channel_member_portal"),
-        "guild_channel_leader_contact_public_id": one_int("channel_leader_contact_public"),
-        "guild_channel_leader_contact_internal_id": one_int("channel_leader_contact_internal"),
-        "guild_channel_weekly_report_id": one_int("channel_weekly_report"),
-        "guild_channel_auction_active_id": one_int("channel_auction_active"),
-        "guild_channel_auction_market_id": one_int("channel_auction_market"),
     }
-    for kind, spec in GUILD_LOOT_RULES.items():
-        raw = form_one("rule_" + kind, str(spec["default"])).strip()
-        try:
-            value = int(raw)
-        except Exception:
-            value = int(spec["default"])
-        settings[str(spec["setting"])] = max(int(spec["min"]), min(int(spec["max"]), value))
+    if states.get("voice", False):
+        settings.update({
+            "guild_role_voice_allowed_ids": many_int("voice_allowed_role_ids"),
+            "guild_role_voice_blocked_ids": many_int("voice_blocked_role_ids"),
+            "guild_channel_voice_category_id": one_int("channel_voice_category"),
+            "guild_channel_voice_return_id": one_int("channel_voice_return"),
+        })
+    if states.get("loot", False) or states.get("needlists", False) or states.get("auctions", False):
+        settings["guild_channel_loot_id"] = one_int("channel_loot")
+    if states.get("points", False) or states.get("loot", False) or states.get("auctions", False):
+        settings["guild_channel_ec_log_id"] = one_int("channel_ec_log")
+    if states.get("game_information", False):
+        settings["guild_channel_news_id"] = one_int("channel_news")
+        settings["guild_channel_guides_id"] = one_int("channel_guides")
+    if states.get("member_portal", False):
+        settings["guild_channel_member_portal_id"] = one_int("channel_member_portal")
+    if states.get("leader_contact", False):
+        settings["guild_channel_leader_contact_public_id"] = one_int("channel_leader_contact_public")
+        settings["guild_channel_leader_contact_internal_id"] = one_int("channel_leader_contact_internal")
+    if states.get("analytics", False):
+        settings["guild_channel_weekly_report_id"] = one_int("channel_weekly_report")
+    if states.get("auctions", False):
+        settings["guild_channel_auction_active_id"] = one_int("channel_auction_active")
+        settings["guild_channel_auction_market_id"] = one_int("channel_auction_market")
+    if states.get("loot", False) or states.get("auctions", False):
+        for kind, spec in GUILD_LOOT_RULES.items():
+            raw = form_one("rule_" + kind, str(spec["default"])).strip()
+            try:
+                value = int(raw)
+            except Exception:
+                value = int(spec["default"])
+            settings[str(spec["setting"])] = max(int(spec["min"]), min(int(spec["max"]), value))
     for key, value in settings.items():
         _set_guild_setting_value(gid, key, value)
     try:
@@ -18745,17 +19107,11 @@ async def guild_config_save(request: Request, _: bool = Depends(_admin_auth)):
 
 @app.get("/settings", response_class=HTMLResponse)
 def settings_page(_: bool = Depends(_admin_auth)):
-    try:
-        return HTMLResponse(_render_settings_dashboard(_snapshot_payload()))
-    except Exception as exc:
-        return HTMLResponse(
-            _html_shell("Beer and Buffs Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
-            status_code=500,
-        )
+    return RedirectResponse("/admin-settings?section=modules", status_code=302)
 
 
 @app.get("/admin-settings", response_class=HTMLResponse)
-def admin_settings_page(_: bool = Depends(_admin_auth), msg: str = "", section: str = "ec"):
+def admin_settings_page(_: bool = Depends(_admin_auth), msg: str = "", section: str = "modules"):
     try:
         return HTMLResponse(_render_admin_settings_editor(_snapshot_payload(), msg=msg, section=section))
     except Exception as exc:
@@ -18775,9 +19131,44 @@ def api_admin_settings(_: bool = Depends(_admin_auth)):
     return JSONResponse({
         "ok": True,
         "guild_id": guild_id,
-        "current": _current_dkp_settings_from_snapshot(snap),
-        "requests": _settings_change_requests_for_dashboard(guild_id, 120) if guild_id else [],
+        "modules": _dashboard_module_states(guild_id),
+        "current": _current_dkp_settings_from_snapshot(snap) if _dashboard_module_enabled("points", guild_id) else {},
+        "requests": _settings_change_requests_for_dashboard(guild_id, 120) if guild_id and _dashboard_module_enabled("points", guild_id) else [],
     })
+
+
+@app.post("/admin/modules/{module_key}/toggle")
+async def admin_module_toggle(module_key: str, request: Request, _: bool = Depends(_admin_auth)):
+    payload = _snapshot_payload()
+    guild_id = _safe_guild_id(payload)
+    if not guild_id:
+        raise HTTPException(status_code=400, detail="Guild-ID fehlt")
+    form = _parse_urlencoded_body(await request.body())
+    enabled = str(form.get("enabled") or "0").strip().lower() in {"1", "true", "yes", "on"}
+    try:
+        changed = _set_dashboard_module_enabled(guild_id, module_key, enabled)
+    except ValueError as exc:
+        return RedirectResponse(
+            "/admin-settings?" + urllib.parse.urlencode({"section": "modules", "msg": str(exc)}),
+            status_code=303,
+        )
+    definition = module_definition(module_key)
+    label = definition.label if definition else module_key
+    changed_labels = [module_definition(key).label if module_definition(key) else key for key in changed]
+    if enabled:
+        msg = f"{label} aktiviert."
+        extras = [name for name in changed_labels if name != label]
+        if extras:
+            msg += " Abhängigkeiten ebenfalls aktiviert: " + ", ".join(extras) + "."
+    else:
+        msg = f"{label} deaktiviert."
+        extras = [name for name in changed_labels if name != label]
+        if extras:
+            msg += " Abhängige Module ebenfalls deaktiviert: " + ", ".join(extras) + "."
+    return RedirectResponse(
+        "/admin-settings?" + urllib.parse.urlencode({"section": "modules", "msg": msg}),
+        status_code=303,
+    )
 
 
 @app.post("/admin/settings-change")
@@ -18787,6 +19178,11 @@ async def admin_settings_change(request: Request, _: bool = Depends(_admin_auth)
     actor = _current_user(request) or {"username": "Dashboard"}
     form = _parse_urlencoded_body(await request.body())
     action = str(form.get("action_type") or "").strip().lower()
+    if action in {"set_event_points", "set_weekly_limit", "set_decay", "set_roles", "set_access_roles"} and not _dashboard_module_enabled("points", guild_id):
+        # Rollen-/Access-Einstellungen werden langfristig aus dem Punktesystem herausgelöst.
+        # Die vorhandene Queue hängt aktuell technisch noch am DKP-Modul und wird deshalb nur dort benutzt.
+        msg = "DKP / Punktesystem ist deaktiviert. Nutze für Rollen und Kanäle die Seite Gilde & Discord."
+        return RedirectResponse("/admin-settings?" + urllib.parse.urlencode({"section": "modules", "msg": msg}), status_code=303)
     clean_payload: dict[str, Any] = {}
     if action == "set_event_points":
         clean_payload = {"event_type": form.get("event_type"), "points": form.get("points")}
@@ -19260,9 +19656,9 @@ def api_system(_: bool = Depends(_admin_auth)):
     return JSONResponse({"ok": True, "guild": snap.get("guild") or {}, "storage": snap.get("storage") or {}, "source_health": snap.get("source_health") or {}})
 
 @app.get("/overview", response_class=HTMLResponse)
-def overview(_: bool = Depends(_auth)):
+def overview(_: bool = Depends(_admin_auth)):
     try:
-        return HTMLResponse(_render_dashboard(_snapshot_payload()))
+        return HTMLResponse(_render_admin_center_dashboard(_snapshot_payload()))
     except Exception as exc:
         return HTMLResponse(
             _html_shell("Beer and Buffs Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
@@ -19273,7 +19669,7 @@ def overview(_: bool = Depends(_auth)):
 @app.get("/", response_class=HTMLResponse)
 def index(request: Request, _: bool = Depends(_auth)):
     try:
-        return HTMLResponse(_render_status_dashboard(_snapshot_payload(), request, nav_mode="member"))
+        return HTMLResponse(_render_member_home(_snapshot_payload(), request))
     except Exception as exc:
         return HTMLResponse(
             _html_shell("Beer and Buffs Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
