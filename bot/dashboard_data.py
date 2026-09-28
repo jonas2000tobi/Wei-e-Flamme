@@ -2233,6 +2233,7 @@ def build_dashboard_snapshot(bot: commands.Bot, guild: discord.Guild) -> dict[st
         },
         "source_health": _source_health(),
         "guild_config": central_config,
+        "modules": dict((central_config or {}).get("modules") or {}),
         "auth": _dashboard_auth_info(guild),
         "profiles": profile_summary,
         "members": profile_summary,

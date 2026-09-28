@@ -51,6 +51,11 @@ except Exception:
     except Exception:
         central_guild_config = None  # type: ignore
 
+try:
+    from bot.module_registry import is_module_enabled  # type: ignore
+except Exception:
+    from module_registry import is_module_enabled  # type: ignore
+
 
 def _guild_brand_name(guild_or_id: Any, fallback: str = "Gilde") -> str:
     try:
@@ -1660,6 +1665,10 @@ async def _maybe_create_event_voice_for_obj(client: discord.Client, obj: dict) -
         if not bool(obj.get("voice_enabled", False)):
             return False
 
+        guild_id = int(obj.get("guild_id", 0) or 0)
+        if guild_id and not is_module_enabled(guild_id, "voice"):
+            return False
+
         if bool(obj.get("voice_cleanup_done", False)):
             return False
 
@@ -1673,7 +1682,6 @@ async def _maybe_create_event_voice_for_obj(client: discord.Client, obj: dict) -
         if now >= delete_after:
             return False
 
-        guild_id = int(obj.get("guild_id", 0) or 0)
         guild = client.get_guild(guild_id) if guild_id else None
         if guild is None:
             return False
@@ -3912,6 +3920,17 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
 
         await send_text_channel_picker(inter, "📢 Zielkanal für Raid-Ankündigung auswählen", _picked)
 
+    async def _require_alliance_module(inter: discord.Interaction) -> bool:
+        guild_id = int(inter.guild_id or 0)
+        if guild_id and is_module_enabled(guild_id, "alliance"):
+            return True
+        message = "❌ Das Allianzsystem ist für diese Gilde deaktiviert. Aktiviere es im Dashboard unter Einstellungen → Module."
+        if inter.response.is_done():
+            await inter.followup.send(message, ephemeral=True)
+        else:
+            await inter.response.send_message(message, ephemeral=True)
+        return False
+
     async def _create_alliance_raid_impl(
         inter: discord.Interaction,
         group: str,
@@ -4135,6 +4154,8 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
         target_role: Optional[discord.Role] = None,
         image_url: Optional[str] = None
     ):
+        if not await _require_alliance_module(inter):
+            return
         await inter.response.defer(ephemeral=True, thinking=True)
         await _create_alliance_raid_impl(inter, group, event_type, title, date, time, description, target_role, image_url)
 
@@ -4158,6 +4179,8 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
         target_role: Optional[discord.Role] = None,
         image_url: Optional[str] = None,
     ):
+        if not await _require_alliance_module(inter):
+            return
         await inter.response.defer(ephemeral=True, thinking=True)
 
         try:
@@ -4192,6 +4215,8 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
 
     @event_group.command(name="alliance_template", description="(Leader) Zeigt Copy-Paste-Vorlagen für Allianz-Raids")
     async def alliance_raid_template(inter: discord.Interaction):
+        if not await _require_alliance_module(inter):
+            return
         await inter.response.defer(ephemeral=True, thinking=False)
 
         ok, msg = _require_alliance_home_leader(inter)
@@ -4446,14 +4471,6 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
         except Exception:
             refresh_members = []
 
-        refresh_members = []
-
-        try:
-            if inter.guild is not None:
-                refresh_members = list(_eligible_members(inter.guild, obj))
-        except Exception:
-            refresh_members = []
-
         store.pop(str(message_id), None)
         save_store()
 
@@ -4481,6 +4498,8 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
 
     @event_group.command(name="alliance_delete", description="(Leader) Löscht einen Allianz-Raid inkl. aller Mirror-Posts")
     async def alliance_raid_delete(inter: discord.Interaction, message_id: str):
+        if not await _require_alliance_module(inter):
+            return
         await inter.response.defer(ephemeral=True, thinking=True)
 
         ok, msg = _require_alliance_home_leader(inter)
@@ -4555,6 +4574,13 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
             await _cleanup_event_voice_for_obj(inter.client, obj)
         except Exception:
             pass
+
+        refresh_members = []
+        try:
+            if inter.guild is not None:
+                refresh_members = list(_eligible_members(inter.guild, obj))
+        except Exception:
+            refresh_members = []
 
         store.pop(str(message_id), None)
         save_store()

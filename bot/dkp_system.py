@@ -17,6 +17,11 @@ except Exception:
 
 import discord
 from discord import app_commands
+
+try:
+    from bot.module_registry import FeatureGroup, is_module_enabled, any_guild_has_module  # type: ignore
+except Exception:
+    from module_registry import FeatureGroup, is_module_enabled, any_guild_has_module  # type: ignore
 from discord.ext import tasks
 from discord.ui import View, button, Select, UserSelect
 from discord.enums import ButtonStyle
@@ -688,6 +693,8 @@ async def _run_scheduled_weekly_reset(client: discord.Client) -> None:
     current_key = _weekly_period_key(now)
 
     for guild in getattr(client, "guilds", []) or []:
+        if not is_module_enabled(int(guild.id), "points"):
+            continue
         home_id = _home_guild_id(default=guild.id)
         if int(guild.id) != int(home_id):
             continue
@@ -2579,6 +2586,9 @@ async def _process_dashboard_ec_award_request(client: discord.Client, row: dict)
     request_id = str(row.get("request_id") or "")
     try:
         guild_id = int(row.get("guild_id", 0) or 0)
+        if not is_module_enabled(guild_id, "points"):
+            _finish_dashboard_ec_award_request(request_id, "rejected", {"ok": False, "error": "DKP / Punktesystem ist deaktiviert."})
+            return
         event_id = str(row.get("event_id") or "")
         event_type = str(row.get("event_type") or "Dashboard Attendance").strip() or "Dashboard Attendance"
         payload = json.loads(row.get("payload_json") or "{}")
@@ -2846,6 +2856,9 @@ async def _process_dashboard_attendance_action(client: discord.Client, row: dict
     request_id = str(row.get("request_id") or "")
     try:
         guild_id = int(row.get("guild_id") or 0)
+        if not is_module_enabled(guild_id, "attendance"):
+            _finish_dashboard_attendance_action(request_id, "rejected", {"ok": False, "error": "Attendance-Modul ist deaktiviert."})
+            return
         event_id = str(row.get("event_id") or "")
         action_type = str(row.get("action_type") or "sync_review").strip().lower()
         try:
@@ -3261,6 +3274,9 @@ async def _process_dashboard_settings_change_request(client: discord.Client, row
     actor_id = int(row.get("actor_id") or 0) if str(row.get("actor_id") or "").isdigit() else 0
     actor_name = str(row.get("actor_name") or "Dashboard")
     try:
+        if not is_module_enabled(guild_id, "points"):
+            _finish_dashboard_settings_change_request(request_id, "rejected", {"ok": False, "error": "DKP / Punktesystem ist deaktiviert.", "request_id": request_id})
+            return
         result = _apply_dashboard_settings_change(row)
         if result.get("ok"):
             result.update({"request_id": request_id, "actor_name": actor_name})
@@ -3324,7 +3340,7 @@ async def dkp_event_check_loop():
         if not bool(obj.get("dkp_enabled", False)) and not str(obj.get("dkp_event_type", "") or "").strip():
             continue
         guild_id = int(obj.get("guild_id", 0) or 0)
-        if not guild_id:
+        if not guild_id or not is_module_enabled(guild_id, "points"):
             continue
         home_id = _home_guild_id(default=guild_id)
         if int(guild_id) != int(home_id):
@@ -3565,7 +3581,7 @@ async def setup_dkp_system(client: discord.Client, tree: app_commands.CommandTre
         except Exception:
             pass
 
-    dkp = app_commands.Group(name="dkp", description="EC / DKP verwalten")
+    dkp = FeatureGroup(module_key="points", name="dkp", description="EC / DKP verwalten")
 
     @dkp.command(name="set_log_channel", description="Leader: DKP-/Loot-Log-Kanal setzen")
     async def dkp_set_log_channel(inter: discord.Interaction):

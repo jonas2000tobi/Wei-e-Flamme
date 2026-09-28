@@ -8,6 +8,11 @@ from typing import Optional
 
 import discord
 from discord import app_commands
+
+try:
+    from bot.module_registry import FeatureGroup, is_module_enabled, any_guild_has_module  # type: ignore
+except Exception:
+    from module_registry import FeatureGroup, is_module_enabled, any_guild_has_module  # type: ignore
 from discord.ui import View, button, Modal, TextInput
 from discord.enums import ButtonStyle
 
@@ -142,6 +147,15 @@ class LeaderStatusView(View):
     def __init__(self):
         super().__init__(timeout=None)
 
+    async def interaction_check(self, inter: discord.Interaction) -> bool:
+        if inter.guild is None or not is_module_enabled(inter.guild.id, "leader_contact"):
+            if not inter.response.is_done():
+                await inter.response.send_message(
+                    "❌ Das **Leader Contact System** ist derzeit deaktiviert.", ephemeral=True
+                )
+            return False
+        return True
+
     async def _edit_status(self, inter: discord.Interaction, new_status: str):
         if not _is_leader_or_admin(inter):
             await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
@@ -215,6 +229,11 @@ class ContactModal(Modal):
         if inter.guild is None:
             await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
             return
+        if not is_module_enabled(inter.guild.id, "leader_contact"):
+            await inter.response.send_message(
+                "❌ Das **Leader Contact System** ist derzeit deaktiviert.", ephemeral=True
+            )
+            return
 
         guild = inter.guild
         leader_role = _leader_role(guild)
@@ -277,6 +296,14 @@ class LeaderContactView(View):
     def __init__(self):
         super().__init__(timeout=None)
 
+    async def interaction_check(self, inter: discord.Interaction) -> bool:
+        if inter.guild is None or not is_module_enabled(inter.guild.id, "leader_contact"):
+            await inter.response.send_message(
+                "❌ Das **Leader Contact System** ist derzeit deaktiviert.", ephemeral=True
+            )
+            return False
+        return True
+
     @button(label="📨 Leader kontaktieren", style=ButtonStyle.primary, custom_id="leader_contact_normal")
     async def btn_normal(self, inter: discord.Interaction, _):
         await inter.response.send_modal(ContactModal(anonymous=False))
@@ -287,7 +314,7 @@ class LeaderContactView(View):
 
 
 async def setup_leader_contact(client: discord.Client, tree: app_commands.CommandTree):
-    leader_group = app_commands.Group(
+    leader_group = FeatureGroup(module_key="leader_contact", 
         name="leader",
         description="Kontakt zur Gildenleitung verwalten",
     )

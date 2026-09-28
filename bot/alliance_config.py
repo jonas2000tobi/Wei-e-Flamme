@@ -15,6 +15,11 @@ except Exception:
 from discord import app_commands
 
 try:
+    from bot.module_registry import FeatureGroup, is_module_enabled, any_guild_has_module  # type: ignore
+except Exception:
+    from module_registry import FeatureGroup, is_module_enabled, any_guild_has_module  # type: ignore
+
+try:
     from bot import guild_config as central_guild_config  # type: ignore
 except Exception:
     try:
@@ -277,7 +282,7 @@ def _server_line(guild_id: str, s: dict) -> str:
 
 
 async def setup_alliance_config(client: discord.Client, tree: app_commands.CommandTree):
-    alliance = app_commands.Group(name="alliance", description="Allianz-Konfiguration verwalten")
+    alliance = FeatureGroup(module_key="alliance", name="alliance", description="Allianz-Konfiguration verwalten")
 
     @alliance.command(name="home_set", description="(Leader) Setzt diesen Discord als Home-Gildenserver")
     async def alliance_home_set(inter: discord.Interaction):

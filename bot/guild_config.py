@@ -16,13 +16,18 @@ try:
 except Exception:  # pragma: no cover
     import runtime_db  # type: ignore
 
+try:
+    from bot.module_registry import is_module_enabled, module_states  # type: ignore
+except Exception:  # pragma: no cover
+    from module_registry import is_module_enabled, module_states  # type: ignore
+
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 
 PROFILE_DEFAULTS: dict[str, Any] = {
-    "display_name": "Beer and Buffs",
-    "short_name": "Beer and Buffs",
-    "bot_display_name": "Beer and Buffs Knecht",
+    "display_name": "Gilde",
+    "short_name": "Gilde",
+    "bot_display_name": "Gildenknecht",
     "timezone": "Europe/Berlin",
     "logo_url": "",
     "banner_url": "",
@@ -79,6 +84,36 @@ RULE_KEYS: dict[str, dict[str, int | str]] = {
     "loot_junk_roll_hours": {"setting": "guild_rule_loot_junk_roll_hours", "default": 24, "min": 1, "max": 720},
 }
 
+
+def _optional_role_module(kind: str) -> str | None:
+    return "voice" if str(kind or "") in {"voice_allowed", "voice_blocked"} else None
+
+
+def _optional_channel_modules(kind: str) -> tuple[str, ...]:
+    key = str(kind or "")
+    if key == "loot":
+        return ("loot", "needlists", "auctions")
+    if key == "ec_log":
+        return ("points",)
+    if key in {"news", "guides"}:
+        return ("game_information",)
+    if key in {"voice_category", "voice_return"}:
+        return ("voice",)
+    if key == "member_portal":
+        return ("member_portal",)
+    if key in {"leader_contact_public", "leader_contact_internal"}:
+        return ("leader_contact",)
+    if key == "weekly_report":
+        return ("analytics",)
+    if key in {"auction_active", "auction_market"}:
+        return ("auctions",)
+    return ()
+
+
+def _any_feature_enabled(guild_id: int, keys: tuple[str, ...]) -> bool:
+    return not keys or any(is_module_enabled(int(guild_id), key) for key in keys)
+
+
 # Gildenbezogene IDs dürfen bei einem Serverwechsel nicht übernommen werden.
 DISCORD_BOUND_SETTING_KEYS = set(ROLE_KEYS.values()) | set(CHANNEL_KEYS.values()) | {
     "dashboard_news_channel_name",
@@ -113,7 +148,7 @@ def ensure_profile(guild: discord.Guild | int, discord_name: str = "") -> dict[s
             guild_id,
             display_name=fallback,
             short_name=fallback,
-            bot_display_name=f"{fallback} Knecht",
+            bot_display_name=f"{fallback} Bot",
             timezone_name="Europe/Berlin",
             status="active",
             discord_name=fallback,
@@ -132,7 +167,7 @@ def normalized_profile(profile: Optional[dict[str, Any]], *, fallback: str = "Gi
     display = str(out.get("display_name") or fallback or "Gilde").strip()
     out["display_name"] = display
     out["short_name"] = str(out.get("short_name") or display).strip()
-    out["bot_display_name"] = str(out.get("bot_display_name") or f"{display} Knecht").strip()
+    out["bot_display_name"] = str(out.get("bot_display_name") or f"{display} Bot").strip()
     out["guild_id"] = int(out.get("guild_id") or guild_id or 0)
     return out
 
@@ -233,7 +268,15 @@ def guild_config_snapshot(guild: discord.Guild) -> dict[str, Any]:
         ch = guild.get_channel(cid) if cid else None
         channels[kind] = {"id": cid, "name": str(getattr(ch, "name", "")) if ch else "", "exists": ch is not None if cid else False}
     rules = {kind: rule_value(guild.id, kind) for kind in RULE_KEYS}
-    return {"profile": profile, "roles": roles, "channels": channels, "rules": rules}
+    try:
+        from bot.module_registry import module_states  # type: ignore
+    except Exception:
+        try:
+            from module_registry import module_states  # type: ignore
+        except Exception:
+            module_states = None  # type: ignore
+    modules = module_states(guild.id) if callable(module_states) else {}
+    return {"profile": profile, "roles": roles, "channels": channels, "rules": rules, "modules": modules}
 
 
 def _is_admin(inter: discord.Interaction) -> bool:
@@ -569,6 +612,10 @@ async def setup_guild_config(bot: commands.Bot, tree: app_commands.CommandTree) 
         if not await asyncio.to_thread(_is_admin, inter):
             await inter.followup.send("❌ Nur für Server-Admins/Leitung.", ephemeral=True)
             return
+        required_module = _optional_role_module(kind.value)
+        if required_module and not await asyncio.to_thread(is_module_enabled, inter.guild.id, required_module):
+            await inter.followup.send("❌ Diese Rolleneinstellung gehört zu einem deaktivierten Modul.", ephemeral=True)
+            return
         key = ROLE_KEYS[kind.value]
         if kind.value in MULTI_ROLE_KINDS:
             value = await asyncio.to_thread(role_ids, inter.guild.id, kind.value)
@@ -605,6 +652,10 @@ async def setup_guild_config(bot: commands.Bot, tree: app_commands.CommandTree) 
         if not await asyncio.to_thread(_is_admin, inter):
             await inter.followup.send("❌ Nur für Server-Admins/Leitung.", ephemeral=True)
             return
+        required_modules = _optional_channel_modules(kind.value)
+        if required_modules and not await asyncio.to_thread(_any_feature_enabled, inter.guild.id, required_modules):
+            await inter.followup.send("❌ Diese Kanaleinstellung gehört zu einem deaktivierten Modul.", ephemeral=True)
+            return
         await asyncio.to_thread(runtime_db.set_guild_setting, inter.guild.id, CHANNEL_KEYS[kind.value], int(channel.id))
         await asyncio.to_thread(sync_legacy_compatibility, inter.guild.id)
         await asyncio.to_thread(
@@ -629,6 +680,10 @@ async def setup_guild_config(bot: commands.Bot, tree: app_commands.CommandTree) 
         if not await asyncio.to_thread(_is_admin, inter):
             await inter.followup.send("❌ Nur für Server-Admins/Leitung.", ephemeral=True)
             return
+        required_module = _optional_role_module(kind.value)
+        if required_module and not await asyncio.to_thread(is_module_enabled, inter.guild.id, required_module):
+            await inter.followup.send("❌ Diese Rolleneinstellung gehört zu einem deaktivierten Modul.", ephemeral=True)
+            return
         await asyncio.to_thread(
             runtime_db.set_guild_setting,
             inter.guild.id,
@@ -648,6 +703,10 @@ async def setup_guild_config(bot: commands.Bot, tree: app_commands.CommandTree) 
         if not await asyncio.to_thread(_is_admin, inter):
             await inter.followup.send("❌ Nur für Server-Admins/Leitung.", ephemeral=True)
             return
+        required_modules = _optional_channel_modules(kind.value)
+        if required_modules and not await asyncio.to_thread(_any_feature_enabled, inter.guild.id, required_modules):
+            await inter.followup.send("❌ Diese Kanaleinstellung gehört zu einem deaktivierten Modul.", ephemeral=True)
+            return
         await asyncio.to_thread(runtime_db.set_guild_setting, inter.guild.id, CHANNEL_KEYS[kind.value], 0)
         await asyncio.to_thread(sync_legacy_compatibility, inter.guild.id)
         await inter.followup.send(f"✅ Kanalzuordnung **{kind.value}** entfernt.", ephemeral=True)
@@ -662,6 +721,12 @@ async def setup_guild_config(bot: commands.Bot, tree: app_commands.CommandTree) 
         await inter.response.defer(ephemeral=True, thinking=True)
         if not await asyncio.to_thread(_is_admin, inter):
             await inter.followup.send("❌ Nur für Server-Admins/Leitung.", ephemeral=True)
+            return
+        if not await asyncio.to_thread(is_module_enabled, inter.guild.id, "loot"):
+            await inter.followup.send(
+                "❌ Das **Loot Management** ist deaktiviert. Aktiviere es zuerst im Dashboard unter Einstellungen → Module.",
+                ephemeral=True,
+            )
             return
         spec = RULE_KEYS[kind.value]
         if value < int(spec["min"]) or value > int(spec["max"]):
@@ -710,8 +775,18 @@ async def setup_guild_config(bot: commands.Bot, tree: app_commands.CommandTree) 
         await inter.response.defer(ephemeral=True, thinking=True)
         cfg = await asyncio.to_thread(guild_config_snapshot, inter.guild)
         p = cfg["profile"]
-        role_lines = [f"• {k}: " + (", ".join(f"<@&{r['id']}>" for r in rows) if rows else "—") for k, rows in cfg["roles"].items()]
-        channel_lines = [f"• {k}: " + (f"<#{row['id']}>" if row.get("id") else "—") for k, row in cfg["channels"].items()]
+        states = await asyncio.to_thread(module_states, inter.guild.id)
+        visible_roles = {
+            k: rows for k, rows in cfg["roles"].items()
+            if not _optional_role_module(k) or states.get(_optional_role_module(k), False)
+        }
+        visible_channels = {
+            k: row for k, row in cfg["channels"].items()
+            if not _optional_channel_modules(k)
+            or any(states.get(module_key, False) for module_key in _optional_channel_modules(k))
+        }
+        role_lines = [f"• {k}: " + (", ".join(f"<@&{r['id']}>" for r in rows) if rows else "—") for k, rows in visible_roles.items()]
+        channel_lines = [f"• {k}: " + (f"<#{row['id']}>" if row.get("id") else "—") for k, row in visible_channels.items()]
         emb = discord.Embed(title=f"⚙️ {p['display_name']} – Konfiguration", color=0xD6A84F)
         emb.add_field(name="Grunddaten", value=f"Bot: {p['bot_display_name']}\nZeitzone: {p['timezone']}\nStatus: {p['status']}", inline=False)
         emb.add_field(name="Rollen", value="\n".join(role_lines)[:1024], inline=False)
@@ -741,8 +816,9 @@ async def setup_guild_config(bot: commands.Bot, tree: app_commands.CommandTree) 
             )[:1024],
             inline=False,
         )
-        rule_lines = [f"• {kind}: {value}" for kind, value in cfg.get("rules", {}).items()]
-        emb.add_field(name="Regeln", value="\n".join(rule_lines)[:1024] or "—", inline=False)
+        if states.get("loot", False) or states.get("auctions", False):
+            rule_lines = [f"• {kind}: {value}" for kind, value in cfg.get("rules", {}).items()]
+            emb.add_field(name="Loot-/Auktionsregeln", value="\n".join(rule_lines)[:1024] or "—", inline=False)
         await inter.followup.send(embed=emb, ephemeral=True)
 
     @guild_group.command(
@@ -762,6 +838,12 @@ async def setup_guild_config(bot: commands.Bot, tree: app_commands.CommandTree) 
         await inter.response.defer(ephemeral=True, thinking=True)
         if not await asyncio.to_thread(_is_admin, inter):
             await inter.followup.send("❌ Nur für Server-Admins/Leitung.", ephemeral=True)
+            return
+        if not await asyncio.to_thread(is_module_enabled, inter.guild.id, "member_portal"):
+            await inter.followup.send(
+                "❌ Das **Member Portal** ist deaktiviert. Aktiviere es zuerst im Dashboard unter Einstellungen → Module.",
+                ephemeral=True,
+            )
             return
 
         try:
@@ -849,6 +931,12 @@ async def setup_guild_config(bot: commands.Bot, tree: app_commands.CommandTree) 
         if not await asyncio.to_thread(_is_admin, inter):
             await inter.followup.send("❌ Nur für Server-Admins/Leitung.", ephemeral=True)
             return
+        if not await asyncio.to_thread(is_module_enabled, inter.guild.id, "member_portal"):
+            await inter.followup.send(
+                "❌ Das **Member Portal** ist deaktiviert. Aktiviere es zuerst im Dashboard unter Einstellungen → Module.",
+                ephemeral=True,
+            )
+            return
         if member.bot:
             await inter.followup.send("❌ Bots bekommen keine Gildenzentrale.", ephemeral=True)
             return
@@ -896,6 +984,12 @@ async def setup_guild_config(bot: commands.Bot, tree: app_commands.CommandTree) 
         await inter.response.defer(ephemeral=True, thinking=True)
         if not await asyncio.to_thread(_is_admin, inter):
             await inter.followup.send("❌ Nur für Server-Admins/Leitung.", ephemeral=True)
+            return
+        if not await asyncio.to_thread(is_module_enabled, inter.guild.id, "member_portal"):
+            await inter.followup.send(
+                "❌ Das **Member Portal** ist deaktiviert. Aktiviere es zuerst im Dashboard unter Einstellungen → Module.",
+                ephemeral=True,
+            )
             return
         if member.bot:
             await inter.followup.send("❌ Bots besitzen keine Gildenzentrale.", ephemeral=True)

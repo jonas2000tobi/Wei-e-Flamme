@@ -19,6 +19,11 @@ except Exception:
 
 import discord
 from discord import app_commands
+
+try:
+    from bot.module_registry import FeatureGroup, is_module_enabled, any_guild_has_module  # type: ignore
+except Exception:
+    from module_registry import FeatureGroup, is_module_enabled, any_guild_has_module  # type: ignore
 from discord.ext import tasks
 from discord.ui import View, button, Select, Modal, TextInput
 from discord.enums import ButtonStyle
@@ -2777,6 +2782,8 @@ def _find_item_for_dashboard_need(guild_id: int, need_slot: str, text: str) -> t
 def _process_dashboard_need_request(row: dict) -> tuple[str, dict]:
     request_id = str(row.get("request_id") or "")
     guild_id = int(row.get("guild_id") or 0)
+    if not is_module_enabled(guild_id, "needlists"):
+        return "rejected", {"ok": False, "error": "Needlists / Wunschlisten sind deaktiviert."}
     target_user_id = int(row.get("target_user_id") or 0)
     action = str(row.get("action_type") or "set").strip().lower()
     try:
@@ -2891,7 +2898,7 @@ async def auto_loot_need_eventstart():
             try:
                 guild_id = int(obj.get("guild_id", 0) or 0)
 
-                if not guild_id:
+                if not guild_id or not is_module_enabled(guild_id, "needlists"):
                     continue
 
                 c = _gcfg(guild_id)
@@ -2927,7 +2934,7 @@ async def auto_loot_need_eventstart():
 
 
 async def setup_loot_needs(client: discord.Client, tree: app_commands.CommandTree):
-    loot_group = app_commands.Group(
+    loot_group = FeatureGroup(module_key="needlists", 
         name="loot",
         description="Loot-Katalog und Needlisten",
     )

@@ -17,6 +17,11 @@ except Exception:
 
 import discord
 from discord import app_commands
+
+try:
+    from bot.module_registry import FeatureGroup, is_module_enabled, any_guild_has_module  # type: ignore
+except Exception:
+    from module_registry import FeatureGroup, is_module_enabled, any_guild_has_module  # type: ignore
 from discord.ext import tasks
 from discord.ui import View, button, Modal, TextInput
 from discord.enums import ButtonStyle
@@ -1715,6 +1720,9 @@ async def _announce_bid_log(client: discord.Client, guild_id: int, auction: dict
 
 
 async def _place_bid(inter: discord.Interaction, guild_id: int, auction_id: str, amount: int, portal_user_id: int | None = None) -> None:
+    if not is_module_enabled(int(guild_id), "auctions"):
+        await _portal_send(inter, "ℹ️ Das Auktionssystem ist für diese Gilde deaktiviert.", ephemeral=True)
+        return
     guild = inter.guild or inter.client.get_guild(int(guild_id))
     if guild is None:
         await _portal_send(inter, "❌ Server konnte nicht zugeordnet werden.", ephemeral=True)
@@ -2987,6 +2995,8 @@ async def _dashboard_apply_drop_create(client: discord.Client, guild: discord.Gu
 
 async def _process_dashboard_loot_action(client: discord.Client, row: dict) -> dict:
     guild_id = int(row.get("guild_id") or 0)
+    if not is_module_enabled(guild_id, "auctions"):
+        return {"ok": False, "status": "rejected", "error": "Auktionssystem ist deaktiviert."}
     auction_id = str(row.get("auction_id") or "")
     action_type = str(row.get("action_type") or "").strip().lower()
     amount = int(row.get("amount") or 0)
@@ -3070,6 +3080,8 @@ async def auction_close_loop():
         try:
             gid = int(gid_str)
         except Exception:
+            continue
+        if not is_module_enabled(gid, "auctions"):
             continue
         auctions = g.get("auctions") if isinstance(g.get("auctions"), dict) else {}
         for aid, auc in list(auctions.items()):
@@ -3857,6 +3869,9 @@ async def _handle_junk_sale_click(inter: discord.Interaction, guild_id: int, auc
 
 
 async def _buy_sale_item(inter: discord.Interaction, guild_id: int, auction_id: str):
+    if not is_module_enabled(int(guild_id), "auctions"):
+        await _portal_send(inter, "ℹ️ Das Auktionssystem ist für diese Gilde deaktiviert.", ephemeral=True)
+        return
     guild = inter.guild or inter.client.get_guild(int(guild_id))
     if guild is None:
         await _portal_send(inter, "❌ Server konnte nicht zugeordnet werden.", ephemeral=True)
@@ -4258,7 +4273,7 @@ async def setup_loot_auction(client: discord.Client, tree: app_commands.CommandT
     except Exception as e:
         print(f"[loot_auction] active auction startup sync scheduling failed: {e!r}")
 
-    group = app_commands.Group(name="auction", description="Loot-Auktionen mit EC")
+    group = FeatureGroup(module_key="auctions", name="auction", description="Loot-Auktionen mit EC")
 
     @group.command(name="set_channel", description="Legacy-Alias: setzt DKP-Log / Auktionsabwicklung")
     async def auction_set_channel(inter: discord.Interaction):

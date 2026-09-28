@@ -8,6 +8,11 @@ from typing import Optional
 
 import discord
 from discord import app_commands
+
+try:
+    from bot.module_registry import FeatureGroup, is_module_enabled, any_guild_has_module  # type: ignore
+except Exception:
+    from module_registry import FeatureGroup, is_module_enabled, any_guild_has_module  # type: ignore
 from discord.enums import ButtonStyle
 
 try:
@@ -427,6 +432,8 @@ async def repair_managed_voice_permissions_once(client: discord.Client) -> dict[
 
     for row in _managed_voice_references():
         guild_id = int(row.get("guild_id") or 0)
+        if not is_module_enabled(guild_id, "voice"):
+            continue
         channel_id = int(row.get("channel_id") or 0)
         guild = client.get_guild(guild_id) if guild_id else None
         channel = guild.get_channel(channel_id) if guild is not None else None
@@ -511,6 +518,11 @@ class VoiceCreateModal(Modal, title="Sprachkanal erstellen"):
     async def on_submit(self, inter: discord.Interaction):
         if inter.guild is None:
             await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
+            return
+        if not await asyncio.to_thread(is_module_enabled, inter.guild.id, "voice"):
+            await inter.response.send_message(
+                "❌ Das **Voice Management** ist derzeit deaktiviert.", ephemeral=True
+            )
             return
 
         source = inter.guild.get_channel(self.source_channel_id)
@@ -611,6 +623,17 @@ class VoiceCreatePanel(View):
     def __init__(self):
         super().__init__(timeout=None)
 
+    async def interaction_check(self, inter: discord.Interaction) -> bool:
+        if inter.guild is None:
+            await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
+            return False
+        if not await asyncio.to_thread(is_module_enabled, inter.guild.id, "voice"):
+            await inter.response.send_message(
+                "❌ Das **Voice Management** ist derzeit deaktiviert.", ephemeral=True
+            )
+            return False
+        return True
+
     @button(label="Sprachkanal erstellen", style=ButtonStyle.primary, custom_id="ebolus_voice_create_open")
     async def open_modal(self, inter: discord.Interaction, btn: discord.ui.Button):
         if inter.guild is None:
@@ -650,7 +673,7 @@ async def setup_voice_creator(client: discord.Client, tree: app_commands.Command
         client.add_listener(on_voice_state_update, "on_voice_state_update")
         setattr(client, "_ebolus_voice_autodelete_listener", True)
 
-    voice_panel = app_commands.Group(name="voice_panel", description="Voice-Panel verwalten")
+    voice_panel = FeatureGroup(module_key="voice", name="voice_panel", description="Voice-Panel verwalten")
 
     @voice_panel.command(name="post", description="Leader: Panel zum Erstellen von Sprachkanälen posten")
     async def post(inter: discord.Interaction):

@@ -10,6 +10,11 @@ except Exception:
 
 import discord
 from discord import app_commands
+
+try:
+    from bot.module_registry import FeatureGroup, is_module_enabled, set_module_enabled, any_guild_has_module  # type: ignore
+except Exception:
+    from module_registry import FeatureGroup, is_module_enabled, set_module_enabled, any_guild_has_module  # type: ignore
 from discord.ui import View, button
 from discord.enums import ButtonStyle
 
@@ -192,7 +197,22 @@ for _raw_ctx in list(_session_records.values()):
     except Exception:
         continue
 
-class CategoryView(View):
+
+class OnboardingFeatureView(View):
+    async def interaction_check(self, inter: discord.Interaction) -> bool:
+        ctx = getattr(self, "ctx", None)
+        guild_id = int(getattr(getattr(inter, "guild", None), "id", 0) or getattr(self, "guild_id", 0) or getattr(ctx, "guild_id", 0) or 0)
+        if guild_id and not is_module_enabled(guild_id, "onboarding"):
+            message = "ℹ️ Das Onboarding-System ist für diese Gilde deaktiviert."
+            if inter.response.is_done():
+                await inter.followup.send(message, ephemeral=True)
+            else:
+                await inter.response.send_message(message, ephemeral=True)
+            return False
+        return True
+
+
+class CategoryView(OnboardingFeatureView):
     def __init__(self, ctx: StepContext):
         super().__init__(timeout=None)
         self.ctx = ctx
@@ -224,7 +244,7 @@ class CategoryView(View):
     async def btn_applicant(self, inter: discord.Interaction, _):
         await self._next(inter, "applicant")
 
-class PrimaryView(View):
+class PrimaryView(OnboardingFeatureView):
     def __init__(self, ctx: StepContext):
         super().__init__(timeout=None)
         self.ctx = ctx
@@ -252,7 +272,7 @@ class PrimaryView(View):
     async def btn_dps(self, inter: discord.Interaction, _):
         await self._next(inter, "DPS")
 
-class ReviewView(View):
+class ReviewView(OnboardingFeatureView):
     def __init__(self, member_id: int, category: str, primary: str, experienced: bool, *, message_id: int = 0, guild_id: int = 0):
         super().__init__(timeout=None)
         self.member_id = int(member_id)
@@ -316,7 +336,7 @@ class ReviewView(View):
             except Exception:
                 pass
 
-class ExperienceView(View):
+class ExperienceView(OnboardingFeatureView):
     def __init__(self, ctx: StepContext):
         super().__init__(timeout=None)
         self.ctx = ctx
@@ -439,7 +459,7 @@ async def send_onboarding_dm(member: discord.Member) -> tuple[bool, str]:
             return False, "Botkonten werden nicht onboardet."
 
         c = _gcfg(member.guild)
-        if not c.get("enabled", True):
+        if not is_module_enabled(member.guild.id, "onboarding"):
             return False, "Onboarding ist für diesen Server deaktiviert."
 
         _forget_member_sessions(member.id)
@@ -464,7 +484,7 @@ async def send_onboarding_dm(member: discord.Member) -> tuple[bool, str]:
 
 
 async def setup_onboarding(client: discord.Client, tree: app_commands.CommandTree) -> None:
-    onboarding_group = app_commands.Group(
+    onboarding_group = FeatureGroup(module_key="onboarding", 
         name="onboarding",
         description="Mitglieder-Onboarding verwalten",
     )
@@ -503,12 +523,11 @@ async def setup_onboarding(client: discord.Client, tree: app_commands.CommandTre
             await inter.response.send_message("Nur Admins.", ephemeral=True)
             return
 
-        c = _gcfg(inter.guild)
-        c["enabled"] = bool(enabled)
-        cfg[str(inter.guild_id)] = c
-        _save_cfg(cfg)
-
-        await inter.response.send_message(f"✅ Onboarding {'aktiviert' if enabled else 'deaktiviert'}.", ephemeral=True)
+        set_module_enabled(int(inter.guild_id), "onboarding", bool(enabled))
+        await inter.response.send_message(
+            f"✅ Onboarding {'aktiviert' if enabled else 'deaktiviert'}. Die Slash-Commands werden automatisch synchronisiert.",
+            ephemeral=True,
+        )
 
     @onboarding_group.command(name="set_categories", description="(Admin) Rollen für Kategorien setzen")
     async def onboarding_set_categories(

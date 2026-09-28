@@ -9,6 +9,11 @@ import discord
 from discord import app_commands
 
 try:
+    from bot.module_registry import FeatureGroup, is_module_enabled, any_guild_has_module  # type: ignore
+except Exception:
+    from module_registry import FeatureGroup, is_module_enabled, any_guild_has_module  # type: ignore
+
+try:
     from bot.runtime_db import (  # type: ignore
         db_status,
         start_voice_session,
@@ -277,6 +282,8 @@ async def _reconcile_voice_sessions_once(client: discord.Client) -> dict[str, in
     stats = {"guilds": 0, "current": 0, "started": 0, "closed": 0, "errors": 0}
     until_iso = _iso_utc(_now_utc() + timedelta(minutes=2))
     for guild in list(getattr(client, "guilds", []) or []):
+        if not is_module_enabled(int(guild.id), "attendance"):
+            continue
         stats["guilds"] += 1
         try:
             current = _current_voice_members(guild)
@@ -370,7 +377,7 @@ async def _bootstrap_current_voice_members(client: discord.Client) -> int:
 
 
 async def setup_voice_attendance(client: discord.Client, tree: app_commands.CommandTree):
-    attendance_group = app_commands.Group(
+    attendance_group = FeatureGroup(module_key="attendance", 
         name="attendance",
         description="Voice-Anwesenheit auswerten",
     )
@@ -379,6 +386,8 @@ async def setup_voice_attendance(client: discord.Client, tree: app_commands.Comm
         async def _voice_attendance_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
             try:
                 if member.bot or member.guild is None:
+                    return
+                if not is_module_enabled(int(member.guild.id), "attendance"):
                     return
                 before_ch = before.channel
                 after_ch = after.channel

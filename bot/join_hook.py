@@ -14,6 +14,11 @@ except Exception:
 
 import discord
 
+try:
+    from bot.module_registry import is_module_enabled  # type: ignore
+except Exception:
+    from module_registry import is_module_enabled  # type: ignore
+
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -55,21 +60,20 @@ async def _try_send_onboarding(
         if member.bot:
             return
 
-        # Schon gesendet? -> nichts tun
-        if _already_sent(member.guild.id, member.id):
-            print(f"[join_hook] Skip: {member} bereits bedient.")
-            return
+        # 1) Optionales Onboarding. Event-Nachsendung bleibt Core und läuft unabhängig davon.
+        if is_module_enabled(member.guild.id, "onboarding"):
+            if not _already_sent(member.guild.id, member.id):
+                try:
+                    await send_onboarding_dm(member)
+                    _mark_sent(member.guild.id, member.id)
+                    print(f"[join_hook] Onboarding-DM an {member} gesendet (reason={reason}).")
+                except Exception as e:
+                    # NICHT markieren, damit spätere Versuche/Manuell möglich sind
+                    print(f"[join_hook] Onboarding-DM an {member} fehlgeschlagen (reason={reason}): {e!r}")
+        else:
+            print(f"[join_hook] Onboarding deaktiviert für Guild {member.guild.id}; nur Event-Nachsendung.")
 
-        # 1) Onboarding-DM
-        try:
-            await send_onboarding_dm(member)
-            _mark_sent(member.guild.id, member.id)
-            print(f"[join_hook] Onboarding-DM an {member} gesendet (reason={reason}).")
-        except Exception as e:
-            # NICHT markieren, damit spätere Versuche/Manuell möglich sind
-            print(f"[join_hook] Onboarding-DM an {member} fehlgeschlagen (reason={reason}): {e!r}")
-
-        # 2) Laufende Raid-Events als DM (immer versuchen, unabhängig davon ob 1) geklappt hat)
+        # 2) Laufende Raid-Events als DM (Core, unabhängig vom Onboarding-Modul)
         try:
             await auto_resend_for_new_member(member)
             print(f"[join_hook] Auto-Resend für {member} ausgeführt.")

@@ -12,6 +12,11 @@ from typing import Optional, Any, Tuple
 
 import discord
 from discord import app_commands
+
+try:
+    from bot.module_registry import FeatureGroup, is_module_enabled, any_guild_has_module  # type: ignore
+except Exception:
+    from module_registry import FeatureGroup, is_module_enabled, any_guild_has_module  # type: ignore
 from discord.ui import View, button, Modal, TextInput, Select, ChannelSelect, RoleSelect
 from discord.enums import ButtonStyle
 
@@ -991,6 +996,8 @@ async def _process_profile_update_requests_once(client: discord.Client) -> dict[
     for row in rows:
         try:
             guild_id = int(row.get("guild_id") or 0)
+            if not is_module_enabled(guild_id, "member_portal"):
+                raise ValueError("Member Portal ist deaktiviert")
             user_id = int(row.get("user_id") or 0)
             class_name = re.sub(r"\s+", " ", str(row.get("class_name") or "").strip())[:80]
             main_role = re.sub(r"\s+", " ", str(row.get("main_role") or "").strip())[:50]
@@ -2498,6 +2505,8 @@ async def repair_stale_portals_once(client: discord.Client) -> dict[str, int]:
     semaphore = asyncio.Semaphore(PORTAL_STALE_REPAIR_CONCURRENCY)
     jobs: list[tuple[discord.Guild, discord.Member]] = []
     for guild in list(getattr(client, "guilds", []) or []):
+        if not is_module_enabled(int(guild.id), "member_portal"):
+            continue
         if not portal_member_role_ids(guild.id) and str(guild.id) not in sent_state:
             continue
         jobs.extend((guild, member) for member in _portal_repair_members_for_guild(guild))
@@ -2569,6 +2578,8 @@ async def cleanup_old_portal_messages_once(client: discord.Client) -> int:
     """Disable obsolete duplicate portal DMs after active portals are usable."""
     total = 0
     for guild in list(getattr(client, "guilds", []) or []):
+        if not is_module_enabled(int(guild.id), "member_portal"):
+            continue
         if not portal_member_role_ids(guild.id) and str(guild.id) not in sent_state:
             continue
         for member in _portal_repair_members_for_guild(guild):
@@ -2779,6 +2790,8 @@ async def repair_all_portals_once(client: discord.Client) -> dict[str, int]:
 
     for guild_id_str, guild_cfg in list(cfg.items()):
         try:
+            if not is_module_enabled(int(guild_id_str), "member_portal"):
+                continue
             if not int((guild_cfg or {}).get("member_role_id", 0) or 0):
                 continue
 
@@ -2847,6 +2860,8 @@ async def reset_all_portals_to_main_once(client: discord.Client) -> dict[str, in
 
     for guild_id_str, guild_cfg in list(cfg.items()):
         try:
+            if not is_module_enabled(int(guild_id_str), "member_portal"):
+                continue
             if not int((guild_cfg or {}).get("member_role_id", 0) or 0):
                 continue
 
@@ -3302,6 +3317,9 @@ class AbsenceModal(PortalSafeModal):
         if not guild:
             await _portal_send(inter, "❌ Server nicht gefunden.")
             return
+        if not is_module_enabled(guild.id, "leader_contact"):
+            await _portal_send(inter, "ℹ️ Das Leader Contact System ist für diese Gilde deaktiviert.", ephemeral=True)
+            return
 
         member = guild.get_member(self.user_id)
 
@@ -3616,12 +3634,20 @@ class PortalSafeView(View):
                     flush=True,
                 )
 
-        if inter.guild is not None or inter.message is None:
+        if inter.guild is not None:
+            if not is_module_enabled(inter.guild.id, "member_portal"):
+                await _portal_send(inter, "ℹ️ Das Member-Portal ist für diese Gilde deaktiviert.", ephemeral=True)
+                return False
+            return True
+        if inter.message is None:
             return True
 
         guild, member = await _resolve_guild_member_from_inter(inter)
         if not guild or not member:
             await _portal_send(inter, "❌ Ich konnte deinen Server nicht zuordnen.", ephemeral=True)
+            return False
+        if not is_module_enabled(guild.id, "member_portal"):
+            await _portal_send(inter, "ℹ️ Das Member-Portal ist für diese Gilde deaktiviert.", ephemeral=True)
             return False
 
         current_id = int(getattr(inter.message, "id", 0) or 0)
@@ -3801,6 +3827,9 @@ class PortalMainSelect(Select):
             return
 
         if choice == "loot":
+            if not is_module_enabled(guild.id, "needlists"):
+                await _portal_send(inter, "ℹ️ Das **Needlist-System** ist für diese Gilde deaktiviert.", ephemeral=True)
+                return
             try:
                 from bot.loot_needs import open_need_menu  # type: ignore
             except ModuleNotFoundError:
@@ -3815,6 +3844,9 @@ class PortalMainSelect(Select):
             return
 
         if choice == "auction":
+            if not is_module_enabled(guild.id, "auctions"):
+                await _portal_send(inter, "ℹ️ Das **Auktionssystem** ist für diese Gilde deaktiviert.", ephemeral=True)
+                return
             try:
                 from bot.loot_auction import open_auction_menu  # type: ignore
             except ModuleNotFoundError:
@@ -6607,6 +6639,13 @@ class AdminMenuView(PortalSafeView):
     @button(label="Loot", emoji=_menu_emoji(EMOJI_LOOT), style=ButtonStyle.secondary, custom_id="portal_admin_loot")
     async def btn_loot(self, inter: discord.Interaction, _):
         guild, member = await _resolve_guild_member_from_inter(inter)
+        if guild and not (
+            is_module_enabled(guild.id, "needlists")
+            or is_module_enabled(guild.id, "loot")
+            or is_module_enabled(guild.id, "auctions")
+        ):
+            await _portal_send(inter, "ℹ️ Die Loot-/Need-Systeme sind für diese Gilde deaktiviert.", ephemeral=True)
+            return
         if not _is_portal_admin(guild, member):
             await _portal_send(inter, "❌ Dieser Bereich ist nur für Gildenleitung, Berater oder Wächter.", ephemeral=True)
             return
@@ -6642,6 +6681,9 @@ class AdminEventMenuView(PortalSafeView):
     @button(label="🌐 Allianz-Event", style=ButtonStyle.secondary, custom_id="portal_admin_event_alliance", row=0)
     async def btn_alliance(self, inter: discord.Interaction, _):
         guild, member = await _resolve_guild_member_from_inter(inter)
+        if guild and not is_module_enabled(guild.id, "alliance"):
+            await _portal_send(inter, "ℹ️ Das **Allianz-System** ist für diese Gilde deaktiviert.", ephemeral=True)
+            return
         if not _is_portal_admin(guild, member):
             await _portal_send(inter, "❌ Dieser Bereich ist nur für Gildenleitung, Berater oder Wächter.", ephemeral=True)
             return
@@ -6678,6 +6720,9 @@ class AdminEventMenuView(PortalSafeView):
     @button(label="✅ Anwesenheit", style=ButtonStyle.secondary, custom_id="portal_admin_event_attendance", row=2)
     async def btn_attendance(self, inter: discord.Interaction, _):
         guild, member = await _resolve_guild_member_from_inter(inter)
+        if guild and not is_module_enabled(guild.id, "attendance"):
+            await _portal_send(inter, "ℹ️ Das **Attendance-System** ist für diese Gilde deaktiviert.", ephemeral=True)
+            return
         if not _is_portal_admin(guild, member):
             await _portal_send(inter, "❌ Dieser Bereich ist nur für Gildenleitung, Berater oder Wächter.", ephemeral=True)
             return
@@ -6691,6 +6736,9 @@ class AdminEventMenuView(PortalSafeView):
     @button(label="🔊 Voice-Einstellungen", style=ButtonStyle.secondary, custom_id="portal_admin_event_voice_settings", row=3)
     async def btn_voice_settings(self, inter: discord.Interaction, _):
         guild, member = await _resolve_guild_member_from_inter(inter)
+        if guild and not is_module_enabled(guild.id, "voice"):
+            await _portal_send(inter, "ℹ️ Das **Voice Management** ist für diese Gilde deaktiviert.", ephemeral=True)
+            return
         if not _is_portal_admin(guild, member):
             await _portal_send(inter, "❌ Dieser Bereich ist nur für Gildenleitung, Berater oder Wächter.", ephemeral=True)
             return
@@ -6720,6 +6768,9 @@ class AdminJunkDropModal(Modal, title="🧹 Müll gedroppt"):
         guild = inter.client.get_guild(self.guild_id) or inter.guild
         if guild is None:
             await _portal_send(inter, "❌ Server konnte nicht zugeordnet werden.", ephemeral=True)
+            return
+        if not is_module_enabled(guild.id, "auctions"):
+            await _portal_send(inter, "ℹ️ Das **Auktionssystem** ist für diese Gilde deaktiviert.", ephemeral=True)
             return
 
         member = guild.get_member(int(inter.user.id))
@@ -6792,6 +6843,9 @@ class AdminLootMenuView(PortalSafeView):
         if not _is_portal_admin(guild, member):
             await _portal_send(inter, "❌ Dieser Bereich ist nur für Gildenleitung, Berater oder Wächter.", ephemeral=True)
             return
+        if not is_module_enabled(guild.id, "needlists"):
+            await _portal_send(inter, "ℹ️ Das **Needlist-System** ist für diese Gilde deaktiviert.", ephemeral=True)
+            return
         if inter.message:
             _mark_portal_sent(guild.id, member.id, inter.message.id)
         try:
@@ -6853,6 +6907,9 @@ class SupportMenuView(PortalSafeView):
 
         if not guild or not member:
             await _portal_send(inter, "❌ Ich konnte deinen Server nicht zuordnen.")
+            return
+        if not is_module_enabled(guild.id, "leader_contact"):
+            await _portal_send(inter, "ℹ️ Das **Leader Contact System** ist für diese Gilde deaktiviert.", ephemeral=True)
             return
 
         if inter.message:
@@ -7429,7 +7486,7 @@ async def refresh_portals_for_guild(
 
 
 async def setup_member_portal(client: discord.Client, tree: app_commands.CommandTree):
-    portal_group = app_commands.Group(
+    portal_group = FeatureGroup(module_key="member_portal", 
         name="portal",
         description="Private Gildenzentrale verwalten",
     )

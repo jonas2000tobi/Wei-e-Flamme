@@ -681,6 +681,129 @@ def get_all_guild_settings(guild_id: int) -> dict[str, Any]:
     return out
 
 
+def get_all_module_settings(guild_id: int) -> dict[str, dict[str, Any]]:
+    """Liest alle Modul-Einstellungen einer Gilde gruppiert nach Modul."""
+    if not _INITIALIZED:
+        init_runtime_db()
+    with _DB_LOCK:
+        if _BACKEND == "postgres":
+            conn = _pg_connect()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT module, key, value_json FROM module_settings WHERE guild_id=%s",
+                        (int(guild_id),),
+                    )
+                    rows = [dict(x) for x in cur.fetchall()]
+            finally:
+                conn.close()
+        else:
+            conn = _sqlite_connect()
+            try:
+                rows = [dict(x) for x in conn.execute(
+                    "SELECT module, key, value_json FROM module_settings WHERE guild_id=?",
+                    (int(guild_id),),
+                ).fetchall()]
+            finally:
+                conn.close()
+    out: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        module = str(row.get("module") or "").strip().lower()
+        key = str(row.get("key") or "").strip()
+        if not module or not key:
+            continue
+        try:
+            value = json.loads(row.get("value_json") or "null")
+        except Exception:
+            continue
+        out.setdefault(module, {})[key] = value
+    return out
+
+
+def get_module_setting(guild_id: int, module: str, key: str, default: Any = None) -> Any:
+    if not _INITIALIZED:
+        init_runtime_db()
+    module = str(module or "").strip().lower()
+    key = str(key or "").strip()
+    if not module or not key:
+        return default
+    with _DB_LOCK:
+        if _BACKEND == "postgres":
+            conn = _pg_connect()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT value_json FROM module_settings WHERE guild_id=%s AND module=%s AND key=%s",
+                        (int(guild_id), module, key),
+                    )
+                    row = cur.fetchone()
+            finally:
+                conn.close()
+        else:
+            conn = _sqlite_connect()
+            try:
+                row = conn.execute(
+                    "SELECT value_json FROM module_settings WHERE guild_id=? AND module=? AND key=?",
+                    (int(guild_id), module, key),
+                ).fetchone()
+            finally:
+                conn.close()
+    if not row:
+        return default
+    try:
+        return json.loads(dict(row).get("value_json") or "null")
+    except Exception:
+        return default
+
+
+def set_module_setting(guild_id: int, module: str, key: str, value: Any) -> bool:
+    if not _INITIALIZED:
+        init_runtime_db()
+    module = str(module or "").strip().lower()
+    key = str(key or "").strip()
+    if not module or not key:
+        return False
+    value_json = _json_dumps(value)
+    updated_at = _now_iso()
+    with _DB_LOCK:
+        if _BACKEND == "postgres":
+            conn = _pg_connect()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        INSERT INTO module_settings(guild_id,module,key,value_json,updated_at)
+                        VALUES (%s,%s,%s,%s,%s)
+                        ON CONFLICT (guild_id,module,key)
+                        DO UPDATE SET value_json=EXCLUDED.value_json, updated_at=EXCLUDED.updated_at
+                        """,
+                        (int(guild_id), module, key, value_json, updated_at),
+                    )
+                conn.commit()
+                return True
+            finally:
+                conn.close()
+        conn = _sqlite_connect()
+        try:
+            conn.execute(
+                """
+                INSERT INTO module_settings(guild_id,module,key,value_json,updated_at)
+                VALUES (?,?,?,?,?)
+                ON CONFLICT(guild_id,module,key)
+                DO UPDATE SET value_json=excluded.value_json, updated_at=excluded.updated_at
+                """,
+                (int(guild_id), module, key, value_json, updated_at),
+            )
+            conn.commit()
+            return True
+        finally:
+            conn.close()
+
+
+def set_module_enabled(guild_id: int, module: str, enabled: bool) -> bool:
+    return set_module_setting(int(guild_id), module, "enabled", bool(enabled))
+
+
 def _pg_table_columns(cur: Any, table: str) -> list[str]:
     cur.execute(
         "SELECT column_name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name=%s ORDER BY ordinal_position",
@@ -723,6 +846,13 @@ def rehome_guild_data(source_guild_id: int, target_guild_id: int, active_user_id
             previous_guild_id=source,
             status="active",
         )
+
+    # Modulschalter sind gildenbezogen, aber nicht an Discord-Rollen/Kanäle gebunden.
+    # Beim Rehome werden sie deshalb mitgenommen.
+    for module_name, values in get_all_module_settings(source).items():
+        for setting_key, setting_value in values.items():
+            set_module_setting(target, module_name, setting_key, setting_value)
+            counts["module_settings"] = counts.get("module_settings", 0) + 1
 
     # Nur nicht-Discordgebundene zentrale Einstellungen übernehmen.
     blocked = {

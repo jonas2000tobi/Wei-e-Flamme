@@ -17,6 +17,11 @@ try:
 except Exception:
     from channel_picker import send_text_channel_picker, send_voice_channel_picker  # type: ignore
 from discord import app_commands
+
+try:
+    from bot.module_registry import FeatureGroup, is_module_enabled, any_guild_has_module  # type: ignore
+except Exception:
+    from module_registry import FeatureGroup, is_module_enabled, any_guild_has_module  # type: ignore
 from discord.ext import tasks
 
 try:
@@ -460,7 +465,7 @@ _report_task_started = False
 
 
 async def setup_weekly_report(client: discord.Client, tree: app_commands.CommandTree):
-    report_group = app_commands.Group(
+    report_group = FeatureGroup(module_key="analytics", 
         name="report",
         description="Wöchentliche Gildenberichte verwalten",
     )
@@ -575,6 +580,8 @@ async def setup_weekly_report(client: discord.Client, tree: app_commands.Command
         async def weekly_report_loop():
             try:
                 for guild in client.guilds:
+                    if not is_module_enabled(int(guild.id), "analytics"):
+                        continue
                     c = _gcfg(guild.id)
 
                     if not _should_post_now(guild.id, c):

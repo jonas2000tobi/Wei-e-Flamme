@@ -18,6 +18,12 @@ import discord
 from discord.ext import commands, tasks
 from discord import app_commands
 
+from guild_modules import COMMAND_MODULE_MAP
+try:
+    from bot.module_registry import is_module_enabled, module_states  # type: ignore
+except Exception:
+    from module_registry import is_module_enabled, module_states  # type: ignore
+
 intents = discord.Intents.default()
 intents.guilds = True
 intents.members = True
@@ -54,6 +60,58 @@ setup_guild_config = None
 store = {}
 _modules_initialized = False
 _startup_failure: str | None = None
+_module_command_signatures: dict[int, tuple[tuple[str, bool], ...]] = {}
+
+
+def _module_signature(guild_id: int) -> tuple[tuple[str, bool], ...]:
+    states = module_states(int(guild_id))
+    return tuple(sorted((str(k), bool(v)) for k, v in states.items()))
+
+
+async def _sync_guild_commands(connected_guild: discord.Guild, *, force: bool = False) -> bool:
+    """Synchronisiert pro Gilde nur Core + aktivierte optionale Command-Gruppen."""
+    guild_id = int(connected_guild.id)
+    signature = _module_signature(guild_id)
+    if not force and _module_command_signatures.get(guild_id) == signature:
+        return False
+
+    guild_object = discord.Object(id=guild_id)
+    try:
+        # Den lokalen Guild-Tree aus dem vollständigen globalen Definitionstree neu aufbauen.
+        # Danach werden deaktivierte Top-Level-Gruppen entfernt, bevor Discord synchronisiert wird.
+        tree.clear_commands(guild=guild_object)
+        tree.copy_global_to(guild=guild_object)
+        disabled: list[str] = []
+        for command_name, module_key in COMMAND_MODULE_MAP.items():
+            if not is_module_enabled(guild_id, module_key):
+                removed = tree.remove_command(command_name, guild=guild_object)
+                if removed is not None:
+                    disabled.append(command_name)
+        guild_synced = await tree.sync(guild=guild_object)
+        _module_command_signatures[guild_id] = signature
+        suffix = f" · deaktiviert: {', '.join(disabled)}" if disabled else ""
+        print(
+            "✅ Guild-Slash-Commands synchronisiert: "
+            f"{connected_guild.name} ({guild_id}) · {len(guild_synced)}{suffix}"
+        )
+        return True
+    except Exception as e:
+        print(f"⚠️ Guild-Sync-Fehler: {connected_guild.name} ({guild_id}) · {e!r}")
+        return False
+
+
+@tasks.loop(seconds=30)
+async def module_command_sync_loop():
+    """Übernimmt Modulschalter aus dem Dashboard ohne Bot-Neustart."""
+    if not bot.is_ready():
+        return
+    for connected_guild in list(bot.guilds):
+        await _sync_guild_commands(connected_guild, force=False)
+
+
+@module_command_sync_loop.before_loop
+async def _before_module_command_sync_loop():
+    await bot.wait_until_ready()
 
 
 def _import_modules():
@@ -335,19 +393,7 @@ async def on_ready():
         # Guild-Commands sind sofort aktuell und passen zur Multi-Guild-Architektur.
         local_global_commands = list(tree.get_commands(guild=None))
         for connected_guild in bot.guilds:
-            guild_object = discord.Object(id=connected_guild.id)
-            try:
-                tree.copy_global_to(guild=guild_object)
-                guild_synced = await tree.sync(guild=guild_object)
-                print(
-                    "✅ Guild-Slash-Commands synchronisiert: "
-                    f"{connected_guild.name} ({connected_guild.id}) · {len(guild_synced)}"
-                )
-            except Exception as e:
-                print(
-                    "⚠️ Guild-Sync-Fehler: "
-                    f"{connected_guild.name} ({connected_guild.id}) · {e!r}"
-                )
+            await _sync_guild_commands(connected_guild, force=True)
 
         # Alte globale Remote-Commands mit der öffentlichen CommandTree-API
         # entfernen. Anschließend werden die lokalen Definitionen wieder in den
@@ -367,6 +413,9 @@ async def on_ready():
             print(f"⚠️ Globale Slash-Commands konnten nicht bereinigt werden: {e!r}")
 
         _modules_initialized = True
+        if not module_command_sync_loop.is_running():
+            module_command_sync_loop.start()
+            print("🧩 Modul-Sync gestartet (Dashboard-Schalter → Discord-Commands).")
         print(f"✅ Module einmalig initialisiert: {sum(results)}/{len(results)}")
     else:
         print("ℹ️ Gateway-Reconnect: Module werden nicht doppelt registriert.")
