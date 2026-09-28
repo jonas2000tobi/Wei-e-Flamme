@@ -67,7 +67,7 @@ async def _dashboard_lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Guild Platform Dashboard", version="2.5.0", lifespan=_dashboard_lifespan)
+app = FastAPI(title="Guild Platform Dashboard", version="2.5.1", lifespan=_dashboard_lifespan)
 security = HTTPBasic(auto_error=False)
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -75,7 +75,7 @@ if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 ASSET_VER = "guild-platform-v2-5-0-welcome"
-DASHBOARD_RELEASE_VERSION = "2.5.0 · Welcome & Onboarding"
+DASHBOARD_RELEASE_VERSION = "2.5.1 · Guild Binding Fix"
 
 _EVENT_IMAGE_ASSETS: dict[str, str] = {
     "guild_boss": f"/static/event_images/guild_boss.webp?v={ASSET_VER}",
@@ -377,11 +377,17 @@ def _guild_profile_row(guild_id: int) -> dict[str, Any]:
 
 
 def _active_guild_id() -> int:
-    # Aktives Postgres-Profil hat Vorrang. DASHBOARD_GUILD_ID ist nur noch
-    # ein Notfall-Fallback für alte Deployments ohne Gildenprofil/Snapshot.
+    # Ein explizit gesetztes DASHBOARD_GUILD_ID bindet diesen Web-Service
+    # immer an genau diese Discord-Gilde. Das ist besonders wichtig, wenn
+    # dieselbe Postgres-Datenbank noch Snapshots/Profiles anderer Gilden
+    # enthält. Ohne diese Priorität konnte das Dashboard nach einem Guild-
+    # Wechsel versehentlich Branding, Rollen und Auth-Listen der zuletzt
+    # aktiven alten Gilde verwenden.
     explicit = str(os.getenv("DASHBOARD_GUILD_ID") or "").strip()
+    if explicit.isdigit():
+        return int(explicit)
     if not _database_url():
-        return int(explicit) if explicit.isdigit() else 0
+        return 0
     try:
         _ensure_guild_profile_schema()
         conn = _pg_connect()
@@ -404,7 +410,7 @@ def _active_guild_id() -> int:
         finally:
             conn.close()
     except Exception:
-        return int(explicit) if explicit.isdigit() else 0
+        return 0
 
 
 def _guild_setting_value(guild_id: int, key: str, default: Any = None) -> Any:
