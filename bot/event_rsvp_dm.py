@@ -3631,6 +3631,134 @@ async def _dashboard_event_delete(client: discord.Client, guild_id: int, payload
     return {"event_id": event_id, "deleted_posts": deleted_posts, "deleted_dms": deleted_dms, "failed_posts": failed_posts[:10], "scheduled_event": scheduled_result}
 
 
+def _dashboard_event_rsvp_open(obj: dict[str, Any]) -> bool:
+    status = str(obj.get("status") or obj.get("state") or "").strip().lower()
+    if status in {"closed", "ended", "finished", "beendet", "archived", "done", "completed", "deleted"}:
+        return False
+    start_raw = str(obj.get("when_iso") or obj.get("start_at") or "").strip()
+    if not start_raw:
+        return True
+    try:
+        start = datetime.fromisoformat(start_raw.replace("Z", "+00:00"))
+        if start.tzinfo is None:
+            start = start.replace(tzinfo=TZ)
+        start = start.astimezone(TZ)
+        end_raw = str(obj.get("end_at") or "").strip()
+        if end_raw:
+            end = datetime.fromisoformat(end_raw.replace("Z", "+00:00"))
+            if end.tzinfo is None:
+                end = end.replace(tzinfo=TZ)
+            end = end.astimezone(TZ)
+        else:
+            end = start + timedelta(minutes=max(30, int(obj.get("duration_minutes") or 120)))
+        return datetime.now(TZ) <= end
+    except Exception:
+        return True
+
+
+async def _dashboard_event_rsvp(client: discord.Client, guild_id: int, payload: dict[str, Any]) -> dict[str, Any]:
+    event_id = str(payload.get("event_id") or "").strip()
+    choice = str(payload.get("choice") or payload.get("response") or "").strip().upper()
+    requested_by = payload.get("requested_by") if isinstance(payload.get("requested_by"), dict) else {}
+    try:
+        user_id = int(requested_by.get("id") or payload.get("user_id") or 0)
+    except Exception:
+        user_id = 0
+    if not event_id or event_id not in store:
+        raise RuntimeError("Event nicht gefunden")
+    if choice not in {"TANK", "HEAL", "DPS", "BANK", "MAYBE", "NO"}:
+        raise RuntimeError("Ungültige RSVP-Auswahl")
+    if not user_id:
+        raise RuntimeError("Discord-User-ID fehlt")
+
+    async with _rsvp_lock(event_id):
+        obj = store.get(event_id)
+        if not isinstance(obj, dict):
+            raise RuntimeError("Event nicht gefunden")
+        _init_event_shape(obj)
+        event_guild_id = int(obj.get("guild_id", 0) or 0)
+        if event_guild_id != int(guild_id):
+            raise RuntimeError("Event gehört nicht zu diesem Server")
+        if not _dashboard_event_rsvp_open(obj):
+            raise RuntimeError("Dieses Event ist für Rückmeldungen geschlossen")
+
+        guild = client.get_guild(int(guild_id))
+        if guild is None:
+            raise RuntimeError("Bot sieht den Server nicht")
+        member = guild.get_member(user_id)
+        if member is None:
+            try:
+                member = await guild.fetch_member(user_id)
+            except Exception:
+                member = None
+        if member is None or member.bot:
+            raise RuntimeError("Mitglied wurde auf dem Discord-Server nicht gefunden")
+
+        target_role_id = int(obj.get("target_role_id", 0) or 0)
+        if target_role_id:
+            target_role = guild.get_role(target_role_id)
+            if target_role is None:
+                raise RuntimeError("Die Zielrolle dieses Events wurde nicht gefunden")
+            if target_role not in getattr(member, "roles", []):
+                raise RuntimeError(f"Du gehörst nicht zur Zielgruppe dieses Events ({target_role.name})")
+
+        display_name = _safe_name(getattr(member, "display_name", None) or getattr(member, "name", None) or f"User {user_id}")
+        guild_label = guild.name if _is_alliance_event(obj) else ""
+        source_guild_id = int(guild.id)
+
+        for role_key in ("TANK", "HEAL", "DPS", "BANK"):
+            obj["yes"][role_key] = [entry for entry in obj["yes"].get(role_key, []) if _entry_user_id(entry) != user_id]
+        obj["no"] = [entry for entry in obj.get("no", []) if _entry_user_id(entry) != user_id]
+        obj["maybe"].pop(str(user_id), None)
+
+        if choice in {"TANK", "HEAL", "DPS"}:
+            obj["yes"][choice].append(_participant_entry(user_id, display_name, guild_label, source_guild_id))
+            response_key = "yes"
+            label = choice
+        elif choice == "BANK":
+            obj["yes"]["BANK"].append(_participant_entry(user_id, display_name, guild_label, source_guild_id))
+            response_key = "bank"
+            label = "Reserve"
+        elif choice == "MAYBE":
+            rid_map = get_role_ids_for_guild(int(obj["guild_id"]))
+            primary = _primary_label(member, rid_map)
+            maybe_obj = _maybe_entry(user_id, display_name, primary)
+            if guild_label:
+                maybe_obj["guild_label"] = guild_label
+            if source_guild_id:
+                maybe_obj["source_guild_id"] = source_guild_id
+            obj["maybe"][str(user_id)] = maybe_obj
+            response_key = "maybe"
+            label = "Vielleicht"
+        else:
+            obj["no"].append(_participant_entry(user_id, display_name, guild_label, source_guild_id))
+            response_key = "no"
+            label = "Abgemeldet"
+
+        obj["last_dashboard_rsvp_at"] = datetime.now(TZ).isoformat()
+        obj["last_dashboard_rsvp_by"] = {"id": str(user_id), "name": display_name, "choice": choice}
+        store[event_id] = obj
+        save_store(event_id)
+        record_response(int(obj["guild_id"]), user_id, event_id, response_key)
+
+        await _push_overview(client, event_id, obj)
+        try:
+            ensure_attendance_snapshot(client, event_id, obj)
+        except Exception:
+            pass
+        try:
+            _phase3_upsert_event_from_store(event_id)
+        except Exception:
+            pass
+        _schedule_portal_refresh_for_user(client, int(guild_id), int(user_id))
+        try:
+            await _delete_irrelevant_bot_dm_messages_for_user(client, user_id, current_msg_id=event_id, limit=200)
+        except Exception:
+            pass
+        await _log(client, int(guild_id), f"Dashboard-RSVP: {display_name} → {label} · {obj.get('title') or event_id}")
+        return {"event_id": event_id, "user_id": user_id, "display_name": display_name, "choice": choice, "label": label}
+
+
 async def _dashboard_event_process_request(client: discord.Client, row: dict[str, Any]) -> tuple[bool, str, dict[str, Any]]:
     payload = {}
     try:
@@ -3650,10 +3778,13 @@ async def _dashboard_event_process_request(client: discord.Client, row: dict[str
     if action == "delete":
         result = await _dashboard_event_delete(client, guild_id, payload)
         return True, f"Event gelöscht: {result.get('event_id')}", result
+    if action == "rsvp":
+        result = await _dashboard_event_rsvp(client, guild_id, payload)
+        return True, f"RSVP aktualisiert: {result.get('display_name')} → {result.get('label')}", result
     raise RuntimeError("Unbekannte Event-Aktion")
 
 
-@tasks.loop(seconds=20)
+@tasks.loop(seconds=5)
 async def dashboard_event_action_loop():
     client = getattr(dashboard_event_action_loop, "_client", None)
     if client is None or not _dashboard_event_queue_available():
