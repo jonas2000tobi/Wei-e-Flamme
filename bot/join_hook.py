@@ -19,6 +19,14 @@ try:
 except Exception:
     from module_registry import is_module_enabled  # type: ignore
 
+try:
+    from bot.onboarding import mark_welcome_member_left  # type: ignore
+except Exception:
+    try:
+        from onboarding import mark_welcome_member_left  # type: ignore
+    except Exception:
+        mark_welcome_member_left = None  # type: ignore
+
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -52,7 +60,7 @@ def _clear_sent(gid: int, uid: int) -> None:
 
 async def _try_send_onboarding(
     member: discord.Member,
-    send_onboarding_dm: Callable[[discord.Member], Awaitable[None]],
+    send_onboarding_dm: Callable[[discord.Member], Awaitable[object]],
     auto_resend_for_new_member: Callable[[discord.Member], Awaitable[None]],
     reason: str,
 ) -> None:
@@ -64,9 +72,18 @@ async def _try_send_onboarding(
         if is_module_enabled(member.guild.id, "onboarding"):
             if not _already_sent(member.guild.id, member.id):
                 try:
-                    await send_onboarding_dm(member)
-                    _mark_sent(member.guild.id, member.id)
-                    print(f"[join_hook] Onboarding-DM an {member} gesendet (reason={reason}).")
+                    result = await send_onboarding_dm(member)
+                    ok = True
+                    detail = ""
+                    if isinstance(result, tuple) and result:
+                        ok = bool(result[0])
+                        if len(result) > 1:
+                            detail = str(result[1] or "")
+                    if ok:
+                        _mark_sent(member.guild.id, member.id)
+                        print(f"[join_hook] Onboarding-DM an {member} gesendet (reason={reason}).")
+                    else:
+                        print(f"[join_hook] Onboarding-DM an {member} nicht zugestellt (reason={reason}): {detail or 'unbekannter Grund'}")
                 except Exception as e:
                     # NICHT markieren, damit spätere Versuche/Manuell möglich sind
                     print(f"[join_hook] Onboarding-DM an {member} fehlgeschlagen (reason={reason}): {e!r}")
@@ -118,7 +135,7 @@ def _chain_listener(client: discord.Client, name: str, ours):
 
 def register_join_hook(
     client: discord.Client,
-    send_onboarding_dm: Callable[[discord.Member], Awaitable[None]],
+    send_onboarding_dm: Callable[[discord.Member], Awaitable[object]],
     auto_resend_for_new_member: Callable[[discord.Member], Awaitable[None]],
 ) -> None:
     """
@@ -153,6 +170,11 @@ def register_join_hook(
 
     async def _on_member_remove(member: discord.Member):
         try:
+            if mark_welcome_member_left is not None:
+                try:
+                    await mark_welcome_member_left(member)
+                except Exception as exc:
+                    print(f"[join_hook] Welcome-Leave-Update für {member} fehlgeschlagen: {exc!r}")
             _clear_sent(member.guild.id, member.id)
             print(f"[join_hook] Merker für {member} entfernt (Leave/Rejoin).")
         except Exception as e:

@@ -1,7 +1,9 @@
 from __future__ import annotations
 import json
+import random
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Any
 
 try:
     from bot.json_store import load_json_file, save_json_atomic, warn_json_store  # type: ignore
@@ -15,6 +17,20 @@ try:
     from bot.module_registry import FeatureGroup, is_module_enabled, set_module_enabled, any_guild_has_module  # type: ignore
 except Exception:
     from module_registry import FeatureGroup, is_module_enabled, set_module_enabled, any_guild_has_module  # type: ignore
+
+try:
+    from bot import runtime_db  # type: ignore
+except Exception:
+    import runtime_db  # type: ignore
+
+try:
+    from guild_modules import DEFAULT_ONBOARDING_WELCOME_SLOGANS
+except Exception:
+    DEFAULT_ONBOARDING_WELCOME_SLOGANS = (
+        "Ein neuer Held betritt das Schlachtfeld.",
+        "Ein wildes {user} ist erschienen!",
+        "Möge dein Loot besser sein als dein Würfelglück.",
+    )
 from discord.ui import View, button
 from discord.enums import ButtonStyle
 
@@ -27,6 +43,7 @@ DATA_DIR = Path(__file__).resolve().parent / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 CFG_FILE = DATA_DIR / "onboarding_cfg.json"
 SESSIONS_FILE = DATA_DIR / "onboarding_sessions.json"
+WELCOME_STATE_FILE = DATA_DIR / "onboarding_welcome_messages.json"
 
 # cfg[guild_id] = {
 #   "enabled": bool,
@@ -44,6 +61,267 @@ def _save_cfg(obj: dict) -> None:
     save_json_atomic(CFG_FILE, obj, context=__name__)
 
 cfg: dict = _load_cfg()
+
+
+def _load_welcome_state() -> dict[str, dict[str, dict[str, Any]]]:
+    raw = load_json_file(WELCOME_STATE_FILE, {}, context=f"{__name__}.welcome")
+    return raw if isinstance(raw, dict) else {}
+
+
+def _save_welcome_state() -> None:
+    save_json_atomic(WELCOME_STATE_FILE, _welcome_state, context=f"{__name__}.welcome")
+
+
+_welcome_state: dict[str, dict[str, dict[str, Any]]] = _load_welcome_state()
+
+
+def _welcome_setting(guild_id: int, key: str, default: Any) -> Any:
+    try:
+        return runtime_db.get_module_setting(int(guild_id), "onboarding", str(key), default)
+    except Exception:
+        return default
+
+
+def _welcome_channel_id(guild_id: int) -> int:
+    try:
+        return int(runtime_db.get_guild_setting(int(guild_id), "guild_channel_welcome_id", 0) or 0)
+    except Exception:
+        return 0
+
+
+def _welcome_cfg(guild: discord.Guild) -> dict[str, Any]:
+    raw_slogans = _welcome_setting(guild.id, "welcome_slogans", list(DEFAULT_ONBOARDING_WELCOME_SLOGANS))
+    if isinstance(raw_slogans, str):
+        raw_slogans = [line.strip() for line in raw_slogans.splitlines() if line.strip()]
+    slogans = [str(x).strip()[:300] for x in (raw_slogans or []) if str(x).strip()]
+    if not slogans:
+        slogans = list(DEFAULT_ONBOARDING_WELCOME_SLOGANS)
+    return {
+        "enabled": bool(_welcome_setting(guild.id, "welcome_enabled", True)),
+        "update_on_leave": bool(_welcome_setting(guild.id, "welcome_update_on_leave", True)),
+        "channel_id": _welcome_channel_id(guild.id),
+        "slogans": slogans[:50],
+    }
+
+
+def _welcome_record(guild_id: int, member_id: int) -> dict[str, Any]:
+    guild_rows = _welcome_state.get(str(int(guild_id))) or {}
+    raw = guild_rows.get(str(int(member_id))) or {}
+    return dict(raw) if isinstance(raw, dict) else {}
+
+
+def _set_welcome_record(guild_id: int, member_id: int, record: dict[str, Any]) -> None:
+    gid = str(int(guild_id))
+    uid = str(int(member_id))
+    guild_rows = _welcome_state.get(gid)
+    if not isinstance(guild_rows, dict):
+        guild_rows = {}
+        _welcome_state[gid] = guild_rows
+    guild_rows[uid] = dict(record)
+    _save_welcome_state()
+
+
+def _welcome_text(text: str, member: discord.Member) -> str:
+    return (
+        str(text or "")
+        .replace("{user}", member.display_name)
+        .replace("{guild}", member.guild.name)
+        .replace("{member_count}", str(getattr(member.guild, "member_count", 0) or len(getattr(member.guild, "members", []) or [])))
+    )
+
+
+def _onboarding_labels(category: str | None, primary: str | None, experienced: bool | None) -> tuple[str, str, str]:
+    category_txt = {
+        "guild": "Gildenmitglied",
+        "ally": "Allianzmitglied",
+        "friend": "Freund",
+        "applicant": "Bewerber",
+    }.get(str(category or ""), "—")
+    primary_txt = {"TANK": "Tank", "HEAL": "Heal", "DPS": "DPS"}.get(str(primary or "").upper(), "—")
+    experience_txt = "—" if experienced is None else ("Erfahren" if bool(experienced) else "Unerfahren")
+    return category_txt, primary_txt, experience_txt
+
+
+def _welcome_embed(
+    member: discord.Member,
+    *,
+    status: str,
+    slogan: str,
+    category: str | None = None,
+    primary: str | None = None,
+    experienced: bool | None = None,
+    reason: str = "",
+) -> discord.Embed:
+    status_map: dict[str, tuple[str, discord.Color]] = {
+        "running": ("🟡 Onboarding läuft", discord.Color.gold()),
+        "review": ("🟠 Wartet auf Freigabe", discord.Color.orange()),
+        "completed": ("🟢 Onboarding abgeschlossen", discord.Color.green()),
+        "rejected": ("🔴 Onboarding abgelehnt", discord.Color.red()),
+        "dm_blocked": ("🔴 Onboarding wartet – Direktnachrichten aktivieren", discord.Color.red()),
+        "left": ("⚫ Server verlassen", discord.Color.from_rgb(80, 80, 80)),
+    }
+    status_text, color = status_map.get(str(status), status_map["running"])
+    embed = discord.Embed(
+        title=f"Willkommen bei {member.guild.name}!",
+        description=_welcome_text(slogan, member),
+        color=color,
+        timestamp=datetime.now(timezone.utc),
+    )
+    try:
+        avatar_url = member.display_avatar.url
+        embed.set_author(name=member.display_name, icon_url=avatar_url)
+        embed.set_thumbnail(url=avatar_url)
+    except Exception:
+        embed.set_author(name=member.display_name)
+    embed.add_field(name="Status", value=status_text, inline=False)
+    if status in {"review", "completed", "rejected"}:
+        cat_txt, pri_txt, exp_txt = _onboarding_labels(category, primary, experienced)
+        embed.add_field(name="Kategorie", value=cat_txt, inline=True)
+        embed.add_field(name="Rolle", value=pri_txt, inline=True)
+        embed.add_field(name="Erfahrung", value=exp_txt, inline=True)
+    if reason:
+        embed.add_field(name="Hinweis", value=str(reason)[:1000], inline=False)
+    try:
+        member_count = getattr(member.guild, "member_count", None)
+        footer = f"Discord: @{member.name}"
+        if member_count:
+            footer += f" · Mitglied #{member_count}"
+        embed.set_footer(text=footer)
+    except Exception:
+        pass
+    return embed
+
+
+async def _fetch_welcome_message(guild: discord.Guild, record: dict[str, Any]) -> tuple[Optional[discord.abc.Messageable], Optional[discord.Message]]:
+    channel_id = int(record.get("channel_id") or 0)
+    message_id = int(record.get("message_id") or 0)
+    if not channel_id or not message_id:
+        return None, None
+    channel = guild.get_channel(channel_id)
+    if channel is None and hasattr(guild, "get_thread"):
+        channel = guild.get_thread(channel_id)
+    if not channel or not hasattr(channel, "fetch_message"):
+        return None, None
+    try:
+        return channel, await channel.fetch_message(message_id)  # type: ignore[attr-defined]
+    except Exception:
+        return channel, None
+
+
+async def ensure_welcome_card(member: discord.Member, *, force_new: bool = False) -> tuple[bool, str]:
+    if member.bot or not is_module_enabled(member.guild.id, "onboarding"):
+        return False, "Onboarding nicht aktiv."
+    wc = _welcome_cfg(member.guild)
+    if not wc.get("enabled"):
+        return False, "Welcome Card deaktiviert."
+    channel_id = int(wc.get("channel_id") or 0)
+    if not channel_id:
+        return False, "Kein Welcome-Kanal konfiguriert."
+    channel = member.guild.get_channel(channel_id)
+    if not isinstance(channel, (discord.TextChannel, discord.Thread)):
+        return False, "Welcome-Kanal nicht gefunden."
+
+    record = _welcome_record(member.guild.id, member.id)
+    if record and not force_new and str(record.get("status") or "") not in {"left", "rejected"}:
+        _, message = await _fetch_welcome_message(member.guild, record)
+        if message:
+            return True, "Vorhandene Welcome Card verwendet."
+
+    slogans = list(wc.get("slogans") or DEFAULT_ONBOARDING_WELCOME_SLOGANS)
+    slogan = random.choice(slogans) if slogans else "Willkommen!"
+    embed = _welcome_embed(member, status="running", slogan=slogan)
+    try:
+        message = await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+    except Exception as exc:
+        print(f"[onboarding] Welcome Card für {member.id} fehlgeschlagen: {exc!r}", flush=True)
+        return False, f"Welcome Card konnte nicht gesendet werden: {type(exc).__name__}"
+    _set_welcome_record(member.guild.id, member.id, {
+        "channel_id": int(channel.id),
+        "message_id": int(message.id),
+        "status": "running",
+        "slogan": slogan,
+        "joined_at": datetime.now(timezone.utc).isoformat(),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    })
+    return True, "Welcome Card gesendet."
+
+
+async def update_welcome_card(
+    member: discord.Member,
+    status: str,
+    *,
+    category: str | None = None,
+    primary: str | None = None,
+    experienced: bool | None = None,
+    reason: str = "",
+) -> bool:
+    if member.bot or not is_module_enabled(member.guild.id, "onboarding"):
+        return False
+    wc = _welcome_cfg(member.guild)
+    if not wc.get("enabled"):
+        return False
+    record = _welcome_record(member.guild.id, member.id)
+    if not record:
+        ok, _ = await ensure_welcome_card(member)
+        if not ok:
+            return False
+        record = _welcome_record(member.guild.id, member.id)
+    _, message = await _fetch_welcome_message(member.guild, record)
+    if not message:
+        if status == "left":
+            return False
+        ok, _ = await ensure_welcome_card(member, force_new=True)
+        if not ok:
+            return False
+        record = _welcome_record(member.guild.id, member.id)
+        _, message = await _fetch_welcome_message(member.guild, record)
+        if not message:
+            return False
+    slogan = str(record.get("slogan") or "Willkommen!")
+    try:
+        await message.edit(embed=_welcome_embed(
+            member,
+            status=status,
+            slogan=slogan,
+            category=category,
+            primary=primary,
+            experienced=experienced,
+            reason=reason,
+        ))
+    except Exception as exc:
+        print(f"[onboarding] Welcome Card Update für {member.id} fehlgeschlagen: {exc!r}", flush=True)
+        return False
+    record.update({
+        "status": str(status),
+        "category": category,
+        "primary": primary,
+        "experienced": experienced,
+        "reason": str(reason or ""),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    })
+    _set_welcome_record(member.guild.id, member.id, record)
+    return True
+
+
+async def mark_welcome_member_left(member: discord.Member) -> None:
+    try:
+        if not is_module_enabled(member.guild.id, "onboarding"):
+            return
+        wc = _welcome_cfg(member.guild)
+        if not wc.get("enabled") or not wc.get("update_on_leave"):
+            return
+        record = _welcome_record(member.guild.id, member.id)
+        if not record:
+            return
+        await update_welcome_card(
+            member,
+            "left",
+            category=record.get("category"),
+            primary=record.get("primary"),
+            experienced=record.get("experienced"),
+        )
+    except Exception as exc:
+        print(f"[onboarding] Welcome Leave Update für {getattr(member, 'id', 0)} fehlgeschlagen: {exc!r}", flush=True)
 
 def _is_admin(inter: discord.Interaction) -> bool:
     p = getattr(inter.user, "guild_permissions", None)
@@ -308,6 +586,13 @@ class ReviewView(OnboardingFeatureView):
             return
 
         roles = await _assign_roles(member, self.category, self.primary, self.experienced)
+        await update_welcome_card(
+            member,
+            "completed",
+            category=self.category,
+            primary=self.primary,
+            experienced=self.experienced,
+        )
         await inter.edit_original_response(
             content=f"✅ **Akzeptiert** – Rollen: {', '.join(r.mention for r in roles) if roles else '—'}",
             view=None
@@ -331,6 +616,14 @@ class ReviewView(OnboardingFeatureView):
         _forget_message(self.message_id or (inter.message.id if inter.message else 0))
 
         if member:
+            await update_welcome_card(
+                member,
+                "rejected",
+                category=self.category,
+                primary=self.primary,
+                experienced=self.experienced,
+                reason="Die Gildenleitung hat das Onboarding nicht freigegeben.",
+            )
             try:
                 await member.send("❌ Deine Anfrage wurde **abgelehnt**.")
             except Exception:
@@ -416,6 +709,14 @@ class ExperienceView(OnboardingFeatureView):
                 _session_records[str(review_message.id)] = review_ctx.to_dict()
                 _save_sessions()
 
+                if member:
+                    await update_welcome_card(
+                        member,
+                        "review",
+                        category=self.ctx.category,
+                        primary=self.ctx.primary,
+                        experienced=experienced,
+                    )
                 await inter.edit_original_response(
                     content="✅ Danke! Deine Angaben wurden zur **Prüfung** an die Gildenleitung gesendet.",
                     view=None
@@ -423,6 +724,13 @@ class ExperienceView(OnboardingFeatureView):
             else:
                 if member:
                     roles = await _assign_roles(member, self.ctx.category, self.ctx.primary, experienced)
+                    await update_welcome_card(
+                        member,
+                        "completed",
+                        category=self.ctx.category,
+                        primary=self.ctx.primary,
+                        experienced=experienced,
+                    )
 
                     if review_ch:
                         await review_ch.send(
@@ -462,6 +770,8 @@ async def send_onboarding_dm(member: discord.Member) -> tuple[bool, str]:
         if not is_module_enabled(member.guild.id, "onboarding"):
             return False, "Onboarding ist für diesen Server deaktiviert."
 
+        await ensure_welcome_card(member)
+        await update_welcome_card(member, "running")
         _forget_member_sessions(member.id)
         ctx = StepContext(member.id, member.guild.id)
 
@@ -477,6 +787,14 @@ async def send_onboarding_dm(member: discord.Member) -> tuple[bool, str]:
         return True, "Onboarding-DM gesendet."
 
     except discord.Forbidden:
+        try:
+            await update_welcome_card(
+                member,
+                "dm_blocked",
+                reason="Direktnachrichten sind deaktiviert. Bitte DMs für diesen Server aktivieren und das Onboarding erneut starten.",
+            )
+        except Exception:
+            pass
         return False, "DM konnte nicht zugestellt werden. Das Mitglied hat Direktnachrichten vermutlich deaktiviert."
     except Exception as exc:
         print(f"[onboarding] DM an {getattr(member, 'id', 0)} fehlgeschlagen: {exc!r}", flush=True)
@@ -663,13 +981,19 @@ async def setup_onboarding(client: discord.Client, tree: app_commands.CommandTre
         pri = c.get("primary_roles") or {}
         exp = c.get("experience_roles") or {}
         rch = _review_channel(inter.guild)
+        wc = _welcome_cfg(inter.guild)
+        wch = inter.guild.get_channel(int(wc.get("channel_id") or 0))
 
         def _m(rid):
             r = _role(inter.guild, rid)
             return r.mention if r else "—"
 
         text = (
-            f"**Onboarding:** {'aktiv' if c.get('enabled', True) else 'inaktiv'}\n"
+            f"**Onboarding:** {'aktiv' if is_module_enabled(inter.guild_id, 'onboarding') else 'inaktiv'}\n"
+            f"**Welcome Card:** {'aktiv' if wc.get('enabled') else 'inaktiv'}\n"
+            f"**Welcome-Kanal:** {wch.mention if wch else '—'}\n"
+            f"**Welcome-Sprüche:** {len(wc.get('slogans') or [])}\n"
+            f"**Leave-Update:** {'Ja' if wc.get('update_on_leave') else 'Nein'}\n"
             f"**Review erforderlich:** {'Ja' if c.get('require_review') else 'Nein'}\n"
             f"**Review/Log-Kanal:** {rch.mention if rch else '—'}\n\n"
             f"**Kategorien**\n"
