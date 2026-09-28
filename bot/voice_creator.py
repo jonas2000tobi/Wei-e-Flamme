@@ -685,11 +685,20 @@ async def setup_voice_creator(client: discord.Client, tree: app_commands.Command
             return
 
         async def _picked(pick_inter: discord.Interaction, kanal: discord.TextChannel):
+            category_hint = "derselben Kategorie wie dieser Textkanal"
+            if central_guild_config is not None:
+                try:
+                    configured_category_id = int(central_guild_config.channel_id(inter.guild.id, "voice_category") or 0)
+                    configured_category = inter.guild.get_channel(configured_category_id)
+                    if isinstance(configured_category, discord.CategoryChannel):
+                        category_hint = f"der konfigurierten Kategorie **{configured_category.name}**"
+                except Exception:
+                    pass
             emb = discord.Embed(
                 title="🔊 Sprachkanal erstellen",
                 description=(
                     "Klicke auf den Button, gib einen Namen und eine Personenanzahl ein.\n"
-                    "Der Sprachkanal wird in derselben Kategorie wie dieser Textkanal erstellt.\n"
+                    f"Der Sprachkanal wird in {category_hint} erstellt.\n"
                     "Sichtbar/beitretbar ist er für die im Dashboard konfigurierten Voice-Rollen.\n"
                     "Nicht berechtigte und ausdrücklich blockierte Rollen werden ausgeschlossen.\n\n"
                     "Leere erstellte Sprachkanäle werden automatisch gelöscht, sobald der letzte Spieler raus ist."
@@ -707,6 +716,45 @@ async def setup_voice_creator(client: discord.Client, tree: app_commands.Command
                 await pick_inter.response.edit_message(content=f"❌ Panel konnte nicht gepostet werden: `{type(e).__name__}`", view=None)
 
         await send_text_channel_picker(inter, "🔊 Textkanal fürs Voice-Panel auswählen", _picked)
+
+    @voice_panel.command(name="status", description="Leader: Zeigt die Voice-Panel-Konfiguration")
+    async def status(inter: discord.Interaction):
+        if inter.guild is None:
+            await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)
+            return
+        if not _is_leader_or_admin(inter):
+            await inter.response.send_message("❌ Nur Leader/Admins.", ephemeral=True)
+            return
+
+        category = None
+        return_channel = None
+        allowed_roles = []
+        blocked_roles = []
+        if central_guild_config is not None:
+            try:
+                category = inter.guild.get_channel(int(central_guild_config.channel_id(inter.guild.id, "voice_category") or 0))
+                return_channel = inter.guild.get_channel(int(central_guild_config.channel_id(inter.guild.id, "voice_return") or 0))
+                allowed_roles = [inter.guild.get_role(int(rid)) for rid in central_guild_config.role_ids(inter.guild.id, "voice_allowed")]
+                blocked_roles = [inter.guild.get_role(int(rid)) for rid in central_guild_config.role_ids(inter.guild.id, "voice_blocked")]
+                allowed_roles = [r for r in allowed_roles if isinstance(r, discord.Role)]
+                blocked_roles = [r for r in blocked_roles if isinstance(r, discord.Role)]
+            except Exception as exc:
+                print(f"[VOICE-PANEL] Status konnte zentrale Config nicht lesen: {exc!r}", flush=True)
+
+        category_text = category.mention if isinstance(category, discord.CategoryChannel) else "— (Kategorie des Panel-Textkanals wird verwendet)"
+        return_text = return_channel.mention if isinstance(return_channel, discord.VoiceChannel) else "—"
+        allowed_text = ", ".join(r.mention for r in allowed_roles) if allowed_roles else "—"
+        blocked_text = ", ".join(r.mention for r in blocked_roles) if blocked_roles else "—"
+        await inter.response.send_message(
+            "**🔊 Voice Management**\n"
+            f"• Ziel-Kategorie: {category_text}\n"
+            f"• Sammel-/Return-Voice: {return_text}\n"
+            f"• Erlaubte Rollen: {allowed_text}\n"
+            f"• Gesperrte Rollen: {blocked_text}\n"
+            "• Panel-Ziel: wird bei `/voice_panel post` als Textkanal ausgewählt\n"
+            "• Auto-Löschung: aktiv, sobald ein erstellter Voice leer ist",
+            ephemeral=True,
+        )
 
     async def _move_members(inter: discord.Interaction, source: discord.VoiceChannel, target: discord.VoiceChannel) -> None:
         if inter.guild is None:

@@ -3825,7 +3825,8 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
         time="Zeit HH:MM (24h)",
         description="Kurzbeschreibung (optional)",
         target_role="(Optional) Nur an diese Rolle DMs versenden",
-        image_url="Optionales Bild fürs Embed"
+        image_url="Optionales Bild fürs Embed",
+        channel="Optionaler Zielkanal; sonst wird der Gilden-Standardkanal für Events verwendet"
     )
     async def raid_create_dm(
         inter: discord.Interaction,
@@ -3834,7 +3835,8 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
         time: str,
         description: Optional[str] = None,
         target_role: Optional[discord.Role] = None,
-        image_url: Optional[str] = None
+        image_url: Optional[str] = None,
+        channel: Optional[discord.TextChannel] = None,
     ):
         if not _is_admin(inter):
             await inter.response.send_message("❌ Nur Admin/Manage Server.", ephemeral=True)
@@ -3849,7 +3851,10 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
             return
 
         async def _picked(pick_inter: discord.Interaction, ch: discord.TextChannel):
-            await pick_inter.response.edit_message(content=f"⏳ Erstelle Raid in {ch.mention} …", view=None)
+            if getattr(pick_inter, "message", None) is not None:
+                await pick_inter.response.edit_message(content=f"⏳ Erstelle Raid in {ch.mention} …", view=None)
+            else:
+                await pick_inter.response.defer(ephemeral=True, thinking=True)
             obj = {
                 "guild_id": int(pick_inter.guild_id),
                 "channel_id": int(ch.id),
@@ -3917,6 +3922,20 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
             )
 
             _schedule_portal_refresh_for_event(pick_inter.client, pick_inter.guild, obj)
+
+        target_channel = channel
+        if target_channel is None and central_guild_config is not None and inter.guild is not None:
+            try:
+                configured_id = int(central_guild_config.channel_id(inter.guild.id, "events") or 0)
+                configured_channel = inter.guild.get_channel(configured_id)
+                if isinstance(configured_channel, discord.TextChannel):
+                    target_channel = configured_channel
+            except Exception as exc:
+                print(f"[event] Standard-Eventkanal konnte nicht geladen werden guild={getattr(inter.guild, 'id', 0)}: {exc!r}", flush=True)
+
+        if isinstance(target_channel, discord.TextChannel):
+            await _picked(inter, target_channel)
+            return
 
         await send_text_channel_picker(inter, "📢 Zielkanal für Raid-Ankündigung auswählen", _picked)
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 import json
 import random
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, List, Any
@@ -44,6 +45,7 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 CFG_FILE = DATA_DIR / "onboarding_cfg.json"
 SESSIONS_FILE = DATA_DIR / "onboarding_sessions.json"
 WELCOME_STATE_FILE = DATA_DIR / "onboarding_welcome_messages.json"
+APPLICATION_STATE_FILE = DATA_DIR / "onboarding_application_channels.json"
 
 # cfg[guild_id] = {
 #   "enabled": bool,
@@ -73,6 +75,192 @@ def _save_welcome_state() -> None:
 
 
 _welcome_state: dict[str, dict[str, dict[str, Any]]] = _load_welcome_state()
+
+
+def _load_application_state() -> dict[str, dict[str, dict[str, Any]]]:
+    raw = load_json_file(APPLICATION_STATE_FILE, {}, context=f"{__name__}.applications")
+    return raw if isinstance(raw, dict) else {}
+
+
+def _save_application_state() -> None:
+    save_json_atomic(APPLICATION_STATE_FILE, _application_state, context=f"{__name__}.applications")
+
+
+_application_state: dict[str, dict[str, dict[str, Any]]] = _load_application_state()
+
+
+def _application_setting(guild_id: int, key: str, default: Any) -> Any:
+    try:
+        return runtime_db.get_module_setting(int(guild_id), "onboarding", str(key), default)
+    except Exception:
+        return default
+
+
+def _application_cfg(guild: discord.Guild) -> dict[str, Any]:
+    lead_role_id = int(_application_setting(guild.id, "application_lead_role_id", 0) or 0)
+    if not lead_role_id:
+        try:
+            lead_role_id = int(runtime_db.get_guild_setting(int(guild.id), "guild_role_leader_id", 0) or 0)
+        except Exception:
+            lead_role_id = 0
+    return {
+        "enabled": bool(_application_setting(guild.id, "application_chat_enabled", True)),
+        "category_id": int(_application_setting(guild.id, "application_category_id", 0) or 0),
+        "lead_role_id": lead_role_id,
+    }
+
+
+def _application_record(guild_id: int, member_id: int) -> dict[str, Any]:
+    guild_rows = _application_state.get(str(int(guild_id))) or {}
+    raw = guild_rows.get(str(int(member_id))) or {}
+    return dict(raw) if isinstance(raw, dict) else {}
+
+
+def _set_application_record(guild_id: int, member_id: int, record: dict[str, Any]) -> None:
+    gid = str(int(guild_id))
+    uid = str(int(member_id))
+    guild_rows = _application_state.get(gid)
+    if not isinstance(guild_rows, dict):
+        guild_rows = {}
+        _application_state[gid] = guild_rows
+    guild_rows[uid] = dict(record)
+    _save_application_state()
+
+
+def _application_channel(guild: discord.Guild, member_id: int) -> Optional[discord.TextChannel]:
+    record = _application_record(guild.id, member_id)
+    channel = guild.get_channel(int(record.get("channel_id") or 0))
+    return channel if isinstance(channel, discord.TextChannel) else None
+
+
+def _application_channel_name(member: discord.Member) -> str:
+    raw = str(member.display_name or member.name or member.id).casefold()
+    slug = re.sub(r"[^a-z0-9äöüß_-]+", "-", raw, flags=re.IGNORECASE)
+    slug = re.sub(r"-+", "-", slug).strip("-_") or str(member.id)
+    return (f"bewerbung-{slug}")[:95]
+
+
+async def _ensure_application_channel(
+    member: discord.Member,
+    *,
+    category: str | None,
+    primary: str | None,
+    experienced: bool | None,
+) -> tuple[Optional[discord.TextChannel], str]:
+    """Erstellt/recycelt den privaten Bewerbungsraum für Bewerber.
+
+    Sichtbar sind @everyone ausdrücklich nicht, der Bewerber, die konfigurierte
+    Lead-Rolle und der Bot. Discord-Administratoren können Kanal-Overwrites
+    technisch immer umgehen; das ist eine Discord-Eigenschaft.
+    """
+    if str(category or "") != "applicant":
+        return None, "Keine Bewerber-Kategorie."
+    conf = _application_cfg(member.guild)
+    if not conf.get("enabled"):
+        return None, "Bewerbungs-Chat deaktiviert."
+
+    existing = _application_channel(member.guild, member.id)
+    if existing is not None:
+        return existing, "Vorhandener Bewerbungs-Chat verwendet."
+
+    category_obj = member.guild.get_channel(int(conf.get("category_id") or 0))
+    if not isinstance(category_obj, discord.CategoryChannel):
+        return None, "Keine Bewerbungs-Kategorie konfiguriert."
+    lead_role = member.guild.get_role(int(conf.get("lead_role_id") or 0))
+    if not isinstance(lead_role, discord.Role):
+        return None, "Keine Lead-Rolle für Bewerbungs-Chats konfiguriert."
+
+    me = member.guild.me
+    overwrites: dict[discord.abc.Snowflake, discord.PermissionOverwrite] = {
+        member.guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        member: discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=True,
+            read_message_history=True,
+            attach_files=True,
+            embed_links=True,
+        ),
+        lead_role: discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=True,
+            read_message_history=True,
+            attach_files=True,
+            embed_links=True,
+        ),
+    }
+    if me is not None:
+        overwrites[me] = discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=True,
+            read_message_history=True,
+            manage_channels=True,
+            manage_messages=True,
+        )
+
+    try:
+        channel = await member.guild.create_text_channel(
+            _application_channel_name(member),
+            category=category_obj,
+            overwrites=overwrites,
+            topic=f"Private Bewerbung von {member} · Discord-ID {member.id}",
+            reason=f"Onboarding-Bewerbung von {member} ({member.id})",
+        )
+    except discord.Forbidden:
+        return None, "Dem Bot fehlen Rechte zum Erstellen des Bewerbungs-Chats."
+    except Exception as exc:
+        return None, f"Bewerbungs-Chat konnte nicht erstellt werden: {type(exc).__name__}"
+
+    _set_application_record(member.guild.id, member.id, {
+        "channel_id": int(channel.id),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "status": "open",
+    })
+
+    cat_txt, pri_txt, exp_txt = _onboarding_labels(category, primary, experienced)
+    embed = discord.Embed(
+        title=f"📝 Bewerbung · {member.display_name}",
+        description=(
+            "Dieser Kanal ist für die Bewerbung und Rückfragen zwischen Bewerber und Gildenleitung gedacht.\n"
+            "Die Onboarding-Angaben sind unten zusammengefasst."
+        ),
+        color=discord.Color.orange(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    try:
+        embed.set_thumbnail(url=member.display_avatar.url)
+    except Exception:
+        pass
+    embed.add_field(name="Bewerber", value=f"{member.mention}\n`{member.id}`", inline=True)
+    embed.add_field(name="Rolle", value=pri_txt, inline=True)
+    embed.add_field(name="Erfahrung", value=exp_txt, inline=True)
+    embed.add_field(name="Kategorie", value=cat_txt, inline=True)
+    embed.set_footer(text="Privater Bewerbungs-Chat · wird nicht automatisch gelöscht")
+    try:
+        await channel.send(content=f"{lead_role.mention} · {member.mention}", embed=embed)
+    except Exception:
+        pass
+    return channel, "Bewerbungs-Chat erstellt."
+
+
+async def _post_application_status(
+    member: discord.Member,
+    text: str,
+    *,
+    status: str,
+    actor: Optional[discord.abc.User] = None,
+) -> None:
+    channel = _application_channel(member.guild, member.id)
+    if channel is None:
+        return
+    actor_txt = f" · von {getattr(actor, 'mention', '')}" if actor is not None else ""
+    try:
+        await channel.send(f"{text}{actor_txt}")
+        record = _application_record(member.guild.id, member.id)
+        record["status"] = str(status)
+        record["updated_at"] = datetime.now(timezone.utc).isoformat()
+        _set_application_record(member.guild.id, member.id, record)
+    except Exception:
+        pass
 
 
 def _welcome_setting(guild_id: int, key: str, default: Any) -> Any:
@@ -341,6 +529,21 @@ def _gcfg(guild: discord.Guild) -> dict:
 def _role(guild: discord.Guild, rid: int | None) -> Optional[discord.Role]:
     return guild.get_role(int(rid or 0)) if rid else None
 
+async def _set_pending_applicant_role(member: discord.Member, enabled: bool) -> Optional[discord.Role]:
+    c = _gcfg(member.guild)
+    role = _role(member.guild, (c.get("category_roles") or {}).get("applicant"))
+    if role is None:
+        return None
+    try:
+        if enabled and role not in member.roles:
+            await member.add_roles(role, reason="Onboarding: Bewerberstatus")
+        elif not enabled and role in member.roles:
+            await member.remove_roles(role, reason="Onboarding: Bewerbung abgelehnt")
+    except Exception:
+        pass
+    return role
+
+
 async def _assign_roles(member: discord.Member, category_key: str, primary_key: str, experienced: bool) -> List[discord.Role]:
     out: List[discord.Role] = []
     g = member.guild
@@ -593,8 +796,19 @@ class ReviewView(OnboardingFeatureView):
             primary=self.primary,
             experienced=self.experienced,
         )
+        if self.category == "applicant":
+            await _post_application_status(
+                member,
+                "✅ **Bewerbung/Onboarding akzeptiert.** Die Gildenleitung kann hier die nächsten Schritte mit dir klären.",
+                status="accepted",
+                actor=inter.user,
+            )
+        member_name = discord.utils.escape_markdown(member.display_name or member.name)
         await inter.edit_original_response(
-            content=f"✅ **Akzeptiert** – Rollen: {', '.join(r.mention for r in roles) if roles else '—'}",
+            content=(
+                f"✅ **Akzeptiert:** **{member_name}** ({member.mention}) – Rollen: "
+                f"{', '.join(r.mention for r in roles) if roles else '—'}"
+            ),
             view=None
         )
         _forget_message(self.message_id or (inter.message.id if inter.message else 0))
@@ -612,7 +826,12 @@ class ReviewView(OnboardingFeatureView):
 
         await inter.response.defer()
         member = await self._get_member(inter.guild)
-        await inter.edit_original_response(content="❌ **Abgelehnt**.", view=None)
+        if member is not None:
+            member_name = discord.utils.escape_markdown(member.display_name or member.name)
+            deny_text = f"❌ **Abgelehnt:** **{member_name}** ({member.mention})."
+        else:
+            deny_text = f"❌ **Abgelehnt:** <@{self.member_id}>."
+        await inter.edit_original_response(content=deny_text, view=None)
         _forget_message(self.message_id or (inter.message.id if inter.message else 0))
 
         if member:
@@ -624,6 +843,14 @@ class ReviewView(OnboardingFeatureView):
                 experienced=self.experienced,
                 reason="Die Gildenleitung hat das Onboarding nicht freigegeben.",
             )
+            if self.category == "applicant":
+                await _set_pending_applicant_role(member, False)
+                await _post_application_status(
+                    member,
+                    "❌ **Bewerbung/Onboarding abgelehnt.** Rückfragen können in diesem Kanal geklärt werden.",
+                    status="rejected",
+                    actor=inter.user,
+                )
             try:
                 await member.send("❌ Deine Anfrage wurde **abgelehnt**.")
             except Exception:
@@ -673,20 +900,36 @@ class ExperienceView(OnboardingFeatureView):
 
             exp_txt = "Erfahren" if experienced else "Unerfahren"
 
-            if require:
-                if not review_ch:
-                    await inter.edit_original_response(
-                        content="❌ Review ist aktiviert, aber kein Review-Kanal gesetzt.",
-                        view=None
-                    )
-                    return
+            if require and not review_ch:
+                await inter.edit_original_response(
+                    content="❌ Review ist aktiviert, aber kein Review-Kanal gesetzt.",
+                    view=None
+                )
+                return
 
+            application_channel: Optional[discord.TextChannel] = None
+            application_info = ""
+            if member and self.ctx.category == "applicant":
+                await _set_pending_applicant_role(member, True)
+                application_channel, application_info = await _ensure_application_channel(
+                    member,
+                    category=self.ctx.category,
+                    primary=self.ctx.primary,
+                    experienced=experienced,
+                )
+
+            if require:
                 desc = (
                     f"**Onboarding-Review:** {member.mention if member else f'<@{self.ctx.member_id}>'}\n"
                     f"**Kategorie:** {cat_txt}\n"
                     f"**Rolle:** {pri_txt}\n"
                     f"**Erfahrung:** {exp_txt}"
                 )
+                if self.ctx.category == "applicant":
+                    if application_channel is not None:
+                        desc += f"\n**Bewerbungs-Chat:** {application_channel.mention}"
+                    elif application_info:
+                        desc += f"\n⚠️ **Bewerbungs-Chat:** {application_info}"
 
                 review_view = ReviewView(
                     self.ctx.member_id,
@@ -717,8 +960,11 @@ class ExperienceView(OnboardingFeatureView):
                         primary=self.ctx.primary,
                         experienced=experienced,
                     )
+                user_done_text = "✅ Danke! Deine Angaben wurden zur **Prüfung** an die Gildenleitung gesendet."
+                if application_channel is not None:
+                    user_done_text += f"\n📝 Dein privater Bewerbungs-Chat wurde erstellt: {application_channel.mention}"
                 await inter.edit_original_response(
-                    content="✅ Danke! Deine Angaben wurden zur **Prüfung** an die Gildenleitung gesendet.",
+                    content=user_done_text,
                     view=None
                 )
             else:
@@ -738,7 +984,10 @@ class ExperienceView(OnboardingFeatureView):
                             f"Rollen: {', '.join(r.mention for r in roles) if roles else '—'}"
                         )
 
-                await inter.edit_original_response(content="✅ Danke! Deine Rollen wurden vergeben.", view=None)
+                auto_done_text = "✅ Danke! Deine Rollen wurden vergeben."
+                if application_channel is not None:
+                    auto_done_text += f"\n📝 Dein privater Bewerbungs-Chat wurde erstellt: {application_channel.mention}"
+                await inter.edit_original_response(content=auto_done_text, view=None)
 
             _forget_message(self.ctx.message_id or (inter.message.id if inter.message else 0))
 
@@ -944,6 +1193,46 @@ async def setup_onboarding(client: discord.Client, tree: app_commands.CommandTre
 
         await send_text_channel_picker(inter, "📝 Onboarding-Review-Kanal auswählen", _picked)
 
+    @onboarding_group.command(name="application_chat", description="(Admin) Privaten Bewerbungs-Chat konfigurieren")
+    @app_commands.describe(
+        enabled="Privaten Bewerbungs-Chat für Kategorie Bewerber aktivieren",
+        category="Discord-Kategorie, in der Bewerbungs-Chats erstellt werden",
+        lead_role="Rolle, die zusammen mit dem Bewerber Zugriff bekommt",
+    )
+    async def onboarding_application_chat(
+        inter: discord.Interaction,
+        enabled: bool,
+        category: Optional[discord.CategoryChannel] = None,
+        lead_role: Optional[discord.Role] = None,
+    ):
+        if not _is_admin(inter):
+            await inter.response.send_message("Nur Admins.", ephemeral=True)
+            return
+
+        guild_id = int(inter.guild_id)
+        runtime_db.set_module_setting(guild_id, "onboarding", "application_chat_enabled", bool(enabled))
+        if category is not None:
+            runtime_db.set_module_setting(guild_id, "onboarding", "application_category_id", int(category.id))
+        if lead_role is not None:
+            runtime_db.set_module_setting(guild_id, "onboarding", "application_lead_role_id", int(lead_role.id))
+
+        conf = _application_cfg(inter.guild)
+        cat_obj = inter.guild.get_channel(int(conf.get("category_id") or 0))
+        role_obj = inter.guild.get_role(int(conf.get("lead_role_id") or 0))
+        warnings = []
+        if enabled and not isinstance(cat_obj, discord.CategoryChannel):
+            warnings.append("keine Bewerbungs-Kategorie gesetzt")
+        if enabled and not isinstance(role_obj, discord.Role):
+            warnings.append("keine Lead-Rolle gesetzt")
+        text = (
+            f"✅ Bewerbungs-Chat: **{'aktiv' if enabled else 'deaktiviert'}**\n"
+            f"• Kategorie: {getattr(cat_obj, 'mention', '—')}\n"
+            f"• Lead-Rolle: {role_obj.mention if role_obj else '—'}"
+        )
+        if warnings:
+            text += "\n⚠️ " + ", ".join(warnings) + "."
+        await inter.response.send_message(text, ephemeral=True)
+
     @onboarding_group.command(name="require_review", description="(Admin) Review durch Staff erzwingen")
     async def onboarding_require_review(inter: discord.Interaction, require: bool):
         if not _is_admin(inter):
@@ -983,6 +1272,9 @@ async def setup_onboarding(client: discord.Client, tree: app_commands.CommandTre
         rch = _review_channel(inter.guild)
         wc = _welcome_cfg(inter.guild)
         wch = inter.guild.get_channel(int(wc.get("channel_id") or 0))
+        app_cfg = _application_cfg(inter.guild)
+        app_category = inter.guild.get_channel(int(app_cfg.get("category_id") or 0))
+        app_lead_role = inter.guild.get_role(int(app_cfg.get("lead_role_id") or 0))
 
         def _m(rid):
             r = _role(inter.guild, rid)
@@ -995,7 +1287,10 @@ async def setup_onboarding(client: discord.Client, tree: app_commands.CommandTre
             f"**Welcome-Sprüche:** {len(wc.get('slogans') or [])}\n"
             f"**Leave-Update:** {'Ja' if wc.get('update_on_leave') else 'Nein'}\n"
             f"**Review erforderlich:** {'Ja' if c.get('require_review') else 'Nein'}\n"
-            f"**Review/Log-Kanal:** {rch.mention if rch else '—'}\n\n"
+            f"**Review/Log-Kanal:** {rch.mention if rch else '—'}\n"
+            f"**Bewerbungs-Chat:** {'aktiv' if app_cfg.get('enabled') else 'inaktiv'}\n"
+            f"**Bewerbungs-Kategorie:** {app_category.mention if isinstance(app_category, discord.CategoryChannel) else '—'}\n"
+            f"**Bewerbungs-Lead:** {app_lead_role.mention if app_lead_role else '—'}\n\n"
             f"**Kategorien**\n"
             f"• Gildenmitglied: {_m(cat.get('guild'))}\n"
             f"• Allianzmitglied: {_m(cat.get('ally'))}\n"
