@@ -60,6 +60,12 @@ MODULES: tuple[ModuleDefinition, ...] = (
         core=True,
     ),
     ModuleDefinition(
+        "member_activity",
+        "Mitgliederaktivität & Rückmeldungen",
+        "Discord-Aktivität, Voice-Zeit und Event-Rückmeldungen in Mitgliederprofilen.",
+        "📈",
+    ),
+    ModuleDefinition(
         "attendance",
         "Attendance",
         "Raid-Anwesenheit, Reviews, Statistiken und optionale Voice-Vorschläge.",
@@ -246,6 +252,7 @@ def required_modules_for_dashboard_path(path: str) -> tuple[str, ...]:
         (("/needs", "/character-editor", "/api/needs", "/export/needs",), "needlists"),
         (("/portal", "/my-profile", "/admin-portal", "/api/portal/", "/api/need-change-requests"), "member_portal"),
         (("/voice", "/api/voice"), "voice"),
+        (("/member-activity",), "member_activity"),
         (("/analytics", "/planning", "/fairness", "/api/analytics", "/api/planning", "/api/fairness", "/api/leadership", "/export/fairness"), "analytics"),
         (("/items", "/api/items"), "game_database"),
         (("/tnl/builds",), "game_integration"),

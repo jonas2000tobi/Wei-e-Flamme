@@ -1,5 +1,6 @@
 from __future__ import annotations
 import json
+import asyncio
 import os
 import threading
 import re
@@ -99,6 +100,97 @@ def _gcfg(guild_id: int) -> dict:
     return c
 
 
+
+def _ticket_db_init() -> None:
+    if not getattr(runtime_db,'_INITIALIZED',False): runtime_db.init_runtime_db()
+    backend=getattr(runtime_db,'_BACKEND','sqlite')
+    schemas=[
+    '''CREATE TABLE IF NOT EXISTS leader_tickets (id {ID}, guild_id {BIG} NOT NULL, creator_user_id {BIG}, creator_name TEXT NOT NULL DEFAULT '', anonymous {BOOL} NOT NULL DEFAULT {FALSE}, subject TEXT NOT NULL DEFAULT '', original_message TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'open', assigned_to_id {BIG}, assigned_to_name TEXT NOT NULL DEFAULT '', discord_internal_channel_id {BIG}, discord_internal_message_id {BIG}, ticket_channel_id {BIG}, created_at TEXT NOT NULL, claimed_at TEXT, closed_at TEXT, closed_by_id {BIG}, closed_by_name TEXT NOT NULL DEFAULT '')''',
+    '''CREATE TABLE IF NOT EXISTS leader_ticket_messages (id {ID}, ticket_id {BIG} NOT NULL, guild_id {BIG} NOT NULL, discord_message_id {BIG}, author_id {BIG}, author_name TEXT NOT NULL DEFAULT '', content TEXT NOT NULL DEFAULT '', attachments_json TEXT NOT NULL DEFAULT '[]', created_at TEXT NOT NULL)''',
+    '''CREATE TABLE IF NOT EXISTS leader_ticket_notes (id {ID}, ticket_id {BIG} NOT NULL, guild_id {BIG} NOT NULL, author_id {BIG}, author_name TEXT NOT NULL DEFAULT '', content TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL)''',
+    '''CREATE TABLE IF NOT EXISTS leader_ticket_actions (id {ID}, ticket_id {BIG} NOT NULL, guild_id {BIG} NOT NULL, action_type TEXT NOT NULL, actor_id {BIG}, actor_name TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'pending', result_text TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, processed_at TEXT)''']
+    if backend=='postgres':
+        conn=runtime_db._pg_connect();
+        try:
+            with conn.cursor() as cur:
+                for q in schemas: cur.execute(q.format(ID='BIGSERIAL PRIMARY KEY',BIG='BIGINT',BOOL='BOOLEAN',FALSE='FALSE'))
+            conn.commit()
+        finally: conn.close()
+    else:
+        conn=runtime_db._sqlite_connect();
+        try:
+            for q in schemas: conn.execute(q.format(ID='INTEGER PRIMARY KEY AUTOINCREMENT',BIG='INTEGER',BOOL='INTEGER',FALSE='0'))
+            conn.commit()
+        finally: conn.close()
+
+def _ticket_create(guild_id:int, creator_id:int|None, creator_name:str, anonymous:bool, subject:str, message:str, internal_channel_id:int, internal_message_id:int)->int:
+    _ticket_db_init(); now=datetime.now(TZ).isoformat(); backend=getattr(runtime_db,'_BACKEND','sqlite')
+    vals=(guild_id,creator_id,creator_name,bool(anonymous),subject,message,internal_channel_id,internal_message_id,now)
+    if backend=='postgres':
+        conn=runtime_db._pg_connect();
+        try:
+            with conn.cursor() as cur:
+                cur.execute('''INSERT INTO leader_tickets(guild_id,creator_user_id,creator_name,anonymous,subject,original_message,discord_internal_channel_id,discord_internal_message_id,created_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id''',vals); row=cur.fetchone()
+            conn.commit(); return int((row or {}).get('id') or 0)
+        finally: conn.close()
+    conn=runtime_db._sqlite_connect();
+    try:
+        cur=conn.execute('''INSERT INTO leader_tickets(guild_id,creator_user_id,creator_name,anonymous,subject,original_message,discord_internal_channel_id,discord_internal_message_id,created_at) VALUES(?,?,?,?,?,?,?,?,?)''',vals); conn.commit(); return int(cur.lastrowid or 0)
+    finally: conn.close()
+
+def _ticket_by_internal_message(guild_id:int,message_id:int)->dict:
+    _ticket_db_init(); backend=getattr(runtime_db,'_BACKEND','sqlite');
+    if backend=='postgres':
+        conn=runtime_db._pg_connect();
+        try:
+            with conn.cursor() as cur: cur.execute('SELECT * FROM leader_tickets WHERE guild_id=%s AND discord_internal_message_id=%s',(guild_id,message_id)); row=cur.fetchone(); return dict(row) if row else {}
+        finally: conn.close()
+    conn=runtime_db._sqlite_connect();
+    try:
+        row=conn.execute('SELECT * FROM leader_tickets WHERE guild_id=? AND discord_internal_message_id=?',(guild_id,message_id)).fetchone(); return dict(row) if row else {}
+    finally: conn.close()
+
+def _ticket_by_id(ticket_id:int)->dict:
+    _ticket_db_init(); backend=getattr(runtime_db,'_BACKEND','sqlite')
+    if backend=='postgres':
+        conn=runtime_db._pg_connect()
+        try:
+            with conn.cursor() as cur: cur.execute('SELECT * FROM leader_tickets WHERE id=%s',(int(ticket_id),)); row=cur.fetchone(); return dict(row) if row else {}
+        finally: conn.close()
+    conn=runtime_db._sqlite_connect()
+    try:
+        row=conn.execute('SELECT * FROM leader_tickets WHERE id=?',(int(ticket_id),)).fetchone(); return dict(row) if row else {}
+    finally: conn.close()
+
+def _ticket_update(ticket_id:int, **fields)->None:
+    if not ticket_id or not fields:return
+    allowed={'status','assigned_to_id','assigned_to_name','claimed_at','ticket_channel_id','closed_at','closed_by_id','closed_by_name'}; data={k:v for k,v in fields.items() if k in allowed}
+    if not data:return
+    _ticket_db_init(); backend=getattr(runtime_db,'_BACKEND','sqlite'); cols=list(data); vals=[data[k] for k in cols]
+    if backend=='postgres':
+        conn=runtime_db._pg_connect();
+        try:
+            with conn.cursor() as cur: cur.execute('UPDATE leader_tickets SET '+','.join(f'{k}=%s' for k in cols)+' WHERE id=%s',tuple(vals+[ticket_id]))
+            conn.commit()
+        finally: conn.close()
+    else:
+        conn=runtime_db._sqlite_connect();
+        try: conn.execute('UPDATE leader_tickets SET '+','.join(f'{k}=?' for k in cols)+' WHERE id=?',tuple(vals+[ticket_id])); conn.commit()
+        finally: conn.close()
+
+def _ticket_add_message(ticket_id:int,guild_id:int,msg:discord.Message)->None:
+    _ticket_db_init(); atts=json.dumps([{'name':a.filename,'url':a.url} for a in msg.attachments],ensure_ascii=False); now=(msg.created_at or datetime.now(TZ)).isoformat(); vals=(ticket_id,guild_id,msg.id,msg.author.id,getattr(msg.author,'display_name',msg.author.name),msg.content or '',atts,now); backend=getattr(runtime_db,'_BACKEND','sqlite')
+    if backend=='postgres':
+        conn=runtime_db._pg_connect();
+        try:
+            with conn.cursor() as cur: cur.execute('INSERT INTO leader_ticket_messages(ticket_id,guild_id,discord_message_id,author_id,author_name,content,attachments_json,created_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s)',vals)
+            conn.commit()
+        finally: conn.close()
+    else:
+        conn=runtime_db._sqlite_connect();
+        try: conn.execute('INSERT INTO leader_ticket_messages(ticket_id,guild_id,discord_message_id,author_id,author_name,content,attachments_json,created_at) VALUES(?,?,?,?,?,?,?,?)',vals); conn.commit()
+        finally: conn.close()
+
 def _is_admin(inter: discord.Interaction) -> bool:
     perms = getattr(inter.user, "guild_permissions", None)
     return bool(perms and (perms.administrator or perms.manage_guild))
@@ -126,22 +218,18 @@ def _archive_channel(guild: discord.Guild) -> Optional[discord.abc.Messageable]:
     return ch if isinstance(ch, (discord.TextChannel, discord.Thread)) else None
 
 
+async def _resolve_archive_channel_for_guild(client:discord.Client, guild:discord.Guild) -> Optional[discord.abc.Messageable]:
+    ch_id=int((_gcfg(guild.id).get("archive_channel_id") or 0))
+    if not ch_id:return None
+    ch=guild.get_channel(ch_id)
+    if isinstance(ch,(discord.TextChannel,discord.Thread)):return ch
+    try: fetched=await client.fetch_channel(ch_id)
+    except Exception:return None
+    return fetched if isinstance(fetched,(discord.TextChannel,discord.Thread)) else None
+
 async def _resolve_archive_channel(inter: discord.Interaction) -> Optional[discord.abc.Messageable]:
-    """Archivkanal robust auflösen, auch wenn er noch nicht im Guild-Cache steckt."""
-    guild = inter.guild
-    if guild is None:
-        return None
-    ch_id = int((_gcfg(guild.id).get("archive_channel_id") or 0))
-    if not ch_id:
-        return None
-    ch = guild.get_channel(ch_id)
-    if isinstance(ch, (discord.TextChannel, discord.Thread)):
-        return ch
-    try:
-        fetched = await inter.client.fetch_channel(ch_id)
-    except Exception:
-        return None
-    return fetched if isinstance(fetched, (discord.TextChannel, discord.Thread)) else None
+    if inter.guild is None:return None
+    return await _resolve_archive_channel_for_guild(inter.client, inter.guild)
 
 
 def _ticket_category(guild: discord.Guild) -> Optional[discord.CategoryChannel]:
@@ -184,42 +272,28 @@ def _replace_status_field(embed: discord.Embed, text: str) -> discord.Embed:
     return new_embed
 
 
-async def _archive_ticket(inter: discord.Interaction, embed: discord.Embed, actor_name: str) -> tuple[bool, Optional[discord.abc.Messageable], str]:
-    guild = inter.guild
-    if guild is None:
-        return False, None, "Guild nicht verfügbar."
-    archive_ch = await _resolve_archive_channel(inter)
-    if archive_ch is None:
-        return False, None, "Kein gültiger Archivkanal konfiguriert oder Kanal nicht erreichbar."
-
-    # Rechte vorab verständlich prüfen. Bei Threads entscheidet Discord zusätzlich
-    # über Thread-Rechte; der Send-Versuch unten bleibt die endgültige Wahrheit.
-    if isinstance(archive_ch, discord.TextChannel):
-        me = guild.me
+async def _archive_ticket_message(client:discord.Client,guild:discord.Guild,message:discord.Message,embed:discord.Embed,actor_name:str,actor_id:int=0)->tuple[bool,Optional[discord.abc.Messageable],str]:
+    archive_ch=await _resolve_archive_channel_for_guild(client,guild)
+    if archive_ch is None:return False,None,"Kein gültiger Archivkanal konfiguriert oder Kanal nicht erreichbar."
+    if isinstance(archive_ch,discord.TextChannel):
+        me=guild.me
         if me is not None:
-            perms = archive_ch.permissions_for(me)
-            if not perms.view_channel or not perms.send_messages:
-                return False, archive_ch, "Dem Bot fehlt im Archivkanal `Kanal ansehen` oder `Nachrichten senden`."
+            perms=archive_ch.permissions_for(me)
+            if not perms.view_channel or not perms.send_messages:return False,archive_ch,"Dem Bot fehlt im Archivkanal `Kanal ansehen` oder `Nachrichten senden`."
+    try: archived=discord.Embed.from_dict(embed.to_dict())
+    except Exception: archived=embed
+    actor=f"<@{int(actor_id)}>" if actor_id else f"**{_safe_text(actor_name)}**"
+    archived.add_field(name="Archiviert von",value=actor,inline=False)
+    archived.add_field(name="Ursprung",value=f"<#{message.channel.id}> · Nachricht `{message.id}`",inline=False)
+    old_footer=str(getattr(getattr(archived,"footer",None),"text","") or "").strip(); stamp=datetime.now(TZ).strftime("%d.%m.%Y %H:%M")
+    archived.set_footer(text=(old_footer+" · " if old_footer else "")+f"Archiviert {stamp}")
+    try:await archive_ch.send(embed=archived,allowed_mentions=discord.AllowedMentions.none())
+    except Exception as exc:return False,archive_ch,f"{type(exc).__name__}: {exc}"
+    return True,archive_ch,""
 
-    try:
-        archived = discord.Embed.from_dict(embed.to_dict())
-    except Exception:
-        archived = embed
-
-    actor = getattr(inter.user, "mention", None) or f"**{_safe_text(actor_name)}**"
-    source = "—"
-    if inter.message is not None:
-        source = f"<#{inter.message.channel.id}> · Nachricht `{inter.message.id}`"
-    archived.add_field(name="Archiviert von", value=str(actor), inline=False)
-    archived.add_field(name="Ursprung", value=source, inline=False)
-    old_footer = str(getattr(getattr(archived, "footer", None), "text", "") or "").strip()
-    stamp = datetime.now(TZ).strftime("%d.%m.%Y %H:%M")
-    archived.set_footer(text=(old_footer + " · " if old_footer else "") + f"Archiviert {stamp}")
-    try:
-        await archive_ch.send(embed=archived, allowed_mentions=discord.AllowedMentions.none())
-    except Exception as exc:
-        return False, archive_ch, f"{type(exc).__name__}: {exc}"
-    return True, archive_ch, ""
+async def _archive_ticket(inter:discord.Interaction,embed:discord.Embed,actor_name:str)->tuple[bool,Optional[discord.abc.Messageable],str]:
+    if inter.guild is None or inter.message is None:return False,None,"Guild/Nachricht nicht verfügbar."
+    return await _archive_ticket_message(inter.client,inter.guild,inter.message,embed,actor_name,int(getattr(inter.user,"id",0) or 0))
 
 
 
@@ -276,84 +350,41 @@ def _existing_ticket_channel(guild: discord.Guild, source_message_id: int) -> Op
     return None
 
 
-async def _ensure_private_ticket_channel(inter: discord.Interaction) -> tuple[Optional[discord.TextChannel], str]:
-    if inter.guild is None or inter.message is None or not inter.message.embeds:
-        return None, "Ticket-Nachricht nicht gefunden."
-    embed = inter.message.embeds[0]
-    member = _ticket_member_from_embed(inter.guild, embed)
-    if member is None:
-        return None, "Für anonyme Meldungen kann kein privater Ticket-Chat geöffnet werden."
-
-    existing = _existing_ticket_channel(inter.guild, int(inter.message.id))
-    if existing is not None:
-        return existing, "Vorhandener Ticket-Chat verwendet."
-
-    leader_role = _leader_role(inter.guild)
-    if not isinstance(leader_role, discord.Role):
-        return None, "Keine Leader-Rolle konfiguriert."
-    internal = _internal_channel(inter.guild)
-    category = _ticket_category(inter.guild)
-    if category is None:
-        category = internal.category if isinstance(internal, discord.TextChannel) else None
-    me = inter.guild.me
-
-    overwrites: dict[discord.abc.Snowflake, discord.PermissionOverwrite] = {
-        inter.guild.default_role: discord.PermissionOverwrite(view_channel=False),
-        member: discord.PermissionOverwrite(
-            view_channel=True,
-            send_messages=True,
-            read_message_history=True,
-            attach_files=True,
-            embed_links=True,
-        ),
-        leader_role: discord.PermissionOverwrite(
-            view_channel=True,
-            send_messages=True,
-            read_message_history=True,
-            attach_files=True,
-            embed_links=True,
-        ),
+async def _ensure_private_ticket_channel_for_message(guild:discord.Guild, message:discord.Message) -> tuple[Optional[discord.TextChannel], str]:
+    if not message.embeds:return None,"Ticket-Nachricht nicht gefunden."
+    embed=message.embeds[0]
+    member=_ticket_member_from_embed(guild,embed)
+    if member is None:return None,"Für anonyme Meldungen kann kein privater Ticket-Chat geöffnet werden."
+    existing=_existing_ticket_channel(guild,int(message.id))
+    if existing is not None:return existing,"Vorhandener Ticket-Chat verwendet."
+    leader_role=_leader_role(guild)
+    if not isinstance(leader_role,discord.Role):return None,"Keine Leader-Rolle konfiguriert."
+    internal=_internal_channel(guild); category=_ticket_category(guild)
+    if category is None:category=internal.category if isinstance(internal,discord.TextChannel) else None
+    me=guild.me
+    overwrites={
+        guild.default_role:discord.PermissionOverwrite(view_channel=False),
+        member:discord.PermissionOverwrite(view_channel=True,send_messages=True,read_message_history=True,attach_files=True,embed_links=True),
+        leader_role:discord.PermissionOverwrite(view_channel=True,send_messages=True,read_message_history=True,attach_files=True,embed_links=True),
     }
-    if me is not None:
-        overwrites[me] = discord.PermissionOverwrite(
-            view_channel=True,
-            send_messages=True,
-            read_message_history=True,
-            manage_channels=True,
-            manage_messages=True,
-        )
-
+    if me is not None:overwrites[me]=discord.PermissionOverwrite(view_channel=True,send_messages=True,read_message_history=True,manage_channels=True,manage_messages=True)
     try:
-        channel = await inter.guild.create_text_channel(
-            _ticket_channel_slug(member, int(inter.message.id)),
-            category=category,
-            overwrites=overwrites,
-            topic=f"Privater Leader-Contact-Chat mit {member} · Leader-Ticket Message-ID {inter.message.id}",
-            reason=f"Leader-Contact Ticket für {member} ({member.id})",
-        )
-    except discord.Forbidden:
-        return None, "Dem Bot fehlen Rechte zum Erstellen eines privaten Ticket-Channels."
-    except Exception as exc:
-        return None, f"Ticket-Channel konnte nicht erstellt werden: {type(exc).__name__}: {exc}"
+        channel=await guild.create_text_channel(_ticket_channel_slug(member,int(message.id)),category=category,overwrites=overwrites,topic=f"Privater Leader-Contact-Chat mit {member} · Leader-Ticket Message-ID {message.id}",reason=f"Leader-Contact Ticket für {member} ({member.id})")
+    except discord.Forbidden:return None,"Dem Bot fehlen Rechte zum Erstellen eines privaten Ticket-Channels."
+    except Exception as exc:return None,f"Ticket-Channel konnte nicht erstellt werden: {type(exc).__name__}: {exc}"
+    summary=discord.Embed(title=f"📨 Leader-Ticket · {member.display_name}",description="Privater Gesprächskanal zwischen Mitglied und Gildenleitung.",color=discord.Color.blurple(),timestamp=datetime.now(TZ))
+    summary.add_field(name="Mitglied",value=member.mention,inline=False)
+    summary.add_field(name="Thema",value=(_embed_field_value(embed,"Thema") or "—")[:1024],inline=False)
+    summary.add_field(name="Ursprüngliche Nachricht",value=(_embed_field_value(embed,"Nachricht") or "—")[:1024],inline=False)
+    summary.add_field(name="Leader-Ticket",value=message.jump_url,inline=False)
+    try:summary.set_thumbnail(url=member.display_avatar.url)
+    except Exception:pass
+    await channel.send(content=member.mention,embed=summary,allowed_mentions=discord.AllowedMentions(users=True,roles=False,everyone=False))
+    return channel,"Ticket-Chat erstellt."
 
-    summary = discord.Embed(
-        title=f"📨 Leader-Ticket · {member.display_name}",
-        description="Privater Gesprächskanal zwischen Mitglied und Gildenleitung.",
-        color=discord.Color.blurple(),
-        timestamp=datetime.now(TZ),
-    )
-    topic = _embed_field_value(embed, "Thema") or "—"
-    message = _embed_field_value(embed, "Nachricht") or "—"
-    summary.add_field(name="Mitglied", value=member.mention, inline=False)
-    summary.add_field(name="Thema", value=topic[:1024], inline=False)
-    summary.add_field(name="Ursprüngliche Nachricht", value=message[:1024], inline=False)
-    summary.add_field(name="Leader-Ticket", value=inter.message.jump_url, inline=False)
-    try:
-        summary.set_thumbnail(url=member.display_avatar.url)
-    except Exception:
-        pass
-    await channel.send(content=member.mention, embed=summary, allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False))
-    return channel, "Ticket-Chat erstellt."
+async def _ensure_private_ticket_channel(inter:discord.Interaction)->tuple[Optional[discord.TextChannel],str]:
+    if inter.guild is None or inter.message is None:return None,"Ticket-Nachricht nicht gefunden."
+    return await _ensure_private_ticket_channel_for_message(inter.guild,inter.message)
 
 class LeaderStatusView(View):
     def __init__(self, anonymous: bool = False):
@@ -398,6 +429,9 @@ class LeaderStatusView(View):
     async def btn_claim(self, inter: discord.Interaction, _):
         name = inter.user.display_name if hasattr(inter.user, "display_name") else inter.user.name
         await self._edit_status(inter, f"👀 Übernommen von **{_safe_text(name)}**")
+        try:
+            t=_ticket_by_internal_message(inter.guild.id,inter.message.id); _ticket_update(int(t.get('id') or 0),status='claimed',assigned_to_id=int(inter.user.id),assigned_to_name=name,claimed_at=datetime.now(TZ).isoformat())
+        except Exception: pass
 
     @button(label="💬 Ticket öffnen", style=ButtonStyle.secondary, custom_id="leader_status_open_chat")
     async def btn_open_chat(self, inter: discord.Interaction, _):
@@ -417,6 +451,9 @@ class LeaderStatusView(View):
             await inter.message.edit(embed=updated, view=self)
         except Exception:
             pass
+        try:
+            t=_ticket_by_internal_message(inter.guild.id,inter.message.id); _ticket_update(int(t.get('id') or 0),status='conversation',ticket_channel_id=int(channel.id))
+        except Exception: pass
         await inter.followup.send(f"✅ {info} {channel.mention}", ephemeral=True)
 
     @button(label="✅ Erledigt", style=ButtonStyle.success, custom_id="leader_status_done")
@@ -437,6 +474,11 @@ class LeaderStatusView(View):
                 await ticket_ch.send(f"✅ Dieses Leader-Ticket wurde von {inter.user.mention} als **erledigt** markiert.", allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False))
             except Exception:
                 pass
+        t={}
+        try:
+            t=_ticket_by_internal_message(inter.guild.id,inter.message.id)
+        except Exception as exc:
+            print(f"[leader_contact] Ticket laden fehlgeschlagen: {exc!r}")
         ok, archive_ch, archive_error = await _archive_ticket(inter, new_embed, name)
         if not ok:
             # Niemals das Original löschen, solange die Archivkopie nicht bestätigt ist.
@@ -446,7 +488,7 @@ class LeaderStatusView(View):
                 pass
             if archive_ch is None and "Kein gültiger Archivkanal" in archive_error:
                 await inter.followup.send(
-                    "✅ Status auf erledigt gesetzt, aber **nicht archiviert**. "
+                    "❌ Ticket wurde **nicht abgeschlossen**, weil die Archivkopie fehlt. "
                     "Bitte `/leader archive_channel` bzw. `leader_contact_archive` prüfen. "
                     f"Details: {archive_error}",
                     ephemeral=True,
@@ -458,6 +500,16 @@ class LeaderStatusView(View):
                     ephemeral=True,
                 )
             return
+
+        # Erst nach bestätigter Discord-Archivkopie dauerhaft abschließen.
+        try:
+            _ticket_update(int(t.get('id') or 0),status='done',closed_at=datetime.now(TZ).isoformat(),closed_by_id=int(inter.user.id),closed_by_name=name)
+            if ticket_ch is not None and t.get('creator_user_id'):
+                member=inter.guild.get_member(int(t.get('creator_user_id')))
+                if member:
+                    await ticket_ch.set_permissions(member,view_channel=True,send_messages=False,read_message_history=True)
+        except Exception as exc:
+            print(f"[leader_contact] Ticket close DB/lock fehlgeschlagen: {exc!r}")
 
         try:
             await inter.message.delete()
@@ -560,11 +612,13 @@ class ContactModal(Modal):
             emb.set_footer(text=f"{now.strftime('%d.%m.%Y %H:%M')} (Europe/Berlin)")
 
         try:
-            await internal_ch.send(
-                content=ping_txt,
-                embed=emb,
-                view=LeaderStatusView(anonymous=self.anonymous)
+            sent_ticket = await internal_ch.send(
+                content=ping_txt, embed=emb, view=LeaderStatusView(anonymous=self.anonymous)
             )
+            try:
+                _ticket_create(guild.id, None if self.anonymous else int(inter.user.id), "Anonym" if self.anonymous else str(getattr(inter.user,'display_name',inter.user.name)), self.anonymous, topic, msg, int(sent_ticket.channel.id), int(sent_ticket.id))
+            except Exception as exc:
+                print(f"[leader_contact] Ticket-DB create fehlgeschlagen: {exc!r}")
         except Exception as e:
             await inter.response.send_message(f"❌ Konnte Anfrage nicht senden: {e}", ephemeral=True)
             return
@@ -596,7 +650,126 @@ class LeaderContactView(View):
         await inter.response.send_modal(ContactModal(anonymous=True))
 
 
+
+def _ticket_action_finish(action_id:int,status:str,result_text:str)->None:
+    backend=getattr(runtime_db,'_BACKEND','sqlite'); now=datetime.now(TZ).isoformat()
+    if backend=='postgres':
+        conn=runtime_db._pg_connect()
+        try:
+            with conn.cursor() as cur:cur.execute('UPDATE leader_ticket_actions SET status=%s,result_text=%s,processed_at=%s WHERE id=%s',(status,result_text[:1000],now,action_id))
+            conn.commit()
+        finally:conn.close()
+    else:
+        conn=runtime_db._sqlite_connect()
+        try:conn.execute('UPDATE leader_ticket_actions SET status=?,result_text=?,processed_at=? WHERE id=?',(status,result_text[:1000],now,action_id));conn.commit()
+        finally:conn.close()
+
+async def _process_ticket_dashboard_action(client:discord.Client,row:dict)->str:
+    ticket=_ticket_by_id(int(row.get('ticket_id') or 0)); guild=client.get_guild(int(row.get('guild_id') or 0))
+    if not ticket or guild is None:raise RuntimeError('Ticket oder Guild nicht gefunden.')
+    ch=guild.get_channel(int(ticket.get('discord_internal_channel_id') or 0))
+    if ch is None:
+        try:ch=await client.fetch_channel(int(ticket.get('discord_internal_channel_id') or 0))
+        except Exception:ch=None
+    if ch is None:raise RuntimeError('Interner Leader-Channel nicht gefunden.')
+    try:message=await ch.fetch_message(int(ticket.get('discord_internal_message_id') or 0))
+    except Exception as exc:raise RuntimeError(f'Ticket-Nachricht nicht gefunden: {exc}')
+    if not message.embeds:raise RuntimeError('Ticket-Embed nicht gefunden.')
+    action=str(row.get('action_type') or ''); actor_name=str(row.get('actor_name') or row.get('actor_id') or 'Dashboard'); actor_id=int(row.get('actor_id') or 0)
+    view=LeaderStatusView(anonymous=bool(ticket.get('anonymous')))
+    if action=='claim':
+        emb=_replace_status_field(message.embeds[0],f"👀 Übernommen von **{_safe_text(actor_name)}**")
+        await message.edit(embed=emb,view=view);_ticket_update(int(ticket['id']),status='claimed',assigned_to_id=actor_id or None,assigned_to_name=actor_name,claimed_at=datetime.now(TZ).isoformat());return 'Ticket übernommen.'
+    if action=='open_chat':
+        if bool(ticket.get('anonymous')):raise RuntimeError('Anonyme Tickets können keinen privaten Chat öffnen.')
+        channel,info=await _ensure_private_ticket_channel_for_message(guild,message)
+        if channel is None:raise RuntimeError(info)
+        emb=_replace_or_add_field(message.embeds[0],'Ticket-Chat',channel.mention,inline=False);await message.edit(embed=emb,view=view);_ticket_update(int(ticket['id']),status='conversation',ticket_channel_id=int(channel.id));return info
+    if action=='done':
+        emb=_replace_status_field(message.embeds[0],f"✅ Erledigt von **{_safe_text(actor_name)}**")
+        ticket_ch=_existing_ticket_channel(guild,int(message.id))
+        ok,archive_ch,err=await _archive_ticket_message(client,guild,message,emb,actor_name,actor_id)
+        if not ok:raise RuntimeError(err)
+        _ticket_update(int(ticket['id']),status='done',closed_at=datetime.now(TZ).isoformat(),closed_by_id=actor_id or None,closed_by_name=actor_name)
+        if ticket_ch is not None and ticket.get('creator_user_id'):
+            member=guild.get_member(int(ticket.get('creator_user_id')))
+            if member:await ticket_ch.set_permissions(member,view_channel=True,send_messages=False,read_message_history=True)
+            try:await ticket_ch.send(f"✅ Dieses Leader-Ticket wurde von **{_safe_text(actor_name)}** als **erledigt** markiert.",allowed_mentions=discord.AllowedMentions.none())
+            except Exception:pass
+        await message.delete();return f"Ticket erledigt und nach {getattr(archive_ch,'mention','#Archiv')} archiviert."
+    raise RuntimeError('Unbekannte Ticket-Aktion.')
+
+async def _ticket_dashboard_action_loop(client:discord.Client)->None:
+    await client.wait_until_ready()
+    while not client.is_closed():
+        try:
+            _ticket_db_init();backend=getattr(runtime_db,'_BACKEND','sqlite');rows=[]
+            if backend=='postgres':
+                conn=runtime_db._pg_connect()
+                try:
+                    with conn.cursor() as cur:cur.execute("SELECT * FROM leader_ticket_actions WHERE status='pending' ORDER BY id LIMIT 20");rows=[dict(r) for r in cur.fetchall()]
+                finally:conn.close()
+            else:
+                conn=runtime_db._sqlite_connect()
+                try:rows=[dict(r) for r in conn.execute("SELECT * FROM leader_ticket_actions WHERE status='pending' ORDER BY id LIMIT 20").fetchall()]
+                finally:conn.close()
+            for row in rows:
+                try:res=await _process_ticket_dashboard_action(client,row);_ticket_action_finish(int(row['id']),'done',res)
+                except Exception as exc:_ticket_action_finish(int(row['id']),'error',f'{type(exc).__name__}: {exc}')
+        except Exception as exc:print(f"[leader_contact] Dashboard-Ticket-Queue: {exc!r}")
+        await asyncio.sleep(5)
+
+async def _ticket_cleanup_loop(client:discord.Client) -> None:
+    await client.wait_until_ready()
+    while not client.is_closed():
+        try:
+            _ticket_db_init(); backend=getattr(runtime_db,'_BACKEND','sqlite'); rows=[]
+            if backend=='postgres':
+                conn=runtime_db._pg_connect()
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT id,guild_id,ticket_channel_id,closed_at FROM leader_tickets WHERE status='done' AND ticket_channel_id IS NOT NULL AND closed_at IS NOT NULL")
+                        rows=[dict(r) for r in cur.fetchall()]
+                finally: conn.close()
+            else:
+                conn=runtime_db._sqlite_connect()
+                try: rows=[dict(r) for r in conn.execute("SELECT id,guild_id,ticket_channel_id,closed_at FROM leader_tickets WHERE status='done' AND ticket_channel_id IS NOT NULL AND closed_at IS NOT NULL").fetchall()]
+                finally: conn.close()
+            now=datetime.now(TZ)
+            for row in rows:
+                try:
+                    closed=datetime.fromisoformat(str(row.get('closed_at')).replace('Z','+00:00'))
+                    if closed.tzinfo is None: closed=closed.replace(tzinfo=TZ)
+                    if (now-closed.astimezone(TZ)).total_seconds() < 7*86400: continue
+                    guild=client.get_guild(int(row.get('guild_id') or 0)); channel=guild.get_channel(int(row.get('ticket_channel_id') or 0)) if guild else None
+                    if channel is not None:
+                        try: await channel.delete(reason='Leader-Ticket seit 7 Tagen erledigt')
+                        except Exception: continue
+                    _ticket_update(int(row.get('id') or 0),ticket_channel_id=None)
+                except Exception: continue
+        except Exception as exc: print(f"[leader_contact] Ticket-Cleanup: {exc!r}")
+        await asyncio.sleep(21600)
+
 async def setup_leader_contact(client: discord.Client, tree: app_commands.CommandTree):
+    _ticket_db_init()
+    asyncio.create_task(_ticket_cleanup_loop(client))
+    asyncio.create_task(_ticket_dashboard_action_loop(client))
+    async def _ticket_message_listener(message:discord.Message):
+        if not message.guild or message.author.bot: return
+        try:
+            backend=getattr(runtime_db,'_BACKEND','sqlite')
+            if backend=='postgres':
+                conn=runtime_db._pg_connect();
+                try:
+                    with conn.cursor() as cur: cur.execute("SELECT id FROM leader_tickets WHERE guild_id=%s AND ticket_channel_id=%s AND status IN ('conversation','claimed','open') ORDER BY id DESC LIMIT 1",(message.guild.id,message.channel.id)); row=cur.fetchone()
+                finally: conn.close()
+            else:
+                conn=runtime_db._sqlite_connect();
+                try: row=conn.execute("SELECT id FROM leader_tickets WHERE guild_id=? AND ticket_channel_id=? AND status IN ('conversation','claimed','open') ORDER BY id DESC LIMIT 1",(message.guild.id,message.channel.id)).fetchone()
+                finally: conn.close()
+            if row: _ticket_add_message(int(dict(row).get('id') or 0),message.guild.id,message)
+        except Exception as exc: print(f"[leader_contact] ticket message log: {exc!r}")
+    client.add_listener(_ticket_message_listener,'on_message')
     leader_group = FeatureGroup(module_key="leader_contact", 
         name="leader",
         description="Kontakt zur Gildenleitung verwalten",

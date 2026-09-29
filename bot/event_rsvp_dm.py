@@ -2221,6 +2221,24 @@ async def event_reminder_loop():
         save_store()
 
 
+
+def _activity_existing_choice(obj: dict, user_id: int) -> str:
+    uid=int(user_id)
+    for role_key in ("TANK","HEAL","DPS","BANK"):
+        if any(_entry_user_id(e)==uid for e in obj.get("yes",{}).get(role_key,[]) or []): return role_key
+    if any(_entry_user_id(e)==uid for e in obj.get("no",[]) or []): return "NO"
+    if str(uid) in (obj.get("maybe",{}) or {}): return "MAYBE"
+    return ""
+
+def _record_member_activity_rsvp(guild_id:int,user_id:int,event_id:str,old_choice:str,new_choice:str)->None:
+    try:
+        from bot.member_activity import record_event_response
+    except Exception:
+        try: from member_activity import record_event_response
+        except Exception: return
+    try: record_event_response(guild_id,user_id,event_id,old_choice,new_choice)
+    except Exception as exc: print(f"[activity] RSVP logging failed: {exc!r}")
+
 async def apply_rsvp(inter: discord.Interaction, msg_id: str, group: str) -> tuple[bool, str]:
     obj = store.get(str(msg_id))
 
@@ -2238,6 +2256,8 @@ async def apply_rsvp(inter: discord.Interaction, msg_id: str, group: str) -> tup
     member = _member_from_event(inter, obj)
     display_name = _current_display_name(member, inter.user)
     guild_label, source_guild_id = _source_label_for_inter(inter, obj) if _is_alliance_event(obj) else ("", int(inter.guild_id or obj.get("guild_id", 0) or 0))
+
+    previous_choice = _activity_existing_choice(obj, uid)
 
     if group in ("TANK", "HEAL", "DPS"):
         response_key = "yes"
@@ -2289,6 +2309,7 @@ async def apply_rsvp(inter: discord.Interaction, msg_id: str, group: str) -> tup
 
     save_store(str(msg_id))
     record_response(int(obj["guild_id"]), uid, str(msg_id), response_key)
+    _record_member_activity_rsvp(int(obj["guild_id"]), uid, str(msg_id), previous_choice, group)
     await _push_overview(inter.client, str(msg_id), obj)
     await _sync_event_lineup_discord(inter.client, str(msg_id), obj)
 
@@ -4083,6 +4104,7 @@ async def _dashboard_event_rsvp(client: discord.Client, guild_id: int, payload: 
             if target_role not in getattr(member, "roles", []):
                 raise RuntimeError(f"Du gehörst nicht zur Zielgruppe dieses Events ({target_role.name})")
 
+        previous_choice = _activity_existing_choice(obj, user_id)
         display_name = _safe_name(getattr(member, "display_name", None) or getattr(member, "name", None) or f"User {user_id}")
         guild_label = guild.name if _is_alliance_event(obj) else ""
         source_guild_id = int(guild.id)
@@ -4121,6 +4143,7 @@ async def _dashboard_event_rsvp(client: discord.Client, guild_id: int, payload: 
         store[event_id] = obj
         save_store(event_id)
         record_response(int(obj["guild_id"]), user_id, event_id, response_key)
+        _record_member_activity_rsvp(int(obj["guild_id"]), user_id, event_id, previous_choice, choice)
 
         await _push_overview(client, event_id, obj)
         await _sync_event_lineup_discord(client, event_id, obj)

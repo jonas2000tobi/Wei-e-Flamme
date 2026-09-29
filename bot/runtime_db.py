@@ -190,6 +190,12 @@ def _init_sqlite() -> dict[str, Any]:
             CREATE INDEX IF NOT EXISTS idx_guild_members_active_name
                 ON guild_members (guild_id, is_active, server_name);
 
+            CREATE TABLE IF NOT EXISTS aion2_profiles (
+                guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL, character_name TEXT NOT NULL DEFAULT '',
+                class_name TEXT NOT NULL DEFAULT '', main_role TEXT NOT NULL DEFAULT '', level INTEGER,
+                gearscore TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL, PRIMARY KEY(guild_id,user_id)
+            );
+
             CREATE TABLE IF NOT EXISTS guild_item_links (
                 guild_id INTEGER NOT NULL,
                 reference_type TEXT NOT NULL,
@@ -409,6 +415,15 @@ def _init_postgres() -> dict[str, Any]:
                 """
                 CREATE INDEX IF NOT EXISTS idx_guild_members_active_name
                     ON guild_members (guild_id, is_active, server_name)
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS aion2_profiles (
+                    guild_id BIGINT NOT NULL, user_id BIGINT NOT NULL, character_name TEXT NOT NULL DEFAULT '',
+                    class_name TEXT NOT NULL DEFAULT '', main_role TEXT NOT NULL DEFAULT '', level INTEGER,
+                    gearscore TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL, PRIMARY KEY(guild_id,user_id)
+                )
                 """
             )
             cur.execute(
@@ -2303,3 +2318,34 @@ def resolve_catalog_item_reference(*, guild_id: int, local_item_id: str = "", it
     if alias_key:
         upsert_guild_item_link(guild_id=int(guild_id), reference_type="alias", reference_key=alias_key, item=item, match_method=method, confidence=confidence, aliases=[clean_name] if clean_name else [])
     return item
+
+
+def upsert_aion2_profile(guild_id:int,user_id:int,*,character_name:str='',class_name:str='',main_role:str='',level=None,gearscore:str='')->bool:
+    if not _INITIALIZED: init_runtime_db()
+    current=get_aion2_profile(guild_id,user_id) or {}; now=_now_iso()
+    vals=(int(guild_id),int(user_id),str(character_name or current.get('character_name') or '')[:120],str(class_name or current.get('class_name') or '')[:80],str(main_role or current.get('main_role') or '')[:30],level if level is not None else current.get('level'),str(gearscore if gearscore!='' else current.get('gearscore') or '')[:40],now)
+    if _BACKEND=='postgres':
+        conn=_pg_connect();
+        try:
+            with conn.cursor() as cur:
+                cur.execute('''INSERT INTO aion2_profiles(guild_id,user_id,character_name,class_name,main_role,level,gearscore,updated_at)
+                VALUES(%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(guild_id,user_id) DO UPDATE SET character_name=EXCLUDED.character_name,class_name=EXCLUDED.class_name,main_role=EXCLUDED.main_role,level=EXCLUDED.level,gearscore=EXCLUDED.gearscore,updated_at=EXCLUDED.updated_at''',vals)
+            conn.commit(); return True
+        finally: conn.close()
+    conn=_sqlite_connect();
+    try:
+        conn.execute('''INSERT INTO aion2_profiles(guild_id,user_id,character_name,class_name,main_role,level,gearscore,updated_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(guild_id,user_id) DO UPDATE SET character_name=excluded.character_name,class_name=excluded.class_name,main_role=excluded.main_role,level=excluded.level,gearscore=excluded.gearscore,updated_at=excluded.updated_at''',vals); conn.commit(); return True
+    finally: conn.close()
+
+def get_aion2_profile(guild_id:int,user_id:int)->dict[str,Any]:
+    if not _INITIALIZED: init_runtime_db()
+    if _BACKEND=='postgres':
+        conn=_pg_connect();
+        try:
+            with conn.cursor() as cur:
+                cur.execute('SELECT * FROM aion2_profiles WHERE guild_id=%s AND user_id=%s',(int(guild_id),int(user_id))); row=cur.fetchone(); return dict(row) if row else {}
+        finally: conn.close()
+    conn=_sqlite_connect();
+    try:
+        row=conn.execute('SELECT * FROM aion2_profiles WHERE guild_id=? AND user_id=?',(int(guild_id),int(user_id))).fetchone(); return dict(row) if row else {}
+    finally: conn.close()

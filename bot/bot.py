@@ -59,6 +59,7 @@ setup_voice_attendance = None
 setup_dashboard_data = None
 setup_guild_config = None
 setup_server_log = None
+setup_member_activity = None
 store = {}
 _modules_initialized = False
 _startup_failure: str | None = None
@@ -178,6 +179,15 @@ def _import_modules():
     except ModuleNotFoundError:
         from server_log import setup_server_log  # type: ignore
         print("✅ Import: server_log (root)")
+
+
+    global setup_member_activity
+    try:
+        from bot.member_activity import setup_member_activity  # type: ignore
+        print("✅ Import: bot.member_activity")
+    except ModuleNotFoundError:
+        from member_activity import setup_member_activity  # type: ignore
+        print("✅ Import: member_activity (root)")
 
     global setup_leader_contact
 
@@ -361,6 +371,7 @@ async def on_ready():
         setup_steps = [
             ("guild_config", setup_guild_config),
             ("server_log", setup_server_log),
+            ("member_activity", setup_member_activity),
             ("audit_system", setup_audit_system),
             ("voice_attendance", setup_voice_attendance),
             ("dashboard_data", setup_dashboard_data),

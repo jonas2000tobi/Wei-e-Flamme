@@ -32,7 +32,7 @@ except Exception:
         "Ein wildes {user} ist erschienen!",
         "Möge dein Loot besser sein als dein Würfelglück.",
     )
-from discord.ui import View, button
+from discord.ui import View, button, Select, Modal, TextInput
 from discord.enums import ButtonStyle
 
 try:
@@ -616,6 +616,13 @@ def _review_channel(guild: discord.Guild) -> Optional[discord.abc.Messageable]:
     ch = guild.get_channel(ch_id)
     return ch if isinstance(ch, (discord.TextChannel, discord.Thread)) else None
 
+
+AION2_CLASSES = ("Gladiator", "Templer", "Assassine", "Jäger", "Zauberer", "Beschwörer", "Kleriker", "Kantor")
+
+def _aion2_enabled(guild_id:int)->bool:
+    try: return bool(runtime_db.get_module_setting(int(guild_id),'onboarding','aion2_enabled',False))
+    except Exception: return False
+
 class StepContext:
     def __init__(
         self,
@@ -627,6 +634,8 @@ class StepContext:
         category: str | None = None,
         primary: str | None = None,
         experienced: bool | None = None,
+        aion_class: str | None = None,
+        aion_character: str | None = None,
     ):
         self.member_id = int(member_id)
         self.guild_id = int(guild_id)
@@ -635,6 +644,8 @@ class StepContext:
         self.category = category
         self.primary = primary
         self.experienced = experienced
+        self.aion_class = aion_class
+        self.aion_character = aion_character
 
     def to_dict(self) -> dict:
         return {
@@ -645,6 +656,8 @@ class StepContext:
             "category": self.category,
             "primary": self.primary,
             "experienced": self.experienced,
+            "aion_class": self.aion_class,
+            "aion_character": self.aion_character,
         }
 
     @classmethod
@@ -657,6 +670,8 @@ class StepContext:
             category=raw.get("category"),
             primary=raw.get("primary"),
             experienced=raw.get("experienced"),
+            aion_class=raw.get("aion_class"),
+            aion_character=raw.get("aion_character"),
         )
 
 
@@ -763,14 +778,16 @@ class PrimaryView(OnboardingFeatureView):
 
     async def _next(self, inter: discord.Interaction, primary: str):
         self.ctx.primary = primary
-        self.ctx.stage = "experience"
         if inter.message:
             self.ctx.message_id = int(inter.message.id)
-        _remember_ctx(self.ctx)
-        await inter.response.edit_message(
-            content="Bist du **erfahren** oder **unerfahren**?",
-            view=ExperienceView(self.ctx)
-        )
+        if _aion2_enabled(self.ctx.guild_id):
+            self.ctx.stage = "aion2_class"
+            _remember_ctx(self.ctx)
+            await inter.response.edit_message(content="🎮 **Aion 2:** Welche Klasse spielst du?", view=Aion2ClassView(self.ctx))
+        else:
+            self.ctx.stage = "experience"
+            _remember_ctx(self.ctx)
+            await inter.response.edit_message(content="Bist du **erfahren** oder **unerfahren**?", view=ExperienceView(self.ctx))
 
     @button(label="🛡️ Tank", style=ButtonStyle.primary, custom_id="onboarding_primary_tank")
     async def btn_tank(self, inter: discord.Interaction, _):
@@ -783,6 +800,33 @@ class PrimaryView(OnboardingFeatureView):
     @button(label="🗡️ DPS", style=ButtonStyle.secondary, custom_id="onboarding_primary_dps")
     async def btn_dps(self, inter: discord.Interaction, _):
         await self._next(inter, "DPS")
+
+
+class Aion2CharacterModal(Modal):
+    def __init__(self, ctx: StepContext):
+        super().__init__(title="Aion 2 Charakter", timeout=300)
+        self.ctx=ctx
+        self.character=TextInput(label="Charaktername",placeholder="Dein Aion-2-Charaktername",required=True,max_length=120)
+        self.add_item(self.character)
+    async def on_submit(self, inter:discord.Interaction):
+        self.ctx.aion_character=str(self.character.value).strip(); self.ctx.stage="experience"; _remember_ctx(self.ctx)
+        try:
+            runtime_db.upsert_aion2_profile(self.ctx.guild_id,self.ctx.member_id,character_name=self.ctx.aion_character,class_name=str(self.ctx.aion_class or ''),main_role=str(self.ctx.primary or ''))
+        except Exception as exc: print(f"[onboarding] Aion2 Profil konnte nicht gespeichert werden: {exc!r}")
+        await inter.response.edit_message(content="Bist du **erfahren** oder **unerfahren**?",view=ExperienceView(self.ctx))
+
+class Aion2ClassSelect(Select):
+    def __init__(self,ctx:StepContext):
+        self.ctx=ctx
+        opts=[discord.SelectOption(label=x,value=x) for x in AION2_CLASSES]
+        super().__init__(placeholder="Aion-2-Klasse auswählen…",min_values=1,max_values=1,options=opts,custom_id="onboarding_aion2_class_select")
+    async def callback(self,inter:discord.Interaction):
+        self.ctx.aion_class=self.values[0]; _remember_ctx(self.ctx)
+        await inter.response.send_modal(Aion2CharacterModal(self.ctx))
+
+class Aion2ClassView(OnboardingFeatureView):
+    def __init__(self,ctx:StepContext):
+        super().__init__(timeout=None); self.ctx=ctx; self.add_item(Aion2ClassSelect(ctx))
 
 class ReviewView(OnboardingFeatureView):
     def __init__(self, member_id: int, category: str, primary: str, experienced: bool, *, message_id: int = 0, guild_id: int = 0):
@@ -1106,6 +1150,8 @@ async def setup_onboarding(client: discord.Client, tree: app_commands.CommandTre
                 client.add_view(PrimaryView(ctx), message_id=mid)
             elif ctx.stage == "experience":
                 client.add_view(ExperienceView(ctx), message_id=mid)
+            elif ctx.stage == "aion2_class":
+                client.add_view(Aion2ClassView(ctx), message_id=mid)
             elif ctx.stage == "review":
                 client.add_view(
                     ReviewView(
