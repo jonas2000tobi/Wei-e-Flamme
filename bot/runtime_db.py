@@ -192,7 +192,7 @@ def _init_sqlite() -> dict[str, Any]:
 
             CREATE TABLE IF NOT EXISTS aion2_profiles (
                 guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL, character_name TEXT NOT NULL DEFAULT '',
-                class_name TEXT NOT NULL DEFAULT '', main_role TEXT NOT NULL DEFAULT '', level INTEGER,
+                class_name TEXT NOT NULL DEFAULT '', main_role TEXT NOT NULL DEFAULT '', faction TEXT NOT NULL DEFAULT '', level INTEGER,
                 gearscore TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL, PRIMARY KEY(guild_id,user_id)
             );
 
@@ -216,6 +216,10 @@ def _init_sqlite() -> dict[str, Any]:
                 ON guild_item_links (guild_id, catalog_item_id);
             """
         )
+        # Bestehende Runtime-DBs erhalten die neue Aion-2-Fraktion ohne Datenverlust.
+        aion2_columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(aion2_profiles)").fetchall()}
+        if "faction" not in aion2_columns:
+            conn.execute("ALTER TABLE aion2_profiles ADD COLUMN faction TEXT NOT NULL DEFAULT ''")
         conn.execute(
             "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at) VALUES (?, ?, ?)",
             (1, "runtime_db_audit_voice_base", _now_iso()),
@@ -421,11 +425,12 @@ def _init_postgres() -> dict[str, Any]:
                 """
                 CREATE TABLE IF NOT EXISTS aion2_profiles (
                     guild_id BIGINT NOT NULL, user_id BIGINT NOT NULL, character_name TEXT NOT NULL DEFAULT '',
-                    class_name TEXT NOT NULL DEFAULT '', main_role TEXT NOT NULL DEFAULT '', level INTEGER,
+                    class_name TEXT NOT NULL DEFAULT '', main_role TEXT NOT NULL DEFAULT '', faction TEXT NOT NULL DEFAULT '', level INTEGER,
                     gearscore TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL, PRIMARY KEY(guild_id,user_id)
                 )
                 """
             )
+            cur.execute("ALTER TABLE aion2_profiles ADD COLUMN IF NOT EXISTS faction TEXT NOT NULL DEFAULT ''")
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS guild_item_links (
@@ -2320,21 +2325,22 @@ def resolve_catalog_item_reference(*, guild_id: int, local_item_id: str = "", it
     return item
 
 
-def upsert_aion2_profile(guild_id:int,user_id:int,*,character_name:str='',class_name:str='',main_role:str='',level=None,gearscore:str='')->bool:
+def upsert_aion2_profile(guild_id:int,user_id:int,*,character_name:str='',class_name:str='',main_role:str='',faction:str='',level=None,gearscore:str='')->bool:
     if not _INITIALIZED: init_runtime_db()
     current=get_aion2_profile(guild_id,user_id) or {}; now=_now_iso()
-    vals=(int(guild_id),int(user_id),str(character_name or current.get('character_name') or '')[:120],str(class_name or current.get('class_name') or '')[:80],str(main_role or current.get('main_role') or '')[:30],level if level is not None else current.get('level'),str(gearscore if gearscore!='' else current.get('gearscore') or '')[:40],now)
+    faction_value=str(faction or current.get('faction') or '').strip().upper()[:20]
+    vals=(int(guild_id),int(user_id),str(character_name or current.get('character_name') or '')[:120],str(class_name or current.get('class_name') or '')[:80],str(main_role or current.get('main_role') or '')[:30],faction_value,level if level is not None else current.get('level'),str(gearscore if gearscore!='' else current.get('gearscore') or '')[:40],now)
     if _BACKEND=='postgres':
         conn=_pg_connect();
         try:
             with conn.cursor() as cur:
-                cur.execute('''INSERT INTO aion2_profiles(guild_id,user_id,character_name,class_name,main_role,level,gearscore,updated_at)
-                VALUES(%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(guild_id,user_id) DO UPDATE SET character_name=EXCLUDED.character_name,class_name=EXCLUDED.class_name,main_role=EXCLUDED.main_role,level=EXCLUDED.level,gearscore=EXCLUDED.gearscore,updated_at=EXCLUDED.updated_at''',vals)
+                cur.execute("""INSERT INTO aion2_profiles(guild_id,user_id,character_name,class_name,main_role,faction,level,gearscore,updated_at)
+                VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(guild_id,user_id) DO UPDATE SET character_name=EXCLUDED.character_name,class_name=EXCLUDED.class_name,main_role=EXCLUDED.main_role,faction=EXCLUDED.faction,level=EXCLUDED.level,gearscore=EXCLUDED.gearscore,updated_at=EXCLUDED.updated_at""",vals)
             conn.commit(); return True
         finally: conn.close()
     conn=_sqlite_connect();
     try:
-        conn.execute('''INSERT INTO aion2_profiles(guild_id,user_id,character_name,class_name,main_role,level,gearscore,updated_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(guild_id,user_id) DO UPDATE SET character_name=excluded.character_name,class_name=excluded.class_name,main_role=excluded.main_role,level=excluded.level,gearscore=excluded.gearscore,updated_at=excluded.updated_at''',vals); conn.commit(); return True
+        conn.execute("""INSERT INTO aion2_profiles(guild_id,user_id,character_name,class_name,main_role,faction,level,gearscore,updated_at) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(guild_id,user_id) DO UPDATE SET character_name=excluded.character_name,class_name=excluded.class_name,main_role=excluded.main_role,faction=excluded.faction,level=excluded.level,gearscore=excluded.gearscore,updated_at=excluded.updated_at""",vals); conn.commit(); return True
     finally: conn.close()
 
 def get_aion2_profile(guild_id:int,user_id:int)->dict[str,Any]:

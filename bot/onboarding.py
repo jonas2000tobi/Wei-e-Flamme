@@ -621,19 +621,36 @@ def _review_channel(guild: discord.Guild) -> Optional[discord.abc.Messageable]:
 
 
 AION2_CLASS_META = {
-    "Templer": ("Templar", "TANK"),
-    "Gladiator": ("Gladiator", "DPS"),
-    "Assassine": ("Assassin", "DPS"),
-    "Jäger": ("Ranger", "DPS"),
-    "Zauberer": ("Sorcerer", "DPS"),
-    "Geisterbeschwörer": ("Spirit Master", "DPS"),
-    "Kleriker": ("Cleric", "HEAL"),
-    "Kantor": ("Chanter", "SUPPORT"),
+    # Deutsch im Bot, englischer Emoji-Name auf Discord.
+    "Templer": ("Templar", "TANK", "Templar"),
+    "Gladiator": ("Gladiator", "DPS", "Gladiator"),
+    "Assassine": ("Assassin", "DPS", "Assassin"),
+    "Jäger": ("Ranger", "DPS", "Ranger"),
+    "Zauberer": ("Sorcerer", "DPS", "Sorcerer"),
+    "Geisterbeschwörer": ("Elementalist", "DPS", "Elementalist"),
+    "Kleriker": ("Cleric", "HEAL", "Cleric"),
+    "Kantor": ("Chanter", "SUPPORT", "Chanter"),
 }
 AION2_CLASSES = tuple(AION2_CLASS_META.keys())
+AION2_FACTIONS = {
+    "ELYOS": ("Elyos", "Elyos"),
+    "ASMODIA": ("Asmodia", "Asmodia"),
+}
+
+
+def _guild_custom_emoji(guild: discord.Guild | None, *names: str):
+    """Findet ein Server-Emoji case-insensitive; bei fehlendem Emoji bleibt die UI nutzbar."""
+    if guild is None:
+        return None
+    wanted = {str(name or "").casefold() for name in names if str(name or "").strip()}
+    for emoji in list(getattr(guild, "emojis", []) or []):
+        if str(getattr(emoji, "name", "") or "").casefold() in wanted:
+            return emoji
+    return None
+
 
 def _aion2_role_for_class(class_name: str | None) -> str:
-    return str((AION2_CLASS_META.get(str(class_name or "")) or ("", ""))[1])
+    return str((AION2_CLASS_META.get(str(class_name or "")) or ("", "", ""))[1])
 
 
 def _aion2_enabled(guild_id:int)->bool:
@@ -653,6 +670,7 @@ class StepContext:
         experienced: bool | None = None,
         aion_class: str | None = None,
         aion_character: str | None = None,
+        aion_faction: str | None = None,
     ):
         self.member_id = int(member_id)
         self.guild_id = int(guild_id)
@@ -663,6 +681,7 @@ class StepContext:
         self.experienced = experienced
         self.aion_class = aion_class
         self.aion_character = aion_character
+        self.aion_faction = aion_faction
 
     def to_dict(self) -> dict:
         return {
@@ -675,6 +694,7 @@ class StepContext:
             "experienced": self.experienced,
             "aion_class": self.aion_class,
             "aion_character": self.aion_character,
+            "aion_faction": self.aion_faction,
         }
 
     @classmethod
@@ -689,6 +709,7 @@ class StepContext:
             experienced=raw.get("experienced"),
             aion_class=raw.get("aion_class"),
             aion_character=raw.get("aion_character"),
+            aion_faction=raw.get("aion_faction"),
         )
 
 
@@ -766,9 +787,10 @@ class CategoryView(OnboardingFeatureView):
         if inter.message:
             self.ctx.message_id = int(inter.message.id)
         if _aion2_enabled(self.ctx.guild_id):
-            self.ctx.stage = "aion2_class"
+            self.ctx.stage = "aion2_faction"
             _remember_ctx(self.ctx)
-            await inter.response.edit_message(content="🎮 **Aion 2:** Welche Klasse spielst du?", view=Aion2ClassView(self.ctx))
+            guild = inter.client.get_guild(self.ctx.guild_id)
+            await inter.response.edit_message(content="🎮 **Aion 2:** Auf welcher Seite spielst du?", view=Aion2FactionView(self.ctx, guild))
         else:
             self.ctx.stage = "primary"
             _remember_ctx(self.ctx)
@@ -800,9 +822,10 @@ class PrimaryView(OnboardingFeatureView):
         if inter.message:
             self.ctx.message_id = int(inter.message.id)
         if _aion2_enabled(self.ctx.guild_id):
-            self.ctx.stage = "aion2_class"
+            self.ctx.stage = "aion2_faction"
             _remember_ctx(self.ctx)
-            await inter.response.edit_message(content="🎮 **Aion 2:** Welche Klasse spielst du?", view=Aion2ClassView(self.ctx))
+            guild = inter.client.get_guild(self.ctx.guild_id)
+            await inter.response.edit_message(content="🎮 **Aion 2:** Auf welcher Seite spielst du?", view=Aion2FactionView(self.ctx, guild))
         else:
             self.ctx.stage = "experience"
             _remember_ctx(self.ctx)
@@ -828,30 +851,121 @@ class Aion2CharacterModal(Modal):
         self.character=TextInput(label="Charaktername",placeholder="Dein Aion-2-Charaktername",required=True,max_length=120)
         self.add_item(self.character)
     async def on_submit(self, inter:discord.Interaction):
-        self.ctx.aion_character=str(self.character.value).strip(); self.ctx.stage="experience"; _remember_ctx(self.ctx)
-        try:
-            runtime_db.upsert_aion2_profile(self.ctx.guild_id,self.ctx.member_id,character_name=self.ctx.aion_character,class_name=str(self.ctx.aion_class or ''),main_role=str(self.ctx.primary or ''))
-        except Exception as exc: print(f"[onboarding] Aion2 Profil konnte nicht gespeichert werden: {exc!r}")
+        # Die Aion-2-Angaben bleiben bis zum erfolgreichen Abschluss nur in der
+        # Onboarding-Session. Ein dauerhaftes Profil wird erst nach Annahme bzw.
+        # nach erfolgreichem Auto-Onboarding angelegt.
+        self.ctx.aion_character=str(self.character.value).strip()
+        self.ctx.stage="experience"
+        _remember_ctx(self.ctx)
         await inter.response.edit_message(content="Bist du **erfahren** oder **unerfahren**?",view=ExperienceView(self.ctx))
 
+class Aion2FactionView(OnboardingFeatureView):
+    def __init__(self, ctx: StepContext, guild: discord.Guild | None = None):
+        super().__init__(timeout=None)
+        self.ctx = ctx
+        for item in self.children:
+            cid = str(getattr(item, "custom_id", "") or "")
+            if cid == "onboarding_aion2_faction_elyos":
+                item.emoji = _guild_custom_emoji(guild, "Elyos")
+            elif cid == "onboarding_aion2_faction_asmodia":
+                item.emoji = _guild_custom_emoji(guild, "Asmodia", "Asmodian")
+
+    async def _choose(self, inter: discord.Interaction, faction: str):
+        self.ctx.aion_faction = faction
+        if inter.message:
+            self.ctx.message_id = int(inter.message.id)
+        self.ctx.stage = "aion2_class"
+        _remember_ctx(self.ctx)
+        guild = inter.client.get_guild(self.ctx.guild_id)
+        label = AION2_FACTIONS.get(faction, (faction, ""))[0]
+        await inter.response.edit_message(
+            content=f"🎮 **Aion 2 · {label}:** Welche Klasse spielst du?",
+            view=Aion2ClassView(self.ctx, guild),
+        )
+
+    @button(label="Elyos", style=ButtonStyle.primary, custom_id="onboarding_aion2_faction_elyos")
+    async def btn_elyos(self, inter: discord.Interaction, _):
+        await self._choose(inter, "ELYOS")
+
+    @button(label="Asmodia", style=ButtonStyle.secondary, custom_id="onboarding_aion2_faction_asmodia")
+    async def btn_asmodia(self, inter: discord.Interaction, _):
+        await self._choose(inter, "ASMODIA")
+
+
 class Aion2ClassSelect(Select):
-    def __init__(self,ctx:StepContext):
-        self.ctx=ctx
-        labels={"TANK":"Tank","HEAL":"Heiler","DPS":"DPS","SUPPORT":"Support"}
-        opts=[discord.SelectOption(label=f"{x} ({AION2_CLASS_META[x][0]})",value=x,description=labels.get(AION2_CLASS_META[x][1],AION2_CLASS_META[x][1])) for x in AION2_CLASSES]
-        super().__init__(placeholder="Aion-2-Klasse auswählen…",min_values=1,max_values=1,options=opts,custom_id="onboarding_aion2_class_select")
-    async def callback(self,inter:discord.Interaction):
-        self.ctx.aion_class=self.values[0]
-        self.ctx.primary=_aion2_role_for_class(self.ctx.aion_class)
+    def __init__(self, ctx: StepContext, guild: discord.Guild | None = None):
+        self.ctx = ctx
+        labels = {"TANK":"Tank", "HEAL":"Heiler", "DPS":"DPS", "SUPPORT":"Support"}
+        opts = []
+        for name in AION2_CLASSES:
+            en, role, emoji_name = AION2_CLASS_META[name]
+            emoji = _guild_custom_emoji(guild, emoji_name)
+            opts.append(discord.SelectOption(
+                label=f"{name} ({en})",
+                value=name,
+                description=labels.get(role, role),
+                emoji=emoji,
+            ))
+        super().__init__(placeholder="Aion-2-Klasse auswählen…", min_values=1, max_values=1, options=opts, custom_id="onboarding_aion2_class_select")
+
+    async def callback(self, inter: discord.Interaction):
+        self.ctx.aion_class = self.values[0]
+        self.ctx.primary = _aion2_role_for_class(self.ctx.aion_class)
         _remember_ctx(self.ctx)
         await inter.response.send_modal(Aion2CharacterModal(self.ctx))
 
+
 class Aion2ClassView(OnboardingFeatureView):
-    def __init__(self,ctx:StepContext):
-        super().__init__(timeout=None); self.ctx=ctx; self.add_item(Aion2ClassSelect(ctx))
+    def __init__(self, ctx: StepContext, guild: discord.Guild | None = None):
+        super().__init__(timeout=None)
+        self.ctx = ctx
+        self.add_item(Aion2ClassSelect(ctx, guild))
+
+def _save_accepted_aion2_profile(
+    guild_id: int,
+    member_id: int,
+    *,
+    aion_class: str | None,
+    aion_character: str | None,
+    aion_faction: str | None,
+    primary: str | None,
+) -> bool:
+    """Persist Aion-2 data only after onboarding was successfully accepted."""
+    class_name = str(aion_class or "").strip()
+    character_name = str(aion_character or "").strip()
+    if not class_name and not character_name:
+        return True
+    role = _aion2_role_for_class(class_name) or str(primary or "").strip().upper()
+    try:
+        return bool(
+            runtime_db.upsert_aion2_profile(
+                int(guild_id),
+                int(member_id),
+                character_name=character_name,
+                class_name=class_name,
+                main_role=role,
+                faction=str(aion_faction or "").strip().upper(),
+            )
+        )
+    except Exception as exc:
+        print(f"[onboarding] Angenommenes Aion2-Profil konnte nicht gespeichert werden: {exc!r}", flush=True)
+        return False
+
 
 class ReviewView(OnboardingFeatureView):
-    def __init__(self, member_id: int, category: str, primary: str, experienced: bool, *, message_id: int = 0, guild_id: int = 0):
+    def __init__(
+        self,
+        member_id: int,
+        category: str,
+        primary: str,
+        experienced: bool,
+        *,
+        message_id: int = 0,
+        guild_id: int = 0,
+        aion_class: str | None = None,
+        aion_character: str | None = None,
+        aion_faction: str | None = None,
+    ):
         super().__init__(timeout=None)
         self.member_id = int(member_id)
         self.category = category
@@ -859,6 +973,9 @@ class ReviewView(OnboardingFeatureView):
         self.experienced = experienced
         self.message_id = int(message_id or 0)
         self.guild_id = int(guild_id or 0)
+        self.aion_class = str(aion_class or "")
+        self.aion_character = str(aion_character or "")
+        self.aion_faction = str(aion_faction or "")
 
     def _is_admin(self, inter: discord.Interaction) -> bool:
         p = getattr(inter.user, "guild_permissions", None)
@@ -886,6 +1003,14 @@ class ReviewView(OnboardingFeatureView):
             return
 
         roles, role_errors = await _assign_roles(member, self.category, self.primary, self.experienced)
+        aion_profile_saved = _save_accepted_aion2_profile(
+            self.guild_id or int(inter.guild.id),
+            self.member_id,
+            aion_class=self.aion_class,
+            aion_character=self.aion_character,
+            aion_faction=self.aion_faction,
+            primary=self.primary,
+        )
         await update_welcome_card(
             member,
             "completed",
@@ -904,6 +1029,8 @@ class ReviewView(OnboardingFeatureView):
         role_error_text = ""
         if role_errors:
             role_error_text = "\n⚠️ **Nicht gesetzt:** " + " · ".join(role_errors)
+        if (self.aion_class or self.aion_character) and not aion_profile_saved:
+            role_error_text += "\n⚠️ **Aion-2-Profil:** konnte nicht dauerhaft gespeichert werden."
         await inter.edit_original_response(
             content=(
                 f"✅ **Akzeptiert:** **{member_name}** ({member.mention}) – Rollen: "
@@ -997,6 +1124,7 @@ class ExperienceView(OnboardingFeatureView):
                 "TANK": "Tank",
                 "HEAL": "Heal",
                 "DPS": "DPS",
+                "SUPPORT": "Support",
             }.get(self.ctx.primary, "—")
 
             exp_txt = "Erfahren" if experienced else "Unerfahren"
@@ -1026,6 +1154,12 @@ class ExperienceView(OnboardingFeatureView):
                     f"**Rolle:** {pri_txt}\n"
                     f"**Erfahrung:** {exp_txt}"
                 )
+                if self.ctx.aion_character or self.ctx.aion_class:
+                    desc += (
+                        f"\n**Aion-2-Fraktion:** {AION2_FACTIONS.get(str(self.ctx.aion_faction or '').upper(), (self.ctx.aion_faction or '—', ''))[0]}"
+                        f"\n**Aion-2-Charakter:** {self.ctx.aion_character or '—'}"
+                        f"\n**Aion-2-Klasse:** {self.ctx.aion_class or '—'}"
+                    )
                 if self.ctx.category == "applicant":
                     if application_channel is not None:
                         desc += f"\n**Bewerbungs-Chat:** {application_channel.mention}"
@@ -1038,6 +1172,9 @@ class ExperienceView(OnboardingFeatureView):
                     self.ctx.primary,
                     experienced,
                     guild_id=self.ctx.guild_id,
+                    aion_class=self.ctx.aion_class,
+                    aion_character=self.ctx.aion_character,
+                    aion_faction=self.ctx.aion_faction,
                 )
                 review_message = await review_ch.send(desc, view=review_view)
                 review_view.message_id = int(review_message.id)
@@ -1049,6 +1186,9 @@ class ExperienceView(OnboardingFeatureView):
                     category=self.ctx.category,
                     primary=self.ctx.primary,
                     experienced=experienced,
+                    aion_class=self.ctx.aion_class,
+                    aion_character=self.ctx.aion_character,
+                    aion_faction=self.ctx.aion_faction,
                 )
                 _session_records[str(review_message.id)] = review_ctx.to_dict()
                 _save_sessions()
@@ -1071,6 +1211,14 @@ class ExperienceView(OnboardingFeatureView):
             else:
                 if member:
                     roles, role_errors = await _assign_roles(member, self.ctx.category, self.ctx.primary, experienced)
+                    aion_profile_saved = _save_accepted_aion2_profile(
+                        self.ctx.guild_id,
+                        self.ctx.member_id,
+                        aion_class=self.ctx.aion_class,
+                        aion_character=self.ctx.aion_character,
+                        aion_faction=self.ctx.aion_faction,
+                        primary=self.ctx.primary,
+                    )
                     await update_welcome_card(
                         member,
                         "completed",
@@ -1089,6 +1237,8 @@ class ExperienceView(OnboardingFeatureView):
                 auto_done_text = "✅ Danke! Deine Rollen wurden vergeben."
                 if member and role_errors:
                     auto_done_text += "\n⚠️ Einige Rollen konnten nicht gesetzt werden. Die Gildenleitung wurde informiert."
+                if member and (self.ctx.aion_class or self.ctx.aion_character) and not aion_profile_saved:
+                    auto_done_text += "\n⚠️ Dein Aion-2-Profil konnte nicht gespeichert werden. Bitte informiere die Gildenleitung."
                 if application_channel is not None:
                     auto_done_text += f"\n📝 Dein privater Bewerbungs-Chat wurde erstellt: {application_channel.mention}"
                 await inter.edit_original_response(content=auto_done_text, view=None)
@@ -1172,8 +1322,10 @@ async def setup_onboarding(client: discord.Client, tree: app_commands.CommandTre
                 client.add_view(PrimaryView(ctx), message_id=mid)
             elif ctx.stage == "experience":
                 client.add_view(ExperienceView(ctx), message_id=mid)
+            elif ctx.stage == "aion2_faction":
+                client.add_view(Aion2FactionView(ctx, client.get_guild(ctx.guild_id)), message_id=mid)
             elif ctx.stage == "aion2_class":
-                client.add_view(Aion2ClassView(ctx), message_id=mid)
+                client.add_view(Aion2ClassView(ctx, client.get_guild(ctx.guild_id)), message_id=mid)
             elif ctx.stage == "review":
                 client.add_view(
                     ReviewView(
@@ -1183,6 +1335,9 @@ async def setup_onboarding(client: discord.Client, tree: app_commands.CommandTre
                         bool(ctx.experienced),
                         message_id=mid,
                         guild_id=ctx.guild_id,
+                        aion_class=ctx.aion_class,
+                        aion_character=ctx.aion_character,
+                        aion_faction=ctx.aion_faction,
                     ),
                     message_id=mid,
                 )
