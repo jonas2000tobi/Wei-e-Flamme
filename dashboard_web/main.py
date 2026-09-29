@@ -39,6 +39,28 @@ from guild_modules import (
 )
 from zoneinfo import ZoneInfo
 
+from aion2_feature import (
+    AION2_CLASS_META,
+    AION2_FACTION_META,
+    AION2_MAP_DIRECT_URL,
+    AION2_MAP_EMBED_URL,
+    normalize_class as aion2_normalize_class,
+    role_for_class as aion2_role_for_class,
+    role_label as aion2_role_label,
+    normalize_faction as aion2_normalize_faction,
+    class_asset as aion2_class_asset,
+)
+
+from event_roles import (
+    CANONICAL_EVENT_ROLES as DASHBOARD_EVENT_ROLES,
+    normalize_event_role,
+    event_role_label,
+    role_bucket as canonical_role_bucket,
+    role_order as canonical_role_order,
+)
+from aion2_routes import build_aion2_router
+from onboarding_routes import build_onboarding_router
+
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, RedirectResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -67,15 +89,15 @@ async def _dashboard_lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Guild Platform Dashboard", version="2.5.2", lifespan=_dashboard_lifespan)
+app = FastAPI(title="Guild Platform Dashboard", version="2.14.0", lifespan=_dashboard_lifespan)
 security = HTTPBasic(auto_error=False)
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
-ASSET_VER = "guild-platform-v2-5-0-welcome"
-DASHBOARD_RELEASE_VERSION = "2.13.0 · Navigation, Kanalwahl & Aion-2-Map"
+ASSET_VER = "guild-platform-v2-14-0-runtime"
+DASHBOARD_RELEASE_VERSION = "2.14.0 · PostgreSQL Runtime, Support & Aion-2"
 
 _EVENT_IMAGE_ASSETS: dict[str, str] = {
     "guild_boss": f"/static/event_images/guild_boss.webp?v={ASSET_VER}",
@@ -1335,8 +1357,8 @@ def _snapshot_payload() -> dict[str, Any]:
 # Phase 3.6: EC/DKP Read-Cutover
 # ---------------------------------------------------------------------------
 # Ziel: Das Dashboard liest EC-Konten, EC-Verlauf und EC-Eventchecks bevorzugt
-# aus den Phase-3-Postgres-Tabellen. JSON/Snapshot bleibt Fallback.
-# Der Bot schreibt weiterhin parallel JSON + Postgres; kein harter Write-Cutover.
+# aus den Phase-3-Postgres-Tabellen. Der Dashboard-Snapshot bleibt nur als
+# Read-Model-Fallback; produktiver Runtime-State liegt in PostgreSQL.
 
 
 def _phase3_json(value: Any, default: Any = None) -> Any:
@@ -1571,8 +1593,8 @@ def _apply_phase3_ec_read_cutover(payload: dict[str, Any]) -> dict[str, Any]:
 # Phase 3.7: Loot/Needs/Auktionen Read-Cutover
 # ---------------------------------------------------------------------------
 # Ziel: Das Dashboard liest Loot-/Need-/Auktionsdaten bevorzugt aus den
-# Phase-3-Postgres-Tabellen. JSON/Snapshot bleibt Fallback. Der Bot schreibt
-# weiterhin parallel JSON + Postgres; kein harter Write-Cutover.
+# Phase-3-Postgres-Tabellen. Der Dashboard-Snapshot bleibt als Read-Model-
+# Fallback; produktiver Runtime-State liegt in PostgreSQL.
 
 
 def _clean_item_display_name(value: Any) -> str:
@@ -3989,19 +4011,34 @@ def _event_name_chips(items: list[tuple[str, str]], *, empty: str = "Keine") -> 
     ) + '</div>'
 
 
-def _event_role_overview_html(event: dict[str, Any]) -> str:
+def _event_role_overview_html(event: dict[str, Any], guild_id: int = 0) -> str:
     groups = _event_yes_groups(event)
     if not groups:
         return '<div class="empty">Keine Zusagen vorhanden.</div>'
-    order = {"TANK": 0, "HEAL": 1, "HEALER": 1, "DPS": 2, "BANK": 3, "RESERVE": 3}
+    participant_ids: list[int] = []
+    for group in groups:
+        for person in group.get("participants") or []:
+            if isinstance(person, dict):
+                uid = _user_id(person.get("user_id") or person.get("id"))
+                if uid:
+                    participant_ids.append(uid)
+    profiles = _aion2_profiles_for_users(int(guild_id or 0), participant_ids) if guild_id else {}
+    order = {"TANK": 0, "SUPPORT": 1, "HEAL": 1, "HEALER": 1, "DPS": 2, "BANK": 3, "RESERVE": 3}
     groups = sorted(groups, key=lambda g: (order.get(str(g.get("role") or "").upper(), 20), str(g.get("role") or "").casefold()))
     blocks: list[str] = []
     for group in groups:
-        role = str(group.get("role") or "Zusage")
+        role_raw = str(group.get("role") or "Zusage")
+        role_key = normalize_event_role(role_raw) or role_raw
         people = [x for x in (group.get("participants") or []) if isinstance(x, dict)]
-        names = sorted([_event_person_name(x) for x in people], key=str.casefold)
-        chips = ''.join(f'<span class="event-role-name">{_e(name)}</span>' for name in names) or '<span class="muted">Niemand</span>'
-        blocks.append(f'<div class="event-role-card"><div class="event-role-head"><h3>{_e(role)}</h3><span class="pill">{len(people)}</span></div><div class="event-role-names">{chips}</div></div>')
+        chips: list[str] = []
+        for person in sorted(people, key=lambda p: _event_person_name(p).casefold()):
+            uid = _user_id(person.get("user_id") or person.get("id"))
+            ap = profiles.get(uid) or {}
+            cls = _aion2_normalize_class(ap.get("class_name"))
+            icon = _cell(_aion2_class_display_html(cls, with_name=False)) if cls else ""
+            chips.append(f'<span class="event-role-name" title="{_e(cls or "Keine Aion-2-Klasse")}">{icon}<b>{_e(_event_person_name(person))}</b></span>')
+        names_html = ''.join(chips) or '<span class="muted">Niemand</span>'
+        blocks.append(f'<div class="event-role-card"><div class="event-role-head"><h3>{_cell(_aion2_role_icon_html(role_key, with_label=True))}</h3><span class="pill">{len(people)}</span></div><div class="event-role-names">{names_html}</div></div>')
     return '<div class="event-role-grid">' + ''.join(blocks) + '</div>'
 
 
@@ -6663,7 +6700,7 @@ def _render_ec_dashboard(data: dict[str, Any]) -> str:
     net_loaded = _num(txs.get("net_loaded"), total_earned - total_spent)
     guild_id = _safe_guild_id(data)
     cut = data.get("phase3_ec_read_cutover") or {}
-    ec_source_label = "Postgres Phase 3" if cut.get("active") else "Snapshot/JSON Fallback"
+    ec_source_label = "Postgres Phase 3" if cut.get("active") else "Dashboard-Snapshot Fallback"
     award_requests = _ec_award_requests_for_dashboard(guild_id, limit=80) if guild_id else []
     award_request_rows = _ec_award_request_table_rows(award_requests, snap)
     pending_count = sum(1 for r in award_requests if str(r.get("status") or "").lower() in {"pending", "processing"})
@@ -6711,7 +6748,7 @@ def _render_ec_dashboard(data: dict[str, Any]) -> str:
       <div>
         <div class="eyebrow">Analytics</div>
         <h1>🪙 EC-Verlauf</h1>
-        <p class="muted">Read-only Auswertung. EC-Quelle: <b>{_e(ec_source_label)}</b>. JSON/Snapshot bleibt Fallback. Snapshot: {_e(_dt(data.get('published_at')))}</p>
+        <p class="muted">Read-only Auswertung. EC-Quelle: <b>{_e(ec_source_label)}</b>. Der Snapshot dient nur als Read-Model-Fallback. Snapshot: {_e(_dt(data.get('published_at')))}</p>
       </div>
       <a class="btn" href="/">Zurück</a>
     </section>
@@ -6719,7 +6756,7 @@ def _render_ec_dashboard(data: dict[str, Any]) -> str:
     <section class="grid">{cards}</section>
     <section class="panel" id="queue">
       <h2>🌐 Dashboard-EC-Buchungen</h2>
-      <p class="muted">Hier siehst du nach „EC wirklich buchen“, ob die Postgres-Anfrage noch offen ist, vom Bot verarbeitet wird oder fertig/abgelehnt wurde. Die Seite schreibt nichts direkt in JSON.</p>
+      <p class="muted">Hier siehst du nach „EC wirklich buchen“, ob die Postgres-Anfrage noch offen ist, vom Bot verarbeitet wird oder fertig/abgelehnt wurde. Die Seite schreibt nicht in lokale Runtime-Dateien; Aktionen laufen über PostgreSQL.</p>
       <p><a class="btn" href="/ec-queue">EC-Queue öffnen</a></p>
       {_table(['Angefragt','Status','Event','Typ','EC','Gebucht','Übersprungen','Admin','Details'], award_request_rows, placeholder='Dashboard-Buchungen durchsuchen…')}
     </section>
@@ -7100,7 +7137,7 @@ def _render_system_dashboard(data: dict[str, Any]) -> str:
     <section class="grid">{cards}</section>
     <section class="panel"><h2>Speicher</h2>{_table(['Key','Wert'], storage_rows, placeholder='Speicher durchsuchen…')}</section>
     <section class="panel"><h2>Guild</h2>{_table(['Key','Wert'], guild_rows, placeholder='Guild durchsuchen…')}</section>
-    <section class="panel"><h2>JSON-Quellen</h2>{_table(['Key','Datei','vorhanden','Status','Bytes','Geändert'], source_rows, placeholder='Quellen durchsuchen…')}</section>
+    <section class="panel"><h2>Runtime-Quellen</h2>{_table(['Key','Datei','vorhanden','Status','Bytes','Geändert'], source_rows, placeholder='Quellen durchsuchen…')}</section>
     """
     return _html_shell("System · Beer and Buffs Dashboard", body, nav_mode="admin")
 
@@ -7161,8 +7198,8 @@ def _member_center_role_bucket(value: Any) -> str:
     txt = str(value or "").strip().lower()
     if any(x in txt for x in ("tank", "wächter", "waechter")):
         return "Tank"
-    if any(x in txt for x in ("heal", "heiler", "support")):
-        return "Heiler"
+    if any(x in txt for x in ("support", "heal", "heiler")):
+        return "Support"
     if any(x in txt for x in ("dps", "dd", "damage", "schaden")):
         return "DPS"
     if any(x in txt for x in ("reserve", "bank")):
@@ -8971,20 +9008,11 @@ def _csv_response(filename: str, headers: list[str], rows: list[list[Any]]) -> R
 # ---------------------------------------------------------------------------
 
 def _role_bucket(label: Any) -> str:
-    txt = str(label or "").strip().lower()
-    if any(x in txt for x in ("tank", "wächter", "waechter")):
-        return "Tank"
-    if any(x in txt for x in ("heal", "heiler", "support")):
-        return "Heiler"
-    if any(x in txt for x in ("dps", "dd", "damage", "schaden")):
-        return "DPS"
-    if any(x in txt for x in ("reserve", "bank")):
-        return "Reserve"
-    return str(label or "Andere") or "Andere"
+    return canonical_role_bucket(label)
 
 
 def _event_role_summary(ev: dict[str, Any]) -> dict[str, int]:
-    out: dict[str, int] = {"Tank": 0, "Heiler": 0, "DPS": 0, "Reserve": 0, "Andere": 0}
+    out: dict[str, int] = {"Tank": 0, "Support": 0, "DPS": 0, "Reserve": 0, "Andere": 0}
     for role, count in (ev.get("yes_counts") or {}).items():
         bucket = _role_bucket(role)
         if bucket not in out:
@@ -9003,9 +9031,9 @@ def _event_readiness_score(role_counts: dict[str, int], participant_count: int) 
     if role_counts.get("Tank", 0) <= 0:
         score -= 30
         issues.append("kein Tank")
-    if role_counts.get("Heiler", 0) <= 0:
+    if role_counts.get("Support", 0) <= 0:
         score -= 30
-        issues.append("kein Heiler")
+        issues.append("kein Support")
     if role_counts.get("DPS", 0) <= 0:
         score -= 20
         issues.append("kein DPS")
@@ -9046,7 +9074,7 @@ def _planning_analytics(snap: dict[str, Any]) -> dict[str, Any]:
             "maybe": int(_num(ev.get("maybe_count"), 0)),
             "no": int(_num(ev.get("no_count"), 0)),
             "tank": counts.get("Tank", 0),
-            "healer": counts.get("Heiler", 0),
+            "healer": counts.get("Support", 0),
             "dps": counts.get("DPS", 0),
             "reserve": counts.get("Reserve", 0),
             "readiness": score,
@@ -9162,7 +9190,7 @@ def _render_planning_dashboard(data: dict[str, Any]) -> str:
     <section class="hero"><div><div class="eyebrow">Planung</div><h1>📅 Event-/Raid-Planung</h1><p class="muted">Schnellprüfung für Rolle, Teilnehmer, Voice und häufige Needs. Read-only.</p></div><a class="btn" href="/api/planning">API</a></section>
     <section class="grid">{cards}</section>
     <section class="panel"><h2>Rollen-Summen über Events</h2>{_bars(plan.get('role_totals') or [])}</section>
-    <section class="panel"><h2>Event-Bereitschaft</h2>{_table(['Event','Zeit','Teilnehmer','Tank','Heiler','DPS','Reserve','Score','Hinweise','Voice'], event_rows, placeholder='Events durchsuchen…')}</section>
+    <section class="panel"><h2>Event-Bereitschaft</h2>{_table(['Event','Zeit','Teilnehmer','Tank','Support','DPS','Reserve','Score','Hinweise','Voice'], event_rows, placeholder='Events durchsuchen…')}</section>
     <section class="panel"><h2>Bedarfs-Hotspots</h2><div class="split"><div><h3>Main-Needs</h3>{_table(['Item','Anzahl'], main_rows, placeholder='Main-Needs durchsuchen…')}</div><div><h3>Secondary-Needs</h3>{_table(['Item','Anzahl'], sec_rows, placeholder='Secondary-Needs durchsuchen…')}</div></div></section>
     """
     return _html_shell("Planung · Beer and Buffs Dashboard", body)
@@ -9508,8 +9536,8 @@ def _event_rsvp_choice_from_status(status: str) -> str:
     value = str(status or "").upper()
     if "TANK" in value:
         return "TANK"
-    if "HEAL" in value:
-        return "HEAL"
+    if "SUPPORT" in value or "HEAL" in value or "HEILER" in value:
+        return "SUPPORT"
     if "DPS" in value or "DD" in value:
         return "DPS"
     if "BANK" in value or "RESERVE" in value:
@@ -9528,7 +9556,7 @@ def _event_rsvp_controls(event_id: str, user_status: str, *, return_to: str, com
     current = _event_rsvp_choice_from_status(user_status)
     choices = [
         ("TANK", "🛡️", "Tank", "tank"),
-        ("HEAL", "✚", "Heal", "heal"),
+        ("SUPPORT", "✚", "Support", "support"),
         ("DPS", "⚔️", "DPS", "dps"),
         ("BANK", "🔖", "Reserve", "reserve"),
         ("MAYBE", "❔", "Vielleicht", "maybe"),
@@ -9602,7 +9630,7 @@ def _render_event_detail(data: dict[str, Any], event_id: str, request: Optional[
         not_joined.append((f"{unnamed_missing} weitere Mitglieder", "missing"))
 
     cards = "".join([
-        _card("Zusagen", summary.get("yes_count", 0), "Tank · Heal · DPS · Bank"),
+        _card("Zusagen", summary.get("yes_count", 0), "Tank · Support · DPS · Bank"),
         _card("Gesamtabstimmung", f"{summary.get('response_count', 0)}/{summary.get('member_total', 0)}", f"{summary.get('vote_percent', 0):.1f} % der Gilde"),
         _card("Vielleicht", summary.get("maybe_count", 0), "noch unentschieden"),
         _card("Nicht abgestimmt", summary.get("no_response_count", 0), "noch keine Rückmeldung"),
@@ -9615,7 +9643,7 @@ def _render_event_detail(data: dict[str, Any], event_id: str, request: Optional[
       .event-role-head{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:11px}
       .event-role-head h3{margin:0;color:#efd594}
       .event-role-names{display:flex;gap:7px;flex-wrap:wrap}
-      .event-role-name{display:inline-flex;padding:7px 10px;border-radius:999px;background:rgba(214,168,79,.08);border:1px solid rgba(214,168,79,.15);font-size:13px}
+      .event-role-name{display:inline-flex;align-items:center;gap:7px;padding:7px 10px;border-radius:999px;background:rgba(214,168,79,.08);border:1px solid rgba(214,168,79,.15);font-size:13px}.event-role-name img{width:25px!important;height:25px!important}.aion-role-glyph{display:inline-grid;place-items:center;min-width:20px}
       .event-name-chips{display:flex;flex-wrap:wrap;gap:8px}
       .event-name-chip{display:inline-flex;align-items:center;gap:7px;padding:7px 10px;border-radius:999px;border:1px solid rgba(255,255,255,.11);background:rgba(255,255,255,.04);font-size:13px}
       .event-name-chip small{font-size:10px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted)}
@@ -9645,7 +9673,7 @@ def _render_event_detail(data: dict[str, Any], event_id: str, request: Optional[
     {f'<section class="panel"><h2>🎮 Deine Rückmeldung</h2><p class="muted">Aktuell: <strong>{_e(current_status if current_status != "—" else "Noch nicht abgestimmt")}</strong>. Änderungen werden an den Bot gesendet und mit dem Discord-Event synchronisiert.</p>{_event_rsvp_controls(str(event_id), current_status, return_to=f"/event/{urllib.parse.quote(str(event_id))}")}</section>' if rsvp_open else ('<section class="panel"><h2>🎮 Deine Rückmeldung</h2><p class="muted">Dieses Event ist für neue Rückmeldungen geschlossen.</p></section>' if current_uid else '')}
     {lineup_panel}
     <section class="panel" id="roles"><h2>📊 Rollenverteilung</h2>{_bars(role_items, max_items=12)}</section>
-    <section class="panel"><h2>✅ Wer ist dabei?</h2><p class="muted">Zusagen sind ausschließlich Tank, Heal, DPS und Bank/Reserve.</p>{_event_role_overview_html(event)}</section>
+    <section class="panel"><h2>✅ Wer ist dabei?</h2><p class="muted">Zusagen sind ausschließlich Tank, Support, DPS und Bank/Reserve.</p>{_event_role_overview_html(event, int(guild_id or 0))}</section>
     <section class="panel" id="open"><h2>🕒 Noch nicht zugesagt</h2><p class="muted">Vielleicht steht zuerst, danach Abmeldungen und Mitglieder ohne Rückmeldung.</p>{_event_name_chips(not_joined, empty='Alle Mitglieder haben zugesagt.')}</section>
     """
     return _html_shell(f"{event.get('title') or 'Event'} · Beer and Buffs Dashboard", body)
@@ -11842,6 +11870,9 @@ def _ensure_v211_tables() -> None:
             cur.execute('''CREATE TABLE IF NOT EXISTS member_membership (guild_id BIGINT NOT NULL,user_id BIGINT NOT NULL,member_since TIMESTAMPTZ,source TEXT NOT NULL DEFAULT 'discord_join',updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),PRIMARY KEY(guild_id,user_id))''')
             cur.execute('''CREATE TABLE IF NOT EXISTS aion2_profiles (guild_id BIGINT NOT NULL,user_id BIGINT NOT NULL,character_name TEXT NOT NULL DEFAULT '',class_name TEXT NOT NULL DEFAULT '',main_role TEXT NOT NULL DEFAULT '',faction TEXT NOT NULL DEFAULT '',level INTEGER,gearscore TEXT NOT NULL DEFAULT '',updated_at TEXT NOT NULL,PRIMARY KEY(guild_id,user_id))''')
             cur.execute("ALTER TABLE aion2_profiles ADD COLUMN IF NOT EXISTS faction TEXT NOT NULL DEFAULT ''")
+            cur.execute("UPDATE aion2_profiles SET main_role='SUPPORT' WHERE UPPER(TRIM(main_role)) IN ('HEAL','HEALER','HEILER')")
+            cur.execute("UPDATE event_rsvp_transitions SET old_choice='SUPPORT' WHERE UPPER(TRIM(old_choice)) IN ('HEAL','HEALER','HEILER')")
+            cur.execute("UPDATE event_rsvp_transitions SET new_choice='SUPPORT' WHERE UPPER(TRIM(new_choice)) IN ('HEAL','HEALER','HEILER')")
             cur.execute('''CREATE TABLE IF NOT EXISTS leader_tickets (id BIGSERIAL PRIMARY KEY,guild_id BIGINT NOT NULL,creator_user_id BIGINT,creator_name TEXT NOT NULL DEFAULT '',anonymous BOOLEAN NOT NULL DEFAULT FALSE,subject TEXT NOT NULL DEFAULT '',original_message TEXT NOT NULL DEFAULT '',status TEXT NOT NULL DEFAULT 'open',assigned_to_id BIGINT,assigned_to_name TEXT NOT NULL DEFAULT '',discord_internal_channel_id BIGINT,discord_internal_message_id BIGINT,ticket_channel_id BIGINT,created_at TEXT NOT NULL,claimed_at TEXT,closed_at TEXT,closed_by_id BIGINT,closed_by_name TEXT NOT NULL DEFAULT '')''')
             cur.execute('''CREATE TABLE IF NOT EXISTS leader_ticket_messages (id BIGSERIAL PRIMARY KEY,ticket_id BIGINT NOT NULL,guild_id BIGINT NOT NULL,discord_message_id BIGINT,author_id BIGINT,author_name TEXT NOT NULL DEFAULT '',content TEXT NOT NULL DEFAULT '',attachments_json TEXT NOT NULL DEFAULT '[]',created_at TEXT NOT NULL)''')
             cur.execute('''CREATE TABLE IF NOT EXISTS leader_ticket_notes (id BIGSERIAL PRIMARY KEY,ticket_id BIGINT NOT NULL,guild_id BIGINT NOT NULL,author_id BIGINT,author_name TEXT NOT NULL DEFAULT '',content TEXT NOT NULL DEFAULT '',created_at TEXT NOT NULL)''')
@@ -11860,7 +11891,7 @@ def _activity_data(guild_id:int,user_id:int)->dict[str,Any]:
             for days in (7,30,90):
                 cur.execute('''SELECT COALESCE(SUM(messages),0) messages,COALESCE(SUM(reactions_given),0) reactions_given,COALESCE(SUM(reactions_received),0) reactions_received,COUNT(*) FILTER(WHERE messages>0 OR reactions_given>0 OR reactions_received>0 OR event_responses>0) active_days FROM member_activity_daily WHERE guild_id=%s AND user_id=%s AND activity_date>=CURRENT_DATE-(%s::int-1)''',(guild_id,user_id,days)); periods[days]=dict(cur.fetchone() or {})
             cur.execute('''SELECT COALESCE(SUM(duration_seconds),0) seconds,COUNT(*) sessions FROM voice_sessions WHERE guild_id=%s AND user_id=%s AND duration_seconds IS NOT NULL''',(guild_id,user_id)); voice=dict(cur.fetchone() or {})
-            cur.execute("SELECT COUNT(DISTINCT event_id) AS c FROM event_rsvp_transitions WHERE guild_id=%s AND user_id=%s AND new_choice='NO' AND old_choice IN ('TANK','HEAL','DPS','BANK')",(guild_id,user_id)); absent=int((cur.fetchone() or {}).get('c') or 0)
+            cur.execute("SELECT COUNT(DISTINCT event_id) AS c FROM event_rsvp_transitions WHERE guild_id=%s AND user_id=%s AND new_choice='NO' AND old_choice IN ('TANK','SUPPORT','HEAL','DPS','BANK')",(guild_id,user_id)); absent=int((cur.fetchone() or {}).get('c') or 0)
             cur.execute('SELECT * FROM aion2_profiles WHERE guild_id=%s AND user_id=%s',(guild_id,user_id)); aion=dict(cur.fetchone() or {})
             # Aktive Tage = Union aus Nachrichten/Reaktionen/Event-Rückmeldung und Voice.
             for days in (7,30,90):
@@ -11898,7 +11929,7 @@ def _member_activity_event_stats(snap:dict[str,Any],user_id:int,member_since:Any
         target=int(ev.get('target_role_id') or 0)
         if target and target not in role_ids: continue
         out['possible']+=1; status=_portal_event_status_for_user(ev,user_id); ch=_event_rsvp_choice_from_status(status)
-        if ch in {'TANK','HEAL','DPS'}: out['yes']+=1
+        if normalize_event_role(ch) in {'TANK','SUPPORT','DPS'}: out['yes']+=1
         elif ch=='BANK': out['reserve']+=1
         elif ch=='MAYBE': out['maybe']+=1
         elif ch=='NO': out['no']+=1
@@ -11918,55 +11949,23 @@ def _member_activity_panel(data:dict[str,Any],user_id:int,current_user:Optional[
     seconds=int(v.get('seconds') or 0); sessions=int(v.get('sessions') or 0); avg=round(seconds/sessions/60,1) if sessions else 0
     return f'''<section class="panel" id="activity"><h2>📈 Aktivität & Rückmeldungen</h2><p class="muted">Keine Attendance-Auswertung: angezeigt werden Event-Rückmeldungen und Discord-Aktivität.</p><div class="grid">{pcards}</div>{_table(['Zeitraum','Aktive Tage','Nachrichten','Reaktionen vergeben','Reaktionen erhalten'],rows,searchable=False)}<div class="grid">{_card('Voice gesamt',f'{round(seconds/3600,1)} h',f'{sessions} Sessions')}{_card('Ø Voice-Session',f'{avg} min','seit Erfassung')}{_card('Letzte Aktivität',_dt(total.get('last_activity')),'Discord-Aktivität')}{_card('Gildenmitglied seit',_dt(d.get('member_since')),'erfasster Beginn')}</div></section>'''
 
-AION2_CLASS_META = {
-    "Templer": {"en": "Templar", "role": "TANK", "emoji": "Templar", "asset": "aion2/templar.png"},
-    "Gladiator": {"en": "Gladiator", "role": "DPS", "emoji": "Gladiator", "asset": "aion2/gladiator.png"},
-    "Assassine": {"en": "Assassin", "role": "DPS", "emoji": "Assassin", "asset": "aion2/assassin.png"},
-    "Jäger": {"en": "Ranger", "role": "DPS", "emoji": "Ranger", "asset": "aion2/ranger.png"},
-    "Zauberer": {"en": "Sorcerer", "role": "DPS", "emoji": "Sorcerer", "asset": "aion2/sorcerer.png"},
-    "Geisterbeschwörer": {"en": "Elementalist", "role": "DPS", "emoji": "Elementalist", "asset": "aion2/elementalist.png"},
-    "Kleriker": {"en": "Cleric", "role": "HEAL", "emoji": "Cleric", "asset": "aion2/cleric.png"},
-    "Kantor": {"en": "Chanter", "role": "SUPPORT", "emoji": "Chanter", "asset": "aion2/chanter.png"},
-}
-AION2_CLASS_ALIASES = {
-    "Beschwörer": "Geisterbeschwörer",
-    "Spiritmaster": "Geisterbeschwörer",
-    "Spirit Master": "Geisterbeschwörer",
-    "Elementalist": "Geisterbeschwörer",
-}
-AION2_FACTION_META = {
-    "ELYOS": {"label": "Elyos", "asset": "aion2/elyos.png"},
-    "ASMODIA": {"label": "Asmodia", "asset": "aion2/asmodia.png"},
-}
-
 def _aion2_normalize_class(value: Any) -> str:
-    raw = re.sub(r"\s+", " ", str(value or "").strip())
-    if raw in AION2_CLASS_META:
-        return raw
-    if raw in AION2_CLASS_ALIASES:
-        return AION2_CLASS_ALIASES[raw]
-    folded = raw.casefold()
-    for name, meta in AION2_CLASS_META.items():
-        if folded in {name.casefold(), str(meta.get("en") or "").casefold()}:
-            return name
-    return ""
+    return aion2_normalize_class(value)
+
 
 def _aion2_role_for_class(value: Any) -> str:
-    name = _aion2_normalize_class(value)
-    return str((AION2_CLASS_META.get(name) or {}).get("role") or "")
+    return aion2_role_for_class(value)
+
 
 def _aion2_role_label(value: Any) -> str:
-    return {"TANK":"Tank","HEAL":"Heiler","DPS":"DPS","SUPPORT":"Support"}.get(str(value or "").upper(), str(value or "—"))
+    return aion2_role_label(value)
+
 
 def _aion2_normalize_faction(value: Any) -> str:
-    raw = str(value or "").strip().upper()
-    aliases = {"ASMODIAN": "ASMODIA", "ASMODIANS": "ASMODIA", "ASMODIER": "ASMODIA"}
-    raw = aliases.get(raw, raw)
-    return raw if raw in AION2_FACTION_META else ""
+    return aion2_normalize_faction(value)
 
 def _aion2_class_icon_url(value: Any) -> str:
-    name = _aion2_normalize_class(value)
-    asset = str((AION2_CLASS_META.get(name) or {}).get("asset") or "")
+    asset = aion2_class_asset(value)
     return _asset(asset) if asset else ""
 
 def _aion2_class_display_html(value: Any, *, with_name: bool = True) -> str:
@@ -11988,6 +11987,12 @@ def _aion2_faction_display_html(value: Any, *, with_name: bool = True) -> str:
     label = str(meta.get("label") or key)
     img = f'<img src="{_e(url)}" alt="{_e(label)}" title="{_e(label)}" style="width:34px;height:34px;object-fit:contain;vertical-align:middle">'
     return _raw(img + (f' <span>{_e(label)}</span>' if with_name else ""))
+
+def _aion2_role_icon_html(value: Any, *, with_label: bool = False) -> str:
+    role = normalize_event_role(value)
+    icon = {"TANK": "🛡️", "SUPPORT": "✚", "DPS": "⚔️", "BANK": "🪑"}.get(role, "•")
+    label = event_role_label(role) if role else str(value or "—")
+    return _raw(f'<span class="aion-role-glyph" title="{_e(label or "Rolle")}">{icon}</span>' + (f' <span>{_e(label)}</span>' if with_label else ""))
 
 def _aion2_profiles_for_users(guild_id: int, user_ids: list[int]) -> dict[int, dict[str, Any]]:
     ids = sorted({int(x) for x in user_ids if int(x or 0) > 0})
@@ -13659,7 +13664,7 @@ def _render_member_portal(data: dict[str, Any], user_id: int, request: Request, 
         else f'<img src="{_e(_brand_image("logo", "beer_and_buffs_logo.png"))}" alt="Profilbild" loading="eager">'
     )
 
-    role_choices = ["DPS", "Tank", "Heiler", "Support", "Flex"]
+    role_choices = ["DPS", "Tank", "Support", "Flex"]
     role_options: list[str] = []
     if main_role not in ("", "—") and main_role not in role_choices:
         role_options.append(f'<option value="{_e(main_role)}" selected>{_e(main_role)}</option>')
@@ -13763,6 +13768,8 @@ def _render_member_portal(data: dict[str, Any], user_id: int, request: Request, 
           <div class="profile-stat"><small>Abwesenheitsstatus</small><strong>{'🌙' if absence_state != 'available' else '✓'}</strong><span>{_e(absence_text)}</span></div>
         </section>
       </div>
+
+      {_aion2_profile_panel(data, uid, current_user) if bool(_dashboard_module_setting_value(int(guild_id or 0), 'onboarding', 'aion2_enabled', False)) else ''}
 
       <div class="profile-middle-grid">
         <section class="profile-section"><h2 class="profile-section-title">Deine kommenden Events</h2><div class="profile-event-list">{upcoming_html}</div><div class="profile-panel-footer"><a href="/member/events">Zu meinen Events</a></div></section>
@@ -13871,8 +13878,8 @@ def _aion2_home_map_panel(guild_id: int) -> str:
     """
     if not bool(_dashboard_module_setting_value(guild_id, "onboarding", "aion2_enabled", False)):
         return ""
-    direct_url = "https://interactivemap.app/aion2/maps/verteron"
-    embed_url = direct_url + "?embed=light"
+    direct_url = AION2_MAP_DIRECT_URL
+    embed_url = AION2_MAP_EMBED_URL
     return f"""
     <section class="panel aion-home-map" id="aion2-map">
       <div class="aion-map-head">
@@ -14055,7 +14062,7 @@ def _render_member_home(data: dict[str, Any], request: Request) -> str:
 def _member_event_role_summary_text(ev: dict[str, Any]) -> str:
     try:
         s = _event_role_summary(ev)
-        return f"Tank {s.get('Tank',0)} · Heal {s.get('Heiler',0)} · DPS {s.get('DPS',0)} · Reserve {s.get('Reserve',0)}"
+        return f"Tank {s.get('Tank',0)} · Support {s.get('Support',0)} · DPS {s.get('DPS',0)} · Reserve {s.get('Reserve',0)}"
     except Exception:
         return "—"
 
@@ -14126,7 +14133,7 @@ def _render_member_events_page(data: dict[str, Any], request: Request) -> str:
         return str(ev.get("event_type") or ev.get("dkp_event_type") or "Gildenevent").strip() or "Gildenevent"
 
     def role_counts(summary: dict[str, Any]) -> dict[str, int]:
-        out = {"Tank": 0, "Heiler": 0, "DPS": 0, "Reserve": 0, "Andere": 0}
+        out = {"Tank": 0, "Support": 0, "DPS": 0, "Reserve": 0, "Andere": 0}
         for group in summary.get("groups") or []:
             if not isinstance(group, dict):
                 continue
@@ -14180,7 +14187,7 @@ def _render_member_events_page(data: dict[str, Any], request: Request) -> str:
         counts = role_counts(summary)
         items = [
             ("🛡️", "Tanks", counts.get("Tank", 0), "tank"),
-            ("✚", "Heiler", counts.get("Heiler", 0), "heal"),
+            ("✚", "Support", counts.get("Support", 0), "support"),
             ("⚔️", "DDs", counts.get("DPS", 0), "dps"),
             ("🔖", "Reserve", counts.get("Reserve", 0), "reserve"),
         ]
@@ -14198,8 +14205,8 @@ def _render_member_events_page(data: dict[str, Any], request: Request) -> str:
         value = status.casefold()
         if "tank" in value:
             return "tank"
-        if "heal" in value:
-            return "heal"
+        if "support" in value or "heal" in value or "heiler" in value:
+            return "support"
         if "dps" in value or "dd" in value:
             return "dps"
         if "reserve" in value or "bank" in value:
@@ -14289,8 +14296,8 @@ def _render_member_events_page(data: dict[str, Any], request: Request) -> str:
         feature_roles = role_counts(feature_summary)
         if feature_roles.get("Tank", 0) <= 0:
             attention_items.append("Noch kein Tank zugesagt")
-        if feature_roles.get("Heiler", 0) <= 0:
-            attention_items.append("Noch kein Heiler zugesagt")
+        if feature_roles.get("Support", 0) <= 0:
+            attention_items.append("Noch kein Support zugesagt")
         if int(feature_summary.get("no_response_count") or 0) > 0:
             attention_items.append(f"{int(feature_summary.get('no_response_count') or 0)} Mitglieder ohne Rückmeldung")
         attention_items.append(until_text(featured))
@@ -14355,9 +14362,9 @@ def _render_member_events_page(data: dict[str, Any], request: Request) -> str:
       .event-role-strip.compact{{grid-template-columns:repeat(4,minmax(0,1fr));margin:10px 0;border-top:1px solid rgba(214,168,79,.16)}}
       .event-role-stat{{display:grid;grid-template-columns:auto 1fr;column-gap:7px;align-items:center;padding:12px 10px;border-right:1px dotted rgba(214,168,79,.28)}}
       .event-role-stat:last-child{{border-right:0}}.event-role-stat>span{{grid-row:1/3;font-size:22px}}.event-role-stat small{{color:#c9bda8}}.event-role-stat strong{{font-size:19px;color:#f2eadb}}
-      .event-role-stat.tank>span{{color:#6ea4e8}}.event-role-stat.heal>span{{color:#83d45f}}.event-role-stat.dps>span{{color:#dc5548}}.event-role-stat.reserve>span{{color:#e2bd52}}.event-role-stat.maybe>span{{color:#b77ce4}}
+      .event-role-stat.tank>span{{color:#6ea4e8}}.event-role-stat.support>span{{color:#83d45f}}.event-role-stat.dps>span{{color:#dc5548}}.event-role-stat.reserve>span{{color:#e2bd52}}.event-role-stat.maybe>span{{color:#b77ce4}}
       .event-own-status{{display:flex;gap:8px;align-items:center;padding:13px 4px;color:#c9bda8}}
-      .event-own-status strong,.event-mini-status strong{{color:#f2eadb}}.event-own-status strong.tank,.event-mini-status strong.tank{{color:#78aeea}}.event-own-status strong.heal,.event-mini-status strong.heal{{color:#8ddf6a}}.event-own-status strong.dps,.event-mini-status strong.dps{{color:#ef6d5c}}.event-own-status strong.reserve,.event-mini-status strong.reserve{{color:#e7c55f}}.event-own-status strong.maybe,.event-mini-status strong.maybe{{color:#c28aef}}.event-own-status strong.no,.event-mini-status strong.no{{color:#c28f87}}
+      .event-own-status strong,.event-mini-status strong{{color:#f2eadb}}.event-own-status strong.tank,.event-mini-status strong.tank{{color:#78aeea}}.event-own-status strong.support,.event-mini-status strong.support{{color:#8ddf6a}}.event-own-status strong.dps,.event-mini-status strong.dps{{color:#ef6d5c}}.event-own-status strong.reserve,.event-mini-status strong.reserve{{color:#e7c55f}}.event-own-status strong.maybe,.event-mini-status strong.maybe{{color:#c28aef}}.event-own-status strong.no,.event-mini-status strong.no{{color:#c28f87}}
       .event-feature-actions{{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}}
       .event-choice{{display:flex;gap:9px;align-items:center;justify-content:center;padding:13px 9px;border:1px solid rgba(214,168,79,.42);background:linear-gradient(180deg,rgba(44,37,30,.88),rgba(15,15,14,.9));color:#e5d3b0;text-decoration:none;text-transform:uppercase;font-family:Georgia,serif;font-weight:800;letter-spacing:.03em}}
       .event-choice:hover{{filter:brightness(1.18)}}.event-choice.participate{{border-color:#8c4c2b;background:linear-gradient(180deg,rgba(105,29,20,.75),rgba(42,13,10,.88))}}.event-choice.maybe{{border-color:#745a91;background:linear-gradient(180deg,rgba(65,38,82,.78),rgba(28,18,36,.9))}}.event-choice.reserve{{border-color:#9b722d;background:linear-gradient(180deg,rgba(106,70,18,.72),rgba(45,31,12,.9))}}
@@ -14894,6 +14901,9 @@ def _render_member_members_page(data: dict[str, Any], request: Request) -> str:
         member_map[uid] = merged
 
     balances = _balance_map(snap)
+    guild_id = int(_safe_guild_id(data) or 0)
+    aion_enabled = bool(_dashboard_module_setting_value(guild_id, 'onboarding', 'aion2_enabled', False)) if guild_id else False
+    aion_profiles = _aion2_profiles_for_users(guild_id, list(member_map.keys())) if aion_enabled else {}
     absences = [row for row in ((snap.get("absences") or {}).get("items") or []) if isinstance(row, dict)]
     now = datetime.now(timezone.utc)
     today = now.date()
@@ -14916,8 +14926,13 @@ def _render_member_members_page(data: dict[str, Any], request: Request) -> str:
         avatar_url = str(row.get("avatar_url") or row.get("display_avatar_url") or row.get("discord_avatar_url") or profile.get("avatar_url") or "").strip()
         rank_label, rank_key = _member_roster_rank({**profile, **row})
         role_counts[rank_label] += 1
-        class_name = str(row.get("class_name") or row.get("main_class") or row.get("character_class") or profile.get("class_name") or "").strip()
-        combat_role = str(row.get("main_role") or profile.get("main_role") or "").strip()
+        aion = aion_profiles.get(uid) or {}
+        if aion.get("character_name"):
+            ingame_name = str(aion.get("character_name") or "").strip()
+        class_name = str(aion.get("class_name") or row.get("class_name") or row.get("main_class") or row.get("character_class") or profile.get("class_name") or "").strip()
+        combat_role = str(aion.get("main_role") or row.get("main_role") or profile.get("main_role") or "").strip()
+        faction = str(aion.get("faction") or "").strip()
+        gearscore = str(aion.get("gearscore") or row.get("gearscore") or profile.get("gearscore") or "").strip()
         class_type = " · ".join(value for value in (class_name, combat_role) if value) or "—"
         absence = _member_absence_state(absences, uid, today)
         event_yes = 0
@@ -14937,6 +14952,10 @@ def _render_member_members_page(data: dict[str, Any], request: Request) -> str:
             "rank_label": rank_label,
             "rank_key": rank_key,
             "class_type": class_type,
+            "class_name": class_name,
+            "combat_role": combat_role,
+            "faction": faction,
+            "gearscore": gearscore,
             "absence": absence,
             "event_yes": event_yes,
             "event_total": len(week_events),
@@ -14976,13 +14995,15 @@ def _render_member_members_page(data: dict[str, Any], request: Request) -> str:
         ec_text = _fmt_ec(ec_value) if ec_value is not None else "—"
         searchable = " ".join([
             str(item.get("display_name") or ""), str(item.get("ingame_name") or ""), str(item.get("rank_label") or ""),
-            str(item.get("class_type") or ""), "abwesend" if status_state == "away" else "online",
+            str(item.get("class_type") or ""), str(item.get("faction") or ""), str(item.get("gearscore") or ""), "abwesend" if status_state == "away" else "online",
         ]).casefold()
         member_rows.append(f'''
           <div class="members-row" role="row" tabindex="0" data-member-row data-member-name="{_e(str(item.get('display_name') or '').casefold())}" data-member-ec="{_e(_num(ec_value, -1))}" data-member-status="{_e(status_state)}" data-member-search="{_e(searchable)}" data-member-href="/portal/member/{int(item['user_id'])}">
-            <div class="members-person" role="cell">{avatar_html(item)}<span><strong>{_e(item.get('display_name'))}</strong><small>{_e(item.get('ingame_name') or 'Kein Ingame-Name')}</small></span></div>
             <div role="cell"><span class="members-rank {item.get('rank_key')}">{_e(item.get('rank_label'))}</span></div>
-            <div class="members-class" role="cell">{_e(item.get('class_type'))}</div>
+            <div class="members-person" role="cell">{avatar_html(item)}<span><strong>{_cell(_aion2_faction_display_html(item.get('faction'), with_name=False)) if item.get('faction') else ''}{_e(item.get('display_name'))}</strong><small>{_e(item.get('ingame_name') or 'Kein Ingame-Name')}</small></span></div>
+            <div class="members-class" role="cell">{_cell(_aion2_class_display_html(item.get('class_name'), with_name=True)) if item.get('class_name') else '—'}</div>
+            <div class="members-gs" role="cell"><strong>{_e(item.get('gearscore') or '—')}</strong></div>
+            <div class="members-role-icon" role="cell">{_cell(_aion2_role_icon_html(item.get('combat_role'), with_label=False))}</div>
             <div role="cell"><span class="members-status {status_state}"><i></i>{_e(absence.get('label') or 'Online')}</span><small class="members-status-detail">{_e(status_detail)}</small></div>
             <div class="members-events" role="cell"><strong>{int(item.get('event_yes') or 0)} / {int(item.get('event_total') or 0)}</strong><small>zugesagt</small></div>
             <div class="members-ec" role="cell"><span>◈</span><strong>{_e(ec_text)}</strong></div>
@@ -15035,7 +15056,7 @@ def _render_member_members_page(data: dict[str, Any], request: Request) -> str:
       .members-toolbar{{display:grid;grid-template-columns:minmax(220px,1fr) 180px;gap:12px;padding:13px;border-bottom:1px solid rgba(214,168,79,.18)}}
       .members-toolbar input,.members-toolbar select{{width:100%;padding:11px 12px;border:1px solid rgba(214,168,79,.25);background:#0a0c10;color:#d8cfba;outline:none}}
       .members-toolbar input:focus,.members-toolbar select:focus{{border-color:#c79b47}}
-      .members-table-head,.members-row{{display:grid;grid-template-columns:minmax(230px,1.35fr) 120px minmax(150px,.85fr) minmax(185px,1fr) 105px 120px;align-items:center}}
+      .members-table-head,.members-row{{display:grid;grid-template-columns:110px minmax(205px,1.2fr) minmax(150px,.85fr) 80px 70px minmax(165px,1fr) 95px 105px;align-items:center}}
       .members-table-head{{padding:11px 14px;color:#bca66f;text-transform:uppercase;letter-spacing:.045em;font:700 11px Georgia,serif;border-bottom:1px solid rgba(214,168,79,.19)}}
       .members-row{{min-height:64px;padding:7px 14px;border-bottom:1px solid rgba(214,168,79,.12);cursor:pointer;transition:.15s ease}}
       .members-row:hover,.members-row.selected{{background:linear-gradient(90deg,rgba(126,30,23,.22),rgba(214,168,79,.035));box-shadow:inset 3px 0 #9d392c}}
@@ -15047,7 +15068,7 @@ def _render_member_members_page(data: dict[str, Any], request: Request) -> str:
       .members-person small,.members-mini-row small{{display:block;color:#8f887a;font-size:11px;margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
       .members-rank{{display:inline-flex;padding:5px 9px;border:1px solid;border-radius:2px;text-transform:uppercase;font:700 10px Georgia,serif}}
       .members-rank.leader{{color:#f0aa8d;border-color:#87362b;background:#4f1915}}.members-rank.advisor{{color:#d5aae5;border-color:#633975;background:#301d38}}.members-rank.guardian{{color:#e4bd70;border-color:#76602e;background:#352c18}}.members-rank.member{{color:#b4c9e4;border-color:#35536e;background:#17293a}}.members-rank.recruit{{color:#b9dba7;border-color:#446a34;background:#1b3319}}
-      .members-class{{color:#aea89c;font-size:12px}}
+      .members-class{{display:flex;align-items:center;gap:7px;color:#aea89c;font-size:12px}}.members-class img{{width:31px!important;height:31px!important}}.members-person strong img{{width:22px!important;height:22px!important;margin-right:5px}}.members-gs{{color:#e0c37d;font:700 13px Georgia,serif}}.members-role-icon{{font-size:21px;text-align:center}}.members-role-icon .aion-role-glyph{{min-width:26px}}
       .members-status{{display:inline-flex;align-items:center;gap:7px;text-transform:uppercase;font:700 11px Georgia,serif}}.members-status i{{width:9px;height:9px;border-radius:50%;box-shadow:0 0 9px currentColor}}
       .members-status.online{{color:#75ca57}}.members-status.online i{{background:#66bd48}}.members-status.away{{color:#df982e}}.members-status.away i{{background:#d78319}}
       .members-status-detail{{display:block;color:#817b70;font-size:10px;margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:180px}}
@@ -15071,7 +15092,7 @@ def _render_member_members_page(data: dict[str, Any], request: Request) -> str:
     </style>
     <nav class="topnav"><a href="/member">Start</a><a href="/member/members">Mitglieder</a><a href="/member/events">Events</a><a href="/member/auctions">Auktionen</a><a href="/portal">Mein Profil</a></nav>
     <main class="members-page">
-      <header class="members-page-header"><div><h1>Mitglieder</h1><p>Übersicht über alle Gildenmitglieder, Rollen und Aktivität</p></div><div class="members-source-note">ⓘ Online und Abwesend werden ausschließlich aus dem Abwesenheiten-Planer berechnet.</div></header>
+      <header class="members-page-header"><div><h1>Mitglieder</h1><p>Rang, Name, Aion-2-Klasse, Gearscore, Rolle und Aktivität</p></div><div class="members-source-note">ⓘ Online und Abwesend werden ausschließlich aus dem Abwesenheiten-Planer berechnet.</div></header>
 
       <section class="members-metrics">
         <article class="members-metric"><div class="members-metric-icon">👥</div><div><small>Mitglieder gesamt</small><strong>{total_members}</strong><span>aktuelle Mitglieder im Snapshot</span></div></article>
@@ -15083,7 +15104,7 @@ def _render_member_members_page(data: dict[str, Any], request: Request) -> str:
       <section class="members-layout">
         <section class="members-section">
           <div class="members-toolbar"><input id="members-search" type="search" placeholder="Mitglied suchen..."><select id="members-sort"><option value="rank">Nach Rolle</option><option value="name">Nach Name</option><option value="ec">Nach EC</option></select></div>
-          <div class="members-table-head" role="row"><span>Name</span><span>Rolle</span><span>Klasse / Typ</span><span>Status</span><span>Events diese Woche</span><span>EC / Punkte</span></div>
+          <div class="members-table-head" role="row"><span>Rang</span><span>Name</span><span>Klasse</span><span>GS</span><span>Rolle</span><span>Status</span><span>Events</span><span>EC</span></div>
           <div id="members-rows">{rows_html}</div>
           <div class="members-table-footer"><div class="members-pagination" id="members-pages"></div><span id="members-range">0 Mitglieder</span></div>
         </section>
@@ -16013,8 +16034,9 @@ def _enqueue_event_action_request(guild_id: int, action_type: str, payload: dict
     if action in {"edit", "delete", "rsvp", "lineup"} and not event_id:
         return {"ok": False, "error": "Event-ID fehlt."}
     if action == "rsvp":
-        choice = str(payload.get("choice") or payload.get("response") or "").strip().upper()
-        if choice not in {"TANK", "HEAL", "DPS", "BANK", "MAYBE", "NO"}:
+        choice = normalize_event_role(payload.get("choice") or payload.get("response") or "")
+        payload["choice"] = choice
+        if choice not in {"TANK", "SUPPORT", "DPS", "BANK", "MAYBE", "NO"}:
             return {"ok": False, "error": "Ungültige RSVP-Auswahl."}
         if not actor_id.isdigit():
             return {"ok": False, "error": "Discord-Login erforderlich."}
@@ -16083,7 +16105,7 @@ def _event_lineup_candidates(event: dict[str, Any]) -> list[dict[str, Any]]:
     """Aktuelle Zusagen eines Events als eindeutige Drag-&-Drop-Kandidaten."""
     out: list[dict[str, Any]] = []
     seen: set[int] = set()
-    role_order = {"TANK": 0, "HEAL": 1, "HEALER": 1, "DPS": 2, "BANK": 3, "RESERVE": 3}
+    role_order = {"TANK": 0, "SUPPORT": 1, "HEAL": 1, "HEALER": 1, "DPS": 2, "BANK": 3, "RESERVE": 3}
     groups = sorted(
         _event_yes_groups(event),
         key=lambda g: (role_order.get(str(g.get("role") or "").upper(), 20), str(g.get("role") or "").casefold()),
@@ -16091,7 +16113,7 @@ def _event_lineup_candidates(event: dict[str, Any]) -> list[dict[str, Any]]:
     for group in groups:
         role_raw = str(group.get("role") or "Zusage").strip()
         role_key = role_raw.upper()
-        role = {"HEALER": "Heal", "HEAL": "Heal", "TANK": "Tank", "DPS": "DPS", "BANK": "Reserve", "RESERVE": "Reserve"}.get(role_key, role_raw or "Zusage")
+        role = {"SUPPORT": "Support", "HEALER": "Support", "HEAL": "Support", "TANK": "Tank", "DPS": "DPS", "BANK": "Reserve", "RESERVE": "Reserve"}.get(role_key, role_raw or "Zusage")
         for person in group.get("participants") or []:
             if not isinstance(person, dict):
                 continue
@@ -16132,7 +16154,7 @@ def _event_lineup_candidates_for_snapshot(snap: dict[str, Any], event: dict[str,
         if role_l in {"no", "nein", "abgemeldet", "maybe", "vielleicht"}:
             continue
         role_key = role_raw.upper()
-        role = {"HEALER": "Heal", "HEAL": "Heal", "TANK": "Tank", "DPS": "DPS", "BANK": "Reserve", "RESERVE": "Reserve"}.get(role_key, role_raw or "Zusage")
+        role = {"SUPPORT": "Support", "HEALER": "Support", "HEAL": "Support", "TANK": "Tank", "DPS": "DPS", "BANK": "Reserve", "RESERVE": "Reserve"}.get(role_key, role_raw or "Zusage")
         out.append({
             "user_id": int(uid),
             "display_name": str(row.get("display_name") or row.get("name") or row.get("server_name") or f"User {uid}"),
@@ -16443,9 +16465,9 @@ def _event_lineup_panel(data: dict[str, Any], event: dict[str, Any], event_id: s
       document.getElementById('lineup-publish').addEventListener('click',()=>save(true));
       document.getElementById('lineup-auto').addEventListener('click',()=>{{
         state.group_size=Number(document.getElementById('lineup-group-size').value||6);state.group_count=Number(document.getElementById('lineup-group-count').value||1);normalize();state.groups.forEach(g=>g.members=[]);state.bench=[];
-        const buckets={{Tank:[],Heal:[],DPS:[],Reserve:[],Other:[]}};(initial.candidates||[]).forEach(p=>(buckets[p.role]||buckets.Other).push(p));
+        const buckets={{Tank:[],Support:[],DPS:[],Reserve:[],Other:[]}};(initial.candidates||[]).forEach(p=>(buckets[p.role]||buckets.Other).push(p));
         for(const key of Object.keys(buckets)) buckets[key].sort((a,b)=>String(a.display_name).localeCompare(String(b.display_name)));
-        const order=[...buckets.Tank,...buckets.Heal,...buckets.DPS,...buckets.Other,...buckets.Reserve];
+        const order=[...buckets.Tank,...buckets.Support,...buckets.DPS,...buckets.Other,...buckets.Reserve];
         let cursor=0;for(const p of order){{let placed=false;for(let tries=0;tries<state.groups.length;tries++){{const gi=cursor%state.groups.length;cursor++;if(state.groups[gi].members.length<state.group_size){{state.groups[gi].members.push(p);placed=true;break}}}}if(!placed)state.bench.push(p)}}
         render();markDirty();
       }});
@@ -16877,7 +16899,7 @@ def _render_events_center(data: dict[str, Any], current_user: Optional[dict[str,
           {image}
           <div class="admin-event-card-body">
             <div class="admin-event-card-head"><div><span class="pill {status_class}">{_e(bucket_label)}</span><span class="pill {_e(queue_class)}">{_e(queue_label)}</span><h3>{_e(title)}</h3><p class="muted">{_event_dt(ev.get('when_iso') or ev.get('start_at') or ev.get('created_at'))}</p></div></div>
-            <div class="admin-event-stats"><span>🛡️ {_e(summary.get('Tank',0))}</span><span>✚ {_e(summary.get('Heiler',0))}</span><span>⚔️ {_e(summary.get('DPS',0))}</span><span>🪑 {_e(summary.get('Reserve',0))}</span><span>👥 {_e(summary.get('yes_count', ev.get('participant_count',0)))}</span></div>
+            <div class="admin-event-stats"><span>🛡️ {_e(summary.get('Tank',0))}</span><span>✚ {_e(summary.get('Support',0))}</span><span>⚔️ {_e(summary.get('DPS',0))}</span><span>🪑 {_e(summary.get('Reserve',0))}</span><span>👥 {_e(summary.get('yes_count', ev.get('participant_count',0)))}</span></div>
             <div class="admin-event-actions">{buttons}</div>
           </div>
         </article>
@@ -17602,7 +17624,7 @@ def _leadership_insights(snap: dict[str, Any]) -> dict[str, Any]:
     if missing_ec:
         tasks.append({"prio": "niedrig", "area": "EC", "task": f"{missing_ec} Mitglieder ohne EC-Konto", "detail": "Kann normal sein, sollte aber geprüft werden.", "link": "/ec"})
     if int(planning.get("events_at_risk") or 0):
-        tasks.append({"prio": "hoch", "area": "Events", "task": f"{planning.get('events_at_risk')} Event(s) mit Rollen-/Teilnehmer-Risiko", "detail": "Tank/Heiler/Teilnehmer prüfen.", "link": "/planning"})
+        tasks.append({"prio": "hoch", "area": "Events", "task": f"{planning.get('events_at_risk')} Event(s) mit Rollen-/Teilnehmer-Risiko", "detail": "Tank/Support/Teilnehmer prüfen.", "link": "/planning"})
     if active_auctions:
         tasks.append({"prio": "mittel", "area": "Loot", "task": f"{len(active_auctions)} aktive Auktion(en)", "detail": "Endzeiten und Führende prüfen.", "link": "/loot"})
     if flagged_members:
@@ -19370,7 +19392,7 @@ async def event_dashboard_rsvp(event_id: str, request: Request, _: bool = Depend
     uid = int(_current_user_id(request) or 0)
     actor = _current_user(request) or {}
     form = _parse_urlencoded_body(await request.body())
-    choice = str(form.get("choice") or "").strip().upper()
+    choice = normalize_event_role(form.get("choice") or "")
     next_path = str(form.get("next") or f"/event/{event_id}").strip()
     allowed_next = {f"/event/{event_id}", "/member/events", "/events"}
     if next_path not in allowed_next:
@@ -19380,7 +19402,7 @@ async def event_dashboard_rsvp(event_id: str, request: Request, _: bool = Depend
         message = "❌ Für Event-Rückmeldungen musst du mit Discord eingeloggt sein."
     elif not guild_id:
         message = "❌ Guild-ID fehlt."
-    elif choice not in {"TANK", "HEAL", "DPS", "BANK", "MAYBE", "NO"}:
+    elif normalize_event_role(choice) not in {"TANK", "SUPPORT", "DPS", "BANK", "MAYBE", "NO"}:
         message = "❌ Ungültige Rückmeldung."
     else:
         event = _event_by_id(snap, str(event_id))
@@ -19393,7 +19415,7 @@ async def event_dashboard_rsvp(event_id: str, request: Request, _: bool = Depend
             actor["user_id"] = str(uid)
             payload = {"event_id": str(event_id), "choice": choice, "source": "dashboard_member_rsvp"}
             result = _enqueue_event_action_request(guild_id, "rsvp", payload, actor)
-            label = {"TANK":"Tank", "HEAL":"Heal", "DPS":"DPS", "BANK":"Reserve", "MAYBE":"Vielleicht", "NO":"Abgemeldet"}.get(choice, choice)
+            label = {"TANK":"Tank", "SUPPORT":"Support", "HEAL":"Support", "HEALER":"Support", "DPS":"DPS", "BANK":"Reserve", "MAYBE":"Vielleicht", "NO":"Abgemeldet"}.get(choice, choice)
             message = (f"✅ {label} wurde an den Bot gesendet. Discord und Dashboard werden synchronisiert." if result.get("ok") else f"❌ {result.get('error') or 'Rückmeldung konnte nicht gesendet werden.'}")
 
     joiner = "&" if "?" in next_path else "?"
@@ -19698,16 +19720,6 @@ async def ticket_note_add(ticket_id:int,request:Request,_:bool=Depends(_admin_au
             conn.commit()
         finally: conn.close()
     return RedirectResponse(f'/ticket/{int(ticket_id)}',status_code=303)
-
-@app.post("/admin/member/{user_id}/aion2")
-async def admin_member_aion2_save(user_id:int,request:Request,_:bool=Depends(_admin_auth)):
-    raw=(await request.body()).decode('utf-8',errors='replace'); form=urllib.parse.parse_qs(raw,keep_blank_values=True); gid=_safe_guild_id(_snapshot_payload()); ch=str((form.get('character_name') or [''])[0]).strip()[:120]; faction=_aion2_normalize_faction((form.get('faction') or [''])[0]); cl=_aion2_normalize_class((form.get('class_name') or [''])[0]); role=_aion2_role_for_class(cl); gs=str((form.get('gearscore') or [''])[0]).strip()[:40]; rawlevel=str((form.get('level') or [''])[0]).strip(); level=int(rawlevel) if rawlevel.isdigit() else None
-    _ensure_v211_tables(); conn=_pg_connect()
-    try:
-        with conn.cursor() as cur: cur.execute('''INSERT INTO aion2_profiles(guild_id,user_id,character_name,class_name,main_role,faction,level,gearscore,updated_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(guild_id,user_id) DO UPDATE SET character_name=EXCLUDED.character_name,class_name=EXCLUDED.class_name,main_role=EXCLUDED.main_role,faction=EXCLUDED.faction,level=EXCLUDED.level,gearscore=EXCLUDED.gearscore,updated_at=EXCLUDED.updated_at''',(gid,user_id,ch,cl,role,faction,level,gs,datetime.now(timezone.utc).isoformat()))
-        conn.commit()
-    finally: conn.close()
-    return RedirectResponse(f'/member/{int(user_id)}#aion2',status_code=303)
 
 @app.get("/admin", response_class=HTMLResponse)
 def admin_actions_page(_: bool = Depends(_admin_auth)):
@@ -20315,91 +20327,6 @@ async def admin_module_toggle(module_key: str, request: Request, _: bool = Depen
         extras = [name for name in changed_labels if name != label]
         if extras:
             msg += " Abhängige Module ebenfalls deaktiviert: " + ", ".join(extras) + "."
-    return RedirectResponse(
-        "/admin-settings?" + urllib.parse.urlencode({"section": "modules", "msg": msg}),
-        status_code=303,
-    )
-
-
-@app.post("/admin/onboarding-aion2-settings")
-async def admin_onboarding_aion2_settings(request: Request, _: bool = Depends(_admin_auth)):
-    raw=(await request.body()).decode("utf-8",errors="replace"); form=urllib.parse.parse_qs(raw,keep_blank_values=True)
-    guild_id=_safe_guild_id(_snapshot_payload())
-    _set_dashboard_module_setting_value(guild_id,"onboarding","aion2_enabled",bool((form.get("aion2_enabled") or [""])[0]))
-    return RedirectResponse("/admin-settings#modules",status_code=303)
-
-@app.post("/admin/onboarding-welcome-settings")
-async def admin_onboarding_welcome_settings(request: Request, _: bool = Depends(_admin_auth)):
-    payload = _snapshot_payload()
-    guild_id = _safe_guild_id(payload)
-    if not guild_id:
-        raise HTTPException(status_code=400, detail="Guild-ID fehlt")
-    if not _dashboard_module_enabled("onboarding", guild_id):
-        return RedirectResponse(
-            "/admin-settings?" + urllib.parse.urlencode({"section": "modules", "msg": "Onboarding & Recruitment ist deaktiviert."}),
-            status_code=303,
-        )
-    form = _parse_urlencoded_body(await request.body())
-    welcome_enabled = str(form.get("welcome_enabled") or "0").strip().lower() in {"1", "true", "yes", "on"}
-    update_on_leave = str(form.get("welcome_update_on_leave") or "0").strip().lower() in {"1", "true", "yes", "on"}
-    channel_raw = str(form.get("welcome_channel_id") or "").strip()
-    channel_id = int(channel_raw) if channel_raw.isdigit() else 0
-    slogans_raw = str(form.get("welcome_slogans") or "")
-    slogans: list[str] = []
-    for line in slogans_raw.splitlines():
-        clean = re.sub(r"\s+", " ", str(line or "").strip())
-        if not clean:
-            continue
-        slogans.append(clean[:300])
-        if len(slogans) >= 50:
-            break
-    if not slogans:
-        slogans = list(DEFAULT_ONBOARDING_WELCOME_SLOGANS)
-
-    _set_guild_setting_value(guild_id, "guild_channel_welcome_id", channel_id)
-    _set_dashboard_module_setting_value(guild_id, "onboarding", "welcome_enabled", welcome_enabled)
-    _set_dashboard_module_setting_value(guild_id, "onboarding", "welcome_update_on_leave", update_on_leave)
-    _set_dashboard_module_setting_value(guild_id, "onboarding", "welcome_slogans", slogans)
-
-    msg = "Welcome-System gespeichert."
-    if welcome_enabled and not channel_id:
-        msg += " Es ist noch kein Welcome-Kanal ausgewählt; bis dahin wird keine öffentliche Welcome Card gesendet."
-    return RedirectResponse(
-        "/admin-settings?" + urllib.parse.urlencode({"section": "modules", "msg": msg}),
-        status_code=303,
-    )
-
-
-@app.post("/admin/onboarding-application-settings")
-async def admin_onboarding_application_settings(request: Request, _: bool = Depends(_admin_auth)):
-    payload = _snapshot_payload()
-    guild_id = _safe_guild_id(payload)
-    if not guild_id:
-        raise HTTPException(status_code=400, detail="Guild-ID fehlt")
-    if not _dashboard_module_enabled("onboarding", guild_id):
-        return RedirectResponse(
-            "/admin-settings?" + urllib.parse.urlencode({"section": "modules", "msg": "Onboarding & Recruitment ist deaktiviert."}),
-            status_code=303,
-        )
-    form = _parse_urlencoded_body(await request.body())
-    enabled = str(form.get("application_chat_enabled") or "0").strip().lower() in {"1", "true", "yes", "on"}
-    category_raw = str(form.get("application_category_id") or "").strip()
-    lead_raw = str(form.get("application_lead_role_id") or "").strip()
-    category_id = int(category_raw) if category_raw.isdigit() else 0
-    lead_role_id = int(lead_raw) if lead_raw.isdigit() else 0
-
-    _set_dashboard_module_setting_value(guild_id, "onboarding", "application_chat_enabled", enabled)
-    _set_dashboard_module_setting_value(guild_id, "onboarding", "application_category_id", category_id)
-    _set_dashboard_module_setting_value(guild_id, "onboarding", "application_lead_role_id", lead_role_id)
-
-    msg = "Bewerbungs-Chat gespeichert."
-    missing = []
-    if enabled and not category_id:
-        missing.append("Bewerbungs-Kategorie")
-    if enabled and not lead_role_id:
-        missing.append("Lead-Rolle")
-    if missing:
-        msg += " Fehlt noch: " + ", ".join(missing) + "."
     return RedirectResponse(
         "/admin-settings?" + urllib.parse.urlencode({"section": "modules", "msg": msg}),
         status_code=303,
@@ -21330,7 +21257,7 @@ def _attendance_candidate_map(snap: dict[str, Any], event: dict[str, Any]) -> di
         if not uid:
             continue
         raw_signup = str(row.get("signup") or "")
-        signup_label = {"TANK": "Tank", "HEAL": "Heal", "DPS": "DPS", "BANK": "Reserve"}.get(raw_signup.upper(), raw_signup or "Zusage")
+        signup_label = {"TANK": "Tank", "SUPPORT": "Support", "HEAL": "Support", "HEALER": "Support", "DPS": "DPS", "BANK": "Reserve"}.get(raw_signup.upper(), raw_signup or "Zusage")
         bot_status = str(row.get("status") or "").lower()
         dashboard_status = {
             "present": "present",
@@ -21807,7 +21734,7 @@ def _render_attendance_event(data: dict[str, Any], event_id: str, saved: bool = 
         payload = dict(payload)
         payload["items"] = list(saved_map.values())
     items = [x for x in ((payload.get("items") if isinstance(payload, dict) else []) or []) if isinstance(x, dict)]
-    signup_order = {"TANK": 0, "HEAL": 1, "HEALER": 1, "DPS": 2, "BANK": 3, "RESERVE": 3, "VIELLEICHT": 4, "ABGEMELDET": 5, "—": 6}
+    signup_order = {"TANK": 0, "SUPPORT": 1, "HEAL": 1, "HEALER": 1, "DPS": 2, "BANK": 3, "RESERVE": 3, "VIELLEICHT": 4, "ABGEMELDET": 5, "—": 6}
     items.sort(key=lambda i: (signup_order.get(str(i.get("signup") or "—").upper(), 20), str(i.get("display_name") or "").casefold()))
     bot_suggested_present = sum(
         1
@@ -21966,7 +21893,7 @@ def _render_attendance_event(data: dict[str, Any], event_id: str, saved: bool = 
       <p class="muted">Nur verwenden, wenn eine Person im Ingame-Screenshot auftaucht, aber in der Liste fehlt.</p>
       <form method="post" action="/admin/attendance/{_e(event_id)}/add-player" style="display:flex;gap:8px;flex-wrap:wrap;align-items:end">
         <label>Spieler<br><select name="user_id" required><option value="">Spieler wählen …</option>{add_player_options}</select></label>
-        <label>Rolle<br><select name="signup"><option value="DPS">DPS</option><option value="TANK">Tank</option><option value="HEAL">Heal</option><option value="BANK">Reserve</option></select></label>
+        <label>Rolle<br><select name="signup"><option value="DPS">DPS</option><option value="TANK">Tank</option><option value="SUPPORT">Support</option><option value="BANK">Reserve</option></select></label>
         <label>Status<br><select name="status"><option value="present">War da</option><option value="partial">Teilweise</option><option value="absent">Nicht da</option><option value="open">Offen</option></select></label>
         <button class="btn" type="submit" {'disabled' if not add_player_options else ''}>➕ Spieler hinzufügen</button>
       </form>
@@ -22331,7 +22258,8 @@ async def admin_attendance_add_player(event_id: str, request: Request, _: bool =
     status = str((form.get("status") or ["present"])[0] or "present").lower()
     if not uid:
         raise HTTPException(status_code=400, detail="Spieler fehlt")
-    if signup not in {"TANK", "HEAL", "DPS", "BANK"}:
+    signup = normalize_event_role(signup)
+    if signup not in {"TANK", "SUPPORT", "DPS", "BANK"}:
         signup = "DPS"
     if status not in {"present", "partial", "absent", "open"}:
         status = "present"
@@ -23236,8 +23164,8 @@ def export_attendance_ec_preview_csv(event_id: str, full_ec: Optional[float] = N
 # ---------------------------------------------------------------------------
 # Ziel dieser Phase:
 # - Dashboard liest Phase-3-Tabellen Postgres-first.
-# - Bot speichert weiterhin JSON und spiegelt direkt nach Postgres.
-# - JSON bleibt Backup/Fallback und lokale Bot-Sicherheitskopie.
+# - Bot speichert produktiven Runtime-State in PostgreSQL und spiegelt relationale Read-Models parallel.
+# - Legacy-JSON ist nur noch Import/Entwicklung; produktiver Runtime-State liegt in PostgreSQL.
 # - Es wird nichts gelöscht.
 
 PHASE3_TABLES = [
@@ -23552,7 +23480,7 @@ def _phase3_status_payload() -> dict[str, Any]:
         "ok": False,
         "database_url": bool(_database_url()),
         "phase": "3.9",
-        "mode": "Dashboard Postgres-first · Bot JSON+Postgres-Spiegelung",
+        "mode": "Dashboard Postgres-first · Bot PostgreSQL-Runtime + Read-Models",
         "tables": {},
         "counts": {},
         "latest_runs": [],
@@ -23769,7 +23697,7 @@ def _phase3_event_rsvp_rows_from_snapshot(snap: dict[str, Any]) -> list[dict[str
     """Extrahiert RSVP-/Teilnehmerzeilen aus den Event-Snapshots.
 
     Unterstützt die vom Bot exportierte Struktur:
-    event.participants = {tank:[...], heal:[...], dps:[...], reserve:[...], maybe:[...], no:[...]}
+    event.participants = {tank:[...], support:[...], dps:[...], reserve:[...], maybe:[...], no:[...]}
     sowie ältere Varianten mit yes/accepted/maybe/no.
     """
     out: list[dict[str, Any]] = []
@@ -24212,7 +24140,7 @@ def _phase3_mirror_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
             cur.execute("""
                 INSERT INTO phase3_migration_runs (run_id, guild_id, mode, status, counts_json, notes, created_at)
                 VALUES (%s,%s,'snapshot_mirror','done',%s,%s,now())
-            """, (run_id, guild_id, _phase3_jsonb(counts), "Sichere Spiegelung aus Dashboard-Snapshot. JSON bleibt Hauptquelle."))
+            """, (run_id, guild_id, _phase3_jsonb(counts), "Sichere Spiegelung aus Dashboard-Snapshot. PostgreSQL-Runtime-State bleibt Hauptquelle."))
         conn.commit()
         return {"ok": True, "run_id": run_id, "guild_id": guild_id, "counts": counts}
     except Exception as exc:
@@ -24248,7 +24176,7 @@ def _phase3_ec_status_payload(payload: dict[str, Any]) -> dict[str, Any]:
         warnings.append("Tabelle phase3_ec_event_checks fehlt noch. Bitte Tabellen vorbereiten ausführen.")
     if not _database_url():
         warnings.append("DATABASE_URL fehlt. Postgres kann nicht genutzt werden.")
-    warnings.append("Hinweis: Dashboard-Snapshot ist kein vollständiges JSON. Für EC zählt die Bot-Spiegelung in Postgres, nicht der kleine Snapshot-Auszug.")
+    warnings.append("Hinweis: Der Dashboard-Snapshot ist nur ein Read-Model-Auszug. Für EC zählt PostgreSQL als produktive Quelle.")
     ready = bool(_database_url()) and db_status.get("tables", {}).get("phase3_ec_balances") and db_status.get("tables", {}).get("phase3_ec_transactions")
     return {"ok": bool(ready), "pairs": ec_pairs, "database": db_status, "warnings": warnings}
 
@@ -24271,7 +24199,7 @@ def _render_phase3_ec_panel(payload: dict[str, Any]) -> str:
         <div class='card'><b>Dashboard-Snapshot</b><p>Kann unvollständig sein und zeigt nur exportierte Ausschnitte.</p></div>
         <div class='card'><b>Postgres</b><p>Enthält die vom Bot gespiegelten EC-Konten und EC-Verläufe.</p></div>
         <div class='card'><b>Read-Cutover aktiv</b><p>Dashboard nutzt Postgres, wenn die Phase-3-Tabellen gefüllt sind.</p></div>
-        <div class='card'><b>JSON bleibt sicher</b><p>Alte JSON-Daten werden nicht gelöscht.</p></div>
+        <div class='card'><b>Legacy-Import</b><p>Alte lokale JSON-Daten werden bei Bedarf einmalig nach PostgreSQL übernommen.</p></div>
       </div>
       {_table(['Bereich','Dashboard-Snapshot','Postgres/Bot-Spiegelung','Status'], rows, searchable=False)}
       {warn_html}
@@ -24318,7 +24246,7 @@ def _render_phase3_loot_panel(payload: dict[str, Any]) -> str:
     return f"""
     <section class='panel'>
       <h2>Phase 3.3 · Loot / Needs / Auktionen</h2>
-      <p>Loot/Needs/Auktionen laufen im Dashboard Postgres-first. Bot speichert JSON und spiegelt Needs, Auktionen, Gebote und Historie nach Postgres.</p>
+      <p>Loot/Needs/Auktionen laufen produktiv über PostgreSQL. Runtime-Dokumente und relationale Read-Models liegen in derselben Datenbank.</p>
       <div class='grid'>
         <div class='card'><b>Needs</b><p>Aktuelle Need-Slots werden in phase3_loot_needs gespiegelt.</p></div>
         <div class='card'><b>Auktionen</b><p>Auktionen und Status landen in phase3_loot_auctions.</p></div>
@@ -24349,7 +24277,7 @@ def _phase3_live_status_payload(payload: dict[str, Any]) -> dict[str, Any]:
         warnings.append("Tabelle phase3_event_rsvps fehlt noch. Bitte Tabellen vorbereiten ausführen.")
     if not _database_url():
         warnings.append("DATABASE_URL fehlt. Postgres kann nicht genutzt werden.")
-    warnings.append("Hinweis: Dashboard liest Events/Profile Postgres-first. JSON bleibt lokale Bot-Sicherheitskopie und Fallback.")
+    warnings.append("Hinweis: Dashboard liest Events/Profile Postgres-first. Der Snapshot bleibt nur als Read-Model-Fallback; lokale JSON-Dateien sind ausschließlich Legacy-Import bzw. Entwicklung.")
     ready = bool(_database_url()) and db_status.get("tables", {}).get("phase3_members") and db_status.get("tables", {}).get("phase3_events") and db_status.get("tables", {}).get("phase3_event_rsvps") and db_status.get("tables", {}).get("phase3_absences")
     return {"ok": bool(ready), "pairs": pairs, "database": db_status, "warnings": warnings}
 
@@ -24393,8 +24321,8 @@ def _phase3_cutover_summary(payload: dict[str, Any]) -> dict[str, Any]:
         "ok": all(active.values()),
         "database_url": bool(_database_url()),
         "read_mode": "postgres_first",
-        "bot_write_mode": "json_plus_postgres_mirror",
-        "json_role": "backup_fallback_and_bot_local_store",
+        "bot_write_mode": "postgres_runtime_plus_relational_read_models",
+        "json_role": "legacy_import_or_local_dev_only",
         "active": active,
         "sources": {
             "ec": ec.get("source") or "snapshot_fallback",
@@ -24467,13 +24395,13 @@ def _render_phase3_database_page(payload: dict[str, Any]) -> str:
     cut_warn_html = "" if not cut_warn else "<div class='notice'><b>Cutover-Hinweise</b><ul>" + "".join(f"<li>{_e(w)}</li>" for w in cut_warn) + "</ul></div>"
     return _html_shell("Phase 3 · Datenbank · Beer and Buffs Dashboard", f"""
     <nav class='topnav'><a href='/'>← Kommando</a><a href='/release'>Release</a><a href='/admin'>Admin</a><a href='/database-audit'>Cutover-Prüfung</a><a href='/api/database-cutover-status'>Cutover API</a><a href='/api/database-status'>Status API</a><a href='/api/database-live-status'>Live API</a></nav>
-    <section class='hero'><div><h1>Phase 3.9 · Online-Datenbank</h1><p>{_e(status_text)} · Dashboard liest Postgres-first. Bot schreibt sicher weiter lokal JSON und spiegelt direkt nach Postgres, damit JSON als Backup/Fallback erhalten bleibt.</p></div><div class='page-actions'><form method='post' action='/database/init' style='display:inline'><button class='btn' type='submit'>Tabellen vorbereiten</button></form><form method='post' action='/database/mirror-snapshot' style='display:inline'><button class='btn' type='submit'>Snapshot nachspiegeln</button></form></div></section>
-    <section class='panel'><h2>Cutover-Stand</h2><p>Das ist der relevante Zustand: Nicht ob JSON-Dateien noch existieren, sondern ob das Dashboard die Live-Bereiche aus Postgres liest.</p>{_table(['Bereich','Status','Quelle','Zeilen/Einträge'], cut_rows, searchable=False)}{cut_warn_html}</section>
+    <section class='hero'><div><h1>Phase 3.9 · Online-Datenbank</h1><p>{_e(status_text)} · Dashboard und Bot arbeiten produktiv auf PostgreSQL. Dashboard-Snapshots und Phase-3-Tabellen sind Read-Models/Spiegelungen; lokales JSON wird nur noch für Entwicklung oder einmaligen Legacy-Import verwendet.</p></div><div class='page-actions'><form method='post' action='/database/init' style='display:inline'><button class='btn' type='submit'>Tabellen vorbereiten</button></form><form method='post' action='/database/mirror-snapshot' style='display:inline'><button class='btn' type='submit'>Snapshot nachspiegeln</button></form></div></section>
+    <section class='panel'><h2>Cutover-Stand</h2><p>Das ist der relevante Zustand: Entscheidend ist, ob die Live-Bereiche vollständig aus PostgreSQL gelesen werden.</p>{_table(['Bereich','Status','Quelle','Zeilen/Einträge'], cut_rows, searchable=False)}{cut_warn_html}</section>
     <section class='panel'><h2>Jetzt gültige Architektur</h2><div class='grid'>
       <div class='card'><b>Dashboard</b><p>Liest EC, Loot, Events und Profile bevorzugt aus Postgres.</p></div>
-      <div class='card'><b>Bot</b><p>Schreibt weiterhin JSON und spiegelt beim Speichern nach Postgres.</p></div>
+      <div class='card'><b>Bot</b><p>Schreibt produktiven Runtime-State direkt nach PostgreSQL und pflegt die relationalen Read-Models.</p></div>
       <div class='card'><b>Dashboard-Aktionen</b><p>EC, Gebote, Käufe, Würfe und Drops laufen über Postgres-Queues zum Bot.</p></div>
-      <div class='card'><b>JSON</b><p>Bleibt Backup/Fallback und lokale Bot-Sicherheitskopie. Nicht löschen.</p></div>
+      <div class='card'><b>Legacy JSON</b><p>Nur noch lokaler Entwicklungsmodus bzw. einmaliger Import. In Produktion wird nicht dorthin zurückgeschrieben.</p></div>
     </div></section>
     {_render_phase3_ec_panel(payload)}
     {_render_phase3_loot_panel(payload)}
@@ -24482,7 +24410,7 @@ def _render_phase3_database_page(payload: dict[str, Any]) -> str:
     <section class='panel'><h2>Phase-3-Tabellen</h2>{_table(['Tabelle','Status','Zeilen'], table_rows, searchable=False)}</section>
     {warn_html}
     <section class='panel'><h2>Letzte Spiegelungen</h2>{_table(['Zeit','Modus','Status','Zahlen','Notiz'], run_rows or [['—','—','—','Noch keine Spiegelung','']], searchable=False)}</section>
-    <section class='panel'><h2>Sicherheitsregeln</h2><ul><li>Diese Seite löscht keine Daten.</li><li>Dashboard ist Postgres-first, sobald die Phase-3-Tabellen Daten liefern.</li><li>JSON bleibt bewusst erhalten und darf nicht überschrieben oder gelöscht werden.</li><li>Spiegelung ist idempotent: erneutes Ausführen aktualisiert vorhandene DB-Zeilen.</li></ul></section>
+    <section class='panel'><h2>Sicherheitsregeln</h2><ul><li>Diese Seite löscht keine Daten.</li><li>Dashboard ist Postgres-first, sobald die Phase-3-Tabellen Daten liefern.</li><li>Lokale JSON-Dateien sind in Produktion keine Schreibquelle mehr; vorhandene Legacy-Daten dienen nur dem einmaligen Import.</li><li>Spiegelung ist idempotent: erneutes Ausführen aktualisiert vorhandene DB-Zeilen.</li></ul></section>
     """, nav_mode="admin")
 
 
@@ -24689,7 +24617,7 @@ def _phase3_audit_payload() -> dict[str, Any]:
                 out["warnings"].append("Events vorhanden, aber keine RSVPs gespiegelt.")
 
             out["notes"].append("Diese Prüfung löscht nichts. Sie zeigt nur, ob ein harter Cutover schon sinnvoll wäre.")
-            out["notes"].append("JSON bleibt Hauptquelle, bis die Blocker weg sind.")
+            out["notes"].append("PostgreSQL-Runtime-State bleibt Hauptquelle; die Blocker betreffen nur die relationale Spiegelung.")
             out["ready"] = not out["blockers"]
             out["ok"] = True
             return out
@@ -24715,7 +24643,7 @@ def _render_phase3_audit_page() -> str:
     orphans = audit.get("orphans") or {}
     samples = audit.get("samples") or {}
     status_label = "✅ Cutover grundsätzlich möglich" if audit.get("ready") else "⚠️ Noch nicht Cutover-bereit"
-    status_hint = "Keine harten Blocker gefunden." if audit.get("ready") else "Erst die Blocker prüfen. JSON bleibt Hauptquelle."
+    status_hint = "Keine harten Blocker gefunden." if audit.get("ready") else "Erst die Blocker der relationalen Spiegelung prüfen."
     cards = [
         ["Mitglieder", counts.get("phase3_members", 0), "phase3_members"],
         ["EC-Konten", counts.get("phase3_ec_balances", 0), "phase3_ec_balances"],
@@ -24764,7 +24692,7 @@ def _render_phase3_audit_page() -> str:
     {_phase3_audit_table('Loot-Historie ohne aktuelles Mitglied', samples.get('loot_history_without_member') or [], [('user_id','User-ID'), ('entries','Einträge'), ('total_amount','Summe')])}
     {_phase3_audit_table('Event-RSVPs ohne aktuelles Mitglied', samples.get('event_rsvps_without_member') or [], [('user_id','User-ID'), ('entries','Antworten'), ('responses','Status')])}
     {_phase3_audit_table('Events ohne RSVPs', samples.get('events_without_rsvps') or [], [('event_id','Event-ID'), ('title','Titel'), ('status','Status'), ('start_at_text','Start')])}
-    <section class='panel'><h2>Sicherheitsregeln</h2><ul><li>Diese Seite löscht nichts.</li><li>Diese Seite stellt nichts auf Postgres um.</li><li>Cutover erst, wenn die Blocker geklärt sind.</li><li>JSON bleibt bis dahin Hauptquelle und Backup.</li></ul></section>
+    <section class='panel'><h2>Sicherheitsregeln</h2><ul><li>Diese Seite löscht nichts.</li><li>Diese Seite verändert den produktiven Runtime-State nicht.</li><li>Die Blocker betreffen nur die relationale Phase-3-Spiegelung.</li><li>Produktiver Runtime-State liegt bereits in PostgreSQL.</li></ul></section>
     """)
 
 
@@ -24779,3 +24707,25 @@ def database_audit_page(_: bool = Depends(_admin_auth)):
 @app.get("/api/database-audit")
 def api_database_audit(_: bool = Depends(_admin_auth)):
     return JSONResponse(_phase3_audit_payload())
+
+# Feature-Router werden bewusst am Dateiende registriert: So bleiben die bestehenden
+# Helper/DB-Funktionen in diesem schrittweisen Refactor unverändert verfügbar,
+# während neue Feature-Routen nicht mehr in der Monolith-Datei wachsen.
+app.include_router(
+    build_aion2_router(
+        admin_auth=_admin_auth,
+        get_guild_id=lambda: int(_safe_guild_id(_snapshot_payload()) or 0),
+        ensure_tables=_ensure_v211_tables,
+        pg_connect=_pg_connect,
+    )
+)
+app.include_router(
+    build_onboarding_router(
+        admin_auth=_admin_auth,
+        get_guild_id=lambda: int(_safe_guild_id(_snapshot_payload()) or 0),
+        module_enabled=_dashboard_module_enabled,
+        set_module_setting=_set_dashboard_module_setting_value,
+        set_guild_setting=_set_guild_setting_value,
+        default_welcome_slogans=DEFAULT_ONBOARDING_WELCOME_SLOGANS,
+    )
+)
