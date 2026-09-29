@@ -565,7 +565,10 @@ async def _assign_roles(member: discord.Member, category_key: str, primary_key: 
 
     prim_map = (c.get("primary_roles") or {})
     pkey = str(primary_key or "").upper()
-    wanted.append((pkey or "Primärrolle", prim_map.get(pkey)))
+    # Aion-2-Support ist als Profilrolle gültig. Eine separate Discord-Supportrolle
+    # bleibt optional, damit ein Kantor-Onboarding nicht unnötig fehlschlägt.
+    if pkey != "SUPPORT" or prim_map.get("SUPPORT"):
+        wanted.append((pkey or "Primärrolle", prim_map.get(pkey)))
 
     exp_map = (c.get("experience_roles") or {})
     exp_key = "experienced" if experienced else "newbie"
@@ -617,7 +620,21 @@ def _review_channel(guild: discord.Guild) -> Optional[discord.abc.Messageable]:
     return ch if isinstance(ch, (discord.TextChannel, discord.Thread)) else None
 
 
-AION2_CLASSES = ("Gladiator", "Templer", "Assassine", "Jäger", "Zauberer", "Beschwörer", "Kleriker", "Kantor")
+AION2_CLASS_META = {
+    "Templer": ("Templar", "TANK"),
+    "Gladiator": ("Gladiator", "DPS"),
+    "Assassine": ("Assassin", "DPS"),
+    "Jäger": ("Ranger", "DPS"),
+    "Zauberer": ("Sorcerer", "DPS"),
+    "Geisterbeschwörer": ("Spirit Master", "DPS"),
+    "Kleriker": ("Cleric", "HEAL"),
+    "Kantor": ("Chanter", "SUPPORT"),
+}
+AION2_CLASSES = tuple(AION2_CLASS_META.keys())
+
+def _aion2_role_for_class(class_name: str | None) -> str:
+    return str((AION2_CLASS_META.get(str(class_name or "")) or ("", ""))[1])
+
 
 def _aion2_enabled(guild_id:int)->bool:
     try: return bool(runtime_db.get_module_setting(int(guild_id),'onboarding','aion2_enabled',False))
@@ -746,14 +763,16 @@ class CategoryView(OnboardingFeatureView):
 
     async def _next(self, inter: discord.Interaction, cat: str):
         self.ctx.category = cat
-        self.ctx.stage = "primary"
         if inter.message:
             self.ctx.message_id = int(inter.message.id)
-        _remember_ctx(self.ctx)
-        await inter.response.edit_message(
-            content="Welche **Spielrolle** spielst du?",
-            view=PrimaryView(self.ctx)
-        )
+        if _aion2_enabled(self.ctx.guild_id):
+            self.ctx.stage = "aion2_class"
+            _remember_ctx(self.ctx)
+            await inter.response.edit_message(content="🎮 **Aion 2:** Welche Klasse spielst du?", view=Aion2ClassView(self.ctx))
+        else:
+            self.ctx.stage = "primary"
+            _remember_ctx(self.ctx)
+            await inter.response.edit_message(content="Welche **Spielrolle** spielst du?", view=PrimaryView(self.ctx))
 
     @button(label="⚔️ Gildenmitglied", style=ButtonStyle.primary, custom_id="onboarding_category_guild")
     async def btn_guild(self, inter: discord.Interaction, _):
@@ -818,10 +837,13 @@ class Aion2CharacterModal(Modal):
 class Aion2ClassSelect(Select):
     def __init__(self,ctx:StepContext):
         self.ctx=ctx
-        opts=[discord.SelectOption(label=x,value=x) for x in AION2_CLASSES]
+        labels={"TANK":"Tank","HEAL":"Heiler","DPS":"DPS","SUPPORT":"Support"}
+        opts=[discord.SelectOption(label=f"{x} ({AION2_CLASS_META[x][0]})",value=x,description=labels.get(AION2_CLASS_META[x][1],AION2_CLASS_META[x][1])) for x in AION2_CLASSES]
         super().__init__(placeholder="Aion-2-Klasse auswählen…",min_values=1,max_values=1,options=opts,custom_id="onboarding_aion2_class_select")
     async def callback(self,inter:discord.Interaction):
-        self.ctx.aion_class=self.values[0]; _remember_ctx(self.ctx)
+        self.ctx.aion_class=self.values[0]
+        self.ctx.primary=_aion2_role_for_class(self.ctx.aion_class)
+        _remember_ctx(self.ctx)
         await inter.response.send_modal(Aion2CharacterModal(self.ctx))
 
 class Aion2ClassView(OnboardingFeatureView):
@@ -1212,24 +1234,26 @@ async def setup_onboarding(client: discord.Client, tree: app_commands.CommandTre
             ephemeral=True
         )
 
-    @onboarding_group.command(name="set_primaries", description="(Admin) Primärrollen für Tank/Heal/DPS setzen")
+    @onboarding_group.command(name="set_primaries", description="(Admin) Primärrollen für Tank/Heal/DPS/Support setzen")
     async def onboarding_set_primaries(
         inter: discord.Interaction,
         tank: discord.Role,
         heal: discord.Role,
-        dps: discord.Role
+        dps: discord.Role,
+        support: Optional[discord.Role] = None
     ):
         if not _is_admin(inter):
             await inter.response.send_message("Nur Admins.", ephemeral=True)
             return
 
         c = _gcfg(inter.guild)
-        c["primary_roles"] = {"TANK": tank.id, "HEAL": heal.id, "DPS": dps.id}
+        c["primary_roles"] = {"TANK": tank.id, "HEAL": heal.id, "DPS": dps.id, "SUPPORT": int(support.id) if support else int((c.get("primary_roles") or {}).get("SUPPORT") or 0)}
         cfg[str(inter.guild_id)] = c
         _save_cfg(cfg)
 
+        support_line = f"\n• 🎵 {support.mention}" if support else "\n• 🎵 Support: keine Discord-Rolle (optional)"
         await inter.response.send_message(
-            f"✅ Primärrollen gesetzt:\n• 🛡️ {tank.mention}\n• 💚 {heal.mention}\n• 🗡️ {dps.mention}",
+            f"✅ Primärrollen gesetzt:\n• 🛡️ {tank.mention}\n• 💚 {heal.mention}\n• 🗡️ {dps.mention}{support_line}",
             ephemeral=True
         )
 
@@ -1383,7 +1407,9 @@ async def setup_onboarding(client: discord.Client, tree: app_commands.CommandTre
             f"**Primärrollen**\n"
             f"• 🛡️ {_m(pri.get('TANK'))}\n"
             f"• 💚 {_m(pri.get('HEAL'))}\n"
-            f"• 🗡️ {_m(pri.get('DPS'))}\n\n"
+            f"• 🗡️ {_m(pri.get('DPS'))}\n"
+            f"• 🎵 Support: {_m(pri.get('SUPPORT'))}\n\n"
+            f"**Aion 2:** {'aktiv' if _aion2_enabled(inter.guild_id) else 'inaktiv'}\n\n"
             f"**Erfahrung**\n"
             f"• 🧠 {_m(exp.get('experienced'))}\n"
             f"• 🌱 {_m(exp.get('newbie'))}"

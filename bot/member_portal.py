@@ -68,6 +68,34 @@ def _guild_bot_name(guild_or_id: Any, fallback: str = "Gildenbot") -> str:
     return fallback
 
 
+try:
+    from bot import runtime_db  # type: ignore
+except Exception:
+    import runtime_db  # type: ignore
+
+AION2_CLASS_META = {
+    "Templer": ("Templar", "TANK", "TP"),
+    "Gladiator": ("Gladiator", "DPS", "GL"),
+    "Assassine": ("Assassin", "DPS", "AS"),
+    "Jäger": ("Ranger", "DPS", "JG"),
+    "Zauberer": ("Sorcerer", "DPS", "ZA"),
+    "Geisterbeschwörer": ("Spirit Master", "DPS", "GB"),
+    "Kleriker": ("Cleric", "HEAL", "KL"),
+    "Kantor": ("Chanter", "SUPPORT", "KA"),
+}
+
+def _aion2_enabled(guild_id: int) -> bool:
+    try:
+        return bool(runtime_db.get_module_setting(int(guild_id), "onboarding", "aion2_enabled", False))
+    except Exception:
+        return False
+
+def _aion2_role_for_class(class_name: str) -> str:
+    return str((AION2_CLASS_META.get(str(class_name or "")) or ("", "", ""))[1])
+
+def _aion2_role_label(role: str) -> str:
+    return {"TANK":"Tank","HEAL":"Heiler","DPS":"DPS","SUPPORT":"Support"}.get(str(role or "").upper(), str(role or "Nicht gesetzt"))
+
 TZ = ZoneInfo("Europe/Berlin")
 
 
@@ -1803,34 +1831,29 @@ def _main_menu_embed(guild: discord.Guild, member: Optional[discord.Member] = No
 
 def _profile_embed(guild: discord.Guild, member: discord.Member) -> discord.Embed:
     p = _user_profile(guild.id, member.id)
-
-    ingame = p.get("ingame_name") or _display_name(member)
-    class_name = p.get("class_name") or "Nicht gesetzt"
-    main_role = p.get("main_role") or "Nicht gesetzt"
-    gearscore = p.get("gearscore") or "Nicht gesetzt"
-
-    emb = discord.Embed(
-        title=f"{EMOJI_PERSONAL} Dein Gildenprofil",
-        description=f"Profil von **{ingame}**",
-        color=discord.Color.gold()
-    )
-
-    emb.add_field(name="🎮 Ingame-Name", value=str(ingame), inline=False)
-    emb.add_field(name="🧩 Klasse", value=str(class_name), inline=True)
-    emb.add_field(name="⚔️ Main-Rolle", value=str(main_role), inline=True)
+    aion = runtime_db.get_aion2_profile(guild.id, member.id) if _aion2_enabled(guild.id) else {}
+    ingame = (aion.get("character_name") if aion else None) or p.get("ingame_name") or _display_name(member)
+    class_name = (aion.get("class_name") if aion else None) or p.get("class_name") or "Nicht gesetzt"
+    main_role = (aion.get("main_role") if aion else None) or p.get("main_role") or "Nicht gesetzt"
+    gearscore = (aion.get("gearscore") if aion else None) or p.get("gearscore") or "Nicht gesetzt"
+    level = aion.get("level") if aion else None
+    emb = discord.Embed(title=f"{EMOJI_PERSONAL} Dein Gildenprofil",description=f"Profil von **{ingame}**",color=discord.Color.gold())
+    emb.add_field(name="🎮 Charaktername" if _aion2_enabled(guild.id) else "🎮 Ingame-Name", value=str(ingame), inline=False)
+    if _aion2_enabled(guild.id):
+        meta=AION2_CLASS_META.get(str(class_name)) or ("", "", "")
+        class_display=f"{class_name} ({meta[0]})" if meta[0] else str(class_name)
+        emb.add_field(name="🧩 Klasse", value=class_display, inline=True)
+        emb.add_field(name="⚔️ Rolle", value=_aion2_role_label(str(main_role)), inline=True)
+        emb.add_field(name="⭐ Level", value=str(level or "Nicht gesetzt"), inline=True)
+    else:
+        emb.add_field(name="🧩 Klasse", value=str(class_name), inline=True)
+        emb.add_field(name="⚔️ Main-Rolle", value=str(main_role), inline=True)
     emb.add_field(name="💠 Gearscore", value=str(gearscore), inline=True)
     emb.add_field(name="🏰 Rang", value=_member_position(guild, member), inline=True)
-    emb.add_field(
-        name="📆 In der Gilde seit",
-        value=f"{_guild_join_date(member)}\n{_guild_days(member)} Tage",
-        inline=True
-    )
+    emb.add_field(name="📆 In der Gilde seit", value=f"{_guild_join_date(member)}\n{_guild_days(member)} Tage", inline=True)
     emb.add_field(name="🟢 Status", value=_status_for_user(guild.id, member.id), inline=False)
-
-    emb.set_footer(text="Bearbeitbar: Ingame-Name, Klasse, Main-Rolle, Gearscore")
-
+    emb.set_footer(text=("Bearbeitbar: Charaktername, Aion-2-Klasse, Level und Gearscore" if _aion2_enabled(guild.id) else "Bearbeitbar: Ingame-Name, Klasse, Main-Rolle, Gearscore"))
     return emb
-
 
 def _events_embed(guild_id: int) -> discord.Embed:
     """Gildenkalender aus den echten Bot-Events plus alten festen Terminen."""
@@ -7339,6 +7362,58 @@ class SupportMenuView(PortalSafeView):
         await _portal_edit(inter, embed=_main_menu_embed(guild, member), view=MemberPortalMainView(guild.id))
 
 
+class Aion2ProfileDetailsModal(PortalSafeModal):
+    def __init__(self, guild_id: int, user_id: int):
+        super().__init__(title="Aion-2-Profil bearbeiten", timeout=300)
+        self.guild_id=guild_id; self.user_id=user_id
+        a=runtime_db.get_aion2_profile(guild_id,user_id) or {}; p=_user_profile(guild_id,user_id)
+        self.character=TextInput(label="Charaktername",required=True,max_length=120,default=str(a.get("character_name") or p.get("ingame_name") or ""))
+        self.level=TextInput(label="Level",required=False,max_length=4,default=str(a.get("level") or ""),placeholder="z. B. 50")
+        self.gearscore=TextInput(label="Gearscore",required=False,max_length=10,default=str(a.get("gearscore") or p.get("gearscore") or ""),placeholder="z. B. 4200")
+        self.add_item(self.character); self.add_item(self.level); self.add_item(self.gearscore)
+    async def on_submit(self, inter: discord.Interaction):
+        level_raw=str(self.level.value or "").strip(); gs_raw=str(self.gearscore.value or "").strip()
+        if level_raw and not level_raw.isdigit():
+            await _portal_send(inter,"❌ Level muss eine Zahl sein."); return
+        if gs_raw and not gs_raw.isdigit():
+            await _portal_send(inter,"❌ Gearscore muss eine Zahl sein."); return
+        current=runtime_db.get_aion2_profile(self.guild_id,self.user_id) or {}; cls=str(current.get("class_name") or ""); role=_aion2_role_for_class(cls) or str(current.get("main_role") or "")
+        runtime_db.upsert_aion2_profile(self.guild_id,self.user_id,character_name=str(self.character.value).strip(),class_name=cls,main_role=role,level=int(level_raw) if level_raw else None,gearscore=gs_raw)
+        p=_user_profile(self.guild_id,self.user_id); p["ingame_name"]=str(self.character.value).strip(); p["class_name"]=cls; p["main_role"]=role; p["gearscore"]=gs_raw
+        await asyncio.to_thread(save_profiles,self.guild_id,self.user_id)
+        try: await _portal_defer(inter)
+        except Exception: pass
+        await ensure_portal_menu_for_user(inter.client,self.guild_id,self.user_id,force_view="profile")
+
+class Aion2ClassSelect(Select):
+    def __init__(self,guild_id:int,user_id:int):
+        self.guild_id=guild_id; self.user_id=user_id
+        current=runtime_db.get_aion2_profile(guild_id,user_id) or {}; selected=str(current.get("class_name") or "")
+        labels={"TANK":"Tank","HEAL":"Heiler","DPS":"DPS","SUPPORT":"Support"}
+        opts=[]
+        for name,(en,role,_icon) in AION2_CLASS_META.items():
+            opts.append(discord.SelectOption(label=f"{name} ({en})",value=name,description=labels.get(role,role),default=(name==selected)))
+        super().__init__(placeholder="Aion-2-Klasse auswählen…",min_values=1,max_values=1,options=opts,custom_id="portal_aion2_class")
+    async def callback(self,inter:discord.Interaction):
+        cls=self.values[0]; role=_aion2_role_for_class(cls); current=runtime_db.get_aion2_profile(self.guild_id,self.user_id) or {}; p=_user_profile(self.guild_id,self.user_id)
+        runtime_db.upsert_aion2_profile(self.guild_id,self.user_id,character_name=str(current.get("character_name") or p.get("ingame_name") or ""),class_name=cls,main_role=role,level=current.get("level"),gearscore=str(current.get("gearscore") or p.get("gearscore") or ""))
+        p["class_name"]=cls; p["main_role"]=role
+        await asyncio.to_thread(save_profiles,self.guild_id,self.user_id)
+        guild=inter.client.get_guild(self.guild_id); member=guild.get_member(self.user_id) if guild else None
+        if guild and member: await _portal_edit(inter,embed=_profile_embed(guild,member),view=Aion2ProfileEditView(self.guild_id,self.user_id))
+        else: await _portal_send(inter,"✅ Aion-2-Klasse gespeichert.")
+
+class Aion2ProfileEditView(PortalSafeView):
+    def __init__(self,guild_id:int,user_id:int):
+        super().__init__(timeout=300); self.guild_id=guild_id; self.user_id=user_id; self.add_item(Aion2ClassSelect(guild_id,user_id))
+    @button(label="Charakter / Level / GS",emoji="✏️",style=ButtonStyle.secondary,custom_id="portal_aion2_details")
+    async def btn_details(self,inter:discord.Interaction,_):
+        await inter.response.send_modal(Aion2ProfileDetailsModal(self.guild_id,self.user_id))
+    @button(label="Zurück",emoji=_menu_emoji(EMOJI_BACK),style=ButtonStyle.secondary,custom_id="portal_aion2_back")
+    async def btn_back(self,inter:discord.Interaction,_):
+        guild,member=await _resolve_guild_member_from_inter(inter)
+        if guild and member: await _portal_edit(inter,embed=_profile_embed(guild,member),view=ProfileView())
+
 class ProfileView(PortalSafeView):
     def __init__(self):
         super().__init__(timeout=None)
@@ -7354,7 +7429,10 @@ class ProfileView(PortalSafeView):
         if inter.message:
             _mark_portal_sent(guild.id, member.id, inter.message.id)
 
-        await inter.response.send_modal(ProfileEditModal(guild.id, inter.user.id))
+        if _aion2_enabled(guild.id):
+            await _portal_edit(inter, embed=_profile_embed(guild, member), view=Aion2ProfileEditView(guild.id, inter.user.id))
+        else:
+            await inter.response.send_modal(ProfileEditModal(guild.id, inter.user.id))
 
     @button(label="Mitglieder", emoji=_menu_emoji(EMOJI_MEMBER), style=ButtonStyle.secondary, custom_id="portal_member_list")
     async def btn_members(self, inter: discord.Interaction, _):

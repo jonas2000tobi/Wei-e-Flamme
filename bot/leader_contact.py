@@ -179,17 +179,46 @@ def _ticket_update(ticket_id:int, **fields)->None:
         finally: conn.close()
 
 def _ticket_add_message(ticket_id:int,guild_id:int,msg:discord.Message)->None:
-    _ticket_db_init(); atts=json.dumps([{'name':a.filename,'url':a.url} for a in msg.attachments],ensure_ascii=False); now=(msg.created_at or datetime.now(TZ)).isoformat(); vals=(ticket_id,guild_id,msg.id,msg.author.id,getattr(msg.author,'display_name',msg.author.name),msg.content or '',atts,now); backend=getattr(runtime_db,'_BACKEND','sqlite')
+    """Speichert oder repariert eine Ticketnachricht anhand ihrer Discord-Message-ID."""
+    _ticket_db_init(); atts=json.dumps([{'name':a.filename,'url':a.url} for a in msg.attachments],ensure_ascii=False); now=(msg.created_at or datetime.now(TZ)).isoformat(); content=str(msg.content or ''); author_name=getattr(msg.author,'display_name',getattr(msg.author,'name',str(msg.author.id))); backend=getattr(runtime_db,'_BACKEND','sqlite')
     if backend=='postgres':
-        conn=runtime_db._pg_connect();
+        conn=runtime_db._pg_connect()
         try:
-            with conn.cursor() as cur: cur.execute('INSERT INTO leader_ticket_messages(ticket_id,guild_id,discord_message_id,author_id,author_name,content,attachments_json,created_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s)',vals)
+            with conn.cursor() as cur:
+                cur.execute('SELECT id,content FROM leader_ticket_messages WHERE ticket_id=%s AND discord_message_id=%s ORDER BY id DESC LIMIT 1',(ticket_id,msg.id)); existing=cur.fetchone()
+                if existing:
+                    cur.execute('UPDATE leader_ticket_messages SET guild_id=%s,author_id=%s,author_name=%s,content=%s,attachments_json=%s,created_at=%s WHERE id=%s',(guild_id,msg.author.id,author_name,content,atts,now,int(existing.get('id'))))
+                else:
+                    cur.execute('INSERT INTO leader_ticket_messages(ticket_id,guild_id,discord_message_id,author_id,author_name,content,attachments_json,created_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s)',(ticket_id,guild_id,msg.id,msg.author.id,author_name,content,atts,now))
             conn.commit()
         finally: conn.close()
     else:
-        conn=runtime_db._sqlite_connect();
-        try: conn.execute('INSERT INTO leader_ticket_messages(ticket_id,guild_id,discord_message_id,author_id,author_name,content,attachments_json,created_at) VALUES(?,?,?,?,?,?,?,?)',vals); conn.commit()
+        conn=runtime_db._sqlite_connect()
+        try:
+            existing=conn.execute('SELECT id,content FROM leader_ticket_messages WHERE ticket_id=? AND discord_message_id=? ORDER BY id DESC LIMIT 1',(ticket_id,msg.id)).fetchone()
+            if existing:
+                conn.execute('UPDATE leader_ticket_messages SET guild_id=?,author_id=?,author_name=?,content=?,attachments_json=?,created_at=? WHERE id=?',(guild_id,msg.author.id,author_name,content,atts,now,int(existing['id'])))
+            else:
+                conn.execute('INSERT INTO leader_ticket_messages(ticket_id,guild_id,discord_message_id,author_id,author_name,content,attachments_json,created_at) VALUES(?,?,?,?,?,?,?,?)',(ticket_id,guild_id,msg.id,msg.author.id,author_name,content,atts,now))
+            conn.commit()
         finally: conn.close()
+
+async def _sync_ticket_channel_history(guild: discord.Guild, ticket: dict, *, limit: int = 250) -> int:
+    channel_id=int(ticket.get('ticket_channel_id') or 0); ticket_id=int(ticket.get('id') or 0)
+    if not channel_id or not ticket_id:return 0
+    channel=guild.get_channel(channel_id)
+    if channel is None:
+        try: channel=await guild.fetch_channel(channel_id)
+        except Exception: return 0
+    if not isinstance(channel,discord.TextChannel):return 0
+    saved=0
+    try:
+        async for msg in channel.history(limit=limit,oldest_first=True):
+            if msg.author.bot: continue
+            _ticket_add_message(ticket_id,guild.id,msg); saved+=1
+    except Exception as exc:
+        print(f"[leader_contact] Ticket-History Sync {ticket_id}: {exc!r}",flush=True)
+    return saved
 
 def _is_admin(inter: discord.Interaction) -> bool:
     perms = getattr(inter.user, "guild_permissions", None)
@@ -477,8 +506,10 @@ class LeaderStatusView(View):
         t={}
         try:
             t=_ticket_by_internal_message(inter.guild.id,inter.message.id)
+            if t and ticket_ch is not None:
+                await _sync_ticket_channel_history(inter.guild,t)
         except Exception as exc:
-            print(f"[leader_contact] Ticket laden fehlgeschlagen: {exc!r}")
+            print(f"[leader_contact] Ticket laden/synchronisieren fehlgeschlagen: {exc!r}")
         ok, archive_ch, archive_error = await _archive_ticket(inter, new_embed, name)
         if not ok:
             # Niemals das Original löschen, solange die Archivkopie nicht bestätigt ist.
@@ -688,6 +719,8 @@ async def _process_ticket_dashboard_action(client:discord.Client,row:dict)->str:
     if action=='done':
         emb=_replace_status_field(message.embeds[0],f"✅ Erledigt von **{_safe_text(actor_name)}**")
         ticket_ch=_existing_ticket_channel(guild,int(message.id))
+        if ticket_ch is not None:
+            await _sync_ticket_channel_history(guild,ticket)
         ok,archive_ch,err=await _archive_ticket_message(client,guild,message,emb,actor_name,actor_id)
         if not ok:raise RuntimeError(err)
         _ticket_update(int(ticket['id']),status='done',closed_at=datetime.now(TZ).isoformat(),closed_by_id=actor_id or None,closed_by_name=actor_name)
@@ -718,6 +751,31 @@ async def _ticket_dashboard_action_loop(client:discord.Client)->None:
                 except Exception as exc:_ticket_action_finish(int(row['id']),'error',f'{type(exc).__name__}: {exc}')
         except Exception as exc:print(f"[leader_contact] Dashboard-Ticket-Queue: {exc!r}")
         await asyncio.sleep(5)
+
+async def _ticket_history_sync_loop(client: discord.Client) -> None:
+    """Hält private Ticket-Chats im Dashboard-Archiv aktuell und repariert ältere leere Einträge."""
+    await client.wait_until_ready()
+    while not client.is_closed():
+        try:
+            _ticket_db_init(); backend=getattr(runtime_db,'_BACKEND','sqlite'); rows=[]
+            if backend=='postgres':
+                conn=runtime_db._pg_connect()
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT * FROM leader_tickets WHERE ticket_channel_id IS NOT NULL AND status IN ('open','claimed','conversation','done') ORDER BY id DESC LIMIT 100")
+                        rows=[dict(r) for r in cur.fetchall()]
+                finally: conn.close()
+            else:
+                conn=runtime_db._sqlite_connect()
+                try: rows=[dict(r) for r in conn.execute("SELECT * FROM leader_tickets WHERE ticket_channel_id IS NOT NULL AND status IN ('open','claimed','conversation','done') ORDER BY id DESC LIMIT 100").fetchall()]
+                finally: conn.close()
+            for row in rows:
+                guild=client.get_guild(int(row.get('guild_id') or 0))
+                if guild is None: continue
+                await _sync_ticket_channel_history(guild,row,limit=250)
+        except Exception as exc:
+            print(f"[leader_contact] Ticket-History Loop: {exc!r}",flush=True)
+        await asyncio.sleep(90)
 
 async def _ticket_cleanup_loop(client:discord.Client) -> None:
     await client.wait_until_ready()
@@ -754,6 +812,7 @@ async def setup_leader_contact(client: discord.Client, tree: app_commands.Comman
     _ticket_db_init()
     asyncio.create_task(_ticket_cleanup_loop(client))
     asyncio.create_task(_ticket_dashboard_action_loop(client))
+    asyncio.create_task(_ticket_history_sync_loop(client))
     async def _ticket_message_listener(message:discord.Message):
         if not message.guild or message.author.bot: return
         try:

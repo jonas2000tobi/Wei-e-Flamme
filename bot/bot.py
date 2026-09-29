@@ -28,7 +28,7 @@ intents = discord.Intents.default()
 intents.guilds = True
 intents.members = True
 intents.dm_messages = True
-intents.message_content = False
+intents.message_content = True
 intents.voice_states = True
 intents.moderation = True
 
