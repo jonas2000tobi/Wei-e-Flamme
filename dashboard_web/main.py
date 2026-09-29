@@ -3133,6 +3133,8 @@ def _admin_quick_links(active: str = "") -> str:
         ("attendance", "/attendance", "✅", "Anwesenheit", "Raid-Reviews und Auswertung", states.get("attendance", False)),
         ("loot", "/loot", "🎁", "Loot", "Loot-Verwaltung", states.get("loot", False)),
         ("members", "/members", "👥", "Mitglieder", "Profile und Notizen", True),
+        ("activity", "/member-activity", "📈", "Mitgliederaktivität", "7/30/90 Tage & Rückmeldungen", states.get("member_activity", False)),
+        ("tickets", "/tickets", "🎫", "Tickets", "Leader Contact & Archiv", states.get("leader_contact", False)),
         ("settings", "/admin-settings", "⚙️", "Einstellungen", "Module, Rollen und Gilden-Setup", True),
         ("system", "/system", "🧩", "System & Logs", "Bot, DB und Quellen", True),
     ]
@@ -9465,6 +9467,8 @@ def _render_member_detail(data: dict[str, Any], user_id: int, current_user: Opti
     </section>
     <section class="grid">{cards}</section>
     {_admin_member_panel(data, int(user_id), current_user)}
+    {_member_activity_panel(data, int(user_id), current_user)}
+    {_aion2_profile_panel(data, int(user_id), current_user)}
     <section class="panel" id="needs">
       <h2>🎁 Needliste</h2>
       <div class="split">
@@ -11817,6 +11821,163 @@ def api_items_stats():
     return JSONResponse({"ok": True, "stats": payload.get("stats")})
 
 
+
+
+
+def _ensure_v211_tables() -> None:
+    if not _database_url(): return
+    conn=_pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute('''CREATE TABLE IF NOT EXISTS member_activity_daily (guild_id BIGINT NOT NULL,user_id BIGINT NOT NULL,activity_date DATE NOT NULL,messages INTEGER NOT NULL DEFAULT 0,reactions_given INTEGER NOT NULL DEFAULT 0,reactions_received INTEGER NOT NULL DEFAULT 0,event_responses INTEGER NOT NULL DEFAULT 0,last_activity_at TIMESTAMPTZ,PRIMARY KEY(guild_id,user_id,activity_date))''')
+            cur.execute('''CREATE TABLE IF NOT EXISTS event_rsvp_transitions (id BIGSERIAL PRIMARY KEY,guild_id BIGINT NOT NULL,user_id BIGINT NOT NULL,event_id TEXT NOT NULL,old_choice TEXT NOT NULL DEFAULT '',new_choice TEXT NOT NULL DEFAULT '',changed_at TIMESTAMPTZ NOT NULL)''')
+            cur.execute('''CREATE TABLE IF NOT EXISTS member_membership (guild_id BIGINT NOT NULL,user_id BIGINT NOT NULL,member_since TIMESTAMPTZ,source TEXT NOT NULL DEFAULT 'discord_join',updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),PRIMARY KEY(guild_id,user_id))''')
+            cur.execute('''CREATE TABLE IF NOT EXISTS aion2_profiles (guild_id BIGINT NOT NULL,user_id BIGINT NOT NULL,character_name TEXT NOT NULL DEFAULT '',class_name TEXT NOT NULL DEFAULT '',main_role TEXT NOT NULL DEFAULT '',level INTEGER,gearscore TEXT NOT NULL DEFAULT '',updated_at TEXT NOT NULL,PRIMARY KEY(guild_id,user_id))''')
+            cur.execute('''CREATE TABLE IF NOT EXISTS leader_tickets (id BIGSERIAL PRIMARY KEY,guild_id BIGINT NOT NULL,creator_user_id BIGINT,creator_name TEXT NOT NULL DEFAULT '',anonymous BOOLEAN NOT NULL DEFAULT FALSE,subject TEXT NOT NULL DEFAULT '',original_message TEXT NOT NULL DEFAULT '',status TEXT NOT NULL DEFAULT 'open',assigned_to_id BIGINT,assigned_to_name TEXT NOT NULL DEFAULT '',discord_internal_channel_id BIGINT,discord_internal_message_id BIGINT,ticket_channel_id BIGINT,created_at TEXT NOT NULL,claimed_at TEXT,closed_at TEXT,closed_by_id BIGINT,closed_by_name TEXT NOT NULL DEFAULT '')''')
+            cur.execute('''CREATE TABLE IF NOT EXISTS leader_ticket_messages (id BIGSERIAL PRIMARY KEY,ticket_id BIGINT NOT NULL,guild_id BIGINT NOT NULL,discord_message_id BIGINT,author_id BIGINT,author_name TEXT NOT NULL DEFAULT '',content TEXT NOT NULL DEFAULT '',attachments_json TEXT NOT NULL DEFAULT '[]',created_at TEXT NOT NULL)''')
+            cur.execute('''CREATE TABLE IF NOT EXISTS leader_ticket_notes (id BIGSERIAL PRIMARY KEY,ticket_id BIGINT NOT NULL,guild_id BIGINT NOT NULL,author_id BIGINT,author_name TEXT NOT NULL DEFAULT '',content TEXT NOT NULL DEFAULT '',created_at TEXT NOT NULL)''')
+            cur.execute('''CREATE TABLE IF NOT EXISTS leader_ticket_actions (id BIGSERIAL PRIMARY KEY,ticket_id BIGINT NOT NULL,guild_id BIGINT NOT NULL,action_type TEXT NOT NULL,actor_id BIGINT,actor_name TEXT NOT NULL DEFAULT '',status TEXT NOT NULL DEFAULT 'pending',result_text TEXT NOT NULL DEFAULT '',created_at TEXT NOT NULL,processed_at TEXT)''')
+        conn.commit()
+    finally: conn.close()
+
+def _activity_data(guild_id:int,user_id:int)->dict[str,Any]:
+    if not _database_url(): return {}
+    _ensure_v211_tables(); conn=_pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute('SELECT member_since FROM member_membership WHERE guild_id=%s AND user_id=%s',(guild_id,user_id)); mr=cur.fetchone() or {}
+            cur.execute('''SELECT COALESCE(SUM(messages),0) messages,COALESCE(SUM(reactions_given),0) reactions_given,COALESCE(SUM(reactions_received),0) reactions_received,COUNT(*) FILTER(WHERE messages>0 OR reactions_given>0 OR reactions_received>0 OR event_responses>0) active_days,MAX(last_activity_at) last_activity FROM member_activity_daily WHERE guild_id=%s AND user_id=%s''',(guild_id,user_id)); total=dict(cur.fetchone() or {})
+            periods={}
+            for days in (7,30,90):
+                cur.execute('''SELECT COALESCE(SUM(messages),0) messages,COALESCE(SUM(reactions_given),0) reactions_given,COALESCE(SUM(reactions_received),0) reactions_received,COUNT(*) FILTER(WHERE messages>0 OR reactions_given>0 OR reactions_received>0 OR event_responses>0) active_days FROM member_activity_daily WHERE guild_id=%s AND user_id=%s AND activity_date>=CURRENT_DATE-(%s::int-1)''',(guild_id,user_id,days)); periods[days]=dict(cur.fetchone() or {})
+            cur.execute('''SELECT COALESCE(SUM(duration_seconds),0) seconds,COUNT(*) sessions FROM voice_sessions WHERE guild_id=%s AND user_id=%s AND duration_seconds IS NOT NULL''',(guild_id,user_id)); voice=dict(cur.fetchone() or {})
+            cur.execute("SELECT COUNT(DISTINCT event_id) AS c FROM event_rsvp_transitions WHERE guild_id=%s AND user_id=%s AND new_choice='NO' AND old_choice IN ('TANK','HEAL','DPS','BANK')",(guild_id,user_id)); absent=int((cur.fetchone() or {}).get('c') or 0)
+            cur.execute('SELECT * FROM aion2_profiles WHERE guild_id=%s AND user_id=%s',(guild_id,user_id)); aion=dict(cur.fetchone() or {})
+            # Aktive Tage = Union aus Nachrichten/Reaktionen/Event-Rückmeldung und Voice.
+            for days in (7,30,90):
+                cur.execute("""SELECT COUNT(*) AS c FROM (
+                    SELECT activity_date::date AS d FROM member_activity_daily
+                    WHERE guild_id=%s AND user_id=%s AND activity_date>=CURRENT_DATE-(%s::int-1)
+                      AND (messages>0 OR reactions_given>0 OR reactions_received>0 OR event_responses>0)
+                    UNION
+                    SELECT DATE(joined_at::timestamptz) AS d FROM voice_sessions
+                    WHERE guild_id=%s AND user_id=%s AND joined_at::timestamptz >= CURRENT_DATE-(%s::int-1)
+                ) active""",(guild_id,user_id,days,guild_id,user_id,days))
+                periods[days]['active_days_union']=int((cur.fetchone() or {}).get('c') or 0)
+            cur.execute("""SELECT COUNT(*) AS c FROM (
+                SELECT activity_date::date AS d FROM member_activity_daily
+                WHERE guild_id=%s AND user_id=%s AND (messages>0 OR reactions_given>0 OR reactions_received>0 OR event_responses>0)
+                UNION
+                SELECT DATE(joined_at::timestamptz) AS d FROM voice_sessions WHERE guild_id=%s AND user_id=%s
+            ) active""",(guild_id,user_id,guild_id,user_id))
+            total['active_days_union']=int((cur.fetchone() or {}).get('c') or 0)
+        return {'member_since':mr.get('member_since'),'total':total,'periods':periods,'voice':voice,'aion':aion,'absent':absent}
+    finally: conn.close()
+
+def _member_activity_event_stats(snap:dict[str,Any],user_id:int,member_since:Any)->dict[str,int]:
+    out={'possible':0,'yes':0,'reserve':0,'maybe':0,'no':0,'missing':0}
+    profile=next((p for p in ((snap.get('profiles') or {}).get('items') or []) if isinstance(p,dict) and _user_id(p.get('user_id'))==int(user_id)),{})
+    role_ids={int(r.get('role_id') or 0) for r in (profile.get('roles') or []) if isinstance(r,dict) and int(r.get('role_id') or 0)}
+    since=None
+    try:
+        if member_since: since=datetime.fromisoformat(str(member_since).replace('Z','+00:00'))
+    except Exception: pass
+    for ev in ((snap.get('events') or {}).get('items') or []):
+        if not isinstance(ev,dict): continue
+        dt=_event_dt_obj(ev.get('when_iso') or ev.get('start_at') or ev.get('created_at'))
+        if since and dt and dt.astimezone(timezone.utc)<since.astimezone(timezone.utc): continue
+        target=int(ev.get('target_role_id') or 0)
+        if target and target not in role_ids: continue
+        out['possible']+=1; status=_portal_event_status_for_user(ev,user_id); ch=_event_rsvp_choice_from_status(status)
+        if ch in {'TANK','HEAL','DPS'}: out['yes']+=1
+        elif ch=='BANK': out['reserve']+=1
+        elif ch=='MAYBE': out['maybe']+=1
+        elif ch=='NO': out['no']+=1
+        else: out['missing']+=1
+    return out
+
+def _member_activity_panel(data:dict[str,Any],user_id:int,current_user:Optional[dict[str,Any]])->str:
+    if not current_user or str(current_user.get('role') or '')!='admin': return ''
+    if not _dashboard_module_states().get('member_activity',False): return ''
+    gid=_safe_guild_id(data); d=_activity_data(gid,user_id); snap=data.get('snapshot') or {}; es=_member_activity_event_stats(snap,user_id,d.get('member_since'))
+    v=d.get('voice') or {}; total=d.get('total') or {}; periods=d.get('periods') or {}; possible=max(0,int(es['possible'])); responded=possible-int(es['missing']); response_pct=round((responded/possible*100),1) if possible else 0; yes_pct=round((int(es['yes'])/possible*100),1) if possible else 0; absent=min(int(d.get('absent') or 0),int(es['no'])); declined=max(0,int(es['no'])-absent)
+    pcards=''.join([_card('Mögliche Events',possible,'seit Gildenbeitritt'),_card('Zugesagt',es['yes'],f'{yes_pct}%'),_card('Reserve',es['reserve'],'separat'),_card('Vielleicht',es['maybe'],'Rückmeldung'),_card('Abgelehnt',declined,'direkt Nein'),_card('Abwesend',absent,'erst bestätigt, dann abgemeldet'),_card('Keine Rückmeldung',es['missing'],f'Rückmeldequote {response_pct}%')])
+    rows=[]
+    for days in (7,30,90):
+        x=periods.get(days) or {}; rows.append([f'{days} Tage',int(x.get('active_days_union') or x.get('active_days') or 0),x.get('messages',0),x.get('reactions_given',0),x.get('reactions_received',0)])
+    rows.append(['Seit Erfassung',int(total.get('active_days_union') or total.get('active_days') or 0),total.get('messages',0),total.get('reactions_given',0),total.get('reactions_received',0)])
+    seconds=int(v.get('seconds') or 0); sessions=int(v.get('sessions') or 0); avg=round(seconds/sessions/60,1) if sessions else 0
+    return f'''<section class="panel" id="activity"><h2>📈 Aktivität & Rückmeldungen</h2><p class="muted">Keine Attendance-Auswertung: angezeigt werden Event-Rückmeldungen und Discord-Aktivität.</p><div class="grid">{pcards}</div>{_table(['Zeitraum','Aktive Tage','Nachrichten','Reaktionen vergeben','Reaktionen erhalten'],rows,searchable=False)}<div class="grid">{_card('Voice gesamt',f'{round(seconds/3600,1)} h',f'{sessions} Sessions')}{_card('Ø Voice-Session',f'{avg} min','seit Erfassung')}{_card('Letzte Aktivität',_dt(total.get('last_activity')),'Discord-Aktivität')}{_card('Gildenmitglied seit',_dt(d.get('member_since')),'erfasster Beginn')}</div></section>'''
+
+def _aion2_profile_panel(data:dict[str,Any],user_id:int,current_user:Optional[dict[str,Any]])->str:
+    gid=_safe_guild_id(data); d=_activity_data(gid,user_id); a=d.get('aion') or {}
+    if not a and not bool(_dashboard_module_setting_value(gid,'onboarding','aion2_enabled',False)): return ''
+    admin=bool(current_user and str(current_user.get('role') or '')=='admin')
+    view=f'''<div class="grid">{_card('Charakter',a.get('character_name') or '—','Aion 2')}{_card('Klasse',a.get('class_name') or '—','Aion 2')}{_card('Rolle',a.get('main_role') or '—','Tank / Heal / DPS')}{_card('Level',a.get('level') or '—','Profil')}{_card('Gearscore',a.get('gearscore') or '—','Profil')}</div>'''
+    form=''
+    if admin:
+        opts=''.join(f'<option value="{_e(c)}"'+(' selected' if str(a.get('class_name') or '')==c else '')+f'>{_e(c)}</option>' for c in ['Gladiator','Templer','Assassine','Jäger','Zauberer','Beschwörer','Kleriker','Kantor'])
+        roles=''.join(f'<option value="{r}"'+(' selected' if str(a.get('main_role') or '')==r else '')+f'>{r}</option>' for r in ['TANK','HEAL','DPS'])
+        form=f'''<form method="post" action="/admin/member/{user_id}/aion2" class="settings-form"><label>Charaktername<br><input name="character_name" value="{_e(a.get('character_name') or '')}" maxlength="120"></label><label>Klasse<br><select name="class_name">{opts}</select></label><label>Rolle<br><select name="main_role">{roles}</select></label><label>Level<br><input type="number" min="1" name="level" value="{_e(a.get('level') or '')}"></label><label>Gearscore<br><input name="gearscore" value="{_e(a.get('gearscore') or '')}" maxlength="40"></label><button class="btn" type="submit">Aion-2-Profil speichern</button></form>'''
+    return f'<section class="panel" id="aion2"><h2>🎮 Aion 2</h2>{view}{form}</section>'
+
+def _ticket_rows(guild_id:int,search:str='')->list[dict[str,Any]]:
+    if not _database_url(): return []
+    _ensure_v211_tables(); conn=_pg_connect()
+    try:
+        with conn.cursor() as cur:
+            if search:
+                cur.execute('SELECT * FROM leader_tickets WHERE guild_id=%s AND LOWER(creator_name) LIKE LOWER(%s) ORDER BY id DESC LIMIT 500',(guild_id,'%'+search+'%'))
+            else: cur.execute('SELECT * FROM leader_tickets WHERE guild_id=%s ORDER BY id DESC LIMIT 500',(guild_id,))
+            return [dict(r) for r in cur.fetchall()]
+    finally: conn.close()
+
+def _render_member_activity_dashboard(data:dict[str,Any])->str:
+    gid=_safe_guild_id(data); snap=data.get('snapshot') or {}; profiles=((snap.get('profiles') or {}).get('items') or []); rows=[]
+    for profile in profiles:
+        if not isinstance(profile,dict): continue
+        uid=_user_id(profile.get('user_id'))
+        if not uid: continue
+        d=_activity_data(gid,uid); p7=(d.get('periods') or {}).get(7) or {}; v=d.get('voice') or {}; ev=_member_activity_event_stats(snap,uid,d.get('member_since')); absent=min(int(d.get('absent') or 0),int(ev.get('no') or 0)); declined=max(0,int(ev.get('no') or 0)-absent)
+        rows.append([_member_link(uid,profile.get('display_name') or profile.get('server_name') or uid),p7.get('active_days_union',p7.get('active_days',0)),p7.get('messages',0),p7.get('reactions_given',0),round(int(v.get('seconds') or 0)/3600,1),ev.get('possible',0),ev.get('yes',0),declined,absent,ev.get('missing',0)])
+    body=f'''{_admin_tabs_style()}{_admin_quick_links('activity')}<section class="hero"><div><div class="eyebrow">Mitglieder</div><h1>📈 Aktivität & Rückmeldungen</h1><p class="muted">Sortierbare Übersicht. Attendance ist bewusst nicht enthalten.</p></div></section><section class="panel">{_table(['Mitglied','Aktive Tage 7T','Nachrichten 7T','Reaktionen 7T','Voice gesamt h','Events möglich','Zugesagt','Abgelehnt','Abwesend','Keine Antwort'],rows,placeholder='Mitglied suchen…')}</section>'''
+    return _html_shell('Mitgliederaktivität · Guild Platform',body,nav_mode='admin')
+
+def _render_tickets_dashboard(data:dict[str,Any],search:str='')->str:
+    gid=_safe_guild_id(data); tickets=_ticket_rows(gid,search); open_count=sum(1 for t in tickets if t.get('status') in {'open','claimed','conversation'}); claimed=sum(1 for t in tickets if t.get('status') in {'claimed','conversation'}); archive=sum(1 for t in tickets if t.get('status')=='done')
+    rows=[]
+    for t in tickets:
+        st={'open':'🆕 Offen','claimed':'👀 Übernommen','conversation':'💬 Im Gespräch','done':'✅ Erledigt'}.get(str(t.get('status')),str(t.get('status'))); creator='Anonym' if t.get('anonymous') else t.get('creator_name') or '—'; rows.append([_raw(f'<a class="link" href="/ticket/{int(t.get("id"))}">#{int(t.get("id"))}</a>'),creator,_short(t.get('subject'),80),st,t.get('assigned_to_name') or '—',_dt(t.get('created_at'))])
+    body=f'''{_admin_tabs_style()}{_admin_quick_links('tickets')}<section class="hero"><div><div class="eyebrow">Leader Contact</div><h1>🎫 Tickets & Archiv</h1><p class="muted">Offene und erledigte Leader-Tickets inklusive privatem Chatverlauf.</p></div></section><section class="grid">{_card('Offen',open_count,'aktive Tickets')}{_card('Übernommen',claimed,'inkl. Gespräch')}{_card('Archiv',archive,'dauerhaft gespeichert')}</section><section class="panel"><form method="get" action="/tickets"><label>🔎 Nach Ersteller suchen<br><input name="q" value="{_e(search)}" placeholder="Discord-/Erstellername"></label><button class="btn" type="submit">Suchen</button></form>{_table(['#','Ersteller','Thema','Status','Bearbeiter','Erstellt'],rows,placeholder='Tickets filtern…')}</section>'''
+    return _html_shell('Tickets · Guild Platform',body,nav_mode='admin')
+
+def _ticket_detail_data(guild_id:int,ticket_id:int)->tuple[dict,list,list]:
+    _ensure_v211_tables(); conn=_pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute('SELECT * FROM leader_tickets WHERE guild_id=%s AND id=%s',(guild_id,ticket_id)); t=dict(cur.fetchone() or {})
+            cur.execute('SELECT * FROM leader_ticket_messages WHERE guild_id=%s AND ticket_id=%s ORDER BY id',(guild_id,ticket_id)); msgs=[dict(r) for r in cur.fetchall()]
+            cur.execute('SELECT * FROM leader_ticket_notes WHERE guild_id=%s AND ticket_id=%s ORDER BY id DESC',(guild_id,ticket_id)); notes=[dict(r) for r in cur.fetchall()]
+        return t,msgs,notes
+    finally: conn.close()
+
+def _render_ticket_detail(data:dict[str,Any],ticket_id:int)->str:
+    gid=_safe_guild_id(data); t,msgs,notes=_ticket_detail_data(gid,ticket_id)
+    if not t:return _html_shell('Ticket nicht gefunden','<section class="panel"><h1>Ticket nicht gefunden</h1></section>',nav_mode='admin')
+    creator='Anonym' if t.get('anonymous') else t.get('creator_name') or '—'; 
+    def _ticket_msg_html(m):
+        att=''
+        try:
+            aa=json.loads(m.get('attachments_json') or '[]'); att=''.join(f'<div><a class="link" href="{_e(a.get("url") or "#")}" target="_blank" rel="noopener">📎 {_e(a.get("name") or "Anhang")}</a></div>' for a in aa if isinstance(a,dict))
+        except Exception: pass
+        return f'<article style="padding:10px;border-bottom:1px solid var(--line)"><b>{_e(m.get("author_name") or m.get("author_id"))}</b> <span class="muted">{_e(_dt(m.get("created_at")))}</span><p>{_e(m.get("content") or "—")}</p>{att}</article>'
+    transcript=''.join(_ticket_msg_html(m) for m in msgs) or '<p class="muted">Kein privater Chatverlauf.</p>'; note_html=''.join(f'<p><b>{_e(n.get("author_name") or n.get("author_id"))}</b> · {_e(_dt(n.get("created_at")))}<br>{_e(n.get("content"))}</p>' for n in notes) or '<p class="muted">Keine internen Notizen.</p>'
+    action_buttons=''
+    if str(t.get('status') or '')!='done':
+        open_btn='' if t.get('anonymous') or t.get('ticket_channel_id') else f'<button class="btn secondary" name="action" value="open_chat" type="submit">💬 Ticket öffnen</button>'
+        action_buttons=f'<form method="post" action="/admin/ticket/{ticket_id}/action" class="editor-actions"><button class="btn secondary" name="action" value="claim" type="submit">👀 Übernehmen</button>{open_btn}<button class="btn" name="action" value="done" type="submit">✅ Erledigt</button></form>'
+    body=f'''{_admin_tabs_style()}{_admin_quick_links('tickets')}<section class="hero"><div><div class="eyebrow">Ticket #{ticket_id}</div><h1>🎫 {_e(t.get('subject') or 'Leader-Ticket')}</h1><p>{_e(creator)} · {_e(t.get('status'))} · {_e(_dt(t.get('created_at')))}</p></div><div><a class="btn" href="/tickets">← Archiv</a>{action_buttons}</div></section><section class="panel"><h2>Ursprüngliche Nachricht</h2><p>{_e(t.get('original_message') or '—')}</p><p class="muted">Bearbeiter: {_e(t.get('assigned_to_name') or '—')} · Ticket-Channel-ID: {_e(t.get('ticket_channel_id') or '—')}</p></section><section class="panel"><h2>💬 Ticket-Chatverlauf</h2>{transcript}</section><section class="panel"><h2>🛡️ Interne Leitungsnotizen</h2>{note_html}<form method="post" action="/admin/ticket/{ticket_id}/note"><textarea name="note" rows="4" maxlength="4000" placeholder="Interne Notiz…"></textarea><button class="btn" type="submit">Notiz hinzufügen</button></form></section>'''
+    return _html_shell(f'Ticket #{ticket_id}',body,nav_mode='admin')
 
 @app.get("/voice", response_class=HTMLResponse)
 def voice_page(_: bool = Depends(_admin_auth)):
@@ -15292,6 +15453,12 @@ def _render_admin_settings_editor(data: dict[str, Any], msg: str = "", section: 
                 <div><div class='eyebrow'>Onboarding & Recruitment</div><h2>📝 Privater Bewerbungs-Chat</h2><p class='muted'>Wählt jemand im Onboarding <strong>Bewerber</strong>, erstellt der Bot nach Abschluss automatisch einen privaten Textkanal für Bewerber und Lead. Der Kanal wird beim Review direkt verlinkt.</p></div>
                 <span class='pill {'ok' if application_chat_enabled else ''}'>{'Aktiv' if application_chat_enabled else 'Aus'}</span>
               </div>
+              <form method='post' action='/admin/onboarding-aion2-settings' class='settings-form'>
+                <h4>🎮 Aion-2-Komponente</h4>
+                <p class='muted'>Optional: erweitert nur dieses Onboarding um Charaktername, Klasse und Rolle. Andere Spiele bleiben unberührt.</p>
+                <label><input type='checkbox' name='aion2_enabled' value='1' {"checked" if bool(_dashboard_module_setting_value(guild_id, "onboarding", "aion2_enabled", False)) else ""}> Aion-2-Komponente aktivieren</label>
+                <button class='btn' type='submit'>Speichern</button>
+              </form>
               <form method='post' action='/admin/onboarding-application-settings' class='settings-form'>
                 <div class='settings-two'>
                   <label>Bewerbungs-Chat aktiv
@@ -19288,6 +19455,52 @@ def member_detail(user_id: int, request: Request, _: bool = Depends(_auth)):
 
 
 
+@app.get("/member-activity", response_class=HTMLResponse)
+def member_activity_dashboard(_:bool=Depends(_admin_auth)):
+    if not _dashboard_module_states().get("member_activity",False):
+        raise HTTPException(status_code=404,detail="Mitgliederaktivität-Modul ist deaktiviert")
+    return HTMLResponse(_render_member_activity_dashboard(_snapshot_payload()))
+
+@app.get("/tickets", response_class=HTMLResponse)
+def tickets_page(request:Request,q:str="",_:bool=Depends(_admin_auth)):
+    return HTMLResponse(_render_tickets_dashboard(_snapshot_payload(),str(q or '').strip()))
+
+@app.get("/ticket/{ticket_id}", response_class=HTMLResponse)
+def ticket_detail_page(ticket_id:int,_:bool=Depends(_admin_auth)):
+    return HTMLResponse(_render_ticket_detail(_snapshot_payload(),int(ticket_id)))
+
+@app.post("/admin/ticket/{ticket_id}/action")
+async def ticket_dashboard_action(ticket_id:int,request:Request,_:bool=Depends(_admin_auth)):
+    raw=(await request.body()).decode('utf-8',errors='replace'); form=urllib.parse.parse_qs(raw,keep_blank_values=True); action=str((form.get('action') or [''])[0]).strip();
+    if action not in {'claim','open_chat','done'}:raise HTTPException(status_code=400,detail='Ungültige Ticket-Aktion')
+    data=_snapshot_payload();gid=_safe_guild_id(data);actor=_current_user(request) or {};_ensure_v211_tables();conn=_pg_connect()
+    try:
+        with conn.cursor() as cur:cur.execute("INSERT INTO leader_ticket_actions(ticket_id,guild_id,action_type,actor_id,actor_name,status,created_at) VALUES(%s,%s,%s,%s,%s,'pending',%s)",(ticket_id,gid,action,_user_id(actor.get('user_id')),str(actor.get('username') or actor.get('user_id') or 'Dashboard'),datetime.now(timezone.utc).isoformat()))
+        conn.commit()
+    finally:conn.close()
+    return RedirectResponse(f'/ticket/{int(ticket_id)}',status_code=303)
+
+@app.post("/admin/ticket/{ticket_id}/note")
+async def ticket_note_add(ticket_id:int,request:Request,_:bool=Depends(_admin_auth)):
+    raw=(await request.body()).decode('utf-8',errors='replace'); form=urllib.parse.parse_qs(raw,keep_blank_values=True); note=str((form.get('note') or [''])[0]).strip()[:4000]; data=_snapshot_payload(); gid=_safe_guild_id(data); actor=_current_user(request) or {}
+    if note and _database_url():
+        _ensure_v211_tables(); conn=_pg_connect()
+        try:
+            with conn.cursor() as cur: cur.execute('INSERT INTO leader_ticket_notes(ticket_id,guild_id,author_id,author_name,content,created_at) VALUES(%s,%s,%s,%s,%s,%s)',(ticket_id,gid,_user_id(actor.get('user_id')),str(actor.get('username') or actor.get('user_id') or ''),note,datetime.now(timezone.utc).isoformat()))
+            conn.commit()
+        finally: conn.close()
+    return RedirectResponse(f'/ticket/{int(ticket_id)}',status_code=303)
+
+@app.post("/admin/member/{user_id}/aion2")
+async def admin_member_aion2_save(user_id:int,request:Request,_:bool=Depends(_admin_auth)):
+    raw=(await request.body()).decode('utf-8',errors='replace'); form=urllib.parse.parse_qs(raw,keep_blank_values=True); gid=_safe_guild_id(_snapshot_payload()); ch=str((form.get('character_name') or [''])[0]).strip()[:120]; cl=str((form.get('class_name') or [''])[0]).strip()[:80]; role=str((form.get('main_role') or [''])[0]).strip()[:30]; gs=str((form.get('gearscore') or [''])[0]).strip()[:40]; rawlevel=str((form.get('level') or [''])[0]).strip(); level=int(rawlevel) if rawlevel.isdigit() else None
+    _ensure_v211_tables(); conn=_pg_connect()
+    try:
+        with conn.cursor() as cur: cur.execute('''INSERT INTO aion2_profiles(guild_id,user_id,character_name,class_name,main_role,level,gearscore,updated_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(guild_id,user_id) DO UPDATE SET character_name=EXCLUDED.character_name,class_name=EXCLUDED.class_name,main_role=EXCLUDED.main_role,level=EXCLUDED.level,gearscore=EXCLUDED.gearscore,updated_at=EXCLUDED.updated_at''',(gid,user_id,ch,cl,role,level,gs,datetime.now(timezone.utc).isoformat()))
+        conn.commit()
+    finally: conn.close()
+    return RedirectResponse(f'/member/{int(user_id)}#aion2',status_code=303)
+
 @app.get("/admin", response_class=HTMLResponse)
 def admin_actions_page(_: bool = Depends(_admin_auth)):
     try:
@@ -19902,6 +20115,13 @@ async def admin_module_toggle(module_key: str, request: Request, _: bool = Depen
         status_code=303,
     )
 
+
+@app.post("/admin/onboarding-aion2-settings")
+async def admin_onboarding_aion2_settings(request: Request, _: bool = Depends(_admin_auth)):
+    raw=(await request.body()).decode("utf-8",errors="replace"); form=urllib.parse.parse_qs(raw,keep_blank_values=True)
+    guild_id=_safe_guild_id(_snapshot_payload())
+    _set_dashboard_module_setting_value(guild_id,"onboarding","aion2_enabled",bool((form.get("aion2_enabled") or [""])[0]))
+    return RedirectResponse("/admin-settings#modules",status_code=303)
 
 @app.post("/admin/onboarding-welcome-settings")
 async def admin_onboarding_welcome_settings(request: Request, _: bool = Depends(_admin_auth)):
