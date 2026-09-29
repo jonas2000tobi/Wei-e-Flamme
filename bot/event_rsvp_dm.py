@@ -21,6 +21,16 @@ try:
 except Exception:
     from role_keys import CANONICAL_EVENT_ROLES, normalize_role_key, normalize_yes_buckets, role_label as canonical_role_label  # type: ignore
 
+try:
+    from bot import runtime_db  # type: ignore
+except Exception:
+    import runtime_db  # type: ignore
+
+try:
+    from bot.aion2_game import AION2_CLASS_META, normalize_class as _aion2_normalize_class  # type: ignore
+except Exception:
+    from aion2_game import AION2_CLASS_META, normalize_class as _aion2_normalize_class  # type: ignore
+
 import discord
 import aiohttp
 from discord import app_commands
@@ -480,8 +490,46 @@ def _short_guild_label(label: str) -> str:
     return clean[:3].title()
 
 
+def _aion2_profile_for_entry(entry: Any, guild: Optional[discord.Guild]) -> dict[str, Any]:
+    if guild is None:
+        return {}
+    uid = _entry_user_id(entry)
+    if not uid:
+        return {}
+    guild_id = int(guild.id)
+    if isinstance(entry, dict):
+        try:
+            guild_id = int(entry.get("source_guild_id", 0) or guild_id)
+        except Exception:
+            guild_id = int(guild.id)
+    try:
+        return runtime_db.get_aion2_profile(guild_id, uid) or {}
+    except Exception:
+        return {}
+
+
+def _aion2_class_emoji_text(entry: Any, guild: Optional[discord.Guild]) -> str:
+    if guild is None:
+        return ""
+    profile = _aion2_profile_for_entry(entry, guild)
+    class_name = _aion2_normalize_class(profile.get("class_name"))
+    meta = AION2_CLASS_META.get(class_name)
+    if not meta:
+        return ""
+    emoji_name = str(meta[2] or meta[0] or "").strip()
+    if not emoji_name:
+        return ""
+    for emoji in list(getattr(guild, "emojis", []) or []):
+        if str(getattr(emoji, "name", "") or "").casefold() == emoji_name.casefold():
+            return str(emoji)
+    return ""
+
+
 def _entry_display_name(entry: Any, guild: Optional[discord.Guild] = None) -> str:
     name = _entry_name(entry, guild)
+    class_emoji = _aion2_class_emoji_text(entry, guild)
+    if class_emoji:
+        name = f"{class_emoji} {name}"
 
     if isinstance(entry, dict):
         label = str(entry.get("guild_label", "") or "").strip()
@@ -3892,10 +3940,25 @@ def _dashboard_lineup_candidates(obj: dict[str, Any]) -> dict[int, dict[str, Any
             uid = _entry_user_id(entry)
             if not uid:
                 continue
+            # Event entries carry source_guild_id; use it for the gespeicherte Aion-Profilzuordnung.
+            profile: dict[str, Any] = {}
+            try:
+                profile_guild_id = int(entry.get("source_guild_id", 0) or obj.get("guild_id", 0) or 0) if isinstance(entry, dict) else int(obj.get("guild_id", 0) or 0)
+            except Exception:
+                profile_guild_id = int(obj.get("guild_id", 0) or 0)
+            if profile_guild_id:
+                try:
+                    profile = runtime_db.get_aion2_profile(profile_guild_id, int(uid)) or {}
+                except Exception:
+                    profile = {}
+            class_name = _aion2_normalize_class(profile.get("class_name"))
+            class_meta = AION2_CLASS_META.get(class_name)
             out[int(uid)] = {
                 "user_id": int(uid),
                 "display_name": _entry_name(entry) or f"User {uid}",
                 "role": role_labels.get(role_key, role_key),
+                "class_name": class_name,
+                "class_emoji_name": str(class_meta[2]) if class_meta else "",
             }
     return out
 
@@ -3949,12 +4012,20 @@ def _dashboard_lineup_clean(obj: dict[str, Any], raw: Any) -> dict[str, Any]:
     }
 
 
-def _dashboard_lineup_member_line(member: dict[str, Any]) -> str:
+def _dashboard_lineup_member_line(member: dict[str, Any], guild: Optional[discord.Guild] = None) -> str:
     uid = int(member.get("user_id") or 0)
     role = str(member.get("role") or "").strip()
     role_icon = {"Tank": "🛡️", "Support": "💚", "DPS": "⚔️", "Reserve": "🪑"}.get(role, "•")
+    class_emoji = ""
+    emoji_name = str(member.get("class_emoji_name") or "").strip()
+    if guild is not None and emoji_name:
+        for emoji in list(getattr(guild, "emojis", []) or []):
+            if str(getattr(emoji, "name", "") or "").casefold() == emoji_name.casefold():
+                class_emoji = str(emoji)
+                break
     who = f"<@{uid}>" if uid else _safe_name(member.get("display_name") or "Unbekannt")
-    return f"{role_icon} {who}" + (f" · {role}" if role else "")
+    class_part = f" {class_emoji}" if class_emoji else ""
+    return f"{role_icon}{class_part} {who}" + (f" · {role}" if role else "")
 
 
 def _dashboard_lineup_embed(guild: discord.Guild, obj: dict[str, Any], lineup: dict[str, Any]) -> discord.Embed:
@@ -3985,7 +4056,7 @@ def _dashboard_lineup_embed(guild: discord.Guild, obj: dict[str, Any], lineup: d
                 used.add(int(m.get("user_id") or 0))
             except Exception:
                 pass
-        text = "\n".join(_dashboard_lineup_member_line(m) for m in members) or "— noch leer —"
+        text = "\n".join(_dashboard_lineup_member_line(m, guild) for m in members) or "— noch leer —"
         emb.add_field(name=f"{group.get('name') or f'Gruppe {idx + 1}'} · {len(members)}/{int(lineup.get('group_size') or 6)}", value=text[:1024], inline=True)
     bench = [m for m in (lineup.get("bench") or []) if isinstance(m, dict)]
     for m in bench:
@@ -3994,11 +4065,11 @@ def _dashboard_lineup_embed(guild: discord.Guild, obj: dict[str, Any], lineup: d
         except Exception:
             pass
     if bench:
-        emb.add_field(name=f"🪑 Reserve · {len(bench)}", value="\n".join(_dashboard_lineup_member_line(m) for m in bench)[:1024], inline=False)
+        emb.add_field(name=f"🪑 Reserve · {len(bench)}", value="\n".join(_dashboard_lineup_member_line(m, guild) for m in bench)[:1024], inline=False)
     candidates = _dashboard_lineup_candidates(obj)
     unassigned = [m for uid, m in candidates.items() if uid not in used]
     if unassigned:
-        emb.add_field(name=f"⏳ Noch nicht eingeteilt · {len(unassigned)}", value="\n".join(_dashboard_lineup_member_line(m) for m in unassigned)[:1024], inline=False)
+        emb.add_field(name=f"⏳ Noch nicht eingeteilt · {len(unassigned)}", value="\n".join(_dashboard_lineup_member_line(m, guild) for m in unassigned)[:1024], inline=False)
     actor = str(lineup.get("updated_by_name") or "Dashboard").strip()
     emb.set_footer(text=f"Live-Sync · zuletzt geändert von {actor}")
     return emb

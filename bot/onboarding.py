@@ -651,6 +651,85 @@ def _aion2_enabled(guild_id:int)->bool:
     try: return bool(runtime_db.get_module_setting(int(guild_id),'onboarding','aion2_enabled',False))
     except Exception: return False
 
+
+def _aion2_class_role_name(class_name: str | None) -> str:
+    canonical = _aion2_normalize_class(class_name)
+    meta = AION2_CLASS_META.get(canonical)
+    return str(meta[0]) if meta else ""
+
+
+async def _assign_aion2_class_role(
+    member: discord.Member,
+    class_name: str | None,
+) -> tuple[Optional[discord.Role], List[str]]:
+    """Vergibt die englische Aion-2-Klassenrolle (z. B. Chanter).
+
+    Die Rolle wird automatisch angelegt, wenn sie auf dem Server noch nicht
+    existiert. Bereits vorhandene andere Aion-2-Klassenrollen werden entfernt,
+    damit ein Mitglied nicht gleichzeitig mehrere Klassenrollen behält.
+    """
+    canonical = _aion2_normalize_class(class_name)
+    role_name = _aion2_class_role_name(canonical)
+    if not canonical or not role_name:
+        return None, []
+
+    guild = member.guild
+    errors: List[str] = []
+    role = next(
+        (r for r in guild.roles if str(r.name or "").casefold() == role_name.casefold()),
+        None,
+    )
+
+    if role is None:
+        try:
+            role = await guild.create_role(
+                name=role_name,
+                reason=f"Aion 2 Onboarding: Klassenrolle {role_name}",
+            )
+        except discord.Forbidden:
+            return None, [f"Aion-Klasse {role_name}: Bot darf keine Rollen erstellen"]
+        except discord.HTTPException as exc:
+            return None, [f"Aion-Klasse {role_name}: Discord-Fehler beim Erstellen ({getattr(exc, 'status', 'HTTP')})"]
+        except Exception as exc:
+            return None, [f"Aion-Klasse {role_name}: Rolle konnte nicht erstellt werden ({type(exc).__name__})"]
+
+    bot_member = guild.me
+    bot_top = getattr(bot_member, "top_role", None)
+    if role.managed:
+        return None, [f"Aion-Klasse {role_name}: Rolle ist von Discord verwaltet"]
+    if bot_top is not None and role >= bot_top:
+        return None, [f"Aion-Klasse {role_name}: Rolle liegt über/gleich der höchsten Bot-Rolle"]
+
+    class_role_names = {str(meta[0]).casefold() for meta in AION2_CLASS_META.values()}
+    old_roles = [
+        r for r in member.roles
+        if r.id != role.id and str(r.name or "").casefold() in class_role_names
+    ]
+    if old_roles:
+        try:
+            await member.remove_roles(*old_roles, reason=f"Aion 2 Onboarding: Klassenwechsel zu {role_name}")
+        except discord.Forbidden:
+            errors.append("alte Aion-Klassenrolle konnte wegen fehlender Berechtigung nicht entfernt werden")
+        except discord.HTTPException as exc:
+            errors.append(f"alte Aion-Klassenrolle konnte nicht entfernt werden ({getattr(exc, 'status', 'HTTP')})")
+        except Exception as exc:
+            errors.append(f"alte Aion-Klassenrolle konnte nicht entfernt werden ({type(exc).__name__})")
+
+    try:
+        if role not in member.roles:
+            await member.add_roles(role, reason=f"Aion 2 Onboarding: Klasse {role_name}")
+    except discord.Forbidden:
+        errors.append(f"Aion-Klasse {role_name}: Bot darf die Rolle nicht vergeben")
+        return None, errors
+    except discord.HTTPException as exc:
+        errors.append(f"Aion-Klasse {role_name}: Discord-Fehler beim Vergeben ({getattr(exc, 'status', 'HTTP')})")
+        return None, errors
+    except Exception as exc:
+        errors.append(f"Aion-Klasse {role_name}: Rolle konnte nicht gesetzt werden ({type(exc).__name__})")
+        return None, errors
+
+    return role, errors
+
 class StepContext:
     def __init__(
         self,
@@ -997,6 +1076,10 @@ class ReviewView(OnboardingFeatureView):
             return
 
         roles, role_errors = await _assign_roles(member, self.category, self.primary, self.experienced)
+        class_role, class_role_errors = await _assign_aion2_class_role(member, self.aion_class)
+        if class_role is not None and all(r.id != class_role.id for r in roles):
+            roles.append(class_role)
+        role_errors.extend(class_role_errors)
         aion_profile_saved = _save_accepted_aion2_profile(
             self.guild_id or int(inter.guild.id),
             self.member_id,
@@ -1206,6 +1289,10 @@ class ExperienceView(OnboardingFeatureView):
             else:
                 if member:
                     roles, role_errors = await _assign_roles(member, self.ctx.category, self.ctx.primary, experienced)
+                    class_role, class_role_errors = await _assign_aion2_class_role(member, self.ctx.aion_class)
+                    if class_role is not None and all(r.id != class_role.id for r in roles):
+                        roles.append(class_role)
+                    role_errors.extend(class_role_errors)
                     aion_profile_saved = _save_accepted_aion2_profile(
                         self.ctx.guild_id,
                         self.ctx.member_id,
@@ -1514,6 +1601,42 @@ async def setup_onboarding(client: discord.Client, tree: app_commands.CommandTre
             await inter.followup.send(f"✅ Onboarding-DM an {member.mention} geschickt.", ephemeral=True)
         else:
             await inter.followup.send(f"❌ Onboarding-DM an {member.mention} fehlgeschlagen: {reason}", ephemeral=True)
+
+    @onboarding_group.command(name="sync_aion_roles", description="(Admin) Aion-2-Klassenrollen aus gespeicherten Profilen synchronisieren")
+    async def onboarding_sync_aion_roles(inter: discord.Interaction):
+        if not _is_admin(inter):
+            await inter.response.send_message("Nur Admins.", ephemeral=True)
+            return
+
+        await inter.response.defer(ephemeral=True, thinking=True)
+        synced = 0
+        skipped = 0
+        failures: list[str] = []
+        for member in list(inter.guild.members):
+            if member.bot:
+                continue
+            try:
+                profile = runtime_db.get_aion2_profile(int(inter.guild_id), int(member.id)) or {}
+            except Exception as exc:
+                failures.append(f"{member.display_name}: Profilfehler {type(exc).__name__}")
+                continue
+            class_name = str(profile.get("class_name") or "").strip()
+            if not _aion2_normalize_class(class_name):
+                skipped += 1
+                continue
+            role, errors = await _assign_aion2_class_role(member, class_name)
+            if role is not None:
+                synced += 1
+            if errors:
+                failures.append(f"{member.display_name}: {'; '.join(errors)}")
+
+        text = f"✅ Aion-Klassenrollen synchronisiert: **{synced}** · ohne Aion-Klasse: **{skipped}**"
+        if failures:
+            preview = "\n".join(f"• {line}" for line in failures[:8])
+            text += f"\n⚠️ Fehler: **{len(failures)}**\n{preview}"
+            if len(failures) > 8:
+                text += f"\n… und {len(failures) - 8} weitere."
+        await inter.followup.send(text, ephemeral=True)
 
     @onboarding_group.command(name="status", description="(Admin) Zeigt aktuelle Onboarding-Konfiguration")
     async def onboarding_status(inter: discord.Interaction):
