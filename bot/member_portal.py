@@ -95,6 +95,57 @@ def _aion2_guild_emoji(guild: discord.Guild | None, name: str):
         return None
     return next((e for e in list(getattr(guild, "emojis", []) or []) if str(getattr(e, "name", "") or "").casefold() == wanted), None)
 
+
+def _aion2_role_emoji_text(role: str | None) -> str:
+    key = str(role or "").strip().upper()
+    if key in {"HEAL", "HEALER", "HEILER"}:
+        key = "SUPPORT"
+    return {
+        "TANK": EMOJI_TANK,
+        "SUPPORT": EMOJI_SUPPORT,
+        "DPS": EMOJI_DPS,
+        "BANK": EMOJI_BANK,
+        "RESERVE": EMOJI_BANK,
+    }.get(key, "")
+
+
+def _aion2_class_text(guild: discord.Guild, class_name: str | None) -> str:
+    canonical = _aion2_normalize_class(class_name)
+    meta = AION2_CLASS_META.get(canonical)
+    if not meta:
+        return str(class_name or "—")
+    emoji = _aion2_guild_emoji(guild, str(meta[2] or meta[0] or ""))
+    prefix = f"{emoji} " if emoji else ""
+    return f"{prefix}{canonical}"
+
+
+def _aion2_faction_text(guild: discord.Guild, faction: str | None) -> str:
+    key = _aion2_normalize_faction(faction)
+    meta = AION2_FACTION_META.get(key)
+    if not meta:
+        return ""
+    emoji = _aion2_guild_emoji(guild, str(meta[1] or meta[0] or ""))
+    return f"{emoji} " if emoji else f"{meta[0]} · "
+
+
+async def _sync_aion2_member_roles(member: discord.Member) -> list[str]:
+    """Hält Klassen-/Fraktionsrollen nach einer Profiländerung synchron.
+
+    Der Import ist absichtlich lokal, damit member_portal und onboarding beim
+    Modulstart keine zirkuläre Abhängigkeit bekommen.
+    """
+    try:
+        try:
+            from bot.onboarding import _assign_aion2_class_role, _assign_aion2_faction_role  # type: ignore
+        except Exception:
+            from onboarding import _assign_aion2_class_role, _assign_aion2_faction_role  # type: ignore
+        profile = runtime_db.get_aion2_profile(member.guild.id, member.id) or {}
+        _class_role, class_errors = await _assign_aion2_class_role(member, profile.get("class_name"))
+        _faction_role, faction_errors = await _assign_aion2_faction_role(member, profile.get("faction"))
+        return [*class_errors, *faction_errors]
+    except Exception as exc:
+        return [f"Aion-Rollensync fehlgeschlagen ({type(exc).__name__})"]
+
 TZ = ZoneInfo("Europe/Berlin")
 
 
@@ -1833,7 +1884,9 @@ def _profile_embed(guild: discord.Guild, member: discord.Member) -> discord.Embe
         faction_display=(f"{faction_emoji} " if faction_emoji else "") + str(faction_meta[0])
         emb.add_field(name="🌗 Fraktion", value=faction_display, inline=True)
         emb.add_field(name="🧩 Klasse", value=class_display, inline=True)
-        emb.add_field(name="⚔️ Rolle", value=_aion2_role_label(str(main_role)), inline=True)
+        role_icon = _aion2_role_emoji_text(str(main_role))
+        role_value = ((role_icon + " ") if role_icon else "") + _aion2_role_label(str(main_role))
+        emb.add_field(name="⚔️ Rolle", value=role_value, inline=True)
         emb.add_field(name="⭐ Level", value=str(level or "Nicht gesetzt"), inline=True)
     else:
         emb.add_field(name="🧩 Klasse", value=str(class_name), inline=True)
@@ -2057,9 +2110,17 @@ def _members_list_embed(guild: discord.Guild) -> discord.Embed:
     current_length = 0
     for i, member in enumerate(members, start=1):
         profile = _user_profile(guild.id, member.id)
-        name = profile.get("ingame_name") or _display_name(member)
+        aion = runtime_db.get_aion2_profile(guild.id, member.id) if _aion2_enabled(guild.id) else {}
+        name = (aion.get("character_name") if aion else None) or profile.get("ingame_name") or _display_name(member)
         position = _member_position_cached(member, positions)
-        line = f"**{i}. {name}** — {position} — GS {profile.get('gearscore') or '—'}"
+        class_name = (aion.get("class_name") if aion else None) or profile.get("class_name") or ""
+        main_role = (aion.get("main_role") if aion else None) or profile.get("main_role") or ""
+        gearscore = (aion.get("gearscore") if aion else None) or profile.get("gearscore") or "—"
+        faction_prefix = _aion2_faction_text(guild, (aion.get("faction") if aion else ""))
+        class_text = _aion2_class_text(guild, class_name) if class_name else "—"
+        role_icon = _aion2_role_emoji_text(main_role)
+        role_part = f" · {role_icon}" if role_icon else ""
+        line = f"{faction_prefix}**{position} · {name}** · {class_text} · GS {gearscore}{role_part}"
         additional = len(line) + (1 if lines else 0)
         if current_length + additional > 3900:
             break
@@ -7390,7 +7451,11 @@ class Aion2ClassSelect(Select):
         p["class_name"]=cls; p["main_role"]=role
         await asyncio.to_thread(save_profiles,self.guild_id,self.user_id)
         guild=inter.client.get_guild(self.guild_id); member=guild.get_member(self.user_id) if guild else None
-        if guild and member: await _portal_edit(inter,embed=_profile_embed(guild,member),view=Aion2ProfileEditView(self.guild_id,self.user_id,guild))
+        if guild and member:
+            role_errors = await _sync_aion2_member_roles(member)
+            if role_errors:
+                print(f"[member_portal] Aion-Rollensync für {member} ({member.id}): " + " | ".join(role_errors), flush=True)
+            await _portal_edit(inter,embed=_profile_embed(guild,member),view=Aion2ProfileEditView(self.guild_id,self.user_id,guild))
         else: await _portal_send(inter,"✅ Aion-2-Klasse gespeichert.")
 
 class Aion2FactionSelect(Select):
@@ -7405,7 +7470,11 @@ class Aion2FactionSelect(Select):
         faction=str(self.values[0] or "").upper(); current=runtime_db.get_aion2_profile(self.guild_id,self.user_id) or {}
         runtime_db.upsert_aion2_profile(self.guild_id,self.user_id,faction=faction)
         guild=inter.client.get_guild(self.guild_id); member=guild.get_member(self.user_id) if guild else None
-        if guild and member: await _portal_edit(inter,embed=_profile_embed(guild,member),view=Aion2ProfileEditView(self.guild_id,self.user_id,guild))
+        if guild and member:
+            role_errors = await _sync_aion2_member_roles(member)
+            if role_errors:
+                print(f"[member_portal] Aion-Rollensync für {member} ({member.id}): " + " | ".join(role_errors), flush=True)
+            await _portal_edit(inter,embed=_profile_embed(guild,member),view=Aion2ProfileEditView(self.guild_id,self.user_id,guild))
         else: await _portal_send(inter,"✅ Aion-2-Fraktion gespeichert.")
 
 class Aion2ProfileEditView(PortalSafeView):
