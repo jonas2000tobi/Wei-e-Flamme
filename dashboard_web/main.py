@@ -75,7 +75,7 @@ if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 ASSET_VER = "guild-platform-v2-5-0-welcome"
-DASHBOARD_RELEASE_VERSION = "2.12.0 · Unified Dashboard, Ticket-Chat & Aion 2"
+DASHBOARD_RELEASE_VERSION = "2.13.0 · Navigation, Kanalwahl & Aion-2-Map"
 
 _EVENT_IMAGE_ASSETS: dict[str, str] = {
     "guild_boss": f"/static/event_images/guild_boss.webp?v={ASSET_VER}",
@@ -4843,6 +4843,8 @@ def _sidebar_html() -> str:
     admin_links += [
         f'<a href="/admin-settings"><img class="nav-ico" src="{_asset("nav_einstellungen.png")}" alt="">Einstellungen</a>',
         f'<a href="/admin/guild-config"><img class="nav-ico" src="{_asset("nav_einstellungen.png")}" alt="">Gilde & Discord</a>',
+    ]
+    info_links = [
         f'<a href="/audit"><img class="nav-ico" src="{_asset("nav_audit.png")}" alt="">Audit</a>',
         f'<a href="/system"><img class="nav-ico" src="{_asset("nav_system.png")}" alt="">System & Logs</a>',
         f'<a href="/database"><img class="nav-ico" src="{_asset("nav_database.png")}" alt="">Datenbank</a>',
@@ -4857,6 +4859,7 @@ def _sidebar_html() -> str:
         {portal_block}
         <details open><summary>Gilde</summary>{''.join(guild_links)}</details>
         <details open><summary>Leitung & Verwaltung</summary>{''.join(admin_links)}</details>
+        <details open class="nav-info"><summary>Infos</summary>{''.join(info_links)}</details>
       </nav>
       <div class="sidebar-footer"><a href="/me">Mein Login</a><a href="/release">Release</a><a href="/logout">Logout</a><span class="version-pill">v{_e(DASHBOARD_RELEASE_VERSION)}</span></div>
     </aside>
@@ -4922,7 +4925,7 @@ def _member_sidebar_html() -> str:
     </aside>
     """
 
-def _html_shell(title: str, body: str, *, nav_mode: str = "member") -> str:
+def _html_shell(title: str, body: str, *, nav_mode: str = "member", active_nav_href: str = "") -> str:
     brand = _guild_brand()
     brand_name = str(brand.get("display_name") or "Gilde")
     # Separate responsive header assets: wide desktop artwork and portrait mobile artwork.
@@ -4967,6 +4970,7 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "member") -> str:
     .side-nav a:hover, .side-nav summary:hover {{ background:rgba(214,168,79,.09); color:var(--gold); }}
     .side-nav a.active {{ background:linear-gradient(90deg,rgba(214,168,79,.18),rgba(214,168,79,.06)); color:var(--gold); border:1px solid rgba(214,168,79,.24); }}
     .side-nav details {{ border-top:1px solid rgba(214,168,79,.10); padding-top:8px; margin-top:8px; }}
+    .side-nav details.nav-info {{ margin-top:20px; padding-top:16px; border-top:1px solid rgba(214,168,79,.24); }}
     .side-nav summary {{ color:var(--muted); text-transform:uppercase; letter-spacing:.08em; font-size:11px; font-weight:800; list-style:none; }}
     .side-nav summary::-webkit-details-marker {{ display:none; }}
     .side-nav details a {{ margin-left:8px; padding:9px 11px; font-size:13px; color:#ead9ae; }}
@@ -6178,12 +6182,18 @@ function filterNextTable(input) {{
 }}
 (function markActiveNav() {{
   const path = window.location.pathname || '/';
+  const forcedHref = {json.dumps(str(active_nav_href or ''), ensure_ascii=False)};
   const links = document.querySelectorAll('.side-nav a');
   let best = null;
-  for (const a of links) {{
-    const href = a.getAttribute('href') || '/';
-    if (href === path || (href !== '/' && path.startsWith(href + '/'))) {{
-      if (!best || href.length > (best.getAttribute('href') || '').length) best = a;
+  if (forcedHref) {{
+    best = Array.from(links).find(a => (a.getAttribute('href') || '') === forcedHref) || null;
+  }}
+  if (!best) {{
+    for (const a of links) {{
+      const href = a.getAttribute('href') || '/';
+      if (href === path || (href !== '/' && path.startsWith(href + '/'))) {{
+        if (!best || href.length > (best.getAttribute('href') || '').length) best = a;
+      }}
     }}
   }}
   if (best) {{ best.classList.add('active'); const d = best.closest('details'); if (d) d.open = true; }}
@@ -13411,6 +13421,7 @@ def _render_member_portal(data: dict[str, Any], user_id: int, request: Request, 
     names = _profile_name_map(snap)
     uid = int(user_id)
     current_user = _current_user(request)
+    own_profile = int(_current_user_id(request) or 0) == uid
     now = datetime.now(timezone.utc)
     brand = _guild_brand(data)
 
@@ -13618,9 +13629,12 @@ def _render_member_portal(data: dict[str, Any], user_id: int, request: Request, 
         profile_update_notice = f'<div class="profile-save-state error">❌ Profiländerung fehlgeschlagen: {_e(latest_profile_update.get("error_text") or "Unbekannter Fehler")}</div>'
 
     admin_links = ""
-    if _is_portal_admin(request) and _current_user_id(request) != uid:
+    if _is_portal_admin(request) and not own_profile:
         admin_links = f'<a class="btn ghost" href="/member/{uid}">Leitungsprüfung</a>'
     msg_html = f'<div class="ok">{_e(msg)}</div>' if msg else ""
+    profile_eyebrow = "Mein Profil" if own_profile else "Mitgliedsprofil"
+    profile_heading = "Mein Profil" if own_profile else display
+    profile_subtitle = "Deine persönliche Gildenübersicht" if own_profile else f"Gildenprofil von {display}"
 
     body = f"""
     <style>
@@ -13681,7 +13695,7 @@ def _render_member_portal(data: dict[str, Any], user_id: int, request: Request, 
       @media(max-width:700px){{.profile-identity{{grid-template-columns:1fr;text-align:center}}.profile-role-pills{{justify-content:center}}.profile-stat-grid{{grid-template-columns:repeat(2,1fr)}}.profile-stat:nth-child(3n){{border-right:1px solid rgba(214,168,79,.20)}}.profile-stat:nth-child(2n){{border-right:0}}.profile-stat:nth-child(n+4){{border-bottom:1px solid rgba(214,168,79,.20)}}.profile-stat:nth-child(n+5){{border-bottom:0}}.profile-event-row{{grid-template-columns:76px minmax(0,1fr)}}.profile-event-side{{grid-column:1/-1;display:flex;justify-content:space-between}}.profile-activity-row{{grid-template-columns:24px 80px minmax(0,1fr)}}.profile-activity-row small{{grid-column:2/-1}}.profile-edit-grid{{grid-template-columns:1fr}}}}
     </style>
     <nav class="topnav"><a href="/member">Startseite</a><a href="/member/events">Events</a><a href="/member/auctions">Auktionen</a><a href="#profile-edit">Profil bearbeiten</a><a href="#needlist-editor">Needliste bearbeiten</a></nav>
-    <section class="hero"><div><div class="eyebrow">Mein Profil</div><h1>Mein Profil</h1><p class="muted">Deine persönliche Gildenübersicht</p></div>{admin_links}</section>
+    <section class="hero"><div><div class="eyebrow">{_e(profile_eyebrow)}</div><h1>{_e(profile_heading)}</h1><p class="muted">{_e(profile_subtitle)}</p></div>{admin_links}</section>
     {msg_html}
     {profile_update_notice}
     <main class="member-profile-dashboard">
@@ -13779,7 +13793,7 @@ def _render_member_portal(data: dict[str, Any], user_id: int, request: Request, 
       }})();
     </script>
     """
-    return _html_shell(f"{display} · Mein Profil", body, nav_mode=_nav_mode_for_request(request))
+    return _html_shell(f"{display} · {'Mein Profil' if own_profile else 'Mitgliedsprofil'}", body, nav_mode=_nav_mode_for_request(request), active_nav_href=("/portal" if own_profile else "/member/members"))
 
 def _member_home_event_rows(events: list[dict[str, Any]], user_id: int) -> str:
     if not events:
@@ -13803,6 +13817,66 @@ def _member_home_auction_rows(auctions: list[dict[str, Any]], snap: dict[str, An
         meta = f"{_phase_label(a)} · {count_value} {count_title} · {_auction_leader_or_roll_text(a, snap)} · {_auction_timer_text(a)}"
         items.append(f'<div class="member-summary-item"><div><div class="member-summary-title">{_cell(_auction_link(aid, title))}</div><div class="member-summary-meta">{_e(meta)}</div></div></div>')
     return '<div class="member-summary-list">' + ''.join(items) + '</div>'
+
+def _aion2_home_map_panel(guild_id: int) -> str:
+    """Aion-2-Livekarte auf der Startseite.
+
+    Die Fremdseite wird direkt eingebettet. Ob Fextralife Iframes zulässt,
+    entscheidet deren aktuelle X-Frame/CSP-Konfiguration im Browser.
+    """
+    if not bool(_dashboard_module_setting_value(guild_id, "onboarding", "aion2_enabled", False)):
+        return ""
+    base = "https://aion2.wiki.fextralife.com/Interactive_Map"
+    maps = [
+        ("Verteron", base + "?map=Verteron"),
+        ("Altgard", base + "?map=Altgard"),
+        ("Abyss", base + "?map=Abyss"),
+    ]
+    buttons = "".join(
+        f'<button type="button" class="aion-map-tab{" active" if i == 0 else ""}" data-map-src="{_e(url)}">{_e(label)}</button>'
+        for i, (label, url) in enumerate(maps)
+    )
+    return f"""
+    <section class="panel aion-home-map" id="aion2-map">
+      <div class="aion-map-head">
+        <div>
+          <div class="eyebrow">Aion 2</div>
+          <h2>🗺️ Interaktive Karte</h2>
+          <p class="muted">Live eingebettete Fextralife-Karte. Die erste Karte wird standardmäßig geladen.</p>
+        </div>
+        <a class="btn secondary" href="{_e(base)}" target="_blank" rel="noopener noreferrer">Extern öffnen ↗</a>
+      </div>
+      <div class="aion-map-tabs">{buttons}</div>
+      <div class="aion-map-frame-wrap">
+        <div class="aion-map-fallback">Falls die Karte leer bleibt, blockiert Fextralife aktuell die Einbettung. Dann bitte „Extern öffnen“ verwenden.</div>
+        <iframe id="aion-map-frame" src="{_e(maps[0][1])}" title="Aion 2 Interactive Map" loading="lazy" referrerpolicy="no-referrer-when-downgrade" allow="fullscreen"></iframe>
+      </div>
+    </section>
+    <style>
+      .aion-home-map{{margin:18px 0}}
+      .aion-map-head{{display:flex;justify-content:space-between;gap:16px;align-items:center;flex-wrap:wrap}}
+      .aion-map-head h2{{margin:2px 0 5px}}
+      .aion-map-tabs{{display:flex;gap:8px;flex-wrap:wrap;margin:14px 0 10px}}
+      .aion-map-tab{{border:1px solid rgba(214,168,79,.28);background:rgba(214,168,79,.06);color:#ead9ae;padding:9px 14px;border-radius:10px;cursor:pointer;font-weight:800}}
+      .aion-map-tab:hover,.aion-map-tab.active{{background:linear-gradient(180deg,#e6bd66,#a97124);color:#160f05;border-color:#efcf89}}
+      .aion-map-frame-wrap{{position:relative;border:1px solid rgba(214,168,79,.28);background:#07090d;min-height:640px;overflow:hidden}}
+      #aion-map-frame{{position:relative;z-index:1;display:block;width:100%;height:70vh;min-height:640px;border:0;background:transparent}}
+      .aion-map-fallback{{position:absolute;z-index:0;inset:0;display:grid;place-items:center;padding:32px;text-align:center;color:#9da8b6;background:linear-gradient(135deg,#090b10,#111722)}}
+      @media(max-width:760px){{#aion-map-frame{{height:68vh;min-height:520px}}.aion-map-frame-wrap{{min-height:520px}}}}
+    </style>
+    <script>
+      (function aionMapTabs(){{
+        const frame=document.getElementById('aion-map-frame');
+        if(!frame)return;
+        document.querySelectorAll('.aion-map-tab').forEach(btn=>btn.addEventListener('click',function(){{
+          document.querySelectorAll('.aion-map-tab').forEach(x=>x.classList.remove('active'));
+          btn.classList.add('active');
+          const src=btn.dataset.mapSrc||'';
+          if(src && frame.getAttribute('src')!==src) frame.setAttribute('src',src);
+        }}));
+      }})();
+    </script>
+    """
 
 def _render_member_home(data: dict[str, Any], request: Request) -> str:
     if not data.get("ok"):
@@ -13890,6 +13964,7 @@ def _render_member_home(data: dict[str, Any], request: Request) -> str:
 
     brand = _guild_brand(snap)
     admin_tools = (_admin_tabs_style()+_admin_quick_links('')) if _is_portal_admin(request) else ''
+    aion_map_panel = _aion2_home_map_panel(guild_id)
     body = f'''
     <nav class="topnav">{"".join(nav)}</nav>
     <section class="hero member-home-hero">
@@ -13900,6 +13975,7 @@ def _render_member_home(data: dict[str, Any], request: Request) -> str:
     </section>
     <section class="grid">{"".join(cards)}</section>
     {admin_tools}
+    {aion_map_panel}
     <section class="split">{"".join(sections)}</section>
     '''
     return _html_shell("Gildenzentrale · Guild Platform", body, nav_mode=_nav_mode_for_request(request))
@@ -14985,7 +15061,7 @@ def _render_member_members_page(data: dict[str, Any], request: Request) -> str:
 
         <aside class="members-side">
           <section class="members-section"><h2 class="members-section-title">Rollenverteilung</h2><div class="members-role-list">{role_rows_html}</div></section>
-          <section class="members-section"><h2 class="members-section-title">Aktionen</h2><div class="members-action-list"><button class="members-action primary" type="button" id="member-open">👤 Mitglied ansehen</button><button class="members-action" type="button" data-member-filter="online">● Online anzeigen</button><button class="members-action" type="button" data-member-filter="away">⌛ Abwesende anzeigen</button><a class="members-action" href="/export/members.csv">⇩ Export</a>{admin_action}</div></section>
+          <section class="members-section"><h2 class="members-section-title">Aktionen</h2><div class="members-action-list"><button class="members-action" type="button" data-member-filter="online">● Online anzeigen</button><button class="members-action" type="button" data-member-filter="away">⌛ Abwesende anzeigen</button><a class="members-action" href="/export/members.csv">⇩ Export</a>{admin_action}</div></section>
           <section class="members-section"><h2 class="members-section-title">Mitgliederstatus</h2><div class="members-status-panel"><div class="members-donut-wrap"><div class="members-donut"></div><div class="members-legend"><span class="on"><b><i></i>Online</b><strong>{online_count} ({online_pct}%)</strong></span><span class="away"><b><i></i>Abwesend</b><strong>{away_count} ({away_pct}%)</strong></span></div></div><div class="members-planner-note">„Online“ bedeutet hier: im Abwesenheiten-Planer derzeit nicht abwesend. Discord-Presence wird bewusst nicht behauptet.</div></div></section>
         </aside>
       </section>
@@ -15002,7 +15078,6 @@ def _render_member_members_page(data: dict[str, Any], request: Request) -> str:
         const sort = document.getElementById('members-sort');
         const pages = document.getElementById('members-pages');
         const range = document.getElementById('members-range');
-        const open = document.getElementById('member-open');
         const pageSize = 10;
         let currentPage = 1;
         let statusFilter = 'all';
@@ -15048,13 +15123,14 @@ def _render_member_members_page(data: dict[str, Any], request: Request) -> str:
         }}
 
         allRows.forEach(function(row){{
-          row.addEventListener('click', function(event){{
-            choose(row);
-            if (event.detail >= 2) window.location.href = row.dataset.memberHref;
+          row.addEventListener('click', function(){{
+            if (row.dataset.memberHref) window.location.href = row.dataset.memberHref;
           }});
           row.addEventListener('keydown', function(event){{
-            if (event.key === 'Enter') window.location.href = row.dataset.memberHref;
-            if (event.key === ' '){{ event.preventDefault(); choose(row); }}
+            if (event.key === 'Enter' || event.key === ' '){{
+              event.preventDefault();
+              if (row.dataset.memberHref) window.location.href = row.dataset.memberHref;
+            }}
           }});
         }});
         document.querySelectorAll('[data-member-filter]').forEach(function(button){{
@@ -15066,7 +15142,6 @@ def _render_member_members_page(data: dict[str, Any], request: Request) -> str:
         }});
         if (search) search.addEventListener('input', function(){{ currentPage = 1; render(); }});
         if (sort) sort.addEventListener('change', function(){{ currentPage = 1; render(); }});
-        if (open) open.addEventListener('click', function(){{ if (selected && selected.dataset.memberHref) window.location.href = selected.dataset.memberHref; }});
         render();
       }})();
     </script>
@@ -16185,6 +16260,7 @@ def _event_lineup_panel(data: dict[str, Any], event: dict[str, Any], event_id: s
             candidate["class_name_en"]=str(meta.get("en") or "")
             candidate["class_role"]=str(meta.get("role") or ap.get("main_role") or "")
             candidate["class_icon"]=str(meta.get("icon") or "?")
+            candidate["class_icon_placeholder"]=True
     stored = _load_event_lineup(guild_id, str(event_id), event, candidates=candidates)
     clean = _normalize_event_lineup(event, stored, candidates=candidates)
     clean["published"] = bool(stored.get("published"))
@@ -16245,7 +16321,7 @@ def _event_lineup_panel(data: dict[str, Any], event: dict[str, Any], event_id: s
       .lineup-groups{{display:grid;grid-template-columns:repeat(auto-fit,minmax(245px,1fr));gap:12px}}.lineup-group{{border:1px solid rgba(214,168,79,.22);border-radius:16px;padding:12px;background:rgba(0,0,0,.15)}}
       .lineup-group-head{{display:flex;justify-content:space-between;gap:8px;align-items:center;margin-bottom:8px}}.lineup-group-name{{font-weight:800;color:#efd594;background:transparent;border:0;border-bottom:1px dashed rgba(239,213,148,.35);min-width:0;width:150px}}
       .lineup-dropzone{{min-height:64px;border:1px dashed rgba(255,255,255,.18);border-radius:12px;padding:8px;display:flex;flex-direction:column;gap:7px}}.lineup-dropzone.drag-over{{border-color:#efd594;background:rgba(214,168,79,.08)}}
-      .lineup-player{{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:9px 10px;border-radius:11px;background:rgba(255,255,255,.055);border:1px solid rgba(255,255,255,.08);cursor:grab;user-select:none}}.lineup-player:active{{cursor:grabbing}}.lineup-player.selected{{outline:2px solid #efd594;background:rgba(214,168,79,.16)}}.lineup-player b{{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}.lineup-player-main{{display:flex;align-items:center;gap:8px;min-width:0}}.lineup-player-meta{{display:flex;align-items:center;gap:5px;flex-wrap:wrap;justify-content:flex-end}}.lineup-class-icon{{width:26px;height:26px;display:inline-grid;place-items:center;border-radius:8px;border:1px solid rgba(239,213,148,.34);background:linear-gradient(145deg,rgba(214,168,79,.22),rgba(20,22,28,.82));color:#f4dc9d;font-size:9px;font-weight:900;letter-spacing:.02em;flex:0 0 26px}}.lineup-class-pill,.lineup-role{{font-size:11px;padding:3px 6px;border-radius:999px;white-space:nowrap}}.lineup-class-pill{{background:rgba(85,120,170,.18);color:#cbdcf5;border:1px solid rgba(115,150,200,.20)}}.lineup-role{{background:rgba(214,168,79,.11);color:#e8cf99}}.lineup-pool .lineup-player{{background:rgba(255,255,255,.035)}}
+      .lineup-player{{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:9px 10px;border-radius:11px;background:rgba(255,255,255,.055);border:1px solid rgba(255,255,255,.08);cursor:grab;user-select:none}}.lineup-player:active{{cursor:grabbing}}.lineup-player.selected{{outline:2px solid #efd594;background:rgba(214,168,79,.16)}}.lineup-player b{{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}.lineup-player-main{{display:flex;align-items:center;gap:8px;min-width:0}}.lineup-player-meta{{display:flex;align-items:center;gap:5px;flex-wrap:wrap;justify-content:flex-end}}.lineup-class-icon{{width:34px;height:34px;display:grid;grid-template-rows:1fr auto;place-items:center;border-radius:8px;border:1px solid rgba(239,213,148,.34);background:radial-gradient(circle at 50% 28%,rgba(214,168,79,.28),rgba(20,22,28,.92));color:#f4dc9d;font-weight:900;flex:0 0 34px;overflow:hidden}}.lineup-class-icon-mark{{font-size:15px;line-height:13px;opacity:.95}}.lineup-class-icon small{{font-size:7px;line-height:9px;letter-spacing:.04em;color:#f4dc9d}}.lineup-class-pill,.lineup-role{{font-size:11px;padding:3px 6px;border-radius:999px;white-space:nowrap}}.lineup-class-pill{{background:rgba(85,120,170,.18);color:#cbdcf5;border:1px solid rgba(115,150,200,.20)}}.lineup-role{{background:rgba(214,168,79,.11);color:#e8cf99}}.lineup-pool .lineup-player{{background:rgba(255,255,255,.035)}}
       @media(max-width:850px){{.lineup-board{{grid-template-columns:1fr}}.lineup-groups{{grid-template-columns:1fr}}}}
     </style>
     <script>
@@ -16263,7 +16339,7 @@ def _event_lineup_panel(data: dict[str, Any], event: dict[str, Any], event_id: s
         state.groups.forEach((g,i)=>{{g.name=g.name||`Gruppe ${{i+1}}`;g.members=(g.members||[]).slice(0,state.group_size)}});
       }}
       function placedIds(){{const x=new Set();state.groups.forEach(g=>(g.members||[]).forEach(m=>x.add(String(m.user_id))));(state.bench||[]).forEach(m=>x.add(String(m.user_id)));return x}}
-      function playerHtml(p){{const sel=String(p.user_id)===selectedUid?' selected':'';const cls=String(p.class_name||'');const icon=String(p.class_icon||'?');const classPill=cls?`<span class="lineup-class-pill">${{esc(cls)}}</span>`:'';const iconHtml=cls?`<span class="lineup-class-icon" title="${{esc(cls)}}">${{esc(icon)}}</span>`:'';return `<div class="lineup-player${{sel}}" draggable="true" tabindex="0" data-user-id="${{esc(p.user_id)}}"><span class="lineup-player-main">${{iconHtml}}<b>${{esc(p.display_name)}}</b></span><span class="lineup-player-meta">${{classPill}}<span class="lineup-role">${{esc(p.role||p.class_role||'')}}</span></span></div>`}}
+      function playerHtml(p){{const sel=String(p.user_id)===selectedUid?' selected':'';const cls=String(p.class_name||'');const icon=String(p.class_icon||'?');const classPill=cls?`<span class="lineup-class-pill">${{esc(cls)}}</span>`:'';const iconHtml=cls?`<span class="lineup-class-icon" title="${{esc(cls)}} · Klassensymbol-Platzhalter"><span class="lineup-class-icon-mark">◇</span><small>${{esc(icon)}}</small></span>`:'';return `<div class="lineup-player${{sel}}" draggable="true" tabindex="0" data-user-id="${{esc(p.user_id)}}"><span class="lineup-player-main">${{iconHtml}}<b>${{esc(p.display_name)}}</b></span><span class="lineup-player-meta">${{classPill}}<span class="lineup-role">${{esc(p.role||p.class_role||'')}}</span></span></div>`}}
       function render(){{
         normalize();
         const used=placedIds();
@@ -16387,9 +16463,28 @@ def _dashboard_select_options_from_settings(snap: dict[str, Any], kind: str) -> 
 
 
 def _dashboard_channel_select_html(snap: dict[str, Any], *, required: bool = True, selected: Any = "", name: str = "channel_id") -> str:
-    opts = _dashboard_select_options_from_settings(snap, "channels")
+    # Event-Zielkanäle kommen primär aus dem echten Discord-Katalog des aktuellen
+    # Guild-Snapshots. Die alte settings.channels-Liste enthält zusätzlich
+    # historische Config-Schlüssel und war deshalb unvollständig/verschmutzt.
+    guild = snap.get("guild") if isinstance(snap.get("guild"), dict) else {}
+    catalog = guild.get("discord_catalog") if isinstance(guild.get("discord_catalog"), dict) else {}
+    catalog_rows = [row for row in (catalog.get("channels") or []) if isinstance(row, dict)]
+    text_rows = [row for row in catalog_rows if str(row.get("kind") or "").lower() == "text"]
+    text_rows.sort(key=lambda row: (int(_num(row.get("position"), 0)), str(row.get("name") or "").casefold()))
+    opts: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for row in text_rows:
+        value = str(row.get("id") or "").strip()
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        opts.append((value, str(row.get("name") or value).strip()))
+    if not opts:
+        opts = _dashboard_select_options_from_settings(snap, "channels")
     req = " required" if required else ""
     selected_s = str(selected or "").strip()
+    if selected_s and selected_s not in {value for value, _ in opts}:
+        opts.insert(0, (selected_s, f"Gespeicherter Kanal {selected_s}"))
     if not opts:
         value = f' value="{_e(selected_s)}"' if selected_s else ""
         return f'<input name="{_e(name)}"{req}{value} placeholder="Kanal-ID, falls keine Kanäle im Snapshot sind">'
@@ -16400,10 +16495,24 @@ def _dashboard_channel_select_html(snap: dict[str, Any], *, required: bool = Tru
     html_value += '</select>'
     return html_value
 
-
 def _dashboard_role_select_html(snap: dict[str, Any], *, selected: Any = "", name: str = "target_role_id") -> str:
-    opts = _dashboard_select_options_from_settings(snap, "roles")
+    guild = snap.get("guild") if isinstance(snap.get("guild"), dict) else {}
+    catalog = guild.get("discord_catalog") if isinstance(guild.get("discord_catalog"), dict) else {}
+    role_rows = [row for row in (catalog.get("roles") or []) if isinstance(row, dict)]
+    role_rows.sort(key=lambda row: (-int(_num(row.get("position"), 0)), str(row.get("name") or "").casefold()))
+    opts: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for row in role_rows:
+        value = str(row.get("id") or "").strip()
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        opts.append((value, str(row.get("name") or value).strip()))
+    if not opts:
+        opts = _dashboard_select_options_from_settings(snap, "roles")
     selected_s = str(selected or "").strip()
+    if selected_s and selected_s not in {value for value, _ in opts}:
+        opts.insert(0, (selected_s, f"Gespeicherte Rolle {selected_s}"))
     if not opts:
         value = f' value="{_e(selected_s)}"' if selected_s else ""
         return f'<input name="{_e(name)}"{value} placeholder="optional: Rollen-ID, falls keine Rollen im Snapshot sind">'
