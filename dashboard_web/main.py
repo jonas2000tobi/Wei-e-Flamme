@@ -75,7 +75,7 @@ if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 ASSET_VER = "guild-platform-v2-5-0-welcome"
-DASHBOARD_RELEASE_VERSION = "2.10.0 · Live-Raidplanung & Ticket-Kategorie"
+DASHBOARD_RELEASE_VERSION = "2.12.0 · Unified Dashboard, Ticket-Chat & Aion 2"
 
 _EVENT_IMAGE_ASSETS: dict[str, str] = {
     "guild_boss": f"/static/event_images/guild_boss.webp?v={ASSET_VER}",
@@ -4816,52 +4816,49 @@ def _render_auction_detail(data: dict[str, Any], auction_id: str, current_user: 
     return _html_shell(f"{_loot_text(auction.get('item_name') or 'Auktion')} · Beer and Buffs Dashboard", body)
 
 def _sidebar_html() -> str:
-    """Admin-/Leader-Sidebar mit Modulfilter."""
-    brand = _guild_brand()
-    logo = _brand_image("logo", "beer_and_buffs_logo.png")
-    states = _dashboard_module_states()
-
-    guild_links = [
+    """Leitungsansicht = normale Gildenansicht plus Admin-Werkzeuge, ohne Portalwechsel."""
+    brand=_guild_brand(); logo=_brand_image("logo","beer_and_buffs_logo.png"); states=_dashboard_module_states()
+    portal_links=[]
+    if states.get("member_portal"): portal_links.append(f'<a href="/portal"><img class="nav-ico" src="{_asset("nav_portal.png")}" alt="">Mein Profil</a>')
+    if states.get("needlists"): portal_links.append(f'<a href="/character-editor"><img class="nav-ico" src="{_asset("nav_builds.png")}" alt="">Charakter & Builds</a>')
+    guild_links=[
         f'<a href="/announcements"><img class="nav-ico" src="{_asset("nav_announcements.png")}" alt="">Ankündigungen</a>',
-        f'<a href="/events-admin"><img class="nav-ico" src="{_asset("nav_events.png")}" alt="">Event-Verwaltung</a>',
+        f'<a href="/member/members"><img class="nav-ico" src="{_asset("nav_mitglieder.png")}" alt="">Mitglieder</a>',
+        f'<a href="/member/events"><img class="nav-ico" src="{_asset("nav_events.png")}" alt="">Events</a>',
     ]
-    if states.get("attendance"):
-        guild_links.append(f'<a href="/attendance"><img class="nav-ico" src="{_asset("nav_anwesenheit.png")}" alt="">Anwesenheit</a>')
-    if states.get("points"):
-        guild_links.append(f'<a href="/ec-queue"><img class="nav-ico" src="{_asset("nav_ec.png")}" alt="">Punkte-Queue</a>')
-    if states.get("loot"):
-        guild_links.append(f'<a href="/loot"><img class="nav-ico" src="{_asset("nav_loot.png")}" alt="">Loot</a>')
-    if states.get("needlists"):
-        guild_links.append(f'<a href="/needs"><img class="nav-ico" src="{_asset("nav_needs.png")}" alt="">Needlists</a>')
-    if states.get("auctions"):
-        guild_links.append(f'<a href="/auctions"><img class="nav-ico" src="{_asset("nav_auktionen.png")}" alt="">Auktionen</a>')
-
+    if states.get("auctions"): guild_links.append(f'<a href="/member/auctions"><img class="nav-ico" src="{_asset("nav_auktionen.png")}" alt="">Auktionen</a>')
+    if states.get("points"): guild_links.append(f'<a href="/member/ec"><img class="nav-ico" src="{_asset("nav_ec.png")}" alt="">Punkte-Verlauf</a>')
+    if states.get("attendance"): guild_links.append(f'<a href="/attendance"><img class="nav-ico" src="{_asset("nav_anwesenheit.png")}" alt="">Anwesenheit</a>')
+    admin_links=[
+        f'<a href="/events-admin"><img class="nav-ico" src="{_asset("nav_events.png")}" alt="">Events verwalten</a>',
+        f'<a href="/members"><img class="nav-ico" src="{_asset("nav_mitglieder.png")}" alt="">Mitgliederverwaltung</a>',
+    ]
+    if states.get("member_activity"): admin_links.append(f'<a href="/member-activity"><img class="nav-ico" src="{_asset("nav_analytics.png")}" alt="">Mitgliederaktivität</a>')
+    if states.get("leader_contact"): admin_links.append(f'<a href="/tickets"><img class="nav-ico" src="{_asset("nav_leitung.png")}" alt="">Tickets & Archiv</a>')
+    if states.get("attendance"): admin_links.append(f'<a href="/attendance"><img class="nav-ico" src="{_asset("nav_anwesenheit.png")}" alt="">Anwesenheit verwalten</a>')
+    if states.get("points"): admin_links.append(f'<a href="/ec-queue"><img class="nav-ico" src="{_asset("nav_ec.png")}" alt="">Punkte-Queue</a>')
+    if states.get("loot"): admin_links.append(f'<a href="/loot"><img class="nav-ico" src="{_asset("nav_loot.png")}" alt="">Loot verwalten</a>')
+    if states.get("needlists"): admin_links.append(f'<a href="/needs"><img class="nav-ico" src="{_asset("nav_needs.png")}" alt="">Needlists verwalten</a>')
+    if states.get("auctions"): admin_links.append(f'<a href="/auctions"><img class="nav-ico" src="{_asset("nav_auktionen.png")}" alt="">Auktionen verwalten</a>')
+    admin_links += [
+        f'<a href="/admin-settings"><img class="nav-ico" src="{_asset("nav_einstellungen.png")}" alt="">Einstellungen</a>',
+        f'<a href="/admin/guild-config"><img class="nav-ico" src="{_asset("nav_einstellungen.png")}" alt="">Gilde & Discord</a>',
+        f'<a href="/audit"><img class="nav-ico" src="{_asset("nav_audit.png")}" alt="">Audit</a>',
+        f'<a href="/system"><img class="nav-ico" src="{_asset("nav_system.png")}" alt="">System & Logs</a>',
+        f'<a href="/database"><img class="nav-ico" src="{_asset("nav_database.png")}" alt="">Datenbank</a>',
+    ]
+    portal_block=f'<details open><summary>Mein Portal</summary>{"".join(portal_links)}</details>' if portal_links else ''
     return f"""
-    <aside class="sidebar admin-sidebar">
-      <div class="brand">
-        <a class="sidebar-logo-link" href="/" aria-label="Zur Startseite" title="Zur Startseite">
-          <div class="brand-mark sidebar-brand-logo"><img src="{_e(logo)}" alt="{_e(brand['display_name'])}"></div>
-        </a>
-        <div class="brand-subtitle"><strong>{_e(brand['short_name'])}</strong><span>Admin-Portal</span></div>
-      </div>
+    <aside class="sidebar admin-sidebar unified-sidebar">
+      <div class="brand"><a class="sidebar-logo-link" href="/" aria-label="Zur Startseite"><div class="brand-mark sidebar-brand-logo"><img src="{_e(logo)}" alt="{_e(brand['display_name'])}"></div></a><div class="brand-subtitle"><strong>{_e(brand['short_name'])}</strong><span>Gilden-Dashboard · Leitung</span></div></div>
       <button class="mobile-nav-toggle" type="button" onclick="document.body.classList.toggle('nav-open')">☰ Menü</button>
       <nav class="side-nav">
         <a href="/"><img class="nav-ico" src="{_asset('nav_kommando.png')}" alt="">Startseite</a>
-        <a class="admin-back" href="/"><span>←</span> Zur normalen Ansicht</a>
-        <details open><summary>Admin</summary>
-          <a href="/admin"><img class="nav-ico" src="{_asset('nav_admin_portal.png')}" alt="">Admin-Portal</a>
-          <a href="/admin/guild-config"><img class="nav-ico" src="{_asset('nav_einstellungen.png')}" alt="">Gilde & Discord</a>
-          <a href="/admin-settings?section=modules"><img class="nav-ico" src="{_asset('nav_einstellungen.png')}" alt="">Module & Einstellungen</a>
-          <a href="/audit"><img class="nav-ico" src="{_asset('nav_audit.png')}" alt="">Audit</a>
-          <a href="/system"><img class="nav-ico" src="{_asset('nav_system.png')}" alt="">System</a>
-          <a href="/database"><img class="nav-ico" src="{_asset('nav_database.png')}" alt="">Datenbank</a>
-        </details>
+        {portal_block}
         <details open><summary>Gilde</summary>{''.join(guild_links)}</details>
+        <details open><summary>Leitung & Verwaltung</summary>{''.join(admin_links)}</details>
       </nav>
-      <div class="sidebar-footer">
-        <a href="/me">Mein Login</a><a href="/release">Release</a><a href="/logout">Logout</a>
-        <span class="version-pill">v{_e(DASHBOARD_RELEASE_VERSION)}</span>
-      </div>
+      <div class="sidebar-footer"><a href="/me">Mein Login</a><a href="/release">Release</a><a href="/logout">Logout</a><span class="version-pill">v{_e(DASHBOARD_RELEASE_VERSION)}</span></div>
     </aside>
     """
 
@@ -4914,7 +4911,6 @@ def _member_sidebar_html() -> str:
       <button class="mobile-nav-toggle" type="button" onclick="document.body.classList.toggle('nav-open')">☰ Menü</button>
       <nav class="side-nav">
         <a href="/"><img class="nav-ico" src="{_asset('nav_kommando.png')}" alt="">Startseite</a>
-        <a class="admin-portal-button" href="/admin"><img class="nav-ico" src="{_asset('nav_admin_portal.png')}" alt="">Admin-Portal</a>
         {portal_block}
         <details open><summary>Gilde</summary>{''.join(guild_links)}</details>
         {game_block}
@@ -6168,7 +6164,7 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "member") -> str:
     }}
   </style>
 </head>
-<body><div class="app-shell">{_member_sidebar_html()}<main class="content">{auth_note}{body}</main></div><script>
+<body><div class="app-shell">{(_sidebar_html() if nav_mode == "admin" else _member_sidebar_html())}<main class="content">{auth_note}{body}</main></div><script>
 function filterNextTable(input) {{
   const wrap = input.nextElementSibling;
   if (!wrap) return;
@@ -11909,16 +11905,63 @@ def _member_activity_panel(data:dict[str,Any],user_id:int,current_user:Optional[
     seconds=int(v.get('seconds') or 0); sessions=int(v.get('sessions') or 0); avg=round(seconds/sessions/60,1) if sessions else 0
     return f'''<section class="panel" id="activity"><h2>📈 Aktivität & Rückmeldungen</h2><p class="muted">Keine Attendance-Auswertung: angezeigt werden Event-Rückmeldungen und Discord-Aktivität.</p><div class="grid">{pcards}</div>{_table(['Zeitraum','Aktive Tage','Nachrichten','Reaktionen vergeben','Reaktionen erhalten'],rows,searchable=False)}<div class="grid">{_card('Voice gesamt',f'{round(seconds/3600,1)} h',f'{sessions} Sessions')}{_card('Ø Voice-Session',f'{avg} min','seit Erfassung')}{_card('Letzte Aktivität',_dt(total.get('last_activity')),'Discord-Aktivität')}{_card('Gildenmitglied seit',_dt(d.get('member_since')),'erfasster Beginn')}</div></section>'''
 
+AION2_CLASS_META = {
+    "Templer": {"en": "Templar", "role": "TANK", "icon": "TP"},
+    "Gladiator": {"en": "Gladiator", "role": "DPS", "icon": "GL"},
+    "Assassine": {"en": "Assassin", "role": "DPS", "icon": "AS"},
+    "Jäger": {"en": "Ranger", "role": "DPS", "icon": "JG"},
+    "Zauberer": {"en": "Sorcerer", "role": "DPS", "icon": "ZA"},
+    "Geisterbeschwörer": {"en": "Spirit Master", "role": "DPS", "icon": "GB"},
+    "Kleriker": {"en": "Cleric", "role": "HEAL", "icon": "KL"},
+    "Kantor": {"en": "Chanter", "role": "SUPPORT", "icon": "KA"},
+}
+AION2_CLASS_ALIASES = {"Beschwörer": "Geisterbeschwörer", "Spiritmaster": "Geisterbeschwörer", "Spirit Master": "Geisterbeschwörer"}
+
+def _aion2_normalize_class(value: Any) -> str:
+    raw = re.sub(r"\s+", " ", str(value or "").strip())
+    if raw in AION2_CLASS_META:
+        return raw
+    if raw in AION2_CLASS_ALIASES:
+        return AION2_CLASS_ALIASES[raw]
+    folded = raw.casefold()
+    for name, meta in AION2_CLASS_META.items():
+        if folded in {name.casefold(), str(meta.get("en") or "").casefold()}:
+            return name
+    return ""
+
+def _aion2_role_for_class(value: Any) -> str:
+    name = _aion2_normalize_class(value)
+    return str((AION2_CLASS_META.get(name) or {}).get("role") or "")
+
+def _aion2_role_label(value: Any) -> str:
+    return {"TANK":"Tank","HEAL":"Heiler","DPS":"DPS","SUPPORT":"Support"}.get(str(value or "").upper(), str(value or "—"))
+
+def _aion2_profiles_for_users(guild_id: int, user_ids: list[int]) -> dict[int, dict[str, Any]]:
+    ids = sorted({int(x) for x in user_ids if int(x or 0) > 0})
+    if not guild_id or not ids or not _database_url():
+        return {}
+    _ensure_v211_tables()
+    conn = _pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM aion2_profiles WHERE guild_id=%s AND user_id = ANY(%s::bigint[])", (int(guild_id), ids))
+            return {int(r.get("user_id") or 0): dict(r) for r in cur.fetchall() if int(r.get("user_id") or 0) > 0}
+    finally:
+        conn.close()
+
 def _aion2_profile_panel(data:dict[str,Any],user_id:int,current_user:Optional[dict[str,Any]])->str:
     gid=_safe_guild_id(data); d=_activity_data(gid,user_id); a=d.get('aion') or {}
     if not a and not bool(_dashboard_module_setting_value(gid,'onboarding','aion2_enabled',False)): return ''
     admin=bool(current_user and str(current_user.get('role') or '')=='admin')
-    view=f'''<div class="grid">{_card('Charakter',a.get('character_name') or '—','Aion 2')}{_card('Klasse',a.get('class_name') or '—','Aion 2')}{_card('Rolle',a.get('main_role') or '—','Tank / Heal / DPS')}{_card('Level',a.get('level') or '—','Profil')}{_card('Gearscore',a.get('gearscore') or '—','Profil')}</div>'''
+    cls=_aion2_normalize_class(a.get('class_name')) or str(a.get('class_name') or '')
+    role=_aion2_role_for_class(cls) or str(a.get('main_role') or '')
+    meta=AION2_CLASS_META.get(cls) or {}
+    class_display=(f"{cls} ({meta.get('en')})" if cls and meta.get('en') else (cls or '—'))
+    view=f'''<div class="grid">{_card('Charakter',a.get('character_name') or '—','Aion 2')}{_card('Klasse',class_display,'Aion 2')}{_card('Rolle',_aion2_role_label(role),'aus Klasse')}{_card('Level',a.get('level') or '—','Profil')}{_card('Gearscore',a.get('gearscore') or '—','Profil')}</div>'''
     form=''
     if admin:
-        opts=''.join(f'<option value="{_e(c)}"'+(' selected' if str(a.get('class_name') or '')==c else '')+f'>{_e(c)}</option>' for c in ['Gladiator','Templer','Assassine','Jäger','Zauberer','Beschwörer','Kleriker','Kantor'])
-        roles=''.join(f'<option value="{r}"'+(' selected' if str(a.get('main_role') or '')==r else '')+f'>{r}</option>' for r in ['TANK','HEAL','DPS'])
-        form=f'''<form method="post" action="/admin/member/{user_id}/aion2" class="settings-form"><label>Charaktername<br><input name="character_name" value="{_e(a.get('character_name') or '')}" maxlength="120"></label><label>Klasse<br><select name="class_name">{opts}</select></label><label>Rolle<br><select name="main_role">{roles}</select></label><label>Level<br><input type="number" min="1" name="level" value="{_e(a.get('level') or '')}"></label><label>Gearscore<br><input name="gearscore" value="{_e(a.get('gearscore') or '')}" maxlength="40"></label><button class="btn" type="submit">Aion-2-Profil speichern</button></form>'''
+        opts='<option value="">— Klasse wählen —</option>'+''.join(f'<option value="{_e(c)}"'+(' selected' if cls==c else '')+f'>{_e(c)} ({_e(m["en"])}) · {_e(_aion2_role_label(m["role"]))}</option>' for c,m in AION2_CLASS_META.items())
+        form=f'''<form method="post" action="/admin/member/{user_id}/aion2" class="settings-form"><label>Charaktername<br><input name="character_name" value="{_e(a.get('character_name') or '')}" maxlength="120"></label><label>Klasse<br><select name="class_name">{opts}</select></label><label>Rolle<br><input value="{_e(_aion2_role_label(role))}" disabled><small class="muted">Wird automatisch aus der Aion-2-Klasse gesetzt.</small></label><label>Level<br><input type="number" min="1" name="level" value="{_e(a.get('level') or '')}"></label><label>Gearscore<br><input name="gearscore" value="{_e(a.get('gearscore') or '')}" maxlength="40"></label><button class="btn" type="submit">Aion-2-Profil speichern</button></form>'''
     return f'<section class="panel" id="aion2"><h2>🎮 Aion 2</h2>{view}{form}</section>'
 
 def _ticket_rows(guild_id:int,search:str='')->list[dict[str,Any]]:
@@ -11947,7 +11990,7 @@ def _render_tickets_dashboard(data:dict[str,Any],search:str='')->str:
     gid=_safe_guild_id(data); tickets=_ticket_rows(gid,search); open_count=sum(1 for t in tickets if t.get('status') in {'open','claimed','conversation'}); claimed=sum(1 for t in tickets if t.get('status') in {'claimed','conversation'}); archive=sum(1 for t in tickets if t.get('status')=='done')
     rows=[]
     for t in tickets:
-        st={'open':'🆕 Offen','claimed':'👀 Übernommen','conversation':'💬 Im Gespräch','done':'✅ Erledigt'}.get(str(t.get('status')),str(t.get('status'))); creator='Anonym' if t.get('anonymous') else t.get('creator_name') or '—'; rows.append([_raw(f'<a class="link" href="/ticket/{int(t.get("id"))}">#{int(t.get("id"))}</a>'),creator,_short(t.get('subject'),80),st,t.get('assigned_to_name') or '—',_dt(t.get('created_at'))])
+        st={'open':'🆕 Offen','claimed':'👀 Übernommen','conversation':'💬 Im Gespräch','done':'✅ Erledigt'}.get(str(t.get('status')),str(t.get('status'))); creator='Anonym' if t.get('anonymous') else t.get('creator_name') or '—'; rows.append([f"#{int(t.get('id'))}",creator,_raw(f'<a class="link ticket-title-link" href="/ticket/{int(t.get("id"))}">{_e(_short(t.get("subject"),80) or "Leader-Ticket")}</a>'),st,t.get('assigned_to_name') or '—',_dt(t.get('created_at'))])
     body=f'''{_admin_tabs_style()}{_admin_quick_links('tickets')}<section class="hero"><div><div class="eyebrow">Leader Contact</div><h1>🎫 Tickets & Archiv</h1><p class="muted">Offene und erledigte Leader-Tickets inklusive privatem Chatverlauf.</p></div></section><section class="grid">{_card('Offen',open_count,'aktive Tickets')}{_card('Übernommen',claimed,'inkl. Gespräch')}{_card('Archiv',archive,'dauerhaft gespeichert')}</section><section class="panel"><form method="get" action="/tickets"><label>🔎 Nach Ersteller suchen<br><input name="q" value="{_e(search)}" placeholder="Discord-/Erstellername"></label><button class="btn" type="submit">Suchen</button></form>{_table(['#','Ersteller','Thema','Status','Bearbeiter','Erstellt'],rows,placeholder='Tickets filtern…')}</section>'''
     return _html_shell('Tickets · Guild Platform',body,nav_mode='admin')
 
@@ -11971,7 +12014,19 @@ def _render_ticket_detail(data:dict[str,Any],ticket_id:int)->str:
             aa=json.loads(m.get('attachments_json') or '[]'); att=''.join(f'<div><a class="link" href="{_e(a.get("url") or "#")}" target="_blank" rel="noopener">📎 {_e(a.get("name") or "Anhang")}</a></div>' for a in aa if isinstance(a,dict))
         except Exception: pass
         return f'<article style="padding:10px;border-bottom:1px solid var(--line)"><b>{_e(m.get("author_name") or m.get("author_id"))}</b> <span class="muted">{_e(_dt(m.get("created_at")))}</span><p>{_e(m.get("content") or "—")}</p>{att}</article>'
-    transcript=''.join(_ticket_msg_html(m) for m in msgs) or '<p class="muted">Kein privater Chatverlauf.</p>'; note_html=''.join(f'<p><b>{_e(n.get("author_name") or n.get("author_id"))}</b> · {_e(_dt(n.get("created_at")))}<br>{_e(n.get("content"))}</p>' for n in notes) or '<p class="muted">Keine internen Notizen.</p>'
+    dedup: dict[str, dict[str, Any]] = {}
+    for m in msgs:
+        key=str(m.get('discord_message_id') or m.get('id') or '')
+        prev=dedup.get(key)
+        if prev is None or (not str(prev.get('content') or '').strip() and str(m.get('content') or '').strip()): dedup[key]=m
+    clean_msgs=[]
+    for m in dedup.values():
+        has_content=bool(str(m.get('content') or '').strip())
+        try: has_att=bool(json.loads(m.get('attachments_json') or '[]'))
+        except Exception: has_att=False
+        if has_content or has_att: clean_msgs.append(m)
+    clean_msgs.sort(key=lambda x: str(x.get('created_at') or ''))
+    transcript=''.join(_ticket_msg_html(m) for m in clean_msgs) or '<p class="muted">Noch kein gespeicherter Nachrichtentext im privaten Ticket-Chat.</p>'; note_html=''.join(f'<p><b>{_e(n.get("author_name") or n.get("author_id"))}</b> · {_e(_dt(n.get("created_at")))}<br>{_e(n.get("content"))}</p>' for n in notes) or '<p class="muted">Keine internen Notizen.</p>'
     action_buttons=''
     if str(t.get('status') or '')!='done':
         open_btn='' if t.get('anonymous') or t.get('ticket_channel_id') else f'<button class="btn secondary" name="action" value="open_chat" type="submit">💬 Ticket öffnen</button>'
@@ -12461,6 +12516,10 @@ def _is_portal_admin(request: Request) -> bool:
     if _auth_mode() in {"basic", "hybrid"} and not _discord_oauth_enabled():
         return True
     return False
+
+
+def _nav_mode_for_request(request: Request) -> str:
+    return "admin" if _is_portal_admin(request) else "member"
 
 
 def _current_user_id(request: Request) -> int:
@@ -13720,7 +13779,7 @@ def _render_member_portal(data: dict[str, Any], user_id: int, request: Request, 
       }})();
     </script>
     """
-    return _html_shell(f"{display} · Mein Profil", body, nav_mode="member")
+    return _html_shell(f"{display} · Mein Profil", body, nav_mode=_nav_mode_for_request(request))
 
 def _member_home_event_rows(events: list[dict[str, Any]], user_id: int) -> str:
     if not events:
@@ -13830,6 +13889,7 @@ def _render_member_home(data: dict[str, Any], request: Request) -> str:
         ''')
 
     brand = _guild_brand(snap)
+    admin_tools = (_admin_tabs_style()+_admin_quick_links('')) if _is_portal_admin(request) else ''
     body = f'''
     <nav class="topnav">{"".join(nav)}</nav>
     <section class="hero member-home-hero">
@@ -13839,9 +13899,10 @@ def _render_member_home(data: dict[str, Any], request: Request) -> str:
       </div>
     </section>
     <section class="grid">{"".join(cards)}</section>
+    {admin_tools}
     <section class="split">{"".join(sections)}</section>
     '''
-    return _html_shell("Gildenzentrale · Guild Platform", body, nav_mode="member")
+    return _html_shell("Gildenzentrale · Guild Platform", body, nav_mode=_nav_mode_for_request(request))
 
 
     """Letzte Dashboard-Einstellungsanträge.
@@ -14236,7 +14297,7 @@ def _render_member_events_page(data: dict[str, Any], request: Request) -> str:
       <div class="events-history-content">{_table(['Event','Zeit','Deine Anmeldung'], history_rows, placeholder='Vergangene Events durchsuchen…')}</div>
     </details>
     '''
-    return _html_shell("Events · Mitgliederbereich", body, nav_mode="member")
+    return _html_shell("Events · Mitgliederbereich", body, nav_mode=_nav_mode_for_request(request))
 
 def _render_member_auctions_page(data: dict[str, Any], request: Request) -> str:
     if not data.get("ok"):
@@ -14537,7 +14598,7 @@ def _render_member_auctions_page(data: dict[str, Any], request: Request) -> str:
       }})();
     </script>
     '''
-    return _html_shell("Auktionen · Mitgliederbereich", body, nav_mode="member")
+    return _html_shell("Auktionen · Mitgliederbereich", body, nav_mode=_nav_mode_for_request(request))
 
 def _member_roster_role_names(row: dict[str, Any]) -> list[str]:
     names: list[str] = []
@@ -14847,7 +14908,7 @@ def _render_member_members_page(data: dict[str, Any], request: Request) -> str:
 
     online_pct = round((online_count / total_members) * 100) if total_members else 0
     away_pct = 100 - online_pct if total_members else 0
-    admin_action = '<a class="members-action" href="/admin">♛ Admin-Portal öffnen</a>' if _is_portal_admin(request) else ''
+    admin_action = ''
 
     body = f'''
     <style>
@@ -15010,7 +15071,7 @@ def _render_member_members_page(data: dict[str, Any], request: Request) -> str:
       }})();
     </script>
     '''
-    return _html_shell("Mitglieder · Beer and Buffs Dashboard", body, nav_mode="member")
+    return _html_shell("Mitglieder · Beer and Buffs Dashboard", body, nav_mode=_nav_mode_for_request(request))
 
 def _render_member_ec_page(data: dict[str, Any], request: Request) -> str:
     if not data.get("ok"):
@@ -15025,7 +15086,7 @@ def _render_member_ec_page(data: dict[str, Any], request: Request) -> str:
     <section class="grid">{_card('EC-Kontostand', _fmt_ec(balance) if balance is not None else '—', 'aktueller Stand')}</section>
     <section class="panel"><h2>EC-Verlauf</h2>{_table(['Zeit','Betrag','Typ','Grund'], rows, placeholder='EC-Verlauf durchsuchen…')}</section>
     """
-    return _html_shell("Meine EC · Mitgliederbereich", body, nav_mode="member")
+    return _html_shell("Meine EC · Mitgliederbereich", body, nav_mode=_nav_mode_for_request(request))
 
 
 
@@ -15455,7 +15516,7 @@ def _render_admin_settings_editor(data: dict[str, Any], msg: str = "", section: 
               </div>
               <form method='post' action='/admin/onboarding-aion2-settings' class='settings-form'>
                 <h4>🎮 Aion-2-Komponente</h4>
-                <p class='muted'>Optional: erweitert nur dieses Onboarding um Charaktername, Klasse und Rolle. Andere Spiele bleiben unberührt.</p>
+                <p class='muted'>Optional: erweitert nur dieses Onboarding um Aion-2-Charaktername und Klasse. Die Rolle wird automatisch aus der Klasse übernommen; andere Spiele bleiben unberührt.</p>
                 <label><input type='checkbox' name='aion2_enabled' value='1' {"checked" if bool(_dashboard_module_setting_value(guild_id, "onboarding", "aion2_enabled", False)) else ""}> Aion-2-Komponente aktivieren</label>
                 <button class='btn' type='submit'>Speichern</button>
               </form>
@@ -16114,6 +16175,16 @@ def _event_lineup_panel(data: dict[str, Any], event: dict[str, Any], event_id: s
     guild_id = int(_safe_guild_id(data) or 0)
     snap = data.get("snapshot") or {}
     candidates = _event_lineup_candidates_for_snapshot(snap, event)
+    aion_profiles = _aion2_profiles_for_users(guild_id, [int(x.get("user_id") or 0) for x in candidates]) if bool(_dashboard_module_setting_value(guild_id,'onboarding','aion2_enabled',False)) else {}
+    for candidate in candidates:
+        ap=aion_profiles.get(int(candidate.get("user_id") or 0)) or {}
+        cls=_aion2_normalize_class(ap.get("class_name"))
+        if cls:
+            meta=AION2_CLASS_META.get(cls) or {}
+            candidate["class_name"]=cls
+            candidate["class_name_en"]=str(meta.get("en") or "")
+            candidate["class_role"]=str(meta.get("role") or ap.get("main_role") or "")
+            candidate["class_icon"]=str(meta.get("icon") or "?")
     stored = _load_event_lineup(guild_id, str(event_id), event, candidates=candidates)
     clean = _normalize_event_lineup(event, stored, candidates=candidates)
     clean["published"] = bool(stored.get("published"))
@@ -16174,7 +16245,7 @@ def _event_lineup_panel(data: dict[str, Any], event: dict[str, Any], event_id: s
       .lineup-groups{{display:grid;grid-template-columns:repeat(auto-fit,minmax(245px,1fr));gap:12px}}.lineup-group{{border:1px solid rgba(214,168,79,.22);border-radius:16px;padding:12px;background:rgba(0,0,0,.15)}}
       .lineup-group-head{{display:flex;justify-content:space-between;gap:8px;align-items:center;margin-bottom:8px}}.lineup-group-name{{font-weight:800;color:#efd594;background:transparent;border:0;border-bottom:1px dashed rgba(239,213,148,.35);min-width:0;width:150px}}
       .lineup-dropzone{{min-height:64px;border:1px dashed rgba(255,255,255,.18);border-radius:12px;padding:8px;display:flex;flex-direction:column;gap:7px}}.lineup-dropzone.drag-over{{border-color:#efd594;background:rgba(214,168,79,.08)}}
-      .lineup-player{{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:9px 10px;border-radius:11px;background:rgba(255,255,255,.055);border:1px solid rgba(255,255,255,.08);cursor:grab;user-select:none}}.lineup-player:active{{cursor:grabbing}}.lineup-player.selected{{outline:2px solid #efd594;background:rgba(214,168,79,.16)}}.lineup-player b{{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}.lineup-role{{font-size:11px;padding:3px 6px;border-radius:999px;background:rgba(214,168,79,.11);color:#e8cf99;white-space:nowrap}}.lineup-pool .lineup-player{{background:rgba(255,255,255,.035)}}
+      .lineup-player{{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:9px 10px;border-radius:11px;background:rgba(255,255,255,.055);border:1px solid rgba(255,255,255,.08);cursor:grab;user-select:none}}.lineup-player:active{{cursor:grabbing}}.lineup-player.selected{{outline:2px solid #efd594;background:rgba(214,168,79,.16)}}.lineup-player b{{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}.lineup-player-main{{display:flex;align-items:center;gap:8px;min-width:0}}.lineup-player-meta{{display:flex;align-items:center;gap:5px;flex-wrap:wrap;justify-content:flex-end}}.lineup-class-icon{{width:26px;height:26px;display:inline-grid;place-items:center;border-radius:8px;border:1px solid rgba(239,213,148,.34);background:linear-gradient(145deg,rgba(214,168,79,.22),rgba(20,22,28,.82));color:#f4dc9d;font-size:9px;font-weight:900;letter-spacing:.02em;flex:0 0 26px}}.lineup-class-pill,.lineup-role{{font-size:11px;padding:3px 6px;border-radius:999px;white-space:nowrap}}.lineup-class-pill{{background:rgba(85,120,170,.18);color:#cbdcf5;border:1px solid rgba(115,150,200,.20)}}.lineup-role{{background:rgba(214,168,79,.11);color:#e8cf99}}.lineup-pool .lineup-player{{background:rgba(255,255,255,.035)}}
       @media(max-width:850px){{.lineup-board{{grid-template-columns:1fr}}.lineup-groups{{grid-template-columns:1fr}}}}
     </style>
     <script>
@@ -16192,7 +16263,7 @@ def _event_lineup_panel(data: dict[str, Any], event: dict[str, Any], event_id: s
         state.groups.forEach((g,i)=>{{g.name=g.name||`Gruppe ${{i+1}}`;g.members=(g.members||[]).slice(0,state.group_size)}});
       }}
       function placedIds(){{const x=new Set();state.groups.forEach(g=>(g.members||[]).forEach(m=>x.add(String(m.user_id))));(state.bench||[]).forEach(m=>x.add(String(m.user_id)));return x}}
-      function playerHtml(p){{const sel=String(p.user_id)===selectedUid?' selected':'';return `<div class="lineup-player${{sel}}" draggable="true" tabindex="0" data-user-id="${{esc(p.user_id)}}"><b>${{esc(p.display_name)}}</b><span class="lineup-role">${{esc(p.role||'')}}</span></div>`}}
+      function playerHtml(p){{const sel=String(p.user_id)===selectedUid?' selected':'';const cls=String(p.class_name||'');const icon=String(p.class_icon||'?');const classPill=cls?`<span class="lineup-class-pill">${{esc(cls)}}</span>`:'';const iconHtml=cls?`<span class="lineup-class-icon" title="${{esc(cls)}}">${{esc(icon)}}</span>`:'';return `<div class="lineup-player${{sel}}" draggable="true" tabindex="0" data-user-id="${{esc(p.user_id)}}"><span class="lineup-player-main">${{iconHtml}}<b>${{esc(p.display_name)}}</b></span><span class="lineup-player-meta">${{classPill}}<span class="lineup-role">${{esc(p.role||p.class_role||'')}}</span></span></div>`}}
       function render(){{
         normalize();
         const used=placedIds();
@@ -19230,7 +19301,7 @@ def member_home(request: Request, _: bool = Depends(_auth)):
     try:
         return HTMLResponse(_render_member_home(_snapshot_payload(), request))
     except Exception as exc:
-        return HTMLResponse(_html_shell("Mitgliederbereich Fehler", f"<section class='panel'><h1>❌ Mitgliederbereich-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>", nav_mode="member"), status_code=500)
+        return HTMLResponse(_html_shell("Mitgliederbereich Fehler", f"<section class='panel'><h1>❌ Mitgliederbereich-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>", nav_mode=_nav_mode_for_request(request)), status_code=500)
 
 
 
@@ -19240,7 +19311,7 @@ def member_events_page(request: Request, _: bool = Depends(_auth)):
     try:
         return HTMLResponse(_render_member_events_page(_snapshot_payload(), request))
     except Exception as exc:
-        return HTMLResponse(_html_shell("Events Fehler", f"<section class='panel'><h1>❌ Events-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>", nav_mode="member"), status_code=500)
+        return HTMLResponse(_html_shell("Events Fehler", f"<section class='panel'><h1>❌ Events-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>", nav_mode=_nav_mode_for_request(request)), status_code=500)
 
 
 @app.get("/member/auctions", response_class=HTMLResponse)
@@ -19248,7 +19319,7 @@ def member_auctions_page(request: Request, _: bool = Depends(_auth)):
     try:
         return HTMLResponse(_render_member_auctions_page(_snapshot_payload(), request))
     except Exception as exc:
-        return HTMLResponse(_html_shell("Auktionen Fehler", f"<section class='panel'><h1>❌ Auktionen-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>", nav_mode="member"), status_code=500)
+        return HTMLResponse(_html_shell("Auktionen Fehler", f"<section class='panel'><h1>❌ Auktionen-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>", nav_mode=_nav_mode_for_request(request)), status_code=500)
 
 
 @app.get("/member/members", response_class=HTMLResponse)
@@ -19256,7 +19327,7 @@ def member_members_page(request: Request, _: bool = Depends(_auth)):
     try:
         return HTMLResponse(_render_member_members_page(_snapshot_payload(), request))
     except Exception as exc:
-        return HTMLResponse(_html_shell("Mitglieder Fehler", f"<section class='panel'><h1>❌ Mitglieder-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>", nav_mode="member"), status_code=500)
+        return HTMLResponse(_html_shell("Mitglieder Fehler", f"<section class='panel'><h1>❌ Mitglieder-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>", nav_mode=_nav_mode_for_request(request)), status_code=500)
 
 
 @app.get("/member/ec", response_class=HTMLResponse)
@@ -19264,7 +19335,7 @@ def member_ec_page(request: Request, _: bool = Depends(_auth)):
     try:
         return HTMLResponse(_render_member_ec_page(_snapshot_payload(), request))
     except Exception as exc:
-        return HTMLResponse(_html_shell("EC Fehler", f"<section class='panel'><h1>❌ EC-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>", nav_mode="member"), status_code=500)
+        return HTMLResponse(_html_shell("EC Fehler", f"<section class='panel'><h1>❌ EC-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>", nav_mode=_nav_mode_for_request(request)), status_code=500)
 
 
 @app.get("/portal", response_class=HTMLResponse)
@@ -19493,7 +19564,7 @@ async def ticket_note_add(ticket_id:int,request:Request,_:bool=Depends(_admin_au
 
 @app.post("/admin/member/{user_id}/aion2")
 async def admin_member_aion2_save(user_id:int,request:Request,_:bool=Depends(_admin_auth)):
-    raw=(await request.body()).decode('utf-8',errors='replace'); form=urllib.parse.parse_qs(raw,keep_blank_values=True); gid=_safe_guild_id(_snapshot_payload()); ch=str((form.get('character_name') or [''])[0]).strip()[:120]; cl=str((form.get('class_name') or [''])[0]).strip()[:80]; role=str((form.get('main_role') or [''])[0]).strip()[:30]; gs=str((form.get('gearscore') or [''])[0]).strip()[:40]; rawlevel=str((form.get('level') or [''])[0]).strip(); level=int(rawlevel) if rawlevel.isdigit() else None
+    raw=(await request.body()).decode('utf-8',errors='replace'); form=urllib.parse.parse_qs(raw,keep_blank_values=True); gid=_safe_guild_id(_snapshot_payload()); ch=str((form.get('character_name') or [''])[0]).strip()[:120]; cl=_aion2_normalize_class((form.get('class_name') or [''])[0]); role=_aion2_role_for_class(cl); gs=str((form.get('gearscore') or [''])[0]).strip()[:40]; rawlevel=str((form.get('level') or [''])[0]).strip(); level=int(rawlevel) if rawlevel.isdigit() else None
     _ensure_v211_tables(); conn=_pg_connect()
     try:
         with conn.cursor() as cur: cur.execute('''INSERT INTO aion2_profiles(guild_id,user_id,character_name,class_name,main_role,level,gearscore,updated_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(guild_id,user_id) DO UPDATE SET character_name=EXCLUDED.character_name,class_name=EXCLUDED.class_name,main_role=EXCLUDED.main_role,level=EXCLUDED.level,gearscore=EXCLUDED.gearscore,updated_at=EXCLUDED.updated_at''',(gid,user_id,ch,cl,role,level,gs,datetime.now(timezone.utc).isoformat()))
@@ -19503,13 +19574,10 @@ async def admin_member_aion2_save(user_id:int,request:Request,_:bool=Depends(_ad
 
 @app.get("/admin", response_class=HTMLResponse)
 def admin_actions_page(_: bool = Depends(_admin_auth)):
-    try:
-        return HTMLResponse(_render_admin_center_dashboard(_snapshot_payload()))
-    except Exception as exc:
-        return HTMLResponse(
-            _html_shell("Beer and Buffs Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
-            status_code=500,
-        )
+    # v2.12: Es gibt keine separate Admin-Ansicht mehr. Admins landen auf
+    # derselben Startseite wie Mitglieder und bekommen dort automatisch die
+    # erweiterten Leitungs-/Verwaltungsbereiche.
+    return RedirectResponse(url="/", status_code=303)
 
 
 @app.get("/admin-legacy", response_class=HTMLResponse)
@@ -20709,7 +20777,7 @@ def index(request: Request, _: bool = Depends(_auth)):
 
 @app.get("/status", response_class=HTMLResponse)
 def status_page(request: Request, _: bool = Depends(_auth)):
-    return HTMLResponse(_render_status_dashboard(_snapshot_payload(), request, nav_mode="member"))
+    return HTMLResponse(_render_status_dashboard(_snapshot_payload(), request, nav_mode=_nav_mode_for_request(request)))
 
 
 @app.get("/api/game-status-live")
