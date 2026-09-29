@@ -1,28 +1,42 @@
 from __future__ import annotations
 
-import sys
-from pathlib import Path
 from typing import Any
 
-# Eine kanonische Rollenlogik für Bot + Dashboard. Legacy HEAL/HEALER wird nur
-# noch beim Einlesen akzeptiert und sofort als SUPPORT behandelt.
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+# Dashboard_Web wird auf Railway als eigener Root (/dashboard_web -> /app)
+# deployed. Daher keine Runtime-Abhängigkeit auf ../bot/role_keys.py.
+CANONICAL_EVENT_ROLES = ("TANK", "SUPPORT", "DPS", "BANK")
 
-from bot.role_keys import (  # noqa: E402
-    CANONICAL_EVENT_ROLES,
-    normalize_role_key,
-    role_label,
-)
+
+def _normalize_role_key(value: Any, *, allow_status: bool = True) -> str:
+    raw = str(value or "").strip().upper()
+    aliases = {
+        "HEAL": "SUPPORT",
+        "HEALER": "SUPPORT",
+        "HEILER": "SUPPORT",
+        "SUP": "SUPPORT",
+        "RESERVE": "BANK",
+    }
+    raw = aliases.get(raw, raw)
+    allowed = set(CANONICAL_EVENT_ROLES)
+    if allow_status:
+        allowed.update({"MAYBE", "NO", "MANUAL", ""})
+    return raw if raw in allowed else raw
 
 
 def normalize_event_role(value: Any) -> str:
-    return normalize_role_key(value)
+    return _normalize_role_key(value)
 
 
 def event_role_label(value: Any) -> str:
-    return role_label(value)
+    key = _normalize_role_key(value)
+    return {
+        "TANK": "Tank",
+        "SUPPORT": "Support",
+        "DPS": "DPS",
+        "BANK": "Reserve",
+        "MAYBE": "Vielleicht",
+        "NO": "Abgemeldet",
+    }.get(key, key or "—")
 
 
 def role_bucket(value: Any) -> str:
@@ -39,4 +53,6 @@ def role_bucket(value: Any) -> str:
 
 
 def role_order(value: Any) -> int:
-    return {"TANK": 0, "SUPPORT": 1, "DPS": 2, "BANK": 3}.get(normalize_event_role(value), 20)
+    return {"TANK": 0, "SUPPORT": 1, "DPS": 2, "BANK": 3}.get(
+        normalize_event_role(value), 20
+    )
