@@ -71,6 +71,17 @@ def _init_sqlite() -> dict[str, Any]:
                 applied_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS runtime_documents (
+                namespace TEXT NOT NULL,
+                document_key TEXT NOT NULL,
+                value_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (namespace, document_key)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_runtime_documents_updated
+                ON runtime_documents (namespace, updated_at DESC);
+
             CREATE TABLE IF NOT EXISTS guild_profiles (
                 guild_id INTEGER PRIMARY KEY,
                 discord_name TEXT NOT NULL DEFAULT '',
@@ -220,6 +231,10 @@ def _init_sqlite() -> dict[str, Any]:
         aion2_columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(aion2_profiles)").fetchall()}
         if "faction" not in aion2_columns:
             conn.execute("ALTER TABLE aion2_profiles ADD COLUMN faction TEXT NOT NULL DEFAULT ''")
+        # Einmalige Rollen-Migration. Legacy-Werte bleiben beim Lesen kompatibel,
+        # werden in der Datenbank aber nicht weiter als HEAL/HEALER geführt.
+        conn.execute("UPDATE aion2_profiles SET main_role='SUPPORT' WHERE UPPER(TRIM(main_role)) IN ('HEAL','HEALER','HEILER')")
+        conn.execute("UPDATE guild_members SET main_role='SUPPORT' WHERE UPPER(TRIM(main_role)) IN ('HEAL','HEALER','HEILER')")
         conn.execute(
             "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at) VALUES (?, ?, ?)",
             (1, "runtime_db_audit_voice_base", _now_iso()),
@@ -244,6 +259,23 @@ def _init_postgres() -> dict[str, Any]:
                     name TEXT NOT NULL,
                     applied_at TEXT NOT NULL
                 )
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS runtime_documents (
+                    namespace TEXT NOT NULL,
+                    document_key TEXT NOT NULL,
+                    value_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (namespace, document_key)
+                )
+                """
+            )
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_runtime_documents_updated
+                    ON runtime_documents (namespace, updated_at DESC)
                 """
             )
             cur.execute(
@@ -431,6 +463,9 @@ def _init_postgres() -> dict[str, Any]:
                 """
             )
             cur.execute("ALTER TABLE aion2_profiles ADD COLUMN IF NOT EXISTS faction TEXT NOT NULL DEFAULT ''")
+            # Einmalige Rollen-Migration auf den neuen kanonischen Key SUPPORT.
+            cur.execute("UPDATE aion2_profiles SET main_role='SUPPORT' WHERE UPPER(TRIM(main_role)) IN ('HEAL','HEALER','HEILER')")
+            cur.execute("UPDATE guild_members SET main_role='SUPPORT' WHERE UPPER(TRIM(main_role)) IN ('HEAL','HEALER','HEILER')")
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS guild_item_links (
@@ -476,8 +511,10 @@ def _init_postgres() -> dict[str, Any]:
 def init_runtime_db() -> dict[str, Any]:
     """Initialisiert die Runtime-Datenbank.
 
-    Production/Railway: Wenn DATABASE_URL auf postgres/postgresql zeigt, wird Postgres genutzt.
-    Fallback: Ohne DATABASE_URL oder bei lokalem Test nutzt der Bot SQLite, damit bestehende Deploys nicht brechen.
+    Mit DATABASE_URL ist PostgreSQL die einzige Runtime-Wahrheit. Ein Verbindungs-
+    oder Schemafehler wird absichtlich nicht mehr auf lokales SQLite umgebogen,
+    damit Bot und Dashboard niemals unbemerkt in getrennte Datenwelten schreiben.
+    Ohne DATABASE_URL bleibt SQLite ausschließlich für lokale Entwicklung/Tests.
     """
     global _INITIALIZED, _BACKEND, _POSTGRES_ERROR
     with _DB_LOCK:
@@ -486,10 +523,15 @@ def init_runtime_db() -> dict[str, Any]:
                 return _init_postgres()
             except Exception as e:
                 _POSTGRES_ERROR = repr(e)
-                print(f"[runtime_db] PostgreSQL konnte nicht initialisiert werden, SQLite-Fallback aktiv: {e!r}")
-                info = _init_sqlite()
-                _BACKEND = "sqlite_fallback"
-                return {**info, "backend": _BACKEND, "postgres_error": _POSTGRES_ERROR}
+                _BACKEND = "postgres_error"
+                raise RuntimeError(
+                    "PostgreSQL ist konfiguriert, konnte aber nicht initialisiert werden. "
+                    "SQLite-Fallback ist in Produktion deaktiviert."
+                ) from e
+        if _database_url():
+            _POSTGRES_ERROR = "DATABASE_URL ist gesetzt, aber kein postgres/postgresql URL."
+            _BACKEND = "postgres_error"
+            raise RuntimeError(_POSTGRES_ERROR)
         return _init_sqlite()
 
 
@@ -507,6 +549,111 @@ def db_status() -> dict[str, Any]:
         "database_url_kind": (parsed.scheme if parsed else ""),
         "postgres_error": _POSTGRES_ERROR,
     }
+
+
+def get_runtime_document(namespace: str, document_key: str, default: Any = None) -> Any:
+    """Liest ein kleines Runtime-Dokument aus der gemeinsamen Datenbank."""
+    if not _INITIALIZED:
+        init_runtime_db()
+    ns = str(namespace or "runtime").strip()[:120] or "runtime"
+    key = str(document_key or "").strip()[:500]
+    if not key:
+        return default
+    with _DB_LOCK:
+        if _BACKEND == "postgres":
+            conn = _pg_connect()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT value_json FROM runtime_documents WHERE namespace=%s AND document_key=%s",
+                        (ns, key),
+                    )
+                    row = cur.fetchone()
+            finally:
+                conn.close()
+        else:
+            conn = _sqlite_connect()
+            try:
+                row = conn.execute(
+                    "SELECT value_json FROM runtime_documents WHERE namespace=? AND document_key=?",
+                    (ns, key),
+                ).fetchone()
+            finally:
+                conn.close()
+    if not row:
+        return default
+    try:
+        raw = row.get("value_json") if isinstance(row, dict) else row["value_json"]
+        return json.loads(raw or "null")
+    except Exception:
+        return default
+
+
+def set_runtime_document(namespace: str, document_key: str, value: Any) -> bool:
+    """Speichert ein JSON-fähiges Runtime-Dokument atomar in PostgreSQL/SQLite."""
+    if not _INITIALIZED:
+        init_runtime_db()
+    ns = str(namespace or "runtime").strip()[:120] or "runtime"
+    key = str(document_key or "").strip()[:500]
+    if not key:
+        raise ValueError("document_key fehlt")
+    payload = _json_dumps(value)
+    now = _now_iso()
+    with _DB_LOCK:
+        if _BACKEND == "postgres":
+            conn = _pg_connect()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """INSERT INTO runtime_documents(namespace, document_key, value_json, updated_at)
+                           VALUES(%s,%s,%s,%s)
+                           ON CONFLICT(namespace, document_key) DO UPDATE SET
+                             value_json=EXCLUDED.value_json, updated_at=EXCLUDED.updated_at""",
+                        (ns, key, payload, now),
+                    )
+                conn.commit()
+            finally:
+                conn.close()
+        else:
+            conn = _sqlite_connect()
+            try:
+                conn.execute(
+                    """INSERT INTO runtime_documents(namespace, document_key, value_json, updated_at)
+                       VALUES(?,?,?,?)
+                       ON CONFLICT(namespace, document_key) DO UPDATE SET
+                         value_json=excluded.value_json, updated_at=excluded.updated_at""",
+                    (ns, key, payload, now),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+    return True
+
+
+def delete_runtime_document(namespace: str, document_key: str) -> bool:
+    if not _INITIALIZED:
+        init_runtime_db()
+    ns = str(namespace or "runtime").strip()[:120] or "runtime"
+    key = str(document_key or "").strip()[:500]
+    with _DB_LOCK:
+        if _BACKEND == "postgres":
+            conn = _pg_connect()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("DELETE FROM runtime_documents WHERE namespace=%s AND document_key=%s", (ns, key))
+                    changed = cur.rowcount > 0
+                conn.commit()
+            finally:
+                conn.close()
+        else:
+            conn = _sqlite_connect()
+            try:
+                cur = conn.execute("DELETE FROM runtime_documents WHERE namespace=? AND document_key=?", (ns, key))
+                changed = cur.rowcount > 0
+                conn.commit()
+            finally:
+                conn.close()
+    return bool(changed)
 
 
 def _json_dumps(value: Any) -> str:
@@ -2329,7 +2476,10 @@ def upsert_aion2_profile(guild_id:int,user_id:int,*,character_name:str='',class_
     if not _INITIALIZED: init_runtime_db()
     current=get_aion2_profile(guild_id,user_id) or {}; now=_now_iso()
     faction_value=str(faction or current.get('faction') or '').strip().upper()[:20]
-    vals=(int(guild_id),int(user_id),str(character_name or current.get('character_name') or '')[:120],str(class_name or current.get('class_name') or '')[:80],str(main_role or current.get('main_role') or '')[:30],faction_value,level if level is not None else current.get('level'),str(gearscore if gearscore!='' else current.get('gearscore') or '')[:40],now)
+    role_value=str(main_role or current.get('main_role') or '').strip().upper()[:30]
+    if role_value in {'HEAL','HEALER','HEILER'}:
+        role_value='SUPPORT'
+    vals=(int(guild_id),int(user_id),str(character_name or current.get('character_name') or '')[:120],str(class_name or current.get('class_name') or '')[:80],role_value,faction_value,level if level is not None else current.get('level'),str(gearscore if gearscore!='' else current.get('gearscore') or '')[:40],now)
     if _BACKEND=='postgres':
         conn=_pg_connect();
         try:

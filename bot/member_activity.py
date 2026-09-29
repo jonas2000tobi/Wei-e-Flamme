@@ -11,6 +11,10 @@ try:
 except Exception:
     import runtime_db
 try:
+    from bot.role_keys import normalize_role_key
+except Exception:
+    from role_keys import normalize_role_key
+try:
     from bot.guild_config import role_ids as guild_role_ids
 except Exception:
     try:
@@ -42,6 +46,8 @@ def _ensure_tables() -> None:
                     guild_id BIGINT NOT NULL, user_id BIGINT NOT NULL, member_since TIMESTAMPTZ,
                     source TEXT NOT NULL DEFAULT 'discord_join', updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     PRIMARY KEY(guild_id,user_id))''')
+                cur.execute("UPDATE event_rsvp_transitions SET old_choice='SUPPORT' WHERE old_choice IN ('HEAL','HEALER')")
+                cur.execute("UPDATE event_rsvp_transitions SET new_choice='SUPPORT' WHERE new_choice IN ('HEAL','HEALER')")
             conn.commit()
         finally: conn.close()
     else:
@@ -59,6 +65,8 @@ def _ensure_tables() -> None:
                 guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL, member_since TEXT,
                 source TEXT NOT NULL DEFAULT 'discord_join', updated_at TEXT NOT NULL,
                 PRIMARY KEY(guild_id,user_id));''')
+            conn.execute("UPDATE event_rsvp_transitions SET old_choice='SUPPORT' WHERE old_choice IN ('HEAL','HEALER')")
+            conn.execute("UPDATE event_rsvp_transitions SET new_choice='SUPPORT' WHERE new_choice IN ('HEAL','HEALER')")
             conn.commit()
         finally: conn.close()
 
@@ -173,7 +181,7 @@ async def setup_member_activity(client:discord.Client, tree) -> None:
 
 def record_event_response(guild_id:int,user_id:int,event_id:str,old_choice:str,new_choice:str)->None:
     _inc(guild_id,user_id,'event_responses')
-    old_choice=str(old_choice or '').upper(); new_choice=str(new_choice or '').upper()
+    old_choice=normalize_role_key(old_choice); new_choice=normalize_role_key(new_choice)
     if not old_choice or old_choice==new_choice: return
     _ensure_tables(); now=datetime.now(timezone.utc).isoformat(); backend=getattr(runtime_db,'_BACKEND','sqlite')
     vals=(int(guild_id),int(user_id),str(event_id),old_choice,new_choice,now)

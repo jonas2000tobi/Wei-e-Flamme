@@ -296,7 +296,7 @@ async def _create_event_from_template(
         "description": str(tpl.get("description", "") or "").strip(),
         "when_iso": when.isoformat(),
         "image_url": image_url,
-        "yes": {"TANK": [], "HEAL": [], "DPS": [], "BANK": []},
+        "yes": {"TANK": [], "SUPPORT": [], "DPS": [], "BANK": []},
         "maybe": {},
         "no": [],
         "target_role_id": target_role_id,

@@ -11,6 +11,11 @@ from datetime import datetime, date, timedelta
 from typing import Optional, Any, Tuple
 
 import discord
+
+try:
+    from bot.json_store import load_json_file, save_json_atomic  # type: ignore
+except Exception:
+    from json_store import load_json_file, save_json_atomic  # type: ignore
 from discord import app_commands
 
 try:
@@ -73,33 +78,16 @@ try:
 except Exception:
     import runtime_db  # type: ignore
 
-AION2_CLASS_META = {
-    # Deutsch im Bot, englischer Name entspricht dem Server-Emoji.
-    "Templer": ("Templar", "TANK", "Templar"),
-    "Gladiator": ("Gladiator", "DPS", "Gladiator"),
-    "Assassine": ("Assassin", "DPS", "Assassin"),
-    "Jäger": ("Ranger", "DPS", "Ranger"),
-    "Zauberer": ("Sorcerer", "DPS", "Sorcerer"),
-    "Geisterbeschwörer": ("Elementalist", "DPS", "Elementalist"),
-    "Kleriker": ("Cleric", "HEAL", "Cleric"),
-    "Kantor": ("Chanter", "SUPPORT", "Chanter"),
-}
-AION2_FACTION_META = {
-    "ELYOS": ("Elyos", "Elyos"),
-    "ASMODIA": ("Asmodia", "Asmodia"),
-}
+try:
+    from bot.aion2_game import AION2_CLASS_META, AION2_FACTIONS as AION2_FACTION_META, role_for_class as _aion2_role_for_class, role_label as _aion2_role_label, normalize_class as _aion2_normalize_class, normalize_faction as _aion2_normalize_faction  # type: ignore
+except Exception:
+    from aion2_game import AION2_CLASS_META, AION2_FACTIONS as AION2_FACTION_META, role_for_class as _aion2_role_for_class, role_label as _aion2_role_label, normalize_class as _aion2_normalize_class, normalize_faction as _aion2_normalize_faction  # type: ignore
 
 def _aion2_enabled(guild_id: int) -> bool:
     try:
         return bool(runtime_db.get_module_setting(int(guild_id), "onboarding", "aion2_enabled", False))
     except Exception:
         return False
-
-def _aion2_role_for_class(class_name: str) -> str:
-    return str((AION2_CLASS_META.get(str(class_name or "")) or ("", "", ""))[1])
-
-def _aion2_role_label(role: str) -> str:
-    return {"TANK":"Tank","HEAL":"Heiler","DPS":"DPS","SUPPORT":"Support"}.get(str(role or "").upper(), str(role or "Nicht gesetzt"))
 
 def _aion2_guild_emoji(guild: discord.Guild | None, name: str):
     wanted = str(name or "").casefold()
@@ -345,7 +333,7 @@ def _get_ec_balance_safe(guild_id: int, user_id: int) -> int:
 # auch wenn der neue Server andere Emoji-IDs vergeben hat.
 _PORTAL_EMOJI_ALIASES: dict[str, tuple[str, ...]] = {
     "tank": ("tank",),
-    "heal": ("heal",),
+    "support": ("support", "heal", "heiler"),
     "dps": ("dps", "dd"),
     "reserve": ("reserve", "bank"),
     "maybe": ("maybe", "vielleicht"),
@@ -368,7 +356,7 @@ _PORTAL_EMOJI_ALIASES: dict[str, tuple[str, ...]] = {
 
 _PORTAL_EMOJI_FALLBACKS: dict[str, str] = {
     "tank": "🛡️",
-    "heal": "💚",
+    "support": "💚",
     "dps": "⚔️",
     "reserve": "🪑",
     "maybe": "❔",
@@ -391,7 +379,9 @@ _PORTAL_EMOJI_FALLBACKS: dict[str, str] = {
 
 _PORTAL_LEGACY_NAME_TO_KEY: dict[str, str] = {
     "tank": "tank",
-    "heal": "heal",
+    "support": "support",
+    "heal": "support",
+    "heiler": "support",
     "dps": "dps",
     "dd": "dps",
     "reserve": "reserve",
@@ -427,7 +417,7 @@ _PORTAL_LEGACY_NAME_TO_KEY: dict[str, str] = {
 # Vor dem tatsächlichen Senden werden sie anhand der Namen gegen die Emojis des
 # neuen Servers ausgetauscht.
 EMOJI_TANK = "<:tank:1516465336054972456>"
-EMOJI_HEAL = "<:heal:1516478246001049690>"
+EMOJI_SUPPORT = "<:heal:1516478246001049690>"
 EMOJI_DPS = "<:dps:1516476505918668940>"
 EMOJI_BANK = "<:reserve:1516465611243520201>"
 EMOJI_MAYBE = "<:maybe:1516465379445047497>"
@@ -489,9 +479,13 @@ def _portal_component_emoji(value: object):
     return _PORTAL_EMOJI_FALLBACKS.get(key, "•")
 
 
-def _portal_emoji_text(key: str, env_name: str = "") -> str:
+def _portal_emoji_text(key: str, *env_names: str) -> str:
     # Optional kann weiterhin gezielt eine ID per Railway überschrieben werden.
-    if env_name:
+    # Beim Support akzeptieren wir zusätzlich den alten HEAL-Variablennamen,
+    # damit bestehende Deployments beim Update nicht ihre Emoji-Konfiguration verlieren.
+    for env_name in env_names:
+        if not env_name:
+            continue
         configured = str(os.getenv(env_name) or "").strip()
         if configured:
             return configured
@@ -542,13 +536,13 @@ def _refresh_portal_emojis(
             if name:
                 _PORTAL_SERVER_EMOJIS[name] = emoji
 
-        global EMOJI_TANK, EMOJI_HEAL, EMOJI_DPS, EMOJI_BANK, EMOJI_MAYBE, EMOJI_NO
+        global EMOJI_TANK, EMOJI_SUPPORT, EMOJI_DPS, EMOJI_BANK, EMOJI_MAYBE, EMOJI_NO
         global EMOJI_EBOLUS, EMOJI_PERSONAL, EMOJI_LOOT, EMOJI_GUILD, EMOJI_CONTACT
         global EMOJI_ADMIN, EMOJI_TIME, EMOJI_VOTED, EMOJI_TARGET, EMOJI_ABSENCE
         global EMOJI_CALENDAR, EMOJI_BACK, EMOJI_HELP, EMOJI_MEMBER
 
         EMOJI_TANK = _portal_emoji_text("tank", "PORTAL_EMOJI_TANK")
-        EMOJI_HEAL = _portal_emoji_text("heal", "PORTAL_EMOJI_HEAL")
+        EMOJI_SUPPORT = _portal_emoji_text("heal", "PORTAL_EMOJI_SUPPORT")
         EMOJI_DPS = _portal_emoji_text("dps", "PORTAL_EMOJI_DPS")
         EMOJI_BANK = _portal_emoji_text("reserve", "PORTAL_EMOJI_RESERVE")
         EMOJI_MAYBE = _portal_emoji_text("maybe", "PORTAL_EMOJI_MAYBE")
@@ -616,33 +610,11 @@ _JSON_WRITE_LOCK = threading.RLock()
 
 
 def _load_json(path: Path, default):
-    """Load JSON safely and log real corruption instead of hiding it."""
-    try:
-        if not path.exists():
-            return default
-        data = json.loads(path.read_text(encoding="utf-8"))
-        return data if isinstance(data, type(default)) else default
-    except Exception as e:
-        print(f"[member_portal] JSON-Lesefehler in {path.name}: {e!r}")
-        return default
+    return load_json_file(path, default, context=__name__)
 
 
 def _save_json(path: Path, obj) -> None:
-    """Atomic JSON write to avoid half-written files after restarts/crashes."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = json.dumps(obj, indent=2, ensure_ascii=False)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-
-    with _JSON_WRITE_LOCK:
-        try:
-            tmp.write_text(payload, encoding="utf-8")
-            os.replace(tmp, path)
-        finally:
-            try:
-                if tmp.exists():
-                    tmp.unlink()
-            except Exception:
-                pass
+    save_json_atomic(path, obj, context=__name__)
 
 
 cfg: dict = _load_json(CFG_FILE, {})
@@ -1552,7 +1524,7 @@ def _rsvp_entry_user_id(entry: Any) -> int:
 def _rsvp_voted(obj: dict, user_id: int) -> bool:
     yes = obj.get("yes") or {}
 
-    for key in ("TANK", "HEAL", "DPS", "BANK"):
+    for key in ("TANK", "SUPPORT", "DPS", "BANK"):
         for entry in yes.get(key, []) or []:
             if _rsvp_entry_user_id(entry) == int(user_id):
                 return True
@@ -1578,7 +1550,8 @@ def _rsvp_user_status(obj: dict, user_id: int) -> str:
 
     labels = {
         "TANK": f"{EMOJI_TANK} Tank",
-        "HEAL": f"{EMOJI_HEAL} Heal",
+        "SUPPORT": f"{EMOJI_SUPPORT} Support",
+        "HEAL": f"{EMOJI_SUPPORT} Support",
         "DPS": f"{EMOJI_DPS} DPS",
         "BANK": f"{EMOJI_BANK} Reserve",
     }
@@ -3295,7 +3268,7 @@ class ProfileEditModal(PortalSafeModal):
 
         self.main_role = TextInput(
             label="Main-Rolle",
-            placeholder="z. B. Heiler, Tank, DPS",
+            placeholder="z. B. Support, Tank, DPS",
             required=True,
             max_length=50,
             default=str(p.get("main_role") or "")
@@ -4650,7 +4623,7 @@ async def _admin_create_regular_raid_from_menu(
         "image_url": str(image_url or "").strip() or None,
         "dkp_enabled": _dkp_enabled_from_type(str(dkp_event_type or "")),
         "dkp_event_type": str(dkp_event_type or "").strip() if _dkp_enabled_from_type(str(dkp_event_type or "")) else "",
-        "yes": {"TANK": [], "HEAL": [], "DPS": [], "BANK": []},
+        "yes": {"TANK": [], "SUPPORT": [], "DPS": [], "BANK": []},
         "maybe": {},
         "no": [],
         "target_role_id": int(target_role_id),
@@ -4846,7 +4819,7 @@ async def _admin_create_alliance_raid_from_menu(
         "image_url": str(image_url or "").strip() or None,
         "dkp_enabled": _dkp_enabled_from_type(str(dkp_event_type or "")),
         "dkp_event_type": str(dkp_event_type or "").strip() if _dkp_enabled_from_type(str(dkp_event_type or "")) else "",
-        "yes": {"TANK": [], "HEAL": [], "DPS": [], "BANK": []},
+        "yes": {"TANK": [], "SUPPORT": [], "DPS": [], "BANK": []},
         "maybe": {},
         "no": [],
         "target_role_id": int(target_role.id) if target_role else 0,
@@ -5858,7 +5831,7 @@ def _attendance_status_label(status: str) -> str:
 
 def _attendance_signup_label(signup: str) -> str:
     s = str(signup or "").strip().upper()
-    return {"TANK": "Tank", "HEAL": "Heal", "DPS": "DPS", "BANK": "Reserve"}.get(s, s or "—")
+    return {"TANK": "Tank", "SUPPORT": "Support", "HEAL": "Support", "HEALER": "Support", "DPS": "DPS", "BANK": "Reserve"}.get(s, s or "—")
 
 
 def _parse_user_id_from_text(text: str) -> int:
@@ -7036,10 +7009,10 @@ class AdminLineupManageView(PortalSafeView):
             if isinstance(group, dict):
                 group["members"] = []
         state["bench"] = []
-        buckets = {"Tank": [], "Heal": [], "DPS": [], "Reserve": [], "Other": []}
+        buckets = {"Tank": [], "Support": [], "DPS": [], "Reserve": [], "Other": []}
         for p in state.get("candidates") or []:
             buckets.get(str(p.get("role") or ""), buckets["Other"]).append(p)
-        order = buckets["Tank"] + buckets["Heal"] + buckets["DPS"] + buckets["Other"] + buckets["Reserve"]
+        order = buckets["Tank"] + buckets["Support"] + buckets["DPS"] + buckets["Other"] + buckets["Reserve"]
         size = int(state.get("group_size") or 6)
         cursor = 0
         for p in order:
@@ -7406,7 +7379,7 @@ class Aion2ClassSelect(Select):
     def __init__(self,guild_id:int,user_id:int,guild:discord.Guild|None=None):
         self.guild_id=guild_id; self.user_id=user_id
         current=runtime_db.get_aion2_profile(guild_id,user_id) or {}; selected=str(current.get("class_name") or "")
-        labels={"TANK":"Tank","HEAL":"Heiler","DPS":"DPS","SUPPORT":"Support"}
+        labels={"TANK":"Tank","HEAL":"Support","HEALER":"Support","DPS":"DPS","SUPPORT":"Support"}
         opts=[]
         for name,(en,role,emoji_name) in AION2_CLASS_META.items():
             opts.append(discord.SelectOption(label=f"{name} ({en})",value=name,description=labels.get(role,role),default=(name==selected),emoji=_aion2_guild_emoji(guild,emoji_name)))

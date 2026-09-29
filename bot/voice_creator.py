@@ -7,6 +7,11 @@ from pathlib import Path
 from typing import Optional
 
 import discord
+
+try:
+    from bot.json_store import load_json_file, save_json_atomic  # type: ignore
+except Exception:
+    from json_store import load_json_file, save_json_atomic  # type: ignore
 from discord import app_commands
 
 try:
@@ -226,21 +231,11 @@ async def ensure_voice_channel_permissions(
 
 
 def _load_json(path: Path, default):
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        return data if isinstance(data, type(default)) else default
-    except Exception:
-        return default
+    return load_json_file(path, default, context=__name__)
 
 
 def _save_json(path: Path, data) -> None:
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-        tmp.replace(path)
-    except Exception as e:
-        print(f"[voice_creator] JSON speichern fehlgeschlagen: {path} {e!r}", flush=True)
+    save_json_atomic(path, data, context=__name__)
 
 
 def _load_tracked_voice_channels() -> dict:

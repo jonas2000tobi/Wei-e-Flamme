@@ -12,6 +12,11 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 try:
+    from bot.json_store import load_json_file, save_json_atomic  # type: ignore
+except Exception:  # pragma: no cover
+    from json_store import load_json_file, save_json_atomic  # type: ignore
+
+try:
     from bot import runtime_db  # type: ignore
 except Exception:  # pragma: no cover
     import runtime_db  # type: ignore
@@ -334,10 +339,8 @@ def _copy_scoped_json(source_guild_id: int, target_guild_id: int, active_user_id
 
     for filename in LEGACY_SCOPED_JSON_FILES:
         path = DATA_DIR / filename
-        if not path.exists():
-            continue
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
+            data = _load_json_dict(path)
         except Exception:
             continue
         if not isinstance(data, dict) or source_key not in data:
@@ -368,9 +371,7 @@ def _copy_scoped_json(source_guild_id: int, target_guild_id: int, active_user_id
         # loot_items.json und guild_chest.json enthalten gildenweite Katalog-/Truhendaten.
 
         data[target_key] = cloned
-        tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-        os.replace(tmp, path)
+        _save_json_dict(path, data)
         counts[filename] = 1
     return counts
 
@@ -419,18 +420,12 @@ def _set_alliance_home_guild(target_guild_id: int, *, source_guild_id: int = 0, 
 
 
 def _load_json_dict(path: Path) -> dict[str, Any]:
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-        return raw if isinstance(raw, dict) else {}
-    except Exception:
-        return {}
+    raw = load_json_file(path, {}, context=f"{__name__}.legacy")
+    return raw if isinstance(raw, dict) else {}
 
 
 def _save_json_dict(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(tmp, path)
+    save_json_atomic(path, payload, context=f"{__name__}.legacy")
 
 
 def sync_legacy_compatibility(guild_id: int) -> dict[str, bool]:

@@ -353,6 +353,33 @@ async def on_ready():
     # on_ready can fire again after a gateway reconnect. Registering commands,
     # listeners and persistent views more than once causes duplicate handlers.
     if not _modules_initialized:
+        # Storage-Cutover vor allen Feature-Imports: In Railway/Produktion ist
+        # PostgreSQL die einzige Runtime-Wahrheit. Vorhandene Alt-JSONs werden
+        # einmalig vollständig importiert; bei DB-Fehler bleibt der Bot bewusst
+        # offline, statt unbemerkt auf eine zweite lokale Datenwelt auszuweichen.
+        try:
+            try:
+                from bot import runtime_db as _runtime_db  # type: ignore
+                from bot.json_store import migrate_legacy_json_directory  # type: ignore
+            except ModuleNotFoundError:
+                import runtime_db as _runtime_db  # type: ignore
+                from json_store import migrate_legacy_json_directory  # type: ignore
+            storage = _runtime_db.init_runtime_db()
+            migration = migrate_legacy_json_directory(Path(__file__).resolve().parent / "data")
+            print(
+                "✅ Runtime-Storage bereit: "
+                f"{storage.get('backend')} · Legacy importiert={migration.get('imported', 0)} "
+                f"· bereits vorhanden={migration.get('existing', 0)} "
+                f"· übersprungen={migration.get('skipped', 0)}",
+                flush=True,
+            )
+            if migration.get("errors"):
+                print("⚠️ Legacy-Import Hinweise: " + " | ".join(migration["errors"][:10]), flush=True)
+        except Exception as e:
+            _startup_failure = f"Runtime-Storage: {type(e).__name__}: {e}"
+            print(f"❌ {_startup_failure}", flush=True)
+            return
+
         _import_modules()
 
         async def _safe_setup(name: str, setup_func):

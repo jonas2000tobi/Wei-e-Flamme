@@ -16,6 +16,11 @@ try:
 except Exception:
     from json_store import load_json_file, save_json_atomic, warn_json_store  # type: ignore
 
+try:
+    from bot.role_keys import CANONICAL_EVENT_ROLES, normalize_role_key, normalize_yes_buckets, role_label as canonical_role_label  # type: ignore
+except Exception:
+    from role_keys import CANONICAL_EVENT_ROLES, normalize_role_key, normalize_yes_buckets, role_label as canonical_role_label  # type: ignore
+
 import discord
 import aiohttp
 from discord import app_commands
@@ -71,10 +76,10 @@ TZ = ZoneInfo("Europe/Berlin")
 
 # Custom Discord-Emojis für RSVP/Rollen.
 # Beim Serverwechsel ändern sich die IDs. Deshalb sucht der Bot die neuen
-# Server-Emojis automatisch anhand der Namen Tank, Heal, DD/DPS, bank,
+# Server-Emojis automatisch anhand der Namen Tank, Support (Legacy-Alias: Heal), DD/DPS, bank,
 # vielleicht und nichtda.
 EMOJI_TANK = "<:tank:1516465336054972456>"
-EMOJI_HEAL = "<:heal:1516478246001049690>"
+EMOJI_SUPPORT = "<:heal:1516478246001049690>"
 EMOJI_DPS = "<:dps:1516476505918668940>"
 EMOJI_BANK = "<:reserve:1516465611243520201>"
 EMOJI_MAYBE = "<:maybe:1516465379445047497>"
@@ -95,7 +100,7 @@ EMOJI_CALENDAR = "<:Kalender:1516462026468098181>"
 
 _RSVP_EMOJI_ALIASES: dict[str, tuple[str, ...]] = {
     "tank": ("tank",),
-    "heal": ("heal",),
+    "support": ("support", "heal", "heiler"),
     "dps": ("dps", "dd"),
     "reserve": ("reserve", "bank"),
     "maybe": ("maybe", "vielleicht"),
@@ -103,7 +108,7 @@ _RSVP_EMOJI_ALIASES: dict[str, tuple[str, ...]] = {
 }
 _RSVP_EMOJI_FALLBACKS: dict[str, str] = {
     "tank": "🛡️",
-    "heal": "💚",
+    "support": "💚",
     "dps": "⚔️",
     "reserve": "🪑",
     "maybe": "❔",
@@ -129,7 +134,7 @@ _EVENT_EMOJI_FALLBACKS: dict[str, str] = {
 }
 _RSVP_LEGACY_TO_KEY: dict[str, str] = {
     "tank": "tank",
-    "heal": "heal",
+    "support": "support",
     "dps": "dps",
     "dd": "dps",
     "reserve": "reserve",
@@ -197,11 +202,11 @@ def _refresh_rsvp_emojis(guild: Optional[discord.Guild], *, log: bool = True) ->
         if name:
             _RSVP_SERVER_EMOJIS[name] = emoji
 
-    global EMOJI_TANK, EMOJI_HEAL, EMOJI_DPS, EMOJI_BANK, EMOJI_MAYBE, EMOJI_NO
+    global EMOJI_TANK, EMOJI_SUPPORT, EMOJI_DPS, EMOJI_BANK, EMOJI_MAYBE, EMOJI_NO
     global EMOJI_CALENDAR, EMOJI_TIME, EMOJI_VOTED, EMOJI_TARGET, EMOJI_ABSENCE
 
     EMOJI_TANK = str(_rsvp_server_emoji("tank") or _RSVP_EMOJI_FALLBACKS["tank"])
-    EMOJI_HEAL = str(_rsvp_server_emoji("heal") or _RSVP_EMOJI_FALLBACKS["heal"])
+    EMOJI_SUPPORT = str(_rsvp_server_emoji("support") or _RSVP_EMOJI_FALLBACKS["support"])
     EMOJI_DPS = str(_rsvp_server_emoji("dps") or _RSVP_EMOJI_FALLBACKS["dps"])
     EMOJI_BANK = str(_rsvp_server_emoji("reserve") or _RSVP_EMOJI_FALLBACKS["reserve"])
     EMOJI_MAYBE = str(_rsvp_server_emoji("maybe") or _RSVP_EMOJI_FALLBACKS["maybe"])
@@ -216,7 +221,7 @@ def _refresh_rsvp_emojis(guild: Optional[discord.Guild], *, log: bool = True) ->
     if log:
         print(
             f"[event_rsvp_dm] Server-Emojis geladen für {guild.name}: "
-            f"Tank={EMOJI_TANK}, Heal={EMOJI_HEAL}, DPS={EMOJI_DPS}, "
+            f"Tank={EMOJI_TANK}, Support={EMOJI_SUPPORT}, DPS={EMOJI_DPS}, "
             f"Reserve={EMOJI_BANK}, Vielleicht={EMOJI_MAYBE}, Abmelden={EMOJI_NO}, "
             f"Kalender={EMOJI_CALENDAR}, Zeit={EMOJI_TIME}, "
             f"Abgestimmt={EMOJI_VOTED}, Zielgruppe={EMOJI_TARGET}",
@@ -234,13 +239,13 @@ def _rebind_rsvp_view_emojis(view: discord.ui.View) -> None:
     # Stattdessen ordnen wir jeden RSVP-Button über seine feste custom_id zu.
     key_by_custom_id = {
         "dm_rsvp_tank": "tank",
-        "dm_rsvp_heal": "heal",
+        "dm_rsvp_heal": "support",
         "dm_rsvp_dps": "dps",
         "dm_rsvp_bank": "reserve",
         "dm_rsvp_maybe": "maybe",
         "dm_rsvp_no": "no",
         "srv_rsvp_tank": "tank",
-        "srv_rsvp_heal": "heal",
+        "srv_rsvp_heal": "support",
         "srv_rsvp_dps": "dps",
         "srv_rsvp_bank": "reserve",
         "srv_rsvp_maybe": "maybe",
@@ -309,6 +314,59 @@ def save_cfg():
 
 def save_attendance():
     _save(ATTENDANCE_FILE, attendance_store)
+
+
+def _migrate_legacy_role_state() -> None:
+    """Migriert geladene Legacy-Rollen sofort auf den kanonischen SUPPORT-Key.
+
+    Discord-custom_ids mit ``heal`` bleiben absichtlich unverändert, damit bereits
+    versendete persistente Event-Nachrichten nach einem Deploy weiter reagieren.
+    """
+    cfg_changed = False
+    for guild_cfg in cfg.values():
+        if not isinstance(guild_cfg, dict):
+            continue
+        if not guild_cfg.get("SUPPORT") and guild_cfg.get("HEAL"):
+            guild_cfg["SUPPORT"] = guild_cfg.get("HEAL")
+            cfg_changed = True
+        if "HEAL" in guild_cfg:
+            guild_cfg.pop("HEAL", None)
+            cfg_changed = True
+    if cfg_changed:
+        save_cfg()
+
+    store_changed = False
+    for event in store.values():
+        if not isinstance(event, dict):
+            continue
+        source = event.get("yes") if isinstance(event.get("yes"), dict) else {}
+        normalized = normalize_yes_buckets(source)
+        if normalized != source:
+            event["yes"] = normalized
+            store_changed = True
+    if store_changed:
+        _save(RSVP_FILE, store)
+
+    attendance_changed = False
+    for guild_events in attendance_store.values():
+        if not isinstance(guild_events, dict):
+            continue
+        for event in guild_events.values():
+            if not isinstance(event, dict):
+                continue
+            for participant in event.get("participants") or []:
+                if not isinstance(participant, dict):
+                    continue
+                old = str(participant.get("signup") or "").strip().upper()
+                new = normalize_role_key(old, allow_status=False)
+                if old and new != old:
+                    participant["signup"] = new
+                    attendance_changed = True
+    if attendance_changed:
+        save_attendance()
+
+
+_migrate_legacy_role_state()
 
 
 async def _log(client: discord.Client, guild_id: int, text: str):
@@ -512,12 +570,10 @@ def _format_dm_text(
 
 
 def _init_event_shape(obj: dict):
-    if "yes" not in obj or not isinstance(obj["yes"], dict):
-        obj["yes"] = {"TANK": [], "HEAL": [], "DPS": [], "BANK": []}
-
-    for k in ("TANK", "HEAL", "DPS", "BANK"):
-        if k not in obj["yes"] or not isinstance(obj["yes"][k], list):
-            obj["yes"][k] = []
+    original_yes = obj.get("yes") if isinstance(obj.get("yes"), dict) else {}
+    normalized_yes = normalize_yes_buckets(original_yes)
+    migrated_role_keys = normalized_yes != original_yes
+    obj["yes"] = normalized_yes
 
     if "maybe" not in obj or not isinstance(obj["maybe"], dict):
         obj["maybe"] = {}
@@ -543,9 +599,9 @@ def _init_event_shape(obj: dict):
     obj.setdefault("voice_created_at", "")
     obj.setdefault("voice_name", "")
 
-    migrated = False
+    migrated = bool(migrated_role_keys)
 
-    for role_key in ("TANK", "HEAL", "DPS", "BANK"):
+    for role_key in CANONICAL_EVENT_ROLES:
         new_list = []
 
         for raw in obj["yes"].get(role_key, []):
@@ -651,7 +707,7 @@ def get_role_ids_for_guild(guild_id: int) -> Dict[str, int]:
 
     return {
         "TANK": int(g.get("TANK", 0) or 0),
-        "HEAL": int(g.get("HEAL", 0) or 0),
+        "SUPPORT": int(g.get("SUPPORT", 0) or g.get("HEAL", 0) or 0),
         "DPS": int(g.get("DPS", 0) or 0),
     }
 
@@ -666,9 +722,9 @@ def _primary_label(member: Optional[discord.Member], rid_map: Dict[str, int]) ->
     if r and r in getattr(member, "roles", []):
         return "Tank"
 
-    r = guild.get_role(rid_map.get("HEAL", 0) or 0)
+    r = guild.get_role(rid_map.get("SUPPORT", 0) or 0)
     if r and r in getattr(member, "roles", []):
-        return "Heal"
+        return "Support"
 
     r = guild.get_role(rid_map.get("DPS", 0) or 0)
     if r and r in getattr(member, "roles", []):
@@ -679,8 +735,8 @@ def _primary_label(member: Optional[discord.Member], rid_map: Dict[str, int]) ->
     if any("tank" in n for n in names):
         return "Tank"
 
-    if any("heal" in n for n in names):
-        return "Heal"
+    if any(("support" in n) or ("heal" in n) or ("heiler" in n) for n in names):
+        return "Support"
 
     if any("dps" in n for n in names) or any("dd" in n for n in names):
         return "DPS"
@@ -712,7 +768,7 @@ def _member_from_event(inter: discord.Interaction, obj: dict) -> Optional[discor
 def _voters_set(obj: dict) -> set[int]:
     voted: set[int] = set()
 
-    for k in ("TANK", "HEAL", "DPS", "BANK"):
+    for k in CANONICAL_EVENT_ROLES:
         voted.update(_entry_user_id(u) for u in obj["yes"].get(k, []))
 
     voted.update(_entry_user_id(u) for u in obj["no"])
@@ -776,12 +832,12 @@ def build_embed(guild: discord.Guild, obj: dict) -> discord.Embed:
     )
 
     tank_names = [_entry_display_name(u, guild) for u in yes.get("TANK", [])]
-    heal_names = [_entry_display_name(u, guild) for u in yes.get("HEAL", [])]
+    heal_names = [_entry_display_name(u, guild) for u in yes.get("SUPPORT", [])]
     dps_names = [_entry_display_name(u, guild) for u in yes.get("DPS", [])]
     bank_names = [_entry_display_name(u, guild) for u in yes.get("BANK", [])]
 
     emb.add_field(name=f"{EMOJI_TANK} Tank ({len(tank_names)})", value="\n".join(tank_names) or "—", inline=True)
-    emb.add_field(name=f"{EMOJI_HEAL} Heal ({len(heal_names)})", value="\n".join(heal_names) or "—", inline=True)
+    emb.add_field(name=f"{EMOJI_SUPPORT} Support ({len(heal_names)})", value="\n".join(heal_names) or "—", inline=True)
     emb.add_field(name=f"{EMOJI_DPS} DPS ({len(dps_names)})", value="\n".join(dps_names) or "—", inline=True)
     emb.add_field(name=f"{EMOJI_BANK} Reserve ({len(bank_names)})", value="\n".join(bank_names) or "—", inline=False)
 
@@ -1213,7 +1269,7 @@ def _attendance_participants_from_event(obj: dict) -> list[dict]:
     out: list[dict] = []
     seen: set[int] = set()
 
-    for role_key in ("TANK", "HEAL", "DPS", "BANK"):
+    for role_key in CANONICAL_EVENT_ROLES:
         for entry in obj.get("yes", {}).get(role_key, []) or []:
             uid = _entry_user_id(entry)
             if not uid or uid in seen:
@@ -1400,14 +1456,14 @@ def _dedupe_attendance_participants(ev: dict) -> bool:
 def add_attendance_participant(guild_id: int, event_id: str, user_id: int, name: str, signup: str = "DPS", status: str = "present", marked_by: int = 0) -> bool:
     """Fügt einen Spieler nachträglich zur EC-Anwesenheitsliste hinzu.
 
-    signup: TANK/HEAL/DPS/BANK. BANK zählt später als Reserve.
+    signup: TANK/SUPPORT/DPS/BANK. BANK zählt später als Reserve.
     status: present/absent/excused/maybe/clear. maybe/offen geben keine EC.
     """
     ev = get_attendance_event(int(guild_id), str(event_id))
     if not ev:
         return False
-    signup = str(signup or "DPS").upper().strip()
-    if signup not in {"TANK", "HEAL", "DPS", "BANK"}:
+    signup = normalize_role_key(signup, allow_status=False) or "DPS"
+    if signup not in set(CANONICAL_EVENT_ROLES):
         signup = "DPS"
     p = _attendance_find_participant(ev, int(user_id))
     if not p:
@@ -1455,8 +1511,8 @@ def set_attendance_signup(guild_id: int, event_id: str, user_id: int, signup: st
     p = _attendance_find_participant(ev, int(user_id))
     if not p:
         return False
-    signup = str(signup or "DPS").upper().strip()
-    if signup not in {"TANK", "HEAL", "DPS", "BANK"}:
+    signup = normalize_role_key(signup, allow_status=False) or "DPS"
+    if signup not in set(CANONICAL_EVENT_ROLES):
         signup = "DPS"
     p["signup"] = signup
     p["updated_by"] = int(marked_by or 0)
@@ -1542,8 +1598,8 @@ def apply_attendance_updates(
                 continue
 
             display_name = str(item.get("display_name") or item.get("name") or f"User {uid}")
-            signup = str(item.get("signup") or "DPS").upper().strip()
-            if signup not in {"TANK", "HEAL", "DPS", "BANK"}:
+            signup = normalize_role_key(item.get("signup") or "DPS", allow_status=False) or "DPS"
+            if signup not in set(CANONICAL_EVENT_ROLES):
                 signup = "DPS"
             target_status = str(item.get("status") or "clear").strip().lower()
             if target_status not in valid_statuses and target_status != "clear":
@@ -2066,7 +2122,7 @@ def _reminder_yes_participants(obj: dict) -> set[int]:
     ids: set[int] = set()
     try:
         _init_event_shape(obj)
-        for key in ("TANK", "HEAL", "DPS", "BANK"):
+        for key in CANONICAL_EVENT_ROLES:
             for entry in obj.get("yes", {}).get(key, []) or []:
                 uid = _entry_user_id(entry)
                 if uid:
@@ -2224,7 +2280,7 @@ async def event_reminder_loop():
 
 def _activity_existing_choice(obj: dict, user_id: int) -> str:
     uid=int(user_id)
-    for role_key in ("TANK","HEAL","DPS","BANK"):
+    for role_key in CANONICAL_EVENT_ROLES:
         if any(_entry_user_id(e)==uid for e in obj.get("yes",{}).get(role_key,[]) or []): return role_key
     if any(_entry_user_id(e)==uid for e in obj.get("no",[]) or []): return "NO"
     if str(uid) in (obj.get("maybe",{}) or {}): return "MAYBE"
@@ -2240,6 +2296,7 @@ def _record_member_activity_rsvp(guild_id:int,user_id:int,event_id:str,old_choic
     except Exception as exc: print(f"[activity] RSVP logging failed: {exc!r}")
 
 async def apply_rsvp(inter: discord.Interaction, msg_id: str, group: str) -> tuple[bool, str]:
+    group = normalize_role_key(group)
     obj = store.get(str(msg_id))
 
     if not obj:
@@ -2259,7 +2316,7 @@ async def apply_rsvp(inter: discord.Interaction, msg_id: str, group: str) -> tup
 
     previous_choice = _activity_existing_choice(obj, uid)
 
-    if group in ("TANK", "HEAL", "DPS"):
+    if group in ("TANK", "SUPPORT", "DPS"):
         response_key = "yes"
     elif group == "BANK":
         response_key = "bank"
@@ -2268,7 +2325,7 @@ async def apply_rsvp(inter: discord.Interaction, msg_id: str, group: str) -> tup
     else:
         response_key = "no"
 
-    for k in ("TANK", "HEAL", "DPS", "BANK"):
+    for k in CANONICAL_EVENT_ROLES:
         obj["yes"][k] = [
             entry for entry in obj["yes"].get(k, [])
             if _entry_user_id(entry) != uid
@@ -2281,7 +2338,7 @@ async def apply_rsvp(inter: discord.Interaction, msg_id: str, group: str) -> tup
 
     obj["maybe"].pop(str(uid), None)
 
-    if group in ("TANK", "HEAL", "DPS"):
+    if group in ("TANK", "SUPPORT", "DPS"):
         obj["yes"][group].append(_participant_entry(uid, display_name, guild_label, source_guild_id))
         text = f"Angemeldet als **{group}**."
 
@@ -2378,9 +2435,9 @@ class RaidView(BaseRaidView):
     async def btn_tank(self, inter: discord.Interaction, _):
         await self._handle(inter, "TANK")
 
-    @button(label="Heal", emoji=_button_emoji(EMOJI_HEAL), style=ButtonStyle.secondary, custom_id="dm_rsvp_heal")
+    @button(label="Support", emoji=_button_emoji(EMOJI_SUPPORT), style=ButtonStyle.secondary, custom_id="dm_rsvp_heal")
     async def btn_heal(self, inter: discord.Interaction, _):
-        await self._handle(inter, "HEAL")
+        await self._handle(inter, "SUPPORT")
 
     @button(label="DPS", emoji=_button_emoji(EMOJI_DPS), style=ButtonStyle.secondary, custom_id="dm_rsvp_dps")
     async def btn_dps(self, inter: discord.Interaction, _):
@@ -2404,9 +2461,9 @@ class ServerRaidView(BaseRaidView):
     async def btn_tank(self, inter: discord.Interaction, _):
         await self._handle(inter, "TANK")
 
-    @button(label="Heal", emoji=_button_emoji(EMOJI_HEAL), style=ButtonStyle.secondary, custom_id="srv_rsvp_heal")
+    @button(label="Support", emoji=_button_emoji(EMOJI_SUPPORT), style=ButtonStyle.secondary, custom_id="srv_rsvp_heal")
     async def btn_heal(self, inter: discord.Interaction, _):
-        await self._handle(inter, "HEAL")
+        await self._handle(inter, "SUPPORT")
 
     @button(label="DPS", emoji=_button_emoji(EMOJI_DPS), style=ButtonStyle.secondary, custom_id="srv_rsvp_dps")
     async def btn_dps(self, inter: discord.Interaction, _):
@@ -2852,6 +2909,7 @@ def _phase3_event_ensure_tables() -> None:
             """)
             cur.execute("CREATE INDEX IF NOT EXISTS idx_phase3_event_rsvps_event ON phase3_event_rsvps (guild_id, event_id)")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_phase3_event_rsvps_user ON phase3_event_rsvps (guild_id, user_id)")
+            cur.execute("UPDATE phase3_event_rsvps SET role_name='SUPPORT' WHERE role_name IN ('HEAL','HEALER')")
         conn.commit()
     finally:
         conn.close()
@@ -2885,7 +2943,7 @@ def _phase3_event_rsvp_rows_from_store(obj: dict, event_id: str) -> list[dict[st
     rows: list[dict[str, Any]] = []
     title = str(obj.get("title") or "Event")
 
-    for role_name in ("TANK", "HEAL", "DPS", "BANK"):
+    for role_name in CANONICAL_EVENT_ROLES:
         for entry in obj.get("yes", {}).get(role_name, []) or []:
             uid = _entry_user_id(entry)
             name = _entry_name(entry)
@@ -3393,7 +3451,7 @@ async def _dashboard_event_create(client: discord.Client, guild_id: int, payload
         "image_type": str(payload.get("image_type") or "auto").strip().lower(),
         "image_url": _dashboard_event_image_url_from_payload(payload),
         "status": "active",
-        "yes": {"TANK": [], "HEAL": [], "DPS": [], "BANK": []},
+        "yes": {"TANK": [], "SUPPORT": [], "DPS": [], "BANK": []},
         "maybe": {},
         "no": [],
         "target_role_id": int(target_role_id or 0),
@@ -3828,8 +3886,8 @@ async def sync_event_lineup_state(client: discord.Client, guild_id: int, event_i
 def _dashboard_lineup_candidates(obj: dict[str, Any]) -> dict[int, dict[str, Any]]:
     _init_event_shape(obj)
     out: dict[int, dict[str, Any]] = {}
-    role_labels = {"TANK": "Tank", "HEAL": "Heal", "DPS": "DPS", "BANK": "Reserve"}
-    for role_key in ("TANK", "HEAL", "DPS", "BANK"):
+    role_labels = {"TANK": "Tank", "SUPPORT": "Support", "HEAL": "Support", "HEALER": "Support", "DPS": "DPS", "BANK": "Reserve"}
+    for role_key in CANONICAL_EVENT_ROLES:
         for entry in obj.get("yes", {}).get(role_key, []) or []:
             uid = _entry_user_id(entry)
             if not uid:
@@ -3894,7 +3952,7 @@ def _dashboard_lineup_clean(obj: dict[str, Any], raw: Any) -> dict[str, Any]:
 def _dashboard_lineup_member_line(member: dict[str, Any]) -> str:
     uid = int(member.get("user_id") or 0)
     role = str(member.get("role") or "").strip()
-    role_icon = {"Tank": "🛡️", "Heal": "💚", "DPS": "⚔️", "Reserve": "🪑"}.get(role, "•")
+    role_icon = {"Tank": "🛡️", "Support": "💚", "DPS": "⚔️", "Reserve": "🪑"}.get(role, "•")
     who = f"<@{uid}>" if uid else _safe_name(member.get("display_name") or "Unbekannt")
     return f"{role_icon} {who}" + (f" · {role}" if role else "")
 
@@ -4060,7 +4118,7 @@ def _dashboard_event_rsvp_open(obj: dict[str, Any]) -> bool:
 
 async def _dashboard_event_rsvp(client: discord.Client, guild_id: int, payload: dict[str, Any]) -> dict[str, Any]:
     event_id = str(payload.get("event_id") or "").strip()
-    choice = str(payload.get("choice") or payload.get("response") or "").strip().upper()
+    choice = normalize_role_key(payload.get("choice") or payload.get("response") or "")
     requested_by = payload.get("requested_by") if isinstance(payload.get("requested_by"), dict) else {}
     try:
         user_id = int(requested_by.get("id") or payload.get("user_id") or 0)
@@ -4068,7 +4126,7 @@ async def _dashboard_event_rsvp(client: discord.Client, guild_id: int, payload: 
         user_id = 0
     if not event_id or event_id not in store:
         raise RuntimeError("Event nicht gefunden")
-    if choice not in {"TANK", "HEAL", "DPS", "BANK", "MAYBE", "NO"}:
+    if choice not in {"TANK", "SUPPORT", "DPS", "BANK", "MAYBE", "NO"}:
         raise RuntimeError("Ungültige RSVP-Auswahl")
     if not user_id:
         raise RuntimeError("Discord-User-ID fehlt")
@@ -4109,12 +4167,12 @@ async def _dashboard_event_rsvp(client: discord.Client, guild_id: int, payload: 
         guild_label = guild.name if _is_alliance_event(obj) else ""
         source_guild_id = int(guild.id)
 
-        for role_key in ("TANK", "HEAL", "DPS", "BANK"):
+        for role_key in CANONICAL_EVENT_ROLES:
             obj["yes"][role_key] = [entry for entry in obj["yes"].get(role_key, []) if _entry_user_id(entry) != user_id]
         obj["no"] = [entry for entry in obj.get("no", []) if _entry_user_id(entry) != user_id]
         obj["maybe"].pop(str(user_id), None)
 
-        if choice in {"TANK", "HEAL", "DPS"}:
+        if choice in {"TANK", "SUPPORT", "DPS"}:
             obj["yes"][choice].append(_participant_entry(user_id, display_name, guild_label, source_guild_id))
             response_key = "yes"
             label = choice
@@ -4316,12 +4374,12 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
         except Exception as e:
             await inter.followup.send(f"❌ Phase 3 Event-Status Fehler: {type(e).__name__}: {e}", ephemeral=True)
 
-    @event_group.command(name="set_roles_dm", description="(Admin) Primärrollen (Tank/Heal/DPS) für Maybe-Label setzen")
-    @app_commands.describe(tank_role="Rolle: Tank", heal_role="Rolle: Heal", dps_role="Rolle: DPS")
+    @event_group.command(name="set_roles_dm", description="(Admin) Primärrollen (Tank/Support/DPS) für Maybe-Label setzen")
+    @app_commands.describe(tank_role="Rolle: Tank", support_role="Rolle: Support", dps_role="Rolle: DPS")
     async def raid_set_roles_dm(
         inter: discord.Interaction,
         tank_role: discord.Role,
-        heal_role: discord.Role,
+        support_role: discord.Role,
         dps_role: discord.Role
     ):
         await inter.response.defer(ephemeral=True, thinking=False)
@@ -4332,13 +4390,14 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
 
         c = cfg.get(str(inter.guild_id)) or {}
         c["TANK"] = int(tank_role.id)
-        c["HEAL"] = int(heal_role.id)
+        c["SUPPORT"] = int(support_role.id)
+        c.pop("HEAL", None)
         c["DPS"] = int(dps_role.id)
         cfg[str(inter.guild_id)] = c
         save_cfg()
 
         await inter.followup.send(
-            f"✅ Gespeichert:\n{EMOJI_TANK} {tank_role.mention}\n{EMOJI_HEAL} {heal_role.mention}\n{EMOJI_DPS} {dps_role.mention}",
+            f"✅ Gespeichert:\n{EMOJI_TANK} {tank_role.mention}\n{EMOJI_SUPPORT} {support_role.mention}\n{EMOJI_DPS} {dps_role.mention}",
             ephemeral=True
         )
 
@@ -4401,7 +4460,7 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
                 "description": (description or "").strip(),
                 "when_iso": when.isoformat(),
                 "image_url": (image_url or "").strip() or None,
-                "yes": {"TANK": [], "HEAL": [], "DPS": [], "BANK": []},
+                "yes": {"TANK": [], "SUPPORT": [], "DPS": [], "BANK": []},
                 "maybe": {},
                 "no": [],
                 "target_role_id": int(target_role.id) if target_role else 0,
@@ -4575,7 +4634,7 @@ async def setup_rsvp_dm(client: discord.Client, tree: app_commands.CommandTree):
             "description": (description or "").strip(),
             "when_iso": when.isoformat(),
             "image_url": (image_url or "").strip() or None,
-            "yes": {"TANK": [], "HEAL": [], "DPS": [], "BANK": []},
+            "yes": {"TANK": [], "SUPPORT": [], "DPS": [], "BANK": []},
             "maybe": {},
             "no": [],
             "target_role_id": int(target_role.id) if target_role else 0,

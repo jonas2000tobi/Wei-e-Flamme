@@ -9,6 +9,11 @@ from typing import Optional
 import discord
 
 try:
+    from bot.json_store import load_json_file, save_json_atomic  # type: ignore
+except Exception:
+    from json_store import load_json_file, save_json_atomic  # type: ignore
+
+try:
     from bot.channel_picker import send_text_channel_picker, send_voice_channel_picker  # type: ignore
 except Exception:
     from channel_picker import send_text_channel_picker, send_voice_channel_picker  # type: ignore
@@ -40,30 +45,11 @@ _JSON_LOCK = threading.RLock()
 
 
 def _load_json(path: Path, default):
-    try:
-        if not path.exists():
-            return default
-        data = json.loads(path.read_text(encoding="utf-8"))
-        return data if isinstance(data, type(default)) else default
-    except Exception as e:
-        print(f"[{Path(__file__).stem}] JSON-Lesefehler {path.name}: {e!r}")
-        return default
+    return load_json_file(path, default, context=__name__)
 
 
 def _save_json(path: Path, obj) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    payload = json.dumps(obj, indent=2, ensure_ascii=False)
-    with _JSON_LOCK:
-        try:
-            tmp.write_text(payload, encoding="utf-8")
-            os.replace(tmp, path)
-        finally:
-            try:
-                if tmp.exists():
-                    tmp.unlink()
-            except Exception:
-                pass
+    save_json_atomic(path, obj, context=__name__)
 
 
 alliance_cfg: dict = _load_json(ALLIANCE_FILE, {})

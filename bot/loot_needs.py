@@ -237,7 +237,7 @@ def _schedule_phase3_need_mirror(guild_id: int | None = None, user_id: int | Non
 
 
 def save_needs(guild_id: int | None = None, user_id: int | None = None) -> None:
-    # JSON bleibt die unmittelbare produktive Quelle. In Postgres wird nur der
+    # Der Runtime-State liegt produktiv in PostgreSQL (json_store/runtime_documents). Parallel wird der
     # geänderte Spieler bzw. die geänderte Gilde ersetzt; ein Full-Mirror bleibt
     # ausschließlich der expliziten Reparatur-/Migrationsfunktion vorbehalten.
     _save_json(NEEDS_FILE, loot_needs)
@@ -1158,7 +1158,7 @@ def _event_participant_ids(obj: dict) -> list[int]:
 
     yes = obj.get("yes") or {}
 
-    for key in ("TANK", "HEAL", "DPS", "BANK"):
+    for key in ("TANK", "SUPPORT", "DPS", "BANK"):
         for entry in yes.get(key, []) or []:
             try:
                 if isinstance(entry, dict):
@@ -3003,7 +3003,7 @@ async def setup_loot_needs(client: discord.Client, tree: app_commands.CommandTre
             status = _phase3_need_status()
             await inter.followup.send(
                 "🧾 **Phase 3.3 Need-Status**\n"
-                f"JSON aktuell: **{status.get('json_current_needs', 0)}**\n"
+                f"Runtime aktuell: **{status.get('json_current_needs', 0)}**\n"
                 f"Postgres Needs: **{status.get('postgres_needs', 0)}**\n"
                 f"Need-Änderungslog: **{status.get('need_change_log', 0)}**\n"
                 f"OK: `{status.get('ok')}`",
@@ -3573,7 +3573,7 @@ async def setup_loot_needs(client: discord.Client, tree: app_commands.CommandTre
             title="🎯 Waffenbedarf – Event-Anmeldung",
             subtitle=(
                 f"Event: **{obj.get('title', 'Event')}**\n"
-                f"Quelle: Tank/Heal/DPS/Bank aus Raid-Anmeldung\n"
+                f"Quelle: Tank/Support/DPS/Bank aus Raid-Anmeldung\n"
                 f"Teilnehmer: **{len(user_ids)}**"
             )
         )

@@ -140,7 +140,7 @@ def _participants_from_event(event: dict) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     seen: set[int] = set()
     yes = event.get("yes") if isinstance(event.get("yes"), dict) else {}
-    for role_key in ("TANK", "HEAL", "DPS", "BANK"):
+    for role_key in ("TANK", "SUPPORT", "DPS", "BANK"):
         for entry in yes.get(role_key, []) or []:
             uid = _entry_user_id(entry)
             if not uid or uid in seen:

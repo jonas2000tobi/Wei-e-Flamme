@@ -12,6 +12,11 @@ import discord
 from discord import app_commands
 
 try:
+    from bot.json_store import load_json_file, save_json_atomic  # type: ignore
+except Exception:
+    from json_store import load_json_file, save_json_atomic  # type: ignore
+
+try:
     from bot.module_registry import FeatureGroup, is_module_enabled, any_guild_has_module  # type: ignore
 except Exception:
     from module_registry import FeatureGroup, is_module_enabled, any_guild_has_module  # type: ignore
@@ -48,25 +53,11 @@ _JSON_LOCK = threading.RLock()
 
 
 def _load_cfg() -> dict:
-    try:
-        return json.loads(CFG_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+    return load_json_file(CFG_FILE, {}, context=__name__)
 
 
 def _save_cfg(obj: dict) -> None:
-    tmp = CFG_FILE.with_name(f".{CFG_FILE.name}.{os.getpid()}.tmp")
-    payload = json.dumps(obj, indent=2, ensure_ascii=False)
-    with _JSON_LOCK:
-        try:
-            tmp.write_text(payload, encoding="utf-8")
-            os.replace(tmp, CFG_FILE)
-        finally:
-            try:
-                if tmp.exists():
-                    tmp.unlink()
-            except Exception:
-                pass
+    save_json_atomic(CFG_FILE, obj, context=__name__)
 
 
 cfg: dict = _load_cfg()

@@ -120,7 +120,7 @@ dkp_transactions: dict = _load_json(DKP_TX_FILE, {})
 dkp_event_checks: dict = _load_json(DKP_CHECK_FILE, {})
 
 # Phase 3.2 Schutz: Postgres-EC darf nur aktive Gildenmitglieder spiegeln.
-# JSON bleibt weiterhin Backup/Fallback und kann historische/alte Accounts enthalten.
+# Legacy-Dateien bleiben nur für lokalen Betrieb/Import; produktiver Runtime-State liegt in PostgreSQL.
 PHASE3_ACTIVE_MEMBER_IDS_BY_GUILD: dict[str, set[str]] = {}
 
 
@@ -632,7 +632,7 @@ def _add_transaction(
         try:
             _phase3_upsert_ec_change(tx)
         except Exception as exc:
-            # JSON bleibt produktive Quelle; der nächste Vollabgleich repariert die Spiegelung.
+            # Runtime-Dokument in PostgreSQL bleibt Quelle; der nächste Vollabgleich repariert die relationale Spiegelung.
             print(f"[phase3-ec] Inkrementelle EC-Spiegelung fehlgeschlagen: {exc!r}", flush=True)
 
         if str(tx_type) in {"event_award", "manual_adjust", "starting_balance", "loot_auction", "loot_sale", "weekly_decay"} or int(actual_amount) != 0:
@@ -876,7 +876,8 @@ def _signup_label(signup: str) -> str:
     signup = str(signup or "")
     return {
         "TANK": "Tank",
-        "HEAL": "Heal",
+        "SUPPORT": "Support",
+        "HEAL": "Support",
         "DPS": "DPS",
         "BANK": "Reserve",
         "MANUAL": "nachgetragen",
@@ -1930,7 +1931,7 @@ def _phase3_ec_enabled() -> bool:
 
 
 def _ensure_phase3_ec_schema() -> None:
-    """Phase 3.2: EC/DKP-Tabellen vorbereiten. JSON bleibt Hauptquelle."""
+    """Phase 3.2: EC/DKP-Tabellen vorbereiten; Runtime-State liegt produktiv in PostgreSQL."""
     if not _phase3_ec_enabled():
         return
     conn = _dash_pg_connect()
@@ -2210,7 +2211,7 @@ def _phase3_mirror_ec_balances_to_pg() -> dict:
                     """, (str(gid), uid_s, balance, _phase3_jsonb(raw)))
                     count += 1
                 # Wichtig: alte/ausgetretene Accounts aus Phase-3-Postgres entfernen.
-                # JSON bleibt Backup/Fallback, aber DB-Phase3 soll nur aktuelle Gildenmitglieder zählen.
+                # Legacy-Daten bleiben für Import/Recovery, aber Phase 3 zählt nur aktuelle Gildenmitglieder.
                 if active_ids:
                     cur.execute(
                         "DELETE FROM phase3_ec_balances WHERE guild_id = %s AND NOT (user_id = ANY(%s::text[]))",
@@ -2275,7 +2276,7 @@ def _phase3_mirror_ec_transactions_to_pg() -> dict:
                     ))
                     count += 1
                 # Auch alte Transaktionen aus Phase-3-Postgres entfernen, wenn der User nicht mehr aktuelles Gildenmitglied ist.
-                # JSON bleibt vollständiges Backup.
+                # Der kanonische Runtime-State bleibt im PostgreSQL-Runtime-Dokument erhalten.
                 if active_ids:
                     cur.execute(
                         "DELETE FROM phase3_ec_transactions WHERE guild_id = %s AND (user_id IS NULL OR user_id = '' OR NOT (user_id = ANY(%s::text[])))",
@@ -2842,11 +2843,12 @@ def _dashboard_status_to_bot(value: object) -> str:
 def _dashboard_signup_to_bot(value: object) -> str:
     signup = str(value or "DPS").strip().upper()
     aliases = {
-        "HEALER": "HEAL",
+        "HEALER": "SUPPORT",
         "RESERVE": "BANK",
         "BANK": "BANK",
         "TANK": "TANK",
-        "HEAL": "HEAL",
+        "HEAL": "SUPPORT",
+        "SUPPORT": "SUPPORT",
         "DPS": "DPS",
     }
     return aliases.get(signup, "DPS")
@@ -4123,12 +4125,12 @@ async def setup_dkp_system(client: discord.Client, tree: app_commands.CommandTre
         lines = [
             "🧱 **Phase 3.2 · EC/DKP Postgres**",
             f"Aktive Gildenmitglieder erkannt: **{js.get('active_members', 0)}**",
-            f"EC-Konten: aktuelle Mitglieder JSON **{js.get('balances', 0)}** · DB **{pg.get('phase3_ec_balances', 0)}**",
-            f"EC-Verlauf: aktuelle Mitglieder JSON **{js.get('transactions', 0)}** · DB **{pg.get('phase3_ec_transactions', 0)}**",
+            f"EC-Konten: Runtime-State **{js.get('balances', 0)}** · DB **{pg.get('phase3_ec_balances', 0)}**",
+            f"EC-Verlauf: Runtime-State **{js.get('transactions', 0)}** · DB **{pg.get('phase3_ec_transactions', 0)}**",
             f"Ausgefiltert: Konten **{js.get('inactive_balances', 0)}** · Verlauf **{js.get('inactive_transactions', 0)}**",
-            f"Eventchecks: JSON **{js.get('checks', 0)}** · DB **{pg.get('phase3_ec_event_checks', 0)}**",
+            f"Eventchecks: Runtime-State **{js.get('checks', 0)}** · DB **{pg.get('phase3_ec_event_checks', 0)}**",
             "",
-            "Dashboard liest EC/DKP Postgres-first. JSON bleibt Bot-Sicherheitskopie/Backup.",
+            "Dashboard liest EC/DKP Postgres-first. Runtime-Dokumente und relationale Tabellen liegen gemeinsam in PostgreSQL.",
         ]
         await inter.followup.send("\n".join(lines), ephemeral=True)
 

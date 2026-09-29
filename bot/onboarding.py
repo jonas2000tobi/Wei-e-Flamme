@@ -25,6 +25,11 @@ except Exception:
     import runtime_db  # type: ignore
 
 try:
+    from bot.aion2_game import AION2_CLASS_META, AION2_CLASSES, AION2_FACTIONS, role_for_class as _aion2_role_for_class, role_label as _aion2_role_label, normalize_class as _aion2_normalize_class, normalize_faction as _aion2_normalize_faction  # type: ignore
+except Exception:
+    from aion2_game import AION2_CLASS_META, AION2_CLASSES, AION2_FACTIONS, role_for_class as _aion2_role_for_class, role_label as _aion2_role_label, normalize_class as _aion2_normalize_class, normalize_faction as _aion2_normalize_faction  # type: ignore
+
+try:
     from guild_modules import DEFAULT_ONBOARDING_WELCOME_SLOGANS
 except Exception:
     DEFAULT_ONBOARDING_WELCOME_SLOGANS = (
@@ -52,7 +57,7 @@ APPLICATION_STATE_FILE = DATA_DIR / "onboarding_application_channels.json"
 #   "review_channel": int,
 #   "require_review": bool,
 #   "category_roles": {"guild": int, "ally": int, "friend": int, "applicant": int},
-#   "primary_roles":  {"TANK": int, "HEAL": int, "DPS": int},
+#   "primary_roles":  {"TANK": int, "SUPPORT": int, "DPS": int},
 #   "experience_roles": {"experienced": int, "newbie": int}
 # }
 
@@ -325,7 +330,7 @@ def _onboarding_labels(category: str | None, primary: str | None, experienced: b
         "friend": "Freund",
         "applicant": "Bewerber",
     }.get(str(category or ""), "—")
-    primary_txt = {"TANK": "Tank", "HEAL": "Heal", "DPS": "DPS"}.get(str(primary or "").upper(), "—")
+    primary_txt = {"TANK": "Tank", "SUPPORT": "Support", "HEAL": "Support", "HEALER": "Support", "DPS": "DPS"}.get(str(primary or "").upper(), "—")
     experience_txt = "—" if experienced is None else ("Erfahren" if bool(experienced) else "Unerfahren")
     return category_txt, primary_txt, experience_txt
 
@@ -522,8 +527,19 @@ def _gcfg(guild: discord.Guild) -> dict:
     c.setdefault("require_review", False)
     c.setdefault("category_roles", {})
     c.setdefault("primary_roles", {})
+    prim = c.get("primary_roles") if isinstance(c.get("primary_roles"), dict) else {}
+    migrated_roles = False
+    if not prim.get("SUPPORT") and prim.get("HEAL"):
+        prim["SUPPORT"] = prim.get("HEAL")
+        migrated_roles = True
+    if "HEAL" in prim:
+        prim.pop("HEAL", None)
+        migrated_roles = True
+    c["primary_roles"] = prim
     c.setdefault("experience_roles", {})
     cfg[str(guild.id)] = c
+    if migrated_roles:
+        _save_cfg(cfg)
     return c
 
 def _role(guild: discord.Guild, rid: int | None) -> Optional[discord.Role]:
@@ -620,24 +636,6 @@ def _review_channel(guild: discord.Guild) -> Optional[discord.abc.Messageable]:
     return ch if isinstance(ch, (discord.TextChannel, discord.Thread)) else None
 
 
-AION2_CLASS_META = {
-    # Deutsch im Bot, englischer Emoji-Name auf Discord.
-    "Templer": ("Templar", "TANK", "Templar"),
-    "Gladiator": ("Gladiator", "DPS", "Gladiator"),
-    "Assassine": ("Assassin", "DPS", "Assassin"),
-    "Jäger": ("Ranger", "DPS", "Ranger"),
-    "Zauberer": ("Sorcerer", "DPS", "Sorcerer"),
-    "Geisterbeschwörer": ("Elementalist", "DPS", "Elementalist"),
-    "Kleriker": ("Cleric", "HEAL", "Cleric"),
-    "Kantor": ("Chanter", "SUPPORT", "Chanter"),
-}
-AION2_CLASSES = tuple(AION2_CLASS_META.keys())
-AION2_FACTIONS = {
-    "ELYOS": ("Elyos", "Elyos"),
-    "ASMODIA": ("Asmodia", "Asmodia"),
-}
-
-
 def _guild_custom_emoji(guild: discord.Guild | None, *names: str):
     """Findet ein Server-Emoji case-insensitive; bei fehlendem Emoji bleibt die UI nutzbar."""
     if guild is None:
@@ -647,10 +645,6 @@ def _guild_custom_emoji(guild: discord.Guild | None, *names: str):
         if str(getattr(emoji, "name", "") or "").casefold() in wanted:
             return emoji
     return None
-
-
-def _aion2_role_for_class(class_name: str | None) -> str:
-    return str((AION2_CLASS_META.get(str(class_name or "")) or ("", "", ""))[1])
 
 
 def _aion2_enabled(guild_id:int)->bool:
@@ -835,9 +829,9 @@ class PrimaryView(OnboardingFeatureView):
     async def btn_tank(self, inter: discord.Interaction, _):
         await self._next(inter, "TANK")
 
-    @button(label="💚 Heal", style=ButtonStyle.secondary, custom_id="onboarding_primary_heal")
+    @button(label="🎵 Support", style=ButtonStyle.secondary, custom_id="onboarding_primary_heal")
     async def btn_heal(self, inter: discord.Interaction, _):
-        await self._next(inter, "HEAL")
+        await self._next(inter, "SUPPORT")
 
     @button(label="🗡️ DPS", style=ButtonStyle.secondary, custom_id="onboarding_primary_dps")
     async def btn_dps(self, inter: discord.Interaction, _):
@@ -895,7 +889,7 @@ class Aion2FactionView(OnboardingFeatureView):
 class Aion2ClassSelect(Select):
     def __init__(self, ctx: StepContext, guild: discord.Guild | None = None):
         self.ctx = ctx
-        labels = {"TANK":"Tank", "HEAL":"Heiler", "DPS":"DPS", "SUPPORT":"Support"}
+        labels = {"TANK":"Tank", "HEAL":"Support", "HEALER":"Support", "DPS":"DPS", "SUPPORT":"Support"}
         opts = []
         for name in AION2_CLASSES:
             en, role, emoji_name = AION2_CLASS_META[name]
@@ -1122,7 +1116,8 @@ class ExperienceView(OnboardingFeatureView):
 
             pri_txt = {
                 "TANK": "Tank",
-                "HEAL": "Heal",
+                "HEAL": "Support",
+                "HEALER": "Support",
                 "DPS": "DPS",
                 "SUPPORT": "Support",
             }.get(self.ctx.primary, "—")
@@ -1389,26 +1384,24 @@ async def setup_onboarding(client: discord.Client, tree: app_commands.CommandTre
             ephemeral=True
         )
 
-    @onboarding_group.command(name="set_primaries", description="(Admin) Primärrollen für Tank/Heal/DPS/Support setzen")
+    @onboarding_group.command(name="set_primaries", description="(Admin) Primärrollen für Tank/Support/DPS setzen")
     async def onboarding_set_primaries(
         inter: discord.Interaction,
         tank: discord.Role,
-        heal: discord.Role,
+        support: discord.Role,
         dps: discord.Role,
-        support: Optional[discord.Role] = None
     ):
         if not _is_admin(inter):
             await inter.response.send_message("Nur Admins.", ephemeral=True)
             return
 
         c = _gcfg(inter.guild)
-        c["primary_roles"] = {"TANK": tank.id, "HEAL": heal.id, "DPS": dps.id, "SUPPORT": int(support.id) if support else int((c.get("primary_roles") or {}).get("SUPPORT") or 0)}
+        c["primary_roles"] = {"TANK": tank.id, "SUPPORT": support.id, "DPS": dps.id}
         cfg[str(inter.guild_id)] = c
         _save_cfg(cfg)
 
-        support_line = f"\n• 🎵 {support.mention}" if support else "\n• 🎵 Support: keine Discord-Rolle (optional)"
         await inter.response.send_message(
-            f"✅ Primärrollen gesetzt:\n• 🛡️ {tank.mention}\n• 💚 {heal.mention}\n• 🗡️ {dps.mention}{support_line}",
+            f"✅ Primärrollen gesetzt:\n• 🛡️ {tank.mention}\n• 🎵 {support.mention}\n• 🗡️ {dps.mention}",
             ephemeral=True
         )
 
@@ -1561,9 +1554,8 @@ async def setup_onboarding(client: discord.Client, tree: app_commands.CommandTre
             f"• Bewerber: {_m(cat.get('applicant'))}\n\n"
             f"**Primärrollen**\n"
             f"• 🛡️ {_m(pri.get('TANK'))}\n"
-            f"• 💚 {_m(pri.get('HEAL'))}\n"
-            f"• 🗡️ {_m(pri.get('DPS'))}\n"
-            f"• 🎵 Support: {_m(pri.get('SUPPORT'))}\n\n"
+            f"• 🎵 {_m(pri.get('SUPPORT') or pri.get('HEAL'))}\n"
+            f"• 🗡️ {_m(pri.get('DPS'))}\n\n"
             f"**Aion 2:** {'aktiv' if _aion2_enabled(inter.guild_id) else 'inaktiv'}\n\n"
             f"**Erfahrung**\n"
             f"• 🧠 {_m(exp.get('experienced'))}\n"

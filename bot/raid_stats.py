@@ -138,7 +138,7 @@ def _voters_set(obj: dict) -> set[int]:
     voted: set[int] = set()
 
     yes = obj.get("yes") or {}
-    for key in ("TANK", "HEAL", "DPS", "BANK"):
+    for key in ("TANK", "SUPPORT", "DPS", "BANK"):
         for entry in yes.get(key, []) or []:
             uid = _entry_user_id(entry)
             if uid:

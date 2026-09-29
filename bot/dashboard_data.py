@@ -13,6 +13,11 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 try:
+    from bot.json_store import load_json_file  # type: ignore
+except Exception:  # pragma: no cover
+    from json_store import load_json_file  # type: ignore
+
+try:
     from bot import runtime_db  # type: ignore
 except Exception:  # pragma: no cover - root fallback for old starts
     import runtime_db  # type: ignore
@@ -433,20 +438,42 @@ def _active_member_ids(guild: discord.Guild) -> set[int]:
 
 def _load_json_file(name: str, default: Any) -> Any:
     path = DATA_DIR / name
-    if not path.exists():
-        return default
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        return load_json_file(path, default, context=f"{__name__}.snapshot", check_type=False)
     except Exception as exc:
         return {"__dashboard_error__": f"{type(exc).__name__}: {exc}"}
 
 
 def _source_health() -> dict[str, dict[str, Any]]:
     out: dict[str, dict[str, Any]] = {}
+    database_mode = bool(str(os.getenv("DATABASE_URL") or "").strip())
     for key, filename in JSON_SOURCES.items():
         path = DATA_DIR / filename
+        if database_mode:
+            try:
+                sentinel = {"__missing_runtime_document__": True}
+                value = runtime_db.get_runtime_document("json_store", f"data/{filename}", sentinel)
+                exists = value is not sentinel and value != sentinel
+                payload = json.dumps(value, ensure_ascii=False) if exists else ""
+                out[key] = {
+                    "file": filename,
+                    "exists": bool(exists),
+                    "ok": True,
+                    "size_bytes": len(payload.encode("utf-8")),
+                    "backend": "postgres",
+                }
+            except Exception as exc:
+                out[key] = {
+                    "file": filename,
+                    "exists": False,
+                    "ok": False,
+                    "size_bytes": 0,
+                    "backend": "postgres",
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            continue
         if not path.exists():
-            out[key] = {"file": filename, "exists": False, "ok": True, "size_bytes": 0}
+            out[key] = {"file": filename, "exists": False, "ok": True, "size_bytes": 0, "backend": "file"}
             continue
         try:
             json.loads(path.read_text(encoding="utf-8"))
@@ -455,14 +482,10 @@ def _source_health() -> dict[str, dict[str, Any]]:
         except Exception as exc:
             ok = False
             error = f"{type(exc).__name__}: {exc}"
-        out[key] = {
-            "file": filename,
-            "exists": True,
-            "ok": ok,
-            "error": error,
-            "size_bytes": path.stat().st_size,
-            "modified_at": datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat(),
-        }
+        row = {"file": filename, "exists": True, "ok": ok, "size_bytes": path.stat().st_size, "backend": "file"}
+        if error:
+            row["error"] = error
+        out[key] = row
     return out
 
 
@@ -2266,8 +2289,8 @@ def build_dashboard_snapshot(bot: commands.Bot, guild: discord.Guild) -> dict[st
 def publish_dashboard_snapshot(bot: commands.Bot, guild: discord.Guild) -> int:
     """Schreibt den aktuellen read-only Snapshot in Postgres/Runtime-DB.
 
-    Der separate Web-Service liest genau diese Tabelle. Produktive Bot-Daten werden
-    nicht verändert; die JSON-Dateien bleiben weiterhin Quelle der alten Systeme.
+    Der separate Web-Service liest genau diese Tabelle. Produktiver Runtime-State
+    liegt mit DATABASE_URL in PostgreSQL; der Snapshot ist nur ein Read-Model.
     """
     snapshot = build_dashboard_snapshot(bot, guild)
     return int(runtime_db.save_dashboard_snapshot(guild_id=int(guild.id), guild_name=str(((snapshot.get("guild") or {}).get("name") or guild.name)), snapshot=snapshot) or 0)
@@ -2594,10 +2617,10 @@ async def setup_dashboard_data(bot: commands.Bot, tree: app_commands.CommandTree
         except Exception as exc:
             pub_txt = f"Fehler: {type(exc).__name__}"
         emb.add_field(name="Web-Dashboard", value=pub_txt, inline=True)
-        emb.add_field(name="JSON-Quellen", value=f"OK: {len(snap.get('source_health', {})) - len(bad_sources)}\nFehler: {len(bad_sources)}\nFehlen: {len(missing_sources)}", inline=True)
+        emb.add_field(name="Runtime-Quellen", value=f"OK: {len(snap.get('source_health', {})) - len(bad_sources)}\nFehler: {len(bad_sources)}\nFehlen: {len(missing_sources)}", inline=True)
         if bad_sources:
             emb.add_field(name="Fehlerhafte Quellen", value="\n".join(f"• {x}" for x in bad_sources[:10]), inline=False)
-        emb.set_footer(text="Dashboard ist read-only. Alte JSON-Daten werden nur gefiltert, nicht gelöscht.")
+        emb.set_footer(text="Dashboard ist read-only. Produktiver Runtime-State liegt in PostgreSQL; Legacy-Dateien werden nicht überschrieben.")
         await inter.followup.send(embed=emb, ephemeral=True)
 
     @dashboard_group.command(name="export", description="Erstellt einen read-only JSON-Export für das spätere Dashboard.")
@@ -2620,7 +2643,7 @@ async def setup_dashboard_data(bot: commands.Bot, tree: app_commands.CommandTree
         except Exception as exc:
             await inter.followup.send(f"❌ Dashboard-Export fehlgeschlagen: `{type(exc).__name__}: {exc}`", ephemeral=True)
 
-    @dashboard_group.command(name="sources", description="Zeigt, welche JSON-Quellen fürs Dashboard gefunden werden.")
+    @dashboard_group.command(name="sources", description="Zeigt, welche Runtime-Quellen fürs Dashboard gefunden werden.")
     async def dashboard_sources(inter: discord.Interaction):
         if inter.guild is None:
             await inter.response.send_message("❌ Nur im Server nutzbar.", ephemeral=True)

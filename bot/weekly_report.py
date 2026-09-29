@@ -129,7 +129,7 @@ def _event_voters(obj: dict) -> set[int]:
 
     yes = obj.get("yes") or {}
 
-    for key in ("TANK", "HEAL", "DPS", "BANK"):
+    for key in ("TANK", "SUPPORT", "DPS", "BANK"):
         for e in yes.get(key, []) or []:
             uid = uid_from(e)
             if uid:
