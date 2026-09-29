@@ -3252,11 +3252,13 @@ def _render_admin_center_dashboard(data: dict[str, Any]) -> str:
 
 
 def _card(title: str, value: Any, sub: str = "") -> str:
+    # _raw(...) is used deliberately for trusted UI fragments such as local
+    # Aion-2 class/faction icons. Ordinary values remain HTML-escaped.
     return f"""
     <div class="card">
       <div class="card-title">{_e(title)}</div>
-      <div class="card-value">{_e(value)}</div>
-      <div class="card-sub">{_e(sub)}</div>
+      <div class="card-value">{_cell(value)}</div>
+      <div class="card-sub">{_cell(sub)}</div>
     </div>
     """
 
@@ -11838,7 +11840,8 @@ def _ensure_v211_tables() -> None:
             cur.execute('''CREATE TABLE IF NOT EXISTS member_activity_daily (guild_id BIGINT NOT NULL,user_id BIGINT NOT NULL,activity_date DATE NOT NULL,messages INTEGER NOT NULL DEFAULT 0,reactions_given INTEGER NOT NULL DEFAULT 0,reactions_received INTEGER NOT NULL DEFAULT 0,event_responses INTEGER NOT NULL DEFAULT 0,last_activity_at TIMESTAMPTZ,PRIMARY KEY(guild_id,user_id,activity_date))''')
             cur.execute('''CREATE TABLE IF NOT EXISTS event_rsvp_transitions (id BIGSERIAL PRIMARY KEY,guild_id BIGINT NOT NULL,user_id BIGINT NOT NULL,event_id TEXT NOT NULL,old_choice TEXT NOT NULL DEFAULT '',new_choice TEXT NOT NULL DEFAULT '',changed_at TIMESTAMPTZ NOT NULL)''')
             cur.execute('''CREATE TABLE IF NOT EXISTS member_membership (guild_id BIGINT NOT NULL,user_id BIGINT NOT NULL,member_since TIMESTAMPTZ,source TEXT NOT NULL DEFAULT 'discord_join',updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),PRIMARY KEY(guild_id,user_id))''')
-            cur.execute('''CREATE TABLE IF NOT EXISTS aion2_profiles (guild_id BIGINT NOT NULL,user_id BIGINT NOT NULL,character_name TEXT NOT NULL DEFAULT '',class_name TEXT NOT NULL DEFAULT '',main_role TEXT NOT NULL DEFAULT '',level INTEGER,gearscore TEXT NOT NULL DEFAULT '',updated_at TEXT NOT NULL,PRIMARY KEY(guild_id,user_id))''')
+            cur.execute('''CREATE TABLE IF NOT EXISTS aion2_profiles (guild_id BIGINT NOT NULL,user_id BIGINT NOT NULL,character_name TEXT NOT NULL DEFAULT '',class_name TEXT NOT NULL DEFAULT '',main_role TEXT NOT NULL DEFAULT '',faction TEXT NOT NULL DEFAULT '',level INTEGER,gearscore TEXT NOT NULL DEFAULT '',updated_at TEXT NOT NULL,PRIMARY KEY(guild_id,user_id))''')
+            cur.execute("ALTER TABLE aion2_profiles ADD COLUMN IF NOT EXISTS faction TEXT NOT NULL DEFAULT ''")
             cur.execute('''CREATE TABLE IF NOT EXISTS leader_tickets (id BIGSERIAL PRIMARY KEY,guild_id BIGINT NOT NULL,creator_user_id BIGINT,creator_name TEXT NOT NULL DEFAULT '',anonymous BOOLEAN NOT NULL DEFAULT FALSE,subject TEXT NOT NULL DEFAULT '',original_message TEXT NOT NULL DEFAULT '',status TEXT NOT NULL DEFAULT 'open',assigned_to_id BIGINT,assigned_to_name TEXT NOT NULL DEFAULT '',discord_internal_channel_id BIGINT,discord_internal_message_id BIGINT,ticket_channel_id BIGINT,created_at TEXT NOT NULL,claimed_at TEXT,closed_at TEXT,closed_by_id BIGINT,closed_by_name TEXT NOT NULL DEFAULT '')''')
             cur.execute('''CREATE TABLE IF NOT EXISTS leader_ticket_messages (id BIGSERIAL PRIMARY KEY,ticket_id BIGINT NOT NULL,guild_id BIGINT NOT NULL,discord_message_id BIGINT,author_id BIGINT,author_name TEXT NOT NULL DEFAULT '',content TEXT NOT NULL DEFAULT '',attachments_json TEXT NOT NULL DEFAULT '[]',created_at TEXT NOT NULL)''')
             cur.execute('''CREATE TABLE IF NOT EXISTS leader_ticket_notes (id BIGSERIAL PRIMARY KEY,ticket_id BIGINT NOT NULL,guild_id BIGINT NOT NULL,author_id BIGINT,author_name TEXT NOT NULL DEFAULT '',content TEXT NOT NULL DEFAULT '',created_at TEXT NOT NULL)''')
@@ -11916,16 +11919,25 @@ def _member_activity_panel(data:dict[str,Any],user_id:int,current_user:Optional[
     return f'''<section class="panel" id="activity"><h2>📈 Aktivität & Rückmeldungen</h2><p class="muted">Keine Attendance-Auswertung: angezeigt werden Event-Rückmeldungen und Discord-Aktivität.</p><div class="grid">{pcards}</div>{_table(['Zeitraum','Aktive Tage','Nachrichten','Reaktionen vergeben','Reaktionen erhalten'],rows,searchable=False)}<div class="grid">{_card('Voice gesamt',f'{round(seconds/3600,1)} h',f'{sessions} Sessions')}{_card('Ø Voice-Session',f'{avg} min','seit Erfassung')}{_card('Letzte Aktivität',_dt(total.get('last_activity')),'Discord-Aktivität')}{_card('Gildenmitglied seit',_dt(d.get('member_since')),'erfasster Beginn')}</div></section>'''
 
 AION2_CLASS_META = {
-    "Templer": {"en": "Templar", "role": "TANK", "icon": "TP"},
-    "Gladiator": {"en": "Gladiator", "role": "DPS", "icon": "GL"},
-    "Assassine": {"en": "Assassin", "role": "DPS", "icon": "AS"},
-    "Jäger": {"en": "Ranger", "role": "DPS", "icon": "JG"},
-    "Zauberer": {"en": "Sorcerer", "role": "DPS", "icon": "ZA"},
-    "Geisterbeschwörer": {"en": "Spirit Master", "role": "DPS", "icon": "GB"},
-    "Kleriker": {"en": "Cleric", "role": "HEAL", "icon": "KL"},
-    "Kantor": {"en": "Chanter", "role": "SUPPORT", "icon": "KA"},
+    "Templer": {"en": "Templar", "role": "TANK", "emoji": "Templar", "asset": "aion2/templar.png"},
+    "Gladiator": {"en": "Gladiator", "role": "DPS", "emoji": "Gladiator", "asset": "aion2/gladiator.png"},
+    "Assassine": {"en": "Assassin", "role": "DPS", "emoji": "Assassin", "asset": "aion2/assassin.png"},
+    "Jäger": {"en": "Ranger", "role": "DPS", "emoji": "Ranger", "asset": "aion2/ranger.png"},
+    "Zauberer": {"en": "Sorcerer", "role": "DPS", "emoji": "Sorcerer", "asset": "aion2/sorcerer.png"},
+    "Geisterbeschwörer": {"en": "Elementalist", "role": "DPS", "emoji": "Elementalist", "asset": "aion2/elementalist.png"},
+    "Kleriker": {"en": "Cleric", "role": "HEAL", "emoji": "Cleric", "asset": "aion2/cleric.png"},
+    "Kantor": {"en": "Chanter", "role": "SUPPORT", "emoji": "Chanter", "asset": "aion2/chanter.png"},
 }
-AION2_CLASS_ALIASES = {"Beschwörer": "Geisterbeschwörer", "Spiritmaster": "Geisterbeschwörer", "Spirit Master": "Geisterbeschwörer"}
+AION2_CLASS_ALIASES = {
+    "Beschwörer": "Geisterbeschwörer",
+    "Spiritmaster": "Geisterbeschwörer",
+    "Spirit Master": "Geisterbeschwörer",
+    "Elementalist": "Geisterbeschwörer",
+}
+AION2_FACTION_META = {
+    "ELYOS": {"label": "Elyos", "asset": "aion2/elyos.png"},
+    "ASMODIA": {"label": "Asmodia", "asset": "aion2/asmodia.png"},
+}
 
 def _aion2_normalize_class(value: Any) -> str:
     raw = re.sub(r"\s+", " ", str(value or "").strip())
@@ -11946,6 +11958,37 @@ def _aion2_role_for_class(value: Any) -> str:
 def _aion2_role_label(value: Any) -> str:
     return {"TANK":"Tank","HEAL":"Heiler","DPS":"DPS","SUPPORT":"Support"}.get(str(value or "").upper(), str(value or "—"))
 
+def _aion2_normalize_faction(value: Any) -> str:
+    raw = str(value or "").strip().upper()
+    aliases = {"ASMODIAN": "ASMODIA", "ASMODIANS": "ASMODIA", "ASMODIER": "ASMODIA"}
+    raw = aliases.get(raw, raw)
+    return raw if raw in AION2_FACTION_META else ""
+
+def _aion2_class_icon_url(value: Any) -> str:
+    name = _aion2_normalize_class(value)
+    asset = str((AION2_CLASS_META.get(name) or {}).get("asset") or "")
+    return _asset(asset) if asset else ""
+
+def _aion2_class_display_html(value: Any, *, with_name: bool = True) -> str:
+    name = _aion2_normalize_class(value)
+    if not name:
+        return "—"
+    meta = AION2_CLASS_META.get(name) or {}
+    url = _aion2_class_icon_url(name)
+    title = f"{name} ({meta.get('en') or ''})".strip()
+    img = f'<img src="{_e(url)}" alt="{_e(name)}" title="{_e(title)}" style="width:34px;height:34px;object-fit:contain;vertical-align:middle">' if url else ""
+    return _raw(img + (f' <span>{_e(name)}</span>' if with_name else ""))
+
+def _aion2_faction_display_html(value: Any, *, with_name: bool = True) -> str:
+    key = _aion2_normalize_faction(value)
+    if not key:
+        return "—"
+    meta = AION2_FACTION_META[key]
+    url = _asset(str(meta.get("asset") or ""))
+    label = str(meta.get("label") or key)
+    img = f'<img src="{_e(url)}" alt="{_e(label)}" title="{_e(label)}" style="width:34px;height:34px;object-fit:contain;vertical-align:middle">'
+    return _raw(img + (f' <span>{_e(label)}</span>' if with_name else ""))
+
 def _aion2_profiles_for_users(guild_id: int, user_ids: list[int]) -> dict[int, dict[str, Any]]:
     ids = sorted({int(x) for x in user_ids if int(x or 0) > 0})
     if not guild_id or not ids or not _database_url():
@@ -11964,14 +12007,16 @@ def _aion2_profile_panel(data:dict[str,Any],user_id:int,current_user:Optional[di
     if not a and not bool(_dashboard_module_setting_value(gid,'onboarding','aion2_enabled',False)): return ''
     admin=bool(current_user and str(current_user.get('role') or '')=='admin')
     cls=_aion2_normalize_class(a.get('class_name')) or str(a.get('class_name') or '')
+    faction=_aion2_normalize_faction(a.get('faction'))
     role=_aion2_role_for_class(cls) or str(a.get('main_role') or '')
-    meta=AION2_CLASS_META.get(cls) or {}
-    class_display=(f"{cls} ({meta.get('en')})" if cls and meta.get('en') else (cls or '—'))
-    view=f'''<div class="grid">{_card('Charakter',a.get('character_name') or '—','Aion 2')}{_card('Klasse',class_display,'Aion 2')}{_card('Rolle',_aion2_role_label(role),'aus Klasse')}{_card('Level',a.get('level') or '—','Profil')}{_card('Gearscore',a.get('gearscore') or '—','Profil')}</div>'''
+    class_display=_aion2_class_display_html(cls, with_name=True)
+    faction_display=_aion2_faction_display_html(faction, with_name=True)
+    view=f'''<div class="grid">{_card('Charakter',a.get('character_name') or '—','Aion 2')}{_card('Fraktion',faction_display,'Aion 2')}{_card('Klasse',class_display,'Aion 2')}{_card('Rolle',_aion2_role_label(role),'aus Klasse')}{_card('Level',a.get('level') or '—','Profil')}{_card('Gearscore',a.get('gearscore') or '—','Profil')}</div>'''
     form=''
     if admin:
         opts='<option value="">— Klasse wählen —</option>'+''.join(f'<option value="{_e(c)}"'+(' selected' if cls==c else '')+f'>{_e(c)} ({_e(m["en"])}) · {_e(_aion2_role_label(m["role"]))}</option>' for c,m in AION2_CLASS_META.items())
-        form=f'''<form method="post" action="/admin/member/{user_id}/aion2" class="settings-form"><label>Charaktername<br><input name="character_name" value="{_e(a.get('character_name') or '')}" maxlength="120"></label><label>Klasse<br><select name="class_name">{opts}</select></label><label>Rolle<br><input value="{_e(_aion2_role_label(role))}" disabled><small class="muted">Wird automatisch aus der Aion-2-Klasse gesetzt.</small></label><label>Level<br><input type="number" min="1" name="level" value="{_e(a.get('level') or '')}"></label><label>Gearscore<br><input name="gearscore" value="{_e(a.get('gearscore') or '')}" maxlength="40"></label><button class="btn" type="submit">Aion-2-Profil speichern</button></form>'''
+        faction_opts='<option value="">— Fraktion wählen —</option>'+''.join(f'<option value="{_e(k)}"'+(' selected' if faction==k else '')+f'>{_e(v["label"])}</option>' for k,v in AION2_FACTION_META.items())
+        form=f'''<form method="post" action="/admin/member/{user_id}/aion2" class="settings-form"><label>Charaktername<br><input name="character_name" value="{_e(a.get('character_name') or '')}" maxlength="120"></label><label>Fraktion<br><select name="faction">{faction_opts}</select></label><label>Klasse<br><select name="class_name">{opts}</select></label><label>Rolle<br><input value="{_e(_aion2_role_label(role))}" disabled><small class="muted">Wird automatisch aus der Aion-2-Klasse gesetzt.</small></label><label>Level<br><input type="number" min="1" name="level" value="{_e(a.get('level') or '')}"></label><label>Gearscore<br><input name="gearscore" value="{_e(a.get('gearscore') or '')}" maxlength="40"></label><button class="btn" type="submit">Aion-2-Profil speichern</button></form>'''
     return f'<section class="panel" id="aion2"><h2>🎮 Aion 2</h2>{view}{form}</section>'
 
 def _ticket_rows(guild_id:int,search:str='')->list[dict[str,Any]]:
@@ -13821,59 +13866,43 @@ def _member_home_auction_rows(auctions: list[dict[str, Any]], snap: dict[str, An
 def _aion2_home_map_panel(guild_id: int) -> str:
     """Aion-2-Livekarte auf der Startseite.
 
-    Die Fremdseite wird direkt eingebettet. Ob Fextralife Iframes zulässt,
-    entscheidet deren aktuelle X-Frame/CSP-Konfiguration im Browser.
+    Fextralife blockiert die Einbettung im Browser. Das Dashboard nutzt daher
+    denselben iframe-tauglichen Kartenanbieter, der bereits für T&L vorhanden ist.
     """
     if not bool(_dashboard_module_setting_value(guild_id, "onboarding", "aion2_enabled", False)):
         return ""
-    base = "https://aion2.wiki.fextralife.com/Interactive_Map"
-    maps = [
-        ("Verteron", base + "?map=Verteron"),
-        ("Altgard", base + "?map=Altgard"),
-        ("Abyss", base + "?map=Abyss"),
-    ]
-    buttons = "".join(
-        f'<button type="button" class="aion-map-tab{" active" if i == 0 else ""}" data-map-src="{_e(url)}">{_e(label)}</button>'
-        for i, (label, url) in enumerate(maps)
-    )
+    direct_url = "https://interactivemap.app/aion2/maps/verteron"
+    embed_url = direct_url + "?embed=light"
     return f"""
     <section class="panel aion-home-map" id="aion2-map">
       <div class="aion-map-head">
         <div>
           <div class="eyebrow">Aion 2</div>
           <h2>🗺️ Interaktive Karte</h2>
-          <p class="muted">Live eingebettete Fextralife-Karte. Die erste Karte wird standardmäßig geladen.</p>
+          <p class="muted">Live-Karte von IMapp. Gebiete und Marker können direkt in der Karte gewechselt werden.</p>
         </div>
-        <a class="btn secondary" href="{_e(base)}" target="_blank" rel="noopener noreferrer">Extern öffnen ↗</a>
+        <a class="btn secondary" href="{_e(direct_url)}" target="_blank" rel="noopener noreferrer">Karte groß öffnen ↗</a>
       </div>
-      <div class="aion-map-tabs">{buttons}</div>
       <div class="aion-map-frame-wrap">
-        <div class="aion-map-fallback">Falls die Karte leer bleibt, blockiert Fextralife aktuell die Einbettung. Dann bitte „Extern öffnen“ verwenden.</div>
-        <iframe id="aion-map-frame" src="{_e(maps[0][1])}" title="Aion 2 Interactive Map" loading="lazy" referrerpolicy="no-referrer-when-downgrade" allow="fullscreen"></iframe>
+        <div id="aion-map-loader" class="aion-map-fallback">🗺️ Aion-2-Karte wird geladen …</div>
+        <iframe id="aion-map-frame" src="{_e(embed_url)}" title="Aion 2 Interactive Map" loading="lazy" referrerpolicy="no-referrer-when-downgrade" allow="fullscreen"></iframe>
       </div>
     </section>
     <style>
       .aion-home-map{{margin:18px 0}}
-      .aion-map-head{{display:flex;justify-content:space-between;gap:16px;align-items:center;flex-wrap:wrap}}
+      .aion-map-head{{display:flex;justify-content:space-between;gap:16px;align-items:center;flex-wrap:wrap;margin-bottom:12px}}
       .aion-map-head h2{{margin:2px 0 5px}}
-      .aion-map-tabs{{display:flex;gap:8px;flex-wrap:wrap;margin:14px 0 10px}}
-      .aion-map-tab{{border:1px solid rgba(214,168,79,.28);background:rgba(214,168,79,.06);color:#ead9ae;padding:9px 14px;border-radius:10px;cursor:pointer;font-weight:800}}
-      .aion-map-tab:hover,.aion-map-tab.active{{background:linear-gradient(180deg,#e6bd66,#a97124);color:#160f05;border-color:#efcf89}}
-      .aion-map-frame-wrap{{position:relative;border:1px solid rgba(214,168,79,.28);background:#07090d;min-height:640px;overflow:hidden}}
-      #aion-map-frame{{position:relative;z-index:1;display:block;width:100%;height:70vh;min-height:640px;border:0;background:transparent}}
+      .aion-map-frame-wrap{{position:relative;border:1px solid rgba(214,168,79,.28);background:#07090d;min-height:640px;overflow:hidden;border-radius:10px}}
+      #aion-map-frame{{position:relative;z-index:1;display:block;width:100%;height:70vh;min-height:640px;border:0;background:#07090d}}
       .aion-map-fallback{{position:absolute;z-index:0;inset:0;display:grid;place-items:center;padding:32px;text-align:center;color:#9da8b6;background:linear-gradient(135deg,#090b10,#111722)}}
       @media(max-width:760px){{#aion-map-frame{{height:68vh;min-height:520px}}.aion-map-frame-wrap{{min-height:520px}}}}
     </style>
     <script>
-      (function aionMapTabs(){{
+      (function aionMapLoader(){{
         const frame=document.getElementById('aion-map-frame');
-        if(!frame)return;
-        document.querySelectorAll('.aion-map-tab').forEach(btn=>btn.addEventListener('click',function(){{
-          document.querySelectorAll('.aion-map-tab').forEach(x=>x.classList.remove('active'));
-          btn.classList.add('active');
-          const src=btn.dataset.mapSrc||'';
-          if(src && frame.getAttribute('src')!==src) frame.setAttribute('src',src);
-        }}));
+        const loader=document.getElementById('aion-map-loader');
+        if(!frame||!loader)return;
+        frame.addEventListener('load',()=>{{loader.style.display='none';}});
       }})();
     </script>
     """
@@ -16259,8 +16288,7 @@ def _event_lineup_panel(data: dict[str, Any], event: dict[str, Any], event_id: s
             candidate["class_name"]=cls
             candidate["class_name_en"]=str(meta.get("en") or "")
             candidate["class_role"]=str(meta.get("role") or ap.get("main_role") or "")
-            candidate["class_icon"]=str(meta.get("icon") or "?")
-            candidate["class_icon_placeholder"]=True
+            candidate["class_icon_url"]=_aion2_class_icon_url(cls)
     stored = _load_event_lineup(guild_id, str(event_id), event, candidates=candidates)
     clean = _normalize_event_lineup(event, stored, candidates=candidates)
     clean["published"] = bool(stored.get("published"))
@@ -16321,7 +16349,7 @@ def _event_lineup_panel(data: dict[str, Any], event: dict[str, Any], event_id: s
       .lineup-groups{{display:grid;grid-template-columns:repeat(auto-fit,minmax(245px,1fr));gap:12px}}.lineup-group{{border:1px solid rgba(214,168,79,.22);border-radius:16px;padding:12px;background:rgba(0,0,0,.15)}}
       .lineup-group-head{{display:flex;justify-content:space-between;gap:8px;align-items:center;margin-bottom:8px}}.lineup-group-name{{font-weight:800;color:#efd594;background:transparent;border:0;border-bottom:1px dashed rgba(239,213,148,.35);min-width:0;width:150px}}
       .lineup-dropzone{{min-height:64px;border:1px dashed rgba(255,255,255,.18);border-radius:12px;padding:8px;display:flex;flex-direction:column;gap:7px}}.lineup-dropzone.drag-over{{border-color:#efd594;background:rgba(214,168,79,.08)}}
-      .lineup-player{{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:9px 10px;border-radius:11px;background:rgba(255,255,255,.055);border:1px solid rgba(255,255,255,.08);cursor:grab;user-select:none}}.lineup-player:active{{cursor:grabbing}}.lineup-player.selected{{outline:2px solid #efd594;background:rgba(214,168,79,.16)}}.lineup-player b{{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}.lineup-player-main{{display:flex;align-items:center;gap:8px;min-width:0}}.lineup-player-meta{{display:flex;align-items:center;gap:5px;flex-wrap:wrap;justify-content:flex-end}}.lineup-class-icon{{width:34px;height:34px;display:grid;grid-template-rows:1fr auto;place-items:center;border-radius:8px;border:1px solid rgba(239,213,148,.34);background:radial-gradient(circle at 50% 28%,rgba(214,168,79,.28),rgba(20,22,28,.92));color:#f4dc9d;font-weight:900;flex:0 0 34px;overflow:hidden}}.lineup-class-icon-mark{{font-size:15px;line-height:13px;opacity:.95}}.lineup-class-icon small{{font-size:7px;line-height:9px;letter-spacing:.04em;color:#f4dc9d}}.lineup-class-pill,.lineup-role{{font-size:11px;padding:3px 6px;border-radius:999px;white-space:nowrap}}.lineup-class-pill{{background:rgba(85,120,170,.18);color:#cbdcf5;border:1px solid rgba(115,150,200,.20)}}.lineup-role{{background:rgba(214,168,79,.11);color:#e8cf99}}.lineup-pool .lineup-player{{background:rgba(255,255,255,.035)}}
+      .lineup-player{{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:9px 10px;border-radius:11px;background:rgba(255,255,255,.055);border:1px solid rgba(255,255,255,.08);cursor:grab;user-select:none}}.lineup-player:active{{cursor:grabbing}}.lineup-player.selected{{outline:2px solid #efd594;background:rgba(214,168,79,.16)}}.lineup-player b{{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}.lineup-player-main{{display:flex;align-items:center;gap:8px;min-width:0}}.lineup-player-meta{{display:flex;align-items:center;gap:5px;flex-wrap:wrap;justify-content:flex-end}}.lineup-class-icon{{width:36px;height:36px;object-fit:contain;flex:0 0 36px;filter:drop-shadow(0 0 4px rgba(0,0,0,.65))}}.lineup-role{{font-size:11px;padding:3px 6px;border-radius:999px;white-space:nowrap;background:rgba(214,168,79,.11);color:#e8cf99}}.lineup-pool .lineup-player{{background:rgba(255,255,255,.035)}}
       @media(max-width:850px){{.lineup-board{{grid-template-columns:1fr}}.lineup-groups{{grid-template-columns:1fr}}}}
     </style>
     <script>
@@ -16339,7 +16367,7 @@ def _event_lineup_panel(data: dict[str, Any], event: dict[str, Any], event_id: s
         state.groups.forEach((g,i)=>{{g.name=g.name||`Gruppe ${{i+1}}`;g.members=(g.members||[]).slice(0,state.group_size)}});
       }}
       function placedIds(){{const x=new Set();state.groups.forEach(g=>(g.members||[]).forEach(m=>x.add(String(m.user_id))));(state.bench||[]).forEach(m=>x.add(String(m.user_id)));return x}}
-      function playerHtml(p){{const sel=String(p.user_id)===selectedUid?' selected':'';const cls=String(p.class_name||'');const icon=String(p.class_icon||'?');const classPill=cls?`<span class="lineup-class-pill">${{esc(cls)}}</span>`:'';const iconHtml=cls?`<span class="lineup-class-icon" title="${{esc(cls)}} · Klassensymbol-Platzhalter"><span class="lineup-class-icon-mark">◇</span><small>${{esc(icon)}}</small></span>`:'';return `<div class="lineup-player${{sel}}" draggable="true" tabindex="0" data-user-id="${{esc(p.user_id)}}"><span class="lineup-player-main">${{iconHtml}}<b>${{esc(p.display_name)}}</b></span><span class="lineup-player-meta">${{classPill}}<span class="lineup-role">${{esc(p.role||p.class_role||'')}}</span></span></div>`}}
+      function playerHtml(p){{const sel=String(p.user_id)===selectedUid?' selected':'';const cls=String(p.class_name||'');const en=String(p.class_name_en||'');const iconUrl=String(p.class_icon_url||'');const title=cls+(en?` (${{en}})`:``);const iconHtml=cls&&iconUrl?`<img class="lineup-class-icon" src="${{esc(iconUrl)}}" alt="${{esc(cls)}}" title="${{esc(title)}}">`:'';return `<div class="lineup-player${{sel}}" draggable="true" tabindex="0" data-user-id="${{esc(p.user_id)}}"><span class="lineup-player-main">${{iconHtml}}<b>${{esc(p.display_name)}}</b></span><span class="lineup-player-meta"><span class="lineup-role">${{esc(p.role||p.class_role||'')}}</span></span></div>`}}
       function render(){{
         normalize();
         const used=placedIds();
@@ -19673,10 +19701,10 @@ async def ticket_note_add(ticket_id:int,request:Request,_:bool=Depends(_admin_au
 
 @app.post("/admin/member/{user_id}/aion2")
 async def admin_member_aion2_save(user_id:int,request:Request,_:bool=Depends(_admin_auth)):
-    raw=(await request.body()).decode('utf-8',errors='replace'); form=urllib.parse.parse_qs(raw,keep_blank_values=True); gid=_safe_guild_id(_snapshot_payload()); ch=str((form.get('character_name') or [''])[0]).strip()[:120]; cl=_aion2_normalize_class((form.get('class_name') or [''])[0]); role=_aion2_role_for_class(cl); gs=str((form.get('gearscore') or [''])[0]).strip()[:40]; rawlevel=str((form.get('level') or [''])[0]).strip(); level=int(rawlevel) if rawlevel.isdigit() else None
+    raw=(await request.body()).decode('utf-8',errors='replace'); form=urllib.parse.parse_qs(raw,keep_blank_values=True); gid=_safe_guild_id(_snapshot_payload()); ch=str((form.get('character_name') or [''])[0]).strip()[:120]; faction=_aion2_normalize_faction((form.get('faction') or [''])[0]); cl=_aion2_normalize_class((form.get('class_name') or [''])[0]); role=_aion2_role_for_class(cl); gs=str((form.get('gearscore') or [''])[0]).strip()[:40]; rawlevel=str((form.get('level') or [''])[0]).strip(); level=int(rawlevel) if rawlevel.isdigit() else None
     _ensure_v211_tables(); conn=_pg_connect()
     try:
-        with conn.cursor() as cur: cur.execute('''INSERT INTO aion2_profiles(guild_id,user_id,character_name,class_name,main_role,level,gearscore,updated_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(guild_id,user_id) DO UPDATE SET character_name=EXCLUDED.character_name,class_name=EXCLUDED.class_name,main_role=EXCLUDED.main_role,level=EXCLUDED.level,gearscore=EXCLUDED.gearscore,updated_at=EXCLUDED.updated_at''',(gid,user_id,ch,cl,role,level,gs,datetime.now(timezone.utc).isoformat()))
+        with conn.cursor() as cur: cur.execute('''INSERT INTO aion2_profiles(guild_id,user_id,character_name,class_name,main_role,faction,level,gearscore,updated_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(guild_id,user_id) DO UPDATE SET character_name=EXCLUDED.character_name,class_name=EXCLUDED.class_name,main_role=EXCLUDED.main_role,faction=EXCLUDED.faction,level=EXCLUDED.level,gearscore=EXCLUDED.gearscore,updated_at=EXCLUDED.updated_at''',(gid,user_id,ch,cl,role,faction,level,gs,datetime.now(timezone.utc).isoformat()))
         conn.commit()
     finally: conn.close()
     return RedirectResponse(f'/member/{int(user_id)}#aion2',status_code=303)
