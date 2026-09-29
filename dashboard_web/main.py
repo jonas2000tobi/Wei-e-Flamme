@@ -13999,20 +13999,106 @@ def _render_member_home(data: dict[str, Any], request: Request) -> str:
         ''')
 
     brand = _guild_brand(snap)
-    admin_tools = (_admin_tabs_style()+_admin_quick_links('')) if _is_portal_admin(request) else ''
+    is_admin = _is_portal_admin(request)
+    admin_tools = (_admin_tabs_style()+_admin_quick_links('')) if is_admin else ''
     aion_map_panel = _aion2_home_map_panel(guild_id)
+
+    # Mobile Startseite bewusst extrem kompakt: drei Statuskacheln, bei Leitung
+    # die wichtigsten Verwaltungswege und danach direkt die Aion-2-Karte.
+    # Der Boss-Wert ist absichtlich nur ein Platzhalter, bis Live-Bossdaten
+    # angebunden sind.
+    mobile_admin_links = ''
+    if is_admin:
+        mobile_admin_links = f'''
+        <section class="mobile-home-admin-links" aria-label="Leitung und Verwaltung">
+          <a href="/events-admin"><img src="{_asset('nav_events.png')}" alt=""><span>Events verwalten</span><strong>›</strong></a>
+          <a href="/members"><img src="{_asset('nav_mitglieder.png')}" alt=""><span>Mitglieder</span><strong>›</strong></a>
+          <a href="/member-activity"><img src="{_asset('nav_analytics.png')}" alt=""><span>Aktivität</span><strong>›</strong></a>
+          <a href="/tickets"><img src="{_asset('nav_leitung.png')}" alt=""><span>Tickets</span><strong>›</strong></a>
+          <a href="/admin-settings"><img src="{_asset('nav_einstellungen.png')}" alt=""><span>Einstellungen</span><strong>›</strong></a>
+          <a href="/system"><img src="{_asset('nav_system.png')}" alt=""><span>System &amp; Logs</span><strong>›</strong></a>
+        </section>
+        '''
+
     body = f'''
-    <nav class="topnav">{"".join(nav)}</nav>
-    <section class="hero member-home-hero">
-      <div style="display:flex;gap:16px;align-items:center;flex-wrap:wrap;">
-        <div class="member-start-logo"><img src="{_e(_brand_image('logo', 'logo_512.png'))}" alt="{_e(brand.get('display_name') or 'Gilde')}"></div>
-        <div><div class="eyebrow">Gildenzentrale</div><h1>Willkommen, {_e(display)}</h1><p class="muted">{_e(brand.get('display_name') or 'Gilde')} · Events, Mitglieder und deine aktivierten Gildenmodule.</p></div>
+    <style>
+      .mobile-home-compact{{display:none}}
+      @media(max-width:900px){{
+        .member-home-desktop{{display:none!important}}
+        .mobile-home-compact{{display:block;padding-top:62px}}
+        .authbar{{display:none!important}}
+        main.content{{padding:0 12px 28px!important}}
+        .mobile-nav-toggle{{
+          display:inline-flex!important;position:fixed!important;
+          top:8px!important;left:50%!important;right:auto!important;bottom:auto!important;
+          transform:translateX(-50%)!important;z-index:220!important;
+          min-width:118px!important;min-height:42px!important;padding:9px 16px!important;
+          border-radius:14px!important;
+        }}
+        body.nav-open .mobile-nav-toggle{{
+          top:10px!important;left:50%!important;right:auto!important;bottom:auto!important;
+          transform:translateX(-50%)!important;
+        }}
+        .mobile-home-stats{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:9px;margin:0 0 14px}}
+        .mobile-home-tile{{
+          aspect-ratio:1/1;min-width:0;padding:10px 7px;border-radius:15px;
+          border:1px solid rgba(214,168,79,.30);
+          background:linear-gradient(155deg,rgba(48,31,16,.92),rgba(9,9,11,.96) 72%);
+          box-shadow:0 10px 24px rgba(0,0,0,.34),inset 0 1px 0 rgba(255,255,255,.035);
+          display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;
+        }}
+        .mobile-home-tile small{{display:block;color:#b8b0a4;font-size:10px;line-height:1.15;margin-bottom:6px}}
+        .mobile-home-tile strong{{display:block;color:#f3d58d;font-family:Georgia,serif;font-size:clamp(21px,7vw,31px);line-height:1}}
+        .mobile-home-tile span{{display:block;margin-top:7px;color:#9da8b6;font-size:9px;line-height:1.2;overflow-wrap:anywhere}}
+        .mobile-home-admin-links{{display:grid;grid-template-columns:1fr;gap:8px;margin:0 0 14px;padding:0}}
+        .mobile-home-admin-links a{{
+          min-height:54px;padding:10px 12px;border-radius:14px;text-decoration:none;color:var(--text);
+          border:1px solid rgba(214,168,79,.23);background:linear-gradient(180deg,rgba(30,22,14,.88),rgba(10,10,12,.95));
+          display:grid;grid-template-columns:32px minmax(0,1fr) 20px;align-items:center;gap:10px;
+          box-shadow:0 8px 18px rgba(0,0,0,.24);
+        }}
+        .mobile-home-admin-links img{{width:30px;height:30px;object-fit:contain}}
+        .mobile-home-admin-links span{{font-weight:800;font-size:14px}}
+        .mobile-home-admin-links strong{{font-size:25px;color:#d6a84f;text-align:right;line-height:1}}
+        .mobile-home-compact + .aion-home-map{{margin-top:0!important}}
+        .aion-home-map{{margin-bottom:0!important}}
+      }}
+      @media(max-width:380px){{
+        .mobile-home-stats{{gap:6px}}
+        .mobile-home-tile{{padding:8px 5px;border-radius:13px}}
+        .mobile-home-tile strong{{font-size:20px}}
+        .mobile-home-tile small{{font-size:9px}}
+        .mobile-home-tile span{{font-size:8px}}
+      }}
+      @media(min-width:901px){{.member-home-desktop{{display:block}}}}
+    </style>
+
+    <div class="member-home-desktop">
+      <nav class="topnav">{"".join(nav)}</nav>
+      <section class="hero member-home-hero">
+        <div style="display:flex;gap:16px;align-items:center;flex-wrap:wrap;">
+          <div class="member-start-logo"><img src="{_e(_brand_image('logo', 'logo_512.png'))}" alt="{_e(brand.get('display_name') or 'Gilde')}"></div>
+          <div><div class="eyebrow">Gildenzentrale</div><h1>Willkommen, {_e(display)}</h1><p class="muted">{_e(brand.get('display_name') or 'Gilde')} · Events, Mitglieder und deine aktivierten Gildenmodule.</p></div>
+        </div>
+      </section>
+      <section class="grid">{"".join(cards)}</section>
+      {admin_tools}
+    </div>
+
+    <section class="mobile-home-compact">
+      <div class="mobile-home-stats">
+        <article class="mobile-home-tile"><small>Mitglieder</small><strong>{member_count}</strong><span>in der Gilde</span></article>
+        <article class="mobile-home-tile"><small>Aktive Events</small><strong>{len(active_events)}</strong><span>laufend / geplant</span></article>
+        <article class="mobile-home-tile"><small>Boss</small><strong>27 Min.</strong><span>Abyss · Nordfestung</span></article>
       </div>
+      {mobile_admin_links}
     </section>
-    <section class="grid">{"".join(cards)}</section>
-    {admin_tools}
+
     {aion_map_panel}
-    <section class="split">{"".join(sections)}</section>
+
+    <div class="member-home-desktop">
+      <section class="split">{"".join(sections)}</section>
+    </div>
     '''
     return _html_shell("Gildenzentrale · Guild Platform", body, nav_mode=_nav_mode_for_request(request))
 
