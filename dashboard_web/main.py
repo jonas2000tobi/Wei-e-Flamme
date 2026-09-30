@@ -3797,7 +3797,7 @@ def _render_dashboard(data: dict[str, Any]) -> str:
       <a class="btn" href="/api/snapshot">JSON ansehen</a>
     </section>
 
-    <section class="grid">{cards}</section>
+    <section class="grid event-detail-stats">{cards}</section>
 
     <section class="panel" id="analytics">
       <h2>📈 Analytics Schnellblick</h2>
@@ -9439,85 +9439,131 @@ def _member_event_rows(snap: dict[str, Any], user_id: int) -> list[list[Any]]:
     return rows[:80]
 
 
-def _render_member_detail(data: dict[str, Any], user_id: int, current_user: Optional[dict[str, Any]] = None) -> str:
+def _render_member_detail(data: dict[str, Any], user_id: int, current_user: Optional[dict[str, Any]] = None, request: Optional[Request] = None) -> str:
     if not data.get("ok"):
-        return _html_shell("Beer and Buffs Dashboard", f"<section class='panel'><h1>📊 Beer and Buffs Dashboard</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
+        return _html_shell("Mitglied", f"<section class='panel'><h1>👤 Mitglied</h1><p class='muted'>{_e(data.get('error'))}</p></section>", nav_mode="member")
+
     snap: dict[str, Any] = data.get("snapshot") or {}
-    profiles = ((snap.get("profiles") or {}).get("items") or [])
-    balances = _balance_map(snap)
-    needs_by_user = _needs_by_user(snap)
-    names = _profile_name_map(snap)
-    profile = None
-    for p in profiles:
-        if isinstance(p, dict) and _user_id(p.get("user_id")) == int(user_id):
-            profile = p
-            break
-    if not profile:
+    uid = int(user_id)
+    guild_id = int(_safe_guild_id(data) or 0)
+    is_admin = bool(request is not None and _is_portal_admin(request))
+
+    profile_items = [row for row in ((snap.get("profiles") or {}).get("items") or []) if isinstance(row, dict)]
+    source_members = [row for row in _insight_members(snap) if isinstance(row, dict)]
+    merged: dict[str, Any] = {}
+    for row in source_members + profile_items:
+        rid = _user_id(row.get("user_id") or row.get("member_id") or row.get("discord_id") or row.get("id"))
+        if rid == uid:
+            merged.update(row)
+    if not merged:
         return _html_shell(
             "Mitglied nicht gefunden",
-            "<section class='panel'><h1>❌ Mitglied nicht gefunden</h1><p class='muted'>Dieses Mitglied ist nicht im aktuellen Dashboard-Snapshot oder hat nicht die gesetzte Gildenrolle.</p><p><a class='btn' href='/members'>Zurück</a></p></section>",
+            "<section class='panel'><h1>❌ Mitglied nicht gefunden</h1><p class='muted'>Dieses Mitglied ist nicht im aktuellen Gilden-Snapshot vorhanden.</p><p><a class='btn' href='/member/members'>Zurück</a></p></section>",
+            nav_mode="member",
         )
 
-    display = profile.get("display_name") or profile.get("ingame_name") or f"User {user_id}"
-    ec_value = balances.get(int(user_id))
-    need_info = needs_by_user.get(int(user_id), {})
-    main_needs = need_info.get("main") if isinstance(need_info, dict) else []
-    secondary_needs = need_info.get("secondary") if isinstance(need_info, dict) else []
-    response = _event_response_counts_for_user(snap, int(user_id))
-    voice_user = next((v for v in ((snap.get("voice") or {}).get("by_user") or []) if isinstance(v, dict) and _user_id(v.get("user_id")) == int(user_id)), {})
-    total_voice_seconds = int(_num(voice_user.get("total_seconds"), 0))
+    aion = (_aion2_profiles_for_users(guild_id, [uid]).get(uid) or {}) if guild_id else {}
+    display = str(merged.get("display_name") or merged.get("discord_name") or merged.get("username") or merged.get("ingame_name") or f"User {uid}")
+    ingame = str(aion.get("character_name") or merged.get("ingame_name") or "—")
+    avatar_url = str(merged.get("avatar_url") or merged.get("display_avatar_url") or merged.get("discord_avatar_url") or "").strip()
+    class_name = str(aion.get("class_name") or merged.get("class_name") or merged.get("main_class") or merged.get("character_class") or "").strip()
+    faction = str(aion.get("faction") or "").strip()
+    main_role = str(aion.get("main_role") or merged.get("main_role") or "").strip()
+    level = aion.get("level") or merged.get("level") or "—"
+    gearscore = str(aion.get("gearscore") or merged.get("gearscore") or merged.get("gear_score") or "—")
+    rank_label, rank_key = _member_roster_rank(merged)
+    joined_raw = merged.get("guild_joined_at") or merged.get("joined_guild_at") or merged.get("member_since") or merged.get("joined_at") or merged.get("created_at") or ""
+    joined_text = _guild_membership_duration(joined_raw)
 
-    tx_rows = []
-    for tx in _tx_for_user(snap, user_id, limit=80):
-        tx_rows.append([_dt(tx.get("created_at")), _fmt_ec(tx.get("amount")), tx.get("raw_type"), _short(tx.get("reason"), 160)])
+    initials = "".join(part[0].upper() for part in re.split(r"\s+", display.strip()) if part)[:2] or "?"
+    if avatar_url.startswith(("https://", "http://", "/static/")):
+        avatar_html = f'<div class="member-profile-avatar"><img src="{_e(avatar_url)}" alt="" onerror="this.parentElement.textContent=\'{_e(initials)}\'"></div>'
+    else:
+        avatar_html = f'<div class="member-profile-avatar">{_e(initials)}</div>'
 
-    voice_rows = []
-    for v in _voice_for_user(snap, user_id, limit=80):
-        seconds = int(_num(v.get("duration_seconds"), 0))
-        minutes = round(seconds / 60, 1) if seconds else "—"
-        voice_rows.append([v.get("channel_name") or v.get("channel_id"), _dt(v.get("joined_at")), _dt(v.get("left_at")), minutes])
+    class_html = _aion2_class_display_html(class_name, with_name=True) if class_name else "—"
+    faction_html = _aion2_faction_display_html(faction, with_name=True) if faction else "—"
 
-    auction_rows = []
-    for a in _auctions_for_user(snap, user_id, limit=80):
-        auction_rows.append([_auction_link(a.get("auction_id"), a.get("item_name")), a.get("status"), _phase_label(a), _fmt_ec(a.get("top_bid_amount")) if a.get("top_bid_amount") is not None else "—", _dt(a.get("ends_at"))])
+    now = datetime.now(BERLIN_TZ)
+    registrations: list[tuple[datetime, str]] = []
+    for ev in _events_items(snap):
+        if not isinstance(ev, dict):
+            continue
+        bucket = _event_overview_bucket(ev, now)
+        if bucket == "past":
+            continue
+        status = _portal_event_status_for_user(ev, uid)
+        if status == "—":
+            continue
+        eid = _event_admin_id(ev)
+        if not eid:
+            continue
+        dt = _event_admin_datetime(ev) or datetime.max.replace(tzinfo=BERLIN_TZ)
+        state = "Läuft" if bucket == "running" else "Geplant"
+        registrations.append((dt, f'''
+          <a class="member-profile-event" href="/event/{urllib.parse.quote(str(eid))}">
+            <span class="member-profile-event-state {bucket}">{_e(state)}</span>
+            <span class="member-profile-event-main"><strong>{_e(_event_admin_title(ev))}</strong><small>{_e(_event_dt(ev.get('when_iso') or ev.get('start_at') or ev.get('created_at')))}</small></span>
+            <span class="member-profile-event-status">{_e(status)}</span>
+            <span class="member-profile-event-open">›</span>
+          </a>
+        '''))
+    registrations.sort(key=lambda item: item[0])
+    events_html = "".join(item[1] for item in registrations) or '<div class="member-profile-empty">Keine Anmeldungen für laufende oder geplante Events.</div>'
 
-    event_rows = _member_event_rows(snap, int(user_id))
-    cards = "".join([
-        _card("Ingame", profile.get("ingame_name") or "—", "Profil"),
-        _card("Rolle", profile.get("main_role") or "—", "Main-Rolle"),
-        _card("Gearscore", profile.get("gearscore") or "—", "Profilwert"),
-        _card("EC", _fmt_ec(ec_value) if ec_value is not None else "—", "aktueller Kontostand"),
-        _card("Eventantworten", f"{response['total']}/{response['events']}", f"Ja {response['yes']} · Vielleicht {response['maybe']} · Nein {response['no']}"),
-        _card("Voice-Zeit", f"{round(total_voice_seconds/3600, 1)} h", f"{int(voice_user.get('sessions') or 0)} Sessions"),
-    ])
+    public_body = f'''
+    <style>
+      .member-profile-page{{display:grid;gap:14px;width:100%;max-width:1050px;margin:0 auto;min-width:0;box-sizing:border-box}}
+      .member-profile-back{{display:flex;align-items:center;justify-content:space-between;gap:12px}}.member-profile-back a{{color:#d9bd7d;text-decoration:none;font-weight:800}}
+      .member-profile-hero{{display:grid;grid-template-columns:auto minmax(0,1fr);gap:18px;align-items:center;padding:20px;border:1px solid rgba(214,168,79,.28);border-radius:18px;background:linear-gradient(145deg,rgba(38,27,17,.9),rgba(8,9,11,.96));min-width:0}}
+      .member-profile-avatar{{width:92px;height:92px;border-radius:50%;overflow:hidden;display:grid;place-items:center;border:2px solid rgba(214,168,79,.5);background:radial-gradient(circle at 35% 25%,#725836,#17181b 70%);color:#f1d89c;font:700 28px Georgia,serif;box-shadow:0 10px 24px rgba(0,0,0,.35)}}.member-profile-avatar img{{width:100%;height:100%;object-fit:cover}}
+      .member-profile-hero-copy{{min-width:0}}.member-profile-hero-copy h1{{margin:3px 0 4px;color:#f0d69b;font:700 clamp(27px,5vw,42px) Georgia,serif;overflow-wrap:anywhere}}.member-profile-hero-copy p{{margin:0;color:#9d978d}}
+      .member-profile-rank{{display:inline-flex;padding:4px 8px;border:1px solid rgba(214,168,79,.3);border-radius:999px;color:#d8bf86;font-size:10px;text-transform:uppercase;letter-spacing:.06em}}
+      .member-profile-facts{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:9px}}.member-profile-fact{{min-width:0;padding:13px;border:1px solid rgba(214,168,79,.2);border-radius:13px;background:rgba(8,9,11,.78)}}.member-profile-fact small{{display:block;color:#8e887f;font-size:10px;text-transform:uppercase;letter-spacing:.06em;margin-bottom:5px}}.member-profile-fact strong{{display:block;color:#e6d5ad;font-size:14px;overflow-wrap:anywhere}}.member-profile-fact img{{width:28px!important;height:28px!important;vertical-align:middle;margin-right:6px}}
+      .member-profile-section{{border:1px solid rgba(214,168,79,.22);border-radius:15px;background:rgba(7,8,10,.78);overflow:hidden}}.member-profile-section h2{{margin:0;padding:13px 15px;border-bottom:1px solid rgba(214,168,79,.14);color:#e2c57f;font:700 19px Georgia,serif}}
+      .member-profile-events{{display:grid}}.member-profile-event{{display:grid;grid-template-columns:auto minmax(0,1fr) auto auto;gap:10px;align-items:center;padding:12px 14px;border-bottom:1px solid rgba(214,168,79,.11);text-decoration:none;color:inherit;min-width:0}}.member-profile-event:last-child{{border-bottom:0}}.member-profile-event:hover{{background:rgba(214,168,79,.05)}}
+      .member-profile-event-state{{padding:3px 7px;border-radius:999px;font-size:9px;font-weight:900;text-transform:uppercase;border:1px solid}}.member-profile-event-state.running{{color:#b9e39d;border-color:#578a43;background:rgba(72,126,48,.18)}}.member-profile-event-state.upcoming{{color:#efd087;border-color:#906c2c;background:rgba(133,94,27,.14)}}
+      .member-profile-event-main{{min-width:0}}.member-profile-event-main strong,.member-profile-event-main small{{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}.member-profile-event-main strong{{color:#e6dac0}}.member-profile-event-main small{{margin-top:3px;color:#89847c;font-size:10px}}.member-profile-event-status{{font-size:11px;color:#c8bea9;white-space:nowrap}}.member-profile-event-open{{font-size:22px;color:#d6a84f}}
+      .member-profile-empty{{padding:18px;color:#888176;text-align:center}}
+      .member-admin-details{{border:1px solid rgba(214,168,79,.22);border-radius:14px;background:rgba(8,9,11,.82);overflow:hidden}}.member-admin-details>summary{{cursor:pointer;padding:14px 16px;color:#e2c57f;font:700 17px Georgia,serif;list-style:none}}.member-admin-details>summary::-webkit-details-marker{{display:none}}.member-admin-details>summary:after{{content:'＋';float:right;color:#d6a84f}}.member-admin-details[open]>summary:after{{content:'−'}}.member-admin-details-body{{padding:0 12px 12px;display:grid;gap:12px}}.member-admin-details-body>.panel{{margin:0!important}}
+      @media(max-width:680px){{main.content{{width:100%!important;max-width:100%!important;min-width:0!important;box-sizing:border-box!important;padding-left:10px!important;padding-right:10px!important;overflow-x:hidden!important}}.member-profile-page{{padding-top:76px!important;gap:9px!important}}.member-profile-hero{{grid-template-columns:64px minmax(0,1fr)!important;gap:11px!important;padding:12px!important;border-radius:13px!important}}.member-profile-avatar{{width:64px!important;height:64px!important;font-size:20px!important}}.member-profile-hero-copy h1{{font-size:23px!important}}.member-profile-hero-copy p{{font-size:11px!important}}.member-profile-facts{{grid-template-columns:repeat(2,minmax(0,1fr))!important;gap:6px!important}}.member-profile-fact{{padding:9px!important;border-radius:10px!important}}.member-profile-fact small{{font-size:8px!important}}.member-profile-fact strong{{font-size:12px!important}}.member-profile-fact img{{width:23px!important;height:23px!important}}.member-profile-section h2{{padding:10px 11px!important;font-size:16px!important}}.member-profile-event{{grid-template-columns:auto minmax(0,1fr) auto!important;gap:6px!important;padding:9px 10px!important}}.member-profile-event-status{{grid-column:2/4;font-size:10px!important}}.member-profile-event-open{{grid-column:3;grid-row:1/3}}.member-admin-details>summary{{padding:11px 12px!important;font-size:15px!important}}}}
+    </style>
+    <main class="member-profile-page">
+      <div class="member-profile-back"><a href="/member/members">← Mitglieder</a>{'<span class="member-profile-rank">Leitungsansicht</span>' if is_admin else ''}</div>
+      <section class="member-profile-hero">{avatar_html}<div class="member-profile-hero-copy"><span class="member-profile-rank {_e(rank_key)}">{_e(rank_label)}</span><h1>{_e(display)}</h1><p>{_e(ingame if ingame != '—' else 'Kein Ingame-Name hinterlegt')}</p></div></section>
+      <section class="member-profile-facts">
+        <article class="member-profile-fact"><small>Ingame-Name</small><strong>{_e(ingame)}</strong></article>
+        <article class="member-profile-fact"><small>Klasse</small><strong>{_cell(class_html)}</strong></article>
+        <article class="member-profile-fact"><small>Level</small><strong>{_e(level)}</strong></article>
+        <article class="member-profile-fact"><small>Gearscore</small><strong>{_e(gearscore)}</strong></article>
+        <article class="member-profile-fact"><small>Fraktion</small><strong>{_cell(faction_html)}</strong></article>
+        <article class="member-profile-fact"><small>In der Gilde</small><strong>{_e(joined_text)}</strong></article>
+      </section>
+      <section class="member-profile-section"><h2>Aktuelle Event-Anmeldungen</h2><div class="member-profile-events">{events_html}</div></section>
+    '''
 
-    body = f"""
-    <nav class="topnav"><a href="/members">← Mitglieder</a><a href="/portal/member/{_e(user_id)}">Portal</a><a href="/member/{_e(user_id)}/loot">Loot-Verlauf</a><a href="/attendance-stats">Anwesenheit-Stats</a><a href="/analytics">Analytics</a><a href="/voice">Voice</a><a href="#needs">Needs</a><a href="#events">Events</a><a href="#ec">EC</a><a href="#voice">Voice</a></nav>
-    <section class="hero">
-      <div>
-        <div class="eyebrow">Mitglied · Tiefenauswertung</div>
-        <h1>👤 {_e(display)}</h1>
-        <p class="muted">User-ID: {_e(user_id)} · Snapshot: {_e(_dt(data.get('published_at')))}</p>
-      </div>
-      <a class="btn" href="/members">Zurück</a>
-    </section>
-    <section class="grid">{cards}</section>
-    {_admin_member_panel(data, int(user_id), current_user)}
-    {_member_activity_panel(data, int(user_id), current_user)}
-    {_aion2_profile_panel(data, int(user_id), current_user)}
-    <section class="panel" id="needs">
-      <h2>🎁 Needliste</h2>
-      <div class="split">
-        <div>{_need_list_html('Main-Needs', main_needs)}</div>
-        <div>{_need_list_html('Secondary-Needs', secondary_needs)}</div>
-      </div>
-    </section>
-    <section class="panel" id="events"><h2>📅 Eventantworten</h2>{_table(['Event','Zeit','Status'], event_rows, placeholder='Events durchsuchen…')}</section>
-    <section class="panel" id="ec"><h2>🪙 Letzte EC-Buchungen</h2>{_table(['Zeit','Betrag','Typ','Grund'], tx_rows, placeholder='Buchungen durchsuchen…')}</section>
-    <section class="panel"><h2>🎁 Auktionen mit aktueller Führung/Gewinn</h2>{_table(['Item','Status','Phase','Gebot','Ende'], auction_rows, placeholder='Auktionen durchsuchen…')}</section>
-    <section class="panel" id="voice"><h2>🎙️ Voice-Sessions</h2>{_table(['Kanal','Rein','Raus','Minuten'], voice_rows, placeholder='Voice durchsuchen…')}</section>
-    """
-    return _html_shell(f"{display} · Beer and Buffs Dashboard", body)
+    if is_admin:
+        balances = _balance_map(snap)
+        need_info = _needs_by_user(snap).get(uid, {})
+        main_needs = need_info.get("main") if isinstance(need_info, dict) else []
+        secondary_needs = need_info.get("secondary") if isinstance(need_info, dict) else []
+        tx_rows = [[_dt(tx.get("created_at")), _fmt_ec(tx.get("amount")), tx.get("raw_type"), _short(tx.get("reason"), 160)] for tx in _tx_for_user(snap, uid, limit=50)]
+        voice_rows = []
+        for v in _voice_for_user(snap, uid, limit=50):
+            seconds = int(_num(v.get("duration_seconds"), 0))
+            voice_rows.append([v.get("channel_name") or v.get("channel_id"), _dt(v.get("joined_at")), _dt(v.get("left_at")), round(seconds / 60, 1) if seconds else "—"])
+        auction_rows = []
+        for a in _auctions_for_user(snap, uid, limit=50):
+            auction_rows.append([_auction_link(a.get("auction_id"), a.get("item_name")), a.get("status"), _phase_label(a), _fmt_ec(a.get("top_bid_amount")) if a.get("top_bid_amount") is not None else "—", _dt(a.get("ends_at"))])
+        public_body += f'''
+        <details class="member-admin-details" open><summary>Mitglied verwalten</summary><div class="member-admin-details-body">{_admin_member_panel(data, uid, current_user)}{_member_activity_panel(data, uid, current_user)}</div></details>
+        <details class="member-admin-details"><summary>Aion-2-Profil bearbeiten</summary><div class="member-admin-details-body">{_aion2_profile_panel(data, uid, current_user)}</div></details>
+        <details class="member-admin-details"><summary>Needs &amp; Loot</summary><div class="member-admin-details-body"><section class="panel"><div class="split"><div>{_need_list_html('Main-Needs', main_needs)}</div><div>{_need_list_html('Secondary-Needs', secondary_needs)}</div></div></section><section class="panel"><h2>Auktionen</h2>{_table(['Item','Status','Phase','Gebot','Ende'], auction_rows, placeholder='Auktionen durchsuchen…')}</section></div></details>
+        <details class="member-admin-details"><summary>EC &amp; Voice</summary><div class="member-admin-details-body"><section class="panel"><h2>EC · {_e(_fmt_ec(balances.get(uid)) if balances.get(uid) is not None else '—')}</h2>{_table(['Zeit','Betrag','Typ','Grund'], tx_rows, placeholder='Buchungen durchsuchen…')}</section><section class="panel"><h2>Voice-Sessions</h2>{_table(['Kanal','Rein','Raus','Minuten'], voice_rows, placeholder='Voice durchsuchen…')}</section></div></details>
+        '''
+
+    public_body += '</main>'
+    return _html_shell(f"{display} · Mitglied", public_body, nav_mode=_nav_mode_for_request(request) if request is not None else "member")
 
 
 def _event_rsvp_is_open(event: dict[str, Any]) -> bool:
@@ -9711,6 +9757,28 @@ def _render_event_detail(data: dict[str, Any], event_id: str, request: Optional[
       .event-name-chip.maybe{border-color:rgba(225,178,62,.38);background:rgba(225,178,62,.09)}
       .event-name-chip.declined{border-color:rgba(205,91,91,.3);background:rgba(205,91,91,.07)}
       .event-name-chip.missing{opacity:.82}
+      .event-detail-page{width:100%;max-width:100%;min-width:0;overflow:hidden;box-sizing:border-box}
+      @media(max-width:680px){
+        main.content{width:100%!important;max-width:100%!important;min-width:0!important;box-sizing:border-box!important;padding-left:10px!important;padding-right:10px!important;overflow-x:hidden!important}
+        .event-detail-page{width:100%!important;max-width:100%!important;min-width:0!important;overflow:hidden!important;box-sizing:border-box!important;padding-top:74px!important}
+        .event-detail-page .topnav{width:100%!important;max-width:100%!important;min-width:0!important;box-sizing:border-box!important;overflow-x:auto!important}
+        .event-detail-hero{display:grid!important;grid-template-columns:1fr!important;gap:10px!important;width:100%!important;max-width:100%!important;min-width:0!important;padding:13px!important;box-sizing:border-box!important;overflow:hidden!important}
+        .event-detail-hero h1{font-size:24px!important;line-height:1.05!important;overflow-wrap:anywhere!important}
+        .event-detail-hero p{font-size:12px!important;line-height:1.35!important;overflow-wrap:anywhere!important}
+        .event-detail-hero .btn{justify-self:start!important;width:auto!important;max-width:100%!important;font-size:12px!important;padding:8px 10px!important}
+        .event-detail-stats{display:grid!important;grid-template-columns:repeat(2,minmax(0,1fr))!important;gap:6px!important;width:100%!important;max-width:100%!important;min-width:0!important}
+        .event-detail-page .card{min-width:0!important;max-width:100%!important;padding:9px!important}
+        .event-detail-page .panel{width:100%!important;max-width:100%!important;min-width:0!important;box-sizing:border-box!important;overflow:hidden!important;padding:12px!important}
+        .event-detail-page .event-role-grid{grid-template-columns:minmax(0,1fr)!important;gap:7px!important}
+        .event-detail-page .event-role-card{padding:10px!important;min-width:0!important;overflow:hidden!important}
+        .event-detail-page .event-role-names,.event-detail-page .event-name-chips{gap:5px!important}
+        .event-detail-page .event-role-name,.event-detail-page .event-name-chip{max-width:100%!important;padding:6px 8px!important;font-size:11px!important;overflow:hidden!important;text-overflow:ellipsis!important}
+        .event-detail-page .public-lineup-grid{grid-template-columns:minmax(0,1fr)!important;gap:7px!important}
+        .event-detail-page .public-lineup-group{padding:9px!important;min-width:0!important}
+        .event-detail-page .public-lineup-player{min-width:0!important;max-width:100%!important;overflow:hidden!important}
+        .event-detail-page .event-rsvp-controls,.event-detail-page .event-rsvp-controls.compact{grid-template-columns:repeat(2,minmax(0,1fr))!important;gap:6px!important}
+        .event-detail-page .event-rsvp-btn{min-width:0!important;padding:8px 5px!important;font-size:11px!important}
+      }
     </style>
     """
 
@@ -9719,8 +9787,9 @@ def _render_event_detail(data: dict[str, Any], event_id: str, request: Optional[
 
     body = f"""
     {css}
+    <div class="event-detail-page">
     <nav class="topnav"><a href="/member/events">← Events</a>{lineup_nav}<a href="#roles">Zusagen</a><a href="#open">Noch nicht zugesagt</a></nav>
-    <section class="hero">
+    <section class="hero event-detail-hero">
       <div>
         <div class="eyebrow">Event · Abstimmungsübersicht</div>
         <h1>📅 {_e(event.get('title') or event_id)}</h1>
@@ -9736,6 +9805,7 @@ def _render_event_detail(data: dict[str, Any], event_id: str, request: Optional[
     <section class="panel" id="roles"><h2>📊 Rollenverteilung</h2>{_bars(role_items, max_items=12)}</section>
     <section class="panel"><h2>✅ Wer ist dabei?</h2><p class="muted">Zusagen sind ausschließlich Tank, Support, DPS und Bank/Reserve.</p>{_event_role_overview_html(event, int(guild_id or 0))}</section>
     <section class="panel" id="open"><h2>🕒 Noch nicht zugesagt</h2><p class="muted">Vielleicht steht zuerst, danach Abmeldungen und Mitglieder ohne Rückmeldung.</p>{_event_name_chips(not_joined, empty='Alle Mitglieder haben zugesagt.')}</section>
+    </div>
     """
     return _html_shell(f"{event.get('title') or 'Event'} · Beer and Buffs Dashboard", body)
 
@@ -14435,46 +14505,129 @@ def _render_events_overview_page(data: dict[str, Any], request: Optional[Request
       .event-create-grid{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:11px}}.event-create-grid label{{display:grid;gap:5px;color:#bdb4a6;font-size:12px}}.event-create-grid .wide{{grid-column:1/-1}}.event-create-grid input,.event-create-grid select,.event-create-grid textarea{{width:100%}}.event-create-check{{display:flex;align-items:center;gap:8px;margin:13px 0;color:#c8bdac}}.event-dialog-actions{{display:flex;justify-content:flex-end;gap:10px;flex-wrap:wrap}}
       @media(max-width:960px){{.events-feature-grid{{grid-template-columns:1fr 1fr}}.events-overview-card:last-child:nth-child(odd){{grid-column:1/-1}}.events-history-row{{grid-template-columns:135px minmax(0,1fr) 65px 100px}}}}
       @media(max-width:680px){{
-        main.content{{overflow-x:hidden!important}}
-        .events-overview-page{{gap:12px;padding-top:70px;overflow-x:hidden;width:100%;max-width:100%;min-width:0}}
-        .events-overview-head{{display:block;width:100%;max-width:100%;min-width:0;padding:0}}
-        .events-overview-title{{display:none}}
-        .events-overview-actions{{display:grid;grid-template-columns:minmax(0,1fr);gap:8px;width:100%;max-width:100%;min-width:0;justify-content:stretch}}
-        .events-mobile-page-title{{display:block;font:700 24px/1.05 Georgia,serif;color:#e5c276;margin:0 0 1px;padding:0 1px}}
-        .events-mini-stats{{order:2;width:100%;max-width:100%;min-width:0;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px}}
-        .events-mini-stat{{width:100%;min-width:0;max-width:100%;padding:7px 4px;border-radius:10px;overflow:hidden}}
-        .events-mini-stat small{{font-size:8px;letter-spacing:.04em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
-        .events-mini-stat strong{{font-size:18px}}
-        .events-create-button{{order:3;width:auto!important;max-width:100%;justify-self:start;padding:8px 12px!important;font-size:13px!important;min-height:0!important;margin-top:1px}}
-        .events-section-title{{margin:1px 0 6px;min-width:0}}
-        .events-section-title h2{{font-size:19px;min-width:0}}
-        .events-section-title .muted{{font-size:10px;white-space:nowrap}}
-        .events-feature-grid{{grid-template-columns:minmax(0,1fr);gap:7px;width:100%;max-width:100%;min-width:0;overflow:hidden}}
-        .events-overview-card{{display:grid;grid-template-columns:72px minmax(0,1fr);width:100%;max-width:100%;min-width:0;min-height:84px;border-radius:12px;overflow:hidden;box-sizing:border-box}}
-        .events-overview-card:last-child:nth-child(odd){{grid-column:auto}}
-        .events-overview-image{{aspect-ratio:auto;width:72px;max-width:72px;height:100%;min-height:84px;border-radius:0;background:radial-gradient(circle at 50% 40%,rgba(130,76,34,.35),rgba(7,8,9,.95));overflow:hidden}}
-        .events-overview-image img{{object-fit:cover}}
-        .events-image-fallback{{font-size:27px}}
-        .events-overview-copy{{padding:8px 9px;min-width:0;max-width:100%;overflow:hidden}}
-        .events-card-top{{align-items:center;gap:5px;min-width:0}}
-        .events-state{{padding:2px 5px;font-size:7px;flex:0 0 auto}}
-        .events-card-date{{font-size:8px;line-height:1.15;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:right}}
-        .events-overview-copy h3{{margin:5px 0 2px;font-size:15px;line-height:1.1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%}}
-        .events-overview-copy p{{display:none}}
-        .events-card-roles{{gap:3px;margin-top:6px;display:flex;flex-wrap:nowrap;max-width:100%;overflow:hidden}}
-        .events-card-roles span{{padding:2px 4px;font-size:8px;flex:0 0 auto}}
-        .events-card-own{{margin-top:5px;padding-top:4px;font-size:9px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
-        .events-history-panel{{width:100%;max-width:100%;min-width:0;overflow:hidden;border-radius:12px}}
-        .events-history-row{{grid-template-columns:minmax(0,1fr) auto;grid-template-rows:auto auto;gap:3px 8px;width:100%;max-width:100%;min-width:0;padding:9px 10px;overflow:hidden;box-sizing:border-box}}
-        .events-history-date{{grid-column:1/2;grid-row:1;font-size:10px;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
-        .events-history-count{{grid-column:2/3;grid-row:1;font-size:10px;white-space:nowrap}}
-        .events-history-title{{grid-column:1/2;grid-row:2;min-width:0;overflow:hidden}}
-        .events-history-title strong{{font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
-        .events-history-title small{{display:none}}
-        .events-history-own{{grid-column:2/3;grid-row:2;text-align:right;font-size:10px;white-space:nowrap}}
-        .events-history-empty{{padding:18px 10px}}
-        .event-create-grid{{grid-template-columns:1fr}}
-        .event-create-grid .wide{{grid-column:auto}}
+        html,body{{max-width:100%;overflow-x:hidden!important}}
+        main.content{{
+          width:100%!important;max-width:100%!important;min-width:0!important;
+          box-sizing:border-box!important;overflow-x:hidden!important;
+          padding-left:10px!important;padding-right:10px!important;
+        }}
+        .events-overview-page{{
+          display:grid!important;gap:11px!important;
+          width:100%!important;max-width:100%!important;min-width:0!important;
+          box-sizing:border-box!important;overflow:hidden!important;
+          padding-top:78px!important;margin:0!important;
+        }}
+        .events-overview-head{{display:block!important;width:100%!important;max-width:100%!important;min-width:0!important;padding:0!important;margin:0!important}}
+        .events-overview-title{{display:none!important}}
+        .events-overview-actions{{
+          display:grid!important;grid-template-columns:minmax(0,1fr)!important;
+          gap:7px!important;width:100%!important;max-width:100%!important;min-width:0!important;
+          box-sizing:border-box!important;justify-content:stretch!important;overflow:hidden!important;
+        }}
+        .events-mobile-page-title{{
+          display:block!important;order:1!important;
+          font:700 21px/1.05 Georgia,serif!important;color:#e5c276!important;
+          margin:0!important;padding:0 1px 2px!important;min-width:0!important;
+        }}
+        .events-mini-stats{{
+          order:2!important;display:grid!important;
+          grid-template-columns:repeat(3,minmax(0,1fr))!important;
+          gap:5px!important;width:100%!important;max-width:100%!important;min-width:0!important;
+          box-sizing:border-box!important;overflow:hidden!important;
+        }}
+        .events-mini-stat{{
+          width:auto!important;min-width:0!important;max-width:100%!important;
+          padding:6px 2px!important;border-radius:9px!important;overflow:hidden!important;
+          box-sizing:border-box!important;
+        }}
+        .events-mini-stat small{{font-size:7px!important;letter-spacing:.02em!important;white-space:nowrap!important;overflow:hidden!important;text-overflow:ellipsis!important}}
+        .events-mini-stat strong{{font-size:17px!important;margin-top:2px!important}}
+        .events-create-button{{
+          order:3!important;width:auto!important;max-width:100%!important;justify-self:start!important;
+          padding:7px 10px!important;font-size:12px!important;min-height:0!important;margin:1px 0 0!important;
+          white-space:nowrap!important;
+        }}
+        .event-page-flash{{width:100%!important;max-width:100%!important;box-sizing:border-box!important}}
+        .events-section-title{{margin:2px 0 5px!important;min-width:0!important;width:100%!important;max-width:100%!important}}
+        .events-section-title h2{{font-size:18px!important;min-width:0!important;margin:0!important}}
+        .events-section-title .muted{{font-size:9px!important;white-space:nowrap!important}}
+        .events-feature-grid{{
+          display:grid!important;grid-template-columns:minmax(0,1fr)!important;
+          gap:6px!important;width:100%!important;max-width:100%!important;min-width:0!important;
+          overflow:hidden!important;box-sizing:border-box!important;
+        }}
+        .events-overview-card{{
+          display:grid!important;grid-template-columns:58px minmax(0,1fr)!important;
+          width:100%!important;max-width:100%!important;min-width:0!important;
+          min-height:72px!important;border-radius:10px!important;overflow:hidden!important;box-sizing:border-box!important;
+          transform:none!important;
+        }}
+        .events-overview-card:last-child:nth-child(odd){{grid-column:auto!important}}
+        .events-overview-image{{
+          aspect-ratio:auto!important;width:58px!important;max-width:58px!important;height:100%!important;
+          min-height:72px!important;border-radius:0!important;overflow:hidden!important;
+        }}
+        .events-overview-image img{{object-fit:cover!important}}
+        .events-image-fallback{{font-size:23px!important}}
+        .events-overview-copy{{padding:7px 8px!important;min-width:0!important;max-width:100%!important;overflow:hidden!important;box-sizing:border-box!important}}
+        .events-card-top{{display:flex!important;align-items:center!important;gap:4px!important;min-width:0!important;max-width:100%!important}}
+        .events-state{{padding:2px 5px!important;font-size:7px!important;flex:0 0 auto!important}}
+        .events-card-date{{font-size:8px!important;line-height:1.1!important;min-width:0!important;overflow:hidden!important;text-overflow:ellipsis!important;white-space:nowrap!important;text-align:right!important}}
+        .events-overview-copy h3{{margin:4px 0 2px!important;font-size:14px!important;line-height:1.05!important;white-space:nowrap!important;overflow:hidden!important;text-overflow:ellipsis!important;max-width:100%!important}}
+        .events-overview-copy p{{display:none!important}}
+        .events-card-roles{{display:flex!important;gap:2px!important;margin-top:5px!important;flex-wrap:nowrap!important;max-width:100%!important;overflow:hidden!important}}
+        .events-card-roles span{{padding:1px 3px!important;font-size:7px!important;flex:0 0 auto!important}}
+        .events-card-own{{margin-top:4px!important;padding-top:3px!important;font-size:8px!important;white-space:nowrap!important;overflow:hidden!important;text-overflow:ellipsis!important}}
+        .events-overview-empty{{padding:18px 10px!important;border-radius:11px!important;width:100%!important;box-sizing:border-box!important}}
+        .events-history-panel{{width:100%!important;max-width:100%!important;min-width:0!important;overflow:hidden!important;border-radius:10px!important;box-sizing:border-box!important}}
+        .events-history-row{{
+          display:grid!important;grid-template-columns:minmax(0,1fr) auto!important;grid-template-rows:auto auto!important;
+          gap:2px 6px!important;width:100%!important;max-width:100%!important;min-width:0!important;
+          padding:8px 9px!important;overflow:hidden!important;box-sizing:border-box!important;
+        }}
+        .events-history-date{{grid-column:1/2!important;grid-row:1!important;font-size:9px!important;min-width:0!important;white-space:nowrap!important;overflow:hidden!important;text-overflow:ellipsis!important}}
+        .events-history-count{{grid-column:2/3!important;grid-row:1!important;font-size:9px!important;white-space:nowrap!important}}
+        .events-history-title{{grid-column:1/2!important;grid-row:2!important;min-width:0!important;overflow:hidden!important}}
+        .events-history-title strong{{font-size:12px!important;white-space:nowrap!important;overflow:hidden!important;text-overflow:ellipsis!important}}
+        .events-history-title small{{display:none!important}}
+        .events-history-own{{grid-column:2/3!important;grid-row:2!important;text-align:right!important;font-size:9px!important;white-space:nowrap!important}}
+        .events-history-empty{{padding:16px 9px!important}}
+
+        /* Event erstellen: echte Handybreite, einspaltig und scrollbar. */
+        .event-create-dialog{{
+          width:calc(100dvw - 16px)!important;max-width:calc(100dvw - 16px)!important;
+          max-height:calc(100dvh - 20px)!important;margin:auto!important;
+          box-sizing:border-box!important;border-radius:14px!important;overflow:hidden!important;
+        }}
+        .event-create-form{{
+          width:100%!important;max-width:100%!important;max-height:calc(100dvh - 20px)!important;
+          box-sizing:border-box!important;overflow-y:auto!important;overflow-x:hidden!important;padding:12px!important;
+        }}
+        .event-dialog-head{{gap:8px!important;margin-bottom:10px!important}}
+        .event-dialog-head h2{{font-size:22px!important}}
+        .event-dialog-close{{width:34px!important;height:34px!important;min-width:34px!important;font-size:22px!important}}
+        .event-create-grid{{grid-template-columns:minmax(0,1fr)!important;gap:8px!important;width:100%!important;max-width:100%!important;min-width:0!important}}
+        .event-create-grid .wide{{grid-column:auto!important}}
+        .event-create-grid label{{min-width:0!important;max-width:100%!important}}
+        .event-create-grid input,.event-create-grid select,.event-create-grid textarea{{
+          width:100%!important;max-width:100%!important;min-width:0!important;box-sizing:border-box!important;
+        }}
+        .event-create-check{{font-size:12px!important;margin:10px 0!important}}
+        .event-dialog-actions{{display:grid!important;grid-template-columns:1fr 1fr!important;gap:7px!important;width:100%!important}}
+        .event-dialog-actions .btn{{width:100%!important;min-width:0!important;padding:9px 7px!important;font-size:12px!important}}
+      }}
+    </style>
+    <style>
+      @media(max-width:680px){{
+        dialog.event-create-dialog[open]{{position:fixed!important;inset:8px!important;margin:0!important;width:auto!important;min-width:0!important;max-width:none!important;height:auto!important;max-height:calc(100dvh - 16px)!important;padding:0!important;box-sizing:border-box!important;overflow:hidden!important}}
+        dialog.event-create-dialog[open] .event-create-form{{width:100%!important;min-width:0!important;max-width:100%!important;height:100%!important;max-height:calc(100dvh - 16px)!important;padding:10px!important;margin:0!important;box-sizing:border-box!important;overflow-y:auto!important;overflow-x:hidden!important}}
+        dialog.event-create-dialog[open] .event-create-form *{{box-sizing:border-box!important;max-width:100%!important;min-width:0!important}}
+        dialog.event-create-dialog[open] .event-create-grid{{display:grid!important;grid-template-columns:1fr!important;width:100%!important;gap:7px!important}}
+        dialog.event-create-dialog[open] .event-create-grid label{{display:grid!important;width:100%!important;min-width:0!important;overflow:hidden!important}}
+        dialog.event-create-dialog[open] input,dialog.event-create-dialog[open] select,dialog.event-create-dialog[open] textarea{{display:block!important;width:100%!important;min-width:0!important;max-width:100%!important;font-size:16px!important;padding:9px!important;box-sizing:border-box!important}}
+        dialog.event-create-dialog[open] textarea{{resize:vertical!important}}
+        dialog.event-create-dialog[open] .event-dialog-actions{{display:grid!important;grid-template-columns:1fr 1fr!important;width:100%!important;gap:6px!important}}
+        dialog.event-create-dialog[open] .event-dialog-actions .btn{{width:100%!important;min-width:0!important;padding:9px 5px!important;font-size:11px!important}}
       }}
     </style>
     <main class="events-overview-page">
@@ -14964,326 +15117,81 @@ def _member_roster_relative(value: Any) -> str:
 
 def _render_member_members_page(data: dict[str, Any], request: Request) -> str:
     if not data.get("ok"):
-        return _html_shell("Mitglieder · Mitgliederbereich", f"<section class='panel'><h1>👥 Mitglieder</h1><p class='muted'>{_e(data.get('error'))}</p></section>", nav_mode="member")
+        return _html_shell("Mitglieder", f"<section class='panel'><h1>👥 Mitglieder</h1><p class='muted'>{_e(data.get('error'))}</p></section>", nav_mode="member")
 
     snap: dict[str, Any] = data.get("snapshot") or {}
+    guild_id = int(_safe_guild_id(data) or 0)
     profile_items = [row for row in ((snap.get("profiles") or {}).get("items") or []) if isinstance(row, dict)]
-    profile_map = {
-        _user_id(row.get("user_id") or row.get("member_id") or row.get("discord_id") or row.get("id")): row
-        for row in profile_items
-        if _user_id(row.get("user_id") or row.get("member_id") or row.get("discord_id") or row.get("id"))
-    }
-    source_members = [row for row in _insight_members(snap) if isinstance(row, dict)]
     member_map: dict[int, dict[str, Any]] = {}
-    for row in source_members + profile_items:
+    for row in [x for x in _insight_members(snap) if isinstance(x, dict)] + profile_items:
         uid = _user_id(row.get("user_id") or row.get("member_id") or row.get("discord_id") or row.get("id"))
         if not uid:
             continue
         merged = dict(member_map.get(uid) or {})
         merged.update(row)
-        if uid in profile_map:
-            profile_overlay = dict(profile_map[uid])
-            profile_overlay.update(merged)
-            merged = profile_overlay
         member_map[uid] = merged
 
-    balances = _balance_map(snap)
-    guild_id = int(_safe_guild_id(data) or 0)
-    aion_enabled = bool(_dashboard_module_setting_value(guild_id, 'onboarding', 'aion2_enabled', False)) if guild_id else False
-    aion_profiles = _aion2_profiles_for_users(guild_id, list(member_map.keys())) if aion_enabled else {}
+    aion_profiles = _aion2_profiles_for_users(guild_id, list(member_map.keys())) if guild_id else {}
     absences = [row for row in ((snap.get("absences") or {}).get("items") or []) if isinstance(row, dict)]
-    now = datetime.now(timezone.utc)
-    today = now.date()
-    week_start = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
-    week_end = week_start + timedelta(days=7)
-    week_events = []
-    for event in _events_items(snap):
-        if not isinstance(event, dict):
-            continue
-        event_dt = _dt_obj(event.get("when_iso") or event.get("start_at") or event.get("created_at"))
-        if event_dt and week_start <= event_dt < week_end:
-            week_events.append(event)
-
+    today = datetime.now(timezone.utc).date()
     members: list[dict[str, Any]] = []
-    role_counts: Counter = Counter()
     for uid, row in member_map.items():
-        profile = profile_map.get(uid, {})
-        display_name = str(row.get("display_name") or row.get("discord_name") or row.get("username") or profile.get("display_name") or profile.get("ingame_name") or f"User {uid}")
-        ingame_name = str(row.get("ingame_name") or profile.get("ingame_name") or "")
-        avatar_url = str(row.get("avatar_url") or row.get("display_avatar_url") or row.get("discord_avatar_url") or profile.get("avatar_url") or "").strip()
-        rank_label, rank_key = _member_roster_rank({**profile, **row})
-        role_counts[rank_label] += 1
         aion = aion_profiles.get(uid) or {}
-        if aion.get("character_name"):
-            ingame_name = str(aion.get("character_name") or "").strip()
-        class_name = str(aion.get("class_name") or row.get("class_name") or row.get("main_class") or row.get("character_class") or profile.get("class_name") or "").strip()
-        combat_role = str(aion.get("main_role") or row.get("main_role") or profile.get("main_role") or "").strip()
-        faction = str(aion.get("faction") or "").strip()
-        gearscore = str(aion.get("gearscore") or row.get("gearscore") or profile.get("gearscore") or "").strip()
-        class_type = " · ".join(value for value in (class_name, combat_role) if value) or "—"
+        display = str(row.get("display_name") or row.get("discord_name") or row.get("username") or row.get("ingame_name") or f"User {uid}")
+        ingame = str(aion.get("character_name") or row.get("ingame_name") or "")
+        avatar = str(row.get("avatar_url") or row.get("display_avatar_url") or row.get("discord_avatar_url") or "").strip()
+        class_name = str(aion.get("class_name") or row.get("class_name") or row.get("main_class") or row.get("character_class") or "").strip()
+        level = aion.get("level") or row.get("level") or "—"
+        gs = str(aion.get("gearscore") or row.get("gearscore") or row.get("gear_score") or "—")
+        rank_label, rank_key = _member_roster_rank(row)
         absence = _member_absence_state(absences, uid, today)
-        event_yes = 0
-        for event in week_events:
-            try:
-                if _portal_event_status_for_user(event, uid).startswith("✅"):
-                    event_yes += 1
-            except Exception:
-                continue
-        joined_at = row.get("guild_joined_at") or row.get("joined_guild_at") or row.get("member_since") or row.get("joined_at") or profile.get("joined_at") or ""
-        last_active = row.get("last_active") or row.get("last_seen") or row.get("updated_at") or profile.get("updated_at") or joined_at
-        members.append({
-            "user_id": uid,
-            "display_name": display_name,
-            "ingame_name": ingame_name,
-            "avatar_url": avatar_url,
-            "rank_label": rank_label,
-            "rank_key": rank_key,
-            "class_type": class_type,
-            "class_name": class_name,
-            "combat_role": combat_role,
-            "faction": faction,
-            "gearscore": gearscore,
-            "absence": absence,
-            "event_yes": event_yes,
-            "event_total": len(week_events),
-            "ec": row.get("ec_balance") if row.get("ec_balance") is not None else balances.get(uid),
-            "joined_at": joined_at,
-            "joined_dt": _member_roster_date(joined_at),
-            "last_active": last_active,
-            "last_active_dt": _member_roster_date(last_active),
-        })
+        members.append({"user_id": uid, "display": display, "ingame": ingame, "avatar": avatar, "class_name": class_name, "level": level, "gs": gs, "rank_label": rank_label, "rank_key": rank_key, "absence": absence})
 
     rank_order = {"leader": 0, "advisor": 1, "guardian": 2, "member": 3, "recruit": 4}
-    members.sort(key=lambda item: (rank_order.get(str(item.get("rank_key")), 9), str(item.get("display_name") or "").casefold()))
-    total_members = len(members)
-    away_count = sum(1 for item in members if (item.get("absence") or {}).get("state") == "away")
-    online_count = max(0, total_members - away_count)
-    leadership_count = sum(1 for item in members if item.get("rank_key") in {"leader", "advisor", "guardian"})
-    planned_count = sum(1 for item in members if bool((item.get("absence") or {}).get("planned")))
+    members.sort(key=lambda x: (rank_order.get(str(x.get("rank_key")), 9), str(x.get("display") or "").casefold()))
+    total = len(members)
+    away = sum(1 for x in members if str((x.get("absence") or {}).get("state")) == "away")
+    leadership = sum(1 for x in members if x.get("rank_key") in {"leader", "advisor", "guardian"})
 
     def initials(name: str) -> str:
-        parts = [part for part in re.split(r"\s+", str(name or "").strip()) if part]
-        return "".join(part[0].upper() for part in parts[:2]) or "?"
+        return "".join(part[0].upper() for part in re.split(r"\s+", str(name or "").strip()) if part)[:2] or "?"
 
-    def avatar_html(item: dict[str, Any]) -> str:
-        url = str(item.get("avatar_url") or "")
-        if url.startswith(("https://", "http://", "/static/")):
-            return f'<span class="members-avatar"><img src="{_e(url)}" alt="" loading="lazy" onerror="this.parentElement.textContent=\'{_e(initials(item.get("display_name") or ""))}\'"></span>'
-        return f'<span class="members-avatar">{_e(initials(item.get("display_name") or ""))}</span>'
-
-    member_rows: list[str] = []
+    rows: list[str] = []
     for item in members:
-        absence = item.get("absence") or {}
-        status_state = str(absence.get("state") or "online")
-        status_detail = str(absence.get("detail") or "")
-        if absence.get("planned"):
-            status_detail = "Geplant " + status_detail
-        ec_value = item.get("ec")
-        ec_text = _fmt_ec(ec_value) if ec_value is not None else "—"
-        searchable = " ".join([
-            str(item.get("display_name") or ""), str(item.get("ingame_name") or ""), str(item.get("rank_label") or ""),
-            str(item.get("class_type") or ""), str(item.get("faction") or ""), str(item.get("gearscore") or ""), "abwesend" if status_state == "away" else "online",
-        ]).casefold()
-        member_rows.append(f'''
-          <div class="members-row" role="row" tabindex="0" data-member-row data-member-name="{_e(str(item.get('display_name') or '').casefold())}" data-member-ec="{_e(_num(ec_value, -1))}" data-member-status="{_e(status_state)}" data-member-search="{_e(searchable)}" data-member-href="/portal/member/{int(item['user_id'])}">
-            <div role="cell"><span class="members-rank {item.get('rank_key')}">{_e(item.get('rank_label'))}</span></div>
-            <div class="members-person" role="cell">{avatar_html(item)}<span><strong>{_cell(_aion2_faction_display_html(item.get('faction'), with_name=False)) if item.get('faction') else ''}{_e(item.get('display_name'))}</strong><small>{_e(item.get('ingame_name') or 'Kein Ingame-Name')}</small></span></div>
-            <div class="members-class" role="cell">{_cell(_aion2_class_display_html(item.get('class_name'), with_name=True)) if item.get('class_name') else '—'}</div>
-            <div class="members-gs" role="cell"><strong>{_e(item.get('gearscore') or '—')}</strong></div>
-            <div class="members-role-icon" role="cell">{_cell(_aion2_role_icon_html(item.get('combat_role'), with_label=False))}</div>
-            <div role="cell"><span class="members-status {status_state}"><i></i>{_e(absence.get('label') or 'Online')}</span><small class="members-status-detail">{_e(status_detail)}</small></div>
-            <div class="members-events" role="cell"><strong>{int(item.get('event_yes') or 0)} / {int(item.get('event_total') or 0)}</strong><small>zugesagt</small></div>
-            <div class="members-ec" role="cell"><span>◈</span><strong>{_e(ec_text)}</strong></div>
-          </div>
+        avatar = str(item.get("avatar") or "")
+        if avatar.startswith(("https://", "http://", "/static/")):
+            avatar_html = f'<span class="roster-avatar"><img src="{_e(avatar)}" alt="" loading="lazy" onerror="this.parentElement.textContent=\'{_e(initials(item.get("display") or ""))}\'"></span>'
+        else:
+            avatar_html = f'<span class="roster-avatar">{_e(initials(item.get("display") or ""))}</span>'
+        class_html = _aion2_class_display_html(item.get("class_name"), with_name=True) if item.get("class_name") else "—"
+        searchable = " ".join([str(item.get("display") or ""), str(item.get("ingame") or ""), str(item.get("class_name") or ""), str(item.get("level") or ""), str(item.get("gs") or ""), str(item.get("rank_label") or "")]).casefold()
+        rows.append(f'''
+          <a class="roster-row" href="/member/{int(item['user_id'])}" data-roster-row data-roster-search="{_e(searchable)}">
+            <div class="roster-person">{avatar_html}<span><strong>{_e(item.get('display'))}</strong><small>{_e(item.get('ingame') or 'Kein Ingame-Name')}</small></span></div>
+            <div class="roster-class">{_cell(class_html)}</div>
+            <div class="roster-value"><small>Level</small><strong>{_e(item.get('level') or '—')}</strong></div>
+            <div class="roster-value"><small>GS</small><strong>{_e(item.get('gs') or '—')}</strong></div>
+            <div class="roster-open">›</div>
+          </a>
         ''')
-    rows_html = "".join(member_rows) or '<div class="members-empty">Keine Mitglieder im aktuellen Snapshot.</div>'
-
-    max_role = max(role_counts.values(), default=1)
-    role_class = {"Anführer": "leader", "Berater": "advisor", "Wächter": "guardian", "Mitglied": "member", "Rekrut": "recruit"}
-    role_rows_html = "".join(
-        f'<div class="members-role-row"><span>{_e(label)}</span><div><i class="{role_class.get(label, "member")}" style="width:{max(5, round((count / max_role) * 100))}%"></i></div><strong>{count}</strong></div>'
-        for label, count in ((label, role_counts.get(label, 0)) for label in ("Anführer", "Berater", "Wächter", "Mitglied", "Rekrut"))
-        if count
-    ) or '<div class="members-empty compact">Keine Rollendaten.</div>'
-
-    joined_members = sorted([item for item in members if item.get("joined_dt")], key=lambda item: item.get("joined_dt"), reverse=True)[:4]
-    joined_html = "".join(
-        f'<a class="members-mini-row" href="/portal/member/{int(item["user_id"])}">{avatar_html(item)}<span><strong>{_e(item.get("display_name"))}</strong><small>{_e(item.get("rank_label"))}</small></span><time>{_e(_member_roster_relative(item.get("joined_at")))}</time></a>'
-        for item in joined_members
-    ) or '<div class="members-empty compact">Keine Beitrittsdaten im Snapshot.</div>'
-
-    upcoming = [item for item in members if bool((item.get("absence") or {}).get("planned"))]
-    upcoming.sort(key=lambda item: (item.get("absence") or {}).get("start") or today)
-    upcoming_html = "".join(
-        f'<a class="members-mini-row" href="/portal/member/{int(item["user_id"])}">{avatar_html(item)}<span><strong>{_e(item.get("display_name"))}</strong><small>{_e((item.get("absence") or {}).get("detail") or "geplant")}</small></span><time>⌛</time></a>'
-        for item in upcoming[:4]
-    ) or '<div class="members-empty compact">Keine kommenden Abwesenheiten eingetragen.</div>'
-
-    online_pct = round((online_count / total_members) * 100) if total_members else 0
-    away_pct = 100 - online_pct if total_members else 0
-    admin_action = ''
+    rows_html = "".join(rows) or '<div class="roster-empty">Keine Mitglieder vorhanden.</div>'
 
     body = f'''
     <style>
-      .members-page{{display:grid;gap:16px}}
-      .members-page-header{{display:flex;justify-content:space-between;align-items:end;gap:20px;padding:8px 2px 2px}}
-      .members-page-header h1{{font:700 clamp(34px,4vw,54px) Georgia,serif;color:#e8c87d;letter-spacing:.03em;margin:0}}
-      .members-page-header p{{margin:6px 0 0}}
-      .members-source-note{{display:inline-flex;align-items:center;gap:8px;padding:9px 12px;border:1px solid rgba(214,168,79,.24);background:rgba(214,168,79,.06);border-radius:10px;color:#c9b98f;font-size:12px}}
-      .members-metrics{{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}}
-      .members-metric,.members-section{{background:linear-gradient(180deg,rgba(21,23,29,.97),rgba(11,13,18,.97));border:1px solid rgba(214,168,79,.28);box-shadow:0 16px 32px rgba(0,0,0,.25),inset 0 1px rgba(255,255,255,.025)}}
-      .members-metric{{min-height:128px;padding:18px 20px;display:grid;grid-template-columns:52px 1fr;gap:14px;align-items:center}}
-      .members-metric-icon{{width:50px;height:50px;border:1px solid rgba(214,168,79,.26);display:grid;place-items:center;font-size:25px;color:#d7b367;background:rgba(214,168,79,.06)}}
-      .members-metric small{{display:block;color:#bda46b;text-transform:uppercase;letter-spacing:.08em;font:700 12px Georgia,serif}}
-      .members-metric strong{{display:block;color:#ead7ac;font:400 31px Georgia,serif;margin:4px 0}}
-      .members-metric span{{display:block;color:#938a78;font-size:12px;line-height:1.4}}
-      .members-layout{{display:grid;grid-template-columns:minmax(0,1fr) 285px;gap:16px;align-items:start}}
-      .members-section{{overflow:hidden}}
-      .members-section-title{{margin:0;padding:14px 17px;border-bottom:1px solid rgba(214,168,79,.22);color:#d9b86d;text-transform:uppercase;letter-spacing:.06em;font:700 16px Georgia,serif}}
-      .members-toolbar{{display:grid;grid-template-columns:minmax(220px,1fr) 180px;gap:12px;padding:13px;border-bottom:1px solid rgba(214,168,79,.18)}}
-      .members-toolbar input,.members-toolbar select{{width:100%;padding:11px 12px;border:1px solid rgba(214,168,79,.25);background:#0a0c10;color:#d8cfba;outline:none}}
-      .members-toolbar input:focus,.members-toolbar select:focus{{border-color:#c79b47}}
-      .members-table-head,.members-row{{display:grid;grid-template-columns:110px minmax(205px,1.2fr) minmax(150px,.85fr) 80px 70px minmax(165px,1fr) 95px 105px;align-items:center}}
-      .members-table-head{{padding:11px 14px;color:#bca66f;text-transform:uppercase;letter-spacing:.045em;font:700 11px Georgia,serif;border-bottom:1px solid rgba(214,168,79,.19)}}
-      .members-row{{min-height:64px;padding:7px 14px;border-bottom:1px solid rgba(214,168,79,.12);cursor:pointer;transition:.15s ease}}
-      .members-row:hover,.members-row.selected{{background:linear-gradient(90deg,rgba(126,30,23,.22),rgba(214,168,79,.035));box-shadow:inset 3px 0 #9d392c}}
-      .members-row[hidden]{{display:none}}
-      .members-person{{display:flex;align-items:center;gap:11px;min-width:0}}
-      .members-avatar{{width:39px;height:39px;flex:0 0 39px;border-radius:50%;display:grid;place-items:center;overflow:hidden;border:1px solid rgba(214,168,79,.43);background:radial-gradient(circle at 35% 25%,#6a5230,#17171a 68%);color:#f2d99e;font:700 12px Georgia,serif}}
-      .members-avatar img{{width:100%;height:100%;object-fit:cover}}
-      .members-person strong,.members-mini-row strong{{display:block;color:#e3d2aa;font:700 14px Georgia,serif;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
-      .members-person small,.members-mini-row small{{display:block;color:#8f887a;font-size:11px;margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
-      .members-rank{{display:inline-flex;padding:5px 9px;border:1px solid;border-radius:2px;text-transform:uppercase;font:700 10px Georgia,serif}}
-      .members-rank.leader{{color:#f0aa8d;border-color:#87362b;background:#4f1915}}.members-rank.advisor{{color:#d5aae5;border-color:#633975;background:#301d38}}.members-rank.guardian{{color:#e4bd70;border-color:#76602e;background:#352c18}}.members-rank.member{{color:#b4c9e4;border-color:#35536e;background:#17293a}}.members-rank.recruit{{color:#b9dba7;border-color:#446a34;background:#1b3319}}
-      .members-class{{display:flex;align-items:center;gap:7px;color:#aea89c;font-size:12px}}.members-class img{{width:31px!important;height:31px!important}}.members-person strong img{{width:22px!important;height:22px!important;margin-right:5px}}.members-gs{{color:#e0c37d;font:700 13px Georgia,serif}}.members-role-icon{{font-size:21px;text-align:center}}.members-role-icon .aion-role-glyph{{min-width:26px}}
-      .members-status{{display:inline-flex;align-items:center;gap:7px;text-transform:uppercase;font:700 11px Georgia,serif}}.members-status i{{width:9px;height:9px;border-radius:50%;box-shadow:0 0 9px currentColor}}
-      .members-status.online{{color:#75ca57}}.members-status.online i{{background:#66bd48}}.members-status.away{{color:#df982e}}.members-status.away i{{background:#d78319}}
-      .members-status-detail{{display:block;color:#817b70;font-size:10px;margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:180px}}
-      .members-events strong,.members-events small{{display:block;text-align:center}}.members-events strong{{color:#d4c7a7;font:700 13px Georgia,serif}}.members-events small{{color:#777267;font-size:9px;margin-top:2px}}
-      .members-ec{{display:flex;justify-content:flex-end;align-items:center;gap:7px;color:#e1bd62}}.members-ec strong{{font:700 13px Georgia,serif}}
-      .members-table-footer{{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:12px 14px;color:#8f8775;font-size:12px}}
-      .members-pagination{{display:flex;gap:6px}}.members-pagination button{{min-width:31px;height:31px;border:1px solid rgba(214,168,79,.24);background:#0b0d11;color:#bfb49c;cursor:pointer}}.members-pagination button.active{{border-color:#a6652f;background:#3b1714;color:#f0cc83}}
-      .members-side{{display:grid;gap:14px}}
-      .members-role-list,.members-action-list,.members-status-panel{{padding:14px}}
-      .members-role-row{{display:grid;grid-template-columns:78px 1fr 26px;gap:9px;align-items:center;margin:10px 0;color:#b8ad96;font-size:12px}}.members-role-row>div{{height:7px;background:#08090c;border:1px solid #292820}}.members-role-row i{{display:block;height:100%}}.members-role-row i.leader{{background:#b33b31}}.members-role-row i.advisor{{background:#7e408e}}.members-role-row i.guardian{{background:#b08938}}.members-role-row i.member{{background:#3e78a9}}.members-role-row i.recruit{{background:#57943f}}
-      .members-action-list{{display:grid;gap:8px}}.members-action{{display:flex;justify-content:center;align-items:center;gap:8px;padding:11px;border:1px solid rgba(214,168,79,.28);background:rgba(214,168,79,.035);color:#d6bd82;text-decoration:none;text-transform:uppercase;font:700 11px Georgia,serif;cursor:pointer}}.members-action.primary{{background:#571916;border-color:#9c3328;color:#efd194}}
-      .members-donut-wrap{{display:grid;grid-template-columns:90px 1fr;gap:14px;align-items:center}}.members-donut{{width:86px;height:86px;border-radius:50%;background:conic-gradient(#69bd4d 0 {online_pct}%,#d4871e {online_pct}% 100%);position:relative}}.members-donut:after{{content:"";position:absolute;inset:15px;border-radius:50%;background:#111318;border:1px solid #4b4539}}
-      .members-legend{{display:grid;gap:8px;color:#b7ad99;font-size:12px}}.members-legend span{{display:flex;align-items:center;justify-content:space-between;gap:8px}}.members-legend i{{width:8px;height:8px;border-radius:50%;display:inline-block;margin-right:6px}}.members-legend .on i{{background:#69bd4d}}.members-legend .away i{{background:#d4871e}}
-      .members-planner-note{{margin-top:13px;padding-top:12px;border-top:1px solid rgba(214,168,79,.15);color:#8d8678;font-size:11px;line-height:1.45}}
-      .members-bottom{{display:grid;grid-template-columns:1fr 1fr;gap:16px}}
-      .members-mini-list{{padding:4px 14px 10px}}.members-mini-row{{display:grid;grid-template-columns:39px minmax(0,1fr) auto;gap:10px;align-items:center;padding:10px 0;border-bottom:1px solid rgba(214,168,79,.12);text-decoration:none}}.members-mini-row:last-child{{border-bottom:0}}.members-mini-row time{{color:#a59a84;font-size:11px}}
-      .members-empty{{padding:25px;color:#8c8475;text-align:center}}.members-empty.compact{{padding:15px}}
-      @media(max-width:1180px){{.members-metrics{{grid-template-columns:repeat(2,1fr)}}.members-layout{{grid-template-columns:1fr}}.members-side{{grid-template-columns:repeat(3,1fr)}}}}
-      @media(max-width:900px){{.members-table-head{{display:none}}.members-row{{grid-template-columns:1fr 1fr;gap:10px;padding:13px}}.members-person{{grid-column:1/-1}}.members-ec{{justify-content:flex-start}}.members-side{{grid-template-columns:1fr}}}}
-      @media(max-width:650px){{.members-page-header{{align-items:start;flex-direction:column}}.members-metrics{{grid-template-columns:1fr}}.members-toolbar{{grid-template-columns:1fr}}.members-row{{grid-template-columns:1fr}}.members-person{{grid-column:auto}}.members-bottom{{grid-template-columns:1fr}}}}
+      .roster-page{{display:grid;gap:12px;width:100%;max-width:1120px;margin:0 auto;min-width:0}}.roster-head{{display:flex;align-items:end;justify-content:space-between;gap:14px;min-width:0}}.roster-head h1{{margin:0;color:#e6c777;font:700 clamp(31px,5vw,44px) Georgia,serif}}.roster-head p{{margin:5px 0 0;color:#918b82}}
+      .roster-stats{{display:flex;gap:7px;align-items:center;flex-wrap:wrap;justify-content:flex-end}}.roster-stat{{display:inline-flex;gap:5px;align-items:center;padding:5px 8px;border:1px solid rgba(214,168,79,.2);border-radius:999px;background:rgba(9,10,12,.7);font-size:10px;color:#9c968c}}.roster-stat strong{{color:#e2c779;font-size:12px}}
+      .roster-box{{border:1px solid rgba(214,168,79,.24);border-radius:15px;overflow:hidden;background:rgba(7,8,10,.82);min-width:0}}.roster-toolbar{{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:9px;align-items:center;padding:10px;border-bottom:1px solid rgba(214,168,79,.13)}}.roster-toolbar input{{width:100%;min-width:0;box-sizing:border-box}}.roster-count{{color:#9d968a;font-size:11px;white-space:nowrap}}
+      .roster-table-head{{display:grid;grid-template-columns:minmax(250px,1.5fr) minmax(190px,1fr) 75px 85px 24px;gap:12px;padding:8px 13px;color:#8f887d;text-transform:uppercase;font-size:9px;letter-spacing:.05em;border-bottom:1px solid rgba(214,168,79,.11)}}
+      .roster-row{{display:grid;grid-template-columns:minmax(250px,1.5fr) minmax(190px,1fr) 75px 85px 24px;gap:12px;align-items:center;padding:10px 13px;border-bottom:1px solid rgba(214,168,79,.1);text-decoration:none;color:inherit;min-width:0;transition:.14s ease}}.roster-row:last-child{{border-bottom:0}}.roster-row:hover{{background:linear-gradient(90deg,rgba(126,30,23,.17),rgba(214,168,79,.03));box-shadow:inset 3px 0 #9d392c}}
+      .roster-person{{display:flex;align-items:center;gap:10px;min-width:0}}.roster-avatar{{width:42px;height:42px;flex:0 0 42px;border-radius:50%;overflow:hidden;display:grid;place-items:center;border:1px solid rgba(214,168,79,.4);background:radial-gradient(circle at 35% 25%,#705633,#17181a 70%);color:#efd798;font:700 12px Georgia,serif}}.roster-avatar img{{width:100%;height:100%;object-fit:cover}}.roster-person span{{min-width:0}}.roster-person strong,.roster-person small{{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}.roster-person strong{{color:#e6d4ac;font:700 14px Georgia,serif}}.roster-person small{{margin-top:2px;color:#878279;font-size:10px}}
+      .roster-class{{min-width:0;color:#b8b0a4;font-size:12px}}.roster-class img{{width:30px!important;height:30px!important;margin-right:6px!important;vertical-align:middle}}.roster-value small,.roster-value strong{{display:block}}.roster-value small{{color:#777269;font-size:8px;text-transform:uppercase}}.roster-value strong{{margin-top:2px;color:#e0c37f;font:700 13px Georgia,serif}}.roster-open{{font-size:23px;color:#d6a84f;text-align:right}}.roster-empty{{padding:22px;text-align:center;color:#8e877d}}
+      @media(max-width:680px){{main.content{{width:100%!important;max-width:100%!important;min-width:0!important;box-sizing:border-box!important;padding-left:10px!important;padding-right:10px!important;overflow-x:hidden!important}}.roster-page{{padding-top:76px!important;gap:8px!important;width:100%!important;max-width:100%!important;min-width:0!important;overflow:hidden!important}}.roster-head{{display:grid!important;gap:7px!important;align-items:start!important}}.roster-head h1{{font-size:27px!important}}.roster-head p{{font-size:11px!important}}.roster-stats{{justify-content:flex-start!important;gap:4px!important}}.roster-stat{{padding:4px 6px!important;font-size:8px!important}}.roster-stat strong{{font-size:10px!important}}.roster-toolbar{{grid-template-columns:minmax(0,1fr) auto!important;padding:7px!important;gap:6px!important}}.roster-toolbar input{{font-size:12px!important;padding:8px!important}}.roster-count{{font-size:9px!important}}.roster-table-head{{display:none!important}}.roster-row{{grid-template-columns:minmax(0,1fr) auto auto 18px!important;grid-template-rows:auto auto!important;gap:5px 7px!important;padding:8px 9px!important;width:100%!important;max-width:100%!important;min-width:0!important;box-sizing:border-box!important;overflow:hidden!important}}.roster-person{{grid-column:1/2!important;grid-row:1/3!important;gap:8px!important;min-width:0!important}}.roster-avatar{{width:38px!important;height:38px!important;flex-basis:38px!important}}.roster-person strong{{font-size:12px!important}}.roster-person small{{font-size:9px!important;max-width:132px!important}}.roster-class{{grid-column:2/5!important;grid-row:1!important;text-align:right!important;font-size:10px!important;white-space:nowrap!important;overflow:hidden!important;text-overflow:ellipsis!important;min-width:0!important}}.roster-class img{{width:23px!important;height:23px!important;margin-right:3px!important}}.roster-value{{grid-row:2!important;text-align:right!important;min-width:36px!important}}.roster-value:nth-of-type(3){{grid-column:2!important}}.roster-value:nth-of-type(4){{grid-column:3!important}}.roster-value small{{font-size:7px!important}}.roster-value strong{{font-size:11px!important}}.roster-open{{grid-column:4!important;grid-row:2!important;font-size:19px!important}}}}
     </style>
-    <nav class="topnav"><a href="/member">Start</a><a href="/member/members">Mitglieder</a><a href="/member/events">Events</a><a href="/member/auctions">Auktionen</a><a href="/portal">Mein Profil</a></nav>
-    <main class="members-page">
-      <header class="members-page-header"><div><h1>Mitglieder</h1><p>Rang, Name, Aion-2-Klasse, Gearscore, Rolle und Aktivität</p></div><div class="members-source-note">ⓘ Online und Abwesend werden ausschließlich aus dem Abwesenheiten-Planer berechnet.</div></header>
-
-      <section class="members-metrics">
-        <article class="members-metric"><div class="members-metric-icon">👥</div><div><small>Mitglieder gesamt</small><strong>{total_members}</strong><span>aktuelle Mitglieder im Snapshot</span></div></article>
-        <article class="members-metric"><div class="members-metric-icon">●</div><div><small>Online</small><strong>{online_count}</strong><span>aktuell nicht als abwesend eingetragen</span></div></article>
-        <article class="members-metric"><div class="members-metric-icon">♛</div><div><small>Leitung</small><strong>{leadership_count}</strong><span>Anführer, Berater und Wächter</span></div></article>
-        <article class="members-metric"><div class="members-metric-icon">⌛</div><div><small>Abwesend</small><strong>{away_count}</strong><span>aktuell laufende Abwesenheiten · {planned_count} geplant</span></div></article>
-      </section>
-
-      <section class="members-layout">
-        <section class="members-section">
-          <div class="members-toolbar"><input id="members-search" type="search" placeholder="Mitglied suchen..."><select id="members-sort"><option value="rank">Nach Rolle</option><option value="name">Nach Name</option><option value="ec">Nach EC</option></select></div>
-          <div class="members-table-head" role="row"><span>Rang</span><span>Name</span><span>Klasse</span><span>GS</span><span>Rolle</span><span>Status</span><span>Events</span><span>EC</span></div>
-          <div id="members-rows">{rows_html}</div>
-          <div class="members-table-footer"><div class="members-pagination" id="members-pages"></div><span id="members-range">0 Mitglieder</span></div>
-        </section>
-
-        <aside class="members-side">
-          <section class="members-section"><h2 class="members-section-title">Rollenverteilung</h2><div class="members-role-list">{role_rows_html}</div></section>
-          <section class="members-section"><h2 class="members-section-title">Aktionen</h2><div class="members-action-list"><button class="members-action" type="button" data-member-filter="online">● Online anzeigen</button><button class="members-action" type="button" data-member-filter="away">⌛ Abwesende anzeigen</button><a class="members-action" href="/export/members.csv">⇩ Export</a>{admin_action}</div></section>
-          <section class="members-section"><h2 class="members-section-title">Mitgliederstatus</h2><div class="members-status-panel"><div class="members-donut-wrap"><div class="members-donut"></div><div class="members-legend"><span class="on"><b><i></i>Online</b><strong>{online_count} ({online_pct}%)</strong></span><span class="away"><b><i></i>Abwesend</b><strong>{away_count} ({away_pct}%)</strong></span></div></div><div class="members-planner-note">„Online“ bedeutet hier: im Abwesenheiten-Planer derzeit nicht abwesend. Discord-Presence wird bewusst nicht behauptet.</div></div></section>
-        </aside>
-      </section>
-
-      <section class="members-bottom">
-        <section class="members-section"><h2 class="members-section-title">Neu beigetreten</h2><div class="members-mini-list">{joined_html}</div></section>
-        <section class="members-section"><h2 class="members-section-title">Kommende Abwesenheiten</h2><div class="members-mini-list">{upcoming_html}</div></section>
-      </section>
-    </main>
-    <script>
-      (function membersPage(){{
-        const allRows = Array.from(document.querySelectorAll('[data-member-row]'));
-        const search = document.getElementById('members-search');
-        const sort = document.getElementById('members-sort');
-        const pages = document.getElementById('members-pages');
-        const range = document.getElementById('members-range');
-        const pageSize = 10;
-        let currentPage = 1;
-        let statusFilter = 'all';
-        let selected = null;
-
-        function visibleRows(){{
-          const q = String(search && search.value || '').trim().toLocaleLowerCase('de');
-          let rows = allRows.filter(function(row){{
-            const statusOk = statusFilter === 'all' || row.dataset.memberStatus === statusFilter;
-            const searchOk = !q || String(row.dataset.memberSearch || '').includes(q);
-            return statusOk && searchOk;
-          }});
-          const mode = sort ? sort.value : 'rank';
-          if (mode === 'name') rows.sort(function(a,b){{ return String(a.dataset.memberName || '').localeCompare(String(b.dataset.memberName || ''), 'de'); }});
-          if (mode === 'ec') rows.sort(function(a,b){{ return Number(b.dataset.memberEc || -1) - Number(a.dataset.memberEc || -1); }});
-          return rows;
-        }}
-
-        function choose(row){{
-          allRows.forEach(function(item){{ item.classList.toggle('selected', item === row); }});
-          selected = row || null;
-        }}
-
-        function render(){{
-          const filtered = visibleRows();
-          const pageCount = Math.max(1, Math.ceil(filtered.length / pageSize));
-          currentPage = Math.min(currentPage, pageCount);
-          const start = (currentPage - 1) * pageSize;
-          const end = Math.min(filtered.length, start + pageSize);
-          const pageRows = new Set(filtered.slice(start, end));
-          allRows.forEach(function(row){{ row.hidden = !pageRows.has(row); }});
-          pages.innerHTML = '';
-          for (let page = 1; page <= pageCount; page += 1){{
-            const button = document.createElement('button');
-            button.type = 'button';
-            button.textContent = String(page);
-            button.classList.toggle('active', page === currentPage);
-            button.addEventListener('click', function(){{ currentPage = page; render(); }});
-            pages.appendChild(button);
-          }}
-          range.textContent = filtered.length ? (start + 1) + '–' + end + ' von ' + filtered.length + ' Mitgliedern' : 'Keine Mitglieder gefunden';
-          if (!selected || selected.hidden) choose(filtered[start] || null);
-        }}
-
-        allRows.forEach(function(row){{
-          row.addEventListener('click', function(){{
-            if (row.dataset.memberHref) window.location.href = row.dataset.memberHref;
-          }});
-          row.addEventListener('keydown', function(event){{
-            if (event.key === 'Enter' || event.key === ' '){{
-              event.preventDefault();
-              if (row.dataset.memberHref) window.location.href = row.dataset.memberHref;
-            }}
-          }});
-        }});
-        document.querySelectorAll('[data-member-filter]').forEach(function(button){{
-          button.addEventListener('click', function(){{
-            statusFilter = statusFilter === button.dataset.memberFilter ? 'all' : button.dataset.memberFilter;
-            currentPage = 1;
-            render();
-          }});
-        }});
-        if (search) search.addEventListener('input', function(){{ currentPage = 1; render(); }});
-        if (sort) sort.addEventListener('change', function(){{ currentPage = 1; render(); }});
-        render();
-      }})();
-    </script>
+    <main class="roster-page"><header class="roster-head"><div><div class="eyebrow">Gilde</div><h1>Mitglieder</h1><p>Discord-Profil, Charakter und Aion-2-Daten auf einen Blick.</p></div><div class="roster-stats"><span class="roster-stat"><strong>{total}</strong> Mitglieder</span><span class="roster-stat"><strong>{leadership}</strong> Leitung</span><span class="roster-stat"><strong>{away}</strong> abwesend</span></div></header><section class="roster-box"><div class="roster-toolbar"><input id="roster-search" type="search" placeholder="Mitglied suchen …"><span class="roster-count" id="roster-count">{total} Mitglieder</span></div><div class="roster-table-head"><span>Mitglied</span><span>Klasse</span><span>Level</span><span>GS</span><span></span></div><div id="roster-rows">{rows_html}</div></section></main>
+    <script>(function(){{const input=document.getElementById('roster-search');const count=document.getElementById('roster-count');const rows=Array.from(document.querySelectorAll('[data-roster-row]'));function render(){{const q=String(input&&input.value||'').trim().toLocaleLowerCase('de');let visible=0;rows.forEach(function(row){{const show=!q||String(row.dataset.rosterSearch||'').includes(q);row.hidden=!show;if(show)visible++;}});if(count)count.textContent=visible+' '+(visible===1?'Mitglied':'Mitglieder');}}if(input)input.addEventListener('input',render);render();}})();</script>
     '''
-    return _html_shell("Mitglieder · Beer and Buffs Dashboard", body, nav_mode=_nav_mode_for_request(request))
+    return _html_shell("Mitglieder", body, nav_mode=_nav_mode_for_request(request))
+
 
 def _render_member_ec_page(data: dict[str, Any], request: Request) -> str:
     if not data.get("ok"):
@@ -16867,7 +16775,26 @@ def _render_event_editor(data: dict[str, Any], event_id: str, current_user: Opti
       .event-editor-layout{{display:grid;grid-template-columns:minmax(0,1.35fr) minmax(300px,.65fr);gap:16px;align-items:start}}.event-editor-form{{display:grid;gap:14px}}.editor-grid{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}}.editor-grid .wide{{grid-column:1/-1}}.event-editor-form input,.event-editor-form select,.event-editor-form textarea{{width:100%}}
       .event-live-preview{{position:sticky;top:16px}}.event-live-preview .preview-card{{border:1px solid rgba(214,168,79,.34);border-radius:16px;overflow:hidden;background:rgba(8,8,10,.88)}}.event-live-preview img{{display:block;width:100%;aspect-ratio:16/9;object-fit:cover}}.preview-body{{padding:16px}}.preview-body h2{{margin:.2rem 0 .35rem}}.preview-meta{{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0}}.preview-meta span{{border:1px solid var(--line);border-radius:999px;padding:5px 8px;font-size:.82rem}}
       .admin-running-warning{{display:grid;gap:4px;padding:12px 14px;border:1px solid #a86d20;background:rgba(168,109,32,.13);border-radius:12px;color:#f2d09a}}.editor-actions{{display:flex;gap:10px;flex-wrap:wrap;align-items:center}}.editor-danger{{margin-top:16px;border-color:rgba(220,70,70,.45)}}.admin-event-image-error,.admin-event-thumb-empty{{aspect-ratio:16/9;align-items:center;justify-content:center;flex-direction:column;gap:6px;background:linear-gradient(135deg,#1a120d,#09090b);color:#d6a84f}}
-      @media(max-width:900px){{.event-editor-layout{{grid-template-columns:1fr}}.event-live-preview{{position:static}}}}@media(max-width:620px){{.editor-grid{{grid-template-columns:1fr}}.editor-grid .wide{{grid-column:auto}}}}
+      @media(max-width:900px){{.event-editor-layout{{grid-template-columns:1fr}}.event-live-preview{{position:static}}}}
+      @media(max-width:620px){{
+        main.content{{width:100%!important;max-width:100%!important;min-width:0!important;box-sizing:border-box!important;padding-left:10px!important;padding-right:10px!important;overflow-x:hidden!important}}
+        .event-editor-layout{{width:100%!important;max-width:100%!important;min-width:0!important;overflow:hidden!important;gap:9px!important}}
+        .event-editor-layout .panel{{width:100%!important;max-width:100%!important;min-width:0!important;box-sizing:border-box!important;overflow:hidden!important;padding:11px!important}}
+        .event-editor-form{{width:100%!important;max-width:100%!important;min-width:0!important}}
+        .editor-grid{{grid-template-columns:minmax(0,1fr)!important;gap:8px!important;width:100%!important;max-width:100%!important;min-width:0!important}}
+        .editor-grid .wide{{grid-column:auto!important}}
+        .editor-grid label{{min-width:0!important;max-width:100%!important}}
+        .event-editor-form input,.event-editor-form select,.event-editor-form textarea{{width:100%!important;max-width:100%!important;min-width:0!important;box-sizing:border-box!important}}
+        .editor-actions{{display:grid!important;grid-template-columns:1fr!important;gap:7px!important;width:100%!important}}
+        .editor-actions .btn{{width:100%!important;max-width:100%!important;box-sizing:border-box!important;font-size:12px!important;padding:9px 8px!important}}
+        .event-live-preview{{width:100%!important;max-width:100%!important;min-width:0!important;overflow:hidden!important}}
+        .preview-body{{padding:11px!important}}
+        .preview-body h2{{font-size:18px!important;overflow-wrap:anywhere!important}}
+        .preview-meta{{gap:5px!important}}
+        .preview-meta span{{font-size:10px!important;padding:4px 6px!important}}
+        .editor-danger form{{display:grid!important;grid-template-columns:1fr!important;width:100%!important}}
+        .editor-danger input,.editor-danger button{{width:100%!important;max-width:100%!important;box-sizing:border-box!important}}
+      }}
     </style>
     {_admin_tabs_style()}
     {_admin_tabs('events')}
@@ -19644,7 +19571,7 @@ def export_member_loot_csv(user_id: int, _: bool = Depends(_auth)):
 @app.get("/member/{user_id}", response_class=HTMLResponse)
 def member_detail(user_id: int, request: Request, _: bool = Depends(_auth)):
     try:
-        return HTMLResponse(_render_member_detail(_snapshot_payload(), int(user_id), _current_user(request)))
+        return HTMLResponse(_render_member_detail(_snapshot_payload(), int(user_id), _current_user(request), request=request))
     except Exception as exc:
         return HTMLResponse(
             _html_shell("Beer and Buffs Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>"),
