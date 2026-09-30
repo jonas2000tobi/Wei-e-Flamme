@@ -6205,9 +6205,27 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "member", active_nav_h
       .status-topnav-shell .status-topnav {{ grid-template-columns:repeat(2,minmax(0,1fr)) !important; }}
       .status-topnav-shell .status-topnav a:last-child {{ grid-column:1/-1; }}
     }}
+    .mobile-home-back {{ display:none; }}
+    @media(max-width:900px) {{
+      .mobile-home-back.show {{
+        display:flex !important; position:fixed; top:8px; left:10px; z-index:225;
+        width:50px; height:50px; align-items:center; justify-content:center;
+        border:1px solid rgba(214,168,79,.24); border-radius:14px;
+        background:linear-gradient(180deg,rgba(32,35,45,.94),rgba(13,14,20,.92));
+        color:#f3e4bd; text-decoration:none; font-size:31px; line-height:1;
+        box-shadow:0 8px 24px rgba(0,0,0,.28);
+      }}
+      .mobile-home-back.show:active {{ transform:scale(.96); }}
+    }}
   </style>
 </head>
-<body><div class="app-shell">{(_sidebar_html() if nav_mode == "admin" else _member_sidebar_html())}<main class="content">{auth_note}{body}</main></div><script>
+<body><a class="mobile-home-back" href="/member" aria-label="Zur Startseite" title="Zur Startseite">←</a><div class="app-shell">{(_sidebar_html() if nav_mode == "admin" else _member_sidebar_html())}<main class="content">{auth_note}{body}</main></div><script>
+(function mobileHomeBack(){{
+  const back = document.querySelector('.mobile-home-back');
+  if (!back) return;
+  const path = (window.location.pathname || '/').replace(/\/+$/, '') || '/';
+  if (path !== '/' && path !== '/member') back.classList.add('show');
+}})();
 function filterNextTable(input) {{
   const wrap = input.nextElementSibling;
   if (!wrap) return;
@@ -12106,7 +12124,7 @@ def _aion2_class_display_html(value: Any, *, with_name: bool = True) -> str:
     meta = AION2_CLASS_META.get(name) or {}
     url = _aion2_class_icon_url(name)
     title = f"{name} ({meta.get('en') or ''})".strip()
-    img = f'<img src="{_e(url)}" alt="{_e(name)}" title="{_e(title)}" style="width:34px;height:34px;object-fit:contain;vertical-align:middle">' if url else ""
+    img = f'<img class="aion-class-img" src="{_e(url)}" alt="" title="{_e(title)}" loading="lazy" onerror="this.style.display=\'none\'" style="width:34px;height:34px;object-fit:contain;vertical-align:middle">' if url else ""
     return _raw(img + (f' <span>{_e(name)}</span>' if with_name else ""))
 
 def _aion2_faction_display_html(value: Any, *, with_name: bool = True) -> str:
@@ -12167,23 +12185,117 @@ def _ticket_rows(guild_id:int,search:str='')->list[dict[str,Any]]:
     finally: conn.close()
 
 def _render_member_activity_dashboard(data:dict[str,Any])->str:
-    gid=_safe_guild_id(data); snap=data.get('snapshot') or {}; profiles=((snap.get('profiles') or {}).get('items') or []); rows=[]
+    gid = _safe_guild_id(data)
+    snap = data.get('snapshot') or {}
+    profiles = [p for p in (((snap.get('profiles') or {}).get('items') or [])) if isinstance(p, dict)]
+    cards: list[str] = []
+    active_members = 0
+    missing_total = 0
+    total_voice_seconds = 0
+
+    def _initials(value: Any) -> str:
+        return ''.join(part[:1].upper() for part in re.split(r'\s+', str(value or '').strip()) if part)[:2] or '?'
+
     for profile in profiles:
-        if not isinstance(profile,dict): continue
-        uid=_user_id(profile.get('user_id'))
-        if not uid: continue
-        d=_activity_data(gid,uid); p7=(d.get('periods') or {}).get(7) or {}; v=d.get('voice') or {}; ev=_member_activity_event_stats(snap,uid,d.get('member_since')); absent=min(int(d.get('absent') or 0),int(ev.get('no') or 0)); declined=max(0,int(ev.get('no') or 0)-absent)
-        rows.append([_member_link(uid,profile.get('display_name') or profile.get('server_name') or uid),p7.get('active_days_union',p7.get('active_days',0)),p7.get('messages',0),p7.get('reactions_given',0),round(int(v.get('seconds') or 0)/3600,1),ev.get('possible',0),ev.get('yes',0),declined,absent,ev.get('missing',0)])
-    body=f'''{_admin_tabs_style()}{_admin_quick_links('activity')}<section class="hero"><div><div class="eyebrow">Mitglieder</div><h1>📈 Aktivität & Rückmeldungen</h1><p class="muted">Sortierbare Übersicht. Attendance ist bewusst nicht enthalten.</p></div></section><section class="panel">{_table(['Mitglied','Aktive Tage 7T','Nachrichten 7T','Reaktionen 7T','Voice gesamt h','Events möglich','Zugesagt','Abgelehnt','Abwesend','Keine Antwort'],rows,placeholder='Mitglied suchen…')}</section>'''
-    return _html_shell('Mitgliederaktivität · Guild Platform',body,nav_mode='admin')
+        uid = _user_id(profile.get('user_id'))
+        if not uid:
+            continue
+        d = _activity_data(gid, uid)
+        p7 = (d.get('periods') or {}).get(7) or {}
+        v = d.get('voice') or {}
+        ev = _member_activity_event_stats(snap, uid, d.get('member_since'))
+        absent = min(int(d.get('absent') or 0), int(ev.get('no') or 0))
+        declined = max(0, int(ev.get('no') or 0) - absent)
+        active_days = int(p7.get('active_days_union', p7.get('active_days', 0)) or 0)
+        messages = int(p7.get('messages', 0) or 0)
+        voice_seconds = int(v.get('seconds') or 0)
+        missing = int(ev.get('missing', 0) or 0)
+        if active_days > 0:
+            active_members += 1
+        missing_total += missing
+        total_voice_seconds += voice_seconds
+
+        name = str(profile.get('display_name') or profile.get('server_name') or profile.get('username') or uid)
+        avatar = str(profile.get('avatar_url') or profile.get('display_avatar_url') or profile.get('discord_avatar_url') or '').strip()
+        init = _initials(name)
+        if avatar.startswith(('https://', 'http://', '/static/')):
+            avatar_html = f'<span class="activity-avatar"><img src="{_e(avatar)}" alt="" loading="lazy" onerror="this.parentElement.textContent=\\\'{_e(init)}\\\'"></span>'
+        else:
+            avatar_html = f'<span class="activity-avatar">{_e(init)}</span>'
+        search = f'{name} {active_days} {messages} {missing}'.casefold()
+        response_text = f'{int(ev.get("yes",0) or 0)} Zusagen · {declined} Absagen · {absent} abwesend'
+        cards.append(f'''
+          <a class="activity-member" href="/member/{int(uid)}" data-activity-row data-search="{_e(search)}">
+            <div class="activity-member-head">{avatar_html}<div class="activity-name"><strong>{_e(name)}</strong><span>{_e(response_text)}</span></div><span class="activity-open">›</span></div>
+            <div class="activity-metrics">
+              <span><small>Aktive Tage · 7T</small><b>{active_days}</b></span>
+              <span><small>Nachrichten · 7T</small><b>{messages}</b></span>
+              <span><small>Voice gesamt</small><b>{round(voice_seconds/3600,1)} h</b></span>
+              <span class="{'warn-metric' if missing else ''}"><small>Keine Antwort</small><b>{missing}</b></span>
+            </div>
+          </a>
+        ''')
+
+    cards_html = ''.join(cards) or '<div class="activity-empty">Keine Aktivitätsdaten vorhanden.</div>'
+    body = f'''
+    <style>
+      .activity-page{{display:grid;gap:12px;max-width:1060px;margin:0 auto;min-width:0}}
+      .activity-head{{display:flex;justify-content:space-between;gap:14px;align-items:end;flex-wrap:wrap}}
+      .activity-head h1{{margin:0;color:#e5c77f;font:700 clamp(30px,5vw,43px) Georgia,serif}}.activity-head p{{margin:5px 0 0;color:#918b82}}
+      .activity-summary{{display:flex;gap:6px;flex-wrap:wrap}}.activity-summary span{{display:inline-flex;gap:5px;align-items:center;padding:5px 8px;border:1px solid rgba(214,168,79,.19);border-radius:999px;background:rgba(9,10,12,.72);color:#948f86;font-size:10px}}.activity-summary b{{color:#e3c77e;font-size:12px}}
+      .activity-box{{border:1px solid rgba(214,168,79,.23);border-radius:16px;overflow:hidden;background:rgba(7,8,10,.84)}}
+      .activity-toolbar{{padding:9px;border-bottom:1px solid rgba(214,168,79,.12)}}.activity-toolbar input{{max-width:420px}}
+      .activity-list{{display:grid}}.activity-member{{display:grid;gap:9px;padding:12px 13px;border-bottom:1px solid rgba(214,168,79,.10);color:inherit;text-decoration:none;min-width:0}}.activity-member:last-child{{border-bottom:0}}.activity-member:hover{{background:rgba(214,168,79,.045)}}
+      .activity-member-head{{display:grid;grid-template-columns:42px minmax(0,1fr) 20px;gap:10px;align-items:center;min-width:0}}.activity-avatar{{width:42px;height:42px;border-radius:50%;overflow:hidden;display:grid;place-items:center;border:1px solid rgba(214,168,79,.36);background:#1a1713;color:#e7cb88;font-weight:800}}.activity-avatar img{{width:100%;height:100%;object-fit:cover}}.activity-name{{min-width:0}}.activity-name strong,.activity-name span{{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}.activity-name strong{{color:#e7d5ad;font:700 15px Georgia,serif}}.activity-name span{{color:#858077;font-size:10px;margin-top:2px}}.activity-open{{font-size:22px;color:#d6a84f}}
+      .activity-metrics{{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px;margin-left:52px}}.activity-metrics span{{padding:7px 8px;border-radius:10px;background:rgba(255,255,255,.025);border:1px solid rgba(214,168,79,.10);min-width:0}}.activity-metrics small,.activity-metrics b{{display:block}}.activity-metrics small{{font-size:8px;color:#777269;text-transform:uppercase;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}.activity-metrics b{{font-size:13px;color:#e0c27b;margin-top:2px}}.activity-metrics span.warn-metric b{{color:#e5a06c}}.activity-empty{{padding:22px;text-align:center;color:#8d877e}}
+      @media(max-width:680px){{.activity-page{{padding-top:76px;gap:9px}}.activity-head{{display:grid;gap:7px}}.activity-head h1{{font-size:27px}}.activity-head p{{font-size:11px}}.activity-toolbar{{padding:7px}}.activity-toolbar input{{font-size:12px;padding:8px}}.activity-member{{padding:9px}}.activity-member-head{{grid-template-columns:38px minmax(0,1fr) 16px;gap:8px}}.activity-avatar{{width:38px;height:38px}}.activity-name strong{{font-size:13px}}.activity-name span{{font-size:9px}}.activity-metrics{{grid-template-columns:repeat(2,minmax(0,1fr));margin-left:46px;gap:5px}}.activity-metrics span{{padding:6px}}.activity-metrics b{{font-size:12px}}}}
+    </style>
+    <main class="activity-page">
+      <header class="activity-head"><div><div class="eyebrow">Mitglieder</div><h1>Aktivität</h1><p>Discord- und Eventaktivität kompakt pro Mitglied.</p></div><div class="activity-summary"><span><b>{len(cards)}</b> Mitglieder</span><span><b>{active_members}</b> aktiv · 7T</span><span><b>{round(total_voice_seconds/3600,1)}</b> Voice h</span><span><b>{missing_total}</b> offene Antworten</span></div></header>
+      <section class="activity-box"><div class="activity-toolbar"><input id="activity-search" type="search" placeholder="Mitglied suchen …"></div><div class="activity-list">{cards_html}</div></section>
+    </main>
+    <script>(function(){{const i=document.getElementById('activity-search');const rows=Array.from(document.querySelectorAll('[data-activity-row]'));if(!i)return;i.addEventListener('input',function(){{const q=String(i.value||'').trim().toLocaleLowerCase('de');rows.forEach(r=>r.hidden=!!q&&!String(r.dataset.search||'').includes(q));}});}})();</script>
+    '''
+    return _html_shell('Mitgliederaktivität · Guild Platform', body, nav_mode='admin')
 
 def _render_tickets_dashboard(data:dict[str,Any],search:str='')->str:
-    gid=_safe_guild_id(data); tickets=_ticket_rows(gid,search); open_count=sum(1 for t in tickets if t.get('status') in {'open','claimed','conversation'}); claimed=sum(1 for t in tickets if t.get('status') in {'claimed','conversation'}); archive=sum(1 for t in tickets if t.get('status')=='done')
-    rows=[]
+    gid = _safe_guild_id(data)
+    tickets = _ticket_rows(gid, search)
+    open_count = sum(1 for t in tickets if t.get('status') in {'open','claimed','conversation'})
+    claimed = sum(1 for t in tickets if t.get('status') in {'claimed','conversation'})
+    archive = sum(1 for t in tickets if t.get('status') == 'done')
+    items: list[str] = []
     for t in tickets:
-        st={'open':'🆕 Offen','claimed':'👀 Übernommen','conversation':'💬 Im Gespräch','done':'✅ Erledigt'}.get(str(t.get('status')),str(t.get('status'))); creator='Anonym' if t.get('anonymous') else t.get('creator_name') or '—'; rows.append([f"#{int(t.get('id'))}",creator,_raw(f'<a class="link ticket-title-link" href="/ticket/{int(t.get("id"))}">{_e(_short(t.get("subject"),80) or "Leader-Ticket")}</a>'),st,t.get('assigned_to_name') or '—',_dt(t.get('created_at'))])
-    body=f'''{_admin_tabs_style()}{_admin_quick_links('tickets')}<section class="hero"><div><div class="eyebrow">Leader Contact</div><h1>🎫 Tickets & Archiv</h1><p class="muted">Offene und erledigte Leader-Tickets inklusive privatem Chatverlauf.</p></div></section><section class="grid">{_card('Offen',open_count,'aktive Tickets')}{_card('Übernommen',claimed,'inkl. Gespräch')}{_card('Archiv',archive,'dauerhaft gespeichert')}</section><section class="panel"><form method="get" action="/tickets"><label>🔎 Nach Ersteller suchen<br><input name="q" value="{_e(search)}" placeholder="Discord-/Erstellername"></label><button class="btn" type="submit">Suchen</button></form>{_table(['#','Ersteller','Thema','Status','Bearbeiter','Erstellt'],rows,placeholder='Tickets filtern…')}</section>'''
-    return _html_shell('Tickets · Guild Platform',body,nav_mode='admin')
+        tid = int(t.get('id'))
+        status_key = str(t.get('status') or '')
+        status_label = {'open':'Offen','claimed':'Übernommen','conversation':'Im Gespräch','done':'Erledigt'}.get(status_key,status_key or '—')
+        status_class = 'done' if status_key == 'done' else ('claimed' if status_key in {'claimed','conversation'} else 'open')
+        creator = 'Anonym' if t.get('anonymous') else str(t.get('creator_name') or '—')
+        subject = _short(t.get('subject'), 100) or 'Leader-Ticket'
+        assigned = str(t.get('assigned_to_name') or 'Noch niemand')
+        items.append(f'''
+          <a class="ticket-row" href="/ticket/{tid}">
+            <div class="ticket-row-top"><span class="ticket-id">#{tid}</span><span class="ticket-status {status_class}">{_e(status_label)}</span><span class="ticket-date">{_e(_dt(t.get('created_at')))}</span></div>
+            <strong class="ticket-subject">{_e(subject)}</strong>
+            <div class="ticket-meta"><span>👤 {_e(creator)}</span><span>🛡️ {_e(assigned)}</span></div>
+            <span class="ticket-open">›</span>
+          </a>
+        ''')
+    tickets_html = ''.join(items) or '<div class="ticket-empty">Keine Tickets vorhanden.</div>'
+    body = f'''
+    <style>
+      .tickets-page{{display:grid;gap:12px;max-width:1020px;margin:0 auto;min-width:0}}.tickets-head{{display:flex;justify-content:space-between;gap:14px;align-items:end;flex-wrap:wrap}}.tickets-head h1{{margin:0;color:#e5c77f;font:700 clamp(30px,5vw,43px) Georgia,serif}}.tickets-head p{{margin:5px 0 0;color:#918b82}}
+      .ticket-stats{{display:flex;gap:6px;flex-wrap:wrap}}.ticket-stats span{{display:inline-flex;gap:5px;align-items:center;padding:5px 9px;border:1px solid rgba(214,168,79,.19);border-radius:999px;background:rgba(9,10,12,.72);font-size:10px;color:#938d83}}.ticket-stats b{{font-size:12px;color:#e2c67b}}
+      .tickets-box{{border:1px solid rgba(214,168,79,.23);border-radius:16px;overflow:hidden;background:rgba(7,8,10,.84)}}.tickets-toolbar{{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:7px;padding:9px;border-bottom:1px solid rgba(214,168,79,.12)}}.tickets-toolbar input{{min-width:0}}.tickets-toolbar .btn{{padding:8px 11px}}
+      .ticket-list{{display:grid}}.ticket-row{{position:relative;display:grid;gap:6px;padding:12px 40px 12px 13px;border-bottom:1px solid rgba(214,168,79,.10);color:inherit;text-decoration:none;min-width:0}}.ticket-row:last-child{{border-bottom:0}}.ticket-row:hover{{background:rgba(214,168,79,.045)}}.ticket-row-top{{display:flex;align-items:center;gap:7px;flex-wrap:wrap}}.ticket-id{{color:#d7b96e;font-weight:800}}.ticket-status{{padding:3px 7px;border-radius:999px;font-size:8px;text-transform:uppercase;font-weight:900;letter-spacing:.04em;border:1px solid rgba(214,168,79,.22)}}.ticket-status.open{{color:#ffd58d}}.ticket-status.claimed{{color:#9fd5ff;border-color:rgba(100,170,220,.3)}}.ticket-status.done{{color:#a9dbaa;border-color:rgba(129,199,132,.3)}}.ticket-date{{margin-left:auto;color:#777269;font-size:9px}}.ticket-subject{{font:700 15px Georgia,serif;color:#e8d7b0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}.ticket-meta{{display:flex;gap:12px;flex-wrap:wrap;color:#858077;font-size:10px}}.ticket-open{{position:absolute;right:13px;top:50%;transform:translateY(-50%);font-size:24px;color:#d6a84f}}.ticket-empty{{padding:22px;text-align:center;color:#8d877e}}
+      @media(max-width:680px){{.tickets-page{{padding-top:76px;gap:9px}}.tickets-head{{display:grid;gap:7px}}.tickets-head h1{{font-size:27px}}.tickets-head p{{font-size:11px}}.tickets-toolbar{{padding:7px}}.tickets-toolbar input{{font-size:12px;padding:8px}}.tickets-toolbar .btn{{font-size:11px;padding:8px 10px}}.ticket-row{{padding:10px 34px 10px 10px}}.ticket-date{{width:100%;margin-left:0}}.ticket-subject{{font-size:13px}}.ticket-meta{{font-size:9px;gap:8px}}}}
+    </style>
+    <main class="tickets-page">
+      <header class="tickets-head"><div><div class="eyebrow">Leitung</div><h1>Tickets</h1><p>Offene Anliegen, Gespräche und Archiv übersichtlich an einem Ort.</p></div><div class="ticket-stats"><span><b>{open_count}</b> offen</span><span><b>{claimed}</b> übernommen</span><span><b>{archive}</b> Archiv</span></div></header>
+      <section class="tickets-box"><form class="tickets-toolbar" method="get" action="/tickets"><input name="q" value="{_e(search)}" placeholder="Ersteller suchen …"><button class="btn" type="submit">Suchen</button></form><div class="ticket-list">{tickets_html}</div></section>
+    </main>
+    '''
+    return _html_shell('Tickets · Guild Platform', body, nav_mode='admin')
 
 def _ticket_detail_data(guild_id:int,ticket_id:int)->tuple[dict,list,list]:
     _ensure_v211_tables(); conn=_pg_connect()
@@ -15180,15 +15292,15 @@ def _render_member_members_page(data: dict[str, Any], request: Request) -> str:
     <style>
       .roster-page{{display:grid;gap:12px;width:100%;max-width:1120px;margin:0 auto;min-width:0}}.roster-head{{display:flex;align-items:end;justify-content:space-between;gap:14px;min-width:0}}.roster-head h1{{margin:0;color:#e6c777;font:700 clamp(31px,5vw,44px) Georgia,serif}}.roster-head p{{margin:5px 0 0;color:#918b82}}
       .roster-stats{{display:flex;gap:7px;align-items:center;flex-wrap:wrap;justify-content:flex-end}}.roster-stat{{display:inline-flex;gap:5px;align-items:center;padding:5px 8px;border:1px solid rgba(214,168,79,.2);border-radius:999px;background:rgba(9,10,12,.7);font-size:10px;color:#9c968c}}.roster-stat strong{{color:#e2c779;font-size:12px}}
-      .roster-box{{border:1px solid rgba(214,168,79,.24);border-radius:15px;overflow:hidden;background:rgba(7,8,10,.82);min-width:0}}.roster-toolbar{{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:9px;align-items:center;padding:10px;border-bottom:1px solid rgba(214,168,79,.13)}}.roster-toolbar input{{width:100%;min-width:0;box-sizing:border-box}}.roster-count{{color:#9d968a;font-size:11px;white-space:nowrap}}
+      .roster-box{{border:1px solid rgba(214,168,79,.24);border-radius:15px;overflow:hidden;background:rgba(7,8,10,.82);min-width:0}}.roster-toolbar{{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:9px;align-items:center;padding:10px;border-bottom:1px solid rgba(214,168,79,.13)}}.roster-toolbar input{{width:100%;min-width:0;box-sizing:border-box}}.roster-toolbar-stats{{display:flex;gap:5px;flex-wrap:wrap;justify-content:flex-end}}
       .roster-table-head{{display:grid;grid-template-columns:minmax(250px,1.5fr) minmax(190px,1fr) 75px 85px 24px;gap:12px;padding:8px 13px;color:#8f887d;text-transform:uppercase;font-size:9px;letter-spacing:.05em;border-bottom:1px solid rgba(214,168,79,.11)}}
       .roster-row{{display:grid;grid-template-columns:minmax(250px,1.5fr) minmax(190px,1fr) 75px 85px 24px;gap:12px;align-items:center;padding:10px 13px;border-bottom:1px solid rgba(214,168,79,.1);text-decoration:none;color:inherit;min-width:0;transition:.14s ease}}.roster-row:last-child{{border-bottom:0}}.roster-row:hover{{background:linear-gradient(90deg,rgba(126,30,23,.17),rgba(214,168,79,.03));box-shadow:inset 3px 0 #9d392c}}
       .roster-person{{display:flex;align-items:center;gap:10px;min-width:0}}.roster-avatar{{width:42px;height:42px;flex:0 0 42px;border-radius:50%;overflow:hidden;display:grid;place-items:center;border:1px solid rgba(214,168,79,.4);background:radial-gradient(circle at 35% 25%,#705633,#17181a 70%);color:#efd798;font:700 12px Georgia,serif}}.roster-avatar img{{width:100%;height:100%;object-fit:cover}}.roster-person span{{min-width:0}}.roster-person strong,.roster-person small{{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}.roster-person strong{{color:#e6d4ac;font:700 14px Georgia,serif}}.roster-person small{{margin-top:2px;color:#878279;font-size:10px}}
       .roster-class{{min-width:0;color:#b8b0a4;font-size:12px}}.roster-class img{{width:30px!important;height:30px!important;margin-right:6px!important;vertical-align:middle}}.roster-value small,.roster-value strong{{display:block}}.roster-value small{{color:#777269;font-size:8px;text-transform:uppercase}}.roster-value strong{{margin-top:2px;color:#e0c37f;font:700 13px Georgia,serif}}.roster-open{{font-size:23px;color:#d6a84f;text-align:right}}.roster-empty{{padding:22px;text-align:center;color:#8e877d}}
-      @media(max-width:680px){{main.content{{width:100%!important;max-width:100%!important;min-width:0!important;box-sizing:border-box!important;padding-left:10px!important;padding-right:10px!important;overflow-x:hidden!important}}.roster-page{{padding-top:76px!important;gap:8px!important;width:100%!important;max-width:100%!important;min-width:0!important;overflow:hidden!important}}.roster-head{{display:grid!important;gap:7px!important;align-items:start!important}}.roster-head h1{{font-size:27px!important}}.roster-head p{{font-size:11px!important}}.roster-stats{{justify-content:flex-start!important;gap:4px!important}}.roster-stat{{padding:4px 6px!important;font-size:8px!important}}.roster-stat strong{{font-size:10px!important}}.roster-toolbar{{grid-template-columns:minmax(0,1fr) auto!important;padding:7px!important;gap:6px!important}}.roster-toolbar input{{font-size:12px!important;padding:8px!important}}.roster-count{{font-size:9px!important}}.roster-table-head{{display:none!important}}.roster-row{{grid-template-columns:minmax(0,1fr) auto auto 18px!important;grid-template-rows:auto auto!important;gap:5px 7px!important;padding:8px 9px!important;width:100%!important;max-width:100%!important;min-width:0!important;box-sizing:border-box!important;overflow:hidden!important}}.roster-person{{grid-column:1/2!important;grid-row:1/3!important;gap:8px!important;min-width:0!important}}.roster-avatar{{width:38px!important;height:38px!important;flex-basis:38px!important}}.roster-person strong{{font-size:12px!important}}.roster-person small{{font-size:9px!important;max-width:132px!important}}.roster-class{{grid-column:2/5!important;grid-row:1!important;text-align:right!important;font-size:10px!important;white-space:nowrap!important;overflow:hidden!important;text-overflow:ellipsis!important;min-width:0!important}}.roster-class img{{width:23px!important;height:23px!important;margin-right:3px!important}}.roster-value{{grid-row:2!important;text-align:right!important;min-width:36px!important}}.roster-value:nth-of-type(3){{grid-column:2!important}}.roster-value:nth-of-type(4){{grid-column:3!important}}.roster-value small{{font-size:7px!important}}.roster-value strong{{font-size:11px!important}}.roster-open{{grid-column:4!important;grid-row:2!important;font-size:19px!important}}}}
+      @media(max-width:680px){{main.content{{width:100%!important;max-width:100%!important;min-width:0!important;box-sizing:border-box!important;padding-left:10px!important;padding-right:10px!important;overflow-x:hidden!important}}.roster-page{{padding-top:76px!important;gap:8px!important;width:100%!important;max-width:100%!important;min-width:0!important;overflow:hidden!important}}.roster-head{{display:grid!important;gap:7px!important;align-items:start!important}}.roster-head h1{{font-size:27px!important}}.roster-head p{{font-size:11px!important}}.roster-stats{{justify-content:flex-start!important;gap:4px!important}}.roster-stat{{padding:4px 6px!important;font-size:8px!important}}.roster-stat strong{{font-size:10px!important}}.roster-toolbar{{grid-template-columns:1fr!important;padding:7px!important;gap:6px!important}}.roster-toolbar input{{font-size:12px!important;padding:8px!important}}.roster-toolbar-stats{{justify-content:flex-start!important;gap:4px!important}}.roster-table-head{{display:none!important}}.roster-row{{grid-template-columns:minmax(0,1fr) auto auto 18px!important;grid-template-rows:auto auto!important;gap:5px 7px!important;padding:8px 9px!important;width:100%!important;max-width:100%!important;min-width:0!important;box-sizing:border-box!important;overflow:hidden!important}}.roster-person{{grid-column:1/2!important;grid-row:1/3!important;gap:8px!important;min-width:0!important}}.roster-avatar{{width:38px!important;height:38px!important;flex-basis:38px!important}}.roster-person strong{{font-size:12px!important}}.roster-person small{{font-size:9px!important;max-width:132px!important}}.roster-class{{grid-column:2/5!important;grid-row:1!important;text-align:right!important;font-size:10px!important;white-space:nowrap!important;overflow:hidden!important;text-overflow:ellipsis!important;min-width:0!important;display:flex!important;justify-content:flex-end!important;align-items:center!important;gap:4px!important}}.roster-class img{{width:25px!important;height:25px!important;margin:0!important;flex:0 0 25px!important}}.roster-value{{grid-row:2!important;text-align:right!important;min-width:36px!important}}.roster-value:nth-of-type(3){{grid-column:2!important}}.roster-value:nth-of-type(4){{grid-column:3!important}}.roster-value small{{font-size:7px!important}}.roster-value strong{{font-size:11px!important}}.roster-open{{grid-column:4!important;grid-row:2!important;font-size:19px!important}}}}
     </style>
-    <main class="roster-page"><header class="roster-head"><div><div class="eyebrow">Gilde</div><h1>Mitglieder</h1><p>Discord-Profil, Charakter und Aion-2-Daten auf einen Blick.</p></div><div class="roster-stats"><span class="roster-stat"><strong>{total}</strong> Mitglieder</span><span class="roster-stat"><strong>{leadership}</strong> Leitung</span><span class="roster-stat"><strong>{away}</strong> abwesend</span></div></header><section class="roster-box"><div class="roster-toolbar"><input id="roster-search" type="search" placeholder="Mitglied suchen …"><span class="roster-count" id="roster-count">{total} Mitglieder</span></div><div class="roster-table-head"><span>Mitglied</span><span>Klasse</span><span>Level</span><span>GS</span><span></span></div><div id="roster-rows">{rows_html}</div></section></main>
-    <script>(function(){{const input=document.getElementById('roster-search');const count=document.getElementById('roster-count');const rows=Array.from(document.querySelectorAll('[data-roster-row]'));function render(){{const q=String(input&&input.value||'').trim().toLocaleLowerCase('de');let visible=0;rows.forEach(function(row){{const show=!q||String(row.dataset.rosterSearch||'').includes(q);row.hidden=!show;if(show)visible++;}});if(count)count.textContent=visible+' '+(visible===1?'Mitglied':'Mitglieder');}}if(input)input.addEventListener('input',render);render();}})();</script>
+    <main class="roster-page"><header class="roster-head"><div><div class="eyebrow">Gilde</div><h1>Mitglieder</h1><p>Discord-Profil, Charakter und Aion-2-Daten auf einen Blick.</p></div></header><section class="roster-box"><div class="roster-toolbar"><input id="roster-search" type="search" placeholder="Mitglied suchen …"><div class="roster-toolbar-stats"><span class="roster-stat"><strong id="roster-count">{total}</strong> Mitglieder</span><span class="roster-stat"><strong>{leadership}</strong> Leitung</span><span class="roster-stat"><strong>{away}</strong> abwesend</span></div></div><div class="roster-table-head"><span>Mitglied</span><span>Klasse</span><span>Level</span><span>GS</span><span></span></div><div id="roster-rows">{rows_html}</div></section></main>
+    <script>(function(){{const input=document.getElementById('roster-search');const count=document.getElementById('roster-count');const rows=Array.from(document.querySelectorAll('[data-roster-row]'));function render(){{const q=String(input&&input.value||'').trim().toLocaleLowerCase('de');let visible=0;rows.forEach(function(row){{const show=!q||String(row.dataset.rosterSearch||'').includes(q);row.hidden=!show;if(show)visible++;}});if(count)count.textContent=String(visible);}}if(input)input.addEventListener('input',render);render();}})();</script>
     '''
     return _html_shell("Mitglieder", body, nav_mode=_nav_mode_for_request(request))
 
@@ -15937,9 +16049,14 @@ def _render_admin_settings_editor(data: dict[str, Any], msg: str = "", section: 
       .module-state{display:inline-flex;padding:3px 8px;border-radius:999px;font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.05em}
       .module-state.on{background:rgba(129,199,132,.14);color:#bfe8c1}.module-state.off{background:rgba(217,104,104,.12);color:#e8a7a7}
       .module-card p{margin:0;color:var(--muted);line-height:1.45}.module-deps{font-size:12px;color:#e5c982}
+      .settings-status-strip,.settings-tab-shell{padding:0}
       @media (max-width: 780px){
-        .settings-two,.settings-readonly-grid{grid-template-columns:1fr}
-        .settings-inline-form{grid-template-columns:1fr}
+        .settings-shell{padding-top:76px;gap:9px}
+        .settings-shell>.panel:first-of-type{padding:0!important;border:0!important;background:transparent!important;box-shadow:none!important}
+        .settings-header{display:grid;gap:8px}.settings-header h1{margin:0;font-size:28px}.settings-header p{font-size:11px;line-height:1.35;margin:4px 0 0}.settings-save-note{padding:8px 10px;border-radius:12px;font-size:10px}.settings-save-note span{display:block;line-height:1.3}
+        .settings-metrics{grid-template-columns:repeat(2,minmax(0,1fr));gap:5px}.settings-metric{padding:8px;gap:6px;border-radius:11px;min-width:0}.settings-metric-icon{font-size:16px}.settings-metric-title{font-size:8px}.settings-metric-value{font-size:13px!important}.settings-metric-meta{font-size:8px!important;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+        .settings-tabs{display:grid!important;grid-template-columns:repeat(2,minmax(0,1fr))!important;gap:5px!important}.settings-tab{min-width:0!important;padding:8px 7px!important;font-size:10px!important;text-align:center!important;justify-content:center!important}
+        .settings-card{padding:10px;border-radius:13px;gap:10px}.settings-card-head{gap:8px}.settings-card-head h2{font-size:19px}.settings-card-head p{font-size:10px}.settings-split,.settings-two,.settings-readonly-grid,.module-grid{grid-template-columns:1fr!important;gap:8px}.settings-subcard,.module-card{padding:10px;border-radius:12px}.settings-subcard h3,.module-card h3{font-size:15px}.module-card p,.settings-bullets,.settings-subcard p{font-size:10px;line-height:1.35}.module-icon{font-size:22px}.settings-inline-form{grid-template-columns:1fr}.settings-form input,.settings-form select,.settings-form textarea{font-size:12px}.mini-table{font-size:10px}.mini-table th,.mini-table td{padding:7px 6px}
       }
     </style>
     """
@@ -15961,10 +16078,9 @@ def _render_admin_settings_editor(data: dict[str, Any], msg: str = "", section: 
           </div>
         </div>
       </section>
-      {_admin_quick_links('settings')}
       {msg_panel}
-      <section class='panel'><div class='settings-metrics'>{top_status}</div></section>
-      <section class='panel'><div class='settings-tabs'>{_settings_nav('modules','Module')}{_settings_nav('events','Events')}{_settings_nav('roles','Rollen')}{_settings_nav('ec','DKP / Punkte') if module_states.get('points') else ''}{_settings_nav('loot','Loot') if any(module_states.get(k) for k in ('loot','needlists','auctions')) else ''}{_settings_nav('dashboard','Dashboard')}{_settings_nav('system','Bot / System')}</div></section>
+      <section class='settings-status-strip'><div class='settings-metrics'>{top_status}</div></section>
+      <section class='settings-tab-shell'><div class='settings-tabs'>{_settings_nav('modules','Module')}{_settings_nav('events','Events')}{_settings_nav('roles','Rollen')}{_settings_nav('ec','DKP / Punkte') if module_states.get('points') else ''}{_settings_nav('loot','Loot') if any(module_states.get(k) for k in ('loot','needlists','auctions')) else ''}{_settings_nav('dashboard','Dashboard')}{_settings_nav('system','Bot / System')}</div></section>
       {section_html}
     </div>
     """
