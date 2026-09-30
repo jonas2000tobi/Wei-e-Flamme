@@ -96,7 +96,7 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
-ASSET_VER = "guild-platform-v2-14-0-runtime"
+ASSET_VER = "guild-platform-v2-14-1-ui-fix"
 DASHBOARD_RELEASE_VERSION = "2.14.0 · PostgreSQL Runtime, Support & Aion-2"
 
 _EVENT_IMAGE_ASSETS: dict[str, str] = {
@@ -4994,7 +4994,10 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "member", active_nav_h
   <style>
     :root {{ --bg:#090b10; --panel:#141923; --panel2:#1b2230; --text:#eef2f7; --muted:#9da8b6; --gold:{_e(brand['accent_color'])}; --line:#303947; --red:#d96868; --green:#81c784; --side:#0b0e14; --side2:#131923; }}
     * {{ box-sizing:border-box; }} html {{ scroll-behavior:smooth; }}
-    body {{ margin:0; font-family:Inter, system-ui, Segoe UI, sans-serif; background:linear-gradient(180deg,rgba(5,6,9,.56),rgba(5,6,9,.88)), url("{_asset('dashboard_bg.webp')}") center center / cover fixed no-repeat; color:var(--text); overflow-x:hidden; }}
+    body {{ margin:0; font-family:Inter, system-ui, Segoe UI, sans-serif; background:linear-gradient(180deg,rgba(5,6,9,.56),rgba(5,6,9,.88)), url("{_asset('dashboard_bg.webp')}") center center / cover fixed no-repeat; color:var(--text); overflow-x:hidden; cursor:default; }}
+    body * {{ cursor:inherit; }}
+    a, button, summary, select, label[for], input[type="button"], input[type="submit"], input[type="reset"], input[type="checkbox"], input[type="radio"], [role="button"] {{ cursor:pointer !important; }}
+    input:not([type]), input[type="text"], input[type="search"], input[type="number"], input[type="email"], input[type="password"], input[type="url"], input[type="tel"], input[type="datetime-local"], input[type="date"], input[type="time"], textarea, [contenteditable="true"] {{ cursor:text !important; }}
     .app-shell {{ display:grid; grid-template-columns:260px minmax(0,1fr); min-height:100vh; }}
     .sidebar {{ position:sticky; top:0; height:100vh; overflow:auto; scrollbar-width:none; -ms-overflow-style:none; padding:18px 14px; background:linear-gradient(180deg,rgba(17,18,26,.97),rgba(11,12,18,.97)); border-right:1px solid rgba(214,168,79,.16); box-shadow:16px 0 45px rgba(0,0,0,.35); }}
     .sidebar::-webkit-scrollbar {{ width:0; height:0; display:none; }}
@@ -5043,6 +5046,10 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "member", active_nav_h
     .topnav a[href="/system"]::before {{ display:block; background-image:url("{_asset('nav_system.png')}"); }}
     .topnav a[href="/exports"]::before {{ display:block; background-image:url("{_asset('nav_exports.png')}"); }}
     .topnav a:hover {{ border-color:var(--gold); color:var(--gold); transform:translateY(-1px); }}
+    .aion-faction-display{{display:inline-flex;align-items:center;gap:5px;vertical-align:middle}}
+    .aion-faction-icon{{position:relative;display:inline-grid;width:34px;height:34px;place-items:center;flex:0 0 34px}}
+    .aion-faction-fallback{{position:absolute;inset:0;display:grid;place-items:center;color:#8f6fd1;font-size:24px;line-height:1}}
+    .aion-faction-img{{position:relative;z-index:1;width:34px!important;height:34px!important;object-fit:contain;background:transparent}}
     .hero {{ position:relative; overflow:hidden; display:flex; justify-content:space-between; gap:18px; align-items:center; min-height:300px; padding:34px; border:1px solid rgba(218,166,74,.38); background-image:linear-gradient(90deg,rgba(6,8,14,.82) 0%,rgba(9,12,20,.54) 45%,rgba(9,12,20,.12) 100%),url("{hero_banner}"); background-position:center center; background-size:cover; background-repeat:no-repeat; border-radius:22px; margin-bottom:18px; box-shadow:0 24px 60px rgba(0,0,0,.50), inset 0 0 0 1px rgba(255,220,150,.06); }}
     .hero::after {{ content:""; position:absolute; inset:0; pointer-events:none; background:radial-gradient(circle at 76% 50%,rgba(214,168,79,.16),transparent 34%), linear-gradient(180deg,transparent,rgba(0,0,0,.24)); }}
     .hero > * {{ position:relative; z-index:1; }}
@@ -6220,6 +6227,13 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "member", active_nav_h
   </style>
 </head>
 <body><a class="mobile-home-back" href="/member" aria-label="Zur Startseite" title="Zur Startseite">←</a><div class="app-shell">{(_sidebar_html() if nav_mode == "admin" else _member_sidebar_html())}<main class="content">{auth_note}{body}</main></div><script>
+(function aionFactionIcons(){{
+  document.querySelectorAll('.aion-faction-img').forEach(function(img){{
+    const fallback=img.parentElement&&img.parentElement.querySelector('.aion-faction-fallback');
+    const sync=function(){{if(fallback) fallback.style.display=(img.complete&&img.naturalWidth>0)?'none':'inline-grid';}};
+    img.addEventListener('load',sync); img.addEventListener('error',sync); sync();
+  }});
+}})();
 (function mobileHomeBack(){{
   const back = document.querySelector('.mobile-home-back');
   if (!back) return;
@@ -9459,7 +9473,7 @@ def _member_event_rows(snap: dict[str, Any], user_id: int) -> list[list[Any]]:
 
 def _render_member_detail(data: dict[str, Any], user_id: int, current_user: Optional[dict[str, Any]] = None, request: Optional[Request] = None) -> str:
     if not data.get("ok"):
-        return _html_shell("Mitglied", f"<section class='panel'><h1>👤 Mitglied</h1><p class='muted'>{_e(data.get('error'))}</p></section>", nav_mode="member")
+        return _html_shell("Mitglied", f"<section class='panel'><h1>👤 Mitglied</h1><p class='muted'>{_e(data.get('error'))}</p></section>", nav_mode=(_nav_mode_for_request(request) if request is not None else "member"))
 
     snap: dict[str, Any] = data.get("snapshot") or {}
     uid = int(user_id)
@@ -9477,7 +9491,7 @@ def _render_member_detail(data: dict[str, Any], user_id: int, current_user: Opti
         return _html_shell(
             "Mitglied nicht gefunden",
             "<section class='panel'><h1>❌ Mitglied nicht gefunden</h1><p class='muted'>Dieses Mitglied ist nicht im aktuellen Gilden-Snapshot vorhanden.</p><p><a class='btn' href='/member/members'>Zurück</a></p></section>",
-            nav_mode="member",
+            nav_mode=(_nav_mode_for_request(request) if request is not None else "member"),
         )
 
     aion = (_aion2_profiles_for_users(guild_id, [uid]).get(uid) or {}) if guild_id else {}
@@ -12134,8 +12148,9 @@ def _aion2_faction_display_html(value: Any, *, with_name: bool = True) -> str:
     meta = AION2_FACTION_META[key]
     url = _asset(str(meta.get("asset") or ""))
     label = str(meta.get("label") or key)
-    img = f'<img src="{_e(url)}" alt="{_e(label)}" title="{_e(label)}" style="width:34px;height:34px;object-fit:contain;vertical-align:middle">'
-    return _raw(img + (f' <span>{_e(label)}</span>' if with_name else ""))
+    img = f'<img class="aion-faction-img" src="{_e(url)}" alt="" title="{_e(label)}" loading="lazy" onerror="this.style.display=\'none\'" style="width:34px;height:34px;object-fit:contain;vertical-align:middle">'
+    fallback = f'<span class="aion-faction-fallback" aria-hidden="true">◈</span>'
+    return _raw(f'<span class="aion-faction-display"><span class="aion-faction-icon">{fallback}{img}</span>' + (f'<span>{_e(label)}</span>' if with_name else "") + '</span>')
 
 def _aion2_role_icon_html(value: Any, *, with_label: bool = False) -> str:
     role = normalize_event_role(value)
@@ -12395,7 +12410,7 @@ def character_editor_page(request: Request, msg: str = "", _: bool = Depends(_au
             _html_shell(
                 "Charakter-Editor Fehler",
                 f"<section class='panel'><h1>❌ Charakter-Editor Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>",
-                nav_mode="member",
+                nav_mode=_nav_mode_for_request(request),
             ),
             status_code=500,
         )
@@ -13708,7 +13723,7 @@ def _render_member_portal(data: dict[str, Any], user_id: int, request: Request, 
         return _html_shell(
             "Profil · Beer and Buffs Dashboard",
             f"<section class='panel'><h1>👤 Mein Profil</h1><p class='muted'>{_e(data.get('error'))}</p></section>",
-            nav_mode="member",
+            nav_mode=_nav_mode_for_request(request),
         )
     if not _portal_can_view(request, int(user_id)):
         raise HTTPException(status_code=403, detail="Du darfst nur dein eigenes Profil sehen. Leitung/Admins sehen alle Mitglieder.")
@@ -14136,7 +14151,7 @@ def _render_member_home(data: dict[str, Any], request: Request) -> str:
         return _html_shell(
             "Mitgliederbereich · Guild Platform",
             f"<section class='panel'><h1>🏠 Mitgliederbereich</h1><p class='muted'>{_e(data.get('error'))}</p></section>",
-            nav_mode="member",
+            nav_mode=_nav_mode_for_request(request),
         )
 
     user = _current_user(request) or {}
@@ -14739,7 +14754,7 @@ def _render_member_auctions_page(data: dict[str, Any], request: Request) -> str:
         return _html_shell(
             "Auktionen · Mitgliederbereich",
             f"<section class='panel'><h1>🏆 Auktionen</h1><p class='muted'>{_e(data.get('error'))}</p></section>",
-            nav_mode="member",
+            nav_mode=_nav_mode_for_request(request),
         )
 
     snap: dict[str, Any] = data.get("snapshot") or {}
@@ -15200,7 +15215,7 @@ def _member_roster_relative(value: Any) -> str:
 
 def _render_member_members_page(data: dict[str, Any], request: Request) -> str:
     if not data.get("ok"):
-        return _html_shell("Mitglieder", f"<section class='panel'><h1>👥 Mitglieder</h1><p class='muted'>{_e(data.get('error'))}</p></section>", nav_mode="member")
+        return _html_shell("Mitglieder", f"<section class='panel'><h1>👥 Mitglieder</h1><p class='muted'>{_e(data.get('error'))}</p></section>", nav_mode=_nav_mode_for_request(request))
 
     snap: dict[str, Any] = data.get("snapshot") or {}
     guild_id = int(_safe_guild_id(data) or 0)
@@ -15278,7 +15293,7 @@ def _render_member_members_page(data: dict[str, Any], request: Request) -> str:
 
 def _render_member_ec_page(data: dict[str, Any], request: Request) -> str:
     if not data.get("ok"):
-        return _html_shell("Meine EC · Mitgliederbereich", f"<section class='panel'><h1>🪙 Meine EC</h1><p class='muted'>{_e(data.get('error'))}</p></section>", nav_mode="member")
+        return _html_shell("Meine EC · Mitgliederbereich", f"<section class='panel'><h1>🪙 Meine EC</h1><p class='muted'>{_e(data.get('error'))}</p></section>", nav_mode=_nav_mode_for_request(request))
     uid = _current_user_id(request)
     snap: dict[str, Any] = data.get("snapshot") or {}
     balance = _balance_map(snap).get(int(uid or 0)) if uid else None
