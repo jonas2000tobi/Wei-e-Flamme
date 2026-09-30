@@ -9597,6 +9597,67 @@ def _event_rsvp_css() -> str:
     </style>"""
 
 
+def _event_public_lineup_panel(data: dict[str, Any], event: dict[str, Any], event_id: str) -> str:
+    guild_id = int(_safe_guild_id(data) or 0)
+    if not guild_id:
+        return ""
+    snap = data.get("snapshot") or {}
+    candidates = _event_lineup_candidates_for_snapshot(snap, event)
+    aion_profiles = _aion2_profiles_for_users(guild_id, [int(x.get("user_id") or 0) for x in candidates]) if bool(_dashboard_module_setting_value(guild_id, 'onboarding', 'aion2_enabled', False)) else {}
+    by_uid: dict[str, dict[str, Any]] = {}
+    for candidate in candidates:
+        uid = str(candidate.get("user_id") or "")
+        ap = aion_profiles.get(int(candidate.get("user_id") or 0)) or {}
+        cls = _aion2_normalize_class(ap.get("class_name"))
+        if cls:
+            candidate["class_name"] = cls
+            candidate["class_icon_url"] = _aion2_class_icon_url(cls)
+        if uid:
+            by_uid[uid] = candidate
+    stored = _load_event_lineup(guild_id, str(event_id), event, candidates=candidates)
+    clean = _normalize_event_lineup(event, stored, candidates=candidates)
+    groups = clean.get("groups") or []
+    bench = clean.get("bench") or []
+    assigned = sum(len(g.get("members") or []) for g in groups if isinstance(g, dict)) + len(bench)
+    if assigned <= 0 and not bool(stored.get("published")):
+        return ""
+
+    def player_html(row: Any) -> str:
+        if isinstance(row, dict):
+            uid = str(row.get("user_id") or "")
+        else:
+            uid = str(row or "")
+        person = by_uid.get(uid) or (row if isinstance(row, dict) else {})
+        name = str(person.get("display_name") or person.get("name") or f"User {uid}")
+        icon = str(person.get("class_icon_url") or "")
+        icon_html = f'<img src="{_e(icon)}" alt="" class="public-lineup-icon">' if icon else ''
+        return f'<span class="public-lineup-player">{icon_html}<strong>{_e(name)}</strong></span>'
+
+    group_html = []
+    for i, group in enumerate(groups):
+        if not isinstance(group, dict):
+            continue
+        members = group.get("members") or []
+        if not members:
+            continue
+        name = str(group.get("name") or f"Gruppe {i+1}")
+        group_html.append(f'<article class="public-lineup-group"><h3>{_e(name)}</h3><div class="public-lineup-players">{"".join(player_html(m) for m in members)}</div></article>')
+    if bench:
+        group_html.append(f'<article class="public-lineup-group reserve"><h3>Reserve</h3><div class="public-lineup-players">{"".join(player_html(m) for m in bench)}</div></article>')
+    if not group_html:
+        return ""
+    return f'''
+    <section class="panel public-lineup-panel" id="lineup">
+      <h2>🧩 Aufstellung</h2>
+      <p class="muted">Aktuell gespeicherte Gruppenaufstellung für dieses Event.</p>
+      <div class="public-lineup-grid">{''.join(group_html)}</div>
+    </section>
+    <style>
+      .public-lineup-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}}.public-lineup-group{{border:1px solid rgba(214,168,79,.22);border-radius:14px;padding:12px;background:rgba(0,0,0,.14)}}.public-lineup-group h3{{margin:0 0 9px;color:#efd594}}.public-lineup-group.reserve{{border-style:dashed}}.public-lineup-players{{display:grid;gap:7px}}.public-lineup-player{{display:flex;align-items:center;gap:8px;padding:8px 9px;border-radius:10px;background:rgba(255,255,255,.045);border:1px solid rgba(255,255,255,.07)}}.public-lineup-icon{{width:30px;height:30px;object-fit:contain;filter:drop-shadow(0 0 4px rgba(0,0,0,.6))}}
+    </style>
+    '''
+
+
 def _render_event_detail(data: dict[str, Any], event_id: str, request: Optional[Request] = None, msg: str = "") -> str:
     if not data.get("ok"):
         return _html_shell("Beer and Buffs Dashboard", f"<section class='panel'><h1>📊 Beer and Buffs Dashboard</h1><p class='muted'>{_e(data.get('error'))}</p></section>")
@@ -9653,12 +9714,12 @@ def _render_event_detail(data: dict[str, Any], event_id: str, request: Optional[
     </style>
     """
 
-    lineup_panel = _event_lineup_panel(data, event, str(event_id), request)
+    lineup_panel = _event_public_lineup_panel(data, event, str(event_id))
     lineup_nav = '<a href="#lineup">Aufstellung</a>' if lineup_panel else ''
 
     body = f"""
     {css}
-    <nav class="topnav"><a href="/planning">← Planung</a>{lineup_nav}<a href="#roles">Zusagen</a><a href="#open">Noch nicht zugesagt</a><a href="/attendance">Anwesenheit nach dem Event</a></nav>
+    <nav class="topnav"><a href="/member/events">← Events</a>{lineup_nav}<a href="#roles">Zusagen</a><a href="#open">Noch nicht zugesagt</a></nav>
     <section class="hero">
       <div>
         <div class="eyebrow">Event · Abstimmungsübersicht</div>
@@ -9666,7 +9727,7 @@ def _render_event_detail(data: dict[str, Any], event_id: str, request: Optional[
         <p class="muted">Zeit: {_e(_event_dt(event.get('when_iso') or event.get('start_at')))} · Stand: {_e(_dt(data.get('published_at')))}</p>
         {f"<p>{_e(event.get('description'))}</p>" if event.get('description') else ""}
       </div>
-      <a class="btn" href="/planning">Zurück</a>
+      <a class="btn" href="/member/events">Zurück zu Events</a>
     </section>
     <section class="grid">{cards}</section>
     {_event_rsvp_flash(msg)}
@@ -14190,349 +14251,206 @@ def _member_event_role_summary_text(ev: dict[str, Any]) -> str:
         return "—"
 
 
-def _render_member_events_page(data: dict[str, Any], request: Request) -> str:
-    if not data.get("ok"):
-        return _html_shell(
-            "Events · Mitgliederbereich",
-            f"<section class='panel'><h1>📅 Events</h1><p class='muted'>{_e(data.get('error'))}</p></section>",
-            nav_mode="member",
-        )
+def _event_overview_bucket(ev: dict[str, Any], now: datetime) -> str:
+    state = str(ev.get("status") or ev.get("state") or "").strip().lower()
+    closed_states = {"closed", "ended", "finished", "beendet", "archived", "done", "completed", "deleted"}
+    if state in closed_states:
+        return "past"
+    if _is_running_event(ev):
+        return "running"
+    dt = _event_admin_datetime(ev)
+    if dt and dt >= now:
+        return "upcoming"
+    return "past"
 
-    uid = int(_current_user_id(request) or 0)
-    page_msg = str(request.query_params.get("msg") or "").strip()
-    snap: dict[str, Any] = data.get("snapshot") or {}
-    guild_id = int(_safe_guild_id(data) or 0)
-    now = datetime.now(BERLIN_TZ)
 
-    active_events = [dict(ev) for ev in _portal_active_events(snap, uid) if isinstance(ev, dict)]
-    active_events.sort(
-        key=lambda ev: _event_dt_obj(ev.get("when_iso") or ev.get("start_at") or ev.get("created_at"))
-        or datetime.max.replace(tzinfo=BERLIN_TZ)
+def _event_overview_card(ev: dict[str, Any], snap: dict[str, Any], *, admin: bool, user_id: int = 0, bucket: str = "upcoming") -> str:
+    eid = _event_admin_id(ev)
+    title = _event_admin_title(ev)
+    href = f"/admin/events/{urllib.parse.quote(eid)}" if admin else f"/event/{urllib.parse.quote(eid)}"
+    label = {"running": "LÄUFT", "upcoming": "GEPLANT", "past": "VERGANGEN"}.get(bucket, "EVENT")
+    cls = {"running": "running", "upcoming": "upcoming", "past": "past"}.get(bucket, "upcoming")
+    img = _dashboard_event_image_url(ev)
+    image_html = (
+        f'<img src="{_e(img)}" alt="{_e(title)}" loading="lazy" onerror="this.style.display=\'none\';this.parentElement.classList.add(\'no-image\')">'
+        if img else ''
     )
-
-    all_events = [dict(ev) for ev in _events_items(snap) if isinstance(ev, dict)]
-    past_events = []
-    for ev in all_events:
-        dt = _event_dt_obj(ev.get("when_iso") or ev.get("start_at") or ev.get("created_at"))
-        if dt and dt < datetime.now(BERLIN_TZ) and not _is_running_event(ev):
-            past_events.append(ev)
-    past_events.sort(
-        key=lambda ev: _event_dt_obj(ev.get("when_iso") or ev.get("start_at") or ev.get("created_at"))
-        or datetime.min.replace(tzinfo=BERLIN_TZ),
-        reverse=True,
-    )
-
-    def event_id(ev: dict[str, Any]) -> str:
-        return str(ev.get("event_id") or ev.get("id") or ev.get("message_id") or "").strip()
-
-    def event_title(ev: dict[str, Any]) -> str:
-        return str(ev.get("title") or ev.get("name") or event_id(ev) or "Gildenevent").strip()
-
-    def event_dt(ev: dict[str, Any]) -> Optional[datetime]:
-        return _event_dt_obj(ev.get("when_iso") or ev.get("start_at") or ev.get("created_at"))
-
-    def event_image(ev: dict[str, Any]) -> str:
-        return _dashboard_event_image_url(ev)
-
-    def discord_event_url(ev: dict[str, Any]) -> str:
-        for key in ("jump_url", "discord_url", "message_url", "scheduled_event_url"):
-            value = str(ev.get(key) or "").strip()
-            if value.startswith("https://"):
-                return value
-        channel_id = str(ev.get("channel_id") or "").strip()
-        message_id = str(ev.get("message_id") or event_id(ev) or "").strip()
-        if guild_id and channel_id.isdigit() and message_id.isdigit():
-            return f"https://discord.com/channels/{guild_id}/{channel_id}/{message_id}"
-        return ""
-
-    def capacity_text(ev: dict[str, Any]) -> str:
-        for key in ("max_participants", "max_players", "capacity", "participant_limit", "limit", "slots"):
-            value = int(_num(ev.get(key), 0))
-            if value > 0:
-                return str(value)
-        return "unbegrenzt"
-
-    def event_type_text(ev: dict[str, Any]) -> str:
-        return str(ev.get("event_type") or ev.get("dkp_event_type") or "Gildenevent").strip() or "Gildenevent"
-
-    def role_counts(summary: dict[str, Any]) -> dict[str, int]:
-        out = {"Tank": 0, "Support": 0, "DPS": 0, "Reserve": 0, "Andere": 0}
-        for group in summary.get("groups") or []:
-            if not isinstance(group, dict):
-                continue
-            bucket = _role_bucket(group.get("role"))
-            if bucket not in out:
-                bucket = "Andere"
-            out[bucket] += len([p for p in (group.get("participants") or []) if isinstance(p, dict)])
-        return out
-
-    def start_status(ev: dict[str, Any]) -> tuple[str, str]:
-        dt = event_dt(ev)
-        if _is_running_event(ev):
-            return "EVENT LÄUFT", "running"
-        if dt and dt >= now:
-            return "ANMELDUNG OFFEN", "open"
-        return "ABGESCHLOSSEN", "closed"
-
-    def until_text(ev: dict[str, Any]) -> str:
-        dt = event_dt(ev)
-        if not dt:
-            return "Zeit unbekannt"
-        end = _event_end_dt(ev, dt)
-        if _is_running_event(ev):
-            minutes = max(1, int((now - dt).total_seconds()) // 60)
-            if minutes < 60:
-                return f"Läuft seit {minutes} Minuten"
-            return f"Läuft seit {minutes // 60} Stunden"
-        if end and now >= end:
-            return "Event beendet"
-        seconds = int((dt - now).total_seconds())
-        if seconds <= 0:
-            return "Event beendet"
-        minutes = max(1, seconds // 60)
-        if minutes < 60:
-            return f"Startet in {minutes} Minuten"
-        hours = minutes // 60
-        if hours < 24:
-            return f"Startet in {hours} Stunden"
-        days = hours // 24
-        return f"Startet in {days} Tagen"
-
-    def image_block(ev: dict[str, Any], *, compact: bool = False) -> str:
-        src = event_image(ev)
-        cls = "event-mini-image" if compact else "event-feature-image"
-        if src:
-            return f'<div class="{cls}"><img src="{_e(src)}" alt="{_e(event_title(ev))}" loading="lazy" onerror="this.style.display=\'none\';this.parentElement.dataset.failed=\'1\'"></div>'
-        icon = "⚔️" if "boss" in event_type_text(ev).casefold() or "raid" in event_type_text(ev).casefold() else "📅"
-        return f'<div class="{cls} event-image-placeholder"><span>{icon}</span><small>{_e(event_type_text(ev))}</small></div>'
-
-    def role_strip(summary: dict[str, Any], *, compact: bool = False) -> str:
-        counts = role_counts(summary)
-        items = [
-            ("🛡️", "Tanks", counts.get("Tank", 0), "tank"),
-            ("✚", "Support", counts.get("Support", 0), "support"),
-            ("⚔️", "DDs", counts.get("DPS", 0), "dps"),
-            ("🔖", "Reserve", counts.get("Reserve", 0), "reserve"),
-        ]
-        if not compact:
-            items.extend([
-                ("❔", "Vielleicht", int(summary.get("maybe_count") or 0), "maybe"),
-                ("✖", "Abgemeldet", int(summary.get("no_count") or 0), "no"),
-            ])
-        return '<div class="event-role-strip ' + ('compact' if compact else '') + '">' + ''.join(
-            f'<div class="event-role-stat {kind}"><span>{icon}</span><small>{_e(label)}</small><strong>{_e(value)}</strong></div>'
-            for icon, label, value, kind in items
-        ) + '</div>'
-
-    def status_class(status: str) -> str:
-        value = status.casefold()
-        if "tank" in value:
-            return "tank"
-        if "support" in value or "heal" in value or "heiler" in value:
-            return "support"
-        if "dps" in value or "dd" in value:
-            return "dps"
-        if "reserve" in value or "bank" in value:
-            return "reserve"
-        if "vielleicht" in value:
-            return "maybe"
-        if "abgemeldet" in value:
-            return "no"
-        return "missing"
-
-    def action_href(ev: dict[str, Any]) -> tuple[str, str]:
-        direct = discord_event_url(ev)
-        if direct:
-            return direct, ' target="_blank" rel="noopener"'
-        eid = event_id(ev)
-        return (f"/event/{urllib.parse.quote(eid)}" if eid else "/member/events"), ""
-
-    def featured_event(ev: dict[str, Any]) -> str:
-        eid = event_id(ev)
-        summary = _event_response_summary(snap, ev)
-        state_label, state_class = start_status(ev)
-        user_status = _portal_event_status_for_user(ev, uid)
-        href, target = action_href(ev)
-        response_text = f"{int(summary.get('response_count') or 0)}/{int(summary.get('member_total') or 0)} · {float(summary.get('vote_percent') or 0):.1f} %"
-        return f'''
-        <article class="event-feature-card">
-          <div class="event-section-title">Nächstes Gildenevent</div>
-          <div class="event-feature-main">
-            {image_block(ev)}
-            <div class="event-feature-copy">
-              <div class="event-type-label">{_e(event_type_text(ev))}</div>
-              <h2>{_e(event_title(ev))}</h2>
-              <div class="event-time-line"><span>▣</span><strong>{_e(_event_dt(ev.get('when_iso') or ev.get('start_at') or ev.get('created_at')))}</strong></div>
-              <span class="event-state-badge {state_class}">{_e(state_label)}</span>
-              <div class="event-feature-numbers">
-                <span>👥 <strong>{_e(summary.get('yes_count', 0))}</strong> / {_e(capacity_text(ev))}</span>
-                <span>🗳️ <strong>{_e(response_text)}</strong> abgestimmt</span>
-              </div>
-              <a class="event-detail-link" href="/event/{_e(eid)}">Teilnehmer & Details öffnen →</a>
-            </div>
-          </div>
-          {role_strip(summary)}
-          <div class="event-own-status"><span>👤 Dein Status:</span><strong class="{status_class(user_status)}">{_e(user_status if user_status != '—' else 'Noch nicht abgestimmt')}</strong></div>
-          {_event_rsvp_controls(eid, user_status, return_to="/member/events") if _event_rsvp_is_open(ev) else '<p class="event-action-note">Dieses Event ist für Rückmeldungen geschlossen.</p>'}
-          <p class="event-action-note">Änderungen werden über den Bot direkt mit dem Discord-Event synchronisiert.</p>
-        </article>
-        '''
-
-    def small_event_card(ev: dict[str, Any]) -> str:
-        eid = event_id(ev)
-        summary = _event_response_summary(snap, ev)
-        user_status = _portal_event_status_for_user(ev, uid)
-        href, target = action_href(ev)
-        return f'''
-        <article class="event-mini-card">
-          {image_block(ev, compact=True)}
-          <div class="event-mini-copy">
-            <div class="event-mini-heading">
-              <div><span class="event-mini-type">{_e(event_type_text(ev))}</span><h3>{_e(event_title(ev))}</h3></div>
-              <span class="event-mini-open">{_e(start_status(ev)[0])}</span>
-            </div>
-            <div class="event-mini-time">▣ {_e(_event_dt(ev.get('when_iso') or ev.get('start_at') or ev.get('created_at')))}</div>
-            <div class="event-mini-count">👥 <strong>{_e(summary.get('yes_count', 0))}</strong> / {_e(capacity_text(ev))} zugesagt · Abstimmung {_e(summary.get('response_count', 0))}/{_e(summary.get('member_total', 0))}</div>
-            {role_strip(summary, compact=True)}
-            <div class="event-mini-status">Dein Status: <strong class="{status_class(user_status)}">{_e(user_status if user_status != '—' else 'Noch nicht abgestimmt')}</strong></div>
-            <div class="event-mini-actions">
-              <a class="event-secondary-button primary" href="/event/{_e(eid)}">Details öffnen</a>
-              {f'<a class="event-secondary-button" href="{_e(href)}"{target}>Discord öffnen</a>' if href.startswith('https://') else ''}
-            </div>
-            {_event_rsvp_controls(eid, user_status, return_to="/member/events", compact=True) if _event_rsvp_is_open(ev) else ''}
-          </div>
-        </article>
-        '''
-
-    featured = active_events[0] if active_events else None
-    other_events = active_events[1:] if len(active_events) > 1 else []
-
-    summaries = [_event_response_summary(snap, ev) for ev in active_events]
-    current_week = now.isocalendar()[:2]
-    this_week = sum(1 for ev in active_events if event_dt(ev) and event_dt(ev).isocalendar()[:2] == current_week)
-    total_responses = sum(int(s.get("response_count") or 0) for s in summaries)
-    total_missing = sum(int(s.get("no_response_count") or 0) for s in summaries)
-
-    attention_items: list[str] = []
-    if featured:
-        feature_summary = _event_response_summary(snap, featured)
-        feature_roles = role_counts(feature_summary)
-        if feature_roles.get("Tank", 0) <= 0:
-            attention_items.append("Noch kein Tank zugesagt")
-        if feature_roles.get("Support", 0) <= 0:
-            attention_items.append("Noch kein Support zugesagt")
-        if int(feature_summary.get("no_response_count") or 0) > 0:
-            attention_items.append(f"{int(feature_summary.get('no_response_count') or 0)} Mitglieder ohne Rückmeldung")
-        attention_items.append(until_text(featured))
-    if not attention_items:
-        attention_items.append("Aktuell keine dringenden Hinweise")
-
-    status_panel = f'''
-    <aside class="event-status-panel">
-      <div class="event-section-title">▥ Event-Status</div>
-      <div class="event-status-list">
-        <div><span>👥 Aktive Events</span><strong>{len(active_events)}</strong></div>
-        <div><span>▣ Diese Woche</span><strong>{this_week}</strong></div>
-        <div><span>▤ Rückmeldungen</span><strong class="positive">{total_responses}</strong></div>
-        <div><span>◷ Nicht reagiert</span><strong class="warning">{total_missing}</strong></div>
+    summary = _event_response_summary(snap, ev)
+    roles = _event_role_summary(ev)
+    desc = _short(ev.get("description") or "Keine Beschreibung hinterlegt.", 150)
+    own = _portal_event_status_for_user(ev, int(user_id)) if user_id else ""
+    own_html = f'<div class="events-card-own">Dein Status: <strong>{_e(own if own != "—" else "Noch nicht abgestimmt")}</strong></div>' if not admin and user_id else ''
+    return f'''
+    <a class="events-overview-card" href="{_e(href)}">
+      <div class="events-overview-image">{image_html}<span class="events-image-fallback">⚔️</span></div>
+      <div class="events-overview-copy">
+        <div class="events-card-top"><span class="events-state {cls}">{_e(label)}</span><span class="events-card-date">{_e(_event_dt(ev.get('when_iso') or ev.get('start_at') or ev.get('created_at')))}</span></div>
+        <h3>{_e(title)}</h3>
+        <p>{_e(desc)}</p>
+        <div class="events-card-roles"><span>🛡️ {_e(roles.get('Tank',0))}</span><span>✚ {_e(roles.get('Support',0))}</span><span>⚔️ {_e(roles.get('DPS',0))}</span><span>🔖 {_e(roles.get('Reserve',0))}</span><span>👥 {_e(summary.get('yes_count',0))}</span></div>
+        {own_html}
       </div>
-      <div class="event-attention-box">
-        <h3>⚠ Aufmerksamkeit</h3>
-        <ul>{''.join(f'<li>{_e(item)}</li>' for item in attention_items)}</ul>
-      </div>
-    </aside>
+    </a>
     '''
 
-    history_rows = []
-    for ev in past_events[:80]:
-        eid = event_id(ev)
-        history_rows.append([
-            _event_link(eid, event_title(ev)),
-            _event_dt(ev.get("when_iso") or ev.get("start_at") or ev.get("created_at")),
-            _portal_event_status_for_user(ev, uid),
-        ])
-    if not history_rows:
-        history_rows = _member_event_rows(snap, uid) if uid else []
 
-    featured_html = featured_event(featured) if featured else '<article class="event-feature-card"><div class="empty">Derzeit ist kein laufendes oder kommendes Event eingetragen.</div></article>'
-    other_html = ''.join(small_event_card(ev) for ev in other_events) or '<div class="empty">Keine weiteren geplanten Events.</div>'
+def _event_create_dialog(snap: dict[str, Any]) -> str:
+    return f'''
+    <dialog id="event-create-dialog" class="event-create-dialog">
+      <form method="post" action="/admin/events/action" class="event-create-form">
+        <input type="hidden" name="action_type" value="create">
+        <input type="hidden" name="description_present" value="1">
+        <input type="hidden" name="image_present" value="1">
+        <div class="event-dialog-head"><div><div class="eyebrow">Eventverwaltung</div><h2>Event erstellen</h2></div><button type="button" class="event-dialog-close" onclick="document.getElementById('event-create-dialog').close()">×</button></div>
+        <div class="event-create-grid">
+          <label class="wide">Titel<input name="title" required maxlength="180" placeholder="z. B. Gildenbosse Sonntag"></label>
+          <label>Eventtyp{_dashboard_visible_event_type_select_html()}</label>
+          <label>EC-Regel{_dashboard_event_type_select_html()}</label>
+          <label>Datum<input name="date" type="date" required></label>
+          <label>Uhrzeit<input name="time" type="time" required></label>
+          <label>Dauer<input name="duration_minutes" type="number" min="30" max="720" step="15" value="120"></label>
+          <label>Zielkanal{_dashboard_channel_select_html(snap, required=True)}</label>
+          <label>Zielrolle{_dashboard_role_select_html(snap)}</label>
+          <label class="wide">Ort / Hinweis<input name="location" placeholder="z. B. Abyss / Discord"></label>
+          <label class="wide">Beschreibung<textarea name="description" rows="4" placeholder="Kurzbeschreibung des Events"></textarea></label>
+          <label>Bild{_dashboard_image_type_select_html('auto', element_id='create-image-type')}</label>
+          <label>Eigene Bild-URL<input name="image_url" placeholder="https://..."></label>
+        </div>
+        <label class="event-create-check"><input type="checkbox" name="send_dms" value="1"> Teilnehmer per DM informieren</label>
+        <div class="event-dialog-actions"><button type="button" class="btn secondary" onclick="document.getElementById('event-create-dialog').close()">Abbrechen</button><button class="btn" type="submit">Event erstellen</button></div>
+      </form>
+    </dialog>
+    '''
+
+
+def _render_events_overview_page(data: dict[str, Any], request: Optional[Request], *, admin: bool, msg: str = "") -> str:
+    nav_mode = "admin" if admin else "member"
+    if not data.get("ok"):
+        return _html_shell("Events", f"<section class='panel'><h1>📅 Events</h1><p class='muted'>{_e(data.get('error'))}</p></section>", nav_mode=nav_mode)
+
+    snap: dict[str, Any] = data.get("snapshot") or {}
+    guild_id = int(_safe_guild_id(data) or 0)
+    uid = int(_current_user_id(request) or 0) if request is not None else 0
+    now = datetime.now(BERLIN_TZ)
+
+    by_id: dict[str, dict[str, Any]] = {}
+    for ev in _events_items(snap):
+        if isinstance(ev, dict):
+            eid = _event_admin_id(ev)
+            if eid:
+                by_id[eid] = dict(ev)
+    if admin:
+        for ev in _events_with_pending_ec_checks(snap):
+            if isinstance(ev, dict):
+                eid = _event_admin_id(ev)
+                if eid:
+                    by_id.setdefault(eid, {}).update(dict(ev))
+        if guild_id:
+            for ev in _open_attendance_review_events_for_homepage(snap, guild_id, limit=120):
+                eid = _event_admin_id(ev)
+                if eid:
+                    by_id.setdefault(eid, {}).update(dict(ev))
+
+    running: list[dict[str, Any]] = []
+    upcoming: list[dict[str, Any]] = []
+    past: list[dict[str, Any]] = []
+    for ev in by_id.values():
+        bucket = _event_overview_bucket(ev, now)
+        {"running": running, "upcoming": upcoming, "past": past}[bucket].append(ev)
+    running.sort(key=lambda ev: _event_admin_datetime(ev) or datetime.max.replace(tzinfo=BERLIN_TZ))
+    upcoming.sort(key=lambda ev: _event_admin_datetime(ev) or datetime.max.replace(tzinfo=BERLIN_TZ))
+    past.sort(key=lambda ev: (_event_admin_datetime(ev) or datetime.min.replace(tzinfo=BERLIN_TZ)), reverse=True)
+
+    featured: list[tuple[dict[str, Any], str]] = []
+    for ev in running:
+        if len(featured) >= 3: break
+        featured.append((ev, "running"))
+    for ev in upcoming:
+        if len(featured) >= 3: break
+        featured.append((ev, "upcoming"))
+    for ev in past:
+        if len(featured) >= 3: break
+        featured.append((ev, "past"))
+
+    featured_html = ''.join(_event_overview_card(ev, snap, admin=admin, user_id=uid, bucket=bucket) for ev, bucket in featured)
+    if not featured_html:
+        featured_html = '<div class="events-overview-empty">Keine Event-Daten vorhanden.</div>'
+
+    history_rows = []
+    for ev in past[:30]:
+        eid = _event_admin_id(ev)
+        href = f"/admin/events/{urllib.parse.quote(eid)}" if admin else f"/event/{urllib.parse.quote(eid)}"
+        summary = _event_response_summary(snap, ev)
+        own = _portal_event_status_for_user(ev, uid) if uid and not admin else ""
+        history_rows.append(f'''
+        <a class="events-history-row" href="{_e(href)}">
+          <span class="events-history-date">{_e(_event_dt(ev.get('when_iso') or ev.get('start_at') or ev.get('created_at')))}</span>
+          <span class="events-history-title"><strong>{_e(_event_admin_title(ev))}</strong><small>{_e(_short(ev.get('description') or 'Keine Beschreibung', 90))}</small></span>
+          <span class="events-history-count">👥 {_e(summary.get('yes_count',0))}</span>
+          {f'<span class="events-history-own">{_e(own if own != "—" else "—")}</span>' if not admin else '<span class="events-history-own">Öffnen ›</span>'}
+        </a>
+        ''')
+    history_html = ''.join(history_rows) or '<div class="events-history-empty">Noch keine vergangenen Events vorhanden.</div>'
+
+    create_button = '<button class="btn events-create-button" type="button" onclick="document.getElementById(\'event-create-dialog\').showModal()">＋ Event erstellen</button>' if admin else ''
+    create_dialog = _event_create_dialog(snap) if admin else ''
+    page_title = "Events verwalten" if admin else "Events"
+    subline = "Events planen, öffnen und vergangene Termine im Blick behalten." if admin else "Laufende, kommende und vergangene Gildenevents auf einen Blick."
+    flash = f'<div class="event-page-flash">{_e(msg)}</div>' if msg else ''
 
     body = f'''
     <style>
-      .events-page-heading{{margin:4px 0 18px;padding:0 4px}}
-      .events-page-heading h1{{margin:0;color:#e5c276;font-size:42px;font-family:Georgia,serif;letter-spacing:.02em}}
-      .events-page-heading p{{margin:6px 0 0}}
-      .events-top-layout{{display:grid;grid-template-columns:minmax(0,2.35fr) minmax(280px,.85fr);gap:18px;align-items:stretch}}
-      .event-feature-card,.event-status-panel,.events-more-panel,.events-history{{border:1px solid rgba(214,168,79,.36);background:linear-gradient(145deg,rgba(12,16,18,.94),rgba(5,7,8,.88));box-shadow:0 18px 48px rgba(0,0,0,.25)}}
-      .event-feature-card{{padding:18px 20px}}
-      .event-section-title{{color:#d9b76d;text-transform:uppercase;letter-spacing:.08em;font-family:Georgia,serif;font-weight:800;font-size:16px;padding-bottom:11px;margin-bottom:14px;border-bottom:1px solid rgba(214,168,79,.26)}}
-      .event-feature-main{{display:grid;grid-template-columns:minmax(190px,30%) minmax(0,1fr);gap:22px;align-items:center}}
-      .event-feature-image{{height:168px;border:1px solid rgba(214,168,79,.25);background:rgba(0,0,0,.34);overflow:hidden}}
-      .event-feature-image img,.event-mini-image img{{width:100%;height:100%;object-fit:cover}}
-      .event-image-placeholder{{display:grid;place-items:center;text-align:center;background:radial-gradient(circle at 50% 40%,rgba(150,87,34,.28),rgba(5,7,8,.92))}}
-      .event-feature-image[data-failed="1"]::after,.event-mini-image[data-failed="1"]::after{{content:"⚔️";font-size:52px;display:grid;place-items:center;width:100%;height:100%;background:radial-gradient(circle at 50% 40%,rgba(150,87,34,.28),rgba(5,7,8,.92))}}
-      .event-image-placeholder span{{font-size:52px}}.event-image-placeholder small{{color:#d9b76d;text-transform:uppercase;letter-spacing:.08em}}
-      .event-feature-copy h2{{font-family:Georgia,serif;font-size:34px;margin:3px 0 8px;color:#f2eadb}}
-      .event-type-label,.event-mini-type{{color:#a99b86;text-transform:uppercase;font-size:11px;letter-spacing:.1em}}
-      .event-time-line{{display:flex;align-items:center;gap:9px;color:#e0b95f;margin-bottom:9px}}
-      .event-state-badge{{display:inline-flex;padding:7px 15px;border:1px solid;border-radius:4px;font-size:12px;font-weight:900;letter-spacing:.06em}}
-      .event-state-badge.open{{color:#b8dd8d;border-color:#56863d;background:rgba(65,117,37,.28)}}
-      .event-state-badge.running{{color:#f2cf72;border-color:#9b7124;background:rgba(132,88,18,.28)}}
-      .event-state-badge.closed{{color:#aab1b7;border-color:#596067;background:rgba(65,70,75,.25)}}
-      .event-feature-numbers{{display:flex;gap:18px;flex-wrap:wrap;margin:13px 0;color:#c9bda8}}
-      .event-detail-link{{color:#d9b76d;text-decoration:none;font-weight:800}}
-      .event-role-strip{{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));margin:17px 0 0;border-top:1px solid rgba(214,168,79,.22);border-bottom:1px solid rgba(214,168,79,.18)}}
-      .event-role-strip.compact{{grid-template-columns:repeat(4,minmax(0,1fr));margin:10px 0;border-top:1px solid rgba(214,168,79,.16)}}
-      .event-role-stat{{display:grid;grid-template-columns:auto 1fr;column-gap:7px;align-items:center;padding:12px 10px;border-right:1px dotted rgba(214,168,79,.28)}}
-      .event-role-stat:last-child{{border-right:0}}.event-role-stat>span{{grid-row:1/3;font-size:22px}}.event-role-stat small{{color:#c9bda8}}.event-role-stat strong{{font-size:19px;color:#f2eadb}}
-      .event-role-stat.tank>span{{color:#6ea4e8}}.event-role-stat.support>span{{color:#83d45f}}.event-role-stat.dps>span{{color:#dc5548}}.event-role-stat.reserve>span{{color:#e2bd52}}.event-role-stat.maybe>span{{color:#b77ce4}}
-      .event-own-status{{display:flex;gap:8px;align-items:center;padding:13px 4px;color:#c9bda8}}
-      .event-own-status strong,.event-mini-status strong{{color:#f2eadb}}.event-own-status strong.tank,.event-mini-status strong.tank{{color:#78aeea}}.event-own-status strong.support,.event-mini-status strong.support{{color:#8ddf6a}}.event-own-status strong.dps,.event-mini-status strong.dps{{color:#ef6d5c}}.event-own-status strong.reserve,.event-mini-status strong.reserve{{color:#e7c55f}}.event-own-status strong.maybe,.event-mini-status strong.maybe{{color:#c28aef}}.event-own-status strong.no,.event-mini-status strong.no{{color:#c28f87}}
-      .event-feature-actions{{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}}
-      .event-choice{{display:flex;gap:9px;align-items:center;justify-content:center;padding:13px 9px;border:1px solid rgba(214,168,79,.42);background:linear-gradient(180deg,rgba(44,37,30,.88),rgba(15,15,14,.9));color:#e5d3b0;text-decoration:none;text-transform:uppercase;font-family:Georgia,serif;font-weight:800;letter-spacing:.03em}}
-      .event-choice:hover{{filter:brightness(1.18)}}.event-choice.participate{{border-color:#8c4c2b;background:linear-gradient(180deg,rgba(105,29,20,.75),rgba(42,13,10,.88))}}.event-choice.maybe{{border-color:#745a91;background:linear-gradient(180deg,rgba(65,38,82,.78),rgba(28,18,36,.9))}}.event-choice.reserve{{border-color:#9b722d;background:linear-gradient(180deg,rgba(106,70,18,.72),rgba(45,31,12,.9))}}
-      .event-action-note{{margin:9px 0 0;text-align:right;color:var(--muted);font-size:11px}}
-      .event-status-panel{{padding:18px}}
-      .event-status-list{{display:grid;border:1px solid rgba(214,168,79,.18)}}
-      .event-status-list>div{{display:flex;justify-content:space-between;gap:12px;align-items:center;padding:15px;border-bottom:1px solid rgba(214,168,79,.16);color:#cabda6}}
-      .event-status-list>div:last-child{{border-bottom:0}}.event-status-list strong{{font-size:22px;color:#f1e8d8}}.event-status-list strong.positive{{color:#77c95b}}.event-status-list strong.warning{{color:#e8953f}}
-      .event-attention-box{{margin-top:16px;padding:15px;border:1px solid rgba(190,67,45,.58);background:linear-gradient(135deg,rgba(94,27,20,.48),rgba(37,13,11,.68))}}
-      .event-attention-box h3{{margin:0 0 9px;color:#e2bd68;text-transform:uppercase;font-family:Georgia,serif}}.event-attention-box ul{{margin:0;padding-left:20px;color:#d7c7b7}}.event-attention-box li{{margin:7px 0}}
-      .events-more-panel{{margin-top:18px;padding:16px}}
-      .events-more-grid{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}}
-      .event-mini-card{{display:grid;grid-template-columns:145px minmax(0,1fr);border:1px solid rgba(214,168,79,.28);background:rgba(6,9,10,.7);min-height:220px}}
-      .event-mini-image{{min-height:220px;border-right:1px solid rgba(214,168,79,.22);overflow:hidden}}
-      .event-mini-copy{{padding:14px 15px;display:flex;flex-direction:column}}
-      .event-mini-heading{{display:flex;justify-content:space-between;gap:10px;align-items:flex-start}}.event-mini-heading h3{{margin:3px 0 4px;color:#f0e7d7;font-family:Georgia,serif;font-size:22px}}
-      .event-mini-open{{font-size:9px;color:#a5cf7a;border:1px solid rgba(89,131,55,.5);padding:5px 7px;white-space:nowrap}}
-      .event-mini-time{{color:#d8b563;font-weight:800;margin-bottom:7px}}.event-mini-count{{color:#c9bda8;font-size:13px}}
-      .event-mini-card .event-role-stat{{padding:8px 5px}}.event-mini-card .event-role-stat>span{{font-size:15px}}.event-mini-card .event-role-stat small{{font-size:9px}}.event-mini-card .event-role-stat strong{{font-size:14px}}
-      .event-mini-status{{margin:3px 0 10px;color:#b8ad9d;font-size:13px}}
-      .event-mini-actions{{margin-top:auto;display:grid;grid-template-columns:1fr 1fr;gap:10px}}
-      .event-secondary-button{{display:flex;align-items:center;justify-content:center;padding:10px;border:1px solid rgba(214,168,79,.38);color:#d8c8aa;text-decoration:none;text-transform:uppercase;font-family:Georgia,serif;font-size:12px}}.event-secondary-button.primary{{border-color:#8e452b;background:rgba(102,28,18,.5)}}
-      .events-history{{margin-top:18px;padding:0}}.events-history>summary{{cursor:pointer;list-style:none;padding:16px 20px;color:#d9b76d;font-family:Georgia,serif;font-size:18px;text-transform:uppercase;letter-spacing:.04em}}.events-history>summary::-webkit-details-marker{{display:none}}.events-history>summary::after{{content:'⌄';float:right}}.events-history[open]>summary{{border-bottom:1px solid rgba(214,168,79,.22)}}.events-history-content{{padding:14px}}
-      @media(max-width:1100px){{.events-top-layout{{grid-template-columns:1fr}}.events-more-grid{{grid-template-columns:1fr}}}}
-      @media(max-width:720px){{.events-page-heading h1{{font-size:34px}}.event-feature-main{{grid-template-columns:1fr}}.event-feature-image{{height:190px}}.event-role-strip{{grid-template-columns:repeat(3,minmax(0,1fr))}}.event-feature-actions{{grid-template-columns:1fr 1fr}}.event-mini-card{{grid-template-columns:105px minmax(0,1fr)}}.event-mini-image{{min-height:235px}}}}
-      @media(max-width:480px){{.event-feature-card,.event-status-panel,.events-more-panel{{padding:13px}}.event-feature-copy h2{{font-size:27px}}.event-role-strip{{grid-template-columns:1fr 1fr}}.event-feature-actions{{grid-template-columns:1fr}}.event-mini-card{{grid-template-columns:1fr}}.event-mini-image{{height:150px;min-height:150px;border-right:0;border-bottom:1px solid rgba(214,168,79,.22)}}.event-mini-heading{{display:block}}.event-mini-open{{display:inline-flex;margin-bottom:6px}}}}
+      .events-overview-page{{display:grid;gap:16px}}
+      .events-overview-head{{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:18px;align-items:start;padding:4px 2px 0}}
+      .events-overview-title h1{{margin:0;color:#e5c276;font:700 clamp(34px,5vw,48px) Georgia,serif}}
+      .events-overview-title p{{margin:7px 0 0;color:var(--muted)}}
+      .events-overview-actions{{display:flex;gap:10px;align-items:center;justify-content:flex-end;flex-wrap:wrap}}
+      .events-mini-stats{{display:grid;grid-template-columns:repeat(3,minmax(82px,1fr));gap:8px}}
+      .events-mini-stat{{min-width:88px;padding:9px 11px;border:1px solid rgba(214,168,79,.24);background:rgba(10,10,12,.78);text-align:center;border-radius:12px}}
+      .events-mini-stat small{{display:block;color:#a9a39a;font-size:10px;text-transform:uppercase;letter-spacing:.07em}}
+      .events-mini-stat strong{{display:block;margin-top:3px;color:#efd18a;font:700 22px Georgia,serif}}
+      .event-page-flash{{padding:11px 14px;border:1px solid rgba(214,168,79,.32);background:rgba(214,168,79,.09);border-radius:12px}}
+      .events-section-title{{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:2px 0 10px}}
+      .events-section-title h2{{margin:0;color:#e5c276;font:700 22px Georgia,serif}}
+      .events-feature-grid{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}}
+      .events-overview-card{{display:block;overflow:hidden;border:1px solid rgba(214,168,79,.30);border-radius:17px;background:linear-gradient(150deg,rgba(22,18,14,.96),rgba(7,8,9,.96));color:inherit;text-decoration:none;box-shadow:0 12px 30px rgba(0,0,0,.22);transition:.15s ease}}
+      .events-overview-card:hover{{transform:translateY(-2px);border-color:rgba(214,168,79,.62)}}
+      .events-overview-image{{position:relative;aspect-ratio:16/8;overflow:hidden;background:radial-gradient(circle at 50% 40%,rgba(130,76,34,.35),rgba(7,8,9,.95));display:grid;place-items:center}}
+      .events-overview-image img{{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;z-index:1}}.events-image-fallback{{font-size:44px;color:#d6a84f}}.events-overview-image.no-image .events-image-fallback{{display:block}}
+      .events-overview-copy{{padding:13px 14px 14px}}.events-card-top{{display:flex;align-items:center;justify-content:space-between;gap:8px}}.events-card-date{{font-size:11px;color:#aaa095;text-align:right}}
+      .events-state{{display:inline-flex;padding:5px 8px;border-radius:999px;font-size:10px;font-weight:900;letter-spacing:.06em;border:1px solid}}.events-state.running{{color:#bde79f;border-color:#5c8d46;background:rgba(70,127,45,.19)}}.events-state.upcoming{{color:#efcf81;border-color:#997029;background:rgba(132,87,17,.18)}}.events-state.past{{color:#aaaeb4;border-color:#5f6368;background:rgba(75,77,80,.18)}}
+      .events-overview-copy h3{{margin:10px 0 6px;font-size:20px;color:#f0e5ce}}.events-overview-copy p{{margin:0;color:#aaa198;font-size:13px;line-height:1.4;min-height:36px}}
+      .events-card-roles{{display:flex;gap:6px;flex-wrap:wrap;margin-top:12px}}.events-card-roles span{{padding:4px 7px;border:1px solid rgba(255,255,255,.09);border-radius:999px;font-size:11px;color:#d9d0c2}}
+      .events-card-own{{margin-top:10px;padding-top:9px;border-top:1px solid rgba(214,168,79,.14);font-size:12px;color:#a9a39a}}.events-card-own strong{{color:#efd18a}}
+      .events-overview-empty{{grid-column:1/-1;padding:34px;border:1px dashed rgba(214,168,79,.28);border-radius:16px;text-align:center;color:var(--muted)}}
+      .events-history-panel{{border:1px solid rgba(214,168,79,.26);border-radius:16px;overflow:hidden;background:rgba(7,8,9,.84)}}
+      .events-history-row{{display:grid;grid-template-columns:160px minmax(0,1fr) 80px 130px;gap:12px;align-items:center;padding:12px 14px;border-bottom:1px solid rgba(214,168,79,.12);color:inherit;text-decoration:none}}.events-history-row:last-child{{border-bottom:0}}.events-history-row:hover{{background:rgba(214,168,79,.045)}}
+      .events-history-date{{color:#c8b487;font-size:12px}}.events-history-title strong{{display:block;color:#e8dcc5}}.events-history-title small{{display:block;color:#908b84;margin-top:3px}}.events-history-count,.events-history-own{{text-align:right;color:#b9afa0;font-size:12px}}.events-history-empty{{padding:25px;text-align:center;color:var(--muted)}}
+      .event-create-dialog{{width:min(820px,calc(100vw - 28px));max-height:90vh;padding:0;border:1px solid rgba(214,168,79,.44);border-radius:18px;background:linear-gradient(145deg,#15110d,#08090a);color:var(--text);box-shadow:0 30px 90px rgba(0,0,0,.65)}}.event-create-dialog::backdrop{{background:rgba(0,0,0,.72);backdrop-filter:blur(4px)}}
+      .event-create-form{{padding:18px;overflow:auto;max-height:90vh}}.event-dialog-head{{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;margin-bottom:14px}}.event-dialog-head h2{{margin:2px 0 0;color:#efd18a;font:700 28px Georgia,serif}}.event-dialog-close{{width:38px;height:38px;border-radius:50%;border:1px solid rgba(214,168,79,.32);background:rgba(255,255,255,.04);color:#eee;font-size:25px;cursor:pointer}}
+      .event-create-grid{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:11px}}.event-create-grid label{{display:grid;gap:5px;color:#bdb4a6;font-size:12px}}.event-create-grid .wide{{grid-column:1/-1}}.event-create-grid input,.event-create-grid select,.event-create-grid textarea{{width:100%}}.event-create-check{{display:flex;align-items:center;gap:8px;margin:13px 0;color:#c8bdac}}.event-dialog-actions{{display:flex;justify-content:flex-end;gap:10px;flex-wrap:wrap}}
+      @media(max-width:960px){{.events-feature-grid{{grid-template-columns:1fr 1fr}}.events-overview-card:last-child:nth-child(odd){{grid-column:1/-1}}.events-history-row{{grid-template-columns:135px minmax(0,1fr) 65px 100px}}}}
+      @media(max-width:680px){{.events-overview-head{{grid-template-columns:1fr}}.events-overview-actions{{justify-content:stretch;display:grid;grid-template-columns:1fr}}.events-mini-stats{{order:2}}.events-create-button{{width:100%}}.events-feature-grid{{grid-template-columns:1fr}}.events-overview-card:last-child:nth-child(odd){{grid-column:auto}}.events-history-row{{grid-template-columns:1fr auto;gap:6px 10px}}.events-history-date{{grid-column:1/-1}}.events-history-title{{grid-column:1/2}}.events-history-count{{grid-column:2/3;grid-row:2}}.events-history-own{{grid-column:1/-1;text-align:left}}.event-create-grid{{grid-template-columns:1fr}}.event-create-grid .wide{{grid-column:auto}}}}
     </style>
-    {_event_rsvp_css()}
-    <nav class="topnav"><a href="/member">Start</a><a href="/member/events">Events</a><a href="/member/auctions">Auktionen</a><a href="/portal">Eigenes Profil</a></nav>
-    {_event_rsvp_flash(page_msg)}
-    <header class="events-page-heading"><h1>Events</h1><p class="muted">Deine kommenden Gildeneinsätze</p></header>
-    <section class="events-top-layout">
-      {featured_html}
-      {status_panel}
-    </section>
-    <section class="events-more-panel">
-      <div class="event-section-title">Weitere geplante Events</div>
-      <div class="events-more-grid">{other_html}</div>
-    </section>
-    <details class="events-history">
-      <summary>◷ Vergangene Events / Verlauf</summary>
-      <div class="events-history-content">{_table(['Event','Zeit','Deine Anmeldung'], history_rows, placeholder='Vergangene Events durchsuchen…')}</div>
-    </details>
+    <main class="events-overview-page">
+      <header class="events-overview-head">
+        <div class="events-overview-title"><div class="eyebrow">{'Leitung · Eventverwaltung' if admin else 'Gilde · Events'}</div><h1>{_e(page_title)}</h1><p>{_e(subline)}</p></div>
+        <div class="events-overview-actions">
+          <div class="events-mini-stats"><div class="events-mini-stat"><small>Laufend</small><strong>{len(running)}</strong></div><div class="events-mini-stat"><small>Geplant</small><strong>{len(upcoming)}</strong></div><div class="events-mini-stat"><small>Vergangen</small><strong>{len(past)}</strong></div></div>
+          {create_button}
+        </div>
+      </header>
+      {flash}
+      <section><div class="events-section-title"><h2>Aktuell / zuletzt</h2><span class="muted">max. 3</span></div><div class="events-feature-grid">{featured_html}</div></section>
+      <section><div class="events-section-title"><h2>Event-Historie</h2><span class="muted">letzte {min(len(past),30)}</span></div><div class="events-history-panel">{history_html}</div></section>
+    </main>
+    {create_dialog}
     '''
-    return _html_shell("Events · Mitgliederbereich", body, nav_mode=_nav_mode_for_request(request))
+    return _html_shell(f"{page_title} · Guild Platform", body, nav_mode=nav_mode)
+
+
+def _render_member_events_page(data: dict[str, Any], request: Request) -> str:
+    return _render_events_overview_page(data, request, admin=False, msg=str(request.query_params.get("msg") or ""))
 
 def _render_member_auctions_page(data: dict[str, Any], request: Request) -> str:
     if not data.get("ok"):
@@ -16859,7 +16777,7 @@ def _event_admin_queue_state(action_rows: list[dict[str, Any]], event_id: str) -
     return ("Synchron", "ok")
 
 
-def _render_event_editor(data: dict[str, Any], event_id: str, current_user: Optional[dict[str, Any]] = None, msg: str = "") -> str:
+def _render_event_editor(data: dict[str, Any], event_id: str, current_user: Optional[dict[str, Any]] = None, msg: str = "", request: Optional[Request] = None) -> str:
     if not data.get("ok"):
         return _html_shell("Event bearbeiten · Beer and Buffs Dashboard", f"<section class='panel'><h1>Event bearbeiten</h1><p>{_e(data.get('error'))}</p></section>", nav_mode="admin")
     ev = _event_admin_find(data, event_id)
@@ -16896,6 +16814,8 @@ def _render_event_editor(data: dict[str, Any], event_id: str, current_user: Opti
       <div class="admin-running-warning"><strong>⚠ Dieses Event läuft bereits.</strong><span>Titel, Beschreibung, Zeitpunkt und Bild können trotzdem geändert werden. Teilnehmer, Rückmeldungen und Anwesenheit bleiben erhalten.</span></div>
     """ if running else ""
     discord_button = f'<a class="btn secondary" href="{_e(discord_url)}" target="_blank" rel="noopener">Discord-Post öffnen</a>' if discord_url else ""
+    admin_lineup_panel = _event_lineup_panel(data, ev, eid, request) if request is not None else ""
+    admin_participants_panel = f'<section class="panel"><h2>👥 Teilnehmerübersicht</h2>{_event_role_overview_html(ev, int(guild_id or 0))}</section>'
     body = f"""
     <style>
       .event-editor-layout{{display:grid;grid-template-columns:minmax(0,1.35fr) minmax(300px,.65fr);gap:16px;align-items:start}}.event-editor-form{{display:grid;gap:14px}}.editor-grid{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}}.editor-grid .wide{{grid-column:1/-1}}.event-editor-form input,.event-editor-form select,.event-editor-form textarea{{width:100%}}
@@ -16940,6 +16860,8 @@ def _render_event_editor(data: dict[str, Any], event_id: str, current_user: Opti
         <section class="panel"><h2>Live-Vorschau</h2><div class="preview-card"><img id="event-preview-image" src="{_e(_dashboard_event_image_url(ev))}" alt="Eventbild"><div id="event-preview-image-error" class="admin-event-image-error" style="display:none"><span>⚠️</span><small>Bild nicht erreichbar</small></div><div class="preview-body"><div class="eyebrow">{_e(visible_type or 'Gildenevent')}</div><h2 id="event-preview-title">{_e(title)}</h2><p id="event-preview-description" class="muted">{_e(description or 'Keine Beschreibung')}</p><div class="preview-meta"><span id="event-preview-date">{_e(date_value)} {_e(time_value)}</span><span>{_e(_event_status_text(ev))}</span><span>{_e(_event_role_counts(ev))}</span></div></div></div></section>
       </aside>
     </div>
+    {admin_participants_panel}
+    {admin_lineup_panel}
     <section class="panel editor-danger"><h2>🗑️ Event löschen</h2><p class="muted">Der Eventpost und die Bot-Daten werden gelöscht. Diese Aktion kann nicht rückgängig gemacht werden.</p><form method="post" action="/admin/events/action" style="display:flex;gap:10px;flex-wrap:wrap;align-items:end"><input type="hidden" name="action_type" value="delete"><input type="hidden" name="event_id" value="{_e(eid)}"><label>Sicherheitswort<br><input name="confirm" placeholder="LÖSCHEN" required></label><button class="btn danger" type="submit" onclick="return confirm('Event wirklich endgültig löschen?')">Endgültig löschen</button></form></section>
     <script>
       const eventPresetUrls = {image_presets_json};
@@ -16953,130 +16875,8 @@ def _render_event_editor(data: dict[str, Any], event_id: str, current_user: Opti
     return _html_shell(f"{title} bearbeiten · Beer and Buffs Dashboard", body, nav_mode="admin")
 
 
-def _render_events_center(data: dict[str, Any], current_user: Optional[dict[str, Any]] = None, msg: str = "", *, nav_mode: str = "admin") -> str:
-    if not data.get("ok"):
-        return _html_shell("Events · Beer and Buffs Dashboard", f"<section class='panel'><h1>📅 Events</h1><p class='muted'>{_e(data.get('error'))}</p></section>", nav_mode=nav_mode)
-
-    snap: dict[str, Any] = data.get("snapshot") or {}
-    guild_id = _safe_guild_id(data)
-    now = datetime.now(BERLIN_TZ)
-    by_id: dict[str, dict[str, Any]] = {}
-    for ev in _events_items(snap):
-        eid = _event_admin_id(ev)
-        if eid:
-            by_id[eid] = dict(ev)
-    for ev in _events_with_pending_ec_checks(snap):
-        eid = _event_admin_id(ev)
-        if eid:
-            by_id.setdefault(eid, {}).update(dict(ev))
-    if guild_id:
-        for ev in _open_attendance_review_events_for_homepage(snap, guild_id, limit=120):
-            eid = _event_admin_id(ev)
-            if eid:
-                by_id.setdefault(eid, {}).update(dict(ev))
-
-    events = list(by_id.values())
-    running: list[dict[str, Any]] = []
-    upcoming: list[dict[str, Any]] = []
-    past: list[dict[str, Any]] = []
-    closed_states = {"closed", "ended", "finished", "beendet", "archived", "done", "completed"}
-    for ev in events:
-        dt = _event_admin_datetime(ev)
-        state = str(ev.get("status") or ev.get("state") or "").strip().lower()
-        if state in closed_states:
-            past.append(ev)
-        elif _is_running_event(ev):
-            running.append(ev)
-        elif dt and dt >= now:
-            upcoming.append(ev)
-        else:
-            past.append(ev)
-    running.sort(key=lambda ev: _event_admin_datetime(ev) or datetime.max.replace(tzinfo=BERLIN_TZ))
-    upcoming.sort(key=lambda ev: _event_admin_datetime(ev) or datetime.max.replace(tzinfo=BERLIN_TZ))
-    past.sort(key=lambda ev: -((_event_admin_datetime(ev) or datetime.min.replace(tzinfo=BERLIN_TZ)).timestamp()))
-
-    action_rows = [r for r in (_dashboard_event_action_requests(guild_id, limit=180) if guild_id else []) if str(r.get("action_type") or "") in {"create","edit","delete"}]
-    action_counts = _event_action_counts(action_rows)
-
-    def _status_bucket(ev: dict[str, Any]) -> str:
-        if ev in running:
-            return "running"
-        if ev in upcoming:
-            return "upcoming"
-        return "past"
-
-    def _event_card(ev: dict[str, Any]) -> str:
-        eid = _event_admin_id(ev)
-        title = _event_admin_title(ev)
-        bucket = _status_bucket(ev)
-        bucket_label = {"running": "LÄUFT", "upcoming": "GEPLANT", "past": "BEENDET"}[bucket]
-        status_class = {"running": "ok", "upcoming": "warn", "past": "muted"}[bucket]
-        queue_label, queue_class = _event_admin_queue_state(action_rows, eid)
-        summary = _event_role_summary(ev)
-        discord_url = _event_admin_discord_url(ev)
-        buttons = _admin_card_action_buttons(eid, discord_url=discord_url, compact=True, include_discord=True)
-        image = _event_admin_image_preview(ev)
-        search_text = " ".join([title, str(ev.get("event_type") or ""), str(ev.get("dkp_event_type") or ""), _event_status_text(ev)]).casefold()
-        return f"""
-        <article class="admin-event-card" data-event-status="{_e(bucket)}" data-search="{_e(search_text)}">
-          {image}
-          <div class="admin-event-card-body">
-            <div class="admin-event-card-head"><div><span class="pill {status_class}">{_e(bucket_label)}</span><span class="pill {_e(queue_class)}">{_e(queue_label)}</span><h3>{_e(title)}</h3><p class="muted">{_event_dt(ev.get('when_iso') or ev.get('start_at') or ev.get('created_at'))}</p></div></div>
-            <div class="admin-event-stats"><span>🛡️ {_e(summary.get('Tank',0))}</span><span>✚ {_e(summary.get('Support',0))}</span><span>⚔️ {_e(summary.get('DPS',0))}</span><span>🪑 {_e(summary.get('Reserve',0))}</span><span>👥 {_e(summary.get('yes_count', ev.get('participant_count',0)))}</span></div>
-            <div class="admin-event-actions">{buttons}</div>
-          </div>
-        </article>
-        """
-
-    all_cards = "".join(_event_card(ev) for ev in (running + upcoming + past[:40])) or '<div class="empty">Keine Events im Snapshot.</div>'
-
-    action_table_rows: list[list[Any]] = []
-    for row in action_rows[:60]:
-        result = ""
-        try:
-            parsed = json.loads(str(row.get("result_json") or "{}"))
-            result = parsed.get("message") or parsed.get("error") or ""
-        except Exception:
-            result = str(row.get("result_json") or "")[:160]
-        eid = str(row.get("event_id") or "")
-        action_table_rows.append([
-            _dt(row.get("requested_at")),
-            row.get("action_type"),
-            _raw(f'<a class="link" href="/admin/events/{_e(eid)}">{_e(eid)}</a>') if eid else "neu",
-            _ec_award_status_label(row.get("status")).replace("EC", ""),
-            row.get("actor_name") or row.get("actor_id") or "—",
-            _short(result or row.get("request_id"), 160),
-        ])
-
-    msg_panel = f"<section class='panel admin-flash'><p>{_e(msg)}</p></section>" if msg else ""
-    body = f"""
-    <style>
-      .event-toolbar{{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:14px}}.event-toolbar input{{flex:1 1 260px}}.event-filter{{border:1px solid var(--line);background:rgba(255,255,255,.03);color:var(--text);border-radius:999px;padding:8px 12px;cursor:pointer}}.event-filter.active{{border-color:#d6a84f;background:rgba(214,168,79,.14);color:#f4d78e}}
-      .admin-event-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(330px,1fr));gap:15px}}.admin-event-card{{border:1px solid rgba(214,168,79,.24);border-radius:16px;overflow:hidden;background:rgba(8,8,10,.82);box-shadow:0 14px 38px rgba(0,0,0,.24)}}.admin-event-thumb{{position:relative;aspect-ratio:16/7;background:#0b0908;overflow:hidden}}.admin-event-thumb img{{width:100%;height:100%;object-fit:cover;display:block}}.admin-event-thumb-empty,.admin-event-image-error{{height:100%;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:5px;color:#d6a84f;background:linear-gradient(135deg,#21150d,#09090b)}}.admin-event-card-body{{padding:15px}}.admin-event-card-head h3{{margin:.55rem 0 .15rem;font-size:1.25rem}}.admin-event-card-head .pill{{margin-right:5px}}.admin-event-stats{{display:flex;gap:7px;flex-wrap:wrap;margin:12px 0}}.admin-event-stats span{{border:1px solid var(--line);border-radius:999px;padding:5px 8px;font-size:.84rem}}.admin-event-actions{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px}}.admin-event-actions .lineup-cta{{grid-column:span 2;box-shadow:0 0 0 1px rgba(239,213,148,.22),0 8px 20px rgba(214,168,79,.14)}}.btn.compact{{padding:7px 10px;font-size:.86rem;text-align:center;justify-content:center}}
-      .create-event-form{{display:grid;gap:13px}}.event-form-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:11px}}.event-form-grid input,.event-form-grid select,.event-form-grid textarea{{width:100%}}@media(max-width:620px){{.admin-event-grid{{grid-template-columns:1fr}}}}
-    </style>
-    {_admin_tabs_style()}
-    {_admin_tabs('events')}
-    <section class="hero"><div><div class="eyebrow">Admin · Eventverwaltung</div><h1>📅 Events verwalten</h1><p class="muted">Geplante, laufende und vergangene Events direkt öffnen. Änderungen werden über die Bot-Queue in den bestehenden Discord-Post übernommen.</p></div><a class="btn" href="#event-create">+ Event erstellen</a></section>
-    {_admin_quick_links('events')}
-    {msg_panel}
-    <section class="grid">{_card('Laufend',len(running),'direkt bearbeitbar')}{_card('Geplant',len(upcoming),'kommende Termine')}{_card('Vergangen',len(past),'im Snapshot')}{_card('Queue offen',action_counts.get('pending',0)+action_counts.get('processing',0),f"Fehler: {action_counts.get('failed',0)+action_counts.get('rejected',0)}")}</section>
-    <section class="panel"><div class="event-toolbar"><input id="admin-event-search" type="search" placeholder="Event suchen…"><button class="event-filter active" data-filter="all">Alle</button><button class="event-filter" data-filter="running">Laufend</button><button class="event-filter" data-filter="upcoming">Geplant</button><button class="event-filter" data-filter="past">Beendet</button></div><div id="admin-event-grid" class="admin-event-grid">{all_cards}</div></section>
-    <section class="panel" id="event-create"><h2>➕ Event erstellen</h2><p class="muted">Das Dashboard legt einen Auftrag an. Der Bot erstellt den Discord-Post und übernimmt die Rückmeldungen.</p>
-      <form method="post" action="/admin/events/action" class="create-event-form">
-        <input type="hidden" name="action_type" value="create"><input type="hidden" name="description_present" value="1"><input type="hidden" name="image_present" value="1">
-        <div class="event-form-grid"><label>Titel<br><input name="title" required maxlength="180" placeholder="z. B. Gildenbosse Sonntag"></label><label>Eventtyp<br>{_dashboard_visible_event_type_select_html()}</label><label>EC-Regel<br>{_dashboard_event_type_select_html()}</label><label>Datum<br><input name="date" type="date" required></label><label>Uhrzeit<br><input name="time" type="time" required></label><label>Dauer in Minuten<br><input name="duration_minutes" type="number" min="30" max="720" step="15" value="120"></label><label>Zielkanal<br>{_dashboard_channel_select_html(snap, required=True)}</label><label>Zielrolle optional<br>{_dashboard_role_select_html(snap)}</label><label>Ort / Hinweis<br><input name="location" placeholder="Beer and Buffs Discord"></label></div>
-        <label>Beschreibung<br><textarea name="description" rows="4" placeholder="Kurzbeschreibung"></textarea></label>
-        <div class="event-form-grid"><label>Bild<br>{_dashboard_image_type_select_html('auto', element_id='create-image-type')}</label><label>Eigene Bild-URL<br><input name="image_url" placeholder="https://..."></label><label style="display:flex;gap:8px;align-items:center;padding-top:22px"><input type="checkbox" name="send_dms" value="1" checked> DMs an Zielgruppe senden</label></div>
-        <button class="btn" type="submit" onclick="return confirm('Event erstellen und an den Bot senden?')">Event erstellen</button>
-      </form>
-    </section>
-    <section class="panel" id="event-queue"><h2>🧾 Event-Aktionsqueue</h2><p class="muted">Erstellen, Bearbeiten und Löschen mit Bot-Status.</p>{_table(['Zeit','Aktion','Event','Status','Von','Ergebnis'], action_table_rows, placeholder='Queue durchsuchen…')}</section>
-    <script>
-      let adminEventFilter='all'; const eventSearch=document.getElementById('admin-event-search'); const eventCards=[...document.querySelectorAll('.admin-event-card')]; function applyAdminEventFilter(){{const q=(eventSearch.value||'').toLowerCase().trim();eventCards.forEach(card=>{{const status=card.dataset.eventStatus;const text=card.dataset.search||'';card.style.display=((adminEventFilter==='all'||status===adminEventFilter)&&(!q||text.includes(q)))?'':'none';}});}} document.querySelectorAll('.event-filter').forEach(btn=>btn.addEventListener('click',()=>{{document.querySelectorAll('.event-filter').forEach(x=>x.classList.remove('active'));btn.classList.add('active');adminEventFilter=btn.dataset.filter;applyAdminEventFilter();}})); eventSearch.addEventListener('input',applyAdminEventFilter);
-    </script>
-    """
-    return _html_shell("Events verwalten · Beer and Buffs Dashboard", body, nav_mode=nav_mode)
+def _render_events_center(data: dict[str, Any], current_user: Optional[dict[str, Any]] = None, msg: str = "", *, nav_mode: str = "admin", request: Optional[Request] = None) -> str:
+    return _render_events_overview_page(data, request, admin=True, msg=msg)
 
 
 @app.get("/events", response_class=HTMLResponse)
@@ -17093,7 +16893,7 @@ def events_page(request: Request, _: bool = Depends(_auth), msg: str = ""):
 @app.get("/events-admin", response_class=HTMLResponse)
 def events_admin_page(request: Request, _: bool = Depends(_admin_auth), msg: str = ""):
     try:
-        return HTMLResponse(_render_events_center(_snapshot_payload(), _current_user(request), msg, nav_mode="admin"))
+        return HTMLResponse(_render_events_center(_snapshot_payload(), _current_user(request), msg, nav_mode="admin", request=request))
     except Exception as exc:
         return HTMLResponse(_html_shell("Beer and Buffs Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>", nav_mode="admin"), status_code=500)
 
@@ -17106,7 +16906,7 @@ def admin_events_alias(_: bool = Depends(_admin_auth)):
 @app.get("/admin/events/{event_id}", response_class=HTMLResponse)
 def admin_event_editor_page(event_id: str, request: Request, _: bool = Depends(_admin_auth), msg: str = ""):
     try:
-        return HTMLResponse(_render_event_editor(_snapshot_payload(), event_id, _current_user(request), msg))
+        return HTMLResponse(_render_event_editor(_snapshot_payload(), event_id, _current_user(request), msg, request=request))
     except Exception as exc:
         return HTMLResponse(_html_shell("Beer and Buffs Dashboard Fehler", f"<section class='panel'><h1>❌ Dashboard-Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>", nav_mode="admin"), status_code=500)
 
