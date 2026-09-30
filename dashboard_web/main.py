@@ -15692,7 +15692,32 @@ def _render_admin_settings_editor(data: dict[str, Any], msg: str = "", section: 
             application_lead_role_id = int(_dashboard_module_setting_value(guild_id, "onboarding", "application_lead_role_id", 0) or 0)
             if not application_lead_role_id:
                 application_lead_role_id = int(_guild_setting_value(guild_id, "guild_role_leader_id", 0) or 0)
+            onboarding_mode = str(_dashboard_module_setting_value(guild_id, "onboarding", "mode", "pm") or "pm").strip().lower()
+            if onboarding_mode not in {"pm", "server"}:
+                onboarding_mode = "pm"
             onboarding_config_html = f"""
+            <section class='settings-card'>
+              <div class='settings-card-head'>
+                <div><div class='eyebrow'>Onboarding & Recruitment</div><h2>🚪 Onboarding-Modus</h2><p class='muted'>Wähle genau einen Ablauf. Beide Modi nutzen dieselben Fragen: Bewerber/Freund/Allianz und – falls Aion 2 aktiv ist – Klasse + Charaktername.</p></div>
+                <span class='pill ok'>{'Server-Onboarding' if onboarding_mode == 'server' else 'PM-Onboarding'}</span>
+              </div>
+              <form method='post' action='/admin/onboarding-mode-settings' class='settings-form'>
+                <label>Modus
+                  <select name='onboarding_mode'>
+                    <option value='pm' {'selected' if onboarding_mode == 'pm' else ''}>PM-Onboarding</option>
+                    <option value='server' {'selected' if onboarding_mode == 'server' else ''}>Server-Onboarding</option>
+                  </select>
+                </label>
+                <div class='settings-readonly-grid'>
+                  <div><span>PM-Onboarding</span><strong>Bot schreibt privat</strong></div>
+                  <div><span>Server-Onboarding</span><strong>Privater Kanal + Zugriffssperre</strong></div>
+                  <div><span>Fragen</span><strong>Bewerber / Freund / Allianz</strong></div>
+                  <div><span>Aion 2</span><strong>Klasse + Charaktername</strong></div>
+                </div>
+                <p class='muted'>Beim Server-Onboarding erstellt der Bot automatisch die Rolle <code>Onboarding offen</code>, die Kategorie <code>ONBOARDING</code> und pro neuem Nutzer einen privaten Kanal. Bis zur Annahme bleibt der öffentliche Bereich gesperrt. Ein Staff-Review ist in diesem Modus immer Pflicht.</p>
+                <button class='btn' type='submit'>Onboarding-Modus speichern</button>
+              </form>
+            </section>
             <section class='settings-card'>
               <div class='settings-card-head'>
                 <div><div class='eyebrow'>Onboarding & Recruitment</div><h2>👋 Welcome Card</h2><p class='muted'>Beim Serverbeitritt erscheint eine Nachricht mit Avatar, Name und Zufallsspruch. Dieselbe Nachricht wird während des Onboardings automatisch aktualisiert.</p></div>
@@ -15729,7 +15754,7 @@ def _render_admin_settings_editor(data: dict[str, Any], msg: str = "", section: 
             </section>
             <section class='settings-card'>
               <div class='settings-card-head'>
-                <div><div class='eyebrow'>Onboarding & Recruitment</div><h2>📝 Privater Bewerbungs-Chat</h2><p class='muted'>Wählt jemand im Onboarding <strong>Bewerber</strong>, erstellt der Bot nach Abschluss automatisch einen privaten Textkanal für Bewerber und Lead. Der Kanal wird beim Review direkt verlinkt.</p></div>
+                <div><div class='eyebrow'>PM-Onboarding</div><h2>📝 Privater Bewerbungs-Chat</h2><p class='muted'>Nur für PM-Onboarding: Wählt jemand <strong>Bewerber</strong>, kann nach dem Ausfüllen zusätzlich ein privater Bewerbungs-Chat für Bewerber und Lead erstellt werden. Beim Server-Onboarding wird stattdessen der bereits vorhandene private Onboarding-Kanal verwendet.</p></div>
                 <span class='pill {'ok' if application_chat_enabled else ''}'>{'Aktiv' if application_chat_enabled else 'Aus'}</span>
               </div>
               <form method='post' action='/admin/onboarding-aion2-settings' class='settings-form'>

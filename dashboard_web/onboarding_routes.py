@@ -45,6 +45,25 @@ def build_onboarding_router(
             status_code=303,
         )
 
+    @router.post("/admin/onboarding-mode-settings")
+    async def admin_onboarding_mode_settings(
+        request: Request,
+        _: bool = Depends(admin_auth),
+    ):
+        guild_id = guild_id_or_400()
+        redirect = onboarding_enabled_or_redirect(guild_id)
+        if redirect:
+            return redirect
+        form = _parse_form(await request.body())
+        raw = str(form.get("onboarding_mode") or "pm").strip().lower()
+        mode = "server" if raw == "server" else "pm"
+        set_module_setting(guild_id, "onboarding", "mode", mode)
+        label = "Server-Onboarding" if mode == "server" else "PM-Onboarding"
+        return RedirectResponse(
+            "/admin-settings?" + urllib.parse.urlencode({"section": "modules", "msg": f"Onboarding-Modus gespeichert: {label}."}),
+            status_code=303,
+        )
+
     @router.post("/admin/onboarding-aion2-settings")
     async def admin_onboarding_aion2_settings(
         request: Request,
