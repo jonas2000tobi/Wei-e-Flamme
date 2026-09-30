@@ -14430,7 +14430,42 @@ def _render_events_overview_page(data: dict[str, Any], request: Optional[Request
       .event-create-form{{padding:18px;overflow:auto;max-height:90vh}}.event-dialog-head{{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;margin-bottom:14px}}.event-dialog-head h2{{margin:2px 0 0;color:#efd18a;font:700 28px Georgia,serif}}.event-dialog-close{{width:38px;height:38px;border-radius:50%;border:1px solid rgba(214,168,79,.32);background:rgba(255,255,255,.04);color:#eee;font-size:25px;cursor:pointer}}
       .event-create-grid{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:11px}}.event-create-grid label{{display:grid;gap:5px;color:#bdb4a6;font-size:12px}}.event-create-grid .wide{{grid-column:1/-1}}.event-create-grid input,.event-create-grid select,.event-create-grid textarea{{width:100%}}.event-create-check{{display:flex;align-items:center;gap:8px;margin:13px 0;color:#c8bdac}}.event-dialog-actions{{display:flex;justify-content:flex-end;gap:10px;flex-wrap:wrap}}
       @media(max-width:960px){{.events-feature-grid{{grid-template-columns:1fr 1fr}}.events-overview-card:last-child:nth-child(odd){{grid-column:1/-1}}.events-history-row{{grid-template-columns:135px minmax(0,1fr) 65px 100px}}}}
-      @media(max-width:680px){{.events-overview-head{{grid-template-columns:1fr}}.events-overview-actions{{justify-content:stretch;display:grid;grid-template-columns:1fr}}.events-mini-stats{{order:2}}.events-create-button{{width:100%}}.events-feature-grid{{grid-template-columns:1fr}}.events-overview-card:last-child:nth-child(odd){{grid-column:auto}}.events-history-row{{grid-template-columns:1fr auto;gap:6px 10px}}.events-history-date{{grid-column:1/-1}}.events-history-title{{grid-column:1/2}}.events-history-count{{grid-column:2/3;grid-row:2}}.events-history-own{{grid-column:1/-1;text-align:left}}.event-create-grid{{grid-template-columns:1fr}}.event-create-grid .wide{{grid-column:auto}}}}
+      @media(max-width:680px){{
+        .events-overview-page{{gap:13px;overflow-x:hidden}}
+        .events-overview-head{{grid-template-columns:1fr;gap:11px}}
+        .events-overview-title h1{{font-size:clamp(31px,10vw,40px);line-height:1}}
+        .events-overview-title p{{font-size:13px;line-height:1.35}}
+        .events-overview-actions{{justify-content:stretch;display:grid;grid-template-columns:1fr;gap:8px}}
+        .events-mini-stats{{order:2;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px}}
+        .events-mini-stat{{min-width:0;padding:7px 5px;border-radius:10px}}
+        .events-mini-stat small{{font-size:8px}}
+        .events-mini-stat strong{{font-size:18px}}
+        .events-create-button{{width:auto!important;justify-self:start;padding:8px 12px!important;font-size:13px!important;min-height:0!important}}
+        .events-section-title{{margin:0 0 7px}}
+        .events-section-title h2{{font-size:19px}}
+        .events-feature-grid{{grid-template-columns:1fr;gap:8px}}
+        .events-overview-card{{display:grid;grid-template-columns:88px minmax(0,1fr);min-height:96px;border-radius:13px}}
+        .events-overview-card:last-child:nth-child(odd){{grid-column:auto}}
+        .events-overview-image{{aspect-ratio:auto;width:88px;height:100%;min-height:96px;border-radius:0;background:radial-gradient(circle at 50% 40%,rgba(130,76,34,.35),rgba(7,8,9,.95))}}
+        .events-overview-image img{{object-fit:cover}}
+        .events-image-fallback{{font-size:30px}}
+        .events-overview-copy{{padding:9px 10px 9px;min-width:0}}
+        .events-card-top{{align-items:flex-start;gap:5px}}
+        .events-state{{padding:3px 6px;font-size:8px}}
+        .events-card-date{{font-size:9px;line-height:1.2}}
+        .events-overview-copy h3{{margin:6px 0 3px;font-size:16px;line-height:1.1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
+        .events-overview-copy p{{display:none}}
+        .events-card-roles{{gap:4px;margin-top:7px}}
+        .events-card-roles span{{padding:2px 5px;font-size:9px}}
+        .events-card-own{{margin-top:6px;padding-top:5px;font-size:10px}}
+        .events-history-row{{grid-template-columns:1fr auto;gap:6px 10px}}
+        .events-history-date{{grid-column:1/-1}}
+        .events-history-title{{grid-column:1/2}}
+        .events-history-count{{grid-column:2/3;grid-row:2}}
+        .events-history-own{{grid-column:1/-1;text-align:left}}
+        .event-create-grid{{grid-template-columns:1fr}}
+        .event-create-grid .wide{{grid-column:auto}}
+      }}
     </style>
     <main class="events-overview-page">
       <header class="events-overview-head">
