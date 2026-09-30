@@ -149,6 +149,43 @@ def _server_channel_name(member: discord.Member) -> str:
     return (f"onboarding-{slug}")[:95]
 
 
+def _applicant_channel_name(member: discord.Member) -> str:
+    raw = str(member.display_name or member.name or member.id).casefold()
+    slug = re.sub(r"[^a-z0-9äöüß_-]+", "-", raw, flags=re.IGNORECASE)
+    slug = re.sub(r"-+", "-", slug).strip("-_") or str(member.id)
+    return (f"bewerber-{slug}")[:95]
+
+
+def _configured_member_role_ids(guild: discord.Guild) -> set[int]:
+    """Rollen, die einen Bewerber zum vollwertigen Gildenmitglied machen."""
+    ids: set[int] = set()
+    try:
+        role_id = int(runtime_db.get_guild_setting(int(guild.id), "dashboard_member_role_id", 0) or 0)
+        if role_id:
+            ids.add(role_id)
+    except Exception:
+        pass
+    try:
+        legacy = int(((_gcfg(guild) or {}).get("category_roles") or {}).get("guild") or 0)
+        if legacy:
+            ids.add(legacy)
+    except Exception:
+        pass
+    if not ids:
+        for role in list(getattr(guild, "roles", []) or []):
+            if str(getattr(role, "name", "") or "").strip().casefold() in {"mitglied", "member"}:
+                ids.add(int(role.id))
+    return ids
+
+
+def _has_member_role(member: discord.Member) -> bool:
+    wanted = _configured_member_role_ids(member.guild)
+    if not wanted:
+        return False
+    current = {int(role.id) for role in list(getattr(member, "roles", []) or [])}
+    return bool(wanted.intersection(current))
+
+
 def _server_staff_role(guild: discord.Guild) -> Optional[discord.Role]:
     ids = []
     try:
@@ -261,7 +298,12 @@ async def _delete_server_channel_later(guild: discord.Guild, member_id: int, del
     _clear_server_record(guild.id, member_id)
 
 
-async def _complete_server_gate(member: discord.Member, *, accepted: bool) -> None:
+async def _complete_server_gate(
+    member: discord.Member,
+    *,
+    accepted: bool,
+    category: str | None = None,
+) -> None:
     record = _server_record(member.guild.id, member.id)
     channel = member.guild.get_channel(int(record.get("channel_id") or 0))
     if accepted:
@@ -277,6 +319,43 @@ async def _complete_server_gate(member: discord.Member, *, accepted: bool) -> No
                 await member.remove_roles(gate_role, reason="Server-Onboarding akzeptiert")
             except Exception:
                 pass
+
+        is_applicant = str(category or "").strip().lower() == "applicant"
+        if is_applicant:
+            # Bewerber erhalten nach dem Review Zugriff auf den öffentlichen Bereich,
+            # behalten aber ihren privaten Bewerberchat für Rückfragen. Erst die
+            # eigentliche Mitgliedsrolle beendet diesen Chat.
+            record["status"] = "applicant_chat"
+            record["accepted_at"] = datetime.now(timezone.utc).isoformat()
+            record["updated_at"] = datetime.now(timezone.utc).isoformat()
+            _set_server_record(member.guild.id, member.id, record)
+            if isinstance(channel, discord.TextChannel):
+                try:
+                    await channel.edit(
+                        name=_applicant_channel_name(member),
+                        topic=f"Privater Bewerberchat für {member} · Discord-ID {member.id}",
+                        reason="Server-Onboarding akzeptiert – Bewerberchat bleibt offen",
+                    )
+                except Exception:
+                    pass
+                try:
+                    await channel.send(
+                        "✅ **Bewerbung akzeptiert!** Du kannst jetzt den öffentlichen Serverbereich sehen.\n\n"
+                        "Dieser private Kanal bleibt für Rückfragen zwischen dir und der Gildenleitung offen. "
+                        "Sobald du die **Mitglied-Rolle** bekommst, wird der Bewerberchat automatisch geschlossen."
+                    )
+                except Exception:
+                    pass
+            # Falls die Mitgliedsrolle ausnahmsweise bereits vorhanden ist, direkt sauber schließen.
+            if _has_member_role(member):
+                if isinstance(channel, discord.TextChannel):
+                    try:
+                        await channel.send("🎉 Du bist jetzt **Mitglied**. Dieser Bewerberchat wird gleich geschlossen.")
+                    except Exception:
+                        pass
+                asyncio.create_task(_delete_server_channel_later(member.guild, member.id, 10.0))
+            return
+
         if isinstance(channel, discord.TextChannel):
             try:
                 await channel.send("✅ **Freigeschaltet!** Dein Onboarding wurde akzeptiert. Du kannst jetzt den öffentlichen Serverbereich sehen. Dieser Kanal wird gleich geschlossen.")
@@ -1492,7 +1571,7 @@ class ReviewView(OnboardingFeatureView):
                 actor=inter.user,
             )
         if self.mode == "server":
-            await _complete_server_gate(member, accepted=True)
+            await _complete_server_gate(member, accepted=True, category=self.category)
 
         member_name = discord.utils.escape_markdown(member.display_name or member.name)
         role_error_text = ""
@@ -1531,7 +1610,7 @@ class ReviewView(OnboardingFeatureView):
         if member:
             await update_welcome_card(member, "rejected", category=self.category, primary=self.primary, experienced=self.experienced, reason="Die Gildenleitung hat das Onboarding nicht freigegeben.")
             if self.mode == "server":
-                await _complete_server_gate(member, accepted=False)
+                await _complete_server_gate(member, accepted=False, category=self.category)
             else:
                 if self.category == "applicant":
                     await _set_pending_applicant_role(member, False)
@@ -1811,6 +1890,58 @@ async def setup_onboarding(client: discord.Client, tree: app_commands.CommandTre
         description="Mitglieder-Onboarding verwalten",
     )
     tree.add_command(onboarding_group)
+
+    async def _server_applicant_member_role_listener(before: discord.Member, after: discord.Member) -> None:
+        if before.bot or int(before.guild.id) != int(after.guild.id):
+            return
+        record = _server_record(after.guild.id, after.id)
+        if str(record.get("status") or "") != "applicant_chat":
+            return
+        before_has = _has_member_role(before)
+        after_has = _has_member_role(after)
+        if before_has or not after_has:
+            return
+        channel = after.guild.get_channel(int(record.get("channel_id") or 0))
+        if isinstance(channel, discord.TextChannel):
+            try:
+                await channel.send(
+                    f"🎉 {after.mention} hat jetzt die **Mitglied-Rolle**. "
+                    "Der Bewerberchat wird in wenigen Sekunden geschlossen."
+                )
+            except Exception:
+                pass
+        record["status"] = "member_promoted"
+        record["updated_at"] = datetime.now(timezone.utc).isoformat()
+        _set_server_record(after.guild.id, after.id, record)
+        asyncio.create_task(_delete_server_channel_later(after.guild, after.id, 10.0))
+
+    client.add_listener(_server_applicant_member_role_listener, "on_member_update")
+
+    async def _close_stale_applicant_chats() -> None:
+        # Nach Bot-Neustart auch Beförderungen erkennen, die während der Offlinezeit passiert sind.
+        await asyncio.sleep(3.0)
+        for gid, rows in list(_server_state.items()):
+            guild = client.get_guild(int(gid))
+            if guild is None or not isinstance(rows, dict):
+                continue
+            for uid, raw in list(rows.items()):
+                if not isinstance(raw, dict) or str(raw.get("status") or "") != "applicant_chat":
+                    continue
+                member = guild.get_member(int(uid))
+                if member is None or not _has_member_role(member):
+                    continue
+                channel = guild.get_channel(int(raw.get("channel_id") or 0))
+                if isinstance(channel, discord.TextChannel):
+                    try:
+                        await channel.send("🎉 Die **Mitglied-Rolle** ist vorhanden. Dieser Bewerberchat wird gleich geschlossen.")
+                    except Exception:
+                        pass
+                raw["status"] = "member_promoted"
+                raw["updated_at"] = datetime.now(timezone.utc).isoformat()
+                _set_server_record(guild.id, member.id, raw)
+                asyncio.create_task(_delete_server_channel_later(guild, member.id, 10.0))
+
+    asyncio.create_task(_close_stale_applicant_chats())
 
     # Persistente Onboarding- und Review-Buttons nach einem Neustart wieder anbinden.
     for message_id, raw_ctx in list(_session_records.items()):
