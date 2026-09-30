@@ -1,4 +1,5 @@
 from __future__ import annotations
+import asyncio
 import json
 import random
 import re
@@ -51,6 +52,7 @@ CFG_FILE = DATA_DIR / "onboarding_cfg.json"
 SESSIONS_FILE = DATA_DIR / "onboarding_sessions.json"
 WELCOME_STATE_FILE = DATA_DIR / "onboarding_welcome_messages.json"
 APPLICATION_STATE_FILE = DATA_DIR / "onboarding_application_channels.json"
+SERVER_STATE_FILE = DATA_DIR / "onboarding_server_channels.json"
 
 # cfg[guild_id] = {
 #   "enabled": bool,
@@ -92,6 +94,204 @@ def _save_application_state() -> None:
 
 
 _application_state: dict[str, dict[str, dict[str, Any]]] = _load_application_state()
+
+
+def _load_server_state() -> dict[str, dict[str, dict[str, Any]]]:
+    raw = load_json_file(SERVER_STATE_FILE, {}, context=f"{__name__}.server")
+    return raw if isinstance(raw, dict) else {}
+
+
+def _save_server_state() -> None:
+    save_json_atomic(SERVER_STATE_FILE, _server_state, context=f"{__name__}.server")
+
+
+_server_state: dict[str, dict[str, dict[str, Any]]] = _load_server_state()
+
+
+def _onboarding_mode(guild_id: int) -> str:
+    try:
+        raw = str(runtime_db.get_module_setting(int(guild_id), "onboarding", "mode", "pm") or "pm").strip().lower()
+    except Exception:
+        raw = "pm"
+    return "server" if raw in {"server", "serverside", "server-side"} else "pm"
+
+
+def _server_record(guild_id: int, member_id: int) -> dict[str, Any]:
+    rows = _server_state.get(str(int(guild_id))) or {}
+    raw = rows.get(str(int(member_id))) or {}
+    return dict(raw) if isinstance(raw, dict) else {}
+
+
+def _set_server_record(guild_id: int, member_id: int, record: dict[str, Any]) -> None:
+    gid = str(int(guild_id))
+    uid = str(int(member_id))
+    rows = _server_state.get(gid)
+    if not isinstance(rows, dict):
+        rows = {}
+        _server_state[gid] = rows
+    rows[uid] = dict(record)
+    _save_server_state()
+
+
+def _clear_server_record(guild_id: int, member_id: int) -> None:
+    gid = str(int(guild_id))
+    uid = str(int(member_id))
+    rows = _server_state.get(gid)
+    if isinstance(rows, dict) and uid in rows:
+        rows.pop(uid, None)
+        _save_server_state()
+
+
+def _server_channel_name(member: discord.Member) -> str:
+    raw = str(member.display_name or member.name or member.id).casefold()
+    slug = re.sub(r"[^a-z0-9äöüß_-]+", "-", raw, flags=re.IGNORECASE)
+    slug = re.sub(r"-+", "-", slug).strip("-_") or str(member.id)
+    return (f"onboarding-{slug}")[:95]
+
+
+def _server_staff_role(guild: discord.Guild) -> Optional[discord.Role]:
+    ids = []
+    try:
+        ids.append(int(runtime_db.get_module_setting(int(guild.id), "onboarding", "server_staff_role_id", 0) or 0))
+    except Exception:
+        pass
+    try:
+        ids.append(int(runtime_db.get_guild_setting(int(guild.id), "guild_role_leader_id", 0) or 0))
+    except Exception:
+        pass
+    try:
+        ids.append(int(runtime_db.get_module_setting(int(guild.id), "onboarding", "application_lead_role_id", 0) or 0))
+    except Exception:
+        pass
+    for rid in ids:
+        if rid:
+            role = guild.get_role(rid)
+            if isinstance(role, discord.Role):
+                return role
+    return None
+
+
+async def _ensure_server_gate_role(guild: discord.Guild) -> tuple[Optional[discord.Role], list[str]]:
+    errors: list[str] = []
+    role_id = 0
+    try:
+        role_id = int(runtime_db.get_module_setting(int(guild.id), "onboarding", "server_gate_role_id", 0) or 0)
+    except Exception:
+        role_id = 0
+    role = guild.get_role(role_id) if role_id else None
+    if role is None:
+        role = next((r for r in guild.roles if str(r.name or "").casefold() == "onboarding offen"), None)
+    if role is None:
+        try:
+            role = await guild.create_role(name="Onboarding offen", reason="Server-Onboarding Gate")
+        except Exception as exc:
+            return None, [f"Gate-Rolle konnte nicht erstellt werden ({type(exc).__name__})"]
+    try:
+        runtime_db.set_module_setting(int(guild.id), "onboarding", "server_gate_role_id", int(role.id))
+    except Exception as exc:
+        errors.append(f"Gate-Rolle konnte nicht gespeichert werden ({type(exc).__name__})")
+    return role, errors
+
+
+async def _ensure_server_category(guild: discord.Guild) -> tuple[Optional[discord.CategoryChannel], list[str]]:
+    errors: list[str] = []
+    category_id = 0
+    try:
+        category_id = int(runtime_db.get_module_setting(int(guild.id), "onboarding", "server_category_id", 0) or 0)
+    except Exception:
+        category_id = 0
+    category = guild.get_channel(category_id) if category_id else None
+    if not isinstance(category, discord.CategoryChannel):
+        category = next((c for c in guild.categories if str(c.name or "").casefold() == "onboarding"), None)
+    staff_role = _server_staff_role(guild)
+    me = guild.me
+    if not isinstance(category, discord.CategoryChannel):
+        overwrites: dict[discord.abc.Snowflake, discord.PermissionOverwrite] = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        }
+        if staff_role is not None:
+            overwrites[staff_role] = discord.PermissionOverwrite(view_channel=True, read_message_history=True)
+        if me is not None:
+            overwrites[me] = discord.PermissionOverwrite(view_channel=True, manage_channels=True, send_messages=True, read_message_history=True)
+        try:
+            category = await guild.create_category("ONBOARDING", overwrites=overwrites, reason="Server-Onboarding")
+        except Exception as exc:
+            return None, [f"Onboarding-Kategorie konnte nicht erstellt werden ({type(exc).__name__})"]
+    try:
+        runtime_db.set_module_setting(int(guild.id), "onboarding", "server_category_id", int(category.id))
+    except Exception as exc:
+        errors.append(f"Onboarding-Kategorie konnte nicht gespeichert werden ({type(exc).__name__})")
+    return category, errors
+
+
+async def _apply_server_gate_permissions(guild: discord.Guild, gate_role: discord.Role, onboarding_category_id: int) -> list[str]:
+    errors: list[str] = []
+    for channel in list(guild.channels):
+        try:
+            if isinstance(channel, discord.CategoryChannel):
+                if int(channel.id) == int(onboarding_category_id):
+                    continue
+                await channel.set_permissions(gate_role, view_channel=False, reason="Server-Onboarding: öffentlicher Bereich gesperrt")
+                continue
+            category = getattr(channel, "category", None)
+            if category is not None and int(getattr(category, "id", 0) or 0) == int(onboarding_category_id):
+                continue
+            if category is None or not bool(getattr(channel, "permissions_synced", False)):
+                await channel.set_permissions(gate_role, view_channel=False, reason="Server-Onboarding: öffentlicher Bereich gesperrt")
+        except Exception as exc:
+            errors.append(f"{getattr(channel, 'name', channel.id)}: {type(exc).__name__}")
+    return errors
+
+
+async def _server_channel_for(member: discord.Member) -> Optional[discord.TextChannel]:
+    record = _server_record(member.guild.id, member.id)
+    channel = member.guild.get_channel(int(record.get("channel_id") or 0))
+    return channel if isinstance(channel, discord.TextChannel) else None
+
+
+async def _delete_server_channel_later(guild: discord.Guild, member_id: int, delay: float = 10.0) -> None:
+    await asyncio.sleep(max(0.0, float(delay)))
+    record = _server_record(guild.id, member_id)
+    channel = guild.get_channel(int(record.get("channel_id") or 0))
+    if isinstance(channel, discord.TextChannel):
+        try:
+            await channel.delete(reason="Server-Onboarding abgeschlossen")
+        except Exception:
+            return
+    _clear_server_record(guild.id, member_id)
+
+
+async def _complete_server_gate(member: discord.Member, *, accepted: bool) -> None:
+    record = _server_record(member.guild.id, member.id)
+    channel = member.guild.get_channel(int(record.get("channel_id") or 0))
+    if accepted:
+        gate_role_id = int(record.get("gate_role_id") or 0)
+        if not gate_role_id:
+            try:
+                gate_role_id = int(runtime_db.get_module_setting(int(member.guild.id), "onboarding", "server_gate_role_id", 0) or 0)
+            except Exception:
+                gate_role_id = 0
+        gate_role = member.guild.get_role(gate_role_id) if gate_role_id else None
+        if gate_role is not None and gate_role in member.roles:
+            try:
+                await member.remove_roles(gate_role, reason="Server-Onboarding akzeptiert")
+            except Exception:
+                pass
+        if isinstance(channel, discord.TextChannel):
+            try:
+                await channel.send("✅ **Freigeschaltet!** Dein Onboarding wurde akzeptiert. Du kannst jetzt den öffentlichen Serverbereich sehen. Dieser Kanal wird gleich geschlossen.")
+            except Exception:
+                pass
+        asyncio.create_task(_delete_server_channel_later(member.guild, member.id, 10.0))
+    else:
+        if isinstance(channel, discord.TextChannel):
+            try:
+                await channel.send("❌ Dein Onboarding wurde **nicht freigegeben**. Der öffentliche Serverbereich bleibt gesperrt. Bei Rückfragen kannst du hier auf die Leitung warten.")
+            except Exception:
+                pass
+        record["status"] = "rejected"
+        record["updated_at"] = datetime.now(timezone.utc).isoformat()
+        _set_server_record(member.guild.id, member.id, record)
 
 
 def _application_setting(guild_id: int, key: str, default: Any) -> Any:
@@ -498,6 +698,15 @@ async def update_welcome_card(
 
 async def mark_welcome_member_left(member: discord.Member) -> None:
     try:
+        if _onboarding_mode(member.guild.id) == "server":
+            record = _server_record(member.guild.id, member.id)
+            channel = member.guild.get_channel(int(record.get("channel_id") or 0))
+            if isinstance(channel, discord.TextChannel):
+                try:
+                    await channel.delete(reason="Mitglied hat Server während Onboarding verlassen")
+                except Exception:
+                    pass
+            _clear_server_record(member.guild.id, member.id)
         if not is_module_enabled(member.guild.id, "onboarding"):
             return
         wc = _welcome_cfg(member.guild)
@@ -564,7 +773,7 @@ async def _set_pending_applicant_role(member: discord.Member, enabled: bool) -> 
     return role
 
 
-async def _assign_roles(member: discord.Member, category_key: str, primary_key: str, experienced: bool) -> tuple[List[discord.Role], List[str]]:
+async def _assign_roles(member: discord.Member, category_key: str, primary_key: str, experienced: bool | None) -> tuple[List[discord.Role], List[str]]:
     """Vergibt Kategorie-, Primär- und Erfahrungsrolle einzeln und meldet Fehler zurück."""
     g = member.guild
     c = _gcfg(g)
@@ -586,9 +795,10 @@ async def _assign_roles(member: discord.Member, category_key: str, primary_key: 
     if pkey != "SUPPORT" or prim_map.get("SUPPORT"):
         wanted.append((pkey or "Primärrolle", prim_map.get(pkey)))
 
-    exp_map = (c.get("experience_roles") or {})
-    exp_key = "experienced" if experienced else "newbie"
-    wanted.append(("Erfahren" if experienced else "Unerfahren", exp_map.get(exp_key)))
+    if experienced is not None:
+        exp_map = (c.get("experience_roles") or {})
+        exp_key = "experienced" if experienced else "newbie"
+        wanted.append(("Erfahren" if experienced else "Unerfahren", exp_map.get(exp_key)))
 
     granted: List[discord.Role] = []
     errors: List[str] = []
@@ -634,6 +844,39 @@ def _review_channel(guild: discord.Guild) -> Optional[discord.abc.Messageable]:
     ch_id = int((_gcfg(guild).get("review_channel") or 0))
     ch = guild.get_channel(ch_id)
     return ch if isinstance(ch, (discord.TextChannel, discord.Thread)) else None
+
+
+async def _ensure_server_review_channel(guild: discord.Guild) -> Optional[discord.TextChannel]:
+    current = _review_channel(guild)
+    if isinstance(current, discord.TextChannel):
+        return current
+    category, _ = await _ensure_server_category(guild)
+    if category is None:
+        return None
+    staff_role = _server_staff_role(guild)
+    me = guild.me
+    overwrites: dict[discord.abc.Snowflake, discord.PermissionOverwrite] = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+    }
+    if staff_role is not None:
+        overwrites[staff_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
+    if me is not None:
+        overwrites[me] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_channels=True)
+    try:
+        channel = await guild.create_text_channel(
+            "onboarding-review",
+            category=category,
+            overwrites=overwrites,
+            topic="Interner Review-Kanal für Server-Onboarding",
+            reason="Server-Onboarding Review-Kanal",
+        )
+    except Exception:
+        return None
+    c = _gcfg(guild)
+    c["review_channel"] = int(channel.id)
+    cfg[str(guild.id)] = c
+    _save_cfg(cfg)
+    return channel
 
 
 def _guild_custom_emoji(guild: discord.Guild | None, *names: str):
@@ -823,6 +1066,7 @@ class StepContext:
         aion_class: str | None = None,
         aion_character: str | None = None,
         aion_faction: str | None = None,
+        mode: str | None = None,
     ):
         self.member_id = int(member_id)
         self.guild_id = int(guild_id)
@@ -834,6 +1078,7 @@ class StepContext:
         self.aion_class = aion_class
         self.aion_character = aion_character
         self.aion_faction = aion_faction
+        self.mode = str(mode or "").strip().lower() or None
 
     def to_dict(self) -> dict:
         return {
@@ -847,6 +1092,7 @@ class StepContext:
             "aion_class": self.aion_class,
             "aion_character": self.aion_character,
             "aion_faction": self.aion_faction,
+            "mode": self.mode,
         }
 
     @classmethod
@@ -862,6 +1108,7 @@ class StepContext:
             aion_class=raw.get("aion_class"),
             aion_character=raw.get("aion_character"),
             aion_faction=raw.get("aion_faction"),
+            mode=raw.get("mode"),
         )
 
 
@@ -926,6 +1173,13 @@ class OnboardingFeatureView(View):
             else:
                 await inter.response.send_message(message, ephemeral=True)
             return False
+        if ctx is not None and int(getattr(ctx, "member_id", 0) or 0) and int(inter.user.id) != int(ctx.member_id):
+            message = "ℹ️ Dieses Onboarding gehört einem anderen Mitglied."
+            if inter.response.is_done():
+                await inter.followup.send(message, ephemeral=True)
+            else:
+                await inter.response.send_message(message, ephemeral=True)
+            return False
         return True
 
 
@@ -939,30 +1193,30 @@ class CategoryView(OnboardingFeatureView):
         if inter.message:
             self.ctx.message_id = int(inter.message.id)
         if _aion2_enabled(self.ctx.guild_id):
-            self.ctx.stage = "aion2_faction"
+            self.ctx.stage = "aion2_class"
             _remember_ctx(self.ctx)
             guild = inter.client.get_guild(self.ctx.guild_id)
-            await inter.response.edit_message(content="🎮 **Aion 2:** Auf welcher Seite spielst du?", view=Aion2FactionView(self.ctx, guild))
+            await inter.response.edit_message(
+                content="🎮 **Aion 2:** Welche Klasse spielst du?",
+                view=Aion2ClassView(self.ctx, guild),
+            )
         else:
             self.ctx.stage = "primary"
             _remember_ctx(self.ctx)
             await inter.response.edit_message(content="Welche **Spielrolle** spielst du?", view=PrimaryView(self.ctx))
 
-    @button(label="⚔️ Gildenmitglied", style=ButtonStyle.primary, custom_id="onboarding_category_guild")
-    async def btn_guild(self, inter: discord.Interaction, _):
-        await self._next(inter, "guild")
-
-    @button(label="🏰 Allianzmitglied", style=ButtonStyle.secondary, custom_id="onboarding_category_ally")
-    async def btn_ally(self, inter: discord.Interaction, _):
-        await self._next(inter, "ally")
+    @button(label="📝 Bewerber", style=ButtonStyle.primary, custom_id="onboarding_category_applicant")
+    async def btn_applicant(self, inter: discord.Interaction, _):
+        await self._next(inter, "applicant")
 
     @button(label="🫱 Freund", style=ButtonStyle.success, custom_id="onboarding_category_friend")
     async def btn_friend(self, inter: discord.Interaction, _):
         await self._next(inter, "friend")
 
-    @button(label="📝 Bewerber", style=ButtonStyle.secondary, custom_id="onboarding_category_applicant")
-    async def btn_applicant(self, inter: discord.Interaction, _):
-        await self._next(inter, "applicant")
+    @button(label="🏰 Allianz", style=ButtonStyle.secondary, custom_id="onboarding_category_ally")
+    async def btn_ally(self, inter: discord.Interaction, _):
+        await self._next(inter, "ally")
+
 
 class PrimaryView(OnboardingFeatureView):
     def __init__(self, ctx: StepContext):
@@ -973,15 +1227,9 @@ class PrimaryView(OnboardingFeatureView):
         self.ctx.primary = primary
         if inter.message:
             self.ctx.message_id = int(inter.message.id)
-        if _aion2_enabled(self.ctx.guild_id):
-            self.ctx.stage = "aion2_faction"
-            _remember_ctx(self.ctx)
-            guild = inter.client.get_guild(self.ctx.guild_id)
-            await inter.response.edit_message(content="🎮 **Aion 2:** Auf welcher Seite spielst du?", view=Aion2FactionView(self.ctx, guild))
-        else:
-            self.ctx.stage = "experience"
-            _remember_ctx(self.ctx)
-            await inter.response.edit_message(content="Bist du **erfahren** oder **unerfahren**?", view=ExperienceView(self.ctx))
+        self.ctx.stage = "submit"
+        _remember_ctx(self.ctx)
+        await inter.response.edit_message(content=_submission_text(self.ctx), view=SubmitView(self.ctx))
 
     @button(label="🛡️ Tank", style=ButtonStyle.primary, custom_id="onboarding_primary_tank")
     async def btn_tank(self, inter: discord.Interaction, _):
@@ -1007,9 +1255,9 @@ class Aion2CharacterModal(Modal):
         # Onboarding-Session. Ein dauerhaftes Profil wird erst nach Annahme bzw.
         # nach erfolgreichem Auto-Onboarding angelegt.
         self.ctx.aion_character=str(self.character.value).strip()
-        self.ctx.stage="experience"
+        self.ctx.stage="submit"
         _remember_ctx(self.ctx)
-        await inter.response.edit_message(content="Bist du **erfahren** oder **unerfahren**?",view=ExperienceView(self.ctx))
+        await inter.response.edit_message(content=_submission_text(self.ctx), view=SubmitView(self.ctx))
 
 class Aion2FactionView(OnboardingFeatureView):
     def __init__(self, ctx: StepContext, guild: discord.Guild | None = None):
@@ -1073,6 +1321,66 @@ class Aion2ClassView(OnboardingFeatureView):
         self.ctx = ctx
         self.add_item(Aion2ClassSelect(ctx, guild))
 
+
+def _submission_text(ctx: StepContext) -> str:
+    cat_txt = {
+        "ally": "Allianz",
+        "friend": "Freund",
+        "applicant": "Bewerber",
+    }.get(str(ctx.category or ""), "—")
+    role_txt = _aion2_role_label(ctx.primary) if ctx.primary else "—"
+    lines = [
+        "✅ **Fast geschafft. Bitte prüfe deine Angaben:**",
+        f"• **Typ:** {cat_txt}",
+    ]
+    if ctx.aion_class or ctx.aion_character:
+        lines.extend([
+            f"• **Aion-2-Klasse:** {ctx.aion_class or '—'}",
+            f"• **Charaktername:** {ctx.aion_character or '—'}",
+            f"• **Rolle:** {role_txt}",
+        ])
+    elif ctx.primary:
+        lines.append(f"• **Rolle:** {role_txt}")
+    lines.append("\nWenn alles stimmt, schicke das Onboarding ab.")
+    return "\n".join(lines)
+
+
+class SubmitView(OnboardingFeatureView):
+    def __init__(self, ctx: StepContext):
+        super().__init__(timeout=None)
+        self.ctx = ctx
+
+    @button(label="✅ Onboarding absenden", style=ButtonStyle.success, custom_id="onboarding_submit")
+    async def btn_submit(self, inter: discord.Interaction, _):
+        await ExperienceView(self.ctx)._finish(inter, None)
+
+
+class ServerStartView(OnboardingFeatureView):
+    def __init__(self, ctx: StepContext):
+        super().__init__(timeout=None)
+        self.ctx = ctx
+
+    @button(label="🚀 Onboarding starten", style=ButtonStyle.primary, custom_id="onboarding_server_start")
+    async def btn_start(self, inter: discord.Interaction, _):
+        if inter.message:
+            self.ctx.message_id = int(inter.message.id)
+        self.ctx.stage = "category"
+        self.ctx.mode = "server"
+        _remember_ctx(self.ctx)
+        record = _server_record(self.ctx.guild_id, self.ctx.member_id)
+        record.update({"status": "running", "updated_at": datetime.now(timezone.utc).isoformat()})
+        _set_server_record(self.ctx.guild_id, self.ctx.member_id, record)
+        await inter.response.edit_message(
+            content=(
+                f"👋 **Willkommen <@{self.ctx.member_id}>!**\n\n"
+                "Bevor du Zugriff auf den Server bekommst, brauchen wir kurz ein paar Angaben.\n"
+                "Wähle zuerst aus, weshalb du hier bist:"
+            ),
+            view=CategoryView(self.ctx),
+            embed=None,
+        )
+
+
 def _save_accepted_aion2_profile(
     guild_id: int,
     member_id: int,
@@ -1088,6 +1396,13 @@ def _save_accepted_aion2_profile(
     if not class_name and not character_name:
         return True
     role = _aion2_role_for_class(class_name) or str(primary or "").strip().upper()
+    faction = str(aion_faction or "").strip().upper()
+    if not faction:
+        try:
+            existing = runtime_db.get_aion2_profile(int(guild_id), int(member_id)) or {}
+            faction = str(existing.get("faction") or "").strip().upper()
+        except Exception:
+            faction = ""
     try:
         return bool(
             runtime_db.upsert_aion2_profile(
@@ -1096,7 +1411,7 @@ def _save_accepted_aion2_profile(
                 character_name=character_name,
                 class_name=class_name,
                 main_role=role,
-                faction=str(aion_faction or "").strip().upper(),
+                faction=faction,
             )
         )
     except Exception as exc:
@@ -1110,13 +1425,14 @@ class ReviewView(OnboardingFeatureView):
         member_id: int,
         category: str,
         primary: str,
-        experienced: bool,
+        experienced: bool | None,
         *,
         message_id: int = 0,
         guild_id: int = 0,
         aion_class: str | None = None,
         aion_character: str | None = None,
         aion_faction: str | None = None,
+        mode: str | None = None,
     ):
         super().__init__(timeout=None)
         self.member_id = int(member_id)
@@ -1128,6 +1444,7 @@ class ReviewView(OnboardingFeatureView):
         self.aion_class = str(aion_class or "")
         self.aion_character = str(aion_character or "")
         self.aion_faction = str(aion_faction or "")
+        self.mode = "server" if str(mode or "").lower() == "server" else "pm"
 
     def _is_admin(self, inter: discord.Interaction) -> bool:
         p = getattr(inter.user, "guild_permissions", None)
@@ -1147,7 +1464,6 @@ class ReviewView(OnboardingFeatureView):
         if not self._is_admin(inter):
             await inter.response.send_message("Nur Admins.", ephemeral=True)
             return
-
         await inter.response.defer()
         member = await self._get_member(inter.guild)
         if not member:
@@ -1156,12 +1472,9 @@ class ReviewView(OnboardingFeatureView):
 
         roles, role_errors = await _assign_roles(member, self.category, self.primary, self.experienced)
         class_role, class_role_errors = await _assign_aion2_class_role(member, self.aion_class)
-        faction_role, faction_role_errors = await _assign_aion2_faction_role(member, self.aion_faction)
-        for aion_role in (class_role, faction_role):
-            if aion_role is not None and all(r.id != aion_role.id for r in roles):
-                roles.append(aion_role)
+        if class_role is not None and all(r.id != class_role.id for r in roles):
+            roles.append(class_role)
         role_errors.extend(class_role_errors)
-        role_errors.extend(faction_role_errors)
         aion_profile_saved = _save_accepted_aion2_profile(
             self.guild_id or int(inter.guild.id),
             self.member_id,
@@ -1170,20 +1483,17 @@ class ReviewView(OnboardingFeatureView):
             aion_faction=self.aion_faction,
             primary=self.primary,
         )
-        await update_welcome_card(
-            member,
-            "completed",
-            category=self.category,
-            primary=self.primary,
-            experienced=self.experienced,
-        )
-        if self.category == "applicant":
+        await update_welcome_card(member, "completed", category=self.category, primary=self.primary, experienced=self.experienced)
+        if self.category == "applicant" and self.mode == "pm":
             await _post_application_status(
                 member,
                 "✅ **Bewerbung/Onboarding akzeptiert.** Die Gildenleitung kann hier die nächsten Schritte mit dir klären.",
                 status="accepted",
                 actor=inter.user,
             )
+        if self.mode == "server":
+            await _complete_server_gate(member, accepted=True)
+
         member_name = discord.utils.escape_markdown(member.display_name or member.name)
         role_error_text = ""
         if role_errors:
@@ -1193,24 +1503,22 @@ class ReviewView(OnboardingFeatureView):
         await inter.edit_original_response(
             content=(
                 f"✅ **Akzeptiert:** **{member_name}** ({member.mention}) – Rollen: "
-                f"{', '.join(r.mention for r in roles) if roles else '—'}"
-                f"{role_error_text}"
+                f"{', '.join(r.mention for r in roles) if roles else '—'}{role_error_text}"
             ),
-            view=None
+            view=None,
         )
         _forget_message(self.message_id or (inter.message.id if inter.message else 0))
-
-        try:
-            await member.send("✅ Deine Anfrage wurde **akzeptiert**. Willkommen!")
-        except Exception:
-            pass
+        if self.mode == "pm":
+            try:
+                await member.send("✅ Deine Anfrage wurde **akzeptiert**. Willkommen!")
+            except Exception:
+                pass
 
     @button(label="❌ Ablehnen", style=ButtonStyle.danger, custom_id="onboarding_review_deny")
     async def btn_deny(self, inter: discord.Interaction, _):
         if not self._is_admin(inter):
             await inter.response.send_message("Nur Admins.", ephemeral=True)
             return
-
         await inter.response.defer()
         member = await self._get_member(inter.guild)
         if member is not None:
@@ -1220,35 +1528,32 @@ class ReviewView(OnboardingFeatureView):
             deny_text = f"❌ **Abgelehnt:** <@{self.member_id}>."
         await inter.edit_original_response(content=deny_text, view=None)
         _forget_message(self.message_id or (inter.message.id if inter.message else 0))
-
         if member:
-            await update_welcome_card(
-                member,
-                "rejected",
-                category=self.category,
-                primary=self.primary,
-                experienced=self.experienced,
-                reason="Die Gildenleitung hat das Onboarding nicht freigegeben.",
-            )
-            if self.category == "applicant":
-                await _set_pending_applicant_role(member, False)
-                await _post_application_status(
-                    member,
-                    "❌ **Bewerbung/Onboarding abgelehnt.** Rückfragen können in diesem Kanal geklärt werden.",
-                    status="rejected",
-                    actor=inter.user,
-                )
-            try:
-                await member.send("❌ Deine Anfrage wurde **abgelehnt**.")
-            except Exception:
-                pass
+            await update_welcome_card(member, "rejected", category=self.category, primary=self.primary, experienced=self.experienced, reason="Die Gildenleitung hat das Onboarding nicht freigegeben.")
+            if self.mode == "server":
+                await _complete_server_gate(member, accepted=False)
+            else:
+                if self.category == "applicant":
+                    await _set_pending_applicant_role(member, False)
+                    await _post_application_status(
+                        member,
+                        "❌ **Bewerbung/Onboarding abgelehnt.** Rückfragen können in diesem Kanal geklärt werden.",
+                        status="rejected",
+                        actor=inter.user,
+                    )
+                try:
+                    await member.send("❌ Deine Anfrage wurde **abgelehnt**.")
+                except Exception:
+                    pass
+
 
 class ExperienceView(OnboardingFeatureView):
+    """Legacy-Kompatibilität. Neue Onboardings fragen Erfahrung nicht mehr ab."""
     def __init__(self, ctx: StepContext):
         super().__init__(timeout=None)
         self.ctx = ctx
 
-    async def _finish(self, inter: discord.Interaction, experienced: bool):
+    async def _finish(self, inter: discord.Interaction, experienced: bool | None):
         try:
             if not inter.response.is_done():
                 await inter.response.defer()
@@ -1256,14 +1561,15 @@ class ExperienceView(OnboardingFeatureView):
             if inter.message:
                 self.ctx.message_id = int(inter.message.id)
             guild = inter.client.get_guild(self.ctx.guild_id)
-
             if not guild:
                 await inter.edit_original_response(content="⚠️ Server nicht gefunden.", view=None)
                 return
 
+            mode = "server" if str(self.ctx.mode or _onboarding_mode(guild.id)) == "server" else "pm"
+            self.ctx.mode = mode
             c = _gcfg(guild)
-            review_ch = _review_channel(guild)
-            require = bool(c.get("require_review"))
+            review_ch = await _ensure_server_review_channel(guild) if mode == "server" else _review_channel(guild)
+            require = True if mode == "server" else bool(c.get("require_review"))
 
             member = guild.get_member(self.ctx.member_id)
             if not member:
@@ -1272,69 +1578,51 @@ class ExperienceView(OnboardingFeatureView):
                 except Exception:
                     member = None
 
-            cat_txt = {
-                "guild": "Gildenmitglied",
-                "ally": "Allianzmitglied",
-                "friend": "Freund",
-                "applicant": "Bewerber",
-            }.get(self.ctx.category, "—")
-
-            pri_txt = {
-                "TANK": "Tank",
-                "HEAL": "Support",
-                "HEALER": "Support",
-                "DPS": "DPS",
-                "SUPPORT": "Support",
-            }.get(self.ctx.primary, "—")
-
-            exp_txt = "Erfahren" if experienced else "Unerfahren"
+            cat_txt = {"ally": "Allianz", "friend": "Freund", "applicant": "Bewerber"}.get(self.ctx.category, "—")
+            pri_txt = {"TANK": "Tank", "HEAL": "Support", "HEALER": "Support", "DPS": "DPS", "SUPPORT": "Support"}.get(str(self.ctx.primary or "").upper(), "—")
 
             if require and not review_ch:
-                await inter.edit_original_response(
-                    content="❌ Review ist aktiviert, aber kein Review-Kanal gesetzt.",
-                    view=None
-                )
+                await inter.edit_original_response(content="❌ Es ist kein Review-Kanal gesetzt. Bitte informiere die Gildenleitung.", view=None)
                 return
 
             application_channel: Optional[discord.TextChannel] = None
             application_info = ""
-            if member and self.ctx.category == "applicant":
+            if member and self.ctx.category == "applicant" and mode == "pm":
                 await _set_pending_applicant_role(member, True)
                 application_channel, application_info = await _ensure_application_channel(
-                    member,
-                    category=self.ctx.category,
-                    primary=self.ctx.primary,
-                    experienced=experienced,
+                    member, category=self.ctx.category, primary=self.ctx.primary, experienced=experienced
                 )
 
             if require:
                 desc = (
                     f"**Onboarding-Review:** {member.mention if member else f'<@{self.ctx.member_id}>'}\n"
-                    f"**Kategorie:** {cat_txt}\n"
-                    f"**Rolle:** {pri_txt}\n"
-                    f"**Erfahrung:** {exp_txt}"
+                    f"**Typ:** {cat_txt}\n"
+                    f"**Rolle:** {pri_txt}"
                 )
                 if self.ctx.aion_character or self.ctx.aion_class:
                     desc += (
-                        f"\n**Aion-2-Fraktion:** {AION2_FACTIONS.get(str(self.ctx.aion_faction or '').upper(), (self.ctx.aion_faction or '—', ''))[0]}"
                         f"\n**Aion-2-Charakter:** {self.ctx.aion_character or '—'}"
                         f"\n**Aion-2-Klasse:** {self.ctx.aion_class or '—'}"
                     )
-                if self.ctx.category == "applicant":
-                    if application_channel is not None:
-                        desc += f"\n**Bewerbungs-Chat:** {application_channel.mention}"
-                    elif application_info:
-                        desc += f"\n⚠️ **Bewerbungs-Chat:** {application_info}"
+                if application_channel is not None:
+                    desc += f"\n**Bewerbungs-Chat:** {application_channel.mention}"
+                elif application_info and mode == "pm":
+                    desc += f"\n⚠️ **Bewerbungs-Chat:** {application_info}"
+                if mode == "server":
+                    server_channel = await _server_channel_for(member) if member else None
+                    if server_channel is not None:
+                        desc += f"\n**Server-Onboarding:** {server_channel.mention}"
 
                 review_view = ReviewView(
                     self.ctx.member_id,
-                    self.ctx.category,
-                    self.ctx.primary,
+                    str(self.ctx.category or ""),
+                    str(self.ctx.primary or ""),
                     experienced,
                     guild_id=self.ctx.guild_id,
                     aion_class=self.ctx.aion_class,
                     aion_character=self.ctx.aion_character,
                     aion_faction=self.ctx.aion_faction,
+                    mode=mode,
                 )
                 review_message = await review_ch.send(desc, view=review_view)
                 review_view.message_id = int(review_message.id)
@@ -1349,35 +1637,31 @@ class ExperienceView(OnboardingFeatureView):
                     aion_class=self.ctx.aion_class,
                     aion_character=self.ctx.aion_character,
                     aion_faction=self.ctx.aion_faction,
+                    mode=mode,
                 )
                 _session_records[str(review_message.id)] = review_ctx.to_dict()
                 _save_sessions()
-
                 if member:
-                    await update_welcome_card(
-                        member,
-                        "review",
-                        category=self.ctx.category,
-                        primary=self.ctx.primary,
-                        experienced=experienced,
-                    )
+                    await update_welcome_card(member, "review", category=self.ctx.category, primary=self.ctx.primary, experienced=experienced)
+                if mode == "server":
+                    record = _server_record(self.ctx.guild_id, self.ctx.member_id)
+                    record.update({"status": "review", "updated_at": datetime.now(timezone.utc).isoformat()})
+                    _set_server_record(self.ctx.guild_id, self.ctx.member_id, record)
                 user_done_text = "✅ Danke! Deine Angaben wurden zur **Prüfung** an die Gildenleitung gesendet."
-                if application_channel is not None:
+                if mode == "server":
+                    user_done_text += "\nDu bleibst bis zur Freigabe in diesem Kanal. Danach wird der öffentliche Serverbereich automatisch freigeschaltet."
+                elif application_channel is not None:
                     user_done_text += f"\n📝 Dein privater Bewerbungs-Chat wurde erstellt: {application_channel.mention}"
-                await inter.edit_original_response(
-                    content=user_done_text,
-                    view=None
-                )
+                await inter.edit_original_response(content=user_done_text, view=None)
             else:
+                role_errors: list[str] = []
+                aion_profile_saved = True
                 if member:
                     roles, role_errors = await _assign_roles(member, self.ctx.category, self.ctx.primary, experienced)
                     class_role, class_role_errors = await _assign_aion2_class_role(member, self.ctx.aion_class)
-                    faction_role, faction_role_errors = await _assign_aion2_faction_role(member, self.ctx.aion_faction)
-                    for aion_role in (class_role, faction_role):
-                        if aion_role is not None and all(r.id != aion_role.id for r in roles):
-                            roles.append(aion_role)
+                    if class_role is not None and all(r.id != class_role.id for r in roles):
+                        roles.append(class_role)
                     role_errors.extend(class_role_errors)
-                    role_errors.extend(faction_role_errors)
                     aion_profile_saved = _save_accepted_aion2_profile(
                         self.ctx.guild_id,
                         self.ctx.member_id,
@@ -1386,32 +1670,14 @@ class ExperienceView(OnboardingFeatureView):
                         aion_faction=self.ctx.aion_faction,
                         primary=self.ctx.primary,
                     )
-                    await update_welcome_card(
-                        member,
-                        "completed",
-                        category=self.ctx.category,
-                        primary=self.ctx.primary,
-                        experienced=experienced,
-                    )
-
-                    if review_ch:
-                        err_line = ("\n⚠️ Nicht gesetzt: " + " · ".join(role_errors)) if role_errors else ""
-                        await review_ch.send(
-                            f"📝 **Auto-Onboarding:** {member.mention} – {cat_txt}, {pri_txt}, {exp_txt}\n"
-                            f"Rollen: {', '.join(r.mention for r in roles) if roles else '—'}{err_line}"
-                        )
-
+                    await update_welcome_card(member, "completed", category=self.ctx.category, primary=self.ctx.primary, experienced=experienced)
                 auto_done_text = "✅ Danke! Deine Rollen wurden vergeben."
                 if member and role_errors:
                     auto_done_text += "\n⚠️ Einige Rollen konnten nicht gesetzt werden. Die Gildenleitung wurde informiert."
                 if member and (self.ctx.aion_class or self.ctx.aion_character) and not aion_profile_saved:
                     auto_done_text += "\n⚠️ Dein Aion-2-Profil konnte nicht gespeichert werden. Bitte informiere die Gildenleitung."
-                if application_channel is not None:
-                    auto_done_text += f"\n📝 Dein privater Bewerbungs-Chat wurde erstellt: {application_channel.mention}"
                 await inter.edit_original_response(content=auto_done_text, view=None)
-
             _forget_message(self.ctx.message_id or (inter.message.id if inter.message else 0))
-
         except Exception as e:
             try:
                 if not inter.response.is_done():
@@ -1420,8 +1686,7 @@ class ExperienceView(OnboardingFeatureView):
                     await inter.followup.send(f"❌ Fehler im Onboarding: {e}", ephemeral=True)
             except Exception:
                 pass
-
-            print(f"[onboarding] ExperienceView _finish Fehler: {e!r}")
+            print(f"[onboarding] Abschlussfehler: {e!r}")
 
     @button(label="🧠 Erfahren", style=ButtonStyle.primary, custom_id="onboarding_experience_yes")
     async def btn_exp(self, inter: discord.Interaction, _):
@@ -1431,44 +1696,113 @@ class ExperienceView(OnboardingFeatureView):
     async def btn_new(self, inter: discord.Interaction, _):
         await self._finish(inter, False)
 
-async def send_onboarding_dm(member: discord.Member) -> tuple[bool, str]:
+
+async def send_pm_onboarding(member: discord.Member) -> tuple[bool, str]:
     try:
         if member.bot:
             return False, "Botkonten werden nicht onboardet."
-
-        c = _gcfg(member.guild)
         if not is_module_enabled(member.guild.id, "onboarding"):
             return False, "Onboarding ist für diesen Server deaktiviert."
-
         await ensure_welcome_card(member)
         await update_welcome_card(member, "running")
         _forget_member_sessions(member.id)
-        ctx = StepContext(member.id, member.guild.id)
-
-        text = (
-            f"👋 **Willkommen {member.display_name}!**\n\n"
-            f"Wähle bitte zuerst deine **Kategorie**."
+        ctx = StepContext(member.id, member.guild.id, mode="pm")
+        message = await member.send(
+            f"👋 **Willkommen {member.display_name}!**\n\nWähle bitte zuerst aus, weshalb du hier bist.",
+            view=CategoryView(ctx),
         )
-
-        message = await member.send(text, view=CategoryView(ctx))
         ctx.message_id = int(message.id)
         ctx.stage = "category"
         _remember_ctx(ctx)
-        return True, "Onboarding-DM gesendet."
-
+        return True, "PM-Onboarding gesendet."
     except discord.Forbidden:
         try:
-            await update_welcome_card(
-                member,
-                "dm_blocked",
-                reason="Direktnachrichten sind deaktiviert. Bitte DMs für diesen Server aktivieren und das Onboarding erneut starten.",
-            )
+            await update_welcome_card(member, "dm_blocked", reason="Direktnachrichten sind deaktiviert. Bitte DMs für diesen Server aktivieren und das Onboarding erneut starten.")
         except Exception:
             pass
-        return False, "DM konnte nicht zugestellt werden. Das Mitglied hat Direktnachrichten vermutlich deaktiviert."
+        return False, "PM konnte nicht zugestellt werden. Das Mitglied hat Direktnachrichten vermutlich deaktiviert."
     except Exception as exc:
-        print(f"[onboarding] DM an {getattr(member, 'id', 0)} fehlgeschlagen: {exc!r}", flush=True)
+        print(f"[onboarding] PM an {getattr(member, 'id', 0)} fehlgeschlagen: {exc!r}", flush=True)
         return False, f"{type(exc).__name__}: {str(exc)[:240]}"
+
+
+async def send_server_onboarding(member: discord.Member) -> tuple[bool, str]:
+    if member.bot:
+        return False, "Botkonten werden nicht onboardet."
+    if not is_module_enabled(member.guild.id, "onboarding"):
+        return False, "Onboarding ist für diesen Server deaktiviert."
+    existing = await _server_channel_for(member)
+    if existing is not None:
+        return True, f"Vorhandener Server-Onboarding-Kanal verwendet: {existing.name}"
+
+    gate_role, role_errors = await _ensure_server_gate_role(member.guild)
+    category, category_errors = await _ensure_server_category(member.guild)
+    errors = [*role_errors, *category_errors]
+    if gate_role is None or category is None:
+        return False, "; ".join(errors) or "Server-Onboarding konnte nicht vorbereitet werden."
+    try:
+        if gate_role not in member.roles:
+            await member.add_roles(gate_role, reason="Server-Onboarding offen")
+    except Exception as exc:
+        return False, f"Gate-Rolle konnte nicht vergeben werden ({type(exc).__name__})"
+    permission_errors = await _apply_server_gate_permissions(member.guild, gate_role, category.id)
+    if permission_errors:
+        print(f"[onboarding] Gate-Permissions: {' | '.join(permission_errors[:8])}", flush=True)
+
+    staff_role = _server_staff_role(member.guild)
+    me = member.guild.me
+    overwrites: dict[discord.abc.Snowflake, discord.PermissionOverwrite] = {
+        member.guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        member: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, attach_files=True, embed_links=True),
+    }
+    if staff_role is not None:
+        overwrites[staff_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
+    if me is not None:
+        overwrites[me] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_channels=True, manage_messages=True)
+    try:
+        channel = await member.guild.create_text_channel(
+            _server_channel_name(member),
+            category=category,
+            overwrites=overwrites,
+            topic=f"Server-Onboarding für {member} · Discord-ID {member.id}",
+            reason=f"Server-Onboarding für {member}",
+        )
+    except Exception as exc:
+        return False, f"Privater Onboarding-Kanal konnte nicht erstellt werden ({type(exc).__name__})"
+
+    _forget_member_sessions(member.id)
+    ctx = StepContext(member.id, member.guild.id, mode="server", stage="server_start")
+    embed = discord.Embed(
+        title="👋 Willkommen – Onboarding erforderlich",
+        description=(
+            f"{member.mention}, bevor du Zugriff auf den öffentlichen Serverbereich bekommst, musst du kurz das Onboarding abschließen.\n\n"
+            "Klicke unten auf **Onboarding starten**. Danach beantwortest du nur die nötigen Fragen und die Gildenleitung prüft deine Angaben."
+        ),
+        color=discord.Color.gold(),
+    )
+    try:
+        embed.set_thumbnail(url=member.display_avatar.url)
+    except Exception:
+        pass
+    message = await channel.send(content=member.mention, embed=embed, view=ServerStartView(ctx), allowed_mentions=discord.AllowedMentions(users=True))
+    ctx.message_id = int(message.id)
+    _remember_ctx(ctx)
+    _set_server_record(member.guild.id, member.id, {
+        "channel_id": int(channel.id),
+        "message_id": int(message.id),
+        "gate_role_id": int(gate_role.id),
+        "status": "waiting_start",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    })
+    return True, f"Server-Onboarding-Kanal erstellt: {channel.name}"
+
+
+async def send_onboarding_dm(member: discord.Member) -> tuple[bool, str]:
+    """Kompatibler Join-Hook-Einstieg: dispatcht je nach gewähltem Modus."""
+    if _onboarding_mode(member.guild.id) == "server":
+        return await send_server_onboarding(member)
+    return await send_pm_onboarding(member)
 
 
 async def setup_onboarding(client: discord.Client, tree: app_commands.CommandTree) -> None:
@@ -1483,14 +1817,21 @@ async def setup_onboarding(client: discord.Client, tree: app_commands.CommandTre
         try:
             ctx = StepContext.from_dict(raw_ctx)
             mid = int(message_id)
-            if ctx.stage == "category":
+            if ctx.stage == "server_start":
+                client.add_view(ServerStartView(ctx), message_id=mid)
+            elif ctx.stage == "category":
                 client.add_view(CategoryView(ctx), message_id=mid)
             elif ctx.stage == "primary":
                 client.add_view(PrimaryView(ctx), message_id=mid)
+            elif ctx.stage == "submit":
+                client.add_view(SubmitView(ctx), message_id=mid)
             elif ctx.stage == "experience":
                 client.add_view(ExperienceView(ctx), message_id=mid)
             elif ctx.stage == "aion2_faction":
-                client.add_view(Aion2FactionView(ctx, client.get_guild(ctx.guild_id)), message_id=mid)
+                # Legacy-Sessions aus alten Deployments: direkt auf Klassenauswahl weiterführen.
+                ctx.stage = "aion2_class"
+                _remember_ctx(ctx)
+                client.add_view(Aion2ClassView(ctx, client.get_guild(ctx.guild_id)), message_id=mid)
             elif ctx.stage == "aion2_class":
                 client.add_view(Aion2ClassView(ctx, client.get_guild(ctx.guild_id)), message_id=mid)
             elif ctx.stage == "review":
@@ -1499,12 +1840,13 @@ async def setup_onboarding(client: discord.Client, tree: app_commands.CommandTre
                         ctx.member_id,
                         str(ctx.category or ""),
                         str(ctx.primary or ""),
-                        bool(ctx.experienced),
+                        ctx.experienced,
                         message_id=mid,
                         guild_id=ctx.guild_id,
                         aion_class=ctx.aion_class,
                         aion_character=ctx.aion_character,
                         aion_faction=ctx.aion_faction,
+                        mode=ctx.mode,
                     ),
                     message_id=mid,
                 )
@@ -1527,7 +1869,6 @@ async def setup_onboarding(client: discord.Client, tree: app_commands.CommandTre
     @onboarding_group.command(name="set_categories", description="(Admin) Rollen für Kategorien setzen")
     async def onboarding_set_categories(
         inter: discord.Interaction,
-        gildenmitglied: discord.Role,
         allianzmitglied: discord.Role,
         freund: discord.Role,
         bewerber: discord.Role,
@@ -1537,8 +1878,9 @@ async def setup_onboarding(client: discord.Client, tree: app_commands.CommandTre
             return
 
         c = _gcfg(inter.guild)
+        previous = c.get("category_roles") or {}
         c["category_roles"] = {
-            "guild": gildenmitglied.id,
+            "guild": int(previous.get("guild") or 0),
             "ally": allianzmitglied.id,
             "friend": freund.id,
             "applicant": bewerber.id,
@@ -1548,9 +1890,8 @@ async def setup_onboarding(client: discord.Client, tree: app_commands.CommandTre
         _save_cfg(cfg)
 
         await inter.response.send_message(
-            f"✅ Kategorien gesetzt:\n"
-            f"• Gildenmitglied: {gildenmitglied.mention}\n"
-            f"• Allianzmitglied: {allianzmitglied.mention}\n"
+            f"✅ Onboarding-Typen gesetzt:\n"
+            f"• Allianz: {allianzmitglied.mention}\n"
             f"• Freund: {freund.mention}\n"
             f"• Bewerber: {bewerber.mention}",
             ephemeral=True
@@ -1574,32 +1915,6 @@ async def setup_onboarding(client: discord.Client, tree: app_commands.CommandTre
 
         await inter.response.send_message(
             f"✅ Primärrollen gesetzt:\n• 🛡️ {tank.mention}\n• 🎵 {support.mention}\n• 🗡️ {dps.mention}",
-            ephemeral=True
-        )
-
-    @onboarding_group.command(name="set_experience", description="(Admin) Rollen für Erfahren/Unerfahren setzen")
-    async def onboarding_set_experience(
-        inter: discord.Interaction,
-        experienced_role: Optional[discord.Role] = None,
-        newbie_role: Optional[discord.Role] = None
-    ):
-        if not _is_admin(inter):
-            await inter.response.send_message("Nur Admins.", ephemeral=True)
-            return
-
-        c = _gcfg(inter.guild)
-        c["experience_roles"] = {
-            "experienced": int(experienced_role.id) if experienced_role else 0,
-            "newbie": int(newbie_role.id) if newbie_role else 0
-        }
-
-        cfg[str(inter.guild_id)] = c
-        _save_cfg(cfg)
-
-        await inter.response.send_message(
-            f"✅ Erfahrungsrollen gesetzt:\n"
-            f"• 🧠 {experienced_role.mention if experienced_role else '—'}\n"
-            f"• 🌱 {newbie_role.mention if newbie_role else '—'}",
             ephemeral=True
         )
 
@@ -1674,7 +1989,7 @@ async def setup_onboarding(client: discord.Client, tree: app_commands.CommandTre
 
         await inter.response.send_message(f"✅ Review erforderlich: {'Ja' if require else 'Nein'}", ephemeral=True)
 
-    @onboarding_group.command(name="send", description="(Admin) Onboarding-DM manuell an ein Mitglied senden")
+    @onboarding_group.command(name="send", description="(Admin) Gewähltes Onboarding manuell für ein Mitglied starten")
     async def onboarding_send(inter: discord.Interaction, member: discord.Member):
         if not _is_admin(inter):
             await inter.response.send_message("Nur Admins.", ephemeral=True)
@@ -1683,11 +1998,11 @@ async def setup_onboarding(client: discord.Client, tree: app_commands.CommandTre
         await inter.response.defer(ephemeral=True, thinking=True)
         ok, reason = await send_onboarding_dm(member)
         if ok:
-            await inter.followup.send(f"✅ Onboarding-DM an {member.mention} geschickt.", ephemeral=True)
+            await inter.followup.send(f"✅ Onboarding für {member.mention} gestartet ({_onboarding_mode(inter.guild_id).upper()}).", ephemeral=True)
         else:
-            await inter.followup.send(f"❌ Onboarding-DM an {member.mention} fehlgeschlagen: {reason}", ephemeral=True)
+            await inter.followup.send(f"❌ Onboarding für {member.mention} fehlgeschlagen: {reason}", ephemeral=True)
 
-    @onboarding_group.command(name="sync_aion_roles", description="(Admin) Aion-2-Klassen- und Fraktionsrollen aus Profilen synchronisieren")
+    @onboarding_group.command(name="sync_aion_roles", description="(Admin) Aion-2-Klassenrollen aus Profilen synchronisieren")
     async def onboarding_sync_aion_roles(inter: discord.Interaction):
         if not _is_admin(inter):
             await inter.response.send_message("Nur Admins.", ephemeral=True)
@@ -1706,21 +2021,16 @@ async def setup_onboarding(client: discord.Client, tree: app_commands.CommandTre
                 failures.append(f"{member.display_name}: Profilfehler {type(exc).__name__}")
                 continue
             class_name = str(profile.get("class_name") or "").strip()
-            faction = str(profile.get("faction") or "").strip()
-            has_class = bool(_aion2_normalize_class(class_name))
-            has_faction = bool(_aion2_normalize_faction(faction))
-            if not has_class and not has_faction:
+            if not _aion2_normalize_class(class_name):
                 skipped += 1
                 continue
-            class_role, class_errors = await _assign_aion2_class_role(member, class_name) if has_class else (None, [])
-            faction_role, faction_errors = await _assign_aion2_faction_role(member, faction) if has_faction else (None, [])
-            if class_role is not None or faction_role is not None:
+            class_role, class_errors = await _assign_aion2_class_role(member, class_name)
+            if class_role is not None:
                 synced += 1
-            errors = [*class_errors, *faction_errors]
-            if errors:
-                failures.append(f"{member.display_name}: {'; '.join(errors)}")
+            if class_errors:
+                failures.append(f"{member.display_name}: {'; '.join(class_errors)}")
 
-        text = f"✅ Aion-Rollen synchronisiert: **{synced}** · ohne Aion-Klasse/Fraktion: **{skipped}**"
+        text = f"✅ Aion-Klassenrollen synchronisiert: **{synced}** · ohne Aion-Klasse: **{skipped}**"
         if failures:
             preview = "\n".join(f"• {line}" for line in failures[:8])
             text += f"\n⚠️ Fehler: **{len(failures)}**\n{preview}"
@@ -1737,7 +2047,6 @@ async def setup_onboarding(client: discord.Client, tree: app_commands.CommandTre
         c = _gcfg(inter.guild)
         cat = c.get("category_roles") or {}
         pri = c.get("primary_roles") or {}
-        exp = c.get("experience_roles") or {}
         rch = _review_channel(inter.guild)
         wc = _welcome_cfg(inter.guild)
         wch = inter.guild.get_channel(int(wc.get("channel_id") or 0))
@@ -1749,30 +2058,28 @@ async def setup_onboarding(client: discord.Client, tree: app_commands.CommandTre
             r = _role(inter.guild, rid)
             return r.mention if r else "—"
 
+        mode_label = "Server-Onboarding" if _onboarding_mode(inter.guild_id) == "server" else "PM-Onboarding"
         text = (
             f"**Onboarding:** {'aktiv' if is_module_enabled(inter.guild_id, 'onboarding') else 'inaktiv'}\n"
+            f"**Modus:** {mode_label}\n"
             f"**Welcome Card:** {'aktiv' if wc.get('enabled') else 'inaktiv'}\n"
             f"**Welcome-Kanal:** {wch.mention if wch else '—'}\n"
             f"**Welcome-Sprüche:** {len(wc.get('slogans') or [])}\n"
             f"**Leave-Update:** {'Ja' if wc.get('update_on_leave') else 'Nein'}\n"
-            f"**Review erforderlich:** {'Ja' if c.get('require_review') else 'Nein'}\n"
-            f"**Review/Log-Kanal:** {rch.mention if rch else '—'}\n"
-            f"**Bewerbungs-Chat:** {'aktiv' if app_cfg.get('enabled') else 'inaktiv'}\n"
+            f"**Review erforderlich:** {'Ja (Server-Onboarding)' if _onboarding_mode(inter.guild_id) == 'server' else ('Ja' if c.get('require_review') else 'Nein')}\n"
+            f"**Review/Log-Kanal:** {rch.mention if rch else 'wird bei Server-Onboarding automatisch erstellt'}\n"
+            f"**Bewerbungs-Chat (PM):** {'aktiv' if app_cfg.get('enabled') else 'inaktiv'}\n"
             f"**Bewerbungs-Kategorie:** {app_category.mention if isinstance(app_category, discord.CategoryChannel) else '—'}\n"
             f"**Bewerbungs-Lead:** {app_lead_role.mention if app_lead_role else '—'}\n\n"
-            f"**Kategorien**\n"
-            f"• Gildenmitglied: {_m(cat.get('guild'))}\n"
-            f"• Allianzmitglied: {_m(cat.get('ally'))}\n"
+            f"**Typen**\n"
+            f"• Allianz: {_m(cat.get('ally'))}\n"
             f"• Freund: {_m(cat.get('friend'))}\n"
             f"• Bewerber: {_m(cat.get('applicant'))}\n\n"
             f"**Primärrollen**\n"
             f"• 🛡️ {_m(pri.get('TANK'))}\n"
             f"• 🎵 {_m(pri.get('SUPPORT') or pri.get('HEAL'))}\n"
             f"• 🗡️ {_m(pri.get('DPS'))}\n\n"
-            f"**Aion 2:** {'aktiv' if _aion2_enabled(inter.guild_id) else 'inaktiv'}\n\n"
-            f"**Erfahrung**\n"
-            f"• 🧠 {_m(exp.get('experienced'))}\n"
-            f"• 🌱 {_m(exp.get('newbie'))}"
+            f"**Aion 2:** {'aktiv' if _aion2_enabled(inter.guild_id) else 'inaktiv'} · Klasse + Charaktername"
         )
 
         await inter.response.send_message(text, ephemeral=True)
