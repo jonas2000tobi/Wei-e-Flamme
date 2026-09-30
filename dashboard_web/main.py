@@ -14133,7 +14133,10 @@ def _render_member_home(data: dict[str, Any], request: Request) -> str:
           background:linear-gradient(155deg,rgba(48,31,16,.92),rgba(9,9,11,.96) 72%);
           box-shadow:0 10px 24px rgba(0,0,0,.34),inset 0 1px 0 rgba(255,255,255,.035);
           display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;
+          color:inherit;text-decoration:none;box-sizing:border-box;
         }}
+        .mobile-home-tile-link{{cursor:pointer;transition:transform .12s ease,border-color .12s ease}}
+        .mobile-home-tile-link:active{{transform:scale(.975);border-color:rgba(214,168,79,.58)}}
         .mobile-home-tile small{{display:block;color:#b8b0a4;font-size:10px;line-height:1.15;margin-bottom:6px}}
         .mobile-home-tile strong{{display:block;color:#f3d58d;font-family:Georgia,serif;font-size:clamp(21px,7vw,31px);line-height:1}}
         .mobile-home-tile span{{display:block;margin-top:7px;color:#9da8b6;font-size:9px;line-height:1.2;overflow-wrap:anywhere}}
@@ -14185,8 +14188,8 @@ def _render_member_home(data: dict[str, Any], request: Request) -> str:
         </div>
       </section>
       <div class="mobile-home-stats">
-        <article class="mobile-home-tile"><small>Mitglieder</small><strong>{member_count}</strong><span>in der Gilde</span></article>
-        <article class="mobile-home-tile"><small>Aktive Events</small><strong>{len(active_events)}</strong><span>laufend / geplant</span></article>
+        <a class="mobile-home-tile mobile-home-tile-link" href="/member/members"><small>Mitglieder</small><strong>{member_count}</strong><span>in der Gilde</span></a>
+        <a class="mobile-home-tile mobile-home-tile-link" href="/member/events"><small>Aktive Events</small><strong>{len(active_events)}</strong><span>laufend / geplant</span></a>
         <article class="mobile-home-tile"><small>Boss</small><strong>27 Min.</strong><span>Abyss · Nordfestung</span></article>
       </div>
       {mobile_admin_links}
@@ -14400,20 +14403,21 @@ def _render_events_overview_page(data: dict[str, Any], request: Optional[Request
 
     body = f'''
     <style>
-      .events-overview-page{{display:grid;gap:16px}}
-      .events-overview-head{{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:18px;align-items:start;padding:4px 2px 0}}
+      .events-overview-page{{display:grid;gap:16px;width:100%;max-width:100%;min-width:0;box-sizing:border-box;overflow-x:hidden}}
+      .events-overview-head{{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:18px;align-items:start;padding:4px 2px 0;width:100%;max-width:100%;min-width:0;box-sizing:border-box}}
       .events-overview-title h1{{margin:0;color:#e5c276;font:700 clamp(34px,5vw,48px) Georgia,serif}}
       .events-overview-title p{{margin:7px 0 0;color:var(--muted)}}
-      .events-overview-actions{{display:flex;gap:10px;align-items:center;justify-content:flex-end;flex-wrap:wrap}}
-      .events-mini-stats{{display:grid;grid-template-columns:repeat(3,minmax(82px,1fr));gap:8px}}
-      .events-mini-stat{{min-width:88px;padding:9px 11px;border:1px solid rgba(214,168,79,.24);background:rgba(10,10,12,.78);text-align:center;border-radius:12px}}
+      .events-overview-actions{{display:flex;gap:10px;align-items:center;justify-content:flex-end;flex-wrap:wrap;min-width:0;max-width:100%}}
+      .events-mobile-page-title{{display:none}}
+      .events-mini-stats{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;min-width:0;max-width:100%;box-sizing:border-box}}
+      .events-mini-stat{{min-width:0;padding:9px 11px;border:1px solid rgba(214,168,79,.24);background:rgba(10,10,12,.78);text-align:center;border-radius:12px;box-sizing:border-box;overflow:hidden}}
       .events-mini-stat small{{display:block;color:#a9a39a;font-size:10px;text-transform:uppercase;letter-spacing:.07em}}
       .events-mini-stat strong{{display:block;margin-top:3px;color:#efd18a;font:700 22px Georgia,serif}}
       .event-page-flash{{padding:11px 14px;border:1px solid rgba(214,168,79,.32);background:rgba(214,168,79,.09);border-radius:12px}}
       .events-section-title{{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:2px 0 10px}}
       .events-section-title h2{{margin:0;color:#e5c276;font:700 22px Georgia,serif}}
-      .events-feature-grid{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}}
-      .events-overview-card{{display:block;overflow:hidden;border:1px solid rgba(214,168,79,.30);border-radius:17px;background:linear-gradient(150deg,rgba(22,18,14,.96),rgba(7,8,9,.96));color:inherit;text-decoration:none;box-shadow:0 12px 30px rgba(0,0,0,.22);transition:.15s ease}}
+      .events-feature-grid{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px;width:100%;max-width:100%;min-width:0;box-sizing:border-box}}
+      .events-overview-card{{display:block;overflow:hidden;border:1px solid rgba(214,168,79,.30);border-radius:17px;background:linear-gradient(150deg,rgba(22,18,14,.96),rgba(7,8,9,.96));color:inherit;text-decoration:none;box-shadow:0 12px 30px rgba(0,0,0,.22);transition:.15s ease;width:100%;max-width:100%;min-width:0;box-sizing:border-box}}
       .events-overview-card:hover{{transform:translateY(-2px);border-color:rgba(214,168,79,.62)}}
       .events-overview-image{{position:relative;aspect-ratio:16/8;overflow:hidden;background:radial-gradient(circle at 50% 40%,rgba(130,76,34,.35),rgba(7,8,9,.95));display:grid;place-items:center}}
       .events-overview-image img{{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;z-index:1}}.events-image-fallback{{font-size:44px;color:#d6a84f}}.events-overview-image.no-image .events-image-fallback{{display:block}}
@@ -14423,46 +14427,52 @@ def _render_events_overview_page(data: dict[str, Any], request: Optional[Request
       .events-card-roles{{display:flex;gap:6px;flex-wrap:wrap;margin-top:12px}}.events-card-roles span{{padding:4px 7px;border:1px solid rgba(255,255,255,.09);border-radius:999px;font-size:11px;color:#d9d0c2}}
       .events-card-own{{margin-top:10px;padding-top:9px;border-top:1px solid rgba(214,168,79,.14);font-size:12px;color:#a9a39a}}.events-card-own strong{{color:#efd18a}}
       .events-overview-empty{{grid-column:1/-1;padding:34px;border:1px dashed rgba(214,168,79,.28);border-radius:16px;text-align:center;color:var(--muted)}}
-      .events-history-panel{{border:1px solid rgba(214,168,79,.26);border-radius:16px;overflow:hidden;background:rgba(7,8,9,.84)}}
-      .events-history-row{{display:grid;grid-template-columns:160px minmax(0,1fr) 80px 130px;gap:12px;align-items:center;padding:12px 14px;border-bottom:1px solid rgba(214,168,79,.12);color:inherit;text-decoration:none}}.events-history-row:last-child{{border-bottom:0}}.events-history-row:hover{{background:rgba(214,168,79,.045)}}
-      .events-history-date{{color:#c8b487;font-size:12px}}.events-history-title strong{{display:block;color:#e8dcc5}}.events-history-title small{{display:block;color:#908b84;margin-top:3px}}.events-history-count,.events-history-own{{text-align:right;color:#b9afa0;font-size:12px}}.events-history-empty{{padding:25px;text-align:center;color:var(--muted)}}
+      .events-history-panel{{border:1px solid rgba(214,168,79,.26);border-radius:16px;overflow:hidden;background:rgba(7,8,9,.84);width:100%;max-width:100%;min-width:0;box-sizing:border-box}}
+      .events-history-row{{display:grid;grid-template-columns:160px minmax(0,1fr) 80px 130px;gap:12px;align-items:center;padding:12px 14px;border-bottom:1px solid rgba(214,168,79,.12);color:inherit;text-decoration:none;width:100%;max-width:100%;min-width:0;box-sizing:border-box;overflow:hidden}}.events-history-row:last-child{{border-bottom:0}}.events-history-row:hover{{background:rgba(214,168,79,.045)}}
+      .events-history-date{{color:#c8b487;font-size:12px}}.events-history-title{{min-width:0;overflow:hidden}}.events-history-title strong{{display:block;color:#e8dcc5;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}.events-history-title small{{display:block;color:#908b84;margin-top:3px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}.events-history-count,.events-history-own{{text-align:right;color:#b9afa0;font-size:12px;white-space:nowrap}}.events-history-empty{{padding:25px;text-align:center;color:var(--muted)}}
       .event-create-dialog{{width:min(820px,calc(100vw - 28px));max-height:90vh;padding:0;border:1px solid rgba(214,168,79,.44);border-radius:18px;background:linear-gradient(145deg,#15110d,#08090a);color:var(--text);box-shadow:0 30px 90px rgba(0,0,0,.65)}}.event-create-dialog::backdrop{{background:rgba(0,0,0,.72);backdrop-filter:blur(4px)}}
       .event-create-form{{padding:18px;overflow:auto;max-height:90vh}}.event-dialog-head{{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;margin-bottom:14px}}.event-dialog-head h2{{margin:2px 0 0;color:#efd18a;font:700 28px Georgia,serif}}.event-dialog-close{{width:38px;height:38px;border-radius:50%;border:1px solid rgba(214,168,79,.32);background:rgba(255,255,255,.04);color:#eee;font-size:25px;cursor:pointer}}
       .event-create-grid{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:11px}}.event-create-grid label{{display:grid;gap:5px;color:#bdb4a6;font-size:12px}}.event-create-grid .wide{{grid-column:1/-1}}.event-create-grid input,.event-create-grid select,.event-create-grid textarea{{width:100%}}.event-create-check{{display:flex;align-items:center;gap:8px;margin:13px 0;color:#c8bdac}}.event-dialog-actions{{display:flex;justify-content:flex-end;gap:10px;flex-wrap:wrap}}
       @media(max-width:960px){{.events-feature-grid{{grid-template-columns:1fr 1fr}}.events-overview-card:last-child:nth-child(odd){{grid-column:1/-1}}.events-history-row{{grid-template-columns:135px minmax(0,1fr) 65px 100px}}}}
       @media(max-width:680px){{
-        .events-overview-page{{gap:13px;overflow-x:hidden}}
-        .events-overview-head{{grid-template-columns:1fr;gap:11px}}
-        .events-overview-title h1{{font-size:clamp(31px,10vw,40px);line-height:1}}
-        .events-overview-title p{{font-size:13px;line-height:1.35}}
-        .events-overview-actions{{justify-content:stretch;display:grid;grid-template-columns:1fr;gap:8px}}
-        .events-mini-stats{{order:2;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px}}
-        .events-mini-stat{{min-width:0;padding:7px 5px;border-radius:10px}}
-        .events-mini-stat small{{font-size:8px}}
+        main.content{{overflow-x:hidden!important}}
+        .events-overview-page{{gap:12px;padding-top:70px;overflow-x:hidden;width:100%;max-width:100%;min-width:0}}
+        .events-overview-head{{display:block;width:100%;max-width:100%;min-width:0;padding:0}}
+        .events-overview-title{{display:none}}
+        .events-overview-actions{{display:grid;grid-template-columns:minmax(0,1fr);gap:8px;width:100%;max-width:100%;min-width:0;justify-content:stretch}}
+        .events-mobile-page-title{{display:block;font:700 24px/1.05 Georgia,serif;color:#e5c276;margin:0 0 1px;padding:0 1px}}
+        .events-mini-stats{{order:2;width:100%;max-width:100%;min-width:0;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px}}
+        .events-mini-stat{{width:100%;min-width:0;max-width:100%;padding:7px 4px;border-radius:10px;overflow:hidden}}
+        .events-mini-stat small{{font-size:8px;letter-spacing:.04em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
         .events-mini-stat strong{{font-size:18px}}
-        .events-create-button{{width:auto!important;justify-self:start;padding:8px 12px!important;font-size:13px!important;min-height:0!important}}
-        .events-section-title{{margin:0 0 7px}}
-        .events-section-title h2{{font-size:19px}}
-        .events-feature-grid{{grid-template-columns:1fr;gap:8px}}
-        .events-overview-card{{display:grid;grid-template-columns:88px minmax(0,1fr);min-height:96px;border-radius:13px}}
+        .events-create-button{{order:3;width:auto!important;max-width:100%;justify-self:start;padding:8px 12px!important;font-size:13px!important;min-height:0!important;margin-top:1px}}
+        .events-section-title{{margin:1px 0 6px;min-width:0}}
+        .events-section-title h2{{font-size:19px;min-width:0}}
+        .events-section-title .muted{{font-size:10px;white-space:nowrap}}
+        .events-feature-grid{{grid-template-columns:minmax(0,1fr);gap:7px;width:100%;max-width:100%;min-width:0;overflow:hidden}}
+        .events-overview-card{{display:grid;grid-template-columns:72px minmax(0,1fr);width:100%;max-width:100%;min-width:0;min-height:84px;border-radius:12px;overflow:hidden;box-sizing:border-box}}
         .events-overview-card:last-child:nth-child(odd){{grid-column:auto}}
-        .events-overview-image{{aspect-ratio:auto;width:88px;height:100%;min-height:96px;border-radius:0;background:radial-gradient(circle at 50% 40%,rgba(130,76,34,.35),rgba(7,8,9,.95))}}
+        .events-overview-image{{aspect-ratio:auto;width:72px;max-width:72px;height:100%;min-height:84px;border-radius:0;background:radial-gradient(circle at 50% 40%,rgba(130,76,34,.35),rgba(7,8,9,.95));overflow:hidden}}
         .events-overview-image img{{object-fit:cover}}
-        .events-image-fallback{{font-size:30px}}
-        .events-overview-copy{{padding:9px 10px 9px;min-width:0}}
-        .events-card-top{{align-items:flex-start;gap:5px}}
-        .events-state{{padding:3px 6px;font-size:8px}}
-        .events-card-date{{font-size:9px;line-height:1.2}}
-        .events-overview-copy h3{{margin:6px 0 3px;font-size:16px;line-height:1.1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
+        .events-image-fallback{{font-size:27px}}
+        .events-overview-copy{{padding:8px 9px;min-width:0;max-width:100%;overflow:hidden}}
+        .events-card-top{{align-items:center;gap:5px;min-width:0}}
+        .events-state{{padding:2px 5px;font-size:7px;flex:0 0 auto}}
+        .events-card-date{{font-size:8px;line-height:1.15;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:right}}
+        .events-overview-copy h3{{margin:5px 0 2px;font-size:15px;line-height:1.1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%}}
         .events-overview-copy p{{display:none}}
-        .events-card-roles{{gap:4px;margin-top:7px}}
-        .events-card-roles span{{padding:2px 5px;font-size:9px}}
-        .events-card-own{{margin-top:6px;padding-top:5px;font-size:10px}}
-        .events-history-row{{grid-template-columns:1fr auto;gap:6px 10px}}
-        .events-history-date{{grid-column:1/-1}}
-        .events-history-title{{grid-column:1/2}}
-        .events-history-count{{grid-column:2/3;grid-row:2}}
-        .events-history-own{{grid-column:1/-1;text-align:left}}
+        .events-card-roles{{gap:3px;margin-top:6px;display:flex;flex-wrap:nowrap;max-width:100%;overflow:hidden}}
+        .events-card-roles span{{padding:2px 4px;font-size:8px;flex:0 0 auto}}
+        .events-card-own{{margin-top:5px;padding-top:4px;font-size:9px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
+        .events-history-panel{{width:100%;max-width:100%;min-width:0;overflow:hidden;border-radius:12px}}
+        .events-history-row{{grid-template-columns:minmax(0,1fr) auto;grid-template-rows:auto auto;gap:3px 8px;width:100%;max-width:100%;min-width:0;padding:9px 10px;overflow:hidden;box-sizing:border-box}}
+        .events-history-date{{grid-column:1/2;grid-row:1;font-size:10px;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
+        .events-history-count{{grid-column:2/3;grid-row:1;font-size:10px;white-space:nowrap}}
+        .events-history-title{{grid-column:1/2;grid-row:2;min-width:0;overflow:hidden}}
+        .events-history-title strong{{font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
+        .events-history-title small{{display:none}}
+        .events-history-own{{grid-column:2/3;grid-row:2;text-align:right;font-size:10px;white-space:nowrap}}
+        .events-history-empty{{padding:18px 10px}}
         .event-create-grid{{grid-template-columns:1fr}}
         .event-create-grid .wide{{grid-column:auto}}
       }}
@@ -14471,6 +14481,7 @@ def _render_events_overview_page(data: dict[str, Any], request: Optional[Request
       <header class="events-overview-head">
         <div class="events-overview-title"><div class="eyebrow">{'Leitung · Eventverwaltung' if admin else 'Gilde · Events'}</div><h1>{_e(page_title)}</h1><p>{_e(subline)}</p></div>
         <div class="events-overview-actions">
+          <div class="events-mobile-page-title">{_e(page_title)}</div>
           <div class="events-mini-stats"><div class="events-mini-stat"><small>Laufend</small><strong>{len(running)}</strong></div><div class="events-mini-stat"><small>Geplant</small><strong>{len(upcoming)}</strong></div><div class="events-mini-stat"><small>Vergangen</small><strong>{len(past)}</strong></div></div>
           {create_button}
         </div>
