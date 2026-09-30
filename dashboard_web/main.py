@@ -14025,7 +14025,7 @@ def _render_member_home(data: dict[str, Any], request: Request) -> str:
       .mobile-home-compact{{display:none}}
       @media(max-width:900px){{
         .member-home-desktop{{display:none!important}}
-        .mobile-home-compact{{display:block;padding-top:62px}}
+        .mobile-home-compact{{display:block;padding-top:78px}}
         .authbar{{display:none!important}}
         main.content{{padding:0 12px 28px!important}}
         .mobile-nav-toggle{{
@@ -14039,6 +14039,32 @@ def _render_member_home(data: dict[str, Any], request: Request) -> str:
           top:10px!important;left:50%!important;right:auto!important;bottom:auto!important;
           transform:translateX(-50%)!important;
         }}
+        .mobile-home-hero{{
+          position:relative;overflow:hidden;margin:0 0 14px;border-radius:20px;
+          border:1px solid rgba(214,168,79,.28);
+          min-height:220px;padding:18px 16px 18px;
+          background:
+            linear-gradient(180deg,rgba(6,7,11,.12) 0%,rgba(6,7,11,.72) 68%,rgba(6,7,11,.92) 100%),
+            url('{_css_url(_brand_image("banner", "beer_and_buffs_opengraph.webp"))}') center/cover no-repeat;
+          box-shadow:0 14px 30px rgba(0,0,0,.32), inset 0 1px 0 rgba(255,255,255,.04);
+          display:flex;align-items:flex-end;
+        }}
+        .mobile-home-hero::after{{
+          content:"";position:absolute;inset:0;
+          background:linear-gradient(90deg,rgba(0,0,0,.35),rgba(0,0,0,.08) 50%,rgba(0,0,0,.42));
+          pointer-events:none;
+        }}
+        .mobile-home-hero-content{{position:relative;z-index:1;max-width:100%}}
+        .mobile-home-hero-logo{{
+          width:74px;height:74px;border-radius:18px;margin-bottom:12px;
+          background:rgba(9,9,12,.34);backdrop-filter:blur(4px);
+          border:1px solid rgba(214,168,79,.28);display:grid;place-items:center;
+          box-shadow:0 8px 20px rgba(0,0,0,.24);
+        }}
+        .mobile-home-hero-logo img{{max-width:56px;max-height:56px;object-fit:contain;display:block}}
+        .mobile-home-hero .eyebrow{{margin:0 0 6px;font-size:11px;letter-spacing:.16em;text-transform:uppercase;color:#d9ba79}}
+        .mobile-home-hero h1{{margin:0;font-family:Georgia,serif;font-size:clamp(34px,11vw,58px);line-height:.95;color:#f4e6bf;text-shadow:0 6px 18px rgba(0,0,0,.42)}}
+        .mobile-home-hero p{{margin:10px 0 0;color:#d5d8df;font-size:14px;line-height:1.35;max-width:95%}}
         .mobile-home-stats{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:9px;margin:0 0 14px}}
         .mobile-home-tile{{
           aspect-ratio:1/1;min-width:0;padding:10px 7px;border-radius:15px;
@@ -14064,6 +14090,10 @@ def _render_member_home(data: dict[str, Any], request: Request) -> str:
         .aion-home-map{{margin-bottom:0!important}}
       }}
       @media(max-width:380px){{
+        .mobile-home-compact{{padding-top:74px}}
+        .mobile-home-hero{{min-height:200px;padding:16px 14px}}
+        .mobile-home-hero-logo{{width:66px;height:66px;margin-bottom:10px}}
+        .mobile-home-hero-logo img{{max-width:50px;max-height:50px}}
         .mobile-home-stats{{gap:6px}}
         .mobile-home-tile{{padding:8px 5px;border-radius:13px}}
         .mobile-home-tile strong{{font-size:20px}}
@@ -14086,6 +14116,14 @@ def _render_member_home(data: dict[str, Any], request: Request) -> str:
     </div>
 
     <section class="mobile-home-compact">
+      <section class="mobile-home-hero">
+        <div class="mobile-home-hero-content">
+          <div class="mobile-home-hero-logo"><img src="{_e(_brand_image('logo', 'logo_512.png'))}" alt="{_e(brand.get('display_name') or 'Gilde')}"></div>
+          <div class="eyebrow">Gildenzentrale</div>
+          <h1>Willkommen, {_e(display)}</h1>
+          <p>{_e(brand.get('display_name') or 'Gilde')} · Events, Mitglieder und deine aktivierten Gildenmodule.</p>
+        </div>
+      </section>
       <div class="mobile-home-stats">
         <article class="mobile-home-tile"><small>Mitglieder</small><strong>{member_count}</strong><span>in der Gilde</span></article>
         <article class="mobile-home-tile"><small>Aktive Events</small><strong>{len(active_events)}</strong><span>laufend / geplant</span></article>
