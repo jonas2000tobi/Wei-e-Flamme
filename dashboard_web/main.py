@@ -12159,19 +12159,23 @@ def _aion2_profiles_for_users(guild_id: int, user_ids: list[int]) -> dict[int, d
 def _aion2_profile_panel(data:dict[str,Any],user_id:int,current_user:Optional[dict[str,Any]])->str:
     gid=_safe_guild_id(data); d=_activity_data(gid,user_id); a=d.get('aion') or {}
     if not a and not bool(_dashboard_module_setting_value(gid,'onboarding','aion2_enabled',False)): return ''
+    current_uid=_user_id((current_user or {}).get('user_id') or (current_user or {}).get('id') or (current_user or {}).get('discord_id'))
     admin=bool(current_user and str(current_user.get('role') or '')=='admin')
+    own=bool(current_uid and int(current_uid)==int(user_id))
+    editable=bool(admin or own)
     cls=_aion2_normalize_class(a.get('class_name')) or str(a.get('class_name') or '')
     faction=_aion2_normalize_faction(a.get('faction'))
     role=_aion2_role_for_class(cls) or str(a.get('main_role') or '')
     class_display=_aion2_class_display_html(cls, with_name=True)
     faction_display=_aion2_faction_display_html(faction, with_name=True)
-    view=f'''<div class="grid">{_card('Charakter',a.get('character_name') or '—','Aion 2')}{_card('Fraktion',faction_display,'Aion 2')}{_card('Klasse',class_display,'Aion 2')}{_card('Rolle',_aion2_role_label(role),'aus Klasse')}{_card('Level',a.get('level') or '—','Profil')}{_card('Gearscore',a.get('gearscore') or '—','Profil')}</div>'''
-    form=''
-    if admin:
+    view=f'''<div class="grid aion2-profile-grid">{_card('Charakter',a.get('character_name') or '—','Aion 2')}{_card('Fraktion',faction_display,'Aion 2')}{_card('Klasse',class_display,'Aion 2')}{_card('Rolle',_aion2_role_label(role),'aus Klasse')}{_card('Level',a.get('level') or '—','Profil')}{_card('Gearscore',a.get('gearscore') or '—','Profil')}</div>'''
+    editor=''
+    if editable:
         opts='<option value="">— Klasse wählen —</option>'+''.join(f'<option value="{_e(c)}"'+(' selected' if cls==c else '')+f'>{_e(c)} ({_e(m["en"])}) · {_e(_aion2_role_label(m["role"]))}</option>' for c,m in AION2_CLASS_META.items())
         faction_opts='<option value="">— Fraktion wählen —</option>'+''.join(f'<option value="{_e(k)}"'+(' selected' if faction==k else '')+f'>{_e(v["label"])}</option>' for k,v in AION2_FACTION_META.items())
-        form=f'''<form method="post" action="/admin/member/{user_id}/aion2" class="settings-form"><label>Charaktername<br><input name="character_name" value="{_e(a.get('character_name') or '')}" maxlength="120"></label><label>Fraktion<br><select name="faction">{faction_opts}</select></label><label>Klasse<br><select name="class_name">{opts}</select></label><label>Rolle<br><input value="{_e(_aion2_role_label(role))}" disabled><small class="muted">Wird automatisch aus der Aion-2-Klasse gesetzt.</small></label><label>Level<br><input type="number" min="1" name="level" value="{_e(a.get('level') or '')}"></label><label>Gearscore<br><input name="gearscore" value="{_e(a.get('gearscore') or '')}" maxlength="40"></label><button class="btn" type="submit">Aion-2-Profil speichern</button></form>'''
-    return f'<section class="panel" id="aion2"><h2>🎮 Aion 2</h2>{view}{form}</section>'
+        action=f'/portal/member/{int(user_id)}/aion2-update' if own else f'/admin/member/{int(user_id)}/aion2'
+        editor=f'''<details class="aion2-profile-editor" id="profile-edit"><summary>Aion-2-Profil bearbeiten</summary><form method="post" action="{action}" class="aion2-profile-form"><label>Charaktername<input name="character_name" value="{_e(a.get('character_name') or '')}" maxlength="120" placeholder="Charaktername"></label><label>Fraktion<select name="faction">{faction_opts}</select></label><label>Klasse<select name="class_name">{opts}</select></label><label>Rolle<input value="{_e(_aion2_role_label(role))}" disabled><small>Wird automatisch aus der Klasse gesetzt.</small></label><label>Level<input type="number" min="1" max="999" name="level" value="{_e(a.get('level') or '')}" placeholder="z. B. 65"></label><label>Gearscore<input name="gearscore" value="{_e(a.get('gearscore') or '')}" maxlength="40" placeholder="z. B. 4200"></label><div class="aion2-save-row"><button class="btn" type="submit">Speichern</button></div></form></details>'''
+    return f'<section class="panel aion2-profile-panel" id="aion2"><div class="aion2-profile-head"><h2>🎮 Aion 2</h2></div>{view}{editor}</section>'
 
 def _ticket_rows(guild_id:int,search:str='')->list[dict[str,Any]]:
     if not _database_url(): return []
@@ -13711,6 +13715,12 @@ def _render_member_portal(data: dict[str, Any], user_id: int, request: Request, 
 
     snap: dict[str, Any] = data.get("snapshot") or {}
     guild_id = _safe_guild_id(data)
+    states = _dashboard_module_states(int(guild_id or 0))
+    needlists_enabled = bool(states.get("needlists", False))
+    points_enabled = bool(states.get("points", False))
+    attendance_enabled = bool(states.get("attendance", False))
+    auctions_enabled = bool(states.get("auctions", False))
+    aion2_enabled = bool(_dashboard_module_setting_value(int(guild_id or 0), 'onboarding', 'aion2_enabled', False))
     names = _profile_name_map(snap)
     uid = int(user_id)
     current_user = _current_user(request)
@@ -13766,31 +13776,24 @@ def _render_member_portal(data: dict[str, Any], user_id: int, request: Request, 
         preferred = next((name for name in role_names if any(term in name.casefold() for term in ("anführer", "gildenmeister", "leader", "berater", "wächter", "guardian"))), "")
         guild_rank = preferred or "Mitglied"
 
-    requests = _need_change_requests(int(guild_id), user_id=uid, limit=40) if guild_id else []
+    requests = _need_change_requests(int(guild_id), user_id=uid, limit=40) if (guild_id and needlists_enabled) else []
     need_editor_actor = current_user if _current_user_id(request) == uid else None
-    shared_item_catalog = _need_builder_items()
-    shared_item_catalog_json = json.dumps(shared_item_catalog, ensure_ascii=False).replace("</", "<\\/")
-    need_editor = _render_need_editor_panel(
-        uid,
-        need_editor_actor,
-        requests,
-        snap,
-        compact=True,
-        item_catalog=shared_item_catalog,
-    )
-
-    need_info = _needs_by_user(snap).get(uid, {})
+    shared_item_catalog = _need_builder_items() if needlists_enabled else []
+    shared_item_catalog_json = json.dumps(shared_item_catalog, ensure_ascii=False).replace("</", "<\/")
+    need_editor = _render_need_editor_panel(uid, need_editor_actor, requests, snap, compact=True, item_catalog=shared_item_catalog) if needlists_enabled else ""
+    need_info = _needs_by_user(snap).get(uid, {}) if needlists_enabled else {}
     main_needs = need_info.get("main") if isinstance(need_info, dict) and isinstance(need_info.get("main"), list) else []
     secondary_needs = need_info.get("secondary") if isinstance(need_info, dict) and isinstance(need_info.get("secondary"), list) else []
     need_count = len(main_needs) + len(secondary_needs)
-    balance = _balance_map(snap).get(uid)
+    balance = _balance_map(snap).get(uid) if points_enabled else None
 
     attendance_player: dict[str, Any] = {}
-    try:
-        attendance_payload = _attendance_stats_payload(data)
-        attendance_player = next((p for p in (attendance_payload.get("player_rows") or []) if _user_id(p.get("user_id")) == uid), {})
-    except Exception:
-        attendance_player = {}
+    if attendance_enabled:
+        try:
+            attendance_payload = _attendance_stats_payload(data)
+            attendance_player = next((p for p in (attendance_payload.get("player_rows") or []) if _user_id(p.get("user_id")) == uid), {})
+        except Exception:
+            attendance_player = {}
 
     def event_dt(ev: dict[str, Any]) -> Optional[datetime]:
         return _event_dt_obj(ev.get("when_iso") or ev.get("start_at") or ev.get("created_at"))
@@ -13820,8 +13823,8 @@ def _render_member_portal(data: dict[str, Any], user_id: int, request: Request, 
     week_total = len(week_events)
     week_percent = round((week_yes / week_total) * 100) if week_total else 0
 
-    auctions = [a for a in (((snap.get("loot") or {}).get("auctions") or {}).get("items") or []) if isinstance(a, dict)]
-    won_auctions = sum(1 for a in auctions if _user_id(a.get("winner_user_id")) == uid)
+    auctions = [a for a in (((snap.get("loot") or {}).get("auctions") or {}).get("items") or []) if isinstance(a, dict)] if auctions_enabled else []
+    won_auctions = sum(1 for a in auctions if _user_id(a.get("winner_user_id")) == uid) if auctions_enabled else 0
 
     def user_in_auction(a: dict[str, Any]) -> bool:
         if _user_id(a.get("top_bid_user_id")) == uid or _user_id(a.get("winner_user_id")) == uid:
@@ -13891,7 +13894,7 @@ def _render_member_portal(data: dict[str, Any], user_id: int, request: Request, 
 
     auctions_html = "".join(auction_row(a) for a in user_active_auctions) or '<div class="profile-empty">Du bist aktuell an keiner laufenden Auktion beteiligt.</div>'
 
-    txs = _tx_for_user(snap, uid, limit=5)
+    txs = _tx_for_user(snap, uid, limit=5) if points_enabled else []
     activity_rows: list[str] = []
     for tx in txs:
         amount = int(_num(tx.get("amount"), 0))
@@ -13929,6 +13932,30 @@ def _render_member_portal(data: dict[str, Any], user_id: int, request: Request, 
     profile_heading = "Mein Profil" if own_profile else display
     profile_subtitle = "Deine persönliche Gildenübersicht" if own_profile else f"Gildenprofil von {display}"
 
+    stat_parts = [
+        f'<div class="profile-stat"><small>Deine Rolle</small><strong>{_e(main_role)}</strong><span>{_e(class_name)}</span></div>',
+        f'<div class="profile-stat"><small>Teilnahmen diese Woche</small><strong>{week_yes} / {week_total}</strong><span>Events</span></div>',
+        f'<div class="profile-stat"><small>Abwesenheitsstatus</small><strong>{"🌙" if absence_state != "available" else "✓"}</strong><span>{_e(absence_text)}</span></div>',
+    ]
+    if points_enabled: stat_parts.append(f'<div class="profile-stat"><small>Coins (EC)</small><strong>🪙 {_e(_fmt_ec(balance) if balance is not None else "—")}</strong><span>Verfügbar</span></div>')
+    if auctions_enabled: stat_parts.append(f'<div class="profile-stat"><small>Auktionen gewonnen</small><strong>⚒️ {won_auctions}</strong><span>Insgesamt</span></div>')
+    if needlists_enabled: stat_parts.append(f'<div class="profile-stat"><small>Needlisteneinträge</small><strong>📋 {need_count}</strong><span>Offen</span></div>')
+    profile_stats_html = ''.join(stat_parts)
+    middle_sections = [f'<section class="profile-section"><h2 class="profile-section-title">Deine kommenden Events</h2><div class="profile-event-list">{upcoming_html}</div><div class="profile-panel-footer"><a href="/member/events">Zu meinen Events</a></div></section>']
+    if auctions_enabled: middle_sections.append(f'<section class="profile-section"><h2 class="profile-section-title">Deine aktiven Auktionen</h2><div class="profile-auction-list">{auctions_html}</div><div class="profile-panel-footer"><a href="/member/auctions">Auktionen öffnen</a></div></section>')
+    middle_sections_html=''.join(middle_sections)
+    bottom_sections=[]
+    if points_enabled: bottom_sections.append(f'<section class="profile-section"><h2 class="profile-section-title">Letzte EC-Aktivitäten</h2><div class="profile-activity-list">{activities_html}</div><div class="profile-panel-footer"><a href="/member/ec">Zur EC-Historie</a></div></section>')
+    bottom_sections.append(f'<section class="profile-section"><h2 class="profile-section-title">Eventbeteiligung · Diese Woche</h2><div class="profile-week"><div class="profile-donut"><div class="profile-donut-text"><strong>{week_percent}%</strong><span>{week_yes} / {week_total}<br>Events</span></div></div><div class="profile-week-legend"><div><span>🟢 Zugesagt</span><strong>{week_yes}</strong></div><div><span>🟡 Offen</span><strong>{week_open}</strong></div><div><span>🔴 Verpasst</span><strong>{week_missed}</strong></div></div></div></section>')
+    bottom_sections_html=''.join(bottom_sections)
+    edit_button = '<a class="btn ghost profile-edit-top" href="#profile-edit">✎ Profil bearbeiten</a>' if (own_profile and aion2_enabled) else ''
+    if _is_portal_admin(request) and not own_profile: edit_button += f'<a class="btn ghost" href="/member/{uid}">Leitungsprüfung</a>'
+    needlist_section = f"""<script>window.BB_SHARED_ITEM_CATALOG = {shared_item_catalog_json};</script><details class="profile-details" id="needlist-editor"><summary>Needliste bearbeiten</summary><div class="profile-details-body">{need_editor}</div></details>""" if needlists_enabled else ''
+    history_section = f"""<details class="profile-details" id="profile-history"><summary>EC- und Eventhistorie</summary><div class="profile-details-body"><section class="grid">{_card('Reviews', attendance_player.get('reviews', 0), 'gewertete Events')}{_card('War da', attendance_player.get('present', 0), 'anwesend')}{_card('Teilweise', attendance_player.get('partial', 0), 'teilweise')}{_card('Nicht da', attendance_player.get('absent', 0), 'abwesend')}{_card('Quote', attendance_player.get('rate') or '—', 'Anwesenheit')}</section></div></details>""" if (points_enabled or attendance_enabled) else ''
+    portal_nav=['<a href="/member">Startseite</a>','<a href="/member/events">Events</a>']
+    if auctions_enabled: portal_nav.append('<a href="/member/auctions">Auktionen</a>')
+    if needlists_enabled: portal_nav.append('<a href="#needlist-editor">Needliste</a>')
+
     body = f"""
     <style>
       .member-profile-dashboard{{display:grid;gap:16px}}
@@ -13946,9 +13973,8 @@ def _render_member_portal(data: dict[str, Any], user_id: int, request: Request, 
       .profile-role-pill{{padding:7px 11px;border:1px solid rgba(214,168,79,.35);background:rgba(214,168,79,.08);font-weight:800;text-transform:uppercase;font-size:12px}}
       .profile-role-pill.primary{{background:rgba(132,29,21,.42);border-color:rgba(204,76,54,.65)}}
       .profile-identity-meta{{display:grid;gap:7px;color:#d9c9aa}}
-      .profile-stat-grid{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr))}}
-      .profile-stat{{min-height:132px;padding:18px;display:grid;align-content:center;justify-items:center;text-align:center;border-right:1px solid rgba(214,168,79,.20);border-bottom:1px solid rgba(214,168,79,.20)}}
-      .profile-stat:nth-child(3n){{border-right:0}}.profile-stat:nth-child(n+4){{border-bottom:0}}
+      .profile-stat-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:1px;background:rgba(214,168,79,.16)}}
+      .profile-stat{{min-height:112px;padding:15px;display:grid;align-content:center;justify-items:center;text-align:center;background:linear-gradient(135deg,rgba(16,15,13,.98),rgba(5,6,6,.97))}}
       .profile-stat small{{color:#d5ad58;font:700 13px Georgia,serif;text-transform:uppercase;letter-spacing:.05em}}
       .profile-stat strong{{font:700 28px Georgia,serif;margin:10px 0 4px}}
       .profile-stat span{{color:#7dd067;font-size:13px}}
@@ -13984,11 +14010,15 @@ def _render_member_portal(data: dict[str, Any], user_id: int, request: Request, 
       .profile-edit-grid input,.profile-edit-grid select{{width:100%;padding:11px 12px;border:1px solid rgba(214,168,79,.25);background:rgba(0,0,0,.35);color:var(--text)}}
       .profile-save-bar{{display:flex;justify-content:flex-end;padding-top:14px}}.profile-save-state{{margin-bottom:12px;padding:11px 13px;border-radius:8px}}.profile-save-state.pending{{background:rgba(214,168,79,.10);color:#f0d58f}}.profile-save-state.error{{background:rgba(211,82,82,.10);color:#ffaaaa}}
       .profile-empty{{padding:24px;color:var(--muted);text-align:center}}
+      .profile-hero-actions{{display:flex;gap:8px;align-items:center;flex-wrap:wrap}}.profile-edit-top{{padding:9px 12px!important;font-size:12px!important}}
+      .aion2-profile-panel{{margin-top:16px}}.aion2-profile-head{{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:10px}}.aion2-profile-head h2{{margin:0}}
+      .aion2-profile-editor{{margin-top:14px;border-top:1px solid rgba(214,168,79,.18)}}.aion2-profile-editor>summary{{cursor:pointer;list-style:none;padding:12px 4px 4px;color:#e8c77e;font-weight:800}}.aion2-profile-editor>summary::-webkit-details-marker{{display:none}}
+      .aion2-profile-form{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin-top:12px}}.aion2-profile-form label{{display:grid;gap:5px;color:#c9b894;font-size:11px;font-weight:800;text-transform:uppercase}}.aion2-profile-form input,.aion2-profile-form select{{width:100%;min-width:0;box-sizing:border-box;padding:10px 11px;border:1px solid rgba(214,168,79,.25);background:rgba(0,0,0,.35);color:var(--text)}}.aion2-profile-form small{{color:var(--muted);text-transform:none;font-weight:400}}.aion2-save-row{{grid-column:1/-1;display:flex;justify-content:flex-end;padding-top:4px}}
       @media(max-width:1100px){{.profile-top-grid,.profile-middle-grid,.profile-bottom-grid{{grid-template-columns:1fr}}.profile-stat-grid{{grid-template-columns:repeat(3,1fr)}}}}
-      @media(max-width:700px){{.profile-identity{{grid-template-columns:1fr;text-align:center}}.profile-role-pills{{justify-content:center}}.profile-stat-grid{{grid-template-columns:repeat(2,1fr)}}.profile-stat:nth-child(3n){{border-right:1px solid rgba(214,168,79,.20)}}.profile-stat:nth-child(2n){{border-right:0}}.profile-stat:nth-child(n+4){{border-bottom:1px solid rgba(214,168,79,.20)}}.profile-stat:nth-child(n+5){{border-bottom:0}}.profile-event-row{{grid-template-columns:76px minmax(0,1fr)}}.profile-event-side{{grid-column:1/-1;display:flex;justify-content:space-between}}.profile-activity-row{{grid-template-columns:24px 80px minmax(0,1fr)}}.profile-activity-row small{{grid-column:2/-1}}.profile-edit-grid{{grid-template-columns:1fr}}}}
+      @media(max-width:700px){{.profile-topnav{{display:none!important}}.profile-page-hero{{margin-top:74px!important;padding:15px!important;min-height:0!important;display:grid!important;gap:10px!important}}.profile-page-hero h1{{font-size:30px!important;line-height:1!important;margin:3px 0 0!important}}.profile-page-hero p{{font-size:11px!important;margin:5px 0 0!important}}.profile-hero-actions{{justify-content:flex-start}}.member-profile-dashboard{{gap:10px;min-width:0}}.profile-top-grid,.profile-middle-grid,.profile-bottom-grid{{grid-template-columns:1fr!important;gap:10px}}.profile-identity{{grid-template-columns:82px minmax(0,1fr);gap:12px;padding:13px;text-align:left}}.profile-avatar-large{{width:76px;height:76px;padding:3px}}.profile-level{{width:34px;height:34px;font-size:11px;margin-top:-20px}}.profile-identity h1{{font-size:22px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}.profile-guild-line{{font-size:11px;margin-bottom:8px}}.profile-role-pills{{justify-content:flex-start;margin:7px 0;gap:5px}}.profile-role-pill{{padding:4px 7px;font-size:9px}}.profile-identity-meta{{font-size:10px;gap:3px}}.profile-stat-grid{{grid-template-columns:repeat(2,minmax(0,1fr))}}.profile-stat{{min-height:82px;padding:9px 7px}}.profile-stat small{{font-size:9px}}.profile-stat strong{{font-size:19px;margin:5px 0 2px}}.profile-stat span{{font-size:9px}}.profile-section-title{{padding:10px 12px;font-size:13px}}.profile-event-list,.profile-auction-list,.profile-activity-list{{padding:7px}}.profile-event-row{{grid-template-columns:62px minmax(0,1fr);gap:8px;padding:7px}}.profile-event-image{{height:54px}}.profile-event-copy h3{{font-size:14px}}.profile-event-copy p,.profile-event-copy small{{font-size:9px}}.profile-event-side{{grid-column:1/-1;display:flex;justify-content:space-between;font-size:9px}}.profile-auction-row{{grid-template-columns:36px minmax(0,1fr) auto;padding:9px 5px;gap:7px}}.profile-activity-row{{grid-template-columns:22px 70px minmax(0,1fr);gap:6px;font-size:10px}}.profile-activity-row small{{grid-column:2/-1}}.profile-week{{padding:14px}}.profile-donut{{width:112px;height:112px}}.profile-donut-text strong{{font-size:23px}}.profile-donut-text span{{font-size:10px}}.aion2-profile-panel{{margin-top:10px;padding:12px!important}}.aion2-profile-grid{{grid-template-columns:repeat(2,minmax(0,1fr))!important;gap:7px!important}}.aion2-profile-grid .card{{min-width:0!important;padding:9px!important}}.aion2-profile-form{{grid-template-columns:1fr;gap:8px}}.aion2-save-row{{grid-column:auto}}.aion2-save-row .btn{{width:100%}}.profile-details{{margin-top:10px}}.profile-details>summary{{padding:11px 12px;font-size:12px}}.profile-details-body{{padding:10px}}}}
     </style>
-    <nav class="topnav"><a href="/member">Startseite</a><a href="/member/events">Events</a><a href="/member/auctions">Auktionen</a><a href="#profile-edit">Profil bearbeiten</a><a href="#needlist-editor">Needliste bearbeiten</a></nav>
-    <section class="hero"><div><div class="eyebrow">{_e(profile_eyebrow)}</div><h1>{_e(profile_heading)}</h1><p class="muted">{_e(profile_subtitle)}</p></div>{admin_links}</section>
+    <nav class="topnav profile-topnav">{"".join(portal_nav)}</nav>
+    <section class="hero profile-page-hero"><div><div class="eyebrow">{_e(profile_eyebrow)}</div><h1>{_e(profile_heading)}</h1><p class="muted">{_e(profile_subtitle)}</p></div><div class="profile-hero-actions">{edit_button}</div></section>
     {msg_html}
     {profile_update_notice}
     <main class="member-profile-dashboard">
@@ -14002,74 +14032,18 @@ def _render_member_portal(data: dict[str, Any], user_id: int, request: Request, 
             <div class="profile-identity-meta"><span>⚙️ Gearscore: <strong>{_e(gearscore)}</strong></span><span>📅 Aktiv { _e(joined_text) }</span></div>
           </div>
         </section>
-        <section class="profile-section profile-stat-grid">
-          <div class="profile-stat"><small>Ebolus Coins (EC)</small><strong>🪙 {_e(_fmt_ec(balance) if balance is not None else '—')}</strong><span>Verfügbar</span></div>
-          <div class="profile-stat"><small>Deine Rolle</small><strong>{_e(main_role)}</strong><span>{_e(class_name)}</span></div>
-          <div class="profile-stat"><small>Teilnahmen diese Woche</small><strong>{week_yes} / {week_total}</strong><span>Events</span></div>
-          <div class="profile-stat"><small>Auktionen gewonnen</small><strong>⚒️ {won_auctions}</strong><span>Insgesamt</span></div>
-          <div class="profile-stat"><small>Needlisteneinträge</small><strong>📋 {need_count}</strong><span>Offen</span></div>
-          <div class="profile-stat"><small>Abwesenheitsstatus</small><strong>{'🌙' if absence_state != 'available' else '✓'}</strong><span>{_e(absence_text)}</span></div>
-        </section>
+        <section class="profile-section profile-stat-grid">{profile_stats_html}</section>
       </div>
 
-      {_aion2_profile_panel(data, uid, current_user) if bool(_dashboard_module_setting_value(int(guild_id or 0), 'onboarding', 'aion2_enabled', False)) else ''}
+      {_aion2_profile_panel(data, uid, current_user) if aion2_enabled else ''}
 
-      <div class="profile-middle-grid">
-        <section class="profile-section"><h2 class="profile-section-title">Deine kommenden Events</h2><div class="profile-event-list">{upcoming_html}</div><div class="profile-panel-footer"><a href="/member/events">Zu meinen Events</a></div></section>
-        <section class="profile-section"><h2 class="profile-section-title">Deine aktiven Auktionen</h2><div class="profile-auction-list">{auctions_html}</div><div class="profile-panel-footer"><a href="/member/auctions">Auktionen öffnen</a></div></section>
-      </div>
-
-      <div class="profile-bottom-grid">
-        <section class="profile-section"><h2 class="profile-section-title">Letzte Aktivitäten</h2><div class="profile-activity-list">{activities_html}</div><div class="profile-panel-footer"><a href="/member/ec">Zur Aktivitäten-Historie</a></div></section>
-        <section class="profile-section"><h2 class="profile-section-title">Eventbeteiligung · Diese Woche</h2><div class="profile-week"><div class="profile-donut"><div class="profile-donut-text"><strong>{week_percent}%</strong><span>{week_yes} / {week_total}<br>Events</span></div></div><div class="profile-week-legend"><div><span>🟢 Zugesagt</span><strong>{week_yes}</strong></div><div><span>🟡 Offen</span><strong>{week_open}</strong></div><div><span>🔴 Verpasst</span><strong>{week_missed}</strong></div></div></div></section>
-        <section class="profile-section"><h2 class="profile-section-title">Profilaktionen</h2><div class="profile-actions"><a class="profile-action primary" href="#profile-edit">Profil bearbeiten</a><a class="profile-action" href="#needlist-editor">Needliste öffnen</a><a class="profile-action" href="/character-editor">Charakter-Editor</a><a class="profile-action" href="/member/auctions">Meine Auktionen</a></div></section>
-      </div>
+      <div class="profile-middle-grid">{middle_sections_html}</div>
+      <div class="profile-bottom-grid">{bottom_sections_html}</div>
     </main>
-
-    <details class="profile-details" id="profile-edit">
-      <summary>Profil bearbeiten</summary>
-      <div class="profile-details-body">
-        <form method="post" action="/portal/member/{uid}/profile-update" data-profile-edit-form="1">
-          <div class="profile-edit-grid">
-            <label>Klasse<input name="class_name" value="{_e('' if class_name == '—' else class_name)}" maxlength="80" placeholder="z. B. Stab / Langbogen"></label>
-            <label>Gearscore<input name="gearscore" type="number" min="1" max="99999" value="{_e('' if gearscore == '—' else gearscore)}" placeholder="z. B. 4200"></label>
-            <label>Rolle<select name="main_role"><option value="">Rolle auswählen</option>{''.join(role_options)}</select></label>
-          </div>
-          <div class="profile-save-bar"><button class="btn" type="submit">Profiländerungen speichern</button></div>
-        </form>
-      </div>
-    </details>
-
-    <script>window.BB_SHARED_ITEM_CATALOG = {shared_item_catalog_json};</script>
-    <details class="profile-details" id="needlist-editor">
-      <summary>Needliste bearbeiten</summary>
-      <div class="profile-details-body">{need_editor}</div>
-    </details>
-
-    <details class="profile-details" id="profile-history">
-      <summary>EC- und Eventhistorie</summary>
-      <div class="profile-details-body">
-        <section class="grid">{_card('Reviews', attendance_player.get('reviews', 0), 'gewertete Events')}{_card('War da', attendance_player.get('present', 0), 'anwesend')}{_card('Teilweise', attendance_player.get('partial', 0), 'teilweise')}{_card('Nicht da', attendance_player.get('absent', 0), 'abwesend')}{_card('Quote', attendance_player.get('rate') or '—', 'Anwesenheit')}</section>
-      </div>
-    </details>
+    {needlist_section}
+    {history_section}
 
     <script>
-      (function profileEditState(){{
-        const form = document.querySelector('[data-profile-edit-form="1"]');
-        if (!form) return;
-        const button = form.querySelector('button[type="submit"]');
-        const signature = function(fd){{ return Array.from(fd.entries()).map(function(x){{ return x[0] + '=' + x[1]; }}).join('&'); }};
-        const start = signature(new FormData(form));
-        function refresh(){{
-          const dirty = signature(new FormData(form)) !== start;
-          if (button) button.textContent = dirty ? 'Änderungen speichern' : 'Profil ist aktuell';
-          if (button) button.disabled = !dirty;
-        }}
-        form.addEventListener('input', refresh);
-        form.addEventListener('change', refresh);
-        form.addEventListener('submit', function(){{ if (button) button.disabled = false; }});
-        refresh();
-      }})();
       (function openProfileHash(){{
         function openTarget(){{
           const id = (window.location.hash || '').slice(1);
@@ -14195,6 +14169,7 @@ def _render_member_home(data: dict[str, Any], request: Request) -> str:
         _card("Mitglieder", member_count, "aktuell in der Gilde"),
         _card("Events", len(active_events), "laufend oder geplant"),
         _card("Aktive Module", sum(1 for key in OPTIONAL_MODULE_KEYS if states.get(key, False)), "optionale Systeme"),
+        _card("Boss", "27 Min.", "Abyss · Nordfestung"),
     ]
     if states.get("points", False):
         my_balance = _balance_map(snap).get(int(uid or 0)) if uid else None
@@ -14378,10 +14353,6 @@ def _render_member_home(data: dict[str, Any], request: Request) -> str:
     </section>
 
     {aion_map_panel}
-
-    <div class="member-home-desktop">
-      <section class="split">{"".join(sections)}</section>
-    </div>
     '''
     return _html_shell("Gildenzentrale · Guild Platform", body, nav_mode=_nav_mode_for_request(request))
 
@@ -19571,6 +19542,29 @@ async def portal_profile_update(user_id: int, request: Request, _: bool = Depend
     )
     params = urllib.parse.urlencode({"msg": f"Profiländerung an den Bot gesendet: {request_id}"})
     return RedirectResponse(url=f"/portal/member/{int(user_id)}?{params}", status_code=303)
+
+
+@app.post("/portal/member/{user_id}/aion2-update")
+async def portal_aion2_update(user_id: int, request: Request, _: bool = Depends(_auth)):
+    current_uid = int(_current_user_id(request) or 0)
+    if current_uid != int(user_id) and not _is_portal_admin(request): raise HTTPException(status_code=403, detail="Keine Berechtigung für dieses Aion-2-Profil.")
+    data = _snapshot_payload(); guild_id = int(_safe_guild_id(data) or 0)
+    if not guild_id: raise HTTPException(status_code=400, detail="Guild-ID fehlt.")
+    if not bool(_dashboard_module_setting_value(guild_id, 'onboarding', 'aion2_enabled', False)): raise HTTPException(status_code=404, detail="Aion-2-Komponente ist nicht aktiv.")
+    form = _parse_urlencoded_body(await request.body())
+    character_name = re.sub(r"\s+", " ", str(form.get("character_name") or "").strip())[:120]
+    faction = _aion2_normalize_faction(form.get("faction")); class_name = _aion2_normalize_class(form.get("class_name")); main_role = _aion2_role_for_class(class_name)
+    gearscore = re.sub(r"\s+", " ", str(form.get("gearscore") or "").strip())[:40]
+    raw_level = re.sub(r"[^0-9]", "", str(form.get("level") or "")); level = int(raw_level) if raw_level else None
+    if level is not None and not (1 <= level <= 999): raise HTTPException(status_code=400, detail="Level muss zwischen 1 und 999 liegen.")
+    _ensure_v211_tables(); conn = _pg_connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute('''INSERT INTO aion2_profiles(guild_id,user_id,character_name,class_name,main_role,faction,level,gearscore,updated_at) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(guild_id,user_id) DO UPDATE SET character_name=EXCLUDED.character_name,class_name=EXCLUDED.class_name,main_role=EXCLUDED.main_role,faction=EXCLUDED.faction,level=EXCLUDED.level,gearscore=EXCLUDED.gearscore,updated_at=EXCLUDED.updated_at''',(guild_id,int(user_id),character_name,class_name,main_role,faction,level,gearscore,datetime.now(timezone.utc).isoformat()))
+        conn.commit()
+    finally: conn.close()
+    target = "/portal" if current_uid == int(user_id) else f"/portal/member/{int(user_id)}"; params = urllib.parse.urlencode({"msg":"Aion-2-Profil gespeichert."})
+    return RedirectResponse(url=f"{target}?{params}#aion2", status_code=303)
 
 
 @app.post("/portal/member/{user_id}/need-change")
