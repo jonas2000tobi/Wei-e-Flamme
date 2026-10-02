@@ -5111,13 +5111,16 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "member", active_nav_h
     .member-home-hero::after {{ background:linear-gradient(180deg,rgba(0,0,0,.02) 0%,rgba(0,0,0,.08) 54%,rgba(0,0,0,.22) 100%) !important; }}
     .member-home-hero-copy {{ position:absolute; inset:0; z-index:3; pointer-events:none; }}
     .member-home-hero-copy::before {{ display:none; }}
+    .member-home-welcome-label,
     .member-home-dynamic-name {{
-      position:absolute; left:22%; right:22%; top:27%; min-height:46px;
+      position:absolute; top:48%; min-height:58px;
       display:flex; align-items:center; justify-content:center; text-align:center;
-      color:#f3f6ff; font-family:Georgia,serif; font-size:clamp(22px,1.9vw,33px); font-weight:800;
+      color:#f3f6ff; font-family:Georgia,serif; font-weight:800;
       line-height:1.02; letter-spacing:.025em; overflow-wrap:anywhere;
       text-shadow:0 3px 14px rgba(0,0,0,.98),0 0 22px rgba(76,108,255,.42);
     }}
+    .member-home-welcome-label {{ left:7%; right:61%; font-size:clamp(24px,2.15vw,38px); text-transform:uppercase; letter-spacing:.07em; }}
+    .member-home-dynamic-name {{ left:61%; right:7%; font-size:clamp(23px,2vw,36px); }}
     .member-summary-list {{ display:grid; gap:10px; margin-top:10px; }}
     .member-summary-item {{ display:grid; grid-template-columns:minmax(0,1fr) auto; gap:12px; align-items:center; padding:12px 13px; border:1px solid rgba(214,168,79,.14); border-radius:14px; background:rgba(32,35,45,.55); }}
     .member-summary-title {{ font-weight:800; color:var(--gold); overflow-wrap:anywhere; }}
@@ -14461,7 +14464,7 @@ def _render_member_home(data: dict[str, Any], request: Request) -> str:
     <div class="member-home-desktop">
       <nav class="topnav">{"".join(nav)}</nav>
       <section class="hero member-home-hero">
-        <div class="member-home-hero-copy"><div class="member-home-dynamic-name">{_e(display)}</div></div>
+        <div class="member-home-hero-copy"><div class="member-home-welcome-label">Willkommen</div><div class="member-home-dynamic-name">{_e(display)}</div></div>
       </section>
       <section class="grid">{"".join(cards)}</section>
       {admin_tools}
@@ -20899,6 +20902,165 @@ AION2_GUIDE_CLASSES = [
 
 AION2_GUIDE_CLASS_LOOKUP = {slug: (name, hint) for slug, name, hint in AION2_GUIDE_CLASSES}
 
+AION2_EVENT_SOURCE_URL = "https://wakayashi.gg/aion2#event-timer"
+
+
+def _aion2_next_hourly(minute: int, now: datetime) -> datetime:
+    candidate = now.replace(minute=int(minute), second=0, microsecond=0)
+    if candidate <= now:
+        candidate += timedelta(hours=1)
+    return candidate
+
+
+def _aion2_next_cycle(hours: list[int], minute: int, now: datetime) -> datetime:
+    for day_offset in range(0, 3):
+        day = (now + timedelta(days=day_offset)).date()
+        for hour in hours:
+            candidate = datetime(day.year, day.month, day.day, int(hour), int(minute), tzinfo=BERLIN_TZ)
+            if candidate > now:
+                return candidate
+    return now + timedelta(hours=3)
+
+
+def _aion2_next_weekly(weekdays: list[int], hour: int, minute: int, now: datetime) -> datetime:
+    for day_offset in range(0, 9):
+        day = (now + timedelta(days=day_offset)).date()
+        if day.weekday() not in weekdays:
+            continue
+        candidate = datetime(day.year, day.month, day.day, int(hour), int(minute), tzinfo=BERLIN_TZ)
+        if candidate > now:
+            return candidate
+    return now + timedelta(days=7)
+
+
+def _aion2_event_timer_items() -> list[dict[str, Any]]:
+    now = datetime.now(BERLIN_TZ)
+    rows = [
+        {"type": "Boss", "name": "Beritra-Luftangriff", "detail": "alle 60 Min. · stündlich zur halben Stunde", "next": _aion2_next_hourly(30, now)},
+        {"type": "Event", "name": "Shugofesta", "detail": "alle 60 Min. · 9 Minispiele · kurzes Eintrittsfenster", "next": _aion2_next_hourly(0, now)},
+        {"type": "Boss", "name": "Watcher Kaira", "detail": "alle 60 Min. · Chaotic Lower Reshanta · despawnt nach 30 Min.", "next": _aion2_next_hourly(0, now)},
+        {"type": "PvP", "name": "Raum-Zeit-Riss", "detail": "alle 3 Std. · Portal ca. 10 Min. offen · Event ca. 1 Std.", "next": _aion2_next_cycle([2, 5, 8, 11, 14, 17, 20, 23], 0, now)},
+        {"type": "Boss", "name": "Abyss-Belagerungsboss & Nahma", "detail": "So + Fr · Chaotic Lower & Middle Reshanta", "next": _aion2_next_weekly([4, 6], 22, 0, now)},
+        {"type": "Event", "name": "Abyss-Event", "detail": "Mi + Sa · Reshanta · Executor-Bosse spawnen 30 Min. später", "next": _aion2_next_weekly([2, 5], 22, 0, now)},
+        {"type": "Boss", "name": "Reshanta-Weltbosse", "detail": "Mi + Sa · Argo, Kaira, Tamasa, Dramos, Marakha, Ducal", "next": _aion2_next_weekly([2, 5], 22, 30, now)},
+        {"type": "PvP", "name": "Abyss-Riss", "detail": "Di + Do · ab Level 45", "next": _aion2_next_weekly([1, 3], 22, 0, now)},
+    ]
+    return sorted(rows, key=lambda row: row["next"])
+
+
+def _aion2_event_timer_html() -> str:
+    rows = _aion2_event_timer_items()
+    cards: list[str] = []
+    icons = {"Boss": "👑", "Event": "✨", "PvP": "⚔️"}
+    for row in rows:
+        next_dt = row["next"]
+        cards.append(
+            f'<article class="a2-live-event" data-event-time="{_e(next_dt.isoformat())}">'
+            f'<div class="a2-live-event-type">{icons.get(row["type"], "•")} {_e(row["type"])}</div>'
+            f'<div class="a2-live-event-main"><strong>{_e(row["name"])}</strong><span>{_e(row["detail"])}</span></div>'
+            f'<div class="a2-live-event-time"><b>{_e(next_dt.strftime("%a %d.%m. · %H:%M"))}</b><span class="a2-countdown">…</span></div>'
+            f'</article>'
+        )
+    return ''.join(cards)
+
+
+def _kantor_guide_body(class_name: str, class_hint: str, icon_url: str) -> str:
+    icon_html = f'<img src="{_e(icon_url)}" alt="{_e(class_name)}" class="kantor-guide-icon">' if icon_url else ''
+    mastery_20 = ["Finsterbruch", "Wirbelschlag", "Zauber der Genesung", "Zerschmetterungsschlag"]
+    mastery_16 = ["Gleißschlag", "Sturmschlag", "Schockaufhebung"]
+    mastery_12 = ["Wuchtschlag", "Hitzewellenschlag", "Erschütterungsschlag", "Wellenschlag"]
+    skill_plus_2 = ["Angriffsvorbereitung", "Kreuzverteidigung", "Schutzformation", "Segen des Lebens", "Zauber der Eingebung"]
+    skill_plus_1 = ["Erschütterungsschlag", "Finsterbruch", "Gleißschlag", "Hitzewellenschlag", "Sturmschlag", "Wellenschlag", "Wirbelschlag", "Wuchtschlag", "Zauber der Genesung", "Zerschmetterungsschlag"]
+    chips20 = ''.join(f'<span>{_e(x)}</span>' for x in mastery_20)
+    chips16 = ''.join(f'<span>{_e(x)}</span>' for x in mastery_16)
+    chips12 = ''.join(f'<span>{_e(x)}</span>' for x in mastery_12)
+    plus2 = ''.join(f'<li>{_e(x)} <b>+2</b></li>' for x in skill_plus_2)
+    plus1 = ''.join(f'<li>{_e(x)} <b>+1</b></li>' for x in skill_plus_1)
+    return f"""
+    <style>
+      .kantor-guide{{display:grid;gap:14px}}
+      .kantor-hero{{position:relative;overflow:hidden;min-height:240px;padding:28px;border-radius:20px;border:1px solid rgba(112,125,248,.32);background:linear-gradient(90deg,rgba(6,10,21,.97),rgba(7,11,24,.82) 52%,rgba(8,12,27,.28)),url('{_asset("oblivion_header_desktop.png")}') center 47%/cover no-repeat;box-shadow:0 18px 44px rgba(0,0,0,.32);display:flex;justify-content:space-between;gap:20px;align-items:center}}
+      .kantor-hero-copy{{position:relative;z-index:2;display:flex;align-items:center;gap:18px;max-width:850px}}
+      .kantor-guide-icon{{width:100px;height:100px;object-fit:contain;filter:drop-shadow(0 14px 22px rgba(45,66,220,.34))}}
+      .kantor-hero .eyebrow{{color:#b5c2ff;font-weight:900;letter-spacing:.16em;text-transform:uppercase}}
+      .kantor-hero h1{{font-family:Georgia,serif;font-size:clamp(40px,5vw,64px);margin:5px 0 8px;color:#f4f7ff}}
+      .kantor-hero p{{margin:0;color:#c4cee1;line-height:1.45}}
+      .kantor-tags{{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}}
+      .kantor-tags span{{padding:6px 10px;border-radius:999px;border:1px solid rgba(120,134,255,.28);background:rgba(18,24,43,.72);color:#c9d3ff;font-size:12px;font-weight:800}}
+      .kantor-grid{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}}
+      .kantor-card{{padding:18px;border-radius:17px;border:1px solid rgba(112,125,248,.23);background:linear-gradient(180deg,rgba(13,18,33,.93),rgba(7,10,19,.95));box-shadow:0 12px 28px rgba(0,0,0,.20)}}
+      .kantor-card.wide{{grid-column:1/-1}}
+      .kantor-card h2{{margin:0 0 10px;font-family:Georgia,serif;color:#eef2ff}}
+      .kantor-card h3{{margin:14px 0 7px;color:#cbd5ff}}
+      .kantor-card p,.kantor-card li{{color:#b7c1d7;line-height:1.5}}
+      .kantor-card ul,.kantor-card ol{{margin:8px 0 0;padding-left:20px}}
+      .kantor-strengths{{border-color:rgba(92,187,137,.28)}}
+      .kantor-weaknesses{{border-color:rgba(205,104,104,.28)}}
+      .kantor-core{{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:16px;align-items:start}}
+      .kantor-core-level{{min-width:120px;text-align:center;padding:14px;border-radius:15px;background:linear-gradient(180deg,rgba(93,107,235,.19),rgba(7,10,19,.72));border:1px solid rgba(120,134,255,.30)}}
+      .kantor-core-level small{{display:block;color:#9cabc9;text-transform:uppercase;letter-spacing:.1em}}
+      .kantor-core-level strong{{display:block;margin-top:5px;font-family:Georgia,serif;font-size:34px;color:#f4f7ff}}
+      .mastery-row{{display:grid;grid-template-columns:70px minmax(0,1fr);gap:10px;align-items:start;margin-top:10px}}
+      .mastery-row b{{color:#b9c5ff}}
+      .mastery-chips{{display:flex;gap:7px;flex-wrap:wrap}}
+      .mastery-chips span{{padding:7px 9px;border-radius:10px;background:rgba(28,35,61,.74);border:1px solid rgba(113,127,247,.22);color:#d3daf0;font-size:12px}}
+      .kantor-stats{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin-top:9px}}
+      .kantor-stat{{padding:10px;border-radius:12px;background:rgba(20,27,47,.72);border:1px solid rgba(112,125,248,.18)}}
+      .kantor-stat small{{display:block;color:#8fa0c2}}
+      .kantor-stat strong{{display:block;color:#f1f4ff;margin-top:3px}}
+      .kantor-board-grid{{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin:10px 0 4px}}
+      .kantor-board{{padding:11px;border-radius:12px;background:rgba(20,27,47,.68);border:1px solid rgba(112,125,248,.18)}}
+      .kantor-board b{{display:block;color:#e7ecff}}
+      .kantor-board span{{display:block;color:#9daccc;font-size:12px;margin-top:3px}}
+      .kantor-skill-list{{columns:2;column-gap:28px}}
+      .kantor-skill-list li{{break-inside:avoid;margin:4px 0}}
+      .kantor-skill-list b{{float:right;color:#b5c2ff}}
+      .macro-steps{{display:grid;gap:8px;counter-reset:macro}}
+      .macro-step{{position:relative;padding:12px 12px 12px 46px;border-radius:13px;background:rgba(20,27,47,.62);border:1px solid rgba(112,125,248,.18);color:#c4cce0}}
+      .macro-step::before{{counter-increment:macro;content:counter(macro);position:absolute;left:12px;top:10px;width:24px;height:24px;border-radius:50%;display:grid;place-items:center;background:rgba(95,111,238,.24);border:1px solid rgba(130,143,255,.34);font-weight:900;color:#eef2ff}}
+      .mistake{{padding:12px;border-radius:13px;border:1px solid rgba(206,113,113,.19);background:rgba(50,20,25,.22);margin-top:8px}}
+      .mistake strong{{display:block;color:#ffc4c4;margin-bottom:4px}}
+      .kantor-source{{font-size:12px;color:#8795b1}}
+      @media(max-width:780px){{.kantor-grid{{grid-template-columns:1fr}}.kantor-card.wide{{grid-column:auto}}.kantor-hero{{padding:18px;display:grid}}.kantor-hero-copy{{align-items:flex-start}}.kantor-guide-icon{{width:72px;height:72px}}.kantor-board-grid{{grid-template-columns:repeat(2,minmax(0,1fr))}}.kantor-stats{{grid-template-columns:repeat(2,minmax(0,1fr))}}.kantor-skill-list{{columns:1}}}}
+    </style>
+    <main class="kantor-guide">
+      <section class="kantor-hero">
+        <div class="kantor-hero-copy">
+          {icon_html}
+          <div>
+            <div class="eyebrow">Klassen Build · Chanter</div>
+            <h1>Kantor</h1>
+            <p>Support-Hybrid mit Gruppenbuffs, Heilung und eigenem Schaden. Der Kern des Builds ist, Buffs dauerhaft aktiv zu halten und <strong>Finsterbruch</strong> in den richtigen Fenstern auszunutzen.</p>
+            <div class="kantor-tags"><span>Leicht</span><span>Support · Stab</span><span>Gruppenbuffs</span><span>Finsterbruch = Kernschaden</span></div>
+          </div>
+        </div>
+        <a class="btn secondary" href="/guides/classes">← Klassenübersicht</a>
+      </section>
+
+      <section class="kantor-grid">
+        <article class="kantor-card kantor-strengths"><h2>Stärken</h2><ul><li>Sehr gute Gruppen-Synergie in PvE und PvP durch Heals und Buffs.</li><li>Die beiden Invokationen laufen als permanente Gruppenbuffs, solange sie aktiv sind.</li><li>Solide Überlebensfähigkeit durch Heal-Skills.</li><li>Open-World-/Pet-Farming wird durch Sturmschlag mit Reset angenehm.</li></ul></article>
+        <article class="kantor-card kantor-weaknesses"><h2>Schwächen</h2><ul><li>Im Early Game ist Finsterbruch wegen langer Cooldowns nur begrenzt verfügbar.</li><li>Kein starker Vollheiler und kein Battle-Rez - damit kein vollständiger Ersatz für einen Kleriker.</li></ul></article>
+
+        <article class="kantor-card wide"><div class="kantor-core"><div><h2>Kernskill: Finsterbruch</h2><p>Physischer Angriff ab Level 4 mit 5 Sekunden Grund-Cooldown. Finsterbruch ist die wichtigste Schadensquelle, wird aber nur kurz nach <strong>Wirbelschlag</strong>, <strong>Wuchtschlag</strong> oder <strong>Marchutans Zorn</strong> verfügbar - deshalb zuerst auf Ziel-Level 20.</p><h3>Spezialitäten - empfohlene Reihenfolge</h3><ol><li>Ab Level 16: Cooldown von Finsterbruch entfernen.</li><li>Ab Level 12: zweite Folge „Durchschlag“ ergänzen.</li><li>Ab Level 8: garantierter kritischer Treffer.</li></ol><p class="kantor-source">Weitere Alternativen im Quellguide: LP-Absorption bzw. Zusatzschaden gegen Ziele mit Schock-Statuseffekt.</p></div><div class="kantor-core-level"><small>Priorität 1</small><strong>Lv. 20</strong></div></div></article>
+
+        <article class="kantor-card wide"><h2>Mastery-Zielstufen</h2><div class="mastery-row"><b>Lv. 20</b><div class="mastery-chips">{chips20}</div></div><div class="mastery-row"><b>Lv. 16</b><div class="mastery-chips">{chips16}</div></div><div class="mastery-row"><b>Lv. 12</b><div class="mastery-chips">{chips12}</div></div></article>
+
+        <article class="kantor-card"><h2>Stigma & Passiv</h2><p><strong>Stigma-Reihenfolge:</strong> Ziel-Level 20 → 20 → 15 → 5. Für mehr dauerhafte Tankiness kann <strong>Segen des Schutzes</strong> anstelle von Invokation des Sprints gespielt werden. Bei hartem Content ist <strong>Fokussierte Verteidigung</strong> eine Alternative mit aktivem Block und Schadensnegierung.</p><p>Die Passiv-Skills werden in der im Quellguide markierten Reihenfolge 1 bis 10 priorisiert.</p></article>
+        <article class="kantor-card"><h2>Daevanion-Bretter</h2><div class="kantor-board-grid"><div class="kantor-board"><b>Nezekan</b><span>ab Lv. 12 · 80 / 134</span></div><div class="kantor-board"><b>Zikel</b><span>ab Lv. 20 · 82 / 134</span></div><div class="kantor-board"><b>Vaizel</b><span>ab Lv. 30 · 84 / 134</span></div><div class="kantor-board"><b>Triniel</b><span>ab Lv. 40 · 89 / 168</span></div></div><p>Alle vier Bretter zusammen: <strong>335 Punkte</strong>.</p></article>
+
+        <article class="kantor-card"><h2>Daevanion Skill-Stufen</h2><h3>+2</h3><ul class="kantor-skill-list">{plus2}</ul><h3>+1</h3><ul class="kantor-skill-list">{plus1}</ul></article>
+        <article class="kantor-card"><h2>Daevanion Werte</h2><div class="kantor-stats"><div class="kantor-stat"><small>Krit.-Widerstand</small><strong>+20</strong></div><div class="kantor-stat"><small>Max. MP</small><strong>+350</strong></div><div class="kantor-stat"><small>Verteidigung</small><strong>+120</strong></div><div class="kantor-stat"><small>Max. LP</small><strong>+600</strong></div><div class="kantor-stat"><small>Krit.-Treffer</small><strong>+15</strong></div><div class="kantor-stat"><small>Angriffskraft</small><strong>+18</strong></div></div><h3>Danach offensiv auffüllen</h3><div class="kantor-tags"><span>Schadensverstärkung +1,5 %</span><span>Angriffskraft +3</span><span>Krit.-Treffer +5</span></div></article>
+
+        <article class="kantor-card wide"><h2>Hotbar & Kampfablauf</h2><div class="kantor-grid"><div><ol><li><strong>1-2:</strong> Mobility und Dashes.</li><li><strong>3:</strong> Heilung und Debuff-Entferner.</li><li><strong>4:</strong> wichtiger Gruppenbuff - vor dem Pull aktivieren; Cooldowns nur initial drücken und danach für Downtime bereithalten.</li><li><strong>5:</strong> Schadens-Skill + Schadens-Buff; später in der Combo gedrückt halten.</li></ol></div><div><ol><li><strong>7-8:</strong> beide Gruppen-Permabuffs/Invokationen dauerhaft aktiv halten.</li><li><strong>E:</strong> bei gestaggertem Boss Sturmraserei spammen; ab Level 16 gibt der Skill viel Cooldown zurück.</li><li><strong>LMB:</strong> Auto-Attack für Weaving/Animation Canceling und Mana-Rückgewinnung.</li><li><strong>R:</strong> Hauptschaden über die Makro-Taste; Finsterbruch nur im geöffneten Fenster.</li></ol></div></div></article>
+
+        <article class="kantor-card wide"><h2>Makro - empfohlener Ablauf</h2><div class="macro-steps"><div class="macro-step">Beide Invokationen aktivieren, falls sie noch nicht leuchten.</div><div class="macro-step"><strong>Hoheit des Sturmwinds</strong> vor dem Pull zünden, damit die noch ungedrückten Skills von der Cooldown-Reduktion profitieren.</div><div class="macro-step"><strong>Wirbelschlag</strong> für Schaden und Buff gedrückt halten.</div><div class="macro-step">Linkslick + <strong>Zerschmetterungsschlag</strong> für Weaving/Animation Canceling halten.</div><div class="macro-step">Makro-Taste (RMB) halten; im Makro liegt <strong>Finsterbruch</strong> mit sehr kurzem Delay (10 ms im Quellsetup).</div></div></article>
+
+        <article class="kantor-card wide"><h2>Drei typische Anfängerfehler</h2><div class="mistake"><strong>Ohne Buffs pullen</strong>Hoheit des Sturmwinds muss vor dem Pull laufen. Erst Buff, dann Boss.</div><div class="mistake"><strong>Invokationen vergessen</strong>Beide Invokationen sind permanente Gruppenbuffs, solange sie leuchten - regelmäßig prüfen.</div><div class="mistake"><strong>Sturmraserei liegen lassen</strong>Wenn der Boss gestaggert ist, Sturmraserei nutzen; ab Level 16 liefert der Skill besonders viel Cooldown zurück.</div></article>
+      </section>
+      <div class="kantor-source">Quelle des Builds: Wakayashi · Stand 27.09.2026 · aus deinem bereitgestellten Kantor/Chanter-PDF zusammengefasst.</div>
+    </main>
+    """
+
 
 def _guide_classes_detail_html() -> str:
     cards: list[str] = []
@@ -21059,6 +21221,9 @@ def guide_class_page(class_slug: str, request: Request, _: bool = Depends(_auth)
         return HTMLResponse(_html_shell("Klasse nicht gefunden", "<section class='panel'><h1>Klasse nicht gefunden</h1><p class='muted'>Für diese Klasse existiert noch keine Guide-Seite.</p><a class='btn secondary' href='/guides/classes'>← Klassenübersicht</a></section>", nav_mode=_nav_mode_for_request(request), active_nav_href="/guides"), status_code=404)
     class_name, class_hint = item
     icon_url = _aion2_class_icon_url(class_name)
+    if key == "kantor":
+        body = _kantor_guide_body(class_name, class_hint, icon_url)
+        return HTMLResponse(_html_shell(f"{class_name} · Klassen Build", body, nav_mode=_nav_mode_for_request(request), active_nav_href="/guides"))
     icon_html = f'<img src="{_e(icon_url)}" alt="{_e(class_name)}" class="class-guide-hero-icon">' if icon_url else ''
     body = f"""
     <style>
@@ -21098,6 +21263,71 @@ def guide_detail_page(guide_key: str, request: Request, _: bool = Depends(_auth)
         return HTMLResponse(_html_shell("Guide nicht gefunden", "<section class='panel'><h1>Guide nicht gefunden</h1><p class='muted'>Dieser Guide existiert noch nicht.</p><a class='btn secondary' href='/guides'>Zurück zu Guides</a></section>", nav_mode=_nav_mode_for_request(request), active_nav_href="/guides"), status_code=404)
     icon_asset, title, subtitle = item
     guide_key = str(guide_key or "").strip().lower()
+    if guide_key == "events":
+        event_cards = _aion2_event_timer_html()
+        body = f"""
+        <style>
+          .a2-events-page{{display:grid;gap:14px}}
+          .a2-events-hero{{position:relative;overflow:hidden;min-height:190px;padding:26px 28px;border-radius:20px;border:1px solid rgba(112,125,248,.34);background:linear-gradient(90deg,rgba(6,10,20,.96),rgba(7,11,24,.78) 50%,rgba(7,11,24,.22)),url('{_asset("oblivion_header_desktop.png")}') center 43%/cover no-repeat;box-shadow:0 18px 44px rgba(0,0,0,.32);display:flex;align-items:center;justify-content:space-between;gap:18px}}
+          .a2-events-hero-copy{{position:relative;z-index:2;max-width:780px}}
+          .a2-events-hero .eyebrow{{color:#b6c3ff;font-weight:900;letter-spacing:.16em;text-transform:uppercase}}
+          .a2-events-hero h1{{font-family:Georgia,serif;font-size:clamp(38px,5vw,60px);margin:6px 0 8px;color:#f3f6ff}}
+          .a2-events-hero p{{margin:0;color:#c4cee1;line-height:1.45}}
+          .a2-events-actions{{position:relative;z-index:2;display:flex;gap:8px;flex-wrap:wrap}}
+          .a2-live-grid{{display:grid;gap:9px;padding:14px;border-radius:18px;border:1px solid rgba(112,125,248,.24);background:linear-gradient(180deg,rgba(8,12,23,.90),rgba(6,9,18,.94))}}
+          .a2-live-event{{display:grid;grid-template-columns:105px minmax(0,1fr) 210px;gap:12px;align-items:center;padding:13px 14px;border-radius:14px;border:1px solid rgba(110,124,247,.20);background:linear-gradient(90deg,rgba(20,27,48,.68),rgba(8,11,20,.72))}}
+          .a2-live-event-type{{font-size:12px;font-weight:900;text-transform:uppercase;letter-spacing:.08em;color:#b7c3ff}}
+          .a2-live-event-main{{display:grid;gap:3px}}
+          .a2-live-event-main strong{{font-size:16px;color:#eef2ff}}
+          .a2-live-event-main span{{font-size:12px;color:#99a7c2}}
+          .a2-live-event-time{{display:grid;gap:3px;text-align:right}}
+          .a2-live-event-time b{{font-size:12px;color:#d4dbef}}
+          .a2-countdown{{font-family:Georgia,serif;font-size:19px;color:#b9c6ff;font-weight:800}}
+          .a2-events-note{{padding:12px 14px;border-radius:13px;border:1px solid rgba(112,125,248,.18);background:rgba(12,17,31,.62);color:#93a0bc;font-size:12px;line-height:1.45}}
+          @media(max-width:760px){{.a2-events-hero{{padding:18px;display:grid}}.a2-live-event{{grid-template-columns:1fr;gap:6px}}.a2-live-event-time{{text-align:left}}}}
+        </style>
+        <main class="a2-events-page">
+          <section class="a2-events-hero">
+            <div class="a2-events-hero-copy"><div class="eyebrow">Aion 2 · Europa</div><h1>Live Event-Timer</h1><p>Die wichtigsten laufenden und kommenden Server-Events als Live-Countdown in Europe/Berlin.</p></div>
+            <div class="a2-events-actions"><a class="btn secondary" href="{_e(AION2_EVENT_SOURCE_URL)}" target="_blank" rel="noopener">Wakayashi Live öffnen ↗</a><a class="btn secondary" href="/guides">← Guides</a></div>
+          </section>
+          <section class="a2-live-grid">{event_cards}</section>
+          <div class="a2-events-note">Die Countdown-Logik folgt den aktuell von Wakayashi veröffentlichten Europa-Serverzeiten. Die Seite aktualisiert sich automatisch, wenn ein Termin erreicht ist; über den Button oben kannst du jederzeit die Live-Quelle öffnen.</div>
+        </main>
+        <script>
+        (function() {{
+          const rows = Array.from(document.querySelectorAll('.a2-live-event[data-event-time]'));
+          let reloading = false;
+          function format(ms) {{
+            let sec = Math.max(0, Math.floor(ms / 1000));
+            const d = Math.floor(sec / 86400); sec %= 86400;
+            const h = Math.floor(sec / 3600); sec %= 3600;
+            const m = Math.floor(sec / 60); const s = sec % 60;
+            const bits = [];
+            if (d) bits.push(d + 'T');
+            if (h || d) bits.push(String(h).padStart(2,'0') + 'h');
+            bits.push(String(m).padStart(2,'0') + 'm');
+            bits.push(String(s).padStart(2,'0') + 's');
+            return bits.join(' ');
+          }}
+          function tick() {{
+            const now = Date.now();
+            let expired = false;
+            rows.forEach(function(row) {{
+              const t = Date.parse(row.dataset.eventTime || '');
+              const el = row.querySelector('.a2-countdown');
+              if (!el || !Number.isFinite(t)) return;
+              const diff = t - now;
+              if (diff <= 0) {{ el.textContent = 'JETZT'; expired = true; }}
+              else el.textContent = 'in ' + format(diff);
+            }});
+            if (expired && !reloading) {{ reloading = true; setTimeout(function() {{ location.reload(); }}, 3500); }}
+          }}
+          tick(); setInterval(tick, 1000); setTimeout(function() {{ location.reload(); }}, 300000);
+        }})();
+        </script>
+        """
+        return HTMLResponse(_html_shell("Events · Guides", body, nav_mode=_nav_mode_for_request(request), active_nav_href="/guides"))
     if guide_key == "classes":
         cards_html = _guide_classes_detail_html()
         body = f"""
