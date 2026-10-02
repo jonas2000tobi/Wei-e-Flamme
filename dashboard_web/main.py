@@ -6205,6 +6205,112 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "member", active_nav_h
       .status-topnav-shell .status-topnav {{ grid-template-columns:repeat(2,minmax(0,1fr)) !important; }}
       .status-topnav-shell .status-topnav a:last-child {{ grid-column:1/-1; }}
     }}
+
+    /* Oblivion / Voidhall frame palette: keep gold typography, cool the UI chrome */
+    :root {{
+      --line:#343d63;
+      --panel:#101625;
+      --panel2:#141c30;
+      --side:#070b14;
+      --side2:#0f1728;
+    }}
+    .sidebar {{
+      background:linear-gradient(180deg,rgba(9,13,24,.975),rgba(5,8,15,.99)) !important;
+      border-color:rgba(104,116,255,.30) !important;
+      box-shadow:16px 0 45px rgba(0,0,0,.44),inset -1px 0 0 rgba(104,116,255,.08) !important;
+    }}
+    .brand,.sidebar-footer,.side-nav details,.side-nav details.nav-info {{
+      border-color:rgba(104,116,255,.18) !important;
+    }}
+    .side-nav a::after {{
+      background:linear-gradient(90deg,transparent,rgba(103,116,255,.28),transparent) !important;
+    }}
+    .side-nav a:hover,.side-nav summary:hover {{
+      background:linear-gradient(90deg,rgba(78,91,190,.20),rgba(44,51,106,.05)) !important;
+      border-color:rgba(111,124,255,.22) !important;
+    }}
+    .side-nav a.active {{
+      background:linear-gradient(90deg,rgba(82,96,207,.30),rgba(41,48,102,.08)) !important;
+      border-color:rgba(120,132,255,.48) !important;
+      box-shadow:inset 3px 0 0 rgba(133,143,255,.95),0 8px 20px rgba(0,0,0,.30) !important;
+    }}
+    .side-nav .admin-portal-button {{
+      border-color:rgba(120,132,255,.38) !important;
+      background:linear-gradient(90deg,rgba(75,87,190,.28),rgba(31,37,81,.14)) !important;
+    }}
+    .authbar,.topnav a,.panel,.card,.metric,.release-card,
+    .admin-quick,.admin-home-event,.home-item,.subpanel {{
+      border-color:rgba(107,119,242,.26) !important;
+    }}
+    .authbar {{
+      background:linear-gradient(180deg,rgba(16,21,37,.92),rgba(7,10,19,.94)) !important;
+      box-shadow:0 10px 28px rgba(0,0,0,.34),inset 0 1px 0 rgba(150,158,255,.05) !important;
+    }}
+    .topnav a,.btn.ghost,.ghost {{
+      background:linear-gradient(180deg,rgba(23,29,51,.90),rgba(8,12,23,.94)) !important;
+      border-color:rgba(108,120,244,.30) !important;
+    }}
+    .topnav a:hover,.btn.ghost:hover,.ghost:hover {{
+      border-color:rgba(132,143,255,.68) !important;
+      background:linear-gradient(180deg,rgba(37,46,82,.94),rgba(12,16,31,.96)) !important;
+    }}
+    .hero {{
+      border-color:rgba(113,126,255,.38) !important;
+      outline-color:rgba(146,155,255,.08) !important;
+    }}
+    .hero::before {{
+      background:
+        linear-gradient(180deg,rgba(255,255,255,.025),transparent 24%,rgba(0,0,0,.38)),
+        radial-gradient(circle at 72% 45%,rgba(83,98,225,.26),transparent 32%) !important;
+    }}
+    .hero-action {{
+      border-color:rgba(111,124,246,.28) !important;
+      background:linear-gradient(180deg,rgba(17,23,40,.82),rgba(7,10,19,.86)) !important;
+    }}
+    .hero-action:hover {{
+      border-color:rgba(133,144,255,.58) !important;
+      background:linear-gradient(180deg,rgba(29,38,67,.88),rgba(9,13,25,.90)) !important;
+    }}
+    .panel,.card,.metric,.release-card {{
+      background:linear-gradient(180deg,rgba(15,20,36,.94),rgba(7,10,19,.92)) !important;
+      box-shadow:0 18px 46px rgba(0,0,0,.40),inset 0 0 0 1px rgba(125,136,255,.035) !important;
+    }}
+    .panel::before,.card::before {{
+      background:linear-gradient(90deg,transparent,rgba(111,124,255,.52),transparent) !important;
+    }}
+    .home-item {{
+      background:linear-gradient(90deg,rgba(77,91,196,.12),rgba(7,10,19,.50)) !important;
+    }}
+    .home-icon {{
+      background:radial-gradient(circle at 40% 30%,rgba(95,108,231,.24),rgba(8,11,21,.78)) !important;
+      border-color:rgba(112,125,248,.30) !important;
+    }}
+    input[type=text],input[type=number],input[type=datetime-local],input[type=date],
+    input[type=url],input[type=search],select,textarea {{
+      background:rgba(7,10,20,.82) !important;
+      border-color:rgba(104,117,240,.26) !important;
+    }}
+    input:focus,select:focus,textarea:focus {{
+      border-color:rgba(132,144,255,.82) !important;
+      box-shadow:0 0 0 3px rgba(94,108,230,.15) !important;
+    }}
+    th,td {{ border-bottom-color:rgba(100,113,230,.16) !important; }}
+    .queue-badge,.pill {{
+      background:rgba(80,94,204,.10) !important;
+      border-color:rgba(111,124,244,.30) !important;
+    }}
+    .mobile-nav-toggle,.mobile-home-back.show {{
+      border-color:rgba(112,124,246,.30) !important;
+      background:linear-gradient(180deg,rgba(24,30,51,.96),rgba(9,13,24,.96)) !important;
+    }}
+    @media(max-width:1100px) {{
+      .sidebar {{ border-bottom-color:rgba(106,119,241,.24) !important; }}
+    }}
+    @media(max-width:760px) {{
+      .sidebar {{ border-bottom-color:rgba(106,119,241,.26) !important; }}
+      body.nav-open .side-nav {{ border-top-color:rgba(106,119,241,.18) !important; }}
+    }}
+
     .mobile-home-back {{ display:none; }}
     @media(max-width:900px) {{
       .mobile-home-back.show {{
