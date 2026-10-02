@@ -5106,11 +5106,19 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "member", active_nav_h
     .member-start-logo img {{ width:100%; height:100%; object-fit:contain; }}
     .member-home-hero {{ align-items:flex-end; min-height:310px; background-image:linear-gradient(180deg,rgba(4,5,12,.08) 0%,rgba(4,5,12,.20) 42%,rgba(4,5,12,.64) 100%), url("{hero_banner}") !important; background-position:center center !important; background-size:cover !important; background-repeat:no-repeat !important; border-color:rgba(113,126,255,.34) !important; }}
     .member-home-hero::after {{ background:linear-gradient(180deg,rgba(0,0,0,.03) 0%,rgba(0,0,0,.12) 54%,rgba(0,0,0,.28) 100%) !important; }}
-    .member-home-hero-copy {{ width:100%; display:flex; justify-content:flex-start; align-items:flex-end; min-height:220px; }}
-    .member-home-player-card {{ display:inline-flex; flex-direction:column; gap:4px; max-width:min(92%,520px); padding:14px 18px; border-radius:18px; border:1px solid rgba(121,133,255,.34); background:linear-gradient(180deg,rgba(7,10,20,.30),rgba(7,10,20,.68)); box-shadow:0 18px 38px rgba(0,0,0,.28); backdrop-filter:blur(6px); }}
-    .member-home-player-card .label {{ color:#d4ddff; font-size:11px; letter-spacing:.18em; text-transform:uppercase; font-weight:800; }}
-    .member-home-player-card .name {{ margin:0; color:#f4f7ff; font-family:Georgia,serif; font-size:clamp(30px,4vw,46px); line-height:1.02; text-shadow:0 3px 14px rgba(0,0,0,.34); overflow-wrap:anywhere; }}
-    .member-home-player-card .sub {{ color:#c6d2ea; font-size:14px; line-height:1.35; }}
+    .member-home-hero-copy {{ position:absolute; inset:0; z-index:3; pointer-events:none; }}
+    .member-home-dynamic-name {{
+      position:absolute; left:43%; right:7%; top:64%; min-height:76px;
+      display:flex; align-items:center; justify-content:center; text-align:center;
+      color:#f3f6ff; font-family:Georgia,serif; font-size:clamp(25px,2.4vw,40px); font-weight:800;
+      line-height:1.02; letter-spacing:.015em; overflow-wrap:anywhere;
+      text-shadow:0 3px 14px rgba(0,0,0,.92),0 0 18px rgba(99,116,255,.30);
+    }}
+    .member-home-dynamic-name::before {{
+      content:""; position:absolute; z-index:-1; inset:-18px -8%;
+      background:radial-gradient(ellipse at center,rgba(4,7,16,.96) 0%,rgba(4,7,16,.88) 45%,rgba(4,7,16,.52) 66%,transparent 82%);
+      filter:blur(2px); pointer-events:none;
+    }}
     .member-summary-list {{ display:grid; gap:10px; margin-top:10px; }}
     .member-summary-item {{ display:grid; grid-template-columns:minmax(0,1fr) auto; gap:12px; align-items:center; padding:12px 13px; border:1px solid rgba(214,168,79,.14); border-radius:14px; background:rgba(32,35,45,.55); }}
     .member-summary-title {{ font-weight:800; color:var(--gold); overflow-wrap:anywhere; }}
@@ -14371,7 +14379,7 @@ def _render_member_home(data: dict[str, Any], request: Request) -> str:
         }}
         .mobile-home-hero{{
           position:relative;overflow:hidden;margin:4px 0 14px;border-radius:22px;
-          border:1px solid rgba(214,168,79,.28);
+          border:1px solid rgba(111,124,246,.34);
           min-height:300px;padding:14px;
           background:
             linear-gradient(180deg,rgba(6,7,11,.04) 0%,rgba(6,7,11,.28) 38%,rgba(6,7,11,.82) 100%),
@@ -14384,41 +14392,44 @@ def _render_member_home(data: dict[str, Any], request: Request) -> str:
           background:linear-gradient(180deg,rgba(0,0,0,.02) 0%,rgba(0,0,0,.08) 40%,rgba(0,0,0,.26) 62%,rgba(0,0,0,.56) 100%);
           pointer-events:none;
         }}
-        .mobile-home-hero-content{{
-          position:relative;z-index:1;max-width:100%;
-          background:linear-gradient(180deg,rgba(7,10,20,.18),rgba(7,10,20,.62));
-          border:1px solid rgba(121,133,255,.28);border-radius:18px;
-          padding:14px 14px 13px;backdrop-filter:blur(4px);
-          box-shadow:0 10px 22px rgba(0,0,0,.24);
-        }}
+        .mobile-home-hero-content{{position:absolute;inset:0;z-index:2;pointer-events:none}}
         .mobile-home-hero-logo{{display:none}}
-        .mobile-home-player-label{{margin:0 0 6px;font-size:10px;letter-spacing:.16em;text-transform:uppercase;color:#d4ddff;font-weight:800}}
-        .mobile-home-player-name{{margin:0;font-family:Georgia,serif;font-size:clamp(24px,8.4vw,36px);line-height:1.02;color:#f4f7ff;text-shadow:0 4px 14px rgba(0,0,0,.34);overflow-wrap:anywhere}}
-        .mobile-home-player-sub{{margin:8px 0 0;color:#c8d3ea;font-size:13px;line-height:1.3;max-width:100%}}
+        .mobile-home-dynamic-name{{
+          position:absolute;left:8%;right:8%;top:72%;min-height:54px;
+          display:flex;align-items:center;justify-content:center;text-align:center;
+          font-family:Georgia,serif;font-size:clamp(22px,7.4vw,34px);font-weight:800;line-height:1.02;
+          color:#f3f6ff;text-shadow:0 3px 12px rgba(0,0,0,.96),0 0 16px rgba(101,117,255,.34);
+          overflow-wrap:anywhere;
+        }}
+        .mobile-home-dynamic-name::before{{
+          content:"";position:absolute;z-index:-1;inset:-13px -10%;
+          background:radial-gradient(ellipse at center,rgba(4,7,16,.97) 0%,rgba(4,7,16,.88) 47%,rgba(4,7,16,.48) 68%,transparent 84%);
+          filter:blur(2px);
+        }}
         .mobile-home-stats{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:9px;margin:0 0 14px}}
         .mobile-home-tile{{
           aspect-ratio:1/1;min-width:0;padding:10px 7px;border-radius:15px;
-          border:1px solid rgba(214,168,79,.30);
-          background:linear-gradient(155deg,rgba(48,31,16,.92),rgba(9,9,11,.96) 72%);
+          border:1px solid rgba(108,121,244,.32);
+          background:linear-gradient(155deg,rgba(20,27,49,.94),rgba(7,10,19,.97) 72%);
           box-shadow:0 10px 24px rgba(0,0,0,.34),inset 0 1px 0 rgba(255,255,255,.035);
           display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;
           color:inherit;text-decoration:none;box-sizing:border-box;
         }}
         .mobile-home-tile-link{{cursor:pointer;transition:transform .12s ease,border-color .12s ease}}
-        .mobile-home-tile-link:active{{transform:scale(.975);border-color:rgba(214,168,79,.58)}}
-        .mobile-home-tile small{{display:block;color:#b8b0a4;font-size:10px;line-height:1.15;margin-bottom:6px}}
-        .mobile-home-tile strong{{display:block;color:#f3d58d;font-family:Georgia,serif;font-size:clamp(21px,7vw,31px);line-height:1}}
-        .mobile-home-tile span{{display:block;margin-top:7px;color:#9da8b6;font-size:9px;line-height:1.2;overflow-wrap:anywhere}}
+        .mobile-home-tile-link:active{{transform:scale(.975);border-color:rgba(137,148,255,.72)}}
+        .mobile-home-tile small{{display:block;color:#aeb9d2;font-size:10px;line-height:1.15;margin-bottom:6px}}
+        .mobile-home-tile strong{{display:block;color:#eef2ff;font-family:Georgia,serif;font-size:clamp(21px,7vw,31px);line-height:1}}
+        .mobile-home-tile span{{display:block;margin-top:7px;color:#9eaac3;font-size:9px;line-height:1.2;overflow-wrap:anywhere}}
         .mobile-home-admin-links{{display:grid;grid-template-columns:1fr;gap:8px;margin:0 0 14px;padding:0}}
         .mobile-home-admin-links a{{
           min-height:54px;padding:10px 12px;border-radius:14px;text-decoration:none;color:var(--text);
-          border:1px solid rgba(214,168,79,.23);background:linear-gradient(180deg,rgba(30,22,14,.88),rgba(10,10,12,.95));
+          border:1px solid rgba(106,119,241,.28);background:linear-gradient(180deg,rgba(20,26,47,.92),rgba(7,10,19,.97));
           display:grid;grid-template-columns:32px minmax(0,1fr) 20px;align-items:center;gap:10px;
           box-shadow:0 8px 18px rgba(0,0,0,.24);
         }}
         .mobile-home-admin-links img{{width:30px;height:30px;object-fit:contain}}
         .mobile-home-admin-links span{{font-weight:800;font-size:14px}}
-        .mobile-home-admin-links strong{{font-size:25px;color:#d6a84f;text-align:right;line-height:1}}
+        .mobile-home-admin-links strong{{font-size:25px;color:#8e9cff;text-align:right;line-height:1}}
         .mobile-home-compact + .aion-home-map{{margin-top:0!important}}
         .aion-home-map{{margin-bottom:0!important}}
       }}
@@ -14426,7 +14437,6 @@ def _render_member_home(data: dict[str, Any], request: Request) -> str:
         .mobile-home-compact{{padding-top:74px}}
         .mobile-home-hero{{min-height:270px;padding:12px}}
         .mobile-home-hero-content{{padding:12px 12px 11px}}
-        .mobile-home-player-name{{font-size:clamp(23px,8vw,34px)}}
         .mobile-home-stats{{gap:6px}}
         .mobile-home-tile{{padding:8px 5px;border-radius:13px}}
         .mobile-home-tile strong{{font-size:20px}}
@@ -14439,13 +14449,7 @@ def _render_member_home(data: dict[str, Any], request: Request) -> str:
     <div class="member-home-desktop">
       <nav class="topnav">{"".join(nav)}</nav>
       <section class="hero member-home-hero">
-        <div class="member-home-hero-copy">
-          <div class="member-home-player-card">
-            <div class="label">Aktiver Spieler</div>
-            <h1 class="name">{_e(display)}</h1>
-            <div class="sub">{_e(brand.get('display_name') or 'Gilde')} · Events, Mitglieder und deine aktivierten Gildenmodule.</div>
-          </div>
-        </div>
+        <div class="member-home-hero-copy"><div class="member-home-dynamic-name">{_e(display)}</div></div>
       </section>
       <section class="grid">{"".join(cards)}</section>
       {admin_tools}
@@ -14453,11 +14457,7 @@ def _render_member_home(data: dict[str, Any], request: Request) -> str:
 
     <section class="mobile-home-compact">
       <section class="mobile-home-hero">
-        <div class="mobile-home-hero-content">
-          <div class="mobile-home-player-label">Aktiver Spieler</div>
-          <h1 class="mobile-home-player-name">{_e(display)}</h1>
-          <p class="mobile-home-player-sub">{_e(brand.get('display_name') or 'Gilde')} · Events, Mitglieder und deine aktivierten Gildenmodule.</p>
-        </div>
+        <div class="mobile-home-hero-content"><div class="mobile-home-dynamic-name">{_e(display)}</div></div>
       </section>
       <div class="mobile-home-stats">
         <a class="mobile-home-tile mobile-home-tile-link" href="/member/members"><small>Mitglieder</small><strong>{member_count}</strong><span>in der Gilde</span></a>
