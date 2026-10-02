@@ -4968,8 +4968,8 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "member", active_nav_h
     brand = _guild_brand()
     brand_name = str(brand.get("display_name") or "Gilde")
     # Separate responsive header assets: wide desktop artwork and portrait mobile artwork.
-    hero_banner = _css_url(_asset("beer_and_buffs_header_desktop_kastleton_v2.png"))
-    hero_banner_mobile = _css_url(_asset("beer_and_buffs_header_mobile_kastleton_v2.png"))
+    hero_banner = _css_url(_asset("oblivion_header_desktop.png"))
+    hero_banner_mobile = _css_url(_asset("oblivion_header_mobile.png"))
     brand_logo = _css_url(_brand_image("logo", "beer_and_buffs_logo.png"))
     for old_name in ("Beer and Buffs", "Beer & Buffs", "Weisse Flamme", "Weiße Flamme", "Ebolus", "ebolus"):
         title = str(title).replace(old_name, brand_name)
@@ -5104,7 +5104,13 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "member", active_nav_h
     .need-slot-row strong {{ color:var(--text); overflow-wrap:anywhere; }}
     .member-start-logo {{ width:86px; height:86px; border-radius:22px; padding:8px; border:1px solid rgba(214,168,79,.32); background:rgba(214,168,79,.08); box-shadow:0 14px 30px rgba(0,0,0,.35); }}
     .member-start-logo img {{ width:100%; height:100%; object-fit:contain; }}
-    .member-home-hero {{ align-items:center; }}
+    .member-home-hero {{ align-items:flex-end; min-height:310px; background-image:linear-gradient(180deg,rgba(4,5,12,.08) 0%,rgba(4,5,12,.20) 42%,rgba(4,5,12,.64) 100%), url("{hero_banner}") !important; background-position:center center !important; background-size:cover !important; background-repeat:no-repeat !important; border-color:rgba(113,126,255,.34) !important; }}
+    .member-home-hero::after {{ background:linear-gradient(180deg,rgba(0,0,0,.03) 0%,rgba(0,0,0,.12) 54%,rgba(0,0,0,.28) 100%) !important; }}
+    .member-home-hero-copy {{ width:100%; display:flex; justify-content:flex-start; align-items:flex-end; min-height:220px; }}
+    .member-home-player-card {{ display:inline-flex; flex-direction:column; gap:4px; max-width:min(92%,520px); padding:14px 18px; border-radius:18px; border:1px solid rgba(121,133,255,.34); background:linear-gradient(180deg,rgba(7,10,20,.30),rgba(7,10,20,.68)); box-shadow:0 18px 38px rgba(0,0,0,.28); backdrop-filter:blur(6px); }}
+    .member-home-player-card .label {{ color:#d4ddff; font-size:11px; letter-spacing:.18em; text-transform:uppercase; font-weight:800; }}
+    .member-home-player-card .name {{ margin:0; color:#f4f7ff; font-family:Georgia,serif; font-size:clamp(30px,4vw,46px); line-height:1.02; text-shadow:0 3px 14px rgba(0,0,0,.34); overflow-wrap:anywhere; }}
+    .member-home-player-card .sub {{ color:#c6d2ea; font-size:14px; line-height:1.35; }}
     .member-summary-list {{ display:grid; gap:10px; margin-top:10px; }}
     .member-summary-item {{ display:grid; grid-template-columns:minmax(0,1fr) auto; gap:12px; align-items:center; padding:12px 13px; border:1px solid rgba(214,168,79,.14); border-radius:14px; background:rgba(32,35,45,.55); }}
     .member-summary-title {{ font-weight:800; color:var(--gold); overflow-wrap:anywhere; }}
@@ -14366,10 +14372,10 @@ def _render_member_home(data: dict[str, Any], request: Request) -> str:
         .mobile-home-hero{{
           position:relative;overflow:hidden;margin:4px 0 14px;border-radius:22px;
           border:1px solid rgba(214,168,79,.28);
-          min-height:260px;padding:14px;
+          min-height:300px;padding:14px;
           background:
             linear-gradient(180deg,rgba(6,7,11,.04) 0%,rgba(6,7,11,.28) 38%,rgba(6,7,11,.82) 100%),
-            url('{_asset("beer_and_buffs_header_mobile_kastleton_v2.png")}') center top/cover no-repeat;
+            url('{_asset("oblivion_header_mobile.png")}') center top/cover no-repeat;
           box-shadow:0 14px 30px rgba(0,0,0,.32), inset 0 1px 0 rgba(255,255,255,.04);
           display:flex;align-items:flex-end;
         }}
@@ -14380,15 +14386,15 @@ def _render_member_home(data: dict[str, Any], request: Request) -> str:
         }}
         .mobile-home-hero-content{{
           position:relative;z-index:1;max-width:100%;
-          background:linear-gradient(180deg,rgba(7,8,11,.18),rgba(7,8,11,.55));
-          border:1px solid rgba(255,255,255,.06);border-radius:18px;
-          padding:14px 14px 13px;backdrop-filter:blur(3px);
-          box-shadow:0 8px 18px rgba(0,0,0,.18);
+          background:linear-gradient(180deg,rgba(7,10,20,.18),rgba(7,10,20,.62));
+          border:1px solid rgba(121,133,255,.28);border-radius:18px;
+          padding:14px 14px 13px;backdrop-filter:blur(4px);
+          box-shadow:0 10px 22px rgba(0,0,0,.24);
         }}
         .mobile-home-hero-logo{{display:none}}
-        .mobile-home-hero .eyebrow{{margin:0 0 5px;font-size:10px;letter-spacing:.16em;text-transform:uppercase;color:#d9ba79}}
-        .mobile-home-hero h1{{margin:0;font-family:Georgia,serif;font-size:clamp(26px,9vw,40px);line-height:.98;color:#f4e6bf;text-shadow:0 4px 14px rgba(0,0,0,.34)}}
-        .mobile-home-hero p{{margin:8px 0 0;color:#d5d8df;font-size:13px;line-height:1.3;max-width:100%}}
+        .mobile-home-player-label{{margin:0 0 6px;font-size:10px;letter-spacing:.16em;text-transform:uppercase;color:#d4ddff;font-weight:800}}
+        .mobile-home-player-name{{margin:0;font-family:Georgia,serif;font-size:clamp(24px,8.4vw,36px);line-height:1.02;color:#f4f7ff;text-shadow:0 4px 14px rgba(0,0,0,.34);overflow-wrap:anywhere}}
+        .mobile-home-player-sub{{margin:8px 0 0;color:#c8d3ea;font-size:13px;line-height:1.3;max-width:100%}}
         .mobile-home-stats{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:9px;margin:0 0 14px}}
         .mobile-home-tile{{
           aspect-ratio:1/1;min-width:0;padding:10px 7px;border-radius:15px;
@@ -14418,9 +14424,9 @@ def _render_member_home(data: dict[str, Any], request: Request) -> str:
       }}
       @media(max-width:380px){{
         .mobile-home-compact{{padding-top:74px}}
-        .mobile-home-hero{{min-height:232px;padding:12px}}
+        .mobile-home-hero{{min-height:270px;padding:12px}}
         .mobile-home-hero-content{{padding:12px 12px 11px}}
-        .mobile-home-hero h1{{font-size:clamp(24px,8vw,34px)}}
+        .mobile-home-player-name{{font-size:clamp(23px,8vw,34px)}}
         .mobile-home-stats{{gap:6px}}
         .mobile-home-tile{{padding:8px 5px;border-radius:13px}}
         .mobile-home-tile strong{{font-size:20px}}
@@ -14433,9 +14439,12 @@ def _render_member_home(data: dict[str, Any], request: Request) -> str:
     <div class="member-home-desktop">
       <nav class="topnav">{"".join(nav)}</nav>
       <section class="hero member-home-hero">
-        <div style="display:flex;gap:16px;align-items:center;flex-wrap:wrap;">
-          <div class="member-start-logo"><img src="{_e(_brand_image('logo', 'logo_512.png'))}" alt="{_e(brand.get('display_name') or 'Gilde')}"></div>
-          <div><div class="eyebrow">Gildenzentrale</div><h1>Willkommen, {_e(display)}</h1><p class="muted">{_e(brand.get('display_name') or 'Gilde')} · Events, Mitglieder und deine aktivierten Gildenmodule.</p></div>
+        <div class="member-home-hero-copy">
+          <div class="member-home-player-card">
+            <div class="label">Aktiver Spieler</div>
+            <h1 class="name">{_e(display)}</h1>
+            <div class="sub">{_e(brand.get('display_name') or 'Gilde')} · Events, Mitglieder und deine aktivierten Gildenmodule.</div>
+          </div>
         </div>
       </section>
       <section class="grid">{"".join(cards)}</section>
@@ -14445,9 +14454,9 @@ def _render_member_home(data: dict[str, Any], request: Request) -> str:
     <section class="mobile-home-compact">
       <section class="mobile-home-hero">
         <div class="mobile-home-hero-content">
-          <div class="eyebrow">Willkommen zurück</div>
-          <h1>{_e(display)}</h1>
-          <p>{_e(brand.get('display_name') or 'Gilde')} · Events, Mitglieder und deine aktivierten Gildenmodule.</p>
+          <div class="mobile-home-player-label">Aktiver Spieler</div>
+          <h1 class="mobile-home-player-name">{_e(display)}</h1>
+          <p class="mobile-home-player-sub">{_e(brand.get('display_name') or 'Gilde')} · Events, Mitglieder und deine aktivierten Gildenmodule.</p>
         </div>
       </section>
       <div class="mobile-home-stats">
