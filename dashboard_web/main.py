@@ -4864,6 +4864,7 @@ def _sidebar_html() -> str:
         f'<a href="/announcements"><img class="nav-ico" src="{_asset("nav_announcements.png")}" alt="">Ankündigungen</a>',
         f'<a href="/member/members"><img class="nav-ico" src="{_asset("nav_mitglieder.png")}" alt="">Mitglieder</a>',
         f'<a href="/member/events"><img class="nav-ico" src="{_asset("nav_events.png")}" alt="">Events</a>',
+        f'<a href="/guides"><img class="nav-ico" src="{_asset("nav_guides.png")}" alt="">Guides</a>',
     ]
     if states.get("auctions"): guild_links.append(f'<a href="/member/auctions"><img class="nav-ico" src="{_asset("nav_auktionen.png")}" alt="">Auktionen</a>')
     if states.get("points"): guild_links.append(f'<a href="/member/ec"><img class="nav-ico" src="{_asset("nav_ec.png")}" alt="">Punkte-Verlauf</a>')
@@ -4920,6 +4921,7 @@ def _member_sidebar_html() -> str:
         f'<a href="/announcements"><img class="nav-ico" src="{_asset("nav_announcements.png")}" alt="">Ankündigungen</a>',
         f'<a href="/member/members"><img class="nav-ico" src="{_asset("nav_mitglieder.png")}" alt="">Mitglieder</a>',
         f'<a href="/member/events"><img class="nav-ico" src="{_asset("nav_events.png")}" alt="">Events</a>',
+        f'<a href="/guides"><img class="nav-ico" src="{_asset("nav_guides.png")}" alt="">Guides</a>',
     ]
     if states.get("auctions"):
         guild_links.append(f'<a href="/member/auctions"><img class="nav-ico" src="{_asset("nav_auktionen.png")}" alt="">Auktionen</a>')
@@ -5104,20 +5106,22 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "member", active_nav_h
     .need-slot-row strong {{ color:var(--text); overflow-wrap:anywhere; }}
     .member-start-logo {{ width:86px; height:86px; border-radius:22px; padding:8px; border:1px solid rgba(214,168,79,.32); background:rgba(214,168,79,.08); box-shadow:0 14px 30px rgba(0,0,0,.35); }}
     .member-start-logo img {{ width:100%; height:100%; object-fit:contain; }}
-    .member-home-hero {{ align-items:flex-end; min-height:310px; background-image:linear-gradient(180deg,rgba(4,5,12,.08) 0%,rgba(4,5,12,.20) 42%,rgba(4,5,12,.64) 100%), url("{hero_banner}") !important; background-position:center center !important; background-size:cover !important; background-repeat:no-repeat !important; border-color:rgba(113,126,255,.34) !important; }}
-    .member-home-hero::after {{ background:linear-gradient(180deg,rgba(0,0,0,.03) 0%,rgba(0,0,0,.12) 54%,rgba(0,0,0,.28) 100%) !important; }}
+    .member-home-hero {{ align-items:flex-end; min-height:350px; background-image:linear-gradient(180deg,rgba(4,5,12,.06) 0%,rgba(4,5,12,.16) 42%,rgba(4,5,12,.58) 100%), url("{hero_banner}") !important; background-position:center 40% !important; background-size:cover !important; background-repeat:no-repeat !important; border-color:rgba(113,126,255,.34) !important; }}
+    .member-home-desktop > .topnav {{ margin-top:-6px !important; margin-bottom:10px !important; }}
+    .member-home-hero::after {{ background:linear-gradient(180deg,rgba(0,0,0,.02) 0%,rgba(0,0,0,.08) 54%,rgba(0,0,0,.22) 100%) !important; }}
     .member-home-hero-copy {{ position:absolute; inset:0; z-index:3; pointer-events:none; }}
     .member-home-hero-copy::before {{
-      content:""; position:absolute; left:39%; right:4%; top:64%; height:26%;
-      background:linear-gradient(180deg,rgba(5,8,18,.02),rgba(5,8,18,.76) 28%,rgba(5,8,18,.88) 52%,rgba(5,8,18,.66) 76%,rgba(5,8,18,.06));
-      filter:blur(.2px); pointer-events:none;
+      content:""; position:absolute; left:38%; right:13%; top:60%; height:24%;
+      background:radial-gradient(ellipse at center,rgba(4,7,16,.98) 0%,rgba(4,7,16,.97) 58%,rgba(4,7,16,.86) 74%,rgba(4,7,16,0) 100%);
+      -webkit-backdrop-filter:blur(5px); backdrop-filter:blur(5px);
+      pointer-events:none;
     }}
     .member-home-dynamic-name {{
-      position:absolute; left:40%; right:4%; top:68%; min-height:54px;
+      position:absolute; left:38%; right:13%; top:65%; min-height:58px;
       display:flex; align-items:center; justify-content:center; text-align:center;
-      color:#f3f6ff; font-family:Georgia,serif; font-size:clamp(24px,2.15vw,36px); font-weight:800;
+      color:#f3f6ff; font-family:Georgia,serif; font-size:clamp(25px,2.2vw,38px); font-weight:800;
       line-height:1.02; letter-spacing:.015em; overflow-wrap:anywhere;
-      text-shadow:0 3px 14px rgba(0,0,0,.96),0 0 20px rgba(99,116,255,.38);
+      text-shadow:0 3px 14px rgba(0,0,0,.98),0 0 22px rgba(99,116,255,.45);
     }}
     .member-summary-list {{ display:grid; gap:10px; margin-top:10px; }}
     .member-summary-item {{ display:grid; grid-template-columns:minmax(0,1fr) auto; gap:12px; align-items:center; padding:12px 13px; border:1px solid rgba(214,168,79,.14); border-radius:14px; background:rgba(32,35,45,.55); }}
@@ -14313,6 +14317,7 @@ def _render_member_home(data: dict[str, Any], request: Request) -> str:
         '<a href="/member/events">Events</a>',
         '<a href="/member/members">Mitglieder</a>',
         '<a href="/announcements">Ankündigungen</a>',
+        '<a href="/guides">Guides</a>',
     ]
     if states.get("member_portal", False):
         nav.append('<a href="/portal">Mein Portal</a>')
@@ -14405,16 +14410,17 @@ def _render_member_home(data: dict[str, Any], request: Request) -> str:
         }}
         .mobile-home-hero-content{{position:absolute;inset:0;z-index:2;pointer-events:none}}
         .mobile-home-hero-content::before{{
-          content:"";position:absolute;left:5%;right:5%;top:72%;height:21%;
-          background:linear-gradient(180deg,rgba(5,8,18,.02),rgba(5,8,18,.78) 28%,rgba(5,8,18,.90) 52%,rgba(5,8,18,.66) 78%,rgba(5,8,18,.03));
+          content:"";position:absolute;left:4%;right:4%;top:68%;height:24%;
+          background:radial-gradient(ellipse at center,rgba(4,7,16,.98) 0%,rgba(4,7,16,.97) 58%,rgba(4,7,16,.84) 76%,rgba(4,7,16,0) 100%);
+          -webkit-backdrop-filter:blur(5px);backdrop-filter:blur(5px);
           pointer-events:none;
         }}
         .mobile-home-hero-logo{{display:none}}
         .mobile-home-dynamic-name{{
-          position:absolute;left:6%;right:6%;top:75%;min-height:46px;
+          position:absolute;left:5%;right:5%;top:72%;min-height:48px;
           display:flex;align-items:center;justify-content:center;text-align:center;
-          font-family:Georgia,serif;font-size:clamp(21px,7vw,32px);font-weight:800;line-height:1.02;
-          color:#f3f6ff;text-shadow:0 3px 12px rgba(0,0,0,.96),0 0 18px rgba(101,117,255,.38);
+          font-family:Georgia,serif;font-size:clamp(22px,7.2vw,33px);font-weight:800;line-height:1.02;
+          color:#f3f6ff;text-shadow:0 3px 12px rgba(0,0,0,.98),0 0 18px rgba(101,117,255,.44);
           overflow-wrap:anywhere;
         }}
         .mobile-home-stats{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:9px;margin:0 0 14px}}
@@ -20875,6 +20881,76 @@ def tnl_builds_page() -> HTMLResponse:
     <section class="panel"><h2>Builds</h2><p class="muted">Platzhalter-Seite für spätere öffentliche/empfohlene Gilden-Builds, Rollen-Guides oder externe Questlog-Build-Links.</p></section>
     """
     return _html_shell("TnL Builds · Beer and Buffs Dashboard", body)
+
+
+
+GUIDE_HUB_ITEMS = {
+    "classes": ("⚔️", "Klassen Builds", "Builds, Rollen und Empfehlungen für die Aion-2-Klassen."),
+    "level-45": ("⬆️", "Level 45 Guide", "Wichtige Schritte, Inhalte und Ziele ab Level 45."),
+    "macros": ("⌨️", "Makros setzen", "Makros sauber einrichten und sinnvoll im Spiel verwenden."),
+    "events": ("📅", "Events", "Gilden- und Gruppeninhalte, Vorbereitung und Ablauf."),
+}
+
+def _guides_hub_html(request: Request) -> str:
+    cards = []
+    for key, (icon, title, subtitle) in GUIDE_HUB_ITEMS.items():
+        cards.append(
+            f'<a class="guide-hub-card" href="/guides/{_e(key)}">'
+            f'<span class="guide-hub-icon">{icon}</span>'
+            f'<strong>{_e(title)}</strong>'
+            f'<small>{_e(subtitle)}</small>'
+            f'<b>Öffnen ›</b></a>'
+        )
+    body = f"""
+    <style>
+      .guide-hub-hero{{margin:0 0 14px;padding:22px 24px;border:1px solid rgba(112,125,248,.26);border-radius:18px;background:linear-gradient(135deg,rgba(17,23,40,.94),rgba(8,11,21,.92));box-shadow:0 18px 42px rgba(0,0,0,.30)}}
+      .guide-hub-hero .eyebrow{{color:#aebcff}}
+      .guide-hub-hero h1{{font-family:Georgia,serif;font-size:clamp(34px,5vw,54px);margin:3px 0 5px;color:#f2f5ff}}
+      .guide-hub-grid{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}}
+      .guide-hub-card{{min-height:150px;padding:18px;border:1px solid rgba(112,125,248,.28);border-radius:18px;background:linear-gradient(145deg,rgba(21,28,50,.93),rgba(7,10,19,.96));text-decoration:none;color:var(--text);display:grid;grid-template-columns:auto minmax(0,1fr) auto;grid-template-rows:auto auto;column-gap:14px;align-items:center;box-shadow:0 14px 30px rgba(0,0,0,.25);transition:transform .14s ease,border-color .14s ease}}
+      .guide-hub-card:hover{{transform:translateY(-2px);border-color:rgba(138,149,255,.62)}}
+      .guide-hub-icon{{grid-row:1/3;font-size:36px}}
+      .guide-hub-card strong{{font-family:Georgia,serif;font-size:22px;color:#eef2ff}}
+      .guide-hub-card small{{color:#a8b4cd;font-size:13px;line-height:1.35}}
+      .guide-hub-card b{{grid-column:3;grid-row:1/3;color:#aebcff;font-size:14px}}
+      @media(max-width:720px){{.guide-hub-grid{{grid-template-columns:1fr}}.guide-hub-card{{min-height:118px;padding:15px}}.guide-hub-hero{{padding:18px}}}}
+    </style>
+    <section class="guide-hub-hero">
+      <div class="eyebrow">Oblivion Wissen</div>
+      <h1>Guides</h1>
+      <p class="muted">Schneller Zugriff auf die wichtigsten Aion-2-Guides der Gilde.</p>
+    </section>
+    <section class="guide-hub-grid">{"".join(cards)}</section>
+    """
+    return _html_shell("Guides", body, nav_mode=_nav_mode_for_request(request), active_nav_href="/guides")
+
+
+@app.get("/guides", response_class=HTMLResponse)
+def guides_page(request: Request, _: bool = Depends(_auth)) -> HTMLResponse:
+    return HTMLResponse(_guides_hub_html(request))
+
+
+@app.get("/guides/{guide_key}", response_class=HTMLResponse)
+def guide_detail_page(guide_key: str, request: Request, _: bool = Depends(_auth)) -> HTMLResponse:
+    item = GUIDE_HUB_ITEMS.get(str(guide_key or "").strip().lower())
+    if not item:
+        return HTMLResponse(_html_shell("Guide nicht gefunden", "<section class='panel'><h1>Guide nicht gefunden</h1><p class='muted'>Dieser Guide existiert noch nicht.</p><a class='btn secondary' href='/guides'>Zurück zu Guides</a></section>", nav_mode=_nav_mode_for_request(request), active_nav_href="/guides"), status_code=404)
+    icon, title, subtitle = item
+    body = f"""
+    <section class="hero">
+      <div>
+        <div class="eyebrow">Guides</div>
+        <h1>{icon} {_e(title)}</h1>
+        <p>{_e(subtitle)}</p>
+      </div>
+      <a class="btn secondary" href="/guides">← Alle Guides</a>
+    </section>
+    <section class="panel">
+      <h2>Inhalt</h2>
+      <p class="muted">Der eigentliche Guide wird hier als nächstes hinterlegt.</p>
+    </section>
+    """
+    return HTMLResponse(_html_shell(f"{title} · Guides", body, nav_mode=_nav_mode_for_request(request), active_nav_href="/guides"))
 
 
 @app.get("/tnl/guides", response_class=HTMLResponse)
