@@ -20884,9 +20884,11 @@ def tnl_builds_page() -> HTMLResponse:
 
 GUIDE_HUB_ITEMS = {
     "classes": ("nav_builds.png", "Klassen Builds", "Builds, Rollen und Empfehlungen für alle Aion-2-Klassen."),
-    "level-45": ("nav_planung.png", "Level 45 Guide", "Wichtige Schritte, Inhalte und Ziele ab Level 45."),
-    "macros": ("nav_guides.png", "Makros setzen", "Makros sauber einrichten und sinnvoll im Spiel verwenden."),
+    "weitere": ("nav_planung.png", "Weitere Guides", "Start, Ressourcen, Hotbar, Makros, Weaving und wichtige Systeme."),
     "events": ("nav_events.png", "Events", "Gilden- und Gruppeninhalte, Vorbereitung und Ablauf."),
+    # Alte URLs bleiben als Kompatibilitäts-Aliase erreichbar.
+    "level-45": ("nav_planung.png", "Perfekter Start", "Die wichtigsten Schritte für einen sauberen Aion-2-Start."),
+    "macros": ("nav_guides.png", "Hotbar, Makros & Weaving", "Skill-Blöcke, Makros, Weaving und Stigma-Slots verständlich erklärt."),
 }
 
 AION2_GUIDE_CLASSES = [
@@ -21527,6 +21529,91 @@ def _guide_classes_detail_html() -> str:
     return ''.join(cards)
 
 
+
+WAKAYASHI_START_GUIDE_URL = "https://wakayashi.gg/aion2/aion-2-der-perfekte-start-verschwende-keine-zeit-ressourcen"
+WAKAYASHI_SKILL_GUIDE_URL = "https://wakayashi.gg/aion2/aion-2-skill-guide-weaving-animation-cancel-makros-stigma-skills"
+
+
+def _additional_guides_hub_html(request: Request) -> str:
+    body = f"""
+    <style>
+      .more-guides{{display:grid;gap:14px}}
+      .more-guides-hero{{position:relative;overflow:hidden;min-height:180px;padding:26px 28px;border-radius:20px;border:1px solid rgba(112,125,248,.34);background:linear-gradient(90deg,rgba(6,10,20,.96),rgba(7,11,24,.78) 50%,rgba(7,11,24,.24)),url('{_asset("oblivion_header_desktop.png")}') center 46%/cover no-repeat;box-shadow:0 18px 44px rgba(0,0,0,.32);display:flex;align-items:center;justify-content:space-between;gap:18px}}
+      .more-guides-hero-copy{{position:relative;z-index:2;max-width:760px}}
+      .more-guides-hero .eyebrow{{color:#b6c3ff;font-weight:900;letter-spacing:.16em;text-transform:uppercase}}
+      .more-guides-hero h1{{font-family:Georgia,serif;font-size:clamp(38px,5vw,60px);margin:6px 0 8px;color:#f3f6ff}}
+      .more-guides-hero p{{margin:0;color:#c4cee1;line-height:1.45}}
+      .more-guides-grid{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}}
+      .more-guide-card{{position:relative;overflow:hidden;min-height:310px;padding:24px;border-radius:19px;text-decoration:none;color:var(--text);border:1px solid rgba(112,125,248,.28);background:linear-gradient(180deg,rgba(12,18,33,.68),rgba(6,9,18,.96)),url('{_asset("oblivion_voidhall_bg.png")}') center/cover no-repeat;box-shadow:0 18px 38px rgba(0,0,0,.30);display:flex;align-items:flex-end}}
+      .more-guide-card.skill{{background:linear-gradient(180deg,rgba(12,18,33,.62),rgba(6,9,18,.96)),url('{_asset("oblivion_header_mobile.png")}') center 35%/cover no-repeat}}
+      .more-guide-card:hover{{transform:translateY(-2px);border-color:rgba(145,157,255,.62)}}
+      .more-guide-copy{{position:relative;z-index:2;display:grid;gap:8px}}
+      .more-guide-icon{{width:58px;height:58px;border-radius:15px;display:grid;place-items:center;background:rgba(8,12,24,.72);border:1px solid rgba(121,134,255,.32);font-size:28px}}
+      .more-guide-card h2{{margin:0;font-family:Georgia,serif;font-size:clamp(27px,3vw,38px);color:#f4f6ff}}
+      .more-guide-card p{{margin:0;color:#c1cbe0;line-height:1.45;max-width:640px}}
+      .more-guide-open{{color:#aebaff;font-weight:900;margin-top:4px}}
+      @media(max-width:760px){{.more-guides-hero{{padding:18px;display:grid}}.more-guides-grid{{grid-template-columns:1fr}}.more-guide-card{{min-height:230px}}}}
+    </style>
+    <main class="more-guides">
+      <section class="more-guides-hero">
+        <div class="more-guides-hero-copy"><div class="eyebrow">Oblivion Wissen</div><h1>Weitere Guides</h1><p>Zwei Grundlagen-Guides für einen sauberen Start und ein funktionierendes Skill-/Makro-Setup.</p></div>
+        <a class="btn secondary" href="/guides">← Guides</a>
+      </section>
+      <section class="more-guides-grid">
+        <a class="more-guide-card" href="/guides/weitere/perfekter-start"><div class="more-guide-copy"><div class="more-guide-icon">🧭</div><h2>Der perfekte Start</h2><p>Levelphase, Energie, Conquest, Federn, Gear, Events, Kinah und wichtige Ressourcenfallen.</p><div class="more-guide-open">Guide öffnen ›</div></div></a>
+        <a class="more-guide-card skill" href="/guides/weitere/skills-makros-weaving"><div class="more-guide-copy"><div class="more-guide-icon">⌨️</div><h2>Hotbar, Makros & Weaving</h2><p>Skill-Blöcke, Bedingungen, Makro-Logik, Animation Cancel, Skill Queue und Stigma-Slots.</p><div class="more-guide-open">Guide öffnen ›</div></div></a>
+      </section>
+    </main>
+    """
+    return _html_shell("Weitere Guides", body, nav_mode=_nav_mode_for_request(request), active_nav_href="/guides")
+
+
+def _perfect_start_guide_html(request: Request) -> str:
+    body = f"""
+    <style>
+      .waka-guide{{display:grid;gap:14px}}
+      .waka-hero{{position:relative;overflow:hidden;min-height:205px;padding:26px 28px;border-radius:20px;border:1px solid rgba(112,125,248,.34);background:linear-gradient(90deg,rgba(6,10,20,.96),rgba(7,11,24,.78) 50%,rgba(7,11,24,.24)),url('{_asset("oblivion_header_desktop.png")}') center 45%/cover no-repeat;box-shadow:0 18px 44px rgba(0,0,0,.32);display:flex;align-items:center;justify-content:space-between;gap:18px}}
+      .waka-hero-copy{{max-width:790px;position:relative;z-index:2}} .waka-hero .eyebrow{{color:#b6c3ff;font-weight:900;letter-spacing:.15em;text-transform:uppercase}} .waka-hero h1{{font-family:Georgia,serif;font-size:clamp(36px,5vw,58px);margin:6px 0 8px;color:#f3f6ff}} .waka-hero p{{margin:0;color:#c4cee1;line-height:1.45}}
+      .waka-grid{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}} .waka-card{{padding:20px;border-radius:18px;border:1px solid rgba(112,125,248,.22);background:linear-gradient(180deg,rgba(12,18,33,.91),rgba(7,10,19,.95));box-shadow:0 16px 34px rgba(0,0,0,.24)}} .waka-card.wide{{grid-column:1/-1}} .waka-card h2{{margin:0 0 11px;font-family:Georgia,serif;color:#f1f4ff;font-size:29px}} .waka-card p,.waka-card li{{color:#c3ccdf;line-height:1.55}} .waka-card ul{{margin:0;padding-left:20px}}
+      .waka-rules{{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:9px}} .waka-rule{{padding:13px;border-radius:14px;background:rgba(16,22,39,.72);border:1px solid rgba(112,125,248,.18);display:grid;gap:5px}} .waka-rule b{{color:#f3f6ff}} .waka-rule span{{color:#9eabc4;font-size:12px;line-height:1.4}}
+      .waka-source{{display:flex;gap:8px;flex-wrap:wrap}} @media(max-width:900px){{.waka-rules{{grid-template-columns:repeat(2,minmax(0,1fr))}}}} @media(max-width:700px){{.waka-hero{{padding:18px;display:grid}}.waka-grid{{grid-template-columns:1fr}}.waka-card.wide{{grid-column:auto}}.waka-rules{{grid-template-columns:1fr}}}}
+    </style>
+    <main class="waka-guide">
+      <section class="waka-hero"><div class="waka-hero-copy"><div class="eyebrow">Weitere Guides · Wakayashi</div><h1>Der perfekte Start</h1><p>Die wichtigsten Entscheidungen und Ressourcenregeln für die Levelphase und den Übergang in Level 45.</p></div><div class="waka-source"><a class="btn secondary" href="{_e(WAKAYASHI_START_GUIDE_URL)}" target="_blank" rel="noopener">Original öffnen ↗</a><a class="btn secondary" href="/guides/weitere">← Weitere Guides</a></div></section>
+      <section class="waka-card wide"><h2>Die fünf Regeln, die du dir merken solltest</h2><div class="waka-rules"><div class="waka-rule"><b>Energie ab Lv. 22</b><span>Für Eroberungs-/Conquest-Dungeons aufheben; Exploration abschließen, aber die Energiekiste nicht looten.</span></div><div class="waka-rule"><b>Amulett & Gürtel</b><span>Bis gelb +0 entwickeln. Danach steigt der Ressourcenpreis laut Guide zu stark.</span></div><div class="waka-rule"><b>Monolith</b><span>Etwa 180 Federn reichen für Level 30; danach ist weiteres Sammeln kein Start-Prioritätsthema.</span></div><div class="waka-rule"><b>Draupnir</b><span>10 Clears geben die einzigartige Pantheon-Statue; Energie lieber für besseren Conquest-Loot aufsparen.</span></div><div class="waka-rule"><b>Events</b><span>Shugo, Dimensional Invasion und Abyss erst ab Level 45 ernsthaft farmen, weil vorher weniger Loot anfällt.</span></div></div></section>
+      <section class="waka-grid"><article class="waka-card"><h2>Levelphase</h2><ul><li>Grüne Sidequests, Sealed Dungeons und Strongholds auf dem Weg mitnehmen; sie füllen auch die rote Fortschrittsleiste.</li><li>Unsichere Twinks bis Level 22 ziehen, damit deren Energie schon im Hintergrund regeneriert.</li><li>Auto-Walk/Travel und freigeschaltete Teleporter sparen viel Laufzeit.</li></ul></article><article class="waka-card"><h2>Ab Level 45</h2><ul><li>Raum-Zeit-Riss für Sidequests, Materialien und seltenen Schmuck nutzen; anfangs besser PvE bleiben.</li><li>Energie in Conquest investieren; Wakayashi zielt früh auf die stärkeren Zwei-Sterne-Dungeons.</li><li>Duties serverweit nur auf dem Main erledigen; ungebundenes Kinah von Twinks kann über das Serverlager zum Main.</li></ul></article></section>
+    </main>
+    """
+    return _html_shell("Der perfekte Start · Guides", body, nav_mode=_nav_mode_for_request(request), active_nav_href="/guides")
+
+
+def _skill_macro_guide_html(request: Request) -> str:
+    body = f"""
+    <style>
+      .waka-guide{{display:grid;gap:14px}} .waka-hero{{position:relative;overflow:hidden;min-height:205px;padding:26px 28px;border-radius:20px;border:1px solid rgba(112,125,248,.34);background:linear-gradient(90deg,rgba(6,10,20,.96),rgba(7,11,24,.78) 50%,rgba(7,11,24,.24)),url('{_asset("oblivion_header_mobile.png")}') center 36%/cover no-repeat;box-shadow:0 18px 44px rgba(0,0,0,.32);display:flex;align-items:center;justify-content:space-between;gap:18px}} .waka-hero-copy{{max-width:790px;position:relative;z-index:2}} .waka-hero .eyebrow{{color:#b6c3ff;font-weight:900;letter-spacing:.15em;text-transform:uppercase}} .waka-hero h1{{font-family:Georgia,serif;font-size:clamp(36px,5vw,58px);margin:6px 0 8px;color:#f3f6ff}} .waka-hero p{{margin:0;color:#c4cee1;line-height:1.45}}
+      .waka-grid{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}} .waka-card{{padding:20px;border-radius:18px;border:1px solid rgba(112,125,248,.22);background:linear-gradient(180deg,rgba(12,18,33,.91),rgba(7,10,19,.95));box-shadow:0 16px 34px rgba(0,0,0,.24)}} .waka-card.wide{{grid-column:1/-1}} .waka-card h2{{margin:0 0 11px;font-family:Georgia,serif;color:#f1f4ff;font-size:29px}} .waka-card p,.waka-card li{{color:#c3ccdf;line-height:1.55}} .waka-card ul,.waka-card ol{{margin:0;padding-left:20px}}
+      .skill-flow{{display:flex;gap:8px;flex-wrap:wrap;align-items:center}} .skill-flow span{{padding:9px 11px;border-radius:12px;background:rgba(16,22,39,.72);border:1px solid rgba(112,125,248,.18);color:#eef2ff;font-weight:800}} .skill-flow i{{font-style:normal;color:#8da0ff;font-weight:900}} .waka-source{{display:flex;gap:8px;flex-wrap:wrap}}
+      @media(max-width:700px){{.waka-hero{{padding:18px;display:grid}}.waka-grid{{grid-template-columns:1fr}}.waka-card.wide{{grid-column:auto}}}}
+    </style>
+    <main class="waka-guide">
+      <section class="waka-hero"><div class="waka-hero-copy"><div class="eyebrow">Weitere Guides · Wakayashi</div><h1>Hotbar, Makros & Weaving</h1><p>Wie Aion 2 Skill-Blöcke abspielt, wie das Makro arbeitet und warum Linksklick + Rechtsklick für viele Klassen so wichtig ist.</p></div><div class="waka-source"><a class="btn secondary" href="{_e(WAKAYASHI_SKILL_GUIDE_URL)}" target="_blank" rel="noopener">Original öffnen ↗</a><a class="btn secondary" href="/guides/weitere">← Weitere Guides</a></div></section>
+      <section class="waka-card wide"><h2>Hotbar & Makro-Logik</h2><div class="skill-flow"><span>Block 0</span><i>↑</i><span>Block 1</span><i>↑</i><span>Block 2</span><i>↑</i><span>Block 3</span></div><p>Die Hotbar wird innerhalb eines Blocks von unten nach oben aufgebaut; beim Entfernen gehst du umgekehrt vor. Bedingungen entscheiden, welcher Skill gerade tatsächlich ausführbar ist. Ein Makro spielt nicht bloß den unteren Skill, sondern arbeitet den ganzen Block ab und springt anschließend weiter. Buffs, Defensives und Charge-Skills bleiben häufig besser manuell.</p></section>
+      <section class="waka-grid"><article class="waka-card"><h2>Weaving</h2><ul><li>Für viele Klassen Linksklick und gehaltenen Rechtsklick gleichzeitig nutzen.</li><li>Linksklick hilft beim Mana und kann Animationen des Makros verkürzen.</li><li>Die sichtbaren Schatten hinter dem Charakter sind das Zeichen für gelungenes Animation-Cancelling.</li><li>Die Makrotaste unter Tasteneinstellungen → Allgemein → „Fähigkeit Makro“ auf Rechtsklick legen; dafür den AION-2-Steuerungsmodus verwenden.</li></ul></article><article class="waka-card"><h2>Skill Queue & Stigma</h2><ul><li>Skill Queue nicht blind kopieren: mit Strg+X im DPS-Meter unter gleichen Bedingungen On/Off vergleichen; früh eher Hits als DPS werten.</li><li>Stigma-Slots öffnen sich auf Level 22, 27, 32 und 37.</li><li>Skillpunkte gibt es weiter pro Level, zusätzliche Slots aber nicht bei jedem Level.</li><li>Die konkreten Hotbars und Makros bleiben klassenabhängig – dafür sind unsere Klassen-Build-Seiten da.</li></ul></article></section>
+    </main>
+    """
+    return _html_shell("Hotbar, Makros & Weaving · Guides", body, nav_mode=_nav_mode_for_request(request), active_nav_href="/guides")
+
+
+@app.get("/guides/weitere/{guide_slug}", response_class=HTMLResponse)
+def additional_guide_page(guide_slug: str, request: Request, _: bool = Depends(_auth)) -> HTMLResponse:
+    key = str(guide_slug or "").strip().lower()
+    if key == "perfekter-start":
+        return HTMLResponse(_perfect_start_guide_html(request))
+    if key in {"skills-makros-weaving", "makros", "skill-guide"}:
+        return HTMLResponse(_skill_macro_guide_html(request))
+    return HTMLResponse(_html_shell("Guide nicht gefunden", "<section class='panel'><h1>Guide nicht gefunden</h1><p class='muted'>Dieser weitere Guide existiert nicht.</p><a class='btn secondary' href='/guides/weitere'>← Weitere Guides</a></section>", nav_mode=_nav_mode_for_request(request), active_nav_href="/guides"), status_code=404)
+
+
 def _guides_hub_html(request: Request) -> str:
     body = f"""
     <style>
@@ -21566,6 +21653,7 @@ def _guides_hub_html(request: Request) -> str:
       .guide-feature-open span{{margin-left:8px;color:#d9b45f}}
 
       .guide-mini-grid{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}}
+      .guide-mini-grid-two{{grid-template-columns:repeat(2,minmax(0,1fr))}}
       .guide-mini{{
         position:relative;overflow:hidden;min-height:250px;border-radius:18px;text-decoration:none;color:var(--text);
         border:1px solid rgba(111,125,247,.34);box-shadow:0 16px 34px rgba(0,0,0,.30);
@@ -21625,20 +21713,12 @@ def _guides_hub_html(request: Request) -> str:
         <div class="guide-feature-open">Öffnen <span>›</span></div>
       </a>
 
-      <section class="guide-mini-grid">
-        <a class="guide-mini level" href="/guides/level-45">
+      <section class="guide-mini-grid guide-mini-grid-two">
+        <a class="guide-mini level" href="/guides/weitere">
           <div class="guide-mini-copy">
             <div class="guide-mini-icon"><img src="{_asset('nav_planung.png')}" alt=""></div>
-            <h3>Level 45 Guide</h3>
-            <p>Wichtige Schritte, Inhalte und Ziele ab Level 45.</p>
-            <div class="guide-mini-open">Öffnen <span>›</span></div>
-          </div>
-        </a>
-        <a class="guide-mini macros" href="/guides/macros">
-          <div class="guide-mini-copy">
-            <div class="guide-mini-icon"><img src="{_asset('nav_guides.png')}" alt=""></div>
-            <h3>Makros setzen</h3>
-            <p>Makros sauber einrichten und sinnvoll im Spiel verwenden.</p>
+            <h3>Weitere Guides</h3>
+            <p>Perfekter Start sowie Hotbar, Makros, Weaving und Stigma-Grundlagen.</p>
             <div class="guide-mini-open">Öffnen <span>›</span></div>
           </div>
         </a>
@@ -21646,7 +21726,7 @@ def _guides_hub_html(request: Request) -> str:
           <div class="guide-mini-copy">
             <div class="guide-mini-icon"><img src="{_asset('nav_events.png')}" alt=""></div>
             <h3>Events</h3>
-            <p>Gilden- und Gruppeninhalte, Vorbereitung und Ablauf.</p>
+            <p>Live-Timer und die wichtigsten laufenden Aion-2-Serverevents.</p>
             <div class="guide-mini-open">Öffnen <span>›</span></div>
           </div>
         </a>
@@ -21681,6 +21761,12 @@ def guide_detail_page(guide_key: str, request: Request, _: bool = Depends(_auth)
         return HTMLResponse(_html_shell("Guide nicht gefunden", "<section class='panel'><h1>Guide nicht gefunden</h1><p class='muted'>Dieser Guide existiert noch nicht.</p><a class='btn secondary' href='/guides'>Zurück zu Guides</a></section>", nav_mode=_nav_mode_for_request(request), active_nav_href="/guides"), status_code=404)
     icon_asset, title, subtitle = item
     guide_key = str(guide_key or "").strip().lower()
+    if guide_key == "weitere":
+        return HTMLResponse(_additional_guides_hub_html(request))
+    if guide_key == "level-45":
+        return HTMLResponse(_perfect_start_guide_html(request))
+    if guide_key == "macros":
+        return HTMLResponse(_skill_macro_guide_html(request))
     if guide_key == "events":
         event_cards = _aion2_event_timer_html()
         body = f"""
