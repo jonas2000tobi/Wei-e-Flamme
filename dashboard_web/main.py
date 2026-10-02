@@ -5106,18 +5106,18 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "member", active_nav_h
     .need-slot-row strong {{ color:var(--text); overflow-wrap:anywhere; }}
     .member-start-logo {{ width:86px; height:86px; border-radius:22px; padding:8px; border:1px solid rgba(214,168,79,.32); background:rgba(214,168,79,.08); box-shadow:0 14px 30px rgba(0,0,0,.35); }}
     .member-start-logo img {{ width:100%; height:100%; object-fit:contain; }}
-    .member-home-hero {{ align-items:flex-end; min-height:350px; background-color:#050814 !important; background-image:linear-gradient(180deg,rgba(4,5,12,.05) 0%,rgba(4,5,12,.14) 42%,rgba(4,5,12,.55) 100%), url("{hero_banner}") !important; background-position:center 37% !important; background-size:94% auto !important; background-repeat:no-repeat !important; border-color:rgba(113,126,255,.34) !important; }}
+    .member-home-hero {{ align-items:flex-end; min-height:350px; background-color:#050814 !important; background-image:linear-gradient(180deg,rgba(4,5,12,.05) 0%,rgba(4,5,12,.14) 42%,rgba(4,5,12,.55) 100%), url("{hero_banner}") !important; background-position:center 42% !important; background-size:100% auto !important; background-repeat:no-repeat !important; border-color:rgba(113,126,255,.34) !important; }}
     .member-home-desktop > .topnav {{ margin-top:-6px !important; margin-bottom:10px !important; }}
     .member-home-hero::after {{ background:linear-gradient(180deg,rgba(0,0,0,.02) 0%,rgba(0,0,0,.08) 54%,rgba(0,0,0,.22) 100%) !important; }}
     .member-home-hero-copy {{ position:absolute; inset:0; z-index:3; pointer-events:none; }}
     .member-home-hero-copy::before {{
-      content:""; position:absolute; left:38%; right:13%; top:60%; height:28%;
+      content:""; position:absolute; left:52%; right:4%; top:62%; height:27%;
       background:radial-gradient(ellipse at center,rgba(4,7,16,.99) 0%,rgba(4,7,16,.98) 58%,rgba(4,7,16,.88) 76%,rgba(4,7,16,0) 100%);
       -webkit-backdrop-filter:blur(6px); backdrop-filter:blur(6px);
       pointer-events:none;
     }}
     .member-home-dynamic-name {{
-      position:absolute; left:38%; right:13%; top:71%; min-height:58px;
+      position:absolute; left:52%; right:4%; top:73%; min-height:58px;
       display:flex; align-items:center; justify-content:center; text-align:center;
       color:#f3f6ff; font-family:Georgia,serif; font-size:clamp(25px,2.2vw,38px); font-weight:800;
       line-height:1.02; letter-spacing:.015em; overflow-wrap:anywhere;
@@ -20892,28 +20892,30 @@ GUIDE_HUB_ITEMS = {
 }
 
 AION2_GUIDE_CLASSES = [
-    ("Gladiator", "Offensiver Nahkampf"),
-    ("Templer", "Defensiver Tank"),
-    ("Assassine", "Burst & Mobilität"),
-    ("Jäger", "Fernkampf & Kontrolle"),
-    ("Zauberer", "Magischer Fernkampf"),
-    ("Beschwörer", "DoTs & Beschwörungen"),
-    ("Kleriker", "Heilung & Schutz"),
-    ("Kantor", "Support & Verstärkung"),
+    ("gladiator", "Gladiator", "Offensiver Nahkampf"),
+    ("templar", "Templer", "Defensiver Tank"),
+    ("assassine", "Assassine", "Burst & Mobilität"),
+    ("jaeger", "Jäger", "Fernkampf & Kontrolle"),
+    ("zauberer", "Zauberer", "Magischer Fernkampf"),
+    ("beschwoerer", "Beschwörer", "DoTs & Beschwörungen"),
+    ("kleriker", "Kleriker", "Heilung & Schutz"),
+    ("kantor", "Kantor", "Support & Verstärkung"),
 ]
+
+AION2_GUIDE_CLASS_LOOKUP = {slug: (name, hint) for slug, name, hint in AION2_GUIDE_CLASSES}
 
 
 def _guide_classes_detail_html() -> str:
     cards: list[str] = []
-    for class_name, class_hint in AION2_GUIDE_CLASSES:
+    for slug, class_name, class_hint in AION2_GUIDE_CLASSES:
         icon_url = _aion2_class_icon_url(class_name)
         icon_html = f'<img class="guide-class-icon" src="{_e(icon_url)}" alt="{_e(class_name)}" loading="lazy" onerror="this.style.display=&quot;none&quot;">' if icon_url else ''
         watermark_html = f'<img class="guide-class-watermark" src="{_e(icon_url)}" alt="" loading="lazy" onerror="this.style.display=&quot;none&quot;">' if icon_url else ''
         cards.append(
-            f'<a class="guide-class-card" href="#" onclick="return false;">'
+            f'<a class="guide-class-card" href="/guides/classes/{_e(slug)}">'
             f'<div class="guide-class-inner">'
             f'<div class="guide-class-head"><span class="guide-class-pill">Aion 2</span>{icon_html}</div>'
-            f'<div class="guide-class-image-wrap">{watermark_html}</div>'
+            f'<div class="guide-class-image-wrap"><div class="guide-class-avatar-space">{watermark_html}<span>Avatar-Artwork</span></div></div>'
             f'<div class="guide-class-copy"><strong>{_e(class_name)}</strong><span>{_e(class_hint)}</span></div>'
             f'</div></a>'
         )
@@ -21054,6 +21056,46 @@ def guides_page(request: Request, _: bool = Depends(_auth)) -> HTMLResponse:
     return HTMLResponse(_guides_hub_html(request))
 
 
+@app.get("/guides/classes/{class_slug}", response_class=HTMLResponse)
+def guide_class_page(class_slug: str, request: Request, _: bool = Depends(_auth)) -> HTMLResponse:
+    key = str(class_slug or "").strip().lower()
+    item = AION2_GUIDE_CLASS_LOOKUP.get(key)
+    if not item:
+        return HTMLResponse(_html_shell("Klasse nicht gefunden", "<section class='panel'><h1>Klasse nicht gefunden</h1><p class='muted'>Für diese Klasse existiert noch keine Guide-Seite.</p><a class='btn secondary' href='/guides/classes'>← Klassenübersicht</a></section>", nav_mode=_nav_mode_for_request(request), active_nav_href="/guides"), status_code=404)
+    class_name, class_hint = item
+    icon_url = _aion2_class_icon_url(class_name)
+    icon_html = f'<img src="{_e(icon_url)}" alt="{_e(class_name)}" class="class-guide-hero-icon">' if icon_url else ''
+    body = f"""
+    <style>
+      .class-guide-hero{{position:relative;overflow:hidden;min-height:220px;padding:28px;border-radius:20px;border:1px solid rgba(112,125,248,.32);background:linear-gradient(90deg,rgba(6,10,21,.96),rgba(7,11,24,.80) 52%,rgba(8,12,27,.30)),url('{_asset("oblivion_header_desktop.png")}') center 44%/cover no-repeat;display:flex;align-items:center;justify-content:space-between;gap:20px;box-shadow:0 18px 44px rgba(0,0,0,.32)}}
+      .class-guide-hero-copy{{position:relative;z-index:2;display:flex;align-items:center;gap:18px}}
+      .class-guide-hero-icon{{width:92px;height:92px;object-fit:contain;filter:drop-shadow(0 14px 22px rgba(45,66,220,.32))}}
+      .class-guide-hero .eyebrow{{color:#b3c0ff;font-weight:900;letter-spacing:.14em}}
+      .class-guide-hero h1{{font-family:Georgia,serif;font-size:clamp(38px,5vw,62px);margin:5px 0 8px;color:#f2f5ff}}
+      .class-guide-hero p{{margin:0;color:#c4cee1;font-size:15px}}
+      .class-guide-layout{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin-top:14px}}
+      .class-guide-section{{min-height:150px;padding:18px;border-radius:16px;border:1px solid rgba(112,125,248,.22);background:linear-gradient(180deg,rgba(13,18,33,.92),rgba(7,10,19,.94))}}
+      .class-guide-section h2{{font-family:Georgia,serif;color:#eef2ff;margin:0 0 8px}}
+      .class-guide-section p{{margin:0;color:#9eabc6;line-height:1.45}}
+      @media(max-width:700px){{.class-guide-hero{{padding:18px;min-height:180px;display:grid}}.class-guide-hero-copy{{align-items:flex-start}}.class-guide-hero-icon{{width:70px;height:70px}}.class-guide-layout{{grid-template-columns:1fr}}}}
+    </style>
+    <section class="class-guide-hero">
+      <div class="class-guide-hero-copy">
+        {icon_html}
+        <div><div class="eyebrow">Klassen Build</div><h1>{_e(class_name)}</h1><p>{_e(class_hint)}</p></div>
+      </div>
+      <a class="btn secondary" href="/guides/classes">← Klassenübersicht</a>
+    </section>
+    <section class="class-guide-layout">
+      <article class="class-guide-section"><h2>Build</h2><p>Platz für den empfohlenen PvE-/PvP-Build und spätere Varianten.</p></article>
+      <article class="class-guide-section"><h2>Ausrüstung & Werte</h2><p>Platz für Gear, Prioritäten, Attribute und Gearscore-Empfehlungen.</p></article>
+      <article class="class-guide-section"><h2>Skills & Rotation</h2><p>Platz für Skill-Priorität, Rotation und wichtige Kombos.</p></article>
+      <article class="class-guide-section"><h2>Tipps & Makros</h2><p>Platz für Klassentipps, Makros und besondere Hinweise.</p></article>
+    </section>
+    """
+    return HTMLResponse(_html_shell(f"{class_name} · Klassen Build", body, nav_mode=_nav_mode_for_request(request), active_nav_href="/guides"))
+
+
 @app.get("/guides/{guide_key}", response_class=HTMLResponse)
 def guide_detail_page(guide_key: str, request: Request, _: bool = Depends(_auth)) -> HTMLResponse:
     item = GUIDE_HUB_ITEMS.get(str(guide_key or "").strip().lower())
@@ -21084,21 +21126,23 @@ def guide_detail_page(guide_key: str, request: Request, _: bool = Depends(_auth)
           .guide-classes-panel{{margin-top:14px;padding:18px;border-radius:18px;border:1px solid rgba(114,128,255,.25);background:linear-gradient(180deg,rgba(8,12,23,.88),rgba(6,9,18,.92));box-shadow:0 16px 34px rgba(0,0,0,.26)}}
           .guide-classes-grid{{display:grid;grid-template-columns:repeat(8,minmax(0,1fr));gap:10px}}
           .guide-class-card{{text-decoration:none;color:var(--text);display:block;min-width:0}}
-          .guide-class-inner{{position:relative;overflow:hidden;min-height:215px;height:100%;padding:12px 10px 14px;border-radius:16px;border:1px solid rgba(110,124,247,.36);background:linear-gradient(180deg,rgba(12,17,31,.92) 0%,rgba(9,12,23,.96) 100%),radial-gradient(circle at 50% 15%,rgba(72,90,210,.18),transparent 42%);box-shadow:0 14px 28px rgba(0,0,0,.24),inset 0 0 0 1px rgba(255,255,255,.03);display:flex;flex-direction:column;align-items:center;text-align:center;gap:10px}}
+          .guide-class-inner{{position:relative;overflow:hidden;min-height:330px;height:100%;padding:12px 10px 16px;border-radius:16px;border:1px solid rgba(110,124,247,.36);background:linear-gradient(180deg,rgba(12,17,31,.92) 0%,rgba(9,12,23,.96) 100%),radial-gradient(circle at 50% 15%,rgba(72,90,210,.18),transparent 42%);box-shadow:0 14px 28px rgba(0,0,0,.24),inset 0 0 0 1px rgba(255,255,255,.03);display:flex;flex-direction:column;align-items:center;text-align:center;gap:10px}}
           .guide-class-card:hover .guide-class-inner{{transform:translateY(-2px);border-color:rgba(153,167,255,.62);box-shadow:0 18px 32px rgba(0,0,0,.32),0 0 0 1px rgba(152,166,255,.08) inset}}
           .guide-class-head{{width:100%;display:flex;align-items:center;justify-content:space-between;gap:8px}}
           .guide-class-pill{{font-size:11px;font-weight:900;letter-spacing:.08em;text-transform:uppercase;color:#b0bdf7;background:rgba(18,24,40,.82);border:1px solid rgba(108,121,242,.24);border-radius:999px;padding:5px 8px}}
           .guide-class-icon{{width:34px;height:34px;object-fit:contain;filter:drop-shadow(0 6px 10px rgba(0,0,0,.35))}}
-          .guide-class-image-wrap{{flex:1;min-height:88px;width:100%;display:grid;place-items:center}}
-          .guide-class-watermark{{width:80px;height:80px;object-fit:contain;opacity:.92;filter:drop-shadow(0 12px 18px rgba(40,62,214,.22)) drop-shadow(0 9px 16px rgba(0,0,0,.28))}}
+          .guide-class-image-wrap{{flex:1;min-height:190px;width:100%;display:grid;place-items:center}}
+          .guide-class-watermark{{width:94px;height:94px;object-fit:contain;opacity:.92;filter:drop-shadow(0 12px 18px rgba(40,62,214,.22)) drop-shadow(0 9px 16px rgba(0,0,0,.28))}}
+          .guide-class-avatar-space{{width:100%;height:100%;min-height:180px;border-radius:12px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;background:linear-gradient(180deg,rgba(15,21,39,.26),rgba(5,8,16,.12));border:1px dashed rgba(118,132,255,.14)}}
+          .guide-class-avatar-space span{{font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:#596788}}
           .guide-class-copy{{display:grid;gap:4px;width:100%}}
           .guide-class-copy strong{{display:block;font-size:19px;line-height:1.05;color:#eef2ff;overflow-wrap:anywhere}}
           .guide-class-copy span{{display:block;font-size:12px;line-height:1.35;color:#aeb9d4}}
           .guide-classes-note{{margin-top:12px;color:#93a0bf;font-size:13px}}
 
-          @media(max-width:1580px){{.guide-classes-grid{{grid-template-columns:repeat(4,minmax(0,1fr))}}}}
+          @media(max-width:1220px){{.guide-classes-grid{{grid-template-columns:repeat(4,minmax(0,1fr))}}}}
           @media(max-width:980px){{.guide-detail-hero{{min-height:184px;padding:22px;display:grid}} .guide-detail-copy{{max-width:100%}} .guide-classes-grid{{grid-template-columns:repeat(4,minmax(0,1fr))}}}}
-          @media(max-width:700px){{.guide-detail-hero{{min-height:170px;padding:18px;border-radius:16px}} .guide-detail-hero h1{{font-size:38px}} .guide-classes-panel{{padding:14px}} .guide-classes-grid{{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}} .guide-class-inner{{min-height:188px}} .guide-class-copy strong{{font-size:18px}}}}
+          @media(max-width:700px){{.guide-detail-hero{{min-height:170px;padding:18px;border-radius:16px}} .guide-detail-hero h1{{font-size:38px}} .guide-classes-panel{{padding:14px}} .guide-classes-grid{{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}} .guide-class-inner{{min-height:250px}} .guide-class-copy strong{{font-size:18px}}}}
         </style>
         <section class="guide-detail-hero">
           <div class="guide-detail-copy">
