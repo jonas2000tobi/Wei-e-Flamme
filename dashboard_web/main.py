@@ -5106,22 +5106,17 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "member", active_nav_h
     .need-slot-row strong {{ color:var(--text); overflow-wrap:anywhere; }}
     .member-start-logo {{ width:86px; height:86px; border-radius:22px; padding:8px; border:1px solid rgba(214,168,79,.32); background:rgba(214,168,79,.08); box-shadow:0 14px 30px rgba(0,0,0,.35); }}
     .member-start-logo img {{ width:100%; height:100%; object-fit:contain; }}
-    .member-home-hero {{ align-items:flex-end; min-height:350px; background-color:#050814 !important; background-image:linear-gradient(180deg,rgba(4,5,12,.05) 0%,rgba(4,5,12,.14) 42%,rgba(4,5,12,.55) 100%), url("{hero_banner}") !important; background-position:center 42% !important; background-size:100% auto !important; background-repeat:no-repeat !important; border-color:rgba(113,126,255,.34) !important; }}
+    .member-home-hero {{ align-items:flex-end; min-height:350px; background-color:#050814 !important; background-image:linear-gradient(180deg,rgba(4,5,12,.03) 0%,rgba(4,5,12,.10) 45%,rgba(4,5,12,.34) 100%), url("{hero_banner}") !important; background-position:center 48% !important; background-size:100% auto !important; background-repeat:no-repeat !important; border-color:rgba(113,126,255,.34) !important; }}
     .member-home-desktop > .topnav {{ margin-top:-6px !important; margin-bottom:10px !important; }}
     .member-home-hero::after {{ background:linear-gradient(180deg,rgba(0,0,0,.02) 0%,rgba(0,0,0,.08) 54%,rgba(0,0,0,.22) 100%) !important; }}
     .member-home-hero-copy {{ position:absolute; inset:0; z-index:3; pointer-events:none; }}
-    .member-home-hero-copy::before {{
-      content:""; position:absolute; left:52%; right:4%; top:62%; height:27%;
-      background:radial-gradient(ellipse at center,rgba(4,7,16,.99) 0%,rgba(4,7,16,.98) 58%,rgba(4,7,16,.88) 76%,rgba(4,7,16,0) 100%);
-      -webkit-backdrop-filter:blur(6px); backdrop-filter:blur(6px);
-      pointer-events:none;
-    }}
+    .member-home-hero-copy::before {{ display:none; }}
     .member-home-dynamic-name {{
-      position:absolute; left:52%; right:4%; top:73%; min-height:58px;
+      position:absolute; left:22%; right:22%; top:27%; min-height:46px;
       display:flex; align-items:center; justify-content:center; text-align:center;
-      color:#f3f6ff; font-family:Georgia,serif; font-size:clamp(25px,2.2vw,38px); font-weight:800;
-      line-height:1.02; letter-spacing:.015em; overflow-wrap:anywhere;
-      text-shadow:0 3px 14px rgba(0,0,0,.98),0 0 22px rgba(99,116,255,.45);
+      color:#f3f6ff; font-family:Georgia,serif; font-size:clamp(22px,1.9vw,33px); font-weight:800;
+      line-height:1.02; letter-spacing:.025em; overflow-wrap:anywhere;
+      text-shadow:0 3px 14px rgba(0,0,0,.98),0 0 22px rgba(76,108,255,.42);
     }}
     .member-summary-list {{ display:grid; gap:10px; margin-top:10px; }}
     .member-summary-item {{ display:grid; grid-template-columns:minmax(0,1fr) auto; gap:12px; align-items:center; padding:12px 13px; border:1px solid rgba(214,168,79,.14); border-radius:14px; background:rgba(32,35,45,.55); }}
