@@ -4934,7 +4934,7 @@ def _member_sidebar_html() -> str:
     if states.get("game_information"):
         game_links.extend([
             f'<a href="/tnl/news"><img class="nav-ico" src="{_asset("nav_news.png")}" alt="">News</a>',
-            f'<a href="/tnl/guides"><img class="nav-ico" src="{_asset("nav_guides.png")}" alt="">Guides</a>',
+            f'<a href="/tnl/guides"><img class="nav-ico" src="{_asset("nav_guides.png")}" alt="">Guides aus Gilde</a>',
         ])
     if states.get("game_integration"):
         game_links.append(f'<a href="/tnl/builds"><img class="nav-ico" src="{_asset("nav_builds.png")}" alt="">Game Builds</a>')
@@ -14355,6 +14355,32 @@ def _render_member_home(data: dict[str, Any], request: Request) -> str:
     admin_tools = (_admin_tabs_style()+_admin_quick_links('')) if is_admin else ''
     aion_map_panel = _aion2_home_map_panel(guild_id)
 
+    # Drei nächste Aion-2-Live-Events direkt über der Karte.
+    next_live_events = _aion2_event_timer_items()[:3]
+    live_event_icons = {"Boss": "👑", "Event": "✨", "PvP": "⚔️"}
+    live_event_cards: list[str] = []
+    for live_event in next_live_events:
+        next_dt = live_event.get("next")
+        if not isinstance(next_dt, datetime):
+            continue
+        live_event_cards.append(
+            f'<a class="home-live-event-card" href="/guides/events" data-event-time="{_e(next_dt.isoformat())}">'
+            f'<div class="home-live-event-top"><span>{live_event_icons.get(str(live_event.get("type") or ""), "•")} {_e(live_event.get("type") or "Event")}</span><b>{_e(next_dt.strftime("%H:%M"))}</b></div>'
+            f'<strong>{_e(live_event.get("name") or "Aion-2-Event")}</strong>'
+            f'<small>{_e(live_event.get("detail") or "")}</small>'
+            f'<div class="home-live-countdown">…</div>'
+            f'</a>'
+        )
+    home_live_events = f"""
+    <section class="home-live-events" aria-label="Nächste Aion 2 Events">
+      <div class="home-live-events-head">
+        <div><span class="eyebrow">AION 2 · LIVE</span><strong>Nächste Events</strong></div>
+        <a href="/guides/events">Alle Events ›</a>
+      </div>
+      <div class="home-live-events-grid">{''.join(live_event_cards)}</div>
+    </section>
+    """ if live_event_cards else ""
+
     # Mobile Startseite bewusst extrem kompakt: drei Statuskacheln, bei Leitung
     # die wichtigsten Verwaltungswege und danach direkt die Aion-2-Karte.
     # Der Boss-Wert ist absichtlich nur ein Platzhalter, bis Live-Bossdaten
@@ -14375,6 +14401,30 @@ def _render_member_home(data: dict[str, Any], request: Request) -> str:
     body = f'''
     <style>
       .mobile-home-compact{{display:none}}
+      .home-live-events{{
+        margin:14px 0 12px;padding:13px 14px 14px;border-radius:16px;
+        border:1px solid rgba(109,123,246,.25);
+        background:linear-gradient(180deg,rgba(13,19,35,.94),rgba(7,10,19,.96));
+        box-shadow:0 12px 28px rgba(0,0,0,.24);
+      }}
+      .home-live-events-head{{display:flex;align-items:end;justify-content:space-between;gap:12px;margin-bottom:10px}}
+      .home-live-events-head>div{{display:grid;gap:1px}}
+      .home-live-events-head .eyebrow{{font-size:9px;letter-spacing:.15em;color:#9eafff;font-weight:900}}
+      .home-live-events-head strong{{font-family:Georgia,serif;font-size:18px;color:#eef2ff}}
+      .home-live-events-head>a{{font-size:11px;font-weight:800;color:#b8c4ff;text-decoration:none;white-space:nowrap}}
+      .home-live-events-grid{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:9px}}
+      .home-live-event-card{{
+        min-width:0;padding:10px 12px;border-radius:13px;text-decoration:none;color:inherit;
+        border:1px solid rgba(108,121,244,.22);
+        background:linear-gradient(145deg,rgba(19,26,48,.88),rgba(7,10,20,.96));
+        display:grid;gap:4px;transition:transform .12s ease,border-color .12s ease,background .12s ease;
+      }}
+      .home-live-event-card:hover{{transform:translateY(-1px);border-color:rgba(137,149,255,.50);background:linear-gradient(145deg,rgba(25,34,62,.92),rgba(8,11,22,.98))}}
+      .home-live-event-top{{display:flex;justify-content:space-between;align-items:center;gap:8px;color:#9dabe0;font-size:9px;font-weight:900;text-transform:uppercase;letter-spacing:.06em}}
+      .home-live-event-top b{{color:#d8e0ff;font-size:11px;letter-spacing:0}}
+      .home-live-event-card>strong{{font-size:13px;color:#f2f5ff;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
+      .home-live-event-card>small{{font-size:9px;color:#93a0bb;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
+      .home-live-countdown{{font-family:Georgia,serif;font-size:15px;font-weight:800;color:#aebcff;margin-top:2px}}
       @media(max-width:900px){{
         .member-home-desktop{{display:none!important}}
         .mobile-home-compact{{display:block;padding-top:78px}}
@@ -14445,7 +14495,17 @@ def _render_member_home(data: dict[str, Any], request: Request) -> str:
         .mobile-home-admin-links img{{width:30px;height:30px;object-fit:contain}}
         .mobile-home-admin-links span{{font-weight:800;font-size:14px}}
         .mobile-home-admin-links strong{{font-size:25px;color:#8e9cff;text-align:right;line-height:1}}
-        .mobile-home-compact + .aion-home-map{{margin-top:0!important}}
+        .home-live-events{{margin:12px 0 10px;padding:11px;border-radius:14px}}
+        .home-live-events-head{{margin-bottom:8px}}
+        .home-live-events-head strong{{font-size:16px}}
+        .home-live-events-grid{{grid-template-columns:repeat(3,minmax(0,1fr));gap:6px}}
+        .home-live-event-card{{padding:8px 7px;border-radius:11px;text-align:center}}
+        .home-live-event-top{{display:grid;grid-template-columns:1fr;justify-items:center;gap:2px;font-size:8px}}
+        .home-live-event-card>strong{{font-size:10px;white-space:normal;line-height:1.15;min-height:23px;display:grid;place-items:center}}
+        .home-live-event-card>small{{display:none}}
+        .home-live-countdown{{font-size:12px}}
+        .mobile-home-compact + .home-live-events{{margin-top:0!important}}
+        .home-live-events + .aion-home-map{{margin-top:0!important}}
         .aion-home-map{{margin-bottom:0!important}}
       }}
       @media(max-width:380px){{
@@ -14482,7 +14542,36 @@ def _render_member_home(data: dict[str, Any], request: Request) -> str:
       {mobile_admin_links}
     </section>
 
+    {home_live_events}
     {aion_map_panel}
+    <script>
+      (function homeAionEventCountdowns(){{
+        const cards=[...document.querySelectorAll('.home-live-event-card[data-event-time]')];
+        if(!cards.length)return;
+        let reloading=false;
+        function tick(){{
+          const now=Date.now();
+          cards.forEach(card=>{{
+            const target=Date.parse(card.dataset.eventTime||'');
+            const out=card.querySelector('.home-live-countdown');
+            if(!Number.isFinite(target)||!out)return;
+            let delta=Math.max(0,target-now);
+            if(delta<=0){{
+              out.textContent='läuft jetzt';
+              if(!reloading){{reloading=true;setTimeout(()=>location.reload(),2500);}}
+              return;
+            }}
+            const total=Math.floor(delta/1000);
+            const d=Math.floor(total/86400);
+            const h=Math.floor((total%86400)/3600);
+            const m=Math.floor((total%3600)/60);
+            const s=total%60;
+            out.textContent=(d?d+'T ':'')+(h?String(h).padStart(2,'0')+'h ':'')+String(m).padStart(2,'0')+'m '+String(s).padStart(2,'0')+'s';
+          }});
+        }}
+        tick();setInterval(tick,1000);
+      }})();
+    </script>
     '''
     return _html_shell("Gildenzentrale · Guild Platform", body, nav_mode=_nav_mode_for_request(request))
 
