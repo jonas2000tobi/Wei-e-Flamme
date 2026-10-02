@@ -96,7 +96,7 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
-ASSET_VER = "guild-platform-v2-14-1-ui-fix"
+ASSET_VER = "guild-platform-v2-14-0-runtime"
 DASHBOARD_RELEASE_VERSION = "2.14.0 · PostgreSQL Runtime, Support & Aion-2"
 
 _EVENT_IMAGE_ASSETS: dict[str, str] = {
@@ -4992,40 +4992,37 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "member", active_nav_h
   <meta property="og:image" content="{_e(_brand_image('banner', 'beer_and_buffs_opengraph.webp'))}">
   <meta name="theme-color" content="{_e(brand['accent_color'])}">
   <style>
-    :root {{ --bg:#090b10; --panel:#141923; --panel2:#1b2230; --text:#eef2f7; --muted:#9da8b6; --gold:{_e(brand['accent_color'])}; --line:#303947; --red:#d96868; --green:#81c784; --side:#0b0e14; --side2:#131923; }}
+    :root {{ --bg:#060913; --panel:#101625; --panel2:#141d31; --text:#eef2f7; --muted:#a7b2c8; --gold:{_e(brand['accent_color'])}; --line:#313a54; --red:#d96868; --green:#81c784; --side:#070b14; --side2:#10182b; --violet:#6f73ff; --indigo:#4e61b9; }}
     * {{ box-sizing:border-box; }} html {{ scroll-behavior:smooth; }}
-    body {{ margin:0; font-family:Inter, system-ui, Segoe UI, sans-serif; background:linear-gradient(180deg,rgba(5,6,9,.56),rgba(5,6,9,.88)), url("{_asset('dashboard_bg.webp')}") center center / cover fixed no-repeat; color:var(--text); overflow-x:hidden; cursor:default; }}
-    body * {{ cursor:inherit; }}
-    a, button, summary, select, label[for], input[type="button"], input[type="submit"], input[type="reset"], input[type="checkbox"], input[type="radio"], [role="button"] {{ cursor:pointer !important; }}
-    input:not([type]), input[type="text"], input[type="search"], input[type="number"], input[type="email"], input[type="password"], input[type="url"], input[type="tel"], input[type="datetime-local"], input[type="date"], input[type="time"], textarea, [contenteditable="true"] {{ cursor:text !important; }}
+    body {{ margin:0; font-family:Inter, system-ui, Segoe UI, sans-serif; background:linear-gradient(180deg,rgba(4,5,11,.54),rgba(4,6,14,.86)), radial-gradient(circle at 50% 18%,rgba(78,97,185,.16),transparent 34%), url("{_asset('oblivion_voidhall_bg.png')}") center center / cover fixed no-repeat; color:var(--text); overflow-x:hidden; }}
     .app-shell {{ display:grid; grid-template-columns:260px minmax(0,1fr); min-height:100vh; }}
-    .sidebar {{ position:sticky; top:0; height:100vh; overflow:auto; scrollbar-width:none; -ms-overflow-style:none; padding:18px 14px; background:linear-gradient(180deg,rgba(17,18,26,.97),rgba(11,12,18,.97)); border-right:1px solid rgba(214,168,79,.16); box-shadow:16px 0 45px rgba(0,0,0,.35); }}
+    .sidebar {{ position:sticky; top:0; height:100vh; overflow:auto; scrollbar-width:none; -ms-overflow-style:none; padding:18px 14px; background:linear-gradient(180deg,rgba(11,14,24,.97),rgba(7,9,17,.97)); border-right:1px solid rgba(126,136,255,.14); box-shadow:16px 0 45px rgba(0,0,0,.42), inset -1px 0 0 rgba(214,168,79,.08); backdrop-filter:blur(4px); }}
     .sidebar::-webkit-scrollbar {{ width:0; height:0; display:none; }}
-    .mobile-nav-toggle {{ display:none; border:1px solid rgba(214,168,79,.24); border-radius:12px; background:linear-gradient(180deg,rgba(32,35,45,.92),rgba(13,14,20,.86)); color:var(--text); font-weight:800; padding:10px 12px; cursor:pointer; }}
-    .brand {{ display:flex; align-items:center; gap:12px; padding:8px 8px 18px; margin-bottom:8px; border-bottom:1px solid rgba(214,168,79,.14); }}
-    .brand-mark {{ width:54px; height:54px; border-radius:16px; background:radial-gradient(circle at 35% 30%,rgba(214,168,79,.18),rgba(32,35,45,.9)); border:1px solid rgba(214,168,79,.24); display:grid; place-items:center; overflow:hidden; }}
+    .mobile-nav-toggle {{ display:none; border:1px solid rgba(126,136,255,.22); border-radius:12px; background:linear-gradient(180deg,rgba(24,28,46,.94),rgba(11,14,24,.90)); color:var(--text); font-weight:800; padding:10px 12px; cursor:pointer; box-shadow:0 10px 24px rgba(0,0,0,.28); }}
+    .brand {{ display:flex; align-items:center; gap:12px; padding:8px 8px 18px; margin-bottom:8px; border-bottom:1px solid rgba(126,136,255,.10); }}
+    .brand-mark {{ width:54px; height:54px; border-radius:16px; background:radial-gradient(circle at 35% 30%,rgba(100,112,255,.22),rgba(18,22,35,.92)); border:1px solid rgba(126,136,255,.18); display:grid; place-items:center; overflow:hidden; }}
     .brand-mark img {{ width:52px; height:52px; object-fit:contain; filter:drop-shadow(0 2px 8px rgba(0,0,0,.75)); }}
     .brand strong {{ display:block; font-size:18px; }} .brand span {{ display:block; color:#e5c982; font-size:12px; }}
     .side-nav {{ display:flex; flex-direction:column; gap:6px; scrollbar-width:none; -ms-overflow-style:none; }}
     .side-nav::-webkit-scrollbar, .sidebar-footer::-webkit-scrollbar {{ width:0; height:0; display:none; }}
     .side-nav a, .side-nav summary {{ color:var(--text); text-decoration:none; padding:10px 12px; border-radius:12px; display:flex; align-items:center; gap:9px; font-size:14px; cursor:pointer; }}
-    .side-nav a:hover, .side-nav summary:hover {{ background:rgba(214,168,79,.09); color:var(--gold); }}
-    .side-nav a.active {{ background:linear-gradient(90deg,rgba(214,168,79,.18),rgba(214,168,79,.06)); color:var(--gold); border:1px solid rgba(214,168,79,.24); }}
-    .side-nav details {{ border-top:1px solid rgba(214,168,79,.10); padding-top:8px; margin-top:8px; }}
-    .side-nav details.nav-info {{ margin-top:20px; padding-top:16px; border-top:1px solid rgba(214,168,79,.24); }}
+    .side-nav a:hover, .side-nav summary:hover {{ background:linear-gradient(90deg,rgba(88,99,185,.14),rgba(214,168,79,.05)); color:var(--gold); }}
+    .side-nav a.active {{ background:linear-gradient(90deg,rgba(88,99,185,.20),rgba(214,168,79,.08)); color:var(--gold); border:1px solid rgba(126,136,255,.24); box-shadow:inset 0 1px 0 rgba(255,255,255,.03); }}
+    .side-nav details {{ border-top:1px solid rgba(126,136,255,.10); padding-top:8px; margin-top:8px; }}
+    .side-nav details.nav-info {{ margin-top:20px; padding-top:16px; border-top:1px solid rgba(126,136,255,.18); }}
     .side-nav summary {{ color:var(--muted); text-transform:uppercase; letter-spacing:.08em; font-size:11px; font-weight:800; list-style:none; }}
     .side-nav summary::-webkit-details-marker {{ display:none; }}
     .side-nav details a {{ margin-left:8px; padding:9px 11px; font-size:13px; color:#ead9ae; }}
     .sidebar-logo-link {{ display:block; flex:0 0 auto; color:inherit; text-decoration:none; border-radius:14px; }}
     .sidebar-logo-link:focus-visible {{ outline:2px solid var(--gold); outline-offset:3px; }}
-    .side-nav .admin-portal-button {{ margin:0 0 6px 0; border:1px solid rgba(214,168,79,.34); background:linear-gradient(90deg,rgba(214,168,79,.18),rgba(65,82,101,.18)); color:var(--gold); font-weight:800; }}
+    .side-nav .admin-portal-button {{ margin:0 0 6px 0; border:1px solid rgba(126,136,255,.28); background:linear-gradient(90deg,rgba(84,95,178,.22),rgba(214,168,79,.10)); color:var(--gold); font-weight:800; }}
     .side-nav .admin-back {{ margin:0 0 6px 0; border:1px solid rgba(129,199,132,.25); background:rgba(129,199,132,.08); color:#bfe8c1; font-weight:800; }}
 
-    .sidebar-footer {{ margin-top:18px; padding-top:14px; border-top:1px solid rgba(214,168,79,.12); display:grid; gap:8px; }}
-    .sidebar-footer a {{ color:var(--muted); text-decoration:none; font-size:13px; padding:8px 10px; border-radius:10px; }} .sidebar-footer a:hover {{ color:var(--gold); background:rgba(214,168,79,.08); }}
+    .sidebar-footer {{ margin-top:18px; padding-top:14px; border-top:1px solid rgba(126,136,255,.12); display:grid; gap:8px; }}
+    .sidebar-footer a {{ color:var(--muted); text-decoration:none; font-size:13px; padding:8px 10px; border-radius:10px; }} .sidebar-footer a:hover {{ color:var(--gold); background:rgba(88,99,185,.10); }}
     main.content {{ max-width:1380px; width:100%; margin:0 auto; padding:22px 24px 70px; }}
     .topnav {{ display:flex; gap:8px; flex-wrap:wrap; padding:0; margin:0 0 18px; background:transparent; border:0; box-shadow:none; }}
-    .topnav a {{ color:var(--text); text-decoration:none; padding:8px 11px; border:1px solid var(--line); border-radius:12px; background:linear-gradient(180deg,rgba(32,35,45,.82),rgba(13,14,20,.78)); font-size:12px; display:inline-flex; align-items:center; gap:7px; box-shadow:inset 0 1px 0 rgba(255,255,255,.04); }}
+    .topnav a {{ color:var(--text); text-decoration:none; padding:8px 11px; border:1px solid var(--line); border-radius:12px; background:linear-gradient(180deg,rgba(21,25,40,.88),rgba(10,12,20,.82)); font-size:12px; display:inline-flex; align-items:center; gap:7px; box-shadow:inset 0 1px 0 rgba(255,255,255,.04), 0 8px 18px rgba(0,0,0,.18); }}
     .topnav a::before {{ content:""; width:18px; height:18px; flex:0 0 18px; background:center / contain no-repeat; filter:drop-shadow(0 1px 3px rgba(0,0,0,.7)); display:none; }}
     .topnav a[href="/"]::before {{ display:block; background-image:url("{_asset('nav_kommando.png')}"); }}
     .topnav a[href="/overview"]::before {{ display:block; background-image:url("{_asset('nav_kommando.png')}"); }}
@@ -5046,18 +5043,14 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "member", active_nav_h
     .topnav a[href="/system"]::before {{ display:block; background-image:url("{_asset('nav_system.png')}"); }}
     .topnav a[href="/exports"]::before {{ display:block; background-image:url("{_asset('nav_exports.png')}"); }}
     .topnav a:hover {{ border-color:var(--gold); color:var(--gold); transform:translateY(-1px); }}
-    .aion-faction-display{{display:inline-flex;align-items:center;gap:5px;vertical-align:middle}}
-    .aion-faction-icon{{position:relative;display:inline-grid;width:34px;height:34px;place-items:center;flex:0 0 34px}}
-    .aion-faction-fallback{{position:absolute;inset:0;display:grid;place-items:center;color:#8f6fd1;font-size:24px;line-height:1}}
-    .aion-faction-img{{position:relative;z-index:1;width:34px!important;height:34px!important;object-fit:contain;background:transparent}}
     .hero {{ position:relative; overflow:hidden; display:flex; justify-content:space-between; gap:18px; align-items:center; min-height:300px; padding:34px; border:1px solid rgba(218,166,74,.38); background-image:linear-gradient(90deg,rgba(6,8,14,.82) 0%,rgba(9,12,20,.54) 45%,rgba(9,12,20,.12) 100%),url("{hero_banner}"); background-position:center center; background-size:cover; background-repeat:no-repeat; border-radius:22px; margin-bottom:18px; box-shadow:0 24px 60px rgba(0,0,0,.50), inset 0 0 0 1px rgba(255,220,150,.06); }}
-    .hero::after {{ content:""; position:absolute; inset:0; pointer-events:none; background:radial-gradient(circle at 76% 50%,rgba(214,168,79,.16),transparent 34%), linear-gradient(180deg,transparent,rgba(0,0,0,.24)); }}
+    .hero::after {{ content:""; position:absolute; inset:0; pointer-events:none; background:radial-gradient(circle at 76% 50%,rgba(93,105,230,.22),transparent 34%), linear-gradient(180deg,transparent,rgba(0,0,0,.24)); }}
     .hero > * {{ position:relative; z-index:1; }}
     .hero h1::before {{ content:""; display:inline-block; width:38px; height:38px; margin-right:10px; vertical-align:-8px; background:url("{brand_logo}") center / contain no-repeat; filter:drop-shadow(0 2px 7px rgba(0,0,0,.8)); }}
     .hero-actions {{ display:grid; grid-template-columns:repeat(3,minmax(142px,1fr)); gap:12px; min-width:min(520px,100%); }}
-    .hero-action {{ position:relative; overflow:hidden; color:var(--text); text-decoration:none; border:1px solid rgba(214,168,79,.22); border-radius:18px; padding:14px 15px; background:linear-gradient(135deg,rgba(32,35,45,.86),rgba(12,13,19,.78)); box-shadow:inset 0 1px 0 rgba(255,255,255,.05), 0 14px 26px rgba(0,0,0,.22); display:grid; gap:3px; min-height:82px; }}
-    .hero-action::before {{ content:""; position:absolute; inset:-60% -30%; background:radial-gradient(circle at 25% 18%,rgba(214,168,79,.20),transparent 32%); opacity:.9; pointer-events:none; }}
-    .hero-action:hover {{ transform:translateY(-2px); border-color:rgba(214,168,79,.55); box-shadow:inset 0 1px 0 rgba(255,255,255,.08), 0 18px 36px rgba(0,0,0,.34); }}
+    .hero-action {{ position:relative; overflow:hidden; color:var(--text); text-decoration:none; border:1px solid rgba(126,136,255,.18); border-radius:18px; padding:14px 15px; background:linear-gradient(135deg,rgba(21,25,40,.88),rgba(10,12,19,.80)); box-shadow:inset 0 1px 0 rgba(255,255,255,.05), 0 14px 26px rgba(0,0,0,.26); display:grid; gap:3px; min-height:82px; }}
+    .hero-action::before {{ content:""; position:absolute; inset:-60% -30%; background:radial-gradient(circle at 25% 18%,rgba(93,105,230,.24),transparent 34%); opacity:.9; pointer-events:none; }}
+    .hero-action:hover {{ transform:translateY(-2px); border-color:rgba(126,136,255,.42); box-shadow:inset 0 1px 0 rgba(255,255,255,.08), 0 18px 36px rgba(0,0,0,.34); }}
     .hero-action span,.hero-action strong,.hero-action small {{ position:relative; z-index:1; }}
     .hero-action span {{ font-size:22px; line-height:1; }}
     .hero-action strong {{ font-size:15px; letter-spacing:.01em; }}
@@ -5070,10 +5063,10 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "member", active_nav_h
     .muted {{ color:var(--muted); }}
     .grid {{ display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:12px; margin:18px 0; }}
     .mini-grid {{ margin:12px 0 18px; }}
-    .card,.panel {{ background:linear-gradient(180deg,rgba(24,26,34,.94),rgba(16,18,25,.94)), url("{_asset('panel_texture.webp')}") center / cover; border:1px solid rgba(214,168,79,.16); border-radius:16px; box-shadow:0 10px 30px rgba(0,0,0,.32), inset 0 1px 0 rgba(255,255,255,.03); }}
+    .card,.panel {{ background:linear-gradient(180deg,rgba(17,21,34,.95),rgba(10,13,22,.95)), url("{_asset('panel_texture.webp')}") center / cover; border:1px solid rgba(126,136,255,.14); border-radius:16px; box-shadow:0 10px 30px rgba(0,0,0,.34), inset 0 1px 0 rgba(255,255,255,.03); }}
     .card {{ padding:16px; }} .card-title {{ color:var(--muted); font-size:13px; }} .card-value {{ font-size:28px; font-weight:800; color:var(--gold); }} .card-sub {{ color:var(--muted); font-size:12px; }}
     .panel {{ padding:18px; margin:14px 0; scroll-margin-top:70px; }}
-    .subpanel {{ background:rgba(32,35,45,.72); border:1px solid var(--line); border-radius:14px; padding:14px; margin:12px 0; }}
+    .subpanel {{ background:rgba(18,23,37,.78); border:1px solid var(--line); border-radius:14px; padding:14px; margin:12px 0; }}
     .analytics-grid {{ display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:12px; margin:12px 0 18px; }}
     .metric {{ background:var(--panel2); border:1px solid var(--line); border-radius:14px; padding:14px; }}
     .metric span {{ display:block; color:var(--muted); font-size:13px; }} .metric strong {{ display:block; color:var(--gold); font-size:28px; }} .metric small {{ color:var(--muted); }}
@@ -5081,12 +5074,12 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "member", active_nav_h
     .home-layout {{ display:grid; grid-template-columns:minmax(0,2fr) minmax(300px,1fr); gap:18px; align-items:start; }}
     .home-stack {{ display:grid; gap:14px; }}
     .home-list {{ display:grid; gap:10px; margin-top:12px; }}
-    .home-item {{ display:grid; grid-template-columns:44px minmax(0,1fr) auto; gap:12px; align-items:center; padding:13px 14px; border:1px solid rgba(214,168,79,.14); border-radius:14px; background:rgba(32,35,45,.55); }}
-    .home-icon {{ width:44px; height:44px; border-radius:12px; display:grid; place-items:center; background:rgba(214,168,79,.12); border:1px solid rgba(214,168,79,.18); font-size:20px; }}
+    .home-item {{ display:grid; grid-template-columns:44px minmax(0,1fr) auto; gap:12px; align-items:center; padding:13px 14px; border:1px solid rgba(126,136,255,.14); border-radius:14px; background:rgba(18,23,37,.62); }}
+    .home-icon {{ width:44px; height:44px; border-radius:12px; display:grid; place-items:center; background:rgba(93,105,230,.12); border:1px solid rgba(126,136,255,.18); font-size:20px; }}
     .home-title {{ font-weight:800; color:var(--text); }} .home-meta {{ color:var(--muted); font-size:13px; margin-top:3px; }}
     .action-list {{ display:grid; gap:10px; margin-top:12px; }}
     .action-list .btn {{ display:block; text-align:center; background:transparent; color:var(--text); border:1px solid rgba(241,234,219,.55); }}
-    .action-list .btn:hover {{ color:#111; background:var(--gold); border-color:var(--gold); }}
+    .action-list .btn:hover {{ color:#10131f; background:var(--gold); border-color:var(--gold); }}
     .bar-row {{ display:grid; grid-template-columns:110px 1fr 44px; gap:10px; align-items:center; margin:8px 0; }} .bar-label,.bar-value {{ color:var(--muted); font-size:13px; }}
     .bar-track {{ height:10px; background:#0b0c10; border:1px solid var(--line); border-radius:999px; overflow:hidden; }} .bar-fill {{ height:100%; background:linear-gradient(90deg,var(--gold),#f2d58a); }}
     .table-search {{ width:100%; max-width:420px; margin:8px 0 12px; padding:10px 12px; border-radius:10px; border:1px solid var(--line); background:#08090d; color:var(--text); outline:none; }}
@@ -6227,13 +6220,6 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "member", active_nav_h
   </style>
 </head>
 <body><a class="mobile-home-back" href="/member" aria-label="Zur Startseite" title="Zur Startseite">←</a><div class="app-shell">{(_sidebar_html() if nav_mode == "admin" else _member_sidebar_html())}<main class="content">{auth_note}{body}</main></div><script>
-(function aionFactionIcons(){{
-  document.querySelectorAll('.aion-faction-img').forEach(function(img){{
-    const fallback=img.parentElement&&img.parentElement.querySelector('.aion-faction-fallback');
-    const sync=function(){{if(fallback) fallback.style.display=(img.complete&&img.naturalWidth>0)?'none':'inline-grid';}};
-    img.addEventListener('load',sync); img.addEventListener('error',sync); sync();
-  }});
-}})();
 (function mobileHomeBack(){{
   const back = document.querySelector('.mobile-home-back');
   if (!back) return;
@@ -9473,7 +9459,7 @@ def _member_event_rows(snap: dict[str, Any], user_id: int) -> list[list[Any]]:
 
 def _render_member_detail(data: dict[str, Any], user_id: int, current_user: Optional[dict[str, Any]] = None, request: Optional[Request] = None) -> str:
     if not data.get("ok"):
-        return _html_shell("Mitglied", f"<section class='panel'><h1>👤 Mitglied</h1><p class='muted'>{_e(data.get('error'))}</p></section>", nav_mode=(_nav_mode_for_request(request) if request is not None else "member"))
+        return _html_shell("Mitglied", f"<section class='panel'><h1>👤 Mitglied</h1><p class='muted'>{_e(data.get('error'))}</p></section>", nav_mode="member")
 
     snap: dict[str, Any] = data.get("snapshot") or {}
     uid = int(user_id)
@@ -9491,7 +9477,7 @@ def _render_member_detail(data: dict[str, Any], user_id: int, current_user: Opti
         return _html_shell(
             "Mitglied nicht gefunden",
             "<section class='panel'><h1>❌ Mitglied nicht gefunden</h1><p class='muted'>Dieses Mitglied ist nicht im aktuellen Gilden-Snapshot vorhanden.</p><p><a class='btn' href='/member/members'>Zurück</a></p></section>",
-            nav_mode=(_nav_mode_for_request(request) if request is not None else "member"),
+            nav_mode="member",
         )
 
     aion = (_aion2_profiles_for_users(guild_id, [uid]).get(uid) or {}) if guild_id else {}
@@ -12148,9 +12134,8 @@ def _aion2_faction_display_html(value: Any, *, with_name: bool = True) -> str:
     meta = AION2_FACTION_META[key]
     url = _asset(str(meta.get("asset") or ""))
     label = str(meta.get("label") or key)
-    img = f'<img class="aion-faction-img" src="{_e(url)}" alt="" title="{_e(label)}" loading="lazy" onerror="this.style.display=\'none\'" style="width:34px;height:34px;object-fit:contain;vertical-align:middle">'
-    fallback = f'<span class="aion-faction-fallback" aria-hidden="true">◈</span>'
-    return _raw(f'<span class="aion-faction-display"><span class="aion-faction-icon">{fallback}{img}</span>' + (f'<span>{_e(label)}</span>' if with_name else "") + '</span>')
+    img = f'<img src="{_e(url)}" alt="{_e(label)}" title="{_e(label)}" style="width:34px;height:34px;object-fit:contain;vertical-align:middle">'
+    return _raw(img + (f' <span>{_e(label)}</span>' if with_name else ""))
 
 def _aion2_role_icon_html(value: Any, *, with_label: bool = False) -> str:
     role = normalize_event_role(value)
@@ -12410,7 +12395,7 @@ def character_editor_page(request: Request, msg: str = "", _: bool = Depends(_au
             _html_shell(
                 "Charakter-Editor Fehler",
                 f"<section class='panel'><h1>❌ Charakter-Editor Fehler</h1><p>{_e(type(exc).__name__)}: {_e(exc)}</p></section>",
-                nav_mode=_nav_mode_for_request(request),
+                nav_mode="member",
             ),
             status_code=500,
         )
@@ -13723,7 +13708,7 @@ def _render_member_portal(data: dict[str, Any], user_id: int, request: Request, 
         return _html_shell(
             "Profil · Beer and Buffs Dashboard",
             f"<section class='panel'><h1>👤 Mein Profil</h1><p class='muted'>{_e(data.get('error'))}</p></section>",
-            nav_mode=_nav_mode_for_request(request),
+            nav_mode="member",
         )
     if not _portal_can_view(request, int(user_id)):
         raise HTTPException(status_code=403, detail="Du darfst nur dein eigenes Profil sehen. Leitung/Admins sehen alle Mitglieder.")
@@ -14151,7 +14136,7 @@ def _render_member_home(data: dict[str, Any], request: Request) -> str:
         return _html_shell(
             "Mitgliederbereich · Guild Platform",
             f"<section class='panel'><h1>🏠 Mitgliederbereich</h1><p class='muted'>{_e(data.get('error'))}</p></section>",
-            nav_mode=_nav_mode_for_request(request),
+            nav_mode="member",
         )
 
     user = _current_user(request) or {}
@@ -14754,7 +14739,7 @@ def _render_member_auctions_page(data: dict[str, Any], request: Request) -> str:
         return _html_shell(
             "Auktionen · Mitgliederbereich",
             f"<section class='panel'><h1>🏆 Auktionen</h1><p class='muted'>{_e(data.get('error'))}</p></section>",
-            nav_mode=_nav_mode_for_request(request),
+            nav_mode="member",
         )
 
     snap: dict[str, Any] = data.get("snapshot") or {}
@@ -15215,7 +15200,7 @@ def _member_roster_relative(value: Any) -> str:
 
 def _render_member_members_page(data: dict[str, Any], request: Request) -> str:
     if not data.get("ok"):
-        return _html_shell("Mitglieder", f"<section class='panel'><h1>👥 Mitglieder</h1><p class='muted'>{_e(data.get('error'))}</p></section>", nav_mode=_nav_mode_for_request(request))
+        return _html_shell("Mitglieder", f"<section class='panel'><h1>👥 Mitglieder</h1><p class='muted'>{_e(data.get('error'))}</p></section>", nav_mode="member")
 
     snap: dict[str, Any] = data.get("snapshot") or {}
     guild_id = int(_safe_guild_id(data) or 0)
@@ -15293,7 +15278,7 @@ def _render_member_members_page(data: dict[str, Any], request: Request) -> str:
 
 def _render_member_ec_page(data: dict[str, Any], request: Request) -> str:
     if not data.get("ok"):
-        return _html_shell("Meine EC · Mitgliederbereich", f"<section class='panel'><h1>🪙 Meine EC</h1><p class='muted'>{_e(data.get('error'))}</p></section>", nav_mode=_nav_mode_for_request(request))
+        return _html_shell("Meine EC · Mitgliederbereich", f"<section class='panel'><h1>🪙 Meine EC</h1><p class='muted'>{_e(data.get('error'))}</p></section>", nav_mode="member")
     uid = _current_user_id(request)
     snap: dict[str, Any] = data.get("snapshot") or {}
     balance = _balance_map(snap).get(int(uid or 0)) if uid else None
@@ -15692,32 +15677,7 @@ def _render_admin_settings_editor(data: dict[str, Any], msg: str = "", section: 
             application_lead_role_id = int(_dashboard_module_setting_value(guild_id, "onboarding", "application_lead_role_id", 0) or 0)
             if not application_lead_role_id:
                 application_lead_role_id = int(_guild_setting_value(guild_id, "guild_role_leader_id", 0) or 0)
-            onboarding_mode = str(_dashboard_module_setting_value(guild_id, "onboarding", "mode", "pm") or "pm").strip().lower()
-            if onboarding_mode not in {"pm", "server"}:
-                onboarding_mode = "pm"
             onboarding_config_html = f"""
-            <section class='settings-card'>
-              <div class='settings-card-head'>
-                <div><div class='eyebrow'>Onboarding & Recruitment</div><h2>🚪 Onboarding-Modus</h2><p class='muted'>Wähle genau einen Ablauf. Beide Modi nutzen dieselben Fragen: Bewerber/Freund/Allianz und – falls Aion 2 aktiv ist – Klasse + Charaktername.</p></div>
-                <span class='pill ok'>{'Server-Onboarding' if onboarding_mode == 'server' else 'PM-Onboarding'}</span>
-              </div>
-              <form method='post' action='/admin/onboarding-mode-settings' class='settings-form'>
-                <label>Modus
-                  <select name='onboarding_mode'>
-                    <option value='pm' {'selected' if onboarding_mode == 'pm' else ''}>PM-Onboarding</option>
-                    <option value='server' {'selected' if onboarding_mode == 'server' else ''}>Server-Onboarding</option>
-                  </select>
-                </label>
-                <div class='settings-readonly-grid'>
-                  <div><span>PM-Onboarding</span><strong>Bot schreibt privat</strong></div>
-                  <div><span>Server-Onboarding</span><strong>Privater Kanal + Zugriffssperre</strong></div>
-                  <div><span>Fragen</span><strong>Bewerber / Freund / Allianz</strong></div>
-                  <div><span>Aion 2</span><strong>Klasse + Charaktername</strong></div>
-                </div>
-                <p class='muted'>Beim Server-Onboarding erstellt der Bot automatisch die Rolle <code>Onboarding offen</code>, die Kategorie <code>ONBOARDING</code> und pro neuem Nutzer einen privaten Kanal. Bis zur Annahme bleibt der öffentliche Bereich gesperrt. Ein Staff-Review ist in diesem Modus immer Pflicht.</p>
-                <button class='btn' type='submit'>Onboarding-Modus speichern</button>
-              </form>
-            </section>
             <section class='settings-card'>
               <div class='settings-card-head'>
                 <div><div class='eyebrow'>Onboarding & Recruitment</div><h2>👋 Welcome Card</h2><p class='muted'>Beim Serverbeitritt erscheint eine Nachricht mit Avatar, Name und Zufallsspruch. Dieselbe Nachricht wird während des Onboardings automatisch aktualisiert.</p></div>
@@ -15754,7 +15714,7 @@ def _render_admin_settings_editor(data: dict[str, Any], msg: str = "", section: 
             </section>
             <section class='settings-card'>
               <div class='settings-card-head'>
-                <div><div class='eyebrow'>PM-Onboarding</div><h2>📝 Privater Bewerbungs-Chat</h2><p class='muted'>Nur für PM-Onboarding: Wählt jemand <strong>Bewerber</strong>, kann nach dem Ausfüllen zusätzlich ein privater Bewerbungs-Chat für Bewerber und Lead erstellt werden. Beim Server-Onboarding wird stattdessen der bereits vorhandene private Onboarding-Kanal verwendet.</p></div>
+                <div><div class='eyebrow'>Onboarding & Recruitment</div><h2>📝 Privater Bewerbungs-Chat</h2><p class='muted'>Wählt jemand im Onboarding <strong>Bewerber</strong>, erstellt der Bot nach Abschluss automatisch einen privaten Textkanal für Bewerber und Lead. Der Kanal wird beim Review direkt verlinkt.</p></div>
                 <span class='pill {'ok' if application_chat_enabled else ''}'>{'Aktiv' if application_chat_enabled else 'Aus'}</span>
               </div>
               <form method='post' action='/admin/onboarding-aion2-settings' class='settings-form'>
