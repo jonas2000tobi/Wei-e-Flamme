@@ -20966,214 +20966,548 @@ def _aion2_event_timer_html() -> str:
 
 
 
-WAKAYASHI_CLASS_GUIDE_DATA: dict[str, dict[str, Any]] = {
+WAKAYASHI_CLASS_GUIDES: dict[str, dict[str, Any]] = {
     "gladiator": {
-        "article_url": "https://wakayashi.gg/aion2/aion-2-gladiator-pve-guide-skills-rotation-makros-wichtige-tipps",
-        "asset_key": "gladiator",
-        "hero_role": "Bruiser · Nahkampf · Großschwert",
-        "lead": "Der Gladiator ist DD und Notfall-Tank in einer Klasse. Der Wakayashi-Build dreht sich vor allem um Front-Attacks, starken Gruppennutzen und Abwärtsschlag als zentrale Schadensquelle.",
-        "tags": ["Front-Attack", "Bruiser", "Offensive Buffs", "Makro-Playstyle"],
-        "quick": [("Kernskill", "Abwärtsschlag ist der Hauptschaden und eine wichtige Aggro-Quelle."), ("Burst", "Furorausbruch macht Abwärtsschlag ohne Bedingung nutzbar und verstärkt den Schaden."), ("Tempo", "Angriffsstellung liefert Kampftempo und bringt die Rotation in Fahrt."), ("Flex", "Kann im schweren Content tanken und sonst offensiv mitlaufen.")],
-        "rotation": ["Am Boss möglichst vorn stehen und Front-Attacks mitnehmen.", "Furorausbruch früh zünden, um das Abwärtsschlag-Fenster zu öffnen.", "Abwärtsschlag konsequent priorisieren; im Early Game zusammen mit Linksklick, später teils nur noch über das Makro.", "Stagger- und Lifesteal-Fenster aktiv ausnutzen, damit der Gladiator stabil und aggressiv bleibt."],
-        "skills": [("Abwärtsschlag", "Hauptschaden und wichtigster Mastery-Skill im Setup."), ("Furorausbruch", "Aktiviert das zentrale Burst-Fenster."), ("Angriffsstellung", "Combat-Speed für mehr Flow und Uptime."), ("Scharfer Schlag", "Frühe Aggro- und Mana-Stütze, vor allem im Tank-Kontext.")],
-        "tips": ["Front-Attack ist Pflicht, weil Buffs und Schaden davon profitieren.", "Gladiator bringt der ganzen Gruppe offensive Unterstützung und wird mit besserem Gear immer komfortabler.", "Mit und ohne Templer lohnen sich unterschiedliche Stigma-Presets."]
+        "asset": "gladiator",
+        "source": "https://wakayashi.gg/aion2/aion-2-gladiator-pve-guide-skills-rotation-makros-wichtige-tipps",
+        "eyebrow": "Aion 2 · Klassen Build · Bruiser",
+        "lead": "Nahkampf-DD, Notfall-Tank und Buff-Maschine. Der Gladiator spielt immer über Front-Attacks und baut seinen Schaden rund um Abwärtsschlag, Furorausbruch und Angriffsstellung auf.",
+        "pills": ["Gladiator", "Bruiser · Großschwert", "Front-Attack", "Makro + Weaving"],
+        "quick": [
+            ("Rolle", "Ohne Templer wirst du durch die hohe Aggro der Rotation praktisch automatisch Main-Tank."),
+            ("Kernschaden", "Abwärtsschlag ist der zentrale Schadens- und Aggro-Skill."),
+            ("Breakpoint", "Furorausbruch plus Remove-Cooldown-Spezialisierung macht Abwärtsschlag später dauerhaft spambar."),
+            ("Front-Attack", "Nicht hinter dem Boss stehen: Gladiator will konsequent von vorne angreifen."),
+            ("Preset", "Mit Templer Zikels Segen, ohne Templer Fokussierter Block für Erfahrener Konterangriff."),
+        ],
+        "overview_title": "Was der Gladiator macht",
+        "overview_html": "<p>Der Gladiator verbindet starken Nahkampfschaden mit sehr hoher Eigenstabilität und gruppenweiten Buffs. Fehlt ein Templer, erzeugt seine normale Rotation so viel Aggro, dass er den Boss ohnehin tankt.</p><div class='chanter-callout'><b>Wichtig:</b> Front-Attack ist Kern des Builds. Selbst wenn ein Templer tankt, stellst du dich vorne dazu, damit die Front-Attack-Boni aktiv bleiben.</div><h3>Gruppennutzen</h3><p>Offensive Buffs erhöhen den Gruppen-DPS, während Lifesteal und defensive Effekte die Gruppe zusätzlich stabilisieren.</p>",
+        "mechanic_title": "Abwärtsschlag & Cooldown-Engine",
+        "mechanic_html": "<p><strong>Abwärtsschlag</strong> ist dein Bread-and-Butter-Skill. <strong>Furorausbruch</strong> macht ihn für ein Zeitfenster ohne normale Bedingung nutzbar; die wichtigste Spezialisierung entfernt den eigenen Cooldown.</p><p><strong>Angriffsstellung</strong> liefert Kampftempo. Auf höherem Level sorgt sie bei Crits zusätzlich dafür, dass Cooldowns herunterrauschen.</p><div class='chanter-callout'><b>Late Game:</b> Sobald Furorausbruch und Angriffsstellung genug Uptime liefern, fällt der Auto-Attack aus der Rotation und du hältst hauptsächlich noch die Makro-Taste.</div>",
+        "flow": ["5 · Angriffsstellung", "Zikels Segen / Block", "E · Verheerender Schlag", "R · Furorausbruch", "RMB halten", "Early: LMB dazu"],
+        "flow_text": "Vor dem Boss die Buffs sauber setzen. Danach Makro laufen lassen, Abwärtsschlag spammen und nur im Early Game zusätzlich Linksklick halten, solange Mana und Uptime noch nicht reichen.",
+        "hotbar": [
+            ("1", "Sprungangriff", "Gap Closer; beim Open-World-Farmen kann der Kill den Cooldown zurücksetzen."),
+            ("2", "Sturmhieb", "Dash/Gap Closer nach Dodge oder im Flug."),
+            ("3", "Spottklinge", "CC und situative Heilung über Spezialisierung."),
+            ("4", "Zerschmetternde Welle", "AoE/Filler, auch zum Zusammenziehen beim Farmen nützlich."),
+            ("5", "Angriffsstellung", "Wichtigster Tempo-Buff und Kern der Cooldown-Engine."),
+            ("Q", "Fokussierter Block", "Ohne Templer für aktiven Block und Erfahrener Konterangriff."),
+            ("E", "Verheerender Schlag", "Starker Schaden + Kampfbereitschaft; liegt im Makro."),
+            ("LMB", "Scharfer Schlag", "Early Mana/Aggro und Auto-Attack; später nicht mehr nötig."),
+            ("RMB", "Makro", "Angriffsstellung → Verheerender Schlag → Furorausbruch."),
+        ],
+        "priorities": [
+            ("1", "Abwärtsschlag", "Hauptschaden; zuerst auf Ziellevel bringen und Remove Cooldown nehmen."),
+            ("2", "Zerreißender Schlag", "Starker Filler und später wichtige Mana-Quelle."),
+            ("3", "Verheerender Schlag", "Damage-Buff und starker Skill im Makro."),
+            ("4", "Erfahrener Konterangriff", "Wichtigste Passive für Front-Attack und Gruppenbuff nach Block."),
+        ],
+        "stigmas": [
+            ("Angriffsstellung", "Pflicht; Combat Speed und später starke Cooldown-Reduktion."),
+            ("Zikels Segen", "Mit Templer im Team die offensive Standardwahl."),
+            ("Klinge des Lebensraubs", "Lifesteal; ab höherem Level sehr starker Gruppenwert."),
+            ("Furorausbruch", "Öffnet das Abwärtsschlag-Fenster und ist zentral für den Build."),
+        ],
+        "stigma_extra": "Ohne Templer Zikels Segen gegen Fokussierter Block tauschen, damit Erfahrener Konterangriff zuverlässig ausgelöst wird.",
+        "macro_title": "Makro richtig einrichten",
+        "macro_html": "<p>Makro auf RMB legen. Die Kernreihenfolge besteht aus <strong>Angriffsstellung → Verheerender Schlag → Furorausbruch</strong>. Early zusätzlich Linksklick halten; später reicht durch die höhere Abwärtsschlag-Uptime das Makro allein.</p><div class='chanter-callout'><b>Preset:</b> Mit Templer offensiver spielen. Ohne Templer Block mitnehmen und damit den Gruppenbuff über Erfahrener Konterangriff auslösen.</div>",
+        "weave_title": "Front-Attack, Block & Sustain",
+        "weave_html": "<p>Blockbare Bossangriffe kannst du aktiv negieren und gleichzeitig deinen Front-Attack-Gruppenbuff auslösen. Spottklinge und Zerschmetternde Welle helfen beim HP-Haushalt; Klinge des Lebensraubs macht den ganzen Trupp deutlich stabiler.</p><p>Im Stagger-Fenster Klingenraserei ausnutzen; der Gladiator gehört zu den Klassen mit besonders viel Stagger-Potenzial.</p>",
     },
     "templar": {
-        "article_url": "https://wakayashi.gg/aion2/aion-2-templer-pve-guide-skills-rotation-makros-wichtige-tipps",
-        "asset_key": "templar",
-        "hero_role": "Tank · Schwert & Schild · Defensive Kontrolle",
-        "lead": "Der Templer ist in Wakayashis Einschätzung der klassische Volltank: extrem defensiv, mit sehr zuverlässiger Aggro und einer der entspanntesten Klassen zum Leveln und Lernen von Bosskämpfen.",
-        "tags": ["Tank", "Leichter Einstieg", "Aggro-Kontrolle", "Schwert & Schild"],
-        "quick": [("Rolle", "Hält Aggro konstant und stabilisiert die Gruppe."), ("Einfachheit", "Gilt als beste Klasse zum Durchleveln und für einen stressfreien Start."), ("Defensive", "Aktive Blocks und Schutz-Skills machen harten Content deutlich sicherer."), ("Solo", "Für Story und Open World sehr angenehm, auch weil er viel verzeiht.")],
-        "rotation": ["Pull kontrolliert beginnen und die Aggro-Skills früh setzen.", "Aktiven Block und Defensiv-Cooldowns nicht horten, sondern an echte Schadensspitzen koppeln.", "Gruppenschutz und Debuffs aktiv halten, damit die Gruppe sicherer und effizienter spielt.", "Im Solo-/Farm-Setup mehr offensive Skills einbauen, im Gruppen-Setup klar tankig bleiben."],
-        "skills": [("Aggro-Skills", "Der Templer stiehlt und hält Aggro besonders zuverlässig."), ("Aktiver Block", "Erlaubt es, viele Mechaniken direkt zu fressen und trotzdem stehen zu bleiben."), ("Defensiv-Cooldowns", "Wichtig für harten Content und on-item-level Dungeons."), ("Gruppenschutz", "Macht selbst squishy Gruppenmitglieder stabiler.")],
-        "tips": ["Wenn du eine sichere Mainstory- oder Einstiegs-Klasse willst, ist Templer laut Wakayashi ganz vorne.", "Der Gladiator ist offensiver, der Templer defensiver – für schwereren Content meist die ruhigere Wahl.", "Presets für Solo und Group Tanking lohnen sich auch hier."]
+        "asset": "templar",
+        "source": "https://wakayashi.gg/aion2#class-guides",
+        "eyebrow": "Aion 2 · Klassen Build · Tank",
+        "lead": "Der klassische defensive Tank mit Schwert und Schild: sehr hohe Stabilität, zuverlässige Aggro und ein besonders leichter Einstieg in Story, Dungeons und Bossmechaniken.",
+        "pills": ["Templer", "Tank · Schwert & Schild", "Front-Attack", "Leichter Einstieg"],
+        "quick": [
+            ("Rolle", "Klassischer Main-Tank mit sehr zuverlässiger Aggro."),
+            ("Defensive", "Aktive Blocks und viele defensive Effekte verzeihen Fehler."),
+            ("Leveling", "Wakayashi nennt den Templer die entspannteste Klasse zum Durchleveln."),
+            ("Front", "Wie Gladiator spielt der Templer den Boss von vorne."),
+            ("Gruppe", "Defensive Gruppenbuffs machen auch fragile Mitspieler deutlich stabiler."),
+        ],
+        "overview_title": "Was der Templer macht",
+        "overview_html": "<p>Der Templer ist der Volltank von Aion 2. Er hält Aggro sehr zuverlässig und bringt genug defensive Werkzeuge mit, um auch on-item-level Content ruhig zu spielen.</p><div class='chanter-callout'><b>Stärke:</b> Er ist weniger offensiv als der Gladiator, dafür aber die sicherere Wahl, wenn der Content wirklich weh tut.</div><h3>Einsteigerfreundlich</h3><p>Gerade die Hauptstory ist knackig; Wakayashi hebt den Templer deshalb als besonders angenehmen ersten Charakter hervor.</p>",
+        "mechanic_title": "Aggro, Block & Gruppenschutz",
+        "mechanic_html": "<p>Das Templer-Gameplay dreht sich um konstante Aggro, Front-Positioning und aktives Blocken. Viele Bossangriffe lassen sich dadurch abfangen, ohne dass du die Position aufgeben musst.</p><p>Seine defensiven Gruppenbuffs helfen nicht nur dir selbst, sondern auch den DDs und Supports, die sonst schneller umfallen würden.</p><div class='chanter-callout'><b>Praxis:</b> Defensive Cooldowns nicht für 'später' horten. Sie gehören genau in die großen Schadensspitzen und Mechaniken.</div>",
+        "flow": ["Boss sauber pullen", "Aggro aufbauen", "Front halten", "Blockbare Treffer abfangen", "Gruppenschutz timen", "Damage-Filler"],
+        "flow_text": "Der Templer ist weniger eine starre Burst-Rotation als sauberes Tank-Management: Position halten, Aggro nicht verlieren und Defensives genau dann drücken, wenn es gebraucht wird.",
+        "hotbar": [
+            ("1", "Gap Closer", "Schnell zum Ziel und den Pull sauber eröffnen."),
+            ("2", "Aggro-Kette", "Früh Feindseligkeit aufbauen und den Boss sicher binden."),
+            ("3", "Control", "CC/Unterbrechung situativ nutzen."),
+            ("4", "AoE-Aggro", "Für mehrere Ziele und Trash-Packs."),
+            ("Q", "Aktiver Block", "Blockbare Mechaniken negieren und Front-Uptime halten."),
+            ("E", "Defensiv-CD", "Für große Boss-Hits und Schadensspitzen."),
+            ("LMB", "Auto-Attack", "Filler und frühes Ressourcen-Management."),
+            ("RMB", "Makro", "Standardkette für Damage/Aggro, sofern im eigenen Setup verwendet."),
+        ],
+        "priorities": [
+            ("1", "Aggro-Skills", "Zuerst die Skills priorisieren, die Bosskontrolle und Feindseligkeit sichern."),
+            ("2", "Aktiver Block", "Direkter Überlebenswert und bessere Uptime an Mechaniken."),
+            ("3", "Defensive Kernskills", "Schadensspitzen planbar machen statt nur reagieren."),
+            ("4", "Offensive Filler", "Danach Schaden erhöhen, ohne Tank-Funktion zu schwächen."),
+        ],
+        "stigmas": [
+            ("Tank-Preset", "Defensive Stigmas für Progress und on-item-level Content."),
+            ("Solo-Preset", "Mehr Schaden für Story, Farmen und Routine-Content."),
+            ("Block-Fokus", "Stigma-Auswahl auf aktive Schadensnegierung ausrichten."),
+            ("Gruppenschutz", "Für harte Gruppenmechaniken defensiven Support priorisieren."),
+        ],
+        "stigma_extra": "Die Wakayashi-Hauptseite führt den Templer als Tank, veröffentlicht dort aber aktuell nicht dieselbe Detailtiefe wie beim Gladiator/Kantor. Deshalb keine erfundenen exakten Stigma-Level.",
+        "macro_title": "Makro & Bedienung",
+        "macro_html": "<p>Beim Templer sollte das Makro nur die wiederholbaren Damage-/Aggro-Ketten übernehmen. Block, Notfall-Defensives und wichtige Gruppen-Cooldowns bleiben manuell, damit sie nicht in einem falschen Moment verbraucht werden.</p><div class='chanter-callout'><b>Grundsatz:</b> Alles, was einen Boss-Hit retten soll, gehört nicht blind ins Makro.</div>",
+        "weave_title": "Tank-Uptime statt Dummy-DPS",
+        "weave_html": "<p>Die Stärke des Templers ist nicht ein einzelner Burst-Knopf, sondern dass er dort stehen bleiben kann, wo andere Klassen ausweichen müssen. Block, Schild und defensive Tools erhöhen dadurch indirekt auch deine Damage-Uptime.</p><p>Für Solo-Inhalte lohnt ein offensiveres Preset; im Gruppen-Progress bleibt Stabilität wichtiger.</p>",
     },
     "assassine": {
-        "article_url": "https://wakayashi.gg/aion2/aion-2-assassinen-pve-guide-skillrotation-makros-alle-skills-erklaert",
-        "asset_key": "assassin",
-        "hero_role": "Melee-DPS · Back-Attack · Burst-Klasse",
-        "lead": "Der Assassine ist die schwerste der hier abgedeckten Klassen und lebt von kurzen, extrem starken Burst-Fenstern. Laut Wakayashi musst du Bossmechaniken kennen, damit deine Buffs nicht ins Leere laufen.",
-        "tags": ["Back-Attack", "Burst", "Stealth", "Weaving"],
-        "quick": [("Burst-Fenster", "Swift Contract und Illusive Clone eröffnen die stärkste Schadensphase."), ("Positioning", "Mit Shadow Strike springst du in den Rücken und nimmst Back-Attacks mit."), ("Stacks", "Insignien werden mit Savage Fang / Savage Roar aufgebaut und mit Insignia Explosion geplatzt."), ("Settings", "Skill Queue auf Off und Quick Slice für Animation-Cancel nutzen.")],
-        "rotation": ["Vor dem Burst Swift Contract und Illusive Clone aktivieren.", "Mit Shadow Strike hinter den Boss springen und dann Herzstoß spammen.", "Parallel Insignien-Stacks aufbauen und bei 5 Stapeln mit Insignia Explosion detonieren.", "Rechtsklick-Makro für Savage Fang + Insignia Explosion nutzen und Weaving über Linksklick/Quick Slice mitnehmen."],
-        "skills": [("Swift Contract", "Buff für Combat Speed und Burst-Fenster."), ("Illusive Clone", "Macht Herzstoß im Burst quasi dauerhaft spambar."), ("Shadow Strike", "Back-Attack-Positioning plus zusätzlicher Schadenswert."), ("Insignia Explosion", "Explodiert volle Stacks und wird mit mehr Progress immer wichtiger.")],
-        "tips": ["Display Boss Orientation Indicator einschalten, damit du Front/Back sofort siehst.", "Wenn der Boss gleich verschwindet, Burst lieber kurz halten statt alles zu verschwenden.", "Für harten Content wird Wakayashi zufolge oft defensiver umgeskillt."]
+        "asset": "assassin",
+        "source": "https://wakayashi.gg/aion2/aion-2-assassinen-pve-guide-skillrotation-makros-alle-skills-erklaert",
+        "eyebrow": "Aion 2 · Klassen Build · Melee DPS",
+        "lead": "Extrem Burst-lastiger Nahkämpfer. Der Assassine plant seine Bufffenster um Bossmechaniken, springt konsequent in den Rücken und verbindet Herzstoß-Spam mit dem Insignien-System.",
+        "pills": ["Assassine", "Melee-DPS · Dolche", "Back-Attack", "Burst + Weaving"],
+        "quick": [
+            ("Burst", "Pakt der Flinkheit + Illusion eröffnen das stärkste Schadensfenster."),
+            ("Position", "Shadow Strike bringt dich in den Rücken und liefert zusätzlichen Crit-Damage-Buff."),
+            ("Herzstoß", "Illusion entfernt den Cooldown und macht Herzstoß im Burst spambar."),
+            ("Insignien", "5 Stacks sammeln und mit Insignia Explosion detonieren."),
+            ("Settings", "Skill Queue Off und Boss Orientation Indicator einschalten."),
+        ],
+        "overview_title": "Burst-Klasse mit Hausaufgaben",
+        "overview_html": "<p>Der Assassine gehört zu den anspruchsvollsten Klassen. Während die Buffs laufen, ist der Schaden extrem hoch; danach folgt eine deutliche Downtime.</p><div class='chanter-callout'><b>Wichtig:</b> Kenn die Bossmechaniken. Wenn du Pakt der Flinkheit und Illusion kurz vor einer I-Frame oder Bewegung zündest, verpufft dein stärkstes Fenster.</div><h3>Immer von hinten</h3><p>Die Klasse lebt von Back-Attacks. Shadow Strike, Infiltrate und Flash Slice helfen dir, die Position schnell wiederherzustellen.</p>",
+        "mechanic_title": "Herzstoß & Insignien",
+        "mechanic_html": "<p>Die erste Kombo ist dein Bufffenster: <strong>Pakt der Flinkheit → Illusion → Shadow Strike → Herzstoß</strong>. Illusion entfernt den Herzstoß-Cooldown.</p><p>Parallel läuft das Insignien-System: Savage Fang gibt sofort 5 Stacks, Savage Roar und die Passive bauen weitere auf. Bei 5 Stacks folgt <strong>Insignia Explosion</strong>.</p><div class='chanter-callout'><b>Später:</b> Mit mehr Combat Speed wird Insignia Explosion immer wichtiger, weil die Stack-Erzeugung häufiger triggert.</div>",
+        "flow": ["4 · Pakt der Flinkheit", "4 · Illusion", "1 · Shadow Strike", "LMB + RMB", "Herzstoß spammen", "5 Stacks → Explosion"],
+        "flow_text": "Buffs schon während des Pulls vorbereiten, dann mit Shadow Strike in den Rücken. Shadow Strike später auch allein wegen seines Crit-Damage-Buffs auf Cooldown nutzen, sofern der Boss nicht gleich wegspringt.",
+        "hotbar": [
+            ("1", "Shadow Strike", "In den Rücken springen; zusätzlich wichtiger Crit-Damage-Buff."),
+            ("2", "Infiltrate", "Mobility nach Dodge, wenn Shadow Strike nicht verfügbar ist."),
+            ("3", "Flash Slice", "Zusätzliche Bewegung; dreht dich um 180 Grad."),
+            ("4", "Swift Contract / Illusion", "Die beiden Burst-Buffs immer in dieser Reihenfolge."),
+            ("LMB", "Quick Slice", "Mana, Weaving/Animation Cancel und Cooldown-Hilfe für Insignia Explosion."),
+            ("RMB", "Makro", "Savage Fang + Insignia Explosion als Kern des Makros."),
+        ],
+        "priorities": [
+            ("1", "Herzstoß", "Aktuell wichtigste direkte Schadensquelle im Burst."),
+            ("2", "Insignia Explosion", "Wird mit mehr Combat Speed und Progress immer wichtiger."),
+            ("3", "Quick Slice", "Mana + Weaving + Cooldown-Interaktion."),
+            ("4", "Shadow Strike", "Position und 20 % Crit-Damage-Buff über die passende Spezialisierung."),
+        ],
+        "stigmas": [
+            ("Savage Fang", "5 Insignien-Stacks sofort; offensiv und Teil des Standard-Makros."),
+            ("Triniel's Dagger", "Kann auf höherem Level All-Skill-Cooldowns zurückgeben."),
+            ("Evasion Stance", "Für harten Content statt Savage Fang als aktiver Block."),
+            ("Throw Shadow Blade", "Open-World-Alternative zum schnellen Taggen und Hinterherspringen."),
+        ],
+        "stigma_extra": "Global stehen zunächst nur vier Stigma-Slots zur Verfügung. Darum Presets je nach Content bauen statt alles gleichzeitig mitnehmen.",
+        "macro_title": "Makro richtig einrichten",
+        "macro_html": "<p>Makro-Taste auf RMB legen. Im Makro stehen <strong>Savage Fang</strong> und <strong>Insignia Explosion</strong>. LMB/Quick Slice gleichzeitig halten, damit die Animationen gecancelt werden und Mana zurückkommt.</p><div class='chanter-callout'><b>Skill Queue:</b> Wakayashi empfiehlt für den Assassinen aktuell <strong>Off</strong>.</div>",
+        "weave_title": "Quick Slice & Back-Attack",
+        "weave_html": "<p>Quick Slice ist Auto-Attack, Manaquelle und Weaving-Werkzeug in einem. Der schwarze Schatten am Charakter zeigt das Animation Cancelling.</p><p>Boss Orientation Indicator auf All oder Back stellen. Orange zeigt dir die Rückseite; genau dort willst du als Assassine stehen.</p>",
     },
     "jaeger": {
-        "article_url": "https://wakayashi.gg/aion2/aion-2-jaeger-ranger-pve-guide-skills-rotation-makros-wichtige-tipps",
-        "asset_key": "ranger",
-        "hero_role": "Range-DPS · Pet-Farming · Bogenschütze",
-        "lead": "Der Jäger ist laut Wakayashi die beste Farm-Klasse im Spiel. Seine große Reichweite und die sehr einfache Grundkombo machen ihn perfekt, um Pet-Fortschritt für den ganzen Server-Account zu farmen.",
-        "tags": ["Fernkampf", "Farm-Klasse", "Pet-Farming", "Einfacher Einstieg"],
-        "quick": [("Farming", "Mit Schnellschuss taggt der Jäger Monster schneller als fast jede andere Klasse."), ("Kernskill", "Deadshot ist der wichtigste Skill und wird im Kampf einfach gehalten/aufgeladen."), ("Makro", "Markierungsgeschoss gehört nicht ins Makro, weil die Animation zu lang ist."), ("Linksklick", "Snipe auf LMB bringt Mana zurück und verbessert die Deadshot-Uptime.")],
-        "rotation": ["Im Kampf Deadshot/Fokus-Schuss sauber geladen verwenden.", "Markierungsgeschoss manuell kurz vor Ablauf des Buffs nachdrücken.", "Snipe/Linksklick zum Weaving, Mana-Management und Cooldown-Trick einsetzen.", "Das Rechtsklick-Makro im AION-2-Modus laufen lassen, nicht im AION-1-Modus."],
-        "skills": [("Schnellschuss", "Wichtig fürs Taggen und die Open-World-Farm-Situation."), ("Deadshot", "Der zentrale Boss-Damage-Skill des Jägers."), ("Markierungsgeschoss", "Starker Buff, aber manuell einsetzen statt Makro."), ("Snipe", "Linksklick-Tool für Mana und bessere Skill-Uptime.")],
-        "tips": ["Als Twink besonders attraktiv, weil Pet-Fortschritt serverweit mitgenommen wird.", "Sehr guter Pick für entspanntes Leveln und Open World.", "Weniger kompliziert als Assassin, aber mit starkem Mehrwert fürs Farmen."]
+        "asset": "ranger",
+        "source": "https://wakayashi.gg/aion2/aion-2-jaeger-ranger-pve-guide-skills-rotation-makros-wichtige-tipps",
+        "eyebrow": "Aion 2 · Klassen Build · Range DPS",
+        "lead": "Einfacher Fernkampf-DD und Wakayashis klare Farm-Empfehlung. Der Jäger kombiniert riesige Reichweite, starke AoEs und Deadshot als zentralen Charge-Skill.",
+        "pills": ["Jäger", "Range-DPS · Bogen", "Pet-Farming", "Makro + Weaving"],
+        "quick": [
+            ("Farming", "Schnellschuss taggt Monster extrem schnell und macht den Jäger zum idealen Pet-Farmer."),
+            ("Kernschaden", "Deadshot/Zielpfeil immer vollständig aufladen."),
+            ("Buffs", "Weiselshoheit → Unterstützungsfeuer → Segensbogen, dann Markierungsgeschoss und Orkanpfeil."),
+            ("Weaving", "Snipe auf LMB cancelt Animationen und gibt Mana zurück."),
+            ("Makro", "Drill Dart, Weiselshoheit und Gale Arrow; Markierungsgeschoss bleibt manuell."),
+        ],
+        "overview_title": "Warum der Jäger so stark beim Farmen ist",
+        "overview_html": "<p>Die große Reichweite und Schnellschuss machen den Jäger ideal, um Open-World-Mobs schneller zu taggen als Nahkampfklassen. Besonders wichtig ist das fürs Pet Genus Insight System.</p><div class='chanter-callout'><b>Account-Nutzen:</b> Der Pet-Fortschritt gilt serverweit. Ein Ranger-Twink kann also auch deinen Main indirekt voranbringen.</div><h3>Einfacher Einstieg</h3><p>Die Grundkombo ist sehr straightforward und eignet sich deshalb gut für Spieler, die einen entspannten Ranged-Start suchen.</p>",
+        "mechanic_title": "Deadshot & Self-Buffs",
+        "mechanic_html": "<p><strong>Deadshot</strong> ist der wichtigste Boss-Skill und muss voll aufgeladen werden. Daneben laufen mehrere Self-Buffs, die du möglichst in guten Damage-Fenstern bündelst.</p><p><strong>Markierungsgeschoss</strong> gehört nicht ins Makro: Die Animation ist lang. Erst bei ungefähr zwei Sekunden Restlaufzeit des Buffs manuell nachdrücken.</p><div class='chanter-callout'><b>Snipe:</b> Hohe Priorität, weil der Skill Weaving, Mana und später zusätzliche Deadshot-Uptime liefert.</div>",
+        "flow": ["3× Buffs", "1 · Markierung", "5 · Orkanpfeil", "2 · Deadshot halten", "LMB + RMB", "Markierung bei ~2 s erneuern"],
+        "flow_text": "Die drei reinen Self-Buffs kannst du schon während des Tank-Pulls vorbereiten. Danach Markierungsgeschoss, Orkanpfeil, Deadshot und anschließend LMB/RMB als Dauerbedienung.",
+        "hotbar": [
+            ("1", "Markierungsgeschoss", "Manuell bei etwa 2 Sekunden Restbuff erneuern; nicht ins Makro."),
+            ("2", "Deadshot", "Voll aufladen und im Kampf gehalten nutzen."),
+            ("3", "Self-Buffs", "Weiselshoheit, Unterstützungsfeuer, Segensbogen nacheinander."),
+            ("5", "Orkanpfeil", "Teil des Openers und starker Buff-/Damage-Baustein."),
+            ("LMB", "Snipe", "Weaving, Mana und Cooldown-Unterstützung."),
+            ("RMB", "Makro", "Drill Dart → Weiselshoheit → Gale Arrow."),
+            ("Extra", "Tempest Shot", "Auf separate Maustaste fürs Open-World-Tagging legen."),
+        ],
+        "priorities": [
+            ("1", "Snipe", "Sehr hohe Priorität; ab Lv. 12 wichtig für bessere Deadshot-Uptime."),
+            ("2", "Deadshot", "Wird mit Progress zur wichtigsten Damage-Quelle."),
+            ("3", "Self-Buffs", "Buff-Uptime maximieren, aber nicht in Boss-I-Frames verschwenden."),
+            ("4", "Mana", "Early bei Problemen ruhig MP-Regulation nutzen und später umstellen."),
+        ],
+        "stigmas": [
+            ("Pflicht-Stigmas", "Vier Kern-Stigmas bilden aktuell das Standard-PvE-Setup."),
+            ("Griffin Arrow", "Kann je nach Vier-Slot-Setup gegen Explosive Arrow diskutiert werden."),
+            ("Buff-Fokus", "Wichtige Buff-Stigmas situativ und nicht blind per Makro feuern."),
+            ("Farm-Preset", "Tempest Shot und AoE-Fokus für Open World getrennt denken."),
+        ],
+        "stigma_extra": "Die globale Version startet mit vier Stigma-Slots. Änderungen am fünften/sechsten Slot später direkt aus der Originalquelle übernehmen.",
+        "macro_title": "Makro richtig einrichten",
+        "macro_html": "<p>RMB als Makro-Taste im AION-2-Modus. Makroblöcke: <strong>Drill Dart → Weiselshoheit → Gale Arrow</strong>. Markierungsgeschoss und Deadshot bleiben manuell, damit Animation und Charge nicht falsch abgefeuert werden.</p><div class='chanter-callout'><b>Skill Queue:</b> Wakayashi spielt aktuell Off, empfiehlt aber wegen Ping die Gegenprobe am DPS-Meter.</div>",
+        "weave_title": "Snipe, Mobility & Open World",
+        "weave_html": "<p>LMB/Snipe cancelt Animationen und hält dein Mana stabil. Markierungsgeschoss kann sich bei Bewegung gleichzeitig als Dash in die jeweilige Richtung verhalten.</p><p>Für Pet-Farming Tempest Shot separat binden und Mobs nur antaggen; Deadshot ist dort wegen der langen Animation eher ungeeignet.</p>",
     },
     "zauberer": {
-        "article_url": "https://wakayashi.gg/aion2/aion-2-zauberer-sorc-pve-guide-skills-rotation-makros-wichtige-tipps",
-        "asset_key": "sorcerer",
-        "hero_role": "Magie-DPS · Feuer & Eis · Ranged",
-        "lead": "Der Zauberer – beziehungsweise die Sorc – steht für klassischen Fernkampf-Burst mit viel visueller Wucht. Wakayashi beschreibt die Klasse als relativ leicht zugänglich, mit großer Reichweite, eigenem Schild und Kontrolle über Feuer- und Eis-Effekte.",
-        "tags": ["Magie-DPS", "Fernkampf", "Shield", "Feuer & Eis"],
-        "quick": [("Spielgefühl", "Sehr klassischer Mage mit starker Optik und viel Distanzspiel."), ("Sicherheit", "Eigener Schild und Kontrollwerkzeuge helfen beim Überleben."), ("Einfachheit", "Gilt als vergleichsweise einfacher Ranged-Pick."), ("Progress", "Ideal für Spieler, die lieber ranged stehen als Mechaniken im Nahkampf zu lösen.")],
-        "rotation": ["Distanz halten und Burst-Fenster sauber in sichere Boss-Phasen legen.", "Defensive Tools wie Schild und Control nicht ignorieren – sie machen die Klasse komfortabel.", "Im Schadensfenster die großen Feuer-/Eis-Skills bündeln und Füller nur zwischen Cooldowns nutzen.", "Makro- und Weaving-Setup wie in Wakayashis allgemeinem Skill-Guide sinnvoll mit der Klassenhotbar verzahnen."],
-        "skills": [("Burst-Spells", "Feuer- und Eis-Skills sind das Herzstück des Schadens."), ("Schutzschild", "Macht die Klasse deutlich verzeihender als viele andere DDs."), ("Kontrolle", "Freeze/Root-Effekte helfen bei Solo- und Gruppencontent."), ("Ranged-Uptime", "Weil du auf Distanz bleibst, verlierst du seltener Damage-Zeit durch Nahkampf-Mechaniken.")],
-        "tips": ["Sehr guter Pick, wenn du optischen Impact und klare Ranged-Gameplay-Loops magst.", "Zauberer, Ranger und Templer gelten bei Wakayashi als entspannt für einen ersten Charakter.", "Sobald der direkte Wakayashi-Guide weiter wächst, kann diese Seite leicht erweitert werden."]
+        "asset": "sorcerer",
+        "source": "https://wakayashi.gg/aion2#class-guides",
+        "eyebrow": "Aion 2 · Klassen Build · Magie DPS",
+        "lead": "Klassischer Ranged-Magier mit Feuer, Eis, starkem visuellen Burst und eigener Defensive. Wakayashi zählt die Sorc zu den entspannteren Klassen für einen ersten Charakter.",
+        "pills": ["Zauberer", "Magie-DPS · Fernkampf", "Feuer & Eis", "Einfacher Einstieg"],
+        "quick": [
+            ("Rolle", "Reiner Magie-DD mit hoher Reichweite."),
+            ("Sicherheit", "Eigener Schild und Eis-Control machen Solo und Bossmechaniken angenehmer."),
+            ("Chain Skills", "Die Klasse nutzt Skillketten; einzelne Tasten laufen mehrere Fähigkeiten nacheinander durch."),
+            ("Range", "Viele Mechaniken kosten weniger Uptime als bei Nahkampfklassen."),
+            ("Einstieg", "Wakayashi nennt Sorc neben Ranger und Templer als relativ entspannt."),
+        ],
+        "overview_title": "Was der Zauberer macht",
+        "overview_html": "<p>Die Sorc ist der klassische Feuer-/Eis-Magier: Distanz, Kontrolle, Schild und starke visuelle Schadensspitzen. Damit spielt sie deutlich sicherer als ein reiner Glaskanonen-Melee.</p><div class='chanter-callout'><b>Spielgefühl:</b> Wenn du lieber auf Reichweite stehst und große Zauber statt Back-/Front-Attack-Positioning willst, ist die Sorc der geradlinigere DD.</div><h3>Control</h3><p>Eis-Effekte helfen dabei, Gegner festzuhalten und Solo-Situationen ruhiger zu lösen.</p>",
+        "mechanic_title": "Chain Skills & Burst-Fenster",
+        "mechanic_html": "<p>Das Aion-2-Skillsystem arbeitet stark mit Chain Skills. Eine belegte Taste kann mehrere Skills nacheinander abspielen und Cooldowns überspringen.</p><p>Für die Sorc bedeutet das: Schadensketten sauber gruppieren und große Cooldowns bewusst in Bossfenster legen, statt alles blind durchlaufen zu lassen.</p><div class='chanter-callout'><b>Quelle:</b> Wakayashi hat aktuell Video-/Klassenmaterial zur Sorc, aber auf der Text-Hauptseite nicht dieselbe technische Detailtiefe wie beim Kantor. Daher keine erfundenen exakten Hotbar-Level.</div>",
+        "flow": ["Distanz herstellen", "Buffs vorbereiten", "große Feuer-/Eis-Kette", "Filler-Ketten", "Schild bei Druck", "Burst erneut in sichere Phase"],
+        "flow_text": "Der Grundablauf ist bewusst generisch gehalten, bis Wakayashi die vollständige Text-Hotbar in derselben Detailtiefe veröffentlicht. Die Seite bleibt aber optisch und strukturell identisch zum Kantor.",
+        "hotbar": [
+            ("1", "Chain Skill 1", "Hauptkette für wiederholbare Magie-Skills."),
+            ("2", "Burst-Kette", "Stärkere Cooldowns in guten Bossfenstern bündeln."),
+            ("3", "Control", "Eis-/CC-Werkzeuge für Solo und Mechaniken."),
+            ("4", "Buffs", "Offensive Buffs manuell und nicht in I-Frames verschwenden."),
+            ("Q", "Schild", "Defensive für unvermeidbaren Schaden."),
+            ("LMB", "Auto/Filler", "Nur soweit das konkrete Setup es für Weaving/Ressourcen braucht."),
+            ("RMB", "Makro", "Wiederholbare Skillketten; große Defensives manuell lassen."),
+        ],
+        "priorities": [
+            ("1", "Haupt-Damage-Kette", "Kernspells zuerst priorisieren."),
+            ("2", "Burst-CDs", "Schadensfenster verstärken und mit Bossphasen synchronisieren."),
+            ("3", "Ressourcen/Uptime", "Mana- und Cooldown-Probleme vor Komfort lösen."),
+            ("4", "Defensive", "Schild/Control nach Bedarf für härteren Content anheben."),
+        ],
+        "stigmas": [
+            ("Damage-Preset", "Stigmas auf maximalen Boss-DPS ausrichten."),
+            ("Control-Preset", "Mehr CC für Solo/Open World."),
+            ("Defensiv-Preset", "Schild/Überleben für Progress priorisieren."),
+            ("Farm-Preset", "AoE und Reichweite für Trash und Open World verstärken."),
+        ],
+        "stigma_extra": "Exakte Level- und Reihenfolgen bleiben bewusst offen, weil die derzeit öffentlich indexierte Wakayashi-Textquelle sie für Sorc nicht vollständig ausweist.",
+        "macro_title": "Makro & Hotbar",
+        "macro_html": "<p>Das Makro sollte wiederholbare Damage-Ketten übernehmen. Große Burst-Buffs, Schild und Control bleiben manuell, damit sie nicht in einer falschen Phase verbraucht werden.</p><div class='chanter-callout'><b>Chain Skills:</b> Aion 2 überspringt Skills auf Cooldown innerhalb einer Kette automatisch. Genau das beim Aufbau der Hotbar ausnutzen.</div>",
+        "weave_title": "Ranged-Uptime & Sicherheit",
+        "weave_html": "<p>Der größte praktische Vorteil ist die Distanz. Während Melees an vielen Mechaniken Position verlieren, kann die Sorc häufiger weiter casten.</p><p>Der eigene Schild und Eis-Control sorgen zusätzlich dafür, dass Fehler weniger hart bestraft werden.</p>",
     },
     "beschwoerer": {
-        "article_url": "https://wakayashi.gg/aion2/aion-2-beschwoerer-spiritmaster-pve-guide-skills-rotation-makros-wichtige-tipps",
-        "asset_key": "elementalist",
-        "hero_role": "Pet-DPS · Ranged · Hohe Uptime",
-        "lead": "Der Beschwörer beziehungsweise Spiritmaster punktet laut Wakayashi mit der höchsten Damage-Uptime im Spiel, weil die Pets weiter angreifen, während du Mechaniken läufst oder dich neu positionierst.",
-        "tags": ["Pet-DPS", "Fernkampf", "Hohe Uptime", "Makro-Setup"],
-        "quick": [("Uptime", "Pets hauen weiter, auch wenn du selbst gerade ausweichst."), ("Opener", "Zu Beginn werden die vier Elementar-Geister rotiert, um die ersten Stacks aufzubauen."), ("Burst", "Elementar Fusion ist der zentrale Schadensknopf nach dem Stack-Aufbau."), ("Flow", "Nach dem Setup übernimmt die normale Kombo/Makro-Rotation.")],
-        "rotation": ["Zum Start die vier Elementar-Geister einmal vollständig durchrotieren.", "Sobald die Initial-Stacks stehen, Elementar Fusion auslösen.", "Danach Buffs aktivieren und den Naturgeist beschwören, um direkt weitere Stacks zu bekommen.", "Anschließend wieder Elementar Fusion nutzen und in die reguläre Makro-/Filler-Rotation übergehen."],
-        "skills": [("Elementar-Geister", "Starten die gesamte Setup-Phase des Builds."), ("Elementar Fusion", "Zentrale Schadensspitze des Beschwörers."), ("Naturgeist", "Liefert direkt weitere Stacks für die nächste Fusion."), ("Pets allgemein", "Sorgen für die außergewöhnlich hohe Damage-Uptime.")],
-        "tips": ["Die Klasse ist besonders angenehm, wenn du in Bossmechaniken viel laufen musst.", "Weil ein Teil des Schadens über Pets kommt, fühlt sich die Uptime oft besser an als bei anderen DDs.", "Die Priorisierung von Skills und Spezialisierungen sollte regelmäßig mit der Originalseite abgeglichen werden."]
+        "asset": "elementalist",
+        "source": "https://wakayashi.gg/aion2/aion-2-beschwoerer-spiritmaster-pve-guide-skills-rotation-makros-wichtige-tipps",
+        "eyebrow": "Aion 2 · Klassen Build · Pet DPS",
+        "lead": "Spiritmaster/Beschwörer mit sehr hoher Damage-Uptime. Bis zu zwei Pets machen weiter Schaden, während du Mechaniken läufst; Elementar Fusion ist das Herzstück des Builds.",
+        "pills": ["Beschwörer", "Pet-DPS · Fernkampf", "Elementar Fusion", "Einfacher Einstieg"],
+        "quick": [
+            ("Uptime", "Pets greifen weiter an, während du selbst Bossmechaniken ausweichst."),
+            ("Stacks", "Vier Elementar-Stacks sammeln und mit Elementar Fusion detonieren."),
+            ("Opener", "1-1-1-1 → 3-3-3-3 → danach LMB + RMB halten."),
+            ("Makro", "Elementar Fusion, Joint Strike Curse und Wind Spirit."),
+            ("Pet-Regel", "Vor Pull ohne Target beschwören und beim Laufen Pets wegschicken, damit sie keinen Trash ziehen."),
+        ],
+        "overview_title": "Warum der Beschwörer so anfängerfreundlich ist",
+        "overview_html": "<p>Der Spiritmaster hat laut Wakayashi die höchste Damage-Uptime im Spiel, weil seine Pets selbst dann weiterhauen, wenn du selbst nur mit Ausweichen beschäftigt bist.</p><div class='chanter-callout'><b>Easy-Tag:</b> Gerade in neuen Dungeons bleibt dein Schaden moderat, obwohl du Mechaniken noch nicht perfekt kennst.</div><h3>Feuergeist</h3><p>Nach dem initialen Durchrotieren der Elementare bleibt normalerweise der Feuergeist draußen, weil er den höchsten Schaden liefert.</p>",
+        "mechanic_title": "Elementar Fusion & vier Stacks",
+        "mechanic_html": "<p>Vier Elementar-Stacks aktivieren <strong>Elementar Fusion</strong>. Jeder beschworene Elementargeist liefert beim Initialisieren einen Stack; auch Auto-Attacks können weitere erzeugen.</p><p>Der Naturgeist gibt beim Beschwören direkt vier Stacks und damit eine sofortige weitere Fusion.</p><div class='chanter-callout'><b>Passive:</b> Spirit Revitalization ist zentral, weil sie die Cooldowns der Spirit Summons senken kann und damit mehr Fusion-Uptime erzeugt.</div>",
+        "flow": ["1-1-1-1 · vier Geister", "Elementar Fusion", "Buff 1 + 2", "Naturgeist", "Elementar Fusion", "LMB + RMB halten"],
+        "flow_text": "Zum Start alle vier Elementargeister rotieren. Danach die Buffs und den Naturgeist nutzen; anschließend übernimmt weitgehend das Makro-Gameplay.",
+        "hotbar": [
+            ("1", "Elementargeister", "Wind, Erde, Wasser, Feuer initial durchrotieren und Stacks forcieren."),
+            ("3", "Elementar Fusion", "Erscheint erst bei vier Stacks; zentraler Damage-Skill."),
+            ("3", "Naturgeist", "Temporäres Pet, das beim Beschwören sofort vier Stacks gibt."),
+            ("LMB", "Cold Shock", "Mana, Weaving und Earth-Tremor-Buff bis zu 10 % Attack."),
+            ("RMB", "Makro", "Elementar Fusion → Joint Strike Curse → Wind Spirit."),
+        ],
+        "priorities": [
+            ("1", "Elementar Fusion", "Zentrale Schadensmechanik; maximale Uptime anstreben."),
+            ("2", "Spirit Revitalization", "Schlüssel-Passive für häufigere Spirit Summons."),
+            ("3", "Joint Strike", "Koordinationsangriffe skalieren mit aktiven Geistern."),
+            ("4", "Cold Shock", "Mana, Weaving und zusätzlicher Attack-Buff."),
+        ],
+        "stigmas": [
+            ("Ancient/Nature Spirit", "In gute Damage-Phasen legen statt stumpf auf Cooldown."),
+            ("Joint Strike Curse", "Makro-Kern; Geister müssen draußen sein."),
+            ("Joint Strike Corrode", "Weiterer Koordinationsangriff mit Pet-Synergie."),
+            ("Buff-Preset", "Große Buffs manuell spielbar, wenn du Boss-I-Frames kennst."),
+        ],
+        "stigma_extra": "Wakayashi aktualisiert die genaue Priorisierung weiter, sobald zusätzliche Stigma-Slots bzw. neue Erkenntnisse verfügbar sind.",
+        "macro_title": "Makro richtig einrichten",
+        "macro_html": "<p>RMB als Makro-Taste im AION-2-Modus. Die drei Blöcke sind <strong>Elementar Fusion → Joint Strike Curse → Wind Spirit</strong>. Danach LMB/Cold Shock und RMB gleichzeitig halten.</p><div class='chanter-callout'><b>Skill Queue:</b> Wakayashi spielt aktuell Off und empfiehlt den Vergleich über den DPS-Meter.</div>",
+        "weave_title": "Cold Shock & Pet-Management",
+        "weave_html": "<p>Cold Shock auf LMB bringt Mana, Animation Cancelling und über Earth Tremor bis zu fünf Attack-Stapel.</p><p>Vor dem Boss nur ohne Target vorbeschwören, sonst startet das Pet den Pull. Zwischen Bossen Pets wegschicken, damit sie keinen Trash hinterherziehen.</p>",
     },
     "kleriker": {
-        "article_url": "https://wakayashi.gg/aion2/aion-2-kleriker-pve-guide-skills-rotation-makros-wichtige-tipps",
-        "asset_key": "cleric",
-        "hero_role": "Heiler · Support · Battle-Res",
-        "lead": "Der Kleriker ist der klassische Heiler von Aion 2. Wakayashi hebt besonders hervor, dass er die Gruppe stabil hält, gleichzeitig Schaden und Buffs mitbringen kann und mit dem Battle-Res einen enorm wichtigen Utility-Vorteil besitzt.",
-        "tags": ["Heiler", "Battle-Res", "Support", "Solo heute leichter"],
-        "quick": [("Hauptrolle", "Hält die Gruppe am Leben und rettet Fehler am zuverlässigsten."), ("Battle-Res", "Kann Spieler mitten im Kampf wiederbeleben."), ("Flex", "Heute solo deutlich angenehmer als früher, auch weil DD-Lastigkeit zugenommen hat."), ("Gruppenwert", "Bleibt in schwerem Content die sicherste Support-Wahl.")],
-        "rotation": ["Heilung und Gruppensicherheit priorisieren, statt blind jeden GCD in Schaden zu pressen.", "Battle-Res für echte Wipe-Gefahr aufsparen und nicht verschwenden.", "Zwischen Schadensspitzen ruhig offensiv unterstützen, solange die Gruppe stabil ist.", "Für Solo und Routine-Content separate Presets mit mehr Schadensfokus einplanen."],
-        "skills": [("Heals", "Bleiben die Basis des Klassenwerts im Gruppen-PvE."), ("Battle-Res", "Ein Alleinstellungsmerkmal gegenüber dem Kantor."), ("Support-Buffs", "Steigern die Stabilität und Effizienz des Runs."), ("Offensive Tools", "Machen Solo- und Farm-Inhalte heutzutage deutlich angenehmer als früher.")],
-        "tips": ["Wenn du Gruppen absichern willst, ist Kleriker die klassische und verlässlichste Wahl.", "In overgeartem Content kann ein Kantor teils den Platz einnehmen, im Progress ist der Kleriker aber Gold wert.", "Heil- und Schadens-Presets sauber trennen, statt alles in ein Setup zu pressen."]
+        "asset": "cleric",
+        "source": "https://wakayashi.gg/aion2#class-guides",
+        "eyebrow": "Aion 2 · Klassen Build · Heiler",
+        "lead": "Der klassische Gruppenheiler mit Schaden, Buffs und Battle-Res. Im schweren Content bleibt der Kleriker die verlässlichste Support-Wahl, kann heute aber deutlich angenehmer solo gespielt werden.",
+        "pills": ["Kleriker", "Heiler · Support", "Battle-Res", "Heal + Damage"],
+        "quick": [
+            ("Heilung", "Primär dafür da, die Gruppe durch echte Schadensspitzen zu bringen."),
+            ("Battle-Res", "Kann einen Spieler mitten im Kampf wiederbeleben."),
+            ("Flex", "Heute deutlich besser solo spielbar als in älteren Versionen."),
+            ("Buffs", "Neben Heilung bringt der Kleriker auch Gruppensupport und eigenen Schaden."),
+            ("Progress", "Für neuen und schweren Content sicherer als ein reiner Kantor-Support."),
+        ],
+        "overview_title": "Was der Kleriker macht",
+        "overview_html": "<p>Der Kleriker ist der klassische Heiler der Trinity. Er hält die Gruppe am Leben, unterstützt mit Buffs und kann gleichzeitig Schaden beitragen, wenn gerade keine Heilung nötig ist.</p><div class='chanter-callout'><b>Alleinstellungsmerkmal:</b> Battle-Res. Ein gefallener Spieler kann mitten im Kampf zurückgeholt werden, ohne auf einen Wipe oder einen limitierten Stein angewiesen zu sein.</div><h3>Heute besser solo</h3><p>Durch Presets und Balancing ist der Kleriker im Solo-Content deutlich angenehmer als früher.</p>",
+        "mechanic_title": "Heal-Priorität & Battle-Res",
+        "mechanic_html": "<p>Die wichtigste Entscheidung ist nicht 'welchen Damage-Skill drücke ich zuerst', sondern wann Heilung wirklich nötig ist. Gute Kleriker halten die Gruppe stabil und nutzen freie GCDs danach für Schaden.</p><p>Battle-Res wird für echte Fehler oder Wipe-Gefahr aufgehoben; er ist zu wertvoll, um ihn leichtfertig zu verbrauchen.</p><div class='chanter-callout'><b>Preset-Idee:</b> Progress-Heal und Solo/DD getrennt halten, statt ein kompromisshaftes Setup für alles zu erzwingen.</div>",
+        "flow": ["Gruppe stabilisieren", "HoT/Buffs aktiv", "Damage-Filler", "Burst-Heal bei Spike", "Cleanse/Utility", "Battle-Res bei Bedarf"],
+        "flow_text": "Beim Kleriker ist der Ablauf reaktiv. Damage kommt immer dann, wenn Heilung und Utility gerade nicht gebraucht werden; große Heal-Cooldowns bleiben bewusst manuell.",
+        "hotbar": [
+            ("1", "Single-Heal", "Schnelle direkte Heilung für akuten Schaden."),
+            ("2", "HoT", "Heilung über Zeit für konstante Gruppenschäden."),
+            ("3", "Cleanse", "Debuffs entfernen, wenn Mechaniken es verlangen."),
+            ("4", "Damage-Kette", "Offensiver Filler in sicheren Phasen."),
+            ("Q", "Defensiv-/Gruppen-CD", "Für große eingehende Schadensspitzen."),
+            ("E", "Battle-Res", "Manuell und bewusst nutzen, niemals blind im Makro."),
+            ("RMB", "Makro", "Nur wiederholbare Damage-/Filler-Ketten, keine Notfall-Heals."),
+        ],
+        "priorities": [
+            ("1", "Kern-Heals", "Zuverlässige Heilung zuerst absichern."),
+            ("2", "Battle-Res / Utility", "Gruppenrettung und Mechanik-Sicherheit."),
+            ("3", "Buffs", "Gruppennutzen erhöhen, sobald die Heilbasis steht."),
+            ("4", "Damage", "Danach offensiv skalieren und Solo-Preset ausbauen."),
+        ],
+        "stigmas": [
+            ("Heal-Preset", "Für Progress und on-item-level Content maximal stabil."),
+            ("Hybrid-Preset", "Mehr Damage für Routine-Runs mit sicherer Gruppe."),
+            ("Solo-Preset", "Offensiver für Story/Open World."),
+            ("Utility-Preset", "Cleanse/Schutz passend zur jeweiligen Mechanik."),
+        ],
+        "stigma_extra": "Die öffentlich indexierte Wakayashi-Hauptseite beschreibt Rolle, Battle-Res und Solo-Flex; exakte Stigma-Level werden hier bewusst nicht erfunden.",
+        "macro_title": "Makro & Bedienung",
+        "macro_html": "<p>Beim Heiler gehören Notfall-Heals, Cleanse und Battle-Res nicht in ein blindes Rotationsmakro. Automatisieren solltest du höchstens wiederholbare Damage- oder Filler-Ketten.</p><div class='chanter-callout'><b>Regel:</b> Alles, was eine konkrete Situation retten soll, bleibt unter deiner direkten Kontrolle.</div>",
+        "weave_title": "Heal zuerst, Schaden danach",
+        "weave_html": "<p>Der Kleriker wird nicht dadurch gut, dass er permanent heilt, sondern dadurch, dass er genau genug heilt. Sobald die Gruppe stabil ist, nutzt du freie Zeit für Schaden und Buffs.</p><p>In übergearteten Gruppen sinkt der Heilbedarf stark; dort kann der Kleriker entsprechend offensiver spielen.</p>",
     },
     "kantor": {
-        "article_url": "https://wakayashi.gg/aion2/aion-2-chanter-pve-guide-skills-rotation-makros-wichtige-tipps",
-        "asset_key": "chanter",
-        "hero_role": "Support · Hybrid · Buffs & Heal-over-Time",
-        "lead": "Der Kantor ist Wakayashis Hybrid aus Support, Schaden und etwas Heilung. Die Seite orientiert sich am Original-Guide und setzt den Fokus auf Mantras, Hoheit des Sturmwindes und Finsterbruch-Fenster.",
-        "tags": ["Hybrid", "Mantras", "Cooldown-Support", "Dark Crush"],
-        "quick": [("Mantras", "Invokation der Unbesiegbarkeit und Invokation des Sprints möglichst permanent halten."), ("Pre-Pull", "Hoheit des Sturmwindes immer vor anderen Cooldowns drücken."), ("Kernskill", "Finsterbruch ist das eigentliche Schadenszentrum des Builds."), ("Settings", "Makro minimal halten und Skill Queue auf Off testen.")],
-        "rotation": ["Mantras aktiv halten und vor dem Pull Hoheit des Sturmwindes setzen.", "Mit Wirbelschlag das erste Finsterbruch-Fenster öffnen.", "Danach Linksklick + Makro gedrückt halten und Finsterbruch-Fenster sauber ausnutzen.", "Recuperation situativ für Debuff-Cleanse und leichte Gruppenheilung einstreuen."],
-        "skills": [("Finsterbruch", "Der wichtigste Schadensskill des Kantors."), ("Wirbelschlag", "Öffnet die Finsterbruch-Fenster."), ("Hoheit des Sturmwindes", "Startet den Kampf mit wichtiger Cooldown-Unterstützung."), ("Recuperation", "Sorgt für Utility und kleine Heilschübe.")],
-        "tips": ["Kantor ersetzt nicht automatisch den Kleriker, wird aber mit Gear und Routine-Content immer interessanter.", "Je mehr Cooldown Reduction du hast, desto besser fühlt sich der Build an.", "Mehrere Presets für offensiv, defensiv und no-cleric lohnen sich deutlich."]
+        "asset": "chanter",
+        "source": "https://wakayashi.gg/aion2/aion-2-chanter-pve-guide-skills-rotation-makros-wichtige-tipps",
+        "thumb": "https://wakayashi.gg/api/yt-thumb?id=sThZpdeW07U",
+        "eyebrow": "Aion 2 · Klassen Build · Support",
+        "lead": "Hybrid aus Support, Heilung und eigenem Schaden. Der Build dreht sich darum, die Gruppenbuffs permanent aktiv zu halten, Hoheit des Sturmwindes korrekt vor dem Pull zu setzen und möglichst viele Finsterbruch-Fenster zu erzeugen.",
+        "pills": ["Chanter", "Support · Stab", "Einfacher Einstieg", "Makro + Weaving"],
+        "quick": [
+            ("Mantras", "Invokation der Unbesiegbarkeit und Invokation des Sprints möglichst permanent aktiv halten."),
+            ("Pre-Pull", "Hoheit des Sturmwindes vor jedem anderen Cooldown drücken."),
+            ("Kernschaden", "Finsterbruch ist das Schadensfundament; ab Lv. 16 mit Cooldown-Entfernung wird das Aktivierungsfenster ausgenutzt."),
+            ("Makro", "Makro enthält nur Finsterbruch. Danach 4 → 5 → LMB + RMB halten."),
+            ("Settings", "Skill Queue unter Einstellungen → Kampf deaktivieren und gegen den Combat Analyzer testen."),
+        ],
+        "overview_title": "Was der Kantor macht",
+        "overview_html": "<p>Er ist kein reiner Kleriker und kein reiner DD. Seine Stärke ist die Kombination aus Gruppensupport, etwas Heilung und eigenem Schaden. In gut eingespielten Gruppen steigt sein Wert stark, weil die Mantras und Cooldown-Unterstützung den Gesamtschaden der Gruppe anheben.</p><div class='chanter-callout'><b>Wichtig:</b> Der Kantor besitzt keinen Battle-Rez und seine Heilung ersetzt einen Kleriker nicht automatisch. Bei übergeartetem oder leichterem Content kann die Gruppe aber mit deutlich weniger klassischer Heilung auskommen.</div><h3>Die zwei Mantras laufen immer</h3><p><strong>Invokation der Unbesiegbarkeit</strong> ist der offensive Pflicht-Toggle. <strong>Invokation des Sprints</strong> liefert Movement-Speed und eine gruppenweite Heil-Aura. Einmal aktivieren und im Fight regelmäßig prüfen, dass beide noch laufen.</p>",
+        "mechanic_title": "Pre-Pull & Kernmechanik",
+        "mechanic_html": "<p><strong>Hoheit des Sturmwindes</strong> wird vor allen anderen Cooldowns gezündet. Der Effekt hilft beim Initial-Cooldown; bereits laufende Rest-Cooldowns profitieren nicht in derselben Weise.</p><p><strong>Finsterbruch</strong> ist das Schadensfundament. Verfügbar wird er nach <strong>Wirbelschlag</strong>, <strong>Wuchtschlag</strong> oder <strong>Marchutans Zorn</strong>. Ab dem wichtigen Lv.-16-Spezialisierungs-Breakpoint fällt der eigene Cooldown weg und das kurze Aktivierungsfenster kann zum Spammen genutzt werden.</p><div class='chanter-callout'><b>Skalierung:</b> Je häufiger deine Trigger zurückkommen und je mehr Cooldown Reduction du hast, desto mehr Finsterbruch-Fenster bekommst du.</div>",
+        "flow": ["Mantras aktiv", "4 · Hoheit des Sturmwindes", "5 · Wirbelschlag", "LMB + RMB halten", "3 situativ"],
+        "flow_text": "Wirbelschlag später wieder manuell einsetzen, wenn ein gutes Schadensfenster besteht. Recuperation zwischendurch für Debuff-Cleanse und etwas Gruppenheilung nutzen. Bei Bossbewegung mit 1 bzw. nach Dodge mit 2 wieder schließen.",
+        "hotbar": [
+            ("1", "Rushing Smash", "Gap Closer zurück an den Gegner."),
+            ("2", "Tremor Crush", "Nach Dodge/Shift als zweiter Gap Closer."),
+            ("3", "Recuperation", "Heal-over-Time + Debuff-Cleanse für dich und die Gruppe."),
+            ("4", "Power of the Storm", "Vor dem Pull aktivieren; wirkt auf Initial Cooldowns."),
+            ("5", "Spinning Strike", "Öffnet das erste Dark-Crush-Fenster und später erneut manuell nutzen."),
+            ("7", "Undefeated Mantra", "Dauerhafter DPS-Mantra-Toggle."),
+            ("8", "Sprint Mantra", "Movement-Speed + gruppenweite Heil-Aura als Toggle."),
+            ("LMB", "Onslaught", "Auto-Attack/Weaving, Mana-Rückgewinnung und ab Lv. 12 Cooldown-Trick."),
+            ("RMB", "Dark-Crush-Makro", "Makrotaste gedrückt halten, sobald der Opener steht."),
+        ],
+        "priorities": [
+            ("1", "Finsterbruch", "zuerst hochziehen; Lv. 16 ist der wichtige Breakpoint für die Cooldown-Entfernung."),
+            ("2", "Wirbelschlag", "zentraler Trigger für Finsterbruch und deshalb früh priorisieren."),
+            ("3", "Onslaught", "danach wegen Mana + Cooldown-Verkürzung für Wirbelschlag."),
+            ("4", "Heilung", "später; ohne Kleriker in der Gruppe entsprechend früher investieren."),
+        ],
+        "stigmas": [
+            ("Invokation der Unbesiegbarkeit", "Pflichtbuff für Gruppenschaden."),
+            ("Invokation des Sprints", "Movement + Heil-Aura; besonders stark, wenn die defensive Alternative nicht nötig ist."),
+            ("Hoheit des Sturmwindes", "Cooldown Reduction + Combat Speed; unbedingt vor dem Pull."),
+            ("Marchutans Zorn", "wichtig, weil es weitere Finsterbruch-Fenster erzeugt."),
+        ],
+        "stigma_extra": "Statt Invokation des Sprints können für härteren Content Segen des Schutzes oder Fokussierte Verteidigung sinnvoll sein. Ohne Kleriker kann zusätzlich Healing Touch interessanter werden.",
+        "macro_title": "Makro richtig einrichten",
+        "macro_html": "<p>Das Makro bleibt bewusst minimal: <strong>nur Finsterbruch</strong>. Makro-Taste unter den Key Settings auf RMB legen, im Skill-Menü das Makro aktivieren und Finsterbruch hinzufügen. Dass der Skill nicht permanent sichtbar ist, ist normal - er erscheint erst nach einem gültigen Trigger.</p><p>Im Kampf: 4 manuell, 5 manuell, anschließend LMB + RMB gedrückt halten. Bei Bewegung 1/2, für Heal/Cleanse 3.</p><div class='chanter-callout'><b>Skill Queue:</b> Unter Einstellungen → Kampf auf <strong>Off</strong> testen; Wakayashi empfiehlt aktuell Off und vergleicht das über den Combat Analyzer.</div>",
+        "weave_title": "Onslaught & Weaving",
+        "weave_html": "<p>Onslaught ist der Auto-Attack. Früh hilft er beim Mana. Ab Lv. 12 reduziert jeder Treffer den Cooldown von Wirbelschlag, wodurch Finsterbruch immer häufiger wieder geöffnet wird. LMB zusammen mit der Makro-Taste ergibt gleichzeitig das Weaving/Animation-Cancelling.</p><p>Wuchtschlag und Marchutans Zorn werden nicht sinnlos gleichzeitig verbraucht; solange ein Finsterbruch-Fenster läuft, wartet der nächste Trigger.</p>",
     },
 }
 
 
-def _wakayashi_class_asset_urls(asset_key: str) -> dict[str, str]:
-    suffix = "?v=1790512307327"
-    return {
-        "art": f"https://wakayashi.gg/cdn-cgi/image/width=700,format=auto/api/media/file/aion2-character-{asset_key}.webp{suffix}",
-        "emblem": f"https://wakayashi.gg/cdn-cgi/image/width=160,format=auto/api/media/file/aion2-emblem-{asset_key}.webp{suffix}",
-    }
+def _wakayashi_class_asset(asset_key: str, kind: str, width: int) -> str:
+    return f"https://wakayashi.gg/cdn-cgi/image/width={int(width)},format=auto/api/media/file/aion2-{kind}-{asset_key}.webp?v=1790512307327"
 
 
-
-def _wakayashi_class_guide_body(class_slug: str, class_name: str, class_hint: str, icon_url: str) -> str:
-    data = WAKAYASHI_CLASS_GUIDE_DATA.get(class_slug)
+def _class_guide_body(class_slug: str, class_name: str, class_hint: str, icon_url: str) -> str:
+    data = WAKAYASHI_CLASS_GUIDES.get(class_slug)
     if not data:
         return ""
-    assets = _wakayashi_class_asset_urls(str(data.get("asset_key") or class_slug))
-    article_url = _e(str(data.get("article_url") or AION2_EVENT_SOURCE_URL))
-    art_url = _e(assets["art"])
-    emblem_url = _e(assets["emblem"])
     icon_fallback = _e(icon_url) if icon_url else _asset("aion2_default_class.png")
-    hero_role = _e(str(data.get("hero_role") or class_hint))
-    lead = _e(str(data.get("lead") or class_hint))
-    tags = ''.join(f'<span>{_e(str(tag))}</span>' for tag in (data.get("tags") or []))
+    asset_key = str(data.get("asset") or class_slug)
+    article_url = _e(str(data.get("source") or AION2_EVENT_SOURCE_URL))
+    art_url = _e(_wakayashi_class_asset(asset_key, "character", 700))
+    emblem_url = _e(_wakayashi_class_asset(asset_key, "emblem", 160))
+    hero_bg = _e(str(data.get("thumb") or _asset("oblivion_header_desktop.png")))
+
+    hotbar_html = ''.join(
+        f'<div class="chanter-hotbar-item"><b>{_e(str(key))}</b><strong>{_e(str(skill))}</strong><span>{_e(str(desc))}</span></div>'
+        for key, skill, desc in (data.get("hotbar") or [])
+    )
     quick_html = ''.join(
-        f'<div class="wk-mini-card"><b>{_e(str(title))}</b><span>{_e(str(desc))}</span></div>'
-        for title, desc in (data.get("quick") or [])
+        f'<div class="chanter-quick"><b>{_e(str(k))}</b><span>{_e(str(v))}</span></div>'
+        for k, v in (data.get("quick") or [])
     )
-    rotation_html = ''.join(f'<li>{_e(str(item))}</li>' for item in (data.get("rotation") or []))
-    skills_html = ''.join(
-        f'<div class="wk-skill"><strong>{_e(str(name))}</strong><span>{_e(str(desc))}</span></div>'
-        for name, desc in (data.get("skills") or [])
+    priority_html = ''.join(
+        f'<div class="chanter-priority"><span>{_e(str(n))}</span><div><b>{_e(str(skill))}</b><small>{_e(str(desc))}</small></div></div>'
+        for n, skill, desc in (data.get("priorities") or [])
     )
-    tips_html = ''.join(f'<li>{_e(str(item))}</li>' for item in (data.get("tips") or []))
+    stigma_html = ''.join(
+        f'<div class="chanter-stigma"><strong>{_e(str(name))}</strong><span>{_e(str(desc))}</span></div>'
+        for name, desc in (data.get("stigmas") or [])
+    )
+    flow = list(data.get("flow") or [])
+    flow_html = ''.join(("" if i == 0 else '<i>→</i>') + f'<span>{_e(str(item))}</span>' for i, item in enumerate(flow))
+    pills_html = ''.join(f'<span>{_e(str(item))}</span>' for item in (data.get("pills") or []))
+
     return f"""
     <style>
-      .wk-guide{{display:grid;gap:14px}}
-      .wk-hero{{position:relative;overflow:hidden;min-height:330px;border-radius:22px;border:1px solid rgba(112,125,248,.34);background:linear-gradient(90deg,rgba(5,8,18,.97) 0%,rgba(5,8,18,.77) 46%,rgba(5,8,18,.18) 100%),url('{_asset("oblivion_header_desktop.png")}') center/cover no-repeat;box-shadow:0 20px 50px rgba(0,0,0,.36);display:grid;grid-template-columns:minmax(0,1fr) 320px;align-items:end;gap:22px;padding:28px}}
-      .wk-hero-copy{{position:relative;z-index:2;max-width:760px}}
-      .wk-eyebrow{{color:#b8c4ff;font-weight:900;letter-spacing:.16em;text-transform:uppercase;font-size:12px}}
-      .wk-title{{display:flex;align-items:center;gap:14px;margin:8px 0 10px}}
-      .wk-title img{{width:72px;height:72px;object-fit:contain;filter:drop-shadow(0 12px 20px rgba(49,73,218,.30))}}
-      .wk-title h1{{margin:0;font-family:Georgia,serif;font-size:clamp(42px,5.4vw,72px);line-height:.95;color:#f7f8ff;text-shadow:0 4px 18px rgba(0,0,0,.52)}}
-      .wk-hero p{{margin:0;color:#d2d8e7;font-size:15px;line-height:1.55;max-width:700px}}
-      .wk-pills{{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px}}
-      .wk-pills span{{padding:7px 10px;border-radius:999px;border:1px solid rgba(122,135,255,.26);background:rgba(82,98,214,.14);font-size:12px;font-weight:800;color:#eef2ff}}
-      .wk-character{{position:relative;z-index:2;align-self:end;justify-self:end;max-height:300px;max-width:290px;filter:drop-shadow(0 22px 24px rgba(0,0,0,.55))}}
-      .wk-character img{{width:100%;max-height:300px;object-fit:contain;object-position:center bottom;display:block}}
-      .wk-section{{padding:20px;border-radius:18px;border:1px solid rgba(112,125,248,.22);background:linear-gradient(180deg,rgba(12,18,33,.91),rgba(7,10,19,.95));box-shadow:0 16px 34px rgba(0,0,0,.24)}}
-      .wk-section h2{{margin:0 0 12px;font-family:Georgia,serif;color:#f1f4ff;font-size:30px}}
-      .wk-section h3{{margin:0 0 8px;color:#edf1ff;font-size:18px}}
-      .wk-section p,.wk-section li{{color:#c3ccdf;line-height:1.6}}
-      .wk-grid{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}}
-      .wk-mini-grid{{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}}
-      .wk-mini-card{{padding:13px;border-radius:14px;border:1px solid rgba(114,128,255,.18);background:rgba(16,22,39,.72);display:grid;gap:5px}}
-      .wk-mini-card b{{color:#f3f6ff}}
-      .wk-mini-card span{{color:#9eabc4;font-size:12px;line-height:1.4}}
-      .wk-skill-list{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}}
-      .wk-skill{{padding:12px;border-radius:13px;background:rgba(16,22,39,.72);border:1px solid rgba(112,125,248,.17);display:grid;gap:4px}}
-      .wk-skill strong{{color:#eef2ff}}
-      .wk-skill span{{color:#9ca9c2;font-size:12px;line-height:1.45}}
-      .wk-callout{{padding:13px 14px;border-radius:14px;border:1px solid rgba(211,171,82,.26);background:linear-gradient(90deg,rgba(75,55,18,.16),rgba(16,22,39,.58));color:#d6dcee}}
-      .wk-callout b{{color:#f1d28b}}
-      .wk-source{{display:grid;grid-template-columns:260px 1fr;gap:16px;align-items:center}}
-      .wk-source img{{width:100%;border-radius:15px;border:1px solid rgba(255,255,255,.08);box-shadow:0 12px 28px rgba(0,0,0,.28)}}
-      .wk-source-actions{{display:flex;gap:8px;flex-wrap:wrap}}
-      @media(max-width:1100px){{.wk-mini-grid{{grid-template-columns:repeat(2,minmax(0,1fr))}}}}
-      @media(max-width:820px){{.wk-hero{{grid-template-columns:1fr;min-height:300px;padding:18px}}.wk-character{{display:none}}.wk-grid,.wk-skill-list{{grid-template-columns:1fr}}.wk-source{{grid-template-columns:1fr}}}}
-      @media(max-width:620px){{.wk-mini-grid{{grid-template-columns:1fr}}.wk-title img{{width:56px;height:56px}}.wk-title h1{{font-size:42px}}}}
+      .chanter-guide{{display:grid;gap:14px}}
+      .chanter-hero{{position:relative;overflow:hidden;min-height:330px;border-radius:22px;border:1px solid rgba(112,125,248,.34);background:linear-gradient(90deg,rgba(5,8,18,.97) 0%,rgba(5,8,18,.77) 46%,rgba(5,8,18,.14) 100%),url('{hero_bg}') center/cover no-repeat;box-shadow:0 20px 50px rgba(0,0,0,.36);display:grid;grid-template-columns:minmax(0,1fr) 320px;align-items:end;gap:22px;padding:28px}}
+      .chanter-hero::after{{content:"";position:absolute;inset:0;background:radial-gradient(circle at 78% 30%,rgba(121,99,38,.12),transparent 32%);pointer-events:none}}
+      .chanter-hero-copy{{position:relative;z-index:2;max-width:760px}}
+      .chanter-hero-eyebrow{{color:#b8c4ff;font-weight:900;letter-spacing:.16em;text-transform:uppercase;font-size:12px}}
+      .chanter-hero-title{{display:flex;align-items:center;gap:14px;margin:8px 0 10px}}
+      .chanter-hero-title img{{width:72px;height:72px;object-fit:contain;filter:drop-shadow(0 12px 20px rgba(49,73,218,.30))}}
+      .chanter-hero-title h1{{margin:0;font-family:Georgia,serif;font-size:clamp(42px,5.4vw,72px);line-height:.95;color:#f7f8ff;text-shadow:0 4px 18px rgba(0,0,0,.52)}}
+      .chanter-hero p{{margin:0;color:#d2d8e7;font-size:15px;line-height:1.55;max-width:690px}}
+      .chanter-pills{{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px}}
+      .chanter-pills span{{padding:7px 10px;border-radius:999px;border:1px solid rgba(122,135,255,.26);background:rgba(82,98,214,.14);font-size:12px;font-weight:800;color:#eef2ff}}
+      .chanter-character{{position:relative;z-index:2;align-self:end;justify-self:end;max-height:300px;max-width:290px;filter:drop-shadow(0 22px 24px rgba(0,0,0,.55))}}
+      .chanter-character img{{width:100%;max-height:300px;object-fit:contain;object-position:center bottom;display:block}}
+      .chanter-section{{padding:20px;border-radius:18px;border:1px solid rgba(112,125,248,.22);background:linear-gradient(180deg,rgba(12,18,33,.91),rgba(7,10,19,.95));box-shadow:0 16px 34px rgba(0,0,0,.24)}}
+      .chanter-section h2{{margin:0 0 12px;font-family:Georgia,serif;color:#f1f4ff;font-size:30px}}
+      .chanter-section h3{{margin:16px 0 8px;color:#edf1ff;font-size:17px}}
+      .chanter-section p,.chanter-section li{{color:#c3ccdf;line-height:1.6}}
+      .chanter-section p{{margin:0 0 10px}}
+      .chanter-grid{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}}
+      .chanter-quick-grid{{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:10px}}
+      .chanter-quick{{padding:13px;border-radius:14px;border:1px solid rgba(114,128,255,.18);background:rgba(16,22,39,.72);display:grid;gap:5px}}
+      .chanter-quick b{{color:#f3f6ff}}
+      .chanter-quick span{{color:#9eabc4;font-size:12px;line-height:1.4}}
+      .chanter-callout{{padding:13px 14px;border-radius:14px;border:1px solid rgba(211,171,82,.26);background:linear-gradient(90deg,rgba(75,55,18,.16),rgba(16,22,39,.58));color:#d6dcee}}
+      .chanter-callout b{{color:#f1d28b}}
+      .chanter-hotbar{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:9px}}
+      .chanter-hotbar-item{{padding:12px;border-radius:13px;border:1px solid rgba(112,125,248,.17);background:rgba(15,21,38,.74);display:grid;grid-template-columns:50px 1fr;column-gap:10px;row-gap:3px;align-items:center}}
+      .chanter-hotbar-item>b{{grid-row:1/3;width:42px;height:42px;border-radius:11px;display:grid;place-items:center;background:rgba(85,102,224,.19);border:1px solid rgba(124,137,255,.28);color:#fff}}
+      .chanter-hotbar-item strong{{color:#eef2ff;font-size:13px}}
+      .chanter-hotbar-item span{{color:#94a1bb;font-size:11px;line-height:1.35}}
+      .chanter-priorities{{display:grid;gap:9px}}
+      .chanter-priority{{display:grid;grid-template-columns:34px 1fr;gap:10px;align-items:start;padding:10px;border-radius:13px;background:rgba(16,22,39,.72);border:1px solid rgba(112,125,248,.17)}}
+      .chanter-priority>span{{width:28px;height:28px;border-radius:50%;display:grid;place-items:center;background:#5366d9;color:white;font-weight:900}}
+      .chanter-priority div{{display:grid;gap:3px}}
+      .chanter-priority b{{color:#eef2ff}}
+      .chanter-priority small{{color:#9ca9c2;line-height:1.4}}
+      .chanter-stigmas{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}}
+      .chanter-stigma{{padding:12px;border-radius:13px;background:rgba(16,22,39,.72);border:1px solid rgba(112,125,248,.17);display:grid;gap:4px}}
+      .chanter-stigma strong{{color:#eef2ff}}
+      .chanter-stigma span{{color:#9ca9c2;font-size:12px;line-height:1.4}}
+      .chanter-source-card{{display:grid;grid-template-columns:260px 1fr;gap:16px;align-items:center}}
+      .chanter-source-card img{{width:100%;border-radius:15px;border:1px solid rgba(255,255,255,.08);box-shadow:0 12px 28px rgba(0,0,0,.28)}}
+      .chanter-source-card h3{{margin:0 0 6px;font-family:Georgia,serif;font-size:24px}}
+      .chanter-source-card p{{margin:0 0 10px}}
+      .chanter-source-actions{{display:flex;gap:8px;flex-wrap:wrap}}
+      .chanter-flow{{display:flex;flex-wrap:wrap;gap:8px;align-items:center}}
+      .chanter-flow span{{padding:9px 11px;border-radius:12px;border:1px solid rgba(112,125,248,.18);background:rgba(16,22,39,.72);color:#eef2ff;font-weight:800}}
+      .chanter-flow i{{font-style:normal;color:#7e8ee8;font-weight:900}}
+      @media(max-width:1100px){{.chanter-quick-grid{{grid-template-columns:repeat(2,minmax(0,1fr))}}.chanter-hotbar{{grid-template-columns:repeat(2,minmax(0,1fr))}}}}
+      @media(max-width:820px){{.chanter-hero{{grid-template-columns:1fr;min-height:300px;padding:18px}}.chanter-character{{display:none}}.chanter-grid{{grid-template-columns:1fr}}.chanter-source-card{{grid-template-columns:1fr}}}}
+      @media(max-width:620px){{.chanter-quick-grid,.chanter-hotbar,.chanter-stigmas{{grid-template-columns:1fr}}.chanter-hero-title img{{width:56px;height:56px}}.chanter-hero-title h1{{font-size:42px}}}}
     </style>
-    <main class="wk-guide">
-      <section class="wk-hero">
-        <div class="wk-hero-copy">
-          <div class="wk-eyebrow">Aion 2 · Klassen Build · Wakayashi-Basis</div>
-          <div class="wk-title"><img src="{emblem_url}" alt="{_e(class_name)} Emblem" onerror="this.src='{icon_fallback}'"><h1>{_e(class_name)}</h1></div>
-          <p>{lead}</p>
-          <div class="wk-pills"><span>{hero_role}</span>{tags}</div>
+    <main class="chanter-guide">
+      <section class="chanter-hero">
+        <div class="chanter-hero-copy">
+          <div class="chanter-hero-eyebrow">{_e(str(data.get('eyebrow') or 'Aion 2 · Klassen Build'))}</div>
+          <div class="chanter-hero-title"><img src="{emblem_url}" alt="{_e(class_name)} Emblem" onerror="this.src='{icon_fallback}'"><h1>{_e(class_name)}</h1></div>
+          <p>{_e(str(data.get('lead') or class_hint))}</p>
+          <div class="chanter-pills">{pills_html}</div>
         </div>
-        <div class="wk-character"><img src="{art_url}" alt="{_e(class_name)} Artwork" onerror="this.style.display='none'"></div>
+        <div class="chanter-character"><img src="{art_url}" alt="{_e(class_name)} Artwork" onerror="this.style.display='none'"></div>
       </section>
 
-      <section class="wk-section">
-        <h2>Das Wichtigste in Kürze</h2>
-        <div class="wk-mini-grid">{quick_html}</div>
+      <section class="chanter-section">
+        <h2>Das Wichtigste</h2>
+        <div class="chanter-quick-grid">{quick_html}</div>
       </section>
 
-      <section class="wk-grid">
-        <article class="wk-section">
-          <h2>Spielweise & Rotation</h2>
-          <p>Diese Seite übernimmt die Kerngedanken der Originalseite von Wakayashi, bereitet sie aber im Oblivion-Look sauberer auf. Gerade bei Klassen mit Makro-, Weaving- oder Preset-Themen lohnt es sich trotzdem, die Originalseite für spätere Updates im Blick zu behalten.</p>
-          <ol>{rotation_html}</ol>
+      <section class="chanter-grid">
+        <article class="chanter-section">
+          <h2>{_e(str(data.get('overview_title') or 'Klassenrolle'))}</h2>
+          {str(data.get('overview_html') or '')}
         </article>
-        <article class="wk-section">
-          <h2>Kernskills & Prioritäten</h2>
-          <div class="wk-skill-list">{skills_html}</div>
+        <article class="chanter-section">
+          <h2>{_e(str(data.get('mechanic_title') or 'Kernmechanik'))}</h2>
+          {str(data.get('mechanic_html') or '')}
         </article>
       </section>
 
-      <section class="wk-grid">
-        <article class="wk-section">
-          <h2>Tipps für den Build</h2>
-          <ul>{tips_html}</ul>
-          <div class="wk-callout"><b>Hinweis:</b> Die genaue Priorisierung von Skills, Spezialitäten, Stigmas und Hotbar-Positionen kann sich mit weiterem Progress ändern. Für Feintuning bleibt Wakayashi die laufende Referenz.</div>
+      <section class="chanter-section">
+        <h2>Dungeon-Rotation</h2>
+        <div class="chanter-flow">{flow_html}</div>
+        <p style="margin-top:12px">{_e(str(data.get('flow_text') or ''))}</p>
+      </section>
+
+      <section class="chanter-section">
+        <h2>Hotbar & Bedienung</h2>
+        <div class="chanter-hotbar">{hotbar_html}</div>
+      </section>
+
+      <section class="chanter-grid">
+        <article class="chanter-section">
+          <h2>Skill-Priorität</h2>
+          <div class="chanter-priorities">{priority_html}</div>
         </article>
-        <article class="wk-section">
-          <h2>Quelle & Weiterklick</h2>
-          <div class="wk-source">
-            <img src="{art_url}" alt="{_e(class_name)} Artwork" loading="lazy" onerror="this.style.display='none'">
-            <div>
-              <h3>Original-Guide von Wakayashi</h3>
-              <p>Hier findest du die Oblivion-Version des Builds mit Artwork, sauberer Struktur und den wichtigsten Kernpunkten. Für den kompletten Originalartikel, mögliche Videos und laufende Aktualisierungen kannst du direkt zur Quelle springen.</p>
-              <div class="wk-source-actions"><a class="btn secondary" href="{article_url}" target="_blank" rel="noopener noreferrer">Original-Guide öffnen ↗</a><a class="btn ghost" href="/guides/classes">← Klassenübersicht</a></div>
-            </div>
+        <article class="chanter-section">
+          <h2>Stigma-Basis</h2>
+          <div class="chanter-stigmas">{stigma_html}</div>
+          <h3>Alternativen / Hinweise</h3>
+          <p>{_e(str(data.get('stigma_extra') or ''))}</p>
+        </article>
+      </section>
+
+      <section class="chanter-grid">
+        <article class="chanter-section">
+          <h2>{_e(str(data.get('macro_title') or 'Makro richtig einrichten'))}</h2>
+          {str(data.get('macro_html') or '')}
+        </article>
+        <article class="chanter-section">
+          <h2>{_e(str(data.get('weave_title') or 'Weaving & Praxis'))}</h2>
+          {str(data.get('weave_html') or '')}
+        </article>
+      </section>
+
+      <section class="chanter-section">
+        <div class="chanter-source-card">
+          <img src="{art_url}" alt="Wakayashi {_e(class_name)} Guide" loading="lazy" onerror="this.style.display='none'">
+          <div>
+            <h3>Original-Guide von Wakayashi</h3>
+            <p>Diese Seite ist im selben Aufbau wie der Kantor-Guide gehalten und auf Basis der aktuell verfügbaren Wakayashi-Inhalte aufbereitet. Für Video-Erklärungen, spätere Änderungen und die jeweils aktuellste Version bleibt die Originalseite die Referenz.</p>
+            <div class="chanter-source-actions"><a class="btn secondary" href="{article_url}" target="_blank" rel="noopener noreferrer">Original-Guide öffnen ↗</a><a class="btn ghost" href="/guides/classes">← Klassenübersicht</a></div>
           </div>
-        </article>
+        </div>
       </section>
     </main>
     """
 
+
+def _kantor_guide_body(class_name: str, class_hint: str, icon_url: str) -> str:
+    return _class_guide_body("kantor", class_name, class_hint, icon_url)
 
 
 def _guide_classes_detail_html() -> str:
@@ -21334,9 +21668,9 @@ def guide_class_page(class_slug: str, request: Request, _: bool = Depends(_auth)
         return HTMLResponse(_html_shell("Klasse nicht gefunden", "<section class='panel'><h1>Klasse nicht gefunden</h1><p class='muted'>Für diese Klasse existiert noch keine Guide-Seite.</p><a class='btn secondary' href='/guides/classes'>← Klassenübersicht</a></section>", nav_mode=_nav_mode_for_request(request), active_nav_href="/guides"), status_code=404)
     class_name, class_hint = item
     icon_url = _aion2_class_icon_url(class_name)
-    body = _wakayashi_class_guide_body(key, class_name, class_hint, icon_url)
+    body = _class_guide_body(key, class_name, class_hint, icon_url)
     if not body:
-        body = f"<section class='panel'><h1>{_e(class_name)}</h1><p class='muted'>Für diese Klasse ist aktuell noch keine aufbereitete Wakayashi-Seite vorhanden.</p><a class='btn secondary' href='/guides/classes'>← Klassenübersicht</a></section>"
+        return HTMLResponse(_html_shell("Klasse nicht gefunden", "<section class='panel'><h1>Guide fehlt</h1><p class='muted'>Für diese Klasse ist aktuell kein Guide-Datensatz hinterlegt.</p><a class='btn secondary' href='/guides/classes'>← Klassenübersicht</a></section>", nav_mode=_nav_mode_for_request(request), active_nav_href="/guides"), status_code=404)
     return HTMLResponse(_html_shell(f"{class_name} · Klassen Build", body, nav_mode=_nav_mode_for_request(request), active_nav_href="/guides"))
 
 
