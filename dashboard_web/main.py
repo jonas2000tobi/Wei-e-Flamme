@@ -21760,9 +21760,9 @@ def _guides_hub_html(request: Request) -> str:
         display:flex;align-items:flex-end;padding:22px;
       }}
       .guide-mini::after{{content:"";position:absolute;inset:0;background:linear-gradient(180deg,rgba(4,7,16,.06) 18%,rgba(4,7,16,.82) 72%,rgba(4,7,16,.96));pointer-events:none}}
-      .guide-mini.level{{background:url('{_asset("oblivion_voidhall_bg.png")}') center 43% / cover no-repeat}}
+      .guide-mini.level{background:url('{_asset("guide_weitere_banner.png")}') center center / cover no-repeat}
       .guide-mini.macros{{background:url('{_asset("oblivion_header_mobile.png")}') center 37% / cover no-repeat}}
-      .guide-mini.events{{background:url('{_asset("oblivion_header_desktop.png")}') 72% 42% / cover no-repeat}}
+      .guide-mini.events{background:url('{_asset("guide_events_banner.png")}') center center / cover no-repeat}
       .guide-mini:hover{{border-color:rgba(139,150,255,.66);transform:translateY(-2px)}}
       .guide-mini-copy{{position:relative;z-index:2;width:100%}}
       .guide-mini-icon{{width:54px;height:54px;margin-bottom:12px;border-radius:15px;display:grid;place-items:center;background:rgba(7,11,23,.72);border:1px solid rgba(121,134,255,.38);backdrop-filter:blur(5px)}}
