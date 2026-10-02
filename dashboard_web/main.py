@@ -5106,18 +5106,18 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "member", active_nav_h
     .need-slot-row strong {{ color:var(--text); overflow-wrap:anywhere; }}
     .member-start-logo {{ width:86px; height:86px; border-radius:22px; padding:8px; border:1px solid rgba(214,168,79,.32); background:rgba(214,168,79,.08); box-shadow:0 14px 30px rgba(0,0,0,.35); }}
     .member-start-logo img {{ width:100%; height:100%; object-fit:contain; }}
-    .member-home-hero {{ align-items:flex-end; min-height:350px; background-image:linear-gradient(180deg,rgba(4,5,12,.06) 0%,rgba(4,5,12,.16) 42%,rgba(4,5,12,.58) 100%), url("{hero_banner}") !important; background-position:center 40% !important; background-size:cover !important; background-repeat:no-repeat !important; border-color:rgba(113,126,255,.34) !important; }}
+    .member-home-hero {{ align-items:flex-end; min-height:350px; background-color:#050814 !important; background-image:linear-gradient(180deg,rgba(4,5,12,.05) 0%,rgba(4,5,12,.14) 42%,rgba(4,5,12,.55) 100%), url("{hero_banner}") !important; background-position:center 37% !important; background-size:94% auto !important; background-repeat:no-repeat !important; border-color:rgba(113,126,255,.34) !important; }}
     .member-home-desktop > .topnav {{ margin-top:-6px !important; margin-bottom:10px !important; }}
     .member-home-hero::after {{ background:linear-gradient(180deg,rgba(0,0,0,.02) 0%,rgba(0,0,0,.08) 54%,rgba(0,0,0,.22) 100%) !important; }}
     .member-home-hero-copy {{ position:absolute; inset:0; z-index:3; pointer-events:none; }}
     .member-home-hero-copy::before {{
-      content:""; position:absolute; left:38%; right:13%; top:60%; height:24%;
-      background:radial-gradient(ellipse at center,rgba(4,7,16,.98) 0%,rgba(4,7,16,.97) 58%,rgba(4,7,16,.86) 74%,rgba(4,7,16,0) 100%);
-      -webkit-backdrop-filter:blur(5px); backdrop-filter:blur(5px);
+      content:""; position:absolute; left:38%; right:13%; top:60%; height:28%;
+      background:radial-gradient(ellipse at center,rgba(4,7,16,.99) 0%,rgba(4,7,16,.98) 58%,rgba(4,7,16,.88) 76%,rgba(4,7,16,0) 100%);
+      -webkit-backdrop-filter:blur(6px); backdrop-filter:blur(6px);
       pointer-events:none;
     }}
     .member-home-dynamic-name {{
-      position:absolute; left:38%; right:13%; top:65%; min-height:58px;
+      position:absolute; left:38%; right:13%; top:68%; min-height:58px;
       display:flex; align-items:center; justify-content:center; text-align:center;
       color:#f3f6ff; font-family:Georgia,serif; font-size:clamp(25px,2.2vw,38px); font-weight:800;
       line-height:1.02; letter-spacing:.015em; overflow-wrap:anywhere;
@@ -14417,7 +14417,7 @@ def _render_member_home(data: dict[str, Any], request: Request) -> str:
         }}
         .mobile-home-hero-logo{{display:none}}
         .mobile-home-dynamic-name{{
-          position:absolute;left:5%;right:5%;top:72%;min-height:48px;
+          position:absolute;left:5%;right:5%;top:74%;min-height:48px;
           display:flex;align-items:center;justify-content:center;text-align:center;
           font-family:Georgia,serif;font-size:clamp(22px,7.2vw,33px);font-weight:800;line-height:1.02;
           color:#f3f6ff;text-shadow:0 3px 12px rgba(0,0,0,.98),0 0 18px rgba(101,117,255,.44);
@@ -20885,42 +20885,138 @@ def tnl_builds_page() -> HTMLResponse:
 
 
 GUIDE_HUB_ITEMS = {
-    "classes": ("⚔️", "Klassen Builds", "Builds, Rollen und Empfehlungen für die Aion-2-Klassen."),
-    "level-45": ("⬆️", "Level 45 Guide", "Wichtige Schritte, Inhalte und Ziele ab Level 45."),
-    "macros": ("⌨️", "Makros setzen", "Makros sauber einrichten und sinnvoll im Spiel verwenden."),
-    "events": ("📅", "Events", "Gilden- und Gruppeninhalte, Vorbereitung und Ablauf."),
+    "classes": ("nav_builds.png", "Klassen Builds", "Builds, Rollen und Empfehlungen für alle Aion-2-Klassen."),
+    "level-45": ("nav_planung.png", "Level 45 Guide", "Wichtige Schritte, Inhalte und Ziele ab Level 45."),
+    "macros": ("nav_guides.png", "Makros setzen", "Makros sauber einrichten und sinnvoll im Spiel verwenden."),
+    "events": ("nav_events.png", "Events", "Gilden- und Gruppeninhalte, Vorbereitung und Ablauf."),
 }
 
+
 def _guides_hub_html(request: Request) -> str:
-    cards = []
-    for key, (icon, title, subtitle) in GUIDE_HUB_ITEMS.items():
-        cards.append(
-            f'<a class="guide-hub-card" href="/guides/{_e(key)}">'
-            f'<span class="guide-hub-icon">{icon}</span>'
-            f'<strong>{_e(title)}</strong>'
-            f'<small>{_e(subtitle)}</small>'
-            f'<b>Öffnen ›</b></a>'
-        )
     body = f"""
     <style>
-      .guide-hub-hero{{margin:0 0 14px;padding:22px 24px;border:1px solid rgba(112,125,248,.26);border-radius:18px;background:linear-gradient(135deg,rgba(17,23,40,.94),rgba(8,11,21,.92));box-shadow:0 18px 42px rgba(0,0,0,.30)}}
-      .guide-hub-hero .eyebrow{{color:#aebcff}}
-      .guide-hub-hero h1{{font-family:Georgia,serif;font-size:clamp(34px,5vw,54px);margin:3px 0 5px;color:#f2f5ff}}
-      .guide-hub-grid{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}}
-      .guide-hub-card{{min-height:150px;padding:18px;border:1px solid rgba(112,125,248,.28);border-radius:18px;background:linear-gradient(145deg,rgba(21,28,50,.93),rgba(7,10,19,.96));text-decoration:none;color:var(--text);display:grid;grid-template-columns:auto minmax(0,1fr) auto;grid-template-rows:auto auto;column-gap:14px;align-items:center;box-shadow:0 14px 30px rgba(0,0,0,.25);transition:transform .14s ease,border-color .14s ease}}
-      .guide-hub-card:hover{{transform:translateY(-2px);border-color:rgba(138,149,255,.62)}}
-      .guide-hub-icon{{grid-row:1/3;font-size:36px}}
-      .guide-hub-card strong{{font-family:Georgia,serif;font-size:22px;color:#eef2ff}}
-      .guide-hub-card small{{color:#a8b4cd;font-size:13px;line-height:1.35}}
-      .guide-hub-card b{{grid-column:3;grid-row:1/3;color:#aebcff;font-size:14px}}
-      @media(max-width:720px){{.guide-hub-grid{{grid-template-columns:1fr}}.guide-hub-card{{min-height:118px;padding:15px}}.guide-hub-hero{{padding:18px}}}}
+      .guides-page{{display:grid;gap:14px}}
+      .guides-hero{{
+        position:relative;overflow:hidden;min-height:150px;padding:24px 28px;border-radius:19px;
+        border:1px solid rgba(112,125,248,.34);
+        background:
+          linear-gradient(90deg,rgba(7,11,24,.96) 0%,rgba(8,13,29,.82) 44%,rgba(8,13,29,.28) 100%),
+          url('{_asset("oblivion_header_desktop.png")}') center 38% / cover no-repeat;
+        box-shadow:0 18px 44px rgba(0,0,0,.34),inset 0 1px 0 rgba(255,255,255,.035);
+        display:flex;align-items:center;
+      }}
+      .guides-hero::after{{content:"";position:absolute;inset:0;background:radial-gradient(circle at 78% 42%,rgba(83,99,226,.22),transparent 26%);pointer-events:none}}
+      .guides-hero-copy{{position:relative;z-index:1}}
+      .guides-hero .eyebrow{{color:#aebcff;font-weight:900;letter-spacing:.15em}}
+      .guides-hero h1{{font-family:Georgia,serif;font-size:clamp(36px,5vw,58px);line-height:.95;margin:7px 0 10px;color:#f5f7ff;text-shadow:0 4px 18px rgba(0,0,0,.42)}}
+      .guides-hero p{{margin:0;color:#c6d2eb;font-size:15px}}
+
+      .guide-feature{{
+        position:relative;overflow:hidden;min-height:310px;border-radius:20px;text-decoration:none;color:var(--text);
+        border:1px solid rgba(220,175,83,.64);
+        background:
+          linear-gradient(90deg,rgba(5,8,17,.92) 0%,rgba(5,8,17,.50) 38%,rgba(5,8,17,.10) 73%),
+          linear-gradient(180deg,rgba(0,0,0,.02),rgba(3,6,15,.76) 100%),
+          url('{_asset("guide_classes_builds_bg.png")}') center 46% / cover no-repeat;
+        box-shadow:0 20px 50px rgba(0,0,0,.36),inset 0 0 0 1px rgba(255,209,115,.07);
+        display:flex;align-items:flex-end;padding:30px 34px;
+      }}
+      .guide-feature:hover{{border-color:rgba(245,196,94,.92);transform:translateY(-1px)}}
+      .guide-feature-copy{{position:relative;z-index:2;max-width:62%;display:grid;gap:7px}}
+      .guide-feature-icon{{width:74px;height:74px;border-radius:50%;display:grid;place-items:center;background:radial-gradient(circle at 50% 40%,rgba(62,82,196,.42),rgba(6,9,19,.82));border:1px solid rgba(114,128,255,.42);box-shadow:0 12px 28px rgba(0,0,0,.35)}}
+      .guide-feature-icon img{{width:47px;height:47px;object-fit:contain}}
+      .guide-feature h2{{margin:0;font-family:Georgia,serif;font-size:clamp(34px,4vw,52px);color:#fff2cf;text-shadow:0 4px 18px rgba(0,0,0,.6)}}
+      .guide-feature p{{margin:0;color:#d3d9e9;font-size:15px;line-height:1.4}}
+      .guide-feature-open{{position:absolute;right:34px;bottom:31px;z-index:3;min-width:162px;padding:13px 22px;border-radius:13px;text-align:center;font-weight:900;color:#fff0c4;border:1px solid rgba(230,182,82,.66);background:linear-gradient(180deg,rgba(31,25,21,.92),rgba(8,10,18,.96));box-shadow:0 0 0 3px rgba(219,171,71,.10),0 12px 24px rgba(0,0,0,.28)}}
+      .guide-feature-open span{{margin-left:8px;color:#d9b45f}}
+
+      .guide-mini-grid{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}}
+      .guide-mini{{
+        position:relative;overflow:hidden;min-height:250px;border-radius:18px;text-decoration:none;color:var(--text);
+        border:1px solid rgba(111,125,247,.34);box-shadow:0 16px 34px rgba(0,0,0,.30);
+        display:flex;align-items:flex-end;padding:22px;
+      }}
+      .guide-mini::after{{content:"";position:absolute;inset:0;background:linear-gradient(180deg,rgba(4,7,16,.06) 18%,rgba(4,7,16,.82) 72%,rgba(4,7,16,.96));pointer-events:none}}
+      .guide-mini.level{{background:url('{_asset("oblivion_voidhall_bg.png")}') center 43% / cover no-repeat}}
+      .guide-mini.macros{{background:url('{_asset("oblivion_header_mobile.png")}') center 37% / cover no-repeat}}
+      .guide-mini.events{{background:url('{_asset("oblivion_header_desktop.png")}') 72% 42% / cover no-repeat}}
+      .guide-mini:hover{{border-color:rgba(139,150,255,.66);transform:translateY(-2px)}}
+      .guide-mini-copy{{position:relative;z-index:2;width:100%}}
+      .guide-mini-icon{{width:54px;height:54px;margin-bottom:12px;border-radius:15px;display:grid;place-items:center;background:rgba(7,11,23,.72);border:1px solid rgba(121,134,255,.38);backdrop-filter:blur(5px)}}
+      .guide-mini-icon img{{width:36px;height:36px;object-fit:contain}}
+      .guide-mini h3{{font-family:Georgia,serif;font-size:clamp(23px,2vw,31px);color:#f0f3ff;margin:0 0 6px}}
+      .guide-mini p{{color:#c2cce0;margin:0 0 12px;line-height:1.4;min-height:42px}}
+      .guide-mini-open{{color:#aab8ff;font-weight:900;font-size:14px}}
+      .guide-mini-open span{{margin-left:6px}}
+
+      @media(max-width:850px){{
+        .guides-hero{{min-height:130px;padding:20px}}
+        .guide-feature{{min-height:260px;padding:22px}}
+        .guide-feature-copy{{max-width:72%}}
+        .guide-feature-open{{right:22px;bottom:22px;min-width:130px;padding:11px 16px}}
+        .guide-mini-grid{{grid-template-columns:1fr}}
+        .guide-mini{{min-height:185px}}
+      }}
+      @media(max-width:560px){{
+        .guides-page{{gap:10px}}
+        .guides-hero{{min-height:118px;padding:17px;border-radius:16px}}
+        .guides-hero h1{{font-size:38px}}
+        .guide-feature{{min-height:240px;padding:18px;border-radius:16px;align-items:flex-end}}
+        .guide-feature-copy{{max-width:100%;padding-bottom:48px}}
+        .guide-feature-icon{{width:56px;height:56px}}
+        .guide-feature-icon img{{width:36px;height:36px}}
+        .guide-feature h2{{font-size:33px}}
+        .guide-feature-open{{left:18px;right:auto;bottom:17px;min-width:118px;padding:9px 14px}}
+        .guide-mini{{min-height:165px;padding:17px;border-radius:15px}}
+        .guide-mini h3{{font-size:25px}}
+      }}
     </style>
-    <section class="guide-hub-hero">
-      <div class="eyebrow">Oblivion Wissen</div>
-      <h1>Guides</h1>
-      <p class="muted">Schneller Zugriff auf die wichtigsten Aion-2-Guides der Gilde.</p>
-    </section>
-    <section class="guide-hub-grid">{"".join(cards)}</section>
+
+    <main class="guides-page">
+      <section class="guides-hero">
+        <div class="guides-hero-copy">
+          <div class="eyebrow">Oblivion Wissen</div>
+          <h1>Guides</h1>
+          <p>Schneller Zugriff auf die wichtigsten Aion-2-Guides der Gilde.</p>
+        </div>
+      </section>
+
+      <a class="guide-feature" href="/guides/classes">
+        <div class="guide-feature-copy">
+          <div class="guide-feature-icon"><img src="{_asset('nav_builds.png')}" alt=""></div>
+          <h2>Klassen Builds</h2>
+          <p>Builds, Rollen und Empfehlungen für alle Aion-2-Klassen.</p>
+        </div>
+        <div class="guide-feature-open">Öffnen <span>›</span></div>
+      </a>
+
+      <section class="guide-mini-grid">
+        <a class="guide-mini level" href="/guides/level-45">
+          <div class="guide-mini-copy">
+            <div class="guide-mini-icon"><img src="{_asset('nav_planung.png')}" alt=""></div>
+            <h3>Level 45 Guide</h3>
+            <p>Wichtige Schritte, Inhalte und Ziele ab Level 45.</p>
+            <div class="guide-mini-open">Öffnen <span>›</span></div>
+          </div>
+        </a>
+        <a class="guide-mini macros" href="/guides/macros">
+          <div class="guide-mini-copy">
+            <div class="guide-mini-icon"><img src="{_asset('nav_guides.png')}" alt=""></div>
+            <h3>Makros setzen</h3>
+            <p>Makros sauber einrichten und sinnvoll im Spiel verwenden.</p>
+            <div class="guide-mini-open">Öffnen <span>›</span></div>
+          </div>
+        </a>
+        <a class="guide-mini events" href="/guides/events">
+          <div class="guide-mini-copy">
+            <div class="guide-mini-icon"><img src="{_asset('nav_events.png')}" alt=""></div>
+            <h3>Events</h3>
+            <p>Gilden- und Gruppeninhalte, Vorbereitung und Ablauf.</p>
+            <div class="guide-mini-open">Öffnen <span>›</span></div>
+          </div>
+        </a>
+      </section>
+    </main>
     """
     return _html_shell("Guides", body, nav_mode=_nav_mode_for_request(request), active_nav_href="/guides")
 
@@ -20935,12 +21031,12 @@ def guide_detail_page(guide_key: str, request: Request, _: bool = Depends(_auth)
     item = GUIDE_HUB_ITEMS.get(str(guide_key or "").strip().lower())
     if not item:
         return HTMLResponse(_html_shell("Guide nicht gefunden", "<section class='panel'><h1>Guide nicht gefunden</h1><p class='muted'>Dieser Guide existiert noch nicht.</p><a class='btn secondary' href='/guides'>Zurück zu Guides</a></section>", nav_mode=_nav_mode_for_request(request), active_nav_href="/guides"), status_code=404)
-    icon, title, subtitle = item
+    icon_asset, title, subtitle = item
     body = f"""
     <section class="hero">
       <div>
         <div class="eyebrow">Guides</div>
-        <h1>{icon} {_e(title)}</h1>
+        <h1><img src="{_asset(icon_asset)}" alt="" style="width:42px;height:42px;vertical-align:-9px;margin-right:8px;object-fit:contain">{_e(title)}</h1>
         <p>{_e(subtitle)}</p>
       </div>
       <a class="btn secondary" href="/guides">← Alle Guides</a>
