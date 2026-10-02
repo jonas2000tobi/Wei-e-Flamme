@@ -4856,7 +4856,7 @@ def _render_auction_detail(data: dict[str, Any], auction_id: str, current_user: 
 
 def _sidebar_html() -> str:
     """Leitungsansicht = normale Gildenansicht plus Admin-Werkzeuge, ohne Portalwechsel."""
-    brand=_guild_brand(); logo=_brand_image("logo","beer_and_buffs_logo.png"); states=_dashboard_module_states()
+    brand=_guild_brand(); logo=_asset("oblivion_logo.png"); states=_dashboard_module_states()
     portal_links=[]
     if states.get("member_portal"): portal_links.append(f'<a href="/portal"><img class="nav-ico" src="{_asset("nav_portal.png")}" alt="">Mein Profil</a>')
     if states.get("needlists"): portal_links.append(f'<a href="/character-editor"><img class="nav-ico" src="{_asset("nav_builds.png")}" alt="">Charakter & Builds</a>')
@@ -4907,7 +4907,7 @@ def _sidebar_html() -> str:
 def _member_sidebar_html() -> str:
     """Normale Sidebar: Core immer sichtbar, optionale Bereiche nur bei aktivem Modul."""
     brand = _guild_brand()
-    logo = _brand_image("logo", "beer_and_buffs_logo.png")
+    logo = _asset("oblivion_logo.png")
     states = _dashboard_module_states()
 
     portal_links: list[str] = []
@@ -5107,17 +5107,17 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "member", active_nav_h
     .member-home-hero {{ align-items:flex-end; min-height:310px; background-image:linear-gradient(180deg,rgba(4,5,12,.08) 0%,rgba(4,5,12,.20) 42%,rgba(4,5,12,.64) 100%), url("{hero_banner}") !important; background-position:center center !important; background-size:cover !important; background-repeat:no-repeat !important; border-color:rgba(113,126,255,.34) !important; }}
     .member-home-hero::after {{ background:linear-gradient(180deg,rgba(0,0,0,.03) 0%,rgba(0,0,0,.12) 54%,rgba(0,0,0,.28) 100%) !important; }}
     .member-home-hero-copy {{ position:absolute; inset:0; z-index:3; pointer-events:none; }}
-    .member-home-dynamic-name {{
-      position:absolute; left:43%; right:7%; top:64%; min-height:76px;
-      display:flex; align-items:center; justify-content:center; text-align:center;
-      color:#f3f6ff; font-family:Georgia,serif; font-size:clamp(25px,2.4vw,40px); font-weight:800;
-      line-height:1.02; letter-spacing:.015em; overflow-wrap:anywhere;
-      text-shadow:0 3px 14px rgba(0,0,0,.92),0 0 18px rgba(99,116,255,.30);
+    .member-home-hero-copy::before {{
+      content:""; position:absolute; left:39%; right:4%; top:64%; height:26%;
+      background:linear-gradient(180deg,rgba(5,8,18,.02),rgba(5,8,18,.76) 28%,rgba(5,8,18,.88) 52%,rgba(5,8,18,.66) 76%,rgba(5,8,18,.06));
+      filter:blur(.2px); pointer-events:none;
     }}
-    .member-home-dynamic-name::before {{
-      content:""; position:absolute; z-index:-1; inset:-18px -8%;
-      background:radial-gradient(ellipse at center,rgba(4,7,16,.96) 0%,rgba(4,7,16,.88) 45%,rgba(4,7,16,.52) 66%,transparent 82%);
-      filter:blur(2px); pointer-events:none;
+    .member-home-dynamic-name {{
+      position:absolute; left:40%; right:4%; top:68%; min-height:54px;
+      display:flex; align-items:center; justify-content:center; text-align:center;
+      color:#f3f6ff; font-family:Georgia,serif; font-size:clamp(24px,2.15vw,36px); font-weight:800;
+      line-height:1.02; letter-spacing:.015em; overflow-wrap:anywhere;
+      text-shadow:0 3px 14px rgba(0,0,0,.96),0 0 20px rgba(99,116,255,.38);
     }}
     .member-summary-list {{ display:grid; gap:10px; margin-top:10px; }}
     .member-summary-item {{ display:grid; grid-template-columns:minmax(0,1fr) auto; gap:12px; align-items:center; padding:12px 13px; border:1px solid rgba(214,168,79,.14); border-radius:14px; background:rgba(32,35,45,.55); }}
@@ -6323,6 +6323,17 @@ def _html_shell(title: str, body: str, *, nav_mode: str = "member", active_nav_h
     @media(max-width:760px) {{
       .sidebar {{ border-bottom-color:rgba(106,119,241,.26) !important; }}
       body.nav-open .side-nav {{ border-top-color:rgba(106,119,241,.18) !important; }}
+    }}
+
+
+    /* New Oblivion guild mark in the persistent sidebar. */
+    .sidebar .brand-mark.sidebar-brand-logo {{ width:132px !important; height:132px !important; flex:0 0 132px !important; margin-inline:auto; }}
+    .sidebar .brand-mark.sidebar-brand-logo img {{ width:100% !important; height:100% !important; object-fit:contain !important; }}
+    @media(max-width:1100px) {{
+      .sidebar .brand-mark.sidebar-brand-logo {{ width:76px !important; height:76px !important; flex:0 0 76px !important; }}
+    }}
+    @media(max-width:760px) {{
+      body.nav-open .sidebar .brand-mark.sidebar-brand-logo {{ width:58px !important; height:58px !important; flex:0 0 58px !important; }}
     }}
 
     .mobile-home-back {{ display:none; }}
@@ -14393,18 +14404,18 @@ def _render_member_home(data: dict[str, Any], request: Request) -> str:
           pointer-events:none;
         }}
         .mobile-home-hero-content{{position:absolute;inset:0;z-index:2;pointer-events:none}}
+        .mobile-home-hero-content::before{{
+          content:"";position:absolute;left:5%;right:5%;top:72%;height:21%;
+          background:linear-gradient(180deg,rgba(5,8,18,.02),rgba(5,8,18,.78) 28%,rgba(5,8,18,.90) 52%,rgba(5,8,18,.66) 78%,rgba(5,8,18,.03));
+          pointer-events:none;
+        }}
         .mobile-home-hero-logo{{display:none}}
         .mobile-home-dynamic-name{{
-          position:absolute;left:8%;right:8%;top:72%;min-height:54px;
+          position:absolute;left:6%;right:6%;top:75%;min-height:46px;
           display:flex;align-items:center;justify-content:center;text-align:center;
-          font-family:Georgia,serif;font-size:clamp(22px,7.4vw,34px);font-weight:800;line-height:1.02;
-          color:#f3f6ff;text-shadow:0 3px 12px rgba(0,0,0,.96),0 0 16px rgba(101,117,255,.34);
+          font-family:Georgia,serif;font-size:clamp(21px,7vw,32px);font-weight:800;line-height:1.02;
+          color:#f3f6ff;text-shadow:0 3px 12px rgba(0,0,0,.96),0 0 18px rgba(101,117,255,.38);
           overflow-wrap:anywhere;
-        }}
-        .mobile-home-dynamic-name::before{{
-          content:"";position:absolute;z-index:-1;inset:-13px -10%;
-          background:radial-gradient(ellipse at center,rgba(4,7,16,.97) 0%,rgba(4,7,16,.88) 47%,rgba(4,7,16,.48) 68%,transparent 84%);
-          filter:blur(2px);
         }}
         .mobile-home-stats{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:9px;margin:0 0 14px}}
         .mobile-home-tile{{
