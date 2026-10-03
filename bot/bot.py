@@ -60,6 +60,7 @@ setup_dashboard_data = None
 setup_guild_config = None
 setup_server_log = None
 setup_member_activity = None
+setup_world_events = None
 store = {}
 _modules_initialized = False
 _startup_failure: str | None = None
@@ -333,6 +334,21 @@ def _import_modules():
         setup_guild_config = None
         print(f"❌ Guild-Konfiguration Import deaktiviert: {e!r}")
 
+    global setup_world_events
+    try:
+        from bot.world_events import setup_world_events  # type: ignore
+        print("✅ Import: bot.world_events")
+    except ModuleNotFoundError:
+        try:
+            from world_events import setup_world_events  # type: ignore
+            print("✅ Import: world_events (root)")
+        except Exception as e:
+            setup_world_events = None
+            print(f"❌ Welt-Events Import deaktiviert: {e!r}")
+    except Exception as e:
+        setup_world_events = None
+        print(f"❌ Welt-Events Import deaktiviert: {e!r}")
+
 def _get_token() -> str | None:
     for key in ("DISCORD_TOKEN", "DISCORD_BOT_TOKEN", "TOKEN"):
         val = os.getenv(key)
@@ -402,6 +418,7 @@ async def on_ready():
             ("audit_system", setup_audit_system),
             ("voice_attendance", setup_voice_attendance),
             ("dashboard_data", setup_dashboard_data),
+            ("world_events", setup_world_events),
             ("alliance_config", setup_alliance_config),
             ("event_rsvp_dm", setup_rsvp_dm),
             ("onboarding", setup_onboarding),

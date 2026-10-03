@@ -6,8 +6,9 @@ import sqlite3
 import threading
 import re
 import difflib
+import hashlib
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any, Optional
 from urllib.parse import urlparse
 
@@ -206,6 +207,41 @@ def _init_sqlite() -> dict[str, Any]:
                 class_name TEXT NOT NULL DEFAULT '', main_role TEXT NOT NULL DEFAULT '', faction TEXT NOT NULL DEFAULT '', level INTEGER,
                 gearscore TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL, PRIMARY KEY(guild_id,user_id)
             );
+
+            CREATE TABLE IF NOT EXISTS world_event_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source TEXT NOT NULL,
+                observed_at TEXT NOT NULL,
+                fingerprint TEXT NOT NULL,
+                payload_json TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_world_event_snapshots_source_observed
+                ON world_event_snapshots (source, observed_at DESC);
+
+            CREATE TABLE IF NOT EXISTS world_event_occurrences (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source TEXT NOT NULL,
+                event_key TEXT NOT NULL,
+                event_name TEXT NOT NULL,
+                event_type TEXT NOT NULL DEFAULT '',
+                scheduled_at TEXT NOT NULL,
+                first_seen_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
+                live_first_seen_at TEXT,
+                live_last_seen_at TEXT,
+                ended_at TEXT,
+                status TEXT NOT NULL DEFAULT 'UPCOMING',
+                approximate INTEGER NOT NULL DEFAULT 0,
+                source_text TEXT NOT NULL DEFAULT '',
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                UNIQUE(source, event_key, scheduled_at)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_world_event_occurrences_schedule
+                ON world_event_occurrences (source, scheduled_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_world_event_occurrences_event
+                ON world_event_occurrences (source, event_key, scheduled_at DESC);
 
             CREATE TABLE IF NOT EXISTS guild_item_links (
                 guild_id INTEGER NOT NULL,
@@ -466,6 +502,57 @@ def _init_postgres() -> dict[str, Any]:
             # Einmalige Rollen-Migration auf den neuen kanonischen Key SUPPORT.
             cur.execute("UPDATE aion2_profiles SET main_role='SUPPORT' WHERE UPPER(TRIM(main_role)) IN ('HEAL','HEALER','HEILER')")
             cur.execute("UPDATE guild_members SET main_role='SUPPORT' WHERE UPPER(TRIM(main_role)) IN ('HEAL','HEALER','HEILER')")
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS world_event_snapshots (
+                    id BIGSERIAL PRIMARY KEY,
+                    source TEXT NOT NULL,
+                    observed_at TEXT NOT NULL,
+                    fingerprint TEXT NOT NULL,
+                    payload_json TEXT NOT NULL
+                )
+                """
+            )
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_world_event_snapshots_source_observed
+                    ON world_event_snapshots (source, observed_at DESC)
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS world_event_occurrences (
+                    id BIGSERIAL PRIMARY KEY,
+                    source TEXT NOT NULL,
+                    event_key TEXT NOT NULL,
+                    event_name TEXT NOT NULL,
+                    event_type TEXT NOT NULL DEFAULT '',
+                    scheduled_at TEXT NOT NULL,
+                    first_seen_at TEXT NOT NULL,
+                    last_seen_at TEXT NOT NULL,
+                    live_first_seen_at TEXT,
+                    live_last_seen_at TEXT,
+                    ended_at TEXT,
+                    status TEXT NOT NULL DEFAULT 'UPCOMING',
+                    approximate BOOLEAN NOT NULL DEFAULT FALSE,
+                    source_text TEXT NOT NULL DEFAULT '',
+                    metadata_json TEXT NOT NULL DEFAULT '{}',
+                    UNIQUE(source, event_key, scheduled_at)
+                )
+                """
+            )
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_world_event_occurrences_schedule
+                    ON world_event_occurrences (source, scheduled_at DESC)
+                """
+            )
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_world_event_occurrences_event
+                    ON world_event_occurrences (source, event_key, scheduled_at DESC)
+                """
+            )
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS guild_item_links (
@@ -2505,3 +2592,365 @@ def get_aion2_profile(guild_id:int,user_id:int)->dict[str,Any]:
     try:
         row=conn.execute('SELECT * FROM aion2_profiles WHERE guild_id=? AND user_id=?',(int(guild_id),int(user_id))).fetchone(); return dict(row) if row else {}
     finally: conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Aion 2 Welt-Event-Historie
+# ---------------------------------------------------------------------------
+
+def _world_event_iso(value: Any = None) -> str:
+    if isinstance(value, datetime):
+        dt = value
+    elif value:
+        try:
+            dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except Exception:
+            dt = datetime.now(timezone.utc)
+    else:
+        dt = datetime.now(timezone.utc)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat()
+
+
+def _world_event_payload(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for raw in events or []:
+        if not isinstance(raw, dict):
+            continue
+        out.append({
+            "key": str(raw.get("key") or "").strip(),
+            "name": str(raw.get("name") or "").strip(),
+            "type": str(raw.get("type") or "").strip(),
+            "status": str(raw.get("status") or "UPCOMING").strip().upper(),
+            "scheduled_at": str(raw.get("scheduled_at") or "").strip(),
+            "source_text": str(raw.get("source_text") or "").strip()[:800],
+        })
+    return out
+
+
+def _world_event_latest_active(source: str, event_key: str) -> Optional[dict[str, Any]]:
+    """Liefert den aktuell offenen Live-Eintrag für ein Event."""
+    if not _INITIALIZED:
+        init_runtime_db()
+    src = str(source or "wakayashi")[:80]
+    key = str(event_key or "")[:120]
+    with _DB_LOCK:
+        if _BACKEND == "postgres":
+            conn = _pg_connect()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """SELECT * FROM world_event_occurrences
+                           WHERE source=%s AND event_key=%s AND status='ACTIVE' AND ended_at IS NULL
+                           ORDER BY last_seen_at DESC LIMIT 1""",
+                        (src, key),
+                    )
+                    row = cur.fetchone()
+                    return dict(row) if row else None
+            finally:
+                conn.close()
+        conn = _sqlite_connect()
+        try:
+            row = conn.execute(
+                """SELECT * FROM world_event_occurrences
+                   WHERE source=? AND event_key=? AND status='ACTIVE' AND ended_at IS NULL
+                   ORDER BY last_seen_at DESC LIMIT 1""",
+                (src, key),
+            ).fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
+
+
+def _world_event_recent_occurrences(source: str, event_key: str, limit: int = 8) -> list[dict[str, Any]]:
+    if not _INITIALIZED:
+        init_runtime_db()
+    src = str(source or "wakayashi")[:80]
+    key = str(event_key or "")[:120]
+    lim = max(1, min(int(limit or 8), 50))
+    with _DB_LOCK:
+        if _BACKEND == "postgres":
+            conn = _pg_connect()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """SELECT * FROM world_event_occurrences
+                           WHERE source=%s AND event_key=%s
+                           ORDER BY scheduled_at DESC LIMIT %s""",
+                        (src, key, lim),
+                    )
+                    return [dict(row) for row in (cur.fetchall() or [])]
+            finally:
+                conn.close()
+        conn = _sqlite_connect()
+        try:
+            rows = conn.execute(
+                """SELECT * FROM world_event_occurrences
+                   WHERE source=? AND event_key=?
+                   ORDER BY scheduled_at DESC LIMIT ?""",
+                (src, key, lim),
+            ).fetchall()
+            return [dict(row) for row in rows]
+        finally:
+            conn.close()
+
+
+def record_world_event_snapshot(
+    events: list[dict[str, Any]],
+    *,
+    source: str = "wakayashi",
+    observed_at: Any = None,
+) -> dict[str, Any]:
+    """Speichert einen Wakayashi-Snapshot und deduplizierte Event-Vorkommen.
+
+    Ein Snapshot wird nur geschrieben, wenn sich Event/Status/Zeit gegenüber dem
+    letzten Snapshot geändert haben. Wiederholte Polls blähen die DB daher nicht auf.
+    """
+    if not _INITIALIZED:
+        init_runtime_db()
+    src = str(source or "wakayashi")[:80]
+    observed = _world_event_iso(observed_at)
+    payload = _world_event_payload(events)
+    stable = [
+        {"key": e["key"], "status": e["status"], "scheduled_at": e["scheduled_at"]}
+        for e in payload
+    ]
+    fingerprint = hashlib.sha256(
+        json.dumps(stable, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    payload_json = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    snapshot_inserted = False
+
+    with _DB_LOCK:
+        if _BACKEND == "postgres":
+            conn = _pg_connect()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT fingerprint FROM world_event_snapshots WHERE source=%s ORDER BY id DESC LIMIT 1",
+                        (src,),
+                    )
+                    last = cur.fetchone()
+                    if not last or str(last.get("fingerprint") or "") != fingerprint:
+                        cur.execute(
+                            "INSERT INTO world_event_snapshots(source, observed_at, fingerprint, payload_json) VALUES (%s,%s,%s,%s)",
+                            (src, observed, fingerprint, payload_json),
+                        )
+                        snapshot_inserted = True
+                conn.commit()
+            finally:
+                conn.close()
+        else:
+            conn = _sqlite_connect()
+            try:
+                row = conn.execute(
+                    "SELECT fingerprint FROM world_event_snapshots WHERE source=? ORDER BY id DESC LIMIT 1",
+                    (src,),
+                ).fetchone()
+                if not row or str(row[0] or "") != fingerprint:
+                    conn.execute(
+                        "INSERT INTO world_event_snapshots(source, observed_at, fingerprint, payload_json) VALUES (?,?,?,?)",
+                        (src, observed, fingerprint, payload_json),
+                    )
+                    snapshot_inserted = True
+                conn.commit()
+            finally:
+                conn.close()
+
+    active_keys: set[str] = set()
+    occurrence_updates = 0
+    observed_dt = datetime.fromisoformat(observed)
+
+    for event in payload:
+        key = event.get("key") or ""
+        name = event.get("name") or key
+        if not key:
+            continue
+        status = str(event.get("status") or "UPCOMING").upper()
+        scheduled = str(event.get("scheduled_at") or "").strip()
+        approximate = False
+
+        if status == "ACTIVE":
+            active_keys.add(key)
+            # Falls die Quelle bei "Live" keine Uhrzeit mehr ausgibt, zuerst den
+            # zuletzt angekündigten Termin in zeitlicher Nähe weiterverwenden.
+            if not scheduled:
+                open_row = _world_event_latest_active(src, key)
+                if open_row:
+                    scheduled = str(open_row.get("scheduled_at") or "")
+                if not scheduled:
+                    best: tuple[float, str] | None = None
+                    for row in _world_event_recent_occurrences(src, key, 8):
+                        try:
+                            candidate = datetime.fromisoformat(str(row.get("scheduled_at") or "").replace("Z", "+00:00"))
+                            if candidate.tzinfo is None:
+                                candidate = candidate.replace(tzinfo=timezone.utc)
+                            delta = abs((observed_dt - candidate.astimezone(timezone.utc)).total_seconds())
+                            if delta <= 2 * 3600 and (best is None or delta < best[0]):
+                                best = (delta, candidate.astimezone(timezone.utc).isoformat())
+                        except Exception:
+                            continue
+                    if best:
+                        scheduled = best[1]
+            if not scheduled:
+                scheduled = observed
+                approximate = True
+
+        if not scheduled:
+            # Ein Eintrag ohne konkrete Zeit und ohne Live-Status ist für die
+            # spätere Musteranalyse nicht belastbar; er bleibt nur im Snapshot.
+            continue
+        scheduled = _world_event_iso(scheduled)
+        metadata_json = json.dumps({"source": src}, ensure_ascii=False)
+
+        with _DB_LOCK:
+            if _BACKEND == "postgres":
+                conn = _pg_connect()
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """
+                            INSERT INTO world_event_occurrences(
+                                source,event_key,event_name,event_type,scheduled_at,first_seen_at,last_seen_at,
+                                live_first_seen_at,live_last_seen_at,ended_at,status,approximate,source_text,metadata_json
+                            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,NULL,%s,%s,%s,%s)
+                            ON CONFLICT(source,event_key,scheduled_at) DO UPDATE SET
+                                event_name=EXCLUDED.event_name,
+                                event_type=EXCLUDED.event_type,
+                                last_seen_at=EXCLUDED.last_seen_at,
+                                live_first_seen_at=COALESCE(world_event_occurrences.live_first_seen_at, EXCLUDED.live_first_seen_at),
+                                live_last_seen_at=COALESCE(EXCLUDED.live_last_seen_at, world_event_occurrences.live_last_seen_at),
+                                status=CASE WHEN EXCLUDED.status='ACTIVE' THEN 'ACTIVE' ELSE world_event_occurrences.status END,
+                                approximate=world_event_occurrences.approximate AND EXCLUDED.approximate,
+                                source_text=EXCLUDED.source_text,
+                                metadata_json=EXCLUDED.metadata_json
+                            """,
+                            (
+                                src, key, name, event.get("type") or "", scheduled, observed, observed,
+                                observed if status == "ACTIVE" else None,
+                                observed if status == "ACTIVE" else None,
+                                status, bool(approximate), event.get("source_text") or "", metadata_json,
+                            ),
+                        )
+                    conn.commit()
+                finally:
+                    conn.close()
+            else:
+                conn = _sqlite_connect()
+                try:
+                    conn.execute(
+                        """
+                        INSERT INTO world_event_occurrences(
+                            source,event_key,event_name,event_type,scheduled_at,first_seen_at,last_seen_at,
+                            live_first_seen_at,live_last_seen_at,ended_at,status,approximate,source_text,metadata_json
+                        ) VALUES (?,?,?,?,?,?,?,?,?,NULL,?,?,?,?)
+                        ON CONFLICT(source,event_key,scheduled_at) DO UPDATE SET
+                            event_name=excluded.event_name,
+                            event_type=excluded.event_type,
+                            last_seen_at=excluded.last_seen_at,
+                            live_first_seen_at=COALESCE(world_event_occurrences.live_first_seen_at, excluded.live_first_seen_at),
+                            live_last_seen_at=COALESCE(excluded.live_last_seen_at, world_event_occurrences.live_last_seen_at),
+                            status=CASE WHEN excluded.status='ACTIVE' THEN 'ACTIVE' ELSE world_event_occurrences.status END,
+                            approximate=world_event_occurrences.approximate AND excluded.approximate,
+                            source_text=excluded.source_text,
+                            metadata_json=excluded.metadata_json
+                        """,
+                        (
+                            src, key, name, event.get("type") or "", scheduled, observed, observed,
+                            observed if status == "ACTIVE" else None,
+                            observed if status == "ACTIVE" else None,
+                            status, 1 if approximate else 0, event.get("source_text") or "", metadata_json,
+                        ),
+                    )
+                    conn.commit()
+                finally:
+                    conn.close()
+        occurrence_updates += 1
+
+    # Live-Perioden schließen, sobald die Quelle das Event nicht mehr als aktiv meldet.
+    with _DB_LOCK:
+        if _BACKEND == "postgres":
+            conn = _pg_connect()
+            try:
+                with conn.cursor() as cur:
+                    if active_keys:
+                        cur.execute(
+                            """UPDATE world_event_occurrences
+                               SET status='ENDED', ended_at=%s
+                               WHERE source=%s AND status='ACTIVE' AND ended_at IS NULL
+                                 AND NOT (event_key = ANY(%s))""",
+                            (observed, src, list(active_keys)),
+                        )
+                    else:
+                        cur.execute(
+                            """UPDATE world_event_occurrences SET status='ENDED', ended_at=%s
+                               WHERE source=%s AND status='ACTIVE' AND ended_at IS NULL""",
+                            (observed, src),
+                        )
+                conn.commit()
+            finally:
+                conn.close()
+        else:
+            conn = _sqlite_connect()
+            try:
+                if active_keys:
+                    marks = ",".join("?" for _ in active_keys)
+                    conn.execute(
+                        f"""UPDATE world_event_occurrences SET status='ENDED', ended_at=?
+                            WHERE source=? AND status='ACTIVE' AND ended_at IS NULL
+                              AND event_key NOT IN ({marks})""",
+                        (observed, src, *sorted(active_keys)),
+                    )
+                else:
+                    conn.execute(
+                        """UPDATE world_event_occurrences SET status='ENDED', ended_at=?
+                           WHERE source=? AND status='ACTIVE' AND ended_at IS NULL""",
+                        (observed, src),
+                    )
+                conn.commit()
+            finally:
+                conn.close()
+
+    return {
+        "ok": True,
+        "source": src,
+        "observed_at": observed,
+        "snapshot_inserted": snapshot_inserted,
+        "occurrence_updates": occurrence_updates,
+    }
+
+
+def get_world_event_history(*, source: str = "wakayashi", days: int = 7, limit: int = 1000) -> list[dict[str, Any]]:
+    """Liefert die deduplizierten Ereignisse für spätere Musteranalyse."""
+    if not _INITIALIZED:
+        init_runtime_db()
+    src = str(source or "wakayashi")[:80]
+    lim = max(1, min(int(limit or 1000), 10000))
+    cutoff = datetime.now(timezone.utc) - timedelta(days=max(1, int(days or 7)))
+    cutoff_iso = cutoff.isoformat()
+    with _DB_LOCK:
+        if _BACKEND == "postgres":
+            conn = _pg_connect()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """SELECT * FROM world_event_occurrences
+                           WHERE source=%s AND scheduled_at >= %s
+                           ORDER BY scheduled_at DESC LIMIT %s""",
+                        (src, cutoff_iso, lim),
+                    )
+                    return [dict(row) for row in (cur.fetchall() or [])]
+            finally:
+                conn.close()
+        conn = _sqlite_connect()
+        try:
+            rows = conn.execute(
+                """SELECT * FROM world_event_occurrences
+                   WHERE source=? AND scheduled_at >= ?
+                   ORDER BY scheduled_at DESC LIMIT ?""",
+                (src, cutoff_iso, lim),
+            ).fetchall()
+            return [dict(row) for row in rows]
+        finally:
+            conn.close()
