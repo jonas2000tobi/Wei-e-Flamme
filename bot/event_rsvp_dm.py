@@ -3771,7 +3771,9 @@ async def _dashboard_event_delete(client: discord.Client, guild_id: int, payload
             scheduled_result = {"deleted": False, "error": f"{type(exc).__name__}: {exc}"}
             failed_posts.append("Discord-Serverevent konnte nicht gelöscht werden")
     store.pop(event_id, None)
-    save_store()
+    # Mirror just this missing event: save_store() alone only upserts remaining
+    # events and leaves the deleted event/RSVP records in phase3 PostgreSQL.
+    save_store(event_id)
     await _log(client, int(guild_id), f"Dashboard-Event gelöscht: {obj.get('title')} ({event_id})")
     return {"event_id": event_id, "deleted_posts": deleted_posts, "deleted_dms": deleted_dms, "failed_posts": failed_posts[:10], "scheduled_event": scheduled_result}
 
