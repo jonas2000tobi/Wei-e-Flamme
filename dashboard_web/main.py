@@ -12415,7 +12415,7 @@ def _render_member_activity_dashboard(data:dict[str,Any])->str:
         search = f'{name} {active_days} {messages} {missing}'.casefold()
         response_text = f'{int(ev.get("yes",0) or 0)} Zusagen · {declined} Absagen · {absent} abwesend'
         cards.append(f'''
-          <a class="activity-member" href="/member/{int(uid)}" data-activity-row data-search="{_e(search)}">
+          <a class="activity-member" href="/member/{int(uid)}" data-activity-row data-search="{_e(search)}" data-name="{_e(name.casefold())}" data-days="{active_days}" data-messages="{messages}" data-voice="{voice_seconds}" data-reactions="{int(p7.get('reactions_given') or 0) + int(p7.get('reactions_received') or 0)}">
             <div class="activity-member-head">{avatar_html}<div class="activity-name"><strong>{_e(name)}</strong><span>{_e(response_text)}</span></div><span class="activity-open">›</span></div>
             <div class="activity-metrics">
               <span><small>Aktive Tage · 7T</small><b>{active_days}</b></span>
@@ -12434,7 +12434,7 @@ def _render_member_activity_dashboard(data:dict[str,Any])->str:
       .activity-head h1{{margin:0;color:#e5c77f;font:700 clamp(30px,5vw,43px) Georgia,serif}}.activity-head p{{margin:5px 0 0;color:#918b82}}
       .activity-summary{{display:flex;gap:6px;flex-wrap:wrap}}.activity-summary span{{display:inline-flex;gap:5px;align-items:center;padding:5px 8px;border:1px solid rgba(214,168,79,.19);border-radius:999px;background:rgba(9,10,12,.72);color:#948f86;font-size:10px}}.activity-summary b{{color:#e3c77e;font-size:12px}}
       .activity-box{{border:1px solid rgba(214,168,79,.23);border-radius:16px;overflow:hidden;background:rgba(7,8,10,.84)}}
-      .activity-toolbar{{padding:9px;border-bottom:1px solid rgba(214,168,79,.12)}}.activity-toolbar input{{max-width:420px}}
+      .activity-toolbar{{padding:9px;border-bottom:1px solid rgba(214,168,79,.12);display:flex;gap:9px;flex-wrap:wrap}}.activity-toolbar input{{flex:1;max-width:420px;min-width:150px}}.activity-toolbar select{{background:#161413;color:#ead49d;border:1px solid rgba(214,168,79,.28);border-radius:8px;padding:8px}}.activity-member[hidden]{{display:none!important}}
       .activity-list{{display:grid}}.activity-member{{display:grid;gap:9px;padding:12px 13px;border-bottom:1px solid rgba(214,168,79,.10);color:inherit;text-decoration:none;min-width:0}}.activity-member:last-child{{border-bottom:0}}.activity-member:hover{{background:rgba(214,168,79,.045)}}
       .activity-member-head{{display:grid;grid-template-columns:42px minmax(0,1fr) 20px;gap:10px;align-items:center;min-width:0}}.activity-avatar{{width:42px;height:42px;border-radius:50%;overflow:hidden;display:grid;place-items:center;border:1px solid rgba(214,168,79,.36);background:#1a1713;color:#e7cb88;font-weight:800}}.activity-avatar img{{width:100%;height:100%;object-fit:cover}}.activity-name{{min-width:0}}.activity-name strong,.activity-name span{{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}.activity-name strong{{color:#e7d5ad;font:700 15px Georgia,serif}}.activity-name span{{color:#858077;font-size:10px;margin-top:2px}}.activity-open{{font-size:22px;color:#d6a84f}}
       .activity-metrics{{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px;margin-left:52px}}.activity-metrics span{{padding:7px 8px;border-radius:10px;background:rgba(255,255,255,.025);border:1px solid rgba(214,168,79,.10);min-width:0}}.activity-metrics small,.activity-metrics b{{display:block}}.activity-metrics small{{font-size:8px;color:#777269;text-transform:uppercase;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}.activity-metrics b{{font-size:13px;color:#e0c27b;margin-top:2px}}.activity-metrics span.warn-metric b{{color:#e5a06c}}.activity-empty{{padding:22px;text-align:center;color:#8d877e}}
@@ -12442,9 +12442,9 @@ def _render_member_activity_dashboard(data:dict[str,Any])->str:
     </style>
     <main class="activity-page">
       <header class="activity-head"><div><div class="eyebrow">Mitglieder</div><h1>Aktivität</h1><p>Discord- und Eventaktivität kompakt pro Mitglied.</p></div><div class="activity-summary"><span><b>{len(cards)}</b> Mitglieder</span><span><b>{active_members}</b> aktiv · 7T</span><span><b>{_voice_duration_label(total_voice_seconds)}</b> Voice</span><span><b>{missing_total}</b> offene Antworten</span></div></header>
-      <section class="activity-box"><div class="activity-toolbar"><input id="activity-search" type="search" placeholder="Mitglied suchen …"></div><div class="activity-list">{cards_html}</div></section>
+      <section class="activity-box"><div class="activity-toolbar"><input id="activity-search" type="search" placeholder="Mitglied suchen …"><select id="activity-sort" aria-label="Aktivität sortieren"><option value="active">Aktivste · 7 Tage</option><option value="inactive">Inaktivste · 7 Tage</option><option value="voice">Voice gesamt</option><option value="messages">Nachrichten · 7 Tage</option><option value="reactions">Reaktionen · 7 Tage</option><option value="name">Name A–Z</option></select></div><div id="activity-list" class="activity-list">{cards_html}</div></section>
     </main>
-    <script>(function(){{const i=document.getElementById('activity-search');const rows=Array.from(document.querySelectorAll('[data-activity-row]'));if(!i)return;i.addEventListener('input',function(){{const q=String(i.value||'').trim().toLocaleLowerCase('de');rows.forEach(r=>r.hidden=!!q&&!String(r.dataset.search||'').includes(q));}});}})();</script>
+    <script>(function(){{const i=document.getElementById('activity-search');const sel=document.getElementById('activity-sort');const box=document.getElementById('activity-list');const rows=Array.from(document.querySelectorAll('[data-activity-row]'));const num=(r,k)=>Number(r.dataset[k]||0);function update(){{const mode=sel.value;const q=String(i.value||'').trim().toLocaleLowerCase('de');rows.sort((a,b)=>{{const alpha=String(a.dataset.name||'').localeCompare(String(b.dataset.name||''),'de');if(mode==='name')return alpha;if(mode==='active'||mode==='inactive'){{const sign=mode==='inactive'?1:-1;return sign*(num(a,'days')-num(b,'days'))||sign*(num(a,'messages')-num(b,'messages'))||sign*(num(a,'voice')-num(b,'voice'))||alpha;}}return num(b,mode)-num(a,mode)||alpha;}});rows.forEach(r=>{{r.hidden=!!q&&!String(r.dataset.search||'').includes(q);box.appendChild(r);}});}}i.addEventListener('input',update);sel.addEventListener('change',update);update();}})();</script>
     '''
     return _html_shell('Mitgliederaktivität · Guild Platform', body, nav_mode='admin')
 
@@ -14750,6 +14750,65 @@ def _event_create_dialog(snap: dict[str, Any]) -> str:
     '''
 
 
+def _completed_deleted_event_ids(guild_id: int) -> set[str]:
+    """Prevent orphaned attendance/EC review stubs from reviving deleted events."""
+    if not guild_id or not _database_url():
+        return set()
+    try:
+        _ensure_admin_tables()
+        conn = _pg_connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""SELECT DISTINCT event_id FROM dashboard_event_action_requests
+                               WHERE guild_id=%s AND action_type='delete' AND status='done'""", (guild_id,))
+                return {str(row['event_id']) for row in (cur.fetchall() or [])}
+        finally:
+            conn.close()
+    except Exception as exc:
+        print(f'[event_delete] Abfrage alter Löschungen fehlgeschlagen: {type(exc).__name__}: {exc}')
+        return set()
+
+
+def _events_prune_plan(snap: dict[str, Any], guild_id: int) -> dict[str, Any]:
+    """Keep the newest three events by their scheduled date, not by list position."""
+    deleted = _completed_deleted_event_ids(guild_id)
+    by_id: dict[str, dict[str, Any]] = {}
+    for event in _events_items(snap):
+        event_id = _event_admin_id(event)
+        if event_id and event_id not in deleted:
+            by_id[event_id] = event
+    ordered = sorted(by_id.values(), key=lambda ev: (
+        _event_admin_datetime(ev) or datetime.min.replace(tzinfo=BERLIN_TZ),
+        _event_admin_id(ev),
+    ), reverse=True)
+    keep, remove = ordered[:3], ordered[3:]
+    # Hash the complete current event selection, protecting against a changed snapshot.
+    data = [guild_id, [(_event_admin_id(ev), str(ev.get('when_iso') or ev.get('start_at') or ev.get('created_at') or '')) for ev in ordered]]
+    fingerprint = hashlib.sha256(json.dumps(data, ensure_ascii=False, separators=(',', ':')).encode('utf-8')).hexdigest()
+    return {'keep': keep, 'remove': remove, 'fingerprint': fingerprint}
+
+
+def _events_prune_admin_form(plan: dict[str, Any]) -> str:
+    keep = plan['keep']
+    remove = plan['remove']
+    if not remove:
+        return ''
+    keep_html = ''.join(f'<li>{_e(_event_admin_title(ev))} · {_e(_event_dt(ev.get("when_iso") or ev.get("start_at") or ev.get("created_at")))}</li>' for ev in keep)
+    remove_html = ''.join(f'<li>{_e(_event_admin_title(ev))} · {_e(_event_dt(ev.get("when_iso") or ev.get("start_at") or ev.get("created_at")))}</li>' for ev in remove[:30])
+    extra = f'<p class="muted">... und {len(remove)-30} weitere.</p>' if len(remove) > 30 else ''
+    return f'''<details class="events-prune-admin" style="margin-top:18px;padding:15px;border:1px solid rgba(220,95,75,.5);border-radius:12px;background:rgba(40,10,10,.35)">
+      <summary style="cursor:pointer;font-weight:800">Alte Events bereinigen · {len(remove)} löschen, 3 behalten</summary>
+      <p>Nur die <b>drei neuesten Event-Termine</b> bleiben erhalten:</p><ol>{keep_html}</ol>
+      <p>Folgende Events werden entfernt (inkl. verknüpfter Discord-Posts, sofern der Bot sie löschen kann):</p><ol>{remove_html}</ol>{extra}
+      <p class="muted">Endgültiges Löschen. Historische Event-Daten lassen sich nicht automatisch wiederherstellen. Es wird nichts allein durch das Deployment gelöscht.</p>
+      <form method="post" action="/admin/events/prune-old" style="display:flex;gap:9px;flex-wrap:wrap;align-items:center">
+        <input type="hidden" name="fingerprint" value="{_e(plan['fingerprint'])}">
+        <input name="confirm" autocomplete="off" placeholder="ALTE EVENTS LÖSCHEN" aria-label="Sicherheitswort" required>
+        <button class="btn danger" type="submit" onclick="return confirm('Wirklich alle außer den drei neuesten Events endgültig löschen?')">{len(remove)} alte Events endgültig löschen</button>
+      </form>
+    </details>'''
+
+
 def _render_events_overview_page(data: dict[str, Any], request: Optional[Request], *, admin: bool, msg: str = "") -> str:
     nav_mode = "admin" if admin else "member"
     if not data.get("ok"):
@@ -14766,16 +14825,19 @@ def _render_events_overview_page(data: dict[str, Any], request: Optional[Request
             eid = _event_admin_id(ev)
             if eid:
                 by_id[eid] = dict(ev)
+    deleted_ids = _completed_deleted_event_ids(guild_id)
+    for deleted_id in deleted_ids:
+        by_id.pop(deleted_id, None)
     if admin:
         for ev in _events_with_pending_ec_checks(snap):
             if isinstance(ev, dict):
                 eid = _event_admin_id(ev)
-                if eid:
+                if eid and eid not in deleted_ids:
                     by_id.setdefault(eid, {}).update(dict(ev))
         if guild_id:
             for ev in _open_attendance_review_events_for_homepage(snap, guild_id, limit=120):
                 eid = _event_admin_id(ev)
-                if eid:
+                if eid and eid not in deleted_ids:
                     by_id.setdefault(eid, {}).update(dict(ev))
 
     running: list[dict[str, Any]] = []
@@ -14824,6 +14886,7 @@ def _render_events_overview_page(data: dict[str, Any], request: Optional[Request
     page_title = "Events verwalten" if admin else "Events"
     subline = "Events planen, öffnen und vergangene Termine im Blick behalten." if admin else "Laufende, kommende und vergangene Gildenevents auf einen Blick."
     flash = f'<div class="event-page-flash">{_e(msg)}</div>' if msg else ''
+    prune_form = _events_prune_admin_form(_events_prune_plan(snap, guild_id)) if admin and guild_id else ''
 
     body = f'''
     <style>
@@ -14996,6 +15059,7 @@ def _render_events_overview_page(data: dict[str, Any], request: Optional[Request
       {flash}
       <section><div class="events-section-title"><h2>Aktuell / zuletzt</h2><span class="muted">max. 3</span></div><div class="events-feature-grid">{featured_html}</div></section>
       <section><div class="events-section-title"><h2>Event-Historie</h2><span class="muted">letzte {min(len(past),30)}</span></div><div class="events-history-panel">{history_html}</div></section>
+      {prune_form}
     </main>
     {create_dialog}
     '''
@@ -15469,6 +15533,83 @@ def _member_roster_relative(value: Any) -> str:
     return f"vor {days} Tag" if days == 1 else f"vor {days} Tagen"
 
 
+def _roster_activity_30d(guild_id: int) -> dict[int, dict[str, int]]:
+    """30-day activity for the entire guild, queried once per table instead of per member.
+
+    The default activity ranking uses active days (text/reactions/RSVP OR voice),
+    then messages/reactions and voice duration as tie breakers. Missing metrics
+    are zero, including on a fresh installation without historical voice data.
+    """
+    if not guild_id or not _database_url():
+        return {}
+    results: dict[int, dict[str, int]] = {}
+    try:
+        conn = _pg_connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT user_id,
+                           COALESCE(SUM(messages), 0) AS messages,
+                           COALESCE(SUM(reactions_given), 0) + COALESCE(SUM(reactions_received), 0) AS reactions
+                    FROM member_activity_daily
+                    WHERE guild_id = %s AND activity_date >= CURRENT_DATE - 29
+                    GROUP BY user_id
+                """, (guild_id,))
+                for row in cur.fetchall() or []:
+                    uid = int(row['user_id'])
+                    results[uid] = {
+                        'messages': int(row['messages'] or 0),
+                        'reactions': int(row['reactions'] or 0),
+                        'voice_seconds': 0, 'active_days': 0,
+                    }
+                cur.execute("""
+                    SELECT user_id,
+                           COALESCE(SUM(GREATEST(0, EXTRACT(EPOCH FROM
+                               LEAST(COALESCE(left_at::timestamptz, NOW()), NOW())
+                               - GREATEST(joined_at::timestamptz, (CURRENT_DATE - 29)::timestamptz)
+                           ))), 0)::bigint AS voice_seconds
+                    FROM voice_sessions
+                    WHERE guild_id = %s
+                      AND joined_at::timestamptz < NOW()
+                      AND COALESCE(left_at::timestamptz, NOW()) > (CURRENT_DATE - 29)::timestamptz
+                    GROUP BY user_id
+                """, (guild_id,))
+                for row in cur.fetchall() or []:
+                    entry = results.setdefault(int(row['user_id']),
+                        {'messages': 0, 'reactions': 0, 'voice_seconds': 0, 'active_days': 0})
+                    entry['voice_seconds'] = int(row['voice_seconds'] or 0)
+                # Count distinct active calendar days, including voice-only days.
+                cur.execute("""
+                    SELECT user_id, COUNT(*)::int AS active_days FROM (
+                        SELECT user_id, activity_date::date AS day FROM member_activity_daily
+                        WHERE guild_id = %s AND activity_date >= CURRENT_DATE - 29
+                          AND (messages > 0 OR reactions_given > 0 OR reactions_received > 0 OR event_responses > 0)
+                        UNION
+                        SELECT user_id, generate_series(
+                            GREATEST((joined_at::timestamptz AT TIME ZONE 'UTC')::date, CURRENT_DATE - 29),
+                            LEAST(((COALESCE(left_at::timestamptz, NOW()) - INTERVAL '1 microsecond')
+                                   AT TIME ZONE 'UTC')::date, CURRENT_DATE),
+                            INTERVAL '1 day'
+                        )::date AS day
+                        FROM voice_sessions
+                        WHERE guild_id = %s AND joined_at::timestamptz < NOW()
+                          AND COALESCE(left_at::timestamptz, NOW()) > joined_at::timestamptz
+                          AND COALESCE(left_at::timestamptz, NOW()) > (CURRENT_DATE - 29)::timestamptz
+                    ) AS daily
+                    GROUP BY user_id
+                """, (guild_id, guild_id))
+                for row in cur.fetchall() or []:
+                    entry = results.setdefault(int(row['user_id']),
+                        {'messages': 0, 'reactions': 0, 'voice_seconds': 0, 'active_days': 0})
+                    entry['active_days'] = int(row['active_days'] or 0)
+        finally:
+            conn.close()
+    except Exception as exc:
+        print(f'[member_roster] Aktivitaetsabfrage fehlgeschlagen: {type(exc).__name__}: {exc}')
+        return {}
+    return results
+
+
 def _render_member_members_page(data: dict[str, Any], request: Request) -> str:
     if not data.get("ok"):
         return _html_shell("Mitglieder", f"<section class='panel'><h1>👥 Mitglieder</h1><p class='muted'>{_e(data.get('error'))}</p></section>", nav_mode="member")
@@ -15486,6 +15627,7 @@ def _render_member_members_page(data: dict[str, Any], request: Request) -> str:
         member_map[uid] = merged
 
     aion_profiles = _aion2_profiles_for_users(guild_id, list(member_map.keys())) if guild_id else {}
+    activity_30d = _roster_activity_30d(guild_id) if guild_id else {}
     absences = [row for row in ((snap.get("absences") or {}).get("items") or []) if isinstance(row, dict)]
     today = datetime.now(timezone.utc).date()
     members: list[dict[str, Any]] = []
@@ -15499,7 +15641,7 @@ def _render_member_members_page(data: dict[str, Any], request: Request) -> str:
         gs = str(aion.get("gearscore") or row.get("gearscore") or row.get("gear_score") or "—")
         rank_label, rank_key = _member_roster_rank(row)
         absence = _member_absence_state(absences, uid, today)
-        members.append({"user_id": uid, "display": display, "ingame": ingame, "avatar": avatar, "class_name": class_name, "level": level, "gs": gs, "rank_label": rank_label, "rank_key": rank_key, "absence": absence})
+        members.append({"user_id": uid, "display": display, "ingame": ingame, "avatar": avatar, "class_name": class_name, "level": level, "gs": gs, "rank_label": rank_label, "rank_key": rank_key, "absence": absence, "activity": activity_30d.get(uid) or {}})
 
     rank_order = {"leader": 0, "advisor": 1, "guardian": 2, "member": 3, "recruit": 4}
     members.sort(key=lambda x: (rank_order.get(str(x.get("rank_key")), 9), str(x.get("display") or "").casefold()))
@@ -15519,9 +15661,16 @@ def _render_member_members_page(data: dict[str, Any], request: Request) -> str:
             avatar_html = f'<span class="roster-avatar">{_e(initials(item.get("display") or ""))}</span>'
         class_html = _aion2_class_display_html(item.get("class_name"), with_name=True) if item.get("class_name") else "—"
         searchable = " ".join([str(item.get("display") or ""), str(item.get("ingame") or ""), str(item.get("class_name") or ""), str(item.get("level") or ""), str(item.get("gs") or ""), str(item.get("rank_label") or "")]).casefold()
+        activity = item.get('activity') or {}
+        days = int(activity.get('active_days') or 0)
+        messages = int(activity.get('messages') or 0)
+        reactions = int(activity.get('reactions') or 0)
+        voice_seconds = int(activity.get('voice_seconds') or 0)
+        voice_label = _voice_duration_label(voice_seconds)
+        rank_sort = rank_order.get(str(item.get('rank_key')), 9)
         rows.append(f'''
-          <a class="roster-row" href="/member/{int(item['user_id'])}" data-roster-row data-roster-search="{_e(searchable)}">
-            <div class="roster-person">{avatar_html}<span><strong>{_e(item.get('display'))}</strong><small>{_e(item.get('ingame') or 'Kein Ingame-Name')}</small></span></div>
+          <a class="roster-row" href="/member/{int(item['user_id'])}" data-roster-row data-roster-search="{_e(searchable)}" data-rank="{rank_sort}" data-name="{_e(str(item.get('display') or '').casefold())}" data-days="{days}" data-messages="{messages}" data-reactions="{reactions}" data-voice="{voice_seconds}">
+            <div class="roster-person">{avatar_html}<span><strong>{_e(item.get('display'))}</strong><small>{_e(item.get('ingame') or 'Kein Ingame-Name')}</small><small class="roster-activity-summary">{days} aktive Tage · {messages} Nachrichten · {voice_label} Voice</small></span></div>
             <div class="roster-class">{_cell(class_html)}</div>
             <div class="roster-value"><small>Level</small><strong>{_e(item.get('level') or '—')}</strong></div>
             <div class="roster-value"><small>GS</small><strong>{_e(item.get('gs') or '—')}</strong></div>
@@ -15534,15 +15683,15 @@ def _render_member_members_page(data: dict[str, Any], request: Request) -> str:
     <style>
       .roster-page{{display:grid;gap:12px;width:100%;max-width:1120px;margin:0 auto;min-width:0}}.roster-head{{display:flex;align-items:end;justify-content:space-between;gap:14px;min-width:0}}.roster-head h1{{margin:0;color:#e6c777;font:700 clamp(31px,5vw,44px) Georgia,serif}}.roster-head p{{margin:5px 0 0;color:#918b82}}
       .roster-stats{{display:flex;gap:7px;align-items:center;flex-wrap:wrap;justify-content:flex-end}}.roster-stat{{display:inline-flex;gap:5px;align-items:center;padding:5px 8px;border:1px solid rgba(214,168,79,.2);border-radius:999px;background:rgba(9,10,12,.7);font-size:10px;color:#9c968c}}.roster-stat strong{{color:#e2c779;font-size:12px}}
-      .roster-box{{border:1px solid rgba(214,168,79,.24);border-radius:15px;overflow:hidden;background:rgba(7,8,10,.82);min-width:0}}.roster-toolbar{{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:9px;align-items:center;padding:10px;border-bottom:1px solid rgba(214,168,79,.13)}}.roster-toolbar input{{width:100%;min-width:0;box-sizing:border-box}}.roster-toolbar-stats{{display:flex;gap:5px;flex-wrap:wrap;justify-content:flex-end}}
+      .roster-box{{border:1px solid rgba(214,168,79,.24);border-radius:15px;overflow:hidden;background:rgba(7,8,10,.82);min-width:0}}.roster-toolbar{{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:9px;align-items:center;padding:10px;border-bottom:1px solid rgba(214,168,79,.13)}} .roster-toolbar .roster-controls{{display:flex;gap:8px;min-width:0;align-items:center}}.roster-toolbar .roster-controls input{{flex:1;width:100%;min-width:0;box-sizing:border-box}}.roster-toolbar .roster-controls select{{flex:0 1 205px;min-width:130px;max-width:230px;padding:8px;border:1px solid rgba(214,168,79,.28);border-radius:8px;color:#ead49d;background:#161413}}.roster-row[hidden]{{display:none!important}}.roster-activity-summary{{color:#a5a095!important;font-size:9px!important}}.roster-toolbar-stats{{display:flex;gap:5px;flex-wrap:wrap;justify-content:flex-end}}
       .roster-table-head{{display:grid;grid-template-columns:minmax(250px,1.5fr) minmax(190px,1fr) 75px 85px 24px;gap:12px;padding:8px 13px;color:#8f887d;text-transform:uppercase;font-size:9px;letter-spacing:.05em;border-bottom:1px solid rgba(214,168,79,.11)}}
       .roster-row{{display:grid;grid-template-columns:minmax(250px,1.5fr) minmax(190px,1fr) 75px 85px 24px;gap:12px;align-items:center;padding:10px 13px;border-bottom:1px solid rgba(214,168,79,.1);text-decoration:none;color:inherit;min-width:0;transition:.14s ease}}.roster-row:last-child{{border-bottom:0}}.roster-row:hover{{background:linear-gradient(90deg,rgba(126,30,23,.17),rgba(214,168,79,.03));box-shadow:inset 3px 0 #9d392c}}
       .roster-person{{display:flex;align-items:center;gap:10px;min-width:0}}.roster-avatar{{width:42px;height:42px;flex:0 0 42px;border-radius:50%;overflow:hidden;display:grid;place-items:center;border:1px solid rgba(214,168,79,.4);background:radial-gradient(circle at 35% 25%,#705633,#17181a 70%);color:#efd798;font:700 12px Georgia,serif}}.roster-avatar img{{width:100%;height:100%;object-fit:cover}}.roster-person span{{min-width:0}}.roster-person strong,.roster-person small{{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}.roster-person strong{{color:#e6d4ac;font:700 14px Georgia,serif}}.roster-person small{{margin-top:2px;color:#878279;font-size:10px}}
       .roster-class{{min-width:0;color:#b8b0a4;font-size:12px}}.roster-class img{{width:30px!important;height:30px!important;margin-right:6px!important;vertical-align:middle}}.roster-value small,.roster-value strong{{display:block}}.roster-value small{{color:#777269;font-size:8px;text-transform:uppercase}}.roster-value strong{{margin-top:2px;color:#e0c37f;font:700 13px Georgia,serif}}.roster-open{{font-size:23px;color:#d6a84f;text-align:right}}.roster-empty{{padding:22px;text-align:center;color:#8e877d}}
-      @media(max-width:680px){{main.content{{width:100%!important;max-width:100%!important;min-width:0!important;box-sizing:border-box!important;padding-left:10px!important;padding-right:10px!important;overflow-x:hidden!important}}.roster-page{{padding-top:76px!important;gap:8px!important;width:100%!important;max-width:100%!important;min-width:0!important;overflow:hidden!important}}.roster-head{{display:grid!important;gap:7px!important;align-items:start!important}}.roster-head h1{{font-size:27px!important}}.roster-head p{{font-size:11px!important}}.roster-stats{{justify-content:flex-start!important;gap:4px!important}}.roster-stat{{padding:4px 6px!important;font-size:8px!important}}.roster-stat strong{{font-size:10px!important}}.roster-toolbar{{grid-template-columns:1fr!important;padding:7px!important;gap:6px!important}}.roster-toolbar input{{font-size:12px!important;padding:8px!important}}.roster-toolbar-stats{{justify-content:flex-start!important;gap:4px!important}}.roster-table-head{{display:none!important}}.roster-row{{grid-template-columns:minmax(0,1fr) auto auto 18px!important;grid-template-rows:auto auto!important;gap:5px 7px!important;padding:8px 9px!important;width:100%!important;max-width:100%!important;min-width:0!important;box-sizing:border-box!important;overflow:hidden!important}}.roster-person{{grid-column:1/2!important;grid-row:1/3!important;gap:8px!important;min-width:0!important}}.roster-avatar{{width:38px!important;height:38px!important;flex-basis:38px!important}}.roster-person strong{{font-size:12px!important}}.roster-person small{{font-size:9px!important;max-width:132px!important}}.roster-class{{grid-column:2/5!important;grid-row:1!important;text-align:right!important;font-size:10px!important;white-space:nowrap!important;overflow:hidden!important;text-overflow:ellipsis!important;min-width:0!important;display:flex!important;justify-content:flex-end!important;align-items:center!important;gap:4px!important}}.roster-class img{{width:25px!important;height:25px!important;margin:0!important;flex:0 0 25px!important}}.roster-value{{grid-row:2!important;text-align:right!important;min-width:36px!important}}.roster-value:nth-of-type(3){{grid-column:2!important}}.roster-value:nth-of-type(4){{grid-column:3!important}}.roster-value small{{font-size:7px!important}}.roster-value strong{{font-size:11px!important}}.roster-open{{grid-column:4!important;grid-row:2!important;font-size:19px!important}}}}
+      @media(max-width:680px){{main.content{{width:100%!important;max-width:100%!important;min-width:0!important;box-sizing:border-box!important;padding-left:10px!important;padding-right:10px!important;overflow-x:hidden!important}}.roster-page{{padding-top:76px!important;gap:8px!important;width:100%!important;max-width:100%!important;min-width:0!important;overflow:hidden!important}}.roster-head{{display:grid!important;gap:7px!important;align-items:start!important}}.roster-head h1{{font-size:27px!important}}.roster-head p{{font-size:11px!important}}.roster-stats{{justify-content:flex-start!important;gap:4px!important}}.roster-stat{{padding:4px 6px!important;font-size:8px!important}}.roster-stat strong{{font-size:10px!important}}.roster-toolbar{{grid-template-columns:1fr!important;padding:7px!important;gap:6px!important}} .roster-toolbar .roster-controls{{flex-direction:column;align-items:stretch;gap:6px}}.roster-toolbar .roster-controls select{{width:100%;min-width:0;max-width:none;flex:auto}}.roster-toolbar input{{font-size:12px!important;padding:8px!important}}.roster-toolbar-stats{{justify-content:flex-start!important;gap:4px!important}}.roster-table-head{{display:none!important}}.roster-row{{grid-template-columns:minmax(0,1fr) auto auto 18px!important;grid-template-rows:auto auto!important;gap:5px 7px!important;padding:8px 9px!important;width:100%!important;max-width:100%!important;min-width:0!important;box-sizing:border-box!important;overflow:hidden!important}}.roster-person{{grid-column:1/2!important;grid-row:1/3!important;gap:8px!important;min-width:0!important}}.roster-avatar{{width:38px!important;height:38px!important;flex-basis:38px!important}}.roster-person strong{{font-size:12px!important}}.roster-person small{{font-size:9px!important;max-width:132px!important}}.roster-class{{grid-column:2/5!important;grid-row:1!important;text-align:right!important;font-size:10px!important;white-space:nowrap!important;overflow:hidden!important;text-overflow:ellipsis!important;min-width:0!important;display:flex!important;justify-content:flex-end!important;align-items:center!important;gap:4px!important}}.roster-class img{{width:25px!important;height:25px!important;margin:0!important;flex:0 0 25px!important}}.roster-value{{grid-row:2!important;text-align:right!important;min-width:36px!important}}.roster-value:nth-of-type(3){{grid-column:2!important}}.roster-value:nth-of-type(4){{grid-column:3!important}}.roster-value small{{font-size:7px!important}}.roster-value strong{{font-size:11px!important}}.roster-open{{grid-column:4!important;grid-row:2!important;font-size:19px!important}}}}
     </style>
-    <main class="roster-page"><header class="roster-head"><div><div class="eyebrow">Gilde</div><h1>Mitglieder</h1><p>Discord-Profil, Charakter und Aion-2-Daten auf einen Blick.</p></div></header><section class="roster-box"><div class="roster-toolbar"><input id="roster-search" type="search" placeholder="Mitglied suchen …"><div class="roster-toolbar-stats"><span class="roster-stat"><strong id="roster-count">{total}</strong> Mitglieder</span><span class="roster-stat"><strong>{leadership}</strong> Leitung</span><span class="roster-stat"><strong>{away}</strong> abwesend</span></div></div><div class="roster-table-head"><span>Mitglied</span><span>Klasse</span><span>Level</span><span>GS</span><span></span></div><div id="roster-rows">{rows_html}</div></section></main>
-    <script>(function(){{const input=document.getElementById('roster-search');const count=document.getElementById('roster-count');const rows=Array.from(document.querySelectorAll('[data-roster-row]'));function render(){{const q=String(input&&input.value||'').trim().toLocaleLowerCase('de');let visible=0;rows.forEach(function(row){{const show=!q||String(row.dataset.rosterSearch||'').includes(q);row.hidden=!show;if(show)visible++;}});if(count)count.textContent=String(visible);}}if(input)input.addEventListener('input',render);render();}})();</script>
+    <main class="roster-page"><header class="roster-head"><div><div class="eyebrow">Gilde</div><h1>Mitglieder</h1><p>Discord-Profil, Charakter und Aion-2-Daten auf einen Blick.</p></div></header><section class="roster-box"><div class="roster-toolbar"><div class="roster-controls"><input id="roster-search" type="search" placeholder="Mitglied suchen …"><select id="roster-sort" aria-label="Mitglieder sortieren"><option value="rank">Rang (Standard)</option><option value="active">Aktivste · 30 Tage</option><option value="inactive">Inaktivste · 30 Tage</option><option value="voice">Voice-Zeit · 30 Tage</option><option value="messages">Nachrichten · 30 Tage</option><option value="reactions">Reaktionen · 30 Tage</option><option value="name">Name A–Z</option></select></div><div class="roster-toolbar-stats"><span class="roster-stat"><strong id="roster-count">{total}</strong> Mitglieder</span><span class="roster-stat"><strong>{leadership}</strong> Leitung</span><span class="roster-stat"><strong>{away}</strong> abwesend</span></div></div><div class="roster-table-head"><span>Mitglied</span><span>Klasse</span><span>Level</span><span>GS</span><span></span></div><div id="roster-rows">{rows_html}</div></section></main>
+    <script>(function(){{const input=document.getElementById('roster-search');const sort=document.getElementById('roster-sort');const count=document.getElementById('roster-count');const container=document.getElementById('roster-rows');const rows=Array.from(document.querySelectorAll('[data-roster-row]'));const num=(r,k)=>Number(r.dataset[k]||0);const name=r=>String(r.dataset.name||'');function render(){{const q=String(input&&input.value||'').trim().toLocaleLowerCase('de');const mode=sort?sort.value:'rank';rows.sort(function(a,b){{const alpha=name(a).localeCompare(name(b),'de');if(mode==='name')return alpha;if(mode==='rank')return num(a,'rank')-num(b,'rank')||alpha;if(mode==='active'||mode==='inactive'){{const factor=mode==='inactive'?1:-1;return factor*(num(a,'days')-num(b,'days'))||factor*(num(a,'messages')+num(a,'reactions')-num(b,'messages')-num(b,'reactions'))||factor*(num(a,'voice')-num(b,'voice'))||alpha;}}const field={{voice:'voice',messages:'messages',reactions:'reactions'}}[mode];return field?num(b,field)-num(a,field)||alpha:alpha;}});let visible=0;rows.forEach(function(row){{const show=!q||String(row.dataset.rosterSearch||'').includes(q);row.hidden=!show;if(show)visible++;container.appendChild(row);}});if(count)count.textContent=String(visible);}}if(input)input.addEventListener('input',render);if(sort)sort.addEventListener('change',render);render();}})();</script>
     '''
     return _html_shell("Mitglieder", body, nav_mode=_nav_mode_for_request(request))
 
@@ -17232,6 +17381,66 @@ def events_admin_page(request: Request, _: bool = Depends(_admin_auth), msg: str
 @app.get("/admin/events", response_class=HTMLResponse)
 def admin_events_alias(_: bool = Depends(_admin_auth)):
     return RedirectResponse("/events-admin", status_code=302)
+
+
+@app.post('/admin/events/prune-old')
+async def admin_events_prune_old(request: Request, _: bool = Depends(_admin_auth)):
+    """Queue deletions through the existing bot path; never mutate event tables here."""
+    def go(message: str) -> RedirectResponse:
+        return RedirectResponse('/events-admin?msg=' + urllib.parse.quote(message), status_code=303)
+
+    form = _parse_urlencoded_body(await request.body())
+    if str(form.get('confirm') or '').strip() != 'ALTE EVENTS LÖSCHEN':
+        return go('Abgebrochen: Sicherheitswort ALTE EVENTS LÖSCHEN eingeben.')
+    payload = _snapshot_payload()
+    if not payload.get('ok'):
+        return go('Abgebrochen: Eventdaten konnten nicht geladen werden.')
+    guild_id = _safe_guild_id(payload)
+    if not guild_id:
+        return go('Abgebrochen: Guild-ID fehlt.')
+    plan = _events_prune_plan(payload.get('snapshot') or {}, guild_id)
+    if not secrets.compare_digest(str(form.get('fingerprint') or ''), plan['fingerprint']):
+        return go('Eventliste hat sich geändert. Bitte Seite neu laden und Löschliste erneut prüfen.')
+    remove = plan['remove']
+    if not remove:
+        return go('Keine alten Events vorhanden. Nichts gelöscht.')
+    if not _database_url():
+        return go('Abgebrochen: PostgreSQL ist nicht verbunden.')
+    # Avoid duplicate queue entries if a user submits the form a second time.
+    ids = [_event_admin_id(ev) for ev in remove]
+    try:
+        _ensure_admin_tables()
+        conn = _pg_connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""SELECT DISTINCT event_id FROM dashboard_event_action_requests
+                               WHERE guild_id=%s AND action_type='delete'
+                                 AND status IN ('pending', 'processing') AND event_id=ANY(%s)""", (guild_id, ids))
+                already = {str(r['event_id']) for r in (cur.fetchall() or [])}
+        finally:
+            conn.close()
+    except Exception as exc:
+        return go(f'Abgebrochen: Löschwarteschlange nicht lesbar ({type(exc).__name__}).')
+    actor = _current_user(request) or {'username': 'Dashboard'}
+    queued = 0
+    errors = []
+    for ev in remove:
+        eid = _event_admin_id(ev)
+        if eid in already:
+            continue
+        try:
+            result = _enqueue_event_action_request(guild_id, 'delete', {'event_id': eid}, actor)
+            if result.get('ok'):
+                queued += 1
+            else:
+                errors.append(f'{_event_admin_title(ev)}: {result.get("error") or "Unbekannter Fehler"}')
+        except Exception as exc:
+            errors.append(f'{_event_admin_title(ev)}: {type(exc).__name__}')
+    result_msg = f'{queued} Löschaufträge an den Bot gesendet; {len(already)} bereits in Bearbeitung. Die 3 neuesten bleiben erhalten.'
+    if errors:
+        result_msg += f' {len(errors)} Fehler beim Einreihen; siehe Railway-Logs.'
+        print('[events_prune] Fehler:', errors)
+    return go(result_msg)
 
 
 @app.get("/admin/events/{event_id}", response_class=HTMLResponse)
