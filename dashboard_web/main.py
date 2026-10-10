@@ -12163,6 +12163,21 @@ def _ensure_v211_tables() -> None:
         conn.commit()
     finally: conn.close()
 
+def _voice_duration_label(seconds:Any)->str:
+    """Show short live voice sessions in minutes instead of rounding to 0.0 h."""
+    try:
+        value=max(0,int(seconds or 0))
+    except (TypeError,ValueError):
+        value=0
+    if not value:
+        return '0 min'
+    if value < 60:
+        return '<1 min'
+    hours, remainder=divmod(value,3600)
+    minutes=remainder//60
+    return f'{hours} h {minutes} min' if hours else f'{minutes} min'
+
+
 def _activity_data(guild_id:int,user_id:int)->dict[str,Any]:
     if not _database_url(): return {}
     _ensure_v211_tables(); conn=_pg_connect()
@@ -12173,7 +12188,29 @@ def _activity_data(guild_id:int,user_id:int)->dict[str,Any]:
             periods={}
             for days in (7,30,90):
                 cur.execute('''SELECT COALESCE(SUM(messages),0) messages,COALESCE(SUM(reactions_given),0) reactions_given,COALESCE(SUM(reactions_received),0) reactions_received,COUNT(*) FILTER(WHERE messages>0 OR reactions_given>0 OR reactions_received>0 OR event_responses>0) active_days FROM member_activity_daily WHERE guild_id=%s AND user_id=%s AND activity_date>=CURRENT_DATE-(%s::int-1)''',(guild_id,user_id,days)); periods[days]=dict(cur.fetchone() or {})
-            cur.execute('''SELECT COALESCE(SUM(duration_seconds),0) seconds,COUNT(*) sessions FROM voice_sessions WHERE guild_id=%s AND user_id=%s AND duration_seconds IS NOT NULL''',(guild_id,user_id)); voice=dict(cur.fetchone() or {})
+            # One scan for all time windows; include open voice sessions live.
+            cur.execute('''SELECT
+                COALESCE(SUM(CASE WHEN left_at IS NULL
+                    THEN GREATEST(0, EXTRACT(EPOCH FROM (NOW() - joined_at::timestamptz)))
+                    ELSE COALESCE(duration_seconds, 0) END), 0)::bigint AS seconds,
+                COUNT(*) AS sessions,
+                COUNT(*) FILTER (WHERE left_at IS NULL) AS open_sessions,
+                COALESCE(SUM(GREATEST(0, EXTRACT(EPOCH FROM
+                    LEAST(COALESCE(left_at::timestamptz, NOW()), NOW())
+                    - GREATEST(joined_at::timestamptz, CURRENT_DATE - INTERVAL '6 days')
+                ))),0)::bigint AS seconds_7,
+                COALESCE(SUM(GREATEST(0, EXTRACT(EPOCH FROM
+                    LEAST(COALESCE(left_at::timestamptz, NOW()), NOW())
+                    - GREATEST(joined_at::timestamptz, CURRENT_DATE - INTERVAL '29 days')
+                ))),0)::bigint AS seconds_30,
+                COALESCE(SUM(GREATEST(0, EXTRACT(EPOCH FROM
+                    LEAST(COALESCE(left_at::timestamptz, NOW()), NOW())
+                    - GREATEST(joined_at::timestamptz, CURRENT_DATE - INTERVAL '89 days')
+                ))),0)::bigint AS seconds_90
+                FROM voice_sessions WHERE guild_id=%s AND user_id=%s''',(guild_id,user_id))
+            voice=dict(cur.fetchone() or {})
+            for days in (7,30,90):
+                periods[days]['voice_seconds']=int(voice.get(f'seconds_{days}') or 0)
             cur.execute("SELECT COUNT(DISTINCT event_id) AS c FROM event_rsvp_transitions WHERE guild_id=%s AND user_id=%s AND new_choice='NO' AND old_choice IN ('TANK','SUPPORT','HEAL','DPS','BANK')",(guild_id,user_id)); absent=int((cur.fetchone() or {}).get('c') or 0)
             cur.execute('SELECT * FROM aion2_profiles WHERE guild_id=%s AND user_id=%s',(guild_id,user_id)); aion=dict(cur.fetchone() or {})
             # Aktive Tage = Union aus Nachrichten/Reaktionen/Event-Rückmeldung und Voice.
@@ -12183,15 +12220,28 @@ def _activity_data(guild_id:int,user_id:int)->dict[str,Any]:
                     WHERE guild_id=%s AND user_id=%s AND activity_date>=CURRENT_DATE-(%s::int-1)
                       AND (messages>0 OR reactions_given>0 OR reactions_received>0 OR event_responses>0)
                     UNION
-                    SELECT DATE(joined_at::timestamptz) AS d FROM voice_sessions
-                    WHERE guild_id=%s AND user_id=%s AND joined_at::timestamptz >= CURRENT_DATE-(%s::int-1)
-                ) active""",(guild_id,user_id,days,guild_id,user_id,days))
+                    SELECT generate_series(
+                        GREATEST((joined_at::timestamptz AT TIME ZONE 'UTC')::date, CURRENT_DATE-(%s::int-1)),
+                        LEAST(((COALESCE(left_at::timestamptz, NOW()) - interval '1 microsecond') AT TIME ZONE 'UTC')::date, CURRENT_DATE),
+                        interval '1 day'
+                    )::date AS d FROM voice_sessions
+                    WHERE guild_id=%s AND user_id=%s
+                      AND joined_at::timestamptz < NOW()
+                      AND COALESCE(left_at::timestamptz, NOW()) > joined_at::timestamptz
+                      AND COALESCE(left_at::timestamptz, NOW()) > (CURRENT_DATE-(%s::int-1))::timestamptz
+                ) active""",(guild_id,user_id,days,days,guild_id,user_id,days))
                 periods[days]['active_days_union']=int((cur.fetchone() or {}).get('c') or 0)
             cur.execute("""SELECT COUNT(*) AS c FROM (
                 SELECT activity_date::date AS d FROM member_activity_daily
                 WHERE guild_id=%s AND user_id=%s AND (messages>0 OR reactions_given>0 OR reactions_received>0 OR event_responses>0)
                 UNION
-                SELECT DATE(joined_at::timestamptz) AS d FROM voice_sessions WHERE guild_id=%s AND user_id=%s
+                SELECT generate_series(
+                    (joined_at::timestamptz AT TIME ZONE 'UTC')::date,
+                    ((COALESCE(left_at::timestamptz, NOW()) - interval '1 microsecond') AT TIME ZONE 'UTC')::date,
+                    interval '1 day'
+                )::date AS d FROM voice_sessions WHERE guild_id=%s AND user_id=%s
+                  AND joined_at::timestamptz < NOW()
+                  AND COALESCE(left_at::timestamptz, NOW()) > joined_at::timestamptz
             ) active""",(guild_id,user_id,guild_id,user_id))
             total['active_days_union']=int((cur.fetchone() or {}).get('c') or 0)
         return {'member_since':mr.get('member_since'),'total':total,'periods':periods,'voice':voice,'aion':aion,'absent':absent}
@@ -12227,10 +12277,12 @@ def _member_activity_panel(data:dict[str,Any],user_id:int,current_user:Optional[
     pcards=''.join([_card('Mögliche Events',possible,'seit Gildenbeitritt'),_card('Zugesagt',es['yes'],f'{yes_pct}%'),_card('Reserve',es['reserve'],'separat'),_card('Vielleicht',es['maybe'],'Rückmeldung'),_card('Abgelehnt',declined,'direkt Nein'),_card('Abwesend',absent,'erst bestätigt, dann abgemeldet'),_card('Keine Rückmeldung',es['missing'],f'Rückmeldequote {response_pct}%')])
     rows=[]
     for days in (7,30,90):
-        x=periods.get(days) or {}; rows.append([f'{days} Tage',int(x.get('active_days_union') or x.get('active_days') or 0),x.get('messages',0),x.get('reactions_given',0),x.get('reactions_received',0)])
-    rows.append(['Seit Erfassung',int(total.get('active_days_union') or total.get('active_days') or 0),total.get('messages',0),total.get('reactions_given',0),total.get('reactions_received',0)])
+        x=periods.get(days) or {}; rows.append([f'{days} Tage',int(x.get('active_days_union') or x.get('active_days') or 0),x.get('messages',0),x.get('reactions_given',0),x.get('reactions_received',0),_voice_duration_label(x.get('voice_seconds'))])
+    rows.append(['Seit Erfassung',int(total.get('active_days_union') or total.get('active_days') or 0),total.get('messages',0),total.get('reactions_given',0),total.get('reactions_received',0),_voice_duration_label(v.get('seconds'))])
     seconds=int(v.get('seconds') or 0); sessions=int(v.get('sessions') or 0); avg=round(seconds/sessions/60,1) if sessions else 0
-    return f'''<section class="panel" id="activity"><h2>📈 Aktivität & Rückmeldungen</h2><p class="muted">Keine Attendance-Auswertung: angezeigt werden Event-Rückmeldungen und Discord-Aktivität.</p><div class="grid">{pcards}</div>{_table(['Zeitraum','Aktive Tage','Nachrichten','Reaktionen vergeben','Reaktionen erhalten'],rows,searchable=False)}<div class="grid">{_card('Voice gesamt',f'{round(seconds/3600,1)} h',f'{sessions} Sessions')}{_card('Ø Voice-Session',f'{avg} min','seit Erfassung')}{_card('Letzte Aktivität',_dt(total.get('last_activity')),'Discord-Aktivität')}{_card('Gildenmitglied seit',_dt(d.get('member_since')),'erfasster Beginn')}</div></section>'''
+    open_sessions=int(v.get('open_sessions') or 0)
+    session_info=f'{sessions} Sessions · {open_sessions} läuft' if open_sessions else f'{sessions} Sessions'
+    return f'''<section class="panel" id="activity"><h2>📈 Aktivität & Rückmeldungen</h2><p class="muted">Keine Attendance-Auswertung: angezeigt werden Event-Rückmeldungen und Discord-Aktivität.</p><div class="grid">{pcards}</div>{_table(['Zeitraum','Aktive Tage','Nachrichten','Reaktionen vergeben','Reaktionen erhalten','Voice-Zeit'],rows,searchable=False)}<div class="grid">{_card('Voice gesamt',_voice_duration_label(seconds),session_info)}{_card('Ø Voice-Session',f'{avg} min','inklusive laufender Sessions')}{_card('Letzte Textaktivität',_dt(total.get('last_activity')),'Nachrichten/Reaktionen/Events')}{_card('Gildenmitglied seit',_dt(d.get('member_since')),'erfasster Beginn')}</div></section>'''
 
 def _aion2_normalize_class(value: Any) -> str:
     return aion2_normalize_class(value)
@@ -12368,7 +12420,7 @@ def _render_member_activity_dashboard(data:dict[str,Any])->str:
             <div class="activity-metrics">
               <span><small>Aktive Tage · 7T</small><b>{active_days}</b></span>
               <span><small>Nachrichten · 7T</small><b>{messages}</b></span>
-              <span><small>Voice gesamt</small><b>{round(voice_seconds/3600,1)} h</b></span>
+              <span><small>Voice gesamt</small><b>{_voice_duration_label(voice_seconds)}</b></span>
               <span class="{'warn-metric' if missing else ''}"><small>Keine Antwort</small><b>{missing}</b></span>
             </div>
           </a>
@@ -12389,7 +12441,7 @@ def _render_member_activity_dashboard(data:dict[str,Any])->str:
       @media(max-width:680px){{.activity-page{{padding-top:76px;gap:9px}}.activity-head{{display:grid;gap:7px}}.activity-head h1{{font-size:27px}}.activity-head p{{font-size:11px}}.activity-toolbar{{padding:7px}}.activity-toolbar input{{font-size:12px;padding:8px}}.activity-member{{padding:9px}}.activity-member-head{{grid-template-columns:38px minmax(0,1fr) 16px;gap:8px}}.activity-avatar{{width:38px;height:38px}}.activity-name strong{{font-size:13px}}.activity-name span{{font-size:9px}}.activity-metrics{{grid-template-columns:repeat(2,minmax(0,1fr));margin-left:46px;gap:5px}}.activity-metrics span{{padding:6px}}.activity-metrics b{{font-size:12px}}}}
     </style>
     <main class="activity-page">
-      <header class="activity-head"><div><div class="eyebrow">Mitglieder</div><h1>Aktivität</h1><p>Discord- und Eventaktivität kompakt pro Mitglied.</p></div><div class="activity-summary"><span><b>{len(cards)}</b> Mitglieder</span><span><b>{active_members}</b> aktiv · 7T</span><span><b>{round(total_voice_seconds/3600,1)}</b> Voice h</span><span><b>{missing_total}</b> offene Antworten</span></div></header>
+      <header class="activity-head"><div><div class="eyebrow">Mitglieder</div><h1>Aktivität</h1><p>Discord- und Eventaktivität kompakt pro Mitglied.</p></div><div class="activity-summary"><span><b>{len(cards)}</b> Mitglieder</span><span><b>{active_members}</b> aktiv · 7T</span><span><b>{_voice_duration_label(total_voice_seconds)}</b> Voice</span><span><b>{missing_total}</b> offene Antworten</span></div></header>
       <section class="activity-box"><div class="activity-toolbar"><input id="activity-search" type="search" placeholder="Mitglied suchen …"></div><div class="activity-list">{cards_html}</div></section>
     </main>
     <script>(function(){{const i=document.getElementById('activity-search');const rows=Array.from(document.querySelectorAll('[data-activity-row]'));if(!i)return;i.addEventListener('input',function(){{const q=String(i.value||'').trim().toLocaleLowerCase('de');rows.forEach(r=>r.hidden=!!q&&!String(r.dataset.search||'').includes(q));}});}})();</script>
