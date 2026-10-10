@@ -42,6 +42,15 @@ except Exception:
 
 TZ = ZoneInfo("Europe/Berlin")
 VOICE_RECONCILE_INTERVAL_SECONDS = 30
+
+
+def _voice_tracking_enabled(guild_id: int) -> bool:
+    """Record voice for member activity even when raid attendance is disabled.
+
+    Both features intentionally share the same voice_sessions records. Disabling
+    one feature must not stop the other one from recording time.
+    """
+    return is_module_enabled(guild_id, "member_activity") or is_module_enabled(guild_id, "attendance")
 _voice_reconcile_task: Optional[asyncio.Task] = None
 
 
@@ -270,7 +279,9 @@ def _current_voice_members(guild: discord.Guild) -> dict[int, tuple[int, str, st
     Gateway-Events nicht verloren.
     """
     current: dict[int, tuple[int, str, str]] = {}
-    for channel in list(getattr(guild, "voice_channels", []) or []):
+    # Stage channels are voice connections, too. Exclude duplicates defensively.
+    channels = list(getattr(guild, "voice_channels", []) or []) + list(getattr(guild, "stage_channels", []) or [])
+    for channel in channels:
         for member in list(getattr(channel, "members", []) or []):
             if getattr(member, "bot", False):
                 continue
@@ -282,11 +293,11 @@ async def _reconcile_voice_sessions_once(client: discord.Client) -> dict[str, in
     stats = {"guilds": 0, "current": 0, "started": 0, "closed": 0, "errors": 0}
     until_iso = _iso_utc(_now_utc() + timedelta(minutes=2))
     for guild in list(getattr(client, "guilds", []) or []):
-        if not is_module_enabled(int(guild.id), "attendance"):
-            continue
         stats["guilds"] += 1
         try:
-            current = _current_voice_members(guild)
+            # With both switches off, close any sessions left open from before
+            # the configuration change instead of letting their time grow forever.
+            current = _current_voice_members(guild) if _voice_tracking_enabled(int(guild.id)) else {}
             stats["current"] += len(current)
             rows = await asyncio.to_thread(
                 fetch_voice_sessions,
@@ -368,7 +379,7 @@ def _start_voice_reconcile_loop(client: discord.Client) -> None:
     if _voice_reconcile_task is not None and not _voice_reconcile_task.done():
         return
     _voice_reconcile_task = asyncio.create_task(_voice_reconcile_loop(client))
-    print(f"🎙️ Voice-Abgleich gestartet: alle {VOICE_RECONCILE_INTERVAL_SECONDS}s.", flush=True)
+    print(f"🎙️ Voice-Abgleich für Mitgliederaktivität/Attendance gestartet: alle {VOICE_RECONCILE_INTERVAL_SECONDS}s.", flush=True)
 
 
 async def _bootstrap_current_voice_members(client: discord.Client) -> int:
@@ -387,7 +398,7 @@ async def setup_voice_attendance(client: discord.Client, tree: app_commands.Comm
             try:
                 if member.bot or member.guild is None:
                     return
-                if not is_module_enabled(int(member.guild.id), "attendance"):
+                if not _voice_tracking_enabled(int(member.guild.id)):
                     return
                 before_ch = before.channel
                 after_ch = after.channel
